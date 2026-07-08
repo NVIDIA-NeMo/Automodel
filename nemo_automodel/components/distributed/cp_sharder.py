@@ -12,26 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-owned context-parallel sharding contract.
+"""Context-parallel batch-sharding contract.
 
-A model that owns its CP batch sharding and attention transport returns a
-:class:`CPSharder` from ``prepare_model_inputs_for_cp`` under the
-``"cp_sharder"`` batch key. ``cp_utils.make_cp_batch_and_ctx`` dispatches to
-``CPSharder.shard_batch`` in place of the default load-balanced
-``context_parallel`` path. This replaces the retired private batch keys
+Every CP backend is a :class:`CPSharder`. A model that owns its CP batch
+sharding and attention transport returns one from
+``prepare_model_inputs_for_cp`` under the ``"cp_sharder"`` batch key; the
+framework constructs its own for the remaining backends (torch
+``context_parallel`` round-robin, TE/THD, MagiAttention) so
+``cp_utils.make_cp_batch_and_ctx`` reduces to resolving a sharder and calling
+``shard_batch``. This replaces the retired private batch keys
 (``_cp_make_batch_fn``, ``_cp_metadata_seq_dims``, ``_cp_metadata_pad_values``,
 ``_cp_full_logits_grad_touch``).
 
 The contract is a closed verb set with open implementations: the dataclass
-slots are plain callables and each model fills them with functions from its own
-directory. ``local_token_global_indices`` — the global position of every local
-token — is the universal layout coordinate system: the default token-tensor
-shard/gather are synthesized from it, so a model only overrides them when it
-has a cheaper communication pattern. ``layout`` is a diagnostic string; no
+slots are plain callables filled with functions from the owning model's
+directory or from the framework. ``local_token_global_indices`` — the global
+position of every local token — is the universal layout coordinate system: the
+default token-tensor shard/gather are synthesized from it, so a sharder only
+overrides them when it has a cheaper communication pattern. Layouts that are a
+pure function of ``(cp_mesh, padded_seq_len)`` (contiguous, round-robin)
+provide it; data-dependent layouts (THD ``cu_seqlens`` partitioning, magi's
+dispatch solver) set it to None. ``layout`` is a diagnostic string; no
 framework code may branch on it.
 
 This module also hosts the shared contiguous-shard batch implementation used
-by models whose CP ranks own contiguous sequence slices (Gemma4, DeepSeek V4).
+by models whose CP ranks own contiguous sequence slices (Gemma4, DeepSeek V4),
+and the round-robin index map matching torch ``context_parallel``'s
+load-balanced sharding.
 """
 
 from __future__ import annotations
@@ -72,6 +79,34 @@ def contiguous_local_indices(cp_mesh, padded_seq_len: int, device: torch.device 
     local_len = padded_seq_len // cp_size
     start = _cp_rank(cp_mesh) * local_len
     return torch.arange(start, start + local_len, device=device, dtype=torch.long)
+
+
+def round_robin_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
+    """Global positions owned by this rank under torch ``context_parallel`` load balancing.
+
+    The sequence splits into ``2 * cp_size`` chunks and rank ``r`` owns chunks
+    ``r`` and ``2 * cp_size - 1 - r`` (head-tail pairing, so causal-attention
+    work stays even across ranks).
+
+    Args:
+        cp_mesh: The context-parallel device (sub)mesh.
+        padded_seq_len: Global sequence length after CP padding; must be
+            divisible by ``2 * cp_size``.
+        device: Device for the returned index tensor.
+
+    Returns:
+        A 1-D int64 tensor of this rank's global token positions, in local
+        shard order (head chunk then tail chunk).
+    """
+    cp_size = cp_mesh.size()
+    if padded_seq_len % (2 * cp_size) != 0:
+        raise ValueError(f"padded_seq_len must be divisible by 2 * cp_size, got {padded_seq_len=} {cp_size=}")
+    chunk_len = padded_seq_len // (2 * cp_size)
+    rank = _cp_rank(cp_mesh)
+    head = torch.arange(rank * chunk_len, (rank + 1) * chunk_len, device=device, dtype=torch.long)
+    tail_start = (2 * cp_size - 1 - rank) * chunk_len
+    tail = torch.arange(tail_start, tail_start + chunk_len, device=device, dtype=torch.long)
+    return torch.cat((head, tail))
 
 
 def shard_token_tensor_by_indices(tensor: torch.Tensor, local_indices: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
@@ -140,34 +175,45 @@ def gather_token_tensor_by_indices(
 
 @dataclass
 class CPSharder:
-    """Model-owned CP layout description consumed by the framework.
+    """CP backend description: how a batch is sharded and where local tokens live.
 
     Attributes:
         shard_batch: ``(cp_mesh, tp_mesh, batch, *, loss_mask=None,
             padding_token_id=0) -> (ctx_factory, batch)``. Pads and shards the
-            batch and installs any model-owned attention transport; returns the
-            forward context factory and the sharded batch.
+            batch and installs any backend-owned attention transport; returns
+            the forward context factory and the sharded batch.
         local_token_global_indices: ``(cp_mesh, padded_seq_len, device) ->
-            LongTensor`` with the global position of each local token.
+            LongTensor`` with the global position of each local token. None for
+            layouts that depend on batch content (THD ``cu_seqlens``
+            partitioning, magi's dispatch solver), where the token-tensor
+            shard/gather verbs are unavailable.
         layout: Diagnostic label; never branched on by framework code.
     """
 
     shard_batch: Callable[..., tuple[Callable, dict[str, Any]]]
-    local_token_global_indices: Callable[..., torch.Tensor]
+    local_token_global_indices: Callable[..., torch.Tensor] | None
     layout: str = "custom"
+
+    def _indices(self, cp_mesh, padded_seq_len: int, device) -> torch.Tensor:
+        if self.local_token_global_indices is None:
+            raise NotImplementedError(
+                f"CPSharder(layout={self.layout!r}) has a data-dependent token layout and does not expose "
+                "local_token_global_indices; token-tensor shard/gather are unavailable."
+            )
+        return self.local_token_global_indices(cp_mesh, padded_seq_len, device)
 
     def shard_token_tensor(self, cp_mesh, tensor: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
         """Shard a full-length token-aligned tensor exactly like the model inputs.
 
         ``tensor`` must already be padded to the CP-padded sequence length.
         """
-        indices = self.local_token_global_indices(cp_mesh, tensor.shape[seq_dim], tensor.device)
+        indices = self._indices(cp_mesh, tensor.shape[seq_dim], tensor.device)
         return shard_token_tensor_by_indices(tensor, indices, seq_dim=seq_dim)
 
     def gather_token_tensor(self, cp_mesh, tensor: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
         """Differentiably gather a token-aligned local shard to global order."""
         padded_seq_len = tensor.shape[seq_dim] * cp_mesh.size()
-        indices = self.local_token_global_indices(cp_mesh, padded_seq_len, tensor.device)
+        indices = self._indices(cp_mesh, padded_seq_len, tensor.device)
         return gather_token_tensor_by_indices(cp_mesh, tensor, indices, seq_dim=seq_dim)
 
 

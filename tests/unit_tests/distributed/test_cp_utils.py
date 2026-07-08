@@ -624,3 +624,58 @@ def test_magi_dispatches_at_the_te_rung():
     seen.clear()
     _, batch2 = _cu.make_cp_batch_and_ctx(None, {"input_ids": torch.tensor([[1, 2]])}, magi=_FakeMagi())
     assert batch2 == {"prepared": True} and seen["cp_mesh"] is None
+
+
+def test_te_dispatches_through_a_framework_sharder(monkeypatch):
+    """use_te resolves to a framework-built THD CPSharder whose shard_batch
+    wraps make_cp_batch_for_te, threading the recipe-static args through."""
+    seen = {}
+
+    def fake_make_cp_batch_for_te(cp_mesh, batch, *, padding_token_id, qkv_format, num_chunks, seq_lens_padding_value):
+        seen.update(
+            cp_mesh=cp_mesh, pad=padding_token_id, fmt=qkv_format, chunks=num_chunks, sent=seq_lens_padding_value
+        )
+        return {"thd": True}
+
+    monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
+
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
+    ctx, batch = _cu.make_cp_batch_and_ctx(
+        device_mesh,
+        {"input_ids": torch.tensor([[1, 2]])},
+        use_te=True,
+        padding_token_id=7,
+        num_chunks=3,
+        seq_lens_padding_value=-5,
+    )
+    assert ctx is contextlib.nullcontext
+    assert batch == {"thd": True}
+    assert seen["cp_mesh"] is device_mesh["cp"]
+    assert (seen["pad"], seen["fmt"], seen["chunks"], seen["sent"]) == (7, "thd", 3, -5)
+
+    # THD conversion also runs at cp<=1 (packing at cp=1), like before.
+    seen.clear()
+    _, batch2 = _cu.make_cp_batch_and_ctx(None, {"input_ids": torch.tensor([[1, 2]])}, use_te=True)
+    assert batch2 == {"thd": True} and seen["cp_mesh"] is None
+
+
+def test_resolve_cp_sharder_layers():
+    """Resolution order: model-owned > magi > TE > generic round-robin > None."""
+    from nemo_automodel.components.distributed.cp_sharder import round_robin_local_indices
+
+    cp2 = _DummySubMesh(2)
+    model_sharder = _contiguous_sharder()
+    common = dict(magi=None, use_te=False, num_chunks=1, seq_lens_padding_value=-1000, model=None)
+
+    # model-owned wins over everything when CP is active
+    assert _cu._resolve_cp_sharder(cp2, model_sharder, **{**common, "use_te": True}) is model_sharder
+    # ...but only shards at cp>1: at cp<=1 the TE rung still resolves
+    assert _cu._resolve_cp_sharder(None, model_sharder, **{**common, "use_te": True}).layout == "thd"
+    # generic torch context_parallel is the framework default at cp>1
+    generic = _cu._resolve_cp_sharder(cp2, None, **common)
+    assert generic.layout == "round_robin"
+    assert generic.shard_batch is _cu.shard_batch_load_balanced
+    assert generic.local_token_global_indices is round_robin_local_indices
+    # no CP prep applies
+    assert _cu._resolve_cp_sharder(None, None, **common) is None
+    assert _cu._resolve_cp_sharder(_DummySubMesh(1), None, **common) is None

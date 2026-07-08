@@ -13,15 +13,13 @@
 # limitations under the License.
 
 import contextlib
-from typing import TYPE_CHECKING, List, Optional, Set
+from typing import List, Optional, Set
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
+from nemo_automodel.components.distributed.cp_sharder import CPSharder, round_robin_local_indices
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
-
-if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.cp_sharder import CPSharder
 
 
 def _build_position_ids(batch, device):
@@ -304,13 +302,15 @@ def prepare_cp_forward(
     cp_size: Optional[int] = None,
     invoke_pre_embed: bool = True,
 ):
-    """Single CP dispatch for a training/eval forward: hook -> backend -> (ctx, batch, sharder).
+    """Single CP dispatch for a training/eval forward: hook -> sharder -> (ctx, batch).
 
-    Collapses the per-recipe CP branching (magi / model-owned / TE / generic
-    torch ``context_parallel``) into one call. When CP is active and the model
-    exposes ``prepare_model_inputs_for_cp``, the hook is invoked uniformly
-    through ``model.__call__(_pre_embed_only=True, ...)`` so FSDP2 pre-forward
-    hooks unshard e.g. vision towers during the pre-embed.
+    Collapses the per-recipe CP branching into one call: the model hook may
+    return a CPSharder, ``make_cp_batch_and_ctx`` resolves it against the
+    framework-owned sharders (magi / TE / generic torch ``context_parallel``)
+    and calls ``shard_batch``. When CP is active and the model exposes
+    ``prepare_model_inputs_for_cp``, the hook is invoked uniformly through
+    ``model.__call__(_pre_embed_only=True, ...)`` so FSDP2 pre-forward hooks
+    unshard e.g. vision towers during the pre-embed.
 
     Args:
         model: The (first) model part, or None (e.g. no-model contexts).
@@ -376,6 +376,75 @@ def prepare_cp_forward(
     )
 
 
+def _resolve_cp_sharder(
+    cp_mesh,
+    model_sharder: Optional[CPSharder],
+    *,
+    magi,
+    use_te: bool,
+    num_chunks: int,
+    seq_lens_padding_value: int,
+    model,
+) -> Optional[CPSharder]:
+    """Resolve the CPSharder for this forward: model-owned > magi > TE > generic.
+
+    Returns None when no CP prep applies. The model-owned and generic torch
+    ``context_parallel`` paths only shard at cp_size > 1; magi and TE stay
+    active at cp_size <= 1 (THD packing conversion / mask-spec activation), so
+    they resolve regardless of mesh size. The magi and THD sharders carry no
+    ``local_token_global_indices``: their token layouts depend on batch content
+    (``cu_seqlens`` partitioning / dispatch solver), not just
+    ``(cp_mesh, seq_len)``.
+    """
+    cp_active = cp_mesh is not None and cp_mesh.size() > 1
+
+    # A model that owns its CP attention returns a CPSharder from its CP
+    # input-prep hook. Honor it instead of any framework-owned path so the
+    # implementation stays with the model.
+    if cp_active and model_sharder is not None:
+        return model_sharder
+
+    if magi is not None and getattr(magi, "enabled", False):
+        # Backend-owned prep (MagiAttention): magi manages its own CP transport,
+        # so like the TE path shard_batch returns (nullcontext, prepped_batch).
+        # All magi internals (HF-vs-custom, recipe domain, cp group) stay in
+        # magi_attn_utils.
+        def _shard_batch_magi(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+            return contextlib.nullcontext, magi.make_cp_batch(
+                cp_mesh,
+                batch,
+                padding_token_id=padding_token_id,
+                num_chunks=num_chunks,
+                is_thd=use_te,
+                model=model,
+            )
+
+        return CPSharder(shard_batch=_shard_batch_magi, local_token_global_indices=None, layout="magi")
+
+    if use_te:
+
+        def _shard_batch_te(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+            return contextlib.nullcontext, make_cp_batch_for_te(
+                cp_mesh,
+                batch,
+                padding_token_id=padding_token_id,
+                qkv_format="thd",
+                num_chunks=num_chunks,
+                seq_lens_padding_value=seq_lens_padding_value,
+            )
+
+        return CPSharder(shard_batch=_shard_batch_te, local_token_global_indices=None, layout="thd")
+
+    if cp_active:
+        return CPSharder(
+            shard_batch=shard_batch_load_balanced,
+            local_token_global_indices=round_robin_local_indices,
+            layout="round_robin",
+        )
+
+    return None
+
+
 def make_cp_batch_and_ctx(
     device_mesh,
     batch,
@@ -386,30 +455,29 @@ def make_cp_batch_and_ctx(
     seq_lens_padding_value: int = -1000,
     magi=None,
     model=None,
-    cp_sharder: "CPSharder | None" = None,
+    cp_sharder: Optional[CPSharder] = None,
 ):
     """
-    Build a CP context manager and shards a batch. If the input device_mesh is None or the size
-    of the context_parallel submesh is 1, this function is effectively a no-op.
+    Resolve a CPSharder and shard the batch; a no-op when no CP prep applies.
 
-    ``cp_sharder`` (returned by a model-owning ``prepare_model_inputs_for_cp``
-    hook) selects model-owned batch sharding; it is an explicit parameter, not
-    a batch key, so the batch stays pure tensors.
-
-    ``magi`` (an enabled MagiState) selects backend-owned batch prep at the same
-    dispatch rung as the TE path; ``model`` is passed through opaquely for its
-    per-step key/spec stamping. Like the TE prep, it also runs at cp_size <= 1
-    (packing conversion / mask-spec activation).
+    Every CP backend is a :class:`CPSharder`. A model that owns its CP
+    attention returns one from its ``prepare_model_inputs_for_cp`` hook
+    (threaded here as ``cp_sharder`` — an explicit parameter, never a batch
+    key, so the batch stays pure tensors); the framework constructs one for
+    magi, TE/THD, and the default load-balanced torch ``context_parallel``
+    path. Resolution order: model-owned > magi > TE > generic. magi and TE
+    also run at cp_size <= 1 (packing conversion / mask-spec activation);
+    ``model`` is passed through opaquely to magi for its per-step key/spec
+    stamping.
 
     Args:
-        cp_mesh (DeviceMesh): The device mesh for context parallel.
+        device_mesh (DeviceMesh): The device mesh; its ``cp``/``tp`` submeshes are read.
         batch (Dict[str, torch.Tensor]): The input batch containing (string, torch.Tensor)
 
     Returns:
-        tuple (contextmanager, dict[str, torch.Tensor]): Returns a tuple with a context manager
-        and a new batch. The context manager is either nullcontext (no CP) or CP context manager as
-        returned by `create_context_parallel_ctx`. The batch has also been passed to
-        `create_context_parallel_ctx` and is accordingly sharded.
+        tuple (contextmanager, dict[str, torch.Tensor]): The forward context
+        factory (nullcontext when the backend owns its transport or CP is
+        inactive) and the prepared/sharded batch.
     """
     from contextlib import nullcontext
 
@@ -418,46 +486,37 @@ def make_cp_batch_and_ctx(
             return device_mesh[name]
         return None
 
-    def _get_mesh_size(mesh):
-        if mesh is None:
-            return 0
-        return mesh.size()
-
     cp_mesh = _get_submesh(device_mesh, "cp")
     tp_mesh = _get_submesh(device_mesh, "tp")
 
-    # A model that owns its CP attention returns a CPSharder from its CP
-    # input-prep hook. Honor it instead of the default load-balanced
-    # context_parallel path so the implementation stays with the model.
-    if _get_mesh_size(cp_mesh) > 1 and cp_sharder is not None:
-        return cp_sharder.shard_batch(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
-
-    if magi is not None and getattr(magi, "enabled", False):
-        # Backend-owned prep (MagiAttention): magi manages its own CP transport,
-        # so like the TE path this returns (nullcontext, prepped_batch). All magi
-        # internals (HF-vs-custom, recipe domain, cp group) stay in magi_attn_utils.
-        return nullcontext, magi.make_cp_batch(
-            cp_mesh,
-            batch,
-            padding_token_id=padding_token_id,
-            num_chunks=num_chunks,
-            is_thd=use_te,
-            model=model,
-        )
-
-    if use_te:
-        return nullcontext, make_cp_batch_for_te(
-            cp_mesh,
-            batch,
-            padding_token_id=padding_token_id,
-            qkv_format="thd",
-            num_chunks=num_chunks,
-            seq_lens_padding_value=seq_lens_padding_value,
-        )
-
-    if _get_mesh_size(cp_mesh) <= 1:
+    sharder = _resolve_cp_sharder(
+        cp_mesh,
+        cp_sharder,
+        magi=magi,
+        use_te=use_te,
+        num_chunks=num_chunks,
+        seq_lens_padding_value=seq_lens_padding_value,
+        model=model,
+    )
+    if sharder is None:
         return nullcontext, batch
+    return sharder.shard_batch(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
 
+
+def shard_batch_load_balanced(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id: int = 0):
+    """Shard a batch with torch ``context_parallel`` round-robin load balancing.
+
+    ``CPSharder.shard_batch`` implementation for the default framework-owned CP
+    path (layout ``"round_robin"``, indices from
+    :func:`~nemo_automodel.components.distributed.cp_sharder.round_robin_local_indices`).
+    Assumes an active CP mesh (size > 1). ``padding_token_id`` is accepted per
+    the contract but unused: CP-pad slots are zero-filled, sit after every real
+    token under the causal mask, and carry -100 labels.
+
+    Returns:
+        ``(ctx_factory, batch)`` where entering ``ctx_factory()`` installs the
+        SDPA-kernel + ``context_parallel`` context for the forward.
+    """
     # Remove attention_mask from the batch so the model does not attempt to
     # build a 4D causal mask (which would have mismatched shapes with
     # DTensor-sharded Q/K/V).  Each self_attn module's forward_pre_hook
@@ -480,11 +539,11 @@ def make_cp_batch_and_ctx(
 
     # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
     batch_size = primary_seq_tensor.shape[0]
-    if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
+    if "position_ids" not in batch:
         batch["position_ids"] = (
             torch.arange(0, seq_len, device=primary_seq_tensor.device).unsqueeze(0).expand(batch_size, -1).contiguous()
         )
-    elif "position_ids" in batch:
+    else:
         position_ids = batch["position_ids"]
         if position_ids.ndim == 2 and position_ids.shape[0] == 1 and batch_size > 1:
             batch["position_ids"] = position_ids.expand(batch_size, -1).contiguous()

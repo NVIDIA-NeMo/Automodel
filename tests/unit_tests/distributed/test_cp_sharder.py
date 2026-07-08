@@ -67,6 +67,31 @@ def test_contiguous_local_indices_requires_divisibility():
 
 
 # ---------------------------------------------------------------------------
+# round_robin_local_indices (torch context_parallel load-balanced layout)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_round_robin_local_indices_matches_torch_chunk_pairing(cp_size):
+    chunk = 3
+    seq = 2 * cp_size * chunk
+    chunks = torch.arange(seq).view(2 * cp_size, chunk)
+    for rank in range(cp_size):
+        expected = torch.cat([chunks[rank], chunks[2 * cp_size - 1 - rank]])
+        indices = cs.round_robin_local_indices(_FakeMesh(cp_size, rank), seq)
+        assert torch.equal(indices, expected)
+
+
+def test_round_robin_local_indices_partition_the_sequence():
+    cp_size, seq = 4, 24
+    all_indices = torch.cat([cs.round_robin_local_indices(_FakeMesh(cp_size, r), seq) for r in range(cp_size)])
+    assert torch.equal(torch.sort(all_indices).values, torch.arange(seq))
+
+
+def test_round_robin_local_indices_requires_divisibility():
+    with pytest.raises(ValueError, match="divisible"):
+        cs.round_robin_local_indices(_FakeMesh(2, 0), 6)
+
+
+# ---------------------------------------------------------------------------
 # shard <-> gather round trip (pure permutation math, no collectives)
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("cp_size", [2, 4])
@@ -115,6 +140,21 @@ def test_sharder_default_shard_token_tensor_uses_indices():
     full = torch.randn(1, 8)
     local = sharder.shard_token_tensor(_FakeMesh(2, 1), full, seq_dim=1)
     torch.testing.assert_close(local, full[:, 4:])
+
+
+def test_sharder_token_verbs_unavailable_for_data_dependent_layouts():
+    # THD/magi layouts depend on batch content (cu_seqlens / dispatch solver),
+    # so their framework sharders carry no index map and the token-tensor verbs
+    # must fail loudly rather than shard the wrong slice.
+    sharder = cs.CPSharder(
+        shard_batch=lambda *a, **k: (contextlib.nullcontext, {}),
+        local_token_global_indices=None,
+        layout="thd",
+    )
+    with pytest.raises(NotImplementedError, match="thd"):
+        sharder.shard_token_tensor(_FakeMesh(2, 0), torch.randn(1, 8))
+    with pytest.raises(NotImplementedError, match="data-dependent"):
+        sharder.gather_token_tensor(_FakeMesh(2, 0), torch.randn(1, 4))
 
 
 # ---------------------------------------------------------------------------
