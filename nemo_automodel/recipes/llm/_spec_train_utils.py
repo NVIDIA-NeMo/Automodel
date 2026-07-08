@@ -24,6 +24,41 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from typing import Any
+
+import torch.nn as nn
+
+from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
+
+
+def apply_draft_fp8(draft_model: nn.Module, cfg_fp8: Any) -> None:
+    """Optionally convert the draft's ``nn.Linear`` layers to torchao ``Float8Linear``, in place.
+
+    ``cfg_fp8`` is the recipe's top-level ``fp8:`` YAML block (dict-like, same
+    surface as the SFT recipe's -- see ``FP8Config``). No-op when the block is
+    absent or ``enabled`` is false. Modifies the draft in place (never
+    reassign ``self.draft_model`` -- ``BaseRecipe.__setattr__`` rejects
+    re-tracking an ``nn.Module`` attribute). Must be called before the draft is
+    wrapped (DDP / ``fully_shard``) so the swapped modules are what gets
+    replicated or sharded.
+    """
+    if cfg_fp8 is None:
+        return
+    apply_fp8_to_model(draft_model, config=build_fp8_config(cfg_fp8))
+
+
+def raise_if_peft_configured(cfg: Any, recipe_name: str) -> None:
+    """Fail fast when a ``peft:`` block is set on a recipe that does not support it.
+
+    The DFlash-family and DSpark drafts register trainable non-LoRA modules on
+    the draft itself (Domino's ``prefix_gru``/``embed_proj``, DSpark's Markov and
+    confidence heads); LoRA's freeze-everything-but-adapters contract would
+    silently freeze them, so reject the config instead of ignoring it.
+    """
+    if cfg.get("peft", None) is not None:
+        raise ValueError(
+            f"peft is not supported by {recipe_name}; LoRA draft training is only available in the EAGLE-3 recipe."
+        )
 
 
 def optim_steps_per_epoch(num_batches_per_epoch: int, grad_accumulation_steps: int) -> int:

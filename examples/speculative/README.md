@@ -128,6 +128,38 @@ full target vocab, the "t2d" direction). The mapping is built and cached by
 or point `recipe_args.selected_token_ids_path` at a precomputed map. `t2d` is
 unset when the draft vocab is uncompressed.
 
+### FP8 draft training
+
+All spec-decode recipes (EAGLE-1/2, EAGLE-3 / P-EAGLE, DFlash / Domino /
+JetSpec, DSpark) accept the same top-level `fp8:` block as the SFT recipes (see
+`components/quantization/fp8.py`). When enabled, the draft's `nn.Linear` layers
+are swapped to torchao `Float8Linear` before the DDP / FSDP2 wrap, so the
+draft's forward and backward GEMMs run in fp8. Requires SM89+ (H100 or newer);
+`emulate: true` runs the fp8 numerics on older GPUs for testing. The frozen
+target model is never converted (it already supports fp8-quantized checkpoints
+via dequant-on-load in the DSpark V4 / GLM path). Linears with a weight dim not
+divisible by 16 are skipped automatically; use `filter_fqns` to exclude more
+(e.g. `["lm_head"]`). On DSpark's FSDP2 path, `enable_fsdp_float8_all_gather`
+plus `precompute_float8_dynamic_scale_for_fsdp` additionally amortize the
+per-step scale computation, mirroring the SFT recipes. See
+`eagle3/qwen3_eagle3_fp8.yaml`.
+
+### LoRA draft adaptation (EAGLE-3 only)
+
+The EAGLE-3 recipe accepts the SFT recipes' `peft:` block (`PeftConfig`). The
+base draft is frozen and only `lora_A`/`lora_B` adapters train; checkpoints are
+adapter-only (`adapter_model.safetensors` via the standard PEFT checkpoint
+path). This is for adapting an existing draft to a new domain or dataset:
+point `recipe_args.draft_weights_path` at the consolidated safetensors export
+of a trained draft to warm-start the base weights (adapters over a randomly
+initialized draft are pointless; `draft_weights_path` also works without
+`peft:` for full-FT continued training). Merge the adapters into the base
+draft before serving. Not supported with `parallel_drafting` (P-EAGLE trains
+`mask_hidden` and the embeddings, which the LoRA freeze would lock), with
+`fp8:`, or in the DFlash-family / DSpark recipes (their drafts carry trainable
+non-LoRA heads that the freeze would silently lock). See
+`eagle3/qwen3_eagle3_lora.yaml`.
+
 ## Target backends
 
 The frozen target produces the supervision signal (aux hidden states plus the
@@ -330,6 +362,8 @@ blocks) instead.
 | `distributed` | Optional; only for MoE / large targets. `strategy: fsdp2`, `tp_size`, `pp_size`, `cp_size`, `ep_size`, `activation_checkpointing`, `sequence_parallel`. Absent means DDP. |
 | `optimizer` | `lr`, `betas`, `weight_decay`, optional `warmup_ratio` (0.05), `min_lr_ratio` (0.1). |
 | `checkpoint` | `enabled`, `checkpoint_dir`, `model_save_format: safetensors`, `save_consolidated`, optional `restore_from` (`LATEST` / subdir / path). |
+| `fp8` | Optional; torchao FP8 draft training, same surface as the SFT recipes. See "FP8 draft training". |
+| `peft` | Optional, EAGLE-3 only; LoRA draft adaptation (`PeftConfig`). See "LoRA draft adaptation". |
 | `wandb` | Optional; `project`, `entity`, `name`. |
 
 ### `recipe_args` common to all methods
@@ -352,6 +386,7 @@ checkpoint cadence: `ckpt_every_steps`, `save_checkpoint_every_epoch`.
 | `aux_layer_ids` | EAGLE-3 | Override the default low/mid/high recipe `[1, n//2-1, n-4]`. |
 | `draft_attn_implementation` | EAGLE-3 | `eager` (default) or `flash_attention_2`. |
 | `fc_norm`, `norm_output` | EAGLE-3.1 | Both default false; either alone is a valid intermediate config. |
+| `draft_weights_path` | EAGLE-3 | Warm-start the draft from a consolidated safetensors export (file or directory); required for meaningful LoRA adaptation. |
 | `target_model_backend`, `remote_urls`, `target_prefetch_depth`, `remote_timeout`, `remote_max_retries` | EAGLE-3 remote | See Target backends. |
 | `cached_target_path` | EAGLE-3 / DSpark offline | Path to a cache produced by `precompute_eagle3.py` or `precompute_dspark.py`. |
 | `parallel_drafting`, `num_depths`, `num_draft_layers`, `down_sample_ratio`, `down_sample_ratio_min`, `mask_token_id`, `sequence_partitions` | P-EAGLE | `mask_token_id` is required (no default). `sequence_partitions > 1` splits each sequence by dependency lineage to bound long-context memory. |

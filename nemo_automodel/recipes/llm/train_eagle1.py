@@ -54,8 +54,10 @@ from nemo_automodel.recipes.base_recipe import (
     _resolve_restore_from_to_ckpt_dir,
 )
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
+    raise_if_peft_configured,
     should_sync_grads,
 )
 
@@ -101,6 +103,7 @@ class TrainEagle1Recipe(BaseRecipe):
 
         recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
+        raise_if_peft_configured(self.cfg, type(self).__name__)
 
         target_path = recipe_cfg.target_model_name_or_path
         target_config = AutoConfig.from_pretrained(
@@ -197,6 +200,8 @@ class TrainEagle1Recipe(BaseRecipe):
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
+        # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede the DDP wrap.
+        apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
         # The target's "Model summary" is logged by apply_model_infrastructure when it
         # loads; the draft is built directly, so log its (trainable) summary here too.
         print_trainable_parameters(self.draft_model, name="Draft")
