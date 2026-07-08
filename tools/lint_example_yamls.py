@@ -43,6 +43,11 @@ EXCLUDED_RECIPE_PREFIXES = (
 
 EXCLUDED_RECIPE_FILES = {
     Path("examples/retrieval/data_utils/mining_config.yaml"),
+    # Command-only configs: launched via
+    # `python -m nemo_automodel.recipes.llm.precompute_dspark_dist -c <config>`
+    # (torchrun for multi-node), so they have no recipe-class entry point by design.
+    Path("examples/speculative/dspark/deepseek_v4_flash_dspark_precompute.yaml"),
+    Path("examples/speculative/dspark/glm_5.2_dspark_precompute.yaml"),
 }
 
 RECIPE_TARGET_HELP = (
