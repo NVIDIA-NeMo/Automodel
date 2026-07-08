@@ -298,6 +298,10 @@ def test_build_target_generic_replicated_path(monkeypatch):
 
 
 def test_make_sync_max_steps_identity_without_process_group():
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        pytest.skip("a process group is already initialized in this session")
     assert pdd._make_sync_max_steps(1, torch.device("cpu")) is None
     # world_size > 1 but no initialized process group also falls back to identity.
     assert pdd._make_sync_max_steps(8, torch.device("cpu")) is None
@@ -307,6 +311,8 @@ def test_make_sync_max_steps_all_reduce_over_single_process_group():
     """With a live (single-process gloo) group, the reducer all-reduces MAX."""
     import torch.distributed as dist
 
+    if dist.is_initialized():
+        pytest.skip("a process group is already initialized in this session")
     store = dist.HashStore()
     dist.init_process_group(backend="gloo", store=store, rank=0, world_size=1)
     try:
