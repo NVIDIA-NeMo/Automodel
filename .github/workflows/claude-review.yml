@@ -145,10 +145,13 @@ jobs:
             speculative flags/modes/extension hooks, and public re-exports of
             implementation helpers. Prefer one canonical typed entry point and keep
             its implementation private;
-          - reject `**kwargs`, untyped `dict`, stringly typed dispatch, or broad
-            parameter bags that make the API accept states no current caller needs.
-            Prefer the smallest explicit typed parameter set; adding a parameter to
-            an existing API is a compatibility and maintenance cost, not a default;
+          - reject `**kwargs`, untyped `dict`, ad-hoc string dispatch that
+            duplicates an existing enum/config type/registry, or broad parameter
+            bags that make the API accept states no current caller needs. Prefer
+            the smallest explicit typed parameter set; adding a parameter to an
+            existing API is a compatibility and maintenance cost, not a default.
+            Established declarative `_target_` and `model_type` registry keys are
+            not API-surface findings by themselves;
           - when a new API replaces an old one, require removal or an explicit,
             tested deprecation/migration path instead of keeping both indefinitely.
             Flag incompatible changes to existing config keys, defaults, signatures,
