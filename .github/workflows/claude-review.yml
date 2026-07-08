@@ -285,6 +285,27 @@ jobs:
           types/messages that do not identify the invalid input or failed operation.
           Prefer a specific exception and preserve translation context with
           `raise ... from exc`. Developer-only invariant assertions are acceptable.
+        - Single-responsibility principle for production classes and functions added
+          or materially expanded by the PR:
+          - a function should perform one cohesive operation at a consistent level
+            of abstraction. A class should own one cohesive state, policy, or
+            lifecycle; its methods should primarily operate on that shared concern;
+          - flag only when changed code couples at least two independently changing
+            responsibilities, supported by concrete evidence such as disjoint state
+            and dependencies, unrelated callers/failure modes, or branches that need
+            separate test fixtures. Examples include combining config parsing with
+            component construction, tensor/kernel math with persistence or network
+            I/O, model execution with checkpoint/logging policy, or generic
+            orchestration with model/backend-specific dispatch;
+          - every finding must name the distinct responsibilities and the existing
+            config, component, adapter, or lifecycle owner each belongs to. Extract
+            the smallest private helper or cohesive object that restores the
+            boundary; do not create another public API, registry, or speculative
+            abstraction merely to make a function shorter;
+          - do not recommend extraction based on line count alone. A linear recipe,
+            CLI entry point, framework adapter, or numerical algorithm may
+            legitimately orchestrate several steps when they serve one outcome and
+            delegate specialized behavior through existing public contracts.
         - Recipe / component boundary violations in files under
           `nemo_automodel/recipes/`. Recipes are thin orchestrators: they should
           compose `config.build(...)` results through public component APIs, not
