@@ -377,14 +377,16 @@ def test_padding_attention_mask_pad_value_is_zero(monkeypatch):
     """If a future caller passes an ``attention_mask`` in the batch, it should
     pad with ``0`` (HF convention: 1=real, 0=pad) -- NOT with True/dtype-default.
 
-    Today ``cp_utils`` strips ``attention_mask`` at the top of the function so
-    this case is moot, but the PAD_FILL table is the right place to encode the
-    semantic in case the strip is ever revisited.
+    Today ``shard_batch_load_balanced`` strips ``attention_mask`` at the top of
+    the function so this case is moot, but the PAD_FILL table is the right
+    place to encode the semantic in case the strip is ever revisited.
     """
+    from nemo_automodel.components.distributed import cp_sharder as _cs
+
     # Just verify the PAD_FILL table itself maps attention_mask -> False
     # (the runtime code path is currently unreachable because attention_mask
-    # is popped at line 272).
-    src = open(_cu.__file__).read()
+    # is popped before the padding pass).
+    src = open(_cs.__file__).read()
     assert '"attention_mask": False' in src, "PAD_FILL must explicitly map attention_mask -> False (HF: 0 = pad)"
 
 
