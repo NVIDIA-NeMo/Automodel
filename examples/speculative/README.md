@@ -128,6 +128,58 @@ full target vocab, the "t2d" direction). The mapping is built and cached by
 or point `recipe_args.selected_token_ids_path` at a precomputed map. `t2d` is
 unset when the draft vocab is uncompressed.
 
+### FP8 draft training
+
+All spec-decode recipes (EAGLE-1/2, EAGLE-3 / P-EAGLE, DFlash / Domino /
+JetSpec, DSpark) accept the same top-level `fp8:` block as the SFT recipes (see
+`components/quantization/fp8.py`). When enabled, the draft's `nn.Linear` layers
+are swapped to torchao `Float8Linear` before the DDP / FSDP2 wrap, so the
+draft's forward and backward GEMMs run in fp8. Requires SM89+ (H100 or newer);
+`emulate: true` runs the fp8 numerics on older GPUs for testing. The frozen
+target model is never converted (it already supports fp8-quantized checkpoints
+via dequant-on-load in the DSpark V4 / GLM path). Linears with a weight dim not
+divisible by 16 are skipped automatically; use `filter_fqns` to exclude more
+(e.g. `["lm_head"]`). On DSpark's FSDP2 path, `enable_fsdp_float8_all_gather`
+plus `precompute_float8_dynamic_scale_for_fsdp` additionally amortize the
+per-step scale computation, mirroring the SFT recipes. See
+`eagle3/qwen3_eagle3_fp8.yaml`.
+
+**Pair `fp8:` with `compile:`.** The recipes also accept the SFT recipes'
+top-level `compile:` block (`CompileConfig`); the draft is compiled in place
+(`nn.Module.compile()`, so checkpoint keys are unchanged) after the fp8 swap.
+This matters for fp8 throughput: Float8Linear's per-GEMM cast/scale ops are
+memory-bound and only pay off once inductor fuses them into the GEMM
+prologue. In eager mode fp8 draft training is typically SLOWER than bf16
+(measured 0.76x on an H100 EAGLE-3 run); compiled, the same A/B measured
+fp8 at 1.03x over bf16 with byte-equivalent convergence. Expect the fp8
+gain to scale with draft GEMM size: a single 4096-wide EAGLE-3 layer sits
+near the float8 break-even point, while wider or deeper drafts (DSpark on
+V4/GLM-scale targets) benefit more. `compile:` also works without `fp8:`
+as a plain draft speedup (measured ~1.34x over the eager bf16 baseline in
+the same run).
+
+### LoRA draft adaptation (EAGLE-3 only)
+
+The EAGLE-3 recipe accepts the SFT recipes' `peft:` block (`PeftConfig`). The
+base draft is frozen and only `lora_A`/`lora_B` adapters train; checkpoints are
+adapter-only (`adapter_model.safetensors` via the standard PEFT checkpoint
+path). This is for adapting an existing draft to a new domain or dataset:
+point `recipe_args.draft_weights_path` at the consolidated safetensors export
+of a trained draft to warm-start the base weights (adapters over a randomly
+initialized draft are pointless; `draft_weights_path` also works without
+`peft:` for full-FT continued training). With a compressed draft vocab the
+base run's token mapping must be reused via `selected_token_ids_path` (the
+frozen `lm_head` rows are tied to it); a differing mapping fails fast at
+load. The FINAL checkpoint of a LoRA run additionally exports the merged
+draft to `model/consolidated` (serve-ready, same layout as full-FT runs), so
+no external merge step is needed. Not supported with `parallel_drafting`
+(P-EAGLE trains `mask_hidden` and the embeddings, which the LoRA freeze would
+lock), with `freeze_embeddings: false` (same freeze conflict), with `fp8:`,
+or in the DFlash-family / DSpark / EAGLE-1/2 recipes (rejected explicitly;
+their drafts carry trainable non-LoRA heads that the freeze would silently
+lock, and only EAGLE-3 implements the warm start). See
+`eagle3/qwen3_eagle3_lora.yaml`.
+
 ## Target backends
 
 The frozen target produces the supervision signal (aux hidden states plus the
@@ -330,6 +382,9 @@ blocks) instead.
 | `distributed` | Optional; only for MoE / large targets. `strategy: fsdp2`, `tp_size`, `pp_size`, `cp_size`, `ep_size`, `activation_checkpointing`, `sequence_parallel`. Absent means DDP. |
 | `optimizer` | `lr`, `betas`, `weight_decay`, optional `warmup_ratio` (0.05), `min_lr_ratio` (0.1). |
 | `checkpoint` | `enabled`, `checkpoint_dir`, `model_save_format: safetensors`, `save_consolidated`, optional `restore_from` (`LATEST` / subdir / path). |
+| `fp8` | Optional; torchao FP8 draft training, same surface as the SFT recipes. See "FP8 draft training". |
+| `compile` | Optional; in-place torch.compile of the draft (`CompileConfig`). Strongly recommended with `fp8`. |
+| `peft` | Optional, EAGLE-3 only; LoRA draft adaptation (`PeftConfig`). See "LoRA draft adaptation". |
 | `wandb` | Optional; `project`, `entity`, `name`. |
 
 ### `recipe_args` common to all methods
@@ -352,6 +407,7 @@ checkpoint cadence: `ckpt_every_steps`, `save_checkpoint_every_epoch`.
 | `aux_layer_ids` | EAGLE-3 | Override the default low/mid/high recipe `[1, n//2-1, n-4]`. |
 | `draft_attn_implementation` | EAGLE-3 | `eager` (default) or `flash_attention_2`. |
 | `fc_norm`, `norm_output` | EAGLE-3.1 | Both default false; either alone is a valid intermediate config. |
+| `draft_weights_path` | EAGLE-3 | Warm-start the draft from a consolidated safetensors export (file or directory); required for meaningful LoRA adaptation. |
 | `target_model_backend`, `remote_urls`, `target_prefetch_depth`, `remote_timeout`, `remote_max_retries` | EAGLE-3 remote | See Target backends. |
 | `cached_target_path` | EAGLE-3 / DSpark offline | Path to a cache produced by `precompute_eagle3.py` or `precompute_dspark.py`. |
 | `parallel_drafting`, `num_depths`, `num_draft_layers`, `down_sample_ratio`, `down_sample_ratio_min`, `mask_token_id`, `sequence_partitions` | P-EAGLE | `mask_token_id` is required (no default). `sequence_partitions > 1` splits each sequence by dependency lineage to bound long-context memory. |

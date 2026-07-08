@@ -34,6 +34,7 @@ import torch
 import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
+from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
@@ -108,8 +109,11 @@ from nemo_automodel.recipes.base_recipe import (
     _resolve_restore_from_to_ckpt_dir,
 )
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_compile,
+    apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
+    raise_if_peft_configured,
 )
 
 logger = logging.getLogger(__name__)
@@ -397,6 +401,7 @@ class TrainDSparkRecipe(BaseRecipe):
 
         recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
+        raise_if_peft_configured(self.cfg, type(self).__name__)
         # The draft is sharded directly with fully_shard over the default world
         # mesh (no explicit MeshContext), so _dp_allreduce reduces over the world group.
         # A DeepSeek V4 target additionally needs its own expert-parallel / FSDP mesh,
@@ -754,6 +759,10 @@ class TrainDSparkRecipe(BaseRecipe):
             lm_head=head_src,
             freeze=bool(recipe_cfg.get("freeze_embeddings", True)),
         )
+        # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede AC and the FSDP2/DDP wrap.
+        apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
+        # Optional torch.compile of the draft, in place; after the fp8 swap.
+        apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
 
         dist_cfg = self.cfg.get("distributed", None)
         activation_checkpointing = dist_cfg.get("activation_checkpointing", False) if dist_cfg is not None else False
@@ -791,6 +800,14 @@ class TrainDSparkRecipe(BaseRecipe):
             else:
                 raise ValueError(f"Unsupported distributed.strategy={strategy!r}; use 'fsdp2' or 'ddp'.")
         self.trainer_module = trainer_module
+        # FP8 + FSDP2 float8 all-gather: amortize the per-parameter dynamic-scale
+        # computation into one call after each optimizer step (mirrors train_ft).
+        # apply_fp8_to_model already resolved whether per-step scale precompute
+        # applies (enabled + tensorwise + fp8 all-gather) onto the draft module;
+        # reuse that instead of re-deriving from raw YAML.
+        self._precompute_fp8_scales = self.parallel_strategy == "fsdp2" and bool(
+            getattr(self.draft_model, "precompute_float8_dynamic_scale_for_fsdp", False)
+        )
 
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
@@ -1071,6 +1088,12 @@ class TrainDSparkRecipe(BaseRecipe):
             if isinstance(self.trainer_module, DistributedDataParallel)
             else self.trainer_module
         )
+
+    def _maybe_precompute_fp8_scales(self) -> None:
+        """Precompute float8 dynamic scales after an optimizer step (FSDP2 fp8 all-gather only)."""
+        if not getattr(self, "_precompute_fp8_scales", False):
+            return
+        precompute_float8_dynamic_scale_for_fsdp(self._module())
 
     def save_checkpoint(
         self,
@@ -1370,6 +1393,7 @@ class TrainDSparkRecipe(BaseRecipe):
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
                         self.lr_scheduler.step()
+                        self._maybe_precompute_fp8_scales()
                         self.runtime.global_step += 1
                         if pbar is not None:
                             pbar.update(1)
@@ -1443,6 +1467,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.lr_scheduler.step()
+                    self._maybe_precompute_fp8_scales()
                     self.runtime.global_step += 1
                     if pbar is not None:
                         pbar.update(1)
