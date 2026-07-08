@@ -222,24 +222,12 @@ def test_init_derives_pad_token_id_from_eos_list():
 
 
 # ---------------------------------------------------------------------------
-# prepare_model_inputs_for_cp / prepare_inputs_embeds_for_cp
+# prepare_model_inputs_for_cp
 # ---------------------------------------------------------------------------
 def test_prepare_model_inputs_requires_input_ids():
     model = Gemma4ForConditionalGeneration(_cfg(), backend=_backend())
     with pytest.raises(ValueError, match="requires input_ids"):
         model.prepare_model_inputs_for_cp({"input_ids": None})
-
-
-def test_prepare_inputs_embeds_for_cp_delegates():
-    cfg = _cfg()
-    cfg.image_token_id = 42
-    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
-    ids = torch.tensor([[1, 42, 3, 4]])
-    # prepare_inputs_embeds_for_cp returns just the inputs_embeds tensor
-    embeds = model.prepare_inputs_embeds_for_cp(input_ids=ids)
-    expected = model.prepare_model_inputs_for_cp({"input_ids": ids})["inputs_embeds"]
-    assert isinstance(embeds, torch.Tensor)
-    assert embeds.shape == expected.shape
 
 
 def test_forward_pre_embed_only_routes_to_prepare(monkeypatch):

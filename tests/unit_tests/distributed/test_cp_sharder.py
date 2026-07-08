@@ -117,18 +117,6 @@ def test_sharder_default_shard_token_tensor_uses_indices():
     torch.testing.assert_close(local, full[:, 4:])
 
 
-def test_sharder_override_slots_win():
-    marker = torch.zeros(1)
-    sharder = cs.CPSharder(
-        shard_batch=lambda *a, **k: (contextlib.nullcontext, {}),
-        local_token_global_indices=cs.contiguous_local_indices,
-        shard_token_tensor_fn=lambda mesh, t, dim: marker,
-        gather_token_tensor_fn=lambda mesh, t, dim: marker,
-    )
-    assert sharder.shard_token_tensor(_FakeMesh(2), torch.randn(1, 8)) is marker
-    assert sharder.gather_token_tensor(_FakeMesh(2), torch.randn(1, 4)) is marker
-
-
 # ---------------------------------------------------------------------------
 # shard_batch_contiguous: pad_multiple + packed-seq-ids flags
 # ---------------------------------------------------------------------------

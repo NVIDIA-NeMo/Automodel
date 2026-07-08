@@ -149,19 +149,11 @@ class CPSharder:
             forward context factory and the sharded batch.
         local_token_global_indices: ``(cp_mesh, padded_seq_len, device) ->
             LongTensor`` with the global position of each local token.
-        shard_token_tensor_fn: Optional override for
-            :meth:`shard_token_tensor`; default synthesized from
-            ``local_token_global_indices``.
-        gather_token_tensor_fn: Optional override for
-            :meth:`gather_token_tensor`; default synthesized from
-            ``local_token_global_indices``.
         layout: Diagnostic label; never branched on by framework code.
     """
 
     shard_batch: Callable[..., tuple[Callable, dict[str, Any]]]
     local_token_global_indices: Callable[..., torch.Tensor]
-    shard_token_tensor_fn: Callable[..., torch.Tensor] | None = None
-    gather_token_tensor_fn: Callable[..., torch.Tensor] | None = None
     layout: str = "custom"
 
     def shard_token_tensor(self, cp_mesh, tensor: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
@@ -169,15 +161,11 @@ class CPSharder:
 
         ``tensor`` must already be padded to the CP-padded sequence length.
         """
-        if self.shard_token_tensor_fn is not None:
-            return self.shard_token_tensor_fn(cp_mesh, tensor, seq_dim)
         indices = self.local_token_global_indices(cp_mesh, tensor.shape[seq_dim], tensor.device)
         return shard_token_tensor_by_indices(tensor, indices, seq_dim=seq_dim)
 
     def gather_token_tensor(self, cp_mesh, tensor: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
         """Differentiably gather a token-aligned local shard to global order."""
-        if self.gather_token_tensor_fn is not None:
-            return self.gather_token_tensor_fn(cp_mesh, tensor, seq_dim)
         padded_seq_len = tensor.shape[seq_dim] * cp_mesh.size()
         indices = self.local_token_global_indices(cp_mesh, padded_seq_len, tensor.device)
         return gather_token_tensor_by_indices(cp_mesh, tensor, indices, seq_dim=seq_dim)

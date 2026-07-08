@@ -1158,7 +1158,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         cp_size = getattr(getattr(self, "dist_setup", None), "cp_size", self.cfg.get("distributed.cp_size", 1))
         # Single CP dispatch: magi / model-owned (CPSharder) / TE-THD / generic
         # torch context_parallel.
-        train_ctx, batch, cp_sharder = prepare_cp_forward(
+        train_ctx, batch = prepare_cp_forward(
             self.model_parts[0] if hasattr(self, "model_parts") else None,
             self.device_mesh,
             batch,

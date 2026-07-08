@@ -17,7 +17,6 @@
 Covers:
   - ``prepare_model_inputs_for_cp`` returns a dict containing ``inputs_embeds``
     with the expected shape and image/video/sound token positions filled.
-  - ``prepare_inputs_embeds_for_cp`` is a thin Tensor-returning wrapper.
   - ``forward(_pre_embed_only=True)`` delegates to ``prepare_model_inputs_for_cp``
     without entering the LLM body (so FSDP2 forward pre-hooks fire on
     ``__call__`` while the LLM forward is skipped).
@@ -232,38 +231,7 @@ def test_prepare_model_inputs_for_cp_removes_consumed_keys_from_batch():
 
 
 # -----------------------------------------------------------------------------
-# prepare_inputs_embeds_for_cp (thin wrapper)
 # -----------------------------------------------------------------------------
-
-
-def test_prepare_inputs_embeds_for_cp_returns_tensor_not_dict():
-    """Thin wrapper: returns ``Tensor`` (just inputs_embeds), not a dict."""
-    model = _make_omni_stub()
-    input_ids = torch.tensor([[1, 2, 3]])
-    out = model.prepare_inputs_embeds_for_cp(input_ids=input_ids)
-    assert isinstance(out, torch.Tensor)
-    assert out.shape == (1, 3, HIDDEN)
-
-
-def test_prepare_inputs_embeds_for_cp_matches_prepare_model_inputs_for_cp():
-    """Wrapper output equals ``prepare_model_inputs_for_cp(...)["inputs_embeds"]``."""
-    model = _make_omni_stub()
-    input_ids = torch.tensor([[1, IMG_TOKEN_ID, 3]])
-    pixel_values = torch.zeros(1, 3, 4, 4)
-    image_flags = torch.tensor([[1]])
-    a = model.prepare_inputs_embeds_for_cp(
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        image_flags=image_flags,
-    )
-    b = model.prepare_model_inputs_for_cp(
-        {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-            "image_flags": image_flags,
-        }
-    )["inputs_embeds"]
-    assert torch.equal(a, b)
 
 
 # -----------------------------------------------------------------------------

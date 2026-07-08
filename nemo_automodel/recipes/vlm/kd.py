@@ -234,17 +234,16 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             for k, v in batch.items()
         }
 
-        def _check_teacher_compat(prepared: dict) -> None:
-            if "inputs_embeds" in prepared:
-                _validate_cp_pre_embed_teacher_compatibility(prepared["inputs_embeds"], self.teacher_model)
-
-        train_ctx, batch, _ = prepare_cp_forward(
+        train_ctx, batch = prepare_cp_forward(
             self.model_parts[0],
             self.device_mesh,
             batch,
             invoke_pre_embed=not self.pp_enabled,
-            on_pre_embedded=_check_teacher_compat,
         )
+        # Hidden-size compatibility with the teacher: checked on the (possibly
+        # sharded) student embeds — sequence sharding never changes the hidden dim.
+        if batch.get("inputs_embeds") is not None:
+            _validate_cp_pre_embed_teacher_compatibility(batch["inputs_embeds"], self.teacher_model)
         labels = batch.pop("labels")
 
         model = self.model_parts[0]

@@ -205,9 +205,12 @@ def test_vlm_kd_cp_prepare_feeds_student_inputs_embeds_to_cp_and_teacher(monkeyp
 
 
 def test_vlm_kd_cp_rejects_teacher_student_hidden_size_mismatch(monkeypatch):
-    monkeypatch.setattr(
-        cp_utils_mod, "make_cp_batch_and_ctx", lambda *args, **kwargs: pytest.fail("CP sharding skipped")
-    )
+    # The teacher-compat check runs on the (sharded) student embeds right after
+    # prepare_cp_forward — sequence sharding never changes the hidden dim, so
+    # sharding is allowed to proceed; only the mismatch error must fire.
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(cp_utils_mod, "make_cp_batch_and_ctx", lambda device_mesh, batch, *a, **k: (nullcontext, batch))
 
     student = _StudentVLM(hidden_size=8)
     teacher = _TeacherVLM(hidden_size=12)

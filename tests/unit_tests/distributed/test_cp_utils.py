@@ -607,7 +607,7 @@ def test_magi_dispatches_at_the_te_rung():
             return {"prepared": True}
 
     model = SimpleNamespace()  # no prepare_model_inputs_for_cp -> hook path skipped
-    ctx, batch, sharder = _cu.prepare_cp_forward(
+    ctx, batch = _cu.prepare_cp_forward(
         model,
         _DummyDeviceMesh(cp_size=2, tp_size=1),
         {"input_ids": torch.tensor([[1, 2]])},
@@ -618,7 +618,6 @@ def test_magi_dispatches_at_the_te_rung():
     )
     assert ctx is _ctxlib.nullcontext
     assert batch == {"prepared": True}
-    assert sharder is None
     assert seen["model"] is model
     assert (seen["is_thd"], seen["pad"], seen["chunks"]) == (True, 7, 3)
     # magi prep also runs at cp<=1, like the TE path

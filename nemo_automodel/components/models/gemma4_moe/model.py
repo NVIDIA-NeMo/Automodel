@@ -1365,25 +1365,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         return {**consumed, **prepared_inputs}
 
-    def prepare_inputs_embeds_for_cp(
-        self,
-        input_ids: torch.Tensor,
-        pixel_values: torch.Tensor | None = None,
-        image_position_ids: torch.Tensor | None = None,
-        mm_token_type_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        batch = {
-            key: value
-            for key, value in {
-                "input_ids": input_ids,
-                "pixel_values": pixel_values,
-                "image_position_ids": image_position_ids,
-                "mm_token_type_ids": mm_token_type_ids,
-            }.items()
-            if value is not None
-        }
-        return self.prepare_model_inputs_for_cp(batch)["inputs_embeds"]
-
     @torch.no_grad()
     def initialize_weights(
         self,

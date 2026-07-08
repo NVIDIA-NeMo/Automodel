@@ -863,37 +863,6 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
 
         return {**consumed, "inputs_embeds": inputs_embeds}
 
-    def prepare_inputs_embeds_for_cp(
-        self,
-        input_ids: torch.Tensor,
-        pixel_values: Optional[torch.Tensor] = None,
-        image_flags: Optional[torch.Tensor] = None,
-        imgs_sizes: Optional[torch.Tensor] = None,
-        pixel_values_videos: Optional[torch.Tensor] = None,
-        sound_features: Optional[torch.Tensor] = None,
-        sound_attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Thin wrapper returning just ``inputs_embeds`` for callers that don't
-        need the full prepared-inputs dict."""
-        batch = {
-            key: value
-            for key, value in {
-                "input_ids": input_ids,
-                "pixel_values": pixel_values,
-                "image_flags": image_flags,
-                "imgs_sizes": imgs_sizes,
-                "pixel_values_videos": pixel_values_videos,
-                "sound_features": sound_features,
-                "sound_attention_mask": sound_attention_mask,
-            }.items()
-            if value is not None
-        }
-        return self.prepare_model_inputs_for_cp(batch)["inputs_embeds"]
-
-    # ------------------------------------------------------------------
-    # Forward pass
-    # ------------------------------------------------------------------
-
     def forward(
         self,
         pixel_values: Optional[torch.FloatTensor] = None,
@@ -962,7 +931,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         if _pre_embed_only:
             return self.prepare_model_inputs_for_cp(kwargs.pop("_cp_batch"), num_chunks=kwargs.pop("num_chunks", 1))
 
-        # Caller pre-supplied inputs_embeds (CP path: prepare_inputs_embeds_for_cp
+        # Caller pre-supplied inputs_embeds (CP path: prepare_model_inputs_for_cp
         # ran the multimodal scatter on the un-sharded sequence before
         # context_parallel sharded the tensors). In that case skip the embed +
         # multimodal-replacement block entirely; the shards are already correct.

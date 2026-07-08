@@ -284,6 +284,13 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             target.register_forward_hook(_post_hook, always_call=True)
 
 
+def _mesh_dim_size(device_mesh, dim: str) -> int:
+    """Size of a named submesh, 0 when the mesh or dimension is absent."""
+    if device_mesh is None or dim not in getattr(device_mesh, "mesh_dim_names", ()):
+        return 0
+    return device_mesh[dim].size()
+
+
 def prepare_cp_forward(
     model,
     device_mesh,
@@ -296,7 +303,6 @@ def prepare_cp_forward(
     loss_mask=None,
     cp_size: Optional[int] = None,
     invoke_pre_embed: bool = True,
-    on_pre_embedded=None,
 ):
     """Single CP dispatch for a training/eval forward: hook -> backend -> (ctx, batch, sharder).
 
@@ -326,26 +332,14 @@ def prepare_cp_forward(
         invoke_pre_embed: Invoke the model hook when CP is active. Recipes pass
             False for PP stages without embeddings and for KD paths that never
             wired model-owned CP.
-        on_pre_embedded: Optional callback receiving the hook's output dict
-            before it is merged into the batch (e.g. KD teacher-compat check).
-
     Returns:
-        ``(ctx_factory, batch, cp_sharder)``. ``cp_sharder`` is the model's
-        ``CPSharder`` when a model-owned hook attached one (consumed by the
-        recipe's ``finalize_loss``), else None.
+        ``(ctx_factory, batch)``.
     """
-
-    def _cp_size(mesh):
-        if mesh is None:
-            return 0
-        if "cp" in getattr(mesh, "mesh_dim_names", {}):
-            return mesh["cp"].size()
-        return 0
 
     magi_enabled = magi is not None and getattr(magi, "enabled", False)
     cp_sharder = None
     has_hook = model is not None and hasattr(model, "prepare_model_inputs_for_cp")
-    effective_cp_size = cp_size if cp_size is not None else _cp_size(device_mesh)
+    effective_cp_size = cp_size if cp_size is not None else _mesh_dim_size(device_mesh, "cp")
 
     # llm-domain magi replaces the whole batch prep (no model has both a CP
     # hook and magi); vlm-domain magi composes with the vision pre-embed.
@@ -356,8 +350,6 @@ def prepare_cp_forward(
         # returned entries are merged on top). Sharder-only hooks (DSV4/GLM)
         # consume nothing; their batch — including ``input_ids`` — stays intact.
         prepared = model(_pre_embed_only=True, _cp_batch=batch, num_chunks=num_chunks)
-        if on_pre_embedded is not None:
-            on_pre_embedded(prepared)
         cp_sharder = prepared.pop("cp_sharder", None)
         # Merge the hook's return: a None value marks a raw input the hook
         # consumed (e.g. into inputs_embeds) — remove it so it cannot reach
@@ -371,7 +363,7 @@ def prepare_cp_forward(
             else:
                 batch[key] = value
 
-    ctx, batch = make_cp_batch_and_ctx(
+    return make_cp_batch_and_ctx(
         device_mesh,
         batch,
         loss_mask,
@@ -382,7 +374,6 @@ def prepare_cp_forward(
         model=model,
         cp_sharder=cp_sharder,
     )
-    return ctx, batch, cp_sharder
 
 
 def make_cp_batch_and_ctx(
