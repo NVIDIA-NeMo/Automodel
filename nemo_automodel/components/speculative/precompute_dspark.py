@@ -51,6 +51,7 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
     manifest_mismatch_fields,
     manifest_path,
     read_manifest,
+    tokenizer_chat_template_sha256,
     write_manifest,
     write_shard,
     write_target_weights,
@@ -119,7 +120,7 @@ def _ensure_resume_compatible(cache_dir: str, manifest: dict[str, Any], existing
                 "cannot be verified. Delete the directory and start fresh."
             )
         return
-    mismatched = manifest_mismatch_fields(read_manifest(cache_dir), manifest)
+    mismatched = manifest_mismatch_fields(read_manifest(cache_dir, allow_incomplete=True), manifest)
     if mismatched:
         raise ValueError(
             f"--resume was requested for {cache_dir}, but the recorded manifest does not match the current "
@@ -190,8 +191,9 @@ def _run(args: argparse.Namespace) -> int:
     )
     num_samples = len(dataloader.dataset)
 
-    # The manifest guards resume for tensor-shaping target/cache settings. If dataset
-    # or tokenization inputs change, use a fresh output directory instead of --resume.
+    # The manifest guards resume for the tensor-shaping target/cache settings AND
+    # the run's input identity (dataset, split, seed, masking, chat template), so a
+    # --resume with different inputs fails instead of mixing supervision.
     manifest = build_cache_manifest(
         target_model=args.target_model,
         target_model_type=model_type,
@@ -201,6 +203,11 @@ def _run(args: argparse.Namespace) -> int:
         num_samples=num_samples,
         shard_size=args.shard_size,
         target_layer_ids=list(target_wrapper.target_layer_ids),
+        train_data_path=str(args.input_data),
+        train_split=args.split,
+        shuffle_seed=int(args.shuffle_seed),
+        mask_reasoning_content=bool(args.mask_reasoning_content),
+        chat_template_sha256=tokenizer_chat_template_sha256(tokenizer),
     )
     if args.resume:
         _ensure_resume_compatible(args.output_dir, manifest, existing)
@@ -210,7 +217,8 @@ def _run(args: argparse.Namespace) -> int:
         target_model.get_output_embeddings(),
         dtype=cache_dtype,
     )
-    write_manifest(args.output_dir, manifest)
+    # Staged publish: incomplete until every shard is written (see ensure_manifest_complete).
+    write_manifest(args.output_dir, {**manifest, "complete": False})
 
     logger.info(
         "Precomputing DSpark cache: %d samples, shard_size=%d, layers=%s, dtype=%s -> %s",
@@ -244,6 +252,7 @@ def _run(args: argparse.Namespace) -> int:
         logger=logger,
     )
 
+    write_manifest(args.output_dir, {**manifest, "complete": True})
     logger.info("Done. Cache written to %s", args.output_dir)
     return 0
 

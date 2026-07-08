@@ -58,6 +58,7 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
     manifest_mismatch_fields,
     manifest_path,
     read_manifest,
+    tokenizer_chat_template_sha256,
     write_manifest,
     write_shard,
     write_target_weights,
@@ -121,11 +122,15 @@ def _ensure_output_dir_compatible(output_dir: str, manifest: dict[str, Any]) -> 
     Distributed precompute writes are idempotent (atomic overwrite), so re-running the
     same config into the same directory safely recomputes. But mixing shards from a
     different target / dataset / shape silently corrupts the cache, so a mismatched
-    existing manifest is a hard error (use a fresh ``cache_output_dir``).
+    existing manifest is a hard error (use a fresh ``cache_output_dir``). The manifest
+    carries the run's input identity (dataset path/split, shuffle seed, masking,
+    effective chat template), so a same-shape different-input rerun is also rejected
+    here rather than interleaving old and new supervision. ``allow_incomplete`` lets
+    a rerun continue into a directory whose previous run was interrupted.
     """
     if not os.path.exists(manifest_path(output_dir)):
         return
-    mismatched = manifest_mismatch_fields(read_manifest(output_dir), manifest)
+    mismatched = manifest_mismatch_fields(read_manifest(output_dir, allow_incomplete=True), manifest)
     if mismatched:
         raise ValueError(
             f"{output_dir} already holds a DSpark cache with a different configuration "
@@ -250,6 +255,11 @@ def run(cfg) -> int:
     target_layer_ids = validate_target_layer_ids(target_layer_ids, num_target_layers)
     target_wrapper = HFDSparkTargetModel(target_model, target_layer_ids=target_layer_ids)
 
+    # Resolved once and passed to BOTH the dataloader and the manifest, so the
+    # recorded input identity is exactly what the forward pass consumed.
+    train_split = recipe_cfg.get("train_split", None)
+    shuffle_seed = int(recipe_cfg.get("shuffle_seed", 42))
+    mask_reasoning_content = bool(recipe_cfg.get("mask_reasoning_content", False))
     dataloader = build_eagle3_dataloader(
         data_path=recipe_cfg.train_data_path,
         tokenizer=tokenizer,
@@ -257,10 +267,10 @@ def run(cfg) -> int:
         batch_size=batch_size,
         shuffle=False,
         num_workers=int(recipe_cfg.get("num_workers", 0)),
-        split=recipe_cfg.get("train_split", None),
+        split=train_split,
         distributed=False,
-        shuffle_seed=int(recipe_cfg.get("shuffle_seed", 42)),
-        mask_reasoning_content=bool(recipe_cfg.get("mask_reasoning_content", False)),
+        shuffle_seed=shuffle_seed,
+        mask_reasoning_content=mask_reasoning_content,
     )
     num_samples = len(dataloader.dataset)
 
@@ -273,6 +283,11 @@ def run(cfg) -> int:
         num_samples=num_samples,
         shard_size=shard_size,
         target_layer_ids=list(target_wrapper.target_layer_ids),
+        train_data_path=str(recipe_cfg.train_data_path),
+        train_split=train_split,
+        shuffle_seed=shuffle_seed,
+        mask_reasoning_content=mask_reasoning_content,
+        chat_template_sha256=tokenizer_chat_template_sha256(tokenizer),
     )
 
     # Gather the (possibly DTensor-sharded) target embed_tokens / lm_head to full
@@ -287,7 +302,10 @@ def run(cfg) -> int:
         if present:
             logger.info("%s already has %d shard(s); they will be overwritten idempotently.", output_dir, len(present))
         write_target_weights(output_dir, embed_full, head_full, dtype=cache_dtype)
-        write_manifest(output_dir, manifest)
+        # Staged publish: the manifest goes down as incomplete before the first
+        # shard and is flipped to complete only after the final barrier, so an
+        # interrupted run can never be consumed as a valid cache.
+        write_manifest(output_dir, {**manifest, "complete": False})
     # The gathered full embed/lm_head tensors are only needed for the rank-zero write
     # above; on a V4/GLM-scale vocab they hold several GB per rank, so free them before
     # the long forward loop.
@@ -329,6 +347,7 @@ def run(cfg) -> int:
     if dist_env.world_size > 1:
         dist.barrier()
     if dist_env.is_main:
+        write_manifest(output_dir, {**manifest, "complete": True})
         logger.info("Done. Distributed DSpark cache written to %s", output_dir)
     return 0
 

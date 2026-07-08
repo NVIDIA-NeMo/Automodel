@@ -99,10 +99,27 @@ def test_compute_batch_cache_downcasts_only_float_tensors():
     torch.testing.assert_close(cache["input_ids"], tb.input_ids)
 
 
+def test_cache_dataset_rejects_incomplete_manifest(tmp_path):
+    """An interrupted precompute (complete: false) must not be consumed as a valid cache."""
+    cache_dir = str(tmp_path / "cache")
+    _write_tiny_cache(cache_dir, num_samples=3, shard_size=2, seq_len=4)
+    manifest = read_manifest(cache_dir)
+    manifest.pop("format_version", None)
+    write_manifest(cache_dir, {**manifest, "complete": False})
+
+    with pytest.raises(ValueError, match="incomplete"):
+        CachedDSparkDataset(cache_dir)
+
+    # Flipped to complete (what the producer does after the last shard): accepted.
+    write_manifest(cache_dir, {**manifest, "complete": True})
+    assert len(CachedDSparkDataset(cache_dir)) == 3
+
+
 def test_cache_dataset_round_trip(tmp_path):
     cache_dir = str(tmp_path / "cache")
     samples = _write_tiny_cache(cache_dir, num_samples=3, shard_size=2, seq_len=4)
 
+    # _write_tiny_cache writes a legacy manifest with no `complete` field: accepted.
     dataset = CachedDSparkDataset(cache_dir)
     assert len(dataset) == 3
     item = dataset[2]

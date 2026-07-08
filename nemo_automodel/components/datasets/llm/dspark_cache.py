@@ -23,6 +23,7 @@ precompute job write those tensors once and lets training stream them later via
 
 from __future__ import annotations
 
+import hashlib
 import os
 from types import SimpleNamespace
 from typing import Any
@@ -76,6 +77,12 @@ def compute_batch_cache(target_batch, cache_dtype: torch.dtype) -> dict[str, tor
     }
 
 
+def tokenizer_chat_template_sha256(tokenizer) -> str:
+    """Return a stable identity for the tokenizer's effective (post-override) chat template."""
+    template = getattr(tokenizer, "chat_template", None) or ""
+    return hashlib.sha256(template.encode("utf-8")).hexdigest()
+
+
 def build_cache_manifest(
     *,
     target_model: str,
@@ -86,12 +93,23 @@ def build_cache_manifest(
     num_samples: int,
     shard_size: int,
     target_layer_ids: list[int],
+    train_data_path: str,
+    train_split: str | None,
+    shuffle_seed: int,
+    mask_reasoning_content: bool,
+    chat_template_sha256: str,
 ) -> dict[str, Any]:
     """Assemble the DSpark cache manifest.
 
     Single source of the manifest schema: both precompute entry points call this, and
     ``train_dspark`` validates cached training against these fields, so adding or
     renaming a field here is the one place the contract changes.
+
+    Beyond the tensor-shaping target/cache settings, the manifest records the
+    *input identity* of the run (dataset path/split, shuffle seed, masking
+    settings, effective chat template): a rerun into an existing directory with
+    a different input therefore fails the manifest-compatibility check instead
+    of silently interleaving old and new supervision shard by shard.
     """
     hidden_size = int(target_text_config.hidden_size)
     return {
@@ -107,13 +125,28 @@ def build_cache_manifest(
         "target_hidden_dim": hidden_size * len(target_layer_ids),
         "target_last_hidden_dim": hidden_size,
         "target_layer_ids": list(target_layer_ids),
+        "train_data_path": str(train_data_path),
+        "train_split": train_split,
+        "shuffle_seed": int(shuffle_seed),
+        "mask_reasoning_content": bool(mask_reasoning_content),
+        "chat_template_sha256": chat_template_sha256,
     }
 
 
+_IDENTITY_EXEMPT_FIELDS = ("format_version", "complete")
+
+
 def manifest_mismatch_fields(recorded: dict[str, Any], manifest: dict[str, Any]) -> list[str]:
-    """Return the manifest keys whose values differ, ignoring ``format_version``."""
-    recorded = {k: v for k, v in recorded.items() if k != "format_version"}
-    return sorted(k for k in recorded.keys() | manifest.keys() if recorded.get(k) != manifest.get(k))
+    """Return the manifest keys whose values differ, ignoring bookkeeping fields.
+
+    ``format_version`` and the ``complete`` marker describe the on-disk state,
+    not the run configuration, so they never count as a mismatch.
+    """
+    return sorted(
+        k
+        for k in recorded.keys() | manifest.keys()
+        if k not in _IDENTITY_EXEMPT_FIELDS and recorded.get(k) != manifest.get(k)
+    )
 
 
 def write_manifest(cache_dir: str, manifest: dict) -> str:
@@ -121,14 +154,39 @@ def write_manifest(cache_dir: str, manifest: dict) -> str:
     return _write_manifest(cache_dir, manifest, _FORMAT_VERSION)
 
 
-def read_manifest(cache_dir: str) -> dict[str, Any]:
-    """Load and validate the DSpark cache manifest."""
-    return _read_manifest(
+def ensure_manifest_complete(manifest: dict[str, Any], cache_dir: str) -> None:
+    """Reject a cache whose producer did not finish writing.
+
+    The precompute entry points write the manifest with ``complete: false``
+    before the first shard and flip it to ``true`` only after every shard has
+    been written, so an interrupted (or still-running) precompute cannot be
+    consumed as a valid cache. Manifests written before the marker existed
+    have no ``complete`` field and are accepted.
+    """
+    if manifest.get("complete", True) is not True:
+        raise ValueError(
+            f"DSpark cache at {cache_dir} is marked incomplete (its precompute was interrupted or is "
+            "still running). Re-run the precompute with the same configuration to finish it, or delete "
+            "the directory and regenerate."
+        )
+
+
+def read_manifest(cache_dir: str, allow_incomplete: bool = False) -> dict[str, Any]:
+    """Load and validate the DSpark cache manifest.
+
+    ``allow_incomplete`` is for the precompute producers themselves (compat
+    checks against a partially written directory); consumers keep the default
+    so an interrupted precompute is never read as a valid cache.
+    """
+    manifest = _read_manifest(
         cache_dir,
         cache_name=_CACHE_NAME,
         format_version=_FORMAT_VERSION,
         producer_name="precompute_dspark",
     )
+    if not allow_incomplete:
+        ensure_manifest_complete(manifest, cache_dir)
+    return manifest
 
 
 def _target_weights_path(cache_dir: str) -> str:
@@ -183,6 +241,7 @@ class CachedDSparkDataset(CachedTensorDataset):
             format_version=_FORMAT_VERSION,
             disk_keys=CACHE_KEYS,
         )
+        ensure_manifest_complete(self.manifest, cache_dir)
 
 
 def _collate_cached(features: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -217,12 +276,14 @@ __all__ = [
     "build_cache_manifest",
     "build_cached_dspark_dataloader",
     "compute_batch_cache",
+    "ensure_manifest_complete",
     "existing_shard_indices",
     "manifest_mismatch_fields",
     "manifest_path",
     "read_manifest",
     "read_target_weight_modules",
     "shard_path",
+    "tokenizer_chat_template_sha256",
     "write_manifest",
     "write_shard",
     "write_target_weights",

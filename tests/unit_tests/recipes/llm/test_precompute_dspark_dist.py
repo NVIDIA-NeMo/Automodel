@@ -110,22 +110,43 @@ def _config_stub():
     return SimpleNamespace(hidden_size=_HIDDEN, vocab_size=_VOCAB, num_hidden_layers=6)
 
 
-def test_build_manifest_schema():
-    manifest = pdd.build_cache_manifest(
+_IDENTITY_KWARGS = dict(
+    train_data_path="data/train.jsonl",
+    train_split="train",
+    shuffle_seed=42,
+    mask_reasoning_content=False,
+    chat_template_sha256="0" * 64,
+)
+
+
+def _manifest_kwargs(**overrides):
+    kwargs = dict(
         target_model="tiny",
         target_model_type="qwen3",
         target_text_config=_config_stub(),
         seq_length=_SEQ,
         dtype="fp32",
-        num_samples=10,
+        num_samples=4,
         shard_size=2,
         target_layer_ids=_LAYERS,
+        **_IDENTITY_KWARGS,
     )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_build_manifest_schema():
+    manifest = pdd.build_cache_manifest(**_manifest_kwargs(num_samples=10))
     assert manifest["target_hidden_dim"] == _HIDDEN * len(_LAYERS)
     assert manifest["target_last_hidden_dim"] == _HIDDEN
     assert manifest["num_hidden_layers"] == 6
     assert manifest["target_layer_ids"] == _LAYERS
     assert manifest["num_samples"] == 10
+    assert manifest["train_data_path"] == "data/train.jsonl"
+    assert manifest["train_split"] == "train"
+    assert manifest["shuffle_seed"] == 42
+    assert manifest["mask_reasoning_content"] is False
+    assert manifest["chat_template_sha256"] == "0" * 64
 
 
 def test_ensure_output_dir_compatible_absent_manifest_is_noop(tmp_path):
@@ -135,16 +156,7 @@ def test_ensure_output_dir_compatible_absent_manifest_is_noop(tmp_path):
 def test_ensure_output_dir_compatible_matching_manifest_ok(tmp_path):
     from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest
 
-    manifest = pdd.build_cache_manifest(
-        target_model="tiny",
-        target_model_type="qwen3",
-        target_text_config=_config_stub(),
-        seq_length=_SEQ,
-        dtype="fp32",
-        num_samples=4,
-        shard_size=2,
-        target_layer_ids=_LAYERS,
-    )
+    manifest = pdd.build_cache_manifest(**_manifest_kwargs())
     write_manifest(str(tmp_path), manifest)
     pdd._ensure_output_dir_compatible(str(tmp_path), manifest)  # identical -> ok
 
@@ -152,18 +164,58 @@ def test_ensure_output_dir_compatible_matching_manifest_ok(tmp_path):
 def test_ensure_output_dir_compatible_mismatch_raises(tmp_path):
     from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest
 
-    base_kwargs = dict(
-        target_model="tiny",
-        target_model_type="qwen3",
-        target_text_config=_config_stub(),
-        seq_length=_SEQ,
-        dtype="fp32",
-        shard_size=2,
-        target_layer_ids=_LAYERS,
-    )
-    write_manifest(str(tmp_path), pdd.build_cache_manifest(num_samples=4, **base_kwargs))
+    write_manifest(str(tmp_path), pdd.build_cache_manifest(**_manifest_kwargs(num_samples=4)))
     with pytest.raises(ValueError, match="different configuration"):
-        pdd._ensure_output_dir_compatible(str(tmp_path), pdd.build_cache_manifest(num_samples=8, **base_kwargs))
+        pdd._ensure_output_dir_compatible(str(tmp_path), pdd.build_cache_manifest(**_manifest_kwargs(num_samples=8)))
+
+
+def test_ensure_output_dir_compatible_rejects_different_input_identity(tmp_path):
+    """A same-shape rerun over a DIFFERENT dataset must be rejected, not interleaved."""
+    from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest
+
+    write_manifest(str(tmp_path), pdd.build_cache_manifest(**_manifest_kwargs()))
+    for field, value in [
+        ("train_data_path", "data/other.jsonl"),
+        ("train_split", "train[:50]"),
+        ("shuffle_seed", 7),
+        ("mask_reasoning_content", True),
+        ("chat_template_sha256", "f" * 64),
+    ]:
+        with pytest.raises(ValueError, match=field):
+            pdd._ensure_output_dir_compatible(
+                str(tmp_path), pdd.build_cache_manifest(**_manifest_kwargs(**{field: value}))
+            )
+
+
+def test_ensure_output_dir_compatible_allows_rerun_into_incomplete_dir(tmp_path):
+    """An interrupted run's directory accepts a same-config rerun (complete flag is not an identity field)."""
+    from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest
+
+    manifest = pdd.build_cache_manifest(**_manifest_kwargs())
+    write_manifest(str(tmp_path), {**manifest, "complete": False})
+    pdd._ensure_output_dir_compatible(str(tmp_path), manifest)
+
+
+def test_incomplete_manifest_rejected_by_consumers(tmp_path):
+    from nemo_automodel.components.datasets.llm.dspark_cache import read_manifest, write_manifest
+
+    manifest = pdd.build_cache_manifest(**_manifest_kwargs())
+    write_manifest(str(tmp_path), {**manifest, "complete": False})
+    with pytest.raises(ValueError, match="incomplete"):
+        read_manifest(str(tmp_path))
+    assert read_manifest(str(tmp_path), allow_incomplete=True)["complete"] is False
+
+    write_manifest(str(tmp_path), {**manifest, "complete": True})
+    assert read_manifest(str(tmp_path))["complete"] is True
+
+
+def test_tokenizer_chat_template_sha256():
+    from nemo_automodel.components.datasets.llm.dspark_cache import tokenizer_chat_template_sha256
+
+    with_template = tokenizer_chat_template_sha256(SimpleNamespace(chat_template="{{ messages }}"))
+    without_template = tokenizer_chat_template_sha256(SimpleNamespace(chat_template=None))
+    assert with_template != without_template
+    assert with_template == tokenizer_chat_template_sha256(SimpleNamespace(chat_template="{{ messages }}"))
 
 
 # ---------------------------------------------------------------------------
