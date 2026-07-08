@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import pytest
 import torch.nn as nn
@@ -201,6 +202,14 @@ def test_query_static_class_from_instance():
     assert caps.supports_thd is True
 
 
+def test_query_static_declaration_inherited_by_runtime_wrapper():
+    class _RuntimeWrapper(_FakeStaticModel):
+        pass
+
+    caps = query_capabilities(_RuntimeWrapper())
+    assert caps == ModelCapabilities(supports_tp=True, supports_pp=True, supports_thd=True)
+
+
 def test_query_dynamic_class_requires_config():
     with pytest.raises(ValueError, match="dynamic capability dispatch"):
         query_capabilities(_FakeDynamicModel)
@@ -216,6 +225,14 @@ def test_query_dynamic_class_via_instance_dispatches_on_config():
     assert caps_a != caps_b
 
 
+def test_query_dynamic_declaration_inherited_by_runtime_wrapper():
+    class _RuntimeWrapper(_FakeDynamicModel):
+        pass
+
+    caps = query_capabilities(_RuntimeWrapper(config=_FakeConfig(archs=[], is_variant_a=True)))
+    assert caps == ModelCapabilities(supports_tp=True, supports_pp=True)
+
+
 def test_query_dynamic_class_via_config_dispatches():
     cfg = _FakeConfig(archs=[], is_variant_a=True)
     # Direct config form requires the arch to resolve via registry; bypass that
@@ -223,6 +240,48 @@ def test_query_dynamic_class_via_config_dispatches():
     inst = _FakeDynamicModel(config=cfg)
     caps = query_capabilities(inst)
     assert caps == ModelCapabilities(supports_tp=True, supports_pp=True)
+
+
+def test_query_model_id_loads_config_and_resolves_architecture():
+    config = _FakeConfig(archs=["FakeStaticModel"])
+    with (
+        patch("transformers.AutoConfig.from_pretrained", return_value=config) as load_config,
+        patch(
+            "nemo_automodel._transformers.model_capabilities._resolve_class_from_arch",
+            return_value=_FakeStaticModel,
+        ) as resolve_class,
+    ):
+        caps = query_capabilities("org/model", trust_remote_code=True)
+
+    assert caps == ModelCapabilities(supports_tp=True, supports_pp=True, supports_thd=True)
+    load_config.assert_called_once_with("org/model", trust_remote_code=True)
+    resolve_class.assert_called_once_with("FakeStaticModel")
+
+
+def test_query_config_resolves_registered_architecture():
+    config = _FakeConfig(archs=["FakeStaticModel"])
+    with (
+        patch.object(ModelRegistry, "has_custom_model", return_value=True),
+        patch.object(ModelRegistry, "get_model_cls_from_model_arch", return_value=_FakeStaticModel) as resolve_class,
+    ):
+        caps = query_capabilities(config)
+
+    assert caps == ModelCapabilities(supports_tp=True, supports_pp=True, supports_thd=True)
+    resolve_class.assert_called_once_with("FakeStaticModel")
+
+
+def test_query_config_rejects_unknown_architecture():
+    config = _FakeConfig(archs=["UnknownArchitecture"])
+    with (
+        patch.object(ModelRegistry, "has_custom_model", return_value=False),
+        pytest.raises(KeyError, match="UnknownArchitecture"),
+    ):
+        query_capabilities(config)
+
+
+def test_query_config_requires_architecture():
+    with pytest.raises(ValueError, match="has no 'architectures' field"):
+        query_capabilities(_FakeConfig(archs=[]))
 
 
 def test_both_patterns_is_rejected():
