@@ -26,6 +26,10 @@ jobs:
         2. Select skills from `.claude/skills/<name>/SKILL.md` deterministically:
            - For every Python change, read `linting-and-formatting`. Also read
              `testing` when behavior or tests change.
+           - For changes to loss normalization, backward/autograd, gradient
+             accumulation/scaling/clipping, optimizer stepping, DTensor placement,
+             or distributed collectives, read `nemo-automodel-distributed-training`,
+             `parity-testing`, and `testing`.
            - For `.github/` or CI changes, read `cicd`.
            - For Fern documentation changes, read `fern-docs`.
            - Read `build-and-dependency`, `parity-testing`, or the relevant
@@ -173,6 +177,84 @@ jobs:
           - flag `.data` mutation that can bypass autograd; prefer `torch.no_grad()`
             with `copy_()`. Exempt tightly controlled initialization, checkpoint,
             or upstream-compatibility code only when the safety invariant is clear.
+        - Distributed autograd and gradient handling. Treat changes to loss
+          normalization, `backward()`, gradient accumulation, `no_sync`, FSDP sync
+          deferral, gradient hooks, mixed-precision scaling/unscaling, norm
+          computation/clipping, optimizer `step()`/`zero_grad()`, DTensor gradients,
+          or autograd-aware collectives as high risk. When changed code touches any
+          of these, verify:
+          - ordering and exactly-once semantics: loss normalization is applied once;
+            accumulated gradients synchronize on the intended final backward;
+            scaled gradients are unscaled before norm checks/clipping; clipping
+            happens before the optimizer step; and scaler update/zeroing occurs at
+            the correct optimizer-step boundary. Include incomplete final
+            accumulation windows and skipped/non-finite steps;
+          - reduction-domain correctness: the norm and scaling factor use the
+            intended DP/DP-shard/DP-replicate/TP/CP/PP/EP groups; replicated or tied
+            parameters are not double-counted; DTensor `Shard`/`Replicate`/`Partial`
+            placements are handled explicitly; and shared versus expert parameters
+            receive the correct, non-duplicated PP/EP scaling;
+          - rank symmetry: every rank enters compatible collectives in the same
+            order even for empty/fully masked batches, unused parameters,
+            rank-conditional branches, variable token counts, or pipeline stages
+            with different local parameters. A path that can silently produce a
+            wrong update, hang, or use a stale/partial gradient is a critical bug;
+          - parameter identity: model surgery, sharding, PEFT injection, weight
+            tying, or parameter replacement must happen before optimizer parameter
+            groups and gradient hooks are captured, or must update them explicitly.
+            Flag stale optimizer references, lost hooks, broken tied storage, and
+            mutation of `.grad` through detached/local tensors that does not update
+            the actual parameter gradient;
+          - recomputation and persisted state: activation checkpointing, saved-tensor
+            offload, dropout, and custom kernels must preserve the intended RNG state
+            and must not mutate caches/buffers in a way that makes recomputation use
+            different values. Optimizer momentum, step counters, and GradScaler state
+            must remain attached to the correct parameter identities and survive any
+            changed sharded checkpoint save/restore path.
+        - Tensor storage and asynchronous lifetime hazards, the PyTorch equivalent
+          of unsafe pointer ownership. In changed code, flag:
+          - in-place writes through views, aliases, `.data`, `detach()`, `to_local()`,
+            or shared/tied storage when autograd versioning or another owner can
+            still observe the tensor; require an explicit clone/copy or documented
+            ownership transfer at the boundary;
+          - custom `torch.autograd.Function` implementations that save mutable
+            aliases, return the wrong number/dtype/device of gradients, mishandle
+            `None` gradients, or fail to declare in-place mutation. Require backward
+            and gradient-parity coverage, not forward-only output checks;
+          - asynchronous collectives, CUDA streams/events, offload, or custom
+            kernels whose input/output/storage can be freed, reused, or mutated
+            before completion. The owning object must retain buffers, wait on
+            `Work`/events at the correct boundary, use `record_stream` where needed,
+            and clean up hooks/process groups deterministically;
+          - custom kernel or `data_ptr`/DLPack boundaries that assume contiguous
+            layout, alignment, dtype, device, shape divisibility, or current-stream
+            execution without validating or encoding that contract.
+        - Distributed gradient test coverage. For any changed behavior covered by
+          the two sections above, require a focused numerical test matrix rather
+          than mocked call assertions alone:
+          - compare per-parameter gradients, reported global norm, and parameters
+            after one optimizer step against a tiny single-process fp32 reference;
+          - exercise size 1 and size >1 for every parallelism axis the changed code
+            affects (DP/FSDP or HSDP, TP, CP, PP, EP), plus at least one supported
+            composed topology when axes interact. Do not demand unsupported
+            strategies or the full Cartesian product; name the smallest missing
+            scenario that exposes the identified risk. Respect the 2-GPU PR
+            functional-test cap; when the smallest real composition needs more
+            ranks, require targeted PR-level coverage plus an existing or added
+            scheduled L1/L2 test for that topology;
+          - cover accumulation 1 and >1, including a partial final window, when
+            accumulation/sync timing changes; cover clipping on/off and relevant
+            precision/scaler states when scaling or clipping changes; and include
+            representative `None`/frozen, tied/shared, expert, empty-supervision,
+            and uneven-token cases when those branches are affected;
+          - cover activation checkpointing/RNG recomputation on and off when that
+            lifecycle changes, and verify save/resume step parity when optimizer or
+            scaler state serialization changes;
+          - pure scaling/norm math may use small CPU unit tests, but collective
+            ordering, DTensor placement, and sync-deferral changes need the smallest
+            real multi-process functional test that can fail on a hang or rank
+            mismatch. Assert finite values and numerical results, not merely that a
+            collective or helper was called.
         - Exception semantics in changed library code. Flag `assert` used for user,
           config, or runtime validation; `sys.exit()` below CLI entry points; broad
           replacement exceptions that discard the original cause; and exception
