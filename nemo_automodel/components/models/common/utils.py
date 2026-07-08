@@ -234,14 +234,33 @@ class BackendConfig:
             )
 
 
+# Register rms_norm as a custom op so that torch.inductor treats it as opaque
+# and calls the deterministic fused CUDA kernel instead of decomposing it into
+# a Triton reduction that is non-deterministic across calls.
+_rms_norm_lib = torch.library.Library("nemo_automodel", "DEF")
+_rms_norm_lib.define("float32_rms_norm(Tensor x, Tensor weight, float eps) -> Tensor")
+
+
+@torch.library.impl(_rms_norm_lib, "float32_rms_norm", "CUDA")
+def _float32_rms_norm_cuda(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    return torch.nn.functional.rms_norm(
+        x.float(), (x.shape[-1],), weight.float(), eps
+    ).to(x.dtype)
+
+
+@torch.library.impl(_rms_norm_lib, "float32_rms_norm", "Meta")
+def _float32_rms_norm_meta(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 @torch.compile(fullgraph=True, dynamic=True)
 def _float32_rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards."""
-    input_dtype = x.dtype
-    x = x.float()
-    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-    return (weight * x).to(input_dtype)
+    """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards.
 
+    Delegates to a custom op so inductor does not decompose rms_norm into a
+    non-deterministic Triton reduction kernel.
+    """
+    return torch.ops.nemo_automodel.float32_rms_norm(x, weight, eps)
 
 class Float32RMSNorm(nn.Module):
     """RMSNorm with explicit fp32 computation for training stability.
