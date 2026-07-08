@@ -1,6 +1,6 @@
 navigation:
   # Version-root landing page. slug: "" mounts index.mdx at the version root
-  # (/latest) so it renders directly instead of auto-redirecting to the first
+  # (/v0.5) so it renders directly instead of auto-redirecting to the first
   # section page — matching the old Sphinx site's /latest/index.html landing.
   - page: "Home"
     path: ./v0.5/pages/index.mdx
