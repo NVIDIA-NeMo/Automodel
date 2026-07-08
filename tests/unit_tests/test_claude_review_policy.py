@@ -36,7 +36,7 @@ def test_review_workflow_has_bounded_trigger_and_dependencies():
     assert "github.event.comment.body == '/claude review'" in job["if"]
     assert job["concurrency"]["cancel-in-progress"] is True
     assert "${{ github.actor }}" in job["concurrency"]["group"]
-    assert "model" not in job["with"]
+    assert job["with"]["model"] == "${{ vars.CLAUDE_MODEL }}"
     assert re.search(r"_claude_review\.yml@[0-9a-f]{40}(?:\s|$)", job["uses"])
 
 
@@ -55,6 +55,11 @@ def test_review_workflow_has_bounded_trigger_and_dependencies():
         ("no free builders", "Flag new free-standing `build_*` helper functions"),
         ("config build purity", "must preserve declarative config state"),
         ("modern annotations", "legacy `Optional[T]`, `Union[X, Y]`"),
+        ("tensor contract docstrings", "Tensor contract docstrings"),
+        ("semantic tensor layout", "every tensor's semantic shape and axis order"),
+        ("distributed tensor layout", "global versus per-rank local shape"),
+        ("structured tensor output", "every tensor-bearing field"),
+        ("docstring scope", "specific changed tensor contract whose layout remains ambiguous"),
         ("quality-gate bypass", "Quality-gate bypasses introduced or expanded"),
         ("minimal API surface", "Minimal public API surface"),
         ("API compatibility cost", "long-lived compatibility obligations"),

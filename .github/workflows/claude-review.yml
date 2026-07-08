@@ -82,6 +82,29 @@ jobs:
           - ambiguous public signatures: boolean-trap parameters, multiple
             same-typed positional runtime arguments that should be keyword-only,
             or long anonymous tuple returns that need a named typed result.
+        - Tensor contract docstrings. For a new public API, or a materially changed
+          tensor input/output contract on an existing public API, require the
+          Google-style `Args` section and, when values are returned, `Returns`
+          section to document:
+          - every tensor's semantic shape and axis order, with symbolic dimensions
+            defined at first use (for example, `B` = batch, `S` = sequence, `H` =
+            hidden). Flag vague descriptions such as "embedding tensor" or
+            unexplained `[B, S, H]` notation;
+          - nonstandard logical layout such as packed, padded, ragged, flattened,
+            interleaved, fused-QKV/GateUp, THD, or channels-first/channels-last, and
+            the before/after layout when the API transforms it;
+          - for distributed tensors, global versus per-rank local shape, the axis
+            that is sharded, and required DTensor placement/mesh semantics
+            (`Shard`, `Replicate`, or `Partial`) when callers must preserve them;
+          - dtype, device, contiguity/stride, divisibility, aliasing, or in-place
+            mutation requirements only when they affect correctness. State whether
+            an output aliases or mutates an input when ownership is not independent;
+          - every tensor-bearing field in a tuple, mapping, dataclass, or model
+            output, not only the first returned tensor.
+          Do not demand retroactive docstring edits for an unchanged inherited or
+          upstream-imposed contract, private implementation helpers, or APIs whose
+          changed inputs and outputs contain no tensors. A finding must quote the
+          specific changed tensor contract whose layout remains ambiguous.
         - Quality-gate bypasses introduced or expanded by changed code. Flag new
           `# noqa`, `# type: ignore`, `# pragma: no cover`, blanket warning
           suppression, `pytest.skip`/`xfail`, or additions to Ruff, `ty`, coverage,
