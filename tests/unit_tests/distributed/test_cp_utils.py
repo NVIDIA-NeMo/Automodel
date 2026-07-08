@@ -31,6 +31,18 @@ import torch
 # Import module under test
 from nemo_automodel.components.distributed import cp_utils as _cu
 from nemo_automodel.components.distributed.cp_sharder import CPSharder, contiguous_local_indices
+
+
+# CPSharder used by the model-owned dispatch tests below (passed as an explicit
+# make_cp_batch_and_ctx parameter; the batch itself stays pure tensors).
+def _contiguous_sharder():
+    return CPSharder(
+        shard_batch=_cm.make_contiguous_shard_cp_batch_and_ctx,
+        local_token_global_indices=contiguous_local_indices,
+        layout="contiguous",
+    )
+
+
 from nemo_automodel.components.models.gemma4_moe import cp_batch as _cm
 
 
@@ -135,14 +147,9 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     batch = {
         "input_ids": torch.tensor([[10, 20, 30, 40]]),
         "labels": labels,
-        "cp_sharder": CPSharder(
-            shard_batch=_cm.make_contiguous_shard_cp_batch_and_ctx,
-            local_token_global_indices=contiguous_local_indices,
-            layout="contiguous",
-        ),
     }
 
-    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask)
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask, cp_sharder=_contiguous_sharder())
 
     assert ctx_obj is contextlib.nullcontext
 
@@ -165,14 +172,9 @@ def test_make_cp_batch_and_ctx_pads_to_cp_load_balance_multiple(monkeypatch):
         "input_ids": torch.tensor([[1, 2, 3]]),
         "labels": torch.tensor([[1, 2, 3]]),
         "mm_token_type_ids": torch.tensor([[0, 1, 0]]),
-        "cp_sharder": CPSharder(
-            shard_batch=_cm.make_contiguous_shard_cp_batch_and_ctx,
-            local_token_global_indices=contiguous_local_indices,
-            layout="contiguous",
-        ),
     }
 
-    _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
+    _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99, cp_sharder=_contiguous_sharder())
 
     assert batch["input_ids"].shape[1] == 2
     assert batch["input_ids"][0, -1].item() == 99
@@ -222,14 +224,9 @@ def test_make_cp_batch_and_ctx_supports_inputs_embeds_and_per_layer_inputs(monke
         "labels": labels,
         "per_layer_inputs": per_layer_inputs,
         "mm_token_type_ids": torch.zeros(1, 4, dtype=torch.long),
-        "cp_sharder": CPSharder(
-            shard_batch=_cm.make_contiguous_shard_cp_batch_and_ctx,
-            local_token_global_indices=contiguous_local_indices,
-            layout="contiguous",
-        ),
     }
 
-    _cu.make_cp_batch_and_ctx(device_mesh, batch)
+    _cu.make_cp_batch_and_ctx(device_mesh, batch, cp_sharder=_contiguous_sharder())
 
     assert batch["position_ids"].shape == (1, 2)
     assert batch["inputs_embeds"].shape == (1, 2, 8)
@@ -244,14 +241,9 @@ def test_make_cp_batch_and_ctx_pads_and_slices_packed_seq_ids(monkeypatch):
         "input_ids": torch.tensor([[1, 2, 3]]),
         "labels": torch.tensor([[1, 2, 3]]),
         "_packed_seq_ids": torch.tensor([[1, 1, 2]]),
-        "cp_sharder": CPSharder(
-            shard_batch=_cm.make_contiguous_shard_cp_batch_and_ctx,
-            local_token_global_indices=contiguous_local_indices,
-            layout="contiguous",
-        ),
     }
 
-    _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
+    _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99, cp_sharder=_contiguous_sharder())
 
     assert torch.equal(batch["input_ids"], torch.tensor([[3, 99]]))
     assert torch.equal(batch["labels"], torch.tensor([[3, -100]]))
@@ -267,14 +259,9 @@ def test_make_cp_batch_and_ctx_includes_padding_mask(monkeypatch):
         "input_ids": torch.tensor([[10, 20, 30, 40]]),
         "labels": torch.tensor([[10, 20, 30, 40]]),
         "padding_mask": padding_mask,
-        "cp_sharder": CPSharder(
-            shard_batch=_cm.make_contiguous_shard_cp_batch_and_ctx,
-            local_token_global_indices=contiguous_local_indices,
-            layout="contiguous",
-        ),
     }
 
-    _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=None)
+    _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=None, cp_sharder=_contiguous_sharder())
 
     # Manual all-gather path slices padding_mask into the batch for the local CP shard.
     assert torch.equal(batch["padding_mask"], torch.tensor([[True, False]]))
@@ -290,14 +277,9 @@ def test_make_cp_batch_and_ctx_3d_mrope_position_ids(monkeypatch):
         "input_ids": torch.arange(seq_len).unsqueeze(0),
         "labels": torch.arange(seq_len).unsqueeze(0),
         "position_ids": position_ids_3d,
-        "cp_sharder": CPSharder(
-            shard_batch=_cm.make_contiguous_shard_cp_batch_and_ctx,
-            local_token_global_indices=contiguous_local_indices,
-            layout="contiguous",
-        ),
     }
 
-    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch)
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, cp_sharder=_contiguous_sharder())
 
     assert ctx_obj is contextlib.nullcontext
     assert new_batch["position_ids"].shape == (3, 1, 4)
@@ -312,14 +294,9 @@ def test_make_cp_batch_and_ctx_2d_position_ids_seq_dim(monkeypatch):
         "input_ids": torch.arange(seq_len).unsqueeze(0),
         "labels": torch.arange(seq_len).unsqueeze(0),
         "position_ids": torch.arange(seq_len).unsqueeze(0),
-        "cp_sharder": CPSharder(
-            shard_batch=_cm.make_contiguous_shard_cp_batch_and_ctx,
-            local_token_global_indices=contiguous_local_indices,
-            layout="contiguous",
-        ),
     }
 
-    _cu.make_cp_batch_and_ctx(device_mesh, batch)
+    _cu.make_cp_batch_and_ctx(device_mesh, batch, cp_sharder=_contiguous_sharder())
 
     assert torch.equal(batch["position_ids"], torch.tensor([[0, 1, 2, 3]]))
 
@@ -334,14 +311,9 @@ def test_make_cp_batch_and_ctx_3d_mrope_with_loss_mask(monkeypatch):
         "input_ids": torch.arange(seq_len).unsqueeze(0),
         "labels": torch.arange(seq_len).unsqueeze(0),
         "position_ids": position_ids_3d,
-        "cp_sharder": CPSharder(
-            shard_batch=_cm.make_contiguous_shard_cp_batch_and_ctx,
-            local_token_global_indices=contiguous_local_indices,
-            layout="contiguous",
-        ),
     }
 
-    _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=loss_mask)
+    _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask=loss_mask, cp_sharder=_contiguous_sharder())
 
     assert batch["position_ids"].shape == (3, 1, 2)
     assert torch.equal(batch["loss_mask"], torch.ones(1, 2))

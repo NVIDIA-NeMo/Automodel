@@ -13,12 +13,15 @@
 # limitations under the License.
 
 import contextlib
-from typing import List, Optional, Set
+from typing import TYPE_CHECKING, List, Optional, Set
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.cp_sharder import CPSharder
 
 
 def _build_position_ids(batch, device):
@@ -355,12 +358,13 @@ def prepare_cp_forward(
         prepared = model(_pre_embed_only=True, _cp_batch=batch, num_chunks=num_chunks)
         if on_pre_embedded is not None:
             on_pre_embedded(prepared)
-        cp_sharder = prepared.get("cp_sharder")
+        cp_sharder = prepared.pop("cp_sharder", None)
         # Merge the hook's return: a None value marks a raw input the hook
         # consumed (e.g. into inputs_embeds) — remove it so it cannot reach
         # the sharded forward. The return channel is used (not in-place pops)
         # because FSDP2's forward-kwargs cast can hand the hook a copy of the
-        # batch dict.
+        # batch dict. The sharder itself is passed onward as an explicit
+        # parameter, never through the batch.
         for key, value in prepared.items():
             if value is None:
                 batch.pop(key, None)
@@ -376,6 +380,7 @@ def prepare_cp_forward(
         num_chunks=num_chunks,
         magi=magi,
         model=model,
+        cp_sharder=cp_sharder,
     )
     return ctx, batch, cp_sharder
 
@@ -390,10 +395,15 @@ def make_cp_batch_and_ctx(
     seq_lens_padding_value: int = -1000,
     magi=None,
     model=None,
+    cp_sharder: "CPSharder | None" = None,
 ):
     """
     Build a CP context manager and shards a batch. If the input device_mesh is None or the size
     of the context_parallel submesh is 1, this function is effectively a no-op.
+
+    ``cp_sharder`` (returned by a model-owning ``prepare_model_inputs_for_cp``
+    hook) selects model-owned batch sharding; it is an explicit parameter, not
+    a batch key, so the batch stays pure tensors.
 
     ``magi`` (an enabled MagiState) selects backend-owned batch prep at the same
     dispatch rung as the TE path; ``model`` is passed through opaquely for its
@@ -426,10 +436,8 @@ def make_cp_batch_and_ctx(
     tp_mesh = _get_submesh(device_mesh, "tp")
 
     # A model that owns its CP attention returns a CPSharder from its CP
-    # input-prep hook (under the "cp_sharder" batch key). Honor it instead of
-    # the default load-balanced context_parallel path so the implementation
-    # stays with the model.
-    cp_sharder = batch.pop("cp_sharder", None)
+    # input-prep hook. Honor it instead of the default load-balanced
+    # context_parallel path so the implementation stays with the model.
     if _get_mesh_size(cp_mesh) > 1 and cp_sharder is not None:
         return cp_sharder.shard_batch(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
 
