@@ -31,9 +31,12 @@ position of every local token — is the universal layout coordinate system: the
 default token-tensor shard/gather are synthesized from it, so a sharder only
 overrides them when it has a cheaper communication pattern. Layouts that are a
 pure function of ``(cp_mesh, padded_seq_len)`` (contiguous, round-robin)
-provide it; data-dependent layouts (THD ``cu_seqlens`` partitioning, magi's
-dispatch solver) set it to None. ``layout`` is a diagnostic string; no
-framework code may branch on it.
+provide it at construction; data-dependent layouts (THD ``cu_seqlens``
+partitioning, magi's dispatch solver) start as None and install the index map
+computed during ``shard_batch`` via :func:`captured_token_indices` — the
+framework builds those sharders per resolution, so a capture never leaks
+across steps. Before the first ``shard_batch`` their token verbs raise.
+``layout`` is a diagnostic string; no framework code may branch on it.
 
 This module also hosts the framework's ``shard_batch`` implementations: the
 shared contiguous-shard batch prep used by models whose CP ranks own contiguous
@@ -111,6 +114,41 @@ def round_robin_local_indices(cp_mesh, padded_seq_len: int, device: torch.device
     return torch.cat((head, tail))
 
 
+def captured_token_indices(local_indices: torch.Tensor) -> Callable[..., torch.Tensor]:
+    """Wrap an index tensor captured during ``shard_batch`` as an indices callable.
+
+    For data-dependent layouts the index map is a byproduct of the sharding
+    itself (TE's ``thd_get_partitioned_indices`` result, magi's
+    ``get_position_ids``) rather than a function of ``(cp_mesh,
+    padded_seq_len)``. The framework sharders install this wrapper on
+    ``local_token_global_indices`` after sharding; it validates the requested
+    length against the captured partition so a mismatched tensor cannot be
+    silently mis-sharded.
+
+    Args:
+        local_indices: This rank's global token positions, as computed by the
+            shard that just ran (flattened; cast to int64).
+
+    Returns:
+        A ``(cp_mesh, padded_seq_len, device) -> LongTensor`` callable
+        returning the captured indices.
+    """
+    local_indices = local_indices.reshape(-1).to(torch.long)
+
+    def _indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
+        cp_size = cp_mesh.size() if cp_mesh is not None else 1
+        expected = local_indices.numel() * cp_size
+        if padded_seq_len != expected:
+            raise ValueError(
+                f"captured CP indices cover a padded stream of {expected} tokens "
+                f"({local_indices.numel()} local x cp_size {cp_size}), got {padded_seq_len=}. "
+                "The tensor does not match the batch this sharder last sharded."
+            )
+        return local_indices if device is None else local_indices.to(device)
+
+    return _indices
+
+
 def shard_token_tensor_by_indices(tensor: torch.Tensor, local_indices: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
     """Keep this rank's slice of a full-length token-aligned tensor.
 
@@ -185,10 +223,12 @@ class CPSharder:
             batch and installs any backend-owned attention transport; returns
             the forward context factory and the sharded batch.
         local_token_global_indices: ``(cp_mesh, padded_seq_len, device) ->
-            LongTensor`` with the global position of each local token. None for
-            layouts that depend on batch content (THD ``cu_seqlens``
-            partitioning, magi's dispatch solver), where the token-tensor
-            shard/gather verbs are unavailable.
+            LongTensor`` with the global position of each local token. Layouts
+            that depend on batch content (THD ``cu_seqlens`` partitioning,
+            magi's dispatch solver) construct with None and install the
+            partition computed during ``shard_batch`` (see
+            :func:`captured_token_indices`); their token verbs raise until the
+            first shard.
         layout: Diagnostic label; never branched on by framework code.
     """
 
@@ -199,8 +239,8 @@ class CPSharder:
     def _indices(self, cp_mesh, padded_seq_len: int, device) -> torch.Tensor:
         if self.local_token_global_indices is None:
             raise NotImplementedError(
-                f"CPSharder(layout={self.layout!r}) has a data-dependent token layout and does not expose "
-                "local_token_global_indices; token-tensor shard/gather are unavailable."
+                f"CPSharder(layout={self.layout!r}) has a data-dependent token layout; its index map is "
+                "captured during shard_batch — token-tensor shard/gather are unavailable before the first shard."
             )
         return self.local_token_global_indices(cp_mesh, padded_seq_len, device)
 

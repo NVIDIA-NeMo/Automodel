@@ -142,6 +142,16 @@ def test_sharder_default_shard_token_tensor_uses_indices():
     torch.testing.assert_close(local, full[:, 4:])
 
 
+def test_captured_token_indices_validates_stream_length():
+    # Captured maps flatten + cast to long, and reject a padded_seq_len that
+    # does not match the partition they were captured from.
+    fn = cs.captured_token_indices(torch.tensor([[1, 0]], dtype=torch.int32))
+    assert torch.equal(fn(_FakeMesh(2, 0), 4), torch.tensor([1, 0]))
+    assert torch.equal(fn(None, 2), torch.tensor([1, 0]))  # no mesh -> cp_size 1
+    with pytest.raises(ValueError, match="does not match"):
+        fn(_FakeMesh(2, 0), 6)
+
+
 def test_sharder_token_verbs_unavailable_for_data_dependent_layouts():
     # THD/magi layouts depend on batch content (cu_seqlens / dispatch solver),
     # so their framework sharders carry no index map and the token-tensor verbs

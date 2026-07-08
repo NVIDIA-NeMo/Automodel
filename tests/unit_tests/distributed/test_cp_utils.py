@@ -513,10 +513,12 @@ def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):
         "cu_seqlens_padded": torch.tensor([0, 4], dtype=torch.int32),
     }
 
-    result = _cu._shard_thd_chunk_for_te(batch, cp_mesh, "thd", -1000, 0)
+    result, local_indices = _cu._shard_thd_chunk_for_te(batch, cp_mesh, "thd", -1000, 0)
 
     assert "input_ids" in result
     assert "attention_mask" not in result
+    # the partition IS the local-token global index map (mock returns arange)
+    assert torch.equal(local_indices, torch.arange(4))
 
 
 def test_make_cp_batch_for_te_unsupported_format():
@@ -602,9 +604,11 @@ def test_magi_dispatches_at_the_te_rung():
         enabled = True
         domain = "llm"
 
-        def make_cp_batch(self, cp_mesh, batch, *, padding_token_id, num_chunks, is_thd, model):
+        def make_cp_batch(
+            self, cp_mesh, batch, *, padding_token_id, num_chunks, is_thd, model, return_local_indices=False
+        ):
             seen.update(cp_mesh=cp_mesh, model=model, is_thd=is_thd, pad=padding_token_id, chunks=num_chunks)
-            return {"prepared": True}
+            return ({"prepared": True}, None) if return_local_indices else {"prepared": True}
 
     model = SimpleNamespace()  # no prepare_model_inputs_for_cp -> hook path skipped
     ctx, batch = _cu.prepare_cp_forward(
@@ -631,11 +635,13 @@ def test_te_dispatches_through_a_framework_sharder(monkeypatch):
     wraps make_cp_batch_for_te, threading the recipe-static args through."""
     seen = {}
 
-    def fake_make_cp_batch_for_te(cp_mesh, batch, *, padding_token_id, qkv_format, num_chunks, seq_lens_padding_value):
+    def fake_make_cp_batch_for_te(
+        cp_mesh, batch, *, padding_token_id, qkv_format, num_chunks, seq_lens_padding_value, return_local_indices=False
+    ):
         seen.update(
             cp_mesh=cp_mesh, pad=padding_token_id, fmt=qkv_format, chunks=num_chunks, sent=seq_lens_padding_value
         )
-        return {"thd": True}
+        return ({"thd": True}, None) if return_local_indices else {"thd": True}
 
     monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
 
@@ -657,6 +663,66 @@ def test_te_dispatches_through_a_framework_sharder(monkeypatch):
     seen.clear()
     _, batch2 = _cu.make_cp_batch_and_ctx(None, {"input_ids": torch.tensor([[1, 2]])}, use_te=True)
     assert batch2 == {"thd": True} and seen["cp_mesh"] is None
+
+
+def test_te_sharder_captures_partition_indices_at_shard_time(monkeypatch):
+    """The THD partition is data-dependent, so the sharder installs the index
+    map its shard_batch just computed: token verbs raise before the first
+    shard, work after it, and reject tensors that don't match the stream."""
+    local_indices = torch.tensor([0, 3])  # this rank's tokens in a 4-token stream (cp=2)
+
+    def fake_make_cp_batch_for_te(cp_mesh, batch, *, return_local_indices=False, **kwargs):
+        return ({"thd": True}, local_indices) if return_local_indices else {"thd": True}
+
+    monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
+
+    cp2 = _DummySubMesh(2)
+    sharder = _cu._resolve_cp_sharder(
+        cp2, None, magi=None, use_te=True, num_chunks=1, seq_lens_padding_value=-1000, model=None
+    )
+    full = torch.arange(4.0)  # [T] token-aligned tensor, THD seq_dim=0
+
+    with pytest.raises(NotImplementedError, match="before the first shard"):
+        sharder.shard_token_tensor(cp2, full, seq_dim=0)
+
+    sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([1, 2, 3, 4])})
+    assert torch.equal(sharder.shard_token_tensor(cp2, full, seq_dim=0), torch.tensor([0.0, 3.0]))
+    with pytest.raises(ValueError, match="does not match"):
+        sharder.shard_token_tensor(cp2, torch.arange(6.0), seq_dim=0)
+
+
+def test_magi_sharder_captures_dispatch_indices():
+    """The magi sharder installs the dispatch-solver index map returned by
+    make_cp_batch (magi's get_position_ids)."""
+
+    class _FakeMagi:
+        enabled = True
+        domain = "llm"
+
+        def make_cp_batch(self, cp_mesh, batch, *, return_local_indices=False, **kwargs):
+            prepped = {"prepared": True}
+            return (prepped, torch.tensor([[0, 2]])) if return_local_indices else prepped
+
+    cp2 = _DummySubMesh(2)
+    sharder = _cu._resolve_cp_sharder(
+        cp2, None, magi=_FakeMagi(), use_te=False, num_chunks=1, seq_lens_padding_value=-1000, model=None
+    )
+    sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([[1, 2, 3, 4]])})
+    full = torch.arange(4.0).unsqueeze(0)  # [1, S_padded]
+    assert torch.equal(sharder.shard_token_tensor(cp2, full, seq_dim=1), torch.tensor([[0.0, 2.0]]))
+
+
+def test_make_cp_batch_for_te_identity_indices_without_cp():
+    """At cp<=1 the THD stream is unsharded, so the index map is the identity."""
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": torch.tensor([[10, 20, 30, 40]]),
+        "position_ids": torch.tensor([[0, 1, 2, 3]]),
+        "seq_lens": torch.tensor([[4]]),
+        "seq_lens_padded": torch.tensor([[4]]),
+    }
+    out, local_indices = _cu.make_cp_batch_for_te(None, batch, return_local_indices=True)
+    assert torch.equal(local_indices, torch.arange(out["input_ids"].shape[-1]))
 
 
 def test_resolve_cp_sharder_layers():
