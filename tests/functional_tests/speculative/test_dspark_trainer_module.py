@@ -25,6 +25,7 @@ from transformers import AutoModelForCausalLM, Qwen3Config
 
 from nemo_automodel.components.datasets.llm.dspark_cache import (
     build_cached_dspark_dataloader,
+    compute_batch_cache,
     read_target_weight_modules,
     write_manifest,
     write_shard,
@@ -34,7 +35,6 @@ from nemo_automodel.components.speculative.dspark import Qwen3DSparkModel, build
 from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics, DSparkTrainerModule
 from nemo_automodel.components.speculative.dspark.registry import build_target_layer_ids
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
-from nemo_automodel.components.speculative.precompute_dspark import _compute_batch_cache
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention backward requires a GPU")
 
@@ -145,7 +145,7 @@ def test_trainer_module_trains_from_offline_cache(tmp_path):
         target_wrapper.get_output_embeddings(),
         dtype=torch.float32,
     )
-    write_shard(cache_dir, 0, _compute_batch_cache(target_batch, cache_dtype=torch.float32))
+    write_shard(cache_dir, 0, compute_batch_cache(target_batch, cache_dtype=torch.float32))
     write_manifest(
         cache_dir,
         {
