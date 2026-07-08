@@ -198,6 +198,28 @@ def _load_draft_weights(draft_model: torch.nn.Module, path: str) -> None:
         raise FileNotFoundError(f"draft_weights_path={path!r} contains no .safetensors files")
     if state_dict.keys().isdisjoint(draft_model.state_dict().keys()):
         raise ValueError(f"draft_weights_path={path!r} shares no keys with the draft model; wrong checkpoint?")
+    # The checkpoint's persistent d2t/t2d buffers encode the draft-vocab mapping
+    # its lm_head rows were trained for. This loads AFTER set_vocab_mapping, so
+    # a silently differing checkpoint mapping would overwrite the run's freshly
+    # selected one while the trainer keeps using the new selected_token_ids --
+    # unreconcilable under LoRA's frozen lm_head. Fail explicitly instead.
+    for key in ("d2t", "t2d"):
+        current = getattr(draft_model, key, None)
+        loaded = state_dict.get(key)
+        if current is None and loaded is None:
+            continue
+        if (
+            current is None
+            or loaded is None
+            or loaded.shape != current.shape
+            or not torch.equal(loaded.to(device=current.device, dtype=current.dtype), current)
+        ):
+            raise ValueError(
+                f"draft_weights_path={path!r} was trained with a different draft-vocab mapping "
+                f"({key} differs from this run's). Reuse the base run's token mapping (point "
+                "recipe_args.selected_token_ids_path at the base run's cached map and keep the same "
+                "draft_vocab_size) so the warm-started lm_head rows stay aligned."
+            )
     missing, unexpected = draft_model.load_state_dict(state_dict, strict=False)
     if missing:
         logger.warning("draft_weights_path: %d draft keys not found in %s (e.g. %s)", len(missing), path, missing[:3])
@@ -1005,6 +1027,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.checkpointer.save_model(
             draft_model,
             path,
+            peft_config=getattr(self, "peft_config", None),
             tokenizer=self.tokenizer,
             is_final_checkpoint=is_final_checkpoint,
         )

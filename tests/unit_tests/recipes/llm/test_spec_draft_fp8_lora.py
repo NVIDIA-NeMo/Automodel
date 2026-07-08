@@ -240,6 +240,119 @@ def test_load_draft_weights_empty_dir_raises(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# _load_draft_weights: draft-vocab mapping guard
+# ---------------------------------------------------------------------------
+
+
+class _TinyMappedDraft(nn.Module):
+    """Tiny draft stand-in carrying the persistent d2t/t2d vocab-mapping buffers."""
+
+    def __init__(self, d2t: torch.Tensor):
+        super().__init__()
+        self.q_proj = nn.Linear(8, 8)
+        self.register_buffer("d2t", d2t)
+        self.register_buffer("t2d", torch.zeros(16, dtype=torch.bool))
+
+
+def test_load_draft_weights_accepts_matching_vocab_mapping(tmp_path):
+    d2t = torch.arange(4, dtype=torch.long)
+    src = _TinyMappedDraft(d2t)
+    _save_tiny_state(tmp_path / "model.safetensors", src.state_dict())
+    dst = _TinyMappedDraft(d2t.clone())
+    _load_draft_weights(dst, str(tmp_path))
+    torch.testing.assert_close(dst.q_proj.weight, src.q_proj.weight)
+
+
+def test_load_draft_weights_rejects_mismatched_vocab_mapping(tmp_path):
+    """A checkpoint trained for a different draft-vocab mapping must fail, not silently overwrite."""
+    src = _TinyMappedDraft(torch.arange(4, dtype=torch.long))
+    _save_tiny_state(tmp_path / "model.safetensors", src.state_dict())
+    dst = _TinyMappedDraft(torch.arange(4, dtype=torch.long) + 7)
+    with pytest.raises(ValueError, match="different draft-vocab mapping"):
+        _load_draft_weights(dst, str(tmp_path))
+
+
+def test_load_draft_weights_rejects_one_sided_mapping(tmp_path):
+    """Checkpoint has mapping buffers but the current draft does not (or vice versa): reject."""
+    src = _TinyMappedDraft(torch.arange(4, dtype=torch.long))
+    _save_tiny_state(tmp_path / "model.safetensors", src.state_dict())
+    with pytest.raises(ValueError, match="different draft-vocab mapping"):
+        _load_draft_weights(_TinyDraft(), str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# save_checkpoint forwards peft_config; adapter-only save round-trip
+# ---------------------------------------------------------------------------
+
+
+def _saving_recipe(tmp_path):
+    """A TrainEagle3Recipe stub with just enough state to run the real save_checkpoint."""
+    from unittest.mock import MagicMock
+
+    from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
+
+    recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
+    recipe.checkpointer = MagicMock()
+    recipe.checkpointer.config = SimpleNamespace(enabled=True, is_async=False)
+    recipe.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    recipe.tokenizer = object()
+    recipe.optimizer = MagicMock()
+    recipe.lr_scheduler = MagicMock()
+    recipe.rng = MagicMock()
+    recipe._module = lambda: SimpleNamespace(draft_model=nn.Linear(2, 2))
+    recipe._save_extra_state = lambda path, epoch: None
+    recipe._update_latest_symlink = lambda path: None
+    recipe.cfg = SimpleNamespace()
+    return recipe
+
+
+def test_save_checkpoint_forwards_peft_config(tmp_path):
+    """Regression: save_model must receive the recipe's PeftConfig or the PeftAddon crashes on None."""
+    recipe = _saving_recipe(tmp_path)
+    recipe.peft_config = PeftConfig(target_modules=["q_proj"])
+    recipe.save_checkpoint(epoch=0, step=1)
+    assert recipe.checkpointer.save_model.call_args.kwargs["peft_config"] is recipe.peft_config
+
+
+def test_save_checkpoint_without_peft_forwards_none(tmp_path):
+    recipe = _saving_recipe(tmp_path)
+    recipe.save_checkpoint(epoch=0, step=1)
+    assert recipe.checkpointer.save_model.call_args.kwargs["peft_config"] is None
+
+
+def test_lora_draft_adapter_save_writes_adapter_files(tmp_path):
+    """End to end: a LoRA-patched draft saved through the real Checkpointer writes adapter-only files."""
+    import os
+
+    from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
+
+    model = _TinyDraft()
+    peft_config = _apply_draft_peft_and_fp8(model, _Cfg({"peft": _peft_node()}), parallel_drafting=False)
+    checkpoint_config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_repo_id="fake/tiny",
+        model_cache_dir=str(tmp_path / "hf_cache"),
+        save_consolidated=False,
+        is_peft=True,
+        model_state_dict_keys=list(model.state_dict().keys()),
+    )
+    checkpointer = checkpoint_config.build(dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+    step_dir = tmp_path / "epoch_0_step_1"
+    os.makedirs(step_dir)
+
+    checkpointer.save_model(model, str(step_dir), peft_config=peft_config)
+
+    adapter_file = step_dir / "model" / "adapter_model.safetensors"
+    assert adapter_file.exists()
+    from safetensors.torch import load_file
+
+    adapter_keys = list(load_file(str(adapter_file)).keys())
+    assert adapter_keys and all("lora_" in k for k in adapter_keys)
+
+
+# ---------------------------------------------------------------------------
 # DSpark _maybe_precompute_fp8_scales
 # ---------------------------------------------------------------------------
 
