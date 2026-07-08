@@ -77,7 +77,12 @@ def _read_video_frames(video_path, processor=None, frame_indices=None, return_me
         If *return_metadata* is True, returns
         ``(frames, video_fps, used_indices)`` instead.
     """
-    import decord
+    try:
+        import decord
+    except ImportError as exc:
+        raise RuntimeError(
+            "decord is required to read video files; install it with: pip install nemo-automodel[vlm-media]"
+        ) from exc
     import torch as _torch
 
     decord.bridge.set_bridge("native")

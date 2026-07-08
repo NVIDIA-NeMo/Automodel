@@ -153,6 +153,16 @@ class TestInitAttachesAdapter:
         assert isinstance(m.state_dict_adapter, Mistral3FP8StateDictAdapter)
         assert m.state_dict_adapter._layout_name == "vlm_full"
 
+    def test_state_dict_adapter_uses_identity_layout_for_mistral_medium_35(self, patched_super_init):
+        qc = {"quant_method": "fp8"}
+        cfg = SimpleNamespace(
+            text_config=SimpleNamespace(model_type="ministral3", num_hidden_layers=88),
+            quantization_config=qc,
+        )
+        m = Mistral3FP8VLMForConditionalGeneration(cfg)
+        assert isinstance(m.state_dict_adapter, Mistral3FP8StateDictAdapter)
+        assert m.state_dict_adapter._layout_name == "vlm_full_identity"
+
 
 class TestInitRegistersRotaryHooks:
     def test_hook_registered_on_modules_with_inv_freq(self, patched_super_init):

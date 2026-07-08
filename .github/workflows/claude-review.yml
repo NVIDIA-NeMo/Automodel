@@ -19,6 +19,7 @@ jobs:
       cancel-in-progress: true
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@0aeb3fffafb8917eccdce94fea160557db4bafab # v1.7.1
     with:
+      model: ${{ vars.CLAUDE_MODEL }}
       prompt: |
         Mandatory workflow — never skip or reorder:
         1. Read the complete PR diff and changed-file list first. Account for every

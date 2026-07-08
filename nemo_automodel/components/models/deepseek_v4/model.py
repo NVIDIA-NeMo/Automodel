@@ -49,6 +49,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
@@ -73,7 +74,7 @@ from nemo_automodel.components.models.deepseek_v4.layers import (
     DeepseekV4HyperConnection,
     DeepseekV4HyperHead,
     DeepseekV4RotaryEmbedding,
-    _dsv4_kernel_backend,
+    _dsv4_sinkhorn_backend,
     build_causal_padding_mask,
     build_packed_causal_padding_mask,
 )
@@ -159,7 +160,7 @@ class DeepseekV4Block(nn.Module):
             hc_sinkhorn_iters=int(getattr(config, "hc_sinkhorn_iters", 20) or 20),
             hc_eps=float(config.hc_eps),
             rms_norm_eps=float(config.rms_norm_eps),
-            sinkhorn_backend=_dsv4_kernel_backend(backend),
+            sinkhorn_backend=_dsv4_sinkhorn_backend(backend),
         )
         self.attn_hc = DeepseekV4HyperConnection(**hc_kwargs)
         self.ffn_hc = DeepseekV4HyperConnection(**hc_kwargs)
@@ -436,6 +437,13 @@ class DeepseekV4Model(nn.Module):
                 raise ValueError("First PP stage requires input_ids or inputs_embeds")
             if inputs_embeds is None:
                 inputs_embeds = self.embed_tokens(input_ids)
+            # Packed-sequence (THD) inputs arrive with the batch axis collapsed
+            # (``process_input_for_thd`` flattens ids to ``[T]`` -> embeds ``[T, dim]``).
+            # Restore the leading batch dim so the hc_mult expand below sees the
+            # expected ``[B, S, dim]`` rank, mirroring the output-side THD
+            # ``unsqueeze(0)`` in ``compute_lm_head_logits(is_thd=True)``.
+            if inputs_embeds.dim() == 2:
+                inputs_embeds = inputs_embeds.unsqueeze(0)
             # Expand embeddings to hc_mult copies: [B,S,dim] -> [B,S,hc_mult,dim]
             h = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
             shape_ref = inputs_embeds  # 3D ref for rotary / mask sizing
@@ -641,6 +649,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)

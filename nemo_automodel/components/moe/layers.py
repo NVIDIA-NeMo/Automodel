@@ -36,6 +36,7 @@ from nemo_automodel.components.moe.experts import (
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
+from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 
 
 class MLP(nn.Module):
@@ -286,6 +287,12 @@ class Gate(nn.Module):
         self._last_expert_load: Optional[torch.Tensor] = None
         self._last_aux_loss: Optional[torch.Tensor] = None
 
+        # Rollout Routing Replay (R3): owns a handle only when enabled so the
+        # default routing path stays a no-op.
+        self.router_replay: Optional[RouterReplay] = (
+            RouterReplay() if getattr(config, "enable_routing_replay", False) else None
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -323,9 +330,16 @@ class Gate(nn.Module):
                 scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
                 original_scores = scores
                 indices = torch.topk(scores, k=self.topk, dim=-1)[1]
+                indices = replay_selection(self.router_replay, indices)
                 weights = scores.gather(1, indices)
             else:
                 values, indices = torch.topk(scores, k=self.topk, dim=-1)
+                replayed = replay_selection(self.router_replay, indices)
+                if replayed is not indices:
+                    # Replay swapped the selection: re-gather the values for the
+                    # replayed experts. Skipped (zero overhead) on the default path.
+                    values = scores.gather(1, replayed)
+                    indices = replayed
                 weights = values.softmax(dim=1, dtype=self.gate_precision or torch.float32)
                 # Use full softmax for aux_loss so P_i represents proper probabilities.
                 # Raw logits can be negative, causing aux_loss to diverge negative.
@@ -351,6 +365,7 @@ class Gate(nn.Module):
                 scores_for_choice = (scores_for_choice * mask.unsqueeze(-1)).flatten(1)
 
             indices = torch.topk(scores_for_choice, self.topk, dim=-1)[1]
+            indices = replay_selection(self.router_replay, indices)
             # Final weights gathered from UNBIASED softmax scores
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sqrtsoftplus":
@@ -362,6 +377,7 @@ class Gate(nn.Module):
                 scores = scores + self.e_score_correction_bias
 
             indices = torch.topk(scores, self.topk, dim=-1)[1]
+            indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sigmoid_with_bias":
             scores = scores.sigmoid()
@@ -382,6 +398,7 @@ class Gate(nn.Module):
                 )
 
             indices = torch.topk(scores_for_choice, k=self.topk, dim=-1, sorted=False)[1]
+            indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
         else:
             scores = scores.sigmoid()
@@ -403,6 +420,7 @@ class Gate(nn.Module):
                 scores = (scores * mask.unsqueeze(-1)).flatten(1)
 
             indices = torch.topk(scores, self.topk, dim=-1)[1]
+            indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
 
         if self.norm_topk_prob and self.topk > 1:
