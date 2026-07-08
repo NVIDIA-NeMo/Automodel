@@ -32,7 +32,11 @@ import torch.nn as nn
 from safetensors.torch import save_file
 
 from nemo_automodel.components._peft.lora import PeftConfig
-from nemo_automodel.recipes.llm._spec_train_utils import apply_draft_fp8, raise_if_peft_configured
+from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_compile,
+    apply_draft_fp8,
+    raise_if_peft_configured,
+)
 from nemo_automodel.recipes.llm.train_dspark import TrainDSparkRecipe
 from nemo_automodel.recipes.llm.train_eagle3 import (
     _apply_draft_peft_and_fp8,
@@ -96,6 +100,29 @@ def test_apply_draft_fp8_enabled_builds_config_and_converts():
     assert fp8_config.recipe_name == "tensorwise"
     assert fp8_config.filter_fqns == ["lm_head"]
     assert fp8_config.emulate is True
+
+
+# ---------------------------------------------------------------------------
+# apply_draft_compile
+# ---------------------------------------------------------------------------
+
+
+def test_apply_draft_compile_none_cfg_is_noop():
+    with patch("nemo_automodel.recipes.llm._spec_train_utils.compile_module_inplace") as mock_compile:
+        apply_draft_compile(_TinyDraft(), None)
+    mock_compile.assert_not_called()
+
+
+def test_apply_draft_compile_disabled_is_noop():
+    model = _TinyDraft()
+    apply_draft_compile(model, {"enabled": False})
+    assert getattr(model, "_compiled_call_impl", None) is None
+
+
+def test_apply_draft_compile_enabled_compiles_in_place():
+    model = _TinyDraft()
+    apply_draft_compile(model, {"enabled": True, "mode": "default"})
+    assert model._compiled_call_impl is not None
 
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,14 @@ fp8:
   filter_fqns: ["lm_head"]
   emulate: false
 
+# torch.compile of the draft (same surface as the SFT recipes' `compile:`
+# block). Strongly recommended together with `fp8:`: the Float8Linear
+# cast/scale ops only pay off once inductor fuses them into the GEMM
+# prologue, and eager-mode fp8 is typically SLOWER than bf16.
+compile:
+  enabled: true
+  mode: default
+
 optimizer:
   lr: 1.0e-4
   betas: [0.9, 0.95]

@@ -67,6 +67,7 @@ from nemo_automodel.recipes.base_recipe import (
     _resolve_restore_from_to_ckpt_dir,
 )
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_compile,
     apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
@@ -374,6 +375,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # Optional LoRA draft adaptation and/or FP8 draft compute, in place
         # (see _apply_draft_peft_and_fp8); must precede the DDP wrap below.
         self.peft_config = _apply_draft_peft_and_fp8(self.draft_model, self.cfg, parallel_drafting)
+        # Optional torch.compile of the draft, in place; after the fp8 swap.
+        apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
         # The target's "Model summary" is logged by apply_model_infrastructure when it
         # loads; the draft is built directly, so log its (trainable) summary here too.
         print_trainable_parameters(self.draft_model, name="Draft")

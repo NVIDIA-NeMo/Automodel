@@ -29,6 +29,7 @@ from typing import Any
 import torch.nn as nn
 
 from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
+from nemo_automodel.components.utils.compile_utils import build_compile_config, compile_module_inplace
 
 
 def apply_draft_fp8(draft_model: nn.Module, cfg_fp8: Any) -> None:
@@ -45,6 +46,22 @@ def apply_draft_fp8(draft_model: nn.Module, cfg_fp8: Any) -> None:
     if cfg_fp8 is None:
         return
     apply_fp8_to_model(draft_model, config=build_fp8_config(cfg_fp8))
+
+
+def apply_draft_compile(draft_model: nn.Module, cfg_compile: Any) -> None:
+    """Optionally ``torch.compile`` the draft in place (top-level ``compile:`` block).
+
+    Same YAML surface as the SFT recipes (``CompileConfig``); no-op when the
+    block is absent or ``enabled`` is false. Uses ``nn.Module.compile()`` so
+    the draft object and its state-dict keys are unchanged (the recipes track
+    the module by reference and checkpoint it directly). Must run after
+    ``apply_draft_fp8`` so inductor traces the swapped ``Float8Linear``
+    modules: fp8's cast/scale ops only pay off once fused into the GEMM
+    prologue, and in eager mode fp8 is typically slower than bf16.
+    """
+    if cfg_compile is None:
+        return
+    compile_module_inplace(draft_model, build_compile_config(cfg_compile))
 
 
 def raise_if_peft_configured(cfg: Any, recipe_name: str) -> None:

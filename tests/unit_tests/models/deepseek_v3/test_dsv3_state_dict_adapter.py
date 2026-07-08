@@ -12,26 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, MagicMock, patch
 from transformers import DeepseekV3Config
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import (
+    _TRITON_AVAILABLE,
+    BLOCK_SIZE,
+    NON_QUANTIZED_KEY_PATTERNS,
     DeepSeekV3StateDictAdapter,
-    calculate_scale_shape,
-    dequantize_from_fp8,
     _dequantize_with_torch,
     _dequantize_with_triton,
     _slice_scale_for_dtensor,
-    should_quantize_key,
+    calculate_scale_shape,
     create_scale_inv_for_weight,
-    NON_QUANTIZED_KEY_PATTERNS,
-    _TRITON_AVAILABLE,
-    BLOCK_SIZE,
+    dequantize_from_fp8,
+    should_quantize_key,
 )
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 

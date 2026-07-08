@@ -109,6 +109,7 @@ from nemo_automodel.recipes.base_recipe import (
     _resolve_restore_from_to_ckpt_dir,
 )
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_compile,
     apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
@@ -760,6 +761,8 @@ class TrainDSparkRecipe(BaseRecipe):
         )
         # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede AC and the FSDP2/DDP wrap.
         apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
+        # Optional torch.compile of the draft, in place; after the fp8 swap.
+        apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
 
         dist_cfg = self.cfg.get("distributed", None)
         activation_checkpointing = dist_cfg.get("activation_checkpointing", False) if dist_cfg is not None else False

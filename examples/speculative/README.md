@@ -144,6 +144,16 @@ plus `precompute_float8_dynamic_scale_for_fsdp` additionally amortize the
 per-step scale computation, mirroring the SFT recipes. See
 `eagle3/qwen3_eagle3_fp8.yaml`.
 
+**Pair `fp8:` with `compile:`.** The recipes also accept the SFT recipes'
+top-level `compile:` block (`CompileConfig`); the draft is compiled in place
+(`nn.Module.compile()`, so checkpoint keys are unchanged) after the fp8 swap.
+This matters for fp8 throughput: Float8Linear's per-GEMM cast/scale ops are
+memory-bound and only pay off once inductor fuses them into the GEMM
+prologue. In eager mode fp8 draft training is typically SLOWER than bf16
+(measured ~0.76x on an H100 EAGLE-3 run); with `compile.enabled: true` the
+fp8 GEMM savings become realizable. `compile:` also works without `fp8:` as
+a plain draft speedup.
+
 ### LoRA draft adaptation (EAGLE-3 only)
 
 The EAGLE-3 recipe accepts the SFT recipes' `peft:` block (`PeftConfig`). The
@@ -363,6 +373,7 @@ blocks) instead.
 | `optimizer` | `lr`, `betas`, `weight_decay`, optional `warmup_ratio` (0.05), `min_lr_ratio` (0.1). |
 | `checkpoint` | `enabled`, `checkpoint_dir`, `model_save_format: safetensors`, `save_consolidated`, optional `restore_from` (`LATEST` / subdir / path). |
 | `fp8` | Optional; torchao FP8 draft training, same surface as the SFT recipes. See "FP8 draft training". |
+| `compile` | Optional; in-place torch.compile of the draft (`CompileConfig`). Strongly recommended with `fp8`. |
 | `peft` | Optional, EAGLE-3 only; LoRA draft adaptation (`PeftConfig`). See "LoRA draft adaptation". |
 | `wandb` | Optional; `project`, `entity`, `name`. |
 
