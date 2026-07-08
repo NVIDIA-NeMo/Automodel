@@ -150,9 +150,13 @@ top-level `compile:` block (`CompileConfig`); the draft is compiled in place
 This matters for fp8 throughput: Float8Linear's per-GEMM cast/scale ops are
 memory-bound and only pay off once inductor fuses them into the GEMM
 prologue. In eager mode fp8 draft training is typically SLOWER than bf16
-(measured ~0.76x on an H100 EAGLE-3 run); with `compile.enabled: true` the
-fp8 GEMM savings become realizable. `compile:` also works without `fp8:` as
-a plain draft speedup.
+(measured 0.76x on an H100 EAGLE-3 run); compiled, the same A/B measured
+fp8 at 1.03x over bf16 with byte-equivalent convergence. Expect the fp8
+gain to scale with draft GEMM size: a single 4096-wide EAGLE-3 layer sits
+near the float8 break-even point, while wider or deeper drafts (DSpark on
+V4/GLM-scale targets) benefit more. `compile:` also works without `fp8:`
+as a plain draft speedup (measured ~1.34x over the eager bf16 baseline in
+the same run).
 
 ### LoRA draft adaptation (EAGLE-3 only)
 
