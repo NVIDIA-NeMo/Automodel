@@ -147,6 +147,7 @@ def test_save_checkpoint_applies_retention_after_sync_save(tmp_path):
     obj.block_size = 4
     obj.num_anchors = 2
     obj.mask_token_id = 99
+    obj.target_layer_ids = [0, 1]
     obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
     obj._complete_pending_checkpoint = lambda: events.append("complete_pending")
     obj._update_latest_symlink = lambda path: events.append(("latest", path))
@@ -181,6 +182,7 @@ def test_save_checkpoint_records_async_best_pending_info_without_metric(tmp_path
     obj.block_size = 4
     obj.num_anchors = 2
     obj.mask_token_id = 99
+    obj.target_layer_ids = [0, 1]
     obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
     obj._complete_pending_checkpoint = lambda: events.append("complete_pending")
 
