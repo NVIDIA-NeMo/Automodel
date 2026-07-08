@@ -105,7 +105,7 @@ ci:
   checkpoint_robustness:
     check_source_load_parity: true
     hf_kl_threshold: 1.1e-2
-    source_load_kl_threshold: 1e-2
+    source_load_kl_threshold: 5e-3
     source_load_cosine_threshold: 0.9995
     tokenizer_name: baidu/ERNIE-4.5-21B-A3B-PT
     hf_device_map_auto: true
