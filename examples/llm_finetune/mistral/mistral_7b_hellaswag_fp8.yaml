@@ -130,5 +130,5 @@ ci:
     source_load_cosine_threshold: 0.999
     tokenizer_name: mistralai/Mistral-7B-v0.1
     no_check_resume: true
-    dataset.limit_dataset_samples: 500
-    validation_dataset.limit_dataset_samples: 500
+    dataset.num_samples_limit: 500
+    validation_dataset.num_samples_limit: 500
