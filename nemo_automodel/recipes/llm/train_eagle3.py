@@ -236,7 +236,11 @@ def _merged_lora_state_dict(draft_model) -> dict[str, torch.Tensor]:
     """Return the full draft state dict with LoRA deltas folded into the base weights.
 
     For every LoRA-patched linear, ``W += (alpha / dim) * lora_B.weight @ lora_A.weight``
-    (the eval-time equivalent of the adapter pathway); ``lora_*`` keys are dropped.
+    (the eval-time equivalent of the adapter pathway). Under DoRA the effective
+    weight is additionally row-rescaled to the learned magnitude,
+    ``W' = (lora_magnitude / ||W + scale * B @ A||_row) * (W + scale * B @ A)``
+    (matching ``LinearLoRA``'s DoRA forward at eval time). ``lora_*`` keys
+    (including ``lora_magnitude``) are dropped.
     """
     state = {k: v.detach().cpu() for k, v in draft_model.state_dict().items() if ".lora_" not in k and "lora_" != k[:5]}
     for module_name, module in draft_model.named_modules():
@@ -246,7 +250,11 @@ def _merged_lora_state_dict(draft_model) -> dict[str, torch.Tensor]:
         delta = (module.lora_B.weight.detach().cpu().float() @ module.lora_A.weight.detach().cpu().float()) * float(
             module.scale
         )
-        state[key] = (state[key].float() + delta).to(draft_model.state_dict()[key].dtype)
+        merged = state[key].float() + delta
+        magnitude = getattr(module, "lora_magnitude", None)
+        if magnitude is not None:
+            merged = merged * (magnitude.detach().cpu().float() / torch.linalg.norm(merged, dim=1)).unsqueeze(1)
+        state[key] = merged.to(draft_model.state_dict()[key].dtype)
     return state
 
 

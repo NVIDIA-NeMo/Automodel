@@ -365,6 +365,30 @@ def test_merged_lora_state_dict_folds_adapters():
     torch.testing.assert_close(merged["fc.weight"], model.fc.weight)
 
 
+@pytest.mark.parametrize("use_dora", [False, True])
+def test_merged_state_dict_forward_parity(use_dora):
+    """The merged weight must be numerically equivalent to the trained adapter forward (LoRA and DoRA)."""
+    from nemo_automodel.recipes.llm.train_eagle3 import _merged_lora_state_dict
+
+    torch.manual_seed(0)
+    model = _TinyDraft()
+    _apply_draft_peft_and_fp8(model, _Cfg({"peft": _peft_node(use_dora=use_dora)}), parallel_drafting=False)
+    with torch.no_grad():
+        model.q_proj.lora_A.weight.normal_()
+        model.q_proj.lora_B.weight.normal_()
+        if use_dora:
+            model.q_proj.lora_magnitude.add_(torch.rand_like(model.q_proj.lora_magnitude))
+    model.eval()
+
+    x = torch.randn(3, 8)
+    with torch.no_grad():
+        y_adapter = model.q_proj(x)
+        merged = _merged_lora_state_dict(model)
+        y_merged = torch.nn.functional.linear(x, merged["q_proj.weight"], merged["q_proj.bias"])
+
+    torch.testing.assert_close(y_merged, y_adapter, rtol=1e-4, atol=1e-5)
+
+
 def test_save_checkpoint_final_lora_exports_merged_draft(tmp_path):
     """The final checkpoint of a LoRA run must leave a serve-ready merged export."""
     recipe = _saving_recipe(tmp_path)
