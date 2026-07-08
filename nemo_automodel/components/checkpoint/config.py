@@ -152,6 +152,11 @@ class CheckpointingConfig:
                 or self.max_recent_checkpoints < 1
             ):
                 raise ValueError("checkpoint.max_recent_checkpoints must be unset or a positive integer")
+            if str(self.checkpoint_dir).startswith("msc://"):
+                raise ValueError(
+                    "checkpoint.max_recent_checkpoints is only supported for local checkpoint directories; "
+                    "unset it when checkpoint.checkpoint_dir uses msc:// storage"
+                )
 
         # Convert a raw string such as "safetensors" into the right Enum.
         formats = [v.value for v in SerializationFormat]

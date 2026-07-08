@@ -988,9 +988,11 @@ class TrainDiffusionRecipe(BaseRecipe):
             consolidation_timeout_minutes=checkpoint_cfg.get("consolidation_timeout_minutes", 30),
             is_peft=self.peft_cfg is not None,
             model_state_dict_keys=model_state_dict_keys,
+            is_async=checkpoint_cfg.get("is_async", False),
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
             max_recent_checkpoints=checkpoint_cfg.get("max_recent_checkpoints", None),
         )
+        self._log_checkpoint_retention_policy(self.checkpoint_config)
         self.restore_from = checkpoint_cfg.get("restore_from", None)
         self.checkpointer = self.checkpoint_config.build(
             dp_rank=self._get_dp_rank(include_cp=True),

@@ -118,6 +118,19 @@ class TestCheckpointingConfig:
         with pytest.raises(ValueError, match="consolidation_timeout_minutes must be greater than 0"):
             CheckpointingConfig(consolidation_timeout_minutes=timeout_minutes)
 
+    @pytest.mark.parametrize("invalid_value", [0, -1, True, False, 1.5, "2"])
+    def test_max_recent_checkpoints_rejects_invalid_values(self, invalid_value):
+        with pytest.raises(ValueError, match="checkpoint.max_recent_checkpoints must be unset or a positive integer"):
+            CheckpointingConfig(max_recent_checkpoints=invalid_value)
+
+    def test_max_recent_checkpoints_rejects_msc_checkpoint_dir(self):
+        with pytest.raises(ValueError, match="max_recent_checkpoints is only supported for local checkpoint"):
+            CheckpointingConfig(
+                checkpoint_dir="msc://bucket/checkpoints",
+                save_consolidated=False,
+                max_recent_checkpoints=1,
+            )
+
     def test_importable_from_checkpointing(self):
         """Verify backward compat: import from checkpointing.py still works."""
         from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig as CkptCfg

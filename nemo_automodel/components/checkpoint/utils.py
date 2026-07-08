@@ -37,6 +37,7 @@ from nemo_automodel.shared.tied_weights import (
 )
 
 logger = logging.getLogger(__name__)
+_AUTOMODEL_CHECKPOINT_RE = re.compile(r"^epoch_\d+_step_(\d+)$")
 
 
 def get_rank_safe() -> int:
@@ -102,16 +103,16 @@ def format_output_file_count(count: int) -> str:
 
 
 def _checkpoint_step_num(path: Path) -> int:
-    """Return the trailing checkpoint step number, or -1 when the name is not a checkpoint."""
-    match = re.search(r"step_(\d+)$", path.stem)
+    """Return the AutoModel checkpoint step number, or -1 when the name is not owned by AutoModel."""
+    match = _AUTOMODEL_CHECKPOINT_RE.fullmatch(path.name)
     return int(match.group(1)) if match else -1
 
 
 def _list_existing_checkpoints(ckpt_root: Path) -> list[Path]:
-    """Return existing checkpoint directories under ckpt_root (matching '*step_*')."""
+    """Return existing AutoModel checkpoint directories under ckpt_root."""
     if not ckpt_root.exists():
         return []
-    checkpoints = [path for path in ckpt_root.glob("*step_*") if path.is_dir() and not path.is_symlink()]
+    checkpoints = [path for path in ckpt_root.glob("epoch_*_step_*") if path.is_dir() and not path.is_symlink()]
     return sorted((path for path in checkpoints if _checkpoint_step_num(path) >= 0), key=_checkpoint_step_num)
 
 
@@ -175,6 +176,11 @@ def _read_checkpoint_metric(checkpoint: Path, metric_key: str | None) -> float |
     return None
 
 
+def _is_checkpoint_pointer_text_file(path: Path) -> bool:
+    """Return whether path looks like a symlink fallback checkpoint pointer."""
+    return path.is_file() and path.suffix == ".txt" and path.stem.isupper()
+
+
 def _find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path]) -> set[Path]:
     """Return checkpoints targeted by top-level symlinks or symlink fallback text files."""
     protected = set()
@@ -194,7 +200,7 @@ def _find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path]
                 raw_target = os.readlink(entry)
             except OSError:
                 continue
-        elif entry.is_file() and entry.suffix == ".txt":
+        elif _is_checkpoint_pointer_text_file(entry):
             try:
                 raw_target = entry.read_text().strip()
             except (OSError, UnicodeError):

@@ -175,8 +175,8 @@ class _ToyModel(HFCheckpointingMixin, nn.Linear):
 
 
 def _checkpoint_dir_names(path):
-    """Return checkpoint directory names under path sorted by step."""
-    names = [p.name for p in path.glob("*step_*") if p.is_dir()]
+    """Return AutoModel checkpoint directory names under path sorted by step."""
+    names = [p.name for p in path.glob("epoch_*_step_*") if p.is_dir()]
     return sorted(names, key=lambda name: int(name.rsplit("_", maxsplit=1)[1]))
 
 
@@ -248,19 +248,15 @@ def test_dp_allreduce_uses_world_group_without_device_mesh(tmp_path, monkeypatch
 
 
 def test_find_latest_checkpoint(tmp_path):
-    """
-    Verify that the helper returns the directory whose name contains the
-    largest step number, irrespective of the exact prefix.
-    """
-    # Build a few fake checkpoint directories.
+    """Verify that latest checkpoint discovery uses AutoModel-owned checkpoint directories."""
     (tmp_path / "epoch_0_step_1").mkdir()
-    (tmp_path / "step_20").mkdir()
+    (tmp_path / "step_20").mkdir()  # should be ignored: not an AutoModel checkpoint name
     (tmp_path / "epoch_3_step_5").mkdir()
     (tmp_path / "misc").mkdir()  # should be ignored
 
     latest = _find_latest_checkpoint(tmp_path)
     assert latest is not None
-    assert latest.name == "step_20", "Did not pick the highest step directory"
+    assert latest.name == "epoch_3_step_5", "Did not pick the highest AutoModel checkpoint directory"
 
 
 @pytest.mark.skipif(not HAS_ET, reason="expecttest required")
@@ -802,6 +798,41 @@ def test_checkpoint_retention_max_recent_two_sliding_window(tmp_path):
         recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
 
     assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_200", "epoch_0_step_300"]
+
+
+def test_checkpoint_retention_ignores_non_automodel_step_directories(tmp_path):
+    """Retention only prunes AutoModel-owned epoch_<n>_step_<n> checkpoint directories."""
+    backup_dir = tmp_path / "backup_step_50"
+    backup_dir.mkdir()
+    (backup_dir / "keep.txt").write_text("not an AutoModel checkpoint")
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+
+    for step in [100, 200]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_200"]
+    assert (backup_dir / "keep.txt").read_text() == "not an AutoModel checkpoint"
+
+
+def test_checkpoint_retention_ignores_non_pointer_text_files(tmp_path):
+    """Plain text files do not pin old checkpoints unless they look like pointer fallback files."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+
+    for step in [100, 200]:
+        x = torch.randn(4, 2)
+        loss = recipe_inst.model(x).sum()
+        loss.backward()
+        recipe_inst.optimizer.step()
+        recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
+        if step == 100:
+            (tmp_path / "notes.txt").write_text("epoch_0_step_100/losses.json")
+
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_200"]
+    assert (tmp_path / "notes.txt").exists()
 
 
 def test_checkpoint_retention_preserves_lowest_val_pointer_target(tmp_path):
