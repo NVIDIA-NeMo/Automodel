@@ -32,6 +32,8 @@ import logging
 import weakref
 from typing import TYPE_CHECKING
 
+from nemo_automodel._transformers.model_capabilities import query_capabilities
+
 if TYPE_CHECKING:
     import torch.nn as nn
 
@@ -70,12 +72,6 @@ def _supports_seq_lens(model: "nn.Module") -> bool:
         return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
     except (ValueError, TypeError):
         return False
-
-
-def _supports_thd(model: "nn.Module") -> bool:
-    """True when the model capability declaration opts into native THD inputs."""
-    capabilities = getattr(model, "ModelCapabilities", None)
-    return bool(getattr(capabilities, "supports_thd", False))
 
 
 def _has_backend(model: "nn.Module") -> bool:
@@ -285,14 +281,18 @@ class ModelSupports:
             getattr(model, "_supports_sdpa", False) is True
             or _uses_te_attention(model)
             or _uses_magi_attention(model)
-            or (_supports_thd(model) and backend_attn == "tilelang")
+            or (self.supports_thd and backend_attn == "tilelang")
         )
         return _supports_seq_lens(model) and sp_attn_backend
 
     @property
     def supports_thd(self) -> bool:
         """Model owns its native THD packed-sequence input path."""
-        return _supports_thd(self._model)
+        try:
+            capabilities = query_capabilities(self._model)
+        except AttributeError:
+            return False
+        return capabilities.supports_thd
 
     @property
     def supports_generate(self) -> bool:
@@ -343,7 +343,7 @@ class ModelSupports:
             return False
         if self.cp_size <= 1:
             return True
-        if _supports_thd(model):
+        if self.supports_thd:
             backend_attn = getattr(getattr(model, "backend", None), "attn", None)
             return backend_attn == "tilelang"
         return _uses_te_attention(model) or _uses_magi_attention(model)
