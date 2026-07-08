@@ -446,6 +446,26 @@ def _derive_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
     return attention_mask.bool().logical_not()
 
 
+def get_block_sequence_ids_for_mask(mm_token_type_ids: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Map multimodal token-type ids to per-vision-group block ids.
+
+    Vision tokens (type ``1``/``2``) get a 0-based group index; text tokens get
+    ``-1``. The result is passed as ``block_sequence_ids`` to ``create_causal_mask``
+    so tokens within the same vision group attend bidirectionally while text stays
+    causal. Vendored verbatim from ``transformers.models.gemma4.modeling_gemma4``
+    (transformers 5.12.1) to avoid depending on a transformers-internal helper.
+    """
+    mm_token_type_ids = mm_token_type_ids.to(device)
+
+    is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
+    is_prev_vision = torch.roll(is_vision, shifts=1, dims=-1)
+    is_prev_vision[..., 0] = False
+    new_vision_starts = is_vision & ~is_prev_vision
+    vision_group_ids = torch.cumsum(new_vision_starts.int(), dim=1) - 1
+    block_sequence_ids = torch.where(is_vision, vision_group_ids, -1)
+    return block_sequence_ids
+
+
 def _build_packed_gemma4_causal_mask_mapping(
     packed_seq_ids: torch.Tensor,
     mm_token_type_ids: torch.Tensor,
@@ -694,7 +714,6 @@ class Gemma4MoETextModelBackend(nn.Module):
             )
         elif use_vision_bidirectional_mask:
             from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-            from transformers.models.gemma4.modeling_gemma4 import get_block_sequence_ids_for_mask
 
             # transformers 5.12 removed gemma4's create_causal_mask_mapping. The
             # vision-aware behaviour (tokens in the same vision group attend
