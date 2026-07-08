@@ -241,16 +241,53 @@ _rms_norm_lib = torch.library.Library("nemo_automodel", "DEF")
 _rms_norm_lib.define("float32_rms_norm(Tensor x, Tensor weight, float eps) -> Tensor")
 
 
-@torch.library.impl(_rms_norm_lib, "float32_rms_norm", "CUDA")
-def _float32_rms_norm_cuda(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _float32_rms_norm_impl(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.nn.functional.rms_norm(
         x.float(), (x.shape[-1],), weight.float(), eps
     ).to(x.dtype)
 
 
+torch.library.impl(_rms_norm_lib, "float32_rms_norm", "CUDA")(_float32_rms_norm_impl)
+torch.library.impl(_rms_norm_lib, "float32_rms_norm", "CPU")(_float32_rms_norm_impl)
+
+
 @torch.library.impl(_rms_norm_lib, "float32_rms_norm", "Meta")
 def _float32_rms_norm_meta(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return torch.empty_like(x)
+
+
+def _float32_rms_norm_setup_context(ctx, inputs, output):
+    x, weight, eps = inputs
+    ctx.save_for_backward(x, weight)
+    ctx.eps = eps
+
+
+def _float32_rms_norm_backward(ctx, grad_output):
+    x, weight = ctx.saved_tensors
+    x_f32 = x.float()
+    w_f32 = weight.float()
+    g_f32 = grad_output.float()
+
+    r = torch.rsqrt(x_f32.pow(2).mean(-1, keepdim=True) + ctx.eps)
+    xnorm = x_f32 * r
+
+    grad_w = (g_f32 * xnorm).sum(list(range(g_f32.ndim - 1)))
+
+    gw = g_f32 * w_f32
+    grad_x = r * (gw - xnorm * (gw * xnorm).mean(-1, keepdim=True))
+
+    return (
+        grad_x.to(x.dtype) if x.requires_grad else None,
+        grad_w.to(weight.dtype) if weight.requires_grad else None,
+        None,  # eps is not differentiable
+    )
+
+
+torch.library.register_autograd(
+    "nemo_automodel::float32_rms_norm",
+    _float32_rms_norm_backward,
+    setup_context=_float32_rms_norm_setup_context,
+)
 
 
 @torch.compile(fullgraph=True, dynamic=True)
