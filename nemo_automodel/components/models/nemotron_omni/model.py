@@ -248,9 +248,6 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         supports_cp: bool = True
         supports_pp: bool = False
         supports_ep: bool = True
-        # Pre-embed CP: the model pre-embeds, then the runtime shards the batch.
-        cp_style: str = "pre_embed"
-        cp_layout: str = "torch_load_balanced"
 
     @classmethod
     def from_config(

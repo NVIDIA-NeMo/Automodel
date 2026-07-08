@@ -705,12 +705,6 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         supports_cp: bool = False
         supports_pp: bool = True
         supports_ep: bool = True
-        # The CP input-prep hook exists regardless of the conservative
-        # supports_cp gate above: it pre-embeds multimodal inputs on the full
-        # sequence for the generic torch CP path (exercised by the ep8/cp2
-        # medpix recipe).
-        cp_style: str = "pre_embed"
-        cp_layout: str = "torch_load_balanced"
 
     @classmethod
     def from_config(

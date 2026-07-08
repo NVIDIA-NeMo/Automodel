@@ -619,9 +619,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
-        # Model-owned CP: DSV4 shards the batch itself with a contiguous layout.
-        cp_style: str = "model_owned"
-        cp_layout: str = "contiguous"
 
     @classmethod
     def from_config(

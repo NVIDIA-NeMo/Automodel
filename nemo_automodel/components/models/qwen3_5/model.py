@@ -802,9 +802,6 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = False
-        # Pre-embed CP: the model pre-embeds, then the runtime shards the batch.
-        cp_style: str = "pre_embed"
-        cp_layout: str = "torch_load_balanced"
 
     @classmethod
     def from_config(

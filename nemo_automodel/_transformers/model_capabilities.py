@@ -54,23 +54,12 @@ class ModelCapabilities:
         supports_cp: Context parallelism.
         supports_pp: Pipeline parallelism.
         supports_ep: Expert parallelism (MoE).
-        cp_style: How the model participates in CP input prep: ``"none"``
-            (no ``prepare_model_inputs_for_cp`` hook), ``"pre_embed"`` (hook
-            precomputes full-sequence inputs for the generic torch CP path),
-            or ``"model_owned"`` (hook returns a ``CPSharder``; the model owns
-            batch sharding and attention transport).
-        cp_layout: Diagnostic label for the model-owned sequence layout (e.g.
-            ``"contiguous"``, ``"packed_thd"``); ``"torch_load_balanced"`` for
-            pre-embed models, ``"none"`` when CP is unsupported. Informational
-            only — framework code must not branch on it.
     """
 
     supports_tp: bool = False
     supports_cp: bool = False
     supports_pp: bool = False
     supports_ep: bool = False
-    cp_style: str = "none"
-    cp_layout: str = "none"
 
 
 def _to_canonical(caps_obj) -> ModelCapabilities:
@@ -87,8 +76,6 @@ def _to_canonical(caps_obj) -> ModelCapabilities:
         supports_cp=bool(caps_obj.supports_cp),
         supports_pp=bool(caps_obj.supports_pp),
         supports_ep=bool(caps_obj.supports_ep),
-        cp_style=str(getattr(caps_obj, "cp_style", "none")),
-        cp_layout=str(getattr(caps_obj, "cp_layout", "none")),
     )
 
 

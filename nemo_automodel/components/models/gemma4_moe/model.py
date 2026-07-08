@@ -827,8 +827,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 supports_cp=True,
                 supports_pp=False,
                 supports_ep=True,
-                cp_style="model_owned",
-                cp_layout="contiguous",
             )
         if getattr(config, "audio_config", None) is not None:
             # Dense + audio variant: gemma-4-E2B-it, gemma-4-E4B-it.
@@ -861,8 +859,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 supports_cp=True,
                 supports_pp=False,
                 supports_ep=False,
-                cp_style="model_owned",
-                cp_layout="contiguous",
             )
         # Plain dense variant: gemma-4-31B-it
         return ModelCapabilities(
@@ -870,8 +866,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             supports_cp=True,
             supports_pp=True,
             supports_ep=False,
-            cp_style="model_owned",
-            cp_layout="contiguous",
         )
 
     @classmethod

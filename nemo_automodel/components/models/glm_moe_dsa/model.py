@@ -265,9 +265,6 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
-        # Model-owned CP: GLM DSA shards its packed THD batch itself.
-        cp_style: str = "model_owned"
-        cp_layout: str = "packed_thd"
 
     @classmethod
     def from_config(
