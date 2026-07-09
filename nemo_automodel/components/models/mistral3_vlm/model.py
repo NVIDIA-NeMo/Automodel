@@ -43,6 +43,7 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration as _HFMistral3ForConditionalGeneration,
 )
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
     Mistral3FP8StateDictAdapter,
@@ -130,6 +131,9 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         supports_ep: bool = False
 
     def __init__(self, config: PretrainedConfig):
+        # The supported Mistral3 checkpoint (mistralai/Mistral-Medium-3.5-128B) is
+        # untied (tie_word_embeddings=False), so reject tie_word_embeddings=True.
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         # HF's Mistral3ForConditionalGeneration.__init__ consults
         # ``config.quantization_config`` and swaps nn.Linear → FP8Linear for
         # every language_model Linear. FP8Linear registers a 0-d
@@ -152,7 +156,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
                 except AttributeError:
                     pass
         super().__init__(config)
-        self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_vlm_full()
+        self.state_dict_adapter = Mistral3FP8StateDictAdapter.for_vlm_full(config)
 
         # Lazy non-persistent buffer reinit. HF's Ministral3RotaryEmbedding /
         # PixtralRotaryEmbedding compute `inv_freq` in their __init__. Under

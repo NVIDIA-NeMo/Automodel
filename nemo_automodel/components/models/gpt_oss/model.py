@@ -21,6 +21,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -34,7 +35,7 @@ from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding,
 from nemo_automodel.components.models.gpt_oss.state_dict_adapter import GPTOSSStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -75,16 +76,9 @@ class Block(nn.Module):
         x = x + attn_out
 
         mlp_in = self.post_attention_layernorm(x)
-        mlp_out = self._mlp(mlp_in, padding_mask)
+        mlp_out = self.mlp(mlp_in, padding_mask)
         x = x + mlp_out
         return x
-
-    def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
-            return self.mlp(x)
-        else:
-            assert isinstance(self.mlp, MoE)
-            return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
@@ -260,6 +254,7 @@ class GptOssForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig(attn="flex")
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = GptOssModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)

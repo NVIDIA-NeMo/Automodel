@@ -89,5 +89,14 @@ distributed:
   enable_async_tensor_parallel: False
   enable_fsdp2_prefetch: True
   enable_compile: True
+  # Keep the 8k benchmark shape but release each layer's full parameters before
+  # moving to the next one; the prior default retained enough all-gathers to OOM.
+  reshard_after_forward: True
   patch_is_packed_sequence: True  # Patch transformers._is_packed_sequence to always return False: removes CPU-GPU sync per attention layer and ensures static shapes for torch.compile. Safe for non-packed (standard) training only.
   defer_fsdp_grad_sync: False   # Must be False with GA>1: True → delayed resharding → OOM
+
+ci:
+  nodes: 8
+  time: "00:30:00"
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

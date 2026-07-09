@@ -38,6 +38,17 @@ from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 
+def _to_full_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialise a (possibly tensor-parallel) tensor as a plain local tensor.
+
+    Under tensor parallelism the target's column-parallel ``lm_head`` and
+    vocab-parallel ``embed_tokens`` return ``DTensor`` outputs. The draft and the
+    block-wise loss consume plain tensors, so gather the full tensor. A no-op for
+    an already-plain (unsharded / replicated) tensor.
+    """
+    return tensor.full_tensor() if hasattr(tensor, "full_tensor") else tensor
+
+
 class NoValidAnchorsError(ValueError):
     """Raised when a batch has no sample long enough to form a DFlash block.
 
@@ -73,8 +84,14 @@ class DFlashTrainerModule(nn.Module):
     ):
         super().__init__()
         self.draft_model = draft_model
-        self.lm_head = target_lm_head
-        self.embed_tokens = target_embed_tokens
+        # Keep the frozen target lm_head / embed_tokens as NON-registered
+        # references. Under tensor parallelism their weights are DTensors; a
+        # registered (DDP-wrapped) sharded param would break DDP's parameter
+        # broadcast/bucketing. Non-registering keeps the DDP-wrapped trainer to
+        # the plain draft params only, while ``self.lm_head`` / ``self.embed_tokens``
+        # attribute access still works. (Mirrors EAGLE core_v12's _target_lm_head.)
+        object.__setattr__(self, "lm_head", target_lm_head)
+        object.__setattr__(self, "embed_tokens", target_embed_tokens)
         self.block_size = block_size
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
@@ -151,7 +168,35 @@ class DFlashTrainerModule(nn.Module):
             anchor_tokens,
             torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
         )
-        return self.embed_tokens(noise_ids)
+        # A tensor-parallel target's embed_tokens is vocab-parallel and returns a
+        # DTensor; gather it so the (plain) draft can consume the noise embedding.
+        return _to_full_tensor(self.embed_tokens(noise_ids))
+
+    def _build_block_targets(
+        self,
+        input_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+        seq_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-block ground-truth tokens and the supervised-position mask.
+
+        Returns ``(label_indices, target_ids, block_mask)`` each of shape
+        ``[B, N, block_size]``. ``label_indices[..., k]`` is the sequence position
+        block position ``k`` predicts (``anchor + k``); ``block_mask`` is the product
+        of block validity, in-bounds, and the gathered loss mask. Shared by the
+        block-wise trainers (DFlash here, JetSpec) so the label/mask gathering lives
+        in one place.
+        """
+        n = anchor_positions.size(1)
+        label_indices = anchor_positions.unsqueeze(-1) + self._block_offsets  # [B, N, bs]
+        valid_label_mask = label_indices < seq_len
+        safe_label_indices = label_indices.clamp(max=seq_len - 1)
+        target_ids = torch.gather(input_ids.unsqueeze(1).expand(-1, n, -1), 2, safe_label_indices)
+        gathered_loss_mask = torch.gather(loss_mask.unsqueeze(1).expand(-1, n, -1), 2, safe_label_indices)
+        block_mask = block_keep_mask.unsqueeze(-1).float() * valid_label_mask.float() * gathered_loss_mask
+        return label_indices, target_ids, block_mask
 
     def forward(
         self,
@@ -185,19 +230,17 @@ class DFlashTrainerModule(nn.Module):
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
         )
-        logits = self.lm_head(output_hidden)
+        # A tensor-parallel target's lm_head is column-parallel and returns
+        # vocab-sharded (DTensor) logits; gather to a full tensor for the loss.
+        logits = _to_full_tensor(self.lm_head(output_hidden))
 
         n = anchor_positions.size(1)
         bs = self.block_size
 
         # Block position k predicts the token at anchor + k.
-        label_indices = anchor_positions.unsqueeze(-1) + self._block_offsets
-        valid_label_mask = label_indices < seq_len
-        safe_label_indices = label_indices.clamp(max=seq_len - 1)
-        target_ids = torch.gather(input_ids.unsqueeze(1).expand(-1, n, -1), 2, safe_label_indices)
-
-        gathered_loss_mask = torch.gather(loss_mask.unsqueeze(1).expand(-1, n, -1), 2, safe_label_indices)
-        block_mask = block_keep_mask.unsqueeze(-1).float() * valid_label_mask.float() * gathered_loss_mask
+        _, target_ids, block_mask = self._build_block_targets(
+            input_ids, loss_mask, anchor_positions, block_keep_mask, seq_len
+        )
 
         # Drop block position 0 (the clean anchor token, never a target); the
         # remaining bs-1 predicted positions are what the loss supervises.

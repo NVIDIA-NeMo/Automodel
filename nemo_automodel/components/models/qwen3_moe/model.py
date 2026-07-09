@@ -20,6 +20,8 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -91,11 +93,13 @@ class Block(nn.Module):
         return x
 
     def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
+        # Activation checkpointing wraps the MLP, so inspect the inner module
+        # to select the call signature while still invoking the wrapper.
+        mlp = unwrap_checkpoint_wrapper(self.mlp)
+        if isinstance(mlp, MLP):
             return self.mlp(x)
-        else:
-            assert isinstance(self.mlp, MoE)
-            return self.mlp(x, padding_mask)
+        assert isinstance(mlp, MoE)
+        return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
@@ -280,6 +284,7 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3MoeModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)

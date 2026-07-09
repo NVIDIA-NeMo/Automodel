@@ -328,9 +328,7 @@ def apply_ac(
     for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
         if mtp_repeated and id(block) in mtp_block_ids:
             continue
-        if ignore_router and hasattr(block, "set_activation_checkpointing"):
-            block.set_activation_checkpointing(True)
-        elif ignore_router:
+        if ignore_router:
             block = ptd_checkpoint_wrapper(
                 block,
                 preserve_rng_state=True,
@@ -576,14 +574,16 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
 
     # Route each attention block's CP setup by capability:
     #   * TE DotProductAttention -> TE's own context-parallel group;
-    #   * a module exposing setup_cp_attention (e.g. Gemma4's p2p ring) -> installs
-    #     its own CP attention + mask handling (model-owned, like TE/DSV4).
+    #   * a module exposing setup_cp_attention (e.g. Gemma4's p2p ring or MiniMax
+    #     M3's block-sparse DSA) -> installs its own CP attention + mask handling
+    #     (model-owned, like TE/DSV4).
     # Any other (non-TE, non-model-owned) attention is not supported under CP here.
     for _parent, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
         layer_type = getattr(block, "layer_type", getattr(block, "attention_type", "full_attention"))
 
         if layer_type in ("full_attention", "sliding_attention"):
-            attn_module = getattr(block.self_attn, "attn_module", None)
+            self_attn = block.self_attn
+            attn_module = getattr(self_attn, "attn_module", None)
             if isinstance(attn_module, DotProductAttention):
                 attn_cp_comm_type = "all_gather" if layer_type == "sliding_attention" else cp_comm_type
                 attn_module.set_context_parallel_group(
@@ -592,15 +592,15 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                     _get_cp_stream(),
                     cp_comm_type=attn_cp_comm_type,
                 )
-            elif hasattr(block.self_attn, "setup_cp_attention"):
+            elif hasattr(self_attn, "setup_cp_attention"):
                 # Model-owned CP attention (e.g. Gemma4's p2p ring): the model
                 # installs its own SDPA hook + mask handling.
-                block.self_attn.setup_cp_attention(cp_mesh)
+                self_attn.setup_cp_attention(cp_mesh)
             else:
                 logger.warning(
                     "Skipping CP setup for block with unsupported attention module "
                     "(neither TE DotProductAttention nor model-owned setup_cp_attention): %s",
-                    type(attn_module).__name__ if attn_module is not None else type(block.self_attn).__name__,
+                    type(attn_module).__name__ if attn_module is not None else type(self_attn).__name__,
                 )
         elif layer_type == "mamba":
             from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel

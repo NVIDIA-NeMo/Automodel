@@ -19,10 +19,12 @@ weights, applying config overrides, and instantiating the model.
 """
 
 import gc
+import glob
 import inspect
 import json
 import logging
 import os
+import shutil
 import threading
 from contextlib import contextmanager
 
@@ -370,6 +372,48 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
         # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
         with dist_utils.FirstRankPerNode():
             snapshot_download(pretrained_model_name_or_path)
+
+
+def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs):
+    """Fully populate HF's dynamic-module (custom code) cache on global rank 0 first.
+
+    ``get_cached_module_file`` copies a custom-code file plus its *direct* relative
+    imports, but ``get_class_in_module`` later validates the *transitive* closure. A
+    checkpoint whose ``modeling_*.py`` reaches a shim only transitively (e.g. DeciLM:
+    ``modeling_decilm -> configuration_decilm -> transformers_4_44_2__configuration_llama``)
+    then dies with ``FileNotFoundError`` because that file was never copied into the
+    model's cache dir; multi-rank reloads from a shared filesystem also race on the
+    partial copy. Copy every ``.py`` from the checkpoint dir into the resolved cache
+    dir under ``FirstRankPerNode`` so the closure is complete before any rank reads it.
+    Best-effort: any failure falls through to HF's own (un-serialized) resolution.
+    """
+    if not pretrained_model_name_or_path or not os.path.isdir(str(pretrained_model_name_or_path)):
+        return
+    auto_map = getattr(hf_config, "auto_map", None)
+    if not isinstance(auto_map, dict) or not auto_map:
+        return
+    try:
+        from transformers.dynamic_module_utils import HF_MODULES_CACHE, get_cached_module_file
+    except Exception:
+        return
+    src_dir = str(pretrained_model_name_or_path)
+    module_files = set()
+    for value in auto_map.values():
+        for ref in value if isinstance(value, (list, tuple)) else [value]:
+            if isinstance(ref, str) and "." in ref:
+                module_files.add(ref.rsplit(".", 1)[0] + ".py")
+    src_py = glob.glob(os.path.join(src_dir, "*.py"))
+    with dist_utils.FirstRankPerNode():
+        for module_file in module_files:
+            try:
+                cached = get_cached_module_file(src_dir, module_file)
+                cache_dir = os.path.dirname(os.path.join(HF_MODULES_CACHE, cached))
+                for src in src_py:
+                    dst = os.path.join(cache_dir, os.path.basename(src))
+                    if not os.path.exists(dst):
+                        shutil.copy2(src, dst)
+            except Exception:
+                pass
 
 
 def _setup_bnb_loading_kwargs(kwargs: dict) -> None:
@@ -888,6 +932,8 @@ def __init_model(
 
     # 3. fallback to HF model class wrapped with mixin
     model = None
+    # Serialize HF custom-code cache population across ranks to avoid a partial-copy race.
+    _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs)
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
         _setup_bnb_loading_kwargs(kwargs)
@@ -947,6 +993,15 @@ def __init_model(
 
 def _tie_weights_nemo(model):
     if not hasattr(model, "_nemo_tied_weights_keys"):
+        return
+
+    # Only re-tie when the controlling config flag actually requests tied
+    # embeddings. ``_nemo_tied_weights_keys`` names the *candidate* tied keys
+    # (pre-v5 list-form ``_tied_weights_keys`` semantics); it does not mean the
+    # model is tied. Re-tying an untied model here would alias away the trained
+    # ``lm_head.weight`` that ``from_pretrained`` just loaded (see #2941).
+    config = getattr(model, "config", None)
+    if config is not None and not checkpoint_utils.get_controlling_tie_word_embeddings(config, type(model).__name__):
         return
 
     def get_module_by_fqn(model, fqn):
