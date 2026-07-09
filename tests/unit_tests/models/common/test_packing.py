@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -15,6 +16,7 @@ import torch
 
 from nemo_automodel.components.models.common.packing import (
     _passthrough_create_causal_mask,
+    _patch_preprocess_mask_arguments_for_packing,
     configure_packing,
     get_attn_implementation,
     get_seqlens_in_batch,
@@ -225,6 +227,21 @@ class TestConfigurePacking:
                     delattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
             else:
                 masking_utils._nemo_automodel_packing_preprocess_patched = original_flag
+
+    def test_warns_when_preprocess_shim_cannot_install(self, monkeypatch, caplog):
+        """A missing _preprocess_mask_arguments must warn (with the transformers version), not silently no-op."""
+        import transformers
+        import transformers.masking_utils as masking_utils
+
+        monkeypatch.setattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", False, raising=False)
+        monkeypatch.delattr(masking_utils, "_preprocess_mask_arguments", raising=False)
+
+        with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.models.common.packing"):
+            _patch_preprocess_mask_arguments_for_packing()
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("mask shim not installed" in msg for msg in warnings)
+        assert any(str(transformers.__version__) in msg for msg in warnings)
 
     def test_patches_loaded_model_modules(self):
         """configure_packing should patch create_causal_mask on loaded modules."""

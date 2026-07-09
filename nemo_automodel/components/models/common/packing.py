@@ -165,6 +165,16 @@ def get_attn_implementation(cfg_model):
     return "sdpa"
 
 
+def _transformers_version() -> str:
+    """Best-effort transformers version string for shim diagnostics."""
+    try:
+        import transformers
+
+        return str(transformers.__version__)
+    except Exception:  # pragma: no cover - transformers is a hard dependency
+        return "unknown"
+
+
 def _patch_preprocess_mask_arguments_for_packing() -> None:
     """Keep indexed packing masks intact in newer Transformers.
 
@@ -178,6 +188,13 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
     try:
         import transformers.masking_utils as masking_utils
     except (ImportError, AttributeError):
+        logger.warning(
+            "Packed-sequence mask shim not installed: transformers.masking_utils is unavailable "
+            "(transformers %s). If this transformers version preprocesses 2D masks before flash "
+            "attention, indexed packing masks may be coerced to bool, silently enabling "
+            "cross-document attention.",
+            _transformers_version(),
+        )
         return
 
     if getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", False):
@@ -185,12 +202,39 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
 
     original_preprocess = getattr(masking_utils, "_preprocess_mask_arguments", None)
     if original_preprocess is None:
+        logger.warning(
+            "Packed-sequence mask shim not installed: transformers.masking_utils has no "
+            "_preprocess_mask_arguments (transformers %s). If this transformers version preprocesses "
+            "2D masks before flash attention, indexed packing masks may be coerced to bool, silently "
+            "enabling cross-document attention.",
+            _transformers_version(),
+        )
         return
 
     preprocess_result_len: int | None = None
 
     def _infer_preprocess_result_len(args, kwargs, inputs_embeds, attention_mask) -> int:
-        """Infer the installed Transformers return arity without losing packed masks."""
+        """Infer the installed Transformers return arity without losing packed masks.
+
+        Calls the original ``_preprocess_mask_arguments`` once with a bool 4D probe
+        mask (which it passes through untouched) so the indexed 2D packing mask is
+        never handed to it, and measures the length of the returned tuple.
+
+        Args:
+            args: Positional arguments of the intercepted call; when present,
+                index 2 is the attention mask and is replaced by the probe mask.
+            kwargs: Keyword arguments of the intercepted call; used (and probed)
+                when the attention mask was passed by keyword.
+            inputs_embeds: ``[B, S, H]`` input embeddings tensor used to size the
+                probe mask (batch and query length).
+            attention_mask: ``[B, S]`` indexed packing mask (1-based document
+                index per position, 0 = padding); only its trailing dimension is
+                read, as the probe's KV length.
+
+        Returns:
+            Length of the tuple returned by the original function, or the
+            historical arity 7 when probing is impossible.
+        """
         if not isinstance(inputs_embeds, torch.Tensor):
             return 7
 
@@ -217,6 +261,13 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
         try:
             return len(original_preprocess(*patched_args, **patched_kwargs))
         except Exception:
+            logger.warning(
+                "Packed-sequence mask shim could not probe the _preprocess_mask_arguments return "
+                "arity (transformers %s); assuming the historical arity of 7. If this transformers "
+                "version changed the signature, packing masks may be mishandled and cross-document "
+                "attention silently enabled.",
+                _transformers_version(),
+            )
             return 7
 
     def _patched_preprocess_mask_arguments(*args, **kwargs):
