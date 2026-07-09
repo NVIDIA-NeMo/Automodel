@@ -122,6 +122,18 @@ class FSDP2Manager:
         Returns:
             The parallelized model.
         """
+        if isinstance(self.activation_checkpointing, str) and not is_selective_activation_checkpointing(
+            self.activation_checkpointing
+        ):
+            # The scoped MoE modes ("non_moe"/"non_moe_no_attn") are implemented
+            # only by the expert-parallel MoE parallelizer. Coercing an unknown
+            # string to full per-block checkpointing would silently checkpoint the
+            # MoE MLP the user asked to exempt, so reject it instead.
+            raise ValueError(
+                f"activation_checkpointing={self.activation_checkpointing!r} is not supported by the dense "
+                "FSDP2 path; only booleans and 'selective' are. The scoped modes 'non_moe' and "
+                "'non_moe_no_attn' require the expert-parallel MoE parallelizer (distributed.ep_size > 1)."
+            )
         if get_world_size_safe() == 1 or self.device_mesh.size() == 1:
             logger.info("World size or FSDP mesh size is 1, skipping parallelization.")
             if self.activation_checkpointing:

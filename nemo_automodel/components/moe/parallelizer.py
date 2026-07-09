@@ -250,7 +250,9 @@ def apply_ac(
             ``"non_moe_no_attn"`` checkpoint per submodule instead of per block: attention
             (``non_moe`` only), layer norms, and dense MLPs are wrapped while the MoE MLP
             (router + expert dispatch) is left uncheckpointed, trading its activation memory
-            for skipping the expensive expert-dispatch recompute in backward.
+            for skipping the expensive expert-dispatch recompute in backward. Note that
+            ``"non_moe_no_attn"`` only exempts ``self_attn``; linear attention
+            (``linear_attn``, e.g. Qwen3-Next GatedDeltaNet) is still checkpointed.
     """
     selective = selective or _is_selective_ac(activation_checkpointing)
     scoped_mode = _scoped_ac_mode(activation_checkpointing)

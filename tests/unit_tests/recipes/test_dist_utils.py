@@ -400,6 +400,18 @@ class TestActivationCheckpointingParsing:
         assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] == value.lower().replace("-", "_")
 
+    @pytest.mark.parametrize("value", ["non_moe", "non_moe_no_attn"])
+    @pytest.mark.parametrize("ep_size", [1, None])
+    def test_scoped_moe_modes_require_ep(self, value, ep_size):
+        # Without EP the MoE parallelizer implementing the scoped modes is never
+        # selected and the dense paths would silently degrade to full per-block
+        # AC (checkpointing the MoE MLP the user asked to exempt).
+        cfg = {"strategy": "fsdp2", "activation_checkpointing": value}
+        if ep_size is not None:
+            cfg["ep_size"] = ep_size
+        with pytest.raises(ValueError, match="ep_size"):
+            parse_distributed_section(cfg)
+
 
 # ---------------------------------------------------------------------------
 # Validation errors surfaced through dict parsing
