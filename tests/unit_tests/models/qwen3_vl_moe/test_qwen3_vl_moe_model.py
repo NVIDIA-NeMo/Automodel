@@ -132,21 +132,35 @@ def vl_config(text_config):
 class TestFp32SafeRotaryEmbeddings:
     def test_text_rotary_inv_freq_remains_fp32(self, text_config):
         rotary = Fp32SafeQwen3VLMoeTextRotaryEmbedding(config=text_config)
-        original = rotary.inv_freq.clone()
+        originals = {
+            name: buf.detach().clone()
+            for name, buf in rotary.named_buffers(recurse=False)
+            if name in ("inv_freq", "original_inv_freq")
+        }
 
         rotary = rotary.to(torch.float16)
 
-        assert rotary.inv_freq.dtype == torch.float32
-        torch.testing.assert_close(rotary.inv_freq.float(), original.float())
+        assert originals
+        for name, original in originals.items():
+            buf = getattr(rotary, name)
+            assert buf.dtype == torch.float32
+            torch.testing.assert_close(buf.float(), original.float())
 
     def test_vision_rotary_inv_freq_remains_fp32(self):
         rotary = Fp32SafeQwen3VLMoeVisionRotaryEmbedding(dim=16)
-        original = rotary.inv_freq.clone()
+        originals = {
+            name: buf.detach().clone()
+            for name, buf in rotary.named_buffers(recurse=False)
+            if name in ("inv_freq", "original_inv_freq")
+        }
 
         rotary = rotary.to(torch.float16)
 
-        assert rotary.inv_freq.dtype == torch.float32
-        torch.testing.assert_close(rotary.inv_freq.float(), original.float())
+        assert originals
+        for name, original in originals.items():
+            buf = getattr(rotary, name)
+            assert buf.dtype == torch.float32
+            torch.testing.assert_close(buf.float(), original.float())
 
 
 @_requires_cuda

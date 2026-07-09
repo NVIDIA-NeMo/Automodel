@@ -30,6 +30,7 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeVisionRotaryEmbedding,
 )
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
@@ -46,15 +47,15 @@ class Fp32SafeQwen3VLMoeTextRotaryEmbedding(Qwen3VLMoeTextRotaryEmbedding):
     """Ensure inv_freq stays in float32"""
 
     def _apply(self, fn: Any, recurse: bool = True):
-        # Keep an fp32 copy before super mutates the registered buffer
-        inv_freq_fp32 = self.inv_freq.detach().clone().to(torch.float32)
+        fp32_buffers = {
+            name: buf.detach().clone().to(torch.float32)
+            for name, buf in self.named_buffers(recurse=False)
+            if name in ("inv_freq", "original_inv_freq")
+        }
         result = super()._apply(fn, recurse=recurse)
-        # Restore dtype while honoring the new device placement
-        self.register_buffer(
-            "inv_freq",
-            inv_freq_fp32.to(device=self.inv_freq.device),
-            persistent=False,
-        )
+        for name, fp32_buffer in fp32_buffers.items():
+            current = getattr(self, name)
+            self.register_buffer(name, fp32_buffer.to(device=current.device), persistent=False)
         return result
 
 
@@ -62,13 +63,15 @@ class Fp32SafeQwen3VLMoeVisionRotaryEmbedding(Qwen3VLMoeVisionRotaryEmbedding):
     """Ensure the vision rotary inv_freq buffer remains float32."""
 
     def _apply(self, fn: Any, recurse: bool = True):
-        inv_freq_fp32 = self.inv_freq.detach().clone().to(torch.float32)
+        fp32_buffers = {
+            name: buf.detach().clone().to(torch.float32)
+            for name, buf in self.named_buffers(recurse=False)
+            if name in ("inv_freq", "original_inv_freq")
+        }
         result = super()._apply(fn, recurse=recurse)
-        self.register_buffer(
-            "inv_freq",
-            inv_freq_fp32.to(device=self.inv_freq.device),
-            persistent=False,
-        )
+        for name, fp32_buffer in fp32_buffers.items():
+            current = getattr(self, name)
+            self.register_buffer(name, fp32_buffer.to(device=current.device), persistent=False)
         return result
 
 
@@ -497,6 +500,7 @@ class Qwen3VLMoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLMoeForCo
                 if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
                     sub_cfg.torch_dtype = top_dtype
 
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         super().__init__(config)
 
         self.backend = backend

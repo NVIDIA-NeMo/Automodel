@@ -41,14 +41,17 @@ SFT vs PEFT is determined by whether `peft` appears in the recipe filename.
 
 ## Recipe CI Configuration
 
-Each recipe YAML under `examples/` has an optional `ci:` section:
+Each recipe YAML under `examples/` has a `ci:` section. It is required for
+newly added CI recipes, which must declare `recipe_owner`, `time`, and `nodes`
+(enforced by `validate_new_recipe_ci.py`); pre-existing recipes are grandfathered:
 
 ```yaml
 ci:
   recipe_owner: username          # Required. Maintainer's handle
   time: "00:25:00"                # Required. SLURM wall time (HH:MM:SS)
-  nodes: 2                        # Optional. SLURM node count (default: 1)
+  nodes: 2                        # Required for new recipes. SLURM node count (omitted -> defaults to 1)
   node_multiplier: true           # Optional. Dynamic node scaling
+  max_steps: 50                   # Optional. Override max training steps for CI
   local_batch_size: 2             # Optional. Override batch size for CI
   nproc_per_node: 1               # Optional. GPUs per node, overrides cluster default (CI var: CONFIG_NPROC_PER_NODE)
   vllm_deploy: true               # Optional. Enable vLLM deployment test
@@ -80,7 +83,7 @@ Phase 5 is the most expensive (two additional training passes). Use `no_check_re
 ### Add a New Recipe to Nightly
 
 1. Create recipe YAML under `examples/{test_folder}/{model_family}/`
-2. Add `ci:` section with `recipe_owner` and `time`
+2. Add `ci:` section with `recipe_owner`, `time`, and `nodes` (use `nodes: 1` for single-node)
 3. Add the path to `configs/{test_folder}/nightly_recipes.yml`
 
 ### Enable Checkpoint Robustness

@@ -215,7 +215,7 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
 
 
 def _fusible(module) -> bool:
-    """A LoRA linear is fusible when it is a plain (non-DoRA, dropout-free, non-DTensor) adapter."""
+    """A LoRA linear is fusible when it is a plain materialized adapter."""
     lora_A = getattr(module, "lora_A", None)
     lora_B = getattr(module, "lora_B", None)
     if lora_A is None or lora_B is None:
@@ -238,6 +238,8 @@ def _fusible(module) -> bool:
         return False
     for w in (base_w, lora_A.weight, lora_B.weight):
         if isinstance(w, DTensor):
+            return False
+        if getattr(w, "is_meta", False):
             return False
     return True
 
@@ -410,8 +412,8 @@ def _is_relu2_mlp(module) -> bool:
     return getattr(module, "activation", None) == "relu2"
 
 
-def _projs_are_lora(module, projs) -> bool:
-    return all(getattr(getattr(module, proj), "lora_A", None) is not None for proj in projs)
+def _projs_are_fusible(module, projs) -> bool:
+    return all(_fusible(getattr(module, proj)) for proj in projs)
 
 
 def _swiglu_forward(mod, orig_forward):
@@ -435,11 +437,12 @@ def install_fused_lora_mlp(model) -> int:
 
     Intended to be called by the LoRA matcher after the projections have been patched to
     ``LinearLoRA``. Handles SiLU-SwiGLU MLPs (gate/up/down) via :func:`fused_lora_swiglu_mlp` and
-    non-gated ReLU² MLPs (up/down) via :func:`fused_lora_relu2_mlp`. The installed ``forward`` falls
-    back to the module's original per-linear ``forward`` whenever fusion does not apply at runtime —
-    notably once the projections become ``DTensor`` under tensor/expert parallelism, or for DoRA /
-    active dropout. This keeps the fused memory win on single-GPU and pure-DP while staying correct
-    (and identical to the unfused path) under sharding.
+    non-gated ReLU² MLPs (up/down) via :func:`fused_lora_relu2_mlp`. A wrapper is installed only when
+    the projections are fusible and materialized at install time. The installed ``forward`` still
+    falls back to the module's original per-linear ``forward`` whenever fusion stops applying at
+    runtime, for example once projections become ``DTensor`` under tensor/expert parallelism, or for
+    DoRA / active dropout. This keeps the fused memory win on single-GPU and pure-DP while staying
+    correct (and identical to the unfused path) under sharding and PP/meta construction.
 
     Returns the number of MLP modules whose ``forward`` was swapped. Idempotent.
     """
@@ -447,9 +450,9 @@ def install_fused_lora_mlp(model) -> int:
     for mlp in model.modules():
         if getattr(mlp, "_lora_mlp_fused", False):
             continue
-        if _is_silu_swiglu_mlp(mlp) and _projs_are_lora(mlp, ("gate_proj", "up_proj", "down_proj")):
+        if _is_silu_swiglu_mlp(mlp) and _projs_are_fusible(mlp, ("gate_proj", "up_proj", "down_proj")):
             mlp.forward = _swiglu_forward(mlp, mlp.forward)
-        elif _is_relu2_mlp(mlp) and _projs_are_lora(mlp, ("up_proj", "down_proj")):
+        elif _is_relu2_mlp(mlp) and _projs_are_fusible(mlp, ("up_proj", "down_proj")):
             mlp.forward = _relu2_forward(mlp, mlp.forward)
         else:
             continue

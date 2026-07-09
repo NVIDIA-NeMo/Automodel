@@ -21,8 +21,8 @@ import torch.nn.functional as F
 from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
 from nemo_automodel.components.models.minimax_m3_vl.layers import (
     MiniMaxM3Indexer,
-    _padding_mask_to_additive_bias,
-    build_block_sparse_attn_bias,
+    _padding_mask_to_keep_mask,
+    build_block_sparse_attn_mask,
 )
 from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
 
@@ -67,7 +67,7 @@ def test_block_sparse_bias_matches_brute_force(block_size, topk):
     torch.manual_seed(0)
     idx_q = torch.randn(2, 16, 2, 8)
     idx_k = torch.randn(2, 16, 1, 8)
-    mine = build_block_sparse_attn_bias(
+    mine = build_block_sparse_attn_mask(
         idx_q,
         idx_k,
         block_size=block_size,
@@ -78,8 +78,9 @@ def test_block_sparse_bias_matches_brute_force(block_size, topk):
         score_type="max",
     )
     ref = _brute_block_select(idx_q, idx_k, block_size, topk, 0, 1, 4)
-    # Compare the boolean attend/ignore pattern (selection is what matters).
-    assert torch.equal(mine == 0, ref == 0)
+    # mine is a boolean keep-mask (True == attend); ref is an additive bias (0 == attend).
+    assert mine.dtype == torch.bool
+    assert torch.equal(mine, ref == 0)
 
 
 def test_dense_layers_have_no_indexer_sparse_layers_do(sparse_model):
@@ -203,12 +204,13 @@ def test_sparse_e2e_parity_vs_reference(sparse_model):
     assert cos > 0.9999, f"cos_sim={cos}"
 
 
-def test_padding_mask_to_additive_bias():
+def test_padding_mask_to_keep_mask():
     ref = torch.zeros(2, 4, 5, 5)
     keep = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 0]])
-    bias = _padding_mask_to_additive_bias(keep, ref)
-    assert bias.shape == (2, 1, 1, 5)
-    assert bias[0, 0, 0].tolist() == [0.0, 0.0, 0.0, float("-inf"), float("-inf")]
+    keep_mask = _padding_mask_to_keep_mask(keep, ref)
+    assert keep_mask.dtype == torch.bool
+    assert keep_mask.shape == (2, 1, 1, 5)
+    assert keep_mask[0, 0, 0].tolist() == [True, True, True, False, False]
 
 
 def test_sparse_forward_with_padding_mask_is_finite(sparse_model):
@@ -229,3 +231,84 @@ def test_index_value_branch_rejected(backend):
     cfg = MiniMaxM3VLTextConfig(torch_dtype="float32", **{**TINY_CFG, "sparse_attention_config": sa})
     with pytest.raises(AssertionError):
         MiniMaxM3SparseForCausalLM(cfg, backend=backend)
+
+
+# head_dim=64 + block_size=128 so SDPA picks the fused bf16 kernel that exposed the
+# additive-(-inf)-mask leak (the tiny block_size-4 config falls back to math, hiding it).
+_BF16_LEAK_CFG = dict(
+    hidden_size=256,
+    intermediate_size=64,
+    dense_intermediate_size=128,
+    shared_intermediate_size=64,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=64,
+    rotary_dim=32,
+    partial_rotary_factor=0.5,
+    vocab_size=128,
+    max_position_embeddings=512,
+    rms_norm_eps=1e-6,
+    rope_theta=10000.0,
+    num_local_experts=4,
+    num_experts_per_tok=2,
+    n_shared_experts=1,
+    moe_layer_freq=[0, 1],
+    use_gemma_norm=True,
+    use_qk_norm=True,
+    qk_norm_type="per_head",
+    scoring_func="sigmoid",
+    use_routing_bias=True,
+    routed_scaling_factor=2.0,
+    swiglu_alpha=1.702,
+    swiglu_limit=7.0,
+    num_mtp_modules=0,
+    sparse_attention_config=dict(
+        use_sparse_attention=True,
+        sparse_index_dim=64,
+        sparse_num_index_heads=2,
+        sparse_topk_blocks=2,
+        sparse_block_size=128,
+        sparse_score_type="max",
+        sparse_init_block=0,
+        sparse_local_block=1,
+        sparse_attention_freq=[0, 1],
+        sparse_disable_index_value=[0, 1],
+    ),
+)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="bf16 SDPA additive-mask leak only reproduces on CUDA")
+def test_eager_sparse_attn_bf16_matches_fp32(backend):
+    """Eager sparse attention in bf16 must match fp32 within rounding (no mask leak).
+
+    Pins build_block_sparse_attn_mask's boolean keep-mask: the old additive ``-inf`` bias
+    leaked past the causal/sparse mask under bf16 SDPA (worst at early positions; mean
+    ~1e-2, max ~0.27), which silently made cp1 (eager) diverge from cp2 (CP/FlexAttention).
+    Boolean masking keeps bf16 within ~1e-4 of fp32; this guard fails if it ever regresses.
+    """
+    from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import MiniMaxM3CPSparseAttention
+
+    dev = torch.device("cuda")
+    torch.manual_seed(0)
+    cfg = MiniMaxM3VLTextConfig(torch_dtype="float32", **_BF16_LEAK_CFG)
+    model = MiniMaxM3SparseForCausalLM(cfg, backend=backend).eval().to(dev)
+    model.initialize_weights(dtype=torch.float32)
+    text = model.model
+    attn = next(
+        layer.self_attn for layer in text.layers.values() if isinstance(layer.self_attn, MiniMaxM3CPSparseAttention)
+    )
+    attn._cp_mesh = None  # eager (non-CP) sparse path
+
+    seqlen = 256  # 2 blocks of block_size=128
+    x = torch.randn(1, seqlen, cfg.hidden_size, device=dev)
+    pos = torch.arange(seqlen, device=dev).unsqueeze(0)
+    with torch.no_grad():
+        out_fp32 = attn(x, freqs_cis=text.make_freqs_cis(pos), attention_mask=None).float()
+        model.to(torch.bfloat16)
+        out_bf16 = attn(x.bfloat16(), freqs_cis=text.make_freqs_cis(pos), attention_mask=None).float()
+
+    diff = (out_fp32 - out_bf16).abs()
+    # post-fix ~8e-5 mean / 1.2e-3 max; the additive-(-inf) leak was ~1e-2 mean / 0.27 max.
+    assert diff.mean() < 1e-3, f"bf16 sparse attn diverges from fp32 (mean {diff.mean():.2e}) -> mask leak regressed"
+    assert diff.max() < 2e-2, f"bf16 sparse attn max diff {diff.max():.2e} -> mask leak regressed"

@@ -128,6 +128,7 @@ optimizer:
   weight_decay: 0.01
 
 ci:
+  time: "00:15:00"
   env_vars:
     MAX_STEPS: 10
 

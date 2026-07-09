@@ -48,6 +48,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
 from nemo_automodel.components.distributed import DistributedSetup, ParallelismSizes, parallelizer
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.distributed.ddp import DDPManager
@@ -611,9 +612,13 @@ class NeMoAutoDiffusionPipeline:
 
         logger.info("[INFO] Loading pipeline from pretrained: %s", pretrained_model_name_or_path)
 
+        # Resolve to a local snapshot dir so a warm HF cache is not re-validated
+        # (and potentially re-downloaded) over the network on every run.
+        model_dir = resolve_diffusion_model_dir(pretrained_model_name_or_path)
+
         # Use DiffusionPipeline.from_pretrained for auto-detection
         pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
-            pretrained_model_name_or_path,
+            model_dir,
             *model_args,
             torch_dtype=torch_dtype,
             **kwargs,
@@ -796,6 +801,10 @@ class NeMoAutoDiffusionPipeline:
         logger.info("[INFO] Initializing pipeline from config with random weights")
         logger.info("[INFO] Model ID: %s", model_id)
         logger.info("[INFO] Transformer class: %s", spec.transformer_cls)
+
+        # Resolve to a local snapshot dir so config/pipeline loads reuse the
+        # warm HF cache instead of re-validating over the network.
+        model_id = resolve_diffusion_model_dir(model_id)
 
         # Dynamically import transformer class from diffusers
         TransformerCls = _import_diffusers_class(spec.transformer_cls)

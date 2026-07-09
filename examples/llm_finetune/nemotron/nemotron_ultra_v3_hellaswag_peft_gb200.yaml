@@ -137,4 +137,5 @@ lr_scheduler:
 ci:
   # pp_size(1) * ep_size(16) = 16 GPUs => 4 nodes (4 GB200/node).
   recipe_owner: adil-a
+  cluster_tag: gb200
   nodes: 4

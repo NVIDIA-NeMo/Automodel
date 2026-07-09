@@ -129,3 +129,7 @@ wandb:
   group: gemma4_e4b_tulu3_text_cp16_64k
   tags: [gemma4-e4b, tulu3, text-only, dense, cp16, 64k, 2node]
   dir: logs/gemma4_e4b_tulu3_text_cp16_64k/wandb
+
+ci:
+  nodes: 2
+  time: "00:15:00"

@@ -55,8 +55,8 @@ Use virtualenv (PyPI, Git, or editable install) when you need:
 Debian-based systems can have dependency conflicts with system packages. Containers provide isolation and consistency.
 
 ```bash
-docker pull nvcr.io/nvidia/nemo-automodel:25.11.00
-docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:25.11.00
+docker pull nvcr.io/nvidia/nemo-automodel:26.06.00
+docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:26.06.00
 ```
 
 **Alternative: virtualenv** (if Docker is not available)
@@ -163,10 +163,10 @@ To verify the install, run `python -c "import nemo_automodel; print(nemo_automod
 ### Install with NeMo Docker Container
 You can use NeMo AutoModel with the NeMo Docker container. Pull the container by running:
 ```bash
-docker pull nvcr.io/nvidia/nemo-automodel:25.11.00
+docker pull nvcr.io/nvidia/nemo-automodel:26.06.00
 ```
 <Note>
-The above `docker` command uses the [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) container. Use the [most recent container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) version to ensure you get the latest version of AutoModel and its dependencies like PyTorch, Transformers, etc.
+The above `docker` command uses the [`26.06.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=26.06.00) container. Use the [most recent container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel) version to ensure you get the latest version of AutoModel and its dependencies like PyTorch, Transformers, etc.
 
 </Note>
 
@@ -175,7 +175,7 @@ Then you can enter the container using:
 docker run --gpus all -it --rm \
   --shm-size=8g \
   -v "$(pwd)"/checkpoints:/opt/Automodel/checkpoints \
-  nvcr.io/nvidia/nemo-automodel:25.11.00
+  nvcr.io/nvidia/nemo-automodel:26.06.00
 ```
 
 <Info>
@@ -186,7 +186,7 @@ docker run --gpus all -it --rm \
   -v /path/to/your/checkpoints:/opt/Automodel/checkpoints \
   -v /path/to/your/datasets:/datasets \
   -v /path/to/your/hf_cache:/root/.cache/huggingface \
-  nvcr.io/nvidia/nemo-automodel:25.11.00
+  nvcr.io/nvidia/nemo-automodel:26.06.00
 ```
 
 </Info>
@@ -240,7 +240,7 @@ This installs AutoModel in editable mode, so changes to the code are immediately
 
 ### Mount the Repo into a NeMo Docker Container
 
-To run `Automodel` inside a NeMo container while **mounting your local repo**, follow these steps:
+To develop against your local checkout while reusing the container's pre-built dependencies, bind-mount your local `Automodel` directory over `/opt/Automodel`, overriding the source installed in the image:
 
 ```bash
 # Step 1: Clone the AutoModel repository.
@@ -248,22 +248,23 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
 
 # Step 2: Pull a compatible container image (replace the tag as needed).
-docker pull nvcr.io/nvidia/nemo-automodel:25.11.00
+docker pull nvcr.io/nvidia/nemo-automodel:26.06.00
 
-# Step 3: Run the container, mount the repo, and run a quick sanity check.
-docker run --gpus all -it --rm \
-  -v $(pwd):/workspace/Automodel \         # Mount repo into container workspace
-  -v $(pwd)/Automodel:/opt/Automodel \     # Optional: Mount Automodel under /opt for flexibility
-  --shm-size=8g \                           # Increase shared memory for PyTorch/data loading
-  nvcr.io/nvidia/nemo-automodel:25.11.00 /bin/bash -c "\
-    cd /workspace/Automodel && \           # Enter the mounted repo
-    pip install -e . && \                  # Install Automodel in editable mode
-    automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml" # Run a usage example
+# Step 3: Run the container, sync the mounted checkout, and run a usage example.
+docker run --gpus all --network=host -it --rm \
+  --shm-size=32g \
+  -v "$(pwd)":/opt/Automodel \
+  nvcr.io/nvidia/nemo-automodel:26.06.00 /bin/bash -c "\
+    cd /opt/Automodel && \
+    bash docker/common/update_pyproject_pytorch.sh /opt/Automodel && \
+    uv sync --locked --extra all --all-groups && \
+    automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml"
 ```
-<Note>
-The above `docker` command mounts your local `Automodel` directory into the container at `/workspace/Automodel`.
 
-</Note>
+<Warning>
+The `update_pyproject_pytorch.sh` step is required. Without it, `uv sync` tries to reinstall `torch`, which causes CUDA version mismatches and TransformerEngine import failures, because `uv` cannot recognize the torch baked into the PyTorch base container.
+
+</Warning>
 
 ## Install Profiles
 
@@ -301,6 +302,43 @@ For vision-language model training, add the VLM extras:
 pip3 install nemo-automodel[vlm]
 ```
 
+<Note>
+`[vlm]` installs the core VLM stack (image processors, tokenizers). Models that
+decode video or use OpenCV / Qwen vision preprocessing — Qwen2.5-VL, Qwen3-VL,
+Qwen3-Omni, Mistral VLMs, and Nemotron-Omni — additionally require the
+`vlm-media` extra (see [Media Extras](#media-extras-video--image-decode)):
+
+```bash
+pip3 install "nemo-automodel[vlm,vlm-media]"
+```
+
+</Note>
+
+### Media Extras (Video & Image Decode)
+
+Media decode dependencies (OpenCV, decord, PyAV via the Qwen utils, and
+imageio-ffmpeg) bundle FFmpeg, which is no longer packaged in the container.
+They are opt-in and split by domain:
+
+| Extra | Pulls in | Needed for |
+|-------|----------|------------|
+| `vlm-media` | OpenCV, decord, qwen-vl-utils, qwen-omni-utils | VLM video reading, Qwen vision preprocessing, Mistral image tokenization |
+| `diffusion-media` | imageio-ffmpeg, OpenCV | Diffusion image/video preprocessing and T2V export |
+| `media` | both of the above | Convenience union |
+
+```bash
+pip3 install "nemo-automodel[vlm,vlm-media]"              # VLM + media
+pip3 install "nemo-automodel[diffusion,diffusion-media]"  # diffusion + media
+```
+
+<Warning>
+**`[all]` does not include the media extras**, and they are not installed in
+the Docker container by default — FFmpeg is no longer packaged in the container.
+After `pip3 install nemo-automodel[all]` (or inside the container) add media
+explicitly: `pip3 install nemo-automodel[media]`.
+
+</Warning>
+
 ### CUDA-Specific Packages
 
 For models requiring TransformerEngine, bitsandbytes, Mamba, or other
@@ -312,11 +350,18 @@ pip3 install nemo-automodel[cuda]
 
 ### All Extras
 
-Install everything (CUDA, VLM, NeMo-Run, etc.):
+Install all standard extras (CUDA, VLM, NeMo-Run, diffusion, etc.):
 
 ```bash
 pip3 install nemo-automodel[all]
 ```
+
+<Note>
+`[all]` intentionally **excludes the media extras** (FFmpeg-bearing). Add them
+explicitly if you need video/image decode:
+`pip3 install nemo-automodel[all,media]`.
+
+</Note>
 
 <Tip>
 You can combine extras: `pip3 install nemo-automodel[vlm,cuda]`
@@ -328,6 +373,8 @@ You can combine extras: `pip3 install nemo-automodel[vlm,cuda]`
 | --------------------------- | --------------------------------------------------------------- |
 | Stable install (PyPI)       | `pip3 install nemo-automodel`                                   |
 | CLI-only (login nodes)      | `pip3 install nemo-automodel[cli]`                              |
+| VLM + media (Qwen/Mistral/video) | `pip3 install "nemo-automodel[vlm,vlm-media]"`             |
+| Diffusion + media           | `pip3 install "nemo-automodel[diffusion,diffusion-media]"`      |
 | Latest from GitHub          | `pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git` |
 | Editable install (dev mode) | `pip install -e .` after cloning                                |
 | Run without installing      | Use `PYTHONPATH=$(pwd)` to run scripts                          |

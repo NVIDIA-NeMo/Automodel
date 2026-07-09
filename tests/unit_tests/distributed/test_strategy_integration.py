@@ -111,15 +111,14 @@ def test_strategy_selection_nemotron_model():
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])
 @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
 @patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively")
-@patch("nemo_automodel.components.distributed.parallelizer._extract_model_layers")
+@patch("nemo_automodel.components.distributed.parallelizer._extract_model_layer_groups")
 @patch("nemo_automodel.components.distributed.parallelizer._get_parallel_plan")
 def test_backward_compatibility_standard_model(
-    mock_get_plan, mock_extract_layers, mock_apply_fsdp, mock_fully_shard,
-    mock_gpgr, mock_device_mesh
+    mock_get_plan, mock_extract_layer_groups, mock_apply_fsdp, mock_fully_shard, mock_gpgr, mock_device_mesh
 ):
     """Test that the refactored code maintains backward compatibility for standard models."""
     mock_fully_shard.side_effect = lambda model, **kwargs: model
-    mock_extract_layers.return_value = []
+    mock_extract_layer_groups.return_value = {"language": []}
     mock_get_plan.return_value = {}
 
     model = MockStandardModel()
@@ -135,7 +134,7 @@ def test_backward_compatibility_standard_model(
     assert result is model
 
     # Should have called the expected functions for standard flow
-    mock_extract_layers.assert_called_once_with(model)
+    mock_extract_layer_groups.assert_called_once_with(model)
     mock_apply_fsdp.assert_called_once()
     mock_fully_shard.assert_called()
 
@@ -143,9 +142,7 @@ def test_backward_compatibility_standard_model(
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])
 @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
 @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
-def test_backward_compatibility_nemotron_model(
-    mock_parallelize_module, mock_fully_shard, mock_gpgr, mock_device_mesh
-):
+def test_backward_compatibility_nemotron_model(mock_parallelize_module, mock_fully_shard, mock_gpgr, mock_device_mesh):
     """Test that the refactored code maintains backward compatibility for NemotronH models."""
     mock_fully_shard.side_effect = lambda model, **kwargs: model
 
@@ -162,7 +159,7 @@ def test_backward_compatibility_nemotron_model(
     assert result is model
 
     # Should have called NemotronH-specific functions
-    if mock_device_mesh['tp'].size() > 1:
+    if mock_device_mesh["tp"].size() > 1:
         mock_parallelize_module.assert_called()  # For TP plans
     else:
         mock_parallelize_module.assert_not_called()
@@ -177,43 +174,54 @@ def test_function_signature_preserved():
 
     # All original parameters should be present
     expected_params = {
-        'model', 'device_mesh', 'mp_policy', 'offload_policy',
-        'sequence_parallel', 'activation_checkpointing', 'tp_shard_plan',
-        'dp_replicate_mesh_name', 'dp_shard_cp_mesh_name', 'tp_mesh_name'
+        "model",
+        "device_mesh",
+        "mp_policy",
+        "offload_policy",
+        "sequence_parallel",
+        "activation_checkpointing",
+        "activation_checkpointing_scope",
+        "tp_shard_plan",
+        "dp_replicate_mesh_name",
+        "dp_shard_cp_mesh_name",
+        "tp_mesh_name",
     }
 
     actual_params = set(sig.parameters.keys())
     assert expected_params <= actual_params  # All expected params are present
 
     # Check that key defaults are preserved
-    assert sig.parameters['sequence_parallel'].default is False
-    assert sig.parameters['activation_checkpointing'].default is False
+    assert sig.parameters["sequence_parallel"].default is False
+    assert sig.parameters["activation_checkpointing"].default is False
 
 
 def test_no_runtime_errors_with_different_model_types(mock_device_mesh):
     """Test that both model types can be processed without runtime errors."""
-    with patch("torch.distributed.get_process_group_ranks", return_value=[0]), \
-         patch("nemo_automodel.components.distributed.parallelizer.fully_shard",
-               side_effect=lambda model, **kwargs: model), \
-         patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"):
-            with patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively"):
-                with patch("nemo_automodel.components.distributed.parallelizer._extract_model_layers",
-                          return_value=[]):
-                    with patch("nemo_automodel.components.distributed.parallelizer._get_parallel_plan",
-                              return_value={}):
+    with (
+        patch("torch.distributed.get_process_group_ranks", return_value=[0]),
+        patch(
+            "nemo_automodel.components.distributed.parallelizer.fully_shard", side_effect=lambda model, **kwargs: model
+        ),
+        patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"),
+    ):
+        with patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively"):
+            with patch(
+                "nemo_automodel.components.distributed.parallelizer._extract_model_layer_groups",
+                return_value={"language": []},
+            ):
+                with patch("nemo_automodel.components.distributed.parallelizer._get_parallel_plan", return_value={}):
+                    # Test standard model
+                    standard_model = MockStandardModel()
+                    result1 = fsdp2_strategy_parallelize(
+                        model=standard_model,
+                        device_mesh=mock_device_mesh,
+                    )
+                    assert result1 is standard_model
 
-                        # Test standard model
-                        standard_model = MockStandardModel()
-                        result1 = fsdp2_strategy_parallelize(
-                            model=standard_model,
-                            device_mesh=mock_device_mesh,
-                        )
-                        assert result1 is standard_model
-
-                        # Test NemotronH model
-                        nemotron_model = MockNemotronModel()
-                        result2 = fsdp2_strategy_parallelize(
-                            model=nemotron_model,
-                            device_mesh=mock_device_mesh,
-                        )
-                        assert result2 is nemotron_model
+                    # Test NemotronH model
+                    nemotron_model = MockNemotronModel()
+                    result2 = fsdp2_strategy_parallelize(
+                        model=nemotron_model,
+                        device_mesh=mock_device_mesh,
+                    )
+                    assert result2 is nemotron_model

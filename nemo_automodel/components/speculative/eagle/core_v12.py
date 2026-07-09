@@ -69,7 +69,16 @@ class EagleTrainerModule(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project predicted hidden states through the frozen target lm_head."""
-        return F.linear(hidden_states, self._target_lm_head.weight)
+        weight = self._target_lm_head.weight
+        # The target may be FSDP2-sharded (the EAGLE-1/2 recipe's optional
+        # ``distributed:`` path, used for targets that do not fit on one GPU),
+        # which makes ``weight`` a ``DTensor``. The draft runs under DDP, so
+        # ``hidden_states`` is a plain tensor and ``F.linear`` cannot mix the
+        # two. Gather the frozen weight to a local full tensor first -- mirrors
+        # ``copy_embeddings_from_target``. No-op when the target is unsharded.
+        if hasattr(weight, "full_tensor"):
+            weight = weight.full_tensor()
+        return F.linear(hidden_states, weight)
 
     def forward(
         self,

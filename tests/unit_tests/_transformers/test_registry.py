@@ -172,6 +172,18 @@ def test_default_registry_has_static_entries():
         assert arch_name in inst.model_arch_name_to_cls.keys()
 
 
+def test_llama_nemotron_vl_registry_entry_is_retrieval_model():
+    """Llama Nemotron VL should be registered as a retrieval architecture."""
+    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegistry
+
+    assert MODEL_ARCH_MAPPING["LlamaNemotronVLModel"] == (
+        "nemo_automodel.components.models.llama_nemotron_vl.model",
+        "LlamaNemotronVLModel",
+        {"retrieval"},
+    )
+    assert ModelRegistry.has_retrieval_model("LlamaNemotronVLModel")
+
+
 def test_step3p7_registry_and_custom_config_registration():
     """Step3p7 VLM support is available through the lazy registry and AutoConfig."""
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING

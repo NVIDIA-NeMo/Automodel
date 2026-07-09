@@ -39,6 +39,62 @@ def _shift_left_with_zero(tensor: torch.Tensor) -> torch.Tensor:
     return torch.cat((tensor[:, 1:], tail), dim=1)
 
 
+def default_eagle3_aux_layer_ids(num_layers: int) -> list[int]:
+    """Return the EAGLE-3 default 3-layer (low / mid / high) aux capture recipe.
+
+    The downstream draft model's ``fc`` projection is sized for exactly
+    ``num_aux_hidden_states`` layers (default 3) of concatenated target hidden
+    states. Silently deduplicating collisions on shallow targets would yield
+    fewer than 3 captured tensors and crash later inside the draft ``fc`` with a
+    confusing shape-mismatch error -- raise here instead so the caller picks 3
+    distinct in-bounds ids that match the draft config. Shared by every target
+    backend (co-located, remote, SGLang) so they all default identically.
+    """
+    candidates = [1, num_layers // 2 - 1, num_layers - 4]
+    if any(c < 0 or c >= num_layers for c in candidates) or len(set(candidates)) != 3:
+        raise ValueError(
+            f"Target model has num_hidden_layers={num_layers}, which is too shallow "
+            f"for the default EAGLE-3 aux recipe {candidates}. Pass aux_layer_ids "
+            f"explicitly (must be 3 distinct in-bounds layer indices, matching the "
+            f"draft model's num_aux_hidden_states)."
+        )
+    return candidates
+
+
+def validate_eagle3_aux_layer_ids(aux_layer_ids: Sequence[int], num_layers: int) -> list[int]:
+    """Validate an aux-layer selection against a target of ``num_layers`` depth.
+
+    Shared by every target backend so an explicit ``aux_layer_ids`` is checked
+    identically whether the target runs co-located, remote, or under SGLang.
+    """
+    aux_layer_ids = list(aux_layer_ids)
+    if len(aux_layer_ids) != 3:
+        raise ValueError(
+            f"EAGLE-3 expects exactly 3 aux_layer_ids, but got {len(aux_layer_ids)}: "
+            f"{aux_layer_ids}. This must match the draft model's num_aux_hidden_states."
+        )
+    if len(set(aux_layer_ids)) != len(aux_layer_ids):
+        raise ValueError(
+            f"EAGLE-3 aux_layer_ids must be distinct, but got {aux_layer_ids}. "
+            "Duplicate ids would collapse the captured aux hidden states."
+        )
+    for layer_id in aux_layer_ids:
+        if layer_id < 0 or layer_id >= num_layers:
+            raise ValueError(f"aux layer id {layer_id} is out of bounds for model with {num_layers} layers")
+    return aux_layer_ids
+
+
+def _to_full_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialise a (possibly tensor-parallel) tensor as a plain local tensor.
+
+    With a tensor-parallel target the lm_head is column-parallel, so its logits
+    come back as a vocab-sharded ``DTensor``. The draft consumes plain tensors,
+    so gather the full tensor before handing it on. A no-op for an already-plain
+    (unsharded or pure-FSDP-replicated) tensor.
+    """
+    return tensor.full_tensor() if hasattr(tensor, "full_tensor") else tensor
+
+
 @dataclass
 class Eagle3TargetBatch:
     """Target-model supervision for one draft-training batch.
@@ -130,45 +186,11 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
             )
 
     def _default_aux_layer_ids(self) -> list[int]:
-        # EAGLE-3 default 3-layer recipe (low / mid / high).
-        #
-        # The downstream draft model's ``fc`` projection is sized for
-        # exactly ``num_aux_hidden_states`` layers (default 3) of
-        # concatenated target hidden states. Silently deduplicating
-        # collisions on shallow targets would yield fewer than 3
-        # captured tensors and crash later inside the draft ``fc`` with
-        # a confusing shape-mismatch error -- raise here instead so the
-        # caller picks 3 distinct in-bounds ids that match the draft
-        # config.
-        num_layers = self.model.config.num_hidden_layers
-        candidates = [1, num_layers // 2 - 1, num_layers - 4]
-        if any(c < 0 or c >= num_layers for c in candidates) or len(set(candidates)) != 3:
-            raise ValueError(
-                f"Target model has num_hidden_layers={num_layers}, which is too shallow "
-                f"for the default EAGLE-3 aux recipe {candidates}. Pass aux_layer_ids "
-                f"explicitly (must be 3 distinct in-bounds layer indices, matching the "
-                f"draft model's num_aux_hidden_states)."
-            )
-        return candidates
+        return default_eagle3_aux_layer_ids(self.model.config.num_hidden_layers)
 
     def _validate_aux_layer_ids(self, aux_layer_ids: Sequence[int]) -> list[int]:
         """Validate aux-layer selection before any forward hooks are registered."""
-        num_layers = self.model.config.num_hidden_layers
-        aux_layer_ids = list(aux_layer_ids)
-        if len(aux_layer_ids) != 3:
-            raise ValueError(
-                f"EAGLE-3 expects exactly 3 aux_layer_ids, but got {len(aux_layer_ids)}: "
-                f"{aux_layer_ids}. This must match the draft model's num_aux_hidden_states."
-            )
-        if len(set(aux_layer_ids)) != len(aux_layer_ids):
-            raise ValueError(
-                f"EAGLE-3 aux_layer_ids must be distinct, but got {aux_layer_ids}. "
-                "Duplicate ids would collapse the captured aux hidden states."
-            )
-        for layer_id in aux_layer_ids:
-            if layer_id < 0 or layer_id >= num_layers:
-                raise ValueError(f"aux layer id {layer_id} is out of bounds for model with {num_layers} layers")
-        return aux_layer_ids
+        return validate_eagle3_aux_layer_ids(aux_layer_ids, self.model.config.num_hidden_layers)
 
     def _get_transformer_layers(self) -> list[nn.Module]:
         """Return decoder layers as an ordered list indexable by integer.
@@ -328,6 +350,11 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         finally:
             for handle in handles:
                 handle.remove()
+        # A tensor-parallel target returns vocab-sharded (DTensor) logits from its
+        # column-parallel lm_head; gather to a full tensor before the draft-vocab
+        # projection and shift. No-op without TP. (TP is gated off with CP for now,
+        # so the CP branch above never produces a TP-sharded logits tensor.)
+        target_logits = _to_full_tensor(target_logits)
         shifted_logits = _shift_left_with_zero(target_logits)
         shifted_input_ids = _shift_left_with_zero(input_ids)
         shifted_loss_mask = _shift_left_with_zero(loss_mask)

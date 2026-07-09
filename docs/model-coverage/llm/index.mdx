@@ -8,7 +8,7 @@ Large Language Models (LLMs) power a variety of tasks such as dialogue systems, 
 NeMo AutoModel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
 
 ## Run LLMs with NeMo AutoModel
-To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [`25.11.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=25.11.00) or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo AutoModel by running:
+To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [`26.06.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=26.06.00) or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo AutoModel by running:
 
 ```bash
 pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
@@ -46,7 +46,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | ZAI / Zhipu AI | [ChatGLM](/model-coverage/large-language-models/chatglm) | `ChatGLMModel` |
 | ZAI / Zhipu AI | [GLM-4](/model-coverage/large-language-models/glm-4) | `GlmForCausalLM`, `Glm4ForCausalLM` |
 | ZAI / Zhipu AI | [GLM-4 MoE](/model-coverage/large-language-models/glm-4-moe-glm-4-5-glm-4-7) | `Glm4MoeForCausalLM`, `Glm4MoeLiteForCausalLM` |
-| ZAI / Zhipu AI | [GLM-5 / GLM-5.1](/model-coverage/large-language-models/glm-5-moe-dsa) | `GlmMoeDsaForCausalLM` |
+| ZAI / Zhipu AI | [GLM-5 / GLM-5.1 / GLM-5.2](/model-coverage/large-language-models/glm-5-moe-dsa) | `GlmMoeDsaForCausalLM` |
 | IBM | [Granite](/model-coverage/large-language-models/granite) | `GraniteForCausalLM` |
 | IBM | [Granite MoE](/model-coverage/large-language-models/granite-moe) | `GraniteMoeForCausalLM`, `GraniteMoeSharedForCausalLM` |
 | IBM | [Bamba](/model-coverage/large-language-models/bamba) | `BambaForCausalLM` |

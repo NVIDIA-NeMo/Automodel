@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import builtins
 import json
 import logging
 import os
@@ -71,6 +72,129 @@ def test_write_scalar_tensor(tmp_path):
     written = output_file.read_bytes()
     assert written == sub_tensor_bytes
     assert os.path.getsize(output_file) == element_size
+
+
+@pytest.mark.run_only_on("CPU")
+def test_consolidate_writes_output_safetensors_without_append(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    tensors = {"weight": torch.arange(4, dtype=torch.float32).reshape(2, 2)}
+    dcp_metadata = {"weight": {"saved_offsets": [0, 0]}}
+    save_file(
+        tensors,
+        input_dir / "model-00001-of-00001.safetensors",
+        metadata={CUSTOM_METADATA_KEY: json.dumps(dcp_metadata)},
+    )
+
+    output_file = output_dir / "model-00001-of-00001.safetensors"
+    real_open = builtins.open
+    output_modes: list[str] = []
+
+    def tracking_open(file, mode="r", *args, **kwargs):
+        if os.fspath(file) == os.fspath(output_file):
+            output_modes.append(mode)
+            if "a" in mode:
+                raise AssertionError(f"Output safetensors file was opened in append mode: {mode}")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+
+    consolidate_safetensors_files(
+        input_dir=str(input_dir),
+        output_dir=str(output_dir),
+        fqn_to_index_mapping={"weight": 1},
+    )
+
+    # Stop tracking before verifying output to avoid counting the read-open from load_file().
+    monkeypatch.setattr(builtins, "open", real_open)
+
+    output_tensors = load_file(output_file)
+    torch.testing.assert_close(output_tensors["weight"], tensors["weight"])
+    assert output_modes == ["wb"]
+
+
+@pytest.mark.run_only_on("CPU")
+def test_consolidate_preserves_semantics_for_multi_shard_outputs_without_append(tmp_path, monkeypatch):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    expected_tensors = {
+        "linear.weight": torch.arange(12, dtype=torch.float32).reshape(4, 3),
+        "norm.weight": torch.arange(4, dtype=torch.float32).to(torch.float16),
+    }
+    save_file(
+        {
+            "linear.weight": expected_tensors["linear.weight"][:2].contiguous(),
+            "norm.weight": expected_tensors["norm.weight"],
+        },
+        input_dir / "model-00001-of-00002.safetensors",
+        metadata={
+            CUSTOM_METADATA_KEY: json.dumps(
+                {
+                    "linear.weight": {"saved_offsets": [0, 0]},
+                    "norm.weight": {"saved_offsets": [0]},
+                }
+            )
+        },
+    )
+    save_file(
+        {"linear.weight": expected_tensors["linear.weight"][2:].contiguous()},
+        input_dir / "model-00002-of-00002.safetensors",
+        metadata={CUSTOM_METADATA_KEY: json.dumps({"linear.weight": {"saved_offsets": [2, 0]}})},
+    )
+
+    expected_weight_map = {
+        "linear.weight": "model-00001-of-00002.safetensors",
+        "norm.weight": "model-00002-of-00002.safetensors",
+    }
+    output_paths = {os.fspath(output_dir / file_name) for file_name in expected_weight_map.values()}
+    real_open = builtins.open
+    output_modes: dict[str, list[str]] = {}
+
+    def tracking_open(file, mode="r", *args, **kwargs):
+        file_path = os.fspath(file)
+        if file_path in output_paths:
+            output_modes.setdefault(os.path.basename(file_path), []).append(mode)
+            if "a" in mode:
+                raise AssertionError(f"Output safetensors file was opened in append mode: {mode}")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+
+    consolidate_safetensors_files(
+        input_dir=str(input_dir),
+        output_dir=str(output_dir),
+        fqn_to_index_mapping={"linear.weight": 1, "norm.weight": 2},
+        num_threads=2,
+    )
+
+    # Stop tracking before verifying output to avoid counting read-opens from load_file().
+    monkeypatch.setattr(builtins, "open", real_open)
+
+    output_tensors = {}
+    for file_name in expected_weight_map.values():
+        output_tensors.update(load_file(output_dir / file_name))
+
+    assert set(output_tensors) == set(expected_tensors)
+    for name, expected_tensor in expected_tensors.items():
+        assert output_tensors[name].shape == expected_tensor.shape
+        assert output_tensors[name].dtype is expected_tensor.dtype
+        torch.testing.assert_close(output_tensors[name], expected_tensor)
+
+    with open(output_dir / "model.safetensors.index.json", "r") as f:
+        index = json.load(f)
+    assert index["weight_map"] == expected_weight_map
+    expected_total_size = sum(tensor.numel() * tensor.element_size() for tensor in expected_tensors.values())
+    assert index["metadata"]["total_size"] == expected_total_size
+    assert output_modes == {
+        "model-00001-of-00002.safetensors": ["wb"],
+        "model-00002-of-00002.safetensors": ["wb"],
+    }
 
 
 @pytest.mark.run_only_on("CPU")
@@ -398,3 +522,31 @@ class TestStorageWriterFinishDiffusersCompatible:
 
         # Should not raise — returns before attempting consolidation or rename
         writer.finish(metadata=MagicMock(), results=[[]])
+
+    def test_finish_uses_direct_consolidation_by_default(self, tmp_path, monkeypatch):
+        consolidated_dir = tmp_path / "consolidated"
+        consolidated_dir.mkdir()
+        captured_kwargs = {}
+
+        def _fake(**kwargs):
+            captured_kwargs.update(kwargs)
+            index = os.path.join(kwargs["output_dir"], "model.safetensors.index.json")
+            with open(index, "w") as f:
+                json.dump({"weight_map": {}}, f)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.checkpoint._backports.hf_storage.consolidate_safetensors_files",
+            _fake,
+        )
+
+        writer = _HuggingFaceStorageWriter(
+            path=str(tmp_path / "shards"),
+            save_sharded=True,
+            consolidated_output_path=str(consolidated_dir),
+            diffusers_compatible=False,
+        )
+
+        writer.finish(metadata=MagicMock(), results=[[]])
+
+        assert captured_kwargs["use_staging"] is False
+        assert captured_kwargs["staging_dir"] is None

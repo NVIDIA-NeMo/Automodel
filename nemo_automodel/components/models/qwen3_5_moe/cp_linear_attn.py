@@ -654,8 +654,8 @@ def install_ssm_gate(mod, fp32_dtype=torch.float32):
 def _resolve_ssm_dtype(config):
     """Resolve the fp32 storage dtype for the SSM-gating params from ``config``.
 
-    Honors ``mamba_ssm_dtype`` (Qwen3.5 stores ``A_log``/``dt_bias`` in fp32);
-    defaults to ``torch.float32``.
+    Honors ``mamba_ssm_dtype`` when present; otherwise defaults to AutoModel's
+    fp32 training-storage contract for ``A_log``/``dt_bias``.
     """
     ssm_dtype = getattr(config, "mamba_ssm_dtype", None)
     if isinstance(ssm_dtype, str):

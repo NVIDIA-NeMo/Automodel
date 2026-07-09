@@ -25,7 +25,7 @@ Import them directly from those modules.
 """
 
 from nemo_automodel.components.speculative.eagle.backend import Eagle3TargetBackend
-from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule
+from nemo_automodel.components.speculative.eagle.core import Eagle3TrainerModule, simulated_accept_length
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
 from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
@@ -39,6 +39,7 @@ from nemo_automodel.components.speculative.eagle.registry import (
     resolve_eagle3_draft_spec,
 )
 from nemo_automodel.components.speculative.eagle.target import HFEagle3TargetModel
+from nemo_automodel.components.speculative.eagle.target_runner import RunnerEagle3TargetModel, TargetRunner
 from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
 
 __all__ = [
@@ -46,6 +47,8 @@ __all__ = [
     "Eagle3TrainerModule",
     "PEagleTrainerModule",
     "Eagle3TargetBackend",
+    "RunnerEagle3TargetModel",
+    "TargetRunner",
     "HFEagleTargetModel",
     "HFEagle3TargetModel",
     "LlamaEagleDraftModel",
@@ -56,4 +59,5 @@ __all__ = [
     "EAGLE3_DRAFT_REGISTRY",
     "resolve_eagle1_draft_spec",
     "resolve_eagle3_draft_spec",
+    "simulated_accept_length",
 ]

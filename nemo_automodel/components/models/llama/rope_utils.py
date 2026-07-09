@@ -169,7 +169,10 @@ class LlamaRotaryEmbedding(nn.Module):
         self.rope_fusion = rope_fusion
         self.dtype = getattr(config, "torch_dtype", None) or torch.float32
 
-        # Map rope types to their respective computation functions
+        # ``default`` and ``llama3`` have local fast-path implementations. Every
+        # other schedule (``yarn``, ``linear``, ``dynamic``, ``longrope``, ...)
+        # is delegated to transformers' canonical ``ROPE_INIT_FUNCTIONS`` so the
+        # frequencies and attention scaling match HuggingFace exactly.
         rope_functions = {
             "default": _compute_default_inv_freq,
             "llama3": _compute_llama3_inv_freq,
@@ -179,8 +182,19 @@ class LlamaRotaryEmbedding(nn.Module):
         _, rope_scaling = _get_rope_config(config)
         rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
 
-        # Fallback to llama3 as the robust default if type is not in our map
-        compute_fn = rope_functions.get(rope_type, _compute_llama3_inv_freq)
+        # Resolve the compute function. An unrecognised ``rope_type`` previously
+        # fell back silently to the llama3 NTK schedule, which yields wrong
+        # frequencies for YaRN/linear/dynamic configs -- a latent bug, e.g. for
+        # an EAGLE dense draft that inherits a YaRN target's ``rope_scaling``.
+        # Delegate such types to transformers instead of guessing.
+        compute_fn = rope_functions.get(rope_type)
+        if compute_fn is None:
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+            compute_fn = ROPE_INIT_FUNCTIONS.get(rope_type)
+            if compute_fn is None:
+                supported = sorted(set(rope_functions) | set(ROPE_INIT_FUNCTIONS))
+                raise ValueError(f"Unsupported RoPE rope_type={rope_type!r}; expected one of {supported}.")
         inv_freq, self.attention_scaling = compute_fn(config, device)
 
         # Keep the config + compute fn so ``_build_cache`` can recompute ``inv_freq``

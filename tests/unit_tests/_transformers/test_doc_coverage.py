@@ -45,6 +45,8 @@ _DOC_ARCH_ALIASES = {
     # Retrieval/bi-encoder variants of Llama, covered on the GritLM page.
     "LlamaBidirectionalForSequenceClassification": "GritLM",
     "LlamaBidirectionalModel": "GritLM",
+    # Multimodal retrieval variant covered by the existing NVIDIA Llama Nemotron embedding page.
+    "LlamaNemotronVLModel": "llama-nemotron-embed-1b-v2",
     # HF ships ``LlavaOnevisionForConditionalGeneration`` (lowercase "n");
     # registry uses ``LlavaOneVisionForConditionalGeneration`` (the NVIDIA
     # re-impl for LLaVA-OneVision-1.5 with RICE ViT).

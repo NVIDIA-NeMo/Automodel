@@ -24,10 +24,50 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
-from nemo_automodel.components.speculative.dflash.core import NoValidAnchorsError
+from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
+from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.recipes.llm import train_dflash
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
+
+_VOCAB = 64
+_HIDDEN = 32
+_MASK_ID = _VOCAB - 1
+_TARGET_LAYER_IDS = [1, 3, 5]
+
+
+def _dflash_draft():
+    cfg = Qwen3Config(
+        vocab_size=_VOCAB,
+        hidden_size=_HIDDEN,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=64,
+        attention_bias=False,
+        attention_dropout=0.0,
+        tie_word_embeddings=False,
+    )
+    cfg.num_target_layers = 8
+    cfg.block_size = 4
+    cfg.dflash_config = {"mask_token_id": _MASK_ID, "target_layer_ids": _TARGET_LAYER_IDS}
+    cfg._attn_implementation = "sdpa"
+    return Qwen3DFlashDraftModel(cfg)
+
+
+def _bare_dflash_recipe():
+    recipe = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    recipe.draft_model = _dflash_draft()
+    recipe.mask_token_id = _MASK_ID
+    recipe.block_size = 4
+    recipe.target_model = SimpleNamespace(
+        get_output_embeddings=lambda: torch.nn.Linear(_HIDDEN, _VOCAB, bias=False),
+        get_input_embeddings=lambda: torch.nn.Embedding(_VOCAB, _HIDDEN),
+    )
+    return recipe
 
 
 def _ckpt_self(ckpt_every_steps, save_every_epoch, global_step, total_optim_steps=None):
@@ -132,7 +172,7 @@ def _eval_self(trainer, num_batches):
         "attention_mask": torch.ones(1, 4, dtype=torch.long),
         "loss_mask": torch.ones(1, 4, dtype=torch.long),
     }
-    return SimpleNamespace(
+    obj = SimpleNamespace(
         val_dataloader=[dict(batch) for _ in range(num_batches)],
         device=torch.device("cpu"),
         trainer_module=trainer,
@@ -144,6 +184,11 @@ def _eval_self(trainer, num_batches):
             )
         ),
     )
+    # _run_eval routes the trainer call through the same _run_trainer_step seam as
+    # training (so subclasses inject their extra inputs); bind the base seam, which
+    # forwards (input_ids, hidden_states, loss_mask) to the trainer module.
+    obj._run_trainer_step = TrainDFlashRecipe._run_trainer_step.__get__(obj)
+    return obj
 
 
 def test_run_eval_returns_none_without_val_dataloader():
@@ -196,3 +241,71 @@ def test_all_ranks_have_valid_ddp_min_reduces_across_ranks(monkeypatch):
     # Every rank valid -> MIN leaves the 1 in place -> all run the backward.
     monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda t, op=None: None)
     assert train_dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is True
+
+
+def _load_extra_state_self(mask_token_id=7):
+    return SimpleNamespace(
+        runtime=SimpleNamespace(global_step=0),
+        _resume_epoch=0,
+        mask_token_id=mask_token_id,
+    )
+
+
+def _write_meta(tmp_path, **fields):
+    meta = {"global_step": 5, "epoch": 2, "block_size": 16, "target_layer_ids": [1, 2]}
+    meta.update(fields)
+    torch.save(meta, tmp_path / "dflash_meta.pt")
+    return str(tmp_path)
+
+
+def test_load_extra_state_restores_step_and_epoch(tmp_path):
+    ckpt_dir = _write_meta(tmp_path, mask_token_id=7)
+    obj = _load_extra_state_self(mask_token_id=7)
+    TrainDFlashRecipe._load_extra_state(obj, ckpt_dir)
+    assert obj.runtime.global_step == 5
+    assert obj._resume_epoch == 2
+
+
+def test_load_extra_state_raises_on_mask_token_id_mismatch(tmp_path):
+    """A resume YAML whose mask_token_id disagrees with the checkpoint must fail loudly."""
+    ckpt_dir = _write_meta(tmp_path, mask_token_id=7)
+    obj = _load_extra_state_self(mask_token_id=99)
+    with pytest.raises(ValueError, match="mask_token_id mismatch on resume"):
+        TrainDFlashRecipe._load_extra_state(obj, ckpt_dir)
+
+
+def test_load_extra_state_accepts_legacy_meta_without_mask_token_id(tmp_path):
+    """Checkpoints saved before mask_token_id was persisted skip the check."""
+    meta = {"global_step": 3, "epoch": 1}
+    torch.save(meta, tmp_path / "dflash_meta.pt")
+    obj = _load_extra_state_self(mask_token_id=99)
+    TrainDFlashRecipe._load_extra_state(obj, str(tmp_path))
+    assert obj.runtime.global_step == 3
+    assert obj._resume_epoch == 1
+
+
+def test_load_extra_state_noop_when_meta_missing(tmp_path):
+    obj = _load_extra_state_self(mask_token_id=7)
+    TrainDFlashRecipe._load_extra_state(obj, str(tmp_path))
+    assert obj.runtime.global_step == 0
+    assert obj._resume_epoch == 0
+
+
+def test_build_trainer_module_defaults_loss_decay_gamma_to_paper_value():
+    """Regression: an unset ``loss_decay_gamma`` used to fall back to ``None``
+    (uniform weighting, decay silently disabled) instead of the paper default
+    (Appendix A.1, matching ``DFlashDecayLoss``'s own default of 7.0)."""
+    recipe = _bare_dflash_recipe()
+    module = recipe._build_trainer_module("sdpa", {})
+    assert isinstance(module, DFlashTrainerModule)
+    assert module.loss_decay_gamma == 7.0
+
+
+def test_build_trainer_module_respects_explicit_loss_decay_gamma():
+    recipe = _bare_dflash_recipe()
+    module = recipe._build_trainer_module("sdpa", {"loss_decay_gamma": None})
+    assert module.loss_decay_gamma is None
+
+    recipe = _bare_dflash_recipe()
+    module = recipe._build_trainer_module("sdpa", {"loss_decay_gamma": 4.0})
+    assert module.loss_decay_gamma == 4.0

@@ -81,6 +81,7 @@ class TestCreatePipelineForwardInner:
 
         # Verify output type
         assert isinstance(output, BaseModelOutputWithPast)
+        assert isinstance(mock_model._pp_causal_mask_cache, dict)
 
     def test_forward_without_embeddings(self):
         # Create mock model without embeddings
@@ -100,6 +101,7 @@ class TestCreatePipelineForwardInner:
 
         # For PipelineStage, should return tensor directly
         assert isinstance(output, torch.Tensor)
+        assert isinstance(mock_model._pp_causal_mask_cache, dict)
 
     def test_forward_with_float_input_ids(self):
         # Test when input_ids is actually hidden states (float type)

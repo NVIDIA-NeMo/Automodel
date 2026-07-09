@@ -15,7 +15,7 @@ The latest Automodel container can be found: [here](https://catalog.ngc.nvidia.c
 The container can be run with the following docker command:
 
 ```bash
-docker run --gpus all --network=host -it --rm --shm-size=32g nvcr.io/nvidia/nemo-automodel:25.11.00 /bin/bash
+docker run --gpus all --network=host -it --rm --shm-size=32g nvcr.io/nvidia/nemo-automodel:26.06.00 /bin/bash
 ```
 
 #### Mounting local Automodel directory into the container
@@ -24,7 +24,7 @@ To sync local Automodel directory into the container, mount the local directory 
 Example docker command:
 
 ```bash
-docker run --gpus all --network=host -it --rm -v <local-Automodel-path>:/opt/Automodel --shm-size=32g nvcr.io/nvidia/nemo-automodel:25.11.00 /bin/bash
+docker run --gpus all --network=host -it --rm -v <local-Automodel-path>:/opt/Automodel --shm-size=32g nvcr.io/nvidia/nemo-automodel:26.06.00 /bin/bash
 ```
 
 Within the container, cd into `/opt/Automodel/` and update the pyproject.toml and uv.lock file by running the following command:

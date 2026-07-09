@@ -31,6 +31,11 @@ recipe_args:
   # removing padding waste. Set to seq_length (or larger); 0 disables.
   packed_sequence_size: 4096
 
+  # Cache the draft-vocab token mapping. The LoRA adaptation example
+  # (qwen3_eagle3_lora.yaml) warm-starts from this run and MUST train against
+  # this exact mapping, so it points selected_token_ids_path at this file.
+  selected_token_ids_path: ./outputs/eagle3_qwen3_8b_perfectblend/draft_token_map.pt
+
 optimizer:
   lr: 1.0e-4
   betas: [0.9, 0.95]

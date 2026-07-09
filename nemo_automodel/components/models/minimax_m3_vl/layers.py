@@ -112,63 +112,54 @@ class MiniMaxM3MLP(nn.Module):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
 
 
+# Cap the fp32 indexer-score tensor [B, H_idx, q_chunk, Tk] per chunk. At 128k with
+# cp_size=8 the full [B, H_idx, T_local, T_global] scores would be hundreds of GB
+# (the real long-context OOM, not FlexAttention) -- so select_sparse_blocks chunks
+# the query dim to keep each chunk's scores within this budget. No effect on small
+# (eager / 4k) cases, which fit in a single chunk.
+_SELECT_SCORE_BUDGET_BYTES = 2 * (1024**3)
+
+
 @torch.no_grad()
-def build_block_sparse_attn_bias(
+def _select_sparse_blocks_chunk(
     idx_q: torch.Tensor,
     idx_k: torch.Tensor,
+    q_positions: torch.Tensor,
     *,
     block_size: int,
     topk_blocks: int,
     init_blocks: int,
     local_blocks: int,
-    num_q_heads: int,
-    score_type: str = "max",
+    score_type: str,
 ) -> torch.Tensor:
-    """Build the additive block-sparse causal attention bias from index q/k.
-
-    Mirrors the sglang ``minimax_sparse`` selection (``block_size_q=1`` ->
-    per-query-position): the index score for (query ``i``, key ``j``) is
-    ``(idx_q[i] . idx_k[j]) * idx_dim**-0.5`` with causal masking; keys are
-    grouped into blocks of ``block_size`` and reduced per block (``max`` or
-    ``lse``). For each query, the current block (``local_blocks``) and the first
-    ``init_blocks`` are always kept and the remaining budget is filled with the
-    highest-scoring causal blocks, up to ``min(topk_blocks, valid_blocks)``.
-
-    Args:
-        idx_q: ``[B, T, H_idx, D]`` index queries (post norm + RoPE).
-        idx_k: ``[B, T, 1, D]`` shared index key (post norm + RoPE).
-        num_q_heads: number of main attention heads; the per-idx-head bias is
-            expanded ``num_q_heads // H_idx`` times (GQA, repeat-interleave).
-
-    Returns:
-        ``[B, num_q_heads, T, T]`` float bias (``0`` where attended, ``-inf``
-        otherwise). Non-differentiable (hard selection).
-    """
-    bsz, seqlen, h_idx, dim = idx_q.shape
+    """Block selection for one query chunk (see :func:`select_sparse_blocks`)."""
+    bsz, tq, h_idx, dim = idx_q.shape
+    tk = idx_k.shape[1]
     device = idx_q.device
     scale = dim**-0.5
+    neg_inf = float("-inf")
 
     q = idx_q.permute(0, 2, 1, 3).float()  # [B, H_idx, Tq, D]
     k = idx_k.permute(0, 2, 1, 3).float()  # [B, 1, Tk, D]
     scores = torch.matmul(q, k.transpose(-1, -2)) * scale  # [B, H_idx, Tq, Tk]
 
-    causal = torch.tril(torch.ones(seqlen, seqlen, dtype=torch.bool, device=device))
-    neg_inf = float("-inf")
-    scores = scores.masked_fill(~causal, neg_inf)
+    # Key-level causal: key j is visible to query i iff j <= global_pos(i).
+    kpos = torch.arange(tk, device=device)
+    causal_key = kpos[None, :] <= q_positions[:, None]  # [Tq, Tk]
+    scores = scores.masked_fill(~causal_key[None, None], neg_inf)
 
-    num_blocks = (seqlen + block_size - 1) // block_size
-    pad = num_blocks * block_size - seqlen
+    num_blocks = (tk + block_size - 1) // block_size
+    pad = num_blocks * block_size - tk
     if pad:
         scores = F.pad(scores, (0, pad), value=neg_inf)
-    scores = scores.view(bsz, h_idx, seqlen, num_blocks, block_size)
+    scores = scores.view(bsz, h_idx, tq, num_blocks, block_size)
     if score_type == "lse":
         block_score = torch.logsumexp(scores, dim=-1)
     else:  # "max"
         block_score = scores.amax(dim=-1)  # [B, H_idx, Tq, num_blocks]
 
-    qpos = torch.arange(seqlen, device=device)
     blk = torch.arange(num_blocks, device=device)
-    cur_block = qpos // block_size
+    cur_block = q_positions // block_size  # [Tq]
     valid_blocks = cur_block + 1  # causal: blocks [0, valid_blocks)
     causal_block = blk[None, :] < valid_blocks[:, None]  # [Tq, num_blocks]
     forced = ((blk[None, :] == cur_block[:, None]) & (local_blocks > 0)) | (blk[None, :] < init_blocks)
@@ -181,27 +172,147 @@ def build_block_sparse_attn_bias(
     topk_idx = sel.topk(k_eff, dim=-1).indices  # [B, H_idx, Tq, k_eff]
     block_sel = torch.zeros_like(block_score, dtype=torch.bool).scatter_(-1, topk_idx, True)
     block_sel = block_sel & causal_block[None, None]  # drop non-causal padding picks
+    return block_sel  # [B, H_idx, Tq, num_blocks]
 
+
+@torch.no_grad()
+def select_sparse_blocks(
+    idx_q: torch.Tensor,
+    idx_k: torch.Tensor,
+    *,
+    block_size: int,
+    topk_blocks: int,
+    init_blocks: int,
+    local_blocks: int,
+    score_type: str = "max",
+    q_positions: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Select, per query, which key blocks to attend to (DSA block top-k).
+
+    Mirrors the sglang ``minimax_sparse`` selection (``block_size_q=1`` ->
+    per-query-position): the index score for (query ``i``, key ``j``) is
+    ``(idx_q[i] . idx_k[j]) * idx_dim**-0.5`` with causal masking; keys are
+    grouped into blocks of ``block_size`` and reduced per block (``max`` or
+    ``lse``). For each query, the current block (``local_blocks``) and the first
+    ``init_blocks`` are always kept and the remaining budget is filled with the
+    highest-scoring causal blocks, up to ``min(topk_blocks, valid_blocks)``.
+
+    Queries and keys are decoupled so the same selection serves the eager square
+    case (``Tq == Tk``, ``q_positions`` defaulting to ``arange``) and the
+    context-parallel case (local queries ``Tq`` against the gathered global key
+    sequence ``Tk``, with ``q_positions`` giving each local query's global
+    position). Key block ``b`` spans key indices ``[b*block_size, ...)`` in the
+    (global) key order. The query dim is chunked so the fp32 score tensor stays
+    within ``_SELECT_SCORE_BUDGET_BYTES`` (the long-context memory bottleneck);
+    per-query independence makes chunking exact (concatenated along Tq).
+
+    Args:
+        idx_q: ``[B, Tq, H_idx, D]`` index queries (post norm + RoPE).
+        idx_k: ``[B, Tk, 1, D]`` shared index key (post norm + RoPE).
+        q_positions: ``[Tq]`` long global position of each query; defaults to
+            ``arange(Tq)`` (the eager square case).
+
+    Returns:
+        ``[B, H_idx, Tq, num_blocks]`` bool block-selection mask (causal +
+        forced init/local blocks + top-k). Non-differentiable (hard selection).
+    """
+    bsz, tq, h_idx, dim = idx_q.shape
+    tk = idx_k.shape[1]
+    device = idx_q.device
+    if q_positions is None:
+        q_positions = torch.arange(tq, device=device)
+    q_positions = q_positions.to(device=device, dtype=torch.long)
+
+    kwargs = dict(
+        block_size=block_size,
+        topk_blocks=topk_blocks,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        score_type=score_type,
+    )
+
+    bytes_per_query = max(1, bsz * h_idx * tk * 4)
+    q_chunk = max(1, min(tq, _SELECT_SCORE_BUDGET_BYTES // bytes_per_query))
+    if q_chunk >= tq:
+        return _select_sparse_blocks_chunk(idx_q, idx_k, q_positions, **kwargs)
+
+    chunks = [
+        _select_sparse_blocks_chunk(idx_q[:, s : s + q_chunk], idx_k, q_positions[s : s + q_chunk], **kwargs)
+        for s in range(0, tq, q_chunk)
+    ]
+    return torch.cat(chunks, dim=2)  # concat along Tq
+
+
+@torch.no_grad()
+def build_block_sparse_attn_mask(
+    idx_q: torch.Tensor,
+    idx_k: torch.Tensor,
+    *,
+    block_size: int,
+    topk_blocks: int,
+    init_blocks: int,
+    local_blocks: int,
+    num_q_heads: int,
+    score_type: str = "max",
+) -> torch.Tensor:
+    """Build the boolean ``[B, num_q_heads, T, T]`` block-sparse causal keep-mask.
+
+    Eager (i.e non-CP) path: selects blocks via :func:`select_sparse_blocks` over the
+    square sequence, expands the block selection to a per-key mask, intersects
+    with token-level causal, and returns a **boolean** keep-mask (``True`` where
+    attended) repeat-interleaved across GQA groups.
+
+    NOTE: returns a boolean mask, NOT an additive ``0``/``-inf`` bias. An additive
+    ``-inf`` bias is numerically unsafe under SDPA in bf16 -- it leaks past the mask
+    at early (few-key) positions, while ``finfo.min`` produces NaNs. SDPA masks
+    correctly with a boolean ``attn_mask`` (matching the CP path's FlexAttention
+    ``BlockMask``).
+
+    Args:
+        idx_q: ``[B, T, H_idx, D]`` index queries (post norm + RoPE).
+        idx_k: ``[B, T, 1, D]`` shared index key (post norm + RoPE).
+        num_q_heads: number of main attention heads; the per-idx-head mask is
+            expanded ``num_q_heads // H_idx`` times (GQA, repeat-interleave).
+    """
+    bsz, seqlen, h_idx, dim = idx_q.shape
+    device = idx_q.device
+
+    block_sel = select_sparse_blocks(
+        idx_q,
+        idx_k,
+        block_size=block_size,
+        topk_blocks=topk_blocks,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        score_type=score_type,
+    )  # [B, H_idx, T, num_blocks]
+
+    causal = torch.tril(torch.ones(seqlen, seqlen, dtype=torch.bool, device=device))
     key_sel = block_sel.repeat_interleave(block_size, dim=-1)[..., :seqlen]  # [B, H_idx, Tq, Tk]
     key_sel = key_sel & causal[None, None]
-    bias = torch.where(key_sel, 0.0, neg_inf).to(torch.float32)
 
     rep = num_q_heads // h_idx
-    return bias.repeat_interleave(rep, dim=1)  # [B, num_q_heads, Tq, Tk]
+    return key_sel.repeat_interleave(rep, dim=1)  # [B, num_q_heads, Tq, Tk] bool (True == attend)
 
 
-def _padding_mask_to_additive_bias(attention_mask: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-    """Convert an incoming attention mask to an additive key bias broadcastable to ``ref``.
+def _padding_mask_to_keep_mask(attention_mask: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """Convert an incoming padding mask to a boolean key keep-mask broadcastable to ``ref``.
 
-    Accepts a 2-D ``[B, T]`` keep-mask (1/True = attend) or an already-additive
-    float mask; returns ``0`` where attended and ``-inf`` where masked.
+    Accepts a 2-D ``[B, T]`` keep-mask (1/True = attend) or an already-boolean 4-D mask;
+    returns a boolean mask (``True`` where the key is attendable) to be AND-ed with the
+    block-sparse keep-mask. Boolean (not additive) so the eager SDPA path is bf16-safe --
+    see :func:`build_block_sparse_attn_mask`.
     """
     if attention_mask.is_floating_point() and attention_mask.dim() >= 3:
-        return attention_mask.to(ref.dtype)
+        raise ValueError(
+            "MiniMax M3 expects a padding keep-mask (2-D [B, T] keep-mask or 4-D bool); got a "
+            f"4-D float mask of shape {tuple(attention_mask.shape)}. Additive float masks are not "
+            "supported (they leak under bf16 SDPA -- see build_block_sparse_attn_mask)."
+        )
     mask = attention_mask
     if mask.dim() == 2:
-        mask = mask[:, None, None, :]  # [B, 1, 1, T] -> masks padded *keys*
-    return torch.where(mask.bool(), 0.0, float("-inf")).to(dtype=ref.dtype, device=ref.device)
+        mask = mask[:, None, None, :]  # [B, 1, 1, T] keep-mask -> masks padded *keys*
+    return mask.bool().to(device=ref.device)
 
 
 class MiniMaxM3Indexer(nn.Module):
@@ -251,7 +362,7 @@ class MiniMaxM3Indexer(nn.Module):
             cp_size=attn_kwargs.get("cp_size", 1),
             cp_rank=attn_kwargs.get("cp_rank", 0),
         )
-        return build_block_sparse_attn_bias(
+        return build_block_sparse_attn_mask(
             idx_q,
             idx_k,
             block_size=self.block_size,
@@ -346,6 +457,11 @@ class MiniMaxM3Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        # padding_mask / position_ids are only consumed by the CP-aware sparse
+        # subclass; drop them here so they never reach the indexer or the attention
+        # backend kwargs (eager path uses freqs_cis, not raw position_ids).
+        attn_kwargs.pop("padding_mask", None)
+        attn_kwargs.pop("position_ids", None)
         if len(x.shape) == 2:
             qkv_format = "thd"
             num_tokens = x.shape[0]
@@ -368,12 +484,13 @@ class MiniMaxM3Attention(nn.Module):
         if self.indexer is not None:
             if qkv_format != "bshd":
                 raise NotImplementedError("MiniMax M3 sparse attention currently supports bshd format only.")
-            sparse_bias = self.indexer(x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, **attn_kwargs)
+            sparse_keep = self.indexer(x, freqs_cis=freqs_cis, num_q_heads=self.num_heads, **attn_kwargs)
             # Preserve the caller's padding mask: padded keys must stay masked
-            # rather than becoming eligible for top-k block selection.
+            # rather than becoming eligible for top-k block selection. Boolean AND
+            # (not additive) so SDPA is bf16-safe -- see build_block_sparse_attn_mask.
             if attention_mask is not None:
-                sparse_bias = sparse_bias + _padding_mask_to_additive_bias(attention_mask, sparse_bias)
-            attention_mask = sparse_bias
+                sparse_keep = sparse_keep & _padding_mask_to_keep_mask(attention_mask, sparse_keep)
+            attention_mask = sparse_keep
 
         q, k = apply_rotary_emb_qk(
             q,
@@ -435,7 +552,19 @@ class Block(nn.Module):
                 f"MiniMax M3 sparse layer {layer_idx} has disable_index_value=0 (index value/output "
                 "projections), which is not supported (only the selection-only indexer is implemented)."
             )
-        self.self_attn = MiniMaxM3Attention(config, backend, is_sparse_attention_layer=is_sparse_attention_layer)
+        if is_sparse_attention_layer:
+            # Sparse layers use the CP-aware attention so context parallelism can
+            # rebuild a correct global-sequence block-sparse mask (FlexAttention).
+            # It delegates to the plain sparse forward when CP is off (_cp_mesh
+            # is None/size 1), so this is a no-op for non-CP runs. Lazy import
+            # breaks the layers <-> cp_sparse_attn import cycle.
+            from nemo_automodel.components.models.minimax_m3_vl.cp_sparse_attn import MiniMaxM3CPSparseAttention
+
+            self.self_attn = MiniMaxM3CPSparseAttention(
+                config, backend, is_sparse_attention_layer=is_sparse_attention_layer
+            )
+        else:
+            self.self_attn = MiniMaxM3Attention(config, backend, is_sparse_attention_layer=is_sparse_attention_layer)
 
         moe_layer_freq = getattr(config, "moe_layer_freq", None)
         self.is_moe_layer = True if moe_layer_freq is None else moe_layer_freq[layer_idx] != 0
@@ -466,12 +595,27 @@ class Block(nn.Module):
         **attn_kwargs: Any,
     ) -> torch.Tensor:
         if attention_mask is not None and padding_mask is None:
-            padding_mask = attention_mask.bool().logical_not()
+            # Derive a per-token [B, T] pad mask (True = pad) for the MoE router.
+            # Needed because packed sequences without CP pass a 4-D block-causal mask
+            # ([B, 1, T, T]) here, and the router needs a flat [B, T]; the old
+            # logical_not() left it 4-D and crashed the MoE (T*T vs T). (Under CP the
+            # mask is stripped before the model, so this only fires on packed-no-CP.)
+            # A 2-D mask is a keep/indexed mask ([B, T], non-zero = real). A packed
+            # block-causal mask is 4-D ([B, 1, T, T]); a token is real iff it attends
+            # itself (diagonal True), so pad tokens (all-False rows) -> True here.
+            if attention_mask.dim() >= 3:
+                diag = torch.diagonal(attention_mask.bool(), dim1=-2, dim2=-1)  # [..., T]
+                padding_mask = diag.reshape(attention_mask.shape[0], -1).logical_not()
+            else:
+                padding_mask = attention_mask.bool().logical_not()
 
         attn_out = self.self_attn(
             x=self.input_layernorm(x),
             freqs_cis=freqs_cis,
             attention_mask=attention_mask,
+            # Consumed by CP-aware sparse attention to mask interior pad keys after
+            # gathering CP shards; popped (ignored) by the eager attention forward.
+            padding_mask=padding_mask,
             **attn_kwargs,
         )
         x = x + attn_out

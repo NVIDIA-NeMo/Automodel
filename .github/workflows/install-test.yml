@@ -244,7 +244,7 @@ jobs:
         # flash-attn from source on every run (~2h+) and dominates CI wall-time.
         # Re-enable once a prebuilt flash-attn wheel is cached in the CUDA wheelhouse.
         # cc @ko3n1g @thomasdhc (oliver könig, Dong Hyuk Chang)
-        extra-groups: ["", "cuda", "vlm", "all"]
+        extra-groups: ["", "cuda", "vlm", "media", "all"]
     env:
       EXTRA: ${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
       WHEELHOUSE_DIR: /tmp/cuda-wheelhouse

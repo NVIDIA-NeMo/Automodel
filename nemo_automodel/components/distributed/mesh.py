@@ -190,6 +190,7 @@ class MeshContext:
         parallelism_sizes: ParallelismSizes | None = None,
         *,
         world_size: int | None = None,
+        timeout_minutes: int | None = None,
     ) -> "MeshContext":
         """Build a topology-only :class:`MeshContext` from parallelism sizes.
 
@@ -200,6 +201,8 @@ class MeshContext:
                 DP inferred from ``world_size``.
             world_size: Total process count. If ``None``, inferred from the
                 distributed environment.
+            timeout_minutes: Optional timeout for process groups created by
+                ``DeviceMesh`` axes.
         """
         if world_size is None:
             world_size = get_world_size_safe()
@@ -212,6 +215,7 @@ class MeshContext:
             strategy_config,
             parallelism_sizes,
             world_size=world_size,
+            timeout_minutes=timeout_minutes,
         )
         return cls.from_meshes(device_mesh, moe_mesh)
 

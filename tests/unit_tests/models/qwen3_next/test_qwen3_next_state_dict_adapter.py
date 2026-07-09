@@ -602,6 +602,20 @@ class TestFp32HolderKeyStripping:
         assert out[q_proj_key] is state_dict[q_proj_key]
         assert out[q_proj_key].dtype == torch.bfloat16
 
+    def test_forced_hf_dtype_mapping_marks_gdn_fp32_params(self):
+        adapter = self._make_adapter()
+        state_dict = {
+            "model.layers.0.linear_attn.A_log": torch.zeros(4, dtype=torch.float32),
+            "model.layers.0.linear_attn.dt_bias": torch.ones(4, dtype=torch.float32),
+            "model.layers.0.linear_attn.conv1d.weight": torch.zeros(4, dtype=torch.float32),
+            "model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2, dtype=torch.float32),
+        }
+
+        assert adapter.forced_hf_dtype_mapping(state_dict) == {
+            "model.layers.0.linear_attn.A_log": "F32",
+            "model.layers.0.linear_attn.dt_bias": "F32",
+        }
+
     def test_bare_key_unchanged(self):
         adapter = self._make_adapter()
         result = adapter.convert_single_tensor_to_hf("model.layers.0.linear_attn.A_log", torch.zeros(4))

@@ -33,6 +33,7 @@ model:
     _target_: nemo_automodel.components.models.common.BackendConfig
     rms_norm: torch_fp32
     linear: torch
+    dispatcher: torch
 
 compile:
   enabled: false

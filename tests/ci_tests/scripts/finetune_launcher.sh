@@ -21,6 +21,11 @@
 
 cd /opt/Automodel
 
+# VLM recipes need qwen-vl-utils/opencv from the opt-in vlm-media extra, kept out of the image.
+case "$CONFIG_PATH" in
+    *vlm_finetune*) uv pip install ".[vlm-media]" ;;
+esac
+
 CONFIG_RESOLVER="python3 /opt/Automodel/tests/ci_tests/scripts/config_resolver.py"
 TEST_DIR="$PIPELINE_DIR/$TEST_NAME"
 mkdir -p "$TEST_DIR"

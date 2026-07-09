@@ -122,4 +122,7 @@ optimizer:
 ci:
   time: "00:40:00"
   nodes: 8
+  cluster_tag: gb200
   ep_size: 16
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

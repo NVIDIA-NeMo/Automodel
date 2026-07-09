@@ -108,6 +108,10 @@ def _resolve_args(custom_args):
         model_path = custom_args["deploy_model_path"]
         adapter_path = custom_args.get("adapter_path")
 
+    # Normalize trailing slash so HF's dynamic-module cache name isn't empty (os.path.basename).
+    if isinstance(model_path, str):
+        model_path = model_path.rstrip("/") or model_path
+
     # -- tokenizer --
     if "tokenizer" in custom_args:
         tokenizer = custom_args["tokenizer"]
@@ -164,17 +168,25 @@ def test_vllm_greedy_matches_hf():
     if smoke_test:
         # Smoke test: just verify vLLM can load the model and generate non-empty output.
         # Uses native vLLM backend (no model_impl="transformers"), no HF comparison.
+        # tp = GPUs exposed by the launcher (CUDA_VISIBLE_DEVICES); 1 by default, more for large models.
+        tp_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
         if adapter_path is not None:
             from vllm.lora.request import LoRARequest
 
-            print(f"[vLLM smoke test] Loading model from {model_path} with enable_lora=True")
-            llm = LLM(model=model_path, enable_lora=True, max_lora_rank=64, trust_remote_code=trust_remote_code)
+            print(f"[vLLM smoke test] Loading model from {model_path} with enable_lora=True (tp={tp_size})")
+            llm = LLM(
+                model=model_path,
+                enable_lora=True,
+                max_lora_rank=64,
+                trust_remote_code=trust_remote_code,
+                tensor_parallel_size=tp_size,
+            )
             lora_request = LoRARequest("adapter", 1, adapter_path)
             sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
             vllm_results = llm.generate(PROMPTS, sampling_params, lora_request=lora_request)
         else:
-            print(f"[vLLM smoke test] Loading model from {model_path}")
-            llm = LLM(model=model_path, trust_remote_code=trust_remote_code)
+            print(f"[vLLM smoke test] Loading model from {model_path} (tp={tp_size})")
+            llm = LLM(model=model_path, trust_remote_code=trust_remote_code, tensor_parallel_size=tp_size)
             sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
             vllm_results = llm.generate(PROMPTS, sampling_params)
 

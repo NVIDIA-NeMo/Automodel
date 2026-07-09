@@ -33,7 +33,7 @@ case "$RECIPE_NAME" in
         MEDIA_TYPE="video"
         PROCESSOR="wan"
         GENERATE_CONFIG="examples/diffusion/generate/configs/generate_wan.yaml"
-        MODEL_NAME="Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        MODEL_NAME="Wan-AI/Wan2.1-T2V-14B-Diffusers"
         INFER_NUM_FRAMES=9
         PREPROCESS_EXTRA_ARGS=""
         ;;
@@ -74,6 +74,9 @@ if [[ "$RECIPE_NAME" == *_lora ]]; then
 fi
 echo "[config] Recipe=$RECIPE_NAME  MediaType=$MEDIA_TYPE  Processor=$PROCESSOR  Model=$MODEL_NAME  LoRA=$IS_LORA"
 
+# Video decodes via imageio-ffmpeg (opt-in diffusion-media extra, kept out of the image).
+DIFFUSION_EXTRAS="--extra diffusion --extra diffusion-media"
+
 # ============================================
 # Stage 1: Download dataset
 # ============================================
@@ -86,7 +89,7 @@ echo "[data] Resolving dataset..."
 echo "============================================"
 if [ "$MEDIA_TYPE" = "image" ]; then
     RAW_DATA_DIR="$DATA_DIR/raw"
-    uv run --extra diffusion python -c "
+    uv run $DIFFUSION_EXTRAS python -c "
 from datasets import load_dataset
 from pathlib import Path
 import json
@@ -109,7 +112,7 @@ with open(jsonl_path, 'w') as jf:
 print(f'Extracted {len(ds)} images to {out_dir}')
 "
 else
-    RAW_DATA_DIR=$(uv run --extra diffusion python -c "
+    RAW_DATA_DIR=$(uv run $DIFFUSION_EXTRAS python -c "
 from huggingface_hub import snapshot_download
 print(snapshot_download('modal-labs/dissolve', repo_type='dataset'))
 " | tail -n 1)
@@ -123,13 +126,13 @@ echo "============================================"
 echo "[preprocess] Converting ${MEDIA_TYPE}s to latents..."
 echo "============================================"
 if [ "$MEDIA_TYPE" = "image" ]; then
-    uv run --extra diffusion python -m tools.diffusion.preprocessing_multiprocess image \
+    uv run $DIFFUSION_EXTRAS python -m tools.diffusion.preprocessing_multiprocess image \
         --image_dir "$RAW_DATA_DIR" \
         --output_dir "$DATA_DIR/cache" \
         --processor "$PROCESSOR" \
         $PREPROCESS_EXTRA_ARGS
 else
-    uv run --extra diffusion python -m tools.diffusion.preprocessing_multiprocess video \
+    uv run $DIFFUSION_EXTRAS python -m tools.diffusion.preprocessing_multiprocess video \
         --video_dir "$RAW_DATA_DIR" \
         --output_dir "$DATA_DIR/cache" \
         --processor "$PROCESSOR" \
@@ -153,6 +156,7 @@ if grep -qE '^ddp:' "/opt/Automodel/${CONFIG_PATH}"; then
 fi
 
 CONFIG="--config /opt/Automodel/${CONFIG_PATH} \
+    --model.pretrained_model_name_or_path $MODEL_NAME \
     --data.dataloader.cache_dir $DATA_DIR/cache \
     --checkpoint.checkpoint_dir $CKPT_DIR \
     --step_scheduler.max_steps ${MAX_STEPS:-100} \
@@ -161,7 +165,7 @@ CONFIG="--config /opt/Automodel/${CONFIG_PATH} \
     ${DIST_OVERRIDE} \
     --wandb.mode disabled"
 
-CMD="uv run --extra diffusion torchrun --nproc-per-node=${NPROC_PER_NODE} \
+CMD="uv run $DIFFUSION_EXTRAS torchrun --nproc-per-node=${NPROC_PER_NODE} \
               --nnodes=${TEST_NODE_COUNT} \
               --rdzv_backend=c10d \
               --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
@@ -190,7 +194,7 @@ else
 fi
 
 if [ "$MEDIA_TYPE" = "image" ]; then
-    uv run --extra diffusion python examples/diffusion/generate/generate.py \
+    uv run $DIFFUSION_EXTRAS python examples/diffusion/generate/generate.py \
         --config "$GENERATE_CONFIG" \
         --model.pretrained_model_name_or_path "$MODEL_NAME" \
         $CKPT_FLAG "$CKPT_STEP_DIR" \
@@ -206,7 +210,7 @@ if [ "$MEDIA_TYPE" = "image" ]; then
         exit 1
     fi
 else
-    uv run --extra diffusion python examples/diffusion/generate/generate.py \
+    uv run $DIFFUSION_EXTRAS python examples/diffusion/generate/generate.py \
         --config "$GENERATE_CONFIG" \
         --model.pretrained_model_name_or_path "$MODEL_NAME" \
         $CKPT_FLAG "$CKPT_STEP_DIR" \

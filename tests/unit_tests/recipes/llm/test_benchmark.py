@@ -180,7 +180,7 @@ class TestBenchmarkingRecipeInitialization:
 
         with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
             with patch("transformers.AutoConfig.from_pretrained", return_value=mock_model_config):
-                recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
+                BenchmarkingRecipeForNextTokenPrediction(mock_config)
 
                 assert mock_config.dataset.vocab_size == 50257
 
@@ -225,6 +225,31 @@ class TestBenchmarkingRecipeInitialization:
             assert vocab_size == 163840
             mock_autoconfig.assert_called_once_with("moonshotai/Kimi-K2-Base", trust_remote_code=True)
 
+    def test_infer_vocab_size_retries_layer_type_validation_error(self, mock_config):
+        """Step-style MTP metadata should not prevent benchmark vocab inference."""
+        model_cfg = ConfigNamespace(
+            trust_remote_code=True,
+            config=ConfigNamespace(
+                _target_="transformers.AutoConfig.from_pretrained",
+                pretrained_model_name_or_path="stepfun-ai/Step-3.5-Flash",
+            ),
+        )
+        model_config = MagicMock(spec=["vocab_size"])
+        model_config.vocab_size = 151936
+        validation_error = ValueError("num_hidden_layers must equal layer_types")
+
+        with (
+            patch(
+                "transformers.AutoConfig.from_pretrained",
+                side_effect=[validation_error, model_config],
+            ) as mock_autoconfig,
+            patch("nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator") as relax,
+        ):
+            assert _infer_vocab_size(model_cfg) == 151936
+
+        relax.assert_called_once()
+        assert mock_autoconfig.call_count == 2
+
     def test_infer_vocab_size_method_target(self, mock_config):
         """`_target_` resolved to a classmethod (e.g. `Class.from_pretrained`) should be invoked directly."""
         mock_model_config = MagicMock(spec=["vocab_size"])
@@ -264,7 +289,7 @@ class TestBenchmarkingRecipeInitialization:
     def test_init_sets_batch_size_from_scheduler(self, mock_config):
         """Test that batch_size is set from step_scheduler."""
         with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
-            recipe = BenchmarkingRecipeForNextTokenPrediction(mock_config)
+            BenchmarkingRecipeForNextTokenPrediction(mock_config)
 
             assert mock_config.dataset.batch_size == 4
 
@@ -537,7 +562,7 @@ class TestBenchmarkingRecipeHelpers:
 
         with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
             with pytest.raises(AttributeError):
-                recipe = BenchmarkingRecipeForNextTokenPrediction(config_without_benchmark)
+                BenchmarkingRecipeForNextTokenPrediction(config_without_benchmark)
 
 
 @pytest.mark.usefixtures("patch_torch_distributed_for_benchmark")
@@ -611,7 +636,14 @@ class TestBenchmarkingRecipeWandBIntegration:
             mock_recipe._log_iteration_metrics("iteration", ga_steps=4, peak_tflops=989, rank=0, iteration=10)
 
             # Verify wandb logging was called with correct parameters
-            expected_timer_names = ["iteration", "optimizer", "forward_backward_0", "forward_backward_1", "forward_backward_2", "forward_backward_3"]
+            expected_timer_names = [
+                "iteration",
+                "optimizer",
+                "forward_backward_0",
+                "forward_backward_1",
+                "forward_backward_2",
+                "forward_backward_3",
+            ]
             mock_recipe.timers.write_to_wandb.assert_called_once_with(
                 names=expected_timer_names,
                 writer=mock_recipe.wandb_run,

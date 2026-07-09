@@ -78,7 +78,7 @@ distributed:
     dtype: bf16
 
 freeze_config:
-  freeze_vision_tower: false
+  freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
 
@@ -115,6 +115,7 @@ optimizer:
   weight_decay: 0.1
 
 ci:
+  time: "00:15:00"
   env_vars:
     MAX_STEPS: 10
 

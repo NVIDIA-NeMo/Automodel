@@ -127,3 +127,51 @@ def test_eagle_trainer_runs_and_backprops():
         if p.requires_grad
     )
     assert has_grad, "expected at least one parameter to receive a non-zero gradient"
+
+
+def test_compute_logits_gathers_sharded_dtensor_target_lm_head():
+    """The token-loss head must work when the target lm_head is an FSDP2 ``DTensor``.
+
+    The EAGLE-1/2 recipe can FSDP2-shard the target (its ``distributed:`` path for
+    targets that do not fit on one GPU), making ``lm_head.weight`` a ``DTensor``
+    while the DDP draft produces plain ``hidden_states``. ``compute_logits`` must
+    gather the weight first; otherwise ``F.linear`` raises a mixed Tensor/DTensor
+    error.
+    """
+    import torch.distributed as dist
+    import torch.nn as nn
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    if not dist.is_available():
+        import pytest
+
+        pytest.skip("torch.distributed is not available")
+
+    already_initialized = dist.is_initialized()
+    if not already_initialized:
+        dist.init_process_group(backend="gloo", rank=0, world_size=1, store=dist.HashStore())
+    try:
+        torch.manual_seed(0)
+        target_model = _build_tiny_target()
+        target_model.requires_grad_(False)
+        draft_model = _build_tiny_draft_model()
+
+        mesh = init_device_mesh("cpu", (1,))
+        full_weight = target_model.lm_head.weight.detach().clone()
+        sharded_weight = distribute_tensor(target_model.lm_head.weight.detach(), mesh, [Shard(0)])
+        # A ``DTensor`` is a ``torch.Tensor`` subclass, so it can back a Parameter;
+        # this reproduces what FSDP2 leaves on ``lm_head.weight`` after sharding.
+        target_model.lm_head.weight = nn.Parameter(sharded_weight, requires_grad=False)
+        assert hasattr(target_model.lm_head.weight, "full_tensor")
+
+        trainer = EagleTrainerModule(draft_model, target_lm_head=target_model.lm_head)
+
+        hidden_states = torch.randn(2, 6, draft_model.config.hidden_size)
+        logits = trainer.compute_logits(hidden_states)
+
+        assert torch.isfinite(logits).all()
+        torch.testing.assert_close(logits, torch.nn.functional.linear(hidden_states, full_weight))
+    finally:
+        if not already_initialized:
+            dist.destroy_process_group()

@@ -48,6 +48,19 @@ logger = logging.getLogger(__name__)
 
 _HAS_SGLANG_PG, _init_custom_process_group = safe_import_from("sglang.srt.utils.common", "init_custom_process_group")
 
+
+def nccl_transport_available() -> bool:
+    """Whether GPU-direct NCCL transfer is usable in this process.
+
+    NCCL transfer relies on sglang's ``init_custom_process_group``; without
+    sglang (e.g. a training client that intentionally keeps sglang out of its
+    env) NCCL cannot work and callers should use the wire fallback. Checking
+    this *before* asking the server to set up its NCCL side avoids leaving the
+    server blocked on a rendezvous the client can never complete.
+    """
+    return _HAS_SGLANG_PG
+
+
 # dtypes NCCL P2P does not support; transmitted as raw uint8 views.
 _NCCL_UNSUPPORTED_DTYPES = {torch.int16, torch.int8, torch.bool}
 _ELEMENT_SIZE = {torch.int16: 2, torch.int8: 1, torch.bool: 1}

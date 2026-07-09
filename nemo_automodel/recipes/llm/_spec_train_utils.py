@@ -24,6 +24,67 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from typing import Any
+
+import torch.nn as nn
+
+from nemo_automodel.components.quantization.fp8 import apply_fp8_to_model, build_fp8_config
+from nemo_automodel.components.utils.compile_utils import build_compile_config, compile_module_inplace
+
+
+def apply_draft_fp8(draft_model: nn.Module, cfg_fp8: Any) -> None:
+    """Optionally convert the draft's ``nn.Linear`` layers to torchao ``Float8Linear``, in place.
+
+    ``cfg_fp8`` is the recipe's top-level ``fp8:`` YAML block (dict-like, same
+    surface as the SFT recipe's -- see ``FP8Config``). No-op when the block is
+    absent or ``enabled`` is false. Modifies the draft in place (never
+    reassign ``self.draft_model`` -- ``BaseRecipe.__setattr__`` rejects
+    re-tracking an ``nn.Module`` attribute). Must be called before the draft is
+    wrapped (DDP / ``fully_shard``) so the swapped modules are what gets
+    replicated or sharded.
+    """
+    if cfg_fp8 is None:
+        return
+    apply_fp8_to_model(draft_model, config=build_fp8_config(cfg_fp8))
+
+
+def apply_draft_compile(draft_model: nn.Module, cfg_compile: Any) -> None:
+    """Optionally ``torch.compile`` the draft in place (top-level ``compile:`` block).
+
+    Same YAML surface as the SFT recipes (``CompileConfig``); no-op when the
+    block is absent or ``enabled`` is false. Uses ``nn.Module.compile()`` so
+    the draft object and its state-dict keys are unchanged (the recipes track
+    the module by reference and checkpoint it directly). Must run after
+    ``apply_draft_fp8`` so inductor traces the swapped ``Float8Linear``
+    modules: fp8's cast/scale ops only pay off once fused into the GEMM
+    prologue, and in eager mode fp8 is typically slower than bf16.
+    """
+    if cfg_compile is None:
+        return
+    compile_module_inplace(draft_model, build_compile_config(cfg_compile))
+
+
+def raise_if_peft_configured(cfg: Any, recipe_name: str) -> None:
+    """Fail fast on EAGLE-3-only draft knobs set on a recipe that does not support them.
+
+    ``peft:``: the DFlash-family and DSpark drafts register trainable non-LoRA
+    modules on the draft itself (Domino's ``prefix_gru``/``embed_proj``, DSpark's
+    Markov and confidence heads); LoRA's freeze-everything-but-adapters contract
+    would silently freeze them, so reject the config instead of ignoring it.
+    ``recipe_args.draft_weights_path``: only the EAGLE-3 recipe implements the
+    warm-start load; a silently ignored knob would train from random init while
+    the user believes the draft was warm-started.
+    """
+    if cfg.get("peft", None) is not None:
+        raise ValueError(
+            f"peft is not supported by {recipe_name}; LoRA draft training is only available in the EAGLE-3 recipe."
+        )
+    recipe_args = cfg.get("recipe_args", None)
+    if recipe_args is not None and recipe_args.get("draft_weights_path", None):
+        raise ValueError(
+            f"recipe_args.draft_weights_path is not supported by {recipe_name}; the draft warm start is only "
+            "available in the EAGLE-3 recipe."
+        )
 
 
 def optim_steps_per_epoch(num_batches_per_epoch: int, grad_accumulation_steps: int) -> int:

@@ -45,7 +45,8 @@ def _resident_compute_dtypes(model, mp_policy, fp32_compute_module_names, monkey
     """
     calls: list[tuple[nn.Module, torch.dtype]] = []
 
-    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy):
+    def fake_fully_shard(mod, *, mesh, mp_policy, offload_policy, reshard_after_forward=None):
+        del reshard_after_forward
         calls.append((mod, mp_policy.param_dtype if mp_policy is not None else None))
 
     # Patch only fully_shard; the real _fully_shard (incl. ModuleList expansion)

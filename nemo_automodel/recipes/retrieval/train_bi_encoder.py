@@ -25,6 +25,7 @@ import torch.nn.functional as F
 import wandb
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -324,10 +325,12 @@ class TrainBiEncoderRecipe(BaseRecipe):
             logger=logger,
         )
 
+        # Might be tokenizer or processor (for VLMs)
         self.tokenizer = self.cfg.tokenizer.instantiate()
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            self.tokenizer.padding_side = "left"
+        tokenizer = self.tokenizer.tokenizer if isinstance(self.tokenizer, ProcessorMixin) else self.tokenizer
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = self.tokenizer.eos_token
+            tokenizer.padding_side = "left"
 
         self.dataloader = build_dataloader(
             self.cfg.dataloader,
@@ -445,6 +448,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
 
         with train_ctx, sync_ctx:
+            if is_train:
+                if query is not None:
+                    query["run_dummy_vision"] = False
+                if passage is not None:
+                    passage["run_dummy_vision"] = True
             q_reps = model(query)
             p_reps = model(passage)
             attr_model = _unwrap_model_for_attrs(model)

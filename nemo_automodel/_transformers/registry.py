@@ -122,6 +122,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.llama_bidirectional.model", "LlamaBidirectionalModel", {"retrieval"}),
         ),
         (
+            "LlamaNemotronVLModel",
+            ("nemo_automodel.components.models.llama_nemotron_vl.model", "LlamaNemotronVLModel", {"retrieval"}),
+        ),
+        (
             "LlamaForCausalLM",
             ("nemo_automodel.components.models.llama.model", "LlamaForCausalLM"),
         ),

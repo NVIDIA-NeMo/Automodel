@@ -48,12 +48,14 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
 from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
@@ -61,8 +63,11 @@ from nemo_automodel.recipes.base_recipe import (
     _resolve_restore_from_to_ckpt_dir,
 )
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_compile,
+    apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
+    raise_if_peft_configured,
     should_sync_grads,
 )
 
@@ -94,6 +99,23 @@ def _all_ranks_have_valid(local_has_valid: int, is_ddp: bool, device) -> bool:
     return bool(flag.item())
 
 
+def _submesh_or_none(device_mesh, name: str):
+    """Return the named (flattened) submesh, or None if absent / no mesh.
+
+    Uses ``get_flat_mesh`` so ``_flatten()``-created axes ("dp") resolve across
+    torch versions. The "dp" axis excludes "tp", so keying the draft DDP group,
+    the dataloader sampler, and the checkpointer dp_rank on it replicates the
+    draft across tensor-parallel ranks (every TP rank in a draft replica sees the
+    same batch).
+    """
+    if device_mesh is None:
+        return None
+    try:
+        return get_flat_mesh(device_mesh, name)
+    except KeyError:
+        return None
+
+
 class TrainDFlashRecipe(BaseRecipe):
     """Recipe for DFlash draft-model training on Qwen3-style dense / MoE targets."""
 
@@ -110,6 +132,7 @@ class TrainDFlashRecipe(BaseRecipe):
 
         recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
+        raise_if_peft_configured(self.cfg, type(self).__name__)
 
         target_path = recipe_cfg.target_model_name_or_path
         target_config = AutoConfig.from_pretrained(
@@ -123,19 +146,7 @@ class TrainDFlashRecipe(BaseRecipe):
         )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
-        target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
-        target_kwargs = {}
-        if target_attn_implementation is not None:
-            target_kwargs["attn_implementation"] = target_attn_implementation
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
-            target_path,
-            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
-            torch_dtype=self.compute_dtype,
-            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
-            **target_kwargs,
-        )
-        self.target_model.to(self.device)
-        self.target_model.requires_grad_(False)
+        self.target_model = self._build_target_model(recipe_cfg, target_path)
 
         # Resolve the captured target layers once and share them between the
         # target wrapper (what to capture) and the draft config (the ``fc`` input
@@ -146,7 +157,7 @@ class TrainDFlashRecipe(BaseRecipe):
             recipe_cfg.get("target_layer_ids", None)
             or build_target_layer_ids(num_target_layers, draft_num_hidden_layers)
         )
-        self.target_wrapper = HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids)
+        self.target_wrapper = self._build_target_wrapper(target_layer_ids)
 
         self.block_size = int(recipe_cfg.get("block_size", 16))
         self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_config.vocab_size)
@@ -162,6 +173,7 @@ class TrainDFlashRecipe(BaseRecipe):
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            dp_mesh=self.dp_mesh,
         )
         self.val_dataloader = None
         if recipe_cfg.get("val_data_path", None):
@@ -176,6 +188,7 @@ class TrainDFlashRecipe(BaseRecipe):
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                dp_mesh=self.dp_mesh,
             )
 
         # DFlash draft config: a small non-causal Qwen3 stack that reuses the
@@ -190,10 +203,7 @@ class TrainDFlashRecipe(BaseRecipe):
         draft_config["max_window_layers"] = draft_num_hidden_layers
         draft_config["num_target_layers"] = num_target_layers
         draft_config["block_size"] = self.block_size
-        draft_config["dflash_config"] = {
-            "mask_token_id": self.mask_token_id,
-            "target_layer_ids": target_layer_ids,
-        }
+        draft_config["dflash_config"] = self._build_dflash_config(recipe_cfg, target_layer_ids)
         # A single knob drives both the trainer's mask format and the draft's
         # attention function -- they must agree (a flex BlockMask only works with
         # the flex attention fn, a dense bool mask only with sdpa/eager).
@@ -201,24 +211,25 @@ class TrainDFlashRecipe(BaseRecipe):
         draft_config_obj = Qwen3Config.from_dict(draft_config)
         draft_config_obj._attn_implementation = attention_backend
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede the DDP wrap.
+        apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
+        # Optional torch.compile of the draft, in place; after the fp8 swap.
+        apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
 
-        trainer_module = DFlashTrainerModule(
-            draft_model=self.draft_model,
-            target_lm_head=self.target_model.get_output_embeddings(),
-            target_embed_tokens=self.target_model.get_input_embeddings(),
-            mask_token_id=self.mask_token_id,
-            block_size=self.block_size,
-            attention_backend=attention_backend,
-            num_anchors=int(recipe_cfg.get("num_anchors", 512)),
-            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
-        ).to(self.device)
+        trainer_module = self._build_trainer_module(attention_backend, recipe_cfg).to(self.device)
         if self.dist_env.world_size > 1:
+            # The frozen target lm_head / embed_tokens are held as non-registered
+            # references on the trainer, so DDP only sees the plain draft params
+            # (no sharded DTensor params to broadcast). The draft's gradient
+            # all-reduce is restricted to the "dp" sub-axis (see
+            # ``_draft_ddp_process_group``).
             trainer_module = DistributedDataParallel(
                 trainer_module,
                 device_ids=[self.device.index] if self.device.type == "cuda" else None,
                 output_device=self.device.index if self.device.type == "cuda" else None,
                 broadcast_buffers=False,
                 find_unused_parameters=False,
+                process_group=self._draft_ddp_process_group(),
             )
         self.trainer_module = trainer_module
 
@@ -263,6 +274,96 @@ class TrainDFlashRecipe(BaseRecipe):
         self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)), ranked=self.dist_env.world_size > 1)
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
+
+    def _build_target_model(self, recipe_cfg, target_path: str) -> torch.nn.Module:
+        """Load the frozen (optionally tensor-parallel) target model.
+
+        With a ``distributed:`` section and ``tp_size>1`` the target is sharded
+        in place by ``from_pretrained`` (its FSDP2 parallelize plan); the small
+        draft stays replicated and runs DDP over the "dp" axis (which excludes
+        "tp"), and the trainer module gathers the target's vocab-sharded lm_head
+        / embed_tokens outputs. Absent, the original single-GPU-per-rank DP path
+        is used. Sets ``self.dist_setup`` / ``self.device_mesh`` / ``self.dp_mesh``
+        as a side effect and returns the (grad-disabled) target.
+        """
+        target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
+        target_kwargs = dict(
+            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
+            torch_dtype=self.compute_dtype,
+            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+        )
+        if target_attn_implementation is not None:
+            target_kwargs["attn_implementation"] = target_attn_implementation
+        self.dist_setup = None
+        self.device_mesh = None
+        self.dp_mesh = None
+        if self.cfg.get("distributed", None) is not None:
+            self.dist_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+            self.device_mesh = self.dist_setup.mesh_context.device_mesh
+            self.dp_mesh = _submesh_or_none(self.device_mesh, "dp")
+            target_kwargs["distributed_setup"] = self.dist_setup
+        target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        if self.dist_setup is None:
+            # ``nn.Module.to`` is in-place; the sharded path is already placed by
+            # ``from_pretrained``.
+            target_model.to(self.device)
+        target_model.requires_grad_(False)
+        return target_model
+
+    def _draft_ddp_process_group(self):
+        """Process group for the draft's gradient all-reduce.
+
+        With tensor parallelism the draft is replicated across tp ranks, so a
+        full-world all-reduce would average duplicate gradients; restrict it to
+        the "dp" sub-axis (which excludes tp) so it reduces only across real data
+        replicas. Without a mesh (tp_size=1) ``dp_mesh`` is None -> return None ->
+        the default full-world group, unchanged.
+        """
+        if self.dp_mesh is not None and self.dp_mesh.size() < self.dist_env.world_size:
+            return self.dp_mesh.get_group()
+        return None
+
+    def _build_target_wrapper(self, target_layer_ids: list[int]) -> HFDFlashTargetModel:
+        """Build the frozen-target hidden-state capture wrapper.
+
+        Subclasses override to capture extra teacher signals (e.g. JetSpec also
+        captures the target logits for its forward-KL distillation).
+        """
+        return HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids)
+
+    def _build_dflash_config(self, recipe_cfg, target_layer_ids: list[int]) -> dict:
+        """Build the draft ``dflash_config`` block. Subclasses extend it (e.g. Domino)."""
+        return {
+            "mask_token_id": self.mask_token_id,
+            "target_layer_ids": target_layer_ids,
+        }
+
+    def _build_trainer_module(self, attention_backend: str, recipe_cfg):
+        """Build the trainer wrapper. Subclasses override to swap the wrapper (e.g. Domino)."""
+        return DFlashTrainerModule(
+            draft_model=self.draft_model,
+            target_lm_head=self.target_model.get_output_embeddings(),
+            target_embed_tokens=self.target_model.get_input_embeddings(),
+            mask_token_id=self.mask_token_id,
+            block_size=self.block_size,
+            attention_backend=attention_backend,
+            num_anchors=int(recipe_cfg.get("num_anchors", 512)),
+            # Paper default (Appendix A.1) for the shipped block_size=16 configs;
+            # matches DFlashDecayLoss's own default. Set null explicitly in YAML
+            # to disable the position decay (uniform weighting).
+            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", 7.0),
+        )
+
+    def _run_trainer_step(self, target_batch):
+        """Run one trainer-module forward. Subclasses override to inject extra inputs (e.g. lambda_base)."""
+        return self.trainer_module(
+            input_ids=target_batch.input_ids,
+            hidden_states=target_batch.hidden_states,
+            loss_mask=target_batch.loss_mask,
+        )
+
+    def _log_extra_train_metrics(self, epoch_idx: int) -> None:
+        """Hook for subclasses to log extra per-step metrics at a log point (no-op here)."""
 
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
@@ -318,7 +419,15 @@ class TrainDFlashRecipe(BaseRecipe):
             ckpt_kwargs["model_state_dict_keys"] = draft_state_dict_keys
 
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
-        dp_rank = dist.get_rank() if dist.is_initialized() else 0
+        # The draft is replicated (never TP-sharded), so key the checkpoint shard
+        # on the dp coordinate -- identical for every tp rank in a replica --
+        # rather than the global rank. dp_mesh is None without a mesh (tp_size=1)
+        # -> global rank, unchanged. tp_rank stays 0 (the draft is not sharded).
+        dp_rank = (
+            self.dp_mesh.get_local_rank()
+            if getattr(self, "dp_mesh", None) is not None
+            else (dist.get_rank() if dist.is_initialized() else 0)
+        )
         self.checkpointer = Checkpointer(
             config=self.checkpoint_config, dp_rank=dp_rank, tp_rank=0, pp_rank=0, moe_mesh=None
         )
@@ -472,12 +581,28 @@ class TrainDFlashRecipe(BaseRecipe):
         self._load_extra_state(ckpt_dir)
 
     def _load_extra_state(self, ckpt_dir: str) -> None:
-        """Restore DFlash meta: global_step and epoch."""
+        """Restore DFlash meta: global_step and epoch, and validate mask_token_id."""
         meta_path = os.path.join(ckpt_dir, "dflash_meta.pt")
         if os.path.exists(meta_path):
             meta = torch.load(meta_path, weights_only=False, map_location="cpu")
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
+            # ``mask_token_id`` comes only from the resume YAML (it is not
+            # restored from the checkpoint); the draft's ``embed_tokens`` row at
+            # that id is the learned "predict here" signal and the inference
+            # runtime fills block slots with the same id. A resume YAML whose
+            # ``mask_token_id`` disagrees with the trained one silently points the
+            # mask slots at an untrained embedding row and degrades acceptance
+            # with no error, so fail loudly on a mismatch. Legacy checkpoints
+            # saved before this field existed (``None``) skip the check.
+            saved_mask_token_id = meta.get("mask_token_id", None)
+            if saved_mask_token_id is not None and int(saved_mask_token_id) != int(self.mask_token_id):
+                raise ValueError(
+                    f"mask_token_id mismatch on resume: the checkpoint at {ckpt_dir} was trained with "
+                    f"mask_token_id={int(saved_mask_token_id)}, but recipe_args.mask_token_id="
+                    f"{int(self.mask_token_id)}. The draft's mask-slot embedding was learned at the "
+                    f"checkpoint's id; set recipe_args.mask_token_id={int(saved_mask_token_id)} to resume."
+                )
 
     def _log_saved_checkpoint(self, kind: str, epoch: int, step: int) -> None:
         """Log a saved checkpoint on rank 0 when checkpointing is enabled."""
@@ -531,11 +656,9 @@ class TrainDFlashRecipe(BaseRecipe):
                     loss_mask=batch["loss_mask"],
                 )
                 try:
-                    metrics = self.trainer_module(
-                        input_ids=target_batch.input_ids,
-                        hidden_states=target_batch.hidden_states,
-                        loss_mask=target_batch.loss_mask,
-                    )
+                    # Route through the same seam as training so subclass-specific
+                    # inputs (Domino's lambda_base, JetSpec's target_logits) are wired.
+                    metrics = self._run_trainer_step(target_batch)
                 except NoValidAnchorsError:
                     # Every sample in this micro-batch is too short to form a block;
                     # skip it without counting, mirroring the training loop.
@@ -596,11 +719,7 @@ class TrainDFlashRecipe(BaseRecipe):
                     with sync_ctx:
                         local_has_valid = 1
                         try:
-                            metrics = self.trainer_module(
-                                input_ids=target_batch.input_ids,
-                                hidden_states=target_batch.hidden_states,
-                                loss_mask=target_batch.loss_mask,
-                            )
+                            metrics = self._run_trainer_step(target_batch)
                             loss = metrics.loss / self.grad_accumulation_steps
                         except NoValidAnchorsError:
                             # Every sample in this micro-batch is too short to form a
@@ -658,6 +777,7 @@ class TrainDFlashRecipe(BaseRecipe):
                                 avg_acc,
                                 current_lr,
                             )
+                            self._log_extra_train_metrics(epoch_idx)
                             running_loss = 0.0
                             running_acc = 0.0
                             running_micro = 0

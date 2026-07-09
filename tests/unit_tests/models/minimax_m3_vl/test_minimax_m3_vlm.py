@@ -158,6 +158,31 @@ def test_vlm_splices_vision_features_via_reference(vlm_model):
     assert torch.allclose(mine, ref, atol=1e-4), (mine - ref).abs().max().item()
 
 
+def test_prepare_model_inputs_for_cp(vlm_model):
+    """CP pre-embed path (Phase 1): ``model(_pre_embed_only=True, ...)`` returns spliced
+    ``inputs_embeds`` identical to the inline embed+splice, and feeding it back through the
+    model reproduces the direct multimodal logits. This is what lets the recipe splice
+    vision into embeddings BEFORE context-parallel sequence sharding."""
+    assert hasattr(vlm_model, "prepare_model_inputs_for_cp")
+    pixel_values, grid_thw, n_tokens = _make_image_inputs(vlm_model)
+    ids = torch.randint(2, 99, (1, 16))
+    ids[0, 5 : 5 + n_tokens] = IMAGE_TOKEN_INDEX
+    hidden = vlm_model.config.text_config.hidden_size
+    with torch.no_grad():
+        prepared = vlm_model(ids, pixel_values=pixel_values, image_grid_thw=grid_thw, _pre_embed_only=True)
+        assert isinstance(prepared, dict) and set(prepared) == {"inputs_embeds"}
+        embeds = prepared["inputs_embeds"]
+        assert embeds.shape == (1, 16, hidden) and torch.isfinite(embeds).all()
+        # (a) equals the reference embed + vision splice
+        ref_embeds = vlm_model.model.embed_tokens(ids).clone()
+        ref_embeds[ids == IMAGE_TOKEN_INDEX] = _ref_vision(vlm_model, pixel_values, grid_thw).to(ref_embeds.dtype)
+        assert torch.allclose(embeds.float(), ref_embeds.float(), atol=1e-4)
+        # (b) feeding the pre-embedded inputs back == the direct multimodal forward
+        via_preembed = vlm_model(inputs_embeds=embeds).float()
+        direct = vlm_model(ids, pixel_values=pixel_values, image_grid_thw=grid_thw).float()
+    assert torch.allclose(via_preembed, direct, atol=1e-4), (via_preembed - direct).abs().max().item()
+
+
 def test_vlm_adapter_roundtrip_and_naming(vlm_model):
     adapter = vlm_model.state_dict_adapter
     native = {k: v.clone() for k, v in vlm_model.state_dict().items()}

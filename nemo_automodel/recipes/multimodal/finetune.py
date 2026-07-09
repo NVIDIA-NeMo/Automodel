@@ -336,6 +336,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         artifact_path: str | None,
         stage: int,
         rank_seed: int,
+        init_seed: int,
         freeze_before_infrastructure: bool = False,
     ):
         """Build BAGEL from HF backbones and apply the configured infrastructure."""
@@ -388,7 +389,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 load_base_model=False,
                 freeze_config=freeze_cfg.to_dict() if freeze_cfg is not None else None,
             )
-            initialize_bagel_non_backbone_weights(model)
+            initialize_bagel_non_backbone_weights(model, seed=init_seed)
             load_bagel_hf_backbone_weights(model, self.cfg.model)
         return model
 
@@ -438,7 +439,8 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
             raise NotImplementedError("Pipeline parallelism is not supported for FinetuneRecipeForMultimodal.")
 
         # -- RNG ----------------------------------------------------------
-        # BAGEL uses a ranked seed: seed = global_seed * world_size + rank.
+        # Runtime RNG is ranked: seed = global_seed * world_size + rank.
+        # BAGEL-owned model weights use global_seed below so initialization is topology independent.
         # PackedDataset applies its own worker reseed at iter-time.
         self.global_seed = int(self.cfg.get("seed", 4396))
         self.data_seed = int(self.cfg.get("dataset.data_seed", 42))
@@ -510,6 +512,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 artifact_path=artifact_path,
                 stage=stage,
                 rank_seed=rank_seed,
+                init_seed=self.global_seed,
             )
         elif model_init_mode == "auto":
             from nemo_automodel.recipes.vlm.finetune import build_model as build_vlm_model
@@ -551,6 +554,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                     artifact_path=artifact_path,
                     stage=stage,
                     rank_seed=rank_seed,
+                    init_seed=self.global_seed,
                     freeze_before_infrastructure=True,
                 )
                 _maybe_resize_bagel_vocab(

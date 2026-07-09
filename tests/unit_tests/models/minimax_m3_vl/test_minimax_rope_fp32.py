@@ -25,8 +25,12 @@ restored to fp32. Runs on CPU.
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
-from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig, MiniMaxM3VLTextConfig
+from nemo_automodel.components.models.minimax_m3_vl.model import (
+    MiniMaxM3SparseForCausalLM,
+    MiniMaxM3SparseForConditionalGeneration,
+)
 
 _TINY_TEXT = dict(
     hidden_size=64,
@@ -116,4 +120,25 @@ def test_initialize_weights_bf16_keeps_vision_inv_freq_fp32():
         assert dtype == torch.float32, f"rotary buffer {name} was cast to {dtype}, expected float32"
 
     assert model.vision_tower.vision_model.inv_freq.dtype == torch.float32
+    assert model.lm_head.weight.dtype == torch.bfloat16
+
+
+def test_cast_bf16_keeps_router_correction_bias_fp32():
+    config = MiniMaxM3VLTextConfig(torch_dtype="float32", **_TINY_TEXT)
+    model = MiniMaxM3SparseForCausalLM(config, backend=_cpu_backend()).eval()
+    expected = {}
+    for name, buf in model.named_buffers():
+        if name.endswith("e_score_correction_bias"):
+            values = torch.linspace(0.00123, 0.00456, buf.numel(), dtype=torch.float32).reshape_as(buf)
+            buf.copy_(values)
+            expected[name] = values
+
+    assert expected, "MiniMax M3 should create router correction-bias buffers"
+
+    cast_model_to_dtype(model, torch.bfloat16)
+
+    buffers = dict(model.named_buffers())
+    for name, values in expected.items():
+        assert buffers[name].dtype == torch.float32
+        torch.testing.assert_close(buffers[name], values)
     assert model.lm_head.weight.dtype == torch.bfloat16

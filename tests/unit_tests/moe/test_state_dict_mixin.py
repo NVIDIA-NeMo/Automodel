@@ -895,3 +895,45 @@ class TestInplaceLoadViews:
         assert "model.layers.0.mlp.experts.gate_and_up_projs" not in out
         assert "model.layers.0.mlp.experts.down_projs" not in out
         assert mixin._inplace_loaded_native_keys == set()
+
+    def test_inplace_load_skips_when_backend_experts_is_te_gate_and_up(self):
+        # GroupedExpertsTE (backend.experts == "te") exposes gate_and_up_projs as a
+        # torch.stack copy of per-expert weights that does not alias the model's grouped
+        # storage. Even for a DTensor source the in-place path must not engage, otherwise
+        # the copy_ would write the throwaway and the experts would never be loaded.
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+        mixin.backend.experts = "te"
+        local_storage = torch.randn(2, 1024, 1024)
+        splits = [local_storage[i] for i in range(2)]
+        mock_dtensor = Mock()
+
+        result = self._run_inplace_conversion(
+            mixin, "model.layers.0.mlp.experts.gate_and_up_projs", mock_dtensor, splits
+        )
+
+        assert result is not None
+        for _, v in result:
+            assert v.is_contiguous(), "experts=='te' must emit contiguous copies, not in-place views"
+        assert not hasattr(mixin, "_inplace_loaded_native_keys") or (
+            "model.layers.0.mlp.experts.gate_and_up_projs" not in (mixin._inplace_loaded_native_keys or set())
+        )
+
+    def test_inplace_load_skips_when_backend_experts_is_te_down_projs(self):
+        # Same non-aliasing reason as the gate_and_up case, for the down_projs branch.
+        mixin = MockMoEStateDictMixin(n_experts=2, inter_dim=512)
+        mixin.backend.experts = "te"
+        local_storage = torch.randn(2, 512, 1024)
+        splits = [local_storage[i] for i in range(2)]
+        mock_dtensor = Mock(spec=["ndim", "shape", "is_meta"])
+        mock_dtensor.ndim = 3
+        mock_dtensor.shape = (2, 512, 1024)
+        mock_dtensor.is_meta = False
+
+        result = self._run_inplace_conversion(mixin, "model.layers.3.mlp.experts.down_projs", mock_dtensor, splits)
+
+        assert result is not None and len(result) == 2
+        for _, v in result:
+            assert v.is_contiguous(), "experts=='te' must emit contiguous copies, not in-place views"
+        assert not hasattr(mixin, "_inplace_loaded_native_keys") or (
+            "model.layers.3.mlp.experts.down_projs" not in (mixin._inplace_loaded_native_keys or set())
+        )
