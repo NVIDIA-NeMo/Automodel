@@ -43,6 +43,11 @@ from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
+from nemo_automodel.components.attention.utils import (
+    initialize_attn_module_and_func,
+    postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
+)
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -77,7 +82,8 @@ class Qwen2Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.rope_fusion = getattr(backend, "rope_fusion", False)
+        self.backend = backend or BackendConfig()
+        self.rope_fusion = self.backend.rope_fusion
 
         # Separate projections -- same layout as HuggingFace default Qwen2
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=True)
@@ -86,6 +92,18 @@ class Qwen2Attention(nn.Module):
 
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+        if self.backend.attn == "te":
+            # BSHD continues through the HuggingFace attention interface; this
+            # module is selected only for packed THD batches.
+            self._te_thd_only = True
+            self.attn_module, self.attn_func = initialize_attn_module_and_func(
+                attn_impl="te",
+                num_attention_heads=config.num_attention_heads,
+                num_qk_channels=self.head_dim,
+                num_v_channels=self.head_dim,
+                softmax_scale=self.scaling,
+                num_gqa_groups=config.num_key_value_heads,
+            )
 
     def forward(
         self,
@@ -96,6 +114,30 @@ class Qwen2Attention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run Qwen2 attention over padded BSHD or packed THD states.
+
+        Args:
+            hidden_states: Hidden states ``[B, S, H]`` or packed local states
+                ``[T, H]``. ``B`` is batch, ``S`` is sequence, ``T`` is local
+                total tokens, and ``H`` is hidden size.
+            position_embeddings: RoPE tensors ``(cos, sin)`` or fused
+                ``(cos, sin, freqs_cis)``. Local tensors use ``[B, S, D]`` or
+                ``[T, D]`` and the fused raw table uses ``[S, 1, 1, D]``.
+            attention_mask: Padded attention mask for BSHD; THD uses cumulative
+                document lengths from ``kwargs``.
+            past_key_values: Optional BSHD KV cache; unsupported for THD.
+            cache_position: Optional BSHD cache positions ``[S]``.
+            **kwargs: THD requires ``qkv_format='thd'`` and ``cu_seqlens``
+                ``[N + 1]``; CP additionally supplies ``cp_size`` and ``cp_rank``.
+
+        Returns:
+            Attention output shaped like ``hidden_states`` and optional BSHD
+            attention weights. THD returns ``None`` for the weights.
+        """
+        is_thd = kwargs.get("qkv_format") == "thd"
+        if is_thd and hidden_states.ndim != 2:
+            raise ValueError(f"THD attention requires hidden_states [T, H], got {tuple(hidden_states.shape)}.")
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -103,16 +145,48 @@ class Qwen2Attention(nn.Module):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
-        query_states = q.view(hidden_shape).transpose(1, 2)
-        key_states = k.view(hidden_shape).transpose(1, 2)
-        value_states = v.view(hidden_shape).transpose(1, 2)
+        if is_thd:
+            query_states = q.view(hidden_shape)
+            key_states = k.view(hidden_states.shape[0], -1, self.head_dim)
+            value_states = v.view(hidden_states.shape[0], -1, self.head_dim)
+        else:
+            query_states = q.view(hidden_shape).transpose(1, 2)
+            key_states = k.view(*input_shape, -1, self.head_dim).transpose(1, 2)
+            value_states = v.view(*input_shape, -1, self.head_dim).transpose(1, 2)
 
         if self.rope_fusion and len(position_embeddings) == 3:
             cos, sin, freqs_cis = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb_fused(query_states, key_states, freqs_cis)
+            query_states, key_states = apply_rotary_pos_emb_fused(
+                query_states,
+                key_states,
+                freqs_cis,
+                cu_seqlens=kwargs.get("cu_seqlens"),
+                cp_size=kwargs.get("cp_size", 1),
+                cp_rank=kwargs.get("cp_rank", 0),
+            )
         else:
             cos, sin = position_embeddings[:2]
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if is_thd:
+            if past_key_values is not None:
+                raise ValueError("Packed THD attention does not support past_key_values.")
+            attn_module = getattr(self, "attn_module", None)
+            if attn_module is None:
+                raise ValueError("Packed THD attention requires backend.attn='te'.")
+            window_size = (-1, 0) if self.sliding_window is None else (self.sliding_window, 0)
+            query_states, key_states, value_states, te_kwargs = preprocess_args_and_kwargs_for_attn(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                "te",
+                window_size=window_size,
+                **kwargs,
+            )
+            attn_output = attn_module(query_states, key_states, value_states, **te_kwargs)
+            attn_output = postprocess_output_for_attn(attn_output, "te")
+            return self.o_proj(attn_output.flatten(1)), None
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -286,6 +360,27 @@ class Qwen2Model(Qwen2PreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
+        """Run the Qwen2 decoder in padded BSHD or packed THD layout.
+
+        Args:
+            input_ids: Token IDs ``[B, S]`` or packed local IDs ``[T]``.
+            attention_mask: Optional padded mask ``[B, S]``. THD uses packed
+                document boundaries instead.
+            position_ids: Position IDs ``[B, S]`` or packed local IDs ``[T]``.
+            past_key_values: Optional BSHD generation cache; unsupported for THD.
+            inputs_embeds: Alternative hidden inputs ``[B, S, H]`` or ``[T, H]``.
+            use_cache: Whether to update the BSHD KV cache.
+            output_attentions: Whether to request attention outputs.
+            output_hidden_states: Whether to retain per-layer hidden states.
+            return_dict: Whether to return ``BaseModelOutputWithPast``.
+            cache_position: Optional BSHD cache positions ``[S]``.
+            **kwargs: THD metadata including ``qkv_format``, ``cu_seqlens``,
+                ``max_seqlen``, ``cp_size``, and ``cp_rank``.
+
+        Returns:
+            Decoder output with final states ``[B, S, H]`` or packed local
+            states ``[T, H]`` and requested hidden-state tensors in that layout.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -299,20 +394,35 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if use_cache and past_key_values is None:
+        is_thd = kwargs.get("qkv_format") == "thd"
+        if is_thd and inputs_embeds.ndim != 2:
+            raise ValueError(f"THD model input must be [T, H], got {tuple(inputs_embeds.shape)}.")
+        if is_thd:
+            use_cache = False
+            if past_key_values is not None:
+                raise ValueError("Packed THD training does not support past_key_values.")
+
+        if not is_thd and use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
-        if cache_position is None:
+        if not is_thd and cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            if is_thd:
+                if kwargs.get("cp_size", 1) > 1:
+                    raise ValueError("THD context parallelism requires explicit position_ids.")
+                position_ids = torch.arange(inputs_embeds.shape[0], device=inputs_embeds.device)
+            else:
+                position_ids = cache_position.unsqueeze(0)
 
         # Create masks (Qwen2 supports sliding window attention)
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
+        if is_thd:
+            causal_mask_mapping = {"full_attention": None, "sliding_attention": None}
+        elif not isinstance(causal_mask_mapping := attention_mask, dict):
             mask_kwargs = {
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
@@ -327,7 +437,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(
+            hidden_states,
+            position_ids,
+            qkv_format="thd" if is_thd else "bshd",
+            cp_size=kwargs.get("cp_size", 1),
+        )
 
         all_hidden_states = () if output_hidden_states else None
 
@@ -383,7 +498,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = True
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = False
 
@@ -448,12 +563,60 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
-        """Forward pass returning CausalLMOutputWithPast."""
+        """Run causal LM projection for BSHD or packed THD inputs.
+
+        Args:
+            input_ids: Token IDs ``[B, S]`` or packed local IDs ``[T]``.
+            attention_mask: Optional padded mask. THD uses ``cu_seqlens``.
+            position_ids: Position IDs ``[B, S]`` or packed local IDs ``[T]``.
+            past_key_values: Optional BSHD KV cache; unsupported for THD.
+            inputs_embeds: Optional hidden inputs ``[B, S, H]`` or ``[T, H]``.
+            labels: Optional labels ``[B, S]`` or packed ``[T]``.
+            use_cache: Whether to update the BSHD KV cache.
+            output_attentions: Whether to request attention outputs.
+            output_hidden_states: Whether to return per-layer hidden states.
+            return_dict: Whether to return ``CausalLMOutputWithPast``.
+            cache_position: Optional BSHD cache positions ``[S]``.
+            logits_to_keep: Positions to project from hidden size ``H`` to
+                vocabulary size ``V``.
+            **kwargs: THD metadata. ``cu_seqlens`` is ``[N + 1]`` and CP adds
+                ``cp_size`` and ``cp_rank``.
+
+        Returns:
+            Causal LM output with BSHD logits ``[B, S, V]``. Packed local
+            logits are restored to ``[1, T, V]``.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        is_thd = kwargs.get("qkv_format") == "thd"
+        if is_thd:
+            if position_ids is None:
+                raise ValueError("Packed THD input requires position_ids.")
+            kwargs.pop("padding_mask", None)
+            if input_ids is not None and input_ids.ndim > 1:
+                input_ids = input_ids.squeeze(0)
+            if position_ids.ndim > 1:
+                position_ids = position_ids.squeeze(0)
+            for key, value in kwargs.items():
+                if not isinstance(value, torch.Tensor):
+                    continue
+                if key == "max_seqlen":
+                    kwargs[key] = value.item()
+                    continue
+                if value.ndim > 1:
+                    value = value.squeeze(0)
+                if key in ("cu_seqlens", "cu_seqlens_padded"):
+                    value = value[value != -1000].contiguous()
+                kwargs[key] = value
+            if inputs_embeds is not None and inputs_embeds.ndim > 2:
+                inputs_embeds = inputs_embeds.squeeze(0)
+            if labels is not None and labels.ndim > 1:
+                labels = labels.squeeze(0)
+            attention_mask = None
 
         # Always use return_dict internally so we can reliably access fields.
         outputs: BaseModelOutputWithPast = self.model(
@@ -472,10 +635,12 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
 
         hidden_states = outputs.last_hidden_state
 
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd).logits
 
         loss = None
         if labels is not None:
+            if is_thd and labels.ndim == 1:
+                labels = labels.unsqueeze(0)
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
         out = CausalLMOutputWithPast(

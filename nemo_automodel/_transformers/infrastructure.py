@@ -374,6 +374,17 @@ def _uses_te_attention(model) -> bool:
     return False
 
 
+def _uses_thd_only_te_attention(model) -> bool:
+    """Return whether TE is restricted to packed THD attention on this model."""
+    model_parts = model.parts if hasattr(model, "parts") else [model]
+    return any(
+        getattr(module, "_te_thd_only", False)
+        for part in model_parts
+        for name, module in part.named_modules()
+        if name.endswith("self_attn")
+    )
+
+
 #  apply_model_infrastructure  --  the main post-init orchestration function
 def apply_model_infrastructure(
     model,
@@ -645,7 +656,8 @@ def apply_model_infrastructure(
                 else:
                     raise
 
-    # Attach CP attention-mask hooks for dense (non-TE) context parallelism.
+    # Configure dense context parallelism. Transformer Engine owns its THD
+    # communication, while SDPA uses DTensor context-parallel hooks.
     # These hooks strip attention_mask and set is_causal=True on self_attn modules
     # so that SDPA handles causal masking internally (compatible with DTensor sharding).
     #
@@ -656,20 +668,30 @@ def apply_model_infrastructure(
     # and clobber the model-owned ring (the original double-apply bug). Non-TE MoE
     # is not excluded by the _uses_te_attention check, so gate on ep_size: only
     # dense (non-MoE) models need this pass.
-    if mesh.cp_size > 1 and mesh.ep_size <= 1 and not _uses_te_attention(model):
+    if mesh.cp_size > 1 and mesh.ep_size <= 1:
         from nemo_automodel.components.distributed.cp_utils import (
             attach_context_parallel_hooks,
             attach_cp_sdpa_hooks,
+            attach_te_context_parallel,
         )
 
-        is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
-        cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
-
         model_parts = model.parts if hasattr(model, "parts") else [model]
-        for mp in model_parts:
-            attach_context_parallel_hooks(mp)
-            if is_compile_enabled:
-                attach_cp_sdpa_hooks(mp, cp_mesh)
+        uses_te_attention = _uses_te_attention(model)
+        if uses_te_attention:
+            cp_mesh = mesh.device_mesh["cp"]
+            configured = sum(attach_te_context_parallel(mp, cp_mesh) for mp in model_parts)
+            if configured == 0:
+                raise ValueError(
+                    "Context parallelism selected Transformer Engine attention, but no "
+                    "DotProductAttention modules were found on the model."
+                )
+        if not uses_te_attention or _uses_thd_only_te_attention(model):
+            is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
+            cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
+            for mp in model_parts:
+                attach_context_parallel_hooks(mp)
+                if is_compile_enabled:
+                    attach_cp_sdpa_hooks(mp, cp_mesh)
 
     # Frozen submodules (e.g. a frozen vision tower) either land in the root FSDP unit
     # (sharded) or are excluded from wrapping, depending on the model/parallelizer. In

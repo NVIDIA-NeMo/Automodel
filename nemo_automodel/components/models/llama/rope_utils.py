@@ -52,10 +52,14 @@ def apply_rotary_pos_emb(
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
-        q: Query tensor [batch, num_heads, seq_len, head_dim]
-        k: Key tensor [batch, num_kv_heads, seq_len, head_dim]
-        cos: Cosine embeddings [batch, seq_len, head_dim]
-        sin: Sine embeddings [batch, seq_len, head_dim]
+        q: Query tensor ``[B, Hq, S, D]`` in BSHD attention layout or
+            ``[T, Hq, D]`` in packed THD layout. ``B`` is batch, ``S`` is
+            sequence, ``T`` is total local tokens, ``Hq`` is query heads, and
+            ``D`` is head dimension.
+        k: Key tensor ``[B, Hkv, S, D]`` or ``[T, Hkv, D]``, where ``Hkv`` is
+            key/value heads.
+        cos: Cosine embeddings ``[B, S, D]`` or ``[T, D]``.
+        sin: Sine embeddings ``[B, S, D]`` or ``[T, D]``.
 
     Returns:
         Rotated (q, k) tensors
@@ -71,18 +75,50 @@ def apply_rotary_pos_emb_fused(
     q: torch.Tensor,
     k: torch.Tensor,
     freqs_cis: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    cp_size: int = 1,
+    cp_rank: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Applies RoPE using TE's fused kernel.
 
     Args:
-        q: Query tensor [batch, num_heads, seq_len, head_dim]
-        k: Key tensor [batch, num_kv_heads, seq_len, head_dim]
-        freqs_cis: Raw angles [seq_len, 1, 1, head_dim] in TE format
+        q: Query tensor ``[B, Hq, S, D]`` or packed ``[T, Hq, D]``.
+        k: Key tensor ``[B, Hkv, S, D]`` or packed ``[T, Hkv, D]``.
+        freqs_cis: Global raw-angle table ``[S, 1, 1, D]`` in TE format.
+        cu_seqlens: Packed-document cumulative lengths ``[N + 1]``. Required
+            for THD, where ``N`` is the number of packed documents.
+        cp_size: Number of context-parallel ranks partitioning ``T``.
+        cp_rank: Rank within the context-parallel mesh.
 
     Returns:
-        Rotated (q, k) tensors
+        Rotated tensors with the same local shapes and storage ownership as
+        ``q`` and ``k``.
     """
     from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb as te_apply_rope
+
+    if q.ndim == 3:
+        if cu_seqlens is None:
+            raise ValueError("Packed THD fused RoPE requires cu_seqlens.")
+        q = te_apply_rope(
+            q,
+            freqs_cis,
+            tensor_format="thd",
+            fused=True,
+            cu_seqlens=cu_seqlens,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+        )
+        k = te_apply_rope(
+            k,
+            freqs_cis,
+            tensor_format="thd",
+            fused=True,
+            cu_seqlens=cu_seqlens,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+        )
+        return q, k
 
     # TE expects bshd format: [batch, seq, heads, head_dim]
     q_bshd = q.permute(0, 2, 1, 3)
@@ -245,7 +281,10 @@ class LlamaRotaryEmbedding(nn.Module):
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        qkv_format: str = "bshd",
+        cp_size: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return (cos, sin) for the given positions.
 
         In the non-fused path ``cos`` / ``sin`` are gathered by the *values* in
@@ -264,19 +303,35 @@ class LlamaRotaryEmbedding(nn.Module):
         ``position_ids``.
 
         Args:
-            x: Input tensor (used for device and dtype)
-            position_ids: Position IDs tensor [batch, seq_len]
+            x: Hidden states ``[B, S, H]`` or packed ``[T, H]``; used for
+                device placement. ``H`` is hidden size.
+            position_ids: Position IDs ``[B, S]`` or packed local IDs ``[T]``.
+            qkv_format: ``"bshd"`` for padded batches or ``"thd"`` for a
+                packed total-token layout.
+            cp_size: Context-parallel size. For fused THD RoPE, the cached raw
+                frequency table spans the global token count ``T * cp_size``.
 
         Returns:
-            (cos, sin) tensors [batch, seq_len, head_dim]
+            Cosine and sine tensors ``[B, S, D]`` or ``[T, D]``. When fused
+            RoPE is enabled, the tuple also carries a global raw-frequency
+            table ``[S, 1, 1, D]`` as its third item.
         """
+        if qkv_format not in ("bshd", "thd"):
+            raise ValueError(f"Unsupported qkv_format={qkv_format!r}; expected 'bshd' or 'thd'.")
+
         if self.rope_fusion:
             # The fused TE kernel indexes raw angles by sequence position and
             # assumes contiguous ``[0, seq_len)`` positions, so it only needs the
             # cache sized to ``seq_len`` -- and must avoid the ``position_ids``
             # host-device sync below on this default GPU training path.
             seq_len = position_ids.shape[-1]
-            self._ensure_cache(seq_len, x.device)
+            global_seq_len = seq_len * cp_size if qkv_format == "thd" else seq_len
+            self._ensure_cache(global_seq_len, x.device)
+            if qkv_format == "thd":
+                flat_position_ids = position_ids.reshape(-1)
+                cos = self._cos_cache[flat_position_ids]
+                sin = self._sin_cache[flat_position_ids]
+                return cos, sin, self._freqs_cache[:global_seq_len]
             cos = self._cos_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
             sin = self._sin_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
             return cos, sin, self._freqs_cache[:seq_len]
