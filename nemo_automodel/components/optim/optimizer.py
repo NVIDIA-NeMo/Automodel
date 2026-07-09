@@ -67,6 +67,26 @@ _DTYPE_FIELDS = ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype")
 # ---------------------------------------------------------------------------
 
 
+def _get_trainable_params_or_raise(part: torch.nn.Module) -> list[torch.nn.Parameter]:
+    trainable_params = [p for p in part.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable parameters found for optimizer build; expected at least one parameter.")
+    return trainable_params
+
+
+def _require_callable_factory(
+    factory: Callable[..., torch.optim.Optimizer] | None,
+) -> Callable[..., torch.optim.Optimizer]:
+    if not callable(factory):
+        raise TypeError("OptimizerFromFactoryConfig.factory must be a callable")
+    return factory
+
+
+# ---------------------------------------------------------------------------
+# Typed optimizer configs
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class OptimizerConfig:
     """Base optimizer config.
@@ -110,8 +130,7 @@ class OptimizerConfig:
         foreach = _foreach_for_mesh(device_mesh)
         optimizers: list[torch.optim.Optimizer] = []
         for part in getattr(model, "parts", [model]):
-            trainable_params = [p for p in part.parameters() if p.requires_grad]
-            assert len(trainable_params) > 0, "trainable_params cannot be empty"
+            trainable_params = _get_trainable_params_or_raise(part)
             optimizers.append(self._build_optimizer(trainable_params, foreach=foreach))
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
@@ -368,7 +387,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         device_mesh: DeviceMesh | None = None,
         is_peft: bool = False,
     ) -> list[torch.optim.Optimizer]:
-        assert callable(self.factory), "OptimizerFromFactoryConfig.factory must be a callable"
+        factory = _require_callable_factory(self.factory)
         foreach = _foreach_for_mesh(device_mesh)
 
         kwargs = dict(self.kwargs)
@@ -379,14 +398,13 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         # Only inject ``foreach`` for factories that actually accept it. The TP>1 path sets
         # ``foreach=False`` via ``_foreach_for_mesh``; passing it to a factory that does not take
         # ``foreach`` (e.g. TE ``FusedAdam``) would raise.  Honour an explicit user-provided value.
-        if foreach is not None and "foreach" not in kwargs and _factory_accepts_foreach(self.factory):
+        if foreach is not None and "foreach" not in kwargs and _factory_accepts_foreach(factory):
             kwargs["foreach"] = foreach
 
         optimizers: list[torch.optim.Optimizer] = []
         for part in getattr(model, "parts", [model]):
-            trainable_params = [p for p in part.parameters() if p.requires_grad]
-            assert len(trainable_params) > 0, "trainable_params cannot be empty"
-            optimizers.append(self.factory(params=trainable_params, **kwargs))
+            trainable_params = _get_trainable_params_or_raise(part)
+            optimizers.append(factory(params=trainable_params, **kwargs))
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
 
@@ -396,7 +414,7 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         *,
         device_mesh: DeviceMesh | None = None,
     ) -> torch.optim.Optimizer:
-        assert callable(self.factory), "OptimizerFromFactoryConfig.factory must be a callable"
+        factory = _require_callable_factory(self.factory)
         foreach = _foreach_for_mesh(device_mesh)
 
         kwargs = dict(self.kwargs)
@@ -404,10 +422,10 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
             val = kwargs.get(attr, None)
             if isinstance(val, str):
                 kwargs[attr] = dtype_from_str(val)
-        if foreach is not None and "foreach" not in kwargs and _factory_accepts_foreach(self.factory):
+        if foreach is not None and "foreach" not in kwargs and _factory_accepts_foreach(factory):
             kwargs["foreach"] = foreach
 
-        return self.factory(params=param_groups, **kwargs)
+        return factory(params=param_groups, **kwargs)
 
 
 # ---------------------------------------------------------------------------

@@ -65,9 +65,9 @@ def test_optimizer_param_scheduler_init_valid_params(dummy_optimizer):
 
 def test_optimizer_param_scheduler_init_invalid_lr_ranges(dummy_optimizer):
     """
-    Tests initialization with invalid learning rate ranges, expecting AssertionError.
+    Tests initialization with invalid learning rate ranges, expecting ValueError.
     """
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="min_lr must be >= 0.0"):
         OptimizerParamScheduler(
             optimizer=dummy_optimizer,
             init_lr=1e-3,
@@ -81,7 +81,7 @@ def test_optimizer_param_scheduler_init_invalid_lr_ranges(dummy_optimizer):
             wd_incr_steps=500,
             wd_incr_style="linear",
         )
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="max_lr must be >= min_lr"):
         OptimizerParamScheduler(
             optimizer=dummy_optimizer,
             init_lr=1e-3,
@@ -95,7 +95,7 @@ def test_optimizer_param_scheduler_init_invalid_lr_ranges(dummy_optimizer):
             wd_incr_steps=500,
             wd_incr_style="linear",
         )
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="init_lr must be <= max_lr"):
         OptimizerParamScheduler(
             optimizer=dummy_optimizer,
             init_lr=1e-2,
@@ -113,9 +113,9 @@ def test_optimizer_param_scheduler_init_invalid_lr_ranges(dummy_optimizer):
 
 def test_optimizer_param_scheduler_init_invalid_warmup_decay_steps(dummy_optimizer):
     """
-    Tests initialization with invalid warmup and decay steps, expecting AssertionError.
+    Tests initialization with invalid warmup and decay steps, expecting ValueError.
     """
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="lr_decay_steps must be > 0"):
         OptimizerParamScheduler(
             optimizer=dummy_optimizer,
             init_lr=1e-5,
@@ -129,7 +129,7 @@ def test_optimizer_param_scheduler_init_invalid_warmup_decay_steps(dummy_optimiz
             wd_incr_steps=500,
             wd_incr_style="linear",
         )
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="lr_warmup_steps must be < lr_decay_steps"):
         OptimizerParamScheduler(
             optimizer=dummy_optimizer,
             init_lr=1e-5,
@@ -148,9 +148,9 @@ def test_optimizer_param_scheduler_init_invalid_warmup_decay_steps(dummy_optimiz
 def test_optimizer_param_scheduler_init_wsd_without_wsd_decay_steps(dummy_optimizer):
     """
     Tests initialization with 'WSD' decay style but missing `wsd_decay_steps`,
-    expecting AssertionError.
+    expecting ValueError.
     """
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="wsd_decay_steps must be set"):
         OptimizerParamScheduler(
             optimizer=dummy_optimizer,
             init_lr=1e-5,
@@ -170,9 +170,9 @@ def test_optimizer_param_scheduler_init_wsd_without_wsd_decay_steps(dummy_optimi
 def test_optimizer_param_scheduler_init_override_and_use_checkpoint_error(dummy_optimizer):
     """
     Tests initialization when both `override_opt_param_scheduler` and
-    `use_checkpoint_opt_param_scheduler` are true, expecting AssertionError.
+    `use_checkpoint_opt_param_scheduler` are true, expecting ValueError.
     """
-    with pytest.raises(AssertionError, match="both override and use-checkpoint are set."):
+    with pytest.raises(ValueError, match="both override and use-checkpoint are set."):
         OptimizerParamScheduler(
             optimizer=dummy_optimizer,
             init_lr=1e-5,
@@ -273,7 +273,7 @@ def test_get_wd_constant(dummy_optimizer):
     scheduler.num_steps = 600
     assert scheduler.get_wd() == 0.05
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="start_wd must equal end_wd"):
         OptimizerParamScheduler(
             optimizer=dummy_optimizer,
             init_lr=1e-5,
@@ -760,7 +760,7 @@ def test_load_state_dict_use_checkpoint_true(dummy_optimizer, caplog):
 def test_load_state_dict_use_checkpoint_false_mismatch(dummy_optimizer, caplog):
     """
     Tests `load_state_dict` when `use_checkpoint_opt_param_scheduler` is False
-    and parameters mismatch, expecting an AssertionError.
+    and parameters mismatch, expecting a ValueError.
     """
     caplog.set_level(logging.INFO)
 
@@ -795,8 +795,8 @@ def test_load_state_dict_use_checkpoint_false_mismatch(dummy_optimizer, caplog):
     }
 
     with pytest.raises(
-        AssertionError,
-        match="OptimizerParamScheduler: class input value 0.001 and checkpointvalue 0.002 for learning rate do not match",
+        ValueError,
+        match="OptimizerParamScheduler: class input value 0.001 and checkpoint value 0.002 for learning rate do not match",
     ):
         scheduler.load_state_dict(checkpoint_state)
 
@@ -808,7 +808,7 @@ def test_load_state_dict_override_true(dummy_optimizer, caplog):
     """
     caplog.set_level(logging.INFO)
 
-    with pytest.raises(AssertionError, match="both override and use-checkpoint are set"):
+    with pytest.raises(ValueError, match="both override and use-checkpoint are set"):
         scheduler = OptimizerParamScheduler(  # noqa: F841
             optimizer=dummy_optimizer,
             init_lr=1e-5,
