@@ -20,6 +20,7 @@ from nemo_automodel._transformers import kernel_patches
 from nemo_automodel._transformers.kernel_patches import (
     FLASH_ATTN_IMPLEMENTATIONS,
     _apply_preload_overrides,
+    _device_supports_fa3,
     _get_next_fallback_attn,
 )
 
@@ -98,7 +99,22 @@ class TestApplyPreloadOverridesPacked:
 
     def test_cp_still_forces_sdpa(self):
         attn, _ = _apply_preload_overrides(
-            tp_size=1, cp_size=2, has_packed_sequence=False, attn_implementation="flash_attention_3",
+            tp_size=1,
+            cp_size=2,
+            has_packed_sequence=False,
+            attn_implementation="flash_attention_3",
             use_liger_kernel=False,
         )
         assert attn == "sdpa"
+
+
+class TestDeviceSupportsFA3:
+    """FA3 is SM90a-only; the device gate must reject non-Hopper capabilities."""
+
+    @pytest.mark.parametrize(
+        "capability,expected",
+        [((9, 0), True), ((10, 0), False), ((12, 0), False), ((8, 0), False)],
+    )
+    def test_capability_gate(self, monkeypatch, capability, expected):
+        monkeypatch.setattr(kernel_patches.torch.cuda, "get_device_capability", lambda: capability)
+        assert _device_supports_fa3() is expected

@@ -50,6 +50,23 @@ try:
 except ImportError:  # older transformers without FA3/FA4 support
     HAS_FA3 = False
     HAS_FA4 = False
+
+
+def _device_supports_fa3() -> bool:
+    """FA3 kernels are compiled for SM90a only (Hopper ISA).
+
+    They do not run on Blackwell (SM100+) or older architectures, and
+    ``is_flash_attn_3_available()`` only checks the package, not the device.
+    (FA4 JIT-compiles per-arch and supports SM90/SM100+, so no gate is needed there.)
+    """
+    return torch.cuda.get_device_capability()[0] == 9
+
+
+# Gate on the actual device so the fallback ladder routes flash_attention_3
+# requests to flash_attention_2/sdpa on non-Hopper GPUs instead of failing at
+# kernel launch.
+if HAS_FA3 and torch.cuda.is_available() and not _device_supports_fa3():
+    HAS_FA3 = False
 FLASH_ATTN_IMPLEMENTATIONS = ("flash_attention_2", "flash_attention_3", "flash_attention_4")
 DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
