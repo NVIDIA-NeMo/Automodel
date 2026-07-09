@@ -165,12 +165,94 @@ def get_attn_implementation(cfg_model):
     return "sdpa"
 
 
+def _patch_preprocess_mask_arguments_for_packing() -> None:
+    """Keep indexed packing masks intact in newer Transformers.
+
+    Transformers 5.x preprocesses 2D attention masks before dispatching
+    attention. For flash attention this can coerce integer indexed masks
+    (``1, 2, ...`` per packed document) to bool masks, losing the document
+    boundaries that ``get_unpad_data`` needs. Preserve non-bool 2D masks for
+    FA2/FA3 so the patched flash-attention path can derive per-document
+    ``cu_seqlens``.
+    """
+    try:
+        import transformers.masking_utils as masking_utils
+    except (ImportError, AttributeError):
+        return
+
+    if getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", False):
+        return
+
+    original_preprocess = getattr(masking_utils, "_preprocess_mask_arguments", None)
+    if original_preprocess is None:
+        return
+
+    preprocess_result_len: int | None = None
+
+    def _infer_preprocess_result_len(args, kwargs, inputs_embeds, attention_mask) -> int:
+        """Infer the installed Transformers return arity without losing packed masks."""
+        if not isinstance(inputs_embeds, torch.Tensor):
+            return 7
+
+        batch_size = inputs_embeds.shape[0] if inputs_embeds.ndim > 0 else 1
+        q_length = inputs_embeds.shape[1] if inputs_embeds.ndim > 1 else 1
+        kv_length = (
+            attention_mask.shape[-1]
+            if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim >= 2
+            else q_length
+        )
+        probe_mask = torch.zeros(
+            (batch_size, 1, q_length, kv_length),
+            dtype=torch.bool,
+            device=inputs_embeds.device,
+        )
+
+        patched_args = list(args)
+        patched_kwargs = dict(kwargs)
+        if len(patched_args) > 2:
+            patched_args[2] = probe_mask
+        else:
+            patched_kwargs["attention_mask"] = probe_mask
+
+        try:
+            return len(original_preprocess(*patched_args, **patched_kwargs))
+        except Exception:
+            return 7
+
+    def _patched_preprocess_mask_arguments(*args, **kwargs):
+        nonlocal preprocess_result_len
+        config = kwargs.get("config", args[0] if len(args) > 0 else None)
+        inputs_embeds = kwargs.get(
+            "inputs_embeds",
+            kwargs.get("input_embeds", args[1] if len(args) > 1 else None),
+        )
+        attention_mask = kwargs.get("attention_mask", args[2] if len(args) > 2 else None)
+        attn_impl = getattr(config, "_attn_implementation", None) or getattr(
+            config, "_attn_implementation_internal", None
+        )
+        if (
+            attention_mask is not None
+            and isinstance(attention_mask, torch.Tensor)
+            and attention_mask.ndim == 2
+            and attention_mask.dtype != torch.bool
+            and attn_impl in ("flash_attention_2", "flash_attention_3")
+        ):
+            if preprocess_result_len is None:
+                preprocess_result_len = _infer_preprocess_result_len(args, kwargs, inputs_embeds, attention_mask)
+            return (True, attention_mask, *([None] * max(preprocess_result_len - 2, 0)))
+        return original_preprocess(*args, **kwargs)
+
+    masking_utils._preprocess_mask_arguments = _patched_preprocess_mask_arguments
+    masking_utils._nemo_automodel_packing_preprocess_patched = True
+
+
 # Model modules whose ``create_causal_mask`` must be patched for neat packing.
 # TODO: perhaps its for ALL models.
 _PACKING_PATCH_MODULES = [
     "transformers.models.qwen2.modeling_qwen2",
     "transformers.models.qwen2_5_vl.modeling_qwen2_5_vl",
     "transformers.models.qwen2_vl.modeling_qwen2_vl",
+    "transformers.models.qwen3.modeling_qwen3",
     "transformers.models.qwen3_5.modeling_qwen3_5",
     "transformers.models.qwen3_vl.modeling_qwen3_vl",
     "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
@@ -193,6 +275,7 @@ def configure_packing(attn_implementation: str = "sdpa") -> None:
     import transformers.modeling_flash_attention_utils
 
     transformers.modeling_flash_attention_utils._get_unpad_data = get_unpad_data
+    _patch_preprocess_mask_arguments_for_packing()
 
     # Each model module imports create_causal_mask into its own namespace at
     # import time, so we must patch each module individually.

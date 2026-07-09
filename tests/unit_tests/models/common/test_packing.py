@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -106,9 +108,7 @@ class TestPassthroughCreateCausalMask:
     def test_handles_extra_kwargs(self):
         """Extra kwargs don't break — indexed mask still passes through."""
         mask = torch.tensor([[1, 1, 2, 2, 0]])
-        result = _passthrough_create_causal_mask(
-            attention_mask=mask, or_mask_function=None, and_mask_function=None
-        )
+        result = _passthrough_create_causal_mask(attention_mask=mask, or_mask_function=None, and_mask_function=None)
         assert result is mask
 
 
@@ -157,6 +157,74 @@ class TestConfigurePacking:
             assert fa_utils._get_unpad_data is get_unpad_data
         finally:
             fa_utils._get_unpad_data = original
+
+    def test_patches_preprocess_mask_arguments_for_indexed_mask(self):
+        """configure_packing should preserve integer indexed masks for FA2."""
+        import transformers.masking_utils as masking_utils
+        import transformers.modeling_flash_attention_utils as fa_utils
+
+        original_unpad = fa_utils._get_unpad_data
+        pre_test_preprocess = masking_utils._preprocess_mask_arguments
+        original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
+        # Earlier tests call configure_packing, which installs the shim on the
+        # module; reload to recover the pristine Transformers function so the
+        # reference call below exercises the real signature.
+        importlib.reload(masking_utils)
+        if hasattr(masking_utils, "_nemo_automodel_packing_preprocess_patched"):
+            delattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
+        original_preprocess = masking_utils._preprocess_mask_arguments
+
+        config = SimpleNamespace(_attn_implementation="flash_attention_2")
+        input_embeds = torch.zeros(1, 5, 8)
+
+        def build_args(attention_mask, cache_position):
+            """Build positional args matching the installed _preprocess_mask_arguments signature.
+
+            ``attention_mask`` is a ``[B, S]`` indexed packing mask (or a
+            ``[B, 1, S, S]`` bool mask for the reference call); the remaining
+            parameters are filled by name so the test tracks Transformers
+            signature changes (e.g. the added ``layer_idx``).
+            """
+            values = {
+                "config": config,
+                "input_embeds": input_embeds,
+                "inputs_embeds": input_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "layer_idx": 0,
+            }
+            args = []
+            for name, param in inspect.signature(original_preprocess).parameters.items():
+                if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                    continue
+                if name in values:
+                    args.append(values[name])
+                elif param.default is not inspect.Parameter.empty:
+                    args.append(param.default)
+                else:
+                    args.append(None)
+            return args
+
+        try:
+            configure_packing("flash_attention_2")
+            mask = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
+            expected_len = len(
+                original_preprocess(*build_args(torch.zeros(1, 1, 5, 5, dtype=torch.bool), torch.arange(5)))
+            )
+            for cache_position in (torch.arange(5), None):
+                result = masking_utils._preprocess_mask_arguments(*build_args(mask, cache_position))
+                assert result[0] is True
+                assert result[1] is mask
+                assert len(result) == expected_len
+                assert result[2:] == (None,) * (expected_len - 2)
+        finally:
+            fa_utils._get_unpad_data = original_unpad
+            masking_utils._preprocess_mask_arguments = pre_test_preprocess
+            if original_flag is None:
+                if hasattr(masking_utils, "_nemo_automodel_packing_preprocess_patched"):
+                    delattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
+            else:
+                masking_utils._nemo_automodel_packing_preprocess_patched = original_flag
 
     def test_patches_loaded_model_modules(self):
         """configure_packing should patch create_causal_mask on loaded modules."""
