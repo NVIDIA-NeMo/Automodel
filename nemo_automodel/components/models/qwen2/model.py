@@ -43,6 +43,7 @@ from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
+from nemo_automodel.components.checkpoint.utils import TieSupport
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -374,6 +375,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
     Uses separate q/k/v and gate/up projections -- HuggingFace layout.
     """
 
+    tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -430,6 +432,13 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        # Transformers v5 does not reliably tie this custom model from the
+        # dict-shaped _tied_weights_keys alone; honor the config flag explicitly
+        # (mirrors LlamaForCausalLM).
+        if getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     @can_return_tuple
     def forward(

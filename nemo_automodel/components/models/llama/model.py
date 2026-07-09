@@ -45,6 +45,7 @@ from transformers.models.llama.modeling_llama import eager_attention_forward
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
+from nemo_automodel.components.checkpoint.utils import TieSupport
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -393,6 +394,7 @@ class LlamaModel(LlamaPreTrainedModel):
 class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
     """Llama model with causal language modeling head."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
