@@ -833,6 +833,17 @@ class Checkpointer:
             expected_keys_for_diff &= loaded_keys_for_diff
         key_diff = _summarize_state_dict_key_diff(expected_keys_for_diff, loaded_keys_for_diff)
         if key_diff["missing_count"] or key_diff["unexpected_count"]:
+            safe_moe_tp_requires_complete_checkpoint = any(
+                getattr(part, "_nemo_moe_tp_requires_pretrained_weights", False) for part in model_state.model
+            )
+            if safe_moe_tp_requires_complete_checkpoint:
+                raise RuntimeError(
+                    "Safe custom-MoE tensor parallelism requires a complete base checkpoint; "
+                    f"missing={key_diff['missing_count']} unexpected={key_diff['unexpected_count']} "
+                    f"(missing examples={key_diff['missing_examples']}, "
+                    f"unexpected examples={key_diff['unexpected_examples']}). Randomly initialized "
+                    "replicated parameters would differ across TP ranks."
+                )
             logging.warning(
                 "Checkpoint key mismatch for %s: missing=%d unexpected=%d "
                 "(missing examples=%s, unexpected examples=%s)",

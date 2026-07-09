@@ -103,6 +103,39 @@ class TestShouldLoadBeforeShard:
         assert _should_load_before_shard(**{**self._DEFAULTS, "ep_size": 1}) is True
 
 
+def test_moe_infrastructure_forwards_fsdp2_tp_sequence_and_offload_settings():
+    """EP's dedicated parallelizer must retain the FSDP2 manager's TP settings."""
+    from nemo_automodel._transformers.infrastructure import instantiate_infrastructure
+    from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+
+    manager = object.__new__(FSDP2Manager)
+    manager.tp_plan = {"lm_head": object()}
+    manager.sequence_parallel = False
+    manager.offload_policy = object()
+    manager.mp_policy = object()
+    manager.reshard_after_forward = True
+    manager.enable_async_tensor_parallel = False
+    mesh = SimpleNamespace(ep_size=2)
+
+    with (
+        patch(f"{_INFRA_MODULE}._instantiate_distributed", return_value=manager),
+        patch(f"{_INFRA_MODULE}._instantiate_pipeline", return_value=None),
+        patch(f"{_INFRA_MODULE}._instantiate_qat", return_value=None),
+    ):
+        model_wrapper, _, parallelize_fn, _ = instantiate_infrastructure(
+            distributed_config=SimpleNamespace(activation_checkpointing=False),
+            mesh=mesh,
+        )
+
+    assert model_wrapper is manager
+    assert parallelize_fn.keywords["tp_shard_plan"] is manager.tp_plan
+    assert parallelize_fn.keywords["sequence_parallel"] is False
+    assert parallelize_fn.keywords["offload_policy"] is manager.offload_policy
+    assert parallelize_fn.keywords["mp_policy"] is manager.mp_policy
+    assert parallelize_fn.keywords["reshard_after_forward"] is True
+    assert parallelize_fn.keywords["enable_async_tensor_parallel"] is False
+
+
 # =============================================================================
 # Tests for apply_model_infrastructure: post-shard initialize_model_weights
 # =============================================================================
@@ -113,6 +146,39 @@ class _DummyModel(torch.nn.Module):
         super().__init__()
         self.linear = torch.nn.Linear(4, 4)
         self.config = SimpleNamespace()
+
+
+def test_safe_moe_tp_requires_real_checkpoint_source_and_rejects_peft():
+    from nemo_automodel._transformers.infrastructure import (
+        _mark_safe_moe_tp_weights_loaded,
+        _validate_safe_moe_tp_weight_source,
+    )
+
+    model = _DummyModel()
+    model._nemo_moe_tp_requires_pretrained_weights = True
+
+    with pytest.raises(ValueError, match="from_config/random initialization"):
+        _validate_safe_moe_tp_weight_source(
+            model,
+            checkpoint_source_available=False,
+            peft_config=None,
+        )
+    with pytest.raises(ValueError, match="does not support PEFT"):
+        _validate_safe_moe_tp_weight_source(
+            model,
+            checkpoint_source_available=True,
+            peft_config=object(),
+        )
+
+    _validate_safe_moe_tp_weight_source(
+        model,
+        checkpoint_source_available=True,
+        peft_config=None,
+    )
+    with pytest.raises(RuntimeError, match="without a completed checkpoint"):
+        _mark_safe_moe_tp_weights_loaded(model, checkpoint_loaded=False)
+    _mark_safe_moe_tp_weights_loaded(model, checkpoint_loaded=True)
+    assert model._nemo_moe_tp_pretrained_weights_loaded is True
 
 
 _INFRA_MODULE = "nemo_automodel._transformers.infrastructure"

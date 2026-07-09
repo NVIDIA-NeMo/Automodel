@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Dict
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -77,6 +78,19 @@ def test_custom_dict_plan(monkeypatch):
     _set_global_model_cls(monkeypatch, _DummyModel)  # irrelevant but required
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False, tp_shard_plan=plan)
     assert result is plan  # identity check
+
+
+def test_custom_moe_explicit_plan_is_validated_even_when_ep_is_one(monkeypatch):
+    _set_global_model_cls(monkeypatch, _DummyModel)
+    monkeypatch.setattr(parallelizer, "_uses_custom_moe_modules", lambda model: True)
+
+    with pytest.raises(ValueError, match="EP-owned"):
+        _get_parallel_plan(
+            _DummyModel(),
+            sequence_parallel=False,
+            tp_shard_plan={"model.layers.*.mlp.experts": object()},
+            tp_size=2,
+        )
 
 
 # 2. Custom plan via *import path*
@@ -149,6 +163,23 @@ def test_optimised_plan_fallback_to_hf(monkeypatch):
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
     assert result is sentinel
+
+
+def test_fail_closed_optimised_plan_does_not_fallback_to_hf(monkeypatch):
+    """Safety-critical architecture plans may reject instead of changing semantics."""
+
+    def _broken_fn(model, seq):
+        raise NotImplementedError("sequence parallel is unsafe")
+
+    _broken_fn._nemo_tp_plan_fail_closed = True
+    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
+    hf_plan = MagicMock(return_value={"unsafe": "fallback"})
+    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", hf_plan, raising=True)
+    _set_global_model_cls(monkeypatch, _DummyModel)
+
+    with pytest.raises(ValueError, match="fail-closed"):
+        _get_parallel_plan(_DummyModel(), sequence_parallel=True)
+    hf_plan.assert_not_called()
 
 
 # 4. HF plan is used when no optimised plan exists

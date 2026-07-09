@@ -16,6 +16,7 @@
 
 import functools
 import logging
+from fnmatch import fnmatchcase
 
 import torch
 import torch.nn as nn
@@ -130,6 +131,123 @@ def _module_weights_are_tied(left: nn.Module | None, right: nn.Module | None) ->
     left_weight = getattr(left, "weight", None)
     right_weight = getattr(right, "weight", None)
     return left_weight is not None and left_weight is right_weight
+
+
+def _is_unsafe_moe_tp_module_path(module_path: str) -> bool:
+    path_segments = set(module_path.split("."))
+    leaf = module_path.rsplit(".", 1)[-1]
+    return (
+        "experts" in path_segments
+        or "gate_and_up_projs" in path_segments
+        or "down_projs" in path_segments
+        or "router" in path_segments
+        or "shared_expert_gate" in path_segments
+        or "gate" in path_segments
+        or leaf in {"mlp", "moe"}
+    )
+
+
+def _validate_moe_tp_plan(plan: object, model: nn.Module | None = None) -> dict[str, ParallelStyle]:
+    """Validate that a TP plan cannot shard routed-expert parameters.
+
+    Routed experts are owned by expert parallelism and, when configured, the
+    independent ``ep_shard`` FSDP mesh. Applying tensor parallelism to the same
+    parameters would compose unrelated DTensor placements and either corrupt
+    ownership or fail during the first grouped GEMM. Shared experts are regular
+    dense MLPs and are intentionally allowed.
+    """
+    if not isinstance(plan, dict) or not plan:
+        raise ValueError("The custom MoE tensor-parallel plan must be a non-empty dictionary.")
+
+    unsafe_paths: list[str] = []
+    unmatched_paths: list[str] = []
+    module_names = tuple(name for name, _ in model.named_modules()) if hasattr(model, "named_modules") else ()
+    for module_path in plan:
+        if not isinstance(module_path, str):
+            raise ValueError("Every custom MoE tensor-parallel plan key must be a module path string.")
+        if _is_unsafe_moe_tp_module_path(module_path):
+            unsafe_paths.append(module_path)
+            continue
+        if module_names:
+            matched_names = [name for name in module_names if fnmatchcase(name, module_path)]
+            if not matched_names:
+                unmatched_paths.append(module_path)
+            elif any(_is_unsafe_moe_tp_module_path(name) for name in matched_names):
+                unsafe_paths.append(module_path)
+
+    if unsafe_paths:
+        formatted = ", ".join(sorted(unsafe_paths))
+        raise ValueError(
+            "Tensor parallelism must not target routed-expert parameters or router outputs because they are "
+            "EP-owned or require global expert logits. "
+            f"Remove these paths from tp_shard_plan: {formatted}. Shared-expert leaf modules remain supported."
+        )
+    if unmatched_paths:
+        formatted = ", ".join(sorted(unmatched_paths))
+        raise ValueError(
+            "Custom MoE tensor-parallel plan patterns must each match at least one concrete module; "
+            f"unmatched paths: {formatted}."
+        )
+    return plan
+
+
+def _resolve_moe_tp_plan(
+    model: nn.Module,
+    *,
+    sequence_parallel: bool,
+    tp_shard_plan: dict[str, ParallelStyle] | str | None,
+    tp_size: int,
+) -> dict[str, ParallelStyle]:
+    """Resolve a fail-closed TP plan for a custom MoE model.
+
+    The generic dense parallelizer has broad fallback plans. Those fallbacks
+    can accidentally match ``*.experts`` on custom MoE architectures, so the
+    MoE path only accepts an explicit plan or an architecture registration and
+    always validates routed-expert ownership before applying it.
+    """
+    if sequence_parallel:
+        raise ValueError(
+            "sequence_parallel=True is not supported by the custom MoE TP path yet; "
+            "use sequence_parallel=False so replicated router/attention activations remain correct."
+        )
+    if tp_size <= 1:
+        return {}
+
+    if tp_shard_plan is not None:
+        # Reuse the standard parser for explicit dictionaries, named plans and
+        # import paths, then apply the stricter MoE ownership validation below.
+        from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
+
+        plan = _get_parallel_plan(
+            model,
+            sequence_parallel=False,
+            tp_shard_plan=tp_shard_plan,
+            tp_size=tp_size,
+        )
+    else:
+        from nemo_automodel.components.distributed.optimized_tp_plans import (
+            PARALLELIZE_FUNCTIONS,
+            _get_class_qualname,
+        )
+
+        model_cls = type(model)
+        plan_factory = PARALLELIZE_FUNCTIONS.get(_get_class_qualname(model_cls))
+        if plan_factory is None:
+            plan_factory = PARALLELIZE_FUNCTIONS.get(model_cls.__name__)
+        if plan_factory is None:
+            raise ValueError(
+                f"No safe tensor-parallel plan is registered for custom MoE model "
+                f"'{model_cls.__name__}' at tp_size={tp_size}. Register a non-expert plan in "
+                "PARALLELIZE_FUNCTIONS or pass tp_shard_plan explicitly; routed experts must remain EP-owned."
+            )
+        try:
+            plan = plan_factory(model, False)
+        except Exception as exc:
+            raise ValueError(
+                f"The registered tensor-parallel plan for custom MoE model '{model_cls.__name__}' failed: {exc}"
+            ) from exc
+
+    return _validate_moe_tp_plan(plan, model=model)
 
 
 class ExpertParallel(ParallelStyle):
@@ -452,6 +570,7 @@ def apply_fsdp(
                 shard_placement_fn=_moe_shard_placement,
                 reshard_after_forward=experts_reshard_after_forward,
                 mp_policy=mp_policy,
+                offload_policy=offload_policy,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters
@@ -542,9 +661,10 @@ def apply_fsdp(
         )
     else:
         if tied_embeddings_cross_fsdp_roots and not wrap_outer_model:
-            logger.warning(
+            raise ValueError(
                 "lm_head.weight is tied to embed_tokens.weight across the outer model boundary, but "
-                "wrap_outer_model=False prevents preserving the tie in one FSDP root."
+                "wrap_outer_model=False cannot preserve that parameter in one FSDP root. "
+                "Use wrap_outer_model=True or untie the embeddings explicitly."
             )
         fully_shard_default(_model)
 
@@ -647,12 +767,55 @@ def parallelize_model(
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
+    offload_policy: OffloadPolicy | None = None,
+    tp_shard_plan: dict[str, ParallelStyle] | str | None = None,
+    sequence_parallel: bool = False,
+    enable_async_tensor_parallel: bool = False,
 ):
-    """Apply context, expert, activation-checkpointing, and FSDP parallelism."""
+    """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism."""
 
-    assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
-        "Tensor parallelism not supported for custom MoE models"
-    )
+    tp_enabled = tp_axis_name is not None and world_mesh[tp_axis_name].size() > 1
+    if tp_enabled:
+        if enable_async_tensor_parallel:
+            raise ValueError(
+                "enable_async_tensor_parallel=True is not supported by the custom MoE TP path; "
+                "it requires sequence parallelism, which is intentionally disabled for replicated router/attention paths."
+            )
+        tp_mesh = world_mesh[tp_axis_name]
+        model_parallel_plan = _resolve_moe_tp_plan(
+            model,
+            sequence_parallel=sequence_parallel,
+            tp_shard_plan=tp_shard_plan,
+            tp_size=tp_mesh.size(),
+        )
+        # Preserve the resolved ownership contract through activation
+        # checkpointing and FSDP wrapping. Downstream tooling combines the
+        # concrete plan paths with the final DTensor placements to build a
+        # fail-closed manifest of trainable parameters that remain replicated
+        # over TP. This applies equally to registered and explicit custom-MoE plans.
+        model._nemo_moe_tp_sharded_module_patterns = tuple(sorted(model_parallel_plan))
+        model._nemo_moe_tp_requires_replica_sync = True
+        # Explicit plans do not call the registered plan factory, so set
+        # the checkpoint-safety marker here as the common authority. Any
+        # custom-MoE TP plan leaves at least some trainable paths replicated;
+        # random/from-config initialization is unsafe until those replicas are
+        # initialized and validated from one complete checkpoint.
+        model._nemo_moe_tp_requires_pretrained_weights = True
+        # PEFT is applied before distributed sharding. Translate each style so
+        # LoRA-wrapped shared-expert/lm-head modules keep the same TP semantics.
+        from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+
+        model_parallel_plan = {path: translate_to_lora(style) for path, style in model_parallel_plan.items()}
+        logger.info(
+            "Applying safe custom-MoE tensor parallelism (tp_size=%d) to %d non-expert module patterns: %s",
+            tp_mesh.size(),
+            len(model_parallel_plan),
+            ", ".join(sorted(model_parallel_plan)),
+        )
+        parallelize_module(model, tp_mesh, model_parallel_plan)
+        from nemo_automodel.components.checkpoint.utils import ensure_tied_lm_head
+
+        ensure_tied_lm_head(model)
 
     cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
     if cp_enabled:
@@ -692,6 +855,7 @@ def parallelize_model(
             ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
             ep_shard_mesh=ep_shard_mesh,
             mp_policy=mp_policy,
+            offload_policy=offload_policy,
             reshard_after_forward=reshard_after_forward,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,

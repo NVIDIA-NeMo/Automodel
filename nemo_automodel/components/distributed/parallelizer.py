@@ -344,6 +344,13 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         category=UserWarning,
                     )
                     parallelize_module(model, tp_mesh, model_parallel_plan)
+                # TP styles replace module weights with DTensors independently.
+                # Restore an architectural embedding/head alias before FSDP
+                # records ownership; re-tying after FSDP can leave two roots
+                # that disagree about the shared parameter.
+                from nemo_automodel.components.checkpoint.utils import ensure_tied_lm_head
+
+                ensure_tied_lm_head(model)
                 if _attention_is_head_sharded(model_parallel_plan):
                     _update_attention_head_counts_for_tp(model, tp_mesh.size())
 
@@ -1881,6 +1888,18 @@ def _should_use_hf_native_gradient_checkpointing(
     )
 
 
+def _uses_custom_moe_modules(model: nn.Module) -> bool:
+    """Return whether ``model`` contains Automodel's grouped custom-MoE layer."""
+    iter_modules = getattr(model, "modules", None)
+    if not callable(iter_modules):
+        return False
+    try:
+        from nemo_automodel.components.moe.layers import MoE
+    except ImportError:
+        return False
+    return any(isinstance(module, MoE) for module in iter_modules())
+
+
 def _get_parallel_plan(
     model: nn.Module,
     sequence_parallel: bool = False,
@@ -1966,6 +1985,11 @@ def _get_parallel_plan(
             model_parallel_plan = func(model, sequence_parallel)
             logger.info(f"Using optimized parallel plan for {model_cls.__name__}.")
         except Exception as e:
+            if getattr(func, "_nemo_tp_plan_fail_closed", False):
+                raise ValueError(
+                    f"The registered tensor-parallel plan for {model_cls.__name__} rejected this configuration: {e}. "
+                    "The plan is marked fail-closed, so an unrelated HuggingFace/default plan will not be substituted."
+                ) from e
             logger.info(f"Optimized parallel plan not available: {e}. Falling back to the HF tp plan.")
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
@@ -1977,6 +2001,11 @@ def _get_parallel_plan(
             model_parallel_plan = func(model, sequence_parallel)
             logger.info(f"Using optimized parallel plan for {model_cls.__name__} (matched by class name).")
         except Exception as e:
+            if getattr(func, "_nemo_tp_plan_fail_closed", False):
+                raise ValueError(
+                    f"The registered tensor-parallel plan for {model_cls.__name__} rejected this configuration: {e}. "
+                    "The plan is marked fail-closed, so an unrelated HuggingFace/default plan will not be substituted."
+                ) from e
             logger.info(f"Optimized parallel plan not available: {e}. Falling back to the HF tp plan.")
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
@@ -2072,6 +2101,15 @@ def _get_parallel_plan(
         for k in ("lm_head", "language_model.lm_head"):
             if model_parallel_plan.pop(k, None) is not None:
                 logger.info("Nemotron-Flash: excluding %s from TP plan to keep lm_head.weight replicated.", k)
+
+    # EP=1 uses this generic FSDP2 path rather than the dedicated MoE
+    # parallelizer. Apply the same routed-expert ownership validation here so
+    # an explicit/wildcard TP plan cannot silently shard expert or router
+    # modules merely because expert parallelism is disabled.
+    if tp_size > 1 and _uses_custom_moe_modules(model):
+        from nemo_automodel.components.moe.parallelizer import _validate_moe_tp_plan
+
+        model_parallel_plan = _validate_moe_tp_plan(model_parallel_plan, model=model)
 
     return model_parallel_plan
 

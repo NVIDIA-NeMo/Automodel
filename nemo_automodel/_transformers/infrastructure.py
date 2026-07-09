@@ -88,6 +88,58 @@ def _ensure_tied_lm_heads(model) -> None:
         ensure_tied_lm_head(model_part)
 
 
+def _safe_moe_tp_parts(model) -> list[torch.nn.Module]:
+    """Return model parts using the conservative custom-MoE TP plan."""
+    model_parts = model.parts if hasattr(model, "parts") else [model]
+    return [
+        model_part
+        for model_part in model_parts
+        if getattr(model_part, "_nemo_moe_tp_requires_pretrained_weights", False)
+    ]
+
+
+def _validate_safe_moe_tp_weight_source(
+    model,
+    *,
+    checkpoint_source_available: bool,
+    peft_config,
+) -> None:
+    """Fail closed when replicated MoE-TP paths cannot start from identical weights.
+
+    The conservative plan intentionally leaves attention/router/norm modules
+    replicated across TP ranks.  Until those replicas have explicit gradient
+    synchronization, they may only be used for deterministic full-parameter
+    training from one successfully loaded shared base checkpoint.
+    """
+    parts = _safe_moe_tp_parts(model)
+    if not parts:
+        return
+    if peft_config is not None:
+        raise ValueError(
+            "Safe custom-MoE tensor parallelism does not support PEFT yet: "
+            "replicated adapters are rank-initialized and can diverge."
+        )
+    if not checkpoint_source_available:
+        raise ValueError(
+            "Safe custom-MoE tensor parallelism requires pretrained weights on every TP rank. "
+            "from_config/random initialization and load_base_model=False are unsupported; "
+            "use from_pretrained (or an explicitly preloaded shared checkpoint)."
+        )
+
+
+def _mark_safe_moe_tp_weights_loaded(model, *, checkpoint_loaded: bool) -> None:
+    """Record successful checkpoint completion for later diagnostics."""
+    parts = _safe_moe_tp_parts(model)
+    if not parts:
+        return
+    if not checkpoint_loaded:
+        raise RuntimeError(
+            "Safe custom-MoE tensor parallelism reached post-load setup without a completed checkpoint load."
+        )
+    for model_part in parts:
+        model_part._nemo_moe_tp_pretrained_weights_loaded = True
+
+
 #  PEFT / quantization helpers
 def _apply_peft_and_lower_precision(
     model, tp_size, autopipeline, peft_config, quantization_config, fp8_config, qat_quantizer
@@ -344,6 +396,22 @@ def instantiate_infrastructure(
         moe_kwargs = moe_parallel_config.to_dict()
         if moe_kwargs.get("mp_policy") is None and model_wrapper is not None:
             moe_kwargs["mp_policy"] = getattr(model_wrapper, "mp_policy", None)
+        if isinstance(model_wrapper, FSDP2Manager):
+            # The dedicated MoE parallelizer replaces FSDP2Manager.parallelize
+            # whenever EP is enabled, so forward every FSDP2 setting it owns
+            # rather than silently dropping TP/SP/offload configuration.
+            moe_kwargs.setdefault("tp_shard_plan", model_wrapper.tp_plan)
+            moe_kwargs.setdefault("sequence_parallel", bool(model_wrapper.sequence_parallel))
+            moe_kwargs.setdefault("offload_policy", model_wrapper.offload_policy)
+            if model_wrapper.reshard_after_forward is not None:
+                # FSDP2Config is the canonical distributed policy. Preserve
+                # the MoE-specific default only when the manager leaves this
+                # setting unspecified.
+                moe_kwargs["reshard_after_forward"] = model_wrapper.reshard_after_forward
+            moe_kwargs.setdefault(
+                "enable_async_tensor_parallel",
+                bool(model_wrapper.enable_async_tensor_parallel),
+            )
         parallelize_fn = partial(
             parallelize_model,
             activation_checkpointing=activation_checkpointing,
@@ -565,6 +633,12 @@ def apply_model_infrastructure(
         else:
             setattr(model, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
 
+    _validate_safe_moe_tp_weight_source(
+        model,
+        checkpoint_source_available=bool(need_checkpoint_load or checkpoint_already_loaded or weights_already_loaded),
+        peft_config=peft_config,
+    )
+
     # Materialize meta-device parameters and initialize weights after sharding.
     # This is needed for both from_pretrained (before checkpoint loading overwrites)
     # and from_config (where this is the only weight initialization).
@@ -605,6 +679,11 @@ def apply_model_infrastructure(
                 pretrained_model_name_or_path,
                 load_base_model=load_base_model,
             )
+
+    _mark_safe_moe_tp_weights_loaded(
+        model,
+        checkpoint_loaded=bool(checkpoint_already_loaded or weights_already_loaded or should_load_checkpoint),
+    )
 
     # Freeze parameters after checkpoint loading and parallelization
     # This catches params created during parallelization (e.g., GroupedExpertsTE in init_token_dispatcher)
