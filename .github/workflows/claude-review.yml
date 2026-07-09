@@ -163,6 +163,29 @@ jobs:
           that class's nested `ModelCapabilities` dataclass (static pattern) or
           inside the `get_capabilities(cls, config)` classmethod (dynamic
           dispatch pattern).
+        - Checkpoint-free model initialization. When a PR adds or materially
+          changes model parameters, persistent buffers, initialization methods,
+          routing state, or a random-init recipe path, verify that construction
+          followed by the production initialization path leaves every tensor that
+          can affect the first forward/backward in a valid state without loading a
+          checkpoint:
+          - flag parameters or persistent buffers allocated with `torch.empty`, or
+            initialized to sentinel/placeholder values, unless every supported
+            model variant and stage (including auxiliary heads and MTP blocks)
+            overwrites them before use. A later checkpoint load is not a substitute
+            when checkpoint-free or random-init training is supported;
+          - require routing/index tables to satisfy the downstream dispatcher's
+            structural invariants before first use: indices must be in range and,
+            when the dispatcher requires it (for example DeepEP top-k routing),
+            expert IDs for each token must be distinct. An all-zero placeholder is
+            valid only when it satisfies the actual routing contract;
+          - require a focused test that disables checkpoint/base-model loading,
+            invokes the production initializer, and asserts finite initialized
+            parameters plus the relevant buffer/routing invariants. When this state
+            affects execution or gradients, also require a finite first
+            forward/backward on the smallest representative backend/topology; apply
+            the distributed test matrix below when a single-process backend cannot
+            exercise the contract.
         - Low-precision dtype hazards in RoPE / precision-sensitive buffers. Flag
           when a module registers a floating-point buffer used to build rotary
           tables — `inv_freq`, `freqs_cis`, or precomputed `cos`/`sin` — and the
