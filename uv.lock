@@ -3438,7 +3438,7 @@ wheels = [
 
 [[package]]
 name = "megatron-fsdp"
-version = "0.2.3"
+version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
@@ -3447,9 +3447,9 @@ dependencies = [
     { name = "torch", version = "2.10.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
     { name = "torch", version = "2.10.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/10/58/1dc5f0a79634cb6dd11715b62c994e6e1d43de952a2ea914c07b78bc3c48/megatron_fsdp-0.2.3.tar.gz", hash = "sha256:d12d93b20e3e5d214ae44d115976b209ef7352221f5ec07767bcbcb978ec5098", size = 86472, upload-time = "2026-02-06T16:30:27.88Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/b5/7d347b3dc00f06f98a4d2767e05fbd1cd4fbb181c6e25a5a0de118c3717a/megatron_fsdp-0.5.0.tar.gz", hash = "sha256:345a470620430a479e172a8dabda34bfa9f737f7aeec63e41f50f5b248cf9adc", size = 106239, upload-time = "2026-06-23T00:15:41.461Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ba/90/11e0eec3676832d12843350d2ab3aba803c91c99f9957e8f02c1ad1eb3c5/megatron_fsdp-0.2.3-py3-none-any.whl", hash = "sha256:d88083fac9cc26bc138532bb23fada22d5fd5774e570cabd92125bc42991d5f3", size = 85888, upload-time = "2026-02-06T16:30:26.442Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/9b/9da4ede7fc8268386657356764b5af0b0389df239ba0d326a0f6711f395b/megatron_fsdp-0.5.0-py3-none-any.whl", hash = "sha256:e45474f048eb634a8a0b52989e2edfc104893ad21671c66d8e7fbd720964b962", size = 106576, upload-time = "2026-06-23T00:15:40.019Z" },
 ]
 
 [[package]]
@@ -4119,7 +4119,7 @@ requires-dist = [
     { name = "imageio-ffmpeg", marker = "extra == 'diffusion-media'" },
     { name = "kernels", marker = "extra == 'diffusion-kernels'" },
     { name = "mamba-ssm", marker = "extra == 'cuda'" },
-    { name = "megatron-fsdp", specifier = ">=0.2.3" },
+    { name = "megatron-fsdp", specifier = "==0.5.0" },
     { name = "mistral-common", marker = "extra == 'vlm'", specifier = ">=1.11.0" },
     { name = "mistral-common", extras = ["audio", "hf-hub", "sentencepiece"] },
     { name = "mlflow" },

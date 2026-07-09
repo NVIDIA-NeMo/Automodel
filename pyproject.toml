@@ -79,7 +79,7 @@ classifiers = [
 ]
 dependencies = [
     "datasets>=4.0.0",
-    "megatron-fsdp>=0.2.3",
+    "megatron-fsdp==0.5.0",
     "mistral-common[audio,hf-hub,sentencepiece]",
     "pybind11",
     "pyyaml",
