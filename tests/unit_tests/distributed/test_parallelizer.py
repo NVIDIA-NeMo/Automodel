@@ -474,11 +474,19 @@ class TestMegatronFSDPStrategyParallelize:
             import_classes_mock,
             raising=False,
         )
+        compat_patch_mock = MagicMock()
+        monkeypatch.setattr(
+            parallelizer,
+            "_patch_megatron_fsdp_050_tp_dtensor_reshape_with_consensus",
+            compat_patch_mock,
+            raising=True,
+        )
 
         return {
             "megatron_fsdp": megatron_fsdp_mock,
             "parallelize_module": parallelize_module_mock,
             "import_classes": import_classes_mock,
+            "compat_patch": compat_patch_mock,
         }
 
     def test_basic_megatron_fsdp_with_default_mesh_names(self, mock_device_mesh_megatron_fsdp, mock_megatron_fsdp_env):
@@ -501,6 +509,10 @@ class TestMegatronFSDPStrategyParallelize:
         call_kwargs = mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.call_args[1]
         assert call_kwargs["dp_shard_dim"] == "dp"
         assert call_kwargs["tp_dim"] == "tp"
+        mock_megatron_fsdp_env["compat_patch"].assert_called_once_with(
+            tp_group=tp_mesh.get_group(),
+            dp_group=dp_mesh.get_group(),
+        )
 
     def test_megatron_fsdp_with_custom_mesh_names(self, mock_megatron_fsdp_env):
         """Test Megatron FSDP with custom mesh names."""
