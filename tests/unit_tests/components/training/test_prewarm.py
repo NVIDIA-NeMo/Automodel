@@ -19,6 +19,7 @@ import torch.distributed as dist
 from nemo_automodel.components.training.prewarm import (
     PrewarmConfig,
     _collect_gdn_autotune_shapes,
+    _dry_run_warmup,
     _prewarm_comm_groups,
     _prewarm_cublas_backward,
     _prewarm_fla_gdn_autotune,
@@ -35,6 +36,29 @@ class _FakeGDN(torch.nn.Module):
         self.head_v_dim = head_v_dim
         self.in_proj_qkv = torch.nn.Linear(4, 4)
         self.chunk_gated_delta_rule = object()  # presence is what the discovery checks
+
+
+class _TinyLM(torch.nn.Module):
+    """Tiny embedding + linear-head language model for dry-run tests."""
+
+    def __init__(self, vocab_size: int = 32, hidden: int = 8):
+        super().__init__()
+        self.embed = torch.nn.Embedding(vocab_size, hidden)
+        self.lm_head = torch.nn.Linear(hidden, vocab_size)
+
+    def get_input_embeddings(self) -> torch.nn.Embedding:
+        return self.embed
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Compute logits.
+
+        Args:
+            input_ids: Token ids of shape ``[B, S]`` (B = batch, S = sequence).
+
+        Returns:
+            Logits of shape ``[B, S, V]`` (V = vocab size).
+        """
+        return self.lm_head(self.embed(input_ids))
 
 
 @pytest.fixture
@@ -59,6 +83,7 @@ def test_prewarm_config_defaults_all_off():
     assert cfg.cublas_backward is False
     assert cfg.fla_gdn_autotune is False
     assert cfg.comm_groups is False
+    assert cfg.dry_run is False
 
 
 def test_apply_runs_only_enabled_prewarms(monkeypatch):
@@ -75,10 +100,16 @@ def test_apply_runs_only_enabled_prewarms(monkeypatch):
         "nemo_automodel.components.training.prewarm._prewarm_comm_groups",
         lambda model_parts, device, pp_mesh=None: calls.append(("comm", pp_mesh)),
     )
+    monkeypatch.setattr(
+        "nemo_automodel.components.training.prewarm._dry_run_warmup",
+        lambda model_parts, device, pp_enabled=False: calls.append(("dry_run", pp_enabled)),
+    )
+
     PrewarmConfig(cublas_backward=True, comm_groups=True).apply(
         model_parts=[torch.nn.Linear(2, 2)],
         device=torch.device("cpu"),
         pp_mesh="pp-mesh",
+        pp_enabled=False,
     )
     assert calls == [("cublas", torch.device("cpu")), ("comm", "pp-mesh")]
 
@@ -90,12 +121,12 @@ def test_apply_runs_only_enabled_prewarms(monkeypatch):
 def test_recipe_config_exposes_typed_prewarm_section():
     from nemo_automodel.recipes._typed_config import RecipeConfig
 
-    cfg = RecipeConfig({"prewarm": {"cublas_backward": True, "comm_groups": True}})
+    cfg = RecipeConfig({"prewarm": {"cublas_backward": True, "dry_run": True}})
     prewarm = cfg.prewarm
     assert isinstance(prewarm, PrewarmConfig)
     assert prewarm.cublas_backward is True
     assert prewarm.fla_gdn_autotune is False
-    assert prewarm.comm_groups is True
+    assert prewarm.dry_run is True
 
     assert RecipeConfig({}).prewarm is None
 
@@ -194,3 +225,47 @@ def test_comm_groups_prewarm_warms_shard_groups(single_rank_gloo):
 
 def test_comm_groups_prewarm_ignores_regular_tensors(single_rank_gloo):
     assert _prewarm_comm_groups([torch.nn.Linear(4, 4)], torch.device("cpu")) == 0
+
+
+# ---------------------------------------------------------------------------
+# Dry-run warmup (RFC)
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_warmup_skips_when_pp_enabled():
+    assert _dry_run_warmup([_TinyLM()], torch.device("cpu"), pp_enabled=True) is False
+
+
+def test_dry_run_warmup_is_side_effect_free_on_cpu():
+    model = _TinyLM()
+    params_before = {name: p.detach().clone() for name, p in model.named_parameters()}
+    rng_before = torch.get_rng_state()
+
+    assert _dry_run_warmup([model], torch.device("cpu"), seq_len=8) is True
+
+    for name, p in model.named_parameters():
+        assert p.grad is None, f"{name} kept a gradient after the dry run"
+        assert torch.equal(p.detach(), params_before[name]), f"{name} changed during the dry run"
+    assert torch.equal(torch.get_rng_state(), rng_before)
+
+
+def test_dry_run_warmup_swallows_forward_failures():
+    class _Broken(_TinyLM):
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            """Raise unconditionally; ``input_ids`` is an unused ``[B, S]`` id tensor."""
+            raise RuntimeError("boom")
+
+    assert _dry_run_warmup([_Broken()], torch.device("cpu")) is False
+
+
+def test_dry_run_warmup_skips_without_vocab_size():
+    model = torch.nn.Linear(4, 4)  # no config and no get_input_embeddings
+    assert _dry_run_warmup([model], torch.device("cpu")) is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_dry_run_warmup_runs_on_gpu():
+    device = torch.device("cuda", torch.cuda.current_device())
+    model = _TinyLM().to(device)
+    assert _dry_run_warmup([model], device, seq_len=8) is True
+    assert all(p.grad is None for p in model.parameters())

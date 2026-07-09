@@ -38,6 +38,7 @@ Prewarms are opt-in from the recipe config::
       cublas_backward: true
       fla_gdn_autotune: true
       comm_groups: true
+      dry_run: false  # RFC, see _dry_run_warmup
 
 All prewarms are best-effort: failures are logged and never abort setup.
 """
@@ -66,11 +67,14 @@ class PrewarmConfig:
             model.
         comm_groups: Eagerly create the NCCL communicators that grad-norm
             clipping will use on its first collective.
+        dry_run: [RFC] Run one tiny synthetic forward+backward through the
+            model to warm every lazily-initialized component at once.
     """
 
     cublas_backward: bool = False
     fla_gdn_autotune: bool = False
     comm_groups: bool = False
+    dry_run: bool = False
 
     def apply(
         self,
@@ -78,6 +82,7 @@ class PrewarmConfig:
         model_parts: list[torch.nn.Module],
         device: torch.device | int | str | None,
         pp_mesh: object | None = None,
+        pp_enabled: bool = False,
     ) -> None:
         """Run the enabled prewarms.
 
@@ -88,6 +93,7 @@ class PrewarmConfig:
             pp_mesh: The pipeline-parallel submesh, if pipeline parallelism is
                 enabled (its process group is warmed for the grad-norm
                 all-reduce).
+            pp_enabled: Whether pipeline parallelism is enabled.
         """
         if self.cublas_backward:
             _prewarm_cublas_backward(device)
@@ -95,6 +101,8 @@ class PrewarmConfig:
             _prewarm_fla_gdn_autotune(model_parts, device)
         if self.comm_groups:
             _prewarm_comm_groups(model_parts, device, pp_mesh=pp_mesh)
+        if self.dry_run:
+            _dry_run_warmup(model_parts, device, pp_enabled=pp_enabled)
 
 
 def _resolve_cuda_device(device: torch.device | int | str | None, label: str) -> torch.device | None:
@@ -498,3 +506,93 @@ def _prewarm_comm_groups(
         torch.cuda.synchronize(device)
     logger.info("Prewarmed %d process group(s) for grad-norm clipping.", len(groups))
     return len(groups)
+
+
+def _dry_run_warmup(
+    model_parts: list[torch.nn.Module],
+    device: torch.device | int | str | None,
+    *,
+    seq_len: int = 64,
+    pp_enabled: bool = False,
+) -> bool:
+    """[RFC] Run one tiny synthetic forward+backward through the model at setup time.
+
+    The targeted prewarms above each address one lazy-initialization source; a
+    dry-run step is the general answer: it exercises the model's real fwd+bwd
+    call graph, so every lazily-initialized kernel library, Triton autotune
+    cache, and gradient-reduction communicator (e.g. FSDP reduce-scatter) used
+    by training is warmed with a tiny input while the allocator pool is empty.
+
+    The dry run is side-effect free with respect to training state:
+
+    - the loss is scaled by zero, so all produced gradients are numerically
+      zero, and gradients are additionally reset with
+      ``zero_grad(set_to_none=True)`` afterwards;
+    - no optimizer step runs;
+    - RNG state (CPU and the target CUDA device) is forked and restored, so
+      data order and dropout draws in real training are unchanged.
+
+    Known limitations (why this is an RFC):
+
+    - Pipeline parallelism is skipped: a synthetic microbatch must flow
+      through the PP schedule for stage-boundary communicators to warm, which
+      needs recipe-level integration rather than a plain ``model(...)`` call.
+    - Models whose forward requires more than ``input_ids`` (e.g.
+      vision-language models needing pixel inputs) are only warmed as far as
+      the forward gets; failures are logged and ignored.
+    - A tiny dense synthetic batch may not reach code paths gated on real
+      data (packed-sequence branches, MoE expert-routing spread).
+
+    Args:
+        model_parts: Model parts; only ``model_parts[0]`` is used (single-part
+            models when PP is disabled).
+        device: Device for the synthetic ``[1, seq_len]`` ``input_ids`` batch;
+            falls back to the current CUDA device (or CPU) when None.
+        seq_len: Sequence length of the synthetic batch.
+        pp_enabled: Whether pipeline parallelism is enabled (skips the dry run).
+
+    Returns:
+        True if the dry run completed, False if it was skipped or failed.
+    """
+    if pp_enabled:
+        logger.warning("Skipping dry-run warmup: pipeline parallelism is not supported yet.")
+        return False
+    if not model_parts:
+        return False
+
+    model = model_parts[0]
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+
+    vocab_size = getattr(getattr(model, "config", None), "vocab_size", None)
+    if vocab_size is None and hasattr(model, "get_input_embeddings"):
+        vocab_size = getattr(model.get_input_embeddings(), "num_embeddings", None)
+    if vocab_size is None:
+        logger.warning("Skipping dry-run warmup: could not determine vocab size.")
+        return False
+
+    fork_devices = [device] if device.type == "cuda" else []
+    try:
+        with torch.random.fork_rng(devices=fork_devices):
+            input_ids = torch.randint(0, int(vocab_size), (1, seq_len), device=device)
+            output = model(input_ids=input_ids)
+            logits = getattr(output, "logits", None)
+            if logits is None:
+                logits = output[0] if isinstance(output, (tuple, list)) else output
+            # Zero-scaled loss: the backward kernels and gradient-reduction
+            # collectives all run, but every produced gradient is zero.
+            (logits.float().sum() * 0.0).backward()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+    except Exception:
+        logger.exception("Dry-run warmup failed; continuing without it.")
+        return False
+    finally:
+        for part in model_parts:
+            part.zero_grad(set_to_none=True)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    logger.info("Finished dry-run warmup (seq_len=%d).", seq_len)
+    return True
