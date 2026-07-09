@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed as dist
 
+from nemo_automodel.components.training import prewarm
 from nemo_automodel.components.training.prewarm import (
     PrewarmConfig,
     _collect_gdn_autotune_shapes,
@@ -23,6 +27,8 @@ from nemo_automodel.components.training.prewarm import (
     _prewarm_comm_groups,
     _prewarm_cublas_backward,
     _prewarm_fla_gdn_autotune,
+    _prewarm_fla_gdn_cp_kernels,
+    _triton_kernel_accepts,
 )
 
 
@@ -59,6 +65,84 @@ class _TinyLM(torch.nn.Module):
             Logits of shape ``[B, S, V]`` (V = vocab size).
         """
         return self.lm_head(self.embed(input_ids))
+
+
+class _TinyBNLM(_TinyLM):
+    """Tiny LM with a BatchNorm layer whose running stats mutate on training-mode forwards."""
+
+    def __init__(self, vocab_size: int = 32, hidden: int = 8):
+        super().__init__(vocab_size, hidden)
+        self.bn = torch.nn.BatchNorm1d(hidden)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Compute logits through embedding, BatchNorm, and the LM head.
+
+        Args:
+            input_ids: Token ids of shape ``[B, S]`` (B = batch, S = sequence).
+
+        Returns:
+            Logits of shape ``[B, S, V]`` (V = vocab size).
+        """
+        hidden = self.embed(input_ids)
+        hidden = self.bn(hidden.transpose(1, 2)).transpose(1, 2)
+        return self.lm_head(hidden)
+
+
+class _TinyGatedLM(torch.nn.Module):
+    """Tiny LM routing through a real MoE ``Gate`` with a positive bias-update factor.
+
+    In training mode every forward accumulates expert load on the gate for the
+    next ``update_bias()`` call, which is exactly the stateful path a dry-run
+    warmup must not leak into.
+    """
+
+    def __init__(self, vocab_size: int = 32, hidden: int = 8):
+        super().__init__()
+        from nemo_automodel.components.moe.config import MoEConfig
+        from nemo_automodel.components.moe.layers import Gate
+
+        self.embed = torch.nn.Embedding(vocab_size, hidden)
+        self.gate = Gate(
+            MoEConfig(
+                n_routed_experts=4,
+                n_shared_experts=0,
+                n_activated_experts=2,
+                n_expert_groups=1,
+                n_limited_groups=1,
+                train_gate=True,
+                gate_bias_update_factor=0.1,
+                aux_loss_coeff=0.0,
+                score_func="sigmoid",
+                route_scale=1.0,
+                dim=hidden,
+                inter_dim=16,
+                moe_inter_dim=16,
+                norm_topk_prob=False,
+                dtype=torch.float32,
+            )
+        )
+        with torch.no_grad():
+            self.gate.weight.normal_(0, 0.02)
+        self.lm_head = torch.nn.Linear(hidden, vocab_size)
+
+    def get_input_embeddings(self) -> torch.nn.Embedding:
+        return self.embed
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Compute logits with hidden states scaled by the gate's routing weights.
+
+        Args:
+            input_ids: Token ids of shape ``[B, S]`` (B = batch, S = sequence).
+
+        Returns:
+            Logits of shape ``[B, S, V]`` (V = vocab size).
+        """
+        hidden = self.embed(input_ids)
+        flat = hidden.reshape(-1, hidden.size(-1))
+        token_mask = torch.ones(flat.size(0), dtype=torch.bool, device=flat.device)
+        weights, _, _ = self.gate(flat, token_mask, cp_mesh=None)
+        scale = weights.sum(dim=-1).reshape(hidden.shape[0], hidden.shape[1], 1)
+        return self.lm_head(hidden * scale)
 
 
 @pytest.fixture
@@ -196,6 +280,49 @@ def test_fla_prewarm_populates_autotune_cache_on_gpu():
     assert _prewarm_fla_gdn_autotune([module], device) is True
 
 
+def test_triton_kernel_accepts_unwraps_wrappers_and_validates_args():
+    jit_fn = SimpleNamespace(arg_names=["a", "b", "c"])
+    autotuner = SimpleNamespace(fn=SimpleNamespace(fn=jit_fn))  # Autotuner(Heuristics(JITFunction))
+
+    assert _triton_kernel_accepts(autotuner, frozenset(("a", "b")), "kernel") is True
+    assert _triton_kernel_accepts(autotuner, frozenset(("a", "missing")), "kernel") is False
+    # Objects exposing no arg_names anywhere in the fn chain are rejected.
+    assert _triton_kernel_accepts(object(), frozenset(("a",)), "kernel") is False
+
+
+def test_fla_cp_kernel_prewarm_skips_when_fla_unavailable(monkeypatch, caplog):
+    monkeypatch.setattr(prewarm, "safe_import", lambda name: (False, None))
+    monkeypatch.setattr(prewarm, "safe_import_from", lambda module, name: (False, None))
+
+    with caplog.at_level(logging.INFO, logger=prewarm.__name__):
+        _prewarm_fla_gdn_cp_kernels({(2, 8, 16, torch.float32): "gdn"}, torch.device("cpu"), seq_len=16)
+
+    assert "fla CP kernels not importable" in caplog.text
+
+
+def test_fla_cp_kernel_prewarm_skips_on_kernel_signature_mismatch(monkeypatch, caplog):
+    launches = []
+
+    class _DriftedKernel:
+        """Triton-like kernel whose parameter list no longer matches the launch contract."""
+
+        arg_names = ["q", "k", "renamed_everything_else"]
+
+        def __getitem__(self, grid):
+            return lambda **kwargs: launches.append(kwargs)
+
+    fake_triton = SimpleNamespace(next_power_of_2=lambda n: n, cdiv=lambda a, b: -(-a // b))
+    monkeypatch.setattr(prewarm, "safe_import", lambda name: (True, fake_triton))
+    monkeypatch.setattr(prewarm, "safe_import_from", lambda module, name: (True, _DriftedKernel()))
+
+    with caplog.at_level(logging.WARNING, logger=prewarm.__name__):
+        _prewarm_fla_gdn_cp_kernels({(2, 8, 16, torch.float32): "gdn"}, torch.device("cpu"), seq_len=16)
+
+    assert launches == []  # nothing may be launched on signature drift
+    assert "pre_process_bwd_kernel_merged" in caplog.text
+    assert "merge_fwd_bwd_kernel" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # Comm-group prewarm
 # ---------------------------------------------------------------------------
@@ -247,6 +374,36 @@ def test_dry_run_warmup_is_side_effect_free_on_cpu():
         assert p.grad is None, f"{name} kept a gradient after the dry run"
         assert torch.equal(p.detach(), params_before[name]), f"{name} changed during the dry run"
     assert torch.equal(torch.get_rng_state(), rng_before)
+
+
+def test_dry_run_warmup_restores_buffers_of_stateful_modules():
+    model = _TinyBNLM()
+    model.train()
+    buffers_before = {name: buf.detach().clone() for name, buf in model.named_buffers()}
+    assert buffers_before, "test model must have stateful buffers"
+
+    assert _dry_run_warmup([model], torch.device("cpu"), seq_len=8) is True
+
+    for name, buf in model.named_buffers():
+        assert torch.equal(buf, buffers_before[name]), f"buffer {name} changed during the dry run"
+
+
+def test_dry_run_warmup_resets_gate_expert_load_accumulator():
+    model = _TinyGatedLM()
+    model.train()
+    assert model.gate._cumulative_expert_load is None
+
+    assert _dry_run_warmup([model], torch.device("cpu"), seq_len=8) is True
+
+    assert model.gate._cumulative_expert_load is None, (
+        "the dry run leaked expert load into the accumulator consumed by the first real update_bias()"
+    )
+    assert all(p.grad is None for p in model.parameters())
+
+    # Sanity check that the dry run exercised the stateful path: an ordinary
+    # training-mode forward does accumulate expert load on this model.
+    model(input_ids=torch.randint(0, 32, (1, 8)))
+    assert model.gate._cumulative_expert_load is not None
 
 
 def test_dry_run_warmup_swallows_forward_failures():

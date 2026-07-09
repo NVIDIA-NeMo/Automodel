@@ -46,9 +46,12 @@ All prewarms are best-effort: failures are logged and never abort setup.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any, Protocol, runtime_checkable
 
 import torch
+from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
 
@@ -81,7 +84,7 @@ class PrewarmConfig:
         *,
         model_parts: list[torch.nn.Module],
         device: torch.device | int | str | None,
-        pp_mesh: object | None = None,
+        pp_mesh: DeviceMesh | None = None,
         pp_enabled: bool = False,
     ) -> None:
         """Run the enabled prewarms.
@@ -158,16 +161,30 @@ def _prewarm_cublas_backward(device: torch.device | int | str | None, size: int 
     return True
 
 
+@runtime_checkable
+class _GDNAttention(Protocol):
+    """Structural type of a gated-delta-net attention module.
+
+    Matches modules (e.g. the qwen3_next / qwen3_5_moe GDN attention layers)
+    that expose the head geometry needed to reconstruct the fla kernel shapes
+    plus the ``chunk_gated_delta_rule`` op backed by those kernels.
+    """
+
+    num_v_heads: int
+    head_k_dim: int
+    head_v_dim: int
+    chunk_gated_delta_rule: Callable[..., Any]
+
+
 def _collect_gdn_autotune_shapes(
     model_parts: list[torch.nn.Module],
 ) -> dict[tuple[int, int, int, torch.dtype], str]:
     """Discover the gated-delta-net kernel shapes present in ``model_parts``.
 
-    A module counts as a GDN attention module when it exposes ``num_v_heads``,
-    ``head_k_dim``, ``head_v_dim`` and a ``chunk_gated_delta_rule`` op. The
-    fla autotune caches are keyed on (H, K, V[, BT]) -- never on sequence
-    length or batch -- so one tiny warmup per unique shape covers the real
-    workload.
+    A module counts as a GDN attention module when it structurally matches
+    :class:`_GDNAttention`. The fla autotune caches are keyed on (H, K, V[,
+    BT]) -- never on sequence length or batch -- so one tiny warmup per unique
+    shape covers the real workload.
 
     Args:
         model_parts: Model parts to scan for GDN modules.
@@ -179,12 +196,7 @@ def _collect_gdn_autotune_shapes(
     shapes: dict[tuple[int, int, int, torch.dtype], str] = {}
     for part in model_parts:
         for name, module in part.named_modules():
-            num_v_heads = getattr(module, "num_v_heads", None)
-            head_k_dim = getattr(module, "head_k_dim", None)
-            head_v_dim = getattr(module, "head_v_dim", None)
-            if num_v_heads is None or head_k_dim is None or head_v_dim is None:
-                continue
-            if not hasattr(module, "chunk_gated_delta_rule"):
+            if not isinstance(module, _GDNAttention):
                 continue
 
             dtype = torch.bfloat16
@@ -192,7 +204,7 @@ def _collect_gdn_autotune_shapes(
                 if param.dtype in (torch.float16, torch.bfloat16, torch.float32):
                     dtype = param.dtype
                     break
-            shape = (int(num_v_heads), int(head_k_dim), int(head_v_dim), dtype)
+            shape = (int(module.num_v_heads), int(module.head_k_dim), int(module.head_v_dim), dtype)
             shapes.setdefault(shape, name)
     return shapes
 
@@ -247,6 +259,95 @@ def _prewarm_fla_gdn_autotune(
     return _prewarm_fla_gdn_end_to_end(shapes, device, seq_len)
 
 
+# Keyword arguments the launches in _prewarm_fla_gdn_cp_kernels pass to the
+# private fla CP kernels. pyproject only lower-bounds the fla version, so the
+# installed kernels' parameter lists are validated against this hand-derived
+# launch contract before launching; on drift the prewarm is skipped.
+_FLA_PRE_PROCESS_BWD_KERNEL_ARGS = frozenset(
+    (
+        "q",
+        "k",
+        "w",
+        "g",
+        "gk",
+        "do",
+        "dhm",
+        "dv",
+        "cu_seqlens",
+        "scale",
+        "T",
+        "H",
+        "K",
+        "V",
+        "BT",
+        "BK1",
+        "USE_EXP2",
+        "BLOCK_SIZE",
+    )
+)
+_FLA_MERGE_FWD_BWD_KERNEL_ARGS = frozenset(
+    (
+        "h",
+        "ag_hm",
+        "pre_or_post_num_ranks",
+        "rank",
+        "seq_offsets",
+        "init_offsets",
+        "h0_seq_ids",
+        "h0",
+        "H",
+        "K",
+        "V",
+        "BK",
+        "FORWARD",
+        "INTRACARD_MODE",
+        "NUM_SEQ_ENTRIES",
+    )
+)
+
+
+def _triton_kernel_accepts(kernel: object, expected_args: frozenset[str], kernel_name: str) -> bool:
+    """Check that a (possibly wrapped) Triton kernel accepts the expected launch arguments.
+
+    Unwraps autotuner/heuristics layers via their ``fn`` attribute until an
+    object exposing the JITFunction's ``arg_names`` is found.
+
+    Args:
+        kernel: The Triton kernel object (a JITFunction, or an Autotuner /
+            Heuristics wrapper around one).
+        expected_args: Keyword-argument names the prewarm launch will pass.
+        kernel_name: Kernel name used in log messages.
+
+    Returns:
+        True when every expected argument is in the kernel's parameter list.
+    """
+    arg_names = None
+    unwrapped = kernel
+    for _ in range(8):
+        if unwrapped is None:
+            break
+        arg_names = getattr(unwrapped, "arg_names", None)
+        if arg_names is not None:
+            break
+        unwrapped = getattr(unwrapped, "fn", None)
+    if arg_names is None:
+        logger.warning(
+            "Cannot determine the parameter list of fla kernel %s; skipping its prewarm.",
+            kernel_name,
+        )
+        return False
+    missing = expected_args - set(arg_names)
+    if missing:
+        logger.warning(
+            "fla kernel %s does not accept expected parameter(s) %s; the installed fla version has drifted "
+            "from the prewarm launch contract, skipping its prewarm.",
+            kernel_name,
+            sorted(missing),
+        )
+        return False
+    return True
+
+
 def _prewarm_fla_gdn_cp_kernels(
     shapes: dict[tuple[int, int, int, torch.dtype], str],
     device: torch.device,
@@ -258,7 +359,9 @@ def _prewarm_fla_gdn_cp_kernels(
     end-to-end warmup in :func:`_prewarm_fla_gdn_end_to_end` does not reach,
     so they are launched once directly with zero-filled tiny tensors (the
     autotuner only measures timing; values are irrelevant). fla builds without
-    CP kernels are skipped.
+    CP kernels are skipped, as are kernels whose parameter list no longer
+    matches the launch contract here (the kernels are private fla API, so the
+    signature is validated before every launch attempt).
 
     Args:
         shapes: Mapping of ``(num_v_heads, head_k_dim, head_v_dim, dtype)`` to
@@ -277,61 +380,72 @@ def _prewarm_fla_gdn_cp_kernels(
     if not has_merge:
         logger.info("fla merge_fwd_bwd_kernel not present in this fla version; skipping its prewarm.")
 
+    warm_pre_process = _triton_kernel_accepts(
+        pre_process_bwd_kernel_merged, _FLA_PRE_PROCESS_BWD_KERNEL_ARGS, "pre_process_bwd_kernel_merged"
+    )
+    warm_merge = has_merge and _triton_kernel_accepts(
+        merge_fwd_bwd_kernel, _FLA_MERGE_FWD_BWD_KERNEL_ARGS, "merge_fwd_bwd_kernel"
+    )
+    if not (warm_pre_process or warm_merge):
+        return
+
     with torch.no_grad():
         for (num_heads, head_k_dim, head_v_dim, dtype), module_name in shapes.items():
             block_size = 32 if head_k_dim <= 64 else 64
             bk1 = triton.next_power_of_2(head_k_dim)
-            grid = (
-                triton.cdiv(head_v_dim, block_size) + triton.cdiv(head_k_dim, block_size),
-                num_heads,
-            )
 
-            q = torch.zeros((1, seq_len, num_heads, head_k_dim), device=device, dtype=dtype)
-            k = torch.zeros_like(q)
-            w = torch.zeros_like(q)
-            g = torch.zeros((1, seq_len, num_heads), device=device, dtype=torch.float32)
-            do = torch.zeros((1, seq_len, num_heads, head_v_dim), device=device, dtype=dtype)
-            dv = torch.zeros_like(do)
-            dhm = torch.zeros((num_heads, head_k_dim, head_v_dim + head_k_dim), device=device, dtype=torch.float32)
-            cu_seqlens = torch.tensor([0, seq_len], device=device, dtype=torch.long)
-
-            logger.info(
-                "Prewarming fla CP GDN bwd kernel | module=%s H=%d K=%d V=%d dtype=%s",
-                module_name,
-                num_heads,
-                head_k_dim,
-                head_v_dim,
-                dtype,
-            )
-            try:
-                pre_process_bwd_kernel_merged[grid](
-                    q=q,
-                    k=k,
-                    w=w,
-                    g=g,
-                    gk=None,
-                    do=do,
-                    dhm=dhm,
-                    dv=dv,
-                    cu_seqlens=cu_seqlens,
-                    scale=1.0,
-                    T=seq_len,
-                    H=num_heads,
-                    K=head_k_dim,
-                    V=head_v_dim,
-                    BT=64,
-                    BK1=bk1,
-                    USE_EXP2=False,
-                    BLOCK_SIZE=block_size,
+            if warm_pre_process:
+                grid = (
+                    triton.cdiv(head_v_dim, block_size) + triton.cdiv(head_k_dim, block_size),
+                    num_heads,
                 )
-                torch.cuda.synchronize(device)
-            except Exception:
-                logger.exception("fla CP GDN pre-process prewarm failed for %s; continuing.", module_name)
-            finally:
-                del q, k, w, g, do, dv, dhm, cu_seqlens
-                torch.cuda.empty_cache()
 
-            if not has_merge:
+                q = torch.zeros((1, seq_len, num_heads, head_k_dim), device=device, dtype=dtype)
+                k = torch.zeros_like(q)
+                w = torch.zeros_like(q)
+                g = torch.zeros((1, seq_len, num_heads), device=device, dtype=torch.float32)
+                do = torch.zeros((1, seq_len, num_heads, head_v_dim), device=device, dtype=dtype)
+                dv = torch.zeros_like(do)
+                dhm = torch.zeros((num_heads, head_k_dim, head_v_dim + head_k_dim), device=device, dtype=torch.float32)
+                cu_seqlens = torch.tensor([0, seq_len], device=device, dtype=torch.long)
+
+                logger.info(
+                    "Prewarming fla CP GDN bwd kernel | module=%s H=%d K=%d V=%d dtype=%s",
+                    module_name,
+                    num_heads,
+                    head_k_dim,
+                    head_v_dim,
+                    dtype,
+                )
+                try:
+                    pre_process_bwd_kernel_merged[grid](
+                        q=q,
+                        k=k,
+                        w=w,
+                        g=g,
+                        gk=None,
+                        do=do,
+                        dhm=dhm,
+                        dv=dv,
+                        cu_seqlens=cu_seqlens,
+                        scale=1.0,
+                        T=seq_len,
+                        H=num_heads,
+                        K=head_k_dim,
+                        V=head_v_dim,
+                        BT=64,
+                        BK1=bk1,
+                        USE_EXP2=False,
+                        BLOCK_SIZE=block_size,
+                    )
+                    torch.cuda.synchronize(device)
+                except Exception:
+                    logger.exception("fla CP GDN pre-process prewarm failed for %s; continuing.", module_name)
+                finally:
+                    del q, k, w, g, do, dv, dhm, cu_seqlens
+                    torch.cuda.empty_cache()
+
+            if not warm_merge:
                 continue
 
             # Also warm the CP-mode state merge kernel. In fla's CP GDN
@@ -435,7 +549,7 @@ def _prewarm_fla_gdn_end_to_end(
 def _prewarm_comm_groups(
     model_parts: list[torch.nn.Module],
     device: torch.device | int | str | None,
-    pp_mesh: object | None = None,
+    pp_mesh: DeviceMesh | None = None,
 ) -> int:
     """Eagerly create the NCCL communicators gradient-norm clipping will use.
 
@@ -492,6 +606,7 @@ def _prewarm_comm_groups(
         try:
             group = pp_mesh.get_group()
         except Exception:
+            logger.exception("Failed to resolve the PP mesh process group; skipping its prewarm.")
             group = None
         if group is not None and id(group) not in seen:
             seen.add(id(group))
@@ -525,10 +640,19 @@ def _dry_run_warmup(
 
     The dry run is side-effect free with respect to training state:
 
-    - the loss is scaled by zero, so all produced gradients are numerically
-      zero, and gradients are additionally reset with
-      ``zero_grad(set_to_none=True)`` afterwards;
+    - gradients are discarded with ``zero_grad(set_to_none=True)`` afterwards.
+      (The loss is also scaled by zero so most produced gradients are
+      numerically zero, but that alone is not a guarantee: the MoE aux-loss
+      backward, ``MoEAuxLossAutoScaler``, injects a fixed gradient scale
+      regardless of the incoming grad -- the ``zero_grad`` reset is what
+      restores the pre-dry-run state);
     - no optimizer step runs;
+    - module buffers (e.g. BatchNorm running statistics) are snapshotted
+      before the forward and restored afterwards;
+    - MoE router gates that accumulate expert load for the correction-bias
+      update during training-mode forwards are reset via their public
+      ``reset_cumulative_expert_load`` hook (matched structurally, since
+      components must not import each other);
     - RNG state (CPU and the target CUDA device) is forked and restored, so
       data order and dropout draws in real training are unchanged.
 
@@ -572,6 +696,10 @@ def _dry_run_warmup(
         logger.warning("Skipping dry-run warmup: could not determine vocab size.")
         return False
 
+    # Snapshot module buffers so the restore below erases any in-place buffer
+    # mutation done by the dry-run forward (BatchNorm running stats, ...).
+    buffer_snapshot = [(buf, buf.detach().clone()) for part in model_parts for buf in part.buffers()]
+
     fork_devices = [device] if device.type == "cuda" else []
     try:
         with torch.random.fork_rng(devices=fork_devices):
@@ -581,7 +709,8 @@ def _dry_run_warmup(
             if logits is None:
                 logits = output[0] if isinstance(output, (tuple, list)) else output
             # Zero-scaled loss: the backward kernels and gradient-reduction
-            # collectives all run, but every produced gradient is zero.
+            # collectives all run, but the produced gradients are unused and
+            # discarded by the zero_grad reset below.
             (logits.float().sum() * 0.0).backward()
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -589,8 +718,20 @@ def _dry_run_warmup(
         logger.exception("Dry-run warmup failed; continuing without it.")
         return False
     finally:
+        with torch.no_grad():
+            for buf, saved in buffer_snapshot:
+                buf.copy_(saved)
         for part in model_parts:
             part.zero_grad(set_to_none=True)
+            for module in part.modules():
+                # MoE router gates accumulate expert load on every
+                # training-mode forward; drop what the dry run added so the
+                # first real correction-bias update only sees real routing
+                # statistics. Matched structurally: components must not
+                # import each other, so Gate cannot be imported here.
+                reset_expert_load = getattr(module, "reset_cumulative_expert_load", None)
+                if callable(reset_expert_load):
+                    reset_expert_load()
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
