@@ -29,6 +29,7 @@ from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.stateful_dataloader import instantiate_dataloader
 from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
@@ -214,7 +215,7 @@ def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_wor
         if collate_fn is not None:
             dl_kwargs["collate_fn"] = collate_fn
 
-        return cfg_dl.instantiate(**dl_kwargs)
+        return instantiate_dataloader(cfg_dl, dp_rank=dp_rank, dp_world_size=dp_world_size, **dl_kwargs)
 
 
 class TrainBiEncoderRecipe(BaseRecipe):
