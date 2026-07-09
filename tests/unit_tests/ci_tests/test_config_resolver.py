@@ -299,6 +299,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "    check_source_load_parity: true             # fixture arg, must NOT become top-level\n"
         "    hf_kl_threshold: 5e-3                       # fixture arg, must NOT become top-level\n"
         "    source_load_kl_threshold: 1e-2              # fixture arg, must NOT become top-level\n"
+        "    source_load_mean_kl_threshold: 1e-3         # fixture arg, must NOT become top-level\n"
         "    source_load_cosine_threshold: 0.999         # fixture arg, must NOT become top-level\n"
         "    tokenizer_name: nvidia/Test                 # fixture arg, must NOT become top-level\n"
         "    dataset.limit_dataset_samples: 500          # dotted -> applied as override\n"
@@ -315,11 +316,13 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert "hf_kl_threshold" not in resolved
     assert "check_source_load_parity" not in resolved
     assert "source_load_kl_threshold" not in resolved
+    assert "source_load_mean_kl_threshold" not in resolved
     assert "source_load_cosine_threshold" not in resolved
     assert "tokenizer_name" not in resolved
     assert resolved["ci"]["checkpoint_robustness"]["hf_kl_threshold"] == 5e-3
     assert resolved["ci"]["checkpoint_robustness"]["check_source_load_parity"] is True
     assert resolved["ci"]["checkpoint_robustness"]["source_load_kl_threshold"] == 1e-2
+    assert resolved["ci"]["checkpoint_robustness"]["source_load_mean_kl_threshold"] == 1e-3
     assert resolved["ci"]["checkpoint_robustness"]["source_load_cosine_threshold"] == 0.999
 
 

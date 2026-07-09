@@ -18,6 +18,7 @@ Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
     [--kl_threshold <float>] [--hf_kl_threshold <float>]
     [--cross_tp_size <int>] [--cross_tp_kl_threshold <float>]
     [--tokenizer_name <str>]
+    [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
     [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
     [--max_vram_gb <float>] [--max_cpu_gb <float>]
 """
@@ -67,6 +68,7 @@ def _extract_custom_args(argv):
         "--resume_loss_threshold",
         "--source_load_cosine_threshold",
         "--source_load_kl_threshold",
+        "--source_load_mean_kl_threshold",
     }
     boolean_keys = {
         "--trust_remote_code",
@@ -453,6 +455,7 @@ def _compare_source_load_parity(
     candidate_model,
     *,
     source_load_kl_threshold: float,
+    source_load_mean_kl_threshold: float,
     source_load_cosine_threshold: float,
 ) -> None:
     """Compare the raw HF source-load reference against the constructed trainer model."""
@@ -468,10 +471,14 @@ def _compare_source_load_parity(
             )
             kl_source = _kl_divergence_from_logits(hf_logits, candidate_logits)
             max_kl_source = kl_source.max().item()
+            mean_kl_source = kl_source.mean().item()
+            p95_kl_source = torch.quantile(kl_source, 0.95).item()
             cosine_source = _cosine_similarity_from_logits(hf_logits, candidate_logits)
             print(
                 f"[Phase 0] Source-load vs constructed-trainer max KL: {max_kl_source:.6e} "
-                f"(threshold: {source_load_kl_threshold:.6e}); cosine={cosine_source:.8f} "
+                f"(threshold: {source_load_kl_threshold:.6e}); mean KL: {mean_kl_source:.6e} "
+                f"(threshold: {source_load_mean_kl_threshold:.6e}); p95 KL: {p95_kl_source:.6e}; "
+                f"cosine={cosine_source:.8f} "
                 f"(threshold: {source_load_cosine_threshold:.8f}); "
                 f"hf_aliased={hf_aliased}; trainer_aliased={candidate_aliased}; "
                 f"tie_word_embeddings={explicit_tie_word_embeddings}"
@@ -480,6 +487,10 @@ def _compare_source_load_parity(
             assert max_kl_source <= source_load_kl_threshold, (
                 f"KL divergence between original HF source load and constructed trainer model too large: "
                 f"max per-token KL = {max_kl_source:.6e} > threshold {source_load_kl_threshold:.6e}"
+            )
+            assert mean_kl_source <= source_load_mean_kl_threshold, (
+                f"Mean KL divergence between original HF source load and constructed trainer model too large: "
+                f"mean per-token KL = {mean_kl_source:.6e} > threshold {source_load_mean_kl_threshold:.6e}"
             )
             assert cosine_source >= source_load_cosine_threshold, (
                 f"Cosine similarity between original HF source load and constructed trainer model too low: "
@@ -786,7 +797,8 @@ def test_checkpoint_robustness():
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
     skip_hf_reload = bool(custom_args.get("skip_hf_reload", False))
     check_source_load_parity = bool(custom_args.get("check_source_load_parity", False))
-    source_load_kl_threshold = float(custom_args.get("source_load_kl_threshold", hf_kl_threshold))
+    source_load_kl_threshold = float(custom_args.get("source_load_kl_threshold", "5e-3"))
+    source_load_mean_kl_threshold = float(custom_args.get("source_load_mean_kl_threshold", "1e-3"))
     source_load_cosine_threshold = float(custom_args.get("source_load_cosine_threshold", "0.9999"))
 
     input_ids = _get_input_ids(tokenizer_name)
@@ -817,6 +829,7 @@ def test_checkpoint_robustness():
             trainer_source_logits,
             trainer.model_parts[0],
             source_load_kl_threshold=source_load_kl_threshold,
+            source_load_mean_kl_threshold=source_load_mean_kl_threshold,
             source_load_cosine_threshold=source_load_cosine_threshold,
         )
         for model_part in trainer.model_parts:

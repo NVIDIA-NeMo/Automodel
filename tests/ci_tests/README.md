@@ -85,7 +85,9 @@ For large reference models, set `hf_device_map_auto: true` so HF can use `device
 whole reference load on one rank's GPU. This is intentionally opt-in rather than the default: small models should keep
 the simpler single-device HF load for deterministic behavior, while large models (for example 9B+ or configs that
 already require multi-GPU HF reloads) should enable it to avoid rank-0 OOM. Tune `source_load_kl_threshold` and
-`source_load_cosine_threshold` only when backend or dtype differences are expected.
+`source_load_mean_kl_threshold` only when backend or dtype differences are expected. The first threshold bounds the
+worst token, while the stricter mean threshold prevents broad drift; Phase 0 also reports p95 KL for diagnosis.
+`source_load_cosine_threshold` remains an independent full-logit check.
 
 `ci.time` must cover both finetune and robustness. Estimated overhead:
 - ~30% with `no_check_resume: true`

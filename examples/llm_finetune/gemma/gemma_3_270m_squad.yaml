@@ -99,6 +99,7 @@ ci:
     check_source_load_parity: true
     hf_kl_threshold: 1e-1
     source_load_kl_threshold: 1e-2
+    source_load_mean_kl_threshold: 1e-3
     source_load_cosine_threshold: 0.9995
     tokenizer_name: google/gemma-3-270m
     dataset.limit_dataset_samples: 500

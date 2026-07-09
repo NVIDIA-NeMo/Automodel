@@ -128,5 +128,6 @@ fixture_keys:
     - skip_hf_reload
     - source_load_cosine_threshold
     - source_load_kl_threshold
+    - source_load_mean_kl_threshold
     - tokenizer_name
     - trust_remote_code

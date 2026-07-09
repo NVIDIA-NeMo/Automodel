@@ -125,8 +125,9 @@ ci:
     # FP8 here is training-time quantization of a bf16 checkpoint (see the fp8
     # section above), so Phase 0 bounds the FP8-prepared trainer model against
     # the raw bf16 HF reference — expect quantization error on top of the usual
-    # bf16 noise, hence the looser thresholds than the non-FP8 mistral recipes.
-    source_load_kl_threshold: 5e-2
+    # bf16 noise, hence the looser cosine threshold than the non-FP8 mistral recipes.
+    source_load_kl_threshold: 1e-2
+    source_load_mean_kl_threshold: 1e-3
     source_load_cosine_threshold: 0.999
     tokenizer_name: mistralai/Mistral-7B-v0.1
     no_check_resume: true

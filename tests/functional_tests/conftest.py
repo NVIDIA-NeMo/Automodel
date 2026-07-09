@@ -135,6 +135,7 @@ _BOOLEAN_OVERRIDES = [
     "resume_loss_threshold",
     "source_load_cosine_threshold",
     "source_load_kl_threshold",
+    "source_load_mean_kl_threshold",
     "cosine_threshold",
     "dataloader.dataset.data_dir_list",
     "tokenizer._target_",
