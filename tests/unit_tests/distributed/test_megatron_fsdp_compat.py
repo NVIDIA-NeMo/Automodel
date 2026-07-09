@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import hashlib
+import importlib
 import inspect
 import time
 from datetime import timedelta
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from types import FunctionType, ModuleType, SimpleNamespace
 
@@ -929,3 +931,95 @@ def test_gloo_rank_skew_patch_error_reaches_full_tp_dp_cartesian_mesh(tmp_path):
         process.join(5)
     assert not hung, "rank-skew consensus test hung instead of synchronously failing"
     assert [process.exitcode for process in processes] == [0] * world_size
+
+
+def _installed_megatron_fsdp_version():
+    try:
+        return importlib_metadata.version("megatron-fsdp")
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+# Unlike the fixture-based tests above, which monkeypatch the fingerprint
+# constants, these tests validate the *shipped* constants against the actually
+# installed wheel, so a typo'd constant cannot pass CI while hard-failing every
+# dp>1 startup. They skip on any other installed version (e.g. containers still
+# shipping 0.2.3) and run wherever the pinned megatron-fsdp==0.5.0 is installed.
+requires_real_megatron_fsdp_050 = pytest.mark.skipif(
+    _installed_megatron_fsdp_version() != compat._MEGATRON_FSDP_TP_DTENSOR_VERSION,
+    reason=(
+        "requires the installed megatron-fsdp to be exactly "
+        f"{compat._MEGATRON_FSDP_TP_DTENSOR_VERSION} (the release the shipped fingerprint "
+        f"constants target); found {_installed_megatron_fsdp_version()!r}"
+    ),
+)
+
+
+@requires_real_megatron_fsdp_050
+def test_050_shipped_fingerprints_match_installed_wheel_and_patch_installs():
+    param_and_grad_buffer = importlib.import_module(compat._MEGATRON_FSDP_TP_DTENSOR_MODULE)
+    megatron_fsdp_module = importlib.import_module(compat._MEGATRON_FSDP_ROOT_FORWARD_MODULE)
+    targets = (
+        (
+            param_and_grad_buffer.make_fsdp_dtensor,
+            compat._MEGATRON_FSDP_TP_DTENSOR_PATCH_MARKER,
+            compat._MEGATRON_FSDP_TP_DTENSOR_SOURCE_SHA256,
+            compat._MEGATRON_FSDP_TP_DTENSOR_QUALNAME,
+            compat._MEGATRON_FSDP_TP_DTENSOR_FIRSTLINENO,
+        ),
+        (
+            param_and_grad_buffer.StorageResizeBasedBucketAllocator.free,
+            compat._MEGATRON_FSDP_STREAM_LIFETIME_PATCH_MARKER,
+            compat._MEGATRON_FSDP_STREAM_LIFETIME_SOURCE_SHA256,
+            compat._MEGATRON_FSDP_STREAM_LIFETIME_QUALNAME,
+            compat._MEGATRON_FSDP_STREAM_LIFETIME_FIRSTLINENO,
+        ),
+        (
+            megatron_fsdp_module.MegatronFSDP.forward,
+            compat._MEGATRON_FSDP_ROOT_FORWARD_PATCH_MARKER,
+            compat._MEGATRON_FSDP_ROOT_FORWARD_SOURCE_SHA256,
+            compat._MEGATRON_FSDP_ROOT_FORWARD_QUALNAME,
+            compat._MEGATRON_FSDP_ROOT_FORWARD_FIRSTLINENO,
+        ),
+        (
+            param_and_grad_buffer.ParamAndGradBuffer.update_main_grads,
+            compat._MEGATRON_FSDP_UPDATE_MAIN_GRADS_PATCH_MARKER,
+            compat._MEGATRON_FSDP_UPDATE_MAIN_GRADS_SOURCE_SHA256,
+            compat._MEGATRON_FSDP_UPDATE_MAIN_GRADS_QUALNAME,
+            compat._MEGATRON_FSDP_UPDATE_MAIN_GRADS_FIRSTLINENO,
+        ),
+    )
+    for function, marker_name, official_sha256, qualname, firstlineno in targets:
+        if getattr(function, marker_name, None) is not None:
+            # An earlier test in this process already installed the compat set;
+            # the idempotent re-install below still re-verifies every constant.
+            continue
+        source = inspect.getsource(function)
+        assert hashlib.sha256(source.encode()).hexdigest() == official_sha256, qualname
+        assert function.__qualname__ == qualname
+        assert function.__code__.co_firstlineno == firstlineno, qualname
+
+    # The install path fail-closes on any mismatch between the shipped official
+    # and patched-source fingerprints, structure constants, and the wheel.
+    compat._patch_megatron_fsdp_050_tp_dtensor_reshape(package_version="0.5.0")
+    status = compat._megatron_fsdp_050_tp_dtensor_patch_status(package_version="0.5.0")
+    assert status["active"] is True
+    assert status["package_version"] == "0.5.0"
+    assert compat._MEGATRON_FSDP_TP_DTENSOR_HELPER in param_and_grad_buffer.make_fsdp_dtensor.__code__.co_names
+
+
+@requires_real_megatron_fsdp_050
+def test_050_compat_kwargs_select_modern_branch_for_installed_wheel():
+    megatron_fsdp = importlib.import_module("megatron_fsdp")
+    from nemo_automodel.components.distributed.parallelizer import _megatron_fsdp_compat_kwargs
+
+    kwargs = _megatron_fsdp_compat_kwargs(
+        megatron_fsdp.fully_shard,
+        grad_reduce_in_fp32=True,
+        preserve_fp32_weights=False,
+        check_for_nan_in_grad=False,
+        report_nan_in_param_grad=True,
+    )
+    assert set(kwargs) == {"mixed_precision_policy", "report_nan_in_param_grad"}
+    assert isinstance(kwargs["mixed_precision_policy"], megatron_fsdp.MixedPrecisionPolicy)
+    assert kwargs["report_nan_in_param_grad"] is True
