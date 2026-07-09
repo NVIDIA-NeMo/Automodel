@@ -20,8 +20,8 @@ recipe body only ever sees typed component configs and calls
 ``self.cfg.<section>.build(...)`` directly.
 
 Known sections are exposed as cached, typed attributes that own a ``build()``:
-``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler`` map to component config
-dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
+``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm`` map to
+component config dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
 ``build_optimizer_config`` / ``build_loss_config`` (which own a ``build()``),
@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
+    from nemo_automodel.components.training.prewarm import PrewarmConfig
 
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
 # to ``StepSchedulerConfig.build(...)`` separately (not config fields).
@@ -177,6 +178,13 @@ class RecipeConfig:
         from nemo_automodel.components.loss.mtp import MTPLossConfig
 
         return MTPLossConfig()
+
+    @cached_property
+    def prewarm(self) -> "PrewarmConfig | None":
+        from nemo_automodel.components.training.prewarm import PrewarmConfig
+
+        node = self._raw.get("prewarm", None)
+        return PrewarmConfig(**_section_kwargs(node)) if node else None
 
     @cached_property
     def checkpoint(self) -> "CheckpointingConfig":
