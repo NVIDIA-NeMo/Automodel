@@ -44,7 +44,12 @@ def test_review_workflow_keeps_main_caller_wiring():
 @pytest.mark.parametrize(
     ("policy", "required_text"),
     [
-        ("complete diff", "Account for every changed file"),
+        ("complete diff", "complete diff for every other changed file"),
+        ("uv lock prefilter", "exclude `uv.lock` before requesting any file diff"),
+        ("uv lock exclusion", "Ignore `uv.lock` completely"),
+        ("uv lock no accounting", "do not open, read, render, quote, summarize, validate, or account for it"),
+        ("uv lock no validation", "Never inspect or validate `uv.lock`"),
+        ("uv lock no comments", "`uv.lock` for any reason"),
         ("self-contained review", "This prompt is self-contained"),
         ("no skill loading", "Do not load or read `SKILL.md`"),
         ("Python case", "All Python changes"),
@@ -115,6 +120,7 @@ def test_review_workflow_keeps_main_caller_wiring():
         ("finding cap", "Report at most 7 high-confidence findings"),
         ("verified evidence", "cite the changed code that proves it"),
         ("current head", "reviewed head revision is still current"),
+        ("excluded file completion", "every non-excluded changed file is accounted for"),
     ],
 )
 def test_review_prompt_keeps_adversarial_policy(policy: str, required_text: str):
