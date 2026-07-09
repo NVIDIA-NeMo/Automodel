@@ -199,6 +199,11 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     return output
 
 
+def _moe_accumulator_dtype(x: torch.Tensor) -> torch.dtype:
+    """Use fp32 accumulators for autograd, but avoid full fp32 buffers in no-grad paths."""
+    return torch.float32 if torch.is_grad_enabled() else x.dtype
+
+
 class GroupedExperts(nn.Module):
     """
     Sparse MoE implementation using all-gather/reduce-scatter primitives.
@@ -417,7 +422,7 @@ class GroupedExperts(nn.Module):
         experts_end_idx,
     ):
         """Per-expert loop forward path using gather/scatter."""
-        y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        y = torch.zeros(x.shape, dtype=_moe_accumulator_dtype(x), device=x.device)
 
         active_local_experts = 0
         for i in range(experts_start_idx, experts_end_idx):
@@ -453,7 +458,7 @@ class GroupedExperts(nn.Module):
             if expert_down_proj_bias is not None:
                 expert_out = expert_out + expert_down_proj_bias * w
 
-            y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
+            y.scatter_add_(dim=0, index=idx_b, src=expert_out.to(dtype=y.dtype))
 
         # Dummy computation for gradient flow when no tokens routed locally
         if active_local_experts == 0:
@@ -461,7 +466,7 @@ class GroupedExperts(nn.Module):
             gate_and_up_out = dummy_x @ gate_and_up_projs[0]
             activated = self.expert_activation_grouped(gate_and_up_out, weights[0, 0, None].unsqueeze(0))
             expert_out = activated @ down_projs[0]
-            y[0] += expert_out[0]
+            y[0] += expert_out[0].to(dtype=y.dtype)
 
         return y
 
@@ -487,7 +492,7 @@ class GroupedExperts(nn.Module):
             experts_start_idx,
         )
 
-        y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+        y = torch.zeros(x.shape, dtype=_moe_accumulator_dtype(x), device=x.device)
 
         if tokens_per_expert.sum() > 0:
             permuted_x = x[sorted_token_ids]
@@ -521,13 +526,13 @@ class GroupedExperts(nn.Module):
                 )
 
             scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
-            y.scatter_add_(0, scatter_ids, output2.float())
+            y.scatter_add_(0, scatter_ids, output2.to(dtype=y.dtype))
         else:
             # Dummy computation for gradient flow
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
             output1_ = self.expert_activation_grouped(output1, weights[0, 0, None].unsqueeze(0))
             output2 = torch.matmul(output1_, down_projs[0])
-            y[0] += output2[0]
+            y[0] += output2[0].to(dtype=y.dtype)
 
         return y
 
