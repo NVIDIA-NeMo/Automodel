@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -225,6 +225,7 @@ class MiniMaxM2Model(nn.Module):
 
 
 class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
 
     @dataclass(frozen=True)
@@ -273,7 +274,7 @@ class MiniMaxM2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = MiniMaxM2Model(

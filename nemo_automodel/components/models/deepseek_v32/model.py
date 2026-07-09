@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -167,6 +167,8 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
     Subclasses V3 ForCausalLM, using DeepseekV32Model and DeepSeekV32StateDictAdapter.
     """
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -209,7 +211,7 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         from nemo_automodel.components.models.common import initialize_linear_module
 
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         # Use V3.2 Model instead of V3 Model
         moe_overrides = kwargs.pop("moe_overrides", None)

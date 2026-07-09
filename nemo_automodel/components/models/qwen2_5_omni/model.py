@@ -44,7 +44,7 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniThinkerForConditionalGeneration as HFQwen2_5OmniThinkerForConditionalGeneration,
 )
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.qwen2_5_omni.state_dict_adapter import Qwen2_5OmniStateDictAdapter
@@ -64,6 +64,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
     HFQwen2_5OmniThinkerForConditionalGeneration,
 ):
     """Qwen2.5-Omni Thinker (audio + image + video + text → text)."""
+
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -103,7 +105,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
     ):
         # Check the controlling top-level flag on the original config before
         # resolving to thinker_config and building the HF parent.
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         thinker_config = _resolve_thinker_config(config)
         super().__init__(thinker_config)
 

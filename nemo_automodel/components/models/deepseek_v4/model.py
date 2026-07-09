@@ -49,7 +49,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
@@ -584,6 +584,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # ``DeepseekV4PreTrainedModel._keep_in_fp32_modules_strict`` (lines 890-900
     # of modular_deepseek_v4.py) plus the existing ``e_score_correction_bias``
     # entry that is specific to KAutomodel's shared Gate buffer.
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = [
         "attn_hc.fn",
         "attn_hc.base",
@@ -649,7 +650,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)

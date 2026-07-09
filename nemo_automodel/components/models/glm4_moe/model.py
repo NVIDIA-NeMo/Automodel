@@ -20,7 +20,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -234,6 +234,7 @@ class Glm4MoeModel(nn.Module):
 
 
 class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
     @dataclass(frozen=True)
@@ -275,7 +276,7 @@ class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         warn_deprecated_model_class("Glm4MoeForCausalLM")
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Glm4MoeModel(

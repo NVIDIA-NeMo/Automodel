@@ -60,7 +60,7 @@ except ModuleNotFoundError:
     Qwen3_5MoeVisionRotaryEmbedding = _make_missing("Qwen3_5MoeVisionRotaryEmbedding")
     HFQwen3_5MoeModel = _make_missing("Qwen3_5MoeModel")
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule, roll_tensor
@@ -693,6 +693,8 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
       * ``lm_head`` with NeMo backend linear
     """
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
@@ -754,7 +756,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
                 if sub_cfg is not config and hasattr(sub_cfg, "torch_dtype"):
                     sub_cfg.torch_dtype = top_dtype
 
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         # Initialize HF parent (creates self.model, self.lm_head, vision encoder, etc.)
         super().__init__(config)
 

@@ -26,7 +26,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -253,6 +253,8 @@ class MiniMaxM3TextModel(nn.Module):
 class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Standalone M3 text backbone for causal LM (Stage 1 parity target)."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
 
     # The state-dict adapter loads every tensor from the checkpoint, so skip HF
@@ -279,7 +281,7 @@ class MiniMaxM3SparseForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMix
     ):
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         self.model = MiniMaxM3TextModel(config, backend=self.backend, moe_config=moe_config)
         self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
@@ -368,6 +370,8 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     positions, then run through the (sparse/dense MoE) language model + lm_head.
     """
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     # Pipeline-parallel routing: keep this VLM's own forward (which splices vision
     # features) instead of letting patch_hf_model_for_pp swap in the generic
     # CausalLM forward (which would drop pixel_values). MTP per-depth outputs are
@@ -425,7 +429,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     ):
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         text_config = config.text_config
         self.backend = backend or BackendConfig()
         self.model = MiniMaxM3TextModel(text_config, backend=self.backend, moe_config=moe_config)

@@ -15,6 +15,7 @@
 import json
 import os
 from collections.abc import Mapping
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,27 @@ def resolve_trust_remote_code(pretrained_model_name_or_path):
     return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
 
 
+class TieSupport(Enum):
+    """Which ``tie_word_embeddings`` settings a model class supports.
+
+    Declared as the ``tie_word_embeddings_support`` class attribute on every
+    registered model class and consulted by
+    :func:`reject_unsupported_tie_word_embeddings` at construction time to reject
+    a config whose tying the architecture cannot honor.
+    """
+
+    #: Both tied and untied heads are supported: the class ties in ``__init__`` /
+    #: ``tie_weights()`` when requested and otherwise runs a separate ``lm_head``.
+    BOTH = "both"
+    #: Only ``tie_word_embeddings=True`` is supported: the architecture ties its
+    #: input and output embeddings and ships checkpoints without a distinct
+    #: ``lm_head.weight``.
+    TIED_ONLY = "tied_only"
+    #: Only ``tie_word_embeddings=False`` is supported: the architecture has
+    #: separate input and output embeddings and never builds a shared ``lm_head``.
+    UNTIED_ONLY = "untied_only"
+
+
 def get_controlling_tie_word_embeddings(config: object, model_class_name: str) -> bool:
     """Resolve the ``tie_word_embeddings`` flag that actually controls lm_head tying.
 
@@ -179,54 +201,52 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
     return get_controlling_tie_word_embeddings(config, type(model).__name__)
 
 
-def reject_unsupported_tied_word_embeddings(config: object, model_class_name: str) -> None:
-    """Reject ``tie_word_embeddings=True`` for models whose HF default is untied.
+def reject_unsupported_tie_word_embeddings(model_cls: type, config: object) -> None:
+    """Reject a ``tie_word_embeddings`` setting the model class cannot honor.
 
-    Separate-head architectures (HF default: distinct input/output embeddings)
-    don't build a shared ``lm_head``, so honoring ``tie_word_embeddings=True``
-    would silently leave a randomly-initialized head or require materializing a
-    tied weight NeMo does not support. Reject it explicitly with a clear message
-    instead of pretending to support it.
+    Reads the class's declared :class:`TieSupport` policy from
+    ``model_cls.tie_word_embeddings_support`` (defaulting to
+    :attr:`TieSupport.BOTH`) and the controlling ``tie_word_embeddings`` flag
+    from :func:`get_controlling_tie_word_embeddings`, then raises when the
+    requested tying falls outside the supported set:
 
-    Uses :func:`get_controlling_tie_word_embeddings`, so composite VLM/omni configs
-    are read from the controlling top-level flag rather than a nested
-    ``text_config``.
+    - ``UNTIED_ONLY`` classes are separate-head architectures (HF default: distinct
+      input/output embeddings) that never build a shared ``lm_head``; honoring
+      ``tie_word_embeddings=True`` would leave a randomly-initialized head.
+    - ``TIED_ONLY`` classes share ``lm_head`` with the input embedding and ship
+      checkpoints without a distinct ``lm_head.weight``; honoring
+      ``tie_word_embeddings=False`` would require materializing a head NeMo does
+      not build and the checkpoint has no weights for.
+
+    Call at the top of ``__init__`` on the *original* top-level config, before
+    unwrapping to ``text_config`` / ``thinker_config`` or calling
+    ``super().__init__()``, so the correct controlling flag is inspected and
+    construction fails fast.
 
     Args:
-        config: The model's config.
-        model_class_name: ``type(self).__name__`` of the constructing model.
+        model_cls: The constructing model class (``type(self)``). Its
+            ``tie_word_embeddings_support`` attribute declares the policy and its
+            ``__name__`` selects the controlling-flag resolution.
+        config: The model's original (top-level) config.
 
     Raises:
-        NotImplementedError: if the controlling ``tie_word_embeddings`` flag is set.
+        NotImplementedError: if tying is requested on a :attr:`TieSupport.UNTIED_ONLY`
+            class, or untying is requested on a :attr:`TieSupport.TIED_ONLY` class.
     """
-    if get_controlling_tie_word_embeddings(config, model_class_name):
+    support = getattr(model_cls, "tie_word_embeddings_support", TieSupport.BOTH)
+    if support is TieSupport.BOTH:
+        return
+
+    model_class_name = model_cls.__name__
+    requested_tied = get_controlling_tie_word_embeddings(config, model_class_name)
+
+    if support is TieSupport.UNTIED_ONLY and requested_tied:
         raise NotImplementedError(
             f"{model_class_name} has separate input and output embeddings and does not "
             f"support tie_word_embeddings=True. The Hugging Face default for this "
             f"architecture is untied; set tie_word_embeddings=False."
         )
-
-
-def reject_unsupported_untied_word_embeddings(config: object, model_class_name: str) -> None:
-    """Reject ``tie_word_embeddings=False`` for models whose HF default is tied.
-
-    Tied-by-default architectures share ``lm_head`` with the input embedding and
-    ship checkpoints without a separate ``lm_head.weight``. Honoring
-    ``tie_word_embeddings=False`` would require materializing a distinct
-    ``lm_head`` NeMo does not build (and a tied checkpoint has no weights for it),
-    so reject it explicitly instead of running with a randomly-initialized head.
-
-    The mirror of :func:`reject_unsupported_tied_word_embeddings`; both read the
-    controlling flag via :func:`get_controlling_tie_word_embeddings`.
-
-    Args:
-        config: The model's config.
-        model_class_name: ``type(self).__name__`` of the constructing model.
-
-    Raises:
-        NotImplementedError: if the controlling ``tie_word_embeddings`` flag evaluates to ``False``.
-    """
-    if not get_controlling_tie_word_embeddings(config, model_class_name):
+    if support is TieSupport.TIED_ONLY and not requested_tied:
         raise NotImplementedError(
             f"{model_class_name} ties its input and output embeddings and does not "
             f"support tie_word_embeddings=False. The Hugging Face default for this "

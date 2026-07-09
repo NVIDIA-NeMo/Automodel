@@ -38,7 +38,7 @@ from transformers.models.mbart.modeling_mbart import (
     MBartScaledWordEmbedding,
 )
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 
@@ -435,6 +435,8 @@ class NemotronParsePreTrainedModel(PreTrainedModel):
 class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParsePreTrainedModel, GenerationMixin):
     """NemotronParse model for conditional generation tasks."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -445,7 +447,7 @@ class NemotronParseForConditionalGeneration(HFCheckpointingMixin, NemotronParseP
         supports_ep: bool = False
 
     def __init__(self, config: NemotronParseConfig, loss_fn=None, **kwargs):
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.loss_fn = loss_fn
 

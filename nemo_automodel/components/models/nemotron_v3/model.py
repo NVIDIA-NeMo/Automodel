@@ -22,7 +22,7 @@ from transformers import AutoConfig
 from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     HFCheckpointingMixin,
@@ -283,6 +283,8 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
     per-step KV caching for attention layers and recurrent state caching for Mamba2 layers.
     """
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     # Hybrid Mamba2/Attention uses NemotronHybridCache, not DynamicCache.
     _is_stateful: bool = True
     main_input_name: str = "input_ids"
@@ -371,7 +373,7 @@ class NemotronHForCausalLM(HFCheckpointingMixin, GenerationMixin, nn.Module, MoE
         """
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
 
         # Base model

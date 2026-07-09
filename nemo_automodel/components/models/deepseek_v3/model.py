@@ -20,7 +20,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -258,6 +258,7 @@ class DeepseekV3Model(nn.Module):
 
 
 class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
     @dataclass(frozen=True)
@@ -300,7 +301,7 @@ class DeepseekV3ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         # The HF DeepSeek-V3 reference computes router scoring in fp32; routing is highly
         # precision-sensitive (small bf16 errors flip expert selection) and the gate is tiny,

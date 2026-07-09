@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import roll_tensor
@@ -313,6 +313,8 @@ class Step3p7Model(nn.Module):
 class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Native Step3.7 VLM implementation for MedPix fine-tuning with EP and PP."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     _keep_in_fp32_modules = ["rotary_emb"]
 
     _pp_keep_self_forward: bool = True
@@ -356,7 +358,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
     ) -> None:
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)

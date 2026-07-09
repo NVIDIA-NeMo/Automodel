@@ -20,7 +20,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -244,6 +244,7 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # The generic HF pipeline forward assumes the HF rotary API
     # (rotary_emb(x, position_ids) -> cos/sin) and crashes on the freqs_cis /
     # THD / CP path, so it must not clobber our forward.
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _pp_keep_self_forward: bool = True
 
     @dataclass(frozen=True)
@@ -284,7 +285,7 @@ class Qwen3MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Qwen3MoeModel(config, backend=self.backend, moe_config=moe_config, moe_overrides=moe_overrides)

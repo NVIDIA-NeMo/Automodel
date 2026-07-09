@@ -43,7 +43,7 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration as _HFMistral3ForConditionalGeneration,
 )
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
     Mistral3FP8StateDictAdapter,
@@ -113,6 +113,8 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
     Mistral3 VLM checkpoint (e.g. dawn-ridge-128B).
     """
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     # See checkpointing.py:initialize_model_weights — gate on this attribute
     # to skip HF's ``initialize_weights()``. The upcoming adapter load will
     # populate every tensor, and skipping avoids a stage-divergent DTensor
@@ -133,7 +135,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
     def __init__(self, config: PretrainedConfig):
         # The supported Mistral3 checkpoint (mistralai/Mistral-Medium-3.5-128B) is
         # untied (tie_word_embeddings=False), so reject tie_word_embeddings=True.
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         # HF's Mistral3ForConditionalGeneration.__init__ consults
         # ``config.quantization_config`` and swaps nn.Linear → FP8Linear for
         # every language_model Linear. FP8Linear registers a 0-d

@@ -108,7 +108,7 @@ class KimiVLConfig(PretrainedConfig):
         return output
 
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
 from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids
@@ -634,6 +634,8 @@ class KimiVLModel(nn.Module):
 class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """KimiVL model with backend-aware DeepseekV3 language model."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
@@ -660,7 +662,7 @@ class KimiVLForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyn
         warn_deprecated_model_class("KimiVLForConditionalGeneration")
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
 
         self.model = KimiVLModel(config, moe_config=moe_config, backend=self.backend)
