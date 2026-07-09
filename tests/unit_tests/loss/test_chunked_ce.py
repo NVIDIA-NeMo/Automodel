@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import pytest
 import torch
 import torch.nn.functional as F
 
 from nemo_automodel.components.loss.chunked_ce import ChunkedCrossEntropy, compute_cross_entropy
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 
 
 def test_compute_cross_entropy_basic():
@@ -110,6 +112,7 @@ def test_chunked_cross_entropy_ignore_index_and_mask():
         f"Expected chunked loss {loss_ref.item()}, but got {loss_chunked.item()}."
     )
 
+
 def test_chunked_cross_entropy_num_label_tokens_normalization():
     """Ensure that the loss is divided by ``num_label_tokens`` when provided."""
 
@@ -129,10 +132,75 @@ def test_chunked_cross_entropy_num_label_tokens_normalization():
     expected_loss = loss_sum / num_label_tokens
 
     # Loss from ChunkedCrossEntropy with num_label_tokens specified
-    loss_chunked = ChunkedCrossEntropy(chunk_len=4)(
-        logits, targets, num_label_tokens=num_label_tokens
-    ).detach()
+    loss_chunked = ChunkedCrossEntropy(chunk_len=4)(logits, targets, num_label_tokens=num_label_tokens).detach()
 
     assert torch.allclose(loss_chunked, expected_loss, atol=1e-6), (
         f"Expected normalized loss {expected_loss.item()}, but got {loss_chunked.item()}."
     )
+
+
+# ---------------------------------------------------------------------------
+# memory-efficient sum path (shared kernel with MaskedCrossEntropy(chunk_size=...))
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("inplace_grad", [False, True])
+def test_chunked_cross_entropy_gradient_parity_with_reference(inplace_grad):
+    """The sum path must match ``F.cross_entropy`` in loss AND gradient, with mask + ignore_index."""
+    torch.manual_seed(7)
+    logits = torch.randn(17, 11, requires_grad=True)
+    reference_logits = logits.detach().clone().requires_grad_()
+    targets = torch.randint(0, logits.shape[-1], (17,))
+    targets[3] = -100
+    mask = torch.ones_like(targets)
+    mask[8] = 0
+
+    loss = ChunkedCrossEntropy(chunk_len=5, inplace_grad=inplace_grad)(logits, targets.clone(), mask=mask)
+    reference_targets = targets.masked_fill(mask == 0, -100)
+    reference = F.cross_entropy(reference_logits, reference_targets, ignore_index=-100, reduction="sum")
+
+    torch.testing.assert_close(loss, reference, rtol=1e-6, atol=1e-7)
+    loss.backward()
+    reference.backward()
+    torch.testing.assert_close(logits.grad, reference_logits.grad, rtol=1e-6, atol=1e-7)
+    if inplace_grad:
+        assert logits.grad.untyped_storage().data_ptr() == logits.untyped_storage().data_ptr()
+
+
+def test_chunked_cross_entropy_matches_masked_cross_entropy_chunked_path():
+    """ChunkedCrossEntropy and MaskedCrossEntropy(chunk_size=...) share one kernel and must agree."""
+    torch.manual_seed(23)
+    logits = torch.randn(3, 6, 13, requires_grad=True)
+    masked_logits = logits.detach().clone().requires_grad_()
+    labels = torch.randint(0, logits.shape[-1], (3, 6))
+    labels[1, 2] = -100
+
+    loss_chunked = ChunkedCrossEntropy(chunk_len=4)(logits, labels.clone())
+    loss_masked = MaskedCrossEntropy(chunk_size=4)(masked_logits, labels.clone())
+
+    torch.testing.assert_close(loss_chunked, loss_masked, rtol=0.0, atol=0.0)
+    loss_chunked.backward()
+    loss_masked.backward()
+    torch.testing.assert_close(logits.grad, masked_logits.grad, rtol=0.0, atol=0.0)
+
+
+def test_chunked_cross_entropy_sum_path_saves_no_fp32_activations():
+    """The sum path must save only the original-dtype logits for backward (no fp32 upcasts)."""
+    torch.manual_seed(29)
+    logits = torch.randn(16, 32, dtype=torch.bfloat16, requires_grad=True)
+    targets = torch.randint(0, logits.shape[-1], (16,))
+
+    saved_float_bytes = 0
+
+    def pack(tensor):
+        nonlocal saved_float_bytes
+        if tensor.is_floating_point() and tensor.dtype != torch.bfloat16:
+            saved_float_bytes += tensor.numel() * tensor.element_size()
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        loss = ChunkedCrossEntropy(chunk_len=4)(logits, targets)
+
+    assert saved_float_bytes == 0, f"sum path saved {saved_float_bytes} bytes of non-bf16 float activations"
+    loss.backward()
+    assert logits.grad is not None and logits.grad.dtype == torch.bfloat16

@@ -67,11 +67,19 @@ class MaskedCrossEntropyConfig(LossConfig):
         fp32_upcast: Cast logits to float32 before computing CE.
         ignore_index: Label value marking padding tokens.
         reduction: Reduction mode — ``"sum"``, ``"mean"``, or ``"none"``.
+        chunk_size: If set, compute the loss one fp32 ``[chunk_size, V]`` slice
+            at a time instead of upcasting the full logits tensor (requires
+            ``reduction="sum"`` and ``fp32_upcast=True``). ``None`` disables
+            chunking.
+        inplace_grad: Only used when ``chunk_size`` is set. If True, backward
+            writes the logits gradient into the logits tensor's storage.
     """
 
     fp32_upcast: bool = True
     ignore_index: int = -100
     reduction: str = "sum"
+    chunk_size: int | None = None
+    inplace_grad: bool = True
 
     def build(self) -> nn.Module:
         from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -80,6 +88,8 @@ class MaskedCrossEntropyConfig(LossConfig):
             fp32_upcast=self.fp32_upcast,
             ignore_index=self.ignore_index,
             reduction=self.reduction,
+            chunk_size=self.chunk_size,
+            inplace_grad=self.inplace_grad,
         )
 
 

@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nemo_automodel.components.loss.masked_ce import _ChunkedMaskedCESum
+
 _compiled_compute_cross_entropy = None
 
 
@@ -43,24 +45,45 @@ def compute_cross_entropy(
 class ChunkedCrossEntropy(nn.Module):
     """Cross-entropy loss computed over sequence chunks."""
 
-    def __init__(self, chunk_len: int = 32, compile: bool = True, ignore_index: int = -100, reduction: str = "sum"):
+    def __init__(
+        self,
+        chunk_len: int = 32,
+        compile: bool = True,
+        ignore_index: int = -100,
+        reduction: str = "sum",
+        inplace_grad: bool = True,
+    ):
         """
         Chunked cross-entropy loss.
+
+        With the default ``reduction="sum"`` the loss is computed by the
+        memory-efficient chunked kernel (:class:`_ChunkedMaskedCESum`): each
+        ``[chunk_len, V]`` slice is upcast to fp32 transiently, only the
+        original-dtype logits are saved for backward, and the softmax is
+        recomputed per chunk in backward. Other reductions fall back to the
+        legacy per-chunk ``torch.compile``-d ``F.cross_entropy`` loop.
 
         Args:
             chunk_len (int, optional): The size of each chunk. The sequence will be split
                 along the first dimension in chunks of this length. Defaults to 32.
-            compile (bool, optional): If True, uses the compiled compute_cross_entropy function.
-                Defaults to True.
+            compile (bool, optional): If True, uses the compiled compute_cross_entropy function
+                on the legacy (non-"sum") path. The "sum" path uses the chunked kernel and
+                does not involve ``torch.compile``. Defaults to True.
             ignore_index (int, optional): Target value that is ignored when computing the loss.
                 Defaults to -100.
             reduction (str, optional): Type of reduction. Defaults to "sum".
+            inplace_grad (bool, optional): only used when ``reduction="sum"``. If True,
+                backward writes the logits gradient into the logits tensor's storage
+                instead of allocating a new ``[N, V]`` buffer. Safe as long as no other
+                autograd node consumes the logits *values* in backward (the producing
+                linear layer does not). Defaults to True.
         """
         super().__init__()
         self.chunk_len = chunk_len
         self.compile = compile
         self.ignore_index = ignore_index
         self.reduction = reduction
+        self.inplace_grad = inplace_grad
 
     def forward(
         self,
@@ -94,16 +117,22 @@ class ChunkedCrossEntropy(nn.Module):
                 labels.masked_fill_(mask.view(-1) == 0, self.ignore_index)
                 del mask
 
-        # maybe refactor if this is moved to a class?
-        global _compiled_compute_cross_entropy
-        if _compiled_compute_cross_entropy is None:
-            _compiled_compute_cross_entropy = torch.compile(compute_cross_entropy, dynamic=True)
+        if self.reduction == "sum":
+            # Memory-efficient path shared with MaskedCrossEntropy(chunk_size=...):
+            # fp32 math one [chunk_len, V] slice at a time, saving only the
+            # original-dtype logits for backward.
+            loss = _ChunkedMaskedCESum.apply(logits, labels, self.ignore_index, self.chunk_len, self.inplace_grad)
+        else:
+            # maybe refactor if this is moved to a class?
+            global _compiled_compute_cross_entropy
+            if _compiled_compute_cross_entropy is None:
+                _compiled_compute_cross_entropy = torch.compile(compute_cross_entropy, dynamic=True)
 
-        seq_len = logits.shape[0]
-        num_chunks = (seq_len + self.chunk_len - 1) // self.chunk_len
-        loss = 0.0
-        for logits_chunk, targets_chunk in zip(logits.chunk(num_chunks, dim=0), labels.chunk(num_chunks, dim=0)):
-            loss += _compiled_compute_cross_entropy(logits_chunk, targets_chunk, self.ignore_index, self.reduction)
+            seq_len = logits.shape[0]
+            num_chunks = (seq_len + self.chunk_len - 1) // self.chunk_len
+            loss = 0.0
+            for logits_chunk, targets_chunk in zip(logits.chunk(num_chunks, dim=0), labels.chunk(num_chunks, dim=0)):
+                loss += _compiled_compute_cross_entropy(logits_chunk, targets_chunk, self.ignore_index, self.reduction)
         if num_label_tokens is not None:
             assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
             loss = loss / num_label_tokens  # pragma: no cover
