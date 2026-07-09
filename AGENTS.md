@@ -224,9 +224,15 @@ model:
 
 ### Dataclass Configs
 
-Every component config is a Python dataclass that exposes `to_dict()` and
-`from_dict()` for serialization round-tripping. When adding a new config field,
-always provide a default value and add it to both methods.
+Every component config is a typed Python dataclass. When adding a field, provide
+a backward-compatible default and keep consumers on the typed object.
+
+Do not add hand-written `to_dict()` or `from_dict()` methods to component
+configs, and do not add new calls to those methods for component configs. Keep
+typed configs intact inside recipes and components. YAML or JSON conversion
+belongs at the existing `ConfigNode`/`RecipeConfig` boundary or another shared
+serializer. Existing legacy methods and upstream-required overrides may remain
+when untouched.
 
 ### Config-Owned Construction
 
