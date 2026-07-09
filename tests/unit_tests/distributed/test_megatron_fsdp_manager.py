@@ -76,13 +76,23 @@ def test_parallelize_world_size_one_logs_error_when_checkpointing_not_supported(
     assert "Model does not support gradient checkpointing. Skipping." in caplog.text
 
 
-def test_parallelize_world_size_gt_one_selects_tp_plan_passes_dims_and_warns_on_nonzero3(monkeypatch, capsys, caplog):
+@pytest.mark.parametrize("flattened_dp_cp", [False, True])
+def test_parallelize_world_size_gt_one_selects_tp_plan_passes_dims_and_warns_on_nonzero3(
+    monkeypatch, capsys, caplog, flattened_dp_cp
+):
     monkeypatch.setattr(mfsdp, "dist", MagicMock(get_world_size=lambda: 8), raising=True)
 
-    # Device mesh with tp > 1 and dp_cp flattened dim
+    # Real MeshContext roots keep dp_cp in _flatten_mapping instead of
+    # advertising it in mesh_dim_names.
     mesh = MagicMock()
     mesh.get_rank.return_value = 0
-    mesh.mesh_dim_names = ("dp_cp", "tp")
+    mesh._get_root_mesh.return_value = mesh
+    if flattened_dp_cp:
+        mesh.mesh_dim_names = ("dp", "cp", "tp")
+        mesh._flatten_mapping = {"dp_cp": MagicMock()}
+    else:
+        mesh.mesh_dim_names = ("dp_cp", "tp")
+        mesh._flatten_mapping = {}
     tp_mesh = MagicMock()
     tp_mesh.size.return_value = 2
     mesh.__getitem__ = lambda self, key: tp_mesh if key == "tp" else MagicMock()

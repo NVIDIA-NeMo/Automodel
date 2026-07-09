@@ -21,6 +21,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.parallelizer import (
     _get_parallel_plan,
     megatron_fsdp_strategy_parallelize,
@@ -131,11 +132,19 @@ class MegatronFSDPManager:
         else:
             tp_shard_plan = None
 
-        # Determine dp_shard_dim based on whether cp is in mesh
-        if "dp_cp" in self.device_mesh.mesh_dim_names:
-            dp_shard_dim = "dp_cp"
-        else:
+        # ``dp_cp`` is normally produced by DeviceMesh._flatten(), so it lives
+        # in the root mesh's private flatten mapping rather than in
+        # ``mesh_dim_names``.  A name-only check silently drops CP from the
+        # Megatron-FSDP shard group on real MeshContext meshes.  Resolve it
+        # through the same compatibility helper used by the rest of the
+        # distributed stack; older meshes with a literal ``dp_cp`` dimension
+        # continue to work as well.
+        try:
+            get_flat_mesh(self.device_mesh, "dp_cp")
+        except KeyError:
             dp_shard_dim = "dp"
+        else:
+            dp_shard_dim = "dp_cp"
         tp_dim = "tp"
 
         model, optimizer = megatron_fsdp_strategy_parallelize(
