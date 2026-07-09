@@ -811,84 +811,42 @@ def test_recipe_cached_path_does_not_load_target_model(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _maybe_shard_dense_target: opt-in FSDP2 sharding of a frozen dense target.
+# _should_shard_dense_target: opt-in gate for loading a frozen dense target
+# FSDP2-sharded via the standard distributed setup.
 # ---------------------------------------------------------------------------
 
 
-class _FakeTargetWrapper:
-    """Minimal HFDSparkTargetModel stand-in exposing the layer accessor used for sharding."""
-
-    def __init__(self, num_layers: int):
-        self._layers = [torch.nn.Linear(4, 4) for _ in range(num_layers)]
-        self._num_layers = num_layers
-
-    def _get_transformer_layers(self):
-        return self._layers
-
-
-def _make_shard_recipe(strategy="fsdp2", world_size=8, target_wrapper=None):
+def _make_shard_recipe(strategy="fsdp2", world_size=8):
     recipe = TrainDSparkRecipe({"distributed": {"strategy": strategy}})
     recipe.dist_env = SimpleNamespace(world_size=world_size, is_main=True)
     recipe.compute_dtype = torch.bfloat16
-    recipe.target_wrapper = _FakeTargetWrapper(4) if target_wrapper is None else target_wrapper
     return recipe
 
 
-def _patch_fully_shard(monkeypatch):
-    """Record fully_shard calls without touching CUDA / a process group."""
-    import torch.distributed.fsdp as fsdp_mod
-
-    calls = []
-    monkeypatch.setattr(fsdp_mod, "fully_shard", lambda layer, **kwargs: calls.append((layer, kwargs)))
-    monkeypatch.setattr(fsdp_mod, "MixedPrecisionPolicy", lambda **kwargs: ("mp_policy", kwargs))
-    return calls
-
-
-def test_shard_dense_target_off_by_default(monkeypatch):
-    # Existing configs (no shard_dense_target) keep the target replicated: no sharding.
-    calls = _patch_fully_shard(monkeypatch)
+def test_should_shard_dense_target_off_by_default():
+    # Existing configs (no shard_dense_target) keep the target replicated.
     recipe = _make_shard_recipe()
-    assert recipe._maybe_shard_dense_target({}, is_moe_target=False) is False
-    assert calls == []
+    assert recipe._should_shard_dense_target({}) is False
 
 
-def test_shard_dense_target_shards_each_layer(monkeypatch):
-    calls = _patch_fully_shard(monkeypatch)
+def test_should_shard_dense_target_true_on_fsdp2_multi_rank():
     recipe = _make_shard_recipe()
-    sharded = recipe._maybe_shard_dense_target({"shard_dense_target": True}, is_moe_target=False)
-    assert sharded is True
-    # Every decoder layer is wrapped, and reshard_after_forward=True is mandatory
-    # (each layer is its own FSDP root and would otherwise stay all-gathered).
-    assert len(calls) == recipe.target_wrapper._num_layers
-    assert all(kwargs.get("reshard_after_forward") is True for _layer, kwargs in calls)
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True
 
 
-def test_shard_dense_target_skips_moe(monkeypatch):
-    # MoE targets are already sharded via their own distributed setup.
-    calls = _patch_fully_shard(monkeypatch)
-    recipe = _make_shard_recipe()
-    assert recipe._maybe_shard_dense_target({"shard_dense_target": True}, is_moe_target=True) is False
-    assert calls == []
+def test_should_shard_dense_target_default_strategy_is_fsdp2():
+    # With no explicit distributed.strategy the default is fsdp2, so the flag takes effect.
+    recipe = TrainDSparkRecipe({})
+    recipe.dist_env = SimpleNamespace(world_size=8, is_main=True)
+    recipe.compute_dtype = torch.bfloat16
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True
 
 
-def test_shard_dense_target_skips_when_no_wrapper(monkeypatch):
-    # Offline cached training loads no target (target_wrapper is None).
-    calls = _patch_fully_shard(monkeypatch)
-    recipe = _make_shard_recipe()
-    recipe.target_wrapper = None
-    assert recipe._maybe_shard_dense_target({"shard_dense_target": True}, is_moe_target=False) is False
-    assert calls == []
-
-
-def test_shard_dense_target_warns_on_single_rank(monkeypatch):
-    calls = _patch_fully_shard(monkeypatch)
+def test_should_shard_dense_target_ignored_on_single_rank():
     recipe = _make_shard_recipe(world_size=1)
-    assert recipe._maybe_shard_dense_target({"shard_dense_target": True}, is_moe_target=False) is False
-    assert calls == []
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is False
 
 
-def test_shard_dense_target_warns_on_ddp(monkeypatch):
-    calls = _patch_fully_shard(monkeypatch)
+def test_should_shard_dense_target_ignored_on_ddp():
     recipe = _make_shard_recipe(strategy="ddp")
-    assert recipe._maybe_shard_dense_target({"shard_dense_target": True}, is_moe_target=False) is False
-    assert calls == []
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is False

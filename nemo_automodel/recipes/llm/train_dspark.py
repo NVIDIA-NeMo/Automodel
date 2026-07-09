@@ -341,34 +341,22 @@ class TrainDSparkRecipe(BaseRecipe):
     def __init__(self, cfg):
         self.cfg = cfg
 
-    def _maybe_shard_dense_target(self, recipe_cfg, is_moe_target: bool) -> bool:
-        """FSDP2-shard a frozen dense target's decoder layers when ``shard_dense_target`` is set.
+    def _should_shard_dense_target(self, recipe_cfg) -> bool:
+        """Whether to load a frozen dense target FSDP2-sharded via the standard distributed setup.
 
-        A dense target (Qwen3 / Gemma4) is otherwise loaded whole and replicated on
-        every rank. For a large dense target (e.g. Gemma4-31B) the frozen target is
-        ~62 GiB, leaving no room for the draft's training activations, so training OOMs
-        at the first backward on 80 GiB GPUs. The MoE targets already avoid this by
-        sharding through their distributed setup; this mirrors it for a dense target by
-        FSDP2-sharding its frozen decoder layers across the world mesh (forward-only
-        all-gather + reshard). ``embed_tokens`` / ``lm_head`` are intentionally left
-        replicated so the draft copies them as plain tensors, keeping the draft-sharing
-        path (which only gathers DTensors for the MoE targets) unchanged.
+        Opt-in (``recipe_args.shard_dense_target``, default ``False``). A dense target
+        (Qwen3 / Gemma4) is otherwise loaded whole and replicated on every rank. For a large
+        dense target (e.g. Gemma4-31B) the frozen target is ~62 GiB, leaving no room for the
+        draft's training activations, so training OOMs at the first backward on 80 GiB GPUs.
+        Loading it through ``create_distributed_setup_from_config`` +
+        ``NeMoAutoModelForCausalLM.from_pretrained(distributed_setup=...)`` FSDP2-shards it
+        across the mesh, the same path the MoE / VL targets already use.
 
-        This is opt-in (``recipe_args.shard_dense_target``, default ``False``): sharding
-        adds a per-microbatch all-gather/reshard of the frozen target, which is pure
-        overhead for a target that already fits replicated (e.g. Qwen3-0.6B), so existing
-        configs keep their replicated behavior unless they request it.
-
-        Args:
-            recipe_cfg: The ``recipe_args`` config section.
-            is_moe_target: Whether the target is an MoE model already sharded via its
-                own distributed setup (DeepSeek V4 / GLM-5.2 / MiniMax M3).
-
-        Returns:
-            ``True`` if the dense target was sharded, ``False`` otherwise.
+        A small target (e.g. Qwen3-0.6B) stays replicated by default, since sharding a target
+        that already fits is pure all-gather overhead. Requires ``distributed.strategy='fsdp2'``
+        on more than one rank; otherwise the request is ignored with a warning and the target
+        stays replicated.
         """
-        if self.target_wrapper is None or is_moe_target:
-            return False
         if not bool(recipe_cfg.get("shard_dense_target", False)):
             return False
         strategy = (self.cfg.get("distributed", None) or {}).get("strategy", "fsdp2")
@@ -382,22 +370,6 @@ class TrainDSparkRecipe(BaseRecipe):
                     self.dist_env.world_size,
                 )
             return False
-
-        from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-
-        target_mp_policy = MixedPrecisionPolicy(param_dtype=self.compute_dtype, reduce_dtype=self.compute_dtype)
-        # reshard_after_forward=True is required: each layer is fully_shard'd without a
-        # parent FSDP module, so it is its own FSDP root and would otherwise default to
-        # reshard_after_forward=False, keeping every layer unsharded (all-gathered) after
-        # the target's forward and OOMing.
-        for layer in self.target_wrapper._get_transformer_layers():
-            fully_shard(layer, mp_policy=target_mp_policy, reshard_after_forward=True)
-        if self.dist_env.is_main:
-            logger.info(
-                "DSpark: FSDP2-sharded the frozen dense target's %d decoder layers across %d ranks.",
-                self.target_wrapper._num_layers,
-                self.dist_env.world_size,
-            )
         return True
 
     def setup(self):
@@ -425,6 +397,9 @@ class TrainDSparkRecipe(BaseRecipe):
         is_glm_5_2_target = target_model_type == _GLM_5_2_MODEL_TYPE
         is_gemma4_target = target_model_type in _GEMMA4_MODEL_TYPES
         is_minimax_m3_target = target_model_type in _MINIMAX_M3_MODEL_TYPES
+        # Set when a dense target is loaded FSDP2-sharded via distributed_setup (opt-in); its
+        # embed_tokens / lm_head then come back as DTensors and need gathering for the draft.
+        dense_target_sharded = False
         self.cached_target_path = recipe_cfg.get("cached_target_path", None)
         is_multimodal = bool(recipe_cfg.get("multimodal", False))
         if is_multimodal and not is_minimax_m3_target:
@@ -568,14 +543,36 @@ class TrainDSparkRecipe(BaseRecipe):
                 target_kwargs = {}
                 if target_attn_implementation is not None:
                     target_kwargs["attn_implementation"] = target_attn_implementation
-                self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
-                    target_path,
-                    trust_remote_code=trust_remote_code,
-                    torch_dtype=self.compute_dtype,
-                    force_hf=bool(recipe_cfg.get("target_force_hf", False)),
-                    **target_kwargs,
-                )
-                self.target_model.to(self.device)
+                if self._should_shard_dense_target(recipe_cfg):
+                    # Load the frozen dense target FSDP2-sharded through the standard distributed
+                    # setup (device mesh + FSDP2 policy, then a root fully_shard on load), the same
+                    # path the MoE / VL targets use, instead of replicating the whole target on
+                    # every rank. embed_tokens / lm_head come back as sharded DTensors and are
+                    # gathered to full tensors before the draft copies them (see below).
+                    self.distributed_setup = create_distributed_setup_from_config(
+                        self.cfg,
+                        world_size=self.dist_env.world_size,
+                    )
+                    self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
+                        target_path,
+                        trust_remote_code=trust_remote_code,
+                        torch_dtype=self.compute_dtype,
+                        force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+                        distributed_setup=self.distributed_setup,
+                        **target_kwargs,
+                    )
+                    dense_target_sharded = True
+                    # A distributed-setup-loaded model already lands correctly placed
+                    # (sharded as DTensors); a blanket .to(device) afterward is redundant.
+                else:
+                    self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
+                        target_path,
+                        trust_remote_code=trust_remote_code,
+                        torch_dtype=self.compute_dtype,
+                        force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+                        **target_kwargs,
+                    )
+                    self.target_model.to(self.device)
             else:
                 self.target_model = None
         if self.target_model is not None:
@@ -603,12 +600,6 @@ class TrainDSparkRecipe(BaseRecipe):
             if self.target_model is not None
             else None
         )
-
-        # Opt-in: FSDP2-shard a large frozen dense target so it stops replicating on
-        # every rank (see _maybe_shard_dense_target). Off by default, so existing
-        # dense-target configs keep their previous replicated behavior.
-        is_moe_target = is_deepseek_v4_target or is_glm_5_2_target or is_minimax_m3_target
-        self._maybe_shard_dense_target(recipe_cfg, is_moe_target=is_moe_target)
 
         self.block_size = int(recipe_cfg.get("block_size", 7))
         self.num_anchors = int(recipe_cfg.get("num_anchors", 512))
@@ -776,9 +767,12 @@ class TrainDSparkRecipe(BaseRecipe):
         if embed_src is None or head_src is None:
             embed_src = self.target_wrapper.get_input_embeddings()
             head_src = self.target_wrapper.get_output_embeddings()
-        if (is_deepseek_v4_target or is_glm_5_2_target or is_minimax_m3_target) and self.cached_target_path is None:
-            # The V4 / GLM / MiniMax M3 target's embed_tokens / lm_head are expert-parallel /
-            # FSDP-sharded DTensors; gather them to full tensors before the draft copies them.
+        if (
+            is_deepseek_v4_target or is_glm_5_2_target or is_minimax_m3_target or dense_target_sharded
+        ) and self.cached_target_path is None:
+            # The MoE / VL targets, and an FSDP2-sharded dense target, store embed_tokens /
+            # lm_head as expert-parallel / FSDP-sharded DTensors; gather them to full tensors
+            # before the draft copies them.
             embed_src = gather_full_weight_module(embed_src)
             head_src = gather_full_weight_module(head_src)
         self.draft_model.initialize_embeddings_and_head(
