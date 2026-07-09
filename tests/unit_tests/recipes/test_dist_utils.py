@@ -20,6 +20,7 @@ Typed validation tests live in ``tests/unit_tests/distributed/test_mesh.py``.
 import pytest
 import torch
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
     DistributedSetup,
@@ -30,6 +31,7 @@ from nemo_automodel.components.distributed.config import (
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.recipes._dist_utils import (
+    _distributed_cfg_to_dict,
     create_distributed_setup_from_config,
     parse_distributed_section,
 )
@@ -675,3 +677,34 @@ class TestCreateDistributedSetupFromConfigWorldSizeAutoDetect:
 
         assert result.strategy_config.sequence_parallel is True
         assert result.strategy_config.defer_fsdp_grad_sync is False
+
+    def test_confignode_without_distributed_block_defaults_to_fsdp2(self, patched_mesh):
+        """Regression: a ConfigNode with no ``distributed:`` block must build the default
+        FSDP2 setup through ``create_distributed_setup_from_config`` rather than raising
+        ``AttributeError`` (the dspark ``shard_dense_target`` multi-rank crash)."""
+        result = create_distributed_setup_from_config(ConfigNode({}), world_size=4)
+
+        assert isinstance(result, DistributedSetup)
+        assert isinstance(result.strategy_config, FSDP2Config)
+        assert patched_mesh["world_size"] == 4
+
+    def test_confignode_with_distributed_block_is_honoured(self, patched_mesh):
+        """A present ``distributed:`` block on a ConfigNode is still read, not shadowed by
+        the missing-block fallback."""
+        result = create_distributed_setup_from_config(
+            ConfigNode({"distributed": {"strategy": "ddp"}}), world_size=2
+        )
+
+        assert isinstance(result.strategy_config, DDPConfig)
+        assert patched_mesh["world_size"] == 2
+
+
+def test_distributed_cfg_to_dict_confignode_without_block_returns_empty():
+    """Regression: the object branch used ``cfg.distributed`` directly, so a ConfigNode
+    without the block raised ``AttributeError``; it must now yield an empty dict."""
+    assert _distributed_cfg_to_dict(ConfigNode({})) == {}
+
+
+def test_distributed_cfg_to_dict_confignode_with_block_returns_block():
+    cfg = ConfigNode({"distributed": {"strategy": "fsdp2", "dp_size": 4}})
+    assert _distributed_cfg_to_dict(cfg) == {"strategy": "fsdp2", "dp_size": 4}
