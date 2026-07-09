@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fail-closed compatibility fixes for published Megatron-FSDP releases."""
+"""Fail-closed compatibility fixes for published Megatron-FSDP releases.
+
+The four rewrite pipelines (``make_fsdp_dtensor``,
+``StorageResizeBasedBucketAllocator.free``, ``MegatronFSDP.forward``, and
+``ParamAndGradBuffer.update_main_grads``) intentionally repeat the same
+validate/rewrite/compile/verify structure so each stays independently
+auditable against its wheel fingerprints. Consolidating them behind a single
+patch-spec dataclass is a planned follow-up, expected to land together with
+retiring the 0.5.0 pin rather than in this compatibility pass.
+"""
 
 from __future__ import annotations
 
@@ -150,6 +159,18 @@ def _make_megatron_fsdp_local_param_shape_helper(dtensor_type: type):
     """Create the exact closure installed in Megatron-FSDP's module globals."""
 
     def local_param_shape(param: Any) -> tuple[int, ...]:
+        """Return the rank-local shape used to view a rank-local flat buffer.
+
+        Args:
+            param: Parameter whose flat-buffer view shape is required. For a
+                ``DTensor``, ``param.shape`` is the global shape (for rowwise
+                TP the trailing dims differ per rank), so the rank-local shard
+                is read via ``to_local()``. A plain tensor's ``shape`` is
+                already rank-local and is used as-is.
+
+        Returns:
+            The rank-local shape as a plain tuple of ints.
+        """
         tensor = param.to_local() if isinstance(param, dtensor_type) else param
         return tuple(tensor.shape)
 
