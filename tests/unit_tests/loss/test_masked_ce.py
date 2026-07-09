@@ -230,6 +230,36 @@ def test_chunked_masked_cross_entropy_zero_num_label_tokens_keeps_zero_gradient(
     assert torch.count_nonzero(logits.grad).item() == 0
 
 
+def test_chunked_masked_cross_entropy_defaults_do_not_mutate_logits():
+    """inplace_grad defaults to False: backward must allocate a fresh grad buffer and keep the logits intact."""
+    torch.manual_seed(3)
+    logits = torch.randn(4, 9, requires_grad=True)
+    original = logits.detach().clone()
+    labels = torch.randint(0, 9, (4,))
+
+    loss = MaskedCrossEntropy(chunk_size=2)(logits, labels)
+    loss.backward()
+
+    torch.testing.assert_close(logits.detach(), original, rtol=0.0, atol=0.0)
+    assert logits.grad.untyped_storage().data_ptr() != logits.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("inplace_grad", [False, True])
+def test_chunked_masked_cross_entropy_double_backward_raises(inplace_grad):
+    """backward is once_differentiable: double-backward must fail loudly, not return wrong grads."""
+    torch.manual_seed(5)
+    logits = torch.randn(4, 9, requires_grad=True)
+    labels = torch.randint(0, 9, (4,))
+
+    loss = MaskedCrossEntropy(chunk_size=2, inplace_grad=inplace_grad)(logits, labels)
+    # Scale by a differentiable weight so the kernel's backward receives a grad
+    # that requires grad (the double-backward scenario once_differentiable guards).
+    weight = torch.ones((), requires_grad=True)
+    (loss * weight).backward(create_graph=True)
+    with pytest.raises(RuntimeError, match="once_differentiable"):
+        logits.grad.sum().backward()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
     reason="requires CUDA with BF16 support",

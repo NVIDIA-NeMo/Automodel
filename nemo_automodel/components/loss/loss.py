@@ -72,14 +72,16 @@ class MaskedCrossEntropyConfig(LossConfig):
             ``reduction="sum"`` and ``fp32_upcast=True``). ``None`` disables
             chunking.
         inplace_grad: Only used when ``chunk_size`` is set. If True, backward
-            writes the logits gradient into the logits tensor's storage.
+            writes the logits gradient into the logits tensor's storage,
+            destroying the logits values. Opt-in: only enable when nothing else
+            consumes the logits after the loss backward.
     """
 
     fp32_upcast: bool = True
     ignore_index: int = -100
     reduction: str = "sum"
     chunk_size: int | None = None
-    inplace_grad: bool = True
+    inplace_grad: bool = False
 
     def build(self) -> nn.Module:
         from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy

@@ -204,3 +204,17 @@ def test_chunked_cross_entropy_sum_path_saves_no_fp32_activations():
     assert saved_float_bytes == 0, f"sum path saved {saved_float_bytes} bytes of non-bf16 float activations"
     loss.backward()
     assert logits.grad is not None and logits.grad.dtype == torch.bfloat16
+
+
+def test_chunked_cross_entropy_defaults_do_not_mutate_logits():
+    """inplace_grad defaults to False, preserving the legacy sum-path behavior of never mutating logits."""
+    torch.manual_seed(31)
+    logits = torch.randn(10, 7, requires_grad=True)
+    original = logits.detach().clone()
+    targets = torch.randint(0, logits.shape[-1], (10,))
+
+    loss = ChunkedCrossEntropy(chunk_len=3)(logits, targets)
+    loss.backward()
+
+    torch.testing.assert_close(logits.detach(), original, rtol=0.0, atol=0.0)
+    assert logits.grad.untyped_storage().data_ptr() != logits.untyped_storage().data_ptr()

@@ -39,6 +39,13 @@ class _ChunkedMaskedCESum(torch.autograd.Function):
       (``cross_entropy`` would additionally save its fp32 log-softmax).
     - backward: recomputes the softmax per chunk from the saved logits and writes
       ``(softmax - onehot) * grad_out`` directly into the gradient buffer.
+
+    Backward is marked ``once_differentiable``: double-backward
+    (``create_graph=True``) raises instead of silently returning wrong
+    higher-order gradients. With ``inplace_grad=True`` a second backward over
+    the same graph (``retain_graph=True``) also fails loudly, because backward
+    overwrites the saved logits and autograd's saved-tensor version check
+    rejects the mutated tensor.
     """
 
     @staticmethod
@@ -89,6 +96,7 @@ class _ChunkedMaskedCESum(torch.autograd.Function):
         return total
 
     @staticmethod
+    @torch.autograd.function.once_differentiable
     def backward(ctx, grad_out: torch.Tensor) -> tuple[torch.Tensor, None, None, None, None]:
         """Compute the gradient with respect to the logits, one chunk at a time.
 
@@ -136,7 +144,8 @@ class MaskedCrossEntropy(nn.Module):
         ignore_index: int = -100,
         reduction: str = "sum",
         chunk_size: int | None = None,
-        inplace_grad: bool = True,
+        *,
+        inplace_grad: bool = False,
     ):
         """
         Masked cross-entropy loss.
@@ -152,11 +161,13 @@ class MaskedCrossEntropy(nn.Module):
                 length. Only the original-dtype logits are saved for backward.
                 Requires ``reduction="sum"`` and ``fp32_upcast=True``. Defaults to
                 None (full-tensor path).
-            inplace_grad (bool): only used when ``chunk_size`` is set. If True,
-                backward writes the logits gradient into the logits tensor's
-                storage instead of allocating a new ``[N, V]`` buffer. Safe as
-                long as no other autograd node consumes the logits *values* in
-                backward (the producing linear layer does not). Defaults to True.
+            inplace_grad (bool): keyword-only; only used when ``chunk_size`` is
+                set. If True, backward writes the logits gradient into the
+                logits tensor's storage instead of allocating a new ``[N, V]``
+                buffer, destroying the logits values. Safe only when no other
+                autograd node consumes the logits *values* in backward (the
+                producing linear layer does not). Opt-in mutation footgun:
+                defaults to False.
         """
         super().__init__()
         if chunk_size is not None:

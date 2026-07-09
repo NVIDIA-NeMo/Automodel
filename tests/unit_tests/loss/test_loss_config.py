@@ -39,7 +39,8 @@ class TestMaskedCrossEntropyConfig:
         assert cfg.ignore_index == -100
         assert cfg.reduction == "sum"
         assert cfg.chunk_size is None
-        assert cfg.inplace_grad is True
+        # Opt-in: inplace_grad destroys the logits values in backward.
+        assert cfg.inplace_grad is False
 
     def test_build(self):
         from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy

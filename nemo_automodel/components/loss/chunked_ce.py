@@ -51,7 +51,8 @@ class ChunkedCrossEntropy(nn.Module):
         compile: bool = True,
         ignore_index: int = -100,
         reduction: str = "sum",
-        inplace_grad: bool = True,
+        *,
+        inplace_grad: bool = False,
     ):
         """
         Chunked cross-entropy loss.
@@ -72,11 +73,14 @@ class ChunkedCrossEntropy(nn.Module):
             ignore_index (int, optional): Target value that is ignored when computing the loss.
                 Defaults to -100.
             reduction (str, optional): Type of reduction. Defaults to "sum".
-            inplace_grad (bool, optional): only used when ``reduction="sum"``. If True,
-                backward writes the logits gradient into the logits tensor's storage
-                instead of allocating a new ``[N, V]`` buffer. Safe as long as no other
-                autograd node consumes the logits *values* in backward (the producing
-                linear layer does not). Defaults to True.
+            inplace_grad (bool, optional): keyword-only; only used when
+                ``reduction="sum"``. If True, backward writes the logits gradient
+                into the logits tensor's storage instead of allocating a new
+                ``[N, V]`` buffer, destroying the logits values. Safe only when no
+                other autograd node consumes the logits *values* in backward (the
+                producing linear layer does not). Opt-in mutation footgun: defaults
+                to False, preserving the legacy behavior of never mutating the
+                logits.
         """
         super().__init__()
         self.chunk_len = chunk_len
