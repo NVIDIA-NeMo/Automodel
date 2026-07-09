@@ -199,6 +199,22 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     return output
 
 
+_GROUPED_MM_SCATTER_CHUNK_TOKENS = 16384
+
+
+def _scatter_add_chunked(
+    y: torch.Tensor,
+    index: torch.Tensor,
+    src: torch.Tensor,
+    chunk_tokens: int = _GROUPED_MM_SCATTER_CHUNK_TOKENS,
+) -> None:
+    """Scatter-add ``src`` into ``y`` along dim 0 without a full dtype-converted copy."""
+    max_chunk_tokens = max(int(chunk_tokens), 1)
+    for chunk_start in range(0, int(src.shape[0]), max_chunk_tokens):
+        chunk_end = min(int(src.shape[0]), chunk_start + max_chunk_tokens)
+        y.scatter_add_(0, index[chunk_start:chunk_end], src[chunk_start:chunk_end].to(dtype=y.dtype))
+
+
 class GroupedExperts(nn.Module):
     """
     Sparse MoE implementation using all-gather/reduce-scatter primitives.
@@ -521,7 +537,7 @@ class GroupedExperts(nn.Module):
                 )
 
             scatter_ids = sorted_token_ids.unsqueeze(1).expand_as(output2)
-            y.scatter_add_(0, scatter_ids, output2.float())
+            _scatter_add_chunked(y, scatter_ids, output2)
         else:
             # Dummy computation for gradient flow
             output1 = torch.matmul(x[0] * 0, gate_and_up_projs[0])
