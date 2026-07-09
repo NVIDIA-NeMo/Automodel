@@ -10,7 +10,7 @@
 # target is ~62 GiB, so training OOMs at the first backward on 80 GiB GPUs. Setting
 # shard_dense_target below makes TrainDSparkRecipe load the dense target through the
 # standard distributed setup (the same FSDP2 path the MoE / VL targets use), which
-# shards it across the world mesh, drops the resident target to ~11 GiB/rank on 8
+# shards it across the world mesh, drops the resident target to ~9 GiB/rank on 8
 # GPUs, and leaves room for the draft's training activations. The
 # draft's per-anchor projection over the 262144-vocab head is the next-largest term,
 # so seq_length and num_anchors are trimmed from the 12B defaults (4096 / 512) to
