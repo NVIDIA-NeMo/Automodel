@@ -24,6 +24,8 @@ linear graph in that mode only.
 
 import torch
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Shard
 
 
 def _is_async_tp_linear_enabled() -> bool:
@@ -63,3 +65,57 @@ def _async_tp_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor |
     # reshape-mm-reshape pattern consumed by micro_pipeline_tp.
     output = F.linear(x, weight)
     return output + bias if bias is not None else output
+
+
+def _tp_linear_forward(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    mm_for_2d_compile: bool,
+) -> torch.Tensor:
+    """Dispatch a TP-safe linear between F.linear, async-TP shaping, and bmm/mm.
+
+    Shared by ``TPLinear.forward`` and ``LinearLoRA.forward``.  Eager
+    unsharded/dim-2-sharded inputs use ``F.linear``; async-TP tracing emits the
+    fusable native linear graph via ``_async_tp_linear``; every remaining
+    compile path and dim-0/1-sharded DTensor input keeps the DTensor-safe
+    matmul fallback (``aten.view`` cannot flatten a sharded dimension).
+
+    Args:
+        x: Input activations of shape ``[B, S, in_features]`` (``B`` = batch,
+            ``S`` = sequence) or ``[N, in_features]`` (``N`` = flattened
+            tokens).  May be a DTensor: a 3-D DTensor sharded on dim 0 or 1
+            (e.g. ``Shard(1)`` from sequence parallelism) always takes the
+            ``torch.bmm`` path — the async-TP fast path assumes the input is
+            replicated or sharded only on the feature dim, so fusion simply
+            does not fire for such layers.
+        weight: Weight of shape ``[out_features, in_features]``; may be a
+            DTensor sharded for colwise (``Shard(0)``) or rowwise (``Shard(1)``)
+            tensor parallelism.
+        bias: Optional bias of shape ``[out_features]``; replicated if DTensor.
+        mm_for_2d_compile: Numerics for 2-D ``x`` traced under torch.compile
+            without async-TP: ``torch.mm`` plus explicit bias add when True
+            (``TPLinear``), ``F.linear`` when False (``LinearLoRA``).
+
+    Returns:
+        Output of shape ``[..., out_features]`` with the same leading
+        dimensions as ``x``.
+    """
+    # bmm avoids aten.view which cannot flatten a sharded dimension.
+    # F.linear calls view([b,s,h]->[b*s,h]) which fails when dim 0/1 is sharded
+    # (sequence parallelism) or during AOT-autograd tracing with compile.
+    x_needs_bmm = (
+        isinstance(x, DTensor) and x.dim() == 3 and any(isinstance(p, Shard) and p.dim < 2 for p in x.placements)
+    )
+    if _is_async_tp_linear_enabled() and not x_needs_bmm:
+        return _async_tp_linear(x, weight, bias)
+    if not torch.compiler.is_compiling() and not x_needs_bmm:
+        return F.linear(x, weight, bias)
+    if x.dim() == 3:
+        out = torch.bmm(x, weight.t().unsqueeze(0).expand(x.shape[0], -1, -1))
+    elif mm_for_2d_compile:
+        out = torch.mm(x, weight.t())
+    else:
+        return F.linear(x, weight, bias)
+    return out + bias if bias is not None else out

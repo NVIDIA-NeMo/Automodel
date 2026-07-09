@@ -18,8 +18,10 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard, distribute_tensor
 
 from nemo_automodel.components._tp_linear import (
     _async_tp_linear,
@@ -35,6 +37,30 @@ def micro_pipeline_tp_enabled():
     torch._inductor.config._micro_pipeline_tp = True
     yield
     torch._inductor.config._micro_pipeline_tp = original
+
+
+@pytest.fixture
+def micro_pipeline_tp_disabled():
+    """Force torch._inductor.config._micro_pipeline_tp off and restore it afterwards."""
+    original = torch._inductor.config._micro_pipeline_tp
+    torch._inductor.config._micro_pipeline_tp = False
+    yield
+    torch._inductor.config._micro_pipeline_tp = original
+
+
+@pytest.fixture
+def single_rank_pg():
+    """Provide a single-rank gloo process group for DTensor placement tests."""
+    if not dist.is_available():
+        pytest.skip("torch.distributed is not available")
+    already = dist.is_initialized()
+    if not already:
+        dist.init_process_group(backend="gloo", rank=0, world_size=1, store=dist.HashStore())
+    try:
+        yield
+    finally:
+        if not already:
+            dist.destroy_process_group()
 
 
 def _capture_compiled_graphs(module: nn.Module, x: torch.Tensor) -> tuple[list[torch.fx.GraphModule], torch.Tensor]:
@@ -73,9 +99,8 @@ class TestIsAsyncTpLinearEnabled:
         assert not torch.compiler.is_compiling()
         assert _is_async_tp_linear_enabled() is False
 
-    def test_false_when_compiling_without_flag(self):
+    def test_false_when_compiling_without_flag(self, micro_pipeline_tp_disabled):
         """The gate must stay closed when _micro_pipeline_tp is not set."""
-        assert torch._inductor.config._micro_pipeline_tp is False
         with patch("torch.compiler.is_compiling", return_value=True):
             assert _is_async_tp_linear_enabled() is False
 
@@ -143,9 +168,8 @@ class TestTPLinearGraphShaping:
         assert F.linear in targets
         assert torch.allclose(out, F.linear(x, linear.weight, linear.bias))
 
-    def test_default_compile_path_keeps_bmm(self):
+    def test_default_compile_path_keeps_bmm(self, micro_pipeline_tp_disabled):
         """Without the flag, the DTensor-safe bmm path must be preserved."""
-        assert torch._inductor.config._micro_pipeline_tp is False
         linear = self._make_tp_linear()
         x = torch.randn(2, 5, 16)
 
@@ -156,6 +180,19 @@ class TestTPLinearGraphShaping:
         assert F.linear not in targets
         assert torch.allclose(out, F.linear(x, linear.weight, linear.bias))
 
+    def test_default_compile_path_2d_uses_mm(self, micro_pipeline_tp_disabled):
+        """Without the flag, 2-D input under compile must keep TPLinear's torch.mm numerics."""
+        linear = self._make_tp_linear()
+        x = torch.randn(8, 16)
+
+        graphs, out = _capture_compiled_graphs(linear, x)
+        targets = _call_function_targets(graphs)
+
+        assert torch.mm in targets
+        assert torch.bmm not in targets
+        assert F.linear not in targets
+        assert torch.allclose(out, F.linear(x, linear.weight, linear.bias), atol=1e-6)
+
     def test_eager_path_unaffected_by_flag(self, micro_pipeline_tp_enabled):
         """Eager TPLinear.forward must not change when only the flag is set."""
         linear = self._make_tp_linear()
@@ -164,3 +201,41 @@ class TestTPLinearGraphShaping:
         out = linear(x)
 
         assert torch.allclose(out, F.linear(x, linear.weight, linear.bias))
+
+
+class TestTPLinearShardedInputUnderAsyncTp:
+    """Dim-0/1-sharded DTensor inputs must keep the bmm path even under async-TP."""
+
+    def test_dim1_sharded_dtensor_takes_bmm_not_async_shaping(self, single_rank_pg):
+        """A sequence-sharded DTensor input must bypass async-TP shaping and not crash.
+
+        Builds a TPLinear with replicated DTensor weight/bias on a world-size-1
+        mesh and feeds a ``[B, S, in_features]`` DTensor input sharded on dim 1
+        (the sequence-parallel layout async-TP mandates), with the async-TP gate
+        mocked open.  The forward must route through ``torch.bmm``, never through
+        ``_async_tp_linear`` (whose ``F.linear`` view cannot flatten the sharded
+        dim), and match the local F.linear reference.
+        """
+        torch.manual_seed(0)
+        linear = nn.Linear(16, 12)
+        linear.__class__ = TPLinear
+        weight_local = linear.weight.detach().clone()
+        bias_local = linear.bias.detach().clone()
+
+        mesh = DeviceMesh("cpu", torch.arange(1))
+        linear.weight = nn.Parameter(distribute_tensor(weight_local, mesh, [Replicate()]))
+        linear.bias = nn.Parameter(distribute_tensor(bias_local, mesh, [Replicate()]))
+        x_local = torch.randn(2, 5, 16)
+        x = DTensor.from_local(x_local, mesh, [Shard(1)], run_check=False)
+
+        with (
+            patch("nemo_automodel.components._tp_linear._is_async_tp_linear_enabled", return_value=True),
+            patch("nemo_automodel.components._tp_linear._async_tp_linear") as async_spy,
+            patch("torch.bmm", wraps=torch.bmm) as bmm_spy,
+        ):
+            out = linear(x)
+
+        async_spy.assert_not_called()
+        bmm_spy.assert_called_once()
+        assert isinstance(out, DTensor)
+        assert torch.allclose(out.full_tensor(), F.linear(x_local, weight_local, bias_local), atol=1e-6)
