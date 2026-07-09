@@ -212,7 +212,16 @@ _VISION_TOWER_ATTRS = ("visual", "vision_tower", "vision_model", "vit_model")
 
 
 def _has_trainable_vision_tower(model: nn.Module) -> bool:
-    """Return whether the model (or its inner ``.model``) exposes a trainable vision tower."""
+    """Return whether the model (or its inner ``.model``) exposes a trainable vision tower.
+
+    Deliberately a cheap duck-typed gate, not a second owner of the vision
+    mapping: it only decides whether importing the heavy, transformers-aware
+    dense parallelizer is worthwhile, while the dense parallelizer's per-model
+    layer-group mapping remains the sole owner of which blocks get wrapped.
+    Requiring a trainable, parameter-bearing tower (rather than mere attribute
+    existence) keeps the import off text-only, frozen-tower, and duck-typed
+    stub-model call paths.
+    """
     for owner in (model, getattr(model, "model", None)):
         if owner is None:
             continue
@@ -244,11 +253,11 @@ def _apply_vision_tower_ac(model: nn.Module) -> None:
     from nemo_automodel.components.distributed.activation_checkpointing import (
         apply_vision_block_checkpointing,
     )
-    from nemo_automodel.components.distributed.parallelizer import _extract_model_layer_groups
+    from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
 
     vision_layers = [
         layer
-        for layer in _extract_model_layer_groups(model).get("vision", [])
+        for layer in get_model_layer_groups(model).get("vision", [])
         if any(param.requires_grad for param in layer.parameters())
     ]
     if not vision_layers:
