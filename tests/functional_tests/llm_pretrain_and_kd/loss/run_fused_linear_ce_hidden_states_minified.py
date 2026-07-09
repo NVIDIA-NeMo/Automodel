@@ -89,7 +89,10 @@ def main() -> int:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(1234)
 
-    batch_size = 1
+    # batch_size must be > 1: FusedLinearCrossEntropy now flattens hidden_states/labels to a
+    # single token axis (THD/CP support), so the "bad" hidden_states[-1] extraction below is a
+    # detectable (token-count) mismatch only when it actually drops batch elements.
+    batch_size = 2
     seq_len = 8
     hidden_size = 32
     vocab_size = 64
@@ -104,7 +107,10 @@ def main() -> int:
 
     out_tensor = _Out(hidden_states=hidden_states)
 
-    # Reproduce the failure mode: indexing a tensor `hidden_states[-1]` drops the batch dim.
+    # Reproduce the failure mode: indexing a tensor `hidden_states[-1]` drops the batch dim,
+    # yielding [T, H] (one sequence) while labels stay [B, T]. After FusedLinearCrossEntropy's
+    # internal flatten the token counts differ (T vs B*T), so cut_cross_entropy still asserts
+    # `e.size()[0:-1] == targets.size()` before any kernel launch.
     bad_hidden_states = out_tensor.hidden_states[-1]
     try:
         _ = FusedLinearCrossEntropy(ignore_index=ignore_index, reduction="sum")(

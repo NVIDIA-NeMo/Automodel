@@ -118,6 +118,7 @@ def test_is_triton_greater_or_equal(monkeypatch):
     """
 
     import pkg_resources
+
     from nemo_automodel.components.loss.linear_ce import new_is_triton_greater_or_equal
 
     class _DummyDist:
@@ -144,6 +145,7 @@ def test_is_triton_greater_or_equal_3_2_0(monkeypatch):
     """Ensure the convenience wrapper compares against 3.1.0 (despite name)."""
 
     import pkg_resources
+
     from nemo_automodel.components.loss.linear_ce import (
         new_is_triton_greater_or_equal_3_2_0,
     )
@@ -157,6 +159,7 @@ def test_is_triton_greater_or_equal_3_2_0(monkeypatch):
 
     monkeypatch.setattr(pkg_resources, "get_distribution", lambda _: _DummyDist("3.0.0"))
     assert new_is_triton_greater_or_equal_3_2_0() is False
+
 
 def test_fused_cross_entropy_normalizes_by_num_tokens(monkeypatch):
     """When num_label_tokens is passed and reduction='sum', the returned loss
@@ -187,3 +190,47 @@ def test_fused_cross_entropy_normalizes_by_num_tokens(monkeypatch):
     # The stub returns 20, so after division by 10 we expect 2.0
     assert torch.is_tensor(out)
     assert out.item() == pytest.approx(2.0)
+
+
+def test_fused_cross_entropy_thd_shape_reconciliation(monkeypatch):
+    """THD / packed-sequence layout must not trip cut_cross_entropy's shape assert.
+
+    Under THD the model emits hidden states as ``[1, T, H]`` while labels stay
+    ``[B, S]`` (T == B*S). ``cut_cross_entropy`` asserts
+    ``hidden.shape[:-1] == labels.shape``; without flattening that is
+    ``[1, T] != [B, S]`` and raises. The forward must collapse both to a single
+    token axis (``[N, H]`` / ``[N]``) first.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("This test requires a GPU")
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    monkeypatch.setattr(linear_ce_mod, "HAVE_CUT_CROSS_ENTROPY", True)
+
+    captured = {}
+
+    def _fake_linear_ce(hidden, weight, targets=None, **kwargs):
+        captured["hidden"] = tuple(hidden.shape)
+        captured["targets"] = tuple(targets.shape)
+        # Mirror the real cut_cross_entropy precondition (cce.py): this is exactly
+        # the assertion that failed for THD before the flatten was added.
+        assert hidden.size()[0:-1] == targets.size(), (hidden.shape, targets.shape)
+        return torch.tensor(1.0)
+
+    # raising=False so the test also runs in environments where the optional
+    # cut_cross_entropy package is not installed (the name is then absent).
+    monkeypatch.setattr(linear_ce_mod, "linear_cross_entropy", _fake_linear_ce, raising=False)
+
+    hidden_dim, vocab_size = 4, 5
+    batch, seq = 2, 3
+    num_tokens = batch * seq
+    hidden = torch.randn(1, num_tokens, hidden_dim)  # THD-packed: [1, T, H]
+    labels = torch.zeros(batch, seq, dtype=torch.long)  # [B, S] — different leading dims
+    weight = torch.randn(vocab_size, hidden_dim)
+
+    loss_fn = linear_ce_mod.FusedLinearCrossEntropy(reduction="sum")
+    out = loss_fn(hidden, labels, weight)  # must not raise
+
+    assert torch.is_tensor(out)
+    assert captured["hidden"] == (num_tokens, hidden_dim)
+    assert captured["targets"] == (num_tokens,)

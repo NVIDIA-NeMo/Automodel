@@ -152,6 +152,16 @@ class FusedLinearCrossEntropy(nn.Module):
         if not HAVE_CUT_CROSS_ENTROPY:
             raise ImportError(MISSING_CUT_CROSS_ENTROPY_MSG)
 
+        # Flatten to a single token axis so the loss is layout-agnostic.
+        # ``cut_cross_entropy`` asserts ``hidden_states.shape[:-1] == labels.shape``;
+        # that holds for the dense ``[B, S, H]`` / ``[B, S]`` case but breaks for the
+        # THD / packed-sequence layout (e.g. hidden ``[1, T, H]`` vs labels ``[B, S]``)
+        # and for context-parallel shards. Collapsing all leading dims to ``[N, H]`` /
+        # ``[N]`` (mirroring MaskedCrossEntropy) satisfies the assert and is a no-op for
+        # the dense case, since the CE sum is invariant to token ordering.
+        hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
+        labels = labels.reshape(-1)
+
         # First compute loss with sum reduction to handle normalization ourselves
         if self.logit_softcapping == 0:
             self.logit_softcapping = None
