@@ -117,6 +117,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
     get_llama_nemotron_super_tp_plan,
 )
 from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+from nemo_automodel.shared.import_utils import safe_import_from
 
 # TODO(boxiangw): Change to MegatronFSDP once it got published
 HAVE_MEGATRON_FSDP = False
@@ -125,11 +126,12 @@ try:
     from megatron_fsdp import fully_shard as megatron_fsdp_fully_shard
     from megatron_fsdp import fully_shard_model as megatron_fsdp_fully_shard_model
 
-    try:
-        from megatron_fsdp import (
-            MixedPrecisionPolicy as MegatronFSDPMixedPrecisionPolicy,
-        )
-    except ImportError:
+    # Only Megatron-FSDP >= 0.4 exports MixedPrecisionPolicy; legacy installs
+    # keep the sentinel so _megatron_fsdp_compat_kwargs can select the API.
+    _have_megatron_fsdp_mixed_precision_policy, MegatronFSDPMixedPrecisionPolicy = safe_import_from(
+        "megatron_fsdp", "MixedPrecisionPolicy"
+    )
+    if not _have_megatron_fsdp_mixed_precision_policy:
         MegatronFSDPMixedPrecisionPolicy = None
 
     HAVE_MEGATRON_FSDP = True
@@ -142,6 +144,11 @@ import nemo_automodel.components.distributed.parallelizer_utils as parallelizer_
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# One-time flag: current Megatron-FSDP releases removed the legacy buffer-level
+# NaN check, so a truthy check_for_nan_in_grad is dropped by the modern branch
+# of _megatron_fsdp_compat_kwargs and only warned about once per process.
+_megatron_fsdp_nan_check_noop_warned = False
 
 
 def _patch_fsdp_accumulated_grad_guard() -> None:
@@ -2185,7 +2192,10 @@ def _megatron_fsdp_compat_kwargs(
     ``MixedPrecisionPolicy`` and added a more expensive per-parameter NaN
     reporter. Use the callable signature instead of a package-version guess,
     and keep the modern reporter as a separate opt-in rather than silently
-    enabling it from the legacy buffer-check setting.
+    enabling it from the legacy buffer-check setting. Because the modern API
+    has no equivalent of the legacy buffer-level check, a truthy
+    ``check_for_nan_in_grad`` is dropped there with a one-time warning that
+    points at ``report_nan_in_param_grad`` as the opt-in replacement.
     """
     try:
         parameters = inspect.signature(shard_fn).parameters
@@ -2209,6 +2219,14 @@ def _megatron_fsdp_compat_kwargs(
         if MegatronFSDPMixedPrecisionPolicy is None:
             raise RuntimeError(
                 "installed Megatron-FSDP exposes its current precision API but does not export MixedPrecisionPolicy"
+            )
+        global _megatron_fsdp_nan_check_noop_warned
+        if check_for_nan_in_grad and not _megatron_fsdp_nan_check_noop_warned:
+            _megatron_fsdp_nan_check_noop_warned = True
+            logger.warning(
+                "check_for_nan_in_grad=True has no effect with the installed Megatron-FSDP: current "
+                "releases removed the legacy buffer-level NaN check. Set report_nan_in_param_grad=True "
+                "to opt into its per-parameter NaN check instead."
             )
         return {
             "mixed_precision_policy": MegatronFSDPMixedPrecisionPolicy(
@@ -2326,6 +2344,11 @@ def megatron_fsdp_strategy_parallelize(
     # locked, atomic compatibility set for every DP-sharded model before TP can
     # mutate it; the TP consensus group may legitimately contain one rank.
     # Unknown ABIs fail on all ranks before any parameter collective can diverge.
+    # dp_mesh.size() == 1 is deliberately out of scope: that topology (e.g.
+    # world_size=2 with tp=2) returns the TP-only model below without ever
+    # calling fully_shard, so none of the patched megatron_fsdp code paths
+    # (make_fsdp_dtensor, allocator free, MegatronFSDP.forward,
+    # update_main_grads) can execute and 0.2.3 installs keep working there.
     if dp_mesh.size() > 1:
         _patch_megatron_fsdp_050_tp_dtensor_reshape_with_consensus(
             tp_group=tp_mesh.get_group(),

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, create_autospec, patch
@@ -689,6 +690,78 @@ class TestMegatronFSDPStrategyParallelize:
             "preserve_fp32_weights": False,
             "check_for_nan_in_grad": True,
         }
+
+    def test_megatron_fsdp_dp1_skips_wrapper_and_compat_patch(self, mock_megatron_fsdp_env):
+        """dp==1 (e.g. world=2, tp=2) returns the TP-only model without fully_shard.
+
+        Because no megatron_fsdp runtime code executes on this topology, the
+        0.5.0 compatibility set must not be installed either — that is the
+        documented reason the compat gate matches the dp>1 wrapping gate.
+        """
+        mesh = MagicMock(spec=DeviceMesh)
+        mesh.device_type = "cpu"
+        dp_mesh = MagicMock()
+        tp_mesh = MagicMock()
+        dp_mesh.size.return_value = 1
+        tp_mesh.size.return_value = 2
+        dp_mesh.ndim = 1
+        tp_mesh.ndim = 1
+        mesh.__getitem__.side_effect = lambda key: {"dp": dp_mesh, "tp": tp_mesh}[key]
+
+        model = MockModel()
+        optimizer = MagicMock()
+
+        result_model, result_optimizer = megatron_fsdp_strategy_parallelize(
+            model=model,
+            device_mesh=mesh,
+            optimizer=optimizer,
+            tp_shard_plan={},
+        )
+
+        mock_megatron_fsdp_env["compat_patch"].assert_not_called()
+        mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.assert_not_called()
+        mock_megatron_fsdp_env["parallelize_module"].assert_called_once()
+        assert result_model is model
+        assert result_optimizer is optimizer
+
+    def test_megatron_fsdp_modern_branch_warns_once_when_nan_check_is_dropped(self, monkeypatch, caplog):
+        """The modern API has no buffer-level NaN check; dropping it warns exactly once."""
+
+        class FakeMixedPrecisionPolicy:
+            def __init__(self, *, main_params_dtype, main_grads_dtype, grad_comm_dtype):
+                del main_params_dtype, main_grads_dtype, grad_comm_dtype
+
+        def modern_fully_shard(*, mixed_precision_policy, report_nan_in_param_grad):
+            del mixed_precision_policy, report_nan_in_param_grad
+
+        monkeypatch.setattr(
+            parallelizer,
+            "MegatronFSDPMixedPrecisionPolicy",
+            FakeMixedPrecisionPolicy,
+            raising=True,
+        )
+        monkeypatch.setattr(parallelizer, "_megatron_fsdp_nan_check_noop_warned", False, raising=True)
+
+        def modern_kwargs(check_for_nan_in_grad):
+            return _megatron_fsdp_compat_kwargs(
+                modern_fully_shard,
+                grad_reduce_in_fp32=False,
+                preserve_fp32_weights=False,
+                check_for_nan_in_grad=check_for_nan_in_grad,
+                report_nan_in_param_grad=False,
+            )
+
+        with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.distributed.parallelizer"):
+            modern_kwargs(check_for_nan_in_grad=False)
+            assert not [record for record in caplog.records if "check_for_nan_in_grad" in record.getMessage()]
+
+            modern_kwargs(check_for_nan_in_grad=True)
+            modern_kwargs(check_for_nan_in_grad=True)
+
+        dropped_warnings = [record for record in caplog.records if "check_for_nan_in_grad" in record.getMessage()]
+        assert len(dropped_warnings) == 1
+        assert dropped_warnings[0].levelno == logging.WARNING
+        assert "report_nan_in_param_grad" in dropped_warnings[0].getMessage()
 
     def test_megatron_fsdp_unknown_precision_api_fails_closed(self):
         def unknown_fully_shard(**kwargs):
