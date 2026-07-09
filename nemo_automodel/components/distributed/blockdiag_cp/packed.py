@@ -18,21 +18,29 @@ Same varlen kernel as the CP block-diagonal path, but for ``cp_size == 1`` (no
 sequence sharding). The whole packed sequence lives on one rank, so it
 degenerates to ``_cp_blockdiag_varlen`` with ``row_offset=0`` (q == k == full
 sequence; square; ``cu_q == cu_k``). This gives packed-sequence block-diagonal
-attention to models whose softmax attention only dispatches to sdpa: the model
-calls :func:`enable_cp1_packed_varlen` at the start of its forward, which (1)
-stashes ``doc_ids`` and (2) routes ``F.scaled_dot_product_attention`` to the
-flash/te varlen kernel -- like the CP path for cp>1.
+attention to models whose softmax attention only dispatches to sdpa.
+
+Integration mirrors :func:`nemo_automodel.components.distributed.cp_utils.attach_cp_sdpa_hooks`:
+
+1. :func:`attach_cp1_packed_varlen_hooks` registers forward pre/post hooks on every
+   ``self_attn`` module (the checkpoint-wrapped INNER module, so the hooks also fire
+   during activation-checkpointing recompute). The pre-hook swaps
+   ``F.scaled_dot_product_attention`` for :func:`_packed_varlen_sdpa`; the post-hook
+   (``always_call=True``) restores stock SDPA. The patch is therefore live only
+   while a hooked attention forward is running -- never process-wide.
+2. The model arms the per-forward state with :func:`enable_cp1_packed_varlen`
+   (doc_ids + backend) at the start of its forward and clears stale state before
+   the NEXT forward with :func:`disable_cp1_packed_varlen`.
 
 IMPORTANT -- state must survive activation-checkpointing RECOMPUTE in backward:
-the patch is installed once (process-global) and the state is set per-forward and
-NOT reset, so the AC worker thread re-running a layer's forward during backward
-reads the SAME doc_ids and reproduces the exact varlen output. (A context manager
-that reset on exit caused the forward to use varlen but the recompute to fall back
-to dense -> AC "saved vs recomputed metadata" shape mismatch.) ``_ThreadSharedVar``
-makes the state visible in the autograd worker thread. The outer model clears
-stale state before each new forward (:func:`disable_cp1_packed_varlen`), then the
-text backend re-arms it for the current packed batch, so vision/unpacked
-attention cannot inherit it.
+the state is set per-forward and NOT reset at the end of the step, so the AC
+worker thread re-running a layer's forward during backward reads the SAME doc_ids
+and reproduces the exact varlen output. (A per-step reset caused the forward to
+use varlen but the recompute to fall back to dense -> AC "saved vs recomputed
+metadata" shape mismatch.) ``_ThreadSharedVar`` makes the state visible in the
+autograd worker thread. Because the outer model clears stale state before each
+new forward, vision/unpacked attention cannot inherit it -- and the shape check
+in :func:`_packed_varlen_sdpa` passes any non-matching call straight through.
 """
 
 from __future__ import annotations
@@ -42,7 +50,6 @@ import torch
 from nemo_automodel.components.distributed.blockdiag_cp import kernels, runtime, state
 
 _PACKED_STATE = state._ThreadSharedVar()
-_PACKED_SDPA_INSTALLED = False
 
 
 def _packed_varlen_sdpa(
@@ -144,25 +151,55 @@ def _packed_varlen_sdpa(
     return out
 
 
+def attach_cp1_packed_varlen_hooks(model: torch.nn.Module) -> None:
+    """Scope the cp1 packed varlen SDPA patch to the model's attention forwards.
+
+    Registers a forward pre-hook / post-hook pair on every ``self_attn`` module
+    that installs :func:`_packed_varlen_sdpa` as ``F.scaled_dot_product_attention``
+    for the duration of that module's forward and restores stock SDPA afterwards
+    (``always_call=True``, so a raising forward cannot leak the patch). Hooks are
+    attached to the checkpoint-wrapped INNER module because CheckpointWrapper's
+    recompute bypasses ``__call__`` on the wrapper -- this is what keeps the
+    varlen path active during activation-checkpointing recompute in backward.
+
+    Same bounded-patch pattern as
+    :func:`nemo_automodel.components.distributed.cp_utils.attach_cp_sdpa_hooks`.
+    Outside these hooks, ``F.scaled_dot_product_attention`` is untouched.
+
+    Args:
+        model: The model whose ``self_attn`` submodules route softmax attention
+            through ``F.scaled_dot_product_attention``.
+    """
+    import torch.nn.functional as F_module
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+    def _pre_hook(module, args, kwargs):
+        F_module.scaled_dot_product_attention = _packed_varlen_sdpa
+        return args, kwargs
+
+    def _post_hook(module, inputs, output):
+        F_module.scaled_dot_product_attention = runtime._ORIGINAL_SDPA
+
+    for name, module in model.named_modules():
+        if name.endswith("self_attn"):
+            target = module._checkpoint_wrapped_module if isinstance(module, CheckpointWrapper) else module
+            target.register_forward_pre_hook(_pre_hook, with_kwargs=True)
+            target.register_forward_hook(_post_hook, always_call=True)
+
+
 def enable_cp1_packed_varlen(doc_ids: torch.Tensor, backend: str) -> None:
     """Arm cp1 packed block-diagonal varlen for the rest of this step.
 
-    Idempotently installs the global SDPA patch and sets the per-forward
-    doc_ids/backend state. It remains armed through backward's
-    activation-checkpoint recomputation; the next outer model forward clears it
-    via :func:`disable_cp1_packed_varlen`.
+    Sets the per-forward doc_ids/backend state read by the SDPA patch that
+    :func:`attach_cp1_packed_varlen_hooks` scopes to the attention forwards. The
+    state remains armed through backward's activation-checkpoint recomputation;
+    the next outer model forward clears it via :func:`disable_cp1_packed_varlen`.
 
     Args:
         doc_ids: Per-position document ids ``[1, S]`` or ``[S]`` (0 == padding)
             over the full packed sequence.
         backend: Varlen kernel backend, ``"flash"`` or ``"te"``.
     """
-    global _PACKED_SDPA_INSTALLED
-    if not _PACKED_SDPA_INSTALLED:
-        import torch.nn.functional as F_module
-
-        F_module.scaled_dot_product_attention = _packed_varlen_sdpa
-        _PACKED_SDPA_INSTALLED = True
     # Segmentation depends only on the packed document ids, not on the layer's
     # Q/K/V tensors. Compute it once per outer forward so every attention
     # layer (and activation-checkpoint recompute) reuses the same CUDA

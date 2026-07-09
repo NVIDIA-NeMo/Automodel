@@ -597,3 +597,73 @@ def test_cp1_packed_passes_through_non_matching_shapes():
         assert torch.allclose(out, ref, atol=1e-6)
     finally:
         bd_packed.disable_cp1_packed_varlen()
+
+
+def test_cp1_packed_hooks_scope_patch_and_cover_ac_recompute(monkeypatch):
+    """The SDPA patch is live only inside hooked attention forwards (incl. AC recompute).
+
+    ``attach_cp1_packed_varlen_hooks`` must (1) leave the process-wide
+    ``F.scaled_dot_product_attention`` untouched outside a hooked forward, (2) route
+    matching SDPA calls inside the attention forward through the varlen path, and
+    (3) fire again during activation-checkpointing recompute in backward (hooks sit
+    on the checkpoint-wrapped inner module).
+    """
+    import torch.nn.functional as F
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    doc_ids = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
+    varlen_calls = []
+    patched_at_forward_entry = []
+
+    def fake_varlen(query, key, value, doc_ids_arg, row_offset, scale, backend, *, meta=None):
+        varlen_calls.append(backend)
+        return query * 2.0
+
+    monkeypatch.setattr(bd_packed.kernels, "_cp_blockdiag_varlen", fake_varlen)
+
+    class _Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(4, 4, bias=False)
+
+        def forward(self, x):
+            """Project ``x`` ``[B, S, E=4]`` to ``[B, H=2, S, D=2]``, run SDPA, return ``[B, S, E]``."""
+            # Record the patch state at forward entry: AC recompute may early-stop the
+            # body once every saved tensor is rebuilt, but it always enters here.
+            patched_at_forward_entry.append(F.scaled_dot_product_attention is bd_packed._packed_varlen_sdpa)
+            B, S, _ = x.shape
+            q = self.proj(x).view(B, S, 2, 2).transpose(1, 2)  # [B, H, S, D]
+            o = F.scaled_dot_product_attention(q, q, q)
+            return o.transpose(1, 2).reshape(B, S, 4)
+
+    class _Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = checkpoint_wrapper(_Attn())
+
+        def forward(self, x):
+            """Run the checkpoint-wrapped attention on ``x`` ``[B, S, E]``."""
+            return self.self_attn(x)
+
+    model = _Block()
+    bd_packed.attach_cp1_packed_varlen_hooks(model)
+    bd_packed.enable_cp1_packed_varlen(doc_ids, "flash")
+    try:
+        # Arming state does NOT patch process-wide SDPA.
+        assert F.scaled_dot_product_attention is bd_runtime._ORIGINAL_SDPA
+        x = torch.randn(1, 5, 4, requires_grad=True)
+        out = model(x)
+        assert patched_at_forward_entry == [True]  # patch was live inside the attention forward
+        assert varlen_calls == ["flash"]  # ...and routed the matching SDPA call to varlen
+        assert F.scaled_dot_product_attention is bd_runtime._ORIGINAL_SDPA  # restored after forward
+        out.sum().backward()  # AC recompute re-enters the inner forward -> hooks fire again
+        assert patched_at_forward_entry == [True, True]
+        assert x.grad is not None
+        assert F.scaled_dot_product_attention is bd_runtime._ORIGINAL_SDPA
+        # A doc_ids-shape-matching SDPA call OUTSIDE any hooked forward is untouched.
+        q = torch.randn(1, 2, 5, 2)
+        n_calls = len(varlen_calls)
+        assert torch.allclose(F.scaled_dot_product_attention(q, q, q), bd_runtime._ORIGINAL_SDPA(q, q, q))
+        assert len(varlen_calls) == n_calls
+    finally:
+        bd_packed.disable_cp1_packed_varlen()

@@ -33,37 +33,32 @@ Integration follows the model-owned CP convention of
 :func:`nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx`: a model
 attaches :func:`make_cp_blockdiag_batch_and_ctx` to the batch as ``_cp_make_batch_fn``
 and routes its softmax attention through :func:`cp_blockdiag_sdpa` while the returned
-context is active.
+context is active. For ``cp_size == 1`` packed runs, the model scopes the varlen SDPA
+patch to its attention forwards with :func:`attach_cp1_packed_varlen_hooks` and arms
+the per-forward state with :func:`enable_cp1_packed_varlen` /
+:func:`disable_cp1_packed_varlen`.
+
+Only these integration entry points are exported; everything else (knob
+normalization, varlen metadata precompute, fire counters, kernels) is an internal
+detail of the package's modules. Model wiring lands in follow-up PRs.
 """
 
 from nemo_automodel.components.distributed.blockdiag_cp.batch import make_cp_blockdiag_batch_and_ctx
-from nemo_automodel.components.distributed.blockdiag_cp.kernels import precompute_blockdiag_varlen_meta
 from nemo_automodel.components.distributed.blockdiag_cp.packed import (
+    attach_cp1_packed_varlen_hooks,
     cp1_packed_varlen_backend,
     disable_cp1_packed_varlen,
     enable_cp1_packed_varlen,
 )
 from nemo_automodel.components.distributed.blockdiag_cp.runtime import cp_blockdiag_sdpa
-from nemo_automodel.components.distributed.blockdiag_cp.state import (
-    configure_cp_varlen,
-    cp_attn_fire_count,
-    cp_varlen_runtime_config,
-    normalize_attn_backend,
-    normalize_kv_exchange,
-    reset_cp_attn_fire_count,
-)
+from nemo_automodel.components.distributed.blockdiag_cp.state import configure_cp_varlen
 
 __all__ = [
+    "attach_cp1_packed_varlen_hooks",
     "configure_cp_varlen",
-    "cp_attn_fire_count",
-    "cp_varlen_runtime_config",
     "cp_blockdiag_sdpa",
     "cp1_packed_varlen_backend",
     "disable_cp1_packed_varlen",
     "enable_cp1_packed_varlen",
     "make_cp_blockdiag_batch_and_ctx",
-    "normalize_attn_backend",
-    "normalize_kv_exchange",
-    "precompute_blockdiag_varlen_meta",
-    "reset_cp_attn_fire_count",
 ]

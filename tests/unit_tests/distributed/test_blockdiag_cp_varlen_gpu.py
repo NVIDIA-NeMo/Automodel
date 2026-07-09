@@ -27,15 +27,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel.components.distributed.blockdiag_cp import (
+    attach_cp1_packed_varlen_hooks,
+    disable_cp1_packed_varlen,
+    enable_cp1_packed_varlen,
+)
 from nemo_automodel.components.distributed.blockdiag_cp.kernels import (
     _cp_blockdiag_mask,
     _cp_blockdiag_varlen,
     precompute_blockdiag_varlen_meta,
 )
-from nemo_automodel.components.distributed.blockdiag_cp.packed import (
-    _PACKED_STATE,
-    enable_cp1_packed_varlen,
-)
+from nemo_automodel.components.distributed.blockdiag_cp.runtime import _ORIGINAL_SDPA
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="varlen parity requires CUDA")
 
@@ -170,13 +172,13 @@ def test_precomputed_meta_bit_identical(backend, name, seg_lens, pad, S, cp, Hq,
     ],
 )
 def test_cp1_packed_hook_parity(backend, seg_lens, pad, S, Hq, Hkv, D):
-    """cp1 packed path: F.sdpa under the armed varlen hook == dense block-diagonal SDPA.
+    """cp1 packed path: F.sdpa under the scoped varlen hooks == dense block-diagonal SDPA.
 
-    Exercises the full hook chain (enable_cp1_packed_varlen global patch ->
-    _packed_varlen_sdpa -> _cp_blockdiag_varlen at row_offset=0), as used by
-    packed cp_size==1 runs. The whole packed sequence is on one rank
-    (q == k == full). The hook persists (no ctx); state is reset after for
-    test isolation.
+    Exercises the full hook chain (attach_cp1_packed_varlen_hooks pre/post hooks ->
+    _packed_varlen_sdpa -> _cp_blockdiag_varlen at row_offset=0), as used by packed
+    cp_size==1 runs. The whole packed sequence is on one rank (q == k == full). The
+    SDPA patch must be live only during the hooked attention forward and restored
+    afterwards.
     """
     _backend_or_skip(backend)
     device = "cuda"
@@ -188,11 +190,29 @@ def test_cp1_packed_hook_parity(backend, seg_lens, pad, S, Hq, Hkv, D):
     k = torch.randn(1, Hkv, S, D, device=device, dtype=dtype)
     v = torch.randn(1, Hkv, S, D, device=device, dtype=dtype)
     ref = _dense_ref(q, k, v, doc_ids, 0)  # [1, Hq, S, D]
+
+    class _SdpaSelfAttn(torch.nn.Module):
+        def forward(self, q, k, v, scale, enable_gqa):
+            """Stock-SDPA attention over ``q`` ``[B, Hq, S, D]`` / ``k``/``v`` ``[B, Hkv, S, D]``."""
+            return F.scaled_dot_product_attention(q, k, v, scale=scale, enable_gqa=enable_gqa)
+
+    class _Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = _SdpaSelfAttn()
+
+        def forward(self, q, k, v, scale, enable_gqa):
+            """Route ``q``/``k``/``v`` ``[B, H, S, D]`` through the hooked attention module."""
+            return self.self_attn(q, k, v, scale, enable_gqa)
+
+    model = _Block()
+    attach_cp1_packed_varlen_hooks(model)
     enable_cp1_packed_varlen(doc_ids, backend)
     try:
-        got = F.scaled_dot_product_attention(q, k, v, scale=D**-0.5, enable_gqa=(Hkv != Hq))
+        got = model(q, k, v, D**-0.5, Hkv != Hq)
     finally:
-        _PACKED_STATE.set(None)  # disarm (patch stays installed but passes through)
+        disable_cp1_packed_varlen()
+    assert F.scaled_dot_product_attention is _ORIGINAL_SDPA  # patch scoped to the hooked forward
     real = (doc_ids[0] > 0).nonzero().flatten()
     d = (ref[0, :, real, :].float() - got[0, :, real, :].float()).abs().max().item()
     assert d < atol, f"[cp1-hook {backend}] max|diff|={d:.4f} >= {atol}"
