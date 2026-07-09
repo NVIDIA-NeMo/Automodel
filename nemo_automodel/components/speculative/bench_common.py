@@ -167,7 +167,7 @@ def _extract_prompt_text(value: Any) -> str | None:
     """Normalize a raw (non-chat) dataset field into a single prompt string.
 
     Accepts a plain string, or a non-empty list of strings (the first entry is
-    used -- e.g. MT-Bench's multi-turn ``turns`` column, reduced to its first
+    used -- e.g. MT-Bench's two-turn ``prompt`` column, reduced to its first
     turn). Returns ``None`` for anything else, or a blank/whitespace-only string.
     """
     if isinstance(value, list):
@@ -196,10 +196,18 @@ def _load_prompts(args: argparse.Namespace) -> list[list[dict[str, Any]]]:
         shuffle_seed=args.shuffle_seed,
     )
     prompt_column = getattr(args, "prompt_column", None)
+    prompt_context_column = getattr(args, "prompt_context_column", None)
     prompts: list[list[dict[str, Any]]] = []
     for row in dataset:
         if prompt_column:
             text = _extract_prompt_text(row.get(prompt_column))
+            # Append a secondary context field (e.g. Alpaca's ``input``) when the
+            # row carries one, so prompts that need it are not truncated to the
+            # bare instruction. The reference answer is never read.
+            if text is not None and prompt_context_column:
+                context = _extract_prompt_text(row.get(prompt_context_column))
+                if context is not None:
+                    text = f"{text}\n\n{context}"
             prompt = [{"role": "user", "content": text}] if text is not None else None
         else:
             prompt = _extract_prompt_messages(row[args.messages_column])

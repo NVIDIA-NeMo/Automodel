@@ -83,6 +83,11 @@ class DatasetSpec:
     Exactly one of ``messages_column`` (an existing OpenAI-messages list) or
     ``prompt_column`` (a raw text field, wrapped into a single-turn user
     message) must be set -- see ``bench_common._load_prompts``.
+
+    ``prompt_context_column`` is an optional second raw-text field appended to
+    ``prompt_column`` (separated by a blank line) when it is non-empty, for
+    datasets whose task context lives in a separate column (e.g. Alpaca's
+    ``input``). It is only valid alongside ``prompt_column``.
     """
 
     name: str
@@ -91,6 +96,7 @@ class DatasetSpec:
     dataset_name: str | None = None
     messages_column: str | None = None
     prompt_column: str | None = None
+    prompt_context_column: str | None = None
     max_new_tokens: int | None = None
 
     def __post_init__(self):
@@ -99,12 +105,19 @@ class DatasetSpec:
                 f"dataset {self.name!r}: exactly one of messages_column / prompt_column must be set "
                 f"(got messages_column={self.messages_column!r}, prompt_column={self.prompt_column!r})"
             )
+        if self.prompt_context_column and not self.prompt_column:
+            raise ValueError(
+                f"dataset {self.name!r}: prompt_context_column={self.prompt_context_column!r} requires "
+                "prompt_column to be set (it is appended to the prompt_column text)."
+            )
 
 
-# The classic EAGLE / EAGLE-2 paper suite: multi-turn chat (MT-Bench), code
-# (HumanEval), math (GSM8K), and single-turn instruction-following (Alpaca).
+# The classic EAGLE / EAGLE-2 paper suite: chat (MT-Bench, first turn), code
+# (HumanEval), math (GSM8K), and instruction-following (Alpaca).
 DEFAULT_DATASET_PRESETS: tuple[DatasetSpec, ...] = (
-    DatasetSpec(name="mt_bench", input_data="HuggingFaceH4/mt_bench_prompts", split="train", prompt_column="turns"),
+    # HuggingFaceH4/mt_bench_prompts stores the two-turn sequence under ``prompt``
+    # (a list); the first turn is used (see bench_common._extract_prompt_text).
+    DatasetSpec(name="mt_bench", input_data="HuggingFaceH4/mt_bench_prompts", split="train", prompt_column="prompt"),
     DatasetSpec(
         name="humaneval",
         input_data="openai/openai_humaneval",
@@ -113,7 +126,16 @@ DEFAULT_DATASET_PRESETS: tuple[DatasetSpec, ...] = (
         max_new_tokens=512,
     ),
     DatasetSpec(name="gsm8k", input_data="openai/gsm8k", dataset_name="main", split="test", prompt_column="question"),
-    DatasetSpec(name="alpaca", input_data="tatsu-lab/alpaca", split="train", prompt_column="instruction"),
+    # Alpaca's task context lives in a separate ``input`` field (non-empty for
+    # ~40% of rows); append it so those prompts are not truncated to the bare
+    # instruction. The reference ``output`` is never included.
+    DatasetSpec(
+        name="alpaca",
+        input_data="tatsu-lab/alpaca",
+        split="train",
+        prompt_column="instruction",
+        prompt_context_column="input",
+    ),
 )
 
 _ENGINE_MODULES = {"sglang": bench_sglang, "vllm": bench_vllm}
@@ -176,6 +198,7 @@ def _dataset_args(base_args: argparse.Namespace, spec: DatasetSpec) -> argparse.
     args.dataset_name = spec.dataset_name
     args.messages_column = spec.messages_column
     args.prompt_column = spec.prompt_column
+    args.prompt_context_column = spec.prompt_context_column
     if spec.max_new_tokens is not None:
         args.max_new_tokens = spec.max_new_tokens
     return args
@@ -215,6 +238,13 @@ async def _run_sweep(args: argparse.Namespace, specs: list[DatasetSpec]) -> list
             continue
         if summary is None:
             results.append({"dataset": spec.name, "error": "no usable prompts loaded"})
+            continue
+        # _run_workload swallows per-request HTTP errors, so an engine whose every
+        # request failed still returns a summary with completed=0 rather than raising.
+        # Treat that as an error row so it is excluded from num_datasets_ok and the
+        # sweep's exit status reflects that no benchmark actually ran.
+        if summary.get("completed", 0) < 1:
+            results.append({"dataset": spec.name, "error": "all requests failed (0 completed)"})
             continue
         results.append({"dataset": spec.name, **summary})
     return results

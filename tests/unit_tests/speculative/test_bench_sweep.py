@@ -509,3 +509,55 @@ def test_main_builds_parser_and_dispatches(monkeypatch):
     rc = main(["--engine", "vllm", "--server", "http://localhost:8000", "--model", "m"])
     assert rc == 0
     assert seen == {"engine": "vllm", "server": "http://localhost:8000"}
+
+
+# ---------------------------------------------------------------------------
+# prompt_context_column (Alpaca-style secondary field) + all-requests-failed row
+# ---------------------------------------------------------------------------
+
+
+def test_dataset_spec_context_column_requires_prompt_column():
+    # Valid alongside prompt_column.
+    DatasetSpec(name="alpaca", input_data="d", prompt_column="instruction", prompt_context_column="input")
+    # Invalid with messages_column (no raw text field to append to).
+    with pytest.raises(ValueError, match="prompt_context_column"):
+        DatasetSpec(name="a", input_data="d", messages_column="messages", prompt_context_column="input")
+
+
+def test_default_presets_mt_bench_column_and_alpaca_context():
+    presets = {s.name: s for s in bench_sweep.DEFAULT_DATASET_PRESETS}
+    # MT-Bench prompts live under `prompt` on HuggingFaceH4/mt_bench_prompts, not `turns`.
+    assert presets["mt_bench"].prompt_column == "prompt"
+    # Alpaca appends its `input` task-context field.
+    assert presets["alpaca"].prompt_column == "instruction"
+    assert presets["alpaca"].prompt_context_column == "input"
+
+
+def test_dataset_args_passes_prompt_context_column():
+    base = argparse.Namespace(
+        input_data="base",
+        split="train",
+        dataset_name=None,
+        messages_column=None,
+        prompt_column=None,
+        max_new_tokens=256,
+    )
+    spec = DatasetSpec(
+        name="alpaca", input_data="tatsu-lab/alpaca", prompt_column="instruction", prompt_context_column="input"
+    )
+    args = _dataset_args(base, spec)
+    assert args.prompt_column == "instruction"
+    assert args.prompt_context_column == "input"
+
+
+def test_run_sweep_all_requests_failed_recorded_as_error(monkeypatch):
+    # An engine whose every request failed returns a summary with completed=0
+    # rather than raising; it must be an error row, not counted as a success.
+    specs = [DatasetSpec(name="down", input_data="d", prompt_column="t")]
+
+    async def _all_failed_summary(args):
+        return {"accept_length": None, "completed": 0, "failed": 4}
+
+    monkeypatch.setattr(bench_sglang, "_run_summary", _all_failed_summary)
+    results = asyncio.run(_run_sweep(_sweep_args(), specs))
+    assert results == [{"dataset": "down", "error": "all requests failed (0 completed)"}]

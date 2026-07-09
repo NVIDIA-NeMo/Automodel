@@ -132,3 +132,43 @@ def test_load_prompts_prompt_column_respects_num_prompts_cap(monkeypatch):
     )
     prompts = _load_prompts(_args(prompt_column="question", num_prompts=2))
     assert len(prompts) == 2
+
+
+# ---------------------------------------------------------------------------
+# _load_prompts: prompt_context_column (Alpaca-style secondary field)
+# ---------------------------------------------------------------------------
+
+
+def test_load_prompts_appends_context_column_when_present(monkeypatch):
+    """Alpaca-shaped rows: instruction + non-empty input are joined into one prompt."""
+    rows = [{"instruction": "Identify the odd one out.", "input": "Twitter, Instagram, Telegram."}]
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages", lambda *a, **k: rows
+    )
+    prompts = _load_prompts(_args(prompt_column="instruction", prompt_context_column="input"))
+    assert prompts == [[{"role": "user", "content": "Identify the odd one out.\n\nTwitter, Instagram, Telegram."}]]
+
+
+def test_load_prompts_omits_empty_context_column(monkeypatch):
+    """A blank/missing context field leaves the bare instruction untouched."""
+    rows = [{"instruction": "Name a color.", "input": ""}, {"instruction": "Name a fruit."}]
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages", lambda *a, **k: rows
+    )
+    prompts = _load_prompts(_args(prompt_column="instruction", prompt_context_column="input"))
+    assert prompts == [
+        [{"role": "user", "content": "Name a color."}],
+        [{"role": "user", "content": "Name a fruit."}],
+    ]
+
+
+def test_load_prompts_context_column_attribute_optional(monkeypatch):
+    """A Namespace that never sets prompt_context_column behaves as before (no append)."""
+    rows = [{"instruction": "Name a color.", "input": "ignored"}]
+    monkeypatch.setattr(
+        "nemo_automodel.components.datasets.llm.chat_dataset._load_openai_messages", lambda *a, **k: rows
+    )
+    args = _args(prompt_column="instruction")  # _args never sets prompt_context_column
+    assert not hasattr(args, "prompt_context_column")
+    prompts = _load_prompts(args)
+    assert prompts == [[{"role": "user", "content": "Name a color."}]]
