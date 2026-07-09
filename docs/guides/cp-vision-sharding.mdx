@@ -1,0 +1,163 @@
+---
+title: "Context-Parallel Vision Sharding"
+description: "Distribute the VLM vision tower across context-parallel ranks at frame granularity, removing the per-rank replicated ViT forward."
+---
+
+## Overview
+
+Vision-language models run the vision tower (ViT) in a **pre-embed** step *outside* the
+context-parallel (CP) attention context: the model embeds all images/videos, scatters the
+vision features into `inputs_embeds`, and only *then* shards the sequence across CP ranks.
+Vision attention is non-causal and incompatible with CP ring attention, so this step cannot
+reuse the sequence shard.
+
+Without vision sharding, that pre-embed `visual(...)` call runs on the **full, un-sharded set
+of images on every CP rank**: with `cp_size=N` the vision tower does **N× redundant compute**
+and holds **O(all-images)** vision activations on each rank.
+
+`nemo_automodel.components.distributed.cp_vision_shard` removes this redundancy by
+partitioning the visual input across the CP group at **frame granularity**, running the
+vision tower on each rank's slice only, and all-gathering the per-frame embeddings back in
+order. The downstream scatter into `inputs_embeds` and the sequence shard are byte-for-byte
+unchanged.
+
+## Design
+
+### Key property: vision frames are independent
+
+Qwen3-VL-style vision towers have **zero cross-frame coupling**:
+
+- attention is **per-frame** — `cu_seqlens` is built from `grid_thw` so each frame's `h*w`
+  patches attend only within that frame;
+- both the rotary and the learned position embeddings are **spatial-only, repeated
+  identically per frame** (temporal reasoning happens later, in the LLM via mRoPE);
+- the patch embedding is per temporal-patch.
+
+So, with all CP ranks holding identical FSDP-all-gathered vision weights:
+
+```
+visual((t,h,w)) == visual(t × (1,h,w))    and    visual(all_frames) == concat_r visual(frames_of_rank_r)
+```
+
+hold **exactly**. Every `(t,h,w)` entry is expanded into `t` per-frame units, the *frames*
+are partitioned contiguously across the CP group, each rank runs `visual` on its slice, and a
+differentiable all-gather reassembles the embeddings in the original order. Sharding at frame
+granularity (rather than whole-entry) lets a **single large video** — or a pack with fewer
+videos than ranks — shard across ranks, and balances finer. Images are `t == 1`, i.e. one
+unit each.
+
+### Flow (per CP rank `r`)
+
+```
+embed_multimodal:
+  vision_output = maybe_distribute_visual(self.visual, pixel_values, grid_thw)
+    ├─ disabled / no CP group / cp_size<=1 / no media / below min tokens → self.visual(full)   [replicate]
+    └─ else:
+         frames = expand each (t,h,w) -> t units of h*w patches       [images: 1 unit each]
+         if num_frame_units < world:                                  [pad path]
+             pad with (world - num_frame_units) minimal (1,sms,sms) zero dummy frames
+             cuts = one frame unit per rank                           [every rank runs ONE frame]
+         else:
+             cuts = contiguous, attention-cost-balanced partition of FRAMES, >=1 frame/rank
+         local  = self.visual(pixel_rows[r], coalesce(frames_of_rank_r))
+         full   = all-gather(local) over the CP group, reassembled in frame order
+         full   = full[:real_token_count]                             # drop the dummy tail (pad path)
+  # unchanged from here: masked_scatter into inputs_embeds, sequence shard
+```
+
+| Concern | Resolution |
+|---|---|
+| **Load balance** | Contiguous partition of per-frame units balanced by cumulative approximate attention cost (`(h*w)^2` per frame), ≥1 frame per rank. Contiguous so the gathered blocks concatenate back in original frame order with no reshuffle. Deterministic, so every rank computes the same cuts. |
+| **Differentiable all-gather** | Per-rank `[max_tokens, H]` blocks are padded to the global max, all-gathered (forward all-gather + concat; backward **reduce-scatter SUM**), then sliced back to true token counts. |
+| **Gradient parity** | Every rank reassembles the full embeds, then keeps only its sequence shard. A frame computed by rank `c` lands in shard-owner rank `s`; reduce-scatter-SUM routes `s`'s gradient back to `c` (summing the straddling case). The total vision-parameter gradient equals the replicated baseline's. |
+| **FSDP / no deadlock** | The distribute / pad / replicate choice is a pure function of `(num_frame_units, world, enabled)` and thus identical on all ranks; every rank makes exactly one `visual` call and the same number of vision-shard collectives. Fewer frame units than ranks **pads with minimal dummy frames** (one unit per rank) so no rank is starved; the dummy embeddings are sliced off before the loss and contribute exactly zero gradient. The all-gather inside `maybe_distribute_visual` is the synchronization boundary — do **not** add an extra post-visual CP barrier. |
+| **Small workloads** | Batches whose visual token count is below `NEMO_CP_SHARD_VISION_MIN_TOKENS` (default `2048`) use the replicated path: they have little memory pressure but would still pay the all-gather synchronization cost. |
+
+`maybe_distribute_visual` also all-gathers an optional `deepstack_features` list
+(Qwen3-VL-style towers); `last_hidden_state` is intentionally left as the local shard since
+`embed_multimodal` only reads `pooler_output` / `deepstack_features`.
+
+For vision towers whose forward does not match the
+`visual(pixel_values, grid_thw=..., return_dict=True)` signature, the lower-level
+`maybe_distribute_independent_units` helper applies the same partition / run-local /
+gather-and-slice scheme to any sequence of independent variable-size units.
+
+### Sharding scope: frozen vs. trainable vision tower
+
+The caller chooses the process group it publishes via `set_cp_vision_group`, and the choice
+is a **deliberate design constraint**, not an optimization detail:
+
+| Vision tower | Sharding group | Why |
+|---|---|---|
+| **Frozen** | Full **CP × TP** rank set | Frame independence + replicated weights make the forward bit-identical for *any* rank group with identical weights, and `requires_grad=False` means no backward ever runs through the gather — zero gradient risk. |
+| **Trainable** | **CP group only** | The vision tower is replicated (not tensor-parallel) across TP ranks. Gathering frames across CP × TP would make the all-gather's reduce-scatter(SUM) backward accumulate the vision gradient **tp-fold**: each TP-replicated sequence shard backprops into the single rank that computed the frame. TP ranks therefore redundantly compute the ViT. |
+| **Pure TP** (`cp_size == 1`) | Not enabled | The pre-embed sharding path is gated on `cp_size > 1`. |
+
+Extending the trainable case to CP × TP would require gathering over CP × TP while reducing
+gradients over CP only (or scaling by `1/tp`), plus a gradient-parity test — until then the
+CP-only group is correct by construction.
+
+## Usage
+
+The helper activates when a process group is published around the VLM pre-embed forward —
+the CP group for a trainable vision tower, or the flattened CP × TP group for a frozen one
+(see [sharding scope](#sharding-scope-frozen-vs-trainable-vision-tower)):
+
+```python
+from nemo_automodel.components.distributed import cp_vision_shard
+
+token = cp_vision_shard.set_cp_vision_group(cp_group)
+try:
+    # pre-embed forward; embed_multimodal routes self.visual(...) through
+    # cp_vision_shard.maybe_distribute_visual(self.visual, pixel_values, grid_thw)
+    ...
+finally:
+    cp_vision_shard.reset_cp_vision_group(token)
+```
+
+Environment toggles:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `NEMO_CP_SHARD_VISION` | `1` | `0` forces the replicated ViT path (exact pre-sharding behavior; use as the A/B baseline). |
+| `NEMO_CP_SHARD_VISION_MIN_TOKENS` | `2048` | Visual-token threshold below which the replicated path is used. |
+
+## Validation
+
+- **Unit tests** (`tests/unit_tests/distributed/test_cp_vision_shard.py`, CPU-only, 40 tests):
+  `visual(full) == concat_r visual(slice_r)` for **forward and vision-parameter gradient** at
+  world sizes 2–4; partition balance/coverage/order; variable-token all-gather forward +
+  backward; end-to-end `maybe_distribute_visual` (including deepstack, video entries, and a
+  single video split across ranks at frame granularity); every fallback; and the pad path
+  end-to-end through the production code, asserting `sum_r grad_r == replicate grad` and that
+  every padded (dummy) rank contributes exactly zero gradient.
+- **Internal validation runs** (Qwen3.5-class VLM): with `cp_size=2`, loss parity with the
+  replicated baseline (step-0 loss bit-identical, later steps within bf16 noise), lower peak
+  memory, and **about +19% tokens/sec per GPU**; validated with both a frozen and a trained
+  vision tower. Frozen-tower runs additionally validated sharding across the full CP × TP
+  rank set: step-0 loss identical to the replicated baseline and **~1.5–2× faster steps** on
+  many-frame video packs.
+
+Because the memory saving depends on activation checkpointing (a checkpointed vision tower
+retains only block-boundary activations), the primary win is **compute**: activation
+checkpointing runs the vision forward twice and sharding divides both by ~`cp_size`.
+
+## Limitations
+
+<Note>
+**Trainable vision towers shard within the CP group only.** This is the deliberate
+gradient-correctness constraint described in
+[sharding scope](#sharding-scope-frozen-vs-trainable-vision-tower): with an unfrozen tower,
+TP ranks redundantly compute the ViT, so the full CP × TP speedup is available only when the
+vision tower is frozen (`freeze_config.freeze_vision_tower: true`, the recipe default).
+</Note>
+
+- **Memory saving is modest under activation checkpointing.** Retained vision activations
+  are already small when the tower is checkpointed; the throughput win is the larger,
+  consistent benefit.
+- **Gathered embeds are full on every rank.** The final per-frame embeddings (small compared
+  to the ViT's internal activations) are reconstructed in full before the existing sequence
+  shard; sharding them too is a separate, more invasive effort.
+- **Model wiring required.** The helper is model-agnostic, but each VLM family's
+  `embed_multimodal` must route its `visual(...)` call through `maybe_distribute_visual`
+  (and the recipe must publish the CP group around the pre-embed forward) to benefit.

@@ -454,6 +454,9 @@ navigation:
       - page: "Pipeline Parallelism"
         path: ../../guides/pipelining.mdx
         slug: pipeline-parallelism
+      - page: "Context-Parallel Vision Sharding"
+        path: ../../guides/cp-vision-sharding.mdx
+        slug: cp-vision-sharding
       - page: "FP8 Training"
         path: ../../guides/fp8-training.mdx
         slug: fp8-training
