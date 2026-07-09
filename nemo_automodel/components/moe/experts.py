@@ -42,11 +42,16 @@ from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 # ── EP variable-length collective helpers ──
 
 
+_ALL_GATHER_CONCAT_VARLEN_BACKWARD_CHUNK_TOKENS = 4096
+
+
 class _AllGatherConcatVarlenFn(Function):
     """All-gather with variable local lengths and autograd-safe backward.
 
     Backward uses all-reduce + local narrow instead of reduce-scatter to avoid
-    monitoredBarrier deadlocks observed with mixed FSDP/EP backward collective ordering.
+    monitoredBarrier deadlocks observed with mixed FSDP/EP backward collective
+    ordering. Long-context EP batches can make the concatenated gradient large,
+    so backward reduces one source-rank slice at a time in token chunks.
     """
 
     @staticmethod
@@ -71,11 +76,22 @@ class _AllGatherConcatVarlenFn(Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        grad_full = grad_output.contiguous()
-        start = sum(ctx.gathered_lens[: ctx.rank])
-        local_len = ctx.gathered_lens[ctx.rank]
-        dist.all_reduce(grad_full, op=dist.ReduceOp.SUM, group=ctx.group)
-        grad_local = grad_full.narrow(0, start, local_len).contiguous()
+        local_len = int(ctx.gathered_lens[ctx.rank])
+        grad_local = grad_output.new_empty((local_len,) + tuple(grad_output.shape[1:]))
+        chunk_tokens = _ALL_GATHER_CONCAT_VARLEN_BACKWARD_CHUNK_TOKENS
+        max_chunk_tokens = max(int(chunk_tokens), 1)
+
+        offset = 0
+        for source_rank, source_len in enumerate(ctx.gathered_lens):
+            source_len = int(source_len)
+            for chunk_start in range(0, source_len, max_chunk_tokens):
+                chunk_len = min(max_chunk_tokens, source_len - chunk_start)
+                grad_chunk = grad_output.narrow(0, offset + chunk_start, chunk_len).clone()
+                dist.all_reduce(grad_chunk, op=dist.ReduceOp.SUM, group=ctx.group)
+                if source_rank == ctx.rank:
+                    grad_local.narrow(0, chunk_start, chunk_len).copy_(grad_chunk)
+            offset += source_len
+
         return grad_local, None, None, None
 
 
