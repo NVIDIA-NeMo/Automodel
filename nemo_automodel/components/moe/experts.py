@@ -1340,7 +1340,14 @@ class GroupedExpertsTE(nn.Module):
                     output2 = _apply_bias(output2, down_bias, splits_t, permuted_probs - 1.0)
         else:
             # Handle edge case: no tokens routed to local experts
-            # Perform dummy computation for gradient flow
+            # Perform dummy computation for gradient flow.  Touching only
+            # ``weight0`` leaves every other local expert with ``grad=None``;
+            # that skips momentum decay, decoupled weight decay, and its
+            # optimizer step.  Grouped GEMM instead produces explicit zero
+            # gradients for all experts, so attach a zero-valued dependency to
+            # every local GroupedLinear parameter.  Indexing one element is
+            # sufficient for autograd to materialize the full zero gradient
+            # without reducing over the (potentially very large) weight.
             def to_local(tensor):
                 if isinstance(tensor, DTensor):
                     return tensor.to_local()
@@ -1350,6 +1357,15 @@ class GroupedExpertsTE(nn.Module):
             output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).T)
             output1_ = self.expert_activation(output1, permuted_probs)
             output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).T)
+            all_expert_dependency = output2.new_zeros(())
+            for grouped_linear in (self.gate_up_linear, self.down_linear):
+                for parameter in grouped_linear.parameters():
+                    local_parameter = to_local(parameter)
+                    if local_parameter.numel() > 0:
+                        all_expert_dependency = (
+                            all_expert_dependency + local_parameter.reshape(-1)[0].to(output2.dtype) * 0
+                        )
+            output2 = output2 + all_expert_dependency
 
         if fp8_active and actual_m_splits is not None:
             output2 = self.fp8_unpadding(output2, actual_m_splits)
