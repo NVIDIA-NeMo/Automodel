@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
+from dataclasses import asdict, dataclass
 from math import ceil
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from torch.distributed.checkpoint.stateful import Stateful
 
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
+
+if TYPE_CHECKING:
+    from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +66,7 @@ class StepScheduler(Stateful):
         save_checkpoint_every_epoch: bool = True,
         val_every_steps: Optional[int] = None,
         log_remote_every_steps: int = 1,
+        loss_average_window_steps: int = 50,
         gc_every_steps: Optional[int] = None,
         start_step: int = 0,
         start_epoch: int = 0,
@@ -81,29 +88,43 @@ class StepScheduler(Stateful):
                 Default: True.
             val_every_steps (Optional[int]): Number of training steps between validation.
             log_remote_every_steps (int): Frequency of remote logging (e.g., WandB, MLflow). Default: 1 (every step).
+            loss_average_window_steps (int): Rolling window size for averaged training loss metrics.
             gc_every_steps (Optional[int]): Frequency of manual garbage collection steps.
             start_step (int): Initial global step. Used when resuming from checkpoint. Default: 0.
             start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
             num_epochs (Optional[int]): Total number of epochs. Default: None or calculated from max_steps if num_epochs is None or 10 if max_steps and num_epochs are both None.
             max_steps (Optional[int]): Maximum number of steps to run. If None, calculated from num_epochs.
         """
-        assert global_batch_size % (local_batch_size * dp_size) == 0, (
-            f"global_batch_size ({global_batch_size}) must be divisible by local_batch_size * dp_size ({local_batch_size} * {dp_size})"
-        )
+        if global_batch_size <= 0:
+            raise ValueError(f"global_batch_size must be greater than 0, got {global_batch_size}")
+        if local_batch_size <= 0:
+            raise ValueError(f"local_batch_size must be greater than 0, got {local_batch_size}")
+        if dp_size <= 0:
+            raise ValueError(f"dp_size must be greater than 0, got {dp_size}")
+        local_global_batch_size = local_batch_size * dp_size
+        if global_batch_size % local_global_batch_size != 0:
+            raise ValueError(
+                f"global_batch_size ({global_batch_size}) must be divisible by local_batch_size * dp_size "
+                f"({local_batch_size} * {dp_size})"
+            )
         self.grad_acc_steps = global_batch_size // (local_batch_size * dp_size)
-        assert self.grad_acc_steps >= 1, (
-            f"grad_acc_steps ({self.grad_acc_steps}) must be greater than or equal to 1. Please ensure that global_batch_size >= (local_batch_size * dp_size)"
-        )
+        if self.grad_acc_steps < 1:
+            raise ValueError(
+                f"grad_acc_steps ({self.grad_acc_steps}) must be greater than or equal to 1. "
+                "Please ensure that global_batch_size >= (local_batch_size * dp_size)"
+            )
         self.dataloader = dataloader
         self.step = start_step
-        assert start_step >= 0, "start_step must be greater than or equal to 0"
+        if start_step < 0:
+            raise ValueError(f"start_step must be greater than or equal to 0, got {start_step}")
         self.epoch = start_epoch
-        assert start_epoch >= 0, "start_epoch must be greater than or equal to 0"
+        if start_epoch < 0:
+            raise ValueError(f"start_epoch must be greater than or equal to 0, got {start_epoch}")
 
         # Throws with IterableDataset.
         try:
             self.epoch_len = ceil(len(dataloader) / self.grad_acc_steps)
-        except:
+        except (NotImplementedError, TypeError, RuntimeError):
             self.epoch_len = None
 
         # This is for backward compatibility in the sense that num_epochs's default value was 10
@@ -114,29 +135,38 @@ class StepScheduler(Stateful):
             )
 
         self.num_epochs = num_epochs
-        assert num_epochs is None or num_epochs > 0, (
-            "num_epochs must be greater than 0 or None if max_steps is provided"
-        )
+        if num_epochs is not None and num_epochs <= 0:
+            raise ValueError(f"num_epochs must be greater than 0 or None if max_steps is provided, got {num_epochs}")
 
         self.val_every_steps = val_every_steps
-        assert val_every_steps is None or val_every_steps > 0, "val_every_steps must be greater than 0 if not None"
+        if val_every_steps is not None and val_every_steps <= 0:
+            raise ValueError(f"val_every_steps must be greater than 0 if not None, got {val_every_steps}")
         self.log_remote_every_steps = log_remote_every_steps
-        assert log_remote_every_steps > 0, "log_remote_every_steps must be greater than 0"
+        if log_remote_every_steps <= 0:
+            raise ValueError(f"log_remote_every_steps must be greater than 0, got {log_remote_every_steps}")
+        self.loss_average_window_steps = loss_average_window_steps
+        if loss_average_window_steps <= 0:
+            raise ValueError(f"loss_average_window_steps must be greater than 0, got {loss_average_window_steps}")
         self.gc_every_steps = gc_every_steps
-        assert gc_every_steps is None or gc_every_steps > 0, "gc_every_steps must be greater than 0 if not None"
+        if gc_every_steps is not None and gc_every_steps <= 0:
+            raise ValueError(f"gc_every_steps must be greater than 0 if not None, got {gc_every_steps}")
         if max_steps is None:
-            assert self.epoch_len is not None, "epoch_len must be provided if max_steps is not provided"
+            if self.epoch_len is None:
+                raise ValueError("epoch_len must be provided if max_steps is not provided")
             max_steps = _calculate_max_steps(self.num_epochs, self.epoch_len)
             logger.info("max_steps not provided; will run for up to {} steps".format(max_steps))
         self.max_steps = max_steps
-        assert max_steps > 0, "max_steps must be greater than 0"
+        if max_steps <= 0:
+            raise ValueError(f"max_steps must be greater than 0, got {max_steps}")
 
         if ckpt_every_steps is None:
             if self.epoch_len is None:
-                ckpt_every_steps = self.max_steps // 2
+                ckpt_every_steps = max(1, self.max_steps // 2)
             else:
                 ckpt_every_steps = self.epoch_len
             logger.info("ckpt_every_steps not provided; will save checkpoint every {} steps".format(ckpt_every_steps))
+        if ckpt_every_steps <= 0:
+            raise ValueError(f"ckpt_every_steps must be greater than 0, got {ckpt_every_steps}")
         self.ckpt_every_steps = ckpt_every_steps
         self.save_checkpoint_every_epoch = save_checkpoint_every_epoch
 
@@ -216,11 +246,26 @@ class StepScheduler(Stateful):
     @property
     def is_last_step(self):
         """
-        Returns whether the training is finished.
+        Returns whether the current step is the final training step.
+
+        Training stops at whichever comes first: reaching ``max_steps`` or
+        exhausting the configured number of epochs (see ``__iter__`` and
+        ``epochs``). ``max_steps`` alone is therefore not enough to detect the
+        end -- a small dataset can run out of epochs long before ``max_steps``
+        is hit (e.g. ``max_steps=100`` with only 60 steps' worth of data). In
+        that case the last batch of the last epoch is the final step. Detect it
+        so the final checkpoint and consolidated export -- which key off this
+        flag (see ``is_ckpt_step`` and the recipes' ``is_final_checkpoint``) --
+        are still written.
         """
         # we +1 here because the step is incremented after
         # the batch is yielded in the tail handling of __iter__
-        return self.step + 1 >= self.max_steps
+        if self.step + 1 >= self.max_steps:
+            return True
+        # Last batch of the last epoch when epochs are exhausted before max_steps.
+        if self.num_epochs is not None and self.epoch + 1 >= self.num_epochs:
+            return self.is_last_batch
+        return False
 
     @property
     def is_last_batch(self):
@@ -274,3 +319,66 @@ class StepScheduler(Stateful):
             s (dict): Dictionary containing 'step' and 'epoch'.
         """
         self.step, self.epoch = s["step"], s["epoch"]
+
+
+# ---------------------------------------------------------------------------
+# Typed config + builder
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StepSchedulerConfig:
+    """User-facing step scheduler configuration.
+
+    These fields correspond to the YAML-configurable parameters of the
+    training loop.  Runtime-only values (``dataloader``, ``dp_size``,
+    ``local_batch_size``) are passed separately to ``build_step_scheduler``.
+
+    Attributes:
+        global_batch_size: Total samples per optimizer step across all GPUs.
+        num_epochs: Number of training epochs.  When ``None`` the builder
+            derives it from ``max_steps``.  Default: 10.
+        max_steps: Hard cap on optimizer steps.  ``None`` means derive from
+            ``num_epochs * epoch_len``.
+        ckpt_every_steps: Save a checkpoint every N optimizer steps.
+            ``None`` defaults to once per epoch.
+        save_checkpoint_every_epoch: Also checkpoint at every epoch boundary.
+        val_every_steps: Run validation every N optimizer steps.
+            ``None`` disables periodic validation.
+        log_remote_every_steps: Log to WandB / MLflow every N steps.
+        loss_average_window_steps: Rolling window size for averaged training loss
+            metrics.
+        gc_every_steps: Force ``gc.collect()`` every N steps.
+            ``None`` disables manual GC.
+        start_step: Initial global step (for checkpoint resume).
+        start_epoch: Initial epoch (for checkpoint resume).
+    """
+
+    global_batch_size: int = 32
+    num_epochs: int | None = 10
+    max_steps: int | None = None
+    ckpt_every_steps: int | None = 100
+    save_checkpoint_every_epoch: bool = True
+    val_every_steps: int | None = None
+    log_remote_every_steps: int = 1
+    loss_average_window_steps: int = 50
+    gc_every_steps: int | None = None
+    start_step: int = 0
+    start_epoch: int = 0
+
+    def build(self, dataloader: DataLoader, dp_group_size: int, local_batch_size: int) -> StepScheduler:
+        """Build the step scheduler.
+
+        Args:
+            dataloader: The training dataloader.
+            dp_group_size: The size of the data parallel group.
+            local_batch_size: The size of the local batch.
+
+        Returns:
+            Configured StepScheduler.
+        """
+        kwargs = asdict(self)
+        kwargs["local_batch_size"] = local_batch_size
+        kwargs["dp_size"] = dp_group_size
+        kwargs["dataloader"] = dataloader
+        return StepScheduler(**kwargs)

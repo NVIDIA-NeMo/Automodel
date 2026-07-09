@@ -110,7 +110,7 @@ class TestExtractModelLayersStringFallbackAndNoneSafe:
        (which happen after PP stage split strips unused sub-modules).
     """
 
-    def _make_fake_qwen35(self, visual_is_none: bool):
+    def _make_fake_qwen35(self, visual_is_none: bool, layers_as_module_dict: bool = False):
         """Build a stand-in object whose type().__name__ is
         'Qwen3_5ForConditionalGeneration' but is NOT the real class — this
         mimics the lazy-import / deepcopy class-identity drift case."""
@@ -121,7 +121,10 @@ class TestExtractModelLayersStringFallbackAndNoneSafe:
         model = Qwen3_5ForConditionalGeneration()
         model.model = nn.Module()
         model.model.language_model = nn.Module()
-        model.model.language_model.layers = nn.ModuleList([nn.Linear(4, 4)])
+        if layers_as_module_dict:
+            model.model.language_model.layers = nn.ModuleDict({"0": nn.Linear(4, 4)})
+        else:
+            model.model.language_model.layers = nn.ModuleList([nn.Linear(4, 4)])
         if not visual_is_none:
             model.model.visual = nn.Module()
             model.model.visual.blocks = nn.ModuleList([nn.Linear(4, 4)])
@@ -145,6 +148,31 @@ class TestExtractModelLayersStringFallbackAndNoneSafe:
         # Only the language_model.layers path survives; flattened to its one Linear.
         assert len(layers) == 1
         assert isinstance(layers[0], nn.Linear)
+
+    def test_module_dict_pp_stage_layers_are_flattened(self):
+        model = self._make_fake_qwen35(visual_is_none=True, layers_as_module_dict=True)
+        # PP splitting replaces ModuleList with ModuleDict keyed by original layer ids.
+        layers = parallelizer._extract_model_layers(model)
+        assert len(layers) == 1
+        assert isinstance(layers[0], nn.Linear)
+
+    def test_unknown_pp_stage_module_dict_heuristic(self):
+        class UnknownPPSplitStage(nn.Module):
+            pass
+
+        model = UnknownPPSplitStage()
+        model.model = nn.Module()
+        model.model.language_model = nn.Module()
+        model.model.language_model.layers = nn.ModuleDict(
+            {
+                "0": nn.Linear(4, 4),
+                "1": nn.Linear(4, 4),
+            }
+        )
+
+        layers = parallelizer._extract_model_layers(model)
+        assert len(layers) == 2
+        assert all(isinstance(x, nn.Linear) for x in layers)
 
 
 class TestAutoPipelineDeferFsdpGradSyncConversion:

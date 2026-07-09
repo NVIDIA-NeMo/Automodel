@@ -21,6 +21,10 @@ from typing import TYPE_CHECKING, Protocol
 import torch
 from torch import nn
 
+from nemo_automodel.components.checkpoint._backports.hf_utils import (
+    FQN_TO_DTYPE_MAPPING_FILENAME,
+    FQN_TO_FILE_INDEX_MAPPING_FILENAME,
+)
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
 
@@ -54,10 +58,12 @@ class ConsolidatedHFAddon:
             model_state (ModelState): Wrapper holding the model parts.
             hf_metadata_dir (str): Target directory for HF metadata artifacts.
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
+            fqn_to_dtype_mapping (dict[str, str] | None): Original HF safetensors dtype map.
         """
         model_state = kwargs["model_state"]
         hf_metadata_dir = kwargs["hf_metadata_dir"]
         fqn_to_file_index_mapping = kwargs["fqn_to_file_index_mapping"]
+        fqn_to_dtype_mapping = kwargs.get("fqn_to_dtype_mapping", None)
         tokenizer = kwargs.get("tokenizer", None)
         model_part = model_state.model[0]  # ModelState already converts to list if needed
         original_model_path = kwargs["original_model_path"]
@@ -110,18 +116,21 @@ class ConsolidatedHFAddon:
                 tokenizer.save_pretrained(hf_metadata_dir)
 
             # save the fqn_to_file_index_mapping file
-            with open(os.path.join(hf_metadata_dir, "fqn_to_file_index_mapping.json"), "w") as f:
+            with open(os.path.join(hf_metadata_dir, FQN_TO_FILE_INDEX_MAPPING_FILENAME), "w") as f:
                 json.dump(fqn_to_file_index_mapping, f, indent=2, sort_keys=True)
+            if fqn_to_dtype_mapping:
+                with open(os.path.join(hf_metadata_dir, FQN_TO_DTYPE_MAPPING_FILENAME), "w") as f:
+                    json.dump(fqn_to_dtype_mapping, f, indent=2, sort_keys=True)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
     def post_save(self, **kwargs) -> None:
         """
-        Move the saved HF metadata to the consolidated directory.
+        Copy the saved HF metadata to the consolidated directory.
 
-        The reason we keep it this way is because the HF metadata needs to be available
-        for offline consolidation, otherwise any changes made to the config during training
-        will be lost.
+        The reason we keep it this way is because the HF metadata needs to stay
+        available for offline consolidation and re-export, otherwise any changes
+        made to the config during training will be lost.
 
         Expected kwargs:
             consolidated_path (str): Target directory for consolidated artifacts.
@@ -134,14 +143,17 @@ class ConsolidatedHFAddon:
             return
 
         if (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0):
-            # Move each item inside hf_metadata_dir into consolidated_path
+            # Copy each public metadata item into consolidated_path while keeping
+            # .hf_metadata intact for the offline consolidation helper.
             for item_name in os.listdir(hf_metadata_path):
-                if item_name == "fqn_to_file_index_mapping.json":
-                    continue  # this is saved by the consolidation step
+                if item_name in {FQN_TO_FILE_INDEX_MAPPING_FILENAME, FQN_TO_DTYPE_MAPPING_FILENAME}:
+                    continue  # internal helper metadata, not part of the HF output
                 src_path = os.path.join(hf_metadata_path, item_name)
                 dst_path = os.path.join(consolidated_path, item_name)
-                shutil.move(src_path, dst_path)
-            shutil.rmtree(hf_metadata_path, ignore_errors=True)
+                if os.path.isdir(src_path):
+                    shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src_path, dst_path)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
@@ -430,6 +442,57 @@ def _save_original_config_json(original_model_path: str, hf_metadata_dir: str, c
         json.dump(cfg, f, indent=2)
 
 
+# Symbols some trust_remote_code models import at module load that newer transformers
+# removed. Map symbol -> (module, fallback literal) so a consolidated checkpoint reloads
+# under a deploy container whose transformers dropped them (e.g. DeciLM/Nemotron-Super
+# imports NEED_SETUP_CACHE_CLASSES_MAPPING, gone since transformers 4.57).
+_REMOVED_TRANSFORMERS_SYMBOLS = {
+    "NEED_SETUP_CACHE_CLASSES_MAPPING": ("transformers.generation.utils", "{}"),
+}
+
+
+def _apply_transformers_compat_guards(py_path: str) -> None:
+    """Guard imports of transformers symbols removed in newer versions.
+
+    For each copied ``.py`` that does ``from <module> import ... <symbol> ...`` where
+    ``<symbol>`` was removed upstream, insert a preamble defining the symbol on
+    ``<module>`` if absent, so the subsequent import resolves. Files that don't
+    reference such symbols are left byte-for-byte unchanged.
+    """
+    try:
+        with open(py_path, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return
+
+    # Seed with symbols already guarded (cross-call idempotency); also dedups multiple
+    # import lines of the same symbol within one file.
+    guarded = {sym for sym in _REMOVED_TRANSFORMERS_SYMBOLS if f"_nemo_compat_mod.{sym}" in text}
+
+    out: list[str] = []
+    changed = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("from ") and " import " in stripped:
+            for symbol, (module, fallback) in _REMOVED_TRANSFORMERS_SYMBOLS.items():
+                if symbol not in guarded and symbol in stripped and f"from {module} import" in stripped:
+                    indent = line[: len(line) - len(stripped)]
+                    out.append(
+                        f"{indent}import {module} as _nemo_compat_mod  # noqa\n"
+                        f'{indent}if not hasattr(_nemo_compat_mod, "{symbol}"):\n'
+                        f"{indent}    _nemo_compat_mod.{symbol} = {fallback}\n"
+                        f"{indent}del _nemo_compat_mod\n"
+                    )
+                    guarded.add(symbol)
+                    changed = True
+                    break
+        out.append(line)
+
+    if changed:
+        with open(py_path, "w", encoding="utf-8") as f:
+            f.writelines(out)
+
+
 def _maybe_save_custom_model_code(
     original_model_path: str | None,
     hf_metadata_dir: str,
@@ -456,6 +519,7 @@ def _maybe_save_custom_model_code(
                 continue
             os.makedirs(os.path.dirname(dst_path) or hf_metadata_dir, exist_ok=True)
             shutil.copy2(src_path, dst_path)
+            _apply_transformers_compat_guards(dst_path)
             copied.add(dst_path)
 
     if original_model_path is not None:

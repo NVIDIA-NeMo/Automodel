@@ -29,6 +29,7 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class Glm4MoeAttention(nn.Module):
@@ -58,23 +59,29 @@ class Glm4MoeAttention(nn.Module):
         self.use_qk_norm = config.use_qk_norm
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
 
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         self.q_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_heads * self.head_dim, config.attention_bias
+            backend.linear, config.hidden_size, self.num_heads * self.head_dim, config.attention_bias, dtype=dtype
         )
         self.k_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, config.attention_bias
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, config.attention_bias, dtype=dtype
         )
         self.v_proj = initialize_linear_module(
-            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, config.attention_bias
+            backend.linear, config.hidden_size, self.num_kv_heads * self.head_dim, config.attention_bias, dtype=dtype
         )
         self.o_proj = initialize_linear_module(
-            backend.linear, self.num_heads * self.head_dim, config.hidden_size, False
+            backend.linear, self.num_heads * self.head_dim, config.hidden_size, False, dtype=dtype
         )
 
         # Optional per-head RMSNorm for Q and K
         if self.use_qk_norm:
-            self.q_norm = initialize_rms_norm_module(backend.rms_norm, self.head_dim, eps=config.rms_norm_eps)
-            self.k_norm = initialize_rms_norm_module(backend.rms_norm, self.head_dim, eps=config.rms_norm_eps)
+            self.q_norm = initialize_rms_norm_module(
+                backend.rms_norm, self.head_dim, eps=config.rms_norm_eps, dtype=dtype
+            )
+            self.k_norm = initialize_rms_norm_module(
+                backend.rms_norm, self.head_dim, eps=config.rms_norm_eps, dtype=dtype
+            )
 
         # Attention implementation
         softmax_scale = self.head_dim**-0.5

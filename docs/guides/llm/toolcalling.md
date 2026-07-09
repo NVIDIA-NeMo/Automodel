@@ -12,7 +12,7 @@ FunctionGemma is a lightweight, 270M-parameter variant built on the Gemma 3 arch
 
 ## Prerequisites
 - Install NeMo AutoModel and its extras: `pip install nemo-automodel`.
-- A FunctionGemma checkpoint available locally or using <https://huggingface.co/google/functiongemma-270m-it>.
+- A FunctionGemma checkpoint available locally or using [google/functiongemma-270m-it](https://huggingface.co/google/functiongemma-270m-it).
 - Small model footprint: can be fine-tuned on a single GPU; scale batch/sequence as needed.
 
 ## xLAM Dataset
@@ -98,11 +98,11 @@ automodel --nproc-per-node=8 examples/llm_finetune/gemma/functiongemma_xlam.yaml
 You should be able to see a training loss curve similar to the one shown below:
 
 <p align="center">
-  <img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/functiongemma-sft-loss.png" alt="FunctionGemma SFT loss" width="400">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/llm/functiongemma-sft-loss.png" alt="FunctionGemma SFT loss" width="400" />
 </p>
 
 ## Run PEFT (LoRA)
-To apply LoRA (PEFT), uncomment the `peft` block in the config and tune rank/alpha/targets per the [SFT/PEFT guide](finetune.md). Example override:
+To apply LoRA (PEFT), uncomment the `peft` block in the config and tune rank/alpha/targets per the [SFT/PEFT guide](finetune.mdx). Example override:
 
 ```yaml
 peft:
@@ -118,5 +118,5 @@ automodel examples/llm_finetune/gemma/functiongemma_xlam.yaml
 ```
 
 <p align="center">
-  <img src="https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/guides/llm/functiongemma-peft-loss.png" alt="FunctionGemma PEFT loss" width="400">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/docs/guides/llm/functiongemma-peft-loss.png" alt="FunctionGemma PEFT loss" width="400" />
 </p>

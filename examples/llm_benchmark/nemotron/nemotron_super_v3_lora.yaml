@@ -16,7 +16,7 @@
 # Benchmarking config for Nemotron-3-Super-120B-A12B LoRA
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/peft/nemotron_super_v3_lora.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/nemotron/nemotron_super_v3_lora.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
@@ -30,12 +30,12 @@ benchmark:
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
-  num_nodes: 4
+  num_nodes: 8
 
 step_scheduler:
   gc_every_steps: 10
   global_batch_size: 512
-  local_batch_size: 4
+  local_batch_size: 2
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
@@ -46,11 +46,11 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  ep_size: 32
+  ep_size: 64
   sequence_parallel: false
   activation_checkpointing: true
   moe:
-    reshard_after_forward: false
+    reshard_after_forward: true
 
 dist_env:
   backend: nccl
@@ -67,8 +67,8 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: false
-    experts: gmm
-    dispatcher: deepep
+    experts: torch_mm
+    dispatcher: hybridep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -106,5 +106,5 @@ optimizer:
   weight_decay: 0
 
 ci:
-  time: "00:20:00"
-  nodes: 4
+  time: "00:30:00"
+  nodes: 8

@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Kernel and attention patching utilities.
+"""Kernel, attention, and model runtime patching utilities.
 
-Functions for SDPA, Liger-kernel, and attention-implementation overrides.
-These are stateless helpers used during model construction.
+Functions for SDPA, Liger-kernel, model runtime hooks, and
+attention-implementation overrides. These are stateless helpers used during
+model construction.
 """
 
 import functools
-import importlib.util
+import importlib
 import inspect
 import logging
 import types
@@ -40,6 +41,31 @@ HAS_FA, _ = safe_import("flash_attn")
 DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
 
 logger = logging.getLogger(__name__)
+
+# Models build their CP/fp32-gate-aware modules at construction; no load-time
+# runtime patching is registered here. (Qwen3.5 dense/MoE build the native
+# CPAwareGatedDeltaNet + fp32 SSMGate in their model __init__.)
+_MODEL_RUNTIME_PATCHES = {}
+
+
+def _set_global_sdpa_backends(sdpa_method):
+    """Apply resolved SDPA backend constraints process-wide for checkpoint recompute."""
+    if sdpa_method is None:
+        return
+
+    enabled = {getattr(backend, "name", str(backend)) for backend in sdpa_method}
+    backend_setters = {
+        "FLASH_ATTENTION": "enable_flash_sdp",
+        "EFFICIENT_ATTENTION": "enable_mem_efficient_sdp",
+        "MATH": "enable_math_sdp",
+        "CUDNN_ATTENTION": "enable_cudnn_sdp",
+    }
+    for backend_name, setter_name in backend_setters.items():
+        setter = getattr(torch.backends.cuda, setter_name, None)
+        if setter is not None:
+            setter(backend_name in enabled)
+
+    logger.info("Set global SDPA backends to %s", sdpa_method)
 
 
 def _assert_same_signature(original, patched):
@@ -73,6 +99,8 @@ def _patch_attention(obj, sdpa_method=None):
             SDPBackend.EFFICIENT_ATTENTION,
             SDPBackend.MATH,
         ]
+    else:
+        _set_global_sdpa_backends(sdpa_method)
     orig_forward = obj.forward
 
     def patch_method(method):
@@ -134,6 +162,34 @@ def _patch_liger_kernel(model):
         logger.warning("Failed to apply liger-kernels to model; falling back to eager")
         del model
         raise RuntimeError("Failed to patch model")
+
+
+def _model_runtime_patch_keys(model):
+    config = getattr(model, "config", None)
+    keys = list(getattr(config, "architectures", None) or [])
+    model_cls_name = type(model).__name__
+    if model_cls_name not in keys:
+        keys.append(model_cls_name)
+    return keys
+
+
+def apply_model_runtime_patches(model, mesh):
+    """Apply registered architecture-specific runtime patches to a model."""
+    seen_hooks = set()
+    for key in _model_runtime_patch_keys(model):
+        hook_spec = _MODEL_RUNTIME_PATCHES.get(key)
+        if hook_spec is None or hook_spec in seen_hooks:
+            continue
+        seen_hooks.add(hook_spec)
+
+        module_name, hook_name = hook_spec
+        try:
+            hook = getattr(importlib.import_module(module_name), hook_name)
+        except ImportError:
+            logger.debug("Runtime patch hook for %s is unavailable: %s.%s", key, module_name, hook_name)
+            continue
+        model = hook(model, mesh=mesh)
+    return model
 
 
 def _patch_legacy_flash_attn_flag():
@@ -216,6 +272,11 @@ def _apply_preload_overrides(tp_size, cp_size, has_packed_sequence, attn_impleme
     if tp_size > 1 or cp_size > 1:
         logger.info("Disabling Liger kernel with TP ({}) or CP ({})".format(tp_size, cp_size))
         use_liger_kernel = False
+
+    # MagiAttention runs its own context-parallel dispatch + masking (incl. packing),
+    # so it must keep its registered backend rather than being forced to SDPA/flash here.
+    if attn_implementation == "magi":
+        return attn_implementation, use_liger_kernel
 
     if cp_size > 1:
         attn_implementation = "sdpa"

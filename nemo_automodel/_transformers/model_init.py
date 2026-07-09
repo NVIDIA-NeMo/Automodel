@@ -19,10 +19,12 @@ weights, applying config overrides, and instantiating the model.
 """
 
 import gc
+import glob
 import inspect
 import json
 import logging
 import os
+import shutil
 import threading
 from contextlib import contextmanager
 
@@ -40,6 +42,18 @@ from transformers.modeling_utils import PreTrainedModel
 if not hasattr(PretrainedConfig, "pad_token_id"):
     PretrainedConfig.pad_token_id = None
 
+# Shim: some trust_remote_code dLLM model code (e.g. Nemotron-Labs-Diffusion)
+# imports check_model_inputs from transformers.utils.generic, which is not
+# present in released transformers versions. Install a no-op fallback.
+import transformers.utils.generic as _generic_utils
+
+if not hasattr(_generic_utils, "check_model_inputs"):
+
+    def _check_model_inputs(func):
+        return func
+
+    _generic_utils.check_model_inputs = _check_model_inputs
+
 from nemo_automodel._transformers.utils import apply_qwen3_omni_config_patch
 
 apply_qwen3_omni_config_patch()
@@ -48,6 +62,10 @@ import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
+from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
+    has_gated_delta_net_fp32_checkpoint_contract,
+    is_gated_delta_net_fp32_param_key,
+)
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
 from nemo_automodel.shared.utils import dtype_from_str
@@ -209,6 +227,14 @@ def _resolve_custom_model_cls_for_config(config):
         return None
 
     arch_name = architectures[0]
+    if arch_name == "HYV3ForCausalLM":
+        from nemo_automodel.components.models.hy_mt2.dispatch import is_hy_mt2_config
+
+        if is_hy_mt2_config(config):
+            from nemo_automodel.components.models.hy_mt2.model import HyMT2ForCausalLM
+
+            return HyMT2ForCausalLM
+
     if not ModelRegistry.has_custom_model(arch_name):
         return None
 
@@ -227,6 +253,18 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     kwargs = kwargs.copy()
     trust_remote_code = kwargs.pop("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path))
     hf_config = kwargs.get("config", None)
+    # A plain-dict ``config`` (e.g. from CLI ``--model.config.num_hidden_layers 16``,
+    # which the config loader materializes as a dict, not a PretrainedConfig) is a set
+    # of config *overrides*, not a finished config object. Treat it as such: drop it
+    # from ``config`` and fold its keys into the kwargs that AutoConfig.from_pretrained
+    # applies as overrides. Returning the raw dict instead would break every downstream
+    # consumer that expects a config object (e.g. get_architectures -> the custom-model
+    # resolver, which would then mis-dispatch to the stock-HF path and reject custom
+    # kwargs like ``backend``).
+    if isinstance(hf_config, dict):
+        kwargs.pop("config", None)
+        kwargs.update(hf_config)
+        hf_config = None
     if hf_config is None:
         # Filter out nested dict kwargs before passing to AutoConfig.from_pretrained.
         # Nested dicts (e.g. text_config={"key": val}) would replace entire sub-configs
@@ -334,6 +372,48 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
         # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
         with dist_utils.FirstRankPerNode():
             snapshot_download(pretrained_model_name_or_path)
+
+
+def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs):
+    """Fully populate HF's dynamic-module (custom code) cache on global rank 0 first.
+
+    ``get_cached_module_file`` copies a custom-code file plus its *direct* relative
+    imports, but ``get_class_in_module`` later validates the *transitive* closure. A
+    checkpoint whose ``modeling_*.py`` reaches a shim only transitively (e.g. DeciLM:
+    ``modeling_decilm -> configuration_decilm -> transformers_4_44_2__configuration_llama``)
+    then dies with ``FileNotFoundError`` because that file was never copied into the
+    model's cache dir; multi-rank reloads from a shared filesystem also race on the
+    partial copy. Copy every ``.py`` from the checkpoint dir into the resolved cache
+    dir under ``FirstRankPerNode`` so the closure is complete before any rank reads it.
+    Best-effort: any failure falls through to HF's own (un-serialized) resolution.
+    """
+    if not pretrained_model_name_or_path or not os.path.isdir(str(pretrained_model_name_or_path)):
+        return
+    auto_map = getattr(hf_config, "auto_map", None)
+    if not isinstance(auto_map, dict) or not auto_map:
+        return
+    try:
+        from transformers.dynamic_module_utils import HF_MODULES_CACHE, get_cached_module_file
+    except Exception:
+        return
+    src_dir = str(pretrained_model_name_or_path)
+    module_files = set()
+    for value in auto_map.values():
+        for ref in value if isinstance(value, (list, tuple)) else [value]:
+            if isinstance(ref, str) and "." in ref:
+                module_files.add(ref.rsplit(".", 1)[0] + ".py")
+    src_py = glob.glob(os.path.join(src_dir, "*.py"))
+    with dist_utils.FirstRankPerNode():
+        for module_file in module_files:
+            try:
+                cached = get_cached_module_file(src_dir, module_file)
+                cache_dir = os.path.dirname(os.path.join(HF_MODULES_CACHE, cached))
+                for src in src_py:
+                    dst = os.path.join(cache_dir, os.path.basename(src))
+                    if not os.path.exists(dst):
+                        shutil.copy2(src, dst)
+            except Exception:
+                pass
 
 
 def _setup_bnb_loading_kwargs(kwargs: dict) -> None:
@@ -600,15 +680,29 @@ def _get_model_tensor(model, name: str):
 
 
 def _restore_loaded_model_dtype(
-    model, pretrained_model_name_or_path, hf_config, quantization_config, load_kwargs
+    model, pretrained_model_name_or_path, hf_config, quantization_config, load_kwargs, requested_dtype=None
 ) -> None:
-    """Restore each loaded tensor to the exact dtype stored in the checkpoint.
+    """Unify each loaded tensor's dtype after HuggingFace's mixed-dtype load.
 
     Some modules allocate parameters in a wider dtype than the checkpoint.
     HuggingFace then copies the checkpoint tensor into that existing tensor,
-    which upcasts the loaded value. We fix that by re-inspecting checkpoint
-    tensor dtypes per key and restoring each loaded parameter/buffer to the
-    dtype that was actually stored in the file.
+    which upcasts the loaded value, leaving the model with a mix of dtypes that
+    trips FSDP2's uniform-original-dtype check. We fix that by re-inspecting the
+    checkpoint tensor dtypes per key and unifying each loaded parameter/buffer.
+
+    The unification target depends on ``requested_dtype``:
+
+      * ``None`` (the user passed ``torch_dtype="auto"``): restore each tensor to
+        the exact dtype stored in the checkpoint -- faithfully mirror the file.
+      * an explicit ``torch.dtype``: restore each floating tensor to the *wider*
+        of (checkpoint dtype, requested dtype). This honors an explicit fp32
+        request (so parameters can serve as fp32 master weights) while preserving
+        intrinsically-fp32 checkpoint params (e.g. ``A_log``) even under a bf16
+        request, and is a no-op for the common bf16/auto case.
+
+    Args:
+        requested_dtype: The resolved ``torch_dtype`` the caller requested, or
+            None when ``"auto"`` was requested.
     """
     if quantization_config is not None or getattr(hf_config, "quantization_config", None) is not None:
         return
@@ -628,30 +722,63 @@ def _restore_loaded_model_dtype(
     if not checkpoint_dtypes:
         return
 
+    preserve_gdn_fp32_params = has_gated_delta_net_fp32_checkpoint_contract(hf_config)
     restored_dtype_by_tensor_id: dict[int, torch.dtype] = {}
     restored_count = 0
     for name, checkpoint_dtype in checkpoint_dtypes.items():
         tensor = _get_model_tensor(model, name)
-        if tensor is None or tensor.dtype == checkpoint_dtype:
+        if tensor is None:
+            continue
+
+        effective_checkpoint_dtype = (
+            torch.float32
+            if checkpoint_dtype.is_floating_point
+            and preserve_gdn_fp32_params
+            and is_gated_delta_net_fp32_param_key(name)
+            else checkpoint_dtype
+        )
+
+        # Record the checkpoint's original dtype on the tensor as the compute-dtype
+        # hint. Storage may be upcast below (fp32 master weights), which erases the
+        # dtype HF intended for compute; downstream sharding (fully_shard_by_dtype)
+        # reads ``_hf_compute_dtype`` to keep intrinsically-fp32 params (e.g. ``A_log``)
+        # computing in fp32 while the bulk computes in mp_policy.param_dtype.
+        if effective_checkpoint_dtype.is_floating_point and tensor.dtype.is_floating_point:
+            tensor._hf_compute_dtype = effective_checkpoint_dtype
+
+        # Pick the unification target. For an explicit floating request, take the
+        # wider of (checkpoint, requested) so explicit fp32 is honored as master
+        # weights while intrinsically-fp32 checkpoint params survive a bf16 request.
+        # For "auto" (requested_dtype is None) or non-floating tensors, mirror the
+        # checkpoint dtype exactly (preserves today's behavior).
+        target_dtype = effective_checkpoint_dtype
+        if (
+            requested_dtype is not None
+            and effective_checkpoint_dtype.is_floating_point
+            and tensor.dtype.is_floating_point
+        ):
+            target_dtype = torch.promote_types(effective_checkpoint_dtype, requested_dtype)
+
+        if tensor.dtype == target_dtype:
             continue
 
         seen_dtype = restored_dtype_by_tensor_id.get(id(tensor))
-        if seen_dtype is not None and seen_dtype != checkpoint_dtype:
+        if seen_dtype is not None and seen_dtype != target_dtype:
             logger.warning(
                 "Skipping conflicting checkpoint dtypes for aliased tensor %s: %s vs %s",
                 name,
                 seen_dtype,
-                checkpoint_dtype,
+                target_dtype,
             )
             continue
 
         try:
-            tensor.data = tensor.data.to(dtype=checkpoint_dtype)
+            tensor.data = tensor.data.to(dtype=target_dtype)
         except (RuntimeError, TypeError) as exc:
-            logger.warning("Failed to restore checkpoint dtype for %s to %s: %s", name, checkpoint_dtype, exc)
+            logger.warning("Failed to restore checkpoint dtype for %s to %s: %s", name, target_dtype, exc)
             continue
 
-        restored_dtype_by_tensor_id[id(tensor)] = checkpoint_dtype
+        restored_dtype_by_tensor_id[id(tensor)] = target_dtype
         restored_count += 1
 
     if restored_count > 0:
@@ -668,6 +795,12 @@ def __init_model(
     *model_args,
     **kwargs,
 ):
+    # Private recipe-level toggle: when False, skip ``_restore_loaded_model_dtype``
+    # so the caller's explicit ``torch_dtype`` is preserved as the master-weight
+    # dtype (needed for mixed-precision training that wants an fp32 master copy).
+    # Default ``True`` keeps existing behavior for every recipe that doesn't set
+    # it. Pop here so the flag never reaches HF's ``from_pretrained``.
+    restore_loaded_dtype = kwargs.pop("_restore_loaded_dtype", True)
     torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
     is_pretrained_init = isinstance(pretrained_model_name_or_path_or_config, str)  # The caller is .from_pretrained
     hf_config = (
@@ -678,6 +811,13 @@ def __init_model(
     pretrained_model_name_or_path = (
         pretrained_model_name_or_path_or_config if is_pretrained_init else getattr(hf_config, "name_or_path")
     )
+    # A plain-dict ``config`` override (e.g. from ``--model.config.num_hidden_layers``)
+    # has already been folded into ``hf_config`` by ``get_hf_config`` above. Drop it from
+    # kwargs so it is not also forwarded into the model constructor / HF from_pretrained
+    # (custom path passes ``hf_config`` positionally as ``config`` -> would collide;
+    # stock-HF path does not accept a dict ``config``).
+    if isinstance(kwargs.get("config"), dict):
+        kwargs.pop("config", None)
     architectures = get_architectures(hf_config)
 
     # Propagate the user-requested dtype to the top-level config and every nested
@@ -731,7 +871,15 @@ def __init_model(
                     attn_implementation=attn_implementation,
                     **kwargs,
                 )
-            _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
+            if restore_loaded_dtype:
+                _restore_loaded_model_dtype(
+                    model,
+                    pretrained_model_name_or_path,
+                    hf_config,
+                    quantization_config,
+                    kwargs,
+                    requested_dtype=(torch_dtype if torch_dtype != "auto" else None),
+                )
         else:
             model = cls._from_config_parent_class(
                 hf_config,
@@ -784,9 +932,27 @@ def __init_model(
 
     # 3. fallback to HF model class wrapped with mixin
     model = None
+    # Serialize HF custom-code cache population across ranks to avoid a partial-copy race.
+    _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs)
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
         _setup_bnb_loading_kwargs(kwargs)
+    # For trust_remote_code custom configs, pre-resolve the model class so we
+    # can strip yaml-level config-attr kwargs (e.g. ``dlm_paradigm``) that the
+    # custom ``__init__`` may not accept. Without this, HF forwards them as
+    # model __init__ kwargs and the call fails if the remote class tightened
+    # its signature. ``_consume_config_overrides`` applies these to hf_config
+    # and removes them from kwargs. ``getattr`` guards against test mocks
+    # where ``cls`` may not expose ``__name__``.
+    cls_name = getattr(cls, "__name__", None)
+    if isinstance(cls_name, str):
+        target_auto_class_name = cls_name[4:] if cls_name.startswith("NeMo") else cls_name
+        remote_model_cls = _try_get_remote_code_model_cls(
+            hf_config, pretrained_model_name_or_path, target_auto_class_name, kwargs
+        )
+        if remote_model_cls is not None:
+            init_param_names = _get_init_param_names(remote_model_cls)
+            _consume_config_overrides(hf_config, kwargs, init_param_names=init_param_names)
     if is_pretrained_init:
         with skip_random_init():
             model = cls._from_pretrained_parent_class(
@@ -796,7 +962,15 @@ def __init_model(
                 attn_implementation=attn_implementation,
                 **kwargs,
             )
-        _restore_loaded_model_dtype(model, pretrained_model_name_or_path, hf_config, quantization_config, kwargs)
+        if restore_loaded_dtype:
+            _restore_loaded_model_dtype(
+                model,
+                pretrained_model_name_or_path,
+                hf_config,
+                quantization_config,
+                kwargs,
+                requested_dtype=(torch_dtype if torch_dtype != "auto" else None),
+            )
     else:
         model = cls._from_config_parent_class(
             hf_config,
@@ -889,6 +1063,40 @@ def _get_init_param_names(model_cls) -> set[str]:
     except (TypeError, ValueError):
         return set()
     return {k for k in sig.parameters.keys() if k != "self"}
+
+
+def _try_get_remote_code_model_cls(hf_config, pretrained_model_name_or_path, target_auto_class_name, kwargs):
+    """Resolve the model class for a ``trust_remote_code`` custom config.
+
+    Looks up ``hf_config.auto_map`` for ``target_auto_class_name`` (falling back
+    to ``AutoModel``) and loads the referenced class via HF's dynamic-module
+    loader. Returns ``None`` if the lookup or load fails for any reason — the
+    caller should treat that as "no pre-resolution available" and fall through
+    to HF's standard handling.
+    """
+    if not kwargs.get("trust_remote_code"):
+        return None
+    if hf_config is None or pretrained_model_name_or_path is None:
+        return None
+    auto_map = getattr(hf_config, "auto_map", None)
+    if not auto_map:
+        return None
+    class_ref = auto_map.get(target_auto_class_name) or auto_map.get("AutoModel")
+    if class_ref is None:
+        return None
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        return get_class_from_dynamic_module(
+            class_ref,
+            pretrained_model_name_or_path,
+            revision=kwargs.get("revision"),
+            code_revision=kwargs.get("code_revision"),
+            cache_dir=kwargs.get("cache_dir"),
+            local_files_only=kwargs.get("local_files_only", False),
+        )
+    except Exception:
+        return None
 
 
 def _consume_config_overrides(config, kwargs: dict, *, init_param_names: set[str] | None = None) -> None:

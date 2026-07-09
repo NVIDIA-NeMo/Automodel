@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import json
 import logging
 import math
@@ -21,7 +22,9 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import torch
 import torch.utils.data
+from datasets import Image as HfImage
 from datasets import load_dataset
 from PIL import Image
 
@@ -111,24 +114,46 @@ def make_cord_v2_dataset(
 
 
 def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
-    """Load and preprocess the MedPix dataset for image-to-text fine-tuning."""
-    dataset = load_dataset(path_or_dataset, split=split)
+    """Load and preprocess the MedPix dataset for image-to-text fine-tuning.
 
-    def format(example):
+    Formatting is deferred to ``__getitem__`` via ``with_transform`` so the
+    dataset stays Arrow-backed (no Python-side copy of every image). Images are
+    loaded undecoded (``Image(decode=False)``) and wrapped as lazy ``PIL``
+    handles (``Image.open`` reads only the header); the actual pixel decode then
+    happens on demand in the DataLoader workers, rather than eagerly decoding the
+    whole split up front.
+    """
+    dataset = load_dataset(path_or_dataset, split=split)
+    if "image_id" in getattr(dataset, "features", {}):
+        dataset = dataset.cast_column("image_id", HfImage(decode=False))
+
+    def lazy_image(value):
+        # ``Image(decode=False)`` yields a ``{"bytes": ..., "path": ...}`` dict.
+        if isinstance(value, dict):
+            if value.get("bytes") is not None:
+                return Image.open(io.BytesIO(value["bytes"]))
+            if value.get("path"):
+                return value["path"]
+        return value
+
+    def transform(batch):
         return {
             "conversation": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": example["image_id"]},
-                        {"type": "text", "text": example["question"]},
-                    ],
-                },
-                {"role": "assistant", "content": [{"type": "text", "text": example["answer"]}]},
-            ],
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": lazy_image(image)},
+                            {"type": "text", "text": question},
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+                ]
+                for image, question, answer in zip(batch["image_id"], batch["question"], batch["answer"])
+            ]
         }
 
-    return [format(example) for example in dataset]
+    return dataset.with_transform(transform)
 
 
 def make_llava_onevision_dataset(
@@ -186,24 +211,121 @@ def make_llava_onevision_dataset(
     return [format(example) for example in dataset]
 
 
-def make_cv17_dataset(path_or_dataset="ysdede/commonvoice_17_tr_fixed", split="train", **kwargs):
-    """Load and preprocess the CommonVoice 17 dataset for audio-to-text fine-tuning."""
-    dataset = load_dataset(path_or_dataset, split=split)
-    all_columns = dataset.column_names
-    columns_to_remove = [col for col in all_columns if col not in ["audio", "transcription"]]
-    dataset = dataset.remove_columns(columns_to_remove)
+def make_tulu3_magicoder_text_mix_dataset(
+    tulu_split: str = "train",
+    magicoder_split: str = "train",
+    seed: int = 42,
+    max_turns: int = 16,
+    limit_total: int | None = None,
+    **kwargs,
+) -> list:
+    """Build a text-only 80/20 mix of Tulu-3-SFT-mixture and Magicoder-OSS-Instruct-75K.
 
-    def format(example):
+    Both datasets are converted into the NeMo VLM ``{"conversation": [...]}`` shape
+    consumed by :func:`nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn`.
+    Because ``default_collate_fn`` is image-aware only when a conversation turn
+    contains an ``{"type": "image", ...}`` entry, returning text-only conversations
+    here yields batches with no ``pixel_values`` / vision tensors -- which is what
+    the Gemma 4 base+drafter composite expects for text-only training.
+
+    Sources:
+        - ``allenai/tulu-3-sft-mixture`` (multi-turn, ``messages`` field of
+          ``{"role", "content"}`` dicts).
+        - ``ise-uiuc/Magicoder-OSS-Instruct-75K`` (2-turn, ``problem`` and
+          ``solution`` fields).
+
+    Mixing uses ``datasets.interleave_datasets`` with probabilities ``[0.8, 0.2]``
+    and ``stopping_strategy="all_exhausted"`` so both datasets are sampled until
+    every example has been drawn at least once.
+
+    Args:
+        tulu_split: HF split expression for the Tulu-3 source (e.g. ``"train"``
+            or ``"train[:50000]"``).
+        magicoder_split: HF split expression for the Magicoder source.
+        seed: Seed forwarded to ``interleave_datasets`` for reproducibility.
+        max_turns: Drop Tulu-3 conversations with more than this many turns to
+            keep memory bounded. Magicoder samples are always 2 turns.
+        limit_total: If set, cap the merged dataset to this many rows.
+        **kwargs: Additional arguments forwarded to ``load_dataset`` for both
+            sources.
+
+    Returns:
+        List of ``{"conversation": [...]}`` dicts. Each conversation is a list of
+        ``{"role": "user"|"assistant"|"system", "content": [{"type": "text", "text": ...}]}``
+        turns with no ``image`` field anywhere in the structure.
+    """
+    from datasets import interleave_datasets
+
+    tulu = load_dataset("allenai/tulu-3-sft-mixture", split=tulu_split, **kwargs)
+    magicoder = load_dataset("ise-uiuc/Magicoder-OSS-Instruct-75K", split=magicoder_split, **kwargs)
+
+    valid_roles = {"system", "user", "assistant"}
+
+    def _tulu_to_conversation(example):
+        messages = example.get("messages") or []
+        if not messages or len(messages) > max_turns:
+            return None
+        conversation = []
+        for turn in messages:
+            role = turn.get("role", "")
+            text = turn.get("content", "") or ""
+            if role not in valid_roles or not text.strip():
+                continue
+            conversation.append(
+                {
+                    "role": role,
+                    "content": [{"type": "text", "text": text}],
+                }
+            )
+        if len(conversation) < 2:
+            return None
+        # The chat template needs at least one assistant turn for labels.
+        if not any(t["role"] == "assistant" for t in conversation):
+            return None
+        return {"conversation": conversation}
+
+    def _magicoder_to_conversation(example):
+        problem = (example.get("problem") or "").strip()
+        solution = (example.get("solution") or "").strip()
+        if not problem or not solution:
+            return None
         return {
             "conversation": [
-                {"role": "user", "content": "<|endoftext11|>Transcribe the Turkish audio clip."},
-                {"role": "assistant", "content": example["transcription"]},
+                {"role": "user", "content": [{"type": "text", "text": problem}]},
+                {"role": "assistant", "content": [{"type": "text", "text": solution}]},
             ],
-            "audio": (example["audio"]["array"], example["audio"]["sampling_rate"]),
         }
 
-    ret = [format(example) for example in dataset]
-    return ret
+    # Project both datasets to a single shared column ("conversation") via
+    # ``datasets.Dataset.map`` so ``interleave_datasets`` can concatenate them.
+    # Rows that fail conversion (too long, missing fields) are emitted with an
+    # empty conversation and then filtered out before materialization.
+    def _tulu_map(example):
+        out = _tulu_to_conversation(example)
+        return {"conversation": out["conversation"] if out is not None else []}
+
+    def _magicoder_map(example):
+        out = _magicoder_to_conversation(example)
+        return {"conversation": out["conversation"] if out is not None else []}
+
+    tulu = tulu.map(_tulu_map, remove_columns=tulu.column_names)
+    magicoder = magicoder.map(_magicoder_map, remove_columns=magicoder.column_names)
+    tulu = tulu.filter(lambda ex: len(ex["conversation"]) >= 2)
+    magicoder = magicoder.filter(lambda ex: len(ex["conversation"]) >= 2)
+
+    mixed = interleave_datasets(
+        [tulu, magicoder],
+        probabilities=[0.8, 0.2],
+        stopping_strategy="all_exhausted",
+        seed=seed,
+    )
+
+    out = []
+    for ex in mixed:
+        out.append({"conversation": ex["conversation"]})
+        if limit_total is not None and len(out) >= limit_total:
+            break
+    return out
 
 
 def make_unimm_chat_dataset(path_or_dataset="Yirany/UniMM-Chat", split="train", **kwargs):
@@ -899,6 +1021,80 @@ def make_meta_dataset(
     return result
 
 
+def _resolve_processor_token_id(processor, attr_names, token_names):
+    """Resolve a model-specific media token id from processor/config/tokenizer."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+
+    config = getattr(processor, "config", None)
+    for source in (processor, config, tokenizer, getattr(tokenizer, "config", None)):
+        if source is None:
+            continue
+        for attr in attr_names:
+            value = getattr(source, attr, None)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str):
+                try:
+                    token_id = tokenizer.convert_tokens_to_ids(value)
+                except Exception:
+                    continue
+                if isinstance(token_id, int) and token_id != unk_id:
+                    return token_id
+    for token in token_names:
+        try:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+        except Exception:
+            continue
+        if isinstance(token_id, int) and token_id != unk_id:
+            return token_id
+    return None
+
+
+def _grid_media_token_count(grid, merge_size: int) -> int:
+    if grid is None:
+        return 0
+    grid_t = torch.as_tensor(grid)
+    if grid_t.numel() == 0:
+        return 0
+    if grid_t.ndim == 1:
+        grid_t = grid_t.view(1, -1)
+    merge_len = int(merge_size) ** 2
+    return int((grid_t.to(torch.long).prod(dim=-1) // merge_len).sum().item())
+
+
+def _media_token_mismatch(input_ids, result, processor) -> str | None:
+    """Return a mismatch description if media grids survived without tokens."""
+    image_token_id = _resolve_processor_token_id(
+        processor,
+        ("image_token_id", "image_token_index", "image_token"),
+        ("<|image_pad|>", "<image>", "<|image|>"),
+    )
+    video_token_id = _resolve_processor_token_id(
+        processor,
+        ("video_token_id", "video_token_index", "video_token"),
+        ("<|video_pad|>", "<video>", "<|video|>"),
+    )
+
+    image_grid = result.get("image_grid_thw")
+    if image_grid is not None and image_token_id is not None:
+        image_merge_size = getattr(getattr(processor, "image_processor", None), "merge_size", 2)
+        expected = _grid_media_token_count(image_grid, image_merge_size)
+        actual = int((input_ids == image_token_id).sum().item())
+        if actual != expected:
+            return f"image tokens={actual}, expected={expected}"
+
+    video_grid = result.get("video_grid_thw")
+    if video_grid is not None and video_token_id is not None:
+        video_merge_size = getattr(getattr(processor, "video_processor", None), "merge_size", 2)
+        expected = _grid_media_token_count(video_grid, video_merge_size)
+        actual = int((input_ids == video_token_id).sum().item())
+        if actual != expected:
+            return f"video tokens={actual}, expected={expected}"
+
+    return None
+
+
 class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
     """Dataset wrapper that tokenizes samples in ``__getitem__``.
 
@@ -922,12 +1118,23 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
     ``pixel_values_videos``, ``video_grid_thw``).
     """
 
-    def __init__(self, dataset, processor, max_length=None, max_retries=10, truncate=False):
+    def __init__(
+        self,
+        dataset,
+        processor,
+        max_length=None,
+        max_retries=10,
+        truncate=False,
+        post_tokenize_hook=None,
+        inject_fake_images=True,
+    ):
         self.dataset = dataset
         self.processor = processor
         self.max_length = max_length
         self.truncate = truncate
         self.max_retries = max_retries
+        self.post_tokenize_hook = post_tokenize_hook
+        self.inject_fake_images = inject_fake_images
         # Compatibility attributes expected by build_dataloader
         self.preload_media = False
 
@@ -958,7 +1165,7 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                 conversation = example["conversation"]
 
                 # Inject fake image into pure-text samples for FSDP/Zero3.
-                injected_fake = not _conversation_has_media(conversation)
+                injected_fake = self.inject_fake_images and not _conversation_has_media(conversation)
                 if injected_fake:
                     conversation = inject_fake_image_into_conversation(conversation)
 
@@ -998,6 +1205,8 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                     processor_kwargs["video_metadata"] = [video_metadata]
 
                 result = self.processor(**processor_kwargs)
+                if self.post_tokenize_hook is not None:
+                    result = self.post_tokenize_hook(result, self.processor)
 
                 input_ids = result["input_ids"][0]  # (seq_len,)
                 seq_len = input_ids.shape[0]
@@ -1038,6 +1247,16 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                         for k, v in result.items()
                     }
                     seq_len = ml
+
+                mismatch = _media_token_mismatch(input_ids, result, self.processor)
+                if mismatch is not None:
+                    logger.warning(
+                        "Sample %d: media token mismatch after tokenization/truncation (%s), replacing.",
+                        idx,
+                        mismatch,
+                    )
+                    idx = random.randint(0, len(self.dataset) - 1)
+                    continue
 
                 output = {
                     "input_ids": input_ids,

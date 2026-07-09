@@ -16,6 +16,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributed.tensor import DTensor, Partial, Shard
 
 from nemo_automodel.components.moe.experts import (
@@ -35,6 +36,21 @@ except ImportError:
 def _to_local(proj):
     """Convert DTensor to local tensor, or return as-is."""
     return proj.to_local() if isinstance(proj, DTensor) else proj
+
+
+def _to_grouped_mm_operand(proj, dtype: torch.dtype):
+    """Convert a projection tensor to the dtype/layout expected by grouped MM."""
+    return _to_local(proj).to(dtype).contiguous()
+
+
+def _pad_lora_rank_for_grouped_mm(lora_A: torch.Tensor, lora_B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad LoRA rank tensors so grouped-mm strides are 16-byte aligned."""
+    rank = lora_A.size(-1)
+    alignment = max(1, 16 // lora_A.element_size())
+    padding = (-rank) % alignment
+    if padding == 0:
+        return lora_A, lora_B
+    return F.pad(lora_A, (0, padding)), F.pad(lora_B, (0, 0, 0, padding))
 
 
 class GroupedExpertsLoRA(GroupedExperts):
@@ -92,10 +108,11 @@ class GroupedExpertsLoRA(GroupedExperts):
         device = obj.gate_and_up_projs.device
 
         up_proj_dim = obj.config.moe_inter_dim * 2 if obj.is_gated else obj.config.moe_inter_dim
+        expert_dim = obj.config.expert_dim
 
         # LoRA weights for gate+up (or just up if non-gated) and down projections
         obj.lora_gate_and_up_A = nn.Parameter(
-            torch.empty(obj.n_routed_experts, obj.config.dim, lora_dim, dtype=dtype, device=device)
+            torch.empty(obj.n_routed_experts, expert_dim, lora_dim, dtype=dtype, device=device)
         )
         obj.lora_gate_and_up_B = nn.Parameter(
             torch.empty(obj.n_routed_experts, lora_dim, up_proj_dim, dtype=dtype, device=device)
@@ -105,7 +122,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             torch.empty(obj.n_routed_experts, obj.config.moe_inter_dim, lora_dim, dtype=dtype, device=device)
         )
         obj.lora_down_B = nn.Parameter(
-            torch.empty(obj.n_routed_experts, lora_dim, obj.config.dim, dtype=dtype, device=device)
+            torch.empty(obj.n_routed_experts, lora_dim, expert_dim, dtype=dtype, device=device)
         )
 
         # Initialize LoRA weights
@@ -155,12 +172,13 @@ class GroupedExpertsLoRA(GroupedExperts):
 
         assert self.n_routed_experts % ep_size == 0
 
-        gate_and_up_projs = _to_local(self.gate_and_up_projs)
-        down_projs = _to_local(self.down_projs)
-        lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A)
-        lora_gate_and_up_B = _to_local(self.lora_gate_and_up_B)
-        lora_down_A = _to_local(self.lora_down_A)
-        lora_down_B = _to_local(self.lora_down_B)
+        compute_dtype = x.dtype
+        gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
+        down_projs = _to_grouped_mm_operand(self.down_projs, compute_dtype)
+        lora_gate_and_up_A = _to_grouped_mm_operand(self.lora_gate_and_up_A, compute_dtype)
+        lora_gate_and_up_B = _to_grouped_mm_operand(self.lora_gate_and_up_B, compute_dtype)
+        lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
+        lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
         if ep_size > 1:
             x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
@@ -177,6 +195,10 @@ class GroupedExpertsLoRA(GroupedExperts):
         experts_end_idx = experts_start_idx + n_local_experts
 
         if self.use_torch_mm:
+            lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
+                lora_gate_and_up_A, lora_gate_and_up_B
+            )
+            lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
             y = self._forward_grouped_mm(
                 x,
                 token_mask,
@@ -369,7 +391,13 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
     def __init__(
         self, orig_module: GroupedExpertsDeepEP, lora_dim=8, alpha=32, lora_A_init_method="xavier", lora_dtype=None
     ):
-        super().__init__(orig_module.config)
+        super().__init__(
+            orig_module.config,
+            dispatcher_backend=orig_module.dispatcher_backend,
+            dispatcher_num_sms=orig_module.dispatcher_num_sms,
+            dispatcher_share_token_dispatcher=orig_module.dispatcher_share_token_dispatcher,
+            dispatcher_async_dispatch=orig_module.dispatcher_async_dispatch,
+        )
 
         self.gate_and_up_projs.data.copy_(orig_module.gate_and_up_projs.data)
         self.down_projs.data.copy_(orig_module.down_projs.data)
@@ -384,6 +412,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         self.ep_rank = getattr(orig_module, "ep_rank", 0)
         self.token_dispatcher = getattr(orig_module, "token_dispatcher", None)
         self.use_torch_mm = getattr(orig_module, "use_torch_mm", False)
+        self.use_mxfp8 = getattr(orig_module, "use_mxfp8", False)
 
         GroupedExpertsDeepEPLoRA._init_adapter(
             self,
@@ -410,10 +439,11 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         device = obj.gate_and_up_projs.device
 
         up_proj_dim = obj.config.moe_inter_dim * 2 if obj.is_gated else obj.config.moe_inter_dim
+        expert_dim = obj.config.expert_dim
 
         # LoRA weights
         obj.lora_gate_and_up_A = nn.Parameter(
-            torch.empty(obj.config.n_routed_experts, obj.config.dim, lora_dim, dtype=dtype, device=device)
+            torch.empty(obj.config.n_routed_experts, expert_dim, lora_dim, dtype=dtype, device=device)
         )
         obj.lora_gate_and_up_B = nn.Parameter(
             torch.empty(obj.config.n_routed_experts, lora_dim, up_proj_dim, dtype=dtype, device=device)
@@ -423,7 +453,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
             torch.empty(obj.config.n_routed_experts, obj.config.moe_inter_dim, lora_dim, dtype=dtype, device=device)
         )
         obj.lora_down_B = nn.Parameter(
-            torch.empty(obj.config.n_routed_experts, lora_dim, obj.config.dim, dtype=dtype, device=device)
+            torch.empty(obj.config.n_routed_experts, lora_dim, expert_dim, dtype=dtype, device=device)
         )
 
         GroupedExpertsDeepEPLoRA.init_lora_weights(obj, lora_A_init_method)
@@ -475,15 +505,20 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         )
         permuted_probs = permuted_probs.unsqueeze(-1)
 
-        gate_and_up_projs = _to_local(self.gate_and_up_projs)
-        down_projs = _to_local(self.down_projs)
-        lora_gate_and_up_A = _to_local(self.lora_gate_and_up_A)
-        lora_gate_and_up_B = _to_local(self.lora_gate_and_up_B)
-        lora_down_A = _to_local(self.lora_down_A)
-        lora_down_B = _to_local(self.lora_down_B)
+        compute_dtype = x.dtype
+        gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
+        down_projs = _to_grouped_mm_operand(self.down_projs, compute_dtype)
+        lora_gate_and_up_A = _to_grouped_mm_operand(self.lora_gate_and_up_A, compute_dtype)
+        lora_gate_and_up_B = _to_grouped_mm_operand(self.lora_gate_and_up_B, compute_dtype)
+        lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
+        lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
 
         if torch.count_nonzero(tokens_per_expert) > 0:
             if self.use_torch_mm:
+                lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
+                    lora_gate_and_up_A, lora_gate_and_up_B
+                )
+                lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
                 tokens_per_expert_gpu = tokens_per_expert.to(
                     device=permuted_local_hidden_states.device, non_blocking=True
                 )

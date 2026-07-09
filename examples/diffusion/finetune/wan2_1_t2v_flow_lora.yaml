@@ -1,6 +1,7 @@
 seed: 42
 
 wandb:
+  enable: false
   project: wan-t2v-flow-matching
   mode: online
   name: wan2_1_lora_run
@@ -10,7 +11,7 @@ dist_env:
   timeout_minutes: 30
 
 model:
-  pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+  pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-14B-Diffusers
   # Required when peft block is present — triggers QKV unfuse before injection
   # and is passed to auto_diffusion_pipeline for model-specific setup.
   model_type: "wan"
@@ -27,15 +28,20 @@ peft:
   dropout: 0.0
   target_modules:
     - "*.to_q"
-    - "*.to_k"
     - "*.to_v"
-    - "*.to_out.0"
 
 optim:
   learning_rate: 5e-6
   optimizer:
+    _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     weight_decay: 0.01
     betas: [0.9, 0.999]
+    master_weights: true
+    store_param_remainders: true
+    exp_avg_dtype: float32
+    exp_avg_sq_dtype: float32
+    adam_w_mode: true
+    bias_correction: true
 
 lr_scheduler:
   lr_decay_style: cosine
@@ -51,6 +57,11 @@ fsdp:
   pp_size: 1
   dp_replicate_size: 1
   dp_size: 8
+  activation_checkpointing: false
+  defer_fsdp_grad_sync: true
+  reduce_dtype: bfloat16
+  enable_fsdp2_prefetch: false
+  enable_compile: true
 
 flow_matching:
   adapter_type: "simple"
@@ -69,8 +80,8 @@ flow_matching:
   summary_log_interval: 10
 
 step_scheduler:
-  global_batch_size: 8
-  local_batch_size: 1
+  global_batch_size: 16
+  local_batch_size: 2
   ckpt_every_steps: 1000
   num_epochs: 100
   log_every: 2

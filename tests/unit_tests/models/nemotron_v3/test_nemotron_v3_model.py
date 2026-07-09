@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.config import MoEConfig
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
@@ -97,7 +98,7 @@ class TestNemotronV3Model:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -328,7 +329,7 @@ class TestNemotronHForCausalLM:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -405,6 +406,91 @@ class TestNemotronHForCausalLM:
         with pytest.raises(ValueError, match="input_ids must be provided if inputs_embeds is not provided"):
             model()
 
+    def _build_stub_inner_model(self, hidden):
+        """Tiny ``nn.Module`` whose forward returns a fixed tensor.  Lets us
+        replace ``NemotronHForCausalLM.model`` (an ``nn.Module``) without
+        tripping ``nn.Module.__setattr__``'s child-module type check."""
+
+        class _StubInner(torch.nn.Module):
+            def forward(self, *args, **kwargs):
+                return hidden
+
+        return _StubInner()
+
+    def test_causal_lm_thd_inputs_embeds_does_not_double_unsqueeze(self, config, backend):
+        """Regression test: in THD mode with ``inputs_embeds``-only inputs, the
+        outer ``NemotronHForCausalLM.forward`` used to double-unsqueeze the
+        logits to ``[1, 1, T, V]``. The inner ``NemotronHModel.forward`` already
+        restores the batch dim (``squeezed_for_thd`` branch), so the outer must
+        only re-add it when the inner returned 2D logits.
+
+        We bypass the attention stack (which needs TE/GPU for THD shapes) by
+        replacing ``model.model`` with a stub that returns a fixed 3D tensor —
+        the same shape the real inner forward returns when it took the
+        ``inputs_embeds`` → squeeze → unsqueeze round-trip.
+        """
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        model = NemotronHForCausalLM(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        seq_len = 8
+        # Stand in for the inner forward that unsqueezed back to [1, T, H].
+        stub_hidden = torch.randn(1, seq_len, config.hidden_size, dtype=torch.bfloat16)
+        model.model = self._build_stub_inner_model(stub_hidden)
+
+        inputs_embeds = torch.randn(1, seq_len, config.hidden_size, dtype=torch.bfloat16)
+        position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32)
+        max_seqlen = torch.tensor(seq_len, dtype=torch.int32)
+
+        output = model(
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_padded=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            qkv_format="thd",
+        )
+
+        assert output.logits.shape == (1, seq_len, config.vocab_size)
+        assert output.logits.dim() == 3
+
+    def test_causal_lm_thd_input_ids_unsqueezes_2d_logits(self, config, backend):
+        """The original THD path (``input_ids`` only, no ``inputs_embeds``) is
+        the one most callers use; the unsqueeze fix must not regress it. The
+        inner forward returns ``[T, H]`` (2D, never went through the
+        ``squeezed_for_thd`` round-trip because ``embed_tokens(input_ids[T])``
+        is already 2D), so the outer still has to add the batch dim."""
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        model = NemotronHForCausalLM(config, backend=backend)
+        model = model.to(torch.bfloat16)
+
+        seq_len = 8
+        # Stand in for the inner forward that returned 2D hidden_states.
+        stub_hidden = torch.randn(seq_len, config.hidden_size, dtype=torch.bfloat16)
+        model.model = self._build_stub_inner_model(stub_hidden)
+
+        input_ids = torch.randint(0, config.vocab_size, (1, seq_len))
+        position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32)
+        max_seqlen = torch.tensor(seq_len, dtype=torch.int32)
+
+        output = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_padded=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            qkv_format="thd",
+        )
+
+        assert output.logits.shape == (1, seq_len, config.vocab_size)
+        assert output.logits.dim() == 3
+
     def test_causal_lm_from_config(self, config, backend):
         """Test from_config classmethod."""
         from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
@@ -431,6 +517,29 @@ class TestNemotronHForCausalLM:
         model = NemotronHForCausalLM(config, backend=backend)
 
         assert hasattr(model, "state_dict_adapter")
+
+    def test_mamba_decay_params_stay_fp32_after_bf16_cast(self, config, backend):
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.layers_block_type = ["mamba", "attention"]
+        model = NemotronHForCausalLM(config, backend=backend)
+        expected = {}
+        for name, param in model.named_parameters():
+            if name.endswith(("A_log", "dt_bias", "D")):
+                values = torch.linspace(0.00123, 0.00456, param.numel(), dtype=torch.float32).reshape_as(param)
+                param.data.copy_(values)
+                expected[name] = values
+
+        assert expected, "Nemotron V3 Mamba layers should create decay parameters"
+        assert all("._fp32_params." in name for name in expected)
+
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        params = dict(model.named_parameters())
+        for name, values in expected.items():
+            assert params[name].dtype == torch.float32
+            torch.testing.assert_close(params[name], values)
+        assert model.lm_head.weight.dtype == torch.bfloat16
 
     def test_model_class_export(self):
         """Test that ModelClass is exported correctly."""
@@ -677,7 +786,7 @@ class TestNemotronV3KVCache:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -875,7 +984,7 @@ class TestNemotronV3MambaCacheGPU:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -1033,7 +1142,7 @@ class TestNemotronV3ModelWithMoE:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=True,  # Use fake balanced gate for deterministic testing
             enable_hf_state_dict_adapter=False,
         )
@@ -1048,6 +1157,43 @@ class TestNemotronV3ModelWithMoE:
         assert model.layers["0"].block_type == "moe"
         assert hasattr(model.layers["0"].mixer, "experts")
         assert hasattr(model.layers["0"].mixer, "shared_experts")
+
+    def test_e_score_correction_bias_stays_fp32_after_dtype_cast(self, config, backend):
+        """Nemotron v3 router correction bias must stay fp32 under bf16 storage casts."""
+        from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM, NemotronV3Model
+
+        backend = BackendConfig(
+            linear=backend.linear,
+            attn=backend.attn,
+            rms_norm=backend.rms_norm,
+            dispatcher="torch",
+            fake_balanced_gate=False,
+            enable_hf_state_dict_adapter=False,
+        )
+        base_model = NemotronV3Model(config, backend=backend)
+        original_bias = torch.tensor([1.001, -2.003, 0.3333, 17.125], dtype=torch.float32)
+        base_model.layers["0"].mixer.gate.e_score_correction_bias.copy_(original_bias)
+        cast_model_to_dtype(base_model, torch.bfloat16)
+
+        base_gate = base_model.layers["0"].mixer.gate
+        assert base_model.embed_tokens.weight.dtype == torch.bfloat16
+        assert base_model.layers["0"].mixer.experts.gate_and_up_projs.dtype == torch.bfloat16
+        assert base_gate.e_score_correction_bias.dtype == torch.float32
+        assert torch.equal(base_gate.e_score_correction_bias, original_bias)
+
+        model = NemotronHForCausalLM(config, backend=backend)
+        model.model.layers["0"].mixer.gate.e_score_correction_bias.copy_(original_bias)
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        gate = model.model.layers["0"].mixer.gate
+        state_dict = model.state_dict()
+        assert model.model.embed_tokens.weight.dtype == torch.bfloat16
+        assert model.model.layers["0"].mixer.experts.gate_and_up_projs.dtype == torch.bfloat16
+        assert gate.e_score_correction_bias.dtype == torch.float32
+        assert torch.equal(gate.e_score_correction_bias, original_bias)
+        assert state_dict["model.layers.0.mixer.gate.e_score_correction_bias"].dtype == torch.float32
+        assert torch.equal(state_dict["model.layers.0.mixer.gate.e_score_correction_bias"], original_bias)
 
     @skip_if_no_gpu
     def test_moe_model_forward(self, config, backend):

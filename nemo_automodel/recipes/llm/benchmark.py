@@ -72,9 +72,24 @@ def _infer_vocab_size(model_cfg):
         model_config = config_cls.from_pretrained(config_section.pretrained_model_name_or_path)
 
     if model_config is None:
-        model_config = AutoConfig.from_pretrained(
-            config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
-        )
+        try:
+            model_config = AutoConfig.from_pretrained(
+                config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+            )
+        except Exception as exc:
+            # Step-3.5 publishes MTP layer metadata in ``layer_types`` in addition
+            # to its transformer-layer count.  Newer Transformers validates those
+            # lengths while loading a config even though benchmark setup only needs
+            # ``vocab_size``.  Reuse the tokenizer compatibility patch, then retry.
+            message = str(exc)
+            if "num_hidden_layers" not in message or "layer_types" not in message:
+                raise
+            from nemo_automodel._transformers.v4_patches.layer_types import relax_layer_types_validator
+
+            relax_layer_types_validator()
+            model_config = AutoConfig.from_pretrained(
+                config_section.pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+            )
 
     if hasattr(model_config, "vocab_size"):
         return model_config.vocab_size
@@ -159,6 +174,16 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         flops = flops_formula(self.model_parts[0].config, gbs=global_batch_size, seq_len=seq_len)
         self.tflops = flops / (10**12)
 
+        # Add Multi-Token-Prediction (MTP) head FLOPs (e.g. Nemotron-3 Ultra). The backbone
+        # FLOPs formula omits the MTP head, and the HF config retains only the physical depth
+        # count, so read the effective settings (depths run, repeated-layer flag, per-depth
+        # block types) from the built model.
+        backbone_tflops = self.tflops
+        mtp_tflops = self._mtp_tflops(global_batch_size, seq_len)
+        self.tflops += mtp_tflops
+        if self.dist_env.is_main:
+            logger.info(f"MTP TFLOPs/GPU: {mtp_tflops:.6f} (backbone {backbone_tflops:.6f}, total {self.tflops:.6f})")
+
         if hasattr(self.cfg, "peft"):
             # Calculate trainable vs non-trainable parameters
             # Need to get these before autopipeline splits the model across PP ranks
@@ -212,6 +237,50 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             barrier=True,
         )
 
+    def _mtp_tflops(self, global_batch_size, seq_len):
+        """TFLOPs added by a Multi-Token-Prediction (MTP) head, if the model has one.
+
+        The backbone FLOPs formula omits the MTP head, and the HF config retains only the
+        physical depth count (and no per-depth block pattern). So read the EFFECTIVE settings
+        from the built model: ``mtp_config.num_layers`` (depths actually run),
+        ``mtp_config.use_repeated_layer``, and the per-sublayer ``block_type`` from
+        ``mtp.layers``. Returns 0.0 when the model has no enabled MTP head.
+        """
+        from nemo_automodel.components.utils.flops_utils import _nemotronh_mtp_flops
+
+        for mp in self.model_parts:
+            mtp_cfg = getattr(mp, "mtp_config", None)
+            mtp = getattr(mp, "mtp", None)
+            layers = getattr(mtp, "layers", None) if mtp is not None else None
+            if mtp_cfg is None or not getattr(mtp_cfg, "enabled", False) or layers is None:
+                continue
+            block_types = [getattr(s, "block_type", "moe") for s in layers]
+            try:
+                flops = _nemotronh_mtp_flops(
+                    mp.config,
+                    global_batch_size,
+                    seq_len,
+                    mtp_cfg.num_layers,
+                    block_types,
+                    mtp_cfg.use_repeated_layer,
+                )
+            except AttributeError as exc:
+                if self.dist_env.is_main:
+                    logger.warning(
+                        "Skipping MTP head FLOPs for %s because the Nemotron-H FLOPs formula "
+                        "does not support this config: %s",
+                        type(mp.config).__name__,
+                        exc,
+                    )
+                continue
+            if self.dist_env.is_main:
+                logger.info(
+                    f"MTP head FLOPs: N={mtp_cfg.num_layers} repeated={mtp_cfg.use_repeated_layer} "
+                    f"blocks={block_types} -> +{flops / (10**12):.6f} TFLOPs"
+                )
+            return flops / (10**12)
+        return 0.0
+
     def run_benchmark(self):
         """Run the benchmarking loop.
 
@@ -224,7 +293,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         # Get benchmarking config
         steps = self._bench_steps
         warmup_steps = self._bench_warmup_steps
-        local_batch_size = self.cfg.step_scheduler.local_batch_size
+        local_batch_size = self.cfg.get("step_scheduler.local_batch_size")
         global_batch_size = self.cfg.step_scheduler.global_batch_size
 
         nsys_start = self._bench_nsys_start
@@ -449,7 +518,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "peak_tflops": peak_tflops,
                 "world_size": self.dist_env.world_size,
                 "global_batch_size": self.cfg.step_scheduler.global_batch_size,
-                "local_batch_size": self.cfg.step_scheduler.local_batch_size,
+                "local_batch_size": self.cfg.get("step_scheduler.local_batch_size"),
                 "seq_len": self._bench_seq_len,
             }
 
@@ -473,7 +542,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         ["Peak TFLOPs", peak_tflops],
                         ["World Size", self.dist_env.world_size],
                         ["Global Batch Size", self.cfg.step_scheduler.global_batch_size],
-                        ["Local Batch Size", self.cfg.step_scheduler.local_batch_size],
+                        ["Local Batch Size", self.cfg.get("step_scheduler.local_batch_size")],
                         ["Sequence Length", self._bench_seq_len],
                     ],
                 )
@@ -511,7 +580,7 @@ def main(config_path=None):
     Loads the configuration, sets up the recipe, and runs the benchmark.
     """
     if config_path is None:
-        # Default to moonlight_16b_torch.yaml in examples/benchmark/configs
+        # Default to moonlight_16b_torch.yaml in examples/llm_benchmark/moonlight
         config_path = (
             pathlib.Path(__file__).parent.parent.parent.resolve()
             / "examples"

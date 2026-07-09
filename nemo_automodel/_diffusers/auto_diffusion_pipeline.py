@@ -48,15 +48,16 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.distributed import parallelizer
+from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
+from nemo_automodel.components.distributed import DistributedSetup, ParallelismSizes, parallelizer
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
-from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 from nemo_automodel.components.distributed.parallelizer import (
     HunyuanParallelizationStrategy,
     WanParallelizationStrategy,
 )
+from nemo_automodel.shared.import_utils import safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
 
 # diffusers is an optional dependency
@@ -188,6 +189,50 @@ def _move_module_to_device(module: nn.Module, device: torch.device, torch_dtype:
         module.to(device=device)
 
 
+def _select_active_transformer(pipe, active_transformer: str) -> None:
+    """Keep only the chosen transformer on a two-transformer pipeline.
+
+    Two-stage diffusion pipelines (Wan2.2 T2V-A14B) register both
+    ``transformer`` (high-noise) and ``transformer_2`` (low-noise). Finetuning
+    only needs one at a time. This helper swaps the chosen one into
+    ``pipe.transformer`` and nulls the other so subsequent device placement,
+    LoRA injection, and FSDP2 wrapping only touch the active model.
+
+    Args:
+        pipe: A diffusers pipeline that may expose ``transformer_2``.
+        active_transformer: Either ``"transformer"`` or ``"transformer_2"``.
+
+    Raises:
+        ValueError: If ``active_transformer`` is unrecognized.
+        AttributeError: If ``active_transformer="transformer_2"`` but the pipeline
+            has no ``transformer_2`` attribute (model is not a two-stage variant).
+    """
+    if active_transformer not in ("transformer", "transformer_2"):
+        raise ValueError(f"active_transformer must be 'transformer' or 'transformer_2', got {active_transformer!r}")
+
+    has_t2 = getattr(pipe, "transformer_2", None) is not None
+    if active_transformer == "transformer_2":
+        if not has_t2:
+            raise AttributeError(
+                "active_transformer='transformer_2' requested but the loaded pipeline "
+                "has no transformer_2 attribute. This option is for two-stage models like "
+                "Wan2.2-T2V-A14B."
+            )
+        # Move transformer_2 into the transformer slot and free the old one.
+        old_transformer = pipe.transformer
+        pipe.transformer = pipe.transformer_2
+        pipe.transformer_2 = None
+        del old_transformer
+        logger.info("[INFO] Selected transformer_2 as active transformer (low-noise stage)")
+    else:
+        if has_t2:
+            pipe.transformer_2 = None
+            logger.info("[INFO] Selected transformer as active transformer (high-noise stage); freed transformer_2")
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _ensure_params_trainable(module: nn.Module, module_name: Optional[str] = None) -> int:
     """
     Ensure that all parameters in the given module are trainable.
@@ -204,19 +249,143 @@ def _ensure_params_trainable(module: nn.Module, module_name: Optional[str] = Non
     return num_trainable_parameters
 
 
+def _is_fp8_training_safe_linear(name: str, linear: nn.Linear) -> bool:
+    """Return whether a Linear has shapes that are safe for FP8 training kernels."""
+    if linear.weight.shape[0] % 16 != 0 or linear.weight.shape[1] % 16 != 0:
+        return False
+    if name.startswith(("time_text_embed.", "norm_out.")):
+        return False
+    if name.endswith(".linear") and any(norm_name in name for norm_name in (".norm.", ".norm1.", ".norm1_context.")):
+        return False
+    return True
+
+
+def _replace_linear_with_transformer_engine(
+    module: nn.Module,
+    module_name: str,
+    *,
+    fp8_safe_only: bool = False,
+) -> int:
+    """Replace torch Linear modules with Transformer Engine Linear modules."""
+    has_te, transformer_engine = safe_import_te()
+    if not has_te:
+        raise ImportError("model.transformer_engine_linear=true requires transformer_engine.pytorch to be importable")
+
+    te_linear_cls = transformer_engine.pytorch.Linear
+    converted = 0
+    skipped = 0
+
+    def replace_children(parent: nn.Module, prefix: str = "") -> None:
+        nonlocal converted, skipped
+        for child_name, child in list(parent.named_children()):
+            child_fqn = f"{prefix}.{child_name}" if prefix else child_name
+            if isinstance(child, nn.Linear):
+                if fp8_safe_only and not _is_fp8_training_safe_linear(child_fqn, child):
+                    skipped += 1
+                    logger.info(
+                        "[TE] Keeping %s.%s as torch.nn.Linear for FP8 shape compatibility; weight shape=%s",
+                        module_name,
+                        child_fqn,
+                        tuple(child.weight.shape),
+                    )
+                    continue
+                te_linear = te_linear_cls(
+                    child.in_features,
+                    child.out_features,
+                    bias=child.bias is not None,
+                    device=child.weight.device,
+                    params_dtype=child.weight.dtype,
+                )
+                te_linear.train(child.training)
+                with torch.no_grad():
+                    te_linear.weight.copy_(child.weight)
+                    te_linear.weight.requires_grad_(child.weight.requires_grad)
+                    if child.bias is not None:
+                        te_linear.bias.copy_(child.bias)
+                        te_linear.bias.requires_grad_(child.bias.requires_grad)
+                setattr(parent, child_name, te_linear)
+                converted += 1
+            elif not isinstance(child, te_linear_cls):
+                replace_children(child, child_fqn)
+
+    replace_children(module)
+    logger.info(
+        "[TE] Replaced %d torch.nn.Linear modules with Transformer Engine Linear in %s; skipped=%d fp8_safe_only=%s",
+        converted,
+        module_name,
+        skipped,
+        fp8_safe_only,
+    )
+    return converted
+
+
+def _remove_child_module(parent: nn.Module, child_name: str) -> int:
+    """Remove a child module and return the number of parameters it owned."""
+    child = getattr(parent, child_name, None)
+    if not isinstance(child, nn.Module):
+        return 0
+
+    parameter_count = sum(parameter.numel() for parameter in child.parameters())
+    delattr(parent, child_name)
+    return parameter_count
+
+
+def _compact_fused_qkv_projection_modules(module: nn.Module, module_name: str) -> tuple[int, int]:
+    """Remove original projection modules that are unused after Diffusers QKV fusion."""
+    removed_modules = 0
+    removed_parameters = 0
+
+    for child in list(module.modules()):
+        if not getattr(child, "fused_projections", False):
+            continue
+
+        if hasattr(child, "to_qkv"):
+            for projection_name in ("to_q", "to_k", "to_v"):
+                parameter_count = _remove_child_module(child, projection_name)
+                if parameter_count:
+                    removed_modules += 1
+                    removed_parameters += parameter_count
+
+        if hasattr(child, "to_added_qkv"):
+            for projection_name in ("add_q_proj", "add_k_proj", "add_v_proj"):
+                parameter_count = _remove_child_module(child, projection_name)
+                if parameter_count:
+                    removed_modules += 1
+                    removed_parameters += parameter_count
+
+    logger.info(
+        "[QKV] Removed %d original projection modules with %s parameters after fused QKV setup in %s",
+        removed_modules,
+        f"{removed_parameters:,}",
+        module_name,
+    )
+    return removed_modules, removed_parameters
+
+
+def _fuse_transformer_qkv_projections(module: nn.Module, module_name: str, *, compact: bool = False) -> int:
+    """Fuse Diffusers attention QKV projections when the transformer exposes that hook."""
+    if not hasattr(module, "fuse_qkv_projections"):
+        raise AttributeError(f"model.fuse_qkv_projections=true requires {module_name} to expose fuse_qkv_projections()")
+
+    module.fuse_qkv_projections()
+    fused = sum(1 for child in module.modules() if getattr(child, "fused_projections", False))
+    logger.info("[QKV] Fused QKV projections for %d attention modules in %s", fused, module_name)
+    if compact:
+        _compact_fused_qkv_projection_modules(module, module_name)
+    return fused
+
+
 def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
     """
     Factory function to create the appropriate parallel manager based on config.
 
-    Constructs the proper config objects (FSDP2Config / DDPConfig) and, for FSDP2,
-    creates the required device mesh before instantiating the manager.  This mirrors
+    Builds a ``DistributedSetup`` via ``DistributedSetup.build(...)``, then instantiates the
+    requested manager from the setup's strategy config and meshes. This mirrors
     the pattern used by ``_instantiate_distributed`` in the transformers infrastructure.
 
     The manager type is determined by the ``_manager_type`` key in *manager_args*:
-    - ``'ddp'``: Creates :class:`DDPConfig` + :class:`DDPManager`
-    - ``'fsdp2'`` (default): Creates :class:`FSDP2Config`, builds a
-      :class:`DeviceMesh` via :func:`create_device_mesh`, then creates
-      :class:`FSDP2Manager`
+    - ``'ddp'``: Creates a DDP ``DistributedSetup`` + ``DDPManager``
+    - ``'fsdp2'`` (default): Creates an FSDP2 ``DistributedSetup`` + ``FSDP2Manager``
 
     Args:
         manager_args: Flat dictionary of arguments.  Recognised keys:
@@ -224,7 +393,6 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
             Common:
                 ``_manager_type`` (str): ``'fsdp2'`` or ``'ddp'``.
                 ``activation_checkpointing`` (bool): Enable activation checkpointing.
-                ``backend`` (str): Distributed backend (default ``'nccl'``).
 
             FSDP2-specific (mesh creation):
                 ``world_size`` (int): Total number of processes.
@@ -244,40 +412,64 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
     """
     args = manager_args.copy()
     manager_type = args.pop("_manager_type", "fsdp2").lower()
+    if "backend" in args:
+        raise ValueError(
+            "backend is not a parallel manager option; configure the process group before parallelization."
+        )
+    parallelism = ParallelismSizes(
+        dp_size=args.get("dp_size"),
+        dp_replicate_size=args.get("dp_replicate_size"),
+        tp_size=args.get("tp_size", 1),
+        pp_size=args.get("pp_size", 1),
+        cp_size=args.get("cp_size", 1),
+        ep_size=args.get("ep_size", 1),
+    )
 
     if manager_type == "ddp":
-        config = DDPConfig(
+        distributed_setup = DistributedSetup.build(
+            strategy=DDPConfig(
+                activation_checkpointing=args.get("activation_checkpointing", False),
+                find_unused_parameters=args.get("find_unused_parameters", False),
+            ),
+            parallelism_sizes=parallelism,
             activation_checkpointing=args.get("activation_checkpointing", False),
-            backend=args.get("backend", "nccl"),
+            world_size=args.get("world_size"),
         )
-        logger.info("[Parallel] Creating DDPManager with config: %s", config)
-        return DDPManager(config)
+        logger.info("[Parallel] Creating DDPManager with config: %s", distributed_setup.strategy_config)
+        return DDPManager(distributed_setup.strategy_config)
 
     elif manager_type == "fsdp2":
-        config = FSDP2Config(
-            activation_checkpointing=args.get("activation_checkpointing", False),
-            mp_policy=args.get("mp_policy", None),
-            backend=args.get("backend", "nccl"),
-            sequence_parallel=args.get("sequence_parallel", False),
-            tp_plan=args.get("tp_plan", None),
-            offload_policy=args.get("offload_policy", None),
-            defer_fsdp_grad_sync=args.get("defer_fsdp_grad_sync", True),
-        )
+        world_size = args.get("world_size")
+        if world_size is None:
+            world_size = torch.distributed.get_world_size()
 
-        world_size = args.get("world_size") or torch.distributed.get_world_size()
-        device_mesh, moe_mesh = create_device_mesh(
-            config,
-            dp_size=args.get("dp_size"),
-            dp_replicate_size=args.get("dp_replicate_size"),
-            tp_size=args.get("tp_size", 1),
-            pp_size=args.get("pp_size", 1),
-            cp_size=args.get("cp_size", 1),
-            ep_size=args.get("ep_size", 1),
+        distributed_setup = DistributedSetup.build(
+            strategy=FSDP2Config(
+                mp_policy=args["mp_policy"] if "mp_policy" in args else None,
+                sequence_parallel=args.get("sequence_parallel", False),
+                tp_plan=args.get("tp_plan", None),
+                patch_is_packed_sequence=args.get("patch_is_packed_sequence", False),
+                offload_policy=args.get("offload_policy", None),
+                defer_fsdp_grad_sync=args.get("defer_fsdp_grad_sync", True),
+                enable_async_tensor_parallel=args.get("enable_async_tensor_parallel", False),
+                enable_compile=args.get("enable_compile", False),
+                enable_fsdp2_prefetch=args.get("enable_fsdp2_prefetch", False),
+                fsdp2_backward_prefetch_depth=args.get("fsdp2_backward_prefetch_depth", 2),
+                fsdp2_forward_prefetch_depth=args.get("fsdp2_forward_prefetch_depth", 1),
+                activation_checkpointing=args.get("activation_checkpointing", False),
+            ),
+            parallelism_sizes=parallelism,
+            activation_checkpointing=args.get("activation_checkpointing", False),
             world_size=world_size,
         )
 
-        logger.info("[Parallel] Creating FSDP2Manager with config: %s", config)
-        return FSDP2Manager(config, device_mesh=device_mesh, moe_mesh=moe_mesh)
+        mesh_context = distributed_setup.mesh_context
+        logger.info("[Parallel] Creating FSDP2Manager with config: %s", distributed_setup.strategy_config)
+        return FSDP2Manager(
+            distributed_setup.strategy_config,
+            device_mesh=mesh_context.device_mesh,
+            moe_mesh=mesh_context.moe_mesh,
+        )
 
     else:
         raise ValueError(f"Unknown manager type: '{manager_type}'. Expected 'ddp' or 'fsdp2'.")
@@ -303,6 +495,8 @@ def _apply_parallelization(
         manager = _create_parallel_manager(manager_args)
         created_managers[comp_name] = manager
         parallel_module = manager.parallelize(comp_module)
+        if hasattr(manager, "maybe_compile"):
+            manager.maybe_compile(parallel_module)
         setattr(pipe, comp_name, parallel_module)
 
     return created_managers
@@ -367,6 +561,11 @@ class NeMoAutoDiffusionPipeline:
         components_to_load: Optional[Iterable[str]] = None,
         peft_cfg=None,
         model_type=None,
+        active_transformer: Optional[str] = None,
+        transformer_engine_linear: bool = False,
+        transformer_engine_fp8_safe_only: bool = False,
+        fuse_qkv_projections: bool = False,
+        compact_fused_qkv_projections: bool = False,
         **kwargs,
     ) -> Tuple[DiffusionPipeline, Dict[str, ParallelManager]]:
         """
@@ -389,7 +588,17 @@ class NeMoAutoDiffusionPipeline:
             peft_cfg: PeftConfig instance or None. When provided, LoRA is injected
                 before _apply_parallelization() (FSDP2 wrapping). Base weights
                 are frozen after FSDP2; LoRA params are collected pre-FSDP2 and stored on pipe.
-            model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
+            model_type: "flux" | "flux2" | "wan" | "hunyuan". Required when peft_cfg is provided.
+            active_transformer: For two-transformer pipelines (e.g. Wan2.2 with
+                ``transformer`` + ``transformer_2``), selects which one becomes
+                ``pipe.transformer`` for training. Accepts ``"transformer"`` (default,
+                high-noise stage in Wan2.2) or ``"transformer_2"`` (low-noise stage).
+                The unused transformer is replaced with ``None`` and freed before
+                device placement so only one transformer occupies GPU memory.
+            transformer_engine_linear: Whether to replace torch.nn.Linear modules in the transformer with TE Linear.
+            transformer_engine_fp8_safe_only: Whether to skip TE Linear conversion for known FP8-incompatible modules.
+            fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer.
+            compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
         Returns:
@@ -403,15 +612,26 @@ class NeMoAutoDiffusionPipeline:
 
         logger.info("[INFO] Loading pipeline from pretrained: %s", pretrained_model_name_or_path)
 
+        # Resolve to a local snapshot dir so a warm HF cache is not re-validated
+        # (and potentially re-downloaded) over the network on every run.
+        model_dir = resolve_diffusion_model_dir(pretrained_model_name_or_path)
+
         # Use DiffusionPipeline.from_pretrained for auto-detection
         pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(
-            pretrained_model_name_or_path,
+            model_dir,
             *model_args,
             torch_dtype=torch_dtype,
             **kwargs,
         )
 
         logger.info("[INFO] Loaded pipeline type: %s", type(pipe).__name__)
+
+        # Two-transformer pipelines (Wan2.2): keep only the selected transformer
+        # on the pipeline so device placement / sharding only touches one model.
+        # We do this before any device move so the dropped transformer never
+        # occupies GPU memory.
+        if active_transformer is not None:
+            _select_active_transformer(pipe, active_transformer)
 
         # Decide device
         dev = _choose_device(device)
@@ -423,6 +643,23 @@ class NeMoAutoDiffusionPipeline:
                     logger.info("[INFO] Moving module: %s to device/dtype", name)
                     _move_module_to_device(module, dev, torch_dtype)
 
+        if compact_fused_qkv_projections and not fuse_qkv_projections:
+            raise ValueError("model.compact_fused_qkv_projections=true requires model.fuse_qkv_projections=true")
+
+        if fuse_qkv_projections:
+            for name, module in _iter_pipeline_modules(pipe):
+                if name == "transformer" and (not components_to_load or name in components_to_load):
+                    _fuse_transformer_qkv_projections(module, name, compact=compact_fused_qkv_projections)
+
+        if transformer_engine_linear:
+            for name, module in _iter_pipeline_modules(pipe):
+                if name == "transformer" and (not components_to_load or name in components_to_load):
+                    _replace_linear_with_transformer_engine(
+                        module,
+                        name,
+                        fp8_safe_only=transformer_engine_fp8_safe_only,
+                    )
+
         if peft_cfg is not None:
             # ── LoRA path ─────────────────────────────────────────────────────
             # LoRA injection MUST run before _apply_parallelization (FSDP2).
@@ -431,7 +668,9 @@ class NeMoAutoDiffusionPipeline:
             # Pre-FSDP2 lora_params refs are stored on pipe and remain valid
             # after wrapping (FSDP2 preserves original Parameter objects).
             if model_type is None:
-                raise ValueError("model_type must be set when peft_cfg is provided. Options: 'flux', 'wan', 'hunyuan'")
+                raise ValueError(
+                    "model_type must be set when peft_cfg is provided. Options: 'flux', 'flux2', 'wan', 'hunyuan'"
+                )
             import dataclasses
 
             from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
@@ -477,20 +716,31 @@ class NeMoAutoDiffusionPipeline:
                         logger.info("[INFO] Ensuring params trainable: %s", name)
                         _ensure_params_trainable(module, module_name=name)
 
+        if peft_cfg is not None:
+            transformer_parallel_args = (parallel_scheme or {}).get("transformer", {})
+            manager_type = str(transformer_parallel_args.get("_manager_type", "fsdp2")).lower()
+            if manager_type == "ddp":
+                for param_name, param in pipe.transformer.named_parameters():
+                    if "lora_" not in param_name and param.requires_grad:
+                        param.requires_grad_(False)
+                logger.info("[LoRA] Froze base weights before DDP wrapping")
+
         # Apply parallelization (FSDP2 or DDP)
-        # LoRA: all params are trainable when fully_shard() runs so FSDP2 sets
-        # up gradient reduction for lora_A/lora_B correctly. Freeze happens below.
+        # FSDP2 LoRA: all params are trainable when fully_shard() runs so FSDP2
+        # sets up gradient reduction for lora_A/lora_B correctly. Freeze happens below.
+        # DDP LoRA: base weights are frozen before wrapping so DDP only reduces LoRA gradients.
         created_managers = _apply_parallelization(pipe, parallel_scheme)
 
-        # Freeze base weights AFTER FSDP2 wrapping — mirrors the LLM pattern in
+        # Freeze base weights after FSDP2 wrapping — mirrors the LLM pattern in
         # nemo_automodel/_transformers/infrastructure.py lines 513-518.
         # FSDP2 must see all params as trainable during fully_shard(); freezing
         # before wrapping causes gradient reduction to malfunction for LoRA params.
+        # For DDP this is harmless because the base was already frozen before wrapping.
         if peft_cfg is not None:
             for name, param in pipe.transformer.named_parameters():
                 if "lora_" not in name and param.requires_grad:
                     param.requires_grad_(False)
-            logger.info("[LoRA] Froze base weights after FSDP2 wrapping")
+            logger.info("[LoRA] Froze base weights after parallelization")
 
         return pipe, created_managers
 
@@ -504,6 +754,10 @@ class NeMoAutoDiffusionPipeline:
         parallel_scheme: Optional[Dict[str, Dict[str, Any]]] = None,
         move_to_device: bool = True,
         components_to_load: Optional[Iterable[str]] = None,
+        transformer_engine_linear: bool = False,
+        transformer_engine_fp8_safe_only: bool = False,
+        fuse_qkv_projections: bool = False,
+        compact_fused_qkv_projections: bool = False,
         **kwargs,
     ) -> Tuple["NeMoAutoDiffusionPipeline", Dict[str, ParallelManager]]:
         """
@@ -525,6 +779,10 @@ class NeMoAutoDiffusionPipeline:
             parallel_scheme: Dict mapping component names to parallel manager kwargs
             move_to_device: Whether to move modules to device
             components_to_load: Which components to process (default: all)
+            transformer_engine_linear: Whether to replace torch.nn.Linear modules in the transformer with TE Linear.
+            transformer_engine_fp8_safe_only: Whether to skip TE Linear conversion for known FP8-incompatible modules.
+            fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer.
+            compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
             **kwargs: Additional arguments
 
         Returns:
@@ -543,6 +801,10 @@ class NeMoAutoDiffusionPipeline:
         logger.info("[INFO] Initializing pipeline from config with random weights")
         logger.info("[INFO] Model ID: %s", model_id)
         logger.info("[INFO] Transformer class: %s", spec.transformer_cls)
+
+        # Resolve to a local snapshot dir so config/pipeline loads reuse the
+        # warm HF cache instead of re-validating over the network.
+        model_id = resolve_diffusion_model_dir(model_id)
 
         # Dynamically import transformer class from diffusers
         TransformerCls = _import_diffusers_class(spec.transformer_cls)
@@ -582,9 +844,23 @@ class NeMoAutoDiffusionPipeline:
                 transformer = transformer.to(dev)
             pipe = cls(transformer=transformer)
 
+        if compact_fused_qkv_projections and not fuse_qkv_projections:
+            raise ValueError("model.compact_fused_qkv_projections=true requires model.fuse_qkv_projections=true")
+
+        if fuse_qkv_projections:
+            for name, module in _iter_pipeline_modules(pipe):
+                if name == "transformer" and (not components_to_load or name in components_to_load):
+                    _fuse_transformer_qkv_projections(module, name, compact=compact_fused_qkv_projections)
+
         # Make parameters trainable (always true for from_config / pretraining)
         for name, module in _iter_pipeline_modules(pipe):
             if not components_to_load or name in components_to_load:
+                if transformer_engine_linear and name == "transformer":
+                    _replace_linear_with_transformer_engine(
+                        module,
+                        name,
+                        fp8_safe_only=transformer_engine_fp8_safe_only,
+                    )
                 _ensure_params_trainable(module, module_name=name)
 
         # Apply parallelization (FSDP2 or DDP)

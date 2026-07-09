@@ -1,6 +1,7 @@
 seed: 42
 
 wandb:
+  enable: false
   project: wan-t2v-flow-matching-pretrain
   mode: online
   name: wan2_1_t2v_fm_pretrain
@@ -12,6 +13,8 @@ dist_env:
 model:
   pretrained_model_name_or_path: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
   mode: pretrain
+  torch_dtype: float32
+  compute_dtype: bfloat16
   pipeline_spec:
     transformer_cls: "WanTransformer3DModel"
     subfolder: "transformer"
@@ -40,6 +43,7 @@ data:
 optim:
   learning_rate: 5e-5
   optimizer:
+    _target_: torch.optim.AdamW
     weight_decay: 0.1
     betas: [0.9, 0.95]
 
@@ -72,6 +76,6 @@ checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
   diffusers_compatible: true
   restore_from: null

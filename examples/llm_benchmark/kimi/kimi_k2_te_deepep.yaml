@@ -15,7 +15,7 @@
 # Benchmarking config for Kimi K2 Te Deepep
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/kimi_k2_te_deepep.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/kimi/kimi_k2_te_deepep.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
@@ -109,3 +109,5 @@ optimizer:
 ci:
   time: "00:45:00"
   nodes: 32
+  env_vars:
+    HF_HUB_OFFLINE: "0"

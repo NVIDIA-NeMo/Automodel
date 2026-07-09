@@ -15,7 +15,7 @@
 # Benchmarking config for GLM-4.7 Te Deepep
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/glm_4.7_te_deepep.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/glm/glm_4.7_te_deepep.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
@@ -33,7 +33,7 @@ benchmark:
 step_scheduler:
   gc_every_steps: 10
   global_batch_size: 2048
-  local_batch_size: 8
+  local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
@@ -59,7 +59,7 @@ distributed:
     layers_per_stage: 2
 
   moe:
-    reshard_after_forward: false
+    reshard_after_forward: true
     wrap_outer_model: false
 
 dist_env:
@@ -79,7 +79,7 @@ model:
     rms_norm: te
     rope_fusion: true
     experts: gmm
-    dispatcher: deepep
+    dispatcher: hybridep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -113,3 +113,5 @@ optimizer:
 ci:
   time: "00:45:00"
   nodes: 32
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

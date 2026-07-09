@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import shutil
+
 import pytest
 
 from tests.utils.test_utils import run_test_script
-import shutil
 
 TEST_FOLDER = "hf_transformer_vlm"
 HF_TRANSFORMER_VLM_FSDP2_TP2_FILENAME = "L2_HF_Transformer_VLM_FSDP2_TP2.sh"
@@ -24,6 +25,9 @@ HF_TRANSFORMER_VLM_FUSED_CE_SFT_FILENAME = "L2_HF_Transformer_VLM_Fused_CE_SFT.s
 HF_TRANSFORMER_VLM_PEFT_FILENAME = "L2_HF_Transformer_VLM_PEFT.sh"
 HF_TRANSFORMER_VLM_SFT_FILENAME = "L2_HF_Transformer_VLM_SFT.sh"
 HF_TRANSFORMER_VLM_SFT_MegatronFSDP_FILENAME = "L2_HF_Transformer_VLM_SFT_MegatronFSDP.sh"
+HF_TRANSFORMER_VLM_GEMMA4_JOINT_DRAFTER_FILENAME = "L2_HF_Transformer_VLM_Gemma4_Joint_Drafter.sh"
+HF_PEFT_VLM_FSDP2_CHECKPOINT_FILENAME = "L2_HF_PEFT_VLM_FSDP2_Checkpoint.sh"
+HF_TRANSFORMER_VLM_META_FILENAME = "L2_HF_Transformer_VLM_Meta.sh"
 
 
 class TestHFTransformerVLM:
@@ -46,8 +50,8 @@ class TestHFTransformerVLM:
         try:
             run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_PEFT_FILENAME)
         finally:
-            # remove the checkpoint directory
-            shutil.rmtree("vlm_checkpoints/", ignore_errors=True)
+            # peft config defaults checkpoint_dir to checkpoints/, not vlm_checkpoints/
+            shutil.rmtree("checkpoints/", ignore_errors=True)
 
     def test_hf_transformer_vlm_sft(self):
         try:
@@ -59,3 +63,23 @@ class TestHFTransformerVLM:
     @pytest.mark.pleasefixme
     def test_hf_transformer_vlm_sft_megatron_fsdp(self):
         run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_SFT_MegatronFSDP_FILENAME)
+
+    def test_hf_transformer_vlm_gemma4_joint_drafter(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_GEMMA4_JOINT_DRAFTER_FILENAME)
+        finally:
+            shutil.rmtree("vlm_checkpoints/", ignore_errors=True)
+
+    def test_hf_peft_vlm_fsdp2_checkpoint(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_PEFT_VLM_FSDP2_CHECKPOINT_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_transformer_vlm_meta(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_VLM_META_FILENAME)
+        finally:
+            # remove the checkpoint directory
+            shutil.rmtree("checkpoints/", ignore_errors=True)

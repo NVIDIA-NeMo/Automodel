@@ -11,6 +11,25 @@ hand.
 
 ---
 
+## Skills
+
+Coding guidelines and operational procedures are organized as agent skills in
+two locations:
+
+- `skills/` -- customer-facing operational skills for using NeMo AutoModel
+  (`nemo-automodel-distributed-training`, `nemo-automodel-launcher-config`,
+  `nemo-automodel-model-onboarding`, `nemo-automodel-recipe-development`)
+- `.agents/contributor-skills/` -- contributor-facing development guidelines
+  (`build-and-dependency`, `cicd`, `fern-docs`, `linting-and-formatting`,
+  `parity-testing`, `testing`)
+
+All skills are symlinked into `.claude/skills/` for unified discovery.
+Contributor skills are intentionally kept outside the public `skills/` catalog
+sync path. Always read the relevant `SKILL.md` before starting any task it
+covers; skills are mandatory context, not optional background reading.
+
+---
+
 ## Coding Style
 
 - **Explicit over implicit.** Inline logic where possible; avoid hiding behavior
@@ -30,6 +49,21 @@ hand.
 - **Package management.** The project uses `uv`. Do not introduce `pip install`
   commands in scripts or docs, instead use `uv`.
 - **Python version.** 3.10+ required. PyTorch 2.6+.
+
+---
+
+## Git & PR conventions
+
+- **Branch names** use the format `<github-handle>/<type>/<short-desc>`
+  (e.g. `jdoe/fix/rope-scaling`).
+- **Commit messages** follow [Conventional Commits](https://www.conventionalcommits.org/):
+  `type(scope)?: description` — e.g. `fix(ci): retry apt-get on mirror failures`.
+- **PR titles** must match the same format. The CI `Validate PR title` check
+  enforces this; a non-conforming title will fail the check.
+  Valid types: `feat` `fix` `docs` `style` `refactor` `perf` `test` `build`
+  `ci` `chore` `revert` `cp`. Title must be ≤ 80 characters.
+- **Never** use bracket-prefixed styles such as `[ci] fix: …` — those will
+  fail validation.
 
 ---
 
@@ -189,17 +223,33 @@ with manual construction unless there is a strong reason.
 
 ## Available Skills
 
-The `skills/` directory contains focused guides for common tasks. Each skill
-file gives step-by-step instructions an AI agent can follow.
+Skill files give step-by-step instructions an AI agent can follow. Public
+catalog skills live in `skills/`; contributor workflow skills live in
+`.agents/contributor-skills/`.
 
-| # | Skill                    | Directory                  | Description                                      |
-|---|--------------------------|----------------------------|--------------------------------------------------|
-| 1 | model-onboarding         | `model-onboarding`         | Onboard a new LLM, VLM, OMNI, MoE, dLLM, text-to-image, text-to-video model family     |
-| 2 | developer-guide          | `developer-guide`          | Environment setup and day-to-day dev workflow     |
-| 3 | recipe-development       | `recipe-development`       | Create and modify training/eval recipes           |
-| 4 | distributed-training     | `distributed-training`     | FSDP2, HSDP, pipeline parallelism, context parallelism |
-| 5 | parity-testing           | `parity-testing`           | Verify numerical correctness against reference implementations |
-| 6 | launcher-config          | `launcher-config`          | Slurm and SkyPilot job submission setup           |
+| # | Skill | Location | Description |
+|---|---|---|---|
+| 1 | nemo-automodel-model-onboarding | `skills/nemo-automodel-model-onboarding` | Onboard a new LLM, VLM, OMNI, MoE, dLLM, text-to-image, text-to-video model family |
+| 2 | nemo-automodel-recipe-development | `skills/nemo-automodel-recipe-development` | Create and modify training/eval recipes |
+| 3 | nemo-automodel-distributed-training | `skills/nemo-automodel-distributed-training` | FSDP2, HSDP, pipeline parallelism, context parallelism |
+| 4 | nemo-automodel-launcher-config | `skills/nemo-automodel-launcher-config` | Slurm and SkyPilot job submission setup |
+| 5 | parity-testing           | `.agents/contributor-skills/parity-testing`   | Verify numerical correctness against reference implementations |
+| 6 | linting-and-formatting   | `.agents/contributor-skills/linting-and-formatting` | ruff rules, type hints, docstrings, copyright headers, code review checklist |
+| 7 | build-and-dependency     | `.agents/contributor-skills/build-and-dependency` | Container setup, uv package management, environment variables, CLI usage |
+| 8 | cicd                     | `.agents/contributor-skills/cicd`             | Commit/PR workflow, CI trigger mechanism, failure investigation |
+| 9 | testing                  | `.agents/contributor-skills/testing`          | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
+| 10 | fern-docs               | `.agents/contributor-skills/fern-docs`        | Maintain the Fern docs site under `docs/` (MDX content) + `docs/fern/` (infra) — pages, slugs, redirects, version aliases, library reference |
 
-When starting a task, identify which skill applies and read that file for
-domain-specific guidance before writing any code.
+**Always read the relevant `SKILL.md` before starting any task it covers —
+skills are mandatory context, not optional background reading.**
+
+**Workflow — mandatory order for every task:**
+1. **Pull information first.** Read the commit, PR, error log, file, or
+   whatever artifact the task is about. Do not reason about it yet.
+2. **Select and invoke the skill.** Based on what you just read, identify
+   the relevant skill and invoke it before forming any answer or plan.
+3. **Answer or implement.** Only after the skill is loaded, use its context
+   to reason, diagnose, or write code.
+
+Never skip or reorder these steps. Do not wait for the user to name the right
+skill keyword — infer it from the artifact you read.

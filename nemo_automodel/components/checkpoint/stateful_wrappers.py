@@ -57,6 +57,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from nemo_automodel.components.checkpoint.utils import (
+    ensure_tied_lm_head,
     get_lm_head_weight_and_name,
     has_local_tied_lm_head,
     is_tied_word_embeddings,
@@ -159,10 +160,11 @@ def _drop_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX) -> None:
             sd[k[len(prefix) :]] = sd.pop(k)
 
 
-def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX, skip_keys: list[str] = []) -> None:
+def _add_outer_prefix(sd: dict[str, Any], prefix: str = _PREFIX, skip_keys: list[str] | None = None) -> None:
     """
     Prepend `prefix` once to every key in-place (inverse of `_drop_outer_prefix`).
     """
+    skip_keys = [] if skip_keys is None else skip_keys
     for k in list(sd.keys()):
         if not k.startswith(prefix) and k not in skip_keys:
             sd[prefix + k] = sd.pop(k)
@@ -250,6 +252,13 @@ class ModelState:
         self.is_init_step = is_init_step
         self.skip_task_head_prefixes = skip_task_head_prefixes or []
 
+    def _refresh_local_tied_lm_head(self) -> None:
+        """Refresh tied-head metadata after DCP has normalized module state."""
+        self.has_local_tied_lm_head = has_local_tied_lm_head(self.model[0])
+        if self.uses_tied_lm_head:
+            _, lm_head_param_name = _get_lm_head_weight_and_name(self.model[0])
+            self.lm_head_param_name = lm_head_param_name
+
     def state_dict(self) -> dict[str, Any]:
         """
         Get the model's state dictionary.
@@ -282,12 +291,14 @@ class ModelState:
         if self.is_peft:
             model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
 
+        self._refresh_local_tied_lm_head()
         if self.has_local_tied_lm_head:
             model_state_dict.pop(self.lm_head_param_name, None)
 
-        if self.is_peft and not _has_quantized_params(self.model[0]):
+        if self.is_peft:
             # HF PEFT models are saved with a "base.model." prefix. This is so they can be loaded
-            # correctly with the HF PEFT API.
+            # correctly with the HF PEFT API. Quantized PEFT bypasses DCP above, but the collected
+            # trainable tensors still need the same on-disk key normalization.
             _add_outer_prefix(model_state_dict, "base_model.model.")
             # DoRA: rename lora_magnitude to match HF PEFT's expected key format
             _rename_dora_keys_to_hf(model_state_dict)
@@ -303,6 +314,9 @@ class ModelState:
         """
         if self.is_init_step:
             self._set_base_model_state_dict(state_dict)
+            if self.uses_tied_lm_head and not self.is_peft:
+                for model_part in self.model:
+                    ensure_tied_lm_head(model_part)
             return
 
         # Multi-stage PP models have different state dicts for each stage.
@@ -334,9 +348,14 @@ class ModelState:
         for model_part in self.model:
             set_model_state_dict(model_part, state_dict, options=options)
 
+        if self.uses_tied_lm_head and not self.is_peft:
+            for model_part in self.model:
+                ensure_tied_lm_head(model_part)
+
     def _get_base_model_state_dict(self) -> dict[str, Any]:
         model_state_dict = {k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()}
 
+        self._refresh_local_tied_lm_head()
         if self.has_local_tied_lm_head:
             model_state_dict.pop(self.lm_head_param_name, None)
 

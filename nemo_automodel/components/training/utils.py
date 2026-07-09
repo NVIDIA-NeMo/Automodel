@@ -181,6 +181,7 @@ def clip_grad_norm(
     device_mesh: DeviceMesh | None = None,
     pp_axis_name: str | None = None,
     foreach: bool = True,
+    use_torch_clip_grad_norm: bool = False,
 ):
     """Common gradient clipping helper.
 
@@ -203,6 +204,7 @@ def clip_grad_norm(
         ep_axis_name: Expert parallel axis name (unused, kept for API compatibility).
         pp_axis_name: Pipeline parallel axis name.
         foreach: Whether to use foreach implementation for clipping.
+        use_torch_clip_grad_norm: Use PyTorch's optimized regular-tensor clipping path when possible.
 
     Returns:
         Total gradient norm as a float.
@@ -219,15 +221,31 @@ def clip_grad_norm(
         assert pp_axis_name is not None, "pp_axis_name must be provided when pp_enabled is True"
         pp_mesh = device_mesh[pp_axis_name] if device_mesh is not None else None
 
-    # Use the new sharding-aware implementation
-    grad_norm = _clip_grad_norm_impl(
-        parameters=parameters,
-        max_norm=max_grad_norm,
-        norm_type=norm_type,
-        error_if_nonfinite=False,
-        foreach=foreach,
-        pp_mesh=pp_mesh,
-    )
+    can_use_torch_clip = use_torch_clip_grad_norm and pp_mesh is None
+    if can_use_torch_clip:
+        for p in parameters:
+            if isinstance(p, DTensor) or isinstance(p.grad, DTensor):
+                can_use_torch_clip = False
+                break
+
+    if can_use_torch_clip:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            parameters,
+            max_grad_norm,
+            norm_type=norm_type,
+            error_if_nonfinite=False,
+            foreach=foreach,
+        )
+    else:
+        # Use the sharding-aware implementation for DTensor, PP, EP, and mixed placement cases.
+        grad_norm = _clip_grad_norm_impl(
+            parameters=parameters,
+            max_norm=max_grad_norm,
+            norm_type=norm_type,
+            error_if_nonfinite=False,
+            foreach=foreach,
+            pp_mesh=pp_mesh,
+        )
 
     # Convert to float for API compatibility
     if isinstance(grad_norm, torch.Tensor):
@@ -300,6 +318,7 @@ def scale_grads_and_clip_grad_norm(
     foreach: bool = True,
     num_label_tokens: int | None = None,
     dp_group_size: int | None = None,
+    use_torch_clip_grad_norm: bool = False,
 ):
     """Scale gradients for PP/EP in a single pass, then clip.
 
@@ -356,10 +375,12 @@ def scale_grads_and_clip_grad_norm(
         device_mesh=device_mesh,
         pp_axis_name=pp_axis_name,
         foreach=foreach,
+        use_torch_clip_grad_norm=use_torch_clip_grad_norm,
     )
 
 
 def move_to_device(model, device):
+    """Move a model and its buffers to a device and release stale CUDA cache."""
     # FSDP modules do not move buffers to the device automatically
     for v in model.buffers():
         v.data = v.data.to(device)
@@ -369,6 +390,8 @@ def move_to_device(model, device):
 
 
 class ScopedModuleOffloading:
+    """Context manager that temporarily moves a module between CPU and CUDA."""
+
     def __init__(self, model, enabled=False):
         self.model = model
         self.enabled = enabled

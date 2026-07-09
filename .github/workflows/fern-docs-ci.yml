@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Validates Fern docs configuration on pull requests.
+
+name: Fern docs (check)
+
+# Runs `fern check` on every push to a `pull-request/<n>` branch -- i.e. whenever
+# `/ok to test <sha>` is posted: copy-pr-bot copies the PR onto pull-request/<n>
+# and pushes it, which fires this (exactly like the main `CICD NeMo` pipeline).
+#
+# Deliberately NO `paths:` filter. GitHub evaluates a push `paths:` filter against
+# the branch-creation diff, which is unreliable for the first push copy-pr-bot
+# makes to a brand-new pull-request/<n> branch, so a docs-only PR can skip a
+# path-filtered check entirely -- that is how a malformed nightly.yml slipped past
+# CI and broke the publish on main. cicd-main.yml omits the filter for the same
+# reason. `fern check` is ~25s and needs no secrets, so running it on every mirror
+# push is cheap and safe.
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # `fern check` validates that every path: referenced by docs.yml / the
+      # version YAMLs exists on disk. The frozen v0.4 pages are archived off main,
+      # so restore them before checking or the validation fatals on missing paths.
+      - name: Stitch archived version pages
+        uses: ./.github/actions/stitch-fern-versions
+        with:
+          archived-versions: |
+            v0.4=docs-archive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Validate MDX syntax
+        run: |
+          mdx_lint_dir="${RUNNER_TEMP}/mdx-lint"
+          mkdir -p "$mdx_lint_dir"
+          printf '%s\n' '{"private":true,"type":"module"}' > "$mdx_lint_dir/package.json"
+          npm --prefix "$mdx_lint_dir" install --silent @mdx-js/mdx@3 remark-frontmatter@5 remark-math@6 >/dev/null
+          MDX_LINT_PREFIX="$mdx_lint_dir" node tools/validate_mdx_syntax.mjs docs
+
+      - name: Validate Fern configuration
+        working-directory: ./docs/fern
+        run: |
+          # Pin the Fern CLI to the version in fern.config.json so CI matches
+          # local `make docs-check` (and the global-theme-capable 5.29.0+ pin).
+          fern_version=$(jq -r .version fern.config.json)
+          npx -y "fern-api@$fern_version" check

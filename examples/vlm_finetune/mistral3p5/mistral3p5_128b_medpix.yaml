@@ -97,7 +97,7 @@ dataloader:
   pin_memory: true
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
-    max_length: 1024
+    max_length: 2048
   drop_last: true
 
 validation_dataset:
@@ -110,7 +110,7 @@ validation_dataloader:
   num_workers: 1
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
-    max_length: 1024
+    max_length: 2048
 
 optimizer:
   _target_: torch.optim.Adam
@@ -124,6 +124,12 @@ lr_scheduler:
   min_lr: 1.0e-6
 
 wandb:
+  enable: false
   project: huiyingl_workspace
   entity: Nemo-automodel
   name: mistral3p5_128b_medpix
+
+ci:
+  recipe_owner: akoumpa
+  nodes: 8                          # TP=8 * PP=8 = 64 GPUs = 8 nodes x 8 GPUs
+  time: "00:30:00"

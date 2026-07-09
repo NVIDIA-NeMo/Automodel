@@ -32,8 +32,26 @@ logger = logging.getLogger(__name__)
 MODEL_ARCH_MAPPING = OrderedDict(
     [
         (
+            "BagelForUnifiedMultimodal",
+            (
+                "nemo_automodel.components.models.bagel.model",
+                "BagelForUnifiedMultimodal",
+            ),
+        ),
+        (
+            "BagelForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.bagel.model",
+                "BagelForUnifiedMultimodal",
+            ),
+        ),
+        (
             "BaichuanForCausalLM",
             ("nemo_automodel.components.models.baichuan.model", "BaichuanForCausalLM"),
+        ),
+        (
+            "BailingMoeV2ForCausalLM",
+            ("nemo_automodel.components.models.ling_v2.model", "BailingMoeV2ForCausalLM"),
         ),
         (
             "DeepseekV3ForCausalLM",
@@ -46,6 +64,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "DeepseekV4ForCausalLM",
             ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
+        ),
+        (
+            "DiffusionGemmaForBlockDiffusion",
+            ("nemo_automodel.components.models.diffusion_gemma.model", "DiffusionGemmaForBlockDiffusion"),
+        ),
+        (
+            "Ernie4_5_MoeForCausalLM",
+            ("nemo_automodel.components.models.ernie4_5.model", "Ernie4_5_MoeForCausalLM"),
         ),
         (
             "Glm4MoeForCausalLM",
@@ -62,6 +88,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "Gemma4ForConditionalGeneration",
             ("nemo_automodel.components.models.gemma4_moe.model", "Gemma4ForConditionalGeneration"),
+        ),
+        (
+            "Gemma4AssistantForCausalLM",
+            ("nemo_automodel.components.models.gemma4_drafter.model", "Gemma4DrafterForCausalLM"),
         ),
         (
             "GptOssForCausalLM",
@@ -92,12 +122,27 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.llama_bidirectional.model", "LlamaBidirectionalModel", {"retrieval"}),
         ),
         (
+            "LlamaNemotronVLModel",
+            ("nemo_automodel.components.models.llama_nemotron_vl.model", "LlamaNemotronVLModel", {"retrieval"}),
+        ),
+        (
             "LlamaForCausalLM",
             ("nemo_automodel.components.models.llama.model", "LlamaForCausalLM"),
         ),
         (
             "MiniMaxM2ForCausalLM",
             ("nemo_automodel.components.models.minimax_m2.model", "MiniMaxM2ForCausalLM"),
+        ),
+        (
+            "MiniMaxM3SparseForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.minimax_m3_vl.model",
+                "MiniMaxM3SparseForConditionalGeneration",
+            ),
+        ),
+        (
+            "MiMoV2FlashForCausalLM",
+            ("nemo_automodel.components.models.mimo_v2_flash.model", "MiMoV2FlashForCausalLM"),
         ),
         (
             "Ministral3ForCausalLM",
@@ -153,8 +198,33 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.hy_v3.model", "HYV3ForCausalLM"),
         ),
         (
+            "HyMT2ForCausalLM",
+            ("nemo_automodel.components.models.hy_mt2.model", "HyMT2ForCausalLM"),
+        ),
+        (
             "Qwen2ForCausalLM",
             ("nemo_automodel.components.models.qwen2.model", "Qwen2ForCausalLM"),
+        ),
+        (
+            "Qwen2_5OmniModel",
+            (
+                "nemo_automodel.components.models.qwen2_5_omni.model",
+                "Qwen2_5OmniThinkerForConditionalGeneration",
+            ),
+        ),
+        (
+            "Qwen2_5OmniForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.qwen2_5_omni.model",
+                "Qwen2_5OmniThinkerForConditionalGeneration",
+            ),
+        ),
+        (
+            "Qwen2_5OmniThinkerForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.qwen2_5_omni.model",
+                "Qwen2_5OmniThinkerForConditionalGeneration",
+            ),
         ),
         (
             "Qwen3MoeForCausalLM",
@@ -163,6 +233,14 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "Qwen3NextForCausalLM",
             ("nemo_automodel.components.models.qwen3_next.model", "Qwen3NextForCausalLM"),
+        ),
+        (
+            "Qwen3_5ForCausalLM",
+            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForCausalLM"),
+        ),
+        (
+            "Qwen3_5ForConditionalGeneration",
+            ("nemo_automodel.components.models.qwen3_5.model", "Qwen3_5ForConditionalGeneration"),
         ),
         (
             "Qwen3OmniMoeForConditionalGeneration",
@@ -180,8 +258,16 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen3_5_moe.model", "Qwen3_5MoeForConditionalGeneration"),
         ),
         (
+            "Step3p6ForConditionalGeneration",
+            ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
+        ),
+        (
             "Step3p5ForCausalLM",
             ("nemo_automodel.components.models.step3p5.model", "Step3p5ForCausalLM"),
+        ),
+        (
+            "Step3p7ForConditionalGeneration",
+            ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
         ),
     ]
 )
@@ -191,13 +277,19 @@ MODEL_ARCH_MAPPING = OrderedDict(
 # checkpoint config.json.  Registered eagerly with AutoConfig so that
 # AutoConfig.from_pretrained can resolve them without trust_remote_code.
 _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
+    "bagel": ("nemo_automodel.components.models.bagel.configuration", "BagelConfig"),
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
+    "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
+    "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
+    "minimax_m3_vl": ("nemo_automodel.components.models.minimax_m3_vl.config", "MiniMaxM3VLConfig"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
+    "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
+    "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
 }
 
 

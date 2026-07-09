@@ -67,7 +67,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
@@ -118,10 +118,12 @@ lr_scheduler:
 ci:
   recipe_owner: akoumpa
   nodes: 2
-  time: "00:45:00"
+  time: "01:15:00"  # 49B finetune+robustness runs ~51-55min wall-clock; 55min is too tight (a run hit 55.1min)
   vllm_deploy: true
-  known_issue_id: AM-155
+  vllm_smoke_test: true  # 49B exceeds 1 GPU; use vLLM's native nemotron-nas backend (no HF reference load)
+  vllm_deploy_gpus: 4  # expose 4 of the node's 8 GPUs for tensor-parallel vLLM load
   checkpoint_robustness:
+    kl_threshold: 5e-3  # 49B bf16 consolidated round-trip drifts ~3e-4; the 1e-5 tp>1 default is too tight
     hf_kl_threshold: 5e-3
     resume_loss_threshold: 5e-2
     distributed.tp_size: 8

@@ -62,7 +62,8 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: true
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -76,7 +77,7 @@ checkpoint:
   enabled: false
   checkpoint_dir: vlm_checkpoints/kimi_k25_2layer/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy

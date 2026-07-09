@@ -307,6 +307,15 @@ def get_decilm_nemotron_tp_plan(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+def _parallelize_decilm_nemotron(
+    model,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    if getattr(getattr(model, "config", None), "model_type", None) != "nemotron-nas":
+        raise ValueError("DeciLM TP plan is only registered for Nemotron-NAS checkpoints")
+    return get_decilm_nemotron_tp_plan(sequence_parallel=sequence_parallel)
+
+
 def _parallelize_baichuan(
     model: BaichuanForCausalLM | None,
     sequence_parallel: bool = False,
@@ -401,6 +410,52 @@ def _parallelize_ministral3(
 
     if sequence_parallel:
         # Enable sequence parallelism only if TP size > 1
+        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
+def _parallelize_nemotron_labs_diffusion(
+    model,  # NemotronLabsDiffusionModel — loaded via trust_remote_code, not importable.
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """TP plan for ``NemotronLabsDiffusionModel`` (Nemotron-Labs-Diffusion).
+
+    Same shape as :func:`_parallelize_ministral3` but the model uses
+    ``encoder.*`` (not ``model.*``) and the output head is ``diffusion_head``
+    (not ``lm_head``).
+    """
+    base_model_tp_plan: dict[str, ParallelStyle] = {
+        "encoder.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        "encoder.layers.*.self_attn.q_proj": ColwiseParallel(),
+        "encoder.layers.*.self_attn.k_proj": ColwiseParallel(),
+        "encoder.layers.*.self_attn.v_proj": ColwiseParallel(),
+        "encoder.layers.*.self_attn.o_proj": RowwiseParallel(),
+        "encoder.layers.*.mlp.up_proj": ColwiseParallel(),
+        "encoder.layers.*.mlp.gate_proj": ColwiseParallel(),
+        "encoder.layers.*.mlp.down_proj": RowwiseParallel(),
+        "diffusion_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    base_model_sp_plan = {
+        "encoder.embed_tokens": VocabParallelEmbedding(
+            input_layouts=Replicate(),
+            output_layouts=Shard(1),
+            use_local_output=False,
+        ),
+        "encoder.norm": SequenceParallel(),
+        "encoder.layers.*.input_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
+        "encoder.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+        "encoder.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
+        "encoder.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1), use_local_output=False),
+        "diffusion_head": ColwiseParallel(
+            input_layouts=Shard(1),
+            output_layouts=Shard(-1),
+            use_local_output=False,
+        ),
+    }
+
+    if sequence_parallel:
         base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
 
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
@@ -622,6 +677,47 @@ def _parallelize_qwen3_5_vlm(
     return get_hf_tp_shard_plan(model)
 
 
+def _parallelize_falcon_h1(
+    model,
+    sequence_parallel: bool = False,
+) -> Dict[str, ParallelStyle]:
+    """Parallelize Falcon-H1 (hybrid Transformer + Mamba2 SSM).
+
+    Every Falcon-H1 decoder layer runs an attention branch (``self_attn``) and a
+    Mamba2 branch (``mamba``) in parallel, followed by an MLP (``feed_forward``).
+    Only the attention and MLP linears are tensor-parallel sharded; the Mamba2
+    mixer stays replicated because its SSM scan / causal conv1d are not
+    TP-shardable with stock kernels (same approach as Qwen3.5's GatedDeltaNet
+    linear-attention branch).
+
+    A dedicated plan is required because HuggingFace ships only
+    ``_tp_plan = {"lm_head": "colwise_gather_output"}`` for FalconH1, and its MLP
+    is named ``feed_forward`` (not ``mlp``). The generic llama-style fallback plan
+    therefore matches neither the HF plan (the ``colwise_gather_output`` style is
+    rejected) nor the MLP module names, leaving the dominant ``feed_forward``
+    weights replicated across TP ranks — which OOMs large variants such as
+    Falcon-H1-34B even under LoRA.
+
+    ``sequence_parallel`` is accepted for signature compatibility but ignored: the
+    parallel Mamba2 branch emits non-sequence-parallel activations that cannot be
+    combined with sequence-parallel attention outputs.
+    """
+    return cast(
+        Dict[str, ParallelStyle],
+        {
+            "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.k_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.v_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+            "model.layers.*.feed_forward.gate_proj": ColwiseParallel(),
+            "model.layers.*.feed_forward.up_proj": ColwiseParallel(),
+            "model.layers.*.feed_forward.down_proj": RowwiseParallel(),
+            "lm_head": ColwiseParallel(output_layouts=Replicate()),
+        },
+    )
+
+
 # Keyed by qualified class name — see _get_class_qualname for why.
 PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(BaichuanForCausalLM): _parallelize_baichuan,
@@ -630,6 +726,19 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(Qwen3ForSequenceClassification): _parallelize_qwen_classification,
     # Hard-coded qualname to avoid eagerly importing transformers.models.qwen3_5.
     "transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5ForConditionalGeneration": _parallelize_qwen3_5_vlm,
+    # NeMo-native Qwen3.5 dense (custom-model port): same plan — shard self_attn +
+    # MLP, leave the GatedDeltaNet (linear_attn) replicated.
+    "nemo_automodel.components.models.qwen3_5.model.Qwen3_5ForConditionalGeneration": _parallelize_qwen3_5_vlm,
+    "nemo_automodel.components.models.qwen3_5.model.Qwen3_5ForCausalLM": _parallelize_qwen3_5_vlm,
+    # Falcon-H1 (hybrid Transformer + Mamba2). HF ships only a minimal
+    # _tp_plan ({"lm_head": "colwise_gather_output"}) and names its MLP
+    # "feed_forward", so the generic fallback plan leaves feed_forward replicated
+    # and OOMs Falcon-H1-34B. Shard self_attn + feed_forward; leave the Mamba2
+    # mixer replicated. Hard-coded qualname avoids eagerly importing
+    # transformers.models.falcon_h1; the bare name covers trust_remote_code loads
+    # whose module path carries a snapshot hash.
+    "transformers.models.falcon_h1.modeling_falcon_h1.FalconH1ForCausalLM": _parallelize_falcon_h1,
+    "FalconH1ForCausalLM": _parallelize_falcon_h1,
     _get_class_qualname(LlamaForCausalLM): _parallelize_llama,
     _get_class_qualname(Ministral3ForCausalLM): _parallelize_ministral3,
     # Mistral3 VLM (Pixtral + Ministral3) — native HF class plus the Automodel
@@ -645,4 +754,8 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
     _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,
     _get_class_qualname(CustomQwen2ForCausalLM): _parallelize_qwen,
+    # trust_remote_code models — matched by bare class __name__ in parallelizer
+    # because their qualname includes a snapshot-hash-bearing module path.
+    "DeciLMForCausalLM": _parallelize_decilm_nemotron,
+    "NemotronLabsDiffusionModel": _parallelize_nemotron_labs_diffusion,
 }

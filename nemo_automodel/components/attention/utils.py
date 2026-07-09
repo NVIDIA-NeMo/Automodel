@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import torch
 import torch.nn as nn
@@ -32,6 +32,7 @@ def initialize_attn_module_and_func(
     num_gqa_groups: int | None = None,
     **kwargs: Any,
 ) -> tuple[nn.Module | None, Callable[..., torch.Tensor]]:
+    """Initialize an attention backend module and callable."""
     if attn_impl == "te":
         from transformer_engine.pytorch.attention import DotProductAttention
 
@@ -47,16 +48,42 @@ def initialize_attn_module_and_func(
         attn_func = attn_module.__call__
         return attn_module, attn_func
     elif attn_impl == "sdpa":
-        defaults = dict(
-            scale=softmax_scale,
-            is_causal=attn_mask_type == "causal",
-            enable_gqa=num_gqa_groups is not None,
-            **kwargs,
-        )
+        supported_sdpa_kwargs = {"attn_mask", "dropout_p", "is_causal", "scale", "enable_gqa"}
+        unexpected_kwargs = kwargs.keys() - supported_sdpa_kwargs
+        if unexpected_kwargs:
+            raise TypeError(f"Unsupported SDPA attention kwargs: {sorted(unexpected_kwargs)}")
 
-        def attn_func(*args, **call_kwargs):
-            merged = {**defaults, **call_kwargs}
-            return F.scaled_dot_product_attention(*args, **merged)
+        default_attn_mask = cast(torch.Tensor | None, kwargs.get("attn_mask", None))
+        default_dropout_p = cast(float, kwargs.get("dropout_p", 0.0))
+        default_is_causal = cast(bool, kwargs.get("is_causal", attn_mask_type == "causal"))
+        default_scale = cast(float | None, kwargs.get("scale", softmax_scale))
+        default_enable_gqa = cast(bool, kwargs.get("enable_gqa", num_gqa_groups is not None))
+
+        def attn_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **call_kwargs: Any) -> torch.Tensor:
+            unexpected_call_kwargs = call_kwargs.keys() - supported_sdpa_kwargs
+            if unexpected_call_kwargs:
+                raise TypeError(f"Unsupported SDPA attention kwargs: {sorted(unexpected_call_kwargs)}")
+
+            attn_mask = cast(torch.Tensor | None, call_kwargs.get("attn_mask", default_attn_mask))
+            dropout_p = cast(float, call_kwargs.get("dropout_p", default_dropout_p))
+            is_causal = cast(bool, call_kwargs.get("is_causal", default_is_causal))
+            scale = cast(float | None, call_kwargs.get("scale", default_scale))
+            enable_gqa = cast(bool, call_kwargs.get("enable_gqa", default_enable_gqa))
+            if enable_gqa and attn_mask is not None:
+                groups = q.shape[-3] // k.shape[-3]
+                k = k.repeat_interleave(groups, dim=-3)
+                v = v.repeat_interleave(groups, dim=-3)
+                enable_gqa = False
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
 
         return None, attn_func
     elif attn_impl == "flex":
@@ -64,6 +91,29 @@ def initialize_attn_module_and_func(
         # We still return the module and a reference to its call for parity with other backends
         attn_func = attn_module.__call__
         return attn_module, attn_func
+    elif attn_impl == "magi":
+        # MagiAttention (Flex-Flash-Attention / context-parallel). The FFA kernel
+        # requires q/k/v to share a single head_dim <= 128, so MLA-style attention
+        # (e.g. DeepSeek-V3, where num_qk_channels != num_v_channels) is unsupported.
+        if num_qk_channels != num_v_channels:
+            raise ValueError(
+                f"attn_impl='magi' requires equal q/k and v head_dim, got "
+                f"num_qk_channels={num_qk_channels} != num_v_channels={num_v_channels}. "
+                "MLA-style attention (e.g. DeepSeek-V3 / Moonlight) is not supported by MagiAttention."
+            )
+        if num_qk_channels > 128:
+            raise ValueError(
+                f"attn_impl='magi' supports head_dim <= 128, got {num_qk_channels} "
+                "(e.g. Gemma3 / Qwen3.5 full-attention layers use 256)."
+            )
+        # requires magi_attention; the guards above are exercised on CPU but the
+        # kernel build is not, so exclude it from coverage.
+        from nemo_automodel.components.distributed.magi_attn_utils import (  # pragma: no cover - requires magi_attention
+            make_magi_attn_func,
+        )
+
+        attn_func = make_magi_attn_func(softmax_scale=softmax_scale)  # pragma: no cover - requires magi_attention
+        return None, attn_func  # pragma: no cover - requires magi_attention
     else:
         raise ValueError(f"Unsupported attention implementation: {attn_impl}")
 
@@ -143,13 +193,66 @@ def preprocess_args_and_kwargs_for_attn(
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
+    elif attn_impl == "magi":  # pragma: no cover - requires magi_attention
+        # magi's attn_func consumes the native [b, s, nh, hd] / [t, nh, hd] layout
+        # directly (no transpose). Forward the genuine mask metadata so the FFA key
+        # matches what the other backends would build: an explicit ``magi_attn_spec``
+        # (arbitrary AttnSlice mask, e.g. a prefix tree) takes priority, else
+        # ``cu_seqlens`` selects a varlen/block-diagonal (packed) mask; absence of
+        # both means a single causal sequence.
+        attn_kwargs = {}
+        for _k in ("magi_attn_spec", "cu_seqlens", "cu_seqlens_q", "window_size"):
+            if kwargs.get(_k) is not None:
+                attn_kwargs[_k] = kwargs[_k]
     else:  # sdpa
         attn_kwargs = {}
         # Transpose for SDPA
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
-        attn_kwargs["is_causal"] = True
+        window_size = kwargs.get("window_size", (-1, 0))
+        left_window, right_window = window_size if isinstance(window_size, tuple) else (window_size, 0)
+        has_local_window = (left_window is not None and left_window >= 0) or (
+            right_window is not None and right_window > 0
+        )
+        key_mask = None
+        explicit_mask = None
+        if attention_mask is not None:
+            if attention_mask.dim() <= 2:
+                key_mask = attention_mask.to(device=q.device, dtype=torch.bool)
+                has_padding_mask = not bool(key_mask.all().item())
+            else:
+                explicit_mask = attention_mask.to(device=q.device)
+                has_padding_mask = False
+        else:
+            has_padding_mask = False
+
+        if has_local_window or has_padding_mask:
+            q_len = q.shape[-2]
+            kv_len = k.shape[-2]
+            kv_offset = max(kv_len - q_len, 0)
+            q_pos = torch.arange(q_len, device=q.device) + kv_offset
+            kv_pos = torch.arange(kv_len, device=q.device)
+            causal_mask = kv_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+
+            if left_window is not None and left_window >= 0:
+                causal_mask = causal_mask & (kv_pos.unsqueeze(0) > q_pos.unsqueeze(1) - left_window)
+            if right_window is not None and right_window > 0:
+                causal_mask = causal_mask & (kv_pos.unsqueeze(0) <= q_pos.unsqueeze(1) + right_window)
+
+            if has_padding_mask:
+                assert key_mask is not None
+                if key_mask.shape[-1] != kv_len:
+                    key_mask = key_mask[..., -kv_len:]
+                causal_mask = causal_mask.unsqueeze(0).unsqueeze(0) & key_mask[:, None, None, :]
+
+            attn_kwargs["attn_mask"] = causal_mask
+            attn_kwargs["is_causal"] = False
+        elif explicit_mask is not None:
+            attn_kwargs["attn_mask"] = explicit_mask
+            attn_kwargs["is_causal"] = False
+        else:
+            attn_kwargs["is_causal"] = True
 
     return q, k, v, attn_kwargs
 

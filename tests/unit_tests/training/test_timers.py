@@ -64,7 +64,7 @@ def patch_torch_distributed(monkeypatch):
     dist_stub._all_gather_base = _all_gather
 
     monkeypatch.setattr(torch, "distributed", dist_stub, raising=False)
-    sys.modules["torch.distributed"] = dist_stub
+    monkeypatch.setitem(sys.modules, "torch.distributed", dist_stub)
 
     # Import the module *after* stubs are in place so it picks them up.
     # Force reload in case it was imported by another test module

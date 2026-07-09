@@ -15,7 +15,7 @@
 # Benchmarking config for Deepseek V3 Torch
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/deepseek_v3_torch.yaml --nproc-per-node 8
+#   automodel examples/llm_benchmark/deepseek/deepseek_v3_torch.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
@@ -33,7 +33,7 @@ benchmark:
 step_scheduler:
   gc_every_steps: 10
   global_batch_size: 512
-  local_batch_size: 8
+  local_batch_size: 4
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
@@ -47,6 +47,7 @@ distributed:
   ep_size: 64
 
   sequence_parallel: false
+  activation_checkpointing: true
 
   pipeline:
     pp_schedule: interleaved1f1b
@@ -109,3 +110,4 @@ ci:
   nodes: 32
   env_vars:
     RDZV_TIMEOUT: "900"
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

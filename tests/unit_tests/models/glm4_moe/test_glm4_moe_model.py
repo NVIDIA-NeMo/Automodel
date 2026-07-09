@@ -12,18 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from transformers.models.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 
-from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm4_moe.model import Block, Glm4MoeForCausalLM, Glm4MoeModel
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.layers import MLP, MoE
-from nemo_automodel.components.models.common import BackendConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -173,7 +171,7 @@ class TestBlock:
         padding_mask = torch.tensor([[0, 0, 1]], dtype=torch.bool, device=device)
 
         with (
-            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
+            patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)),
             patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask, padding_mask=padding_mask)
@@ -293,7 +291,7 @@ class TestGlm4MoeModel:
                     mock_freqs.return_value = torch.randn(
                         batch, seq_len, int(glm_config.head_dim * glm_config.partial_rotary_factor)
                     )
-                    out = model(input_ids)
+                    model(input_ids)
 
         # Verify position_ids_to_freqs_cis was called
         mock_freqs.assert_called_once()
@@ -376,8 +374,9 @@ class TestGlm4MoeForCausalLM:
             "forward",
             return_value=torch.randn(batch, seq_len, glm_config.hidden_size, device=device).to(torch.bfloat16),
         ):
-            logits = model(input_ids)
+            out = model(input_ids)
 
+        logits = out.logits
         assert logits.shape == (batch, seq_len, glm_config.vocab_size)
 
     def test_forward_with_thd_format_squeezes_input(self, glm_config, backend_config, device):
@@ -396,8 +395,9 @@ class TestGlm4MoeForCausalLM:
             ),
         ):
             mock_squeeze.return_value = (input_ids.squeeze(0), None, None, {"qkv_format": "thd"})
-            logits = model(input_ids, qkv_format="thd")
+            out = model(input_ids, qkv_format="thd")
 
+        logits = out.logits
         mock_squeeze.assert_called_once()
         # Output should be unsqueezed back to batch dimension
         assert logits.shape == (batch, seq_len, glm_config.vocab_size)

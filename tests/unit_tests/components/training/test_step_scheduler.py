@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import pytest
+
 from nemo_automodel.components.training.step_scheduler import (
     StepScheduler,
     _calculate_max_steps,
@@ -261,9 +262,52 @@ def test_ckpt_every_steps_larger_than_max_steps(
         val = is_ckpt_step.pop(0)
         assert val == scheduler.is_ckpt_step, i
         assert val == scheduler.is_last_batch, i
-        if max_steps is None:
-            assert val == scheduler.is_last_step, i
+        # is_last_step must fire on the final batch regardless of whether the run
+        # ends by hitting max_steps or by exhausting epochs (here max_steps=1000
+        # is never reached; the single epoch runs out first).
+        assert val == scheduler.is_last_step, i
     assert len(is_ckpt_step) == 0
+
+
+def test_is_last_step_when_epochs_exhausted_before_max_steps():
+    """Regression: epochs can run out before max_steps with a small dataset.
+
+    Mirrors the diffusion finetune CI setup that regressed (e.g. hunyuan_t2v_flow):
+    max_steps=100 but only num_epochs * epoch_len = 30 * 2 = 60 steps of data
+    exist, with periodic (ckpt_every_steps=100) and epoch-boundary
+    (save_checkpoint_every_epoch=False) checkpointing both disabled. The final
+    step must still be flagged so the final/consolidated checkpoint is written;
+    otherwise no checkpoint is ever saved.
+    """
+    num_epochs = 30
+    epoch_len = 2
+    max_steps = 100  # never reached: only num_epochs * epoch_len = 60 steps of data
+
+    scheduler = StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        ckpt_every_steps=max_steps,  # periodic save never fires (60 < 100)
+        save_checkpoint_every_epoch=False,
+        dataloader=SizedDataLoader(num_batches=epoch_len),
+        num_epochs=num_epochs,
+        max_steps=max_steps,
+    )
+
+    last_step_flags = []
+    ckpt_step_flags = []
+    for _epoch in scheduler.epochs:
+        for _batches in scheduler:
+            last_step_flags.append(scheduler.is_last_step)
+            ckpt_step_flags.append(scheduler.is_ckpt_step)
+
+    # All 60 steps ran (max_steps was never the limiter).
+    assert len(last_step_flags) == num_epochs * epoch_len
+    # is_last_step -- and therefore is_ckpt_step -- fire exactly once, on the final step.
+    assert sum(last_step_flags) == 1
+    assert last_step_flags[-1] is True
+    assert sum(ckpt_step_flags) == 1
+    assert ckpt_step_flags[-1] is True
 
 
 @pytest.mark.parametrize(
@@ -305,7 +349,7 @@ def test_ckpt_every_steps_is_none(dataloader, is_iterable):
 
 def test_iterable_dataloader():
     dataloader = IterableDataLoader(num_batches=10)
-    scheduler = StepScheduler(
+    StepScheduler(
         global_batch_size=1,
         local_batch_size=1,
         dp_size=1,
@@ -350,7 +394,7 @@ def test_is_gc_step_every_n_steps():
 
 def test_gc_every_steps_must_be_positive():
     dataloader = SizedDataLoader(num_batches=1)
-    with pytest.raises(AssertionError, match="gc_every_steps must be greater than 0 if not None"):
+    with pytest.raises(ValueError, match="gc_every_steps must be greater than 0 if not None"):
         StepScheduler(
             global_batch_size=1,
             local_batch_size=1,

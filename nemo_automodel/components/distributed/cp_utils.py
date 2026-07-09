@@ -101,6 +101,94 @@ def create_context_parallel_ctx(
     )
 
 
+def make_target_cp_ctx(cp_mesh: DeviceMesh, input_ids, position_ids=None):
+    """Build a context-parallel context for a frozen target forward.
+
+    Shards ``input_ids`` (and ``position_ids``) along the sequence dim across
+    ``cp_mesh`` so the target's self-attention runs as ring attention. Unlike
+    :func:`make_cp_batch_and_ctx`, this does not require ``labels`` and is meant
+    for the EAGLE-3 target wrapper, which gathers the aux/logits back to the full
+    sequence (see :func:`gather_cp_seq`) before handing them to the draft.
+
+    Load balancing is disabled (``_cp_options.enable_load_balance = False``) so
+    each rank holds a contiguous sequence chunk and the gather is a plain ordered
+    concat (no round-robin un-permute). The sharding is thrown away right after
+    the forward, so load balancing buys nothing here, and the ordered shard makes
+    the gather deterministic. This is a process-global torch flag; the EAGLE-3
+    recipe is the only context-parallel user in its process.
+
+    The sequence is right-padded to a multiple of ``cp_size``; the returned
+    ``orig_len`` lets the caller slice the gathered outputs back down.
+
+    Args:
+        cp_mesh: The context-parallel device (sub)mesh.
+        input_ids: ``[B, T]`` token ids.
+        position_ids: Optional ``[B, T]`` (or ``[1, T]``) position ids; an arange
+            is injected when omitted.
+
+    Returns:
+        ``(cp_ctx, sharded_input_ids, sharded_position_ids, orig_len)``. Enter
+        ``cp_ctx`` to run the target forward on the sharded tensors.
+    """
+    from torch.distributed.tensor.experimental import context_parallel
+    from torch.distributed.tensor.experimental._attention import _cp_options
+
+    _cp_options.enable_load_balance = False
+
+    cp_size = cp_mesh.size()
+    batch_size, orig_len = input_ids.shape[0], input_ids.shape[1]
+    if position_ids is None:
+        position_ids = torch.arange(orig_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+    position_ids = position_ids.to(input_ids.device)
+    if position_ids.shape[0] == 1 and batch_size > 1:
+        position_ids = position_ids.expand(batch_size, -1)
+
+    # ``context_parallel`` shards these buffers in place and (being in
+    # ``no_restore_buffers``) does not restore them on exit, so they must be
+    # fresh tensors -- otherwise the caller's ``input_ids``/``position_ids``,
+    # which ``generate_batch`` still uses unsharded for the shifted outputs,
+    # would be corrupted. ``pad`` already produces a new tensor; ``clone`` the
+    # unpadded case.
+    pad = (-orig_len) % cp_size
+    ids_buf = torch.nn.functional.pad(input_ids, (0, pad)) if pad else input_ids.clone()
+    pos_buf = torch.nn.functional.pad(position_ids, (0, pad)) if pad else position_ids.clone()
+    ids_buf = ids_buf.contiguous()
+    pos_buf = pos_buf.contiguous()
+
+    cp_ctx = context_parallel(
+        cp_mesh,
+        buffers=[ids_buf, pos_buf],
+        buffer_seq_dims=[1, 1],
+        no_restore_buffers={ids_buf, pos_buf},
+    )
+    return cp_ctx, ids_buf, pos_buf, orig_len
+
+
+def gather_cp_seq(cp_mesh: DeviceMesh, tensors: List[torch.Tensor], seq_dim: int, orig_len: int):
+    """Gather context-parallel sharded ``tensors`` back to the full sequence.
+
+    Inverse of the sharding done by :func:`make_target_cp_ctx`. Uses torch's
+    ``context_parallel_unshard`` with ``load_balancer=None`` (matching the
+    load-balancing-disabled sharding) and slices the right-pad back off.
+
+    Args:
+        cp_mesh: The context-parallel device (sub)mesh used to shard.
+        tensors: Local-shard tensors (e.g. captured aux hidden states, logits),
+            each sharded to ``T/cp`` along ``seq_dim``.
+        seq_dim: The sequence dimension to gather along.
+        orig_len: The pre-pad sequence length to slice back to.
+
+    Returns:
+        A list of full-sequence tensors of length ``orig_len`` along ``seq_dim``.
+    """
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor.experimental._attention import context_parallel_unshard
+
+    local_tensors = [t.to_local() if isinstance(t, DTensor) else t for t in tensors]
+    full = context_parallel_unshard(cp_mesh, local_tensors, [seq_dim] * len(local_tensors))
+    return [t.narrow(seq_dim, 0, orig_len).contiguous() for t in full]
+
+
 def attach_context_parallel_hooks(model: torch.nn.Module):
     """Attach forward pre-hooks to self_attn modules to fix attention masks for context parallelism.
 
@@ -193,26 +281,6 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             target.register_forward_hook(_post_hook, always_call=True)
 
 
-def attach_linear_attn_position_hooks(model: torch.nn.Module):
-    """Forward pre-hook on decoder layers to pass position_ids to linear_attn.
-
-    HF Qwen3.5 decoder layers don't pass position_ids to linear_attn, but
-    CPAwareGatedDeltaNet needs them under CP to undo load-balanced sharding.
-    This hook captures position_ids from the decoder layer's kwargs and
-    stores it on the linear_attn module so its forward can read it.
-    """
-
-    def _decoder_pre_hook(_module, _args, kwargs):
-        _module.linear_attn._cached_position_ids = kwargs.get("position_ids", None)
-        return None
-
-    for _, mod in model.named_modules():
-        if hasattr(mod, "linear_attn") and hasattr(mod, "layer_type"):
-            if not getattr(mod, "_linear_attn_pos_hook_registered", False):
-                mod.register_forward_pre_hook(_decoder_pre_hook, with_kwargs=True)
-                mod._linear_attn_pos_hook_registered = True
-
-
 def make_cp_batch_and_ctx(
     device_mesh,
     batch,
@@ -251,6 +319,13 @@ def make_cp_batch_and_ctx(
     cp_mesh = _get_submesh(device_mesh, "cp")
     tp_mesh = _get_submesh(device_mesh, "tp")
 
+    # A model that owns its CP attention can attach a batch-sharding callable to
+    # the batch in its pre-embed step. Honor it instead of the default
+    # load-balanced context_parallel path so the implementation stays with the model.
+    cp_make_batch_fn = batch.pop("_cp_make_batch_fn", None)
+    if _get_mesh_size(cp_mesh) > 1 and cp_make_batch_fn is not None:
+        return cp_make_batch_fn(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
+
     if use_te:
         return nullcontext, make_cp_batch_for_te(
             cp_mesh,
@@ -271,11 +346,30 @@ def make_cp_batch_and_ctx(
     # so that SDPA handles causal masking internally.
     batch.pop("attention_mask", None)
 
-    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
-    if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
-        batch["position_ids"] = torch.arange(0, batch["input_ids"].shape[1]).unsqueeze(0).to(batch["input_ids"].device)
+    # Determine the primary sequence tensor: inputs_embeds (VLM with CP, where
+    # multimodal token replacement happened pre-shard) or input_ids (standard LLM).
+    has_inputs_embeds = "inputs_embeds" in batch
+    has_input_ids = "input_ids" in batch
+    assert has_inputs_embeds ^ has_input_ids, (
+        "make_cp_batch_and_ctx requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
+    )
+    if has_inputs_embeds:
+        primary_seq_tensor = batch["inputs_embeds"]
+    else:
+        primary_seq_tensor = batch["input_ids"]
+    seq_len = primary_seq_tensor.shape[1]
 
-    input_ids = batch["input_ids"]
+    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
+    batch_size = primary_seq_tensor.shape[0]
+    if "position_ids" not in batch and (_get_mesh_size(cp_mesh) > 1 or _get_mesh_size(tp_mesh) > 1):
+        batch["position_ids"] = (
+            torch.arange(0, seq_len, device=primary_seq_tensor.device).unsqueeze(0).expand(batch_size, -1).contiguous()
+        )
+    elif "position_ids" in batch:
+        position_ids = batch["position_ids"]
+        if position_ids.ndim == 2 and position_ids.shape[0] == 1 and batch_size > 1:
+            batch["position_ids"] = position_ids.expand(batch_size, -1).contiguous()
+
     position_ids = batch["position_ids"]
 
     # Determine correct seq dim for CP sharding
@@ -284,12 +378,19 @@ def make_cp_batch_and_ctx(
 
     labels = batch["labels"]
 
-    # Collect all available tensors for context parallel
-    cp_buffers = [input_ids, labels, position_ids]
+    # Collect all available tensors for context parallel.  We track each
+    # cp_buffer's batch key (when sourced from ``batch``) so the padding pass
+    # below can pick the semantically-correct fill sentinel and mirror the
+    # padded tensor back into ``batch``.  ``loss_mask`` is passed as an arg
+    # (not in batch) so it has no key.
+    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
+    cp_buffers = [primary_seq_tensor, labels, position_ids]
+    # inputs_embeds is [B, S, H] → seq_dim=1; input_ids is [B, S] → seq_dim=1
     cp_seq_dims = [1, 1, pos_seq_dim]
-    cp_no_restore_buffers = {input_ids, labels}
+    cp_no_restore_buffers = {primary_seq_tensor, labels}
+    batch_buffer_keys: dict[int, str] = {0: primary_key, 1: "labels", 2: "position_ids"}
 
-    # Add loss_mask if available
+    # Add loss_mask if available (passed as arg, not in batch -> no key)
     if loss_mask is not None:
         cp_buffers.append(loss_mask)
         cp_seq_dims.append(1)
@@ -298,9 +399,49 @@ def make_cp_batch_and_ctx(
     # Add padding_mask if available in batch
     if "padding_mask" in batch:
         padding_mask = batch["padding_mask"]
+        batch_buffer_keys[len(cp_buffers)] = "padding_mask"
         cp_buffers.append(padding_mask)
         cp_seq_dims.append(1)
         cp_no_restore_buffers.add(padding_mask)
+
+    # Pad sequence length to be divisible by 2 * cp_size (required by
+    # context_parallel load balancing). The inputs_embeds path can hit
+    # arbitrary seq lengths from the VLM collator, so we pad here rather
+    # than relying on dataset-side padding.
+    #
+    # Per-buffer pad sentinels: each tensor's "ignore" value is semantic, not
+    # dtype-derived.  ``labels``/``padding_mask``/``attention_mask`` are all
+    # int/bool but have different ignore conventions.  Falling through to 0
+    # for ``padding_mask`` (== False == "real token") would tell the MoE
+    # router to route the cp-pad slots to experts -- silently wasting capacity
+    # and skewing load-balance loss.
+    PAD_FILL = {
+        "labels": -100,  # CE ignore_index
+        "padding_mask": True,  # bool: True == "this position is pad, ignore"
+        "attention_mask": False,  # HF: 0 == "this position is pad, ignore"
+        # everything else (input_ids, position_ids, ...) -> 0
+    }
+    cp_divisor = cp_mesh.size() * 2
+    if seq_len % cp_divisor != 0:
+        pad_len = cp_divisor - (seq_len % cp_divisor)
+        new_no_restore = set()
+        for i, (buf, dim) in enumerate(zip(cp_buffers, cp_seq_dims)):
+            pad_shape = list(buf.shape)
+            pad_shape[dim] = pad_len
+            if buf.dtype.is_floating_point:
+                pad_val = torch.zeros(pad_shape, dtype=buf.dtype, device=buf.device)
+            else:
+                fill_val = PAD_FILL.get(batch_buffer_keys.get(i), 0)
+                pad_val = torch.full(pad_shape, fill_val, dtype=buf.dtype, device=buf.device)
+            old_buf = buf
+            cp_buffers[i] = torch.cat([buf, pad_val], dim=dim)
+            if old_buf in cp_no_restore_buffers:
+                new_no_restore.add(cp_buffers[i])
+        cp_no_restore_buffers = new_no_restore
+        # Mirror every batch-sourced cp_buffer back into ``batch`` so any
+        # downstream consumer reading from the dict sees the padded shape.
+        for idx, key in batch_buffer_keys.items():
+            batch[key] = cp_buffers[idx]
 
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,

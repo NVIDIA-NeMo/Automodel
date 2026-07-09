@@ -15,7 +15,7 @@
 # Benchmarking config for Qwen3 VL 235B Te Deepep
 
 # To run this recipe:
-#   automodel examples/benchmark/configs/qwen3_vl_235b_te_deepep.yaml --nproc-per-node 8
+#   automodel examples/vlm_benchmark/qwen/qwen3_vl_235b_te_deepep.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
 recipe: BenchmarkingRecipeForNextTokenPrediction
@@ -78,8 +78,8 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: false
-    experts: gmm
-    dispatcher: deepep
+    experts: torch_mm
+    dispatcher: hybridep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true

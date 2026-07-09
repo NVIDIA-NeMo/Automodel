@@ -31,6 +31,7 @@ from nemo_automodel._transformers.model_init import (
     _setup_bnb_loading_kwargs,
     _stream_load_bnb_weights,
     _streaming_bnb_supported,
+    _try_get_remote_code_model_cls,
     get_hf_config,
 )
 from nemo_automodel.components.models.common.utils import BackendConfig
@@ -212,6 +213,77 @@ class TestGetHfConfigNestedKwargs:
         call_kwargs = mock_from_pretrained.call_args[1]
         assert "text_config" not in call_kwargs
         assert call_kwargs["output_hidden_states"] is True
+
+    @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=False)
+    @patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained")
+    def test_dict_config_override_folded_into_auto_config(self, mock_from_pretrained, mock_trust):
+        """A plain-dict ``config`` (from --model.config.*) must be applied as overrides,
+        not returned verbatim. Regression for NVBugs 6259955 Defect 2: a dict config flipped
+        custom-model dispatch to the stock-HF path (get_architectures(dict) -> None)."""
+        built = MagicMock()
+        mock_from_pretrained.return_value = built
+
+        result = get_hf_config(
+            "fake/model",
+            attn_implementation="eager",
+            config={"num_hidden_layers": 16},
+        )
+
+        # The dict must NOT be returned as-is; a real config object is built instead.
+        assert result is built
+        call_kwargs = mock_from_pretrained.call_args[1]
+        # The override keys are folded into the AutoConfig.from_pretrained call ...
+        assert call_kwargs["num_hidden_layers"] == 16
+        # ... and the raw ``config`` dict is not forwarded as a kwarg.
+        assert "config" not in call_kwargs
+
+
+class TestDictConfigOverrideKeepsCustomPath:
+    """NVBugs 6259955 Defect 2: --model.config.* overrides must not flip dispatch off the
+    custom model path, and the dict ``config`` must not reach the model constructor."""
+
+    def _make_config(self):
+        config = MagicMock()
+        config.architectures = ["SomeModel"]
+        config.torch_dtype = "bfloat16"
+        config.name_or_path = "fake/model"
+        return config
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init.get_hf_config")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_dict_config_not_forwarded_to_custom_init(self, mock_resolve_cls, mock_get_hf_config, _mock_download):
+        hf_config = self._make_config()
+        mock_get_hf_config.return_value = hf_config
+
+        captured_kwargs = {}
+        captured_args = {}
+
+        def fake_model_cls(config, **kwargs):
+            captured_args["config"] = config
+            captured_kwargs.update(kwargs)
+            return MagicMock()
+
+        fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
+        mock_resolve_cls.return_value = fake_model_cls
+
+        is_custom, _ = _init_model(
+            cls=MagicMock(),
+            pretrained_model_name_or_path_or_config="fake/model",
+            attn_implementation="flash_attention_2",
+            torch_dtype="auto",
+            quantization_config=None,
+            force_hf=False,
+            backend={"attn": "sdpa"},
+            config={"num_hidden_layers": 16},
+        )
+
+        # Custom path stays selected (dispatch did not flip to stock-HF) ...
+        assert is_custom is True
+        assert captured_args["config"] is hf_config
+        # ... and the dict ``config`` override never reaches the constructor (would
+        # otherwise collide with the positional config and/or raise TypeError).
+        assert "config" not in captured_kwargs
 
 
 class TestSetupBnbLoadingKwargs:
@@ -607,3 +679,27 @@ class TestGetHfConfigLayerTypesRetry:
         with pytest.raises(ValueError, match="pip install --upgrade nemo_automodel"):
             get_hf_config("fake/model", "sdpa")
         mock_fix.assert_not_called()
+
+
+class TestTryGetRemoteCodeModelCls:
+    """Tests for the pre-resolution helper used to consume config-attr kwargs
+    on the trust-remote-code HF-fallback path.
+    """
+
+    def test_loads_class_via_target_key(self):
+        cfg = MagicMock()
+        cfg.auto_map = {"AutoModelForCausalLM": "modeling.MyModel"}
+        fake_cls = object()
+        with patch("transformers.dynamic_module_utils.get_class_from_dynamic_module") as mock_load:
+            mock_load.return_value = fake_cls
+            result = _try_get_remote_code_model_cls(
+                cfg, "/some/path", "AutoModelForCausalLM", {"trust_remote_code": True}
+            )
+        assert result is fake_cls
+        assert mock_load.call_args.args[0] == "modeling.MyModel"
+
+    def test_returns_none_when_trust_remote_code_not_set(self):
+        cfg = MagicMock()
+        cfg.auto_map = {"AutoModelForCausalLM": "modeling.MyModel"}
+        result = _try_get_remote_code_model_cls(cfg, "/some/path", "AutoModelForCausalLM", {})
+        assert result is None

@@ -29,6 +29,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import weakref
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -91,20 +92,62 @@ def _uses_te_attention(model: "nn.Module") -> bool:
     return getattr(model, "_te_attention_injected", False)
 
 
+def _uses_magi_attention(model: "nn.Module") -> bool:
+    """True when the model uses the MagiAttention (FFA / context-parallel) backend.
+
+    MagiAttention implements context parallelism via its own load-balancing
+    dispatch (see ``components/distributed/magi_attn_utils.py``), so it supports CP.
+    """
+    backend = getattr(model, "backend", None)
+    return getattr(backend, "attn", None) == "magi"
+
+
+def _is_deepseek_v4(model: "nn.Module") -> bool:
+    """True when the model is a DeepSeek V4 custom model.
+
+    DSV4 owns its context-parallel attention (Miles-style contiguous query shard
+    plus all-gathered K/V), so its CP support is gated on the TileLang attention
+    backend rather than the generic TE/SDPA/Magi paths.
+    """
+    config = getattr(model, "config", None)
+    return getattr(config, "model_type", None) == "deepseek_v4" or type(model).__name__.startswith("DeepseekV4")
+
+
+def _is_glm_moe_dsa(model: "nn.Module") -> bool:
+    config = getattr(model, "config", None)
+    return getattr(config, "model_type", None) == "glm_moe_dsa" or type(model).__name__.startswith("GlmMoeDsa")
+
+
 def _is_hybrid(model: "nn.Module") -> bool:
     """True when the model mixes attention with non-attention layers (e.g. Mamba/SSM).
 
     Detected via config attributes used by NemotronH (``layers_block_type``)
     and HF hybrid models (``hybrid_override_pattern``, ``is_hybrid_model``).
+    For VLM wrappers, also inspect the inner ``language_model``'s config.
     """
-    config = getattr(model, "config", None)
-    if config is None:
-        return False
-    for attr in ("layers_block_type", "hybrid_override_pattern"):
-        pattern = getattr(config, attr, None)
-        if pattern and any(str(c).upper() == "M" for c in pattern):
+    candidates = [getattr(model, "config", None)]
+    inner = getattr(model, "language_model", None)
+    if inner is not None:
+        candidates.append(getattr(inner, "config", None))
+    # VLM configs nest the decoder config under ``text_config``.
+    for c in list(candidates):
+        if c is not None:
+            candidates.append(getattr(c, "text_config", None))
+    for config in candidates:
+        if config is None:
+            continue
+        for attr in ("layers_block_type", "hybrid_override_pattern"):
+            pattern = getattr(config, attr, None)
+            if pattern and any(str(c).upper() == "M" for c in pattern):
+                return True
+        if getattr(config, "is_hybrid_model", False) is True:
             return True
-    return getattr(config, "is_hybrid_model", False) is True
+        # Qwen3.5 / Qwen3-Next style: per-layer ``layer_types`` mixing
+        # ``linear_attention`` (gated-delta / SSM) with ``full_attention``.
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types and any(str(t) == "linear_attention" for t in layer_types):
+            return True
+    return False
 
 
 class ModelSupports:
@@ -121,12 +164,23 @@ class ModelSupports:
         model.supports.pp   # ...
     """
 
-    __slots__ = ("_model", "_model_cls", "_mesh")
+    __slots__ = ("_model_ref", "_model_cls", "_mesh")
 
     def __init__(self, model: "nn.Module", mesh: "MeshContext | None" = None) -> None:
-        self._model = model
+        # Hold the model weakly. ``ModelSupports`` is attached back onto the model
+        # as ``model._supports``; a strong reference here would form a
+        # ``model <-> _supports`` cycle, so the capability descriptor must never be
+        # the reason a (multi-GiB) model stays resident after its owner is dropped.
+        self._model_ref = weakref.ref(model)
         self._model_cls = type(model)
         self._mesh = mesh
+
+    @property
+    def _model(self) -> "nn.Module":
+        model = self._model_ref()
+        if model is None:
+            raise ReferenceError("ModelSupports: underlying model has been garbage-collected")
+        return model
 
     def __repr__(self) -> str:
         names = (
@@ -186,6 +240,7 @@ class ModelSupports:
         | Model kind       | Attention      | CP?     |
         +------------------+----------------+---------+
         | Custom           | TE             | Yes     |
+        | Custom           | Magi (FFA)     | Yes     |
         | Custom hybrid    | TE / SDPA      | Yes     |
         | Custom           | FlexAttention  | No      |
         | HF (pure attn)   | SDPA           | Yes     |
@@ -194,10 +249,16 @@ class ModelSupports:
         +------------------+----------------+---------+
         """
         if _has_backend(self._model):
-            if _is_hybrid(self._model):
+            backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+            if _is_deepseek_v4(self._model) or _is_glm_moe_dsa(self._model):
+                # DSV4 owns its CP attention (Miles-style); gated on TileLang.
+                return backend_attn == "tilelang"
+            # Hybrids, and custom models that ship their own CP-aware attention and opt in
+            # via ``_supports_cp_sdpa``, may run CP on either TE or SDPA attention.
+            if _is_hybrid(self._model) or getattr(self._model, "_supports_cp_sdpa", False):
                 backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
                 return backend_attn in ("te", "sdpa")
-            return _uses_te_attention(self._model)
+            return _uses_te_attention(self._model) or _uses_magi_attention(self._model)
         if _is_hybrid(self._model):
             return False
         return getattr(self._model, "_supports_sdpa", False) is True
@@ -212,7 +273,15 @@ class ModelSupports:
     @property
     def supports_sequence_packing(self) -> bool:
         """``forward()`` accepts ``seq_lens`` for packed-sequence training."""
-        sp_attn_backend = getattr(self._model, "_supports_sdpa", False) is True or _uses_te_attention(self._model)
+        sp_attn_backend = (
+            getattr(self._model, "_supports_sdpa", False) is True
+            or _uses_te_attention(self._model)
+            or _uses_magi_attention(self._model)
+            or (
+                _is_glm_moe_dsa(self._model)
+                and getattr(getattr(self._model, "backend", None), "attn", None) == "tilelang"
+            )
+        )
         return _supports_seq_lens(self._model) and sp_attn_backend
 
     @property
@@ -253,10 +322,17 @@ class ModelSupports:
 
     @property
     def supports_cp_with_sequence_packing(self) -> bool:
-        """CP + packed sequences requires TE attention backend."""
+        """CP + packed sequences requires the TE or MagiAttention backend.
+
+        MagiAttention dispatches the packed sequence across the CP group with its
+        own load-balancing solver and a per-document varlen mask, so it supports
+        CP + packing (see ``magi_attn_utils.magi_prepare_packed_cp``)."""
         if self.cp_size <= 1:
             return self.supports_sequence_packing
-        return self.supports_sequence_packing and _uses_te_attention(self._model)
+        if _is_glm_moe_dsa(self._model):
+            backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
+            return self.supports_sequence_packing and backend_attn == "tilelang"
+        return self.supports_sequence_packing and (_uses_te_attention(self._model) or _uses_magi_attention(self._model))
 
 
 def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
@@ -323,6 +399,15 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
                 f"distributed:\n"
                 f"  cp_size: 1"
             )
+        elif _is_deepseek_v4(model):
+            errors.append(
+                f"Context parallelism (cp_size={cp_size}) for {arch} requires "
+                f"the TileLang attention backend (backend.attn='tilelang').\n"
+                f"Please re-run with --distributed.cp_size=1 or switch to TileLang attention:\n"
+                f"model:\n"
+                f"  backend:\n"
+                f"    attn: tilelang"
+            )
         elif _has_backend(model):
             errors.append(
                 f"Context parallelism (cp_size={cp_size}) for {arch} requires "
@@ -360,7 +445,11 @@ def _supports_forwarding_property(name: str) -> property:
     """Property that forwards ``model.<name>`` to ``model.supports.<name>``."""
 
     def fget(self: "nn.Module") -> bool:
-        return getattr(self.supports, name)
+        try:
+            return getattr(self.supports, name)
+        except ReferenceError:
+            self._supports = ModelSupports(self, getattr(self, "_mesh", None))  # type: ignore[attr-defined]
+            return getattr(self._supports, name)  # type: ignore[attr-defined]
 
     fget.__name__ = name
     return property(fget)
@@ -368,8 +457,13 @@ def _supports_forwarding_property(name: str) -> property:
 
 def _lazy_supports_property(self: "nn.Module") -> ModelSupports:
     try:
-        return self._supports  # type: ignore[attr-defined]
+        supports = self._supports  # type: ignore[attr-defined]
+        supports._model
+        return supports
     except AttributeError:
+        self._supports = ModelSupports(self, getattr(self, "_mesh", None))  # type: ignore[attr-defined]
+        return self._supports  # type: ignore[attr-defined]
+    except ReferenceError:
         self._supports = ModelSupports(self, getattr(self, "_mesh", None))  # type: ignore[attr-defined]
         return self._supports  # type: ignore[attr-defined]
 

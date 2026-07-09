@@ -70,11 +70,11 @@ Keys at layer indices ≥ `num_hidden_layers` (default 80) are silently dropped 
 
 A ready-to-use recipe ships at [`examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml). The yaml header documents how to adjust `ep_size` and `pp_size` for different cluster configurations.
 
-NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide.
+NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.mdx) guide.
 
 ### Standalone Slurm Script
 
-Below is a standalone Slurm script example for the HellaSwag recipe. Before running it, ensure your cluster environment is configured following the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide. Then submit the job:
+Below is a standalone Slurm script example for the HellaSwag recipe. Before running it, ensure your cluster environment is configured following the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.mdx) guide. Then submit the job:
 
 ```bash
 export TRANSFORMERS_OFFLINE=1
@@ -97,4 +97,4 @@ srun --output=output.out \
 - Ensure your Hugging Face cache (`HF_HOME`) is configured and that the dataset is already cached locally.
 - To enable Weights & Biases logging, set your `WANDB_API_KEY` and uncomment the `wandb` section at the bottom of the YAML file.
 - The full recipe uses `pp_size=4` and `ep_size=32` (128 GPUs total). Valid `ep_size` values are any divisor of 192 (e.g. 8, 16, 24, 32, 48, 64, 96, 192); adjust `pp_size` and `--nproc-per-node` to match your node count.
-- For a quick end-to-end smoke test on 8 GPUs use [`examples/llm_finetune/hy_v3/hy3_4layer_p0_smoke.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_4layer_p0_smoke.yaml), which builds only the first 4 layers.
+- For a quick end-to-end smoke test on 8 GPUs use [`examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/hy_v3/hy3_preview_deepep.yaml).

@@ -15,6 +15,7 @@
 import logging
 import os
 import subprocess
+import sys
 from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -66,9 +67,7 @@ def compile_helper():
     is invoked on a single process."""
 
     path = os.path.abspath(os.path.dirname(__file__))
-    ret = subprocess.run(["make", "-C", path])
+    ret = subprocess.run(["make", "-C", path, f"PYTHON={sys.executable}"])
     if ret.returncode != 0:
         logger.error("Making C++ dataset helpers module failed, exiting.")
-        import sys
-
         sys.exit(1)

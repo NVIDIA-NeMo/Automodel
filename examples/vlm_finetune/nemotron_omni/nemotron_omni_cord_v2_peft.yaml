@@ -61,7 +61,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: vlm_checkpoints/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
@@ -106,6 +106,7 @@ validation_dataloader:
     max_length: 4096
 
 wandb:
+  enable: false
   entity: Nemo-automodel
   project: huiyingl_workspace
   name: nemotron_omni_cordv2_v2_lora_400steps
@@ -115,3 +116,7 @@ optimizer:
   lr: 1e-3
   weight_decay: 0.01
   betas: [0.9, 0.95]
+
+ci:
+  recipe_owner: HuiyingLi
+  time: "00:15:00"
