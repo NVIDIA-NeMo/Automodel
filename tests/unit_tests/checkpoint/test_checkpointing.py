@@ -43,6 +43,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _divide_keys_by_size,
     _ensure_dirs,
     _equally_divide_layers,
+    _filter_non_tensor_state_for_dcp,
     _is_custom_model,
     _model_has_dtensors,
     _normalize_dtype_mapping_to_state_dict_keys,
@@ -64,6 +65,13 @@ CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
 
 
+class _FakeDTensorStateValue:
+    """Minimal tensor-like object for DCP filtering tests."""
+
+    def to_local(self):
+        return torch.zeros(1)
+
+
 def _make_keys(count: int) -> list[str]:
     return [f"layer.{i}" for i in range(count)]
 
@@ -73,6 +81,32 @@ def _count_by_shard(mapping: dict[str, int]) -> dict[int, int]:
     for shard_index in mapping.values():
         counts[shard_index] = counts.get(shard_index, 0) + 1
     return counts
+
+
+def test_filter_non_tensor_state_for_dcp_keeps_tensor_like_values(caplog):
+    tensor = torch.zeros(1)
+    dtensor_like = _FakeDTensorStateValue()
+    code = (lambda value: value).__code__
+    state_dict = {
+        "layer.weight": tensor,
+        "layer.dtensor": dtensor_like,
+        "plain.object": object(),
+        "code.object": code,
+        "layer.not_dtensor": SimpleNamespace(to_local=None),
+    }
+
+    caplog.set_level(logging.WARNING)
+    filtered = _filter_non_tensor_state_for_dcp(
+        state_dict, checkpoint_path="/tmp/model", operation="load"
+    )
+
+    assert set(filtered) == {"layer.weight", "layer.dtensor"}
+    assert filtered["layer.weight"] is tensor
+    assert filtered["layer.dtensor"] is dtensor_like
+    assert "Dropping 3 non-tensor state_dict entries before DCP load" in caplog.text
+    assert "plain.object" in caplog.text
+    assert "code.object" in caplog.text
+    assert "layer.not_dtensor" in caplog.text
 
 
 def test_extract_file_index_with_status_supports_hf_and_qwen35_patterns():
@@ -1332,6 +1366,97 @@ class TestLoadModelExtraState:
         assert captured["requested_keys"] == {"layer.weight"}
         assert "module _extra_state keys" in caplog.text
         mock_model_state.load_state_dict.assert_called_once()
+
+    def test_non_tensor_state_entries_are_filtered_before_dcp_save(self, tmp_path, caplog):
+        checkpointer = self._make_checkpointer()
+        checkpointer._addons = []
+        model = SimpleNamespace(state_dict_adapter=object())
+        tensor = torch.zeros(2, 2)
+        dtensor_like = _FakeDTensorStateValue()
+        initial_state_dict = {
+            "layer.weight": tensor,
+            "layer.dtensor": dtensor_like,
+            "layer.extra_object": object(),
+            "layer.code": (lambda value: value).__code__,
+        }
+        captured = {}
+
+        def fake_do_save(state_dict, *args, **kwargs):
+            captured["saved_keys"] = set(state_dict)
+            return None
+
+        caplog.set_level(logging.WARNING)
+        with (
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch.object(checkpointer, "_maybe_build_consolidated_index", return_value=None),
+            patch.object(checkpointer, "_maybe_build_original_dtype_mapping", return_value=None),
+            patch("nemo_automodel.components.checkpoint.checkpointing._warn_if_large_inline_consolidation"),
+            patch.object(checkpointer, "_get_storage_writer", return_value=object()),
+            patch.object(checkpointer, "_do_save", side_effect=fake_do_save),
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = initial_state_dict.copy()
+
+            checkpointer.save_model(model, str(tmp_path))
+
+        assert captured["saved_keys"] == {"layer.weight", "layer.dtensor"}
+        assert "Dropping 2 non-tensor state_dict entries before DCP save" in caplog.text
+        assert "layer.extra_object" in caplog.text
+        assert "layer.code" in caplog.text
+
+    def test_non_tensor_state_entries_are_filtered_before_dcp_load(self, caplog):
+        checkpointer = self._make_checkpointer()
+        model = SimpleNamespace(state_dict_adapter=object())
+        tensor = torch.zeros(2, 2)
+        dtensor_like = _FakeDTensorStateValue()
+        initial_state_dict = {
+            "layer.weight": tensor,
+            "layer.dtensor": dtensor_like,
+            "layer.extra_object": object(),
+            "layer.code": (lambda value: value).__code__,
+        }
+        captured = {}
+
+        def fake_do_load(state_dict, *args, **kwargs):
+            captured["requested_keys"] = set(state_dict)
+            return dict(state_dict)
+
+        caplog.set_level(logging.WARNING)
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+            patch.object(checkpointer, "_get_storage_reader", return_value=object()),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
+                side_effect=lambda module, state_dict, **kwargs: state_dict,
+            ),
+            patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
+        ):
+            mock_model_state = mock_model_state_cls.return_value
+            mock_model_state.model = [model]
+            mock_model_state.state_dict.return_value = initial_state_dict.copy()
+
+            checkpointer.load_model(model, model_path="/fake/path")
+
+        assert captured["requested_keys"] == {"layer.weight", "layer.dtensor"}
+        assert "Dropping 2 non-tensor state_dict entries before DCP load" in caplog.text
+        assert "layer.extra_object" in caplog.text
+        assert "layer.code" in caplog.text
+        mock_model_state.load_state_dict.assert_called_once()
+        assert mock_model_state.load_state_dict.call_args.kwargs["strict"] is False
+        assert set(mock_model_state.load_state_dict.call_args.args[0]) == {
+            "layer.weight",
+            "layer.dtensor",
+        }
 
 
 # =============================================================================
