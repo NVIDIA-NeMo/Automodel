@@ -208,6 +208,55 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
             )
 
 
+_VISION_TOWER_ATTRS = ("visual", "vision_tower", "vision_model", "vit_model")
+
+
+def _has_trainable_vision_tower(model: nn.Module) -> bool:
+    """Return whether the model (or its inner ``.model``) exposes a trainable vision tower."""
+    for owner in (model, getattr(model, "model", None)):
+        if owner is None:
+            continue
+        for attr in _VISION_TOWER_ATTRS:
+            tower = getattr(owner, attr, None)
+            if tower is None or not hasattr(tower, "parameters"):
+                continue
+            if any(param.requires_grad for param in tower.parameters()):
+                return True
+    return False
+
+
+def _apply_vision_tower_ac(model: nn.Module) -> None:
+    """Checkpoint trainable VLM vision-tower blocks on the expert-parallel path.
+
+    ``apply_ac`` iterates only the text/MTP decoder stack
+    (``_iter_transformer_and_mtp_blocks``), and the generic FSDP2 scope
+    handling does not run for expert-parallel configs, so a trainable vision
+    tower would otherwise keep every activation. Reuses the per-model vision
+    layer mapping from the dense parallelizer and wraps the blocks with the
+    recompute-safe vision checkpoint spec. Fully frozen vision towers are left
+    untouched, consistent with the generic path's frozen-tower behavior.
+    """
+    if not _has_trainable_vision_tower(model):
+        return
+
+    # Lazy imports keep the heavy, transformers-aware dense parallelizer module
+    # off the text-only MoE call path.
+    from nemo_automodel.components.distributed.activation_checkpointing import (
+        apply_vision_block_checkpointing,
+    )
+    from nemo_automodel.components.distributed.parallelizer import _extract_model_layer_groups
+
+    vision_layers = [
+        layer
+        for layer in _extract_model_layer_groups(model).get("vision", [])
+        if any(param.requires_grad for param in layer.parameters())
+    ]
+    if not vision_layers:
+        logger.info("No trainable vision blocks found; skipping vision-tower activation checkpointing.")
+        return
+    apply_vision_block_checkpointing(model, vision_layers)
+
+
 def apply_ac(
     model: nn.Module,
     ignore_router: bool = True,
@@ -229,6 +278,9 @@ def apply_ac(
             (shared with the dense FSDP2 path) to each block. Takes precedence over
             ``ignore_router``; the shared policy already saves expert-parallel communication
             collectives and ``topk``, so it composes with expert parallelism.
+
+    Trainable VLM vision-tower blocks are checkpointed as well (in both modes) with a
+    recompute-safe vision spec; frozen vision towers are left untouched.
     """
     if not selective and not ignore_router:
         logger.warning(
@@ -258,6 +310,7 @@ def apply_ac(
             # enabled, so it is a no-op for every other mode.
             setattr(block, SELECTIVE_AC_WRAPPER_FLAG, True)
             parent_layers.register_module(layer_id, block)
+        _apply_vision_tower_ac(model)
         return
 
     # Derive hidden_size and num_experts from model.config if not provided
@@ -338,6 +391,8 @@ def apply_ac(
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
 
         parent_layers.register_module(layer_id, block)
+
+    _apply_vision_tower_ac(model)
 
 
 def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):

@@ -388,6 +388,83 @@ def _replace_child_module(root: nn.Module, target: nn.Module, replacement: nn.Mo
     return False
 
 
+def _vision_math_sdpa_context_fn():
+    """Build a ``context_fn`` for ``checkpoint_wrapper`` that pins the MATH SDPA backend.
+
+    Returns ``(forward_ctx, recompute_ctx)``, both pinning the SDPA backend to
+    MATH, so a checkpointed vision block never recomputes attention on the
+    cuDNN or mem-efficient kernels. Fused-kernel behavior is not stable across
+    checkpoint recompute (cuDNN fails on CPU-resident philox seeds and the
+    mem-efficient kernel loses ops from checkpoint storage), so both the
+    forward and the recompute run the MATH backend.
+    """
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    return sdpa_kernel([SDPBackend.MATH]), sdpa_kernel([SDPBackend.MATH])
+
+
+def _vision_blocks_use_external_flash_attention(model: nn.Module, layers: list[nn.Module]) -> bool:
+    """Return whether vision blocks dispatch attention through an external FlashAttention package."""
+    implementations: set[str] = set()
+    for cfg in (
+        getattr(getattr(model, "config", None), "vision_config", None),
+        getattr(model, "config", None),
+    ):
+        impl = str(getattr(cfg, "_attn_implementation", "") or "").strip().lower()
+        if impl:
+            implementations.add(impl)
+    for block in layers:
+        attn_cfg = getattr(getattr(block, "attn", None), "config", None)
+        impl = str(getattr(attn_cfg, "_attn_implementation", "") or "").strip().lower()
+        if impl:
+            implementations.add(impl)
+    return any(impl.startswith("flash") for impl in implementations)
+
+
+def apply_vision_block_checkpointing(model: nn.Module, layers: list[nn.Module]) -> None:
+    """Wrap vision-tower blocks with a recompute-safe checkpoint spec.
+
+    The plain ``checkpoint_wrapper`` spec used for decoder blocks cannot
+    recompute HF-style vision attention: fused SDPA kernel behavior is not
+    stable across checkpoint recompute, and the resulting metadata mismatch
+    trips the wrapper's determinism check with a ``CheckpointError``. Each
+    block is instead wrapped non-reentrantly without RNG-state preservation or
+    determinism checks, with the MATH SDPA backend pinned on both the
+    checkpoint forward and its recompute via ``context_fn``.
+
+    Vision towers running external FlashAttention kernels dispatch attention
+    outside the SDPA backend context, and replaying the FlashAttention forward
+    inside checkpoint backward is not safe; for those, only each block's MLP
+    is wrapped so attention is never recomputed.
+
+    Args:
+        model: Root model that owns ``layers``; wrapped blocks are re-registered
+            in its module tree.
+        layers: Vision-tower blocks to wrap (mutated in place on the MLP-only path).
+    """
+    if not layers:
+        return
+    if _vision_blocks_use_external_flash_attention(model, layers):
+        wrapped = sum(_wrap_first_existing_attr(block, ("mlp", "feed_forward", "ffn")) for block in layers)
+        logger.info(
+            "Applied MLP-only activation checkpointing to %d of %d FlashAttention vision blocks.",
+            wrapped,
+            len(layers),
+        )
+        return
+    for i, block in enumerate(layers):
+        wrapped_block = checkpoint_wrapper(
+            block,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            preserve_rng_state=False,
+            determinism_check="none",
+            context_fn=_vision_math_sdpa_context_fn,
+        )
+        if not _replace_child_module(model, block, wrapped_block):
+            logger.warning("Could not replace vision block %d with checkpoint wrapper.", i)
+    logger.info("Applied full-block activation checkpointing to %d vision blocks.", len(layers))
+
+
 def detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:
     """Detect KV-sharing and disable ``use_cache`` for non-KV-shared models.
 
