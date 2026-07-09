@@ -96,3 +96,8 @@ optimizer:
 lr_scheduler:
   lr_decay_style: cosine
   min_lr: 2.0e-6
+
+ci:
+  # Raise the wall-clock past the 00:10:00 default so the 1000-step run
+  # finishes within its SLURM allocation (AM-629).
+  time: "00:30:00"

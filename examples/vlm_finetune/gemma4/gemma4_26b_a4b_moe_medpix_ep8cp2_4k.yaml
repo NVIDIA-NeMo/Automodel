@@ -100,3 +100,8 @@ freeze_config:
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
+
+ci:
+  # Raise the wall-clock past the 00:10:00 default so the 100-step MoE run
+  # finishes within its SLURM allocation (AM-629).
+  time: "00:30:00"

@@ -150,3 +150,8 @@ optimizer:
 # wandb:
 #   project: hy_mt2-30b-a3b-sft
 #   name: hy_mt2_30b_a3b_sft
+
+ci:
+  # Raise the wall-clock past the 00:10:00 default so the 100-step MoE run
+  # finishes within its SLURM allocation (AM-629).
+  time: "00:30:00"
