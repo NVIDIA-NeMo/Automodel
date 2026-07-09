@@ -56,10 +56,17 @@ def test_review_workflow_has_bounded_trigger_and_dependencies():
         ("config build purity", "must preserve declarative config state"),
         ("modern annotations", "legacy `Optional[T]`, `Union[X, Y]`"),
         ("tensor contract docstrings", "Tensor contract docstrings"),
-        ("semantic tensor layout", "every tensor's semantic shape and axis order"),
+        ("all tensor input functions", "For every new function or method"),
+        ("changed tensor handling", "signature or tensor-handling body is materially changed"),
+        ("test tensor helpers", "production, test, and example code"),
+        ("private tensor helpers", "public APIs; private helpers"),
+        ("nested tensor inputs", "tensors nested in tuples/lists/mappings/dataclasses"),
+        ("semantic tensor layout", "every tensor input and output's semantic shape and axis order"),
+        ("arbitrary tensor layout", "If arbitrary ranks or leading dimensions are accepted"),
         ("distributed tensor layout", "global versus per-rank local shape"),
         ("structured tensor output", "every tensor-bearing field"),
-        ("docstring scope", "specific changed tensor contract whose layout remains ambiguous"),
+        ("local tensor documentation", "own docstring is the default source of truth"),
+        ("docstring scope", "specific changed tensor input whose layout remains ambiguous"),
         ("quality-gate bypass", "Quality-gate bypasses introduced or expanded"),
         ("minimal API surface", "Minimal public API surface"),
         ("API compatibility cost", "long-lived compatibility obligations"),
@@ -111,3 +118,4 @@ def test_review_prompt_does_not_reintroduce_known_false_positive():
     assert _normalize("Do not require annotation cleanup") in _normalize(prompt)
     assert _normalize("(and the `build_*` builders)") not in _normalize(prompt)
     assert _normalize("deterministic seeds") not in _normalize(prompt)
+    assert _normalize("private implementation helpers, or APIs") not in _normalize(prompt)

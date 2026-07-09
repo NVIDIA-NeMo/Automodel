@@ -82,14 +82,23 @@ jobs:
           - ambiguous public signatures: boolean-trap parameters, multiple
             same-typed positional runtime arguments that should be keyword-only,
             or long anonymous tuple returns that need a named typed result.
-        - Tensor contract docstrings. For a new public API, or a materially changed
-          tensor input/output contract on an existing public API, require the
-          Google-style `Args` section and, when values are returned, `Returns`
-          section to document:
-          - every tensor's semantic shape and axis order, with symbolic dimensions
-            defined at first use (for example, `B` = batch, `S` = sequence, `H` =
-            hidden). Flag vague descriptions such as "embedding tensor" or
-            unexplained `[B, S, H]` notation;
+        - Tensor contract docstrings. For every new function or method, or any
+          function/method whose signature or tensor-handling body is materially
+          changed, that accepts a tensor input, require its docstring to document
+          that input's layout. This includes production, test, and example code;
+          public APIs; private helpers; constructors; `forward`/`backward` methods;
+          callbacks; and nested/local functions. This rule does not require general
+          docstrings on test helpers that accept no tensors. Treat `torch.Tensor`,
+          tensor type aliases, `DTensor`,
+          `nn.Parameter`, optional tensors, variadic tensors, and tensors nested in
+          tuples/lists/mappings/dataclasses as tensor inputs. Require the Google-style
+          `Args` section and, when values are returned, `Returns` section to document:
+          - every tensor input and output's semantic shape and axis order, with
+            symbolic dimensions defined at first use (for example, `B` = batch, `S`
+            = sequence, `H` = hidden). Flag vague descriptions such as "embedding
+            tensor" or unexplained `[B, S, H]` notation. If arbitrary ranks or
+            leading dimensions are accepted, state that explicitly and identify the
+            constrained axes (for example, `[..., H]` with `H` = hidden size);
           - nonstandard logical layout such as packed, padded, ragged, flattened,
             interleaved, fused-QKV/GateUp, THD, or channels-first/channels-last, and
             the before/after layout when the API transforms it;
@@ -101,10 +110,13 @@ jobs:
             an output aliases or mutates an input when ownership is not independent;
           - every tensor-bearing field in a tuple, mapping, dataclass, or model
             output, not only the first returned tensor.
-          Do not demand retroactive docstring edits for an unchanged inherited or
-          upstream-imposed contract, private implementation helpers, or APIs whose
-          changed inputs and outputs contain no tensors. A finding must quote the
-          specific changed tensor contract whose layout remains ambiguous.
+          The function or method's own docstring is the default source of truth; a
+          precise reference to a documented base-class or `Protocol` contract is
+          acceptable only when the implementation preserves it exactly. Call-site
+          comments and tests do not replace contract documentation. Do not demand
+          retroactive edits for an untouched function merely because nearby code
+          changed, or for generated/vendored/backport code. A finding must quote the
+          specific changed tensor input whose layout remains ambiguous.
         - Quality-gate bypasses introduced or expanded by changed code. Flag new
           `# noqa`, `# type: ignore`, `# pragma: no cover`, blanket warning
           suppression, `pytest.skip`/`xfail`, or additions to Ruff, `ty`, coverage,
