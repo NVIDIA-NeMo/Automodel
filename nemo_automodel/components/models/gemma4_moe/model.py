@@ -78,6 +78,7 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     CausalLMOutputWithPast = _make_missing("CausalLMOutputWithPast")
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_untied_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
@@ -446,6 +447,26 @@ def _derive_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
     return attention_mask.bool().logical_not()
 
 
+def get_block_sequence_ids_for_mask(mm_token_type_ids: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Map multimodal token-type ids to per-vision-group block ids.
+
+    Vision tokens (type ``1``/``2``) get a 0-based group index; text tokens get
+    ``-1``. The result is passed as ``block_sequence_ids`` to ``create_causal_mask``
+    so tokens within the same vision group attend bidirectionally while text stays
+    causal. Vendored verbatim from ``transformers.models.gemma4.modeling_gemma4``
+    (transformers 5.12.1) to avoid depending on a transformers-internal helper.
+    """
+    mm_token_type_ids = mm_token_type_ids.to(device)
+
+    is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
+    is_prev_vision = torch.roll(is_vision, shifts=1, dims=-1)
+    is_prev_vision[..., 0] = False
+    new_vision_starts = is_vision & ~is_prev_vision
+    vision_group_ids = torch.cumsum(new_vision_starts.int(), dim=1) - 1
+    block_sequence_ids = torch.where(is_vision, vision_group_ids, -1)
+    return block_sequence_ids
+
+
 def _build_packed_gemma4_causal_mask_mapping(
     packed_seq_ids: torch.Tensor,
     mm_token_type_ids: torch.Tensor,
@@ -693,18 +714,27 @@ class Gemma4MoETextModelBackend(nn.Module):
                 flex_block_size=(32, 32) if getattr(self.config, "head_dim", 0) > 256 else 128,
             )
         elif use_vision_bidirectional_mask:
-            from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
+            from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
-            causal_mask_mapping = create_causal_mask_mapping(
-                config=self.config,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-                mm_token_type_ids=mm_token_type_ids,
-                pixel_values=pixel_values,
-                is_training=self.training,
-            )
+            # transformers 5.12 removed gemma4's create_causal_mask_mapping. The
+            # vision-aware behaviour (tokens in the same vision group attend
+            # bidirectionally; text tokens stay causal) is now expressed via
+            # block_sequence_ids passed to the standard mask builders.
+            block_sequence_ids = torch.full(inputs_embeds.shape[:2], -1, device=inputs_embeds.device)
+            if mm_token_type_ids is not None:
+                block_sequence_ids = get_block_sequence_ids_for_mask(mm_token_type_ids, device=inputs_embeds.device)
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+                "block_sequence_ids": block_sequence_ids,
+            }
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
         else:
             from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
@@ -712,7 +742,6 @@ class Gemma4MoETextModelBackend(nn.Module):
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
-                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
@@ -925,6 +954,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     ):
         if not _GEMMA4_HF_AVAILABLE:
             raise UnavailableError("transformers.models.gemma4 is not available.")
+        # Gemma4 is tied by default; untying would need a materialized separate
+        # lm_head NeMo doesn't build, so reject tie_word_embeddings=False up front.
+        reject_unsupported_untied_word_embeddings(config, type(self).__name__)
         backend = backend or BackendConfig()
 
         # Merge text_config overrides (e.g. from YAML) into the proper config
@@ -973,9 +1005,13 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             # Dense Gemma4 — keep vanilla HF model. Attach the model-owned p2p ring
             # CP attention to each HF self-attn so setup_cp_attention can install it
             # when CP is enabled. (The MoE path attaches it per Gemma4MoEDecoderLayer.)
+            # ``cp_full_attn_backend: ffpa`` routes the full-attention head_dim=512
+            # ring chunks through the FFPA CuTeDSL kernel (eligibility re-checked per
+            # call in _ring_use_ffpa_varlen); default "flex" preserves prior behavior.
+            use_ffpa_cp = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower() == "ffpa"
             for module in self.modules():
                 if isinstance(module, Gemma4Attention):
-                    attach_gemma4_cp_ring_attention(module)
+                    attach_gemma4_cp_ring_attention(module, use_ffpa=use_ffpa_cp)
             return
 
         # --- MoE path: replace the text model ---

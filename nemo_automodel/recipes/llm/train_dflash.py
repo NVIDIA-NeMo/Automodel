@@ -63,8 +63,11 @@ from nemo_automodel.recipes.base_recipe import (
     _resolve_restore_from_to_ckpt_dir,
 )
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_compile,
+    apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
+    raise_if_peft_configured,
     should_sync_grads,
 )
 
@@ -129,6 +132,7 @@ class TrainDFlashRecipe(BaseRecipe):
 
         recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
+        raise_if_peft_configured(self.cfg, type(self).__name__)
 
         target_path = recipe_cfg.target_model_name_or_path
         target_config = AutoConfig.from_pretrained(
@@ -153,7 +157,7 @@ class TrainDFlashRecipe(BaseRecipe):
             recipe_cfg.get("target_layer_ids", None)
             or build_target_layer_ids(num_target_layers, draft_num_hidden_layers)
         )
-        self.target_wrapper = HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids)
+        self.target_wrapper = self._build_target_wrapper(target_layer_ids)
 
         self.block_size = int(recipe_cfg.get("block_size", 16))
         self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_config.vocab_size)
@@ -207,6 +211,10 @@ class TrainDFlashRecipe(BaseRecipe):
         draft_config_obj = Qwen3Config.from_dict(draft_config)
         draft_config_obj._attn_implementation = attention_backend
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede the DDP wrap.
+        apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
+        # Optional torch.compile of the draft, in place; after the fp8 swap.
+        apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
 
         trainer_module = self._build_trainer_module(attention_backend, recipe_cfg).to(self.device)
         if self.dist_env.world_size > 1:
@@ -315,6 +323,14 @@ class TrainDFlashRecipe(BaseRecipe):
             return self.dp_mesh.get_group()
         return None
 
+    def _build_target_wrapper(self, target_layer_ids: list[int]) -> HFDFlashTargetModel:
+        """Build the frozen-target hidden-state capture wrapper.
+
+        Subclasses override to capture extra teacher signals (e.g. JetSpec also
+        captures the target logits for its forward-KL distillation).
+        """
+        return HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids)
+
     def _build_dflash_config(self, recipe_cfg, target_layer_ids: list[int]) -> dict:
         """Build the draft ``dflash_config`` block. Subclasses extend it (e.g. Domino)."""
         return {
@@ -332,7 +348,10 @@ class TrainDFlashRecipe(BaseRecipe):
             block_size=self.block_size,
             attention_backend=attention_backend,
             num_anchors=int(recipe_cfg.get("num_anchors", 512)),
-            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
+            # Paper default (Appendix A.1) for the shipped block_size=16 configs;
+            # matches DFlashDecayLoss's own default. Set null explicitly in YAML
+            # to disable the position decay (uniform weighting).
+            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", 7.0),
         )
 
     def _run_trainer_step(self, target_batch):
@@ -637,11 +656,9 @@ class TrainDFlashRecipe(BaseRecipe):
                     loss_mask=batch["loss_mask"],
                 )
                 try:
-                    metrics = self.trainer_module(
-                        input_ids=target_batch.input_ids,
-                        hidden_states=target_batch.hidden_states,
-                        loss_mask=target_batch.loss_mask,
-                    )
+                    # Route through the same seam as training so subclass-specific
+                    # inputs (Domino's lambda_base, JetSpec's target_logits) are wired.
+                    metrics = self._run_trainer_step(target_batch)
                 except NoValidAnchorsError:
                     # Every sample in this micro-batch is too short to form a block;
                     # skip it without counting, mirroring the training loop.

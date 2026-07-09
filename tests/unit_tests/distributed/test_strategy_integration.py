@@ -117,14 +117,14 @@ def test_strategy_selection_nemotron_model():
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])
 @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
 @patch("nemo_automodel.components.distributed.parallelizer.DefaultParallelizationStrategy._shard_modules_recursively")
-@patch("nemo_automodel.components.distributed.parallelizer._extract_model_layers")
+@patch("nemo_automodel.components.distributed.parallelizer._extract_model_layer_groups")
 @patch("nemo_automodel.components.distributed.parallelizer.get_tp_plan")
 def test_backward_compatibility_standard_model(
-    mock_get_plan, mock_extract_layers, mock_shard_modules, mock_fully_shard, mock_gpgr, mock_device_mesh
+    mock_get_plan, mock_extract_layer_groups, mock_shard_modules, mock_fully_shard, mock_gpgr, mock_device_mesh
 ):
     """Test that the refactored code maintains backward compatibility for standard models."""
     mock_fully_shard.side_effect = lambda model, **kwargs: model
-    mock_extract_layers.return_value = []
+    mock_extract_layer_groups.return_value = {"language": []}
     mock_get_plan.return_value = {}
 
     model = MockStandardModel()
@@ -140,7 +140,7 @@ def test_backward_compatibility_standard_model(
     assert result is model
 
     # Should have called the expected functions for standard flow
-    mock_extract_layers.assert_called_once_with(model)
+    mock_extract_layer_groups.assert_called_once_with(model)
     mock_shard_modules.assert_called_once()
     mock_fully_shard.assert_called()
 
@@ -186,6 +186,7 @@ def test_function_signature_preserved():
         "offload_policy",
         "sequence_parallel",
         "activation_checkpointing",
+        "activation_checkpointing_scope",
         "tp_shard_plan",
         "dp_replicate_mesh_name",
         "dp_shard_cp_mesh_name",
@@ -209,8 +210,13 @@ def test_no_runtime_errors_with_different_model_types(mock_device_mesh):
         ),
         patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"),
     ):
-        with patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively"):
-            with patch("nemo_automodel.components.distributed.parallelizer._extract_model_layers", return_value=[]):
+        with patch(
+            "nemo_automodel.components.distributed.parallelizer.DefaultParallelizationStrategy._shard_modules_recursively"
+        ):
+            with patch(
+                "nemo_automodel.components.distributed.parallelizer._extract_model_layer_groups",
+                return_value={"language": []},
+            ):
                 with patch("nemo_automodel.components.distributed.parallelizer.get_tp_plan", return_value={}):
                     # Test standard model
                     standard_model = MockStandardModel()

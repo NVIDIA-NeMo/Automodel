@@ -86,7 +86,7 @@ dependencies = [
     "tiktoken",
     "torch>=2.6.0",
     "torchdata",
-    "transformers==5.8.1",
+    "transformers==5.12.1",
     "wandb>=0.28.0",
     "torchao",
     "mlflow",
@@ -129,6 +129,7 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
+ffpa = ["ffpa-attn>=0.1.19"]
 fla = [
     "flash-linear-attention>=0.4.2",
 ]
@@ -162,6 +163,7 @@ msc = [
     "multi-storage-client>=0.13",
 ]
 vlm-media = [
+    "albumentations",  # required by nemotron-parse processor remote code; pulls opencv-python-headless
     "opencv-python-headless==4.10.0.84",
     "decord; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "qwen-omni-utils",
@@ -506,6 +508,8 @@ allowed-unresolved-imports = [
     "deep_ep.**",
     "dion",
     "fast_hadamard_transform",
+    "ffpa_attn",
+    "ffpa_attn.**",
     "fla.**",
     "flash_attn",
     "grouped_gemm",

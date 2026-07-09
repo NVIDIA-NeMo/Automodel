@@ -28,12 +28,16 @@ native ``encode``/``decode`` building blocks with the fork's **inference** mask
 apples. The block-causal training mask is covered by
 ``test_diffusion_gemma_mask.py``.
 
-Requires the fork (``transformers.models.diffusion_gemma``), which lives only
-in the pinned 5.8-dev wheel; the whole module is skipped otherwise so it does
-not break collection on a stock-transformers environment.
+Requires the ``transformers`` ``diffusion_gemma`` model -- either the pinned
+5.8-dev fork or mainline transformers >= 5.11 (which upstreamed it). The whole
+module is skipped when it is absent so it does not break collection on a
+stock-transformers environment. ``diffusion_gemma`` is multimodal; the reference
+is built with a tiny throwaway vision tower (see ``_tiny_vision_config_dict``)
+and compared on the text path only.
 """
 
 import importlib.util
+import inspect
 import re
 
 import pytest
@@ -80,13 +84,40 @@ def _tiny_text_config_dict() -> dict:
     )
 
 
+def _tiny_vision_config_dict() -> dict:
+    """Tiny ``gemma4_vision`` config so the multimodal reference can be built.
+
+    ``diffusion_gemma`` is a multimodal architecture. The pinned 5.8-dev fork
+    guarded the vision tower (``vision_config=None`` -> ``vision_tower=None``),
+    but mainline transformers (>= 5.11) dropped that guard and unconditionally
+    runs ``vision_tower = AutoModel.from_config(config.vision_config)``, so the
+    reference can no longer be constructed with ``vision_config=None``. Hand it a
+    *tiny* vision tower instead: it is built but never exercised -- both models
+    are compared on the text path only (no ``pixel_values``), the native model
+    ignores ``vision_config`` entirely, and the adapter drops all
+    ``model.encoder.*`` (vision) weights -- so it cannot perturb the comparison.
+    """
+    return dict(
+        model_type="gemma4_vision",
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=16,
+        patch_size=16,
+        position_embedding_size=64,
+        pooling_kernel_size=1,
+    )
+
+
 def _build_fork_model(text_cfg: dict):
     from transformers.models.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaConfig
     from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
         DiffusionGemmaForBlockDiffusion,
     )
 
-    config = DiffusionGemmaConfig(text_config=dict(text_cfg), vision_config=None, canvas_length=8)
+    config = DiffusionGemmaConfig(text_config=dict(text_cfg), vision_config=_tiny_vision_config_dict(), canvas_length=8)
     config._attn_implementation = "eager"
     model = DiffusionGemmaForBlockDiffusion(config).to(torch.float32).eval()
     return model, config
@@ -100,7 +131,7 @@ def _build_native_model(text_cfg: dict):
 
     # The native model now reuses the fork's config; self_conditioning/freeze_router are
     # model-construction flags (not strict config fields), so pass them to the model.
-    config = DiffusionGemmaConfig(text_config=dict(text_cfg), vision_config=None, canvas_length=8)
+    config = DiffusionGemmaConfig(text_config=dict(text_cfg), vision_config=_tiny_vision_config_dict(), canvas_length=8)
     backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch_fp32", enable_hf_state_dict_adapter=True)
     model = (
         DiffusionGemmaForBlockDiffusion(config, backend=backend, self_conditioning=True, freeze_router=False)
@@ -179,7 +210,15 @@ def test_forward_parity_with_fork():
     canvas_ids = torch.randint(0, vocab, (batch_size, canvas_len))
 
     with torch.no_grad():
-        fork_out = fork_model(input_ids=input_ids, canvas_ids=canvas_ids, self_conditioning_logits=None)
+        # ``canvas_ids`` was renamed ``decoder_input_ids`` when diffusion_gemma was
+        # upstreamed (5.8-dev fork -> mainline >= 5.11); pick whichever kwarg this
+        # transformers exposes so the test is version-agnostic.
+        canvas_kwarg = (
+            "decoder_input_ids"
+            if "decoder_input_ids" in inspect.signature(fork_model.forward).parameters
+            else "canvas_ids"
+        )
+        fork_out = fork_model(input_ids=input_ids, self_conditioning_logits=None, **{canvas_kwarg: canvas_ids})
         fork_logits = fork_out.logits
 
         # Native: drive the building blocks with the fork's inference mask

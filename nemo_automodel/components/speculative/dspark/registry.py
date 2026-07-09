@@ -22,8 +22,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from transformers import PreTrainedModel
+from torch import nn
 
+from nemo_automodel.components.speculative.dspark.draft_deepseek_v4 import DeepseekV4DSparkModel
+from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSparkModel
+from nemo_automodel.components.speculative.dspark.draft_glm_5_2 import Glm5_2DSparkModel
+from nemo_automodel.components.speculative.dspark.draft_minimax_m3 import MiniMaxM3DSparkModel
 from nemo_automodel.components.speculative.dspark.draft_qwen3 import Qwen3DSparkModel
 
 
@@ -31,7 +35,9 @@ from nemo_automodel.components.speculative.dspark.draft_qwen3 import Qwen3DSpark
 class DraftSpec:
     """How to build a DSpark draft model for a particular target architecture."""
 
-    draft_cls: type[PreTrainedModel]
+    # Constructed as ``draft_cls(draft_config)``; some drafts are HF PreTrainedModel
+    # subclasses (Qwen3, Gemma4) while others are plain modules (V4, GLM, MiniMax M3).
+    draft_cls: type[nn.Module]
 
 
 # Qwen3-style dense (and MoE) targets: the draft only consumes the target's
@@ -44,6 +50,22 @@ _DENSE_ARCHITECTURES: tuple[str, ...] = (
 DSPARK_DRAFT_REGISTRY: dict[str, DraftSpec] = {
     arch: DraftSpec(draft_cls=Qwen3DSparkModel) for arch in _DENSE_ARCHITECTURES
 }
+# DeepSeek V4 target: a V4-attention draft (Q-LoRA, single shared K=V latent,
+# grouped O-LoRA, interleaved partial RoPE), registered separately from the
+# Qwen3-style drafts because its backbone differs.
+DSPARK_DRAFT_REGISTRY["DeepseekV4ForCausalLM"] = DraftSpec(draft_cls=DeepseekV4DSparkModel)
+# GLM-5.2 target (HF arch GlmMoeDsaForCausalLM): a dense GLM MLA draft (DeepSeek-V3-style
+# Q-LoRA + compressed KV latent + interleaved complex RoPE), with the DSA indexer and MoE
+# dropped. Registered separately because its MLA backbone differs from V4's.
+DSPARK_DRAFT_REGISTRY["GlmMoeDsaForCausalLM"] = DraftSpec(draft_cls=Glm5_2DSparkModel)
+# Gemma4 targets: the MoE VLM (model_type "gemma4") and the encoder-free unified model
+# (model_type "gemma4_unified") share one dense Gemma4 draft built from the target's
+# text sub-config.
+DSPARK_DRAFT_REGISTRY["Gemma4ForConditionalGeneration"] = DraftSpec(draft_cls=Gemma4DSparkModel)
+DSPARK_DRAFT_REGISTRY["Gemma4UnifiedForConditionalGeneration"] = DraftSpec(draft_cls=Gemma4DSparkModel)
+# MiniMax M3 VL target (model_type "minimax_m3_vl"): a dense text-only draft built from
+# the target's text sub-config.
+DSPARK_DRAFT_REGISTRY["MiniMaxM3SparseForConditionalGeneration"] = DraftSpec(draft_cls=MiniMaxM3DSparkModel)
 
 
 def resolve_dspark_draft_spec(architectures: list[str]) -> DraftSpec:
