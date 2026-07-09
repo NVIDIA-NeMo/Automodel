@@ -8,16 +8,11 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
+  id-token: write
 
 jobs:
   claude-review:
-    if: |
-      github.event.issue.pull_request &&
-      github.event.comment.body == '/claude review'
-    concurrency:
-      group: claude-review-${{ github.event.issue.number }}-${{ github.actor }}
-      cancel-in-progress: true
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@0aeb3fffafb8917eccdce94fea160557db4bafab # v1.7.1
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@v1.7.0
     with:
       model: ${{ vars.CLAUDE_MODEL }}
       prompt: |

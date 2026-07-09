@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
 from pathlib import Path
 
 import pytest
@@ -31,14 +30,15 @@ def _review_job() -> dict:
     return workflow["jobs"]["claude-review"]
 
 
-def test_review_workflow_has_bounded_trigger_and_dependencies():
+def test_review_workflow_keeps_main_caller_wiring():
+    workflow = yaml.safe_load(WORKFLOW_PATH.read_text())
     job = _review_job()
 
-    assert "github.event.comment.body == '/claude review'" in job["if"]
-    assert job["concurrency"]["cancel-in-progress"] is True
-    assert "${{ github.actor }}" in job["concurrency"]["group"]
+    assert workflow["permissions"]["id-token"] == "write"
+    assert "if" not in job
+    assert "concurrency" not in job
     assert job["with"]["model"] == "${{ vars.CLAUDE_MODEL }}"
-    assert re.search(r"_claude_review\.yml@[0-9a-f]{40}(?:\s|$)", job["uses"])
+    assert job["uses"] == "NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@v1.7.0"
 
 
 @pytest.mark.parametrize(
