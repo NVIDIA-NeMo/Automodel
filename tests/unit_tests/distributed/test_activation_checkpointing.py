@@ -94,10 +94,24 @@ class _RecordingVisionBlock(nn.Module):
         return x + self.mlp(out)
 
 
-class _VisionModel(nn.Module):
-    def __init__(self, num_blocks: int = 1):
+class _DropoutVisionBlock(nn.Module):
+    """Minimal vision block with dropout, exercising RNG-state handling across recompute."""
+
+    def __init__(self):
         super().__init__()
-        self.blocks = nn.ModuleList(_RecordingVisionBlock() for _ in range(num_blocks))
+        self.attn = nn.Linear(_D, _D)
+        self.dropout = nn.Dropout(0.5)
+        self.mlp = nn.Linear(_D, _D)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply attention proxy + dropout + MLP to patch embeddings of shape ``[S, H]``."""
+        return x + self.mlp(self.dropout(self.attn(x)))
+
+
+class _VisionModel(nn.Module):
+    def __init__(self, num_blocks: int = 1, block_cls: type[nn.Module] = _RecordingVisionBlock):
+        super().__init__()
+        self.blocks = nn.ModuleList(block_cls() for _ in range(num_blocks))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply all vision blocks to patch embeddings of shape ``[S, H]``, returning ``[S, H]``."""
@@ -145,6 +159,32 @@ def test_apply_vision_block_checkpointing_recomputes_under_math_and_matches_refe
         assert torch.allclose(got.grad, want.grad)
 
 
+def test_apply_vision_block_checkpointing_preserves_dropout_rng_on_recompute():
+    """Backward recompute must redraw the forward's dropout mask, or gradients silently corrupt."""
+    model = _VisionModel(block_cls=_DropoutVisionBlock)
+    reference = copy.deepcopy(model)
+    model.train()
+    reference.train()
+
+    ac.apply_vision_block_checkpointing(model, list(model.blocks))
+    assert isinstance(model.blocks[0], CheckpointWrapper)
+
+    x = torch.randn(64, _D)
+    torch.manual_seed(1234)
+    out = model(x)
+    out.sum().backward()
+
+    torch.manual_seed(1234)
+    ref_out = reference(x)
+    ref_out.sum().backward()
+
+    # Same seed -> same forward mask; grads only match if the recompute (which runs
+    # after the global RNG has advanced) restores the checkpoint-time RNG state.
+    assert torch.allclose(out, ref_out)
+    for got, want in zip(model.parameters(), reference.parameters()):
+        assert torch.allclose(got.grad, want.grad)
+
+
 def test_apply_vision_block_checkpointing_flash_attention_config_wraps_mlp_only():
     model = _VisionModel()
     model.config = SimpleNamespace(vision_config=SimpleNamespace(_attn_implementation="flash_attention_2"))
@@ -164,3 +204,17 @@ def test_apply_vision_block_checkpointing_detects_flash_attention_on_blocks():
 
     assert not isinstance(model.blocks[0], CheckpointWrapper)
     assert isinstance(model.blocks[0].mlp, CheckpointWrapper)
+
+
+def test_apply_vision_block_checkpointing_detects_kernel_hub_flash_attention():
+    """transformers-5 kernel-hub identifiers must also route to the MLP-only path."""
+    model = _VisionModel()
+    model.config = SimpleNamespace(
+        vision_config=SimpleNamespace(_attn_implementation="kernels-community/vllm-flash-attn3")
+    )
+
+    ac.apply_vision_block_checkpointing(model, list(model.blocks))
+
+    assert not isinstance(model.blocks[0], CheckpointWrapper)
+    assert isinstance(model.blocks[0].mlp, CheckpointWrapper)
+    assert not isinstance(model.blocks[0].attn, CheckpointWrapper)

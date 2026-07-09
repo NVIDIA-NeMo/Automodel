@@ -404,7 +404,12 @@ def _vision_math_sdpa_context_fn():
 
 
 def _vision_blocks_use_external_flash_attention(model: nn.Module, layers: list[nn.Module]) -> bool:
-    """Return whether vision blocks dispatch attention through an external FlashAttention package."""
+    """Return whether vision blocks dispatch attention through an external FlashAttention package.
+
+    Matches both classic HF identifiers (``flash_attention_2``/``flash_attention_3``)
+    and transformers-5 kernel-hub identifiers (e.g. ``kernels-community/flash-attn3``,
+    ``kernels-community/vllm-flash-attn3``) via case-insensitive substring match.
+    """
     implementations: set[str] = set()
     for cfg in (
         getattr(getattr(model, "config", None), "vision_config", None),
@@ -418,7 +423,7 @@ def _vision_blocks_use_external_flash_attention(model: nn.Module, layers: list[n
         impl = str(getattr(attn_cfg, "_attn_implementation", "") or "").strip().lower()
         if impl:
             implementations.add(impl)
-    return any(impl.startswith("flash") for impl in implementations)
+    return any("flash" in impl for impl in implementations)
 
 
 def apply_vision_block_checkpointing(model: nn.Module, layers: list[nn.Module]) -> None:
@@ -426,11 +431,14 @@ def apply_vision_block_checkpointing(model: nn.Module, layers: list[nn.Module]) 
 
     The plain ``checkpoint_wrapper`` spec used for decoder blocks cannot
     recompute HF-style vision attention: fused SDPA kernel behavior is not
-    stable across checkpoint recompute, and the resulting metadata mismatch
-    trips the wrapper's determinism check with a ``CheckpointError``. Each
-    block is instead wrapped non-reentrantly without RNG-state preservation or
-    determinism checks, with the MATH SDPA backend pinned on both the
-    checkpoint forward and its recompute via ``context_fn``.
+    stable across checkpoint recompute (the cuDNN kernel fails on CPU-resident
+    philox seeds and the mem-efficient kernel loses ops from checkpoint
+    storage). Each block is instead wrapped non-reentrantly with the MATH SDPA
+    backend pinned on both the checkpoint forward and its recompute via
+    ``context_fn``, which keeps the recompute kernel-identical to the forward.
+    RNG state is preserved so dropout/DropPath-bearing towers draw the same
+    mask on recompute as on the forward, and the wrapper's default determinism
+    check stays on.
 
     Vision towers running external FlashAttention kernels dispatch attention
     outside the SDPA backend context, and replaying the FlashAttention forward
@@ -456,8 +464,7 @@ def apply_vision_block_checkpointing(model: nn.Module, layers: list[nn.Module]) 
         wrapped_block = checkpoint_wrapper(
             block,
             checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-            preserve_rng_state=False,
-            determinism_check="none",
+            preserve_rng_state=True,
             context_fn=_vision_math_sdpa_context_fn,
         )
         if not _replace_child_module(model, block, wrapped_block):
