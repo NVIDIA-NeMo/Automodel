@@ -104,7 +104,12 @@ def test_parallelize_world_size_gt_one_selects_tp_plan_passes_dims_and_warns_on_
     monkeypatch.setattr(mfsdp, "_get_parallel_plan", get_plan_mock, raising=True)
     monkeypatch.setattr(mfsdp, "megatron_fsdp_strategy_parallelize", strat_mock, raising=True)
 
-    mgr = _make_manager(mesh, activation_checkpointing=True, zero_dp_strategy=2)
+    mgr = _make_manager(
+        mesh,
+        activation_checkpointing=True,
+        zero_dp_strategy=2,
+        report_nan_in_param_grad=True,
+    )
 
     caplog.set_level(logging.ERROR)
     out_model, out_opt = mgr.parallelize(model=object(), optimizer="opt")
@@ -130,6 +135,8 @@ def test_parallelize_world_size_gt_one_selects_tp_plan_passes_dims_and_warns_on_
     assert strat_kwargs["tp_shard_plan"] == tp_plan
     assert strat_kwargs["dp_shard_dim"] == "dp_cp"
     assert strat_kwargs["tp_dim"] == "tp"
+    assert strat_kwargs["check_for_nan_in_grad"] is True
+    assert strat_kwargs["report_nan_in_param_grad"] is True
 
 
 def test_parallelize_world_size_gt_one_skips_tp_plan_when_tp_size_is_one(monkeypatch, capsys):

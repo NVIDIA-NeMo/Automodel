@@ -82,6 +82,7 @@ class MegatronFSDPManager:
         self.overlap_grad_reduce = config.overlap_grad_reduce
         self.overlap_param_gather = config.overlap_param_gather
         self.check_for_nan_in_grad = config.check_for_nan_in_grad
+        self.report_nan_in_param_grad = config.report_nan_in_param_grad
         self.average_in_collective = config.average_in_collective
         self.disable_bucketing = config.disable_bucketing
         self.calculate_per_token_loss = config.calculate_per_token_loss
@@ -160,6 +161,7 @@ class MegatronFSDPManager:
             overlap_grad_reduce=self.overlap_grad_reduce,
             overlap_param_gather=self.overlap_param_gather,
             check_for_nan_in_grad=self.check_for_nan_in_grad,
+            report_nan_in_param_grad=self.report_nan_in_param_grad,
             average_in_collective=self.average_in_collective,
             disable_bucketing=self.disable_bucketing,
             calculate_per_token_loss=self.calculate_per_token_loss,

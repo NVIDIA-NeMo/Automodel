@@ -14,7 +14,7 @@
 
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 import torch
@@ -36,6 +36,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     _extract_model_layers,
     _filter_layer_groups_for_activation_checkpointing,
     _get_parallel_plan,
+    _megatron_fsdp_compat_kwargs,
     _update_attention_head_counts_for_tp,
     apply_fsdp2_sharding_recursively,
     get_hf_tp_shard_plan,
@@ -396,9 +397,57 @@ class TestMegatronFSDPStrategyParallelize:
     @pytest.fixture
     def mock_megatron_fsdp_env(self, monkeypatch):
         """Mock Megatron FSDP environment and dependencies."""
+
+        def legacy_fully_shard(
+            *,
+            module,
+            optimizer,
+            fsdp_unit_modules,
+            device_mesh,
+            dp_shard_dim,
+            tp_dim,
+            zero_dp_strategy,
+            init_model_with_meta_device,
+            grad_reduce_in_fp32,
+            preserve_fp32_weights,
+            overlap_grad_reduce,
+            overlap_param_gather,
+            check_for_nan_in_grad,
+            average_in_collective,
+            disable_bucketing,
+            calculate_per_token_loss,
+            keep_fp8_transpose_cache,
+            nccl_ub,
+            fsdp_double_buffer,
+        ):
+            del (
+                module,
+                optimizer,
+                fsdp_unit_modules,
+                device_mesh,
+                dp_shard_dim,
+                tp_dim,
+                zero_dp_strategy,
+                init_model_with_meta_device,
+                grad_reduce_in_fp32,
+                preserve_fp32_weights,
+                overlap_grad_reduce,
+                overlap_param_gather,
+                check_for_nan_in_grad,
+                average_in_collective,
+                disable_bucketing,
+                calculate_per_token_loss,
+                keep_fp8_transpose_cache,
+                nccl_ub,
+                fsdp_double_buffer,
+            )
+
         # Mock megatron_fsdp module
         megatron_fsdp_mock = SimpleNamespace()
-        megatron_fsdp_mock.fully_shard = MagicMock(return_value=(MagicMock(), None))
+        megatron_fsdp_mock.fully_shard = create_autospec(
+            legacy_fully_shard,
+            return_value=(MagicMock(), None),
+        )
 
         # Mock HAVE_MEGATRON_FSDP flag
         monkeypatch.setattr(
@@ -556,6 +605,209 @@ class TestMegatronFSDPStrategyParallelize:
                 model=model,
                 device_mesh=mesh,
             )
+
+    @pytest.mark.parametrize("grad_reduce_in_fp32", [False, True])
+    @pytest.mark.parametrize("preserve_fp32_weights", [False, True])
+    @pytest.mark.parametrize("check_for_nan_in_grad", [False, True])
+    @pytest.mark.parametrize("report_nan_in_param_grad", [False, True])
+    def test_megatron_fsdp_current_precision_controls_preserve_legacy_semantics(
+        self,
+        monkeypatch,
+        grad_reduce_in_fp32,
+        preserve_fp32_weights,
+        check_for_nan_in_grad,
+        report_nan_in_param_grad,
+    ):
+        class FakeMixedPrecisionPolicy:
+            def __init__(
+                self,
+                *,
+                main_params_dtype,
+                main_grads_dtype,
+                grad_comm_dtype,
+            ):
+                self.main_params_dtype = main_params_dtype
+                self.main_grads_dtype = main_grads_dtype
+                self.grad_comm_dtype = grad_comm_dtype
+
+        def modern_fully_shard(*, mixed_precision_policy, report_nan_in_param_grad):
+            del mixed_precision_policy, report_nan_in_param_grad
+
+        monkeypatch.setattr(
+            parallelizer,
+            "MegatronFSDPMixedPrecisionPolicy",
+            FakeMixedPrecisionPolicy,
+            raising=True,
+        )
+        kwargs = _megatron_fsdp_compat_kwargs(
+            modern_fully_shard,
+            grad_reduce_in_fp32=grad_reduce_in_fp32,
+            preserve_fp32_weights=preserve_fp32_weights,
+            check_for_nan_in_grad=check_for_nan_in_grad,
+            report_nan_in_param_grad=report_nan_in_param_grad,
+        )
+
+        assert set(kwargs) == {
+            "mixed_precision_policy",
+            "report_nan_in_param_grad",
+        }
+        policy = kwargs["mixed_precision_policy"]
+        assert policy.main_params_dtype is (torch.float32 if preserve_fp32_weights else None)
+        assert policy.main_grads_dtype is (torch.float32 if grad_reduce_in_fp32 else None)
+        assert policy.grad_comm_dtype is None
+        assert kwargs["report_nan_in_param_grad"] is report_nan_in_param_grad
+
+    def test_megatron_fsdp_legacy_precision_controls_remain_unchanged(self):
+        def legacy_fully_shard(
+            *,
+            grad_reduce_in_fp32,
+            preserve_fp32_weights,
+            check_for_nan_in_grad,
+        ):
+            del grad_reduce_in_fp32, preserve_fp32_weights, check_for_nan_in_grad
+
+        assert _megatron_fsdp_compat_kwargs(
+            legacy_fully_shard,
+            grad_reduce_in_fp32=True,
+            preserve_fp32_weights=False,
+            check_for_nan_in_grad=True,
+            report_nan_in_param_grad=False,
+        ) == {
+            "grad_reduce_in_fp32": True,
+            "preserve_fp32_weights": False,
+            "check_for_nan_in_grad": True,
+        }
+
+    def test_megatron_fsdp_unknown_precision_api_fails_closed(self):
+        def unknown_fully_shard(**kwargs):
+            del kwargs
+
+        with pytest.raises(RuntimeError, match="unsupported Megatron-FSDP fully_shard API"):
+            _megatron_fsdp_compat_kwargs(
+                unknown_fully_shard,
+                grad_reduce_in_fp32=False,
+                preserve_fp32_weights=False,
+                check_for_nan_in_grad=False,
+                report_nan_in_param_grad=False,
+            )
+
+    @pytest.mark.parametrize("with_optimizer", [False, True])
+    def test_megatron_fsdp_current_strict_signature_for_model_and_optimizer_paths(
+        self,
+        monkeypatch,
+        mock_device_mesh_megatron_fsdp,
+        mock_megatron_fsdp_env,
+        with_optimizer,
+    ):
+        calls = []
+
+        class FakeMixedPrecisionPolicy:
+            def __init__(
+                self,
+                *,
+                main_params_dtype,
+                main_grads_dtype,
+                grad_comm_dtype,
+            ):
+                self.main_params_dtype = main_params_dtype
+                self.main_grads_dtype = main_grads_dtype
+                self.grad_comm_dtype = grad_comm_dtype
+
+        class ShardedModel:
+            def __init__(self):
+                self.replaced = False
+
+            def _replace_param_with_distributed_if_needed(self):
+                self.replaced = True
+
+        def record_modern_call(
+            *,
+            module,
+            fsdp_unit_modules,
+            device_mesh,
+            dp_shard_dim,
+            tp_dim,
+            zero_dp_strategy,
+            init_model_with_meta_device,
+            mixed_precision_policy,
+            overlap_grad_reduce,
+            overlap_param_gather,
+            report_nan_in_param_grad,
+            average_in_collective,
+            disable_bucketing,
+            calculate_per_token_loss,
+            keep_fp8_transpose_cache,
+            nccl_ub,
+            fsdp_double_buffer,
+        ):
+            calls.append(locals())
+            return ShardedModel()
+
+        def record_modern_call_with_optimizer(
+            *,
+            module,
+            optimizer,
+            fsdp_unit_modules,
+            device_mesh,
+            dp_shard_dim,
+            tp_dim,
+            zero_dp_strategy,
+            init_model_with_meta_device,
+            mixed_precision_policy,
+            overlap_grad_reduce,
+            overlap_param_gather,
+            report_nan_in_param_grad,
+            average_in_collective,
+            disable_bucketing,
+            calculate_per_token_loss,
+            keep_fp8_transpose_cache,
+            nccl_ub,
+            fsdp_double_buffer,
+        ):
+            calls.append(locals())
+            return ShardedModel(), optimizer
+
+        monkeypatch.setattr(
+            parallelizer,
+            "MegatronFSDPMixedPrecisionPolicy",
+            FakeMixedPrecisionPolicy,
+            raising=True,
+        )
+        monkeypatch.setattr(
+            parallelizer,
+            "megatron_fsdp_fully_shard_model",
+            record_modern_call,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            parallelizer,
+            "megatron_fsdp_fully_shard",
+            record_modern_call_with_optimizer,
+            raising=False,
+        )
+
+        mesh, *_ = mock_device_mesh_megatron_fsdp
+        optimizer = object() if with_optimizer else None
+        result_model, result_optimizer = megatron_fsdp_strategy_parallelize(
+            model=MockModel(),
+            device_mesh=mesh,
+            optimizer=optimizer,
+            grad_reduce_in_fp32=True,
+            preserve_fp32_weights=False,
+            check_for_nan_in_grad=True,
+            report_nan_in_param_grad=False,
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["mixed_precision_policy"].main_params_dtype is None
+        assert calls[0]["mixed_precision_policy"].main_grads_dtype is torch.float32
+        assert calls[0]["mixed_precision_policy"].grad_comm_dtype is None
+        assert calls[0]["report_nan_in_param_grad"] is False
+        assert result_optimizer is optimizer
+        if with_optimizer:
+            assert calls[0]["optimizer"] is optimizer
+        else:
+            assert result_model.replaced is True
 
 
 class TestUtilityFunctions:
@@ -786,6 +1038,7 @@ class TestApplyFsdpShardingRecursively:
     def mock_mesh(self):
         """Create a mock device mesh."""
         mesh = MagicMock(spec=DeviceMesh)
+        mesh.mesh_dim_names = ("dp", "tp")
         return mesh
 
     @pytest.fixture

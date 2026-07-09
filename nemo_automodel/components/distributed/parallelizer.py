@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import inspect
 import logging
 import warnings
 from abc import ABC, abstractmethod
@@ -121,8 +122,16 @@ try:
     from megatron_fsdp import fully_shard as megatron_fsdp_fully_shard
     from megatron_fsdp import fully_shard_model as megatron_fsdp_fully_shard_model
 
+    try:
+        from megatron_fsdp import (
+            MixedPrecisionPolicy as MegatronFSDPMixedPrecisionPolicy,
+        )
+    except ImportError:
+        MegatronFSDPMixedPrecisionPolicy = None
+
     HAVE_MEGATRON_FSDP = True
 except (ImportError, FileNotFoundError, OSError):
+    MegatronFSDPMixedPrecisionPolicy = None
     pass
 
 # Import as module so tests can patch nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype
@@ -2159,6 +2168,63 @@ def fsdp2_strategy_parallelize(
     )
 
 
+def _megatron_fsdp_compat_kwargs(
+    shard_fn,
+    *,
+    grad_reduce_in_fp32: bool,
+    preserve_fp32_weights: bool,
+    check_for_nan_in_grad: bool,
+    report_nan_in_param_grad: bool,
+) -> Dict[str, Any]:
+    """Translate legacy precision controls to the installed Megatron-FSDP API.
+
+    Megatron-FSDP 0.4 replaced the two legacy precision booleans with a
+    ``MixedPrecisionPolicy`` and added a more expensive per-parameter NaN
+    reporter. Use the callable signature instead of a package-version guess,
+    and keep the modern reporter as a separate opt-in rather than silently
+    enabling it from the legacy buffer-check setting.
+    """
+    try:
+        parameters = inspect.signature(shard_fn).parameters
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("cannot determine the installed Megatron-FSDP fully_shard API") from exc
+
+    legacy_names = {
+        "grad_reduce_in_fp32",
+        "preserve_fp32_weights",
+        "check_for_nan_in_grad",
+    }
+    modern_names = {"mixed_precision_policy", "report_nan_in_param_grad"}
+    if legacy_names.issubset(parameters):
+        return {
+            "grad_reduce_in_fp32": grad_reduce_in_fp32,
+            "preserve_fp32_weights": preserve_fp32_weights,
+            "check_for_nan_in_grad": check_for_nan_in_grad,
+        }
+
+    if modern_names.issubset(parameters):
+        if MegatronFSDPMixedPrecisionPolicy is None:
+            raise RuntimeError(
+                "installed Megatron-FSDP exposes its current precision API but does not export MixedPrecisionPolicy"
+            )
+        return {
+            "mixed_precision_policy": MegatronFSDPMixedPrecisionPolicy(
+                main_params_dtype=torch.float32 if preserve_fp32_weights else None,
+                main_grads_dtype=torch.float32 if grad_reduce_in_fp32 else None,
+                # In current Megatron-FSDP, None makes communication use the main
+                # gradient dtype, matching the legacy grad_reduce_in_fp32 flag.
+                grad_comm_dtype=None,
+            ),
+            "report_nan_in_param_grad": report_nan_in_param_grad,
+        }
+
+    raise RuntimeError(
+        "unsupported Megatron-FSDP fully_shard API: expected either legacy "
+        f"arguments {sorted(legacy_names)!r} or current arguments "
+        f"{sorted(modern_names)!r}; got {sorted(parameters)!r}"
+    )
+
+
 def megatron_fsdp_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
@@ -2172,6 +2238,7 @@ def megatron_fsdp_strategy_parallelize(
     overlap_grad_reduce: bool = True,
     overlap_param_gather: bool = True,
     check_for_nan_in_grad: bool = True,
+    report_nan_in_param_grad: bool = False,
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
@@ -2209,6 +2276,9 @@ def megatron_fsdp_strategy_parallelize(
             forward computation.
         check_for_nan_in_grad (bool): Whether to check gradients for NaNs/Infs
             before applying the optimizer step.
+        report_nan_in_param_grad (bool): Whether current Megatron-FSDP should
+            perform its precise per-parameter gradient NaN check. Disabled by
+            default because it can significantly reduce training throughput.
         average_in_collective (bool): Perform gradient averaging inside the
             collective operation instead of dividing afterward.
         disable_bucketing (bool): Disable gradient bucketing; gradients are
@@ -2287,11 +2357,8 @@ def megatron_fsdp_strategy_parallelize(
         tp_dim=tp_dim,
         zero_dp_strategy=zero_dp_strategy,
         init_model_with_meta_device=init_fsdp_with_meta_device,
-        grad_reduce_in_fp32=grad_reduce_in_fp32,
-        preserve_fp32_weights=preserve_fp32_weights,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
-        check_for_nan_in_grad=check_for_nan_in_grad,
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,
         calculate_per_token_loss=calculate_per_token_loss,
@@ -2300,8 +2367,26 @@ def megatron_fsdp_strategy_parallelize(
         fsdp_double_buffer=fsdp_double_buffer,
     )
     if optimizer is not None:
+        fsdp_kwargs.update(
+            _megatron_fsdp_compat_kwargs(
+                megatron_fsdp_fully_shard,
+                grad_reduce_in_fp32=grad_reduce_in_fp32,
+                preserve_fp32_weights=preserve_fp32_weights,
+                check_for_nan_in_grad=check_for_nan_in_grad,
+                report_nan_in_param_grad=report_nan_in_param_grad,
+            )
+        )
         model, optimizer = megatron_fsdp_fully_shard(module=model, optimizer=optimizer, **fsdp_kwargs)
     else:
+        fsdp_kwargs.update(
+            _megatron_fsdp_compat_kwargs(
+                megatron_fsdp_fully_shard_model,
+                grad_reduce_in_fp32=grad_reduce_in_fp32,
+                preserve_fp32_weights=preserve_fp32_weights,
+                check_for_nan_in_grad=check_for_nan_in_grad,
+                report_nan_in_param_grad=report_nan_in_param_grad,
+            )
+        )
         model = megatron_fsdp_fully_shard_model(module=model, **fsdp_kwargs)
         model._replace_param_with_distributed_if_needed()
 
