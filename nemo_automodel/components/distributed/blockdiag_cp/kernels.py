@@ -20,7 +20,14 @@ import logging
 
 import torch
 
+from nemo_automodel.shared.import_utils import safe_import_from, safe_import_te
+
 logger = logging.getLogger(__name__)
+
+# Availability probes only -- the kernel symbols themselves are imported at the
+# call sites so a per-call stub (tests) or lazy TE extension load keeps working.
+HAS_FLASH_VARLEN, _ = safe_import_from("flash_attn", "flash_attn_varlen_func")
+HAS_TE, _ = safe_import_te()
 
 _CP_FLASH_DETERMINISTIC = False
 _CP_FLASH_WARNED = False
@@ -57,16 +64,12 @@ def _varlen_backend_unavailable_reason(
     if device.type != "cuda":
         return f"varlen CP attention requires CUDA, got device={device}"
     if backend == "flash":
-        try:
-            from flash_attn import flash_attn_varlen_func  # noqa: F401
-        except Exception as exc:
-            return f"flash_attn varlen kernel is unavailable ({type(exc).__name__})"
+        if not HAS_FLASH_VARLEN:
+            return "flash_attn varlen kernel is unavailable"
         return None
     if backend == "te":
-        try:
-            from transformer_engine.pytorch import DotProductAttention  # noqa: F401
-        except Exception as exc:
-            return f"TransformerEngine varlen kernel is unavailable ({type(exc).__name__})"
+        if not HAS_TE:
+            return "TransformerEngine varlen kernel is unavailable"
         return None
     return f"unsupported varlen backend={backend}"
 
@@ -518,12 +521,9 @@ def _cp_blockdiag_varlen(query, key_full, value_full, doc_ids, row_offset, scale
             )
             _CP_FLASH_WARNED = True
         return None
-    try:
-        if backend == "flash":
-            from flash_attn import flash_attn_varlen_func  # noqa: F401
-    except Exception:
+    if backend == "flash" and not HAS_FLASH_VARLEN:
         if not _CP_FLASH_WARNED:
-            logger.warning("flash_attn import failed; reporting the unavailable varlen path to the caller")
+            logger.warning("flash_attn is unavailable; reporting the unavailable varlen path to the caller")
             _CP_FLASH_WARNED = True
         return None
 
