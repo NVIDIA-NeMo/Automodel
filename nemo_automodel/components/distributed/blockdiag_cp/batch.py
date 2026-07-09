@@ -113,7 +113,8 @@ def make_cp_blockdiag_batch_and_ctx(
     rank = cp_mesh.get_local_rank()
     group = cp_mesh.get_group()
 
-    assert "inputs_embeds" in batch, "block-diagonal CP requires pre-embedded 'inputs_embeds' in the batch"
+    if "inputs_embeds" not in batch:
+        raise ValueError("block-diagonal CP requires pre-embedded 'inputs_embeds' in the batch")
 
     ie = batch["inputs_embeds"]
     B, S = ie.shape[0], ie.shape[1]
@@ -159,11 +160,12 @@ def make_cp_blockdiag_batch_and_ctx(
     # shape crash deep in the backward AC-recompute. Later torch versions resolve
     # it correctly. Fail loud and early here instead of crashing in backward.
     _group_world = torch.distributed.get_world_size(group)
-    assert _group_world == world, (
-        f"block-diagonal CP: K/V all-gather group world ({_group_world}) != "
-        f"cp_mesh.size() ({world}). The cp sub-group is mis-resolved -- a DeviceMesh "
-        f"flatten/slice bug seen on torch 2.8 when dp>1; upgrade torch."
-    )
+    if _group_world != world:
+        raise RuntimeError(
+            f"block-diagonal CP: K/V all-gather group world ({_group_world}) != "
+            f"cp_mesh.size() ({world}). The cp sub-group is mis-resolved -- a DeviceMesh "
+            f"flatten/slice bug seen on torch 2.8 when dp>1; upgrade torch."
+        )
 
     # Block-diagonal CP shards ONE packed sequence per rank and assumes local batch
     # B==1 (packing collapses many samples into a single sequence). B>1 is
