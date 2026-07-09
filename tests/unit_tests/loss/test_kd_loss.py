@@ -29,6 +29,17 @@ from nemo_automodel.components.loss.kd_loss import (
     _kl_forward_tp,
 )
 
+try:
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Replicate
+
+    HAVE_DTENSOR = True
+except Exception:  # pragma: no cover
+    DTensor = None  # type: ignore[assignment]
+    Replicate = None  # type: ignore[assignment]
+    init_device_mesh = None  # type: ignore[assignment]
+    HAVE_DTENSOR = False
+
 # ---------------------------------------------------------------------------
 # Reference implementation (no TP, no T² scaling applied yet)
 # ---------------------------------------------------------------------------
@@ -587,3 +598,33 @@ def test_kd_loss_tp_path_with_temperature(trivial_pg):
     assert torch.allclose(loss_no_tp, loss_tp, atol=1e-5), (
         f"Non-TP loss {loss_no_tp.item():.6f} != TP loss {loss_tp.item():.6f}"
     )
+
+
+@pytest.mark.skipif(not HAVE_DTENSOR, reason="DTensor not available")
+def test_kd_loss_materializes_dtensor_labels_before_masking():
+    """DTensor labels should be materialized before building the boolean mask."""
+    mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
+    student_logits = torch.randn(4, 8, dtype=torch.float32)
+    teacher_logits = torch.randn(4, 8, dtype=torch.float32)
+    labels_local = torch.tensor([0, -100, 1, 2])
+    labels = DTensor.from_local(labels_local, mesh, [Replicate()])
+
+    loss = KDLoss()(student_logits, teacher_logits, labels)
+    ref = _reference_kd_loss(student_logits, teacher_logits, labels_local)
+
+    assert torch.allclose(loss, ref, atol=1e-6), f"Expected {ref}, got {loss}"
+
+
+@pytest.mark.skipif(not HAVE_DTENSOR, reason="DTensor not available")
+def test_kd_loss_tp_path_localizes_dtensor_labels_before_masking(trivial_pg):
+    """Explicit TP path should localize DTensor labels before applying the mask."""
+    mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
+    student_logits = torch.randn(4, 8, dtype=torch.float32)
+    teacher_logits = torch.randn(4, 8, dtype=torch.float32)
+    labels_local = torch.tensor([0, -100, 1, 2])
+    labels = DTensor.from_local(labels_local, mesh, [Replicate()])
+
+    loss = KDLoss(tp_group=trivial_pg)(student_logits, teacher_logits, labels)
+    ref = _reference_kd_loss(student_logits, teacher_logits, labels_local)
+
+    assert torch.allclose(loss, ref, atol=1e-6), f"Expected {ref}, got {loss}"
