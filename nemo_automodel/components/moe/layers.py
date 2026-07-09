@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-from contextlib import nullcontext
 from functools import partial
 from typing import Optional
 
@@ -37,8 +36,7 @@ from nemo_automodel.components.moe.experts import (
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
-
-_shared_experts_stream: Optional[torch.cuda.Stream] = None
+from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 
 
 class MLP(nn.Module):
@@ -289,6 +287,12 @@ class Gate(nn.Module):
         self._last_expert_load: Optional[torch.Tensor] = None
         self._last_aux_loss: Optional[torch.Tensor] = None
 
+        # Rollout Routing Replay (R3): owns a handle only when enabled so the
+        # default routing path stays a no-op.
+        self.router_replay: Optional[RouterReplay] = (
+            RouterReplay() if getattr(config, "enable_routing_replay", False) else None
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -326,9 +330,16 @@ class Gate(nn.Module):
                 scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
                 original_scores = scores
                 indices = torch.topk(scores, k=self.topk, dim=-1)[1]
+                indices = replay_selection(self.router_replay, indices)
                 weights = scores.gather(1, indices)
             else:
                 values, indices = torch.topk(scores, k=self.topk, dim=-1)
+                replayed = replay_selection(self.router_replay, indices)
+                if replayed is not indices:
+                    # Replay swapped the selection: re-gather the values for the
+                    # replayed experts. Skipped (zero overhead) on the default path.
+                    values = scores.gather(1, replayed)
+                    indices = replayed
                 weights = values.softmax(dim=1, dtype=self.gate_precision or torch.float32)
                 # Use full softmax for aux_loss so P_i represents proper probabilities.
                 # Raw logits can be negative, causing aux_loss to diverge negative.
@@ -354,6 +365,7 @@ class Gate(nn.Module):
                 scores_for_choice = (scores_for_choice * mask.unsqueeze(-1)).flatten(1)
 
             indices = torch.topk(scores_for_choice, self.topk, dim=-1)[1]
+            indices = replay_selection(self.router_replay, indices)
             # Final weights gathered from UNBIASED softmax scores
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sqrtsoftplus":
@@ -365,6 +377,7 @@ class Gate(nn.Module):
                 scores = scores + self.e_score_correction_bias
 
             indices = torch.topk(scores, self.topk, dim=-1)[1]
+            indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sigmoid_with_bias":
             scores = scores.sigmoid()
@@ -385,6 +398,7 @@ class Gate(nn.Module):
                 )
 
             indices = torch.topk(scores_for_choice, k=self.topk, dim=-1, sorted=False)[1]
+            indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
         else:
             scores = scores.sigmoid()
@@ -406,6 +420,7 @@ class Gate(nn.Module):
                 scores = (scores * mask.unsqueeze(-1)).flatten(1)
 
             indices = torch.topk(scores, self.topk, dim=-1)[1]
+            indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
 
         if self.norm_topk_prob and self.topk > 1:
@@ -633,7 +648,7 @@ class MoE(nn.Module):
             )
             self.experts = GroupedExperts(config, backend=backend)
         elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep"):
-            if backend.experts in ("gmm", "torch_mm"):
+            if backend.experts in ("gmm", "torch_mm", "torch_mm_mxfp8"):
                 self.experts = GroupedExpertsDeepEP(
                     config,
                     backend=backend,
@@ -689,8 +704,6 @@ class MoE(nn.Module):
         # Set during model parallelization (see parallelizer.apply_cp)
         self.cp_mesh: Optional[DeviceMesh] = None
 
-        self._disable_shared_expert_overlap = backend.disable_shared_expert_overlap
-
     def forward(
         self,
         x: torch.Tensor,
@@ -727,27 +740,15 @@ class MoE(nn.Module):
 
         weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
 
-        # Shared-expert output (optionally gated).  Run on a side CUDA stream
-        # to overlap with the grouped-expert dispatch comm, unless overlap is
-        # disabled (in which case run sequentially on the current stream).
+        # Shared-expert output (optionally gated), computed inline on the main stream.
         z = None
-        side_stream = None
         if self.shared_experts is not None:
-            if not self._disable_shared_expert_overlap:
-                global _shared_experts_stream
-                if _shared_experts_stream is None:
-                    _shared_experts_stream = torch.cuda.Stream()
-                side_stream = _shared_experts_stream
-                side_stream.wait_stream(torch.cuda.current_stream())
-            stream_ctx = torch.cuda.stream(side_stream) if side_stream is not None else nullcontext()
-            with stream_ctx:
-                z = self.shared_experts(x)
-                if self.shared_expert_gate is not None:
-                    z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
+            z = self.shared_experts(x)
+            if self.shared_expert_gate is not None:
+                z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
 
+        # Routed experts on the main stream.
         y = self.experts(x_latent, token_mask, weights, indices)
-        if side_stream is not None:
-            torch.cuda.current_stream().wait_stream(side_stream)
 
         if self.fc2_latent_proj is not None:
             y = self.fc2_latent_proj(y)

@@ -22,11 +22,13 @@ To add support for other backbones (e.g., Qwen2, Mistral), create a similar
 module in a new directory (e.g., qwen2_bidirectional/) with its own ModelClass export.
 """
 
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from transformers import initialization as init
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_bidirectional_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
@@ -87,6 +89,15 @@ class LlamaBidirectionalModel(LlamaModel):
     """
 
     config_class = LlamaBidirectionalConfig
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     def __init__(self, config: LlamaConfig):
         """
@@ -189,6 +200,15 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
 
     config_class = LlamaBidirectionalConfig
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
+
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
@@ -196,6 +216,20 @@ class LlamaBidirectionalForSequenceClassification(LlamaPreTrainedModel):
         self.model = LlamaBidirectionalModel(config)
         # Initialize weights and apply final processing
         self.post_init()
+
+    # TODO: remove this once we upgrade to transformers 5.9.x
+    @torch.no_grad()
+    def _init_weights(self, module):
+        if module is self.score:
+            # Backport huggingface/transformers#46030 for transformers 5.8.x:
+            # initialize the actual dtype tensor, not a float() copy.
+            std = getattr(self.config, "initializer_range", 0.02) or 0.02
+            init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                init.zeros_(module.bias)
+            return
+
+        super()._init_weights(module)
 
     def forward(
         self,

@@ -15,6 +15,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -77,7 +78,9 @@ AUTO_DISCOVER_SCOPES = {
 def _discover_via_glob(automodel_dir: str, examples_subpath: str) -> list[Path]:
     """Discover every recipe YAML under examples/<examples_subpath>/."""
     automodel_path = Path(automodel_dir)
-    return sorted(p.relative_to(automodel_path) for p in (automodel_path / "examples" / examples_subpath).rglob("*.yaml"))
+    return sorted(
+        p.relative_to(automodel_path) for p in (automodel_path / "examples" / examples_subpath).rglob("*.yaml")
+    )
 
 
 def _discover_via_recipe_list(automodel_dir: str, scope: str, test_folder: str) -> list[Path]:
@@ -118,9 +121,12 @@ CI_KEY_TO_VAR = {
     "time": "TIME",
     "nodes": "TEST_NODE_COUNT",
     "node_multiplier": "NODE_MULTIPLIER",
+    "max_steps": "MAX_STEPS",
     "local_batch_size": "LOCAL_BATCH_SIZE",
+    "ep_size": "EP_SIZE",
     "recipe_owner": "RECIPE_OWNER",
     "nproc_per_node": "CONFIG_NPROC_PER_NODE",
+    "cluster_tag": "RESERVED_CLUSTER_TAG",
 }
 
 
@@ -176,6 +182,8 @@ def _enrich_base_job(job: Dict[str, Any], ci_config: Dict[str, Any], scope: str)
             job["variables"][ci_var] = DQ(str(value))
         elif ci_var == "NODE_MULTIPLIER":
             job["variables"][ci_var] = str(value).lower()
+        elif ci_var == "RESERVED_CLUSTER_TAG":
+            job["variables"][ci_var] = f"/{value}/"
         else:
             job["variables"][ci_var] = value
 
@@ -225,7 +233,8 @@ def generate_job(
     base_allow_failure = recipe_allow_failure or config.stem in (config_override.get("known_issue") or [])
 
     base_job = _build_job(
-        config, scope,
+        config,
+        scope,
         extends=".llm_benchmark_test" if "benchmark" in config.stem else f".{test_folder}_test",
         stage=_compute_base_stage(test_folder, config, has_robustness),
         allow_failure=base_allow_failure,
@@ -237,33 +246,39 @@ def generate_job(
     # vLLM deploy variant. `ci.vllm_deploy_known_issue_id` suppresses just this
     # variant (base job still runs) -- use for bugs that only manifest in vllm deploy.
     if ci_config.get("vllm_deploy") and not ci_config.get("vllm_deploy_known_issue_id"):
-        variants.append((
-            "_vllm_deploy",
-            _build_job(
-                config, scope,
-                extends=".vllm_deploy_test",
-                stage="peft_vllm_deploy" if "peft" in config.stem else "sft_vllm_deploy",
-                allow_failure=recipe_allow_failure,
-                known_issue_id=known_issue_id,
-            ),
-        ))
+        variants.append(
+            (
+                "_vllm_deploy",
+                _build_job(
+                    config,
+                    scope,
+                    extends=".vllm_deploy_test",
+                    stage="peft_vllm_deploy" if "peft" in config.stem else "sft_vllm_deploy",
+                    allow_failure=recipe_allow_failure,
+                    known_issue_id=known_issue_id,
+                ),
+            )
+        )
 
     # Retrieval eval variants. Bi-encoders opt into embed_eval, cross-encoders
     # into rerank_eval. Both extend the same per-folder eval template.
     for ci_key, suffix in (("embed_eval", "_embed_eval"), ("rerank_eval", "_rerank_eval")):
         if not ci_config.get(ci_key):
             continue
-        variants.append((
-            suffix,
-            _build_job(
-                config, scope,
-                extends=f".{test_folder}_eval_test",
-                stage="retrieval_eval",
-                extra_vars={"FINETUNE_TEST_NAME": f"{config.stem}"},
-                allow_failure=recipe_allow_failure,
-                known_issue_id=known_issue_id,
-            ),
-        ))
+        variants.append(
+            (
+                suffix,
+                _build_job(
+                    config,
+                    scope,
+                    extends=f".{test_folder}_eval_test",
+                    stage="retrieval_eval",
+                    extra_vars={"FINETUNE_TEST_NAME": f"{config.stem}"},
+                    allow_failure=recipe_allow_failure,
+                    known_issue_id=known_issue_id,
+                ),
+            )
+        )
 
     return variants
 
@@ -291,6 +306,7 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[
     exempt_configs = set(config_override.get("exempt_configs") or [])
 
     pipeline: Dict[str, Any] = {"include": ["automodel/automodel_ci_template.yml"]}
+    job_name_suffix = os.environ.get("AUTOMODEL_CI_JOB_NAME_SUFFIX", "")
 
     for config in yml_configs:
         # Skip missing recipes so one bad reference doesn't abort the whole pipeline.
@@ -305,7 +321,7 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[
 
         for suffix, job in generate_job(config, config_override, scope, test_folder, automodel_dir):
             job["variables"]["MODEL_FAMILY"] = model_name
-            pipeline[f"{config_name}{suffix}"] = job
+            pipeline[f"{config_name}{suffix}{job_name_suffix}"] = job
 
     return pipeline
 
@@ -318,9 +334,7 @@ def _normalize_scope(value: str) -> str:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--automodel-dir", type=str, required=True, help="Path to Automodel directory")
-    parser.add_argument(
-        "--scope", type=_normalize_scope, required=True, help="Scope of the tests (nightly, release)"
-    )
+    parser.add_argument("--scope", type=_normalize_scope, required=True, help="Scope of the tests (nightly, release)")
     parser.add_argument("--test-folder", type=str, required=True, help="Target folder to search")
     args = parser.parse_args()
 

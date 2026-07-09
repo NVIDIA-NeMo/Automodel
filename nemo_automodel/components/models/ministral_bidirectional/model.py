@@ -8,6 +8,8 @@ attention, suitable for generating embeddings where each token should attend
 to all other tokens in the sequence.
 """
 
+from dataclasses import dataclass
+
 import torch
 from transformers import AutoConfig, AutoModel
 from transformers.cache_utils import Cache, DynamicCache
@@ -54,6 +56,15 @@ class Ministral3BidirectionalModel(Ministral3Model):
     """
 
     config_class = Ministral3BidirectionalConfig
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     def __init__(self, config) -> None:
         super().__init__(config)

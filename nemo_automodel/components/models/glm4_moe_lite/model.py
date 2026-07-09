@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     cast_model_to_dtype,
+    compute_lm_head_logits,
     get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,
@@ -30,6 +34,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
+from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 from nemo_automodel.components.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
@@ -41,6 +46,10 @@ class Block(nn.Module):
     def __init__(self, layer_idx: int, config: Any, moe_config: MoEConfig, backend: BackendConfig):
         super().__init__()
         self.self_attn = MLA(config, backend)
+
+        # Thread dtype from config.torch_dtype so the block's own params stay
+        # aligned with the rest of the model (fp32 under fp32 master weights).
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
 
         # GLM4-MoE-Lite uses mlp_layer_types to determine dense vs MoE layers
         mlp_layer_types = getattr(config, "mlp_layer_types", None)
@@ -54,11 +63,13 @@ class Block(nn.Module):
         if is_moe_layer:
             self.mlp = MoE(moe_config, backend)
         else:
-            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear)
+            self.mlp = MLP(config.hidden_size, config.intermediate_size, backend.linear, dtype=dtype)
 
-        self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
+        )
         self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
         )
         self.layer_idx = layer_idx
 
@@ -115,6 +126,11 @@ class Glm4MoeLiteModel(nn.Module):
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
 
+        # Resolve model dtype once; thread it explicitly to every sub-module
+        # so fp32 master weights work even when construction is not wrapped in
+        # local_torch_dtype().
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         # Map config -> MoE wrapper (same as GLM4 MoE)
         moe_defaults = dict(
             dim=config.hidden_size,
@@ -135,18 +151,19 @@ class Glm4MoeLiteModel(nn.Module):
             router_bias=False,
             expert_activation="swiglu",
             softmax_before_topk=False,  # GLM4 uses sigmoid, not softmax
+            dtype=model_dtype,
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
         self.moe_config = moe_config or MoEConfig(**moe_defaults)
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, dtype=model_dtype)
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = Block(layer_id, config, self.moe_config, backend)
-        self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        )
 
         # Rotary embedding for MLA
         # MLA uses qk_rope_head_dim for the rope dimension
@@ -218,6 +235,15 @@ class Glm4MoeLiteModel(nn.Module):
 class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = True
+
     @classmethod
     def from_config(
         cls,
@@ -248,8 +274,10 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         **kwargs,
     ):
+        warn_deprecated_model_class("Glm4MoeLiteForCausalLM")
         super().__init__()
         self.config = config
+        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = Glm4MoeLiteModel(
@@ -258,10 +286,13 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear, config.hidden_size, config.vocab_size, bias=False, dtype=model_dtype
+        )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Glm4MoeStateDictAdapter(
-                self.config, self.model.moe_config, self.backend, dtype=get_dtype(config.torch_dtype, torch.bfloat16)
+                self.config, self.model.moe_config, self.backend, dtype=model_dtype
             )
 
     def get_input_embeddings(self):
@@ -283,9 +314,18 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> torch.Tensor:
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
+    ) -> CausalLMOutputWithPast:
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
+        is_thd = "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd"
+        if is_thd:
             input_ids, position_ids, padding_mask, attn_kwargs = squeeze_input_for_thd(
                 input_ids, position_ids, padding_mask, attn_kwargs
             )
@@ -298,10 +338,10 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
-        logits = self.lm_head(hidden) if self.lm_head else hidden
-        if "qkv_format" in attn_kwargs and attn_kwargs["qkv_format"] == "thd":
-            logits = logits.unsqueeze(0)
-        return logits
+
+        return compute_lm_head_logits(
+            self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
+        )
 
     @torch.no_grad()
     def initialize_weights(

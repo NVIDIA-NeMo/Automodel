@@ -168,6 +168,14 @@ def get_model_conversion_mapping(
 _VLM_KEY_MAPPINGS: dict[str, dict[str, str]] = {
     "gemma3": {
         r"^language_model\.model\.": "model.language_model.",
+        # transformers 5.8 flattened SiglipVisionModel: the v5.5 `vision_model.`
+        # wrapper that Gemma3's vision_tower used to have is gone, so HF gemma3
+        # checkpoints saved before this flip (keys like `vision_tower.vision_model.X`)
+        # no longer match the in-memory FQNs (`model.vision_tower.X`). Strip the
+        # legacy `vision_model.` segment before applying the generic vision_tower
+        # rule. Order matters: dict iteration is insertion order and
+        # `_get_key_renaming_mapping` returns on the first regex match.
+        r"^vision_tower\.vision_model\.": "model.vision_tower.",
         r"^vision_tower\.": "model.vision_tower.",
         r"^multi_modal_projector\.": "model.multi_modal_projector.",
         r"^language_model\.lm_head\.": "lm_head.",

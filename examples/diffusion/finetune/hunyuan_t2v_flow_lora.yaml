@@ -1,6 +1,7 @@
 seed: 42
 
 wandb:
+  enable: false
   project: hunyuan-video-training
   mode: online
   name: hunyuan_lora_run
@@ -16,9 +17,10 @@ model:
   model_type: "hunyuan"
   mode: "finetune"
   # Hunyuan's attention processor passes attn_mask to dispatch_attention_fn,
-  # which flash-attn 2 rejects ("`attn_mask` is not supported for flash-attn 2.").
-  # Use diffusers' native (PyTorch SDPA) backend, which handles attn_mask correctly.
-  attention_backend: "native"
+  # which plain flash-attn 2 rejects. flash_varlen plus the mask optimization
+  # keeps the packed-mask path correct and is the fastest validated LoRA setup.
+  attention_backend: "flash_varlen"
+  optimize_hunyuan_flash_varlen_mask: true
 
 # ── LoRA / PEFT configuration ─────────────────────────────────────────────────
 # Remove this section for full fine-tune.

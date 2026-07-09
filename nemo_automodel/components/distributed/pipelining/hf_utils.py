@@ -14,6 +14,7 @@
 
 import logging
 import types
+from collections.abc import MutableMapping
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
@@ -29,6 +30,7 @@ TEXT_MODULE_ATTRS = ("language_model", "text_model", "text_decoder")
 MULTIMODAL_SUFFIXES = (
     "vision_tower",
     "visual",
+    "vision_model",
     "image_encoder",
     "vision_encoder",
     "embed_vision",
@@ -39,6 +41,7 @@ MULTIMODAL_SUFFIXES = (
     "multi_modal_projector",
     "multimodal_projector",
     "vision_projector",
+    "vit_large_projector",
     "audio_projector",
 )
 
@@ -55,6 +58,53 @@ def get_text_module(model: nn.Module) -> nn.Module:
             if nested is not None and isinstance(nested, nn.Module):
                 return nested
     return model
+
+
+def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_position, position_ids):
+    """Build a stage's ``causal_mask_mapping``, caching it per stage when safe.
+
+    Under pipeline parallelism the mask precomputed in the data pipeline only reaches
+    the first stage; non-first stages arrive with ``causal_mask_mapping=None`` and used
+    to recompute it on every microbatch (slow, and a torch.compile graph-break). When
+    no explicit ``attention_mask`` is provided -- the common fixed-length / packed
+    training case, and exactly what non-first stages receive -- the causal mask depends
+    only on ``(seq_len, dtype, device)`` and is constant across microbatches and steps,
+    so it is built once per stage and reused. With an explicit ``attention_mask`` (which
+    may encode per-batch padding) it is rebuilt each call. Behavior is identical to the
+    previous recompute; only the redundant recomputation is removed.
+    """
+    # An ``attention_mask`` that is already a mask-mapping dict is used as-is.
+    if isinstance(attention_mask, dict):
+        return attention_mask
+
+    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+
+    cacheable = attention_mask is None
+    cache_key = (inputs_embeds.shape[1], inputs_embeds.dtype, inputs_embeds.device)
+    cache = getattr(module, "_pp_causal_mask_cache", None)
+    if cache is not None and not isinstance(cache, MutableMapping):
+        cache = None
+    if cacheable and cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    # Note: inputs_embeds is only used for shape and dtype, not values.
+    mask_kwargs = {
+        "config": module.config,
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": attention_mask,
+        "past_key_values": None,  # Training-only: no KV cache
+        "position_ids": position_ids,
+    }
+    causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
+    if getattr(module, "has_sliding_layers", False) is True:
+        causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+
+    if cacheable:
+        if cache is None:
+            cache = {}
+            module._pp_causal_mask_cache = cache
+        cache[cache_key] = causal_mask_mapping
+    return causal_mask_mapping
 
 
 def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callable:
@@ -110,39 +160,15 @@ def create_pipeline_forward_inner(model_class_name: str = "AutoModel") -> Callab
             position_ids = cache_position.unsqueeze(0)
 
         # Attention mask handling (compilation-friendly):
-        # causal_mask_mapping should be precomputed in data pipeline via default_collater
-        # If not provided, model will fail - this enforces clean separation
+        # causal_mask_mapping is precomputed in the data pipeline (default_collater +
+        # add_causal_masks_to_batch) and passed to the first stage. The PP schedule
+        # cannot forward this dict to non-first stages, which therefore arrive with
+        # causal_mask_mapping=None. Build it once per stage and cache it (see
+        # _build_or_reuse_pp_causal_mask) instead of recomputing every microbatch.
         if causal_mask_mapping is None:
-            # If causal_mask_mapping is missing, fall back to on-the-fly computation.
-            # This is not recommended for compilation, as it introduces runtime overhead.
-            # TODO(PP): In pipeline parallelism, causal_mask_mapping is passed as a kwarg
-            # but it is a dict (not a tensor), so it cannot be chunked by the PP schedule.
-            # Non-first stages receive causal_mask_mapping=None and hit this fallback,
-            # recomputing the mask every microbatch. This is a performance issue but not
-            # a correctness bug since each stage has the full config to recompute correctly.
-            # Long-term fix: pass the mask through stage input/output or compute it once
-            # per stage and cache it.
-            logger.warning(
-                "causal_mask_mapping not provided; computing it here. "
-                "This is slow and not recommended for compilation. "
-                "Precompute causal_mask_mapping in the data pipeline for best performance."
+            causal_mask_mapping = _build_or_reuse_pp_causal_mask(
+                self, inputs_embeds, attention_mask, cache_position, position_ids
             )
-            if not isinstance((causal_mask_mapping := attention_mask), dict):
-                from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-
-                # Note: inputs_embeds is only used for shape and dtype, not values
-                # We could use a dummy tensor here, but inputs_embeds is already available
-                mask_kwargs = {
-                    "config": self.config,
-                    "inputs_embeds": inputs_embeds,
-                    "attention_mask": attention_mask,
-                    "cache_position": cache_position,
-                    "past_key_values": None,  # Training-only: no KV cache
-                    "position_ids": position_ids,
-                }
-                causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
-                if hasattr(self, "has_sliding_layers") and self.has_sliding_layers:
-                    causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         hidden_states = inputs_embeds
 
@@ -294,9 +320,8 @@ def create_pipeline_forward_gemma4_text() -> Callable:
 
         mask_kwargs = {
             "config": self.config,
-            "input_embeds": inputs_embeds,
+            "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
-            "cache_position": cache_position,
             "past_key_values": None,
             "position_ids": position_ids,
         }
@@ -316,6 +341,15 @@ def create_pipeline_forward_gemma4_text() -> Callable:
 
         hidden_states = inputs_embeds
         config_layer_types = getattr(self.config, "layer_types", None)
+        # HF transfomers v5.8.1+ Gemma4 attention threads a single mutable mapping through every decoder
+        # layer for kv-sharing: "full-length" layers (store_full_length_kv) write their
+        # keys/values into it and kv-shared layers (is_kv_shared_layer) read them back.
+        # The decoder-layer kwarg defaults to None, so a store layer would execute
+        # ``None[layer_type] = ...`` -> TypeError. Create one per stage and thread it,
+        # mirroring HF's Gemma4TextModel.forward. gemma-4-31B, 26B-A4B have num_kv_shared_layers=0
+        # (no readers, store is a harmless no-op write); for a kv-sharing model split
+        # across PP stages only within-stage sharing would work here.
+        shared_kv_states: dict = {}
         if hasattr(self, "layers") and self.layers is not None:
             layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
             for decoder_layer in layer_iter:
@@ -338,6 +372,7 @@ def create_pipeline_forward_gemma4_text() -> Callable:
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                     padding_mask=padding_mask,
+                    shared_kv_states=shared_kv_states,
                 )
                 hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
 

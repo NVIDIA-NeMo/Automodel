@@ -28,6 +28,7 @@ model:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import torch
@@ -46,9 +47,11 @@ from transformers.utils import TransformersKwargs, can_return_tuple
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
+    compute_lm_head_logits,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
@@ -339,7 +342,6 @@ class LlamaModel(LlamaPreTrainedModel):
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
@@ -395,6 +397,15 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = True
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = False
+
     @classmethod
     def from_config(
         cls,
@@ -409,6 +420,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         config: LlamaConfig,
         backend: Optional[BackendConfig] = None,
     ):
+        warn_deprecated_model_class("LlamaForCausalLM")
         super().__init__(config)
         self.config = config
         self.backend = backend or BackendConfig()
@@ -420,6 +432,12 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         self.state_dict_adapter = LlamaStateDictAdapter(config=self.config)
         # Initialize weights and apply final processing
         self.post_init()
+
+        # Transformers v5 does not reliably tie this custom model from the
+        # dict-shaped _tied_weights_keys alone. Explicitly honor the config
+        # flag after initialization.
+        if getattr(config, "tie_word_embeddings", False):
+            self.tie_weights()
 
         # Convert to configured dtype if specified
         if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
@@ -440,6 +458,10 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        if getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def set_decoder(self, decoder):
         self.model = decoder
@@ -504,14 +526,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
 
         hidden_states = outputs.last_hidden_state
 
-        # Only compute necessary logits (optimization for training and generation)
-        # DTensor compatibility with pytorch 2.9.0: when logits_to_keep=0, slice(0, None, None) would select all
-        # elements but DTensor cannot handle sliced DTensor. Skip slicing when logits_to_keep=0.
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None:

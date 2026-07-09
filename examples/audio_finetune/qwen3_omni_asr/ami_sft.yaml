@@ -66,8 +66,8 @@ model:
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: te
-    enable_deepep: true
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -101,7 +101,7 @@ loss_fn:
 #   assistant(  text=<transcript>  )
 # No system turn (system_prompt: null).
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_hf_audio_asr_dataset
+  _target_: nemo_automodel.components.datasets.audio.datasets.make_hf_audio_asr_dataset
   path_or_dataset: edinburghcstr/ami
   name: ihm
   split: train
@@ -118,7 +118,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 2
   collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.qwen3_omni_asr_collate_fn
+    _target_: nemo_automodel.components.datasets.audio.collate_fns.qwen3_omni_asr_collate_fn
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -128,10 +128,11 @@ optimizer:
   weight_decay: 0.0
 
 wandb:
+  enable: false
   project: ${oc.env:WANDB_PROJECT,qwen3-omni-asr-ami}
   name: ${oc.env:WANDB_NAME,qwen3_omni_asr_ami_fullft}
   dir: ${oc.env:WANDB_DIR,result/wandb}
 
 ci:
-  recipe_owner: yuekaiz
+  recipe_owner: yuekaizhang
   time: "00:30:00"

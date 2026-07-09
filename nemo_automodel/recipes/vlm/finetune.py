@@ -29,20 +29,16 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import mlflow
 import torch
 import torch.nn as nn
 import wandb
-from huggingface_hub import constants as hf_constants
-from megatron_fsdp import MegatronFSDP
-from megatron_fsdp.fully_shard import fully_shard_optimizer
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
-from wandb import Settings
 
 from nemo_automodel._transformers import (
     NeMoAutoModelForCausalLM,
@@ -50,31 +46,30 @@ from nemo_automodel._transformers import (
     NeMoAutoModelForMultimodalLM,
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
-from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp, wrap_vlm_collate_for_pp
-from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import (
-    configure_mlflow,
     end_mlflow_active_run_as_killed,
     to_float_metrics,
 )
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
-from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
     prepare_after_first_microbatch,
@@ -84,15 +79,23 @@ from nemo_automodel.components.training.utils import (
 )
 from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
-from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.shared.te_patches import apply_te_patches
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
 
-    from nemo_automodel.components.distributed.init_utils import DistInfo
 
 logger = logging.getLogger(__name__)
+
+try:
+    from megatron_fsdp import MegatronFSDP
+    from megatron_fsdp.fully_shard import fully_shard_optimizer
+except (ImportError, FileNotFoundError, OSError):
+    MegatronFSDP = None
+    fully_shard_optimizer = None
 
 # ---------------------------
 #  Stateless helper functions
@@ -117,12 +120,8 @@ def build_model(
     seed,
     cfg_fp8=None,
     cfg_compile=None,
-    device_mesh=None,
-    moe_mesh=None,
-    distributed_config=None,
-    pipeline_config=None,
-    cfg_moe=None,
-    activation_checkpointing=False,
+    distributed_setup: DistributedSetup | None = None,
+    cfg_quantization=None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
 
@@ -133,31 +132,21 @@ def build_model(
         # Build infrastructure kwargs
         kwargs = {
             "peft_config": cfg_peft,
-            "device_mesh": device_mesh,
-            "moe_mesh": moe_mesh,
-            "distributed_config": distributed_config,
-            "pipeline_config": pipeline_config,
             "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
         }
-
-        if cfg_moe is not None:
-            from nemo_automodel.components.moe.config import MoEParallelizerConfig
-
-            if isinstance(cfg_moe, MoEParallelizerConfig):
-                kwargs["moe_config"] = cfg_moe
-            else:
-                moe_dict = cfg_moe.to_dict() if hasattr(cfg_moe, "to_dict") else dict(cfg_moe)
-                # activation_checkpointing is handled separately; strip config keys
-                moe_dict.pop("activation_checkpointing", None)
-                moe_dict.pop("_target_", None)
-                kwargs["moe_config"] = MoEParallelizerConfig(**moe_dict)
-            kwargs["activation_checkpointing"] = activation_checkpointing
+        if distributed_setup is not None:
+            kwargs["distributed_setup"] = distributed_setup
 
         if cfg_fp8 is not None:
             fp8_config = build_fp8_config(cfg_fp8)
             kwargs["fp8_config"] = fp8_config
         if cfg_compile is not None:
             kwargs["compile_config"] = build_compile_config(cfg_compile)
+        if cfg_quantization is not None:
+            logger.info("Model weight quantization enabled with BitsAndBytes")
+            from nemo_automodel.components.quantization.qlora import create_bnb_config
+
+            kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
 
         # Check if using NeMoAutoModel
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
@@ -169,8 +158,11 @@ def build_model(
             NeMoAutoModelForCausalLM.from_pretrained,
         )
 
-        if is_nemo_auto_model:
-            # NeMoAutoModel handles infrastructure internally
+        # The Gemma4 base + drafter composite loads its sub-models via the
+        # NeMoAuto paths internally, so it gets the same infrastructure kwargs.
+        is_joint_composite = _is_gemma4_joint_target(cfg_model.get("_target_", None))
+
+        if is_nemo_auto_model or is_joint_composite:
             model = cfg_model.instantiate(**kwargs)
         else:
             raise ValueError(
@@ -180,85 +172,54 @@ def build_model(
     return model
 
 
-def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
-    """Build an optimizer for the model.
+def _is_gemma4_joint_target(target) -> bool:
+    """Return True if ``target`` is :meth:`Gemma4WithDrafter.from_pretrained`.
 
-    Args:
-        model: The model to build an optimizer for.
-        cfg_opt: The configuration for the optimizer.
-        distributed_config: The distributed configuration.
-        device_mesh: The device mesh.
+    Imported lazily so the optional ``transformers.models.gemma4_assistant``
+    dependency only fires when a joint recipe is actually requested.
     """
-    if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
-        # TP does not support foreach
-        cfg_opt.foreach = False
-
-    optimizer = []
-    for part in getattr(model, "parts", [model]):
-        trainable_params = list(filter(lambda x: x.requires_grad, part.parameters()))
-        assert len(trainable_params) > 0, "trainable_params cannot be empty"
-        tmp_optimizer = cfg_opt.instantiate(params=trainable_params)
-        if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
-            # Only call fully_shard_optimizer when the model was actually wrapped
-            # with MegatronFSDP. When dp_mesh.size()==1 the parallelizer skips
-            # MegatronFSDP wrapping and the parameters won't carry the required
-            # _megatron_fsdp_model attribute.
-            if isinstance(part, MegatronFSDP):
-                fully_shard_optimizer(tmp_optimizer)
-        optimizer.append(tmp_optimizer)
-
-    return optimizer
-
-
-def build_checkpoint_config(cfg_ckpt, cache_dir, model_repo_id, is_peft) -> CheckpointingConfig:
-    """Build a checkpoint configuration.
-
-    Args:
-        cfg_ckpt: Configuration for checkpointing.
-        cache_dir: Cache directory for the model.
-        model_repo_id: Model repository ID.
-        is_peft: Whether the model is PEFT.
-
-    Returns:
-        The instantiated checkpoint configuration.
-    """
-    ckpt_kwargs = dict(
-        enabled=True,
-        checkpoint_dir="checkpoints/",
-        model_save_format="safetensors",
-        model_repo_id=model_repo_id,
-        model_cache_dir=cache_dir if cache_dir is not None else hf_constants.HF_HUB_CACHE,
-        save_consolidated=True,
-        is_peft=is_peft,
-    )
-    user_cfg = {}
-    if cfg_ckpt is not None:
-        user_cfg = cfg_ckpt.to_dict()
-        user_cfg.pop("restore_from", None)
-    if is_peft and user_cfg.get("model_save_format") == "torch_save":
-        logger.warning(
-            "PEFT checkpointing is not supported for `torch_save` format; "
-            "discarding user checkpoint config and using safetensors defaults "
-            "(preserving `checkpoint_dir` if set)."
+    if target is None:
+        return False
+    try:
+        from nemo_automodel.components.models.gemma4_drafter.composite import (
+            Gemma4WithDrafter,
         )
-        if "checkpoint_dir" in user_cfg:
-            ckpt_kwargs["checkpoint_dir"] = user_cfg["checkpoint_dir"]
-    else:
-        ckpt_kwargs |= user_cfg
-    checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
-    return checkpoint_config
+    except ImportError:
+        return False
+    # Bound classmethods are not identity-stable across accesses; compare via ==.
+    return target == Gemma4WithDrafter.from_pretrained
 
 
-def build_loss_fn(cfg_loss):
-    """Build a loss function.
+def _shift_labels_left(labels: torch.Tensor, k: int) -> torch.Tensor:
+    """Shift ``labels`` left by ``k`` positions, padding the tail with ``-100``.
+
+    Used to build drafter-step targets in joint base + drafter training.
+
+    The VLM collate pipeline already pre-shifts labels by 1 so that
+    ``labels[t] == input_ids[t + 1]`` (the next-token target). Drafter step ``k``
+    predicts position ``t + 1 + k`` of the original sequence, which corresponds
+    to ``labels[t + k]`` in the pre-shifted convention. So for step ``k``:
+
+    * ``k = 0`` (one-step drafter) -> no shift; reuse ``labels`` as-is.
+    * ``k = 1`` -> shift labels left by 1 (drafter predicts two tokens ahead).
+    * ``k = n`` -> shift labels left by ``n``.
 
     Args:
-        cfg_loss: Loss function configuration.
+        labels: ``[B, S]`` LongTensor of label ids (``-100`` marks ignored
+            positions).
+        k: Number of positions to shift to the left. ``k <= 0`` is a no-op.
 
     Returns:
-        The instantiated loss function.
+        A new ``[B, S]`` LongTensor with ``labels[:, k:]`` in the leading slice
+        and ``-100`` in the trailing ``k`` columns. When ``k <= 0``, the input
+        is returned unchanged.
     """
-    return cfg_loss.instantiate()
+    if k <= 0:
+        return labels
+    shifted = torch.full_like(labels, fill_value=-100)
+    if k < labels.size(-1):
+        shifted[..., : labels.size(-1) - k] = labels[..., k:]
+    return shifted
 
 
 def _move_to_device(value: Any, device: torch.device) -> Any:
@@ -406,6 +367,7 @@ def build_dataloader(
                 max_length=max_length,
                 truncate=truncate,
                 post_tokenize_hook=post_tokenize_hook,
+                inject_fake_images=cfg_ds.get("inject_fake_images", True),
             )
 
             if packing_cfg:
@@ -427,7 +389,38 @@ def build_dataloader(
                 )
                 _pad_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
                 _collate_max_length = packing_cfg.get("collate_max_length", None)
-                _attn_impl = get_attn_implementation(cfg_model)
+                # The packed collater builds a dense [B, 1, S, S] block-causal mask for
+                # sdpa/eager but keeps a cheap indexed [B, S] mask for flash_attention_2.
+                # At long context (e.g. 128k) the dense mask is ~S^2 bytes/sample and
+                # OOMs the dataloader workers. ``packed_sequence.attn_implementation``
+                # overrides the mask form: set it to "flash_attention_2" for
+                # context-parallel runs, where the attention mask is stripped before the
+                # model anyway (document boundaries are recovered from position_ids), so
+                # the indexed form is both sufficient and orders of magnitude cheaper.
+                # Attn computation still uses the model's backend; the attn_implementation
+                # attribute in packing_cfg only switches the collater mask format. It is
+                # therefore only safe to diverge from the model backend when cp>1, where the
+                # mask is stripped before the model. Without CP the collater mask must match
+                # the model backend, so ignore the override (and warn) and fall back to it.
+                cp_size = (
+                    device_mesh["cp"].size()
+                    if device_mesh is not None and "cp" in getattr(device_mesh, "mesh_dim_names", ())
+                    else 1
+                )
+                _model_attn_impl = get_attn_implementation(cfg_model)
+                _pack_attn_override = packing_cfg.get("attn_implementation", None)
+                if _pack_attn_override is not None and cp_size > 1:
+                    _attn_impl = _pack_attn_override
+                else:
+                    if _pack_attn_override not in (None, _model_attn_impl):
+                        logging.warning(
+                            "Ignoring packed_sequence.attn_implementation=%r at cp_size=1: the packed "
+                            "mask format must match the model attention backend (%r) when the mask is "
+                            "not stripped by context parallelism.",
+                            _pack_attn_override,
+                            _model_attn_impl,
+                        )
+                    _attn_impl = _model_attn_impl
 
                 configure_packing(attn_implementation=_attn_impl)
                 logging.info(f"Configured VLM neat packing for attn_implementation={_attn_impl}")
@@ -475,128 +468,6 @@ def build_dataloader(
         return cfg_dl.instantiate(
             dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
         ), processor
-
-
-def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
-    """Build and initialize distributed training resources.
-
-    Args:
-        cfg_dist: Configuration for distributed training.
-
-    Returns:
-        Distributed training information from initialize_distributed.
-    """
-    backend = cfg_dist.get("backend", "nccl")
-    timeout = cfg_dist.get("timeout_minutes", 1)
-    return initialize_distributed(backend=backend, timeout_minutes=timeout)
-
-
-def build_step_scheduler(cfg, dataloader, dp_group_size, local_batch_size):
-    """Build the step scheduler.
-
-    Args:
-        cfg: configuration for the StepScheduler class.
-        dataloader: the training dataloader, used for extracting the epoch_len (in batches).
-        dp_group_size: the size of the data parallel group.
-        micro_batch_size: the size of the micro batch.
-
-    Returns:
-        StepScheduler: the configured StepScheduler.
-    """
-    assert "_target_" not in cfg, "_target_ not permitted in step scheduler"
-    default_kwargs = dict(
-        num_epochs=10,
-        global_batch_size=32,
-        local_batch_size=local_batch_size,
-        dp_size=dp_group_size,
-        ckpt_every_steps=100,
-        dataloader=dataloader,
-    )
-    if cfg is not None:
-        default_kwargs |= cfg.to_dict()
-    return StepScheduler(**default_kwargs)
-
-
-def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamScheduler] | None:  # noqa: F821
-    """Build the learning rate scheduler.
-
-    Args:
-        cfg: Configuration for the OptimizerParamScheduler.
-        optimizer: The optimizer to be scheduled.
-        step_scheduler: The step scheduler to extract training parameters.
-
-    Returns:
-        OptimizerParamScheduler: The configured learning rate scheduler, or None if not configured.
-    """
-    if cfg is None:
-        return None
-
-    # Calculate total steps for the training run
-    total_epochs = step_scheduler.num_epochs
-    epoch_len = len(step_scheduler.dataloader)
-    grad_acc_steps = step_scheduler.grad_acc_steps
-
-    # Total optimizer steps (accounting for gradient accumulation)
-    total_steps = (total_epochs * epoch_len) // grad_acc_steps
-    if step_scheduler.max_steps is not None:
-        total_steps = min(total_steps, step_scheduler.max_steps)
-
-    optimizer_param_schedulers = []
-    user_kwargs = cfg.to_dict()
-    default_kwargs = dict(
-        lr_warmup_steps=min(1000, total_steps // 10),  # 10% warmup or max 1000 steps
-        lr_decay_steps=total_steps,
-        lr_decay_style="cosine",
-        wd_incr_steps=total_steps,
-        wd_incr_style="constant",
-    )
-
-    if not isinstance(optimizer, list):
-        optimizer = [optimizer]
-
-    for opt in optimizer:
-        base_lr = opt.param_groups[0]["lr"]
-        default_kwargs.update(
-            dict(
-                optimizer=opt,
-                init_lr=base_lr * 0.1,  # Start warmup at 10% of base LR
-                max_lr=base_lr,
-                min_lr=base_lr * 0.01,  # End at 1% of base LR
-                start_wd=opt.param_groups[0].get("weight_decay", 0.0),
-                end_wd=opt.param_groups[0].get("weight_decay", 0.0),
-            )
-        )
-        default_kwargs.update(user_kwargs)
-        optimizer_param_schedulers.append(OptimizerParamScheduler(**default_kwargs))
-
-    logger.info(
-        f"Building LR scheduler with total_steps={total_steps}, "
-        f"warmup_steps={default_kwargs['lr_warmup_steps']}, "
-        f"decay_style={default_kwargs['lr_decay_style']}"
-    )
-
-    return optimizer_param_schedulers
-
-
-def build_wandb(cfg) -> wandb.Run:
-    """Instantiates wandb and returns the instance. If no name is given, it will use the model name.
-
-    Args:
-        cfg: Configuration for wandb.
-
-    Returns:
-        The wandb instance.
-    """
-    assert cfg.get("wandb", None) is not None
-    kwargs = cfg.wandb.to_dict()
-    if kwargs.get("name", "") == "":
-        kwargs["name"] = "_".join(_get_model_name(cfg.model).split("/")[-2:])
-    run = wandb.init(
-        **kwargs,
-        config=cfg.to_dict(),
-        settings=Settings(silent=True),
-    )
-    return run
 
 
 def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
@@ -654,13 +525,18 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
 class FinetuneRecipeForVLM(BaseRecipe):
     """Recipe for fine-tuning a VLM model."""
 
+    # MagiAttention is disabled until setup() resolves it from config; this
+    # disabled default keeps the train step working if setup() is skipped (e.g.
+    # unit tests that exercise the step directly). It is read-only.
+    magi = MagiState()
+
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
 
         Args:
             cfg: Configuration dictionary/object for training.
         """
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     # ------------------ build phase ------------------
     def setup(self):
@@ -672,7 +548,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
         """
         torch.cuda.reset_peak_memory_stats()
-        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        self.dist_env = initialize_distributed(
+            backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
+            timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
+        )
         setup_logging()
 
         apply_cache_compatibility_patches()
@@ -680,20 +559,34 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Set up the stateful random number generator
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
 
-        self.dist_setup = setup_distributed(self.cfg, world_size=self.dist_env.world_size)
-        self.distributed_config = self.dist_setup.strategy_config
-        self.device_mesh = self.dist_setup.device_mesh
-        self.moe_mesh = self.dist_setup.moe_mesh
-        self.pp_enabled = self.dist_setup.pp_enabled
-        self.pipeline_config = self.dist_setup.pipeline_config
+        (
+            self.distributed_setup,
+            self.mesh_context,
+            self.distributed_config,
+            self.device_mesh,
+            self.moe_mesh,
+            self.pp_enabled,
+            self.pipeline_config,
+            self.moe_parallel_config,
+            self.activation_checkpointing,
+        ) = self._distributed_setup_attributes(
+            create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+        )
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        # MagiAttention (FFA) backend for the language backbone; the vision tower
+        # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
+        # model.backend.attn="magi" (custom VLMs, e.g. qwen3_vl_moe).
+        self.magi = setup_magi(self.cfg, self.device_mesh, label="VLM language backbone")
+
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = build_wandb(self.cfg)
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
-        if self.dist_env.is_main and hasattr(self.cfg, "mlflow"):
-            if configure_mlflow(self.cfg) is not None:
+        if self.dist_env.is_main and self.cfg.mlflow is not None:
+            run_config = self.cfg.to_yaml_dict(use_orig_values=True)
+            checkpoint_dir = self.cfg.get("checkpoint.checkpoint_dir", None)
+            if self.cfg.mlflow.build(checkpoint_dir=checkpoint_dir, run_config=run_config) is not None:
                 logging.info("MLflow experiment tracking enabled")
 
         # Log experiment details on main rank
@@ -701,15 +594,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self._log_library_versions()
 
         # Build loss_fn (will be set on pipeline_config if PP enabled)
-        self.loss_fn = build_loss_fn(self.cfg.loss_fn)
+        self.loss_fn = self.cfg.loss_fn.build()
 
         # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
         if self.pp_enabled:
-            pp_batch_size = self.cfg.step_scheduler.local_batch_size
+            pp_batch_size = self.cfg.get("step_scheduler.local_batch_size", 1)
             pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
 
-            assert pp_batch_size // pp_microbatch_size >= self.dist_setup.pp_size, (
-                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.dist_setup.pp_size}"
+            assert pp_batch_size // pp_microbatch_size >= self.mesh_context.pp_size, (
+                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.mesh_context.pp_size}"
             )
 
             assert not isinstance(self.distributed_config, MegatronFSDPConfig), (
@@ -729,13 +622,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
 
-        # Build checkpoint config
-        checkpoint_config = build_checkpoint_config(
-            self.cfg.get("checkpoint", None),
-            self.cfg.get("model.cache_dir", None),
-            _get_model_name(self.cfg.model),
-            True if self.cfg.get("peft", None) else False,
-        )
+        # Checkpoint config (model-derived fields are filled in by RecipeConfig)
+        checkpoint_config = self.cfg.checkpoint
 
         if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
             self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)
@@ -743,9 +631,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
             self.max_grad_norm = 1.0
 
-        # Create Checkpointer instance
-        self.checkpointer = Checkpointer(
-            config=checkpoint_config,
+        # Build the checkpointer from its config
+        self.checkpointer = checkpoint_config.build(
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
@@ -753,9 +640,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
-        if self.dist_setup.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
-            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.dist_setup.cp_size)
+        if self.mesh_context.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
+            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.mesh_context.cp_size)
             self.cfg.model.backend.rope_fusion = False
+
+        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
 
         model = build_model(
             self.cfg.model,
@@ -764,14 +653,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
             seed=self.cfg.get("seed", 42),
             cfg_fp8=self.cfg.get("fp8", None),
             cfg_compile=self.cfg.get("compile", None),
-            device_mesh=self.device_mesh,
-            moe_mesh=self.moe_mesh,
-            distributed_config=self.distributed_config,
-            pipeline_config=self.pipeline_config,
-            cfg_moe=self.dist_setup.moe_config,
-            activation_checkpointing=self.dist_setup.activation_checkpointing,
+            distributed_setup=self.distributed_setup,
+            cfg_quantization=self.cfg.get("quantization", None),
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        apply_te_patches()
+        optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
+        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        self.optimizer = shard_optimizers_for_megatron_fsdp(
+            model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
+        )
 
         if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
             logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
@@ -783,6 +673,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         else:
             self.model_parts = [model]
             self.pp = None
+        if self.pp_enabled:
+            self._configure_pipeline_loss_fn()
 
         # Extract mRoPE position-id builder from the model so VLM neat packing can
         # produce 3D position_ids per sample. Without this, packed multimodal
@@ -791,7 +683,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         pp_n_microbatches = None
         pp_cp_preembed = (
             self.pp_enabled
-            and self.dist_setup.cp_size > 1
+            and self.mesh_context.cp_size > 1
             and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp")
         )
         if self.pp_enabled and not pp_cp_preembed:
@@ -827,16 +719,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
-        self.step_scheduler = build_step_scheduler(
-            self.cfg.get("step_scheduler", None),
+        self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
             self._get_dp_group_size(),
-            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+            self.cfg.get("step_scheduler.local_batch_size", 1),
         )
         self._setup_garbage_collection(self.step_scheduler)
 
         # Build learning rate scheduler
-        self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
+        self.lr_scheduler = (
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            if self.cfg.lr_scheduler is not None
+            else None
+        )
 
         # Log model, parameter counts, norms, optimizer and scheduler
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
@@ -913,6 +808,55 @@ class FinetuneRecipeForVLM(BaseRecipe):
             end_mlflow_active_run_as_killed()
 
     # ------------------ helpers ------------------
+    def _maybe_add_drafter_loss(
+        self,
+        *,
+        out: Any,
+        base_loss: torch.Tensor,
+        labels: torch.Tensor,
+        model: nn.Module,
+        num_label_tokens: int,
+        log: bool = False,
+    ) -> torch.Tensor:
+        """Return ``base_loss + lambda * sum_k CE(drafter_logits[k], shifted_labels_k)``.
+
+        If ``out`` does not carry a non-empty ``drafter_logits`` attribute (i.e. the
+        model isn't a joint composite), returns ``base_loss`` unchanged.
+
+        For drafter step ``k``, labels are shifted left by ``k`` positions to match
+        the VLM collate's pre-shifted convention (``labels[t] == input_ids[t+1]``).
+        ``log=True`` emits a one-line breakdown on rank 0; callers should gate this
+        on the appropriate step / microbatch index to avoid log spam.
+        """
+        drafter_logits = getattr(out, "drafter_logits", None)
+        if drafter_logits is None or len(drafter_logits) == 0:
+            return base_loss
+
+        drafter_loss_weight = getattr(out, "drafter_loss_weight", 1.0)
+        drafter_loss_total = None
+        for k, dl in enumerate(drafter_logits):
+            shifted_labels = _shift_labels_left(labels, k)
+            l_k = calculate_loss(
+                self.loss_fn,
+                logits=dl,
+                labels=shifted_labels,
+                model=model,
+                hidden_states=None,
+                num_label_tokens=num_label_tokens,
+            )
+            drafter_loss_total = l_k if drafter_loss_total is None else drafter_loss_total + l_k
+
+        total_loss = base_loss + drafter_loss_weight * drafter_loss_total
+        if log and self.dist_env.is_main:
+            logger.info(
+                "[joint-drafter] L_base=%.4f L_drafter=%.4f L_total=%.4f (lambda=%.3f)",
+                base_loss.detach().item(),
+                drafter_loss_total.detach().item(),
+                total_loss.detach().item(),
+                drafter_loss_weight,
+            )
+        return total_loss
+
     def _maybe_set_pp_first_stage_embed_input_meta(self, model_input: torch.Tensor) -> None:
         if (
             not self.pp_enabled
@@ -957,8 +901,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
             if not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False):
                 mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-                with torch.no_grad():
-                    prepared = _model(_pre_embed_only=True, **mm_kwargs)
+                prepared = _model(_pre_embed_only=True, **mm_kwargs)
                 for k in VLM_INPUT_KEYS:
                     batch.pop(k, None)
                 batch.update(prepared)
@@ -967,7 +910,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     if k != "input_ids":
                         batch.pop(k, None)
 
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        if self.magi.enabled:
+            # magi manages the language-backbone attention itself (vision stays on
+            # SDPA); skip the torch-native DTensor CP context.
+            train_ctx, batch = self.magi.prepare_vlm_batch(
+                self.model_parts[0], batch
+            )  # pragma: no cover - requires GPU + magi_attention
+        else:
+            train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
 
         if self.pp_enabled:
@@ -1029,12 +979,64 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     logits=getattr(out, "logits", out),
                     labels=labels,
                     model=model,
-                    hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
+                    hidden_states=get_final_hidden_states(out),
                     num_label_tokens=num_label_tokens,
                 )
+                # DSV4-style MTP loss (from main): triggers when the model emits
+                # ``mtp_per_depth_h`` / ``mtp_per_depth_logits``.
+                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
+                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    mtp_cfg = self.cfg.mtp
+                    scaling_factor = (
+                        mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
+                    )
+                    local_loss = local_loss + calculate_mtp_loss(
+                        self.loss_fn,
+                        mtp_per_depth_h=mtp_per_depth_h,
+                        mtp_per_depth_logits=mtp_per_depth_logits,
+                        labels=labels,
+                        model=model,
+                        scaling_factor=scaling_factor,
+                        num_label_tokens=num_label_tokens,
+                        ignore_index=mtp_cfg.ignore_index,
+                    )
+
+                # Joint base + drafter co-training (Gemma4WithDrafter and
+                # similar): detect by presence of ``drafter_logits`` on the
+                # model output and add
+                # ``drafter_loss_weight * sum_k CE(drafter_logits[k], shifted_labels_k)``
+                # to the base loss. See ``_shift_labels_left`` for the shift
+                # convention. Mutually exclusive with the DSV4-style MTP path
+                # above -- only one of ``drafter_logits`` /
+                # ``mtp_per_depth_*`` is set per model.
+                local_loss = self._maybe_add_drafter_loss(
+                    out=out,
+                    base_loss=local_loss,
+                    labels=labels,
+                    model=model,
+                    num_label_tokens=num_label_tokens,
+                    # Log once per remote-logging step on the first microbatch.
+                    log=(idx == 0 and self.step_scheduler.is_remote_logging_step),
+                )
+
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+
+    def _configure_pipeline_loss_fn(self):
+        if self.pp is None or not self.pp.info.has_last_stage:
+            return
+
+        last_stage_model = None
+        for model_part, stage in zip(self.model_parts, self.pp.info.stages):
+            if stage.is_last:
+                last_stage_model = model_part
+                break
+        if last_stage_model is None:
+            raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
+
+        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(self.loss_fn, last_stage_model)
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
         """Execute a single training step.
@@ -1234,6 +1236,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
                         else None,
                         num_label_tokens=num_label_tokens,
                     )
+                    # Mirror training: include the drafter term so validation
+                    # reflects drafter drift, not just the base.
+                    local_loss = self._maybe_add_drafter_loss(
+                        out=out,
+                        base_loss=local_loss,
+                        labels=labels,
+                        model=self.model_parts[0],
+                        num_label_tokens=num_label_tokens,
+                    )
                     total_num_label_tokens += num_label_tokens
 
                 total_loss += local_loss.item() * num_label_tokens
@@ -1241,7 +1252,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         # Aggregate across ranks if distributed is initialized
         total_loss = self._dp_allreduce(torch.FloatTensor([total_loss]), include_cp=True).item()
-        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens]), include_cp=True).item()
+        # `num_label_tokens` is measured before CP sharding, so each CP rank
+        # contributes the full sequence token count while `total_loss` is
+        # reconstructed from CP-sharded loss sums. Do not sum tokens over CP.
+        total_tokens = self._dp_allreduce(torch.LongTensor([total_tokens])).item()
         total_num_label_tokens = self._dp_allreduce(torch.LongTensor([total_num_label_tokens])).item()
 
         val_loss = total_loss / max(total_tokens, 1e-8)

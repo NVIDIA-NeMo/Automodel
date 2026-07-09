@@ -49,7 +49,8 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: true
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -129,7 +130,9 @@ optimizer:
   weight_decay: 0.1
 
 ci:
-  time: "00:15:00"
+  recipe_owner: HuiyingLi
+  max_steps: 10
+  time: "00:20:00"
 
 # wandb:
 #   project: <your_wandb_project>

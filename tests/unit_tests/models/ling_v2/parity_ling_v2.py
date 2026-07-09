@@ -17,7 +17,7 @@
 
 NOT a pytest test — meant to be run by hand inside a GPU container against
 the real ``inclusionAI/Ling-mini-2.0`` checkpoint.  Implements the three
-levels from ``skills/parity-testing/SKILL.md``:
+levels from ``.agents/contributor-skills/parity-testing/SKILL.md``:
 
     Level 1  state-dict round-trip                       CPU / fp32
     Level 2  per-component (RoPE, gate) parity           CPU / fp32
@@ -242,7 +242,7 @@ def level3_e2e_logits(hf_model_id: str) -> bool:
     input_ids = torch.randint(0, vocab, (1, 64), device=device)
     with torch.no_grad():
         hf_out = hf_model(input_ids).logits.float()
-        nemo_out = nemo_model(input_ids).float()
+        nemo_out = nemo_model(input_ids).logits.float()
 
     if nemo_out.shape != hf_out.shape:
         print(f"  ERROR: shape mismatch hf {hf_out.shape} vs nemo {nemo_out.shape}")

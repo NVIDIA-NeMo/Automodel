@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import functools
 import inspect
 import logging
 import math
@@ -280,6 +281,7 @@ def _precompute_stage_shapes(
     model_config,
     microbatch_size: int,
     seq_len: int,
+    tensor_dtype: torch.dtype | None = None,
 ) -> None:
     """Precompute input/output meta tensors for each pipeline stage to bypass serial shape inference.
 
@@ -300,11 +302,13 @@ def _precompute_stage_shapes(
     hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)
 
     for stage in stages:
-        # Infer the computation dtype from the stage's parameters
-        try:
-            model_dtype = next(stage.submod.parameters()).dtype
-        except StopIteration:
-            model_dtype = torch.bfloat16
+        if tensor_dtype is None:
+            try:
+                model_dtype = next(stage.submod.parameters()).dtype
+            except StopIteration:
+                model_dtype = torch.bfloat16
+        else:
+            model_dtype = tensor_dtype
 
         get_stage_metas = _get_optional_hook(stage.submod, "get_pipeline_stage_metas")
         if get_stage_metas is not None:
@@ -346,6 +350,7 @@ def reset_pp_stage_shapes(
     model_config,
     microbatch_size: int,
     seq_len: int,
+    tensor_dtype: torch.dtype | None = None,
 ) -> None:
     """Reset pipeline stage infrastructure and recompute shapes for a new sequence length.
 
@@ -377,7 +382,7 @@ def reset_pp_stage_shapes(
         stage.grad_send_info = None
 
     # Analytically set shapes for the new seq_len (no forward pass)
-    _precompute_stage_shapes(stages, model_config, microbatch_size, seq_len)
+    _precompute_stage_shapes(stages, model_config, microbatch_size, seq_len, tensor_dtype=tensor_dtype)
 
     # Trigger _initialize_stage(s) on the next step() call.
     # PipelineScheduleSingle uses singular, PipelineScheduleMulti uses plural.
@@ -387,6 +392,49 @@ def reset_pp_stage_shapes(
     if hasattr(schedule, "_stages_forward_initialized"):
         schedule._stages_forward_initialized = False
         schedule._stages_backward_initialized = False
+
+
+def _wrap_stage_forward_to_emit_tensor(stage_model: nn.Module) -> None:
+    """Make a pipeline stage's ``forward`` emit a tensor, not a ``ModelOutput``.
+
+    Custom ``*ForCausalLM`` / ``*ForConditionalGeneration`` models now return a
+    ``CausalLMOutputWithPast`` from ``forward`` (fused-linear cross-entropy
+    support, ``compute_lm_head_logits``). ``torch.distributed.pipelining``
+    requires every stage to emit a tensor (or tuple/list of tensors):
+    ``PipelineStage._validate_fwd_outputs`` and the inter-stage P2P send/recv
+    treat the output as tensor leaves and read ``.shape`` on each, which raises
+    ``AttributeError: 'CausalLMOutputWithPast' object has no attribute 'shape'``.
+
+    The stage's outer ``forward`` is left intact (a) for models that opt out of
+    patching via ``_pp_keep_self_forward`` and (b) for MoE configs that set
+    ``patch_causal_lm_model=False`` so only the inner model is patched. In both
+    cases the kept outer ``forward`` returns a ``ModelOutput``. This wraps it so
+    the return is unwrapped to its ``.logits`` tensor:
+    ``compute_lm_head_logits`` puts the projected logits there on the final stage
+    and the pass-through ``hidden_states`` on non-final stages (``lm_head is
+    None``) -- exactly the tensor each stage must forward, and the logits the
+    last-stage loss (``PipelineCausalLMLoss`` / ``MaskedCrossEntropy``) consumes.
+
+    No-op when ``forward`` already returns a tensor or a tuple (the patched
+    ``create_pipeline_forward_causal_lm`` path, and MTP models that emit a
+    ``(logits, *mtp, seq_idx)`` tuple), since only ``ModelOutput`` is unwrapped.
+    """
+    from transformers.modeling_outputs import ModelOutput
+
+    original_forward = stage_model.forward
+    # Idempotent: avoid double-wrapping if a stage module is processed twice.
+    if getattr(original_forward, "_pp_unwraps_model_output", False):
+        return
+
+    @functools.wraps(original_forward)
+    def _pp_tensor_forward(*args, **kwargs):
+        output = original_forward(*args, **kwargs)
+        if isinstance(output, ModelOutput):
+            return output.logits
+        return output
+
+    _pp_tensor_forward._pp_unwraps_model_output = True
+    stage_model.forward = _pp_tensor_forward
 
 
 def split_model_into_stages(
@@ -575,6 +623,12 @@ def split_model_into_stages(
         # Process the model
         _process_module(stage_model)
 
+        # torch.distributed.pipelining stages must emit tensors. Custom model
+        # forwards now return a CausalLMOutputWithPast; unwrap it to .logits so
+        # stage validation and inter-stage P2P see a tensor. No-op for the
+        # patched-forward path (already returns a tensor).
+        _wrap_stage_forward_to_emit_tensor(stage_model)
+
         # Create pipeline stage
         stage = PipelineStage(
             stage_model,
@@ -709,6 +763,7 @@ def pipeline_model(
     patch_stage_backward_maybe_with_nosync: bool = False,
     reduce_grad_per_microbatch: bool = False,
     seq_len: int | None = None,
+    tensor_dtype: torch.dtype | None = None,
 ) -> tuple[_PipelineSchedule, list[torch.nn.Module], bool, bool, list[PipelineStage]]:
     """HF-specific pipeline model splitting."""
     pp_size = world_mesh[pp_axis_name].size()
@@ -747,7 +802,7 @@ def pipeline_model(
     # Precompute stage shapes to bypass serial P2P shape inference.
     # This must happen *after* parallelization so that dtypes are final.
     if seq_len is not None:
-        _precompute_stage_shapes(stages, model.config, microbatch_size, seq_len)
+        _precompute_stage_shapes(stages, model.config, microbatch_size, seq_len, tensor_dtype=tensor_dtype)
 
     # Build pipeline schedule
     pp_schedule = build_pipeline_schedule(

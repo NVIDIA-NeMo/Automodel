@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 # Pipeline class name -> output type mapping
 _PIPELINE_OUTPUT_TYPES = {
     "FluxPipeline": "image",
+    "Flux2Pipeline": "image",
     "QwenImagePipeline": "image",
     "WanPipeline": "video",
     "HunyuanVideoPipeline": "video",
@@ -183,27 +184,63 @@ def _build_parallel_scheme(scheme_cfg, dist_info):
 
 
 def load_checkpoint_into_pipeline(pipe, cfg):
-    """Load a training checkpoint into the pipeline's transformer.
+    """Load training checkpoint(s) into the pipeline's transformer(s).
 
-    Expects a consolidated HF safetensors checkpoint produced by training
-    with model_save_format: safetensors, save_consolidated: true, and
-    diffusers_compatible: true. The checkpoint directory should contain
-    model/consolidated/ with diffusion_pytorch_model.safetensors.index.json
-    and the corresponding safetensors files.
+    Supports both single-transformer pipelines (Wan2.1, FLUX, HunyuanVideo) and
+    two-transformer pipelines (Wan2.2-T2V-A14B with ``transformer`` for the
+    high-noise stage and ``transformer_2`` for the low-noise stage).
 
-    Uses the standard diffusers from_pretrained() API for loading.
+    Single-transformer path: set ``model.checkpoint`` to load into ``pipe.transformer``.
+
+    Two-transformer path (Wan2.2): set ``model.checkpoint_high_noise`` and/or
+    ``model.checkpoint_low_noise``. Each is independently optional — a missing
+    one leaves that stage's transformer at its hub-pretrained weights, which is
+    useful for sanity-checking a partial finetune.
+
+    Expects consolidated HF safetensors checkpoints produced by training with
+    ``model_save_format: safetensors`` and ``save_consolidated: true``.
 
     Args:
-        pipe: The diffusion pipeline with a `.transformer` attribute.
-        cfg: Config node with `model.checkpoint` path.
+        pipe: The diffusion pipeline. May expose ``transformer_2`` for Wan2.2.
+        cfg: Config node with one of ``model.checkpoint``,
+            ``model.checkpoint_high_noise``, or ``model.checkpoint_low_noise``.
+
+    Raises:
+        ValueError: If both single-stage and two-stage checkpoint fields are set.
     """
     checkpoint = getattr(cfg.model, "checkpoint", None)
-    if not checkpoint:
-        return
+    checkpoint_high = getattr(cfg.model, "checkpoint_high_noise", None)
+    checkpoint_low = getattr(cfg.model, "checkpoint_low_noise", None)
+
+    if checkpoint and (checkpoint_high or checkpoint_low):
+        raise ValueError(
+            "model.checkpoint is mutually exclusive with "
+            "model.checkpoint_high_noise / model.checkpoint_low_noise. "
+            "Use the latter pair for two-transformer pipelines (Wan2.2) and "
+            "model.checkpoint for single-transformer pipelines."
+        )
 
     dtype_str = getattr(cfg.inference, "dtype", "bfloat16")
     torch_dtype = _resolve_dtype(dtype_str)
 
+    if checkpoint:
+        _load_checkpoint_into_attr(pipe, "transformer", checkpoint, torch_dtype)
+        return
+
+    if checkpoint_high:
+        _load_checkpoint_into_attr(pipe, "transformer", checkpoint_high, torch_dtype)
+    if checkpoint_low:
+        if getattr(pipe, "transformer_2", None) is None:
+            raise ValueError(
+                "model.checkpoint_low_noise is set but the loaded pipeline has no "
+                "transformer_2 attribute. This option only applies to two-stage "
+                "models like Wan2.2-T2V-A14B."
+            )
+        _load_checkpoint_into_attr(pipe, "transformer_2", checkpoint_low, torch_dtype)
+
+
+def _load_checkpoint_into_attr(pipe, attr_name, checkpoint, torch_dtype):
+    """Load a single consolidated/sharded checkpoint into ``pipe.<attr_name>``."""
     checkpoint_dir = Path(checkpoint)
     if not checkpoint_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
@@ -213,32 +250,53 @@ def load_checkpoint_into_pipeline(pipe, cfg):
     consolidated_st_dir = checkpoint_dir / "model" / "consolidated"
     sharded_dir = checkpoint_dir / "model"
 
+    target = getattr(pipe, attr_name)
+    if target is None:
+        raise AttributeError(f"Pipeline has no attribute {attr_name!r} to load checkpoint into")
+
+    # Load checkpoints to CPU first: load_state_dict copies into the target's
+    # existing (already-on-device) parameters, so a GPU map_location would hold a
+    # second full copy of the weights on-device and roughly double peak GPU memory.
+    # This matters for Wan2.2 two-stage inference, where this runs once per stage
+    # and the first transformer is still resident when the second loads.
     if ema_path.exists():
-        logger.info("Loading EMA checkpoint from %s", ema_path)
-        ema_state = torch.load(ema_path, map_location="cuda", weights_only=True)
-        pipe.transformer.load_state_dict(ema_state, strict=True)
-        logger.info("Loaded EMA checkpoint")
+        logger.info("Loading EMA checkpoint from %s into %s", ema_path, attr_name)
+        ema_state = torch.load(ema_path, map_location="cpu", weights_only=True)
+        target.load_state_dict(ema_state, strict=True)
     elif consolidated_path.exists():
-        logger.info("Loading consolidated checkpoint from %s", consolidated_path)
-        state_dict = torch.load(consolidated_path, map_location="cuda", weights_only=True)
+        logger.info("Loading consolidated checkpoint from %s into %s", consolidated_path, attr_name)
+        state_dict = torch.load(consolidated_path, map_location="cpu", weights_only=True)
         if "model_state_dict" in state_dict:
             state_dict = state_dict["model_state_dict"]
-        pipe.transformer.load_state_dict(state_dict, strict=True)
-        logger.info("Loaded consolidated checkpoint")
+        target.load_state_dict(state_dict, strict=True)
     elif consolidated_st_dir.is_dir() and any(
         name.endswith(".safetensors") for name in os.listdir(consolidated_st_dir)
     ):
-        logger.info("Loading consolidated safetensors checkpoint from %s", consolidated_st_dir)
-        pipe.transformer = type(pipe.transformer).from_pretrained(str(consolidated_st_dir), torch_dtype=torch_dtype)
-        pipe.transformer.to("cuda")
-        logger.info("Loaded consolidated safetensors checkpoint")
+        logger.info("Loading consolidated safetensors checkpoint from %s into %s", consolidated_st_dir, attr_name)
+        new_module = type(target).from_pretrained(str(consolidated_st_dir), torch_dtype=torch_dtype)
+        new_module.to("cuda")
+        setattr(pipe, attr_name, new_module)
     elif sharded_dir.is_dir() and any(name.endswith(".distcp") for name in os.listdir(sharded_dir)):
-        logger.info("Loading sharded FSDP checkpoint from %s", sharded_dir)
-        pipe.transformer = _load_sharded_fsdp_checkpoint(pipe.transformer, str(sharded_dir), torch_dtype)
-        pipe.transformer.to("cuda", dtype=torch_dtype)
-        logger.info("Loaded sharded FSDP checkpoint")
+        logger.info("Loading sharded FSDP checkpoint from %s into %s", sharded_dir, attr_name)
+        new_module = _load_sharded_fsdp_checkpoint(target, str(sharded_dir), torch_dtype)
+        new_module.to("cuda", dtype=torch_dtype)
+        setattr(pipe, attr_name, new_module)
+    elif sharded_dir.is_dir() and any(
+        name.startswith("shard-") and name.endswith(".safetensors") for name in os.listdir(sharded_dir)
+    ):
+        # NeMo-AutoModel sharded HF safetensors: one ``shard-XXXXX-*.safetensors``
+        # per FSDP rank from a run that set ``save_consolidated: false``. Use the
+        # DCP HuggingFaceStorageReader to materialize the full state dict.
+        logger.info("Loading sharded HF safetensors checkpoint from %s into %s", sharded_dir, attr_name)
+        new_module = _load_sharded_hf_safetensors_checkpoint(target, str(sharded_dir), torch_dtype)
+        new_module.to("cuda", dtype=torch_dtype)
+        setattr(pipe, attr_name, new_module)
     else:
-        logger.warning("No recognized checkpoint format found in %s, using base model weights", checkpoint_dir)
+        logger.warning(
+            "No recognized checkpoint format found in %s, leaving %s at base weights",
+            checkpoint_dir,
+            attr_name,
+        )
 
 
 def load_lora_weights_into_pipeline(pipe, cfg):
@@ -266,14 +324,34 @@ def load_lora_weights_into_pipeline(pipe, cfg):
         raise FileNotFoundError(f"LoRA weights directory not found: {lora_path}")
 
     with open(lora_path / "adapter_config.json") as f:
-        peft_config = PeftConfig.from_dict(json.load(f))
-    apply_lora_to_linear_modules(pipe.transformer, peft_config, skip_freeze=True)
+        peft_config_dict = json.load(f)
+    if "dim" not in peft_config_dict and "r" in peft_config_dict:
+        peft_config_dict["dim"] = peft_config_dict["r"]
+    if "alpha" not in peft_config_dict and "lora_alpha" in peft_config_dict:
+        peft_config_dict["alpha"] = peft_config_dict["lora_alpha"]
+    if "dropout" not in peft_config_dict and "lora_dropout" in peft_config_dict:
+        peft_config_dict["dropout"] = peft_config_dict["lora_dropout"]
+
+    peft_config = PeftConfig.from_dict(peft_config_dict)
+    num_lora_modules = apply_lora_to_linear_modules(pipe.transformer, peft_config, skip_freeze=True)
+    if num_lora_modules == 0:
+        raise RuntimeError(f"No transformer modules matched LoRA config from {lora_path / 'adapter_config.json'}")
+
     state_dict = load_file(lora_path / "adapter_model.safetensors", device="cuda")
-    pipe.transformer.load_state_dict(state_dict, strict=False)
+    state_dict = {key.removeprefix("base_model.model."): value for key, value in state_dict.items()}
+    load_result = pipe.transformer.load_state_dict(state_dict, strict=False)
+    missing_lora_keys = sorted(key for key in load_result.missing_keys if ".lora_" in key)
+    unexpected_lora_keys = sorted(key for key in load_result.unexpected_keys if ".lora_" in key)
+    if missing_lora_keys or unexpected_lora_keys:
+        raise RuntimeError(
+            "LoRA checkpoint did not load cleanly. "
+            f"missing_lora_keys={missing_lora_keys[:10]}, unexpected_lora_keys={unexpected_lora_keys[:10]}"
+        )
+    logger.info("Loaded LoRA adapter from %s (%d modules, %d tensors)", lora_path, num_lora_modules, len(state_dict))
 
 
 def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bfloat16):
-    """Load sharded FSDP/DCP checkpoint into a transformer module.
+    """Load sharded FSDP1 .distcp checkpoint into a transformer module.
 
     Creates a temporary gloo process group for single-GPU loading if
     torch.distributed is not already initialized.
@@ -302,19 +380,59 @@ def _load_sharded_fsdp_checkpoint(transformer, sharded_dir, torch_dtype=torch.bf
     try:
         transformer.to(device="cuda", dtype=torch_dtype)
         fsdp_transformer = FSDP(transformer, use_orig_params=True)
-
         FSDP.set_state_dict_type(
             fsdp_transformer,
             StateDictType.SHARDED_STATE_DICT,
             state_dict_config=ShardedStateDictConfig(offload_to_cpu=True),
         )
-
         model_state = fsdp_transformer.state_dict()
         dist_load(state_dict=model_state, storage_reader=FileSystemReader(sharded_dir))
         fsdp_transformer.load_state_dict(model_state)
-
-        # Unwrap back to the original module for inference
         return fsdp_transformer.module
+    finally:
+        if init_dist:
+            dist.destroy_process_group()
+
+
+def _load_sharded_hf_safetensors_checkpoint(transformer, sharded_dir, torch_dtype=torch.bfloat16):
+    """Load NeMo-AutoModel sharded HF safetensors checkpoint into a transformer.
+
+    Handles directories containing ``shard-XXXXX-model-XXXXX-of-XXXXX.safetensors``
+    files produced by training runs with ``save_consolidated: false``. Uses DCP's
+    ``HuggingFaceStorageReader`` to gather all shards into the target state dict.
+
+    Args:
+        transformer: The transformer nn.Module to load weights into.
+        sharded_dir: Path to the directory containing shard-*.safetensors files.
+        torch_dtype: The dtype to cast the transformer to before loading.
+
+    Returns:
+        The transformer module with the merged state dict loaded.
+    """
+    from torch.distributed.checkpoint import load as dist_load
+
+    # Prefer the upstream HF storage reader; fall back to NeMo's backport if
+    # the torch version is too old to ship it.
+    try:
+        from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
+    except ImportError:
+        from nemo_automodel.components.checkpoint._backports.hf_storage import (
+            _HuggingFaceStorageReader as HuggingFaceStorageReader,
+        )
+
+    init_dist = False
+    if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+        init_dist = True
+
+    try:
+        transformer.to(device="cuda", dtype=torch_dtype)
+        state_dict = transformer.state_dict()
+        dist_load(state_dict=state_dict, storage_reader=HuggingFaceStorageReader(path=sharded_dir))
+        transformer.load_state_dict(state_dict, strict=True)
+        return transformer
     finally:
         if init_dist:
             dist.destroy_process_group()

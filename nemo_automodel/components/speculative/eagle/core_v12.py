@@ -46,6 +46,7 @@ class EagleTrainerModule(nn.Module):
         target_lm_head: nn.Module,
         hidden_loss_weight: float = 1.0,
         token_loss_weight: float = 0.1,
+        feature_noise: float = 0.0,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -55,11 +56,29 @@ class EagleTrainerModule(nn.Module):
         object.__setattr__(self, "_target_lm_head", target_lm_head)
         self.hidden_loss_weight = hidden_loss_weight
         self.token_loss_weight = token_loss_weight
+        # EAGLE feature-noise data augmentation. The original paper adds noise
+        # sampled from U(-0.1, 0.1) to the target features fed to the draft during
+        # training, to mitigate the error accumulation that compounds across the
+        # autoregressive drafting steps. ``feature_noise`` is the (symmetric)
+        # magnitude; 0 disables it. EAGLE (Li et al., 2024), arXiv:2401.15077:
+        # "we employ data augmentation by adding random noise sampled from a
+        # uniform distribution U(-0.1, 0.1) to features of the target LLM during
+        # training."
+        self.feature_noise = feature_noise
         self.hidden_loss_fn = nn.SmoothL1Loss(reduction="none")
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project predicted hidden states through the frozen target lm_head."""
-        return F.linear(hidden_states, self._target_lm_head.weight)
+        weight = self._target_lm_head.weight
+        # The target may be FSDP2-sharded (the EAGLE-1/2 recipe's optional
+        # ``distributed:`` path, used for targets that do not fit on one GPU),
+        # which makes ``weight`` a ``DTensor``. The draft runs under DDP, so
+        # ``hidden_states`` is a plain tensor and ``F.linear`` cannot mix the
+        # two. Gather the frozen weight to a local full tensor first -- mirrors
+        # ``copy_embeddings_from_target``. No-op when the target is unsharded.
+        if hasattr(weight, "full_tensor"):
+            weight = weight.full_tensor()
+        return F.linear(hidden_states, weight)
 
     def forward(
         self,
@@ -71,6 +90,16 @@ class EagleTrainerModule(nn.Module):
         target_logits: torch.Tensor,
     ) -> EagleStepMetrics:
         """Run one EAGLE-1 / EAGLE-2 training step."""
+        if self.training and self.feature_noise > 0:
+            # EAGLE feature-noise augmentation (see __init__): add
+            # U(-feature_noise, feature_noise) to the draft's input features.
+            # ``rand_like`` is in [0, 1), so ``(rand_like - 0.5) * 2 * fn`` is
+            # uniform on (-fn, fn). Only the draft *input* is perturbed; the
+            # SmoothL1 regression target ``target_hidden_states`` stays clean.
+            # No-op in eval (``self.training`` is False).
+            input_hidden_states = input_hidden_states + (torch.rand_like(input_hidden_states) - 0.5) * (
+                2.0 * self.feature_noise
+            )
         predicted_hidden_states = self.draft_model(
             input_ids=input_ids,
             target_hidden_states=input_hidden_states,

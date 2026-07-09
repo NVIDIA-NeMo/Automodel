@@ -1,0 +1,180 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# BAGEL pretraining - joint understanding + generation.
+#
+# This config initializes BAGEL from pretrained Qwen and SigLIP backbones,
+# then trains on the packed multimodal mixture defined below.
+
+recipe: PretrainRecipeForMultimodal
+
+seed: 4396
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  max_steps: 100
+  ckpt_every_steps: 100000
+  val_every_steps: 100000
+  save_checkpoint_every_epoch: false
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+tokenizer:
+  pretrained_model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+
+model:
+  init_mode: hf_backbones
+  stage: 2
+  llm_path: Qwen/Qwen2.5-7B-Instruct
+  vit_path: HuggingFaceM4/siglip-so400m-14-980-flash-attn2-navit
+  vae_path: /path/to/ae.safetensors
+  layer_module: Qwen2MoTDecoderLayer
+  llm_qk_norm: true
+  tie_word_embeddings: false
+  copy_init_moe: true
+  torch_dtype: float32
+  max_latent_size: 64
+  # Set to 0 to encode the whole image batch at once.
+  vae_encode_micro_batch_size: 1
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/bagel-pretrain-am
+  model_save_format: torch_save
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  dp_replicate_size: 1
+  cp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: bfloat16
+    output_dtype: bfloat16
+    cast_forward_inputs: true
+
+dataset:
+  # Replace these paths with prepared BAGEL-format data.
+  # For parquet-backed mandatory groups, num_files / num_used_data should be
+  # at least the data-parallel world size so every rank receives files.
+  dataset_info:
+    t2i_pretrain:
+      t2i:
+        data_dir: /path/to/bagel_data/t2i
+        num_files: 8
+        num_total_samples: 1000
+    unified_edit:
+      edit_data:
+        data_dir: /path/to/bagel_data/editing/images
+        num_files: 8
+        num_total_samples: 1000
+        parquet_info_path: /path/to/bagel_data/editing/parquet_info.json
+    vlm_sft:
+      vlm_data:
+        data_dir: /path/to/bagel_data/vlm/images
+        jsonl_path: /path/to/bagel_data/vlm/train.jsonl
+        num_total_samples: 1000
+  grouped_datasets:
+    t2i_pretrain:
+      dataset_names:
+        - t2i
+      image_transform_args:
+        image_stride: 16
+        max_image_size: 1024
+        min_image_size: 512
+      is_mandatory: true
+      num_used_data:
+        - 8
+      weight: 1
+    unified_edit:
+      dataset_names:
+        - edit_data
+      image_transform_args:
+        image_stride: 16
+        max_image_size: 1024
+        min_image_size: 512
+      vit_image_transform_args:
+        image_stride: 14
+        max_image_size: 518
+        min_image_size: 224
+      is_mandatory: false
+      num_used_data:
+        - 8
+      weight: 1
+    vlm_sft:
+      dataset_names:
+        - vlm_data
+      image_transform_args:
+        image_stride: 14
+        max_image_size: 980
+        min_image_size: 378
+        max_pixels: 2_007_040
+      frame_sampler_args:
+        max_num_frames: 12
+        min_num_frames: 8
+      is_mandatory: true
+      shuffle_lines: true
+      shuffle_seed: 0
+      num_used_data:
+        - 1000
+      weight: 1
+  expected_num_tokens: 10240
+  max_num_tokens: 11520
+  max_num_tokens_per_sample: 10240
+  prefer_buffer_before: 16384
+  max_buffer_size: 50
+  vit_patch_size: 14
+  max_num_patch_per_side: 70
+  interpolate_pos: false
+  data_seed: 42
+  text_cond_dropout_prob: 0.1
+  vit_cond_dropout_prob: 0.4
+  vae_cond_dropout_prob: 0.1
+  vae_image_downsample: 16
+  max_latent_size: 64
+  use_flex: true
+
+dataloader:
+  num_workers: 1
+  pin_memory: true
+  prefetch_factor: 2
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-15
+  weight_decay: 0.0
+  # foreach=false: on torch>=2.12, AdamW's _foreach_* ops over FSDP2-sharded (DTensor) params
+  # are re-planned by DTensor's sharding propagator every step via the *uncached* path (a
+  # foreach op's list argument isn't cached), leaking OpStrategy/OpSpec + FakeTensor dispatch-
+  # cache entries (~19.6k Python objects/step -> growing gen-2 GC pauses -> throughput sinks
+  # monotonically over a run). Single-tensor ops (foreach=false) hit the sharding cache, so
+  # nothing accumulates; the optimizer is a tiny slice of step time, so the cost is ~0.8%.
+  # Remove once the DTensor foreach path is fixed upstream.
+  foreach: false
+
+lr_scheduler:
+  schedule: constant
+  warmup_steps: 2000
+
+clip_grad_norm:
+  max_norm: 1.0
+
+freeze_config:
+  freeze_vision_tower: false
+  freeze_language_model: false
+
+ema:
+  decay: 0.9999
+  implementation: auto
+
+wandb:
+  enable: false
+  project: bagel-pretraining
+  mode: disabled
+  name: bagel_mot_pretrain

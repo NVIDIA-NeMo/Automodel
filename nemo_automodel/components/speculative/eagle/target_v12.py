@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 
 import torch
@@ -26,6 +27,17 @@ def _shift_left_with_zero(tensor: torch.Tensor) -> torch.Tensor:
     """Shift a batched sequence tensor left and zero-fill the tail."""
     tail = torch.zeros_like(tensor[:, :1])
     return torch.cat((tensor[:, 1:], tail), dim=1)
+
+
+def _to_full_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialise a (possibly tensor-parallel) tensor as a plain local tensor.
+
+    With a tensor-parallel target the lm_head is column-parallel, so its logits
+    come back as a vocab-sharded ``DTensor``. The draft consumes plain tensors,
+    so gather the full tensor before handing it on. A no-op for an already-plain
+    (unsharded or pure-FSDP-replicated) tensor.
+    """
+    return tensor.full_tensor() if hasattr(tensor, "full_tensor") else tensor
 
 
 @dataclass
@@ -62,15 +74,31 @@ class HFEagleTargetModel:
         loss_mask: torch.Tensor,
     ) -> EagleTargetBatch:
         """Run the target transformer and prepare shifted supervision tensors."""
-        outputs = self.model.model(
+        # Strip HF-only flags when the base model doesn't declare them.
+        # AutoModel's custom backbones expose a ``**attn_kwargs`` catch-all
+        # and silently ignore ``output_*`` / ``use_cache``; HF backbones
+        # declare them and care.
+        base_model = self.model.model
+        base_forward_params = inspect.signature(base_model.forward).parameters
+        extra_kwargs = {
+            name: False
+            for name in ("output_hidden_states", "output_attentions", "use_cache")
+            if name in base_forward_params
+        }
+        outputs = base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_attentions=False,
-            output_hidden_states=False,
-            use_cache=False,
+            **extra_kwargs,
         )
-        hidden_states = outputs[0]
-        logits = self.model.lm_head(hidden_states)
+        # HF base models return a dataclass whose first item is
+        # ``last_hidden_state``; AutoModel custom backbones return the
+        # bare hidden tensor.
+        hidden_states = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
+        # A tensor-parallel target has a column-parallel lm_head, so its logits
+        # are a vocab-sharded DTensor; gather to a full tensor for the draft. The
+        # hidden states stay replicated under the default (non sequence-parallel)
+        # plan, so they need no gather. No-op without TP.
+        logits = _to_full_tensor(self.model.lm_head(hidden_states))
         return EagleTargetBatch(
             input_hidden_states=hidden_states,
             target_hidden_states=_shift_left_with_zero(hidden_states),

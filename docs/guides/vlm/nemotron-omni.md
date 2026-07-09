@@ -63,9 +63,9 @@ git clone -b nemotron-omni ssh://git@gitlab-master.nvidia.com:12051/huiyingl/aut
 cd automodel-omni
 ```
 
-:::{note}
-NemotronOmni requires `mamba_ssm`, `causal_conv1d`, and `decord` packages, which are included in the NeMo AutoModel container.
-:::
+<Note>
+NemotronOmni requires `mamba_ssm` and `causal_conv1d` (the `cuda` extra, pre-built in the NeMo AutoModel container) plus `decord` for video reading. Since the FFmpeg media split, `decord` is **no longer bundled in the container** — add it via the `vlm-media` extra: `pip install "nemo-automodel[vlm-media]"`.
+</Note>
 
 ---
 
@@ -140,7 +140,8 @@ model:
     linear: torch
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: false
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
