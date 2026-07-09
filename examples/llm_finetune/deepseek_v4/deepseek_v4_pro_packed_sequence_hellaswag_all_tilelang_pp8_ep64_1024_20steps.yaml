@@ -130,5 +130,4 @@ ci:
   # pp_size(8) * ep_size(64) = 512 GPUs => 64 nodes (8 H100/node).
   recipe_owner: hemildesai
   nodes: 64
-  # Cold multi-node start + TileLang JIT runs past the 00:30:00 allocation (AM-629).
   time: "01:00:00"
