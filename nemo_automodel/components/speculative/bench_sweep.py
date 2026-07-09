@@ -24,13 +24,13 @@ instead of the user invoking ``bench_sglang``/``bench_vllm`` once per dataset
 and collating the output by hand.
 
 Default dataset suite -- the four benchmarks the EAGLE / EAGLE-2 papers report
-acceptance / speedup numbers on: MT-Bench (multi-turn chat), HumanEval (code),
+acceptance / speedup numbers on: MT-Bench (first turn), HumanEval (code),
 GSM8K (math), and Alpaca (single-turn instruction-following). None of these
 ship a chat-messages column the way ``bench_sglang``/``bench_vllm``'s
 ``--messages-column`` expects, so each reads a raw text field instead
 (``bench_common``'s ``--prompt-column`` path: the field is wrapped into a
-fresh single-turn user message; a list value, e.g. MT-Bench's multi-turn
-``turns`` column, uses its first entry).
+fresh single-turn user message; a list value, e.g. MT-Bench's two-turn
+``prompt`` column, uses its first entry).
 
 Override the default suite with ``--datasets-config <path.yaml>``: a YAML list
 of entries, each ``{name, input_data, split, dataset_name, messages_column |

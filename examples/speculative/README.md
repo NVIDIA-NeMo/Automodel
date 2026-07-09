@@ -386,7 +386,7 @@ python -m nemo_automodel.components.speculative.bench_sweep --engine sglang --se
 ```
 
 The default suite is the four benchmarks the EAGLE / EAGLE-2 papers report
-acceptance/speedup on -- MT-Bench (multi-turn chat), HumanEval (code), GSM8K
+acceptance/speedup on -- MT-Bench (first turn), HumanEval (code), GSM8K
 (math), and Alpaca (single-turn instruction-following). None of these ship a
 chat-messages column, so each is read via `--prompt-column` (a raw text field
 wrapped into a fresh single-turn user message) rather than
