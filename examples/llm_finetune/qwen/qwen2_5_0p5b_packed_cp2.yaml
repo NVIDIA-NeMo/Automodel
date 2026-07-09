@@ -97,4 +97,5 @@ optimizer:
 ci:
   recipe_owner: akoumpa
   time: "00:15:00"
+  nodes: 1
   nproc_per_node: 2
