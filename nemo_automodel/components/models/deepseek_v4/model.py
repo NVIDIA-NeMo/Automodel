@@ -219,14 +219,15 @@ class DeepseekV4Block(nn.Module):
         dtype = x.dtype
         return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2).to(dtype), x)
 
-    def init_weights(self, buffer_device: torch.device) -> None:
+    def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         self.input_layernorm.reset_parameters()
         self.post_attention_layernorm.reset_parameters()
-        self.self_attn.init_weights(buffer_device)
-        self.mlp.init_weights(buffer_device)
-        # HC mixer params stay at whatever the checkpoint provides (init.normal_
-        # on ``fn``, init.zeros_ on ``base``, init.ones_ on ``scale`` for random
-        # init — matches HF's _init_weights at modular_deepseek_v4.py:923-926).
+        self.self_attn.init_weights(buffer_device, init_std=init_std)
+        self.mlp.init_weights(buffer_device, init_std=init_std)
+        if isinstance(self.mlp.gate, DeepseekV4HashGate):
+            self.mlp.gate.init_weights(init_std=init_std)
+        self.attn_hc.init_weights(init_std)
+        self.ffn_hc.init_weights(init_std)
 
 
 class DeepseekV4HashGate(nn.Module):
@@ -279,10 +280,17 @@ class DeepseekV4HashGate(nn.Module):
     def update_bias(self) -> None:
         """No-op for compat with callers that walk MoE gates and call update_bias."""
 
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        nn.init.zeros_(self.weight)
+    def init_weights(self, init_std: float = 0.02) -> None:
+        """Initialize the trainable gate and a valid deterministic hash table.
+
+        Args:
+            init_std: Standard deviation for the routing weight initialization.
+        """
+        nn.init.normal_(self.weight, mean=0.0, std=init_std)
         with torch.no_grad():
-            self.tid2eid.zero_()
+            token_ids = torch.arange(self.tid2eid.shape[0], device=self.tid2eid.device).unsqueeze(1)
+            expert_offsets = torch.arange(self.topk, device=self.tid2eid.device).unsqueeze(0)
+            self.tid2eid.copy_((token_ids * self.topk + expert_offsets) % self.n_experts)
 
     def forward(
         self,
@@ -569,13 +577,16 @@ class DeepseekV4Model(nn.Module):
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        init_std = float(getattr(self.config, "initializer_range", 0.02))
         with buffer_device:
             if self.embed_tokens is not None:
                 nn.init.normal_(self.embed_tokens.weight)
             if self.norm is not None:
                 self.norm.reset_parameters()
+            if self.hc_head is not None:
+                self.hc_head.init_weights(init_std)
         for layer in self.layers.values():
-            layer.init_weights(buffer_device=buffer_device)
+            layer.init_weights(buffer_device=buffer_device, init_std=init_std)
 
 
 class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
