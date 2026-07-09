@@ -92,7 +92,6 @@ def _build_or_reuse_pp_causal_mask(module, inputs_embeds, attention_mask, cache_
         "config": module.config,
         "inputs_embeds": inputs_embeds,
         "attention_mask": attention_mask,
-        "cache_position": cache_position,
         "past_key_values": None,  # Training-only: no KV cache
         "position_ids": position_ids,
     }
@@ -324,9 +323,8 @@ def create_pipeline_forward_gemma4_text() -> Callable:
 
         mask_kwargs = {
             "config": self.config,
-            "input_embeds": inputs_embeds,
+            "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
-            "cache_position": cache_position,
             "past_key_values": None,
             "position_ids": position_ids,
         }

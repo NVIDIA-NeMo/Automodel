@@ -333,6 +333,19 @@ class TestActivationCheckpointingParsing:
         assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] is True
 
+    @pytest.mark.parametrize("strategy", ["fsdp2", "ddp"])
+    def test_scope_forwarded_to_strategy_config(self, strategy):
+        result = parse_distributed_section(
+            {
+                "strategy": strategy,
+                "activation_checkpointing": True,
+                "activation_checkpointing_scope": "language",
+            }
+        )
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["strategy_config"].activation_checkpointing_scope == ("language",)
+        assert result["activation_checkpointing"] is True
+
     def test_selective_parsed_for_fsdp2_when_no_ep(self):
         result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "selective", "ep_size": 1})
         # AC is kept off the strategy config and carried on the parsed value.
