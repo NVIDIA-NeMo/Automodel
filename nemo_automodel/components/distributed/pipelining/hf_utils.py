@@ -233,6 +233,17 @@ def create_pipeline_forward_causal_lm() -> Callable:
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[torch.Tensor, BaseModelOutputWithPast]:
+        """Pipeline-stage forward for a causal-LM wrapper.
+
+        B=microbatch, S=seq, H=hidden, V=vocab. Non-first stages take input
+        hidden states ``[B, S, H]`` via ``inputs_embeds`` (or ``input_ids`` when
+        already floating-point).
+
+        Returns hidden states ``[B, S, H]`` when ``self._pp_return_hidden_states``
+        is set (lm_head deferred to FusedLinearCrossEntropy); else logits
+        ``[B, S', V]`` when this stage owns ``lm_head`` (``S'`` = ``S`` sliced by
+        ``logits_to_keep``); else hidden states ``[B, S, H]`` for the next stage.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

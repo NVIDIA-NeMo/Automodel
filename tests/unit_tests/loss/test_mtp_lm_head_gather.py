@@ -224,6 +224,22 @@ def test_pipeline_loss_fused_ce_routes_bare_tensor_as_hidden_states():
     assert captured["logits"] is None
 
 
+def test_pipeline_loss_fused_ce_with_mtp_tuple_raises():
+    """FusedLinearCrossEntropy cannot consume an MTP tuple output (it carries
+    logits, not the hidden states the fused loss needs), so the last-stage loss
+    must reject it explicitly instead of silently mishandling the tensors."""
+    from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
+
+    loss_mod = PipelineCausalLMLoss(FusedLinearCrossEntropy(), _TinyModel())
+
+    logits = torch.randn(B, S, V)
+    mtp_h = torch.randn(B, S, H)  # per-depth hidden states appended by an MTP model
+    labels = torch.randint(0, V, (B, S))
+
+    with pytest.raises(ValueError, match="FusedLinearCrossEntropy is not supported with MTP"):
+        loss_mod((logits, mtp_h), labels)
+
+
 def test_non_fused_path_does_not_gather_lm_head():
     """Logit-based losses (non-Fused) must not trigger the LM-head weight gather."""
     hs, labels = _inputs()

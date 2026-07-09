@@ -221,6 +221,20 @@ class PipelineCausalLMLoss(nn.Module):
         return None, output
 
     def forward(self, output, labels: torch.Tensor) -> torch.Tensor:
+        """Last-stage pipeline loss (main CE plus optional MTP aux CE).
+
+        B=microbatch, S=seq, H=hidden, V=vocab.
+
+        Args:
+            output: bare hidden states ``[B, S, H]`` (FusedLinearCrossEntropy
+                path), a HF output with logits ``[B, S, V]``, or an MTP tuple
+                ``(logits, *mtp_per_depth_h[, seq_idx])`` with ``seq_idx``
+                ``[B, S]`` int32. A tuple with FusedLinearCrossEntropy raises.
+            labels: target token ids ``[B, S]`` int64.
+
+        Returns:
+            Scalar loss tensor.
+        """
         seq_idx_mb, output = self._extract_seq_idx_tail(output)
 
         if isinstance(output, tuple):
