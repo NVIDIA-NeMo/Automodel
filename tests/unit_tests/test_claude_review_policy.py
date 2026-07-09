@@ -19,6 +19,7 @@ import pytest
 import yaml
 
 WORKFLOW_PATH = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "claude-review.yml"
+AGENTS_PATH = Path(__file__).resolve().parents[2] / "AGENTS.md"
 
 
 def _normalize(text: str) -> str:
@@ -119,3 +120,15 @@ def test_review_prompt_does_not_reintroduce_known_false_positive():
     assert _normalize("(and the `build_*` builders)") not in _normalize(prompt)
     assert _normalize("deterministic seeds") not in _normalize(prompt)
     assert _normalize("private implementation helpers, or APIs") not in _normalize(prompt)
+
+
+def test_agents_uses_review_prompt_as_development_guidance():
+    guidance = _normalize(AGENTS_PATH.read_text())
+
+    assert _normalize(".github/workflows/claude-review.yml") in guidance
+    assert _normalize("jobs.claude-review.with.prompt") in guidance
+    assert _normalize("mandatory development guidance") in guidance
+    assert _normalize("before planning or editing") in guidance
+    assert _normalize("Review-bot mechanics do not govern development work") in guidance
+    assert _normalize("`config.build(...)` results") in guidance
+    assert _normalize("new free-standing `build_*` helpers") in guidance
