@@ -120,3 +120,155 @@ def test_masked_cross_entropy_num_label_tokens_normalization():
     assert torch.allclose(loss_masked, expected_loss, atol=1e-6), (
         f"Expected normalized loss {expected_loss.item()}, but got {loss_masked.item()}."
     )
+
+
+# ---------------------------------------------------------------------------
+# chunked path (chunk_size is not None)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("inplace_grad", [False, True])
+def test_chunked_masked_cross_entropy_matches_full_tensor_path(inplace_grad):
+    """The chunked path must match the full-tensor path in loss and gradient on CPU."""
+    torch.manual_seed(11)
+    logits = torch.randn(2, 5, 13, requires_grad=True)
+    reference_logits = logits.detach().clone().requires_grad_()
+    labels = torch.randint(0, logits.shape[-1], (2, 5))
+    labels[0, 1] = -100
+    mask = torch.ones_like(labels)
+    mask[1, 3] = 0
+
+    loss = MaskedCrossEntropy(chunk_size=3, inplace_grad=inplace_grad)(logits, labels.clone(), mask=mask)
+    reference = MaskedCrossEntropy()(reference_logits, labels.clone(), mask=mask)
+
+    torch.testing.assert_close(loss, reference, rtol=1e-6, atol=1e-7)
+    loss.backward()
+    reference.backward()
+    torch.testing.assert_close(logits.grad, reference_logits.grad, rtol=1e-6, atol=1e-7)
+    if inplace_grad:
+        assert logits.grad.untyped_storage().data_ptr() == logits.untyped_storage().data_ptr()
+
+
+def test_chunked_masked_cross_entropy_matches_cross_entropy_reference():
+    """Direct parity against ``F.cross_entropy`` (sum reduction) with mask + ignore_index holes."""
+    torch.manual_seed(13)
+    logits = torch.randn(3, 7, 11, requires_grad=True)
+    reference_logits = logits.detach().clone().requires_grad_()
+    labels = torch.randint(0, logits.shape[-1], (3, 7))
+    labels[0, 2] = -100
+    mask = torch.ones_like(labels)
+    mask[2, 4] = 0
+    expected_labels = labels.masked_fill(mask == 0, -100)
+
+    loss = MaskedCrossEntropy(chunk_size=4)(logits, labels.clone(), mask=mask)
+    reference = F.cross_entropy(
+        reference_logits.reshape(-1, reference_logits.shape[-1]),
+        expected_labels.reshape(-1),
+        ignore_index=-100,
+        reduction="sum",
+    )
+
+    torch.testing.assert_close(loss, reference, rtol=1e-6, atol=1e-7)
+    loss.backward()
+    reference.backward()
+    torch.testing.assert_close(logits.grad, reference_logits.grad, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("chunk_size", [-3, 0])
+def test_chunked_masked_cross_entropy_rejects_nonpositive_chunk_size_at_init(chunk_size):
+    """Non-positive chunk sizes must be rejected at construction time."""
+    with pytest.raises(ValueError, match="chunk_size must be greater than zero"):
+        MaskedCrossEntropy(chunk_size=chunk_size)
+
+
+def test_chunked_masked_cross_entropy_rejects_unsupported_reduction_and_dtype_config():
+    """chunk_size only composes with reduction='sum' and fp32_upcast=True."""
+    with pytest.raises(ValueError, match="reduction='sum'"):
+        MaskedCrossEntropy(chunk_size=2, reduction="mean")
+    with pytest.raises(ValueError, match="fp32_upcast=True"):
+        MaskedCrossEntropy(chunk_size=2, fp32_upcast=False)
+
+
+def test_chunked_masked_cross_entropy_revalidates_mutated_chunk_size_at_forward():
+    """A chunk_size mutated after construction is re-validated on every forward."""
+    loss_fn = MaskedCrossEntropy(chunk_size=2)
+    loss_fn.chunk_size = -1
+
+    with pytest.raises(ValueError, match="chunk_size must be greater than zero"):
+        loss_fn(torch.randn(2, 7), torch.tensor([1, 2]))
+
+
+@pytest.mark.parametrize("label_shape", [(2, 3), (2, 5), (8,)])
+def test_chunked_masked_cross_entropy_rejects_mismatched_labels(label_shape):
+    """Labels that do not match logits.shape[:-1] must be rejected (even with equal numel)."""
+    logits = torch.randn(2, 4, 7)
+    labels = torch.zeros(label_shape, dtype=torch.long)
+
+    with pytest.raises(ValueError, match=r"logits\.shape\[:-1\] == labels\.shape"):
+        MaskedCrossEntropy(chunk_size=2)(logits, labels)
+
+
+def test_chunked_masked_cross_entropy_rejects_mask_shape_mismatch():
+    """A mask with the right numel but wrong shape must be rejected."""
+    logits = torch.randn(2, 4, 7)
+    labels = torch.zeros(2, 4, dtype=torch.long)
+    mask = torch.ones(8, dtype=torch.long)
+
+    with pytest.raises(ValueError, match=r"mask\.shape == labels\.shape"):
+        MaskedCrossEntropy(chunk_size=2)(logits, labels, mask=mask)
+
+
+def test_chunked_masked_cross_entropy_zero_num_label_tokens_keeps_zero_gradient():
+    """num_label_tokens=0 must produce a zero loss with a zero (but connected) gradient."""
+    logits = torch.randn(3, 17, requires_grad=True)
+    labels = torch.tensor([1, 2, 3])
+
+    loss = MaskedCrossEntropy(chunk_size=2)(logits, labels, num_label_tokens=0)
+    loss.backward()
+
+    assert loss.detach().item() == 0.0
+    assert torch.count_nonzero(logits.grad).item() == 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
+    reason="requires CUDA with BF16 support",
+)
+@pytest.mark.parametrize("inplace_grad", [False, True])
+def test_chunked_masked_cross_entropy_cuda_bf16_matches_fp32_reference(inplace_grad):
+    """BF16 logits on CUDA must track the fp32 reference within BF16 tolerances."""
+    device = torch.device("cuda", 0)
+    torch.manual_seed(19)
+    logits = torch.randn(2, 7, 31, device=device, dtype=torch.bfloat16, requires_grad=True)
+    reference_logits = logits.detach().float().requires_grad_()
+    labels = torch.randint(0, logits.shape[-1], (2, 7), device=device)
+    labels[0, 2] = -100
+    mask = torch.ones_like(labels)
+    mask[1, 5] = 0
+    num_label_tokens = int(((labels != -100) & (mask != 0)).sum().item())
+
+    loss = MaskedCrossEntropy(chunk_size=4, inplace_grad=inplace_grad)(
+        logits,
+        labels.clone(),
+        mask=mask,
+        num_label_tokens=num_label_tokens,
+    )
+    reference_labels = labels.masked_fill(mask == 0, -100)
+    reference = (
+        F.cross_entropy(
+            reference_logits.reshape(-1, reference_logits.shape[-1]),
+            reference_labels.reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+        )
+        / num_label_tokens
+    )
+
+    torch.testing.assert_close(loss, reference, rtol=2e-3, atol=2e-3)
+    loss.backward()
+    reference.backward()
+    torch.cuda.synchronize(device)
+
+    torch.testing.assert_close(logits.grad.float(), reference_logits.grad, rtol=2e-2, atol=2e-3)
+    if inplace_grad:
+        assert logits.grad.untyped_storage().data_ptr() == logits.untyped_storage().data_ptr()
