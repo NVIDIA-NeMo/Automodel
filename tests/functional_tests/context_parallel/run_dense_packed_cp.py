@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-GPU packed-THD CP parity for two-layer dense Llama and Qwen2 models.
+"""Two-GPU packed-THD CP parity for two-layer dense Llama, Qwen2, and Qwen3.
 
 Run with::
 
@@ -28,12 +28,13 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from transformer_engine.pytorch import DotProductAttention
-from transformers import LlamaConfig, Qwen2Config
+from transformers import LlamaConfig, Qwen2Config, Qwen3Config
 
 from nemo_automodel.components.distributed.cp_utils import attach_te_context_parallel, make_cp_batch_for_te
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM
+from nemo_automodel.components.models.qwen3.model import Qwen3ForCausalLM
 
 NUM_HIDDEN_LAYERS = 2
 
@@ -68,9 +69,12 @@ def _build_model(model_kind: str, device: torch.device) -> torch.nn.Module:
     if model_kind == "llama":
         config = LlamaConfig(**common)
         model_cls = LlamaForCausalLM
-    else:
+    elif model_kind == "qwen2":
         config = Qwen2Config(**common)
         model_cls = Qwen2ForCausalLM
+    else:
+        config = Qwen3Config(**common, head_dim=8)
+        model_cls = Qwen3ForCausalLM
     config._attn_implementation = "sdpa"
     config.use_cache = False
     config.torch_dtype = torch.bfloat16
@@ -130,7 +134,8 @@ def _run_model(model_kind: str, device: torch.device, cp_mesh) -> None:
     baseline_batch = make_cp_batch_for_te(None, _clone_batch(batch))
     baseline_labels = baseline_batch.pop("labels")
     baseline_logits = baseline_model(**baseline_batch).logits.squeeze(0)
-    baseline_logits.float().square().sum().backward()
+    loss_normalizer = baseline_logits.numel()
+    (baseline_logits.float().square().sum() / loss_normalizer).backward()
     baseline_grads = [layer.self_attn.q_proj.weight.grad.detach().float() for layer in baseline_model.model.layers]
     assert baseline_labels.shape == (8,)
 
@@ -140,7 +145,7 @@ def _run_model(model_kind: str, device: torch.device, cp_mesh) -> None:
     cp_batch = make_cp_batch_for_te(cp_mesh, _clone_batch(batch))
     cp_batch.pop("labels")
     local_logits = cp_model(**cp_batch).logits.squeeze(0)
-    local_logits.float().square().sum().backward()
+    (local_logits.float().square().sum() / loss_normalizer).backward()
 
     cu_seqlens = cp_batch["cu_seqlens"]
     indices = tex.thd_get_partitioned_indices(cu_seqlens, 8, cp_mesh.size(), rank).to(torch.int32)
@@ -156,7 +161,7 @@ def _run_model(model_kind: str, device: torch.device, cp_mesh) -> None:
 
     torch.testing.assert_close(cp_logits, baseline_logits, atol=3e-2, rtol=3e-2)
     for cp_grad, baseline_grad in zip(cp_grads, baseline_grads):
-        torch.testing.assert_close(cp_grad, baseline_grad, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(cp_grad, baseline_grad, atol=1e-3, rtol=5e-2)
     assert torch.isfinite(cp_logits).all()
     assert all(torch.isfinite(cp_grad).all() for cp_grad in cp_grads)
     if rank == 0:
@@ -174,7 +179,7 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     cp_mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("cp",))["cp"]
     try:
-        for model_kind in ("llama", "qwen2"):
+        for model_kind in ("llama", "qwen2", "qwen3"):
             _run_model(model_kind, device, cp_mesh)
             dist.barrier()
     finally:

@@ -58,5 +58,5 @@ class TestContextParallelAttention:
         run_test_script(TEST_FOLDER, CP_QWEN3_5_MOE_LINEAR_ATTN_TEST_FILENAME)
 
     def test_cp_dense_packed(self):
-        """Test two-layer packed THD forward and gradient parity for dense Llama and Qwen2."""
+        """Test two-layer packed THD forward and gradient parity for dense Llama, Qwen2, and Qwen3."""
         run_test_script(TEST_FOLDER, CP_DENSE_PACKED_TEST_FILENAME)

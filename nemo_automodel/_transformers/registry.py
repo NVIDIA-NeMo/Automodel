@@ -206,6 +206,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.qwen2.model", "Qwen2ForCausalLM"),
         ),
         (
+            "Qwen3ForCausalLM",
+            ("nemo_automodel.components.models.qwen3.model", "Qwen3ForCausalLM"),
+        ),
+        (
             "Qwen2_5OmniModel",
             (
                 "nemo_automodel.components.models.qwen2_5_omni.model",

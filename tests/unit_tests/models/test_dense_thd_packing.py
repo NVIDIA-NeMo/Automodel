@@ -23,9 +23,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import LlamaConfig, Qwen2Config
+from transformers import LlamaConfig, Qwen2Config, Qwen3Config
 
 from nemo_automodel.components.models.common import BackendConfig
+
+MODEL_KINDS = ("llama", "qwen2", "qwen3")
 
 
 class _ReferencePackedAttention(nn.Module):
@@ -86,7 +88,7 @@ def _build_model(model_kind: str, monkeypatch: pytest.MonkeyPatch) -> nn.Module:
             attention_dropout=0.0,
             tie_word_embeddings=False,
         )
-    else:
+    elif model_kind == "qwen2":
         module = importlib.import_module("nemo_automodel.components.models.qwen2.model")
         model_cls = module.Qwen2ForCausalLM
         config = Qwen2Config(
@@ -96,6 +98,21 @@ def _build_model(model_kind: str, monkeypatch: pytest.MonkeyPatch) -> nn.Module:
             num_hidden_layers=1,
             num_attention_heads=4,
             num_key_value_heads=2,
+            max_position_embeddings=32,
+            attention_dropout=0.0,
+            tie_word_embeddings=False,
+        )
+    else:
+        module = importlib.import_module("nemo_automodel.components.models.qwen3.model")
+        model_cls = module.Qwen3ForCausalLM
+        config = Qwen3Config(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=4,
             max_position_embeddings=32,
             attention_dropout=0.0,
             tie_word_embeddings=False,
@@ -110,7 +127,7 @@ def _build_model(model_kind: str, monkeypatch: pytest.MonkeyPatch) -> nn.Module:
         return model_cls(config, backend=backend).to(torch.float32)
 
 
-@pytest.mark.parametrize("model_kind", ["llama", "qwen2"])
+@pytest.mark.parametrize("model_kind", MODEL_KINDS)
 def test_packed_thd_matches_per_document_logits_and_gradients(model_kind, monkeypatch):
     """Packed THD must preserve document boundaries in forward and backward."""
     torch.manual_seed(1234)
@@ -159,7 +176,7 @@ def test_packed_thd_matches_per_document_logits_and_gradients(model_kind, monkey
     assert packed_model.ModelCapabilities().supports_cp is True
 
 
-@pytest.mark.parametrize("model_kind", ["llama", "qwen2"])
+@pytest.mark.parametrize("model_kind", MODEL_KINDS)
 def test_single_token_thd_preserves_sequence_axis(model_kind, monkeypatch):
     """A one-token packed sequence must retain the THD token dimension."""
     model = _build_model(model_kind, monkeypatch).eval()
@@ -175,7 +192,7 @@ def test_single_token_thd_preserves_sequence_axis(model_kind, monkeypatch):
     assert logits.shape == (1, 1, model.config.vocab_size)
 
 
-@pytest.mark.parametrize("model_kind", ["llama", "qwen2"])
+@pytest.mark.parametrize("model_kind", MODEL_KINDS)
 def test_packed_thd_rejects_non_te_attention(model_kind, monkeypatch):
     """THD must fail before silently treating packed documents as one sequence."""
     model = _build_model(model_kind, monkeypatch).eval()
