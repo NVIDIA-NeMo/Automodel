@@ -77,21 +77,19 @@ embed_multimodal:
 (Qwen3-VL-style towers); `last_hidden_state` is intentionally left as the local shard since
 `embed_multimodal` only reads `pooler_output` / `deepstack_features`.
 
-For vision towers whose forward does not match the
-`visual(pixel_values, grid_thw=..., return_dict=True)` signature, the lower-level
-`maybe_distribute_independent_units` helper applies the same partition / run-local /
-gather-and-slice scheme to any sequence of independent variable-size units.
-
 ### Sharding scope: frozen vs. trainable vision tower
 
-The caller chooses the process group it publishes via `set_cp_vision_group`, and the choice
-is a **deliberate design constraint**, not an optimization detail:
+The caller **declares** the scope of the process group it publishes via
+`set_cp_vision_group(group, spans_only_cp=...)`, and the declaration is **enforced**:
+`maybe_distribute_visual` raises a `ValueError` — on every rank, before any collective —
+when the vision tower has trainable parameters but the published group was not declared
+CP-only (`spans_only_cp=False`).
 
 | Vision tower | Sharding group | Why |
 |---|---|---|
-| **Frozen** | Full **CP × TP** rank set | Frame independence + replicated weights make the forward bit-identical for *any* rank group with identical weights, and `requires_grad=False` means no backward ever runs through the gather — zero gradient risk. |
-| **Trainable** | **CP group only** | The vision tower is replicated (not tensor-parallel) across TP ranks. Gathering frames across CP × TP would make the all-gather's reduce-scatter(SUM) backward accumulate the vision gradient **tp-fold**: each TP-replicated sequence shard backprops into the single rank that computed the frame. TP ranks therefore redundantly compute the ViT. |
-| **Pure TP** (`cp_size == 1`) | Not enabled | The pre-embed sharding path is gated on `cp_size > 1`. |
+| **Frozen** | Full **CP × TP** rank set (`spans_only_cp=False`) | Frame independence + replicated weights make the forward bit-identical for *any* rank group with identical weights, and `requires_grad=False` means no backward ever runs through the gather — zero gradient risk. |
+| **Trainable** | **CP group only** (`spans_only_cp=True`, the default) | The vision tower is replicated (not tensor-parallel) across TP ranks. Gathering frames across CP × TP would make the all-gather's reduce-scatter(SUM) backward accumulate the vision gradient **tp-fold**: each TP-replicated sequence shard backprops into the single rank that computed the frame. TP ranks therefore redundantly compute the ViT — and `maybe_distribute_visual` **raises** if a trainable tower is published with `spans_only_cp=False`. |
+| **Pure TP** (`cp_size == 1`) | Not enabled | With no CP there is no CP group to publish: either no group is set, or the published group has size 1 — `maybe_distribute_visual` falls back to the replicated path whenever the group size is ≤ 1. |
 
 Extending the trainable case to CP × TP would require gathering over CP × TP while reducing
 gradients over CP only (or scaling by `1/tp`), plus a gradient-parity test — until then the
@@ -100,13 +98,17 @@ CP-only group is correct by construction.
 ## Usage
 
 The helper activates when a process group is published around the VLM pre-embed forward —
-the CP group for a trainable vision tower, or the flattened CP × TP group for a frozen one
+the CP group for a trainable vision tower, or the flattened CP × TP group (declared with
+`spans_only_cp=False`) for a frozen one
 (see [sharding scope](#sharding-scope-frozen-vs-trainable-vision-tower)):
 
 ```python
 from nemo_automodel.components.distributed import cp_vision_shard
 
+# Trainable vision tower: publish the CP-only group (spans_only_cp defaults to True).
 token = cp_vision_shard.set_cp_vision_group(cp_group)
+# Frozen vision tower only: a wider CP x TP group may be published instead --
+# token = cp_vision_shard.set_cp_vision_group(cp_tp_group, spans_only_cp=False)
 try:
     # pre-embed forward; embed_multimodal routes self.visual(...) through
     # cp_vision_shard.maybe_distribute_visual(self.visual, pixel_values, grid_thw)
@@ -124,13 +126,20 @@ Environment toggles:
 
 ## Validation
 
-- **Unit tests** (`tests/unit_tests/distributed/test_cp_vision_shard.py`, CPU-only, 40 tests):
+- **Unit tests** (`tests/unit_tests/distributed/test_cp_vision_shard.py`, CPU-only, 42 tests):
   `visual(full) == concat_r visual(slice_r)` for **forward and vision-parameter gradient** at
   world sizes 2–4; partition balance/coverage/order; variable-token all-gather forward +
   backward; end-to-end `maybe_distribute_visual` (including deepstack, video entries, and a
-  single video split across ranks at frame granularity); every fallback; and the pad path
-  end-to-end through the production code, asserting `sum_r grad_r == replicate grad` and that
-  every padded (dummy) rank contributes exactly zero gradient.
+  single video split across ranks at frame granularity); every fallback (including `None`
+  media inputs); the trainable-tower sharding-scope guard; and the pad path end-to-end
+  through the production code, asserting `sum_r grad_r == replicate grad` and that every
+  padded (dummy) rank contributes exactly zero gradient.
+- **Real-collective tests** (`tests/unit_tests/distributed/test_cp_vision_shard_gloo.py`,
+  2-rank gloo on CPU): `maybe_distribute_visual` forward + backward through the actual
+  `all_gather` / `reduce_scatter(SUM)` collectives — each rank backprops its sequence shard
+  and the group-summed vision-parameter gradients must equal the single-process replicated
+  reference, for both the balanced-partition path (with deepstack) and the dummy-pad path
+  (padded rank receives exactly zero gradient).
 - **Internal validation runs** (Qwen3.5-class VLM): with `cp_size=2`, loss parity with the
   replicated baseline (step-0 loss bit-identical, later steps within bf16 noise), lower peak
   memory, and **about +19% tokens/sec per GPU**; validated with both a frozen and a trained
