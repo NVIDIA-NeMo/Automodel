@@ -353,7 +353,12 @@ class GroupedExperts(nn.Module):
                 return torch.cat(gathered, dim=0)
 
             x = _all_gather_dim0_var(x, differentiable=True)
-            weights = _all_gather_dim0_var(weights.float(), differentiable=False)
+            # Routing probabilities participate in the main-loss gradient.
+            # A plain ``dist.all_gather`` detaches every gathered tensor and
+            # silently leaves the router trainable only through auxiliary
+            # losses.  Use the same autograd-safe variable-length gather as
+            # activations so each source rank receives its local weight grad.
+            weights = _all_gather_dim0_var(weights.float(), differentiable=True)
             indices = _all_gather_dim0_var(indices, differentiable=False)
             token_mask = _all_gather_dim0_var(token_mask, differentiable=False)
 
