@@ -27,6 +27,11 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
 )
 
+from nemo_automodel.components._tp_linear import (
+    _async_tp_linear,
+    _is_async_tp_linear_enabled,
+)
+
 
 def _distribute_param(_module, name, device_mesh, src_data_rank, placements):
     param = getattr(_module, name)
@@ -49,7 +54,9 @@ class TPLinear(nn.Linear):
     torch.bmm is a native 3-D op whose backward is also bmm -- no view is ever
     emitted.  DTensor has explicit strategies for bmm covering the ColwiseParallel
     (Replicate x Shard(2) -> Shard(2)) and RowwiseParallel (Shard(2) x Shard(1) ->
-    Partial) patterns.
+    Partial) patterns.  The exception is Inductor's async-TP mode: its fusion
+    pass recognizes reshape-mm-reshape but not bmm, so that mode emits the
+    former while every other compile path retains the DTensor-safe fallback.
 
     Note: expand(b, -1, -1) dispatches through DTensor's ShardingPropagator which
     caches via lru_cache keyed on DTensorSpec.  With dynamic shapes, b = x.shape[0]
@@ -64,6 +71,9 @@ class TPLinear(nn.Linear):
     """
 
     def forward(self, x):
+        if _is_async_tp_linear_enabled():
+            return _async_tp_linear(x, self.weight, self.bias)
+
         # bmm avoids aten.view which cannot flatten a sharded dimension.
         _x_needs_bmm = (
             isinstance(x, DTensor) and x.dim() == 3 and any(isinstance(p, Shard) and p.dim < 2 for p in x.placements)

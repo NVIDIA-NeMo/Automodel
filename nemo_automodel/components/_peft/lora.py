@@ -30,6 +30,10 @@ from nemo_automodel.components._peft.lora_kernel import (
     lora_forward_wrapper,
 )
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
+from nemo_automodel.components._tp_linear import (
+    _async_tp_linear,
+    _is_async_tp_linear_enabled,
+)
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
@@ -274,21 +278,24 @@ class LinearLoRA(nn.Linear):
             bias = self.bias
             if bias is not None and bias.numel() == 0:
                 bias = None
-            # bmm avoids aten.view which cannot flatten a sharded dimension.
-            # F.linear calls view([b,s,h]->[b*s,h]) which fails when dim 0/1 is sharded
-            # (sequence parallelism) or during AOT-autograd tracing with compile.
-            _x_needs_bmm = (
-                isinstance(x, DTensor)
-                and x.dim() == 3
-                and any(isinstance(p, _Shard) and p.dim < 2 for p in x.placements)
-            )
-            if torch.compiler.is_compiling() or _x_needs_bmm:
-                b = x.shape[0]
-                res = torch.bmm(x, self.weight.t().unsqueeze(0).expand(b, -1, -1))
-                if bias is not None:
-                    res = res + bias
+            if _is_async_tp_linear_enabled():
+                res = _async_tp_linear(x, self.weight, bias)
             else:
-                res = F.linear(x, self.weight, bias)
+                # bmm avoids aten.view which cannot flatten a sharded dimension.
+                # F.linear calls view([b,s,h]->[b*s,h]) which fails when dim 0/1 is sharded
+                # (sequence parallelism) or during AOT-autograd tracing with compile.
+                _x_needs_bmm = (
+                    isinstance(x, DTensor)
+                    and x.dim() == 3
+                    and any(isinstance(p, _Shard) and p.dim < 2 for p in x.placements)
+                )
+                if x.dim() == 3 and (torch.compiler.is_compiling() or _x_needs_bmm):
+                    b = x.shape[0]
+                    res = torch.bmm(x, self.weight.t().unsqueeze(0).expand(b, -1, -1))
+                    if bias is not None:
+                        res = res + bias
+                else:
+                    res = F.linear(x, self.weight, bias)
 
         if not self.use_dora:
             if self.dropout_position == "pre":

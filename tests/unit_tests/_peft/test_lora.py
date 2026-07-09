@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch.nn as nn
@@ -536,3 +538,45 @@ def test_memory_efficient_lora_output_is_inplace_safe():
             ref_model.per_layer_model_projection.lora_B.weight.grad,
             atol=1e-6,
         )
+
+
+def _make_lora_with_random_adapters(in_features: int = 16, out_features: int = 12) -> LinearLoRA:
+    """Build a LinearLoRA with non-zero adapters so the LoRA delta is exercised."""
+    base = nn.Linear(in_features, out_features)
+    lora = LinearLoRA(base, dim=4, alpha=8, use_memory_efficient_lora=False)
+    with torch.no_grad():
+        lora.lora_A.weight.normal_()
+        lora.lora_B.weight.normal_()
+    return lora
+
+
+def test_linear_lora_async_tp_mode_matches_eager():
+    """The async-TP F.linear shaping must stay numerically identical to eager."""
+    torch.manual_seed(0)
+    lora = _make_lora_with_random_adapters()
+    x = torch.randn(2, 5, 16)
+    ref = lora(x)
+
+    original = torch._inductor.config._micro_pipeline_tp
+    torch._inductor.config._micro_pipeline_tp = True
+    try:
+        with patch("torch.compiler.is_compiling", return_value=True):
+            out = lora(x)
+    finally:
+        torch._inductor.config._micro_pipeline_tp = original
+
+    assert torch.allclose(out, ref, atol=1e-6)
+
+
+def test_linear_lora_2d_input_under_compile_uses_f_linear():
+    """2-D input while compile-tracing must skip the 3-D bmm path and match eager."""
+    torch.manual_seed(0)
+    lora = _make_lora_with_random_adapters()
+    x = torch.randn(8, 16)
+    ref = lora(x)
+
+    assert torch._inductor.config._micro_pipeline_tp is False
+    with patch("torch.compiler.is_compiling", return_value=True):
+        out = lora(x)
+
+    assert torch.allclose(out, ref, atol=1e-6)
