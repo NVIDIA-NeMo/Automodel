@@ -38,6 +38,7 @@ Megatron-FSDP sharding).  Subclasses only implement the small
 
 from __future__ import annotations
 
+import functools
 import importlib
 import inspect
 import logging
@@ -569,22 +570,47 @@ def _drop_empty_local_shards(params: list[Any]) -> list[Any]:
             dim-0-sharded local shard may be empty on this rank.
 
     Returns:
-        ``params`` with zero-numel local shards removed.  Param groups whose
-        parameter list becomes empty are dropped; the remaining groups keep
+        ``params`` with zero-numel local shards removed.  Param groups keep
         their other options unchanged.
+
+    Raises:
+        ValueError: If every parameter of the flat list — or of any single
+            param group — is locally empty on this rank.  Neither outcome has
+            a safe representation: dropping a whole group makes
+            ``optimizer.param_groups`` rank-asymmetric (LR/WD schedulers
+            address groups positionally, e.g. ``param_groups[0]``, so ranks
+            would silently schedule different lr/wd for shards other ranks
+            own), while keeping an empty group breaks torch DCP's flattened
+            optimizer-state load, which indexes the first param of each group.
     """
+    remedy = (
+        "This happens when FSDP2 shards parameters whose dim-0 is smaller than the shard group "
+        "(e.g. tiny biases/norm weights of a small module on a wide mesh). Merge such parameters "
+        "into a group that keeps at least one non-empty local shard on every rank, or shrink the "
+        "sharding mesh so every rank owns at least one element."
+    )
     params = list(params)
     dropped = 0
     if params and isinstance(params[0], dict):
         filtered: list[Any] = []
-        for group in params:
+        for idx, group in enumerate(params):
             kept = [p for p in group["params"] if _local_numel(p) > 0]
             dropped += len(group["params"]) - len(kept)
-            if kept:
-                filtered.append({**group, "params": kept})
+            if not kept:
+                raise ValueError(
+                    f"Every parameter in optimizer param group {idx} has a zero-numel local shard on "
+                    f"this rank; TE FusedAdam cannot hold them (multi_tensor_apply faults on empty "
+                    f"tensors) and the group can be neither dropped nor kept empty. {remedy}"
+                )
+            filtered.append({**group, "params": kept})
     else:
         filtered = [p for p in params if _local_numel(p) > 0]
         dropped = len(params) - len(filtered)
+        if params and not filtered:
+            raise ValueError(
+                f"Every trainable parameter of this model part has a zero-numel local shard on this "
+                f"rank, leaving TE FusedAdam with an empty parameter list. {remedy}"
+            )
     if dropped:
         logger.warning(
             "Dropped %d parameter(s) with zero-numel local shards from TE FusedAdam on this rank: "
@@ -598,10 +624,18 @@ def _drop_empty_local_shards(params: list[Any]) -> list[Any]:
 def _is_te_fused_adam(factory: Callable[..., Any]) -> bool:
     """Return ``True`` if ``factory`` is TransformerEngine's ``FusedAdam`` (or a subclass).
 
+    ``functools.partial`` wrappers are unwrapped (iteratively, for nested
+    partials) before the identity check, so ``partial(FusedAdam, ...)``
+    factories are recognized.  Other wrapper callables (closures, custom
+    factory functions) are opaque and are NOT recognized; such factories must
+    guard against zero-numel local shards themselves.
+
     Identity-based and import-free: TE is an optional dependency, so this never
     imports it.  If TE has not been imported yet, ``factory`` cannot be TE's
     ``FusedAdam`` class and the check is trivially ``False``.
     """
+    while isinstance(factory, functools.partial):
+        factory = factory.func
     te_optimizers = sys.modules.get("transformer_engine.pytorch.optimizers")
     if te_optimizers is None:
         return False
