@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU coverage for the selective-AC save-set build (FFPA fold-in wiring)."""
+"""CPU coverage for the selective-AC save-set build (FFPA fold-in wiring) and vision checkpointing."""
 
+import copy
+from types import SimpleNamespace
+
+import torch
+import torch.nn.functional as F
 from torch import nn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper, checkpoint_wrapper
 
 from nemo_automodel.components.distributed import activation_checkpointing as ac
 
@@ -49,3 +54,113 @@ def test_build_save_set_ok_when_ffpa_absent(monkeypatch):
 
     save_ops = ac._build_selective_ac_save_ops()
     assert isinstance(save_ops, frozenset) and len(save_ops) > 0
+
+
+_D = 8
+
+
+class _RecordingVisionBlock(nn.Module):
+    """Minimal HF-style vision block (``attn``, no ``self_attn``) that runs real SDPA.
+
+    Records the enabled SDPA backends (``math``, ``flash``, ``mem_efficient``) on
+    every forward call, so tests can assert both the checkpoint forward and its
+    recompute ran with the MATH backend pinned.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.attn = nn.Linear(_D, 3 * _D)
+        self.mlp = nn.Linear(_D, _D)
+        self.backend_states: list[tuple[bool, bool, bool]] = []
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply SDPA + MLP to patch embeddings.
+
+        Args:
+            x: Patch embeddings of shape ``[S, H]`` (``S`` = patches, ``H`` = hidden).
+
+        Returns:
+            Block output of shape ``[S, H]``.
+        """
+        self.backend_states.append(
+            (
+                torch.backends.cuda.math_sdp_enabled(),
+                torch.backends.cuda.flash_sdp_enabled(),
+                torch.backends.cuda.mem_efficient_sdp_enabled(),
+            )
+        )
+        q, k, v = (t.unsqueeze(0).unsqueeze(0) for t in self.attn(x).chunk(3, dim=-1))
+        out = F.scaled_dot_product_attention(q, k, v).squeeze(0).squeeze(0)
+        return x + self.mlp(out)
+
+
+class _VisionModel(nn.Module):
+    def __init__(self, num_blocks: int = 1):
+        super().__init__()
+        self.blocks = nn.ModuleList(_RecordingVisionBlock() for _ in range(num_blocks))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply all vision blocks to patch embeddings of shape ``[S, H]``, returning ``[S, H]``."""
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
+def test_vision_math_sdpa_context_fn_pins_math_on_forward_and_recompute():
+    forward_ctx, recompute_ctx = ac._vision_math_sdpa_context_fn()
+
+    for ctx in (forward_ctx, recompute_ctx):
+        with ctx:
+            assert torch.backends.cuda.math_sdp_enabled()
+            assert not torch.backends.cuda.flash_sdp_enabled()
+            assert not torch.backends.cuda.mem_efficient_sdp_enabled()
+
+
+def test_apply_vision_block_checkpointing_recomputes_under_math_and_matches_reference():
+    model = _VisionModel()
+    reference = copy.deepcopy(model)
+    block = model.blocks[0]
+
+    ac.apply_vision_block_checkpointing(model, [block])
+    assert isinstance(model.blocks[0], CheckpointWrapper)
+    assert ac.unwrap_checkpoint_wrapper(model.blocks[0]) is block
+
+    x = torch.randn(4, _D)
+    out = model(x)
+    out.sum().backward()
+
+    # Non-reentrant checkpointing runs the block forward twice (forward + backward
+    # recompute); both runs must see only the MATH SDPA backend enabled.
+    assert len(block.backend_states) == 2
+    assert all(state == (True, False, False) for state in block.backend_states)
+
+    # Run the reference under the same MATH pin so the comparison is
+    # kernel-identical (the fused SDPA kernels differ from MATH by float noise).
+    ref_ctx, _ = ac._vision_math_sdpa_context_fn()
+    with ref_ctx:
+        ref_out = reference(x)
+        ref_out.sum().backward()
+    assert torch.allclose(out, ref_out)
+    for got, want in zip(model.parameters(), reference.parameters()):
+        assert torch.allclose(got.grad, want.grad)
+
+
+def test_apply_vision_block_checkpointing_flash_attention_config_wraps_mlp_only():
+    model = _VisionModel()
+    model.config = SimpleNamespace(vision_config=SimpleNamespace(_attn_implementation="flash_attention_2"))
+
+    ac.apply_vision_block_checkpointing(model, list(model.blocks))
+
+    assert not isinstance(model.blocks[0], CheckpointWrapper)
+    assert isinstance(model.blocks[0].mlp, CheckpointWrapper)
+    assert not isinstance(model.blocks[0].attn, CheckpointWrapper)
+
+
+def test_apply_vision_block_checkpointing_detects_flash_attention_on_blocks():
+    model = _VisionModel()
+    model.blocks[0].attn.config = SimpleNamespace(_attn_implementation="flash_attention_3")
+
+    ac.apply_vision_block_checkpointing(model, list(model.blocks))
+
+    assert not isinstance(model.blocks[0], CheckpointWrapper)
+    assert isinstance(model.blocks[0].mlp, CheckpointWrapper)
