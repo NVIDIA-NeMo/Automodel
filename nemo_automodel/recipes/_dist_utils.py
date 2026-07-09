@@ -50,6 +50,9 @@ def _normalize_activation_checkpointing(value: Any) -> bool | str:
 
     ``True`` keeps the existing full checkpointing behavior. ``"selective"``
     enables PyTorch selective activation checkpointing for supported paths.
+    ``"non_moe"`` and ``"non_moe_no_attn"`` enable scoped checkpointing on the
+    MoE parallelizer path: submodules are wrapped individually while the MoE
+    MLP (and, for ``"non_moe_no_attn"``, self-attention) stays uncheckpointed.
     """
     if value is None:
         return False
@@ -61,9 +64,12 @@ def _normalize_activation_checkpointing(value: Any) -> bool | str:
             return False
         if normalized in {"true", "on", "full", "enabled", "yes"}:
             return True
-        if normalized == "selective":
-            return "selective"
-    raise ValueError("distributed.activation_checkpointing must be a boolean or one of 'full', 'selective', 'false'.")
+        if normalized in {"selective", "non_moe", "non_moe_no_attn"}:
+            return normalized
+    raise ValueError(
+        "distributed.activation_checkpointing must be a boolean or one of "
+        "'full', 'selective', 'non_moe', 'non_moe_no_attn', 'false'."
+    )
 
 
 def parse_distributed_section(cfg_dict: dict) -> dict:

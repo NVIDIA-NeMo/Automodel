@@ -390,6 +390,16 @@ class TestActivationCheckpointingParsing:
         assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] == "selective"
 
+    @pytest.mark.parametrize("value", ["non_moe", "non-moe", "NON_MOE", "non_moe_no_attn", "non-moe-no-attn"])
+    def test_scoped_moe_modes_survive_normalization(self, value):
+        # Scoped modes are consumed by the MoE parallelizer (parallelize_model ->
+        # apply_ac); like "selective" they are carried on the parsed value.
+        result = parse_distributed_section(
+            {"strategy": "fsdp2", "activation_checkpointing": value, "ep_size": 2, "moe": {}}
+        )
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["activation_checkpointing"] == value.lower().replace("-", "_")
+
 
 # ---------------------------------------------------------------------------
 # Validation errors surfaced through dict parsing
