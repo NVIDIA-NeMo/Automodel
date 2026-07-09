@@ -28,7 +28,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Dict
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -163,23 +162,6 @@ def test_optimised_plan_fallback_to_hf(monkeypatch):
 
     result = _get_parallel_plan(_DummyModel(), sequence_parallel=False)
     assert result is sentinel
-
-
-def test_fail_closed_optimised_plan_does_not_fallback_to_hf(monkeypatch):
-    """Safety-critical architecture plans may reject instead of changing semantics."""
-
-    def _broken_fn(model, seq):
-        raise NotImplementedError("sequence parallel is unsafe")
-
-    _broken_fn._nemo_tp_plan_fail_closed = True
-    parallelizer.PARALLELIZE_FUNCTIONS[_get_class_qualname(_DummyModel)] = _broken_fn
-    hf_plan = MagicMock(return_value={"unsafe": "fallback"})
-    monkeypatch.setattr(parallelizer, "get_hf_tp_shard_plan", hf_plan, raising=True)
-    _set_global_model_cls(monkeypatch, _DummyModel)
-
-    with pytest.raises(ValueError, match="fail-closed"):
-        _get_parallel_plan(_DummyModel(), sequence_parallel=True)
-    hf_plan.assert_not_called()
 
 
 # 4. HF plan is used when no optimised plan exists

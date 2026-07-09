@@ -1985,11 +1985,6 @@ def _get_parallel_plan(
             model_parallel_plan = func(model, sequence_parallel)
             logger.info(f"Using optimized parallel plan for {model_cls.__name__}.")
         except Exception as e:
-            if getattr(func, "_nemo_tp_plan_fail_closed", False):
-                raise ValueError(
-                    f"The registered tensor-parallel plan for {model_cls.__name__} rejected this configuration: {e}. "
-                    "The plan is marked fail-closed, so an unrelated HuggingFace/default plan will not be substituted."
-                ) from e
             logger.info(f"Optimized parallel plan not available: {e}. Falling back to the HF tp plan.")
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
@@ -2001,11 +1996,6 @@ def _get_parallel_plan(
             model_parallel_plan = func(model, sequence_parallel)
             logger.info(f"Using optimized parallel plan for {model_cls.__name__} (matched by class name).")
         except Exception as e:
-            if getattr(func, "_nemo_tp_plan_fail_closed", False):
-                raise ValueError(
-                    f"The registered tensor-parallel plan for {model_cls.__name__} rejected this configuration: {e}. "
-                    "The plan is marked fail-closed, so an unrelated HuggingFace/default plan will not be substituted."
-                ) from e
             logger.info(f"Optimized parallel plan not available: {e}. Falling back to the HF tp plan.")
             model_parallel_plan = get_hf_tp_shard_plan(model)
 
