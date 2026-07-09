@@ -44,8 +44,16 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import Qwen3Config
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest, write_shard, write_target_weights
+from nemo_automodel.recipes.llm._dspark_target_build import (
+    build_deepseek_v4_backend,
+    gather_full_weight_module,
+    repair_glm_5_2_qk_rope_head_dim,
+    resolve_reduced_target_layers,
+)
 from nemo_automodel.recipes.llm.train_dspark import (
     TrainDSparkRecipe,
     _apply_draft_activation_checkpointing,
@@ -53,11 +61,10 @@ from nemo_automodel.recipes.llm.train_dspark import (
     _build_dspark_optimizer,
     _extract_mm_kwargs,
     _init_dspark_wandb,
-    _repair_glm_5_2_qk_rope_head_dim,
     _resolve_dspark_optimizer_spec,
-    _resolve_reduced_target_layers,
     _resolve_wandb_kwargs,
     _resolve_warmup_steps,
+    _validate_cached_dspark_manifest,
 )
 
 JINJA = (
@@ -148,25 +155,25 @@ def test_chat_template_non_string_is_coerced(tmp_path):
 
 
 def test_reduced_layers_none_passes_through():
-    assert _resolve_reduced_target_layers(43, None) is None
+    assert resolve_reduced_target_layers(43, None) is None
 
 
 def test_reduced_layers_valid():
-    assert _resolve_reduced_target_layers(43, 4) == 4
+    assert resolve_reduced_target_layers(43, 4) == 4
 
 
 def test_reduced_layers_string_coerced():
-    assert _resolve_reduced_target_layers(43, "4") == 4
+    assert resolve_reduced_target_layers(43, "4") == 4
 
 
 def test_reduced_layers_full_depth_allowed():
-    assert _resolve_reduced_target_layers(43, 43) == 43
+    assert resolve_reduced_target_layers(43, 43) == 43
 
 
 @pytest.mark.parametrize("bad", [0, -1, 44, 100])
 def test_reduced_layers_out_of_range_raises(bad):
     with pytest.raises(ValueError, match="target_num_hidden_layers"):
-        _resolve_reduced_target_layers(43, bad)
+        resolve_reduced_target_layers(43, bad)
 
 
 # ---------------------------------------------------------------------------
@@ -426,19 +433,19 @@ def test_optimizer_spec_real_config_node_without_target_defaults_to_adamw():
 
 def test_repair_glm_qk_rope_restores_clobbered_value():
     cfg = SimpleNamespace(qk_rope_head_dim=192)
-    _repair_glm_5_2_qk_rope_head_dim(cfg, {"qk_rope_head_dim": 64, "head_dim": 192})
+    repair_glm_5_2_qk_rope_head_dim(cfg, {"qk_rope_head_dim": 64, "head_dim": 192})
     assert cfg.qk_rope_head_dim == 64
 
 
 def test_repair_glm_qk_rope_noop_when_already_matching():
     cfg = SimpleNamespace(qk_rope_head_dim=64)
-    _repair_glm_5_2_qk_rope_head_dim(cfg, {"qk_rope_head_dim": 64})
+    repair_glm_5_2_qk_rope_head_dim(cfg, {"qk_rope_head_dim": 64})
     assert cfg.qk_rope_head_dim == 64
 
 
 def test_repair_glm_qk_rope_noop_when_raw_config_omits_field():
     cfg = SimpleNamespace(qk_rope_head_dim=192)
-    _repair_glm_5_2_qk_rope_head_dim(cfg, {"head_dim": 192})
+    repair_glm_5_2_qk_rope_head_dim(cfg, {"head_dim": 192})
     assert cfg.qk_rope_head_dim == 192
 
 
@@ -481,7 +488,7 @@ def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeyp
     ``from_config`` with ``load_base_model=True``."""
     import json
 
-    import nemo_automodel.recipes.llm.train_dspark as td
+    import nemo_automodel.recipes.llm._dspark_target_build as tb
 
     (tmp_path / "config.json").write_text(json.dumps(_TINY_GLM_CONFIG))
 
@@ -492,19 +499,22 @@ def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeyp
         captured.update(kwargs)
         return "target-model"
 
-    monkeypatch.setattr(td, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
-    monkeypatch.setattr(td, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
-
-    recipe = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
-    recipe.cfg = SimpleNamespace()
-    recipe.device = SimpleNamespace(type="cuda")
-    recipe.compute_dtype = torch.bfloat16
-    recipe.dist_env = SimpleNamespace(world_size=8)
+    monkeypatch.setattr(tb, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
+    monkeypatch.setattr(tb, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
 
     recipe_cfg = _opt_cfg(target_num_hidden_layers=2)
-    target_config, target_model = recipe._build_glm_5_2_target(str(tmp_path), recipe_cfg, False)
+    target_config, target_model, distributed_setup = tb.build_glm_5_2_target(
+        cfg=SimpleNamespace(),
+        world_size=8,
+        device=SimpleNamespace(type="cuda"),
+        compute_dtype=torch.bfloat16,
+        target_path=str(tmp_path),
+        recipe_cfg=recipe_cfg,
+        trust_remote_code=False,
+    )
 
     assert target_model == "target-model"
+    assert distributed_setup == "distributed-setup"
     assert captured["config"] is target_config
     # The reduction survives (from_pretrained would have re-read the 8-layer config).
     assert target_config.num_hidden_layers == 2
@@ -516,7 +526,285 @@ def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeyp
 
 
 def test_build_glm_5_2_target_requires_cuda(tmp_path):
-    recipe = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
-    recipe.device = SimpleNamespace(type="cpu")
+    from nemo_automodel.recipes.llm._dspark_target_build import build_glm_5_2_target
+
     with pytest.raises(RuntimeError, match="requires CUDA"):
-        recipe._build_glm_5_2_target(str(tmp_path), _opt_cfg(), False)
+        build_glm_5_2_target(
+            cfg=SimpleNamespace(),
+            world_size=1,
+            device=SimpleNamespace(type="cpu"),
+            compute_dtype=torch.float32,
+            target_path=str(tmp_path),
+            recipe_cfg=_opt_cfg(),
+            trust_remote_code=False,
+        )
+
+
+def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch):
+    """The V4 build must hand the (reduced) config to ``from_config`` with the sharded
+    distributed_setup and ``load_base_model=True`` (the full 43-layer target OOMs on
+    one node, so ``target_num_hidden_layers`` must survive to ``from_config``)."""
+    import nemo_automodel.recipes.llm._dspark_target_build as tb
+
+    captured = {}
+
+    def _fake_from_config(config=None, **kwargs):
+        captured["config"] = config
+        captured.update(kwargs)
+        return "target-model"
+
+    monkeypatch.setattr(
+        tb.DeepseekV4Config, "from_pretrained", staticmethod(lambda *a, **k: SimpleNamespace(num_hidden_layers=43))
+    )
+    monkeypatch.setattr(tb, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
+    monkeypatch.setattr(tb, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
+
+    target_config, target_model, distributed_setup = tb.build_deepseek_v4_target(
+        cfg=SimpleNamespace(),
+        world_size=8,
+        device=SimpleNamespace(type="cuda"),
+        compute_dtype=torch.bfloat16,
+        target_path="v4",
+        recipe_cfg=_opt_cfg(target_num_hidden_layers=4),
+        trust_remote_code=False,
+    )
+
+    assert target_model == "target-model"
+    assert distributed_setup == "distributed-setup"
+    assert target_config.num_hidden_layers == 4
+    assert captured["config"] is target_config
+    assert captured["load_base_model"] is True
+    assert captured["distributed_setup"] == "distributed-setup"
+    assert captured["torch_dtype"] == torch.bfloat16
+
+
+def test_build_deepseek_v4_target_requires_cuda():
+    from nemo_automodel.recipes.llm._dspark_target_build import build_deepseek_v4_target
+
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        build_deepseek_v4_target(
+            cfg=SimpleNamespace(),
+            world_size=1,
+            device=SimpleNamespace(type="cpu"),
+            compute_dtype=torch.float32,
+            target_path="v4",
+            recipe_cfg=_opt_cfg(),
+            trust_remote_code=False,
+        )
+
+
+def test_build_deepseek_v4_backend_defaults():
+    backend = build_deepseek_v4_backend(_opt_cfg())
+    assert backend.attn == "tilelang"
+    assert backend.experts == "torch_mm"
+    assert backend.dispatcher == "hybridep"
+    assert backend.enable_hf_state_dict_adapter is True
+
+
+def test_gather_full_weight_module_passthrough_and_full_tensor():
+    plain = torch.nn.Linear(2, 2)
+    assert gather_full_weight_module(plain) is plain  # plain .weight -> unchanged
+
+    gathered = torch.zeros(3)
+    dtensor_like = SimpleNamespace(weight=SimpleNamespace(full_tensor=lambda: gathered))
+    out = gather_full_weight_module(dtensor_like)
+    assert out is not dtensor_like
+    assert out.weight is gathered
+
+    no_weight = SimpleNamespace(weight=None)
+    assert gather_full_weight_module(no_weight) is no_weight
+
+
+# ---------------------------------------------------------------------------
+# _validate_cached_dspark_manifest
+# ---------------------------------------------------------------------------
+
+
+def _cached_manifest(**overrides):
+    manifest = {
+        "target_model": "tiny-qwen3",
+        "target_model_type": "qwen3",
+        "target_vocab_size": 64,
+        "hidden_size": 32,
+        "num_hidden_layers": 6,
+        "seq_length": 8,
+        "dtype": "fp32",
+        "target_hidden_dim": 96,
+        "target_last_hidden_dim": 32,
+        "target_layer_ids": [1, 3, 5],
+    }
+    manifest.update(overrides)
+    return manifest
+
+
+def _target_config(**overrides):
+    fields = {"vocab_size": 64, "hidden_size": 32, "num_hidden_layers": 6}
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _validate_cached_manifest(manifest=None, target_config=None, target_layer_ids=None, **kwargs):
+    _validate_cached_dspark_manifest(
+        "/cache",
+        _cached_manifest() if manifest is None else manifest,
+        _target_config() if target_config is None else target_config,
+        [1, 3, 5] if target_layer_ids is None else target_layer_ids,
+        target_model=kwargs.pop("target_model", "tiny-qwen3"),
+        target_model_type=kwargs.pop("target_model_type", "qwen3"),
+        seq_length=kwargs.pop("seq_length", 8),
+        compute_dtype=kwargs.pop("compute_dtype", torch.float32),
+    )
+
+
+def test_cached_dspark_manifest_accepts_matching_shapes():
+    _validate_cached_manifest()
+
+
+def test_cached_dspark_manifest_warns_on_target_path_mismatch(caplog):
+    caplog.set_level("WARNING")
+    _validate_cached_manifest(
+        manifest=_cached_manifest(target_model="/precompute/path/to/target"),
+        target_model="/training/path/to/target",
+    )
+    assert "raw paths can differ across machines" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "manifest,target_config,target_layer_ids,pattern",
+    [
+        (_cached_manifest(target_model_type="llama"), _target_config(), [1, 3, 5], "target_model_type"),
+        (_cached_manifest(target_vocab_size=65), _target_config(), [1, 3, 5], "target_vocab_size"),
+        (_cached_manifest(hidden_size=16), _target_config(), [1, 3, 5], "hidden_size"),
+        (_cached_manifest(num_hidden_layers=7), _target_config(), [1, 3, 5], "num_hidden_layers"),
+        (_cached_manifest(seq_length=16), _target_config(), [1, 3, 5], "seq_length"),
+        (_cached_manifest(dtype="int4"), _target_config(), [1, 3, 5], "dtype"),
+        (_cached_manifest(dtype="bf16"), _target_config(), [1, 3, 5], "CPU cached training"),
+        (_cached_manifest(target_hidden_dim=64), _target_config(), [1, 3, 5], "target_hidden_dim"),
+        (_cached_manifest(target_last_hidden_dim=16), _target_config(), [1, 3, 5], "target_last_hidden_dim"),
+        (_cached_manifest(target_layer_ids=[1, 2, 3]), _target_config(), [1, 3, 5], "target_layer_ids"),
+    ],
+)
+def test_cached_dspark_manifest_rejects_mismatch(manifest, target_config, target_layer_ids, pattern):
+    with pytest.raises(ValueError, match=pattern):
+        _validate_cached_manifest(manifest, target_config, target_layer_ids)
+
+
+def test_cached_dspark_manifest_accepts_bf16_cache_on_cuda_dtype():
+    _validate_cached_manifest(manifest=_cached_manifest(dtype="bf16"), compute_dtype=torch.bfloat16)
+
+
+def test_recipe_cached_path_does_not_load_target_model(monkeypatch, tmp_path):
+    """The recipe-level offline path must skip building the live target wrapper."""
+    import nemo_automodel.recipes.llm.train_dspark as train_dspark_module
+
+    vocab_size = 64
+    hidden_size = 32
+    target_layer_ids = [1, 3]
+    cache_dir = str(tmp_path / "cache")
+    embed = torch.nn.Embedding(vocab_size, hidden_size)
+    head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+    write_target_weights(cache_dir, embed, head, dtype=torch.float32)
+    write_shard(
+        cache_dir,
+        0,
+        {
+            "input_ids": torch.randint(0, vocab_size, (1, 8), dtype=torch.long),
+            "loss_mask": torch.ones(1, 8, dtype=torch.long),
+            "target_hidden_states": torch.randn(1, 8, hidden_size * len(target_layer_ids)),
+            "target_last_hidden_states": torch.randn(1, 8, hidden_size),
+        },
+    )
+    write_manifest(
+        cache_dir,
+        {
+            "target_model": "tiny-qwen3",
+            "target_model_type": "qwen3",
+            "target_vocab_size": vocab_size,
+            "hidden_size": hidden_size,
+            "num_hidden_layers": 4,
+            "seq_length": 8,
+            "dtype": "fp32",
+            "num_samples": 1,
+            "shard_size": 1,
+            "target_hidden_dim": hidden_size * len(target_layer_ids),
+            "target_last_hidden_dim": hidden_size,
+            "target_layer_ids": target_layer_ids,
+        },
+    )
+
+    class _CfgNode(dict):
+        def __getattr__(self, key):
+            try:
+                return self[key]
+            except KeyError as exc:
+                raise AttributeError(key) from exc
+
+        def to_dict(self):
+            return dict(self)
+
+    cfg = _CfgNode(
+        recipe_args=_CfgNode(
+            target_model_name_or_path="tiny-qwen3",
+            cached_target_path=cache_dir,
+            seq_length=8,
+            micro_batch_size=1,
+            mask_token_id=7,
+            num_epochs=1,
+            output_dir=str(tmp_path / "out"),
+            target_layer_ids=target_layer_ids,
+            draft_num_hidden_layers=1,
+            num_anchors=4,
+            block_size=2,
+            markov_rank=8,
+            attention_backend="flex_attention",
+            trust_remote_code=False,
+        ),
+        optimizer=_CfgNode(lr=1e-4, warmup_ratio=0.0, min_lr_ratio=0.1),
+        checkpoint=_CfgNode(enabled=False),
+        raw_config={},
+    )
+    target_config = Qwen3Config(
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        intermediate_size=2 * hidden_size,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+    )
+    target_config.architectures = ["Qwen3ForCausalLM"]
+
+    monkeypatch.setattr(
+        train_dspark_module,
+        "initialize_distributed",
+        lambda **_kwargs: SimpleNamespace(device=torch.device("cpu"), world_size=1, is_main=True),
+    )
+    monkeypatch.setattr(train_dspark_module, "setup_logging", lambda: None)
+    monkeypatch.setattr(train_dspark_module, "_read_target_model_type", lambda *_args, **_kwargs: "qwen3")
+    monkeypatch.setattr(train_dspark_module.AutoConfig, "from_pretrained", lambda *_args, **_kwargs: target_config)
+    monkeypatch.setattr(
+        train_dspark_module.NeMoAutoTokenizer,
+        "from_pretrained",
+        lambda *_args, **_kwargs: _tok(chat_template=None),
+    )
+    monkeypatch.setattr(
+        train_dspark_module.NeMoAutoModelForCausalLM,
+        "from_pretrained",
+        lambda *_args, **_kwargs: pytest.fail("cached_target_path must not load the target model"),
+    )
+    monkeypatch.setattr(
+        train_dspark_module,
+        "HFDSparkTargetModel",
+        lambda *_args, **_kwargs: pytest.fail("cached_target_path must not build a live target wrapper"),
+    )
+    monkeypatch.setattr(TrainDSparkRecipe, "_build_checkpointer", lambda self, _target_path: None)
+    monkeypatch.setattr(TrainDSparkRecipe, "load_checkpoint", lambda self, restore_from=None: None)
+
+    recipe = TrainDSparkRecipe(cfg)
+    recipe.setup()
+
+    assert recipe.target_model is None
+    assert recipe.target_wrapper is None
+    assert len(recipe.train_dataloader.dataset) == 1
+    torch.testing.assert_close(recipe.draft_model.embed_tokens.weight.detach().cpu(), embed.weight.detach())
+    torch.testing.assert_close(recipe.draft_model.lm_head.weight.detach().cpu(), head.weight.detach())

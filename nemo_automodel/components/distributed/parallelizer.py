@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
-from typing import Any, Dict, Generator, List, Optional, Union
+from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple, Union
 
 import torch
 import transformers
@@ -65,6 +65,10 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     apply_submodule_checkpointing,
     detect_kv_sharing_and_maybe_disable_cache,
     is_selective_activation_checkpointing,
+)
+from nemo_automodel.components.distributed.config import (
+    ActivationCheckpointingScope,
+    normalize_activation_checkpointing_scope,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
 
@@ -168,7 +172,12 @@ def _patch_fsdp_accumulated_grad_guard() -> None:
     FSDPParam.to_accumulated_grad_if_needed = guarded
 
 
-def apply_selective_activation_checkpointing(model: nn.Module, *, enable_compile: bool = False) -> None:
+def apply_selective_activation_checkpointing(
+    model: nn.Module,
+    *,
+    enable_compile: bool = False,
+    activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
+) -> None:
     """Apply selective activation checkpointing to ``model`` end to end.
 
     Standalone entry point (detects KV-sharing, disables ``use_cache``, and
@@ -178,8 +187,10 @@ def apply_selective_activation_checkpointing(model: nn.Module, *, enable_compile
     Args:
         model: The model to checkpoint.
         enable_compile: Whether per-layer ``torch.compile`` will be applied.
+        activation_checkpointing_scope: Which extracted layer groups to wrap.
     """
-    layers = _extract_model_layers(model)
+    layer_groups = _extract_model_layer_groups(model)
+    layers, _ = _filter_layer_groups_for_activation_checkpointing(layer_groups, activation_checkpointing_scope)
     if not layers:
         logger.warning("No transformer layers found; skipping selective activation checkpointing.")
         return
@@ -253,6 +264,7 @@ class ParallelizationStrategy(ABC):
         dp_shard_cp_mesh_name: str = "dp_shard_cp",
         tp_mesh_name: str = "tp",
         reshard_after_forward: Optional[bool] = None,
+        activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
         **kwargs,
     ) -> nn.Module:
         """Apply parallelization strategy to the model."""
@@ -280,6 +292,7 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         fsdp2_backward_prefetch_depth: int = 2,
         fsdp2_forward_prefetch_depth: int = 1,
         reshard_after_forward: Optional[bool] = None,
+        activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
         fully_shard_fn=None,
     ) -> nn.Module:
         """Apply the default parallelization flow."""
@@ -297,8 +310,8 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 "gathered across microbatches. This may increase per-microbatch all-gathers and reduce throughput."
             )
 
-        # Extract layers from the model for parallelization
-        layers = _extract_model_layers(model)
+        # Extract layers from the model for parallelization.
+        layer_groups = _extract_model_layer_groups(model)
 
         # TP sharding with enhanced plan generation
         if tp_mesh.size() > 1:
@@ -353,44 +366,40 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         # Apply activation checkpointing to transformer blocks if requested
         if activation_checkpointing:
             _has_kv_sharing = detect_kv_sharing_and_maybe_disable_cache(model)
+            ac_layers, ac_scopes = _filter_layer_groups_for_activation_checkpointing(
+                layer_groups,
+                activation_checkpointing_scope,
+            )
 
             if is_selective_activation_checkpointing(activation_checkpointing):
-                apply_selective_checkpointing_to_layers(model, layers, _has_kv_sharing, enable_compile=enable_compile)
-            elif _apply_bagel_full_layer_activation_checkpointing(model):
+                apply_selective_checkpointing_to_layers(
+                    model,
+                    ac_layers,
+                    _has_kv_sharing,
+                    enable_compile=enable_compile,
+                )
+            elif ac_scopes == ("all",) and _apply_bagel_full_layer_activation_checkpointing(model):
                 logger.info("Using BAGEL full-layer activation checkpointing; skipping submodule checkpoint wrappers.")
             elif enable_compile:
                 # NO_REENTRANT is required for compile: REENTRANT's first forward runs under
                 # no_grad, causing AOT autograd to trace a forward-only graph that drops LoRA
                 # (and other trainable) weight gradients.  Wrapping must happen BEFORE FSDP2
                 # sharding so the module structure is stable when fully_shard() indexes params.
-                for layer in layers:
-                    for attr in ("self_attn", "mlp"):
+                for layer in ac_layers:
+                    for attr in ("self_attn", "attention", "attn", "mlp", "feed_forward", "ffn"):
                         m = getattr(layer, attr, None)
                         if m is not None:
                             setattr(layer, attr, checkpoint_wrapper(m, checkpoint_impl=CheckpointImpl.NO_REENTRANT))
             else:
-                # Preserve original behavior when compile is disabled.
-                # For HF models on transformers >= 5.3.0, GradientCheckpointingLayer applies
-                # AC at full-layer granularity via __call__ -- fewer CheckpointWrapper objects
-                # and no memory-fragmentation overhead from sub-module wrapping.
-                _use_hf_native_grad_ckpt = False
-                try:
-                    from transformers.modeling_layers import GradientCheckpointingLayer as _HFGradLayer
-
-                    _use_hf_native_grad_ckpt = (
-                        bool(layers)
-                        and layers[0].__class__.__module__.startswith("transformers.")
-                        and isinstance(layers[0], _HFGradLayer)
-                        and getattr(model, "supports_gradient_checkpointing", False)
-                        and hasattr(model, "gradient_checkpointing_enable")
-                    )
-                except ImportError:
-                    pass
-
-                if _use_hf_native_grad_ckpt:
+                if _should_use_hf_native_gradient_checkpointing(
+                    model,
+                    layer_groups,
+                    ac_scopes,
+                    enable_compile=enable_compile,
+                ):
                     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
                 else:
-                    apply_submodule_checkpointing(layers, _has_kv_sharing)
+                    apply_submodule_checkpointing(ac_layers, _has_kv_sharing)
 
         # Set up mixed precision policy
         if not mp_policy:
@@ -1562,75 +1571,143 @@ def _find_largest_module_list(model: nn.Module) -> Optional[Union[nn.ModuleList,
     return largest_module_list
 
 
-def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
-    """
-    Extract layers from different model architectures for parallelization.
+def _reduce_attrs(model: nn.Module, fqns: Sequence[str]) -> List[nn.Module]:
+    ans = []
+    for fqn in fqns:
+        parts = fqn.split(".")
+        obj = model
+        for part in parts:
+            obj = getattr(obj, part, None)
+            if obj is None:
+                break
+        if obj is not None:
+            ans.append(obj)
+    return ans
 
-    This function handles various model types including vision-language models,
-    causal language models, and multimodal models. It collects both language
-    model layers and vision model layers where applicable.
 
-    Args:
-        model (nn.Module): The model to extract layers from.
+def _extend_layers(layers: List[nn.Module], modules: Sequence[nn.Module]) -> None:
+    for m in modules:
+        if isinstance(m, nn.ModuleList):
+            layers.extend(m)
+        elif isinstance(m, nn.ModuleDict):
+            layers.extend(m.values())
+        else:
+            layers.append(m)
 
-    Returns:
-        List[nn.Module]: A list of all layers that should be parallelized.
-    """
 
-    def _reduce_attrs(model, fqns: List[str]) -> List[nn.Module]:
-        if isinstance(fqns, str):
-            fqns = [fqns]
-        ans = []
-        for fqn in fqns:
-            parts = fqn.split(".")
-            obj = model
-            for part in parts:
-                obj = getattr(obj, part, None)
-                if obj is None:
-                    break
-            if obj is not None:
-                ans.append(obj)
-        return ans
-
+def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
     # Gemma3 layer paths depend on transformers version
     _gemma3_layers = (
-        ["model.layers", "model.vision_tower.vision_model.encoder.layers"]
+        {
+            "language": ["model.layers"],
+            "vision": ["model.vision_tower.vision_model.encoder.layers"],
+        }
         if _is_transformers_v5_or_higher()
-        else ["language_model.layers", "vision_tower.vision_model.encoder.layers"]
+        else {
+            "language": ["language_model.layers"],
+            "vision": ["vision_tower.vision_model.encoder.layers"],
+        }
     )
-    VLM_MODEL_CLS_TO_LAYERS = {
+    return {
         Gemma3ForConditionalGeneration: _gemma3_layers,
-        Qwen2_5_VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
-        Qwen2VLForConditionalGeneration: ["language_model.layers", "visual.blocks"],
-        # Note: `model.` is not a mistake here, it's the full fqn
-        SmolVLMForConditionalGeneration: ["model.text_model.layers", "model.vision_model.encoder.layers"],
-        LlavaForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
-        LlavaNextForConditionalGeneration: ["model.language_model.layers", "vision_tower.vision_model.encoder.layers"],
-        LlavaNextVideoForConditionalGeneration: [
-            "model.language_model.layers",
-            "vision_tower.vision_model.encoder.layers",
-        ],
-        LlavaOnevisionForConditionalGeneration: [
-            "model.language_model.layers",
-            "vision_tower.vision_model.encoder.layers",
-        ],
-        Mistral3ForConditionalGeneration: ["model.language_model.layers", "model.vision_tower.transformer.layers"],
+        Qwen2_5_VLForConditionalGeneration: {
+            "language": ["language_model.layers"],
+            "vision": ["visual.blocks"],
+        },
+        Qwen2VLForConditionalGeneration: {
+            "language": ["language_model.layers"],
+            "vision": ["visual.blocks"],
+        },
+        # Note: `model.` is not a mistake here, it's the full fqn.
+        SmolVLMForConditionalGeneration: {
+            "language": ["model.text_model.layers"],
+            "vision": ["model.vision_model.encoder.layers"],
+        },
+        LlavaForConditionalGeneration: {
+            "language": ["model.language_model.layers"],
+            "vision": ["vision_tower.vision_model.encoder.layers"],
+        },
+        LlavaNextForConditionalGeneration: {
+            "language": ["model.language_model.layers"],
+            "vision": ["vision_tower.vision_model.encoder.layers"],
+        },
+        LlavaNextVideoForConditionalGeneration: {
+            "language": ["model.language_model.layers"],
+            "vision": ["vision_tower.vision_model.encoder.layers"],
+        },
+        LlavaOnevisionForConditionalGeneration: {
+            "language": ["model.language_model.layers"],
+            "vision": ["vision_tower.vision_model.encoder.layers"],
+        },
+        Mistral3ForConditionalGeneration: {
+            "language": ["model.language_model.layers"],
+            "vision": [
+                "model.vision_tower.encoder.layers",
+                "model.vision_tower.vision_model.encoder.layers",
+                "model.vision_tower.transformer.layers",
+            ],
+        },
         # FP8 VLM subclass (own FP8 dequant on top of HF's Mistral3). String-keyed
         # because NeMo Auto wraps the class via HFCheckpointingMixin into a new
         # type with the same __name__ but distinct identity, so direct class
         # comparison misses; the elif `model_cls.__name__ in MAP` check catches it.
-        "Mistral3FP8VLMForConditionalGeneration": [
-            "model.language_model.layers",
-            "model.vision_tower.transformer.layers",
-        ],
-        Llama4ForConditionalGeneration: ["language_model.model.layers", "vision_model.model.layers"],
+        "Mistral3FP8VLMForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": [
+                "model.vision_tower.encoder.layers",
+                "model.vision_tower.vision_model.encoder.layers",
+                "model.vision_tower.transformer.layers",
+            ],
+        },
+        # Retrieval text encoder in components.models.ministral_bidirectional.model.
+        "Ministral3BidirectionalModel": {"language": ["layers"]},
+        # Retrieval VLM in components.models.llama_nemotron_vl.model. String-keyed
+        # to keep distributed core from importing optional model-specific deps.
+        "LlamaNemotronVLModel": {
+            "language": ["language_model.layers"],
+            "vision": [
+                "vision_model.vision_model.encoder.layers",
+                "vision_model.encoder.layers",
+            ],
+        },
+        Llama4ForConditionalGeneration: {
+            "language": ["language_model.model.layers"],
+            "vision": ["vision_model.model.layers"],
+        },
         # String-keyed to avoid eagerly importing transformers.models.qwen3_5 at
         # module load (which would defeat test monkeypatches that stub the
         # module before first import).
-        "Qwen3_5ForConditionalGeneration": ["model.language_model.layers", "model.visual.blocks"],
-        Gemma4ForConditionalGeneration: ["model.language_model.layers"],
-        # String fallback in case of class identity mismatch across imports
-        "Gemma4ForConditionalGeneration": ["model.language_model.layers"],
+        "Qwen3_5ForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.visual.blocks"],
+        },
+        "Qwen3_5MoeForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.visual.blocks"],
+        },
+        "Qwen3VLMoeForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.visual.blocks"],
+        },
+        Gemma4ForConditionalGeneration: {"language": ["model.language_model.layers"]},
+        # String fallback in case of class identity mismatch across imports.
+        "Gemma4ForConditionalGeneration": {"language": ["model.language_model.layers"]},
+        "KimiVLForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.vision_tower.encoder.blocks"],
+        },
+        "KimiK25VLForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.vision_tower.encoder.blocks"],
+        },
+        "MiniMaxM3SparseForConditionalGeneration": {
+            "language": ["model.layers"],
+            "vision": ["vision_tower.vision_model.encoder.layers"],
+        },
+        "Step3p7ForConditionalGeneration": {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.vision_model.transformer.resblocks"],
+        },
         # BAGEL (text-to-image + understanding). String-keyed to avoid an
         # import cycle: parallelizer is core distributed code, the BAGEL
         # model lives under components/models/bagel/. Lists both the Qwen2
@@ -1639,41 +1716,48 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
         # transformer_auto_wrap_policy class set; without the SigLIP
         # entry, Stage 2 OOMs on 8x80GB because the SigLIP layers sit in
         # the root FSDP unit's all-gather peak).
-        "BagelForUnifiedMultimodal": [
-            "model.language_model.model.layers",
-            "model.vit_model.vision_model.encoder.layers",
-        ],
-    }
-    LLM_MODEL_CLS_TO_LAYERS = {
-        "NemotronHForCausalLM": ["backbone.layers", "model.layers"],
-        GPT2LMHeadModel: ["transformer.h"],
+        "BagelForUnifiedMultimodal": {
+            "language": ["model.language_model.model.layers"],
+            "vision": ["model.vit_model.vision_model.encoder.layers"],
+        },
+        "NemotronHForCausalLM": {"language": ["backbone.layers", "model.layers"]},
+        GPT2LMHeadModel: {"language": ["transformer.h"]},
     }
 
-    MODEL_CLS_TO_LAYERS = VLM_MODEL_CLS_TO_LAYERS | LLM_MODEL_CLS_TO_LAYERS
 
-    def _extend_layers(layers, modules):
-        for m in modules:
-            if isinstance(m, nn.ModuleList):
-                layers.extend(m)
-            elif isinstance(m, nn.ModuleDict):
-                layers.extend(m.values())
-            else:
-                layers.append(m)
-
+def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
+    """Extract transformer layers grouped by model role."""
     model_cls = type(model)
-    layers: List[nn.Module] = []
-    if model_cls in MODEL_CLS_TO_LAYERS:
-        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls]))
-    elif model_cls.__name__ in MODEL_CLS_TO_LAYERS:
-        _extend_layers(layers, _reduce_attrs(model, MODEL_CLS_TO_LAYERS[model_cls.__name__]))
+    if model_cls.__name__ in {"BiEncoderModel", "CrossEncoderModel", "FSDPBiEncoderModel"}:
+        inner_model = getattr(model, "model", None)
+        if isinstance(inner_model, nn.Module):
+            return _extract_model_layer_groups(inner_model)
+
+    model_cls_to_layer_groups = _get_model_layer_group_specs()
+    layer_group_specs = None
+    if model_cls in model_cls_to_layer_groups:
+        layer_group_specs = model_cls_to_layer_groups[model_cls]
+    elif model_cls.__name__ in model_cls_to_layer_groups:
+        layer_group_specs = model_cls_to_layer_groups[model_cls.__name__]
+
+    layer_groups: Dict[str, List[nn.Module]] = {}
+    if layer_group_specs is not None:
+        for group_name, fqns in layer_group_specs.items():
+            layers: List[nn.Module] = []
+            _extend_layers(layers, _reduce_attrs(model, fqns))
+            if layers:
+                layer_groups[group_name] = layers
     elif hasattr(model, "model") and hasattr(model.model, "layers"):
-        # Default case for all other models (assumed to be a causal LM)
-        if isinstance(model.model.layers, nn.ModuleDict):
-            layers.extend(model.model.layers.values())
-        else:
-            layers.extend(model.model.layers)
+        # Default case for all other models (assumed to be a causal LM).
+        layer_groups["language"] = (
+            list(model.model.layers.values())
+            if isinstance(model.model.layers, nn.ModuleDict)
+            else list(model.model.layers)
+        )
     elif hasattr(model, "layers"):
-        layers.extend(model.layers)
+        layer_groups["language"] = (
+            list(model.layers.values()) if isinstance(model.layers, nn.ModuleDict) else list(model.layers)
+        )
     else:
         # Use heuristic to find the largest layer container in the model.
         logger.warning(f"Unknown model type: {model_cls}. Using heuristic to find transformer layers.")
@@ -1685,14 +1769,116 @@ def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
                 f"Unknown model type: {model_cls} and no ModuleList or ModuleDict found in model structure"
             )
 
-        if isinstance(largest_module_list, nn.ModuleDict):
-            layers.extend(largest_module_list.values())
-        else:
-            layers.extend(largest_module_list)
+        layer_groups["unknown"] = (
+            list(largest_module_list.values())
+            if isinstance(largest_module_list, nn.ModuleDict)
+            else list(largest_module_list)
+        )
         logger.info(f"Successfully extracted {len(largest_module_list)} layers using heuristic")
 
-    assert all(isinstance(m, nn.Module) for m in layers), "layers shoudl be nn.Module instances"
-    return layers
+    layers = [layer for group_layers in layer_groups.values() for layer in group_layers]
+    assert all(isinstance(m, nn.Module) for m in layers), "layers should be nn.Module instances"
+    return layer_groups
+
+
+def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
+    """
+    Extract layers from different model architectures for parallelization.
+
+    This compatibility wrapper flattens grouped language/vision/audio layers.
+    New activation-checkpointing code should use ``_extract_model_layer_groups``
+    so scope decisions can be explicit.
+    """
+    layer_groups = _extract_model_layer_groups(model)
+    return [layer for group_layers in layer_groups.values() for layer in group_layers]
+
+
+def _dedupe_layers(layers: Sequence[nn.Module]) -> List[nn.Module]:
+    deduped: List[nn.Module] = []
+    seen: set[int] = set()
+    for layer in layers:
+        layer_id = id(layer)
+        if layer_id in seen:
+            continue
+        seen.add(layer_id)
+        deduped.append(layer)
+    return deduped
+
+
+def _has_trainable_parameters(module: nn.Module) -> bool:
+    return any(param.requires_grad for param in module.parameters(recurse=True))
+
+
+def _filter_layer_groups_for_activation_checkpointing(
+    layer_groups: Dict[str, List[nn.Module]],
+    activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
+) -> Tuple[List[nn.Module], Tuple[str, ...]]:
+    """Select trainable activation-checkpointed layers from grouped model layers."""
+    scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
+    all_layers = [layer for group_layers in layer_groups.values() for layer in group_layers]
+
+    selected = []
+    if scopes == ("all",):
+        selected = all_layers
+    else:
+        for scope in scopes:
+            if scope == "multimodal":
+                selected.extend(layer_groups.get("vision", []))
+                selected.extend(layer_groups.get("audio", []))
+            else:
+                selected.extend(layer_groups.get(scope, []))
+
+    selected = _dedupe_layers(selected)
+    skipped_frozen = [layer for layer in selected if not _has_trainable_parameters(layer)]
+    if skipped_frozen:
+        selected = [layer for layer in selected if _has_trainable_parameters(layer)]
+    group_counts = {name: len(layers) for name, layers in layer_groups.items()}
+    selected_counts = {
+        name: sum(1 for layer in layers if any(layer is selected_layer for selected_layer in selected))
+        for name, layers in layer_groups.items()
+    }
+    logger.info(
+        "Activation checkpointing scope %s selected %d/%d trainable layers; groups=%s selected_groups=%s "
+        "skipped_frozen=%d",
+        scopes,
+        len(selected),
+        len(all_layers),
+        group_counts,
+        selected_counts,
+        len(skipped_frozen),
+    )
+    if all_layers and not selected:
+        logger.warning("Activation checkpointing scope %s selected no layers.", scopes)
+    return selected, scopes
+
+
+def _should_use_hf_native_gradient_checkpointing(
+    model: nn.Module,
+    layer_groups: Dict[str, List[nn.Module]],
+    scopes: Tuple[str, ...],
+    *,
+    enable_compile: bool = False,
+) -> bool:
+    """Return whether HF-native gradient checkpointing can preserve AutoModel's AC scope."""
+    if enable_compile or scopes != ("all",):
+        return False
+    if set(layer_groups) != {"language"}:
+        return False
+    language_layers = layer_groups.get("language", [])
+    if not language_layers:
+        return False
+    if any(not _has_trainable_parameters(layer) for layer in language_layers):
+        return False
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer as _HFGradLayer
+    except ImportError:
+        return False
+    return (
+        language_layers[0].__class__.__module__.startswith("transformers.")
+        and isinstance(language_layers[0], _HFGradLayer)
+        and getattr(model, "supports_gradient_checkpointing", False)
+        and hasattr(model, "gradient_checkpointing_enable")
+    )
 
 
 def _get_parallel_plan(
@@ -1909,6 +2095,7 @@ def fsdp2_strategy_parallelize(
     fsdp2_backward_prefetch_depth: int = 2,
     fsdp2_forward_prefetch_depth: int = 1,
     reshard_after_forward: Optional[bool] = None,
+    activation_checkpointing_scope: ActivationCheckpointingScope | None = "all",
 ):
     """
     Apply parallelisms and activation checkpointing to the model.
@@ -1968,6 +2155,7 @@ def fsdp2_strategy_parallelize(
         fsdp2_backward_prefetch_depth=fsdp2_backward_prefetch_depth,
         fsdp2_forward_prefetch_depth=fsdp2_forward_prefetch_depth,
         reshard_after_forward=reshard_after_forward,
+        activation_checkpointing_scope=activation_checkpointing_scope,
     )
 
 

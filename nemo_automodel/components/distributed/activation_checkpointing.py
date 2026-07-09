@@ -40,6 +40,18 @@ from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint
 logger = logging.getLogger(__name__)
 
 
+def unwrap_checkpoint_wrapper(module: nn.Module) -> nn.Module:
+    """Return the activation-checkpointed module, or the input module if it is not wrapped.
+
+    Args:
+        module: Module that may have been wrapped by ``checkpoint_wrapper``.
+
+    Returns:
+        The inner checkpointed module when present, otherwise ``module``.
+    """
+    return getattr(module, "_checkpoint_wrapped_module", module)
+
+
 def _resolve_torch_op(namespace: str, name: str, overload: str = "default"):
     """Resolve ``torch.ops.<namespace>.<name>.<overload>``, or ``None`` if absent."""
     ns = getattr(torch.ops, namespace, None)
@@ -294,6 +306,18 @@ def _disable_dynamo_lru_cache() -> None:
         logger.debug("Could not disable dynamo LRU cache for selective AC + compile.", exc_info=True)
 
 
+def _wrap_first_existing_attr(module: nn.Module, attr_names: tuple[str, ...], *, skip: bool = False) -> int:
+    """Checkpoint-wrap the first matching child attr on ``module``."""
+    if skip:
+        return 0
+    for attr in attr_names:
+        child = getattr(module, attr, None)
+        if isinstance(child, nn.Module):
+            setattr(module, attr, checkpoint_wrapper(child))
+            return 1
+    return 0
+
+
 def apply_submodule_checkpointing(layers: List[nn.Module], has_kv_sharing: bool) -> None:
     """Wrap a transformer block's sub-modules with ``checkpoint_wrapper``.
 
@@ -309,15 +333,28 @@ def apply_submodule_checkpointing(layers: List[nn.Module], has_kv_sharing: bool)
         layers: Transformer decoder layers to wrap (mutated in place).
         has_kv_sharing: Whether the model reuses K/V across layers via the cache.
     """
+    wrapped_counts: dict[str, int] = {
+        "mlp": 0,
+        "attention": 0,
+        "pre_norm": 0,
+        "post_norm": 0,
+        "mot": 0,
+    }
     for layer in layers:
-        if hasattr(layer, "mlp"):
-            layer.mlp = checkpoint_wrapper(layer.mlp)  # type: ignore
-        if hasattr(layer, "self_attn") and not has_kv_sharing:
-            layer.self_attn = checkpoint_wrapper(layer.self_attn)  # type: ignore
-        if hasattr(layer, "input_layernorm"):
-            layer.input_layernorm = checkpoint_wrapper(layer.input_layernorm)  # type: ignore
-        if hasattr(layer, "post_attention_layernorm"):
-            layer.post_attention_layernorm = checkpoint_wrapper(layer.post_attention_layernorm)  # type: ignore
+        wrapped_counts["mlp"] += _wrap_first_existing_attr(layer, ("mlp", "feed_forward", "ffn"))
+        wrapped_counts["attention"] += _wrap_first_existing_attr(
+            layer,
+            ("self_attn", "attention", "attn"),
+            skip=has_kv_sharing,
+        )
+        wrapped_counts["pre_norm"] += _wrap_first_existing_attr(
+            layer,
+            ("input_layernorm", "attention_norm", "layer_norm1", "norm1"),
+        )
+        wrapped_counts["post_norm"] += _wrap_first_existing_attr(
+            layer,
+            ("post_attention_layernorm", "ffn_norm", "layer_norm2", "norm2"),
+        )
 
         # MoT (mixture-of-transformers) sibling submodules -- present in BAGEL's
         # Qwen2MoTDecoderLayer for the generation expert. mlp_moe_gen is a full
@@ -325,10 +362,14 @@ def apply_submodule_checkpointing(layers: List[nn.Module], has_kv_sharing: bool)
         # doubles per-layer activation memory in Stage-2 BAGEL training.
         if hasattr(layer, "mlp_moe_gen"):
             layer.mlp_moe_gen = checkpoint_wrapper(layer.mlp_moe_gen)  # type: ignore
+            wrapped_counts["mot"] += 1
         if hasattr(layer, "input_layernorm_moe_gen"):
             layer.input_layernorm_moe_gen = checkpoint_wrapper(layer.input_layernorm_moe_gen)  # type: ignore
+            wrapped_counts["mot"] += 1
         if hasattr(layer, "post_attention_layernorm_moe_gen"):
             layer.post_attention_layernorm_moe_gen = checkpoint_wrapper(layer.post_attention_layernorm_moe_gen)  # type: ignore
+            wrapped_counts["mot"] += 1
+    logger.info("Applied submodule activation checkpointing to %d layers: %s", len(layers), wrapped_counts)
 
 
 def _replace_child_module(root: nn.Module, target: nn.Module, replacement: nn.Module) -> bool:
