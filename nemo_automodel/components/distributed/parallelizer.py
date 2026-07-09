@@ -2107,7 +2107,7 @@ def _get_parallel_plan(
     # an explicit/wildcard TP plan cannot silently shard expert or router
     # modules merely because expert parallelism is disabled.
     if tp_size > 1 and _uses_custom_moe_modules(model):
-        from nemo_automodel.components.moe.parallelizer import _validate_moe_tp_plan
+        from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
 
         model_parallel_plan = _validate_moe_tp_plan(model_parallel_plan, model=model)
 

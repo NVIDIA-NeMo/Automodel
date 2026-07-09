@@ -16,7 +16,6 @@
 
 import functools
 import logging
-from fnmatch import fnmatchcase
 
 import torch
 import torch.nn as nn
@@ -35,6 +34,7 @@ from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedE
 from nemo_automodel.components.moe.layers import (
     MoE,
 )
+from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -131,64 +131,6 @@ def _module_weights_are_tied(left: nn.Module | None, right: nn.Module | None) ->
     left_weight = getattr(left, "weight", None)
     right_weight = getattr(right, "weight", None)
     return left_weight is not None and left_weight is right_weight
-
-
-def _is_unsafe_moe_tp_module_path(module_path: str) -> bool:
-    path_segments = set(module_path.split("."))
-    leaf = module_path.rsplit(".", 1)[-1]
-    return (
-        "experts" in path_segments
-        or "gate_and_up_projs" in path_segments
-        or "down_projs" in path_segments
-        or "router" in path_segments
-        or "shared_expert_gate" in path_segments
-        or "gate" in path_segments
-        or leaf in {"mlp", "moe"}
-    )
-
-
-def _validate_moe_tp_plan(plan: object, model: nn.Module | None = None) -> dict[str, ParallelStyle]:
-    """Validate that a TP plan cannot shard routed-expert parameters.
-
-    Routed experts are owned by expert parallelism and, when configured, the
-    independent ``ep_shard`` FSDP mesh. Applying tensor parallelism to the same
-    parameters would compose unrelated DTensor placements and either corrupt
-    ownership or fail during the first grouped GEMM. Shared experts are regular
-    dense MLPs and are intentionally allowed.
-    """
-    if not isinstance(plan, dict) or not plan:
-        raise ValueError("The custom MoE tensor-parallel plan must be a non-empty dictionary.")
-
-    unsafe_paths: list[str] = []
-    unmatched_paths: list[str] = []
-    module_names = tuple(name for name, _ in model.named_modules()) if hasattr(model, "named_modules") else ()
-    for module_path in plan:
-        if not isinstance(module_path, str):
-            raise ValueError("Every custom MoE tensor-parallel plan key must be a module path string.")
-        if _is_unsafe_moe_tp_module_path(module_path):
-            unsafe_paths.append(module_path)
-            continue
-        if module_names:
-            matched_names = [name for name in module_names if fnmatchcase(name, module_path)]
-            if not matched_names:
-                unmatched_paths.append(module_path)
-            elif any(_is_unsafe_moe_tp_module_path(name) for name in matched_names):
-                unsafe_paths.append(module_path)
-
-    if unsafe_paths:
-        formatted = ", ".join(sorted(unsafe_paths))
-        raise ValueError(
-            "Tensor parallelism must not target routed-expert parameters or router outputs because they are "
-            "EP-owned or require global expert logits. "
-            f"Remove these paths from tp_shard_plan: {formatted}. Shared-expert leaf modules remain supported."
-        )
-    if unmatched_paths:
-        formatted = ", ".join(sorted(unmatched_paths))
-        raise ValueError(
-            "Custom MoE tensor-parallel plan patterns must each match at least one concrete module; "
-            f"unmatched paths: {formatted}."
-        )
-    return plan
 
 
 def _resolve_moe_tp_plan(
