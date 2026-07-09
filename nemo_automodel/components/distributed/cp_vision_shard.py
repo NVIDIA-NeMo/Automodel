@@ -35,36 +35,65 @@ Memory/compute: vision forward + activations drop ~cp_size x; the final gathered
 embeds (small vs the ViT's internal patch activations) are reconstructed in full
 on every rank, then immediately sequence-sharded by the existing CP sharder.
 
-Sharding-group scope (deliberate design constraint): the caller chooses the process
-group it publishes via :func:`set_cp_vision_group`.  With a FROZEN vision tower,
-frames may be sharded across the full CP x TP rank set: the forward is bit-identical
-(per-frame independence, replicated weights) and ``requires_grad=False`` means no
-backward ever runs through the gather.  With a TRAINABLE vision tower, publish the
-CP group only: the vision tower is replicated (not tensor-parallel) across TP ranks,
-so gathering frames across CP x TP would make the all-gather's reduce-scatter(SUM)
-backward accumulate the vision gradient tp-fold (each TP-replicated sequence shard
-backprops into the single compute rank).  Under pure TP (``cp_size == 1``) this
-sharding is not enabled.
+Sharding-group scope (deliberate, machine-checked design constraint): the caller
+declares the scope of the process group it publishes via
+``set_cp_vision_group(group, spans_only_cp=...)``.  With a FROZEN vision tower,
+frames may be sharded across the full CP x TP rank set (``spans_only_cp=False``):
+the forward is bit-identical (per-frame independence, replicated weights) and
+``requires_grad=False`` means no backward ever runs through the gather.  With a
+TRAINABLE vision tower, only a CP-only group (``spans_only_cp=True``, the default)
+is valid: the vision tower is replicated (not tensor-parallel) across TP ranks,
+so gathering frames across CP x TP would make the all-gather's
+reduce-scatter(SUM) backward accumulate the vision gradient tp-fold (each
+TP-replicated sequence shard backprops into the single compute rank).
+:func:`maybe_distribute_visual` raises when a trainable tower meets a group not
+declared CP-only.  Under pure TP (``cp_size == 1``) the published group has size
+1, so this sharding is not enabled.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable, Sequence
-from typing import TypeVar
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.distributed as dist
 
+__all__ = [
+    "cp_vision_sharding_active",
+    "maybe_distribute_visual",
+    "reset_cp_vision_group",
+    "set_cp_vision_group",
+]
+
 logger = logging.getLogger(__name__)
 _LOGGED_ONCE = False
+_LOGGED_SMALL_FALLBACK = False
+_LOGGED_CUDA_GRID_HOST_SYNC = False
+
+
+@dataclass(frozen=True)
+class _GroupScope:
+    """The published sharding group plus the caller's declaration of its scope.
+
+    ``spans_only_cp=False`` marks a group that also spans replicated non-CP axes
+    (e.g. the flattened CP x TP set); that is only safe for a frozen vision tower.
+    """
+
+    group: dist.ProcessGroup
+    spans_only_cp: bool
+
+
+# Token restoring the previous published scope; opaque to callers.
+CpVisionGroupToken = _GroupScope | None
 
 
 class _GroupHolder:
-    """Plain get/set/reset holder for the CP process group active during the VLM
-    pre-embed step.  Set by the VLM CP recipe around the pre-embed forward and read
-    by ``maybe_distribute_visual``.
+    """Plain get/set/reset holder for the sharding-group scope active during the
+    VLM pre-embed step.  Set by the VLM CP recipe around the pre-embed forward and
+    read by ``maybe_distribute_visual``.
 
     A plain attribute (not a ``ContextVar``) is sufficient: the vision pre-embed
     runs synchronously in the main thread OUTSIDE activation checkpointing, so
@@ -73,28 +102,22 @@ class _GroupHolder:
     """
 
     def __init__(self):
-        self._value = None
+        self._value: _GroupScope | None = None
 
-    def get(self):
+    def get(self) -> _GroupScope | None:
         return self._value
 
-    def set(self, value):
+    def set(self, value: _GroupScope | None) -> _GroupScope | None:
         token = self._value
         self._value = value
         return token
 
-    def reset(self, token):
+    def reset(self, token: _GroupScope | None) -> None:
         self._value = token
 
 
-# Holds the CP NCCL process group (or ``None``) for the current pre-embed call.
+# Holds the published sharding-group scope (or ``None``) for the current pre-embed call.
 _CP_VISION_GROUP = _GroupHolder()
-_CP_VISION_CPU_GRIDS = _GroupHolder()
-_LOGGED_SMALL_FALLBACK = False
-_LOGGED_CUDA_GRID_HOST_SYNC = False
-_LOGGED_INDEPENDENT_UNITS: set[str] = set()
-
-_UnitT = TypeVar("_UnitT")
 
 
 class _AllGatherSeqDiff(torch.autograd.Function):
@@ -126,15 +149,13 @@ class _AllGatherSeqDiff(torch.autograd.Function):
         return local, None, None
 
 
-def _vision_grid_cpu_ok(visual) -> bool:
+def _vision_grid_cpu_ok(visual: torch.nn.Module) -> bool:
     """Return True when HF vision attention can consume CPU grid metadata."""
-    if getattr(visual, "_nemo_cpu_grid_flash_ok", False):
-        return True
     impl = str(getattr(getattr(visual, "config", None), "_attn_implementation", "") or "").lower()
     return bool(impl) and not impl.startswith("flash")
 
 
-def _grid_for_visual(visual, grid_thw: torch.Tensor, pixel_values: torch.Tensor) -> torch.Tensor:
+def _grid_for_visual(visual: torch.nn.Module, grid_thw: torch.Tensor, pixel_values: torch.Tensor) -> torch.Tensor:
     """Move ``grid_thw`` ([N, 3] long, rows of (t, h, w)) to the device ``visual`` expects.
 
     CPU when the attention implementation consumes host metadata, else ``pixel_values``'s
@@ -184,47 +205,31 @@ def _grid_list_for_planning(grid_thw: torch.Tensor) -> tuple[list[list[int]], to
     return grid_host.tolist(), grid_host
 
 
-def set_cp_vision_group(group):
-    """Install the CP process group for the next pre-embed forward; returns a token."""
-    return _CP_VISION_GROUP.set(group)
-
-
-def reset_cp_vision_group(token) -> None:
-    """Restore the previous CP vision group (pair with :func:`set_cp_vision_group`)."""
-    _CP_VISION_GROUP.reset(token)
-
-
-def set_cp_vision_cpu_grids(grids: dict[str, torch.Tensor]):
-    """Publish original CPU VLM grid metadata for the current CP pre-embed call.
-
-    FSDP may move tensor kwargs to the compute device before model.forward runs. The
-    Qwen3-VL vision tower also needs ``grid_thw`` as Python/CPU metadata, so keep the
-    dataloader's CPU tensors available through this side channel and let the model's
-    pre-embed path pass those into ``maybe_distribute_visual``.
+def set_cp_vision_group(group: dist.ProcessGroup | None, *, spans_only_cp: bool = True) -> CpVisionGroupToken:
+    """Install the sharding process group for the next pre-embed forward.
 
     Args:
-        grids: Mapping from batch key (e.g. ``"image_grid_thw"``) to the dataloader's
-            CPU [N, 3] grid tensor of (t, h, w) rows.
+        group: Process group to shard vision frames across, or ``None`` to disable
+            sharding for the call.
+        spans_only_cp: Declaration of the group's scope.  ``True`` (default) states
+            that ``group`` spans context-parallel ranks only -- always
+            gradient-correct.  Pass ``False`` only for a group that also spans
+            replicated non-CP axes (e.g. the flattened CP x TP rank set); that is
+            valid solely for a FROZEN vision tower, and
+            :func:`maybe_distribute_visual` raises when a trainable tower meets a
+            group not declared CP-only (the gather's reduce-scatter(SUM) backward
+            would otherwise accumulate the vision gradient tp-fold).
 
     Returns:
-        A token to pass to :func:`reset_cp_vision_cpu_grids`.
+        A token to pass to :func:`reset_cp_vision_group`.
     """
-    return _CP_VISION_CPU_GRIDS.set(grids)
+    scope = None if group is None else _GroupScope(group=group, spans_only_cp=spans_only_cp)
+    return _CP_VISION_GROUP.set(scope)
 
 
-def reset_cp_vision_cpu_grids(token) -> None:
-    """Restore the previous CPU grid metadata (pair with :func:`set_cp_vision_cpu_grids`)."""
-    _CP_VISION_CPU_GRIDS.reset(token)
-
-
-def cp_vision_grid_metadata(key: str, fallback: torch.Tensor | None) -> torch.Tensor | None:
-    """Return the published CPU [N, 3] grid tensor for ``key``, or ``fallback`` when absent."""
-    grids = _CP_VISION_CPU_GRIDS.get()
-    if isinstance(grids, dict):
-        value = grids.get(key)
-        if isinstance(value, torch.Tensor):
-            return value
-    return fallback
+def reset_cp_vision_group(token: CpVisionGroupToken) -> None:
+    """Restore the previous sharding-group scope (pair with :func:`set_cp_vision_group`)."""
+    _CP_VISION_GROUP.reset(token)
 
 
 def _shard_vision_enabled() -> bool:
@@ -245,10 +250,32 @@ def cp_vision_sharding_active() -> bool:
     Model-specific pre-embed implementations can use it to leave their ordinary
     (replicated / CP-off) multimodal forward completely untouched.
     """
-    group = _CP_VISION_GROUP.get()
-    if group is None or not _shard_vision_enabled():
+    scope = _CP_VISION_GROUP.get()
+    if scope is None or not _shard_vision_enabled():
         return False
-    return dist.get_world_size(group) > 1
+    return dist.get_world_size(scope.group) > 1
+
+
+def _check_group_scope_for_trainable(visual: torch.nn.Module, scope: _GroupScope) -> None:
+    """Raise when a trainable vision tower is sharded over a group not declared CP-only.
+
+    The ViT is replicated (not tensor-parallel) across TP ranks, so gathering frames
+    across a CP x TP group makes the all-gather's reduce-scatter(SUM) backward
+    accumulate the vision gradient tp-fold.  This check is deterministic across ranks
+    (``requires_grad`` and the declaration are identical everywhere), so it raises on
+    every rank before any collective.
+    """
+    if scope.spans_only_cp:
+        return
+    if any(p.requires_grad for p in visual.parameters()):
+        raise ValueError(
+            "cp_vision_shard: the vision tower has trainable parameters but the published "
+            "sharding group was declared spans_only_cp=False (e.g. the flattened CP x TP rank "
+            "set). The vision tower is replicated across TP ranks, so gathering frames over "
+            "that group would accumulate the vision gradient tp-fold in the all-gather's "
+            "reduce-scatter(SUM) backward. Publish the CP-only group "
+            "(set_cp_vision_group(cp_group)) or freeze the vision tower."
+        )
 
 
 def _min_shard_tokens() -> int:
@@ -284,12 +311,7 @@ def _contiguous_balanced_bounds(patches: torch.Tensor, world: int) -> list[int] 
     every rank, so all ranks compute the same partition (and thus the same per-rank token
     counts they need to unpack the all-gather).
     """
-    return _contiguous_balanced_cost_bounds(patches.to(torch.long).square(), world)
-
-
-def _contiguous_balanced_cost_bounds(costs: torch.Tensor, world: int) -> list[int] | None:
-    """Contiguously balance already-computed positive per-unit costs."""
-    n = int(costs.shape[0])
+    n = int(patches.shape[0])
     if n < world:
         return None
     if world <= 1:
@@ -299,12 +321,12 @@ def _contiguous_balanced_cost_bounds(costs: torch.Tensor, world: int) -> list[in
     # host sync + Python bisect is both cheap and device-agnostic.
     import bisect
 
-    costs_list = [int(x) for x in costs.tolist()]
-    if any(value <= 0 for value in costs_list):
+    costs = [int(x) * int(x) for x in patches.tolist()]
+    if any(value <= 0 for value in costs):
         raise ValueError("partition costs must be positive")
     cum = []
     acc = 0
-    for c in costs_list:
+    for c in costs:
         acc += c
         cum.append(acc)
     total = acc
@@ -320,7 +342,9 @@ def _contiguous_balanced_cost_bounds(costs: torch.Tensor, world: int) -> list[in
     return cuts
 
 
-def _all_gather_var_tokens(local: torch.Tensor, group, world: int, token_counts: list[int]) -> torch.Tensor:
+def _all_gather_var_tokens(
+    local: torch.Tensor, group: dist.ProcessGroup, world: int, token_counts: list[int]
+) -> torch.Tensor:
     """Differentiable all-gather of per-rank ``[n_r, H]`` token blocks into the full
     ``[sum(n_r), H]`` tensor in rank order.
 
@@ -345,148 +369,11 @@ def _all_gather_var_tokens(local: torch.Tensor, group, world: int, token_counts:
     return torch.cat(blocks, dim=0)
 
 
-def maybe_distribute_independent_units(
-    units: Sequence[_UnitT],
-    run_units: Callable[[list[_UnitT]], torch.Tensor],
-    *,
-    unit_token_counts: Sequence[int],
-    unit_costs: Sequence[int] | None = None,
-    make_dummy_unit: Callable[[], _UnitT] | None = None,
-    dummy_token_count: int | None = None,
-    dummy_cost: int | None = None,
-    name: str = "visual",
-) -> torch.Tensor:
-    """Run independent variable-size units across CP ranks and gather their tokens.
-
-    ``units`` must already be in the exact output order.  The helper assigns
-    *contiguous* ranges of that sequence to ranks, calls ``run_units`` exactly
-    once on the local range, and reconstructs the full ``[tokens, hidden]``
-    tensor with one differentiable variable-length all-gather.  Consequently,
-    concatenating each rank's local output preserves both unit order and token
-    order without a post-gather permutation.
-
-    When there are fewer real units than ranks, ``make_dummy_unit`` supplies a
-    legal model input.  Dummy units are appended at the tail, one per otherwise
-    empty rank; their gathered tokens are sliced off before returning, so their
-    forward participates in FSDP consistently while receiving exactly zero
-    gradient.  ``run_units`` may additionally attach zero-valued parameter
-    anchors to its returned tensor (for example, for an alternate image/video
-    patch embedder not selected by that rank).
-
-    Outside an active CP vision group, or when ``NEMO_CP_SHARD_VISION=0``, this
-    is a transparent local call over all real units.  Callers that need strict
-    byte-for-byte legacy behavior may use :func:`cp_vision_sharding_active` to
-    bypass construction of units altogether.
-
-    Args:
-        units: Independent units in exact output order; opaque to this helper, only
-            forwarded to ``run_units``.
-        run_units: Runs a contiguous sub-list of ``units`` and returns their tokens as a
-            ``[tokens, H]`` tensor (H = hidden size; ``[units, tokens_per_unit, H]`` is
-            also accepted and flattened), concatenated in the given unit order.
-        unit_token_counts: Output token count of each unit (all > 0), aligned with
-            ``units``.
-        unit_costs: Optional positive per-unit compute cost used to balance the
-            contiguous partition; defaults to ``token_count ** 2`` (attention-like).
-        make_dummy_unit: Builds one legal dummy unit; required when
-            ``len(units) < cp_size``.
-        dummy_token_count: Output token count of a dummy unit (> 0).
-        dummy_cost: Optional cost of a dummy unit; defaults to ``dummy_token_count ** 2``.
-        name: Label used in log/error messages.
-
-    Returns:
-        ``[sum(unit_token_counts), H]`` tensor of all real units' tokens in unit order,
-        identical (forward and gradient) to ``run_units(list(units))``.
-    """
-    real_units = list(units)
-    token_counts_per_unit = [int(value) for value in unit_token_counts]
-    if len(token_counts_per_unit) != len(real_units):
-        raise ValueError(
-            f"{name}: unit_token_counts has {len(token_counts_per_unit)} entries for {len(real_units)} units."
-        )
-    if any(value <= 0 for value in token_counts_per_unit):
-        raise ValueError(f"{name}: every real unit must produce at least one token.")
-
-    if unit_costs is None:
-        costs = [value * value for value in token_counts_per_unit]
-    else:
-        costs = [int(value) for value in unit_costs]
-        if len(costs) != len(real_units):
-            raise ValueError(f"{name}: unit_costs has {len(costs)} entries for {len(real_units)} units.")
-        if any(value <= 0 for value in costs):
-            raise ValueError(f"{name}: every unit cost must be positive.")
-
-    group = _CP_VISION_GROUP.get()
-    if group is None or not _shard_vision_enabled():
-        return run_units(real_units)
-
-    world = dist.get_world_size(group)
-    if world <= 1:
-        return run_units(real_units)
-
-    n_real_units = len(real_units)
-    real_token_count = sum(token_counts_per_unit)
-    n_pad = 0
-    planned_units = real_units
-    planned_token_counts = token_counts_per_unit
-    planned_costs = costs
-
-    if n_real_units < world:
-        if make_dummy_unit is None or dummy_token_count is None:
-            raise ValueError(
-                f"{name}: {n_real_units} units cannot cover {world} CP ranks; "
-                "provide make_dummy_unit and dummy_token_count."
-            )
-        dummy_tokens = int(dummy_token_count)
-        if dummy_tokens <= 0:
-            raise ValueError(f"{name}: dummy_token_count must be positive.")
-        dummy_unit_cost = int(dummy_cost if dummy_cost is not None else dummy_tokens * dummy_tokens)
-        if dummy_unit_cost <= 0:
-            raise ValueError(f"{name}: dummy_cost must be positive.")
-
-        n_pad = world - n_real_units
-        planned_units = real_units + [make_dummy_unit() for _ in range(n_pad)]
-        planned_token_counts = token_counts_per_unit + [dummy_tokens] * n_pad
-        planned_costs = costs + [dummy_unit_cost] * n_pad
-        # Exactly one unit per rank.  Real units precede dummies, which makes
-        # ``[:real_token_count]`` below remove the complete dummy tail.
-        cuts = list(range(world + 1))
-    else:
-        cuts = _contiguous_balanced_cost_bounds(torch.tensor(planned_costs, dtype=torch.long), world)
-        if cuts is None:  # Defensive: only possible for an empty input, handled above.
-            raise RuntimeError(f"{name}: failed to partition {len(planned_units)} units across {world} ranks.")
-
-    rank = dist.get_rank(group)
-    rank_token_counts = [sum(planned_token_counts[cuts[r] : cuts[r + 1]]) for r in range(world)]
-    local_units = planned_units[cuts[rank] : cuts[rank + 1]]
-    local = run_units(local_units)
-    if not isinstance(local, torch.Tensor) or local.ndim < 2:
-        shape = None if not isinstance(local, torch.Tensor) else tuple(local.shape)
-        raise ValueError(f"{name}: run_units must return a [tokens, hidden] tensor, got {shape}.")
-    local = local.reshape(-1, local.shape[-1])
-    expected_local_tokens = rank_token_counts[rank]
-    if local.shape[0] != expected_local_tokens:
-        raise ValueError(
-            f"{name}: rank {rank} produced {local.shape[0]} tokens for its units, expected {expected_local_tokens}."
-        )
-
-    if name not in _LOGGED_INDEPENDENT_UNITS:
-        _LOGGED_INDEPENDENT_UNITS.add(name)
-        logger.warning(
-            "%s independent units SHARDED (world=%d): %d real + %d dummy; per-rank units=%s tokens=%s",
-            name,
-            world,
-            n_real_units,
-            n_pad,
-            [cuts[r + 1] - cuts[r] for r in range(world)],
-            rank_token_counts,
-        )
-
-    gathered = _all_gather_var_tokens(local, group, world, rank_token_counts)
-    return gathered[:real_token_count]
-
-
-def maybe_distribute_visual(visual, pixel_values, grid_thw):
+def maybe_distribute_visual(
+    visual: torch.nn.Module,
+    pixel_values: torch.Tensor | None,
+    grid_thw: torch.Tensor | None,
+) -> Any:
     """Run ``visual(pixel_values, grid_thw=grid_thw, return_dict=True)`` but distribute the
     forward across the CP group when enabled, returning an output object whose
     ``pooler_output`` (and ``deepstack_features`` list, if any) are the FULL gathered
@@ -501,9 +388,11 @@ def maybe_distribute_visual(visual, pixel_values, grid_thw):
             ``visual(pixel_values, grid_thw=..., return_dict=True)``.
         pixel_values: ``[total_patch_rows, patch_dim]`` pixel rows for ALL entries,
             frame-contiguous in entry order (entry order, then frame order within each
-            entry) -- the exact tensor the replicated call would receive.
+            entry) -- the exact tensor the replicated call would receive.  ``None``
+            (no media in the batch) is forwarded to ``visual`` unchanged.
         grid_thw: ``[N, 3]`` tensor, one (t, h, w) row per media entry (N = entries;
-            ``t * h * w`` patch rows per entry).  Expected on CPU.
+            ``t * h * w`` patch rows per entry).  Expected on CPU.  ``None`` (no media
+            in the batch) is forwarded to ``visual`` unchanged.
 
     Returns:
         The vision tower's output object.  ``pooler_output`` is the full gathered
@@ -512,15 +401,26 @@ def maybe_distribute_visual(visual, pixel_values, grid_thw):
         (when present) is gathered to the same shape.  ``last_hidden_state`` is left as
         the local shard (unused downstream).  Forward and vision-parameter gradients are
         exactly equal to the replicated call's.
+
+    Raises:
+        ValueError: When the vision tower has trainable parameters but the published
+            group was declared ``spans_only_cp=False`` (see :func:`set_cp_vision_group`),
+            or when a rank's local visual output does not match its planned token count.
     """
-    group = _CP_VISION_GROUP.get()
-    if grid_thw is None or pixel_values is None or group is None or not _shard_vision_enabled():
+    if grid_thw is None or pixel_values is None:
+        # No media inputs: nothing to shard and no grid to place; keep the exact
+        # replicated call (grid/device handling would dereference the missing input).
+        return visual(pixel_values, grid_thw=grid_thw, return_dict=True)
+
+    scope = _CP_VISION_GROUP.get()
+    if scope is None or not _shard_vision_enabled():
         return visual(
             pixel_values,
             grid_thw=_grid_for_visual(visual, grid_thw, pixel_values),
             return_dict=True,
         )
 
+    group = scope.group
     world = dist.get_world_size(group)
     if world <= 1:
         return visual(
@@ -528,6 +428,8 @@ def maybe_distribute_visual(visual, pixel_values, grid_thw):
             grid_thw=_grid_for_visual(visual, grid_thw, pixel_values),
             return_dict=True,
         )
+
+    _check_group_scope_for_trainable(visual, scope)
 
     sms_sq = int(visual.spatial_merge_size) ** 2
 
@@ -553,7 +455,7 @@ def maybe_distribute_visual(visual, pixel_values, grid_thw):
         global _LOGGED_SMALL_FALLBACK
         if not _LOGGED_SMALL_FALLBACK:
             _LOGGED_SMALL_FALLBACK = True
-            logger.warning(
+            logger.info(
                 "vision tower using replicated path for small visual workload "
                 "(tokens=%d < NEMO_CP_SHARD_VISION_MIN_TOKENS=%d)",
                 n_real_tokens,
@@ -611,7 +513,7 @@ def maybe_distribute_visual(visual, pixel_values, grid_thw):
     if not _LOGGED_ONCE:
         _LOGGED_ONCE = True
         frames_per_rank = [cuts[r + 1] - cuts[r] for r in range(world)]
-        logger.warning(
+        logger.info(
             "vision tower SHARDED across vision-shard group (world=%d): %d entries / %d "
             "frame-units (+%d dummy pad) -> per-rank frames=%s tokens=%s (was: full ViT replicated "
             "on every rank)",
@@ -650,6 +552,15 @@ def maybe_distribute_visual(visual, pixel_values, grid_thw):
 
     local_out = visual(local_pixel, grid_thw=local_grid, return_dict=True)
 
+    # Validate the planned per-rank token count before the collective: a mismatch would
+    # otherwise silently mis-slice every rank's block out of the gathered tensor.
+    expected_local_tokens = token_counts[rank]
+    if local_out.pooler_output.shape[0] != expected_local_tokens:
+        raise ValueError(
+            f"cp_vision_shard: rank {rank} produced {local_out.pooler_output.shape[0]} visual "
+            f"tokens for its frame slice, expected {expected_local_tokens}."
+        )
+
     # Gather all per-rank blocks (real + any dummy) in rank order, then slice to the real
     # token count: dummy frames live on the last `n_pad` ranks, so their tokens are the
     # tail and ``[:n_real_tokens]`` drops them.  In the non-padded path n_real_tokens is the
@@ -661,6 +572,12 @@ def maybe_distribute_visual(visual, pixel_values, grid_thw):
     ]
     deepstack = getattr(local_out, "deepstack_features", None)
     if deepstack is not None:
+        for k, d in enumerate(deepstack):
+            if d.shape[0] != expected_local_tokens:
+                raise ValueError(
+                    f"cp_vision_shard: rank {rank} deepstack feature {k} has {d.shape[0]} visual "
+                    f"tokens, expected {expected_local_tokens}."
+                )
         local_out.deepstack_features = [
             _all_gather_var_tokens(d, group, world, token_counts)[:n_real_tokens] for d in deepstack
         ]

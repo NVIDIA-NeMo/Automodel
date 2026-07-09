@@ -57,12 +57,26 @@ class _StubVisual(torch.nn.Module):
         sms_sq = self.spatial_merge_size**2
         x = self.proj(pixel_values)  # [total_patches, hidden] — per row, entry-independent
         merged = x.reshape(-1, sms_sq, x.shape[-1]).mean(dim=1)  # [total_patches/sms_sq, hidden]
-        out = SimpleNamespace(
-            pooler_output=merged, last_hidden_state=x, deepstack_features=None
-        )
+        out = SimpleNamespace(pooler_output=merged, last_hidden_state=x, deepstack_features=None)
         if self.with_deepstack:
             out.deepstack_features = [merged * (k + 1) for k in range(self.n_deepstack)]
         return out
+
+
+class _RecorderVisual(torch.nn.Module):
+    """Parameter-free stub that records its call args and returns a fixed output.
+
+    ``pixel_values`` / ``grid_thw`` are treated as opaque pass-through objects (may be
+    ``None``); the returned ``pooler_output`` is a constant ``[1, 4]`` zero tensor.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(self, pixel_values, grid_thw=None, return_dict=True):
+        self.calls.append((pixel_values, grid_thw))
+        return SimpleNamespace(pooler_output=torch.zeros(1, 4), last_hidden_state=None, deepstack_features=None)
 
 
 def _grid(entries):
@@ -271,129 +285,10 @@ def test_all_gather_var_tokens_forward_backward(monkeypatch, world):
     assert local.grad is not None and local.grad.shape == local.shape
 
 
-def _run_independent_unit_case(
-    monkeypatch,
-    *,
-    rank,
-    world,
-    units,
-    token_counts,
-    costs,
-    rank_blocks,
-    dummy=None,
-    dummy_tokens=None,
-):
-    """Drive the generic production helper with in-process collectives."""
-    import torch.distributed as dist
-
-    max_tokens = max(block.shape[0] for block in rank_blocks)
-    collective_calls = {"gather": 0}
-
-    def fake_all_gather(out_list, _local, group=None):
-        collective_calls["gather"] += 1
-        for output, block in zip(out_list, rank_blocks):
-            padded = torch.cat(
-                [block, block.new_zeros(max_tokens - block.shape[0], block.shape[-1])],
-                dim=0,
-            )
-            output.copy_(padded)
-
-    def fake_reduce_scatter(local, chunks, op=None, group=None):
-        local.copy_(chunks[rank])
-
-    monkeypatch.setattr(dist, "get_world_size", lambda group=None: world)
-    monkeypatch.setattr(dist, "get_rank", lambda group=None: rank)
-    monkeypatch.setattr(dist, "all_gather", fake_all_gather)
-    monkeypatch.setattr(dist, "reduce_scatter", fake_reduce_scatter)
-
-    scale = torch.nn.Parameter(torch.tensor(1.0))
-    local_units = []
-
-    def run_units(selected):
-        local_units.extend(selected)
-        rows = [
-            torch.full((unit[1], 1), float(unit[0])) * scale
-            for unit in selected
-        ]
-        return torch.cat(rows, dim=0)
-
-    token = vs.set_cp_vision_group(object())
-    try:
-        output = vs.maybe_distribute_independent_units(
-            units,
-            run_units,
-            unit_token_counts=token_counts,
-            unit_costs=costs,
-            make_dummy_unit=(lambda: dummy) if dummy is not None else None,
-            dummy_token_count=dummy_tokens,
-            name="test independent units",
-        )
-    finally:
-        vs.reset_cp_vision_group(token)
-    return output, scale, local_units, collective_calls
-
-
-def test_independent_units_preserve_order_and_use_one_differentiable_gather(monkeypatch):
-    # Direct costs split [4,1 | 9,1] into two contiguous ranges. Each tuple is
-    # (value, output-token-count), so gathered values reveal any reordering.
-    units = [(10, 2), (11, 1), (20, 3), (21, 1)]
-    rank_blocks = [
-        torch.tensor([[10.0], [10.0], [11.0]]),
-        torch.tensor([[20.0], [20.0], [20.0], [21.0]]),
-    ]
-    output, scale, local_units, calls = _run_independent_unit_case(
-        monkeypatch,
-        rank=0,
-        world=2,
-        units=units,
-        token_counts=[2, 1, 3, 1],
-        costs=[4, 1, 9, 1],
-        rank_blocks=rank_blocks,
-    )
-
-    assert local_units == units[:2]
-    assert output[:, 0].tolist() == [10.0, 10.0, 11.0, 20.0, 20.0, 20.0, 21.0]
-    assert calls["gather"] == 1
-    output.sum().backward()
-    assert scale.grad is not None
-    assert scale.grad.item() == pytest.approx(31.0)
-
-
-def test_independent_units_pad_empty_ranks_with_legal_zero_grad_dummy(monkeypatch):
-    units = [(3, 2), (5, 1)]
-    dummy = (99, 2)
-    rank_blocks = [
-        torch.tensor([[3.0], [3.0]]),
-        torch.tensor([[5.0]]),
-        torch.tensor([[99.0], [99.0]]),
-        torch.tensor([[99.0], [99.0]]),
-    ]
-    output, scale, local_units, calls = _run_independent_unit_case(
-        monkeypatch,
-        rank=2,
-        world=4,
-        units=units,
-        token_counts=[2, 1],
-        costs=[4, 1],
-        rank_blocks=rank_blocks,
-        dummy=dummy,
-        dummy_tokens=2,
-    )
-
-    assert local_units == [dummy]
-    assert output[:, 0].tolist() == [3.0, 3.0, 5.0]
-    assert calls["gather"] == 1
-    output.sum().backward()
-    # The gathered dummy tail is sliced before loss; differentiable gather
-    # routes an exact zero gradient back to the padded rank's legal forward.
-    assert scale.grad is not None
-    assert scale.grad.item() == 0.0
-
-
 # ======================================================================================
 # D. maybe_distribute_visual end-to-end (simulated ranks) + fallbacks + deepstack
 # ======================================================================================
-def _simulate_maybe_distribute(visual, pixel, grid, world, rank, monkeypatch, *, grad=False):
+def _simulate_maybe_distribute(visual, pixel, grid, world, rank, monkeypatch, *, grad=False, spans_only_cp=True):
     """Drive the real maybe_distribute_visual on `rank` with all ranks' data supplied to a
     mocked all-gather, returning its output object.
 
@@ -425,9 +320,7 @@ def _simulate_maybe_distribute(visual, pixel, grid, world, rank, monkeypatch, *,
         cuts = list(range(world + 1))
     else:
         cuts = vs._contiguous_balanced_bounds(torch.tensor(f_patches, dtype=torch.long), world)
-    token_counts = [
-        sum(f_patches[i] // sms_sq for i in range(cuts[r], cuts[r + 1])) for r in range(world)
-    ]
+    token_counts = [sum(f_patches[i] // sms_sq for i in range(cuts[r], cuts[r + 1])) for r in range(world)]
     max_tok = max(token_counts)
     pix_bounds = [0]
     for p in f_patches:
@@ -470,7 +363,7 @@ def _simulate_maybe_distribute(visual, pixel, grid, world, rank, monkeypatch, *,
 
         monkeypatch.setattr(dist, "reduce_scatter", fake_reduce_scatter)
 
-    tok = vs.set_cp_vision_group(object())  # any non-None group activates the path
+    tok = vs.set_cp_vision_group(object(), spans_only_cp=spans_only_cp)  # any non-None group activates the path
     try:
         return vs.maybe_distribute_visual(visual, pixel, grid)
     finally:
@@ -539,30 +432,96 @@ def test_maybe_distribute_falls_back_without_group():
     assert torch.allclose(out.pooler_output, visual(pixel, grid).pooler_output, atol=1e-6)
 
 
-def test_patched_flash_visual_keeps_grid_metadata_on_cpu():
-    visual = _StubVisual()
-    visual.config = SimpleNamespace(_attn_implementation="flash_attention_2")
-    visual._nemo_cpu_grid_flash_ok = True
-
+def test_grid_for_visual_follows_attention_implementation():
+    """CPU-metadata attention impls (non-flash) keep grid_thw on CPU untouched; flash
+    impls get the grid on pixel_values' device."""
     grid = _grid([(1, 2, 2)])
     pixel = _pixels(grid)
 
-    assert vs._vision_grid_cpu_ok(visual)
-    assert vs._grid_for_visual(visual, grid, pixel).device.type == "cpu"
+    sdpa_visual = _StubVisual()
+    sdpa_visual.config = SimpleNamespace(_attn_implementation="sdpa")
+    assert vs._vision_grid_cpu_ok(sdpa_visual)
+    assert vs._grid_for_visual(sdpa_visual, grid, pixel) is grid
+
+    flash_visual = _StubVisual()
+    flash_visual.config = SimpleNamespace(_attn_implementation="flash_attention_2")
+    assert not vs._vision_grid_cpu_ok(flash_visual)
+    assert vs._grid_for_visual(flash_visual, grid, pixel).device == pixel.device
 
 
-def test_cp_vision_cpu_grid_metadata_side_channel():
-    fallback = _grid([(1, 2, 2)])
-    cpu_grid = _grid([(2, 4, 4)])
+@pytest.mark.parametrize(
+    "pixel_is_none,grid_is_none",
+    [(True, True), (False, True), (True, False)],
+)
+def test_maybe_distribute_falls_back_when_media_inputs_are_none(monkeypatch, pixel_is_none, grid_is_none):
+    """No media inputs (grid_thw and/or pixel_values is None) must route straight to the
+    plain visual(...) call -- forwarding both arguments UNCHANGED, with no grid device
+    handling (which would dereference the missing input) and no collectives -- even while
+    a multi-rank group is active."""
+    import torch.distributed as dist
 
-    assert vs.cp_vision_grid_metadata("video_grid_thw", fallback) is fallback
-    token = vs.set_cp_vision_cpu_grids({"video_grid_thw": cpu_grid})
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
+
+    def fail_collective(*args, **kwargs):
+        raise AssertionError("no-media fallback must not enter collectives")
+
+    monkeypatch.setattr(dist, "all_gather", fail_collective)
+
+    pixel = None if pixel_is_none else _pixels(_grid(_ENTRIES))
+    grid = None if grid_is_none else _grid(_ENTRIES)
+    visual = _RecorderVisual()
+    tok = vs.set_cp_vision_group(object())
     try:
-        assert vs.cp_vision_grid_metadata("video_grid_thw", fallback) is cpu_grid
-        assert vs.cp_vision_grid_metadata("image_grid_thw", fallback) is fallback
+        out = vs.maybe_distribute_visual(visual, pixel, grid)
     finally:
-        vs.reset_cp_vision_cpu_grids(token)
-    assert vs.cp_vision_grid_metadata("video_grid_thw", fallback) is fallback
+        vs.reset_cp_vision_group(tok)
+
+    assert len(visual.calls) == 1
+    called_pixel, called_grid = visual.calls[0]
+    assert called_pixel is pixel
+    assert called_grid is grid
+    assert out.pooler_output.shape == (1, 4)
+
+
+def test_trainable_tower_rejects_group_not_declared_cp_only(monkeypatch):
+    """A TRAINABLE vision tower published with spans_only_cp=False must raise before any
+    collective: the ViT is replicated across TP ranks, so gathering frames over a CP x TP
+    group would accumulate the vision gradient tp-fold (silent wrong gradients)."""
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
+
+    def fail_collective(*args, **kwargs):
+        raise AssertionError("trainable-tower scope violation must raise before collectives")
+
+    monkeypatch.setattr(dist, "all_gather", fail_collective)
+
+    grid = _grid(_ENTRIES)
+    pixel = _pixels(grid)
+    visual = _StubVisual()
+    assert any(p.requires_grad for p in visual.parameters())
+    tok = vs.set_cp_vision_group(object(), spans_only_cp=False)
+    try:
+        with pytest.raises(ValueError, match="spans_only_cp"):
+            vs.maybe_distribute_visual(visual, pixel, grid)
+    finally:
+        vs.reset_cp_vision_group(tok)
+
+
+def test_frozen_tower_shards_over_group_not_declared_cp_only(monkeypatch):
+    """A FROZEN tower may shard across a wider (e.g. CP x TP) group: requires_grad=False
+    means no backward ever runs through the gather, and forward parity still holds."""
+    torch.manual_seed(4)
+    grid = _grid(_ENTRIES)
+    pixel = _pixels(grid)
+    visual = _StubVisual()
+    visual.requires_grad_(False)
+
+    rep = visual(pixel, grid).pooler_output
+    out = _simulate_maybe_distribute(visual, pixel, grid, world=2, rank=0, monkeypatch=monkeypatch, spans_only_cp=False)
+
+    assert out.pooler_output.shape == rep.shape
+    assert torch.allclose(out.pooler_output, rep, atol=1e-6)
 
 
 def test_maybe_distribute_disabled_by_env(monkeypatch):
@@ -608,8 +567,8 @@ def test_maybe_distribute_falls_back_below_min_tokens(monkeypatch):
     "world,entries",
     [
         (8, [(1, 2, 2), (1, 4, 4)]),  # 2 image entries < world 8
-        (4, [(1, 2, 2)]),             # single image < world 4
-        (4, [(2, 2, 2)]),             # single 2-frame video (2 units) < world 4
+        (4, [(1, 2, 2)]),  # single image < world 4
+        (4, [(2, 2, 2)]),  # single 2-frame video (2 units) < world 4
     ],
 )
 def test_maybe_distribute_pads_when_fewer_entries_than_ranks(monkeypatch, world, entries):
@@ -633,10 +592,10 @@ def test_maybe_distribute_pads_when_fewer_entries_than_ranks(monkeypatch, world,
 @pytest.mark.parametrize(
     "world,entries",
     [
-        (4, [(1, 2, 2)]),              # single image, 1 unit < world 4 -> 3 dummy pads
-        (4, [(1, 2, 2), (1, 4, 4)]),   # 2 image units < world 4 -> 2 dummy pads
-        (4, [(2, 2, 2)]),              # single 2-frame video (2 units) < world 4 -> 2 pads
-        (8, [(1, 2, 2), (1, 4, 4)]),   # 2 units < world 8 -> 6 dummy pads
+        (4, [(1, 2, 2)]),  # single image, 1 unit < world 4 -> 3 dummy pads
+        (4, [(1, 2, 2), (1, 4, 4)]),  # 2 image units < world 4 -> 2 dummy pads
+        (4, [(2, 2, 2)]),  # single 2-frame video (2 units) < world 4 -> 2 pads
+        (8, [(1, 2, 2), (1, 4, 4)]),  # 2 units < world 8 -> 6 dummy pads
     ],
 )
 def test_pad_backward_through_real_code_matches_replicate(monkeypatch, world, entries):
@@ -675,9 +634,7 @@ def test_pad_backward_through_real_code_matches_replicate(monkeypatch, world, en
     gws, gbs = [], []
     for r in range(world):
         visual.zero_grad(set_to_none=True)
-        out = _simulate_maybe_distribute(
-            visual, pixel, grid, world, rank=r, monkeypatch=monkeypatch, grad=True
-        )
+        out = _simulate_maybe_distribute(visual, pixel, grid, world, rank=r, monkeypatch=monkeypatch, grad=True)
         assert out.pooler_output.shape == rep_out.shape
         assert torch.allclose(out.pooler_output, rep_out, atol=1e-6)  # forward still exact
         (out.pooler_output * target).sum().backward()
