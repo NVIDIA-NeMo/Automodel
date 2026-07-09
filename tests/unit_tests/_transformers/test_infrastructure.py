@@ -150,8 +150,8 @@ class _DummyModel(torch.nn.Module):
 
 def test_safe_moe_tp_requires_real_checkpoint_source_and_rejects_peft():
     from nemo_automodel._transformers.infrastructure import (
-        _mark_safe_moe_tp_weights_loaded,
         _validate_safe_moe_tp_weight_source,
+        _verify_safe_moe_tp_weights_loaded,
     )
 
     model = _DummyModel()
@@ -176,9 +176,8 @@ def test_safe_moe_tp_requires_real_checkpoint_source_and_rejects_peft():
         peft_config=None,
     )
     with pytest.raises(RuntimeError, match="without a completed checkpoint"):
-        _mark_safe_moe_tp_weights_loaded(model, checkpoint_loaded=False)
-    _mark_safe_moe_tp_weights_loaded(model, checkpoint_loaded=True)
-    assert model._nemo_moe_tp_pretrained_weights_loaded is True
+        _verify_safe_moe_tp_weights_loaded(model, checkpoint_loaded=False)
+    _verify_safe_moe_tp_weights_loaded(model, checkpoint_loaded=True)
 
 
 _INFRA_MODULE = "nemo_automodel._transformers.infrastructure"

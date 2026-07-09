@@ -1214,7 +1214,6 @@ def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
     )
 
     assert calls == ["tp", "tie", "cp", "ep", "ac", "fsdp"]
-    assert model._nemo_moe_tp_sharded_module_patterns == tuple(sorted(safe_plan))
     assert model._nemo_moe_tp_requires_replica_sync is True
     assert model._nemo_moe_tp_requires_pretrained_weights is True
     P._resolve_moe_tp_plan.assert_called_once_with(

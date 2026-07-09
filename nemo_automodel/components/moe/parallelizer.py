@@ -730,18 +730,18 @@ def parallelize_model(
             tp_shard_plan=tp_shard_plan,
             tp_size=tp_mesh.size(),
         )
-        # Preserve the resolved ownership contract through activation
-        # checkpointing and FSDP wrapping. Downstream tooling combines the
-        # concrete plan paths with the final DTensor placements to build a
-        # fail-closed manifest of trainable parameters that remain replicated
-        # over TP. This applies equally to registered and explicit custom-MoE plans.
-        model._nemo_moe_tp_sharded_module_patterns = tuple(sorted(model_parallel_plan))
+        # Every custom-MoE TP plan keeps the token path (attention, router)
+        # replicated across TP ranks, so each expert gradient accumulates
+        # tp_size identical contributions through the EP all-gather.
+        # get_expert_tp_replication_factor reads this marker to remove that
+        # factor in scale_grads_and_clip_grad_norm.
         model._nemo_moe_tp_requires_replica_sync = True
-        # Explicit plans do not call the registered plan factory, so set
-        # the checkpoint-safety marker here as the common authority. Any
-        # custom-MoE TP plan leaves at least some trainable paths replicated;
-        # random/from-config initialization is unsafe until those replicas are
-        # initialized and validated from one complete checkpoint.
+        # The replicated paths have no gradient synchronization of their own;
+        # they stay identical across TP ranks only when every rank starts from
+        # the same complete pretrained checkpoint. This marker makes
+        # apply_model_infrastructure and checkpoint loading fail closed on
+        # random/from-config initialization or partial checkpoints. It applies
+        # equally to registered and explicit custom-MoE plans.
         model._nemo_moe_tp_requires_pretrained_weights = True
         # PEFT is applied before distributed sharding. Translate each style so
         # LoRA-wrapped shared-expert/lm-head modules keep the same TP semantics.

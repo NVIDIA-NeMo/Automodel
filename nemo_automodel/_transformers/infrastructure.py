@@ -127,17 +127,14 @@ def _validate_safe_moe_tp_weight_source(
         )
 
 
-def _mark_safe_moe_tp_weights_loaded(model, *, checkpoint_loaded: bool) -> None:
-    """Record successful checkpoint completion for later diagnostics."""
-    parts = _safe_moe_tp_parts(model)
-    if not parts:
+def _verify_safe_moe_tp_weights_loaded(model, *, checkpoint_loaded: bool) -> None:
+    """Fail closed when the safe custom-MoE TP path skipped the checkpoint load."""
+    if not _safe_moe_tp_parts(model):
         return
     if not checkpoint_loaded:
         raise RuntimeError(
             "Safe custom-MoE tensor parallelism reached post-load setup without a completed checkpoint load."
         )
-    for model_part in parts:
-        model_part._nemo_moe_tp_pretrained_weights_loaded = True
 
 
 #  PEFT / quantization helpers
@@ -680,7 +677,7 @@ def apply_model_infrastructure(
                 load_base_model=load_base_model,
             )
 
-    _mark_safe_moe_tp_weights_loaded(
+    _verify_safe_moe_tp_weights_loaded(
         model,
         checkpoint_loaded=bool(checkpoint_already_loaded or weights_already_loaded or should_load_checkpoint),
     )
