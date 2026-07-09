@@ -41,11 +41,13 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.optim.dion import build_dion_optimizer, is_dion_optimizer
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
@@ -189,7 +191,7 @@ class FusedAdamConfig(OptimizerConfig):
         master_weight_dtype = kwargs.pop("master_weight_dtype", None)
         if master_weight_dtype is not None:
             master_weight_dtype = dtype_from_str(master_weight_dtype)
-        return FusedAdam(params, **kwargs, master_weight_dtype=master_weight_dtype)
+        return FusedAdam(_drop_empty_local_shards(params), **kwargs, master_weight_dtype=master_weight_dtype)
 
 
 @dataclass
@@ -386,6 +388,11 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         for part in getattr(model, "parts", [model]):
             trainable_params = [p for p in part.parameters() if p.requires_grad]
             assert len(trainable_params) > 0, "trainable_params cannot be empty"
+            # TE FusedAdam's multi_tensor_apply faults on zero-numel local shards; see
+            # _drop_empty_local_shards.  Same guard as FusedAdamConfig, for the YAML
+            # ``_target_: transformer_engine...FusedAdam`` escape hatch.
+            if _is_te_fused_adam(self.factory):
+                trainable_params = _drop_empty_local_shards(trainable_params)
             optimizers.append(self.factory(params=trainable_params, **kwargs))
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
@@ -407,6 +414,8 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         if foreach is not None and "foreach" not in kwargs and _factory_accepts_foreach(self.factory):
             kwargs["foreach"] = foreach
 
+        if _is_te_fused_adam(self.factory):
+            param_groups = _drop_empty_local_shards(param_groups)
         return self.factory(params=param_groups, **kwargs)
 
 
@@ -520,6 +529,84 @@ def _foreach_for_mesh(device_mesh: DeviceMesh | None) -> bool | None:
     ):
         return False
     return None
+
+
+def _local_numel(param: torch.Tensor) -> int:
+    """Number of elements of ``param`` owned by this rank.
+
+    Args:
+        param: Parameter tensor of arbitrary shape. For a ``DTensor`` (e.g. an
+            FSDP2 parameter with a dim-0 ``Shard`` placement), the global shape
+            may be non-empty while this rank's local shard holds zero elements;
+            the local (``to_local()``) element count is returned. For a plain
+            tensor, local and global element counts coincide (``numel()``).
+
+    Returns:
+        Element count of the rank-local shard; 0 when this rank owns no slice.
+    """
+    if isinstance(param, DTensor):
+        return param.to_local().numel()
+    return param.numel()
+
+
+def _drop_empty_local_shards(params: list[Any]) -> list[Any]:
+    """Drop parameters whose rank-local shard holds zero elements.
+
+    FSDP2 shards every parameter along dim-0 across the shard group, so any
+    parameter with dim-0 smaller than the group — e.g. the biases, norm
+    weights, or class/position embeddings of a small dense vision tower
+    sharded over a wide mesh — leaves zero-numel local shards on the tail
+    ranks.  TransformerEngine FusedAdam's ``multi_tensor_apply`` kernel has no
+    empty-tensor guard and faults (CUDA misaligned address / illegal memory
+    access) at the first optimizer step.  Dropping locally-empty shards is
+    exact, not an approximation: every element of those parameters lives on
+    other ranks, whose optimizers update them; this rank has nothing to do.
+
+    Args:
+        params: Flat list of parameters, or list of param-group dicts with a
+            ``"params"`` list.  Parameters are plain tensors or ``DTensor``s;
+            a ``DTensor`` parameter carries a non-empty global shape whose
+            dim-0-sharded local shard may be empty on this rank.
+
+    Returns:
+        ``params`` with zero-numel local shards removed.  Param groups whose
+        parameter list becomes empty are dropped; the remaining groups keep
+        their other options unchanged.
+    """
+    params = list(params)
+    dropped = 0
+    if params and isinstance(params[0], dict):
+        filtered: list[Any] = []
+        for group in params:
+            kept = [p for p in group["params"] if _local_numel(p) > 0]
+            dropped += len(group["params"]) - len(kept)
+            if kept:
+                filtered.append({**group, "params": kept})
+    else:
+        filtered = [p for p in params if _local_numel(p) > 0]
+        dropped = len(params) - len(filtered)
+    if dropped:
+        logger.warning(
+            "Dropped %d parameter(s) with zero-numel local shards from TE FusedAdam on this rank: "
+            "TransformerEngine's multi_tensor_apply faults on empty tensors, and every element of "
+            "the dropped parameters is owned (and updated) by other ranks.",
+            dropped,
+        )
+    return filtered
+
+
+def _is_te_fused_adam(factory: Callable[..., Any]) -> bool:
+    """Return ``True`` if ``factory`` is TransformerEngine's ``FusedAdam`` (or a subclass).
+
+    Identity-based and import-free: TE is an optional dependency, so this never
+    imports it.  If TE has not been imported yet, ``factory`` cannot be TE's
+    ``FusedAdam`` class and the check is trivially ``False``.
+    """
+    te_optimizers = sys.modules.get("transformer_engine.pytorch.optimizers")
+    if te_optimizers is None:
+        return False
+    te_fused_adam = getattr(te_optimizers, "FusedAdam", None)
+    return isinstance(te_fused_adam, type) and isinstance(factory, type) and issubclass(factory, te_fused_adam)
 
 
 def _factory_accepts_foreach(factory: Callable[..., Any]) -> bool:
