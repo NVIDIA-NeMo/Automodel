@@ -31,7 +31,7 @@ from contextlib import AbstractContextManager, nullcontext
 from copy import copy
 from dataclasses import dataclass, field, fields, is_dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast, runtime_checkable
 
 from torch.utils.data import DataLoader, IterableDataset
 from torch.utils.data.sampler import Sampler
@@ -150,6 +150,8 @@ class PackingConfig:
     max_packs: int | None = None
     prepacked: bool = False
     """Whether the dataset already contains packed samples and must not be repacked."""
+    requires_model_configuration: ClassVar[bool] = False
+    """Whether model-side packing hooks must be configured before building the dataset."""
 
     def build(
         self,
@@ -210,6 +212,7 @@ class ThdPackingConfig(PackingConfig):
 class NeatPackingConfig(PackingConfig):
     """NEAT (bin-packed) packing paired with ``neat_packed_collater``."""
 
+    requires_model_configuration: ClassVar[bool] = True
     drop_long_samples: bool = True
 
     def build(
