@@ -32,6 +32,8 @@ import logging
 import weakref
 from typing import TYPE_CHECKING
 
+from nemo_automodel._transformers.model_capabilities import query_capabilities
+
 if TYPE_CHECKING:
     import torch.nn as nn
 
@@ -273,16 +275,24 @@ class ModelSupports:
     @property
     def supports_sequence_packing(self) -> bool:
         """``forward()`` accepts ``seq_lens`` for packed-sequence training."""
+        model = self._model
+        backend_attn = getattr(getattr(model, "backend", None), "attn", None)
         sp_attn_backend = (
-            getattr(self._model, "_supports_sdpa", False) is True
-            or _uses_te_attention(self._model)
-            or _uses_magi_attention(self._model)
-            or (
-                _is_glm_moe_dsa(self._model)
-                and getattr(getattr(self._model, "backend", None), "attn", None) == "tilelang"
-            )
+            getattr(model, "_supports_sdpa", False) is True
+            or _uses_te_attention(model)
+            or _uses_magi_attention(model)
+            or (self.supports_thd and backend_attn == "tilelang")
         )
-        return _supports_seq_lens(self._model) and sp_attn_backend
+        return _supports_seq_lens(model) and sp_attn_backend
+
+    @property
+    def supports_thd(self) -> bool:
+        """Model owns its native THD packed-sequence input path."""
+        try:
+            capabilities = query_capabilities(self._model)
+        except AttributeError:
+            return False
+        return capabilities.supports_thd
 
     @property
     def supports_generate(self) -> bool:
@@ -322,17 +332,21 @@ class ModelSupports:
 
     @property
     def supports_cp_with_sequence_packing(self) -> bool:
-        """CP + packed sequences requires the TE or MagiAttention backend.
+        """CP + packed sequences requires a backend with packed CP routing.
 
         MagiAttention dispatches the packed sequence across the CP group with its
         own load-balancing solver and a per-document varlen mask, so it supports
-        CP + packing (see ``magi_attn_utils.magi_prepare_packed_cp``)."""
+        CP + packing (see ``magi_attn_utils.magi_prepare_packed_cp``). Models
+        with native THD support own their packed CP path in TileLang attention."""
+        model = self._model
+        if not self.supports_sequence_packing:
+            return False
         if self.cp_size <= 1:
-            return self.supports_sequence_packing
-        if _is_glm_moe_dsa(self._model):
-            backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
-            return self.supports_sequence_packing and backend_attn == "tilelang"
-        return self.supports_sequence_packing and (_uses_te_attention(self._model) or _uses_magi_attention(self._model))
+            return True
+        if self.supports_thd:
+            backend_attn = getattr(getattr(model, "backend", None), "attn", None)
+            return backend_attn == "tilelang"
+        return _uses_te_attention(model) or _uses_magi_attention(model)
 
 
 def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
@@ -456,16 +470,14 @@ def _supports_forwarding_property(name: str) -> property:
 
 
 def _lazy_supports_property(self: "nn.Module") -> ModelSupports:
-    try:
-        supports = self._supports  # type: ignore[attr-defined]
-        supports._model
+    supports = getattr(self, "_supports", None)
+    if isinstance(supports, ModelSupports) and supports._model_ref() is self:
         return supports
-    except AttributeError:
-        self._supports = ModelSupports(self, getattr(self, "_mesh", None))  # type: ignore[attr-defined]
-        return self._supports  # type: ignore[attr-defined]
-    except ReferenceError:
-        self._supports = ModelSupports(self, getattr(self, "_mesh", None))  # type: ignore[attr-defined]
-        return self._supports  # type: ignore[attr-defined]
+    # Pipeline splitting deep-copies model stages after capabilities were attached.
+    # The copied ``_supports`` still points at the source model, so rebuild it for
+    # the live stage before any supports_* forwarding property is evaluated.
+    self._supports = ModelSupports(self, getattr(self, "_mesh", None))  # type: ignore[attr-defined]
+    return self._supports  # type: ignore[attr-defined]
 
 
 @functools.lru_cache(maxsize=1)

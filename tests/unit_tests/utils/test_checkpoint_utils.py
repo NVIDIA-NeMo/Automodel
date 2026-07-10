@@ -178,13 +178,24 @@ def test_reject_unsupported_tied_word_embeddings_omni_wrapper_path():
     """The guard raises for a full Omni wrapper whose thinker_config requests tying."""
     wrapper = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=True))
     with pytest.raises(NotImplementedError):
-        checkpoint_utils.reject_unsupported_tied_word_embeddings(
-            wrapper, "Qwen2_5OmniThinkerForConditionalGeneration"
-        )
+        checkpoint_utils.reject_unsupported_tied_word_embeddings(wrapper, "Qwen2_5OmniThinkerForConditionalGeneration")
     wrapper_untied = SimpleNamespace(thinker_config=SimpleNamespace(tie_word_embeddings=False))
     checkpoint_utils.reject_unsupported_tied_word_embeddings(
         wrapper_untied, "Qwen3OmniMoeThinkerForConditionalGeneration"
     )  # no raise
+
+
+def test_reject_unsupported_untied_word_embeddings_raises_when_untied():
+    """A tied-default model with tie_word_embeddings=False is rejected."""
+    config = SimpleNamespace(tie_word_embeddings=False)
+    with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=False"):
+        checkpoint_utils.reject_unsupported_untied_word_embeddings(config, "Gemma4ForConditionalGeneration")
+
+
+def test_reject_unsupported_untied_word_embeddings_noop_when_tied():
+    """The default (tied) config passes the untie guard without raising."""
+    config = SimpleNamespace(tie_word_embeddings=True)
+    checkpoint_utils.reject_unsupported_untied_word_embeddings(config, "Gemma4ForConditionalGeneration")  # no raise
 
 
 class _DraftLikeModel(nn.Module):

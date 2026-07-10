@@ -334,9 +334,9 @@ def prepare_cp_forward(
         loss_mask: Optional per-token mask forwarded to the batch sharding.
         cp_size: Override for the hook gate (e.g. the config-declared CP size);
             derived from the ``cp`` submesh when None.
-        invoke_pre_embed: Invoke the model hook when CP is active. Recipes pass
-            False for PP stages without embeddings and for KD paths that never
-            wired model-owned CP.
+        invoke_pre_embed: Invoke the model hook when CP is active or the model
+            owns native THD preparation. Recipes pass False for PP stages
+            without embeddings and for KD paths that never wired model-owned CP.
     Returns:
         ``(ctx_factory, batch)``.
     """
@@ -349,7 +349,8 @@ def prepare_cp_forward(
     # llm-domain magi replaces the whole batch prep (no model has both a CP
     # hook and magi); vlm-domain magi composes with the vision pre-embed.
     magi_replaces_hook = magi_enabled and getattr(magi, "domain", "llm") == "llm"
-    if effective_cp_size > 1 and has_hook and not magi_replaces_hook and invoke_pre_embed:
+    model_owns_thd = use_te and bool(getattr(model, "supports_thd", False))
+    if (effective_cp_size > 1 or model_owns_thd) and has_hook and not magi_replaces_hook and invoke_pre_embed:
         # The whole batch rides through __call__ as an opaque kwarg; the model
         # reads the keys it needs and removes the raw inputs it consumed (its
         # returned entries are merged on top). Sharder-only hooks (DSV4/GLM)
@@ -393,10 +394,10 @@ def _resolve_cp_sharder(
 ) -> Optional[CPSharder]:
     """Resolve the CPSharder for this forward: model-owned > magi > TE > generic.
 
-    Returns None when no CP prep applies. The model-owned and generic torch
-    ``context_parallel`` paths only shard at cp_size > 1; magi and TE stay
-    active at cp_size <= 1 (THD packing conversion / mask-spec activation), so
-    they resolve regardless of mesh size. The magi and THD token layouts depend
+    Returns None when no CP prep applies. The generic torch
+    ``context_parallel`` path only shards at cp_size > 1; model-owned, magi,
+    and TE sharders may also run at cp_size <= 1 for native THD packing
+    conversion / mask-spec activation. The magi and THD token layouts depend
     on batch content (``cu_seqlens`` partitioning / dispatch solver), not just
     ``(cp_mesh, seq_len)``, so their sharders construct without
     ``local_token_global_indices`` and install the index map computed during
@@ -407,7 +408,7 @@ def _resolve_cp_sharder(
     # A model that owns its CP attention returns a CPSharder from its CP
     # input-prep hook. Honor it instead of any framework-owned path so the
     # implementation stays with the model.
-    if cp_active and model_sharder is not None:
+    if model_sharder is not None:
         return model_sharder
 
     if magi is not None and getattr(magi, "enabled", False):

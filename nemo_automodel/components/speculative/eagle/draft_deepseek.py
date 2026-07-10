@@ -55,6 +55,20 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
 )
 
 
+def _resolve_rope_theta(config: PretrainedConfig) -> float:
+    """Read the RoPE base the way the DeepSeek target does.
+
+    transformers 5.x moved ``rope_theta`` under ``config.rope_parameters`` and
+    dropped the top-level attribute (``DeepseekV3Config(rope_theta=...).rope_theta``
+    raises ``AttributeError``), so a bare ``getattr(config, "rope_theta", 10000.0)``
+    always returns the fallback and the draft's rotary phase silently diverges from
+    any target whose base is not 10000. The top-level read is kept only as a
+    fallback for older configs.
+    """
+    rope_parameters = getattr(config, "rope_parameters", None) or {}
+    return float(rope_parameters.get("rope_theta", getattr(config, "rope_theta", 10000.0)))
+
+
 def _build_causal_mask(attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Build a standard ``[B, 1, T, T]`` additive causal + padding mask for eager attention."""
     batch_size, seq_len = attention_mask.shape
@@ -121,7 +135,7 @@ class Eagle3DeepseekMLAAttention(nn.Module):
         freqs = precompute_freqs_cis(
             self.qk_rope_head_dim,
             getattr(config, "max_position_embeddings", 4096),
-            getattr(config, "rope_theta", 10000.0),
+            _resolve_rope_theta(config),
             getattr(config, "rope_scaling", None),
         )
         self.register_buffer("rope_freqs", freqs, persistent=False)
@@ -151,7 +165,7 @@ class Eagle3DeepseekMLAAttention(nn.Module):
             fresh = precompute_freqs_cis(
                 self.qk_rope_head_dim,
                 getattr(self.config, "max_position_embeddings", 4096),
-                getattr(self.config, "rope_theta", 10000.0),
+                _resolve_rope_theta(self.config),
                 getattr(self.config, "rope_scaling", None),
             )
             self.rope_freqs = fresh.to(device=rope_freqs.device, dtype=torch.float32)

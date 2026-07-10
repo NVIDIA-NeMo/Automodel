@@ -44,6 +44,17 @@ def test_linter_requires_recipe_target():
     assert "Missing recipe target" in errors[0].message
 
 
+def test_linter_exempts_command_only_precompute_configs():
+    """The dspark distributed-precompute configs are launched via `python -m`, not a recipe class."""
+    for name in ("deepseek_v4_flash_dspark_precompute.yaml", "glm_5.2_dspark_precompute.yaml"):
+        errors = lint_yaml_text(
+            "recipe_args: {}\n",
+            Path("examples/speculative/dspark") / name,
+            Path.cwd(),
+        )
+        assert errors == []
+
+
 def test_linter_requires_recipe_first():
     errors = lint_yaml_text(
         "step_scheduler: {}\nrecipe: TrainFinetuneRecipeForNextTokenPrediction\n",
