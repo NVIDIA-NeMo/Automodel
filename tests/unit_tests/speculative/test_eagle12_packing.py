@@ -121,6 +121,20 @@ def test_packing_requires_position_ids():
         draft(ids, th, torch.ones(1, 6, dtype=torch.long), seq_lens=torch.tensor([[3, 3]], dtype=torch.long))
 
 
+def test_recipe_packing_kwargs_helper():
+    """The recipe helper extracts packing metadata only when the batch is packed."""
+    from nemo_automodel.recipes.llm.train_eagle1 import _packing_kwargs
+
+    assert _packing_kwargs({"input_ids": torch.zeros(1, 4)}) == {}
+    packed = {
+        "input_ids": torch.zeros(1, 4),
+        "position_ids": torch.zeros(1, 4),
+        "seq_lens": torch.tensor([[4]]),
+        "doc_remaining": torch.zeros(1, 4),
+    }
+    assert set(_packing_kwargs(packed)) == {"position_ids", "seq_lens", "doc_remaining"}
+
+
 def test_target_wrapper_packing_isolates_documents_and_carries_metadata():
     """generate_batch under packing must isolate the target's hidden states per document
     and carry position_ids / seq_lens / doc_remaining through to the trainer."""
