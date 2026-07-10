@@ -21,13 +21,10 @@ collectives before DSV4 sparse attention consumes them.
 
 from __future__ import annotations
 
-import contextlib
 import math
 
 import torch
 import torch.distributed as dist
-
-from nemo_automodel.shared.cp_batch import convert_attention_mask_to_padding_mask, shard_batch_contiguous
 
 _SEQ_LENS_PADDING_VALUE = -1000
 
@@ -437,6 +434,13 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     At CP size one, the native THD route only marks packed input as THD and leaves
     its tensors and packing metadata unchanged.
     """
+    import contextlib
+
+    from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
+        convert_attention_mask_to_padding_mask,
+        shard_batch_contiguous,
+    )
+
     cp_size = cp_mesh.size()
     packed = batch.get("qkv_format") == "thd" or "seq_lens" in batch or "cu_seqlens" in batch
     if cp_size <= 1:

@@ -26,9 +26,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel.components.distributed import cp_sharder as cm
 from nemo_automodel.components.distributed import cp_utils as cu
-from nemo_automodel.shared import cp_batch as cm
-from nemo_automodel.shared.cp_contracts import CPBatchWithIndices
 
 
 @pytest.fixture(autouse=True)
@@ -127,17 +126,17 @@ def test_cp_attention_hooks_restores_sdpa_on_exception():
 # ---------------------------------------------------------------------------
 def test_pad_tensor_noop_when_pad_len_zero():
     t = torch.randn(2, 4)
-    assert cm._pad_tensor_seq_dim(t, 1, 0) is t
+    assert cm._pad_tensor_seq_dim_(t, 1, 0) is t
 
 
 def test_pad_position_ids_noop_when_pad_len_zero():
     p = torch.arange(4).unsqueeze(0)
-    assert cm._pad_position_ids_seq_dim(p, 1, 0) is p
+    assert cm._pad_position_ids_seq_dim_(p, 1, 0) is p
 
 
 def test_pad_position_ids_extends_monotonically():
     p = torch.tensor([[0, 1, 2, 3]])
-    out = cm._pad_position_ids_seq_dim(p, 1, 2)
+    out = cm._pad_position_ids_seq_dim_(p, 1, 2)
     assert out.tolist() == [[0, 1, 2, 3, 4, 5]]
 
 
@@ -184,6 +183,9 @@ def test_make_contiguous_shard_pads_and_slices_all_keys():
         "per_layer_inputs": torch.randn(1, seq, d),
         "padding_mask": torch.zeros(1, seq, dtype=torch.bool),
         "vision_extra": torch.zeros(1, seq, dtype=torch.long),
+        # model-specific per-token keys ride the generic metadata mechanism
+        "_cp_metadata_seq_dims": {"vision_extra": 1, "mm_token_type_ids": 1, "per_layer_inputs": 1},
+        "_cp_metadata_pad_values": {"vision_extra": 0, "mm_token_type_ids": 0, "per_layer_inputs": 0},
     }
     labels = torch.zeros(1, seq, dtype=torch.long)
     position_ids = torch.arange(seq).unsqueeze(0)
@@ -199,8 +201,6 @@ def test_make_contiguous_shard_pads_and_slices_all_keys():
         pos_seq_dim=1,
         loss_mask=loss_mask,
         padding_token_id=0,
-        extra_seq_keys={"vision_extra": 1, "mm_token_type_ids": 1, "per_layer_inputs": 1},
-        extra_pad_values={"vision_extra": 0, "mm_token_type_ids": 0, "per_layer_inputs": 0},
     )
     # rank 0 keeps the first local_seq_len=4 positions
     assert out["inputs_embeds"].shape == (1, 4, d)
@@ -236,8 +236,8 @@ def test_make_contiguous_shard_uses_dist_rank_when_initialized():
 
 def test_make_contiguous_shard_raises_when_not_divisible(monkeypatch):
     # Force padding to be a no-op so the post-pad divisibility check trips.
-    monkeypatch.setattr(cm, "_pad_tensor_seq_dim", lambda t, *a, **k: t)
-    monkeypatch.setattr(cm, "_pad_position_ids_seq_dim", lambda p, *a, **k: p)
+    monkeypatch.setattr(cm, "_pad_tensor_seq_dim_", lambda t, *a, **k: t)
+    monkeypatch.setattr(cm, "_pad_position_ids_seq_dim_", lambda p, *a, **k: p)
     batch = {"input_ids": torch.zeros(1, 6, dtype=torch.long)}
     labels = torch.zeros(1, 6, dtype=torch.long)
     position_ids = torch.arange(6).unsqueeze(0)
@@ -266,9 +266,8 @@ def test_make_cp_batch_and_ctx_use_te_routes_to_te_builder():
 
     dm = _DM(cp=_FakeMesh(size=2))
     # The TE sharder requests the partition indices alongside the batch.
-    with mock.patch.object(
-        cu, "_make_cp_batch_for_te_with_indices", return_value=CPBatchWithIndices(sentinel, None)
-    ) as te:
-        ctx, out = cu.make_cp_batch_and_ctx(dm, {"input_ids": torch.zeros(1, 4, dtype=torch.long)}, use_te=True)
+    with mock.patch.object(cu, "make_cp_batch_for_te", return_value=(sentinel, None)) as te:
+        ctx, out, _ = cu.make_cp_batch_and_ctx(dm, {"input_ids": torch.zeros(1, 4, dtype=torch.long)}, use_te=True)
     te.assert_called_once()
+    assert te.call_args.kwargs["return_local_indices"] is True
     assert out is sentinel

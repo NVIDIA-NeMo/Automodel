@@ -42,7 +42,6 @@ from nemo_automodel.components.models.deepseek_v4.cp import make_dsv4_contiguous
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
 from nemo_automodel.components.moe.parallelizer import apply_cp, apply_ep
 from nemo_automodel.components.moe.state_dict_utils import get_expert_range_for_rank_from_mesh
-from nemo_automodel.shared.cp_contracts import CPSharder, contiguous_local_indices
 
 N_LAYERS = 4
 EP_SIZE = 8
@@ -223,15 +222,9 @@ def _prepare_batch(
 ):
     if cp_size > 1:
         cp_mesh = device_mesh["cp"]
+        batch["_cp_make_batch_fn"] = partial(make_dsv4_contiguous_shard_cp_batch_and_ctx, pad_multiple=128)
         batch["_dsv4_cp_group"] = cp_mesh.get_group()
-        cp_sharder = CPSharder(
-            shard_batch=partial(make_dsv4_contiguous_shard_cp_batch_and_ctx, pad_multiple=128),
-            local_token_global_indices=contiguous_local_indices,
-            layout="contiguous",
-        )
-    else:
-        cp_sharder = None
-    train_ctx, batch = make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=0, cp_sharder=cp_sharder)
+    train_ctx, batch = make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=0)
     labels = batch.pop("labels")
     return train_ctx, batch, labels
 

@@ -37,7 +37,6 @@ from nemo_automodel.components.models.step3p7.vision_encoder import StepRobotics
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
-from nemo_automodel.shared.cp_contracts import CPPreparedInputs
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 logger = logging.getLogger(__name__)
@@ -490,30 +489,27 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
 
     def prepare_model_inputs_for_cp(
         self,
-        input_ids: torch.Tensor,
+        batch: dict[str, Any],
         *,
-        pixel_values: torch.Tensor | None = None,
-        patch_pixel_values: torch.Tensor | None = None,
-        num_patches: torch.Tensor | list[int] | tuple[int, ...] | None = None,
-        image_embeds: torch.Tensor | None = None,
-    ) -> CPPreparedInputs:
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
         """Merge vision features into token embeddings before CP sequence sharding.
 
-        Args:
-            input_ids: Full token IDs ``[B, S]``, where ``B`` is batch size and
-                ``S`` is sequence length.
-            pixel_values: Optional image tensor in the encoder's native layout.
-            patch_pixel_values: Optional flattened image patches.
-            num_patches: Per-image patch counts ``[N_image]`` or a Python
-                sequence with the same values.
-            image_embeds: Optional precomputed image embeddings.
+        Removes the raw input keys it consumed from ``batch``; the dispatcher merges
+        the returned entries on top.
 
-        Returns:
-            Full-sequence embeddings ``[B, S, H]``, where ``H`` is hidden size,
-            with consumed raw inputs marked as ``None``.
+        Args:
+            batch: The batch dict (with ``input_ids`` and optional multimodal
+                keys).
+            num_chunks: Number of chunks for load-balanced CP sharding.
         """
+        input_ids = batch.get("input_ids")
         if input_ids is None:
             raise ValueError("Step3p7 CP pre-embedding requires input_ids.")
+        pixel_values = batch.get("pixel_values")
+        patch_pixel_values = batch.get("patch_pixel_values")
+        num_patches = batch.get("num_patches")
+        image_embeds = batch.get("image_embeds")
         multimodal_embeddings = self.model.get_multimodal_embeddings(
             pixel_values=pixel_values,
             patch_pixel_values=patch_pixel_values,
@@ -525,14 +521,10 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         # removes them from the batch (the hook may receive a copy of the
         # batch dict when FSDP2 casts forward kwargs, so in-place pops are
         # not reliable; the return channel is).
-        return {
-            "input_ids": None,
-            "pixel_values": None,
-            "patch_pixel_values": None,
-            "num_patches": None,
-            "image_embeds": None,
-            "inputs_embeds": inputs_embeds,
+        consumed = {
+            key: None for key in ("input_ids", "pixel_values", "patch_pixel_values", "num_patches", "image_embeds")
         }
+        return {**consumed, "inputs_embeds": inputs_embeds}
 
     def forward(
         self,
@@ -546,7 +538,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
-    ) -> CPPreparedInputs | Step3p7CausalLMOutput | torch.Tensor | tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor | Step3p7CausalLMOutput:
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -554,17 +546,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         )
 
         if kwargs.pop("_pre_embed_only", False):
-            batch = kwargs.pop("_cp_batch")
-            cp_input_ids = batch.get("input_ids")
-            if not isinstance(cp_input_ids, torch.Tensor):
-                raise ValueError("Step3p7 CP pre-embedding requires tensor input_ids")
-            return self.prepare_model_inputs_for_cp(
-                cp_input_ids,
-                pixel_values=batch.get("pixel_values"),
-                patch_pixel_values=batch.get("patch_pixel_values"),
-                num_patches=batch.get("num_patches"),
-                image_embeds=batch.get("image_embeds"),
-            )
+            return self.prepare_model_inputs_for_cp(kwargs.pop("_cp_batch"), num_chunks=kwargs.pop("num_chunks", 1))
 
         is_pp_stage = self._is_pipeline_parallel_stage()
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled

@@ -26,7 +26,7 @@ Architecture name: "NemotronH_Nano_Omni_Reasoning_V3" (from config.json)
 import logging
 import warnings
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -42,7 +42,6 @@ from nemo_automodel.components.models.nemotron_v3.model import (
     NemotronHForCausalLM as NemotronV3ForCausalLM,
 )
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.shared.cp_contracts import CPPreparedInputs
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .state_dict_adapter import NemotronOmniStateDictAdapter
@@ -762,14 +761,10 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
 
     def prepare_model_inputs_for_cp(
         self,
-        input_ids: torch.Tensor,
-        pixel_values: torch.Tensor | None = None,
-        image_flags: torch.Tensor | None = None,
-        imgs_sizes: torch.Tensor | None = None,
-        pixel_values_videos: torch.Tensor | None = None,
-        sound_features: torch.Tensor | None = None,
-        sound_attention_mask: torch.Tensor | None = None,
-    ) -> CPPreparedInputs:
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
         """Merge image/video/audio features into text embeddings BEFORE CP sharding.
 
         Under CP > 1 the sequence is sharded; multimodal scatter must run on the
@@ -777,22 +772,21 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         its local slice of input_ids. Returns a dict so future per-layer inputs
         can ride alongside ``inputs_embeds``.
 
-        Args:
-            input_ids: Full token IDs ``[B, S]``, where ``B`` is batch size and
-                ``S`` is sequence length.
-            pixel_values: Optional image pixels in the vision encoder layout.
-            image_flags: Optional image-row selection flags.
-            imgs_sizes: Optional original image sizes ``[N_image, 2]``.
-            pixel_values_videos: Optional video pixels in encoder layout.
-            sound_features: Optional audio features ``[B_audio, T_audio, F]``.
-            sound_attention_mask: Optional audio mask ``[B_audio, T_audio]``.
+        Removes the raw input keys it consumed from ``batch``; the dispatcher merges
+        the returned entries on top.
 
-        Returns:
-            Full-sequence embeddings ``[B, S, H]``, where ``H`` is hidden size,
-            with consumed raw inputs marked as ``None``.
+        Args:
+            batch: The batch dict (with ``input_ids`` and optional multimodal
+                keys).
+            num_chunks: Number of chunks for load-balanced CP sharding.
         """
-        if input_ids is None:
-            raise ValueError("Nemotron Omni CP pre-embedding requires input_ids")
+        input_ids = batch.get("input_ids")
+        pixel_values = batch.get("pixel_values")
+        image_flags = batch.get("image_flags")
+        imgs_sizes = batch.get("imgs_sizes")
+        pixel_values_videos = batch.get("pixel_values_videos")
+        sound_features = batch.get("sound_features")
+        sound_attention_mask = batch.get("sound_attention_mask")
         inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
 
         if pixel_values is not None and imgs_sizes is not None:
@@ -821,8 +815,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             inputs_embeds = inputs_embeds.reshape(B, N, C)
 
         if pixel_values_videos is not None:
-            if pixel_values is not None:
-                raise ValueError("pixel_values and pixel_values_videos are mutually exclusive")
+            assert pixel_values is None, "pixel_values and pixel_values_videos are mutually exclusive"
             B_v, N_v, C_v = inputs_embeds.shape
             inputs_embeds = inputs_embeds.reshape(B_v * N_v, C_v)
             video_selected = input_ids.reshape(B_v * N_v) == self.img_context_token_id
@@ -857,65 +850,20 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # removes them from the batch (the hook may receive a copy of the
         # batch dict when FSDP2 casts forward kwargs, so in-place pops are
         # not reliable; the return channel is).
-        return {
-            "input_ids": None,
-            "pixel_values": None,
-            "image_flags": None,
-            "imgs_sizes": None,
-            "pixel_values_videos": None,
-            "sound_features": None,
-            "sound_attention_mask": None,
-            "inputs_embeds": inputs_embeds,
+        consumed = {
+            key: None
+            for key in (
+                "input_ids",
+                "pixel_values",
+                "image_flags",
+                "imgs_sizes",
+                "pixel_values_videos",
+                "sound_features",
+                "sound_attention_mask",
+            )
         }
 
-    def prepare_inputs_embeds_for_cp(
-        self,
-        input_ids: torch.Tensor,
-        pixel_values: torch.Tensor | None = None,
-        image_flags: torch.Tensor | None = None,
-        imgs_sizes: torch.Tensor | None = None,
-        pixel_values_videos: torch.Tensor | None = None,
-        sound_features: torch.Tensor | None = None,
-        sound_attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Return full-sequence embeddings through the deprecated legacy API.
-
-        Args:
-            input_ids: Token IDs ``[B, S]``, where ``B`` is batch size and
-                ``S`` is sequence length.
-            pixel_values: Optional image pixels in vision-encoder layout.
-            image_flags: Optional image-row selection flags.
-            imgs_sizes: Optional image sizes ``[N, 2]``, where ``N`` is image
-                count.
-            pixel_values_videos: Optional video pixels in encoder layout.
-            sound_features: Optional audio features ``[A, T, F]``, where ``A``
-                is audio batch, ``T`` is audio time, and ``F`` is feature size.
-            sound_attention_mask: Optional audio mask ``[A, T]``.
-
-        Returns:
-            Full embeddings ``[B, S, H]``, where ``H`` is hidden size.
-
-        Deprecated:
-            Use :meth:`prepare_model_inputs_for_cp`. This compatibility path
-            will be removed in the next major release.
-        """
-        warnings.warn(
-            "prepare_inputs_embeds_for_cp is deprecated; use prepare_model_inputs_for_cp",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        inputs_embeds = self.prepare_model_inputs_for_cp(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_flags=image_flags,
-            imgs_sizes=imgs_sizes,
-            pixel_values_videos=pixel_values_videos,
-            sound_features=sound_features,
-            sound_attention_mask=sound_attention_mask,
-        )["inputs_embeds"]
-        if inputs_embeds is None:
-            raise RuntimeError("Nemotron Omni CP preparation did not produce inputs_embeds")
-        return inputs_embeds
+        return {**consumed, "inputs_embeds": inputs_embeds}
 
     def forward(
         self,
@@ -983,19 +931,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # weights, but does NOT want the LM forward to run. Returns a dict with
         # at least ``inputs_embeds``.
         if _pre_embed_only:
-            batch = kwargs.pop("_cp_batch")
-            cp_input_ids = batch.get("input_ids")
-            if not isinstance(cp_input_ids, torch.Tensor):
-                raise ValueError("Nemotron Omni CP pre-embedding requires tensor input_ids")
-            return self.prepare_model_inputs_for_cp(
-                cp_input_ids,
-                pixel_values=batch.get("pixel_values"),
-                image_flags=batch.get("image_flags"),
-                imgs_sizes=batch.get("imgs_sizes"),
-                pixel_values_videos=batch.get("pixel_values_videos"),
-                sound_features=batch.get("sound_features"),
-                sound_attention_mask=batch.get("sound_attention_mask"),
-            )
+            return self.prepare_model_inputs_for_cp(kwargs.pop("_cp_batch"), num_chunks=kwargs.pop("num_chunks", 1))
 
         # Caller pre-supplied inputs_embeds (CP path: prepare_model_inputs_for_cp
         # ran the multimodal scatter on the un-sharded sequence before

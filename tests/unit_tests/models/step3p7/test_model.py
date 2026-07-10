@@ -293,7 +293,8 @@ def test_prepare_model_inputs_for_cp_and_pre_embed_only_error():
     input_ids = torch.tensor([[1, 31, 2]])
     image_embeds = torch.randn(1, 8)
 
-    result = wrapper.prepare_model_inputs_for_cp(input_ids, image_embeds=image_embeds)
+    batch = {"input_ids": input_ids, "image_embeds": image_embeds}
+    result = wrapper.prepare_model_inputs_for_cp(batch)
     assert {k for k, v in result.items() if v is not None} == {"inputs_embeds"}
     assert result["inputs_embeds"].shape == (1, 3, 8)
     # Consumed raw inputs come back as None markers for the dispatcher to remove.
@@ -308,7 +309,7 @@ def test_prepare_model_inputs_for_cp_and_pre_embed_only_error():
         3,
         8,
     )
-    with pytest.raises(ValueError, match="CP pre-embedding requires.*input_ids"):
+    with pytest.raises(ValueError, match="CP pre-embedding requires input_ids"):
         wrapper(_pre_embed_only=True, _cp_batch={})
 
 

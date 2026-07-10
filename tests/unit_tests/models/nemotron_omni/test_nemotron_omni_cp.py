@@ -109,7 +109,7 @@ def _make_omni_stub(*, with_sound_encoder: bool = True):
 def test_prepare_model_inputs_for_cp_returns_dict():
     model = _make_omni_stub()
     input_ids = torch.tensor([[1, 2, 3, 4]])
-    out = model.prepare_model_inputs_for_cp(input_ids)
+    out = model.prepare_model_inputs_for_cp({"input_ids": input_ids})
     assert isinstance(out, dict)
     assert "inputs_embeds" in out
     assert out["inputs_embeds"].shape == (1, 4, HIDDEN)
@@ -119,7 +119,7 @@ def test_prepare_model_inputs_for_cp_text_only_returns_pure_embeds():
     """No multimodal inputs -> embeds are just embed_tokens(input_ids)."""
     model = _make_omni_stub()
     input_ids = torch.tensor([[5, 6, 7]])
-    out = model.prepare_model_inputs_for_cp(input_ids)["inputs_embeds"]
+    out = model.prepare_model_inputs_for_cp({"input_ids": input_ids})["inputs_embeds"]
     expected = model.language_model.get_input_embeddings()(input_ids)
     assert torch.equal(out, expected)
 
@@ -130,9 +130,13 @@ def test_prepare_model_inputs_for_cp_image_scatter_at_placeholder_positions():
     input_ids = torch.tensor([[1, IMG_TOKEN_ID, IMG_TOKEN_ID, 4]])
     pixel_values = torch.zeros(2, 3, 4, 4)  # 2 tiles
     image_flags = torch.tensor([[1], [1]])
-    out = model.prepare_model_inputs_for_cp(input_ids, pixel_values=pixel_values, image_flags=image_flags)[
-        "inputs_embeds"
-    ]
+    out = model.prepare_model_inputs_for_cp(
+        {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+            "image_flags": image_flags,
+        }
+    )["inputs_embeds"]
     assert out.shape == (1, 4, HIDDEN)
     # Positions 1 and 2 are image tokens => value 9.0
     assert torch.allclose(out[0, 1], torch.full((HIDDEN,), 9.0))
@@ -151,9 +155,13 @@ def test_prepare_model_inputs_for_cp_dynamic_res_takes_priority_over_static():
     input_ids = torch.tensor([[1, IMG_TOKEN_ID, 3]])
     pixel_values = torch.zeros(1, 3, 8, 8)
     imgs_sizes = torch.tensor([[8, 8]])
-    out = model.prepare_model_inputs_for_cp(input_ids, pixel_values=pixel_values, imgs_sizes=imgs_sizes)[
-        "inputs_embeds"
-    ]
+    out = model.prepare_model_inputs_for_cp(
+        {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+            "imgs_sizes": imgs_sizes,
+        }
+    )["inputs_embeds"]
     # extract_feature_dynamic stub returns 7.0; extract_feature returns 9.0
     assert torch.allclose(out[0, 1], torch.full((HIDDEN,), 7.0))
 
@@ -164,7 +172,12 @@ def test_prepare_model_inputs_for_cp_video_scatter_at_img_token_positions():
     model = _make_omni_stub()
     input_ids = torch.tensor([[1, IMG_TOKEN_ID, IMG_TOKEN_ID, 4]])
     pixel_values_videos = torch.zeros(2, 3, 4, 4)
-    out = model.prepare_model_inputs_for_cp(input_ids, pixel_values_videos=pixel_values_videos)["inputs_embeds"]
+    out = model.prepare_model_inputs_for_cp(
+        {
+            "input_ids": input_ids,
+            "pixel_values_videos": pixel_values_videos,
+        }
+    )["inputs_embeds"]
     assert torch.allclose(out[0, 1], torch.full((HIDDEN,), 5.0))
     assert torch.allclose(out[0, 2], torch.full((HIDDEN,), 5.0))
 
@@ -175,9 +188,11 @@ def test_prepare_model_inputs_for_cp_sound_scatter_at_sound_token():
     sound_features = torch.zeros(2, 4, 16)  # 2 sound chunks
     sound_attention_mask = torch.ones(2, 4)
     out = model.prepare_model_inputs_for_cp(
-        input_ids,
-        sound_features=sound_features,
-        sound_attention_mask=sound_attention_mask,
+        {
+            "input_ids": input_ids,
+            "sound_features": sound_features,
+            "sound_attention_mask": sound_attention_mask,
+        }
     )["inputs_embeds"]
     assert torch.allclose(out[0, 0], torch.full((HIDDEN,), 3.0))
     assert torch.allclose(out[0, 2], torch.full((HIDDEN,), 3.0))
@@ -190,7 +205,12 @@ def test_prepare_model_inputs_for_cp_sound_skipped_when_no_sound_encoder():
     model = _make_omni_stub(with_sound_encoder=False)
     input_ids = torch.tensor([[SOUND_TOKEN_ID, 2, SOUND_TOKEN_ID]])
     sound_features = torch.zeros(2, 4, 16)
-    out = model.prepare_model_inputs_for_cp(input_ids, sound_features=sound_features)["inputs_embeds"]
+    out = model.prepare_model_inputs_for_cp(
+        {
+            "input_ids": input_ids,
+            "sound_features": sound_features,
+        }
+    )["inputs_embeds"]
     # Should equal pure embed lookup (sound positions unchanged)
     expected = model.language_model.get_input_embeddings()(input_ids)
     assert torch.equal(out, expected)
@@ -199,28 +219,19 @@ def test_prepare_model_inputs_for_cp_sound_skipped_when_no_sound_encoder():
 def test_prepare_model_inputs_for_cp_removes_consumed_keys_from_batch():
     """Consumed raw inputs come back as None markers for the dispatcher to remove."""
     model = _make_omni_stub()
-    out = model.prepare_model_inputs_for_cp(
-        torch.tensor([[1, IMG_TOKEN_ID, IMG_TOKEN_ID, 4]]),
-        pixel_values=torch.zeros(2, 3, 4, 4),
-        image_flags=torch.tensor([[1], [1]]),
-    )
+    batch = {
+        "input_ids": torch.tensor([[1, IMG_TOKEN_ID, IMG_TOKEN_ID, 4]]),
+        "pixel_values": torch.zeros(2, 3, 4, 4),
+        "image_flags": torch.tensor([[1], [1]]),
+    }
+    out = model.prepare_model_inputs_for_cp(batch)
     assert out["input_ids"] is None
     assert out["pixel_values"] is None
     assert out["image_flags"] is None
 
 
-def test_prepare_model_inputs_for_cp_requires_input_ids():
-    model = _make_omni_stub()
-    with pytest.raises(ValueError, match="requires input_ids"):
-        model.prepare_model_inputs_for_cp(None)
-
-
-def test_prepare_inputs_embeds_for_cp_compatibility_wrapper():
-    model = _make_omni_stub()
-    input_ids = torch.tensor([[1, 2, 3]])
-    with pytest.warns(DeprecationWarning, match="prepare_model_inputs_for_cp"):
-        actual = model.prepare_inputs_embeds_for_cp(input_ids)
-    torch.testing.assert_close(actual, model.prepare_model_inputs_for_cp(input_ids)["inputs_embeds"])
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 # -----------------------------------------------------------------------------

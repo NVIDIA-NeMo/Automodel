@@ -366,10 +366,9 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
         # KD has not wired model-owned CP; skip the pre-embed hook explicitly.
-        cp_forward = prepare_cp_forward(
+        train_ctx, batch, _ = prepare_cp_forward(
             self.model_parts[0], self.device_mesh, batch, loss_mask=labels, invoke_pre_embed=False
         )
-        train_ctx, batch = cp_forward.context_factory, cp_forward.batch
 
         model = self.model_parts[0]
         sync_ctx = (
@@ -453,7 +452,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             for k, v in batch.items()
         }
         # KD has not wired model-owned CP; skip the pre-embed hook explicitly.
-        cp_forward = prepare_cp_forward(
+        train_ctx, batch, _ = prepare_cp_forward(
             self.model_parts[0],
             self.device_mesh,
             batch,
@@ -462,7 +461,6 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             num_chunks=_get_num_thd_chunks(True, self.cfg),
             invoke_pre_embed=False,
         )
-        train_ctx, batch = cp_forward.context_factory, cp_forward.batch
         labels = batch.pop("labels")
         input_ids = batch.pop("input_ids")
         batch_filtered = {k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)}

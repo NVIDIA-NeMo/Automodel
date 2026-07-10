@@ -52,17 +52,17 @@ class _DummyDeviceMesh(dict):
 
 
 def test_xor_assertion_neither_present(monkeypatch):
-    """Batch missing both input_ids AND inputs_embeds must raise ValueError."""
+    """Batch missing both input_ids AND inputs_embeds must raise AssertionError."""
     monkeypatch.setattr(_cu, "create_context_parallel_ctx", lambda **kw: object())
     monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: "ctx")
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     batch = {"labels": torch.zeros(1, 4, dtype=torch.long)}  # neither present
-    with pytest.raises(ValueError, match="exactly one of"):
+    with pytest.raises(AssertionError, match="exactly one of"):
         _cu.make_cp_batch_and_ctx(device_mesh, batch)
 
 
 def test_xor_assertion_both_present(monkeypatch):
-    """Batch with BOTH input_ids and inputs_embeds must raise ValueError."""
+    """Batch with BOTH input_ids and inputs_embeds must raise AssertionError."""
     monkeypatch.setattr(_cu, "create_context_parallel_ctx", lambda **kw: object())
     monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: "ctx")
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
@@ -71,7 +71,7 @@ def test_xor_assertion_both_present(monkeypatch):
         "inputs_embeds": torch.zeros(1, 4, 8),
         "labels": torch.zeros(1, 4, dtype=torch.long),
     }
-    with pytest.raises(ValueError, match="exactly one of"):
+    with pytest.raises(AssertionError, match="exactly one of"):
         _cu.make_cp_batch_and_ctx(device_mesh, batch)
 
 
@@ -190,7 +190,7 @@ def test_inputs_embeds_no_op_when_cp_size_le_1():
     inputs_embeds = torch.randn(1, 4, 8)
     batch = {"inputs_embeds": inputs_embeds, "labels": torch.zeros(1, 4, dtype=torch.long)}
 
-    ctx, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch)
+    ctx, new_batch, _ = _cu.make_cp_batch_and_ctx(device_mesh, batch)
     assert ctx is contextlib.nullcontext
     assert new_batch is batch
     # Must NOT inject position_ids when CP is off
@@ -371,6 +371,23 @@ def test_padding_mask_pad_value_is_True_not_False(monkeypatch):
     # Positions 6, 7 are cp-pad slots -- MUST be True (pad), not False
     assert bool(padded[0, 6].item()) is True, "cp-pad slot 6 should be marked as padding (True)"
     assert bool(padded[0, 7].item()) is True, "cp-pad slot 7 should be marked as padding (True)"
+
+
+def test_padding_attention_mask_pad_value_is_zero(monkeypatch):
+    """If a future caller passes an ``attention_mask`` in the batch, it should
+    pad with ``0`` (HF convention: 1=real, 0=pad) -- NOT with True/dtype-default.
+
+    Today ``shard_batch_load_balanced`` strips ``attention_mask`` at the top of
+    the function so this case is moot, but the PAD_FILL table is the right
+    place to encode the semantic in case the strip is ever revisited.
+    """
+    from nemo_automodel.components.distributed import cp_sharder as _cs
+
+    # Just verify the PAD_FILL table itself maps attention_mask -> False
+    # (the runtime code path is currently unreachable because attention_mask
+    # is popped before the padding pass).
+    src = open(_cs.__file__).read()
+    assert '"attention_mask": False' in src, "PAD_FILL must explicitly map attention_mask -> False (HF: 0 = pad)"
 
 
 def test_padding_mirrors_padding_mask_back_into_batch(monkeypatch):

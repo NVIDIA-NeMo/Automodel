@@ -25,7 +25,6 @@ from nemo_automodel.components.distributed import cp_utils as cp_utils_mod
 from nemo_automodel.components.loss import kd_loss as kd_loss_module
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.recipes.vlm import kd as vlm_kd
-from nemo_automodel.shared.cp_contracts import CPForwardResult, CPSharder, identity_local_indices, shard_batch_identity
 
 
 class _MeshDim:
@@ -168,15 +167,11 @@ def test_vlm_kd_uses_tp_kd_loss_path(monkeypatch, trivial_pg):
 def test_vlm_kd_cp_prepare_feeds_student_inputs_embeds_to_cp_and_teacher(monkeypatch):
     make_cp_calls = []
 
-    def fake_make_cp_batch_and_sharder(device_mesh, batch, *args, **kwargs):
+    def fake_make_cp_batch_and_ctx(device_mesh, batch, *args, **kwargs):
         make_cp_calls.append((device_mesh, dict(batch)))
-        return CPForwardResult(
-            nullcontext,
-            batch,
-            CPSharder(shard_batch_identity, identity_local_indices, layout="none"),
-        )
+        return nullcontext, batch, None
 
-    monkeypatch.setattr(cp_utils_mod, "_make_cp_batch_and_sharder", fake_make_cp_batch_and_sharder)
+    monkeypatch.setattr(cp_utils_mod, "make_cp_batch_and_ctx", fake_make_cp_batch_and_ctx)
 
     student = _StudentVLM(hidden_size=8)
     teacher = _TeacherVLM(hidden_size=8)
@@ -215,9 +210,7 @@ def test_vlm_kd_cp_rejects_teacher_student_hidden_size_mismatch(monkeypatch):
     # sharding is allowed to proceed; only the mismatch error must fire.
     from contextlib import nullcontext
 
-    monkeypatch.setattr(
-        cp_utils_mod, "make_cp_batch_and_ctx", lambda device_mesh, batch, *a, **k: (nullcontext, batch, None)
-    )
+    monkeypatch.setattr(cp_utils_mod, "make_cp_batch_and_ctx", lambda device_mesh, batch, *a, **k: (nullcontext, batch, None))
 
     student = _StudentVLM(hidden_size=8)
     teacher = _TeacherVLM(hidden_size=12)

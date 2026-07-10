@@ -646,7 +646,7 @@ class TestGemma4ForConditionalGeneration:
             "get_image_features",
             return_value=MagicMock(pooler_output=image_features),
         ):
-            prepared = model.prepare_model_inputs_for_cp(input_ids, pixel_values=pixel_values)
+            prepared = model.prepare_model_inputs_for_cp({"input_ids": input_ids, "pixel_values": pixel_values})
 
         torch.testing.assert_close(prepared["inputs_embeds"][:, 0, :], base_embeds[:, 0, :])
         torch.testing.assert_close(prepared["inputs_embeds"][:, 1, :], image_features)

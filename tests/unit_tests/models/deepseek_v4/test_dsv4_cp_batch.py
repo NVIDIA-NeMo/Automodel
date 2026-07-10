@@ -451,8 +451,8 @@ def test_contiguous_shard_syncs_packed_length_for_hybridep(monkeypatch):
 
 
 def test_contiguous_shard_requires_exactly_one_primary_key():
-    # both input_ids and inputs_embeds -> explicit contract error
-    with pytest.raises(ValueError, match="exactly one"):
+    # both input_ids and inputs_embeds -> assertion
+    with pytest.raises(AssertionError):
         _shard(
             {
                 "input_ids": torch.arange(8).view(1, 8),
@@ -462,8 +462,8 @@ def test_contiguous_shard_requires_exactly_one_primary_key():
             cp_size=2,
             local_rank=0,
         )
-    # neither -> explicit contract error
-    with pytest.raises(ValueError, match="exactly one"):
+    # neither -> assertion
+    with pytest.raises(AssertionError):
         _shard({"labels": torch.arange(8).view(1, 8)}, cp_size=2, local_rank=0)
 
 
@@ -479,7 +479,7 @@ def test_prepare_model_inputs_for_cp_returns_sharder():
     # The method only reads self.config, so a lightweight stand-in suffices.
     cfg = SimpleNamespace(compress_ratios=[0, 4, 128])
     fake_self = SimpleNamespace(config=cfg, backend=SimpleNamespace(dispatcher="hybridep"))
-    prepared = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, torch.arange(8).view(1, 8))
+    prepared = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, {"input_ids": torch.arange(8).view(1, 8)})
 
     sharder = prepared["cp_sharder"]
     assert sharder.layout == "contiguous"
@@ -500,11 +500,11 @@ def test_forward_pre_embed_only_branch_delegates_to_prepare():
     # before any model compute, so a fake self exercises it without a build.
     cfg = SimpleNamespace(compress_ratios=[4])
     fake_self = SimpleNamespace(config=cfg, backend=SimpleNamespace(dispatcher="deepep"))
-    fake_self.prepare_model_inputs_for_cp = (
-        lambda input_ids, **kwargs: DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, input_ids, **kwargs)
+    fake_self.prepare_model_inputs_for_cp = lambda batch, **kwargs: DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(
+        fake_self, batch, **kwargs
     )
-    # The dispatcher hands the batch through _cp_batch and explicitly binds
-    # forward's input_ids argument to None.
+    # The dispatcher hands the whole batch dict through the _cp_batch kwarg;
+    # forward's positional input_ids is unused by the interception.
     out = DeepseekV4ForCausalLM.forward(
         fake_self, None, _pre_embed_only=True, _cp_batch={"input_ids": torch.arange(8).view(1, 8)}
     )
@@ -521,10 +521,10 @@ def test_setup_cp_attention_stores_group():
 
 
 def test_module_exposes_pad_helper_noops():
-    from nemo_automodel.shared import cp_batch
+    from nemo_automodel.components.distributed import cp_sharder
 
     # pad_len <= 0 is a no-op (returns the same tensor object) for both pad helpers.
     t = torch.arange(6).view(1, 6)
-    assert cp_batch._pad_tensor_seq_dim(t, 1, 0, 0) is t
+    assert cp_sharder._pad_tensor_seq_dim_(t, 1, 0, 0) is t
     pos = torch.arange(6).view(1, 6)
-    assert cp_batch._pad_position_ids_seq_dim(pos, 1, 0) is pos
+    assert cp_sharder._pad_position_ids_seq_dim_(pos, 1, 0) is pos
