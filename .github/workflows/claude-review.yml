@@ -107,6 +107,16 @@ jobs:
           - ambiguous public signatures: boolean-trap parameters, multiple
             same-typed positional runtime arguments that should be keyword-only,
             or long anonymous tuple returns that need a named typed result.
+        - Model-specific ownership is mandatory. Model-specific logic may live
+          only under `nemo_automodel/components/models/<model>/`. Treat logic as
+          model-specific when it names or branches on a model or family, hard-codes
+          its module/parameter paths or weight layout, or implements its
+          architecture, initialization, or parallelization policy. If changed code
+          adds or expands such logic anywhere else, including another directory
+          under `nemo_automodel/components/` or a recipe, report a critical finding
+          and require relocation to the owning model package. Shared components may
+          expose generic typed contracts and invoke model-owned hooks, but must not
+          encode model identities or model-specific policy.
         - Tensor contract docstrings. For every new function or method, or any
           function/method whose signature or tensor-handling body is materially
           changed, that accepts a tensor input, require its docstring to document
@@ -118,12 +128,20 @@ jobs:
           `nn.Parameter`, optional tensors, variadic tensors, and tensors nested in
           tuples/lists/mappings/dataclasses as tensor inputs. Require the Google-style
           `Args` section and, when values are returned, `Returns` section to document:
-          - every tensor input and output's semantic shape and axis order, with
-            symbolic dimensions defined at first use (for example, `B` = batch, `S`
-            = sequence, `H` = hidden). Flag vague descriptions such as "embedding
-            tensor" or unexplained `[B, S, H]` notation. If arbitrary ranks or
-            leading dimensions are accepted, state that explicitly and identify the
-            constrained axes (for example, `[..., H]` with `H` = hidden size);
+          - every tensor input and output's semantic shape and axis order. Follow
+            the common format `hidden_states: Tensor of shape [batch, sequence,
+            hidden].` Use clear, conventional dimension names such as `batch`,
+            `sequence`, `tokens`, `hidden`, `heads`, `channels`, and `vocab` without
+            explaining them. Define non-obvious or model-specific dimension names at
+            first use. Flag vague descriptions such as "embedding tensor" or
+            layouts that do not follow this format. If arbitrary ranks or leading
+            dimensions are accepted, state that explicitly and identify the
+            constrained axes (for example, `hidden_states: Tensor of shape [...,
+            hidden], with arbitrary leading dimensions.`). When reporting a layout
+            documentation finding, include a concrete compliant rewrite in the
+            review; for example, `fused_qkv: Tensor of shape [batch, sequence, 3,
+            heads, head_dim], where axis 2 stores query, key, and value in that
+            order.`;
           - nonstandard logical layout such as packed, padded, ragged, flattened,
             interleaved, fused-QKV/GateUp, THD, or channels-first/channels-last, and
             the before/after layout when the API transforms it;
