@@ -398,14 +398,27 @@ def detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:
     Returns:
         bool: Whether the model uses KV-sharing.
     """
-    text_cfg = getattr(getattr(model, "config", None), "text_config", None) or getattr(model, "config", None)
+    config = getattr(model, "config", None)
+    text_cfg = getattr(config, "text_config", None) or config
     has_kv_sharing = getattr(text_cfg, "num_kv_shared_layers", 0) > 0
-    if not has_kv_sharing:
-        if hasattr(model, "config") and getattr(model.config, "use_cache", None) is not False:
-            try:
-                model.config.use_cache = False
-            except Exception:
-                pass
+    if not has_kv_sharing and config is not None:
+        # Composite (e.g. VLM) configs carry per-modality sub-configs, and the
+        # text model reads ``text_config.use_cache`` rather than the composite
+        # value. Leaving a sub-config cache enabled keeps a DynamicCache alive
+        # under checkpointing, so self-attention appends K/V twice (forward and
+        # recompute) and backward fails with a CheckpointError metadata
+        # mismatch. Disable the cache on the composite config and on every
+        # sub-config that exposes ``use_cache``.
+        sub_config_names = getattr(type(config), "sub_configs", None) or {"text_config": None}
+        sub_configs = (getattr(config, name, None) for name in sub_config_names)
+        for cfg in (config, *sub_configs):
+            if cfg is None or (cfg is not config and not hasattr(cfg, "use_cache")):
+                continue
+            if getattr(cfg, "use_cache", None) is not False:
+                try:
+                    cfg.use_cache = False
+                except Exception:
+                    pass
     return has_kv_sharing
 
 
