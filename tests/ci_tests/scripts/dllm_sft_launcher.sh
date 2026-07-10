@@ -100,8 +100,17 @@ else
     CKPT_ARGS="--checkpoint.enabled false --checkpoint.checkpoint_dir $CKPT_DIR"
 fi
 
+# lr_warmup_steps must stay below the capped max_steps (scheduler asserts
+# warmup < decay); recipe values (e.g. nemotron's 50) assume a full run.
+# group_by_length precomputes token lengths over the whole dataset (~86 min on
+# tulu-3's 939k samples) -- pointless for a few-step smoke, and it blows the
+# CI wall clock.  The recipe delivers group_by_length=false safely even for
+# recipes that never set it (train_ft.py pops the key before the dataloader
+# is instantiated).
 CONFIG="--config /opt/Automodel/${CONFIG_PATH} \
     --step_scheduler.max_steps ${MAX_STEPS:-10} \
+    --lr_scheduler.lr_warmup_steps 1 \
+    --dataloader.group_by_length false \
     ${CKPT_ARGS} \
     ${DATASET_ARGS}"
 
