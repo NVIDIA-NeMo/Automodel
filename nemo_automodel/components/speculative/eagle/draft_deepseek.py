@@ -430,6 +430,14 @@ class DeepseekV3Eagle3DraftModel(PreTrainedModel):
                 diagonal block is position-wise and stays document-safe; cross-document
                 supervision is masked by the trainer's ``doc_remaining`` gate, not here.
         """
+        if seq_lens is not None and position_ids is None:
+            # Packing needs per-document position_ids: the arange fallback below
+            # would give every document after the first a global (wrong) RoPE
+            # phase. Fail loud, matching the target-side guard in target.py.
+            raise ValueError(
+                "DeepseekV3Eagle3DraftModel: sequence packing (seq_lens) requires per-document "
+                "position_ids (reset to range(doc_len) within each document), but none were provided."
+            )
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long).unsqueeze(0)
             position_ids = position_ids.expand(input_ids.shape[0], -1)

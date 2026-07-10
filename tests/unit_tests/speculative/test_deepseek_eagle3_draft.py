@@ -162,6 +162,31 @@ def test_packed_draft_attention_isolates_documents():
     assert not torch.allclose(out_ref[:, 3:], out_perturbed[:, 3:])  # doc B changed
 
 
+def test_packing_requires_position_ids():
+    """Packing without per-document position_ids must fail loud, not silently use arange."""
+    draft = _build_draft().eval()
+    ids = torch.randint(0, _VOCAB, (1, 6))
+    proj = draft.project_hidden_states(torch.randn(1, 6, _HIDDEN * 3))
+    with pytest.raises(ValueError, match="per-document position_ids"):
+        draft(ids, proj, torch.ones(1, 6, dtype=torch.long), seq_lens=torch.tensor([[3, 3]], dtype=torch.long))
+
+
+def test_packing_rejects_seq_lens_not_summing_to_t():
+    """A seq_lens row that does not sum to T must raise, not silently misbucket documents."""
+    draft = _build_draft().eval()
+    ids = torch.randint(0, _VOCAB, (1, 6))
+    proj = draft.project_hidden_states(torch.randn(1, 6, _HIDDEN * 3))
+    position_ids = torch.tensor([[0, 1, 2, 0, 1, 2]], dtype=torch.long)
+    with pytest.raises(ValueError, match="sum to seq_length"):
+        draft(
+            ids,
+            proj,
+            torch.ones(1, 6, dtype=torch.long),
+            position_ids=position_ids,
+            seq_lens=torch.tensor([[3, 2]], dtype=torch.long),  # sums to 5, not 6
+        )
+
+
 def test_set_vocab_mapping_builds_d2t_t2d():
     draft = _build_draft()
     selected = torch.arange(_DRAFT_VOCAB) * 2  # draft id i -> target id 2i
