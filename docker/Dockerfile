@@ -223,7 +223,13 @@ RUN git clone --depth 1 --branch v0.17.0 --recurse-submodules --shallow-submodul
 ARG FLASH_ATTN_REF=002cce0a1
 ARG INSTALL_FA3=true
 ARG INSTALL_FA4=false
-RUN if [ "$INSTALL_FA3" = "true" ] || [ "$INSTALL_FA4" = "true" ]; then \
+# TARGETARCH is provided by buildx. FA3 is skipped on arm64 automatically: the
+# arm64 image targets GB200 (Blackwell), where the SM90a-only FA3 kernels are
+# dead weight, and CI cross-builds arm64 under QEMU where the ~25 min nvcc
+# compile is impractical.
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
+    if [ "$INSTALL_FA3" = "true" ] || [ "$INSTALL_FA4" = "true" ]; then \
         git clone --filter=blob:none https://github.com/Dao-AILab/flash-attention.git /tmp/fa && \
         cd /tmp/fa && git checkout ${FLASH_ATTN_REF} && \
         git submodule update --init csrc/cutlass; \
