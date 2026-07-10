@@ -290,6 +290,13 @@ class DFlashTrainerModule(nn.Module):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         packed = seq_lens is not None
+        if packed and (position_ids is None or doc_remaining is None):
+            # A partial set would silently drop the in-document anchor constraint
+            # (cross-document supervision) or the per-document RoPE positions.
+            raise ValueError(
+                "Sequence packing requires position_ids, seq_lens, and doc_remaining together; "
+                "got seq_lens without the other packing metadata."
+            )
 
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
             seq_len, loss_mask, device, doc_remaining=doc_remaining if packed else None
@@ -337,9 +344,9 @@ class DFlashTrainerModule(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        doc_remaining: Optional[torch.Tensor] = None,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> DFlashStepMetrics:
         """Parallel block-wise training forward pass.
 

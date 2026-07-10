@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
@@ -249,6 +250,21 @@ def test_jetspec_packed_two_doc_runs_and_backprops():
     out.loss.backward()
     grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
     assert grad > 0
+
+
+def test_partial_packing_metadata_fails_loud():
+    """seq_lens without the rest of the packing metadata must not silently drop
+    the in-document constraints."""
+    trainer = _build_jetspec()
+    input_ids, hidden, loss_mask, target_logits = _inputs(24, with_logits=True)
+    with pytest.raises(ValueError, match="position_ids, seq_lens, and doc_remaining together"):
+        trainer(
+            input_ids=input_ids,
+            hidden_states=hidden,
+            loss_mask=loss_mask,
+            target_logits=target_logits,
+            seq_lens=torch.tensor([[24]], dtype=torch.long),
+        )
 
 
 def test_jetspec_packed_anchors_stay_in_document(monkeypatch):

@@ -286,11 +286,11 @@ class DominoTrainerModule(DFlashTrainerModule):
 
         Sequence packing (``position_ids`` ``[B, S]`` per-document reset positions,
         ``seq_lens`` ``[B, max_docs]`` document lengths, ``doc_remaining`` ``[B, S]``)
-        is handled by the shared DFlash prologue; additionally, ``shift_label``
-        labels reaching one past the block (``anchor + block_size``) are truncated
-        at the anchor's document boundary below.
+        is handled by the shared DFlash prologue; ``shift_label`` labels reaching
+        one past the block (``anchor + block_size``) are truncated at the anchor's
+        document boundary by ``_build_block_targets``.
         """
-        bsz, seq_len = input_ids.shape
+        _, seq_len = input_ids.shape
         device = input_ids.device
 
         anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask = (
@@ -338,8 +338,8 @@ class DominoTrainerModule(DFlashTrainerModule):
             target_ids=target_ids,
         ).reshape(bsz, n * bs, -1)
 
-        # --- Weight mask: block validity * bounds * (exclude anchor) * loss_mask.
-        # ``block_mask`` already carries validity, bounds, and the loss mask.
+        # --- Weight mask: ``block_mask`` (block validity * bounds * loss_mask),
+        # plus the anchor-position exclusion when labels are not shifted.
         weight_mask = block_mask
         if not self.shift_label:
             pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
