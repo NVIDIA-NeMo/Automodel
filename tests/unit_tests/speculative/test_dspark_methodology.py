@@ -196,6 +196,9 @@ def test_acceptance_rate_and_tau_match_reference():
     expected_tau = (accept[0, 0].cumprod(0).sum() + 1.0) / (1.0 + 1e-6)
     assert torch.allclose(terms["accept_rate"], expected_accept, atol=1e-6)
     assert torch.allclose(terms["tau"], expected_tau, atol=1e-6)
+    # Per-position sums (the DP-reduced ingredients of accept_rate@k).
+    assert torch.allclose(terms["accept_rate_per_pos_num"], (accept * mask).sum(dim=(0, 1)), atol=1e-6)
+    assert torch.allclose(terms["accept_rate_per_pos_den"], mask.sum(dim=(0, 1)), atol=1e-6)
 
 
 def test_confidence_calibration_matches_reference():
@@ -228,10 +231,17 @@ def test_confidence_calibration_matches_reference():
     tv = (draft_logits.softmax(-1) - aligned.softmax(-1)).abs().sum(-1)
     accept = (1.0 - 0.5 * tv).clamp(0.0, 1.0)
     mask = eval_mask.float()
-    error = confidence_pred.sigmoid() - accept
+    confidence_probs = confidence_pred.sigmoid()
+    error = confidence_probs - accept
     den = mask.sum() + 1e-6
     assert torch.allclose(terms["confidence_abs_error"], (error.abs() * mask).sum() / den, atol=1e-6)
     assert torch.allclose(terms["confidence_bias"], (error * mask).sum() / den, atol=1e-6)
+    # Cumulative (prefix-survival) calibration bias: prefix products of the
+    # confidence probs vs the measured acceptance, weighted then averaged.
+    conf_prefix = (confidence_probs * mask).cumprod(dim=-1)
+    target_prefix = (accept * mask).cumprod(dim=-1)
+    expected_cumprod = ((conf_prefix - target_prefix) * mask).sum() / den
+    assert torch.allclose(terms["confidence_cumprod_bias"], expected_cumprod, atol=1e-6)
 
 
 def test_chunked_probability_distance_matches_reference_and_gradient():

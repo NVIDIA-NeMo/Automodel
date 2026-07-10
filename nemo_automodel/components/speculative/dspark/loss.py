@@ -129,9 +129,13 @@ def _collect_acceptance_diagnostics(
     signal is available (``accept_rate_3d is None``).
     """
     zero = outputs.draft_logits.new_zeros((), dtype=torch.float32)
+    block_size = outputs.draft_logits.shape[2]
+    pos_zero = outputs.draft_logits.new_zeros((block_size,), dtype=torch.float32)
     terms = {
         "accept_rate_num": zero,
         "accept_rate_den": zero,
+        "accept_rate_pos_num": pos_zero,
+        "accept_rate_pos_den": pos_zero,
         "tau_num": zero,
         "tau_den": zero,
         "confidence_abs_error_num": zero,
@@ -146,6 +150,10 @@ def _collect_acceptance_diagnostics(
     valid_accept_rate = accept_rate_3d * eval_mask
     terms["accept_rate_num"] = valid_accept_rate.sum()
     terms["accept_rate_den"] = eval_mask.sum()
+    # Per-block-position acceptance (accept_rate@k): sum over (batch, blocks) so the
+    # recipe can DP-all-reduce the numerator/denominator and form a global per-k ratio.
+    terms["accept_rate_pos_num"] = valid_accept_rate.sum(dim=(0, 1))
+    terms["accept_rate_pos_den"] = eval_mask.sum(dim=(0, 1))
 
     # Expected accepted prefix length per block: a draft token survives only when
     # every earlier token in its block is also accepted, hence the running product
@@ -327,6 +335,10 @@ def compute_dspark_loss(
             "confidence_bias": loss_terms["confidence_bias_num"] / (loss_terms["confidence_diag_den"] + 1e-6),
             "confidence_cumprod_bias": loss_terms["confidence_cumprod_bias_num"]
             / (loss_terms["confidence_diag_den"] + 1e-6),
+            # Unreduced per-position sums: the recipe DP-all-reduces these and forms
+            # accept_rate@k = sum(num) / sum(den) across ranks and the log window.
+            "accept_rate_per_pos_num": loss_terms["accept_rate_pos_num"],
+            "accept_rate_per_pos_den": loss_terms["accept_rate_pos_den"],
         }
         return backward_loss, terms
     return backward_loss

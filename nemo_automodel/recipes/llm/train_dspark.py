@@ -1249,6 +1249,8 @@ class TrainDSparkRecipe(BaseRecipe):
                 running_conf_abs_err = 0.0
                 running_conf_bias = 0.0
                 running_conf_cumprod_bias = 0.0
+                running_accept_pos_num = torch.zeros(self.block_size, device=self.device)
+                running_accept_pos_den = torch.zeros(self.block_size, device=self.device)
                 running_micro = 0
                 epoch_loss = 0.0
                 micro_step = 0
@@ -1276,6 +1278,8 @@ class TrainDSparkRecipe(BaseRecipe):
                     running_conf_abs_err += metrics.confidence_abs_error.detach().item()
                     running_conf_bias += metrics.confidence_bias.detach().item()
                     running_conf_cumprod_bias += metrics.confidence_cumprod_bias.detach().item()
+                    running_accept_pos_num += metrics.accept_rate_per_pos_num.detach()
+                    running_accept_pos_den += metrics.accept_rate_per_pos_den.detach()
                     running_micro += 1
                     epoch_loss += metrics.loss.detach().item()
                     micro_step += 1
@@ -1295,27 +1299,34 @@ class TrainDSparkRecipe(BaseRecipe):
                         self._maybe_save_step_checkpoint(epoch_idx)
 
                         if self.runtime.global_step % self.log_every_steps == 0:
-                            # One collective: window sums of the loss terms and the acceptance
-                            # diagnostics plus the micro-batch count, summed across DP ranks,
-                            # then divided -> global means.
-                            window = self._dp_allreduce(
-                                torch.tensor(
-                                    [
-                                        running_loss,
-                                        running_ce,
-                                        running_l1,
-                                        running_conf,
-                                        running_accept,
-                                        running_tau,
-                                        running_conf_abs_err,
-                                        running_conf_bias,
-                                        running_conf_cumprod_bias,
-                                        float(running_micro),
-                                    ],
-                                    device=self.device,
-                                    dtype=torch.float32,
-                                )
-                            ).tolist()
+                            # One collective: window sums of the loss terms and the
+                            # acceptance diagnostics (scalars + the per-position accept_rate
+                            # numerator/denominator) plus the micro-batch count, summed across
+                            # DP ranks, then divided -> global means. Concatenating the
+                            # per-position sums keeps this to a single all-reduce.
+                            scalars = torch.tensor(
+                                [
+                                    running_loss,
+                                    running_ce,
+                                    running_l1,
+                                    running_conf,
+                                    running_accept,
+                                    running_tau,
+                                    running_conf_abs_err,
+                                    running_conf_bias,
+                                    running_conf_cumprod_bias,
+                                    float(running_micro),
+                                ],
+                                device=self.device,
+                                dtype=torch.float32,
+                            )
+                            reduced = self._dp_allreduce(
+                                torch.cat([scalars, running_accept_pos_num, running_accept_pos_den])
+                            )
+                            n_scalars = scalars.numel()
+                            window = reduced[:n_scalars].tolist()
+                            pos_num = reduced[n_scalars : n_scalars + self.block_size]
+                            pos_den = reduced[n_scalars + self.block_size :]
                             count = max(1.0, window[-1])
                             avg = {
                                 "loss": window[0] / count,
@@ -1328,9 +1339,14 @@ class TrainDSparkRecipe(BaseRecipe):
                                 "confidence_bias": window[7] / count,
                                 "confidence_cumprod_bias": window[8] / count,
                             }
+                            # accept_rate@k is the global per-position ratio sum(num)/sum(den).
+                            for k, rate in enumerate((pos_num / pos_den.clamp_min(1.0)).tolist()):
+                                avg[f"accept_rate@{k}"] = rate
                             running_loss = running_ce = running_l1 = running_conf = 0.0
                             running_accept = running_tau = 0.0
                             running_conf_abs_err = running_conf_bias = running_conf_cumprod_bias = 0.0
+                            running_accept_pos_num = torch.zeros(self.block_size, device=self.device)
+                            running_accept_pos_den = torch.zeros(self.block_size, device=self.device)
                             running_micro = 0
                             if self.dist_env.is_main:
                                 current_lr = self.lr_scheduler.get_last_lr()[0]
@@ -1342,23 +1358,23 @@ class TrainDSparkRecipe(BaseRecipe):
                                         metrics={**avg, "lr": current_lr, "mem": mem},
                                     )
                                 )
-                                self._wandb_log(
-                                    {
-                                        "train/loss": avg["loss"],
-                                        "train/ce_loss": avg["ce_loss"],
-                                        "train/tv_loss": avg["l1_loss"],
-                                        "train/confidence_loss": avg["confidence_loss"],
-                                        "train/accept_rate": avg["accept_rate"],
-                                        "train/tau": avg["tau"],
-                                        "train/confidence_abs_error": avg["confidence_abs_error"],
-                                        "train/confidence_bias": avg["confidence_bias"],
-                                        "train/confidence_cumprod_bias": avg["confidence_cumprod_bias"],
-                                        "train/lr": current_lr,
-                                        "train/mem_gib": mem,
-                                        "train/epoch": epoch_idx,
-                                    },
-                                    step=self.runtime.global_step,
-                                )
+                                wandb_metrics = {
+                                    "train/loss": avg["loss"],
+                                    "train/ce_loss": avg["ce_loss"],
+                                    "train/tv_loss": avg["l1_loss"],
+                                    "train/confidence_loss": avg["confidence_loss"],
+                                    "train/accept_rate": avg["accept_rate"],
+                                    "train/tau": avg["tau"],
+                                    "train/confidence_abs_error": avg["confidence_abs_error"],
+                                    "train/confidence_bias": avg["confidence_bias"],
+                                    "train/confidence_cumprod_bias": avg["confidence_cumprod_bias"],
+                                    "train/lr": current_lr,
+                                    "train/mem_gib": mem,
+                                    "train/epoch": epoch_idx,
+                                }
+                                for k in range(self.block_size):
+                                    wandb_metrics[f"train/accept_rate@{k}"] = avg[f"accept_rate@{k}"]
+                                self._wandb_log(wandb_metrics, step=self.runtime.global_step)
                                 if pbar is not None:
                                     pbar.set_postfix(loss=f"{avg['loss']:.4f}", lr=f"{current_lr:.2e}")
                                 logger.info(

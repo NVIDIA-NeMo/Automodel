@@ -39,7 +39,9 @@ class DSparkStepMetrics:
     Beyond the loss and its three terms, this carries acceptance diagnostics that
     the recipe logs: ``accept_rate`` (mean per-token acceptance probability),
     ``tau`` (expected accepted block length), and the confidence-head calibration
-    error/bias against the measured acceptance rate.
+    error/bias against the measured acceptance rate. ``accept_rate_per_pos_num`` /
+    ``accept_rate_per_pos_den`` are the ``[block_size]`` unreduced sums the recipe
+    DP-all-reduces into the per-position ``accept_rate@k`` curve.
     """
 
     loss: torch.Tensor
@@ -51,6 +53,8 @@ class DSparkStepMetrics:
     confidence_abs_error: torch.Tensor
     confidence_bias: torch.Tensor
     confidence_cumprod_bias: torch.Tensor
+    accept_rate_per_pos_num: torch.Tensor
+    accept_rate_per_pos_den: torch.Tensor
 
 
 class DSparkTrainerModule(nn.Module):
@@ -104,6 +108,8 @@ class DSparkTrainerModule(nn.Module):
             confidence_abs_error=terms["confidence_abs_error"],
             confidence_bias=terms["confidence_bias"],
             confidence_cumprod_bias=terms["confidence_cumprod_bias"],
+            accept_rate_per_pos_num=terms["accept_rate_per_pos_num"],
+            accept_rate_per_pos_den=terms["accept_rate_per_pos_den"],
         )
 
 
