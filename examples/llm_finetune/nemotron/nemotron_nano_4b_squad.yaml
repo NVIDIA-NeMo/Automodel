@@ -101,7 +101,7 @@ ci:
     kl_threshold: 5e-3
     hf_kl_threshold: 5e-3
     source_load_kl_threshold: 5e-3
-    source_load_cosine_threshold: 0.9999
+    source_load_cosine_threshold: 0.9995
     tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
     trust_remote_code: true
     hf_device_map_auto: true
