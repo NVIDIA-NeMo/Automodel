@@ -103,12 +103,100 @@ def test_ttt_cache_recurrence_grows_and_runs_diagonal_path():
     assert torch.isfinite(out1).all()
 
 
-def test_packing_not_supported_yet():
+def test_packed_single_doc_matches_unpacked_forward():
+    """A packed row that is one full-width document must match the plain causal forward.
+
+    ``seq_lens=[[T]]`` with ``position_ids=arange`` builds a block-causal mask that is
+    exactly the lower-triangular causal mask, so the packed path must be bit-identical
+    to the unpacked path (which also uses ``arange`` positions and an all-ones mask).
+    """
     draft = _build_draft().eval()
-    ids = torch.randint(0, _VOCAB, (1, 4))
-    proj = draft.project_hidden_states(torch.randn(1, 4, _HIDDEN * 3))
-    with pytest.raises(NotImplementedError, match="sequence packing"):
-        draft(ids, proj, torch.ones(1, 4, dtype=torch.long), seq_lens=torch.tensor([4]))
+    batch, seq = 1, 6
+    input_ids = torch.randint(0, _VOCAB, (batch, seq))
+    proj = draft.project_hidden_states(torch.randn(batch, seq, _HIDDEN * 3))
+    attn = torch.ones(batch, seq, dtype=torch.long)
+    position_ids = torch.arange(seq, dtype=torch.long).unsqueeze(0)
+
+    out_unpacked = draft(input_ids, proj, attn, position_ids=position_ids, cache_hidden=[[], []])
+    out_packed = draft(
+        input_ids,
+        proj,
+        attn,
+        position_ids=position_ids,
+        cache_hidden=[[], []],
+        seq_lens=torch.tensor([[seq]], dtype=torch.long),
+    )
+    torch.testing.assert_close(out_packed, out_unpacked)
+
+
+def test_packed_draft_attention_isolates_documents():
+    """Block-causal packing must isolate documents: perturbing only doc B's inputs
+    leaves doc A's output bit-identical (cross-document attention is masked)."""
+    torch.manual_seed(0)
+    draft = _build_draft().eval()
+    seq_len = 6
+    seq_lens = torch.tensor([[3, 3]], dtype=torch.long)  # doc A: slots 0..2, doc B: slots 3..5
+    position_ids = torch.tensor([[0, 1, 2, 0, 1, 2]], dtype=torch.long)  # reset per document
+    input_ids = torch.randint(0, _VOCAB, (1, seq_len))
+    projected = draft.project_hidden_states(torch.randn(1, seq_len, _HIDDEN * 3))
+
+    def run(ids, proj):
+        return draft(
+            input_ids=ids,
+            projected_hidden_states=proj,
+            attention_mask=torch.ones(1, seq_len, dtype=torch.long),
+            position_ids=position_ids,
+            cache_hidden=[[], []],
+            seq_lens=seq_lens,
+        )
+
+    out_ref = run(input_ids, projected)
+    # Perturb only document B (slots 3..5).
+    ids_b = input_ids.clone()
+    ids_b[:, 3:] = torch.randint(0, _VOCAB, (1, 3))
+    proj_b = projected.clone()
+    proj_b[:, 3:] = torch.randn(1, 3, _HIDDEN)
+    out_perturbed = run(ids_b, proj_b)
+
+    torch.testing.assert_close(out_ref[:, :3], out_perturbed[:, :3])  # doc A unchanged
+    assert not torch.allclose(out_ref[:, 3:], out_perturbed[:, 3:])  # doc B changed
+
+
+def test_trainer_integration_packed_trains_on_cpu():
+    """The MLA draft trains end to end through the shared trainer with packing metadata
+    (per-document position_ids, block-causal seq_lens, and doc_remaining supervision gate)."""
+    draft = _build_draft()
+    selected_token_ids = torch.arange(_DRAFT_VOCAB, dtype=torch.long)
+    selected_token_mask = torch.zeros(_VOCAB, dtype=torch.bool)
+    selected_token_mask[selected_token_ids] = True
+    module = Eagle3TrainerModule(
+        draft,
+        selected_token_ids=selected_token_ids,
+        selected_token_mask=selected_token_mask,
+        ttt_steps=2,
+    )
+
+    # One packed row: two docs of length 3 over T=6.
+    doc_len, num_docs = 3, 2
+    seq = doc_len * num_docs
+    position_ids = torch.cat([torch.arange(doc_len) for _ in range(num_docs)]).unsqueeze(0)
+    seq_lens = torch.tensor([[doc_len] * num_docs], dtype=torch.long)
+    doc_remaining = torch.cat([torch.arange(doc_len - 1, -1, -1) for _ in range(num_docs)]).unsqueeze(0)
+
+    out = module(
+        input_ids=torch.randint(0, _VOCAB, (1, seq)),
+        attention_mask=torch.ones(1, seq, dtype=torch.long),
+        loss_mask=torch.ones(1, seq, dtype=torch.long),
+        aux_hidden_states=torch.randn(1, seq, _HIDDEN * 3),
+        target_logits=torch.randn(1, seq, _VOCAB),
+        position_ids=position_ids,
+        seq_lens=seq_lens,
+        doc_remaining=doc_remaining,
+    )
+    assert torch.isfinite(out.loss)
+    out.loss.backward()
+    grads = [p.grad for p in draft.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads)
 
 
 def test_set_vocab_mapping_builds_d2t_t2d():

@@ -34,9 +34,11 @@ projection layout and the interleaved RoPE are taken from the onboarded DeepSeek
 target (``components/models/deepseek_v3``: the ``MLA`` projection structure and
 ``rope_utils``), not reimplemented.
 
-Scope (v1): EAGLE-3 single fused draft layer, eager attention. P-EAGLE
-parallel-drafting, flash-attention, and sequence packing are intentionally left
-to follow-ups (they are orthogonal to the MLA attention this file adds).
+Scope: EAGLE-3 single fused draft layer, eager attention. Sequence packing is
+supported via the shared ``[B, 1, T, T]`` block-causal mask (see
+``forward``); the MLA attention is eager-only, so packing reuses the eager mask
+path rather than a FlashAttention varlen kernel. P-EAGLE parallel-drafting and
+flash-attention remain follow-ups (orthogonal to the MLA attention this file adds).
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig, PreTrainedModel
 
+from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
 from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
@@ -410,18 +413,45 @@ class DeepseekV3Eagle3DraftModel(PreTrainedModel):
         cache_hidden: Optional[list[list[torch.Tensor]]] = None,
         seq_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run one EAGLE-3 TTT draft step (eager attention; ``seq_lens`` packing not supported in v1)."""
-        if seq_lens is not None:
-            raise NotImplementedError(
-                "DeepseekV3Eagle3DraftModel does not support sequence packing (seq_lens) yet; use the unpacked path."
-            )
+        """Run one EAGLE-3 TTT draft step (eager attention).
+
+        Tensor contracts (batch ``B``, sequence length ``T``):
+
+        - ``input_ids`` ``[B, T]`` long; ``projected_hidden_states`` ``[B, T, H]``
+          (draft hidden size); ``attention_mask`` ``[B, T]`` (1 = real, 0 = pad);
+          ``position_ids`` ``[B, T]`` long or ``None`` (defaults to ``arange``).
+        - ``cache_hidden`` is the EAGLE-3 TTT cache ``[K_list, V_list]``: pass
+          ``[[], []]`` on the first step and the same list on each later step;
+          the attention layer appends per-step K/V. ``None`` allocates a fresh
+          cache (step 0 == a plain causal forward).
+        - ``seq_lens`` ``[B, max_docs]`` long (0-padded per-document lengths that
+          sum to ``T`` per row) turns on sequence packing: Block-1 attention
+          becomes document-level block-causal via
+          :func:`build_block_causal_additive_mask`. The MLA attention is
+          eager-only, so packing takes the eager mask path (no FA2 varlen).
+          Callers must pass per-document ``position_ids`` (reset to
+          ``range(doc_len)`` within each document) so the rotary phase matches the
+          target; the TTT diagonal block is position-wise and stays document-safe.
+          Cross-document TTT supervision is masked by the trainer's
+          ``doc_remaining`` gate, not here.
+        """
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long).unsqueeze(0)
             position_ids = position_ids.expand(input_ids.shape[0], -1)
         if cache_hidden is None:
             cache_hidden = [[], []]
 
-        causal_mask = _build_causal_mask(attention_mask=attention_mask, dtype=projected_hidden_states.dtype)
+        if seq_lens is not None:
+            # Packed: document structure comes from seq_lens (block-causal mask),
+            # so the plain causal + padding mask does not apply.
+            causal_mask = build_block_causal_additive_mask(
+                seq_lens,
+                seq_length=input_ids.shape[1],
+                dtype=projected_hidden_states.dtype,
+                device=input_ids.device,
+            )
+        else:
+            causal_mask = _build_causal_mask(attention_mask=attention_mask, dtype=projected_hidden_states.dtype)
         draft_input_embeds = self.embed_input_ids(input_ids)
         hidden_states = self.model.layers[0](
             input_embeds=draft_input_embeds,
