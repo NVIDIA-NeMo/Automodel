@@ -245,6 +245,26 @@ def test_make_vision_collator_from_processor_method_returns_bound_method():
     assert collator([{"question": "Q"}]) == {"features": [{"question": "Q"}]}
 
 
+def test_processor_method_collator_resolves_method_once():
+    class FakeProcessor:
+        resolve_count = 0
+
+        def __getattribute__(self, name):
+            if name == "process_queries_documents_biencoder":
+                type(self).resolve_count += 1
+            return super().__getattribute__(name)
+
+        def process_queries_documents_biencoder(self, features):
+            return {"features": features}
+
+    processor = FakeProcessor()
+    collator = rc.ProcessorMethodCollator(processor, "process_queries_documents_biencoder")
+
+    assert collator([{"question": "Q1"}]) == {"features": [{"question": "Q1"}]}
+    assert collator([{"question": "Q2"}]) == {"features": [{"question": "Q2"}]}
+    assert FakeProcessor.resolve_count == 1
+
+
 def test_make_vision_collator_from_processor_method_missing_method_raises():
     with pytest.raises(AttributeError):
         rc.make_vision_collator_from_processor_method(object(), "missing_collator")

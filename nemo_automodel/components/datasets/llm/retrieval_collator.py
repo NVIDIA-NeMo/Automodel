@@ -304,6 +304,30 @@ class CrossEncoderCollator(DataCollatorWithPadding):
         return batch_dict
 
 
+class ProcessorMethodCollator:
+    """Expose one method of a multimodal processor as a dataloader collator."""
+
+    def __init__(self, tokenizer: ProcessorMixin, collator_fn_name: str) -> None:
+        """Resolve the processor method once during dataloader construction.
+
+        Args:
+            tokenizer: Runtime multimodal processor.
+            collator_fn_name: Processor method used to collate each batch.
+        """
+        self.collate_fn = getattr(tokenizer, collator_fn_name)
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
+        """Collate retrieval examples with the resolved processor method.
+
+        Args:
+            batch: Retrieval examples for one local batch.
+
+        Returns:
+            Processor-produced tensor batch.
+        """
+        return self.collate_fn(batch)
+
+
 def make_vision_collator_from_processor_method(tokenizer: ProcessorMixin, collator_fn_name: str):
     """
     Turns a method of a processor into a collator function.

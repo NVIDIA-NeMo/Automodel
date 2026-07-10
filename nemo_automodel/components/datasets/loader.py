@@ -40,6 +40,7 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
 if TYPE_CHECKING:
     from torch.utils.data import Sampler
+    from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,8 @@ class PackingConfig:
 
     packed_sequence_size: int
     max_packs: int | None = None
+    prepacked: bool = False
+    """Whether the dataset already contains packed samples and must not be repacked."""
 
     def build(
         self,
@@ -231,15 +234,40 @@ COLLATE_FNS: dict[str, str] = {
 }
 
 
-def make_collate_fn(target: Any, kwargs: dict[str, Any] | None = None) -> Callable[..., Any] | None:
-    """Resolve a collate-fn ``target`` and bind ``kwargs`` to it (``target=None`` → ``None``).
+@dataclass
+class CollatorConfig:
+    """Construction-time configuration for a tokenizer-aware collator class."""
+
+    factory: Callable[..., Callable[..., Any]]
+    kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | ProcessorMixin") -> Callable[..., Any]:
+        """Instantiate the collator once with its runtime tokenizer or processor.
+
+        Args:
+            tokenizer: Runtime tokenizer or multimodal processor used by the collator.
+
+        Returns:
+            Callable collator passed to the dataloader.
+        """
+        collator = self.factory(tokenizer=tokenizer, **self.kwargs)
+        if not callable(collator):
+            raise TypeError(f"Collator factory {self.factory!r} returned non-callable {type(collator).__name__}")
+        return collator
+
+
+def make_collate_fn(target: Any, kwargs: dict[str, Any] | None = None) -> Callable[..., Any] | CollatorConfig | None:
+    """Resolve a collate target into a batch callable or tokenizer-aware config.
 
     ``target`` is a key in :data:`COLLATE_FNS` (e.g. ``"default"``), a dotted import path, or an already
-    resolved callable. ``kwargs`` are ``partial``-bound, since the collate fn is later called per batch.
+    resolved callable. Collator classes become :class:`CollatorConfig` so :meth:`DataloaderConfig.build`
+    instantiates them once with the runtime tokenizer. Function kwargs remain partial-bound per batch.
     """
     if target is None:
         return None
     fn = _resolve_target(target, COLLATE_FNS)
+    if inspect.isclass(fn):
+        return CollatorConfig(factory=fn, kwargs=kwargs or {})
     return partial(fn, **kwargs) if kwargs else fn
 
 
@@ -267,7 +295,8 @@ DATASET_CONFIGS: dict[str, str] = {
     # pre-Config dataset class / ``make_*`` factory onto its config, so an old YAML that points ``_target_`` at
     # the dataset itself constructs the typed config. A ``_target_`` already naming a ``<Name>Config`` is not a
     # key here, so it falls through to a direct import. A target with no config (a few VLM factories) hits the
-    # legacy shim. Keyed by bare name (module-independent), so re-exports resolve to the same config.
+    # legacy shim. Most entries are keyed by bare name (module-independent), while exact dotted-path entries
+    # disambiguate factories that share a name but implement different dataset formats.
     "megatronpretraining": f"{_DATASETS}.llm.megatron_dataset.MegatronPretrainingConfig",
     "make_squad_dataset": f"{_DATASETS}.llm.squad.SquadConfig",
     "hellaswag": f"{_DATASETS}.llm.hellaswag.HellaSwagConfig",
@@ -283,6 +312,9 @@ DATASET_CONFIGS: dict[str, str] = {
     "glue_mrpc": f"{_DATASETS}.llm.seq_cls.GLUE_MRPCConfig",
     "build_unpacked_dataset": f"{_DATASETS}.llm.mock.MockUnpackedDatasetConfig",
     "make_retrieval_dataset": f"{_DATASETS}.llm.retrieval_dataset.RetrievalDatasetConfig",
+    f"{_DATASETS}.llm.retrieval_dataset_inline.make_retrieval_dataset": (
+        f"{_DATASETS}.llm.retrieval_dataset_inline.InlineRetrievalDatasetConfig"
+    ),
     "make_rdr_dataset": f"{_DATASETS}.vlm.datasets.RdrDatasetConfig",
     "make_cord_v2_dataset": f"{_DATASETS}.vlm.datasets.CordV2DatasetConfig",
     "make_unimm_chat_dataset": f"{_DATASETS}.vlm.datasets.UnimmChatDatasetConfig",
@@ -294,17 +326,17 @@ DATASET_CONFIGS: dict[str, str] = {
 def make_dataset_config(target: Any, kwargs: dict[str, Any] | None = None) -> Any:
     """Resolve a dataset ``_target_`` to an object exposing ``build(**runtime) -> Dataset``.
 
-    The ``_target_``'s bare name (``split(".")[-1].lower()``) is looked up in :data:`DATASET_CONFIGS` to map a
-    pre-Config dataset class / ``make_*`` factory onto its typed ``<Name>Config``; misses fall back to the
-    ``_target_`` itself (so a ``_target_`` that already names a ``<Name>Config`` imports directly). A resolved
-    typed config (a dataclass exposing ``build``) is constructed from ``kwargs`` filtered to its fields; any
-    other resolved object (a dataset class / factory with no config — a few VLM factories) is wrapped in a
-    :class:`_LegacyDatasetConfig` shim so old YAMLs keep working.
+    Exact dotted-path registrations are checked first, then the ``_target_``'s bare name
+    (``split(".")[-1].lower()``). This maps a pre-Config dataset class / ``make_*`` factory onto its typed
+    ``<Name>Config`` while allowing same-named factories with different formats. Misses fall back to the
+    ``_target_`` itself, so a target that already names a config imports directly. A resolved typed config is
+    constructed from ``kwargs`` filtered to its fields; other factories use :class:`_LegacyDatasetConfig`.
     """
     kwargs = kwargs or {}
     if not isinstance(target, str):
         target = f"{target.__module__}.{getattr(target, '__qualname__', getattr(target, '__name__', ''))}"
-    obj = _resolve_target(DATASET_CONFIGS.get(target.split(".")[-1].lower(), target), {})
+    config_target = DATASET_CONFIGS.get(target, DATASET_CONFIGS.get(target.split(".")[-1].lower(), target))
+    obj = _resolve_target(config_target, {})
     if is_dataclass(obj) and hasattr(obj, "build"):
         valid = {f.name for f in fields(obj)}
         return obj(**{k: v for k, v in kwargs.items() if k in valid})
@@ -402,7 +434,7 @@ class DataloaderConfig:
     shuffle_buffer_size: int = 10000
     batch_size: int = 1
     seed: int = 42
-    collate_fn: Callable | None = None
+    collate_fn: Callable | CollatorConfig | None = None
     loader_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def build(
@@ -443,7 +475,7 @@ class DataloaderConfig:
                 dataset = self.dataset_config.build(**_filter_runtime(self.dataset_config.build, runtime))
 
             collate_override = None
-            if self.packing is not None:
+            if self.packing is not None and not self.packing.prepacked:
                 dataset, collate_override = self.packing.build(
                     dataset,
                     split=getattr(self.dataset_config, "split", None),
@@ -453,9 +485,19 @@ class DataloaderConfig:
                     cp_size=cp_size,
                     attn_implementation=attn_implementation,
                 )
+            elif self.packing is not None:
+                logger.info(
+                    "Using prepacked sequence dataset with size %s; skipping loader-side packing",
+                    self.packing.packed_sequence_size,
+                )
 
             # Collate: packing override -> custom collate_fn -> shared default; then the optional PP wrapper.
             collate_fn = collate_override or self.collate_fn
+            if isinstance(collate_fn, CollatorConfig):
+                tokenizer = runtime.get("tokenizer")
+                if tokenizer is None:
+                    raise ValueError("A tokenizer or processor is required to build the configured collator")
+                collate_fn = collate_fn.build(tokenizer=tokenizer)
             if collate_fn is None:
                 from nemo_automodel.components.datasets.utils import default_collater
 
@@ -483,7 +525,7 @@ def build_dataloader_config(
     *,
     dataloader: dict[str, Any] | None = None,
     packing: PackingConfig | None = None,
-    collate_fn: Callable | None = None,
+    collate_fn: Callable | CollatorConfig | None = None,
     seed: int = 42,
     local_batch_size: int = 1,
 ) -> DataloaderConfig:
@@ -517,6 +559,7 @@ def build_dataloader_config(
 
 __all__ = [
     "COLLATE_FNS",
+    "CollatorConfig",
     "DATASET_CONFIGS",
     "PACKING_CONFIGS",
     "DataloaderConfig",

@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib
 import logging
 import sys
 import types
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -31,7 +30,13 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA n
 from torch.utils.data import IterableDataset
 
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
-from nemo_automodel.components.datasets.loader import DataloaderConfig, build_dataloader_config
+from nemo_automodel.components.datasets.loader import (
+    DataloaderConfig,
+    build_dataloader_config,
+    make_collate_fn,
+    make_dataset_config,
+    make_packing_config,
+)
 from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
 from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
@@ -41,9 +46,18 @@ from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callab
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _build_pp_collate_wrapper,
+    _should_pack_validation,
     build_model,
     compute_trust_remote_code_from_model,
 )
+
+
+def _target_kwargs(node):
+    if node is None:
+        return None, {}
+    if isinstance(node, str):
+        return node, {}
+    return _callable_and_kwargs(node)
 
 
 def _build_loader(
@@ -63,32 +77,35 @@ def _build_loader(
     cp_size=1,
     model=None,
 ):
-    """Resolve the loader YAML like ``RecipeConfig.dataloader`` and build it (no ``build_dataloader``)."""
-    factory, ds_kwargs = _callable_and_kwargs(cfg_ds)
+    """Resolve loader YAML like ``RecipeConfig.dataloader`` and build it."""
+    del global_batch_size, max_steps, val_check_interval
+    target, ds_kwargs = _callable_and_kwargs(cfg_ds)
     ds_kwargs.pop("tokenizer", None)
+    dataset_config = make_dataset_config(target, ds_kwargs)
     dl = _as_dict(cfg_dl)
     dl.pop("_target_", None)
-    collate = dl.pop("collate_fn", None)
+    collate = make_collate_fn(*_target_kwargs(dl.pop("collate_fn", None)))
+    ps = _as_dict(cfg_ps)
+    packing = None
+    if ps.get("packed_sequence_size", 0) > 0:
+        packing = make_packing_config(ps.pop("packing_strategy", "thd"), ps)
     config = build_dataloader_config(
-        factory,
-        ds_kwargs,
+        dataset_config,
         dataloader=dl,
-        packed_sequence=_as_dict(cfg_ps) if cfg_ps else None,
+        packing=packing,
         collate_fn=collate,
         seed=seed,
         local_batch_size=local_batch_size,
-        global_batch_size=global_batch_size,
-        max_steps=max_steps,
-        val_check_interval=val_check_interval,
     )
-    loader = config.build(
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        pp_enabled=pp_enabled,
-        model=model,
-        cp_size=cp_size,
-        collate_wrapper=_build_pp_collate_wrapper(cfg_model, pp_enabled),
-    )
+    with patch("nemo_automodel.components.training.rng.ScopedRNG", lambda *a, **k: nullcontext()):
+        loader = config.build(
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            pp_enabled=pp_enabled,
+            model=model,
+            cp_size=cp_size,
+            collate_wrapper=_build_pp_collate_wrapper(cfg_model, pp_enabled),
+        )
     return loader, None
 
 
@@ -266,8 +283,7 @@ def test_validation_dataloaders_collects_and_names_properly():
 
     assert set(result.keys()) == {"default", "val", "test"}
     assert all(isinstance(v, DataloaderConfig) for v in result.values())
-    # The resolved schedule is carried on each config.
-    assert all(v.global_batch_size == 16 and v.batch_size == 8 for v in result.values())
+    assert all(v.batch_size == 8 for v in result.values())
 
 
 def test_validation_dataloaders_no_validation_keys():
@@ -319,6 +335,49 @@ def test_validation_dataloaders_skip_packing_without_pack_size():
     )
 
     assert RecipeConfig(cfg).validation_dataloaders["default"].packing is None
+
+
+@pytest.mark.parametrize("attn", ["magi", "te", "sdpa"])
+def test_should_pack_validation_for_explicit_thd_collater(attn):
+    collate_fn = "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"
+    cfg = RecipeConfig(
+        ConfigNode(
+            {
+                "model": {"backend": {"attn": attn}},
+                "dataloader": {"collate_fn": collate_fn},
+                "validation_dataloader": {"collate_fn": collate_fn},
+                "packed_sequence": {"packed_sequence_size": 1024},
+            }
+        )
+    )
+
+    assert _should_pack_validation(cfg, nn.Module()) is True
+
+
+def test_should_not_pack_validation_without_pack_size():
+    cfg = RecipeConfig(ConfigNode({"model": {}, "packed_sequence": {"packed_sequence_size": 0}}))
+
+    assert _should_pack_validation(cfg, nn.Module()) is False
+
+
+def test_should_pack_validation_when_model_requires_training_layout():
+    collate_fn = "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"
+    cfg = RecipeConfig(
+        ConfigNode(
+            {
+                "model": {"backend": {"attn": "sdpa"}},
+                "dataloader": {"collate_fn": collate_fn},
+                "validation_dataloader": {},
+                "packed_sequence": {"packed_sequence_size": 1024},
+            }
+        )
+    )
+
+    class ModelRequiresPackedValidation(nn.Module):
+        def should_pack_validation_with_training(self):
+            return True
+
+    assert _should_pack_validation(cfg, ModelRequiresPackedValidation()) is True
 
 
 class DummyLinear(nn.Module):
@@ -558,7 +617,6 @@ def test_build_dataloader_prepacked_sequence_skips_recipe_packing(monkeypatch):
     )
     cfg_dl = ConfigNode(
         {
-            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
             "num_workers": 0,
         }
     )
@@ -586,10 +644,8 @@ def test_build_dataloader_prepacked_sequence_skips_recipe_packing(monkeypatch):
         model=_PackedModel(),
     )
 
-    assert dl == "dl"
     assert tok is None
-    mod = importlib.import_module("tests.unit_tests.recipes.test_train_ft")
-    ds = mod.dl_factory_capture.captured["dataset"]
+    ds = dl.dataset
     assert ds.__class__.__name__ == "DummyIterableDataset"
     assert ds._shuffle_calls == []
 
@@ -602,7 +658,7 @@ def test_build_dataloader_packing_uses_configured_cp_size(monkeypatch, supports_
         captured.update(kwargs)
         return dataset
 
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.pack_dataset", fake_pack_dataset)
+    monkeypatch.setattr("nemo_automodel.components.datasets.llm.packed_sequence.pack_dataset", fake_pack_dataset)
     cfg_ds = ConfigNode(
         {
             "_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset",
@@ -611,19 +667,25 @@ def test_build_dataloader_packing_uses_configured_cp_size(monkeypatch, supports_
     )
     cfg_dl = ConfigNode(
         {
-            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
             "num_workers": 0,
         }
     )
     cfg_model = ConfigNode({})
     cfg_ps = ConfigNode({"packed_sequence_size": 8, "packing_strategy": "thd"})
 
-    class _PackedModel(nn.Module):
-        def forward(self, input_ids, seq_lens=None):
-            return input_ids
+    if supports_thd:
+
+        class _PackedModel(nn.Module):
+            def forward(self, input_ids, seq_lens=None):
+                return input_ids
+
+    else:
+
+        class _PackedModel(nn.Module):
+            def forward(self, input_ids):
+                return input_ids
 
     model = _PackedModel()
-    model.supports_thd = supports_thd
 
     dl, _ = _build_loader(
         cfg_ds=cfg_ds,
@@ -642,8 +704,11 @@ def test_build_dataloader_packing_uses_configured_cp_size(monkeypatch, supports_
         model=model,
     )
 
-    assert dl == "dl"
-    assert captured["cp_size"] == 2
+    assert dl.dataset.__class__.__name__ == "DummyMapDataset"
+    if supports_thd:
+        assert captured["cp_size"] == 2
+    else:
+        assert captured == {}
 
 
 class _FlagCM(AbstractContextManager):
@@ -2095,6 +2160,7 @@ class TestRunValidationToolCallEval:
     def _run(self, recipe, monkeypatch):
         # max_memory_allocated() is CUDA-only; stub it so the CPU metrics build works.
         monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: 0)
+        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", lambda **kwargs: nullcontext())
         return recipe._run_validation_epoch([])  # empty loader -> straight to the eval block
 
     def test_fsdp2_skips_in_loop_eval(self, monkeypatch):

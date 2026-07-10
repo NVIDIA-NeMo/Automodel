@@ -23,15 +23,13 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 import wandb
-from torch.utils.data import IterableDataset
-from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
@@ -179,44 +177,6 @@ def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
     return query_batch_dict, doc_batch_dict
 
 
-def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_world_size=1):
-    """Build a DataLoader for encoder training."""
-    with ScopedRNG(seed=seed, ranked=True):
-        with FirstRankPerNode():
-            dataset = cfg_dl.dataset.instantiate()
-
-        collate_fn = None
-        if hasattr(cfg_dl, "collate_fn") and hasattr(cfg_dl.collate_fn, "_target_"):
-            collate_fn = cfg_dl.collate_fn.instantiate(tokenizer=tokenizer)
-
-        if not isinstance(dataset, IterableDataset):
-            shuffle = cfg_dl.get("shuffle", True)
-            if "shuffle" in cfg_dl:
-                del cfg_dl.shuffle
-
-            dist_sampler_kwargs = {
-                "num_replicas": dp_world_size,
-                "rank": dp_rank,
-                "shuffle": shuffle,
-            }
-            sampler = StatefulDistributedSampler(
-                dataset,
-                seed=seed,
-                drop_last=True,
-                **dist_sampler_kwargs,
-            )
-            dl_kwargs = {"sampler": sampler, "batch_size": batch_size}
-        else:
-            logging.info("Using IterableDataset; skipping sampler.")
-            dl_kwargs = {"dataset": dataset, "batch_size": batch_size}
-
-        dl_kwargs["dataset"] = dataset
-        if collate_fn is not None:
-            dl_kwargs["collate_fn"] = collate_fn
-
-        return cfg_dl.instantiate(**dl_kwargs)
-
-
 class TrainBiEncoderRecipe(BaseRecipe):
     """Recipe for training encoder models with contrastive learning."""
 
@@ -332,32 +292,23 @@ class TrainBiEncoderRecipe(BaseRecipe):
             tokenizer.pad_token = self.tokenizer.eos_token
             tokenizer.padding_side = "left"
 
-        self.dataloader = build_dataloader(
-            # Raw ``dataloader`` config node (retrieval nests dataset under dataloader.dataset);
-            # RecipeConfig.dataloader is the typed LLM-recipe property and resolves to None here.
-            self.cfg.get("dataloader"),
-            self.tokenizer,
-            seed=self.cfg.get("seed", 42),
-            batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-            dp_rank=self._get_dp_rank(),
-            dp_world_size=self._get_dp_group_size(),
-        )
-        self.train_n_passages = self.cfg.get("dataloader.dataset.n_passages", 1)
+        dataloader_config = self.cfg.dataloader
+        if dataloader_config is None:
+            raise ValueError("Retrieval training requires a top-level dataset config")
+        loader_runtime = {
+            "tokenizer": self.tokenizer,
+            "dp_rank": self._get_dp_rank(),
+            "dp_world_size": self._get_dp_group_size(),
+        }
+        self.dataloader = dataloader_config.build(**loader_runtime)
+        self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
 
         self.val_dataloader = None
-        if "validation_dataloader" in self.cfg:
-            val_batch_size = self.cfg.get(
-                "validation_dataloader.batch_size", self.cfg.get("step_scheduler.local_batch_size", 1)
-            )
-            self.val_dataloader = build_dataloader(
-                self.cfg.validation_dataloader,
-                self.tokenizer,
-                seed=self.cfg.get("seed", 42),
-                batch_size=val_batch_size,
-                dp_rank=self._get_dp_rank(),
-                dp_world_size=self._get_dp_group_size(),
-            )
-            self.val_n_passages = self.cfg.get("validation_dataloader.dataset.n_passages", self.train_n_passages)
+        validation_configs = self.cfg.validation_dataloaders
+        if validation_configs:
+            validation_config = next(iter(validation_configs.values()))
+            self.val_dataloader = validation_config.build(**loader_runtime)
+            self.val_n_passages = getattr(validation_config.dataset_config, "n_passages", self.train_n_passages)
 
         self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
