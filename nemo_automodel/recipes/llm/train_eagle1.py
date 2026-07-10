@@ -72,6 +72,30 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
+def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_size: int) -> None:
+    """Reject sequence-packing configs the EAGLE-1/2 path cannot honor (fail fast at setup).
+
+    - Context parallelism shards the sequence and strips the 4D block-causal mask
+      packing relies on, and EAGLE-1/2 has no CP sequence-sharding path, so
+      ``cp_size > 1`` with packing would silently train on wrong supervision.
+    - A FlashAttention target infers document boundaries from per-document
+      ``position_ids``, which transformers packs only at batch size 1.
+    """
+    if cp_size > 1:
+        raise NotImplementedError(
+            "Sequence packing (packed_sequence_size>0) is not supported with context parallelism "
+            "(distributed.cp_size>1) in EAGLE-1/2; CP shards the sequence and strips the 4D block-causal "
+            "mask packing relies on. Set cp_size=1 or packed_sequence_size=0."
+        )
+    if "flash" in target_attn_impl and micro_batch_size > 1:
+        raise ValueError(
+            "Sequence packing with a FlashAttention target requires micro_batch_size=1 "
+            f"(got {micro_batch_size}); FlashAttention infers document boundaries from per-document "
+            "position_ids, which transformers packs only at batch size 1. Set micro_batch_size=1 or "
+            "load the target with attn_implementation='sdpa'."
+        )
+
+
 def _packing_kwargs(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Sequence-packing metadata from a dataloader batch (empty dict when unpacked).
 
@@ -184,6 +208,14 @@ class TrainEagle1Recipe(BaseRecipe):
         # single-step draft both consume the block-causal packing metadata
         # (position_ids / seq_lens / doc_remaining) the packed loader emits.
         packed_sequence_size = int(recipe_cfg.get("packed_sequence_size", 0) or 0)
+        if packed_sequence_size > 0:
+            # Fail fast at setup (before the multi-GPU load + dataloader build) on
+            # packing configs EAGLE-1/2 cannot honor, rather than mid-run.
+            _validate_packing_gates(
+                cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
+                target_attn_impl=getattr(self.target_model.config, "_attn_implementation", None) or "",
+                micro_batch_size=int(recipe_cfg.micro_batch_size),
+            )
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
             tokenizer=self.tokenizer,
