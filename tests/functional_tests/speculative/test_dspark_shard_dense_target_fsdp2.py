@@ -32,6 +32,7 @@ on two NCCL ranks, with a tiny random Qwen3 target saved to disk (no download):
 Requires 2 GPUs (FlexAttention has no CPU backward); spawns its own NCCL ranks.
 """
 
+import math
 import os
 
 import pytest
@@ -191,7 +192,7 @@ def _rank_worker(rank: int, world_size: int, init_file: str, model_dir: str) -> 
             loss.backward()
             optim.step()
             losses.append(loss.item())
-        assert all(torch.isfinite(torch.tensor(x)) for x in losses), f"non-finite loss: {losses}"
+        assert all(math.isfinite(x) for x in losses), f"non-finite loss: {losses}"
         assert losses[-1] < losses[0], f"loss did not decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"
         dist.barrier()
     finally:

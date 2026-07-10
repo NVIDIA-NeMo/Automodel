@@ -253,11 +253,7 @@ def _distributed_cfg_to_dict(cfg: Any | None) -> dict:
         if isinstance(distributed_cfg, dict):
             return distributed_cfg.copy()
         return cfg.copy()
-    distributed_cfg = getattr(cfg, "distributed", None)
-    if distributed_cfg is None:
-        # A config object without a ``distributed:`` block defaults to the empty
-        # (default FSDP2) configuration, matching the dict path above.
-        return {}
+    distributed_cfg = cfg.distributed
     return distributed_cfg.to_dict() if hasattr(distributed_cfg, "to_dict") else dict(distributed_cfg)
 
 

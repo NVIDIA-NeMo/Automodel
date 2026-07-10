@@ -59,6 +59,7 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
     apply_submodule_checkpointing,
     is_selective_activation_checkpointing,
 )
+from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -101,7 +102,7 @@ from nemo_automodel.components.speculative.dspark.target_utils import (
 )
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS
-from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, parse_distributed_section
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
@@ -335,6 +336,19 @@ def _validate_cached_dspark_manifest(
         )
 
 
+def _distributed_section_dict(cfg) -> dict:
+    """Return the ``distributed:`` section of a top-level recipe config as a plain dict.
+
+    A missing block yields ``{}``, i.e. the default FSDP2 configuration; this keeps the
+    fail-loud missing-block contract of ``create_distributed_setup_from_config`` intact
+    for callers that require an explicit block.
+    """
+    section = cfg.get("distributed", None)
+    if section is None:
+        return {}
+    return section.to_dict() if hasattr(section, "to_dict") else dict(section)
+
+
 class TrainDSparkRecipe(BaseRecipe):
     """Recipe for DSpark draft-model training on Qwen3, Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 VL targets."""
 
@@ -359,37 +373,42 @@ class TrainDSparkRecipe(BaseRecipe):
 
         Raises:
             ValueError: if ``shard_dense_target`` is requested together with a model-parallel
-                axis (``tp_size``/``pp_size``/``cp_size``/``ep_size`` > 1). DSpark's
-                forward-hook hidden-state capture needs one non-pipelined ``model(...)`` call
-                per rank (``pp_size > 1`` builds an ``AutoPipeline`` instead of a module), and
-                the other axes are untested for the frozen dense target here.
+                or replication axis (``tp_size``/``pp_size``/``cp_size``/``ep_size``/
+                ``dp_replicate_size`` > 1). DSpark's forward-hook hidden-state capture needs
+                one non-pipelined ``model(...)`` call per rank (``pp_size > 1`` builds an
+                ``AutoPipeline`` instead of a module), the other model-parallel axes are
+                untested for the frozen dense target here, and HSDP replication re-replicates
+                the target across the replicate dimension, defeating the sharding.
         """
         if not bool(recipe_cfg.get("shard_dense_target", False)):
             return False
-        distributed_cfg = self.cfg.get("distributed", None) or {}
-        # Case-fold to match parse_distributed_section's strategy normalization.
-        strategy = str(distributed_cfg.get("strategy", "fsdp2")).lower()
-        if self.dist_env.world_size <= 1 or strategy != "fsdp2":
+        # Reuse the canonical distributed-section parser (strategy case-folding, YAML-null
+        # axis defaulting) instead of re-reading the raw block, so the gate cannot drift
+        # from what create_distributed_setup_from_config later builds.
+        parsed = parse_distributed_section(_distributed_section_dict(self.cfg))
+        if self.dist_env.world_size <= 1 or not isinstance(parsed["strategy_config"], FSDP2Config):
             if self.dist_env.is_main:
                 logger.warning(
                     "recipe_args.shard_dense_target=true is ignored: it requires "
-                    "distributed.strategy='fsdp2' on more than one rank (got strategy=%r, "
+                    "distributed.strategy='fsdp2' on more than one rank (got strategy=%s, "
                     "world_size=%d); the dense target stays replicated per rank.",
-                    strategy,
+                    type(parsed["strategy_config"]).__name__,
                     self.dist_env.world_size,
                 )
             return False
-        model_parallel_axes = {
-            axis: int(distributed_cfg.get(axis, None) or 1) for axis in ("tp_size", "pp_size", "cp_size", "ep_size")
+        unsupported = {
+            axis: parsed[axis]
+            for axis in ("tp_size", "pp_size", "cp_size", "ep_size", "dp_replicate_size")
+            if (parsed[axis] or 1) != 1
         }
-        unsupported = {axis: size for axis, size in model_parallel_axes.items() if size != 1}
         if unsupported:
             raise ValueError(
                 f"recipe_args.shard_dense_target=true only supports a pure FSDP2 data-parallel "
-                f"topology (tp_size=pp_size=cp_size=ep_size=1), got {unsupported}. DSpark's "
-                f"hidden-state capture needs one non-pipelined model call per rank (pp_size>1 "
-                f"builds an AutoPipeline the target wrapper cannot run), and the remaining "
-                f"model-parallel axes are unsupported for the frozen dense target."
+                f"topology (tp_size=pp_size=cp_size=ep_size=dp_replicate_size=1), got {unsupported}. "
+                f"DSpark's hidden-state capture needs one non-pipelined model call per rank "
+                f"(pp_size>1 builds an AutoPipeline the target wrapper cannot run), the remaining "
+                f"model-parallel axes are unsupported for the frozen dense target, and HSDP "
+                f"replication re-replicates the target, defeating the sharding."
             )
         return True
 
@@ -567,8 +586,10 @@ class TrainDSparkRecipe(BaseRecipe):
                     # path the MoE / VL targets use, instead of replicating the whole target on
                     # every rank. embed_tokens / lm_head come back as sharded DTensors and are
                     # gathered to full tensors before the draft copies them (see below).
+                    # A config without a distributed: block resolves to the default FSDP2 setup
+                    # (the helper's cfg=None path) instead of failing on the missing attribute.
                     self.distributed_setup = create_distributed_setup_from_config(
-                        self.cfg,
+                        self.cfg if self.cfg.get("distributed", None) is not None else None,
                         world_size=self.dist_env.world_size,
                     )
                 self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
@@ -808,7 +829,8 @@ class TrainDSparkRecipe(BaseRecipe):
         # Multi-GPU strategy: FSDP2 (default) shards the draft per block, or DDP.
         self.parallel_strategy = "ddp"
         if self.dist_env.world_size > 1:
-            strategy = dist_cfg.get("strategy", "fsdp2") if dist_cfg is not None else "fsdp2"
+            # Case-fold to match parse_distributed_section's strategy normalization.
+            strategy = str(dist_cfg.get("strategy", "fsdp2")).lower() if dist_cfg is not None else "fsdp2"
             self.parallel_strategy = strategy
             if strategy == "fsdp2":
                 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
