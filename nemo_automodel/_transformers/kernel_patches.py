@@ -47,6 +47,34 @@ logger = logging.getLogger(__name__)
 # CPAwareGatedDeltaNet + fp32 SSMGate in their model __init__.)
 _MODEL_RUNTIME_PATCHES = {}
 
+# SDPA backends that are safe for the eval/validation forward. The cuDNN
+# fused-MHA backend is intentionally excluded: on some cuDNN versions it returns
+# ``mha_graph.execute(...).is_good() == false`` for validation-forward shapes
+# (e.g. Qwen3.5 dense VLM full-attention layers use head_dim=256 with an explicit
+# attention mask), crashing ``F.scaled_dot_product_attention``. This mirrors the
+# cuDNN exclusion that ``resolve_sdpa_method`` already applies for activation
+# checkpointing. See NVBugs 6293238.
+_EVAL_SAFE_SDPA_BACKENDS = [
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
+
+
+def eval_safe_sdpa_kernel():
+    """Return an ``sdpa_kernel`` context excluding the cuDNN fused-MHA backend.
+
+    Use around eval/validation forwards so SDPA never dispatches to the cuDNN
+    backend, which can fail ``is_good()`` on validation-forward shapes. Custom
+    models (e.g. Qwen3.5) do not go through ``_patch_attention`` and so would
+    otherwise let PyTorch auto-select cuDNN for the eval forward. See NVBugs
+    6293238.
+
+    Returns:
+        A context manager constraining SDPA to flash / mem-efficient / math.
+    """
+    return sdpa_kernel(_EVAL_SAFE_SDPA_BACKENDS)
+
 
 def _set_global_sdpa_backends(sdpa_method):
     """Apply resolved SDPA backend constraints process-wide for checkpoint recompute."""
