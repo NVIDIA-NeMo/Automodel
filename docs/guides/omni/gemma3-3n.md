@@ -175,7 +175,6 @@ With the freezing configuration, you can selectively freeze specific parts of th
 
 ```yaml
 freeze_config:
-  freeze_embeddings: true        # Freeze embeddings
   freeze_vision_tower: true      # Freeze vision encoder (recommended for VLMs)
   freeze_audio_tower: true       # Freeze audio encoder (for multimodal models)
   freeze_language_model: false   # Allow language model adaptation
