@@ -207,6 +207,33 @@ def reject_unsupported_tied_word_embeddings(config: object, model_class_name: st
         )
 
 
+def reject_unsupported_untied_word_embeddings(config: object, model_class_name: str) -> None:
+    """Reject ``tie_word_embeddings=False`` for models whose HF default is tied.
+
+    Tied-by-default architectures share ``lm_head`` with the input embedding and
+    ship checkpoints without a separate ``lm_head.weight``. Honoring
+    ``tie_word_embeddings=False`` would require materializing a distinct
+    ``lm_head`` NeMo does not build (and a tied checkpoint has no weights for it),
+    so reject it explicitly instead of running with a randomly-initialized head.
+
+    The mirror of :func:`reject_unsupported_tied_word_embeddings`; both read the
+    controlling flag via :func:`get_controlling_tie_word_embeddings`.
+
+    Args:
+        config: The model's config.
+        model_class_name: ``type(self).__name__`` of the constructing model.
+
+    Raises:
+        NotImplementedError: if the controlling ``tie_word_embeddings`` flag evaluates to ``False``.
+    """
+    if not get_controlling_tie_word_embeddings(config, model_class_name):
+        raise NotImplementedError(
+            f"{model_class_name} ties its input and output embeddings and does not "
+            f"support tie_word_embeddings=False. The Hugging Face default for this "
+            f"architecture is tied; set tie_word_embeddings=True."
+        )
+
+
 def _normalize_param_name(name: str) -> str:
     """Strip wrapper-specific prefixes from a parameter name."""
     return name.replace("_orig_mod.", "")

@@ -27,6 +27,7 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
     CACHE_KEYS,
     CachedDSparkDataset,
     build_cached_dspark_dataloader,
+    compute_batch_cache,
     existing_shard_indices,
     read_manifest,
     read_target_weight_modules,
@@ -37,7 +38,6 @@ from nemo_automodel.components.datasets.llm.dspark_cache import (
 from nemo_automodel.components.datasets.llm.offline_cache import dataloader_from_sample
 from nemo_automodel.components.speculative.precompute_dspark import (
     _build_parser,
-    _compute_batch_cache,
     _ensure_resume_compatible,
     _run,
     _validate_args,
@@ -89,7 +89,7 @@ def _write_tiny_cache(cache_dir: str, num_samples: int = 3, shard_size: int = 2,
 
 def test_compute_batch_cache_downcasts_only_float_tensors():
     tb = _fake_target_batch()
-    cache = _compute_batch_cache(tb, cache_dtype=torch.bfloat16)
+    cache = compute_batch_cache(tb, cache_dtype=torch.bfloat16)
 
     assert set(cache) == set(CACHE_KEYS)
     assert cache["input_ids"].dtype == torch.long
@@ -99,10 +99,27 @@ def test_compute_batch_cache_downcasts_only_float_tensors():
     torch.testing.assert_close(cache["input_ids"], tb.input_ids)
 
 
+def test_cache_dataset_rejects_incomplete_manifest(tmp_path):
+    """An interrupted precompute (complete: false) must not be consumed as a valid cache."""
+    cache_dir = str(tmp_path / "cache")
+    _write_tiny_cache(cache_dir, num_samples=3, shard_size=2, seq_len=4)
+    manifest = read_manifest(cache_dir)
+    manifest.pop("format_version", None)
+    write_manifest(cache_dir, {**manifest, "complete": False})
+
+    with pytest.raises(ValueError, match="incomplete"):
+        CachedDSparkDataset(cache_dir)
+
+    # Flipped to complete (what the producer does after the last shard): accepted.
+    write_manifest(cache_dir, {**manifest, "complete": True})
+    assert len(CachedDSparkDataset(cache_dir)) == 3
+
+
 def test_cache_dataset_round_trip(tmp_path):
     cache_dir = str(tmp_path / "cache")
     samples = _write_tiny_cache(cache_dir, num_samples=3, shard_size=2, seq_len=4)
 
+    # _write_tiny_cache writes a legacy manifest with no `complete` field: accepted.
     dataset = CachedDSparkDataset(cache_dir)
     assert len(dataset) == 3
     item = dataset[2]
