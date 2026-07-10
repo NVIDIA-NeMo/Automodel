@@ -78,6 +78,9 @@ class TrainJetSpecRecipe(TrainDFlashRecipe):
             hidden_states=target_batch.hidden_states,
             loss_mask=target_batch.loss_mask,
             target_logits=target_batch.logits,
+            position_ids=target_batch.position_ids,
+            seq_lens=target_batch.seq_lens,
+            doc_remaining=target_batch.doc_remaining,
         )
         self._last_jetspec_metrics = metrics
         return metrics
