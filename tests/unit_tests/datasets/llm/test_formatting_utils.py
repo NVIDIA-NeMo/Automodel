@@ -118,10 +118,14 @@ def test_mask_labels_to_last_turn_on_binary_mask():
 def test_is_consistent_render_prefix():
     is_prefix = formatting_utils._is_consistent_render_prefix
     assert is_prefix([], [1, 2, 3])  # empty prefix is trivially consistent
+    assert is_prefix([1], [1, 2, 3])  # single-token exact prefix
     assert is_prefix([1, 2], [1, 2, 3])  # exact token prefix
-    assert is_prefix([1, 9], [1, 2, 3])  # divergence only at the final prefix token is tolerated
+    assert not is_prefix([9], [1, 2, 3])  # single-token divergence still moves the boundary
+    assert not is_prefix([1, 9], [1, 2, 3])  # divergence at the final prefix token
     assert not is_prefix([1, 9, 3], [1, 2, 3])  # divergence before the final token
     assert not is_prefix([1, 2, 3, 4], [1, 2, 3])  # prefix render longer than the full render
+    assert is_prefix([1, 9], [1, 2, 3], trailing_token_id=9)  # known standalone terminator
+    assert not is_prefix([9], [1, 2, 3], trailing_token_id=9)  # no content to validate before terminator
 
 
 class _RewritingTokenizer:
@@ -193,7 +197,7 @@ def test_format_chat_template_raises_on_rewriting_template():
         )
 
 
-def test_reasoning_mask_skips_rewritten_turns_and_masks_stable_ones(caplog):
+def test_reasoning_mask_ignores_absent_rewritten_turns_and_masks_stable_ones(caplog):
     # The early assistant turn is re-rendered without reasoning in the full
     # conversation (nothing to mask there); the final turn is stable and its
     # reasoning tokens must still be masked.
@@ -204,7 +208,7 @@ def test_reasoning_mask_skips_rewritten_turns_and_masks_stable_ones(caplog):
     with caplog.at_level("WARNING"):
         mask = formatting_utils._build_reasoning_mask(tok, formatted, full_ids)
 
-    assert "Skipping reasoning_content masking for assistant message 1" in caplog.text
+    assert "Could not isolate reasoning_content tokens for assistant message 1" in caplog.text
     reasoning_positions = [i for i, token in enumerate(full_ids) if token == tok._REASONING_TOKEN]
     assert reasoning_positions  # the final turn's reasoning is rendered
     assert [i for i, value in enumerate(mask) if value] == reasoning_positions
@@ -212,3 +216,88 @@ def test_reasoning_mask_skips_rewritten_turns_and_masks_stable_ones(caplog):
     # Passing the reference render explicitly must not change the result.
     explicit = formatting_utils._build_reasoning_mask(tok, formatted, full_ids, unpadded_full_ids=list(full_ids))
     assert explicit == mask
+
+
+class _HeaderRewritingTokenizer(_RewritingTokenizer):
+    """Rewrites a header based on message count while preserving all reasoning."""
+
+    truncation_side = "right"
+
+    def apply_chat_template(self, messages, **kwargs):
+        ids = [len(messages)]
+        for msg in messages:
+            ids.append(self._ROLE_TOKEN)
+            if msg["role"] == "assistant" and msg.get("reasoning_content"):
+                ids.extend([self._REASONING_TOKEN] * len(msg["reasoning_content"].split()))
+            ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
+        if kwargs.get("truncation") is True and kwargs.get("max_length") is not None:
+            if self.truncation_side == "left":
+                ids = ids[-kwargs["max_length"] :]
+            else:
+                ids = ids[: kwargs["max_length"]]
+        return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+
+def test_reasoning_mask_uses_full_render_when_prefix_header_is_rewritten():
+    tok = _HeaderRewritingTokenizer()
+    formatted = _rewriting_conversation()
+    full_ids = tok.apply_chat_template(formatted)["input_ids"]
+
+    mask = formatting_utils._build_reasoning_mask(tok, formatted, full_ids)
+
+    reasoning_positions = [i for i, token in enumerate(full_ids) if token == tok._REASONING_TOKEN]
+    assert reasoning_positions
+    assert [i for i, value in enumerate(mask) if value] == reasoning_positions
+
+
+def test_reasoning_mask_maps_untruncated_span_into_right_truncated_render():
+    tok = _HeaderRewritingTokenizer()
+    formatted = _rewriting_conversation()
+    full_ids = tok.apply_chat_template(formatted, truncation=True, max_length=8)["input_ids"]
+
+    mask = formatting_utils._build_reasoning_mask(
+        tok,
+        formatted,
+        full_ids,
+        truncation=True,
+        seq_length=8,
+        unpadded_full_ids=full_ids,
+    )
+
+    reasoning_positions = [i for i, token in enumerate(full_ids) if token == tok._REASONING_TOKEN]
+    assert reasoning_positions
+    assert [i for i, value in enumerate(mask) if value] == reasoning_positions
+
+
+def test_reasoning_mask_maps_untruncated_span_into_left_truncated_render():
+    tok = _HeaderRewritingTokenizer()
+    tok.truncation_side = "left"
+    formatted = _rewriting_conversation()
+    full_ids = tok.apply_chat_template(formatted, truncation=True, max_length=8)["input_ids"]
+
+    mask = formatting_utils._build_reasoning_mask(
+        tok,
+        formatted,
+        full_ids,
+        truncation=True,
+        seq_length=8,
+        unpadded_full_ids=full_ids,
+    )
+
+    reasoning_positions = [i for i, token in enumerate(full_ids) if token == tok._REASONING_TOKEN]
+    assert reasoning_positions
+    assert [i for i, value in enumerate(mask) if value] == reasoning_positions
+
+
+def test_reasoning_mask_rejects_noncontiguous_truncation_window():
+    tok = _HeaderRewritingTokenizer()
+
+    with pytest.raises(ValueError, match="not a contiguous prefix or suffix"):
+        formatting_utils._build_reasoning_mask(
+            tok,
+            _rewriting_conversation(),
+            [12345],
+            truncation=True,
+            seq_length=1,
+            unpadded_full_ids=[12345],
+        )
