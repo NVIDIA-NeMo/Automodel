@@ -20,7 +20,7 @@ recipe body only ever sees typed component configs and calls
 ``self.cfg.<section>.build(...)`` directly.
 
 Known sections are exposed as cached, typed attributes that own a ``build()``:
-``wandb``/``mlflow``/``tokenizer``/``step_scheduler``/``lr_scheduler`` map to
+``model``/``dataloader``/``tokenizer``/``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler`` map to
 component config dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
@@ -28,9 +28,8 @@ component config dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve t
 while the ``checkpoint`` block is coerced directly into a component
 :class:`~nemo_automodel.components.checkpoint.config.CheckpointingConfig` (the
 model-derived ``model_repo_id`` / ``model_cache_dir`` / ``is_peft`` are filled
-in here from the surrounding YAML).  Sections with no typed view (e.g.
-``model``, ``comet``) fall through to the raw ``ConfigNode`` via
-``__getattr__``.
+in here from the surrounding YAML). Sections with no typed view (for example
+``comet``) fall through to the raw ``ConfigNode`` via ``__getattr__``.
 
 This is the recipe layer, so it is allowed to know the YAML schema (which keys
 are runtime args, ``_target_`` resolution, etc.); the components themselves stay
@@ -39,27 +38,38 @@ YAML-free.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from nemo_automodel.components.loggers.loggers import CometConfig, MLflowConfig, WandbConfig
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
 if TYPE_CHECKING:
+    import torch.nn as nn
+
     from nemo_automodel._transformers.tokenizer_config import TokenizerConfig
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderConfig
-    from nemo_automodel.components.datasets.loader import DataloaderConfig
+    from nemo_automodel.components.datasets.loader import (
+        BatchSamplerConfig,
+    )
+    from nemo_automodel.components.datasets.loader import (
+        DataloaderConfig as ComponentDataloaderConfig,
+    )
     from nemo_automodel.components.datasets.multimodal.loader import BagelDataloaderConfig
-    from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig, VlmProcessorConfig
+    from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig
+    from nemo_automodel.components.distributed.pipelining import AutoPipeline
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
     from nemo_automodel.recipes.llm.config import LlmInputConfig
+    from nemo_automodel.recipes.model_config import ModelConfig
+    from nemo_automodel.recipes.vlm.config import VlmInputConfig
 
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
 # to ``StepSchedulerConfig.build(...)`` separately (not config fields).
@@ -114,6 +124,26 @@ def _target_kwargs(node: Any) -> tuple[Any, dict[str, Any]]:
     return _callable_and_kwargs(node)
 
 
+def _resolve_model_value(value: object) -> object:
+    """Resolve model-section mappings into typed nested target configs."""
+    from nemo_automodel.recipes.model_config import ModelTargetConfig
+
+    if hasattr(value, "to_dict") or isinstance(value, Mapping):
+        kwargs = _as_dict(value)
+        target = kwargs.pop("_target_", None)
+        resolved = {name: _resolve_model_value(item) for name, item in kwargs.items()}
+        if target is None:
+            return resolved
+        if not callable(target):
+            raise TypeError(f"Model _target_ must resolve to a callable, got {target!r}")
+        return ModelTargetConfig(factory=target, kwargs=resolved)
+    if isinstance(value, list):
+        return [_resolve_model_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_resolve_model_value(item) for item in value)
+    return value
+
+
 def _model_name_from_cfg(cfg_model: Any) -> str | None:
     if cfg_model is None:
         return None
@@ -148,12 +178,31 @@ def _trust_remote_code_from_model(cfg_model: Any) -> bool:
     return resolve_trust_remote_code(_model_name_from_cfg(cfg_model))
 
 
+def _is_multimodal_model_target(target: object) -> bool:
+    """Return whether a model target has a multimodal preprocessing contract."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText, NeMoAutoModelForMultimodalLM
+
+    if target in {
+        NeMoAutoModelForImageTextToText.from_config,
+        NeMoAutoModelForImageTextToText.from_pretrained,
+        NeMoAutoModelForMultimodalLM.from_config,
+        NeMoAutoModelForMultimodalLM.from_pretrained,
+    }:
+        return True
+    try:
+        from nemo_automodel.components.models.gemma4_drafter.composite import Gemma4WithDrafter
+    except ImportError:
+        return False
+    return target == Gemma4WithDrafter.from_pretrained
+
+
 class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
-    ``wandb``, ``mlflow``, ``tokenizer``, ``step_scheduler``, ``lr_scheduler``,
-    ``optimizer``, ``loss_fn`` and ``checkpoint`` are exposed as typed objects that own a
-    ``.build(...)`` (``optimizer`` is an
+    ``model``, ``dataloader``, ``tokenizer``, ``wandb``, ``mlflow``,
+    ``step_scheduler``, ``lr_scheduler``, ``optimizer``, ``loss_fn`` and
+    ``checkpoint`` are exposed as typed objects that own a ``.build(...)``
+    (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
     ``checkpoint`` a
     :class:`~nemo_automodel.components.checkpoint.config.CheckpointingConfig`);
@@ -201,15 +250,34 @@ class RecipeConfig:
         factory, kwargs = _callable_and_kwargs(node)
         return build_optimizer_config(factory, kwargs)
 
+    def _uses_multimodal_inputs(self) -> bool:
+        """Return whether the configured model consumes a multimodal processor."""
+        from transformers import AutoProcessor
+
+        model_node = self._raw.get("model", None)
+        model_target = _as_dict(model_node).get("_target_", None) if model_node is not None else None
+        if _is_multimodal_model_target(model_target):
+            return True
+        if "processor" in self._raw.to_dict():
+            return True
+        tokenizer_node = self._raw.get("tokenizer", None)
+        if tokenizer_node is None:
+            return False
+        return _as_dict(tokenizer_node).get("_target_", None) == AutoProcessor.from_pretrained
+
     @cached_property
     def tokenizer(self) -> "TokenizerConfig":
         """Resolve the recipe's tokenizer or processor factory configuration."""
+        from transformers import AutoProcessor
+
         from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
         from nemo_automodel._transformers.tokenizer_config import TokenizerConfig
 
         dataset_node = self._raw.get("dataset", None)
         dataset_has_tokenizer = dataset_node is not None and "tokenizer" in _as_dict(dataset_node)
         raw_has_tokenizer = "tokenizer" in self._raw.to_dict()
+        raw_has_processor = "processor" in self._raw.to_dict()
+        uses_processor = self._uses_multimodal_inputs()
 
         if dataset_has_tokenizer:
             node = dataset_node.get("tokenizer", None)
@@ -217,12 +285,20 @@ class RecipeConfig:
         elif raw_has_tokenizer:
             node = self._raw.get("tokenizer", None)
             inject_model_trust = False
+        elif raw_has_processor:
+            warnings.warn(
+                "The top-level processor section is deprecated; rename it to tokenizer",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            node = self._raw.get("processor", None)
+            inject_model_trust = False
         else:
             model_name = _model_name_from_cfg(self._raw.get("model", None))
             if model_name is None:
                 return TokenizerConfig()
             return TokenizerConfig(
-                factory=NeMoAutoTokenizer.from_pretrained,
+                factory=AutoProcessor.from_pretrained if uses_processor else NeMoAutoTokenizer.from_pretrained,
                 kwargs={
                     "pretrained_model_name_or_path": model_name,
                     "trust_remote_code": _trust_remote_code_from_model(self._raw.get("model", None)),
@@ -234,19 +310,16 @@ class RecipeConfig:
 
         kwargs = _as_dict(node)
         target = kwargs.pop("_target_", None)
-        factory = NeMoAutoTokenizer.from_pretrained if target is None else target
+        factory = (AutoProcessor if uses_processor else NeMoAutoTokenizer).from_pretrained if target is None else target
         if not callable(factory):
             raise TypeError(f"Tokenizer _target_ must resolve to a callable, got {factory!r}")
         if inject_model_trust:
             kwargs.setdefault("trust_remote_code", _trust_remote_code_from_model(self._raw.get("model", None)))
+        if uses_processor:
+            model_name = _model_name_from_cfg(self._raw.get("model", None))
+            if model_name is not None:
+                kwargs.setdefault("pretrained_model_name_or_path", model_name)
         return TokenizerConfig(factory=factory, kwargs=kwargs)
-
-    @cached_property
-    def dataloader(self) -> "DataloaderConfig" | None:
-        node = self._raw.get("dataset", None)
-        if node is None:
-            return None
-        return self._resolve_dataloader(node, self._raw.get("dataloader", None))
 
     def _packing_config(self):
         """Resolve the recipe's optional sequence-packing strategy config."""
@@ -257,8 +330,8 @@ class RecipeConfig:
             return make_packing_config(ps.pop("packing_strategy", "thd"), ps)
         return None
 
-    def _resolve_dataloader(self, dataset_node: Any, dataloader_node: Any) -> "DataloaderConfig":
-        """Resolve YAML dataset/loader blocks into one typed dataloader config."""
+    def _resolve_text_dataloader(self, dataset_node: Any, dataloader_node: Any) -> "ComponentDataloaderConfig":
+        """Resolve text dataset/loader blocks into one typed dataloader config."""
         from torch.utils.data import DataLoader
         from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -329,7 +402,7 @@ class RecipeConfig:
         return DataloaderConfig(
             dataset_config=dataset_config,
             packing=self._packing_config(),
-            batch_sampler_config=batch_sampler_config,
+            batch_sampler_config=cast("BatchSamplerConfig | None", batch_sampler_config),
             dataset_build_schedule=schedule if isinstance(dataset_config, ScheduledDatasetConfig) else None,
             shuffle=loader_kwargs.pop("shuffle", None),
             group_by_length=loader_kwargs.pop("group_by_length", False),
@@ -344,9 +417,8 @@ class RecipeConfig:
             drop_last=loader_kwargs.pop("drop_last", False),
         )
 
-    @cached_property
-    def validation_dataloaders(self) -> dict[str, "DataloaderConfig"]:
-        """One :class:`DataloaderConfig` per ``validation_dataset*`` block (mirrors :meth:`dataloader`)."""
+    def _resolve_text_validation_dataloaders(self) -> dict[str, "ComponentDataloaderConfig"]:
+        """Resolve one text dataloader config per ``validation_dataset*`` block."""
 
         def _name(key: str) -> str:
             key = key.replace("validation_dataset", "")
@@ -355,51 +427,181 @@ class RecipeConfig:
             return key or "default"
 
         val_dl_node = self._raw.get("validation_dataloader", None)
-        out: dict[str, "DataloaderConfig"] = {}
+        out: dict[str, "ComponentDataloaderConfig"] = {}
         for key in filter(lambda k: k.startswith("validation_dataset"), self._raw.to_dict().keys()):
             node = self._raw.get(key, None)
             if node is None:
                 continue
-            out[_name(key)] = self._resolve_dataloader(node, val_dl_node)
+            out[_name(key)] = self._resolve_text_dataloader(node, val_dl_node)
         return out
 
     @cached_property
-    def llm_inputs(self) -> "LlmInputConfig":
-        """Resolve the complete typed LLM input-pipeline configuration."""
+    def dataloader(self) -> "LlmInputConfig | VlmInputConfig | None":
+        """Resolve the recipe's complete train and validation input pipeline."""
         from nemo_automodel.components.models.common.packing import get_attn_implementation
         from nemo_automodel.recipes.llm.config import LlmInputConfig
 
-        train = self.dataloader
-        if train is None:
-            raise ValueError("An LLM recipe requires a dataset configuration")
+        dataset_node = self._raw.get("dataset", None)
+        if dataset_node is None:
+            return None
+        if self._uses_multimodal_inputs():
+            from nemo_automodel.recipes.vlm.config import VlmInputConfig
+
+            validation_node = self._raw.get("validation_dataset", None)
+            validation = (
+                {
+                    "default": self._resolve_vlm_dataloader(
+                        validation_node,
+                        self._raw.get("validation_dataloader", None),
+                    )
+                }
+                if validation_node is not None
+                else {}
+            )
+            return VlmInputConfig(
+                train=self._resolve_vlm_dataloader(
+                    dataset_node,
+                    self._raw.get("dataloader", None),
+                    packed_sequence_node=self._raw.get("packed_sequence", None),
+                ),
+                validation=validation,
+                batch_size=self._raw.get("step_scheduler.local_batch_size", 1),
+                seed=self._raw.get("seed", 42),
+                attn_implementation=get_attn_implementation(self._raw.get("model", None)),
+            )
         return LlmInputConfig(
-            train=train,
-            validation=self.validation_dataloaders,
+            train=self._resolve_text_dataloader(dataset_node, self._raw.get("dataloader", None)),
+            validation=self._resolve_text_validation_dataloaders(),
             attn_implementation=get_attn_implementation(self._raw.get("model", None)),
         )
 
-    @staticmethod
-    def _resolve_vlm_processor(node: Any) -> "VlmProcessorConfig":
-        """Resolve an optional processor section into its typed component config."""
-        from nemo_automodel.components.datasets.vlm.loader import VlmProcessorConfig
+    def _resolve_model(self, model_key: str, *, include_recipe_features: bool) -> "ModelConfig | None":
+        """Resolve a model section and its recipe-level construction settings."""
+        from nemo_automodel._transformers import (
+            NeMoAutoModelBiEncoder,
+            NeMoAutoModelCrossEncoder,
+            NeMoAutoModelForCausalLM,
+            NeMoAutoModelForImageTextToText,
+            NeMoAutoModelForMultimodalLM,
+            NeMoAutoModelForSequenceClassification,
+        )
+        from nemo_automodel.components.quantization.fp8 import FP8Config
+        from nemo_automodel.components.quantization.qlora import BitsAndBytesQuantizationConfig
+        from nemo_automodel.components.utils.compile_utils import CompileConfig
+        from nemo_automodel.recipes.model_config import ModelConfig, ModelTargetConfig
 
+        node = self._raw.get(model_key, None)
         if node is None:
-            return VlmProcessorConfig()
-        kwargs = _as_dict(node)
-        target = kwargs.pop("_target_", None)
-        if target is None:
-            return VlmProcessorConfig(kwargs=kwargs)
-        if not callable(target):
-            raise TypeError(f"VLM processor _target_ must resolve to a callable, got {target!r}")
-        return VlmProcessorConfig(factory=target, kwargs=kwargs)
+            return None
+        target = _resolve_model_value(node)
+        if not isinstance(target, ModelTargetConfig):
+            raise TypeError(f"{model_key} must define a callable _target_")
 
-    @classmethod
-    def resolve_vlm_dataloader(
-        cls,
+        sequence_classification_targets = {
+            NeMoAutoModelForSequenceClassification.from_config,
+            NeMoAutoModelForSequenceClassification.from_pretrained,
+        }
+        is_sequence_classification = target.factory in sequence_classification_targets
+
+        fp8_config = None
+        compile_config = None
+        quantization_config = None
+        qat_enabled = False
+        qat_config = None
+        sdpa_method = None
+        if include_recipe_features:
+            compile_node = self._raw.get("compile", None)
+            if compile_node is not None:
+                compile_config = CompileConfig(**_section_kwargs(compile_node))
+
+            quantization_node = self._raw.get("quantization", None)
+            if quantization_node is not None:
+                quantization_config = BitsAndBytesQuantizationConfig(**_section_kwargs(quantization_node))
+
+            if not is_sequence_classification:
+                fp8_node = self._raw.get("fp8", None)
+                if fp8_node is not None:
+                    fp8_config = FP8Config(**_section_kwargs(fp8_node))
+
+                qat_node = self._raw.get("qat", None)
+                if qat_node is not None:
+                    qat_enabled = bool(qat_node.get("enabled", False))
+                    if qat_enabled:
+                        qat_target_node = qat_node.get("qat_config", qat_node.get("quantizer", None))
+                        if qat_target_node is not None:
+                            qat_config = _resolve_model_value(qat_target_node)
+                            if not isinstance(qat_config, ModelTargetConfig):
+                                raise TypeError("qat.qat_config must define a callable _target_")
+
+                configured_sdpa = self._raw.get("sdpa_method", None)
+                if configured_sdpa is not None:
+                    sdpa_method = tuple(configured_sdpa)
+
+        infrastructure_targets = {
+            NeMoAutoModelForCausalLM.from_config,
+            NeMoAutoModelForCausalLM.from_pretrained,
+            NeMoAutoModelForImageTextToText.from_config,
+            NeMoAutoModelForImageTextToText.from_pretrained,
+            NeMoAutoModelForMultimodalLM.from_config,
+            NeMoAutoModelForMultimodalLM.from_pretrained,
+            NeMoAutoModelBiEncoder.from_pretrained,
+            NeMoAutoModelCrossEncoder.from_pretrained,
+            *sequence_classification_targets,
+        }
+        packed = _as_dict(self._raw.get("packed_sequence", None))
+        has_packed_sequence = None
+        packing_aware_target = target.factory in {
+            NeMoAutoModelForCausalLM.from_config,
+            NeMoAutoModelForCausalLM.from_pretrained,
+            NeMoAutoModelForImageTextToText.from_config,
+            NeMoAutoModelForImageTextToText.from_pretrained,
+            NeMoAutoModelForMultimodalLM.from_config,
+            NeMoAutoModelForMultimodalLM.from_pretrained,
+        } or _is_multimodal_model_target(target.factory)
+        if packing_aware_target and not is_sequence_classification:
+            has_packed_sequence = bool(
+                packed.get("packed_sequence_size", 0) > 0
+                or packed.get("pack_size", 0) > 0
+                or packed.get("enabled", False)
+            )
+        freeze_key = "freeze_config" if model_key == "model" else "teacher_freeze_config"
+        freeze_node = self._raw.get(freeze_key, None)
+        return ModelConfig(
+            model_factory=cast("Callable[..., nn.Module | AutoPipeline]", target.factory),
+            model_kwargs=target.kwargs,
+            factory_applies_infrastructure=(
+                target.factory in infrastructure_targets or _is_multimodal_model_target(target.factory)
+            ),
+            model_name=_model_name_from_cfg(node),
+            seed=self._raw.get("seed", 42),
+            has_packed_sequence=has_packed_sequence,
+            freeze_config=_as_dict(freeze_node) if freeze_node is not None else None,
+            fp8_config=fp8_config,
+            compile_config=compile_config,
+            quantization_config=quantization_config,
+            qat_enabled=qat_enabled,
+            qat_config=qat_config,
+            sdpa_method=sdpa_method,
+        )
+
+    @cached_property
+    def model(self) -> "ModelConfig":
+        """Resolve the recipe model and its construction settings."""
+        config = self._resolve_model("model", include_recipe_features=True)
+        if config is None:
+            raise ValueError("A recipe model configuration is required")
+        return config
+
+    @cached_property
+    def teacher_model(self) -> "ModelConfig | None":
+        """Resolve the optional KD teacher model without student-only features."""
+        return self._resolve_model("teacher_model", include_recipe_features=False)
+
+    def _resolve_vlm_dataloader(
+        self,
         dataset_node: Any,
         dataloader_node: Any,
         *,
-        processor_node: Any = None,
         packed_sequence_node: Any = None,
     ) -> "VlmDataloaderConfig":
         """Resolve VLM YAML sections into one typed input-pipeline config.
@@ -407,7 +609,6 @@ class RecipeConfig:
         Args:
             dataset_node: Dataset config node containing its ``_target_`` and declarative fields.
             dataloader_node: StatefulDataLoader config node.
-            processor_node: Optional processor factory or AutoProcessor keyword config.
             packed_sequence_node: Optional top-level VLM neat-packing config.
 
         Returns:
@@ -508,7 +709,6 @@ class RecipeConfig:
 
         return VlmDataloaderConfig(
             dataset_config=dataset_config,
-            processor_config=cls._resolve_vlm_processor(processor_node),
             pretokenization=pretokenization,
             packing=packing,
             collator=collator,
@@ -519,31 +719,6 @@ class RecipeConfig:
             persistent_workers=loader_kwargs.pop("persistent_workers", False),
             prefetch_factor=loader_kwargs.pop("prefetch_factor", None),
             drop_last=loader_kwargs.pop("drop_last", False),
-        )
-
-    @cached_property
-    def vlm_dataloader(self) -> "VlmDataloaderConfig" | None:
-        """Typed VLM training input-pipeline config."""
-        dataset_node = self._raw.get("dataset", None)
-        if dataset_node is None:
-            return None
-        return self.resolve_vlm_dataloader(
-            dataset_node,
-            self._raw.get("dataloader", None),
-            processor_node=self._raw.get("processor", None),
-            packed_sequence_node=self._raw.get("packed_sequence", None),
-        )
-
-    @cached_property
-    def vlm_validation_dataloader(self) -> "VlmDataloaderConfig" | None:
-        """Typed VLM validation input-pipeline config."""
-        dataset_node = self._raw.get("validation_dataset", None)
-        if dataset_node is None:
-            return None
-        return self.resolve_vlm_dataloader(
-            dataset_node,
-            self._raw.get("validation_dataloader", None),
-            processor_node=self._raw.get("processor", None),
         )
 
     @staticmethod
@@ -566,7 +741,7 @@ class RecipeConfig:
         target, kwargs = _callable_and_kwargs(node)
         module = getattr(target, "__module__", None)
         name = getattr(target, "__qualname__", getattr(target, "__name__", None))
-        target_path = f"{module}.{name}" if module and name else target
+        target_path = f"{module}.{name}" if module and name else None
         config_types = {
             "nemo_automodel.components.datasets.diffusion.collate_fns.build_text_to_image_multiresolution_dataloader": (
                 TextToImageDataloaderConfig
@@ -581,9 +756,11 @@ class RecipeConfig:
                 MockWanDataloaderConfig
             ),
         }
-        config_type = config_types.get(target_path, target)
+        config_type = config_types.get(target_path) if target_path is not None else None
+        if config_type is None:
+            config_type = target
         if not is_dataclass(config_type) or not hasattr(config_type, "build"):
-            raise ValueError(f"Unsupported diffusion dataloader _target_ {target_path!r}")
+            raise ValueError(f"Unsupported diffusion dataloader _target_ {target_path or target!r}")
         valid = {field.name for field in fields(config_type)}
         unknown = sorted(set(kwargs) - valid)
         if unknown:

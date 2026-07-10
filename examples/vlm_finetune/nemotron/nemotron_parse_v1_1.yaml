@@ -43,7 +43,7 @@ model:
   attn_implementation: eager
   trust_remote_code: True
 
-processor:
+tokenizer:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-Parse-v1.1
   trust_remote_code: True

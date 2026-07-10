@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 import pathlib
 import time
-from contextlib import nullcontext
 
 import torch
 import wandb
@@ -26,21 +25,16 @@ from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
+from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import (
-    _get_model_name,
-    build_model,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -77,14 +71,11 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=self.cfg.model.model_name)
             logging.info("🚀 View run at {}".format(run.url))
 
         self._log_experiment_details()
         self._log_library_versions()
-
-        # For classification, use standard attention implementation
-        use_hf_fa2 = False
 
         # loss function: standard CE on logits
         self.loss_fn = torch.nn.CrossEntropyLoss()
@@ -106,13 +97,8 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         self.peft_config = self.cfg.instantiate_path("peft")
         # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
-        model = build_model(
-            cfg_model=self.cfg.model,
-            cfg_peft=self.peft_config,
-            seed=self.cfg.get("seed", 42),
-            has_packed_sequence=use_hf_fa2,
-            cfg_compile=self.cfg.get("compile", None),
-            cfg_quantization=self.cfg.get("quantization", None),
+        model = self.cfg.model.build(
+            peft_config=self.peft_config,
             distributed_setup=self.distributed_setup,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
@@ -127,24 +113,19 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         self.tokenizer = self.cfg.tokenizer.build()
 
-        def materialize_loader(config):
-            build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
-            with ScopedRNG(seed=config.seed, ranked=True):
-                return config.build(
-                    tokenizer=self.tokenizer,
-                    dataset_build_context=build_context,
-                    dp_rank=self._get_dp_rank(),
-                    dp_world_size=self._get_dp_group_size(),
-                    pp_enabled=False,
-                    cp_size=self.cfg.get("distributed.cp_size", 1),
-                )
-
-        self.dataloader = materialize_loader(self.cfg.dataloader)
-
-        self.val_dataloader = None
-        val_configs = self.cfg.validation_dataloaders
-        if val_configs:
-            self.val_dataloader = materialize_loader(next(iter(val_configs.values())))
+        dataloader_config = self.cfg.dataloader
+        if dataloader_config is None:
+            raise ValueError("Sequence classification requires a dataset configuration")
+        input_pipeline = dataloader_config.build(
+            model=model,
+            tokenizer=self.tokenizer,
+            dp_rank=self._get_dp_rank(),
+            dp_world_size=self._get_dp_group_size(),
+            pp_enabled=False,
+            cp_size=self.cfg.get("distributed.cp_size", 1),
+        )
+        self.dataloader = input_pipeline.train
+        self.val_dataloader = next(iter(input_pipeline.validation.values()), None)
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         self.step_scheduler = self.cfg.step_scheduler.build(

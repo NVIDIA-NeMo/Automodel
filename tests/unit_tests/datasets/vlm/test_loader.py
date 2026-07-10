@@ -18,7 +18,6 @@ from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.vlm.loader import (
     VlmCollatorConfig,
     VlmDataloaderConfig,
-    VlmProcessorConfig,
 )
 from nemo_automodel.components.datasets.vlm.mock import MockVlmDatasetConfig
 from nemo_automodel.recipes._typed_config import RecipeConfig
@@ -53,6 +52,10 @@ def test_recipe_config_separates_vlm_dataset_wrapper_and_packing_fields():
     config = RecipeConfig(
         ConfigNode(
             {
+                "model": {
+                    "_target_": "nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained",
+                    "pretrained_model_name_or_path": "org/model",
+                },
                 "dataset": {
                     "_target_": "nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset",
                     "num_samples": 4,
@@ -73,7 +76,7 @@ def test_recipe_config_separates_vlm_dataset_wrapper_and_packing_fields():
                 },
             }
         )
-    ).vlm_dataloader
+    ).dataloader.train
 
     assert config is not None
     assert isinstance(config.dataset_config, MockVlmDatasetConfig)
@@ -85,35 +88,29 @@ def test_recipe_config_separates_vlm_dataset_wrapper_and_packing_fields():
     assert config.packing.collate_max_length == 128
 
 
-def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterates():
+def test_vlm_dataloader_uses_runtime_tokenizer_and_builds_dataset_inside_context():
     events = []
     processor = DummyProcessor()
-
-    def build_processor():
-        events.append("processor")
-        return processor
 
     def collate(examples, *, processor, prefix):
         return [prefix + example for example in examples], processor
 
     config = VlmDataloaderConfig(
         dataset_config=StaticDatasetConfig(events),
-        processor_config=VlmProcessorConfig(factory=build_processor),
         collator=VlmCollatorConfig(factory=collate, kwargs={"prefix": "item:"}),
         shuffle=False,
         num_workers=0,
     )
 
-    result = config.build(
-        pretrained_model_name_or_path="unused",
+    dataloader = config.build(
+        tokenizer=processor,
         dp_rank=0,
         dp_world_size=1,
         batch_size=2,
         dataset_build_context=BuildContext(events),
     )
-    batch, batch_processor = next(iter(result.dataloader))
+    batch, batch_processor = next(iter(dataloader))
 
-    assert events == ["enter", "processor", "dataset", "exit"]
-    assert result.processor is processor
+    assert events == ["enter", "dataset", "exit"]
     assert batch == ["item:one", "item:two"]
     assert batch_processor is processor

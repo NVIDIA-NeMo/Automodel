@@ -69,7 +69,7 @@ model:
   use_sdpa_patching: false
   attn_implementation: eager
 
-processor:
+tokenizer:
   padding_side: right
 
 checkpoint:

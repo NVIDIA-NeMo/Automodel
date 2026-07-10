@@ -45,7 +45,7 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import nullcontext
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import torch
 import wandb
@@ -55,6 +55,7 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
@@ -73,8 +74,8 @@ from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _get_num_thd_chunks,
-    build_model,
 )
+from nemo_automodel.recipes.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -87,21 +88,17 @@ def _build_kd_loss_fn(cfg_kd):
 
 
 def _build_teacher_model(
-    cfg_teacher,
-    seed,
-    has_packed_sequence,
+    model_config: ModelConfig | None,
     distributed_setup: DistributedSetup | None = None,
-    device=None,
-):
+    device: torch.device | str | None = None,
+) -> torch.nn.Module:
     """Build and initialize the teacher model for knowledge distillation.
 
     Uses the same infrastructure as student model (NeMoAutoModelForCausalLM) but without
     PEFT, FP8, or QAT since the teacher should be frozen in full precision.
 
     Args:
-        cfg_teacher: Configuration for teacher model instantiation.
-        seed: Random seed for reproducibility.
-        has_packed_sequence: Whether using packed sequences.
+        model_config: Typed teacher-model construction config.
         distributed_setup: Resolved distributed topology and policy object.
         device: Device to place the teacher model on.
 
@@ -112,41 +109,29 @@ def _build_teacher_model(
         The `offload_teacher_model` config option is not supported with this approach.
         Device placement is handled internally by NeMoAutoModelForCausalLM infrastructure.
     """
-    assert cfg_teacher is not None, "`teacher_model` section missing from YAML config"
+    if model_config is None:
+        raise ValueError("`teacher_model` section missing from YAML config")
     logger.info("Instantiating teacher model")
 
-    # Build teacher model using the same infrastructure as student
-    # but without PEFT/FP8/QAT (teacher should be frozen in full precision)
-    with ScopedRNG(seed=seed, ranked=True):
-        kwargs: Dict[str, Any] = {
-            "has_packed_sequence": has_packed_sequence,
-            "distributed_setup": distributed_setup,
-        }
-
-        teacher_model = cfg_teacher.instantiate(**kwargs)
-
-        # Ensure the teacher model is on the correct device
-        teacher_model = teacher_model.to(device)
-
-        # Set teacher to eval mode and freeze parameters
-        teacher_model.eval()
-        for p in teacher_model.parameters():
-            p.requires_grad_(False)
-
-        return teacher_model
+    teacher_model = model_config.build(distributed_setup=distributed_setup)
+    if isinstance(teacher_model, AutoPipeline):
+        raise TypeError("Non-PP KD teacher construction returned an AutoPipeline")
+    teacher_model = teacher_model.to(device)
+    teacher_model.eval()
+    for parameter in teacher_model.parameters():
+        parameter.requires_grad_(False)
+    return teacher_model
 
 
 def _build_teacher_model_with_pp(
-    cfg_teacher,
-    seed: int,
-    has_packed_sequence: bool,
+    model_config: ModelConfig | None,
     pipeline_config: PipelineConfig,
     distributed_setup: DistributedSetup,
     activation_checkpointing: bool,
-) -> Any:
+) -> torch.nn.Module | AutoPipeline:
     """Build teacher model with same parallelization as student (TP/EP/SP/PP).
 
-    Teacher is built via build_model with pipeline_config so it becomes an AutoPipeline
+    Teacher is built through its typed model config with the student pipeline policy
     when PP is enabled. No PEFT/FP8/QAT. Teacher is frozen and set to eval mode.
 
     Logit capture: a closure stores logits on the last PP stage each time the pipeline
@@ -154,9 +139,7 @@ def _build_teacher_model_with_pp(
     are retained; set pp_microbatch_size == pp_batch_size to avoid stale KD targets.
 
     Args:
-        cfg_teacher: Configuration for teacher model instantiation.
-        seed: Random seed for reproducibility.
-        has_packed_sequence: Whether using packed sequences.
+        model_config: Typed teacher-model construction config.
         pipeline_config: PipelineConfig from the student, used as a template.
         distributed_setup: Student distributed setup, used as a template.
         activation_checkpointing: Whether to enable activation checkpointing.
@@ -164,7 +147,8 @@ def _build_teacher_model_with_pp(
     Returns:
         The frozen teacher AutoPipeline with a ``_teacher_logits_capture`` attribute.
     """
-    assert cfg_teacher is not None, "`teacher_model` section missing from YAML config"
+    if model_config is None:
+        raise ValueError("`teacher_model` section missing from YAML config")
     logger.info("Instantiating teacher model (parallelized with TP/EP/SP/PP)")
 
     # Mutable list so the closure can overwrite it. Overwritten once per microbatch;
@@ -199,18 +183,7 @@ def _build_teacher_model_with_pp(
         activation_checkpointing=activation_checkpointing,
     )
 
-    with ScopedRNG(seed=seed, ranked=True):
-        teacher_model = build_model(
-            cfg_teacher,
-            cfg_peft=None,
-            has_packed_sequence=has_packed_sequence,
-            seed=seed,
-            cfg_fp8=None,
-            cfg_compile=None,
-            cfg_quantization=None,
-            distributed_setup=teacher_distributed_setup,
-            cfg_qat=None,
-        )
+    teacher_model = model_config.build(distributed_setup=teacher_distributed_setup)
 
     # Freeze all teacher parameters.
     for part in getattr(teacher_model, "parts", [teacher_model]):
@@ -264,9 +237,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     "(e.g. MaskedCrossEntropy). FusedLinearCrossEntropy is not supported for PP KD."
                 )
             self.teacher_model = _build_teacher_model_with_pp(
-                cfg_teacher=self.cfg.get("teacher_model", None),
-                seed=self.cfg.get("seed", 42),
-                has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+                model_config=self.cfg.teacher_model,
                 pipeline_config=self.pipeline_config,
                 distributed_setup=self.distributed_setup,
                 activation_checkpointing=self.activation_checkpointing,
@@ -280,9 +251,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                 )
         else:
             self.teacher_model = _build_teacher_model(
-                cfg_teacher=self.cfg.get("teacher_model", None),
-                seed=self.cfg.get("seed", 42),
-                has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+                model_config=self.cfg.teacher_model,
                 distributed_setup=self.distributed_setup,
                 device=teacher_device,
             )
@@ -449,7 +418,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
             batch,
-            use_te=self.cfg.llm_inputs.requires_pp_thd_microbatch_override,
+            use_te=self.cfg.dataloader.requires_pp_thd_microbatch_override,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_get_num_thd_chunks(True, self.cfg),
         )

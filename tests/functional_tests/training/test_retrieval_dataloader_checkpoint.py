@@ -157,10 +157,11 @@ def _build_retrieval_dataloader(data_file: str, model_type: str, tokenizer, batc
     dataloader_config = RecipeConfig(cfg).dataloader
     assert dataloader_config is not None
     return dataloader_config.build(
+        model=torch.nn.Module(),
         tokenizer=tokenizer,
         dp_rank=0,
         dp_world_size=1,
-    )
+    ).train
 
 
 def _tensors_equal(batch_a: dict, batch_b: dict) -> None:

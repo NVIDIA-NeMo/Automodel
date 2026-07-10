@@ -32,15 +32,12 @@ from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_o
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 from nemo_automodel.recipes._typed_config import (
     _STEP_SCHEDULER_RUNTIME_KEYS,
+    RecipeConfig,
     _as_dict,
     _callable_and_kwargs,
     _section_kwargs,
 )
-from nemo_automodel.recipes.vlm.finetune import (
-    FinetuneRecipeForVLM,
-    _get_model_name,
-    build_model,
-)
+from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
@@ -74,16 +71,6 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler):
 class _Cfg(SimpleNamespace):
     def get(self, key, default=None):
         return getattr(self, key, default)
-
-
-def test_get_model_name_prefers_pretrained_path():
-    cfg = _Cfg(pretrained_model_name_or_path="org/model")
-    assert _get_model_name(cfg) == "org/model"
-
-    cfg = _Cfg(config={"pretrained_model_name_or_path": "nested/model"})
-    assert _get_model_name(cfg) == "nested/model"
-
-    assert _get_model_name(_Cfg()) is None
 
 
 def _count_trainable(parameters):
@@ -151,206 +138,6 @@ class DummyModelConfig:
 
     def get(self, key, default=None):
         return getattr(self, key, default)
-
-
-# -----------------------------------------------------------------------------
-# build_model / build_optimizer
-# -----------------------------------------------------------------------------
-
-
-def test_build_model_and_optimizer_basic():
-    """Test basic build_model and build_optimizer for VLM."""
-    cfg_model = DummyModelConfig()
-    cfg_opt = DummyOptConfig(lr=0.01)
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        model = build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=123,
-        )
-        optim = build_optimizer(model, cfg_opt, None, None)
-
-    # Check returned objects and their properties
-    assert isinstance(model, DummyModel)
-    assert isinstance(optim, list)
-    assert len(optim) == 1
-    assert isinstance(optim[0], torch.optim.Optimizer)
-
-
-def test_build_model_passes_freeze_config():
-    """Test that freeze_config is passed to model instantiation."""
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    captured_kwargs = {}
-
-    class CapturingModelConfig:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            captured_kwargs.update(kwargs)
-            return DummyModel()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = CapturingModelConfig()
-
-    class FreezeConfig:
-        def to_dict(self):
-            return {"freeze_language_model": False, "freeze_vision_tower": True}
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=FreezeConfig(),
-            cfg_peft=None,
-            seed=123,
-        )
-
-    # Verify freeze_config was passed to model instantiation
-    assert "freeze_config" in captured_kwargs
-    assert captured_kwargs["freeze_config"] == {"freeze_language_model": False, "freeze_vision_tower": True}
-
-
-def test_build_model_passes_distributed_setup():
-    """Distributed policy is passed through the single setup object."""
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-    from nemo_automodel.components.distributed.config import DistributedSetup
-    from nemo_automodel.components.distributed.mesh import MeshContext
-
-    captured_kwargs = {}
-
-    class CapturingModelConfig:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            captured_kwargs.update(kwargs)
-            return DummyModel()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = CapturingModelConfig()
-    distributed_setup = DistributedSetup(mesh_context=MeshContext())
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=123,
-            distributed_setup=distributed_setup,
-        )
-
-    assert captured_kwargs["distributed_setup"] is distributed_setup
-    assert "moe_config" not in captured_kwargs
-    assert "activation_checkpointing" not in captured_kwargs
-
-
-def test_build_model_no_moe_config_when_cfg_moe_is_none():
-    """Test that moe_config and activation_checkpointing are not in kwargs when cfg_moe is None."""
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    captured_kwargs = {}
-
-    class CapturingModelConfig:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            captured_kwargs.update(kwargs)
-            return DummyModel()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = CapturingModelConfig()
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=123,
-        )
-
-    assert "moe_config" not in captured_kwargs
-    assert "activation_checkpointing" not in captured_kwargs
-
-
-def test_build_model_passes_quantization_config():
-    """cfg_quantization is converted via create_bnb_config and forwarded as quantization_config."""
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    captured_kwargs = {}
-
-    class CapturingModelConfig:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            captured_kwargs.update(kwargs)
-            return DummyModel()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = CapturingModelConfig()
-    cfg_quantization = SimpleNamespace(load_in_4bit=True)
-    sentinel_bnb = object()
-
-    with (
-        patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True),
-        patch(
-            "nemo_automodel.components.quantization.qlora.create_bnb_config",
-            return_value=sentinel_bnb,
-        ) as mock_create,
-    ):
-        build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=123,
-            cfg_quantization=cfg_quantization,
-        )
-
-    # Wiring: cfg_quantization -> create_bnb_config(...) -> kwargs["quantization_config"]
-    mock_create.assert_called_once_with(cfg_quantization)
-    assert captured_kwargs.get("quantization_config") is sentinel_bnb
-
-
-def test_build_model_no_quantization_config_when_none():
-    """No quantization_config kwarg when cfg_quantization is None (the default)."""
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    captured_kwargs = {}
-
-    class CapturingModelConfig:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            captured_kwargs.update(kwargs)
-            return DummyModel()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = CapturingModelConfig()
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=123,
-        )
-
-    assert "quantization_config" not in captured_kwargs
 
 
 # -----------------------------------------------------------------------------
@@ -616,426 +403,6 @@ def _vlm_dataloader_cfg():
             "num_workers": 0,
         }
     )
-
-
-def test_autoprocessor_success():
-    """Test successful AutoProcessor creation."""
-
-    with patch("transformers.AutoProcessor") as mock_auto_processor:
-        mock_processor = MagicMock()
-        mock_auto_processor.from_pretrained.return_value = mock_processor
-
-        model_id = "test/model"
-
-        processor = mock_auto_processor.from_pretrained(model_id)
-
-        assert processor is mock_processor
-        mock_auto_processor.from_pretrained.assert_called_once_with("test/model")
-
-
-def test_autoprocessor_exception_handling(caplog):
-    """Test AutoProcessor exception handling and logging in build_dataloader."""
-    import logging
-
-    from nemo_automodel.recipes.vlm.finetune import build_dataloader
-
-    with (
-        patch("transformers.AutoProcessor.from_pretrained") as mock_from_pretrained,
-        patch("nemo_automodel.components.training.rng.StatefulRNG"),
-        patch("torch.utils.data.distributed.DistributedSampler"),
-        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"NoneType": MagicMock()}),
-    ):
-        # Set up the exception
-        mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
-
-        # Mock configurations - minimal setup
-        cfg_ds = ConfigNode({"_target_": _test_vlm_dataset, "path_or_dataset": "test/dataset"})
-        cfg_dl = _vlm_dataloader_cfg()
-
-        cfg_processor = None  # This triggers the exception path
-
-        with caplog.at_level(logging.WARNING):
-            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, "test/model", cfg_processor, None, 123, 1)
-
-        # Verify the results
-        assert processor is None
-        mock_from_pretrained.assert_called_once_with("test/model")
-
-
-def test_autoprocessor_retries_on_layer_types_mismatch():
-    """On StrictDataclassClassValidationError from validate_layer_type,
-    relax the validator globally and retry AutoProcessor.from_pretrained once."""
-    from huggingface_hub.errors import StrictDataclassClassValidationError
-
-    from nemo_automodel.recipes.vlm.finetune import build_dataloader
-
-    stub_processor = MagicMock()
-    calls = {"n": 0}
-
-    def fake_from_pretrained(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            cause = ValueError("`num_hidden_layers` (45) must be equal to the number of layer types (48).")
-            raise StrictDataclassClassValidationError(validator="validate_layer_type", cause=cause)
-        return stub_processor
-
-    with (
-        patch("transformers.AutoProcessor.from_pretrained", side_effect=fake_from_pretrained),
-        patch(
-            "nemo_automodel._transformers.v4_patches.layer_types.relax_layer_types_validator", return_value=True
-        ) as mock_relax,
-        patch("nemo_automodel.components.training.rng.StatefulRNG"),
-        patch("torch.utils.data.distributed.DistributedSampler"),
-        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"MagicMock": MagicMock()}),
-    ):
-        cfg_ds = ConfigNode({"_target_": _test_vlm_dataset, "path_or_dataset": "test/dataset"})
-        cfg_dl = _vlm_dataloader_cfg()
-
-        dataloader, processor = build_dataloader(cfg_ds, cfg_dl, "stepfun-ai/Step-3.5-Flash", None, None, 123, 1)
-
-        assert processor is stub_processor
-        assert calls["n"] == 2
-        mock_relax.assert_called_once()
-
-
-def test_autoprocessor_loads_inside_first_rank_per_node():
-    """Test that processor instantiation happens inside the FirstRankPerNode context."""
-
-    from nemo_automodel.recipes.vlm.finetune import build_dataloader
-
-    call_order = []
-
-    class TrackingFirstRankPerNode:
-        def __enter__(self):
-            call_order.append("enter_first_rank")
-            return self
-
-        def __exit__(self, *args):
-            call_order.append("exit_first_rank")
-            return False
-
-    def tracking_from_pretrained(*args, **kwargs):
-        call_order.append("autoprocessor")
-        return MagicMock()
-
-    with (
-        patch("nemo_automodel.recipes.vlm.finetune.FirstRankPerNode", TrackingFirstRankPerNode),
-        patch("transformers.AutoProcessor.from_pretrained", side_effect=tracking_from_pretrained),
-        patch("nemo_automodel.components.training.rng.StatefulRNG"),
-        patch("torch.utils.data.distributed.DistributedSampler"),
-        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"NoneType": MagicMock()}),
-    ):
-        cfg_ds = ConfigNode({"_target_": _test_vlm_dataset, "path_or_dataset": "test/dataset"})
-        cfg_dl = _vlm_dataloader_cfg()
-
-        build_dataloader(cfg_ds, cfg_dl, "test/model", None, None, 123, 1)
-
-    assert "enter_first_rank" in call_order
-    assert "autoprocessor" in call_order
-    assert "exit_first_rank" in call_order
-    first_rank_idx = call_order.index("enter_first_rank")
-    processor_idx = call_order.index("autoprocessor")
-    exit_idx = call_order.index("exit_first_rank")
-    assert first_rank_idx < processor_idx < exit_idx, (
-        f"AutoProcessor must load inside FirstRankPerNode context, got order: {call_order}"
-    )
-
-
-def test_autoprocessor_with_processor_kwargs(caplog):
-    """Test AutoProcessor exception handling when cfg_processor has no instantiate method."""
-    import logging
-
-    from nemo_automodel.recipes.vlm.finetune import build_dataloader
-
-    # Simple processor config class without instantiate method
-    class ProcessorConfig:
-        def to_dict(self):
-            return {"trust_remote_code": True, "some_param": "value"}
-
-    with (
-        patch("transformers.AutoProcessor.from_pretrained") as mock_from_pretrained,
-        patch("nemo_automodel.components.training.rng.StatefulRNG"),
-        patch("torch.utils.data.distributed.DistributedSampler"),
-        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"NoneType": MagicMock()}),
-    ):
-        # Set up the exception
-        mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
-
-        # Mock configurations - minimal setup
-        cfg_ds = ConfigNode({"_target_": _test_vlm_dataset, "path_or_dataset": "test/dataset"})
-        cfg_dl = _vlm_dataloader_cfg()
-
-        cfg_processor = ProcessorConfig()  # This has to_dict but no instantiate
-
-        with caplog.at_level(logging.WARNING):
-            dataloader, processor = build_dataloader(cfg_ds, cfg_dl, "test/model", cfg_processor, None, 123, 1)
-
-        # Verify the results
-        assert processor is None
-        mock_from_pretrained.assert_called_once_with("test/model", trust_remote_code=True, some_param="value")
-
-
-# -----------------------------------------------------------------------------
-# chat_template override tests for build_dataloader
-# -----------------------------------------------------------------------------
-
-
-def test_build_dataloader_chat_template_applied():
-    """chat_template in dataset config is applied to processor and not leaked to dataset target."""
-    from nemo_automodel.recipes.vlm.finetune import build_dataloader
-
-    ds_calls = []
-
-    def ds_factory(path_or_dataset, split=None):
-        ds_calls.append({"path_or_dataset": path_or_dataset, "split": split})
-        return [{}]
-
-    class DummyProcessor:
-        def __init__(self):
-            self.chat_template = "{{ default }}"
-            self.tokenizer = SimpleNamespace(chat_template="{{ default }}")
-
-    processor = DummyProcessor()
-    cfg_ds = ConfigNode(
-        {"_target_": ds_factory, "path_or_dataset": "ds/path", "split": "train", "chat_template": "{{ custom }}"}
-    )
-    cfg_dl = _vlm_dataloader_cfg()
-
-    with (
-        pytest.warns(DeprecationWarning, match="RecipeConfig.vlm_dataloader"),
-        patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
-        patch("torch.utils.data.distributed.DistributedSampler"),
-        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}),
-    ):
-        _, built_processor = build_dataloader(cfg_ds, cfg_dl, "model", None, None, 42, 1)
-
-    assert built_processor.chat_template == "{{ custom }}"
-    assert built_processor.tokenizer.chat_template == "{{ custom }}"
-    assert ds_calls == [{"path_or_dataset": "ds/path", "split": "train"}]
-
-
-def test_build_dataloader_no_chat_template():
-    """Without chat_template, processor template stays unchanged."""
-    from nemo_automodel.recipes.vlm.finetune import build_dataloader
-
-    def ds_factory(path_or_dataset, split=None):
-        return [{}]
-
-    class DummyProcessor:
-        def __init__(self):
-            self.chat_template = "{{ original }}"
-            self.tokenizer = SimpleNamespace(chat_template="{{ original }}")
-
-    processor = DummyProcessor()
-    cfg_ds = ConfigNode({"_target_": ds_factory, "path_or_dataset": "ds/path", "split": "train"})
-    cfg_dl = _vlm_dataloader_cfg()
-
-    with (
-        patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
-        patch("torch.utils.data.distributed.DistributedSampler"),
-        patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}),
-    ):
-        _, built_processor = build_dataloader(cfg_ds, cfg_dl, "model", None, None, 42, 1)
-
-    assert built_processor.chat_template == "{{ original }}"
-    assert built_processor.tokenizer.chat_template == "{{ original }}"
-
-
-# -----------------------------------------------------------------------------
-# State dict adapter tests for _maybe_adapt_state_dict_to_hf in VLM
-# -----------------------------------------------------------------------------
-
-
-class MockStateDictAdapter:
-    """Mock state dict adapter that transforms keys."""
-
-    def to_hf(self, state_dict, exclude_key_regex=None, quantization=False, **kwargs):
-        """Transform state dict keys by adding 'vlm_transformed_' prefix."""
-        return {f"vlm_transformed_{k}": v for k, v in state_dict.items()}
-
-
-class DummyModelWithAdapter(torch.nn.Module):
-    """VLM model with a state_dict_adapter for testing."""
-
-    def __init__(self):
-        super().__init__()
-        self.embedding = torch.nn.Embedding(10, 4)
-        self.language_model = torch.nn.Linear(4, 4)
-        self.state_dict_adapter = MockStateDictAdapter()
-
-    def forward(self, x):
-        return self.language_model(self.embedding(x))
-
-
-class DummyModelConfigWithAdapter:
-    """Mock model config that returns a model with state_dict_adapter."""
-
-    def __init__(self):
-        from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-        # Add _target_ to make the config valid for VLM finetuning
-        self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-    def instantiate(self, **kwargs):
-        return DummyModelWithAdapter()
-
-    def get(self, key, default=None):
-        return getattr(self, key, default)
-
-
-def test_vlm_build_model_with_adapter():
-    """Test that model with state_dict_adapter is properly instantiated in VLM."""
-
-    # Create a config that simulates NeMoAutoModel's internal infrastructure handling
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    class NeMoModelConfigWithAdapter:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            return DummyModelWithAdapter()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = NeMoModelConfigWithAdapter()
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        model = build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=123,
-        )
-
-    # Model should be instantiated with adapter
-    assert model is not None
-    assert hasattr(model, "state_dict_adapter")
-
-
-def test_vlm_build_model_without_adapter():
-    """Test that model without state_dict_adapter is properly instantiated in VLM."""
-
-    # Create a config that simulates NeMoAutoModel's internal infrastructure handling (no adapter)
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    class NeMoModelConfigNoAdapter:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            return DummyModel()  # No adapter
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = NeMoModelConfigNoAdapter()
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        model = build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=123,
-        )
-
-    # Model should be instantiated without adapter
-    assert model is not None
-    assert not hasattr(model, "state_dict_adapter")
-
-
-def test_vlm_build_model_with_quantization_config():
-    """Test that model with quantization_config is properly instantiated in VLM."""
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    # Create a model config that simulates NeMoAutoModel's internal infrastructure handling
-    class DummyQuantizedVLMModelConfig:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            model = DummyModel()
-            # Add a config attribute with quantization_config
-            model.config = SimpleNamespace(quantization_config={"bits": 4})
-            return model
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = DummyQuantizedVLMModelConfig()
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        model = build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=123,
-        )
-
-    # Model should be instantiated with quantization config
-    assert model is not None
-    assert hasattr(model.config, "quantization_config")
-
-
-def test_vlm_build_model_without_quantization_config():
-    """Test that model without quantization_config is properly instantiated in VLM."""
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    # Create a config that simulates NeMoAutoModel's internal infrastructure handling (no quant config)
-    class DummyNoQuantVLMModelConfig:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            return DummyModel()  # DummyModel has no config.quantization_config
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = DummyNoQuantVLMModelConfig()
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        model = build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=123,
-        )
-
-    # Model should be instantiated without quantization config
-    assert model is not None
-    assert not hasattr(model.config, "quantization_config")
-
-
-# =============================================================================
-# New tests for VLM-specific build_model / build_optimizer functionality
-# =============================================================================
-
-
-def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
-    """Test that VLM build_model raises ValueError when target is not NeMoAutoModelForImageTextToText."""
-
-    # Create a cfg_model that targets something other than NeMoAutoModelForImageTextToText
-    class InvalidModelConfig:
-        def __init__(self):
-            self._target_ = "some.invalid.Target"
-
-        def instantiate(self, **kwargs):
-            return DummyModel()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = InvalidModelConfig()
-
-    with pytest.raises(ValueError, match="VLM finetuning requires NeMoAutoModelForImageTextToText"):
-        build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=42,
-        )
 
 
 from nemo_automodel.recipes.vlm.finetune import calculate_loss
@@ -2496,102 +1863,6 @@ class TestForwardBackwardStepNonPP:
 
 
 # -----------------------------------------------------------------------------
-# build_optimizer returns correct type (diff coverage)
-# -----------------------------------------------------------------------------
-
-
-def test_vlm_build_model_and_optimizer_return_values():
-    """Test that VLM build_model and build_optimizer return proper values."""
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    class NeMoVLMModelConfig:
-        def __init__(self):
-            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
-
-        def instantiate(self, **kwargs):
-            return DummyModel()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = NeMoVLMModelConfig()
-    cfg_opt = DummyOptConfig(lr=0.01)
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        model = build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=42,
-        )
-        optimizer = build_optimizer(model, cfg_opt, None, None)
-
-    assert model is not None
-    assert optimizer is not None
-
-
-@pytest.mark.parametrize("entry_point", ["from_config", "from_pretrained"])
-def test_vlm_build_model_validates_nemo_auto_model_entry_points(entry_point):
-    """Test that VLM recognizes both NeMoAutoModelForImageTextToText entry points."""
-    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
-
-    target = getattr(NeMoAutoModelForImageTextToText, entry_point)
-
-    class NeMoVLMModelConfig:
-        def __init__(self):
-            self._target_ = target
-
-        def instantiate(self, **kwargs):
-            return DummyModel()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = NeMoVLMModelConfig()
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        # Should not raise - entry point should be recognized
-        model = build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=42,
-        )
-
-    assert model is not None
-
-
-@pytest.mark.parametrize("entry_point", ["from_config", "from_pretrained"])
-def test_vlm_build_model_accepts_multimodal_lm_entry_points(entry_point):
-    """Test that VLM build_model accepts NeMoAutoModelForMultimodalLM entry points."""
-    from nemo_automodel._transformers import NeMoAutoModelForMultimodalLM
-
-    target = getattr(NeMoAutoModelForMultimodalLM, entry_point)
-
-    class NeMoVLMModelConfig:
-        def __init__(self):
-            self._target_ = target
-
-        def instantiate(self, **kwargs):
-            return DummyModel()
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
-
-    cfg_model = NeMoVLMModelConfig()
-
-    with patch("nemo_automodel.recipes.vlm.finetune._supports_logits_to_keep", return_value=True):
-        model = build_model(
-            cfg_model=cfg_model,
-            cfg_freeze=None,
-            cfg_peft=None,
-            seed=42,
-        )
-
-    assert model is not None
-
-
-# -----------------------------------------------------------------------------
 # rope_fusion disabled when cp > 1
 # -----------------------------------------------------------------------------
 
@@ -2642,23 +1913,27 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     )
     dummy_model = DummyModel()
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *a, **k: dummy_model)
+    monkeypatch.setattr(
+        RecipeConfig,
+        "model",
+        property(lambda self: SimpleNamespace(model_name="dummy", build=lambda **kwargs: dummy_model)),
+    )
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
         property(lambda self: SimpleNamespace(build=lambda *a, **k: [dummy_opt])),
     )
     loader_config = SimpleNamespace(
-        packing=None,
-        resolve_packing_attn_implementation=lambda **kwargs: None,
-        build=lambda **kwargs: SimpleNamespace(dataloader="dl", processor="proc"),
+        build=lambda **kwargs: SimpleNamespace(train="dl", validation={}),
     )
     monkeypatch.setattr(
-        "nemo_automodel.recipes._typed_config.RecipeConfig.vlm_dataloader",
+        RecipeConfig,
+        "tokenizer",
+        property(lambda self: SimpleNamespace(build=lambda: "proc")),
+    )
+    monkeypatch.setattr(
+        RecipeConfig,
+        "dataloader",
         property(lambda self: loader_config),
-    )
-    monkeypatch.setattr(
-        "nemo_automodel.recipes._typed_config.RecipeConfig.vlm_validation_dataloader",
-        property(lambda self: None),
     )
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
@@ -2718,15 +1993,15 @@ def _minimal_vlm_cfg(cp_size: int, rope_fusion: bool):
     )
 
 
-def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
-    """rope_fusion should be set to False during VLM setup when cp_size > 1."""
+def test_vlm_rope_fusion_config_preserved_when_cp_gt_1(monkeypatch):
+    """VLM setup must not mutate the declarative rope_fusion setting."""
     cfg = _minimal_vlm_cfg(cp_size=2, rope_fusion=True)
     _patch_vlm_setup_minimals(monkeypatch, cp_size=2)
 
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
 
-    assert cfg.model.backend.rope_fusion is False
+    assert cfg.model.backend.rope_fusion is True
 
 
 def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
@@ -3003,7 +2278,7 @@ class TestChunkVlmMedia:
 
 
 # -----------------------------------------------------------------------------
-# get_rope_index forwarding tests for build_dataloader
+# get_rope_index forwarding tests for the shared dataloader config
 #
 # Guard against a regression where the VLM recipe forgot to pass
 # get_rope_index to neat_pack_dataset_vlm, silently degrading mRoPE to
@@ -3036,7 +2311,6 @@ def _patches_for_packing(neat_pack_side_effect):
     processor.tokenizer.pad_token_id = 0
     processor.chat_template = "{{ x }}"
     return processor, [
-        patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
         patch("torch.utils.data.distributed.DistributedSampler"),
         patch(
             "nemo_automodel.components.datasets.vlm.datasets.PreTokenizedDatasetWrapper",
@@ -3047,19 +2321,44 @@ def _patches_for_packing(neat_pack_side_effect):
             side_effect=neat_pack_side_effect,
         ),
         patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", return_value=MagicMock()),
-        patch("nemo_automodel.components.models.common.packing.configure_packing"),
-        patch(
-            "nemo_automodel.components.models.common.packing.get_attn_implementation",
-            return_value="sdpa",
-        ),
+        patch("nemo_automodel.recipes.vlm.config.configure_packing"),
     ]
 
 
-def test_build_dataloader_forwards_get_rope_index_to_packing():
-    """get_rope_index passed to build_dataloader must reach neat_pack_dataset_vlm."""
-    from contextlib import ExitStack
+def _build_packed_vlm_dataloader(dataset_cfg, processor, *, get_rope_index=None):
+    """Build the canonical VLM dataloader pipeline for packing tests."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 
-    from nemo_automodel.recipes.vlm.finetune import build_dataloader
+    raw = ConfigNode(
+        {
+            "model": {
+                "_target_": NeMoAutoModelForImageTextToText.from_pretrained,
+                "pretrained_model_name_or_path": "test/model",
+            },
+            "dataset": dataset_cfg.to_dict(),
+            "dataloader": _vlm_dataloader_cfg().to_dict(),
+            "packed_sequence": _make_packing_cfg(pack_size=64).to_dict(),
+            "step_scheduler": {"local_batch_size": 1},
+        }
+    )
+    model = DummyModel()
+    if get_rope_index is not None:
+        model.get_rope_index = get_rope_index
+    return (
+        RecipeConfig(raw)
+        .dataloader.build(
+            model=model,
+            tokenizer=processor,
+            dp_rank=0,
+            dp_world_size=1,
+        )
+        .train
+    )
+
+
+def test_dataloader_forwards_get_rope_index_to_packing():
+    """The canonical dataloader config forwards model mRoPE construction."""
+    from contextlib import ExitStack
 
     sentinel = MagicMock(name="get_rope_index")
     captured = {}
@@ -3068,33 +2367,21 @@ def test_build_dataloader_forwards_get_rope_index_to_packing():
         captured.update(kwargs)
         return MagicMock()
 
-    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+    processor, ctx_managers = _patches_for_packing(fake_neat_pack)
 
     with ExitStack() as stack:
         for cm in ctx_managers:
             stack.enter_context(cm)
-        build_dataloader(
-            _make_dataset_cfg(),
-            _vlm_dataloader_cfg(),
-            "test/model",
-            None,
-            None,
-            42,
-            1,
-            cfg_ps=_make_packing_cfg(pack_size=64),
-            get_rope_index=sentinel,
-        )
+        _build_packed_vlm_dataloader(_make_dataset_cfg(), processor, get_rope_index=sentinel)
 
     assert captured.get("get_rope_index") is sentinel, (
-        f"build_dataloader must forward get_rope_index to neat_pack_dataset_vlm; got kwargs={list(captured.keys())}"
+        f"dataloader config must forward get_rope_index; got kwargs={list(captured.keys())}"
     )
 
 
-def test_build_dataloader_default_get_rope_index_is_none():
+def test_dataloader_default_get_rope_index_is_none():
     """When the model does not expose get_rope_index, packing must receive None."""
     from contextlib import ExitStack
-
-    from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
     captured = {}
 
@@ -3102,34 +2389,23 @@ def test_build_dataloader_default_get_rope_index_is_none():
         captured.update(kwargs)
         return MagicMock()
 
-    _, ctx_managers = _patches_for_packing(fake_neat_pack)
+    processor, ctx_managers = _patches_for_packing(fake_neat_pack)
 
     with ExitStack() as stack:
         for cm in ctx_managers:
             stack.enter_context(cm)
-        build_dataloader(
-            _make_dataset_cfg(),
-            _vlm_dataloader_cfg(),
-            "test/model",
-            None,
-            None,
-            42,
-            1,
-            cfg_ps=_make_packing_cfg(pack_size=64),
-        )
+        _build_packed_vlm_dataloader(_make_dataset_cfg(), processor)
 
     assert "get_rope_index" in captured, "neat_pack_dataset_vlm must receive get_rope_index kwarg even when None"
     assert captured["get_rope_index"] is None
 
 
-def _run_build_dataloader_capturing_wrapper(dataset_cfg):
-    """Run build_dataloader (pretokenize path) and return the PreTokenizedDatasetWrapper mock."""
+def _run_dataloader_capturing_wrapper(dataset_cfg):
+    """Build the canonical pretokenized pipeline and return its wrapper mock."""
     from contextlib import ExitStack
 
-    from nemo_automodel.recipes.vlm.finetune import build_dataloader
-
     wrapper_mock = MagicMock(return_value=MagicMock())
-    _, ctx_managers = _patches_for_packing(lambda *a, **k: MagicMock())
+    processor, ctx_managers = _patches_for_packing(lambda *a, **k: MagicMock())
 
     with ExitStack() as stack:
         for cm in ctx_managers:
@@ -3141,28 +2417,19 @@ def _run_build_dataloader_capturing_wrapper(dataset_cfg):
                 wrapper_mock,
             )
         )
-        build_dataloader(
-            dataset_cfg,
-            _vlm_dataloader_cfg(),
-            "test/model",
-            None,
-            None,
-            42,
-            1,
-            cfg_ps=_make_packing_cfg(pack_size=64),
-        )
+        _build_packed_vlm_dataloader(dataset_cfg, processor)
     return wrapper_mock
 
 
-def test_build_dataloader_inject_fake_images_defaults_true():
+def test_dataloader_inject_fake_images_defaults_true():
     """When dataset cfg omits inject_fake_images, the wrapper defaults to True."""
-    wrapper_mock = _run_build_dataloader_capturing_wrapper(_make_dataset_cfg())
+    wrapper_mock = _run_dataloader_capturing_wrapper(_make_dataset_cfg())
     assert wrapper_mock.call_args.kwargs["inject_fake_images"] is True
 
 
-def test_build_dataloader_forwards_inject_fake_images_false():
+def test_dataloader_forwards_inject_fake_images_false():
     """inject_fake_images=False in dataset cfg must reach PreTokenizedDatasetWrapper."""
     cfg = ConfigNode({"_target_": _test_vlm_dataset, "truncate": True, "inject_fake_images": False})
 
-    wrapper_mock = _run_build_dataloader_capturing_wrapper(cfg)
+    wrapper_mock = _run_dataloader_capturing_wrapper(cfg)
     assert wrapper_mock.call_args.kwargs["inject_fake_images"] is False

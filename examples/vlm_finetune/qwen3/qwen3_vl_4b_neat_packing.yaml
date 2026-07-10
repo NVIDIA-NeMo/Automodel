@@ -40,7 +40,7 @@ model:
   pretrained_model_name_or_path: Qwen/Qwen3-VL-4B-Thinking
   attn_implementation: flash_attention_2
 
-processor:
+tokenizer:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3-VL-4B-Thinking
   min_pixels: 200704  # 256*28*28

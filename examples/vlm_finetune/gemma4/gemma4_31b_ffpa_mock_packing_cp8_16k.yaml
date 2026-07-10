@@ -52,7 +52,7 @@ model:
     use_cache: false
     cp_full_attn_backend: ffpa  # route head_dim=512 full-attention ring chunks through FFPA varlen
 
-processor:
+tokenizer:
   padding_side: right
 
 checkpoint:

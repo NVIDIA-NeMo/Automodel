@@ -13,32 +13,65 @@
 # limitations under the License.
 
 
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
 from nemo_automodel.shared.import_utils import safe_import
+
+if TYPE_CHECKING:
+    from transformers import BitsAndBytesConfig
 
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
 HAS_TRANSFORMERS, transformers = safe_import("transformers")
 
 
-def create_bnb_config(config: dict):
-    """Create BitsAndBytes config for quantization."""
-    if not HAS_BNB:
-        raise ImportError("bitsandbytes is required for QLora")
+@dataclass(frozen=True)
+class BitsAndBytesQuantizationConfig:
+    """Declarative BitsAndBytes weight-quantization configuration."""
 
-    if not HAS_TRANSFORMERS:
-        raise ImportError("transformers is required for QLora")
+    load_in_4bit: bool = False
+    load_in_8bit: bool = False
+    bnb_4bit_compute_dtype: str = "bfloat16"
+    bnb_4bit_use_double_quant: bool = True
+    bnb_4bit_quant_type: str = "nf4"
+    bnb_4bit_quant_storage: str = "bfloat16"
 
-    if config.load_in_4bit:
-        return transformers.BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=config.get("bnb_4bit_compute_dtype", "bfloat16"),
-            bnb_4bit_use_double_quant=config.get("bnb_4bit_use_double_quant", True),
-            bnb_4bit_quant_type=config.get("bnb_4bit_quant_type", "nf4"),
-            bnb_4bit_quant_storage=config.get("bnb_4bit_quant_storage", "bfloat16"),
-        )
-    elif config.load_in_8bit:
-        return transformers.BitsAndBytesConfig(load_in_8bit=True)
-    else:
+    def build(self) -> "BitsAndBytesConfig | None":
+        """Build the corresponding Transformers BitsAndBytes config.
+
+        Returns:
+            Transformers quantization config, or ``None`` when quantization is disabled.
+
+        Raises:
+            ImportError: If BitsAndBytes or Transformers is unavailable.
+        """
+        if not HAS_BNB:
+            raise ImportError("bitsandbytes is required for QLora")
+        if not HAS_TRANSFORMERS:
+            raise ImportError("transformers is required for QLora")
+        if self.load_in_4bit:
+            return transformers.BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=self.bnb_4bit_compute_dtype,
+                bnb_4bit_use_double_quant=self.bnb_4bit_use_double_quant,
+                bnb_4bit_quant_type=self.bnb_4bit_quant_type,
+                bnb_4bit_quant_storage=self.bnb_4bit_quant_storage,
+            )
+        if self.load_in_8bit:
+            return transformers.BitsAndBytesConfig(load_in_8bit=True)
         return None
+
+
+def create_bnb_config(config: dict):
+    """Compatibility wrapper around :class:`BitsAndBytesQuantizationConfig`."""
+    return BitsAndBytesQuantizationConfig(
+        load_in_4bit=config.get("load_in_4bit", False),
+        load_in_8bit=config.get("load_in_8bit", False),
+        bnb_4bit_compute_dtype=config.get("bnb_4bit_compute_dtype", "bfloat16"),
+        bnb_4bit_use_double_quant=config.get("bnb_4bit_use_double_quant", True),
+        bnb_4bit_quant_type=config.get("bnb_4bit_quant_type", "nf4"),
+        bnb_4bit_quant_storage=config.get("bnb_4bit_quant_storage", "bfloat16"),
+    ).build()
 
 
 def verify_qlora_quantization(model) -> bool:

@@ -124,6 +124,12 @@ class _Cfg:
     def get(self, key, default=None):
         return self._values.get(key, default)
 
+    def __getattr__(self, name):
+        try:
+            return self._values[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
 
 @pytest.mark.parametrize(
     "cfg_overrides, expected_offload, expected_device",
@@ -133,9 +139,7 @@ class _Cfg:
         ({"offload_teacher_model": True}, True, "cpu"),
     ],
 )
-def test_setup_sets_offload_flag_and_teacher_device(
-    monkeypatch, cfg_overrides, expected_offload, expected_device
-):
+def test_setup_sets_offload_flag_and_teacher_device(monkeypatch, cfg_overrides, expected_offload, expected_device):
     captured = {}
 
     def fake_build_teacher_model(**kwargs):
@@ -172,7 +176,7 @@ def test_setup_sets_offload_flag_and_teacher_device(
     assert captured["super_setup_called"] is True
     assert recipe._offload_teacher_model is expected_offload
     assert captured["build_teacher_kwargs"]["device"] == expected_device
-    assert captured["build_teacher_kwargs"]["seed"] == 7
+    assert captured["build_teacher_kwargs"]["model_config"] == {"pretrained_model_name_or_path": "teacher"}
     assert recipe.kd_ratio == 0.5
     assert recipe._ce_loss_buffer == []
     assert recipe._kd_loss_buffer == []

@@ -29,30 +29,23 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import mlflow
 import torch
 import torch.nn as nn
 import wandb
-from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from transformers.processing_utils import ProcessorMixin
 
-from nemo_automodel._transformers import (
-    NeMoAutoModelForCausalLM,
-    NeMoAutoModelForImageTextToText,
-    NeMoAutoModelForMultimodalLM,
-)
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
-from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
+from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import (
@@ -64,7 +57,6 @@ from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
@@ -74,16 +66,11 @@ from nemo_automodel.components.training.utils import (
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
-from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, _supports_logits_to_keep, filter_forward_kwargs
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
-
-if TYPE_CHECKING:
-    from torch.optim import Optimizer
-
 
 logger = logging.getLogger(__name__)
 
@@ -97,94 +84,6 @@ except (ImportError, FileNotFoundError, OSError):
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
-
-
-def _get_model_name(cfg_model):
-    if cfg_model.get("pretrained_model_name_or_path", None) is not None:
-        return cfg_model.pretrained_model_name_or_path
-    elif cfg_model.get("config", None) is not None:
-        if isinstance(cfg_model.config, str):
-            return cfg_model.config
-        return cfg_model.config.get("pretrained_model_name_or_path", None)
-    else:
-        return None
-
-
-def build_model(
-    cfg_model,
-    cfg_freeze,
-    cfg_peft,
-    seed,
-    cfg_fp8=None,
-    cfg_compile=None,
-    distributed_setup: DistributedSetup | None = None,
-    cfg_quantization=None,
-) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
-    """Build and initialize a model for VLM.
-
-    Returns:
-        The instantiated model and optimizer.
-    """
-    with ScopedRNG(seed=seed, ranked=True):
-        # Build infrastructure kwargs
-        kwargs = {
-            "peft_config": cfg_peft,
-            "freeze_config": cfg_freeze.to_dict() if cfg_freeze is not None else None,
-        }
-        if distributed_setup is not None:
-            kwargs["distributed_setup"] = distributed_setup
-
-        if cfg_fp8 is not None:
-            fp8_config = build_fp8_config(cfg_fp8)
-            kwargs["fp8_config"] = fp8_config
-        if cfg_compile is not None:
-            kwargs["compile_config"] = build_compile_config(cfg_compile)
-        if cfg_quantization is not None:
-            logger.info("Model weight quantization enabled with BitsAndBytes")
-            from nemo_automodel.components.quantization.qlora import create_bnb_config
-
-            kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
-
-        # Check if using NeMoAutoModel
-        is_nemo_auto_model = cfg_model.get("_target_", None) in (
-            NeMoAutoModelForImageTextToText.from_config,
-            NeMoAutoModelForImageTextToText.from_pretrained,
-            NeMoAutoModelForMultimodalLM.from_config,
-            NeMoAutoModelForMultimodalLM.from_pretrained,
-            NeMoAutoModelForCausalLM.from_config,
-            NeMoAutoModelForCausalLM.from_pretrained,
-        )
-
-        # The Gemma4 base + drafter composite loads its sub-models via the
-        # NeMoAuto paths internally, so it gets the same infrastructure kwargs.
-        is_joint_composite = _is_gemma4_joint_target(cfg_model.get("_target_", None))
-
-        if is_nemo_auto_model or is_joint_composite:
-            model = cfg_model.instantiate(**kwargs)
-        else:
-            raise ValueError(
-                f"VLM finetuning requires NeMoAutoModelForImageTextToText. "
-                f"Got model target: {cfg_model.get('_target_', None)}"
-            )
-    return model
-
-
-def _is_gemma4_joint_target(target) -> bool:
-    """Return True if ``target`` is :meth:`Gemma4WithDrafter.from_pretrained`.
-
-    Imported lazily so the optional ``transformers.models.gemma4_assistant``
-    dependency only fires when a joint recipe is actually requested.
-    """
-    if target is None:
-        return False
-    try:
-        from nemo_automodel.components.models.gemma4_drafter.composite import (
-            Gemma4WithDrafter,
-        )
-    except ImportError:
-        return False
-    # Bound classmethods are not identity-stable across accesses; compare via ==.
-    return target == Gemma4WithDrafter.from_pretrained
 
 
 def _shift_labels_left(labels: torch.Tensor, k: int) -> torch.Tensor:
@@ -229,89 +128,6 @@ def _move_to_device(value: Any, device: torch.device) -> Any:
     if isinstance(value, tuple):
         return tuple(_move_to_device(v, device) for v in value)
     return value
-
-
-def build_dataloader(
-    cfg_ds,
-    cfg_dl,
-    pretrained_model_name_or_path,
-    cfg_processor,
-    device_mesh,
-    seed,
-    local_batch_size,
-    cfg_model=None,
-    cfg_ps=None,
-    get_rope_index=None,
-    pp_n_microbatches=None,
-) -> tuple[DataLoader, ProcessorMixin]:
-    """Build a DataLoader for the VLM dataset.
-
-    Args:
-        cfg_ds: Dataset configuration.
-        cfg_dl: DataLoader configuration.
-        pretrained_model_name_or_path: Pretrained model name or path for processor loading.
-        cfg_processor: Processor configuration or None.
-        device_mesh: Device mesh for distributed training.
-        seed: Random seed.
-        local_batch_size: Local batch size.
-        cfg_model: Model configuration (used to detect attention backend).
-        cfg_ps: Packed sequence configuration (top-level ``packed_sequence:`` section).
-            When provided, takes precedence over ``dataset.packing``.
-        get_rope_index: Optional ``model.get_rope_index`` callable. When provided,
-            VLM neat packing computes mRoPE 3D position IDs per sample so packed
-            mRoPE-aware models (Qwen2.5-VL, Qwen3-VL, ...) preserve multimodal
-            position semantics across pack boundaries instead of falling back to
-            plain 1D positions.
-        pp_n_microbatches: When set, wrap collate so VLM media tensors are
-            pre-chunked for this many PP microbatches before entering the train loop.
-
-    Returns:
-        The instantiated DataLoader and processor.
-    """
-    warnings.warn(
-        "build_dataloader is deprecated; resolve RecipeConfig.vlm_dataloader and call its build() method",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    config = RecipeConfig.resolve_vlm_dataloader(
-        cfg_ds,
-        cfg_dl,
-        processor_node=cfg_processor,
-        packed_sequence_node=cfg_ps,
-    )
-    dp_rank = 0
-    dp_world_size = 1
-    cp_size = 1
-    if device_mesh is not None:
-        from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-
-        dp_mesh = get_flat_mesh(device_mesh, "dp")
-        dp_rank = dp_mesh.get_local_rank()
-        dp_world_size = dp_mesh.size()
-        if "cp" in getattr(device_mesh, "mesh_dim_names", ()):
-            cp_size = device_mesh["cp"].size()
-
-    from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
-
-    packing_attn_implementation = config.resolve_packing_attn_implementation(
-        model_attn_implementation=get_attn_implementation(cfg_model),
-        cp_size=cp_size,
-    )
-    if config.packing is not None:
-        configure_packing(attn_implementation=packing_attn_implementation)
-
-    with ScopedRNG(seed=seed, ranked=True):
-        result = config.build(
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            batch_size=local_batch_size,
-            dataset_build_context=FirstRankPerNode(),
-            get_rope_index=get_rope_index,
-            packing_attn_implementation=packing_attn_implementation,
-            pp_n_microbatches=pp_n_microbatches,
-        )
-    return result.dataloader, result.processor
 
 
 def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
@@ -424,7 +240,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=self.cfg.model.model_name)
             logging.info("🚀 View run at {}".format(run.url))
 
         if self.dist_env.is_main and self.cfg.mlflow is not None:
@@ -483,22 +299,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        # Disable fused RoPE when context parallelism is enabled (cp > 1)
-        if self.mesh_context.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
-            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.mesh_context.cp_size)
-            self.cfg.model.backend.rope_fusion = False
-
         # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
-
-        model = build_model(
-            self.cfg.model,
-            self.cfg.get("freeze_config", None),
-            self.peft_config,
-            seed=self.cfg.get("seed", 42),
-            cfg_fp8=self.cfg.get("fp8", None),
-            cfg_compile=self.cfg.get("compile", None),
+        model = self.cfg.model.build(
+            peft_config=self.peft_config,
             distributed_setup=self.distributed_setup,
-            cfg_quantization=self.cfg.get("quantization", None),
         )
         apply_te_patches()
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
@@ -520,58 +324,20 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
 
-        # Extract mRoPE position-id builder from the model so VLM neat packing can
-        # produce 3D position_ids per sample. Without this, packed multimodal
-        # training silently degrades mRoPE to plain 1D positions.
-        get_rope_index = getattr(self.model_parts[0], "get_rope_index", None)
-        pp_n_microbatches = None
-        pp_cp_preembed = (
-            self.pp_enabled
-            and self.mesh_context.cp_size > 1
-            and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp")
-        )
-        if self.pp_enabled and not pp_cp_preembed:
-            pp_n_microbatches = self.pp.pp_batch_size // self.pp.pp_microbatch_size
-
-        dataloader_config = self.cfg.vlm_dataloader
+        self.tokenizer = self.cfg.tokenizer.build()
+        dataloader_config = self.cfg.dataloader
         if dataloader_config is None:
             raise ValueError("VLM training requires a dataset config")
-        from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
-
-        packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
-            model_attn_implementation=get_attn_implementation(self.cfg.model),
+        input_pipeline = dataloader_config.build(
+            model=model,
+            tokenizer=self.tokenizer,
+            dp_rank=self._get_dp_rank(),
+            dp_world_size=self._get_dp_group_size(),
+            pp_enabled=self.pp_enabled,
             cp_size=self.mesh_context.cp_size,
         )
-        if dataloader_config.packing is not None:
-            configure_packing(attn_implementation=packing_attn_implementation)
-        with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
-            dataloader_build = dataloader_config.build(
-                pretrained_model_name_or_path=_get_model_name(self.cfg.model),
-                dp_rank=self._get_dp_rank(),
-                dp_world_size=self._get_dp_group_size(),
-                batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                dataset_build_context=FirstRankPerNode(),
-                get_rope_index=get_rope_index,
-                packing_attn_implementation=packing_attn_implementation,
-                pp_n_microbatches=pp_n_microbatches,
-            )
-        self.dataloader = dataloader_build.dataloader
-        self.processor = dataloader_build.processor
-
-        # Build validation dataloader if the config provides it
-        self.val_dataloader = None
-        validation_config = self.cfg.vlm_validation_dataloader
-        if validation_config is not None:
-            with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
-                validation_build = validation_config.build(
-                    pretrained_model_name_or_path=_get_model_name(self.cfg.model),
-                    dp_rank=self._get_dp_rank(),
-                    dp_world_size=self._get_dp_group_size(),
-                    batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                    dataset_build_context=FirstRankPerNode(),
-                    get_rope_index=get_rope_index,
-                )
-            self.val_dataloader = validation_build.dataloader
+        self.dataloader = input_pipeline.train
+        self.val_dataloader = next(iter(input_pipeline.validation.values()), None)
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler

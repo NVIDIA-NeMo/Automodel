@@ -54,7 +54,7 @@ model:
   # 26B-A4B does not use kv_shared layers (only used in 2B, 4B), hence use_cache: false.
     use_cache: false
 
-processor:
+tokenizer:
   padding_side: right
 
 checkpoint:

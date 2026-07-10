@@ -37,7 +37,7 @@ model:
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
-processor:
+tokenizer:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
   trust_remote_code: true
