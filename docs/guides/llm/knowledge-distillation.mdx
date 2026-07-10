@@ -63,10 +63,7 @@ dist_env:
   backend: nccl
   timeout_minutes: 1
 
-rng:
-  _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 1111
-  ranked: true
+seed: 1111
 
 # Student
 model:

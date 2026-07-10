@@ -273,13 +273,14 @@ Validation:
 ### Checkpoints saved
 
 ```
-checkpoint_dir/
-  epoch_0_step_99/
-  epoch_1_step_199/
-  epoch_2_step_299/
+vlm_checkpoints/
+  epoch_0_step_99/             # sharded weights + model/consolidate.sh
+  epoch_1_step_199/            # sharded weights + model/consolidate.sh
+  epoch_2_step_299/            # sharded weights + model/consolidate.sh
   epoch_3_step_399/
     model/
-      consolidated/          <-- HF-compatible checkpoint for inference
+      consolidate.sh
+      consolidated/            # inline HF export: final checkpoint only
         config.json
         model.safetensors.index.json
         model-00001-of-00017.safetensors
@@ -293,7 +294,7 @@ checkpoint_dir/
   validation.jsonl
 ```
 
-For LoRA, the checkpoint saves adapter weights instead:
+Both checked-in configs set `save_consolidated: final`. For full SFT, intermediate checkpoints (including an intermediate `LOWEST_VAL`) remain sharded until you run their generated consolidation helper. For LoRA, the checkpoint saves adapter weights instead:
 ```
   model/
     adapter_model.safetensors   (~27 MB)
@@ -309,7 +310,11 @@ For LoRA, the checkpoint saves adapter weights instead:
 ### Full SFT inference
 
 Load the consolidated checkpoint and run inference on a handful of validation samples
-to spot-check structured output.
+to spot-check structured output. If `LOWEST_VAL` is not the final checkpoint, first run:
+
+```bash
+bash vlm_checkpoints/LOWEST_VAL/model/consolidate.sh
+```
 
 ```python
 import torch
@@ -318,7 +323,7 @@ from transformers import AutoModel, AutoProcessor
 from datasets import load_dataset
 from nemo_automodel.components.datasets.vlm.utils import json2token
 
-CKPT = "<checkpoint_dir>/LOWEST_VAL/model/consolidated"
+CKPT = "vlm_checkpoints/LOWEST_VAL/model/consolidated"
 
 # Load processor
 processor = AutoProcessor.from_pretrained(CKPT, trust_remote_code=True)
