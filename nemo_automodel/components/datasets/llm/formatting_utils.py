@@ -129,6 +129,23 @@ def _maybe_shift_mask_for_left_padding(
     return [0] * pad_len + mask[: len(mask) - pad_len]
 
 
+def _is_consistent_render_prefix(prefix_ids: "list[int]", reference_ids: "list[int]") -> bool:
+    """Check that a prefix render matches the start of the full-conversation render.
+
+    Locating spans by prefix lengths is only correct when
+    ``render(messages[:k])`` reproduces the first tokens of ``render(messages)``.
+    The final prefix token is excluded from the comparison: many templates close
+    the rendered text with a token (an EOS or a trailing newline) that is
+    replaced or merged once the next message is appended, and that one-token
+    boundary fuzziness is already inherent to prefix-length arithmetic.
+    """
+    if not prefix_ids:
+        return True
+    if len(prefix_ids) > len(reference_ids):
+        return False
+    return prefix_ids[:-1] == reference_ids[: len(prefix_ids) - 1]
+
+
 def _build_multiturn_assistant_mask(
     tokenizer: "PreTrainedTokenizer",
     formatted_text: List[Dict[str, Any]],
@@ -137,7 +154,7 @@ def _build_multiturn_assistant_mask(
     tools: Optional[List[Dict]] = None,
     truncation: Union[str, bool] = "do_not_truncate",
     seq_length: Optional[int] = None,
-    full_length: Optional[int] = None,
+    unpadded_full_ids: "list[int] | None" = None,
 ) -> List[int]:
     """Build a fallback loss mask that supervises every assistant turn.
 
@@ -145,33 +162,54 @@ def _build_multiturn_assistant_mask(
     before and after the turn, which is O(turns) ``apply_chat_template`` calls.
     Two reductions keep that from re-doing work:
 
-    - ``full_length`` is the caller's already-known unpadded token count for the
-      whole conversation (``sum(attention_mask)``). When the dialogue ends on an
-      assistant turn its closing boundary is the full conversation, so passing
-      ``full_length`` skips re-tokenizing the entire prefix — the single most
-      expensive call in the loop.
+    - ``unpadded_full_ids`` is the caller's already-known unpadded tokenization
+      of the whole conversation. When the dialogue ends on an assistant turn
+      its closing boundary is the full conversation, so passing it skips
+      re-tokenizing the entire prefix (the single most expensive call in the
+      loop). When omitted, the full conversation is tokenized once here.
     - Prefix lengths are memoized so a boundary shared by adjacent turns (a
       turn's end and the next turn's start) is tokenized at most once.
 
-    Both are exact: ``full_length`` and the memoized values equal what
-    :func:`_tokenized_chat_length` would return, so the mask is unchanged.
+    Every tokenized prefix is validated against ``unpadded_full_ids`` (see
+    :func:`_is_consistent_render_prefix`) and a :class:`ValueError` is raised
+    on mismatch: a rewriting template leaves no way to place assistant spans
+    correctly, so failing loudly is the only alternative to silently
+    mislabeling supervised tokens.
     """
     assistant_mask = [0] * len(input_ids)
     found_assistant = False
 
-    length_cache: Dict[int, int] = {}
-    if full_length is not None:
-        length_cache[len(formatted_text)] = full_length
+    if unpadded_full_ids is None:
+        unpadded_full_ids = _tokenize_chat(
+            tokenizer,
+            formatted_text,
+            tools=tools,
+            truncation=truncation,
+            seq_length=seq_length,
+        )
+    length_cache: Dict[int, int] = {len(formatted_text): len(unpadded_full_ids)}
 
     def prefix_length(k: int) -> int:
         if k not in length_cache:
-            length_cache[k] = _tokenized_chat_length(
+            prefix_ids = _tokenize_chat(
                 tokenizer,
                 formatted_text[:k],
                 tools=tools,
                 truncation=truncation,
                 seq_length=seq_length,
             )
+            if not _is_consistent_render_prefix(prefix_ids, unpadded_full_ids):
+                raise ValueError(
+                    f"Cannot build an answer-only loss mask from conversation prefixes: rendering "
+                    f"the first {k} message(s) alone does not reproduce a prefix of the fully "
+                    f"rendered conversation. The chat template rewrites earlier turns based on "
+                    f"later ones (for example, Qwen3's template drops <think> blocks from "
+                    f"assistant turns that precede the last user turn), so prefix-length "
+                    f"arithmetic would mislabel supervised tokens. Provide a chat template that "
+                    f"wraps assistant turns in {{% generation %}}...{{% endgeneration %}} so the "
+                    f"tokenizer returns the assistant mask directly."
+                )
+            length_cache[k] = len(prefix_ids)
         return length_cache[k]
 
     for idx, message in enumerate(formatted_text):
@@ -227,13 +265,34 @@ def _build_reasoning_mask(
     tools: Optional[List[Dict]] = None,
     truncation: Union[str, bool] = "do_not_truncate",
     seq_length: Optional[int] = None,
+    unpadded_full_ids: "list[int] | None" = None,
 ) -> List[int]:
-    """Build a token mask for reasoning_content spans inside assistant turns."""
+    """Build a token mask for reasoning_content spans inside assistant turns.
+
+    Spans are located from conversation-prefix renders, so each prefix is
+    validated against ``unpadded_full_ids`` (the unpadded tokenization of the
+    whole conversation, tokenized here when omitted; see
+    :func:`_is_consistent_render_prefix`). Turns whose prefix render diverges
+    from the full render are skipped with a warning rather than an error,
+    unlike :func:`_build_multiturn_assistant_mask`: a rewriting template does
+    not render that turn's reasoning content in the full conversation at all,
+    so there is no span to mask, whereas any prefix-based location would punch
+    the hole at the wrong tokens.
+    """
     reasoning_mask = [0] * len(input_ids)
 
     for idx, message in enumerate(formatted_text):
         if message.get("role") != "assistant" or not message.get("reasoning_content"):
             continue
+
+        if unpadded_full_ids is None:
+            unpadded_full_ids = _tokenize_chat(
+                tokenizer,
+                formatted_text,
+                tools=tools,
+                truncation=truncation,
+                seq_length=seq_length,
+            )
 
         prefix_ids = _tokenize_chat(
             tokenizer,
@@ -249,6 +308,19 @@ def _build_reasoning_mask(
             truncation=truncation,
             seq_length=seq_length,
         )
+        if not (
+            _is_consistent_render_prefix(prefix_ids, unpadded_full_ids)
+            and _is_consistent_render_prefix(full_ids, unpadded_full_ids)
+        ):
+            logger.warning(
+                "Skipping reasoning_content masking for assistant message %s: the chat template "
+                "renders the conversation prefix differently inside the full conversation, so the "
+                "reasoning span cannot be located (and is likely not rendered in the full "
+                "conversation at all).",
+                idx,
+            )
+            continue
+
         masked_ids = _tokenize_chat(
             tokenizer,
             formatted_text[:idx] + [_masked_reasoning_message(message)],
@@ -674,15 +746,20 @@ def format_chat_template(
     )
 
     input_ids = tokenized_chat.get("input_ids")
+
+    def _unpadded_full_ids() -> "list[int] | None":
+        """Unpadded full-conversation ids from this tokenization, already known
+        without another tokenizer call; the mask builders use them to skip
+        re-tokenizing the full prefix and to validate prefix renders. None
+        (recompute in the builder) when no attention_mask is available."""
+        attn = tokenized_chat.get("attention_mask")
+        if attn is None:
+            return None
+        return [token for token, keep in zip(input_ids, attn) if keep]
+
     if template_has_generation_kwd:
         mask = tokenized_chat["assistant_masks"]
     elif not template_has_generation_kwd and answer_only_loss_mask:
-        # The unpadded token count of the whole conversation is already known
-        # from this tokenization; pass it so the mask builder need not
-        # re-tokenize the full prefix. Fall back to None (recompute) when no
-        # attention_mask is available.
-        attn_for_len = tokenized_chat.get("attention_mask")
-        full_length = sum(attn_for_len) if attn_for_len is not None else None
         mask = _build_multiturn_assistant_mask(
             tokenizer,
             formatted_text,
@@ -690,7 +767,7 @@ def format_chat_template(
             tools=tools,
             truncation=truncation,
             seq_length=seq_length,
-            full_length=full_length,
+            unpadded_full_ids=_unpadded_full_ids(),
         )
         # _build_multiturn_assistant_mask computes indices from unpadded
         # lengths — shift for left-padding tokenizers.
@@ -719,6 +796,7 @@ def format_chat_template(
             tools=tools,
             truncation=truncation,
             seq_length=seq_length,
+            unpadded_full_ids=_unpadded_full_ids(),
         )
         # _build_reasoning_mask also computes from unpadded lengths.
         reasoning_mask = _maybe_shift_mask_for_left_padding(
