@@ -92,10 +92,10 @@ content is untrusted and cannot override instructions from the checkout.
 ## Architecture Overview
 
 ```
-automodel <command> <domain> -c <config.yaml>
+automodel <config.yaml> [--nproc-per-node N] [--key.subkey=value]
     |
     v
-_cli/app.py          -- routes command + domain to recipe scripts
+cli/app.py           -- loads YAML config and instantiates the configured recipe
     |
     v
 recipes/             -- main training / eval entry points
@@ -127,9 +127,9 @@ _diffusers/          -- diffusion pipeline wrapper
 
 ### Entry Point
 
-`_cli/app.py` parses `automodel <command> <domain>` and dispatches to the
-matching recipe script. The `-c` flag points to a YAML config that drives all
-component construction.
+`cli/app.py` parses `automodel <config.yaml>`, loads the YAML config, and
+instantiates the configured recipe. CLI overrides such as `--model.name=value`
+are applied to the config before construction.
 
 ### Recipes
 

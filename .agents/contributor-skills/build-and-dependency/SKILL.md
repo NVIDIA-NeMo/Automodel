@@ -120,31 +120,23 @@ export HF_HOME="/path/to/hf_cache" # Hugging Face cache directory
 
 ## CLI Usage
 
-The entry point is `automodel` (defined at `nemo_automodel._cli.app:main`).
+The entry point is `automodel` (defined at `nemo_automodel.cli.app:main`).
 
-Pattern: `automodel <command> <domain> -c <config.yaml>`
+Pattern: `automodel <config.yaml> [--nproc-per-node N] [--key.subkey=value]`
 
 ```bash
-# LLM
-automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
-automodel pretrain llm -c config.yaml
-automodel kd llm -c config.yaml
-automodel benchmark llm -c config.yaml
+# Source checkout: the YAML recipe selects LLM, VLM, diffusion, or retrieval behavior.
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 8
+uv run automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
 
-# VLM
-automodel finetune vlm -c config.yaml
-
-# Diffusion
-automodel finetune diffusion -c config.yaml
-
-# Retrieval
-automodel finetune retrieval -c config.yaml
+# External torchrun launch for clusters that set rank and rendezvous explicitly.
+uv run torchrun --nproc-per-node 8 -m nemo_automodel.cli.app examples/retrieval/bi_encoder/llama3_2_1b.yaml
 ```
 
 Override any config value from the CLI:
 
 ```bash
-automodel finetune llm -c config.yaml --model.name_or_path meta-llama/Llama-3.2-1B
+uv run automodel config.yaml --model.name_or_path=meta-llama/Llama-3.2-1B
 ```
 
 ## Common Pitfalls
