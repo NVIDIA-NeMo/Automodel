@@ -214,7 +214,7 @@ linting = [
     "import-linter~=2.4",
     "ty>=0.0.20",
 ]
-test = ["coverage", "pytest", "peft>=0.18.1", "ruamel.yaml", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
+test = ["coverage", "pytest", "pytest-timeout", "peft>=0.18.1", "ruamel.yaml", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 dev = [
     "cut-cross-entropy",
     "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
@@ -333,6 +333,9 @@ requires-dist = ["torch", "packaging", "ninja", "setuptools"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# 60sec ought to be enough
+timeout = 60
+timeout_method = "thread"
 
 [tool.coverage.paths]
 source = ["nemo_automodel", "/opt/Automodel/nemo_automodel", "/home/runner/work/Automodel/Automodel/nemo_automodel"]
