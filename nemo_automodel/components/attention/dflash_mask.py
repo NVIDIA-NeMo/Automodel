@@ -108,6 +108,7 @@ def create_dflash_sdpa_mask(
     is_ctx = kv_idx < ctx_len
     ctx_visible = is_ctx & (kv_idx < anchor_exp)
     if ctx_doc_id is not None:
+        assert anchor_doc_id is not None, "anchor_doc_id is required when ctx_doc_id is given"
         # Packing: a block attends only to context tokens in its anchor's
         # document. Build a per-kv doc id whose noise slots are a sentinel (-1)
         # that never matches an anchor's (>=0) doc id, then compare per block.
@@ -168,6 +169,9 @@ def build_dflash_mask_mod(
         is_ctx = kv_idx < ctx_len
         ctx_visible = is_ctx & (kv_idx < anchor)
         if doc_aware:
+            # Narrow the captured ``Tensor | None`` args for ty; narrowing from
+            # the enclosing scope does not reach the closure body.
+            assert ctx_doc_id is not None and anchor_doc_id is not None
             # Packing: restrict the context prefix to the anchor's document.
             # Clamp the kv index into range for the ctx lookup; the result only
             # gates ``ctx_visible`` (already False on the noise half).
