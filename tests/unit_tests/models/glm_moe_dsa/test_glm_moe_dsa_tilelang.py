@@ -1109,7 +1109,7 @@ def test_glm_dsa_prepare_model_inputs_for_cp_binds_batch_sharder():
 
     prepared = model.prepare_model_inputs_for_cp(input_ids=torch.arange(8).view(1, 8), num_chunks=3)
 
-    assert prepared["_cp_full_logits_grad_touch"] is True
+    assert set(prepared) == {"_cp_make_batch_fn"}
     fn = prepared["_cp_make_batch_fn"]
     assert fn.func is cp_mod.make_glm_dsa_packed_cp_batch_and_ctx
     assert fn.keywords["num_chunks"] == 3
