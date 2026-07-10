@@ -229,6 +229,13 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
 
         return hf_state_dict
 
+    def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
+        meta_state_dict = {
+            key: torch.empty_like(value, device="meta") if isinstance(value, torch.Tensor) else value
+            for key, value in state_dict.items()
+        }
+        return list(self.to_hf(meta_state_dict, exclude_key_regex=r".*_extra_state.*"))
+
     def _gather_expert_tensor(
         self,
         tensor: torch.Tensor,

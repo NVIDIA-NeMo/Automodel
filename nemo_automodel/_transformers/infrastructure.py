@@ -527,9 +527,13 @@ def apply_model_infrastructure(
         checkpoint_already_loaded = True
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
-    pre_shard_hf_state_dict_keys = list(
-        _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=False).keys()
-    )
+    state_dict_adapter = getattr(model, "state_dict_adapter", None)
+    if state_dict_adapter is not None:
+        pre_shard_hf_state_dict_keys = state_dict_adapter.get_hf_state_dict_keys(model.state_dict())
+    else:
+        pre_shard_hf_state_dict_keys = list(
+            _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=False).keys()
+        )
 
     # Apply freezing before sharding
     freeze_config = _kwargs.get("freeze_config")

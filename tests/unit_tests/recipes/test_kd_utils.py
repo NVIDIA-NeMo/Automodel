@@ -117,14 +117,6 @@ def test_separate_kd_setup_assigns_contiguous_disjoint_ranks(monkeypatch):
             },
             "student=2.*teacher=1 != world_size=4",
         ),
-        (
-            {
-                "separate_meshes": True,
-                "distributed": {"dp_size": 2, "ep_size": 2},
-                "teacher_distributed": {"dp_size": 2},
-            },
-            "distributed.ep_size > 1 is not supported",
-        ),
     ],
 )
 def test_kd_setup_rejects_ambiguous_rank_splits(cfg, message):
@@ -213,6 +205,42 @@ def _run_kd_bridge_worker(rank: int, world_size: int, init_file: str) -> None:
 def test_kd_mesh_bridge_routes_two_student_replicas_through_teacher_tp2(tmp_path):
     """Exercise explicit subset meshes and bridge collectives on four CPU ranks."""
     mp.spawn(_run_kd_bridge_worker, args=(4, str(tmp_path / "process_group")), nprocs=4, join=True)
+
+
+def _run_subset_ep_mesh_worker(rank: int, world_size: int, init_file: str) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        cfg = {
+            "separate_meshes": True,
+            "distributed": {"strategy": "fsdp2", "dp_size": 2},
+            "teacher_distributed": {
+                "strategy": "fsdp2",
+                "dp_size": 4,
+                "pp_size": 2,
+                "ep_size": 2,
+                "pipeline": {},
+            },
+        }
+        setups = kd_utils.create_kd_distributed_setups(cfg, world_size=world_size)
+        if rank in setups.teacher_ranks:
+            device_mesh = setups.teacher.mesh_context.device_mesh
+            moe_mesh = setups.teacher.mesh_context.moe_mesh
+            assert device_mesh["pp"].size() == 2
+            assert moe_mesh is not None
+            assert moe_mesh["ep"].size() == 2
+            assert set(dist.get_process_group_ranks(moe_mesh["ep"].get_group())).issubset(setups.teacher_ranks)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_separate_kd_setup_builds_teacher_ep_mesh_on_rank_subset(tmp_path):
+    """Teacher PP and EP groups may occupy ranks disjoint from the student mesh."""
+    mp.spawn(_run_subset_ep_mesh_worker, args=(10, str(tmp_path / "ep_process_group")), nprocs=10, join=True)
 
 
 def test_pp_kd_wrapper_consumes_teacher_microbatches_in_order():

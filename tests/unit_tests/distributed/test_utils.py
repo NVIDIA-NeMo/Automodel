@@ -109,6 +109,17 @@ def test_first_rank_per_node_uses_explicit_process_group(monkeypatch, patch_dist
     assert seen_groups == [group, group]
 
 
+def test_barrier_with_timeout_reuses_explicit_process_group(monkeypatch, patch_dist):
+    group = object()
+    seen_groups = []
+    monkeypatch.setattr(du.dist, "get_world_size", lambda group=None: 2, raising=False)
+    monkeypatch.setattr(du.dist, "barrier", lambda group=None: seen_groups.append(group), raising=False)
+    monkeypatch.setattr(du, "_create_gloo_group", lambda: pytest.fail("unexpected Gloo group"))
+
+    assert du._barrier_with_timeout(timeout=du.timedelta(seconds=1), group=group)
+    assert seen_groups == [group]
+
+
 def test_reduce_loss_no_dp(monkeypatch):
     """
     With dp_group=None the routine must simply sum the supplied tensors and

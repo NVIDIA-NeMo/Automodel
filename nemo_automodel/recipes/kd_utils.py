@@ -75,8 +75,6 @@ def _mesh_size(distributed_cfg: Any, *, label: str) -> int:
     cfg_dict = _section_to_dict(distributed_cfg)
     parsed = parse_distributed_section(cfg_dict)
     sizes = parsed["parallelism_sizes"]
-    if sizes.ep_size > 1:
-        raise ValueError(f"{label}.ep_size > 1 is not supported with separate KD meshes")
     if sizes.dp_size is None:
         raise ValueError(
             f"{label}.dp_size must be set when separate_meshes=true so the non-overlapping rank split is explicit"

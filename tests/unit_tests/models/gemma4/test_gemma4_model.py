@@ -27,6 +27,7 @@ from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4MoEModel,
     Gemma4MoETextModelBackend,
     _build_packed_gemma4_causal_mask_mapping,
+    _build_unpacked_gemma4_causal_mask_mapping,
     _derive_padding_mask,
 )
 from nemo_automodel.components.moe.config import MoEConfig
@@ -505,6 +506,29 @@ class TestPackedGemma4MaskMapping:
         assert not sliding_allowed[0, 0, 3, 0]
         assert not sliding_allowed[0, 0, 5, 1]
         assert not sliding_allowed[0, 0, 7, 7]
+
+    def test_unpacked_mask_uses_legacy_mapping_when_available(self, monkeypatch):
+        from transformers.models.gemma4 import modeling_gemma4
+
+        expected = {"full_attention": object(), "sliding_attention": object()}
+        legacy_mapping = MagicMock(return_value=expected)
+        monkeypatch.setattr(modeling_gemma4, "create_causal_mask_mapping", legacy_mapping, raising=False)
+        inputs_embeds = torch.zeros(1, 4, 8)
+        mm_token_type_ids = torch.zeros(1, 4, dtype=torch.long)
+
+        actual = _build_unpacked_gemma4_causal_mask_mapping(
+            MagicMock(),
+            inputs_embeds,
+            None,
+            None,
+            None,
+            mm_token_type_ids,
+            None,
+            is_training=False,
+        )
+
+        assert actual is expected
+        assert legacy_mapping.call_args.kwargs["mm_token_type_ids"] is mm_token_type_ids
 
 
 # ---------------------------------------------------------------------------

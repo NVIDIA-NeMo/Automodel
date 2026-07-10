@@ -27,7 +27,7 @@ from nemo_automodel.components.distributed.config import DDPConfig
 logger = logging.getLogger(__name__)
 
 
-def _create_gloo_group(group: dist.ProcessGroup | None = None) -> dist.ProcessGroup | None:
+def _create_gloo_group() -> dist.ProcessGroup | None:
     """
     Create a Gloo process group for barrier operations.
 
@@ -41,17 +41,7 @@ def _create_gloo_group(group: dist.ProcessGroup | None = None) -> dist.ProcessGr
         return None
 
     try:
-        # ``new_group`` normally requires every default-group rank to call it.
-        # Subset recipes only execute this path on ranks that own the trainable
-        # model, so use local synchronization for an explicit subgroup.
-        if group is None:
-            gloo_group = dist.new_group(backend="gloo")
-        else:
-            gloo_group = dist.new_group(
-                ranks=dist.get_process_group_ranks(group),
-                backend="gloo",
-                use_local_synchronization=True,
-            )
+        gloo_group = dist.new_group(backend="gloo")
         logger.debug("Created Gloo group for barrier operations")
         return gloo_group
     except Exception as e:
@@ -61,10 +51,11 @@ def _create_gloo_group(group: dist.ProcessGroup | None = None) -> dist.ProcessGr
 
 def _barrier_with_timeout(timeout: timedelta, group: dist.ProcessGroup | None = None) -> bool:
     """
-    A timeout wrapper for torch.distributed.barrier() using Gloo backend.
+    Run a barrier using the timeout configured on its process group.
 
-    This approach creates a separate Gloo process group for barrier operations
-    while keeping the main NCCL backend for training operations.
+    Explicit model-local groups are reused directly so subset ranks do not need
+    to create another process group in a globally coordinated order. The default
+    group path uses a temporary Gloo group and ``monitored_barrier``.
 
     Args:
         timeout: Maximum time to wait for the barrier
@@ -76,8 +67,16 @@ def _barrier_with_timeout(timeout: timedelta, group: dist.ProcessGroup | None = 
     if not dist.is_initialized() or dist.get_world_size(group=group) == 1:
         return True
 
+    if group is not None:
+        try:
+            dist.barrier(group=group)
+            return True
+        except Exception as e:
+            logger.warning(f"Barrier failed: {e}")
+            return False
+
     # Use Gloo group for barrier operations
-    gloo_group = _create_gloo_group(group)
+    gloo_group = _create_gloo_group()
     if gloo_group is None:
         # Fallback to regular barrier if Gloo group creation fails
         try:

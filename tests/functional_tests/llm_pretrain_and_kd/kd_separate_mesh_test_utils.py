@@ -22,13 +22,31 @@ from torch.utils.data import Dataset
 
 
 class TinyKDDataset(Dataset):
-    """Small deterministic next-token dataset."""
+    """Small deterministic next-token dataset built from natural text."""
 
-    def __init__(self, num_samples: int = 16, seq_length: int = 8):
+    def __init__(self, tokenizer, num_samples: int = 16, seq_length: int = 8, repeat_first_sample: bool = False):
+        corpus = (
+            "Knowledge distillation trains a compact student model to reproduce useful behavior from a larger "
+            "teacher model. The student reads ordinary text, predicts the next token, and learns from both the "
+            "ground truth and the teacher distribution. Distributed training can place the student and teacher "
+            "on separate device meshes while preserving the mathematical objective. This test uses deterministic "
+            "language about software engineering, scientific computing, and reliable validation so that pretrained "
+            "language models receive realistic token sequences instead of arbitrary vocabulary identifiers. Careful "
+            "experiments compare every logged loss component across tensor, pipeline, and expert parallel layouts. "
+            "When numerical differences appear, the run is repeated with controlled seeds and controlled precision until "
+            "the source of the discrepancy is understood. Reproducible tests record model versions, cluster topology, "
+            "container images, and exact metrics so another engineer can independently verify the result."
+        )
+        token_ids = tokenizer.encode(corpus, add_special_tokens=True)
+        if len(token_ids) <= seq_length:
+            raise ValueError(f"Natural-text fixture produced only {len(token_ids)} tokens for seq_length={seq_length}")
+
         self.samples = []
         for sample_index in range(num_samples):
-            input_ids = [3 + (sample_index + position) % 24 for position in range(seq_length)]
-            labels = input_ids[1:] + [2]
+            start = 0 if repeat_first_sample else (sample_index * seq_length) % (len(token_ids) - seq_length)
+            window = token_ids[start : start + seq_length + 1]
+            input_ids = window[:-1]
+            labels = window[1:]
             labels[0] = -100
             self.samples.append({"input_ids": input_ids, "labels": labels})
 
@@ -39,10 +57,18 @@ class TinyKDDataset(Dataset):
         return len(self.samples)
 
 
-def make_tiny_kd_dataset(tokenizer=None, num_samples: int = 16, seq_length: int = 8) -> TinyKDDataset:
-    """Build the deterministic test dataset; ``tokenizer`` verifies recipe injection."""
-    del tokenizer
-    return TinyKDDataset(num_samples=num_samples, seq_length=seq_length)
+def make_tiny_kd_dataset(
+    tokenizer=None, num_samples: int = 16, seq_length: int = 8, repeat_first_sample: bool = False
+) -> TinyKDDataset:
+    """Build the deterministic tokenizer-encoded test dataset."""
+    if tokenizer is None:
+        raise ValueError("TinyKDDataset requires a tokenizer")
+    return TinyKDDataset(
+        tokenizer=tokenizer,
+        num_samples=num_samples,
+        seq_length=seq_length,
+        repeat_first_sample=repeat_first_sample,
+    )
 
 
 def create_tiny_llama_assets(output_dir: str | pathlib.Path) -> None:

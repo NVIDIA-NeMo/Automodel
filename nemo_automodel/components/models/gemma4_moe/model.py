@@ -470,6 +470,51 @@ def get_block_sequence_ids_for_mask(mm_token_type_ids: torch.Tensor, device: tor
     return block_sequence_ids
 
 
+def _build_unpacked_gemma4_causal_mask_mapping(
+    config,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    past_key_values,
+    position_ids: torch.Tensor | None,
+    mm_token_type_ids: torch.Tensor | None,
+    pixel_values: torch.Tensor | None,
+    *,
+    is_training: bool,
+) -> dict[str, torch.Tensor]:
+    from transformers.models.gemma4 import modeling_gemma4
+
+    legacy_mask_mapping = getattr(modeling_gemma4, "create_causal_mask_mapping", None)
+    if legacy_mask_mapping is not None:
+        return legacy_mask_mapping(
+            config=config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            mm_token_type_ids=mm_token_type_ids,
+            pixel_values=pixel_values,
+            is_training=is_training,
+        )
+
+    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+
+    block_sequence_ids = torch.full(inputs_embeds.shape[:2], -1, device=inputs_embeds.device)
+    if mm_token_type_ids is not None:
+        block_sequence_ids = get_block_sequence_ids_for_mask(mm_token_type_ids, device=inputs_embeds.device)
+    mask_kwargs = {
+        "config": config,
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": attention_mask,
+        "past_key_values": past_key_values,
+        "position_ids": position_ids,
+        "block_sequence_ids": block_sequence_ids,
+    }
+    return {
+        "full_attention": create_causal_mask(**mask_kwargs),
+        "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+    }
+
+
 def _build_packed_gemma4_causal_mask_mapping(
     packed_seq_ids: torch.Tensor,
     mm_token_type_ids: torch.Tensor,
@@ -717,27 +762,16 @@ class Gemma4MoETextModelBackend(nn.Module):
                 flex_block_size=(32, 32) if getattr(self.config, "head_dim", 0) > 256 else 128,
             )
         elif use_vision_bidirectional_mask:
-            from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-
-            # transformers 5.12 removed gemma4's create_causal_mask_mapping. The
-            # vision-aware behaviour (tokens in the same vision group attend
-            # bidirectionally; text tokens stay causal) is now expressed via
-            # block_sequence_ids passed to the standard mask builders.
-            block_sequence_ids = torch.full(inputs_embeds.shape[:2], -1, device=inputs_embeds.device)
-            if mm_token_type_ids is not None:
-                block_sequence_ids = get_block_sequence_ids_for_mask(mm_token_type_ids, device=inputs_embeds.device)
-            mask_kwargs = {
-                "config": self.config,
-                "inputs_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-                "block_sequence_ids": block_sequence_ids,
-            }
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-            }
+            causal_mask_mapping = _build_unpacked_gemma4_causal_mask_mapping(
+                self.config,
+                inputs_embeds,
+                attention_mask,
+                past_key_values,
+                position_ids,
+                mm_token_type_ids,
+                pixel_values,
+                is_training=self.training,
+            )
         else:
             from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 

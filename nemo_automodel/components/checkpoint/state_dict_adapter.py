@@ -71,3 +71,7 @@ class StateDictAdapter(ABC):
             Returns a list because some native tensors may split into multiple HF tensors.
         """
         pass
+
+    def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
+        """Return the Hugging Face keys produced by ``to_hf``."""
+        return list(self.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=False))

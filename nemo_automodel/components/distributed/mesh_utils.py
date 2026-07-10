@@ -334,7 +334,9 @@ def _create_fsdp2_device_mesh(
             device_mesh,
             ep_shard_size=ep_shard_size,
             ep_size=ep_size,
+            pp_size=pp_size,
             timeout_minutes=timeout_minutes,
+            ranks=ranks,
         )
 
     return device_mesh, moe_mesh
@@ -374,9 +376,36 @@ def _create_moe_mesh(
     *,
     ep_shard_size: int,
     ep_size: int,
+    pp_size: int = 1,
     timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
 ) -> DeviceMesh:
     non_pp_axes = (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD, MeshAxisName.CP, MeshAxisName.TP)
+    if ranks is not None:
+        current_rank = dist.get_rank()
+        ranks_per_stage = ep_shard_size * ep_size
+        backend_override = _nccl_backend_override(
+            (MeshAxisName.EP_SHARD, MeshAxisName.EP),
+            device_type=device_mesh.device_type,
+            timeout_minutes=timeout_minutes,
+        )
+        local_mesh = None
+        first_mesh = None
+        for stage in range(pp_size):
+            stage_ranks = ranks[stage * ranks_per_stage : (stage + 1) * ranks_per_stage]
+            stage_mesh = DeviceMesh(
+                device_mesh.device_type,
+                mesh=torch.tensor(stage_ranks, dtype=torch.int64).reshape(ep_shard_size, ep_size),
+                mesh_dim_names=(MeshAxisName.EP_SHARD, MeshAxisName.EP),
+                backend_override=backend_override,
+            )
+            if first_mesh is None:
+                first_mesh = stage_mesh
+            if current_rank in stage_ranks:
+                local_mesh = stage_mesh
+        if first_mesh is None:
+            raise RuntimeError("Failed to construct an expert-parallel mesh")
+        return local_mesh if local_mesh is not None else first_mesh
     return _unflatten_compat(
         device_mesh[non_pp_axes]._flatten(),
         axis=0,

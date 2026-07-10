@@ -193,6 +193,17 @@ class TestBackendDictCoercion:
 
         assert "backend" not in captured
 
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_process_group_is_forwarded_only_to_weight_download(self, mock_resolve_cls, mock_download):
+        process_group = object()
+
+        captured = self._run_init_model(mock_resolve_cls, _process_group=process_group)
+
+        assert "_process_group" not in captured
+        assert mock_download.call_args.args[1] == "fake/model"
+        assert mock_download.call_args.kwargs == {"process_group": process_group}
+
 
 class TestGetHfConfigNestedKwargs:
     """get_hf_config should filter nested dict kwargs from AutoConfig.from_pretrained."""

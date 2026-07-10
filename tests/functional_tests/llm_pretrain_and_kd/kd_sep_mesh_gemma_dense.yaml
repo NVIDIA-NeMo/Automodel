@@ -1,0 +1,97 @@
+recipe: KnowledgeDistillationRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 24
+  local_batch_size: 3
+  max_steps: 3
+  num_epochs: 1
+  ckpt_every_steps: 100
+  val_every_steps: 100
+  log_remote_every_steps: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: google/gemma-3-270m
+  torch_dtype: bfloat16
+  attn_implementation: eager
+
+teacher_model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: google/gemma-4-31B-it
+  torch_dtype: bfloat16
+  attn_implementation: eager
+
+offload_teacher_model: false
+separate_meshes: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: 8
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: false
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: /workspace/results/kd_sep_mesh/shared_dense
+  model_save_format: torch_save
+  save_consolidated: false
+
+clip_grad_norm:
+  max_norm: 1.0
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: true
+
+kd_ratio: 0.5
+kd_loss_fn:
+  _target_: nemo_automodel.components.loss.kd_loss.KDLoss
+  ignore_index: -100
+  temperature: 1.0
+  fp32_upcast: true
+  chunk_size: 4096
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 0.0
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  foreach: false
+
+dataset:
+  _target_: tests.functional_tests.llm_pretrain_and_kd.kd_separate_mesh_test_utils.make_tiny_kd_dataset
+  tokenizer:
+    pretrained_model_name_or_path: google/gemma-3-270m
+  num_samples: 72
+  seq_length: 16
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+  num_workers: 0
+
+wandb:
+  entity: Nemo-automodel
+  project: kd_sep_mesh
+  name: shared_dense_dp8
+  group: gemma3_270m__gemma4_31b
+  job_type: parity
+  tags: [kd, shared-mesh, dense-teacher, cw-dfw]
+  dir: /workspace/results/kd_sep_mesh/wandb
