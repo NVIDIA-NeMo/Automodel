@@ -170,12 +170,6 @@ class MoEParallelizerConfig:
     # per expert than the forward pass, which makes torch.utils.checkpoint raise a
     # CheckpointError on the backward recompute.
     ignore_router_for_ac: bool = True
-    # How trainable VLM vision-tower blocks are checkpointed under activation checkpointing.
-    # "submodule" (default) wraps each block's attention/MLP/norms with plain checkpoint_wrapper,
-    # matching the generic FSDP2/DDP path. "pinned_block" wraps whole blocks and pins the SDPA
-    # backend set on both the checkpoint forward and its recompute, for environments where
-    # ambient SDPA backend forcing does not span the recompute.
-    vision_checkpoint_spec: str = "submodule"
     reshard_after_forward: bool = False
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
     wrap_outer_model: bool = True

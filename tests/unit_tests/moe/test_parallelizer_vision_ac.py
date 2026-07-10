@@ -16,7 +16,6 @@
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -104,23 +103,40 @@ class _TextOnlyModel(nn.Module):
         self.model = _LanguageModel()
 
 
-def _assert_submodule_wrapped(visual: nn.Module) -> None:
-    """Assert the default spec: blocks stay unwrapped, attention + MLP checkpoint-wrapped."""
+def _assert_vision_submodules_wrapped(visual: nn.Module) -> None:
+    """Assert per-submodule wrapping: blocks stay unwrapped, attention + MLP checkpoint-wrapped."""
     for block in visual.blocks:
         assert not isinstance(block, CheckpointWrapper)
         assert isinstance(block.attn, CheckpointWrapper)
         assert isinstance(block.mlp, CheckpointWrapper)
 
 
-def test_apply_ac_checkpoints_trainable_vision_submodules_by_default():
+def _assert_vision_untouched(visual: nn.Module) -> None:
+    """Assert no vision block or submodule got checkpoint-wrapped."""
+    for block in visual.blocks:
+        assert not isinstance(block, CheckpointWrapper)
+        assert not isinstance(block.attn, CheckpointWrapper)
+        assert not isinstance(block.mlp, CheckpointWrapper)
+
+
+def _assert_decoder_wrapped(language_model: nn.Module) -> None:
+    assert all(isinstance(layer, CheckpointWrapper) for layer in language_model.layers)
+
+
+def _assert_decoder_untouched(language_model: nn.Module) -> None:
+    assert all(not isinstance(layer, CheckpointWrapper) for layer in language_model.layers)
+
+
+def test_apply_ac_checkpoints_decoder_and_vision_submodules_by_default():
     model = Qwen3VLMoeForConditionalGeneration()
 
     moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2)
 
-    # Default spec matches the generic FSDP2/DDP path: per-submodule wrapping
-    # (attention included -- SDPA/flash replay inside checkpoint backward is safe).
-    _assert_submodule_wrapped(model.model.visual)
-    assert all(isinstance(layer, CheckpointWrapper) for layer in model.model.language_model.layers)
+    # Default scope ("all"): decoder blocks plus the trainable vision tower, the latter
+    # with the same per-submodule wrapping as the generic FSDP2/DDP path (attention
+    # included -- SDPA/flash replay inside checkpoint backward is safe).
+    _assert_vision_submodules_wrapped(model.model.visual)
+    _assert_decoder_wrapped(model.model.language_model)
 
     # The wrapped tower must recompute cleanly: forward + backward produce grads.
     out = model.model.visual(torch.randn(4, _DIM))
@@ -129,25 +145,53 @@ def test_apply_ac_checkpoints_trainable_vision_submodules_by_default():
     assert qkv_weight.grad is not None
 
 
-def test_apply_ac_pinned_block_spec_wraps_whole_vision_blocks():
+def test_apply_ac_scope_language_skips_vision_tower():
     model = Qwen3VLMoeForConditionalGeneration()
 
-    moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2, vision_checkpoint_spec="pinned_block")
+    moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2, activation_checkpointing_scope="language")
 
-    assert all(isinstance(block, CheckpointWrapper) for block in model.model.visual.blocks)
-    assert all(isinstance(layer, CheckpointWrapper) for layer in model.model.language_model.layers)
-
-    out = model.model.visual(torch.randn(4, _DIM))
-    out.sum().backward()
-    qkv_weight = model.model.visual.blocks[0]._checkpoint_wrapped_module.attn.qkv.weight
-    assert qkv_weight.grad is not None
+    _assert_decoder_wrapped(model.model.language_model)
+    _assert_vision_untouched(model.model.visual)
 
 
-def test_apply_ac_rejects_unknown_vision_checkpoint_spec():
+def test_apply_ac_scope_vision_skips_decoder_entirely():
     model = Qwen3VLMoeForConditionalGeneration()
 
-    with pytest.raises(ValueError, match="vision_checkpoint_spec"):
-        moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2, vision_checkpoint_spec="mlp_only")
+    # No hidden_size/num_experts: a vision-only scope must not touch the decoder path,
+    # including its config-derivation (which would raise on this config-less stub).
+    moe_parallelizer.apply_ac(model, activation_checkpointing_scope="vision")
+
+    _assert_vision_submodules_wrapped(model.model.visual)
+    _assert_decoder_untouched(model.model.language_model)
+
+
+def test_apply_ac_scope_vision_selective_skips_decoder_entirely():
+    model = Qwen3VLMoeForConditionalGeneration()
+
+    moe_parallelizer.apply_ac(model, selective=True, activation_checkpointing_scope="vision")
+
+    _assert_vision_submodules_wrapped(model.model.visual)
+    _assert_decoder_untouched(model.model.language_model)
+
+
+def test_apply_ac_scope_multimodal_selects_vision_group():
+    model = Qwen3VLMoeForConditionalGeneration()
+
+    moe_parallelizer.apply_ac(model, activation_checkpointing_scope="multimodal")
+
+    # "multimodal" expands to vision + audio; the audio group does not exist on this
+    # model, so only the vision tower is wrapped.
+    _assert_vision_submodules_wrapped(model.model.visual)
+    _assert_decoder_untouched(model.model.language_model)
+
+
+def test_apply_ac_scope_audio_wraps_nothing_on_vision_only_model():
+    model = Qwen3VLMoeForConditionalGeneration()
+
+    moe_parallelizer.apply_ac(model, activation_checkpointing_scope="audio")
+
+    _assert_vision_untouched(model.model.visual)
+    _assert_decoder_untouched(model.model.language_model)
 
 
 def test_apply_ac_skips_frozen_vision_tower():
@@ -157,11 +201,8 @@ def test_apply_ac_skips_frozen_vision_tower():
 
     moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2)
 
-    for block in model.model.visual.blocks:
-        assert not isinstance(block, CheckpointWrapper)
-        assert not isinstance(block.attn, CheckpointWrapper)
-        assert not isinstance(block.mlp, CheckpointWrapper)
-    assert all(isinstance(layer, CheckpointWrapper) for layer in model.model.language_model.layers)
+    _assert_vision_untouched(model.model.visual)
+    _assert_decoder_wrapped(model.model.language_model)
 
 
 def test_apply_ac_selective_also_checkpoints_vision_submodules():
@@ -169,18 +210,18 @@ def test_apply_ac_selective_also_checkpoints_vision_submodules():
 
     moe_parallelizer.apply_ac(model, selective=True)
 
-    _assert_submodule_wrapped(model.model.visual)
-    assert all(isinstance(layer, CheckpointWrapper) for layer in model.model.language_model.layers)
+    _assert_vision_submodules_wrapped(model.model.visual)
+    _assert_decoder_wrapped(model.model.language_model)
 
 
 def test_apply_ac_flash_attention_vision_tower_also_wraps_attention():
-    """FA replay inside checkpoint backward is safe; FA-configured towers get the full default spec."""
+    """FA replay inside checkpoint backward is safe; FA-configured towers get the same wrapping."""
     model = Qwen3VLMoeForConditionalGeneration()
     model.config = SimpleNamespace(vision_config=SimpleNamespace(_attn_implementation="flash_attention_2"))
 
     moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2)
 
-    _assert_submodule_wrapped(model.model.visual)
+    _assert_vision_submodules_wrapped(model.model.visual)
 
 
 def test_apply_ac_leaves_text_only_models_unchanged():
@@ -188,4 +229,4 @@ def test_apply_ac_leaves_text_only_models_unchanged():
 
     moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2)
 
-    assert all(isinstance(layer, CheckpointWrapper) for layer in model.model.layers)
+    _assert_decoder_wrapped(model.model)

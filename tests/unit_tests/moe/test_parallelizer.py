@@ -934,7 +934,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     apply_ep_mock.assert_called_once()
     # AC enabled
     apply_ac_mock.assert_called_once_with(
-        model, ignore_router=True, selective=False, vision_checkpoint_spec="submodule"
+        model, ignore_router=True, selective=False, activation_checkpointing_scope="all"
     )
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args

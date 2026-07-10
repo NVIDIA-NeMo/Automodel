@@ -210,8 +210,6 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
 
 _VISION_TOWER_ATTRS = ("visual", "vision_tower", "vision_model", "vit_model")
 
-_VISION_CHECKPOINT_SPECS = ("submodule", "pinned_block")
-
 
 def _has_trainable_vision_tower(model: nn.Module) -> bool:
     """Return whether the model (or its inner ``.model``) exposes a trainable vision tower.
@@ -236,46 +234,66 @@ def _has_trainable_vision_tower(model: nn.Module) -> bool:
     return False
 
 
-def _apply_vision_tower_ac(model: nn.Module, vision_checkpoint_spec: str = "submodule") -> None:
+def _apply_vision_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> None:
     """Checkpoint trainable VLM vision-tower blocks on the expert-parallel path.
 
     ``apply_ac`` iterates only the text/MTP decoder stack
     (``_iter_transformer_and_mtp_blocks``), and the generic FSDP2 scope
     handling does not run for expert-parallel configs, so a trainable vision
-    tower would otherwise keep every activation. Reuses the per-model vision
-    layer mapping from the dense parallelizer. The default ``"submodule"`` spec
-    applies the same per-submodule wrapping (attention/MLP/norms) as the
-    generic FSDP2/DDP path; ``"pinned_block"`` wraps whole blocks with the
-    SDPA-backend-pinned spec for environments where ambient SDPA backend
-    forcing does not span the checkpoint recompute. Fully frozen vision towers
-    are left untouched, consistent with the generic path's frozen-tower
-    behavior.
+    tower would otherwise keep every activation. Reuses the per-model
+    layer-group mapping from the dense parallelizer and applies the same
+    per-submodule wrapping (attention/MLP/norms) as the generic FSDP2/DDP
+    path, with ``sdpa_backend_snapshot_context_fn`` on the attention/MLP
+    wrappers so the backward-time recompute reruns under the forward-time SDPA
+    backend set. Fully frozen vision towers are left untouched, consistent
+    with the generic path's frozen-tower behavior.
+
+    Args:
+        model: Root model owning the tower(s) to checkpoint.
+        scopes: Normalized activation-checkpointing scope tuple. ``("all",)``
+            selects the vision group; otherwise only the named non-language
+            groups are selected, with ``multimodal`` expanding to vision +
+            audio. Groups the model does not expose are simply absent.
     """
-    if not _has_trainable_vision_tower(model):
+    if scopes == ("all",):
+        group_names: tuple[str, ...] = ("vision",)
+    else:
+        group_names = tuple(
+            dict.fromkeys(
+                name
+                for scope in scopes
+                for name in (("vision", "audio") if scope == "multimodal" else (scope,))
+                if name != "language"
+            )
+        )
+    if not group_names or not _has_trainable_vision_tower(model):
         return
 
     # Lazy imports keep the heavy, transformers-aware dense parallelizer module
     # off the text-only MoE call path.
     from nemo_automodel.components.distributed.activation_checkpointing import (
         apply_submodule_checkpointing,
-        apply_vision_block_checkpointing,
+        sdpa_backend_snapshot_context_fn,
     )
     from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
 
-    vision_layers = [
+    layer_groups = get_model_layer_groups(model)
+    tower_layers = [
         layer
-        for layer in get_model_layer_groups(model).get("vision", [])
+        for name in group_names
+        for layer in layer_groups.get(name, [])
         if any(param.requires_grad for param in layer.parameters())
     ]
-    if not vision_layers:
-        logger.info("No trainable vision blocks found; skipping vision-tower activation checkpointing.")
+    if not tower_layers:
+        logger.info(
+            "No trainable vision blocks selected by activation checkpointing scope %s; "
+            "skipping vision-tower activation checkpointing.",
+            scopes,
+        )
         return
-    if vision_checkpoint_spec == "pinned_block":
-        apply_vision_block_checkpointing(model, vision_layers)
-    else:
-        # Vision towers have no KV cache, so KV-sharing (a text-decoder concern)
-        # never applies here.
-        apply_submodule_checkpointing(vision_layers, has_kv_sharing=False)
+    # Vision towers have no KV cache, so KV-sharing (a text-decoder concern)
+    # never applies here.
+    apply_submodule_checkpointing(tower_layers, has_kv_sharing=False, context_fn=sdpa_backend_snapshot_context_fn)
 
 
 def apply_ac(
@@ -284,7 +302,7 @@ def apply_ac(
     hidden_size: int | None = None,
     num_experts: int | None = None,
     selective: bool = False,
-    vision_checkpoint_spec: str = "submodule",
+    activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
 ):
     """Apply activation checkpointing to the model.
 
@@ -300,21 +318,27 @@ def apply_ac(
             (shared with the dense FSDP2 path) to each block. Takes precedence over
             ``ignore_router``; the shared policy already saves expert-parallel communication
             collectives and ``topk``, so it composes with expert parallelism.
-        vision_checkpoint_spec: How trainable VLM vision-tower blocks are checkpointed.
-            ``"submodule"`` (the default) wraps each block's attention/MLP/norms with plain
-            ``checkpoint_wrapper``, matching the generic FSDP2/DDP path. ``"pinned_block"``
-            wraps whole blocks and pins the SDPA backend set on both the checkpoint forward
-            and its recompute, for environments where ambient SDPA backend forcing does not
-            span the recompute.
+        activation_checkpointing_scope: Which layer groups to checkpoint -- the same field
+            and semantics as the generic FSDP2/DDP path. ``"all"`` (the default) checkpoints
+            the text/MoE decoder blocks plus the trainable vision tower; ``"language"`` the
+            decoder blocks only; ``"vision"`` (or ``"multimodal"``) only the trainable
+            tower blocks, skipping decoder checkpointing entirely. The scope decides WHICH
+            groups participate; the ``selective``/``ignore_router`` mode decides HOW the
+            selected decoder blocks are checkpointed.
 
-    Trainable VLM vision-tower blocks are checkpointed as well (in both modes) per
-    ``vision_checkpoint_spec``; frozen vision towers are left untouched.
+    Trainable VLM vision-tower blocks selected by the scope get the same per-submodule
+    wrapping (attention/MLP/norms) as the generic FSDP2/DDP path, with the SDPA backend
+    set snapshotted at checkpoint-forward time and restored during the backward-time
+    recompute; frozen vision towers are left untouched.
     """
-    if vision_checkpoint_spec not in _VISION_CHECKPOINT_SPECS:
-        raise ValueError(
-            f"Unknown vision_checkpoint_spec {vision_checkpoint_spec!r}; expected one of {_VISION_CHECKPOINT_SPECS}."
-        )
-    if not selective and not ignore_router:
+    # Lazy import: keeps the scope normalization single-sourced with the strategy
+    # configs without importing distributed.config on the (torch-stub-friendly)
+    # module import path.
+    from nemo_automodel.components.distributed.config import normalize_activation_checkpointing_scope
+
+    scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
+    checkpoint_decoder = "all" in scopes or "language" in scopes
+    if checkpoint_decoder and not selective and not ignore_router:
         logger.warning(
             "Activation checkpointing is enabled with ignore_router_for_ac=False. The MoE "
             "router/dispatch will be recomputed in the backward pass, which can route a "
@@ -325,24 +349,31 @@ def apply_ac(
         )
 
     if selective:
-        # Reuse the dense FSDP2 selective policy so the save-op set (attention,
-        # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
-        from nemo_automodel.components.distributed.activation_checkpointing import (
-            SELECTIVE_AC_WRAPPER_FLAG,
-            make_selective_checkpoint_context_fn,
-        )
+        if checkpoint_decoder:
+            # Reuse the dense FSDP2 selective policy so the save-op set (attention,
+            # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
+            from nemo_automodel.components.distributed.activation_checkpointing import (
+                SELECTIVE_AC_WRAPPER_FLAG,
+                make_selective_checkpoint_context_fn,
+            )
 
-        selective_context_fn = make_selective_checkpoint_context_fn()
-        for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
-            block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, context_fn=selective_context_fn)
-            # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
-            # selective policy visible to the partitioner) instead of unwrapping and
-            # compiling the block inner, which would collapse selective AC into full
-            # recompute. The flag is only read when per-layer torch.compile is
-            # enabled, so it is a no-op for every other mode.
-            setattr(block, SELECTIVE_AC_WRAPPER_FLAG, True)
-            parent_layers.register_module(layer_id, block)
-        _apply_vision_tower_ac(model, vision_checkpoint_spec)
+            selective_context_fn = make_selective_checkpoint_context_fn()
+            for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+                block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, context_fn=selective_context_fn)
+                # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
+                # selective policy visible to the partitioner) instead of unwrapping and
+                # compiling the block inner, which would collapse selective AC into full
+                # recompute. The flag is only read when per-layer torch.compile is
+                # enabled, so it is a no-op for every other mode.
+                setattr(block, SELECTIVE_AC_WRAPPER_FLAG, True)
+                parent_layers.register_module(layer_id, block)
+        _apply_vision_tower_ac(model, scopes)
+        return
+
+    if not checkpoint_decoder:
+        # Vision-only (or otherwise non-language) scope: skip decoder checkpointing
+        # entirely, including the hidden_size/num_experts derivation it needs.
+        _apply_vision_tower_ac(model, scopes)
         return
 
     # Derive hidden_size and num_experts from model.config if not provided
@@ -424,7 +455,7 @@ def apply_ac(
 
         parent_layers.register_module(layer_id, block)
 
-    _apply_vision_tower_ac(model, vision_checkpoint_spec)
+    _apply_vision_tower_ac(model, scopes)
 
 
 def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):
@@ -730,7 +761,7 @@ def parallelize_model(
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = True,
-    vision_checkpoint_spec: str = "submodule",
+    activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
@@ -761,7 +792,7 @@ def parallelize_model(
             model,
             ignore_router=ignore_router_for_ac,
             selective=_is_selective_ac(activation_checkpointing),
-            vision_checkpoint_spec=vision_checkpoint_spec,
+            activation_checkpointing_scope=activation_checkpointing_scope,
         )
 
     if ep_shard_axis_names is not None:

@@ -27,6 +27,8 @@ parallelizer file stays small.
 
 import logging
 import os
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from typing import List
 
 import torch
@@ -307,19 +309,66 @@ def _disable_dynamo_lru_cache() -> None:
         logger.debug("Could not disable dynamo LRU cache for selective AC + compile.", exc_info=True)
 
 
-def _wrap_first_existing_attr(module: nn.Module, attr_names: tuple[str, ...], *, skip: bool = False) -> int:
+def sdpa_backend_snapshot_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
+    """Snapshot the ambient SDPA backend set and restore it on checkpoint recompute.
+
+    A ``context_fn`` for non-reentrant ``checkpoint_wrapper``: torch's
+    non-reentrant checkpoint invokes it at region entry on every checkpointed
+    forward, so the flags read here are exactly the backends the forward runs
+    under. Checkpoint recompute faults if and only if the effective SDPA
+    backend set differs between the forward and the backward-time replay (the
+    two passes then save different tensors and the wrapper's determinism check
+    raises ``CheckpointError``). Re-pinning the forward-time set during the
+    recompute therefore gives parity by construction: a no-op in clean
+    environments, and correct under ambient backend forcing (an
+    ``sdpa_kernel`` pin or module-level backend toggling) that is active at
+    forward time but does not span the recompute. Caveat: forcing toggled
+    *inside* the checkpointed region between attention calls is not captured,
+    because the snapshot is taken once at region entry.
+
+    Returns:
+        ``(forward_ctx, recompute_ctx)``: a no-op context for the checkpoint
+        forward, and an ``sdpa_kernel`` context restoring the captured backend
+        set for the backward-time recompute.
+    """
+    captured = [
+        backend
+        for enabled, backend in (
+            (torch.backends.cuda.flash_sdp_enabled(), SDPBackend.FLASH_ATTENTION),
+            (torch.backends.cuda.mem_efficient_sdp_enabled(), SDPBackend.EFFICIENT_ATTENTION),
+            (torch.backends.cuda.cudnn_sdp_enabled(), SDPBackend.CUDNN_ATTENTION),
+            (torch.backends.cuda.math_sdp_enabled(), SDPBackend.MATH),
+        )
+        if enabled
+    ]
+    return nullcontext(), sdpa_kernel(captured)
+
+
+def _wrap_first_existing_attr(
+    module: nn.Module,
+    attr_names: tuple[str, ...],
+    *,
+    skip: bool = False,
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
+) -> int:
     """Checkpoint-wrap the first matching child attr on ``module``."""
     if skip:
         return 0
+    checkpoint_kwargs = {} if context_fn is None else {"context_fn": context_fn}
     for attr in attr_names:
         child = getattr(module, attr, None)
         if isinstance(child, nn.Module):
-            setattr(module, attr, checkpoint_wrapper(child))
+            setattr(module, attr, checkpoint_wrapper(child, **checkpoint_kwargs))
             return 1
     return 0
 
 
-def apply_submodule_checkpointing(layers: List[nn.Module], has_kv_sharing: bool) -> None:
+def apply_submodule_checkpointing(
+    layers: List[nn.Module],
+    has_kv_sharing: bool,
+    *,
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
+) -> None:
     """Wrap a transformer block's sub-modules with ``checkpoint_wrapper``.
 
     This is the sub-module granularity path used both as the default
@@ -333,6 +382,11 @@ def apply_submodule_checkpointing(layers: List[nn.Module], has_kv_sharing: bool)
     Args:
         layers: Transformer decoder layers to wrap (mutated in place).
         has_kv_sharing: Whether the model reuses K/V across layers via the cache.
+        context_fn: Optional factory returning ``(forward_ctx, recompute_ctx)``
+            for the attention and MLP checkpoint wrappers (e.g.
+            ``sdpa_backend_snapshot_context_fn``). Norm wrappers stay plain:
+            they dispatch no SDPA, so their recompute cannot diverge on
+            backend state.
     """
     wrapped_counts: dict[str, int] = {
         "mlp": 0,
@@ -342,11 +396,12 @@ def apply_submodule_checkpointing(layers: List[nn.Module], has_kv_sharing: bool)
         "mot": 0,
     }
     for layer in layers:
-        wrapped_counts["mlp"] += _wrap_first_existing_attr(layer, ("mlp", "feed_forward", "ffn"))
+        wrapped_counts["mlp"] += _wrap_first_existing_attr(layer, ("mlp", "feed_forward", "ffn"), context_fn=context_fn)
         wrapped_counts["attention"] += _wrap_first_existing_attr(
             layer,
             ("self_attn", "attention", "attn"),
             skip=has_kv_sharing,
+            context_fn=context_fn,
         )
         wrapped_counts["pre_norm"] += _wrap_first_existing_attr(
             layer,
@@ -387,81 +442,6 @@ def _replace_child_module(root: nn.Module, target: nn.Module, replacement: nn.Mo
         if _replace_child_module(child, target, replacement):
             return True
     return False
-
-
-def _make_pinned_sdpa_context_fn(backends: list[SDPBackend]):
-    """Build a ``context_fn`` for ``checkpoint_wrapper`` that pins one SDPA backend set.
-
-    The returned zero-argument callable produces ``(forward_ctx, recompute_ctx)``
-    pinning the same ``backends`` on both the checkpoint forward and its
-    backward-time recompute, so both passes always dispatch attention through
-    the identical SDPA kernel set.
-
-    Args:
-        backends: SDPA backends enabled inside both contexts.
-
-    Returns:
-        A callable suitable for ``checkpoint_wrapper``'s ``context_fn`` argument.
-    """
-
-    def context_fn():
-        return sdpa_kernel(backends), sdpa_kernel(backends)
-
-    return context_fn
-
-
-def apply_vision_block_checkpointing(
-    model: nn.Module,
-    layers: list[nn.Module],
-    backends: list[SDPBackend] | None = None,
-) -> None:
-    """Wrap whole vision-tower blocks with an SDPA-backend-pinned checkpoint spec.
-
-    Opt-in alternative to the default per-submodule wrapping
-    (``apply_submodule_checkpointing``). Recomputing SDPA (including flash
-    attention) inside checkpoint backward is safe in itself — validated across
-    two torch/cuDNN generations. Replay faults only when the effective SDPA
-    backend set differs between the forward and the backward-time recompute,
-    e.g. when ambient backend forcing (an ``sdpa_kernel`` pin or module-level
-    backend toggling) is active during the forward but does not span the
-    recompute; this divergence has only been observed under an expert-parallel
-    MoE stack with module-level backend forcing. Pinning the same backend set
-    on both sides via ``context_fn`` removes the divergence at full speed. This
-    spec is not needed when no ambient forcing exists or when the training-time
-    backend context also spans ``loss.backward()``.
-
-    Each block is wrapped non-reentrantly with RNG state preserved (so
-    dropout/DropPath-bearing towers redraw the forward's mask on recompute) and
-    the wrapper's default determinism check kept on.
-
-    Args:
-        model: Root model that owns ``layers``; wrapped blocks are re-registered
-            in its module tree.
-        layers: Vision-tower blocks to wrap.
-        backends: SDPA backends pinned on both the checkpoint forward and its
-            recompute. Defaults to ``[FLASH_ATTENTION, EFFICIENT_ATTENTION]``,
-            which keeps fused-kernel speed; ``[SDPBackend.MATH]`` remains a
-            last-resort escape hatch.
-    """
-    if not layers:
-        return
-    if backends is None:
-        backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
-    context_fn = _make_pinned_sdpa_context_fn(backends)
-    for i, block in enumerate(layers):
-        wrapped_block = checkpoint_wrapper(
-            block,
-            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-            preserve_rng_state=True,
-            context_fn=context_fn,
-        )
-        if not _replace_child_module(model, block, wrapped_block):
-            logger.warning("Could not replace vision block %d with checkpoint wrapper.", i)
-    logger.info(
-        "Applied full-block activation checkpointing with pinned SDPA backends %s to %d vision blocks.",
-        [backend.name for backend in backends],
-        len(layers),
-    )
 
 
 def detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:

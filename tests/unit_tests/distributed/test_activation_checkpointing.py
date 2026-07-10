@@ -14,13 +14,16 @@
 
 """CPU coverage for the selective-AC save-set build (FFPA fold-in wiring) and vision checkpointing."""
 
+import contextlib
 import copy
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper, checkpoint_wrapper
-from torch.nn.attention import SDPBackend
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.utils.checkpoint import CheckpointError
 
 from nemo_automodel.components.distributed import activation_checkpointing as ac
 
@@ -58,143 +61,158 @@ def test_build_save_set_ok_when_ffpa_absent(monkeypatch):
 
 _D = 8
 
-_DEFAULT_PINNED_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+# (flash, mem_efficient, cudnn, math) -- the flag order of _sdp_backend_state.
+_MATH_ONLY = (False, False, False, True)
 
 
-def _sdp_backend_state() -> tuple[bool, bool, bool]:
-    """Return the global (math, flash, mem_efficient) SDPA backend enablement flags."""
+def _sdp_backend_state() -> tuple[bool, bool, bool, bool]:
+    """Return the global (flash, mem_efficient, cudnn, math) SDPA backend enablement flags."""
     return (
-        torch.backends.cuda.math_sdp_enabled(),
         torch.backends.cuda.flash_sdp_enabled(),
         torch.backends.cuda.mem_efficient_sdp_enabled(),
+        torch.backends.cuda.cudnn_sdp_enabled(),
+        torch.backends.cuda.math_sdp_enabled(),
     )
 
 
-class _RecordingVisionBlock(nn.Module):
-    """Minimal HF-style vision block (``attn``, no ``self_attn``) that runs real SDPA.
+class _RecordingSdpaAttention(nn.Module):
+    """Minimal HF-style vision attention running real SDPA.
 
-    Records the enabled SDPA backends (``math``, ``flash``, ``mem_efficient``) on
-    every forward call, so tests can assert both the checkpoint forward and its
-    recompute ran with the same pinned backend set.
+    Records the enabled SDPA backend flags on every forward call, so tests can
+    assert which backend set the checkpoint forward and its backward-time
+    recompute ran under.
     """
 
     def __init__(self):
         super().__init__()
-        self.attn = nn.Linear(_D, 3 * _D)
-        self.mlp = nn.Linear(_D, _D)
-        self.backend_states: list[tuple[bool, bool, bool]] = []
+        self.qkv = nn.Linear(_D, 3 * _D)
+        self.proj = nn.Linear(_D, _D)
+        self.backend_states: list[tuple[bool, bool, bool, bool]] = []
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply SDPA + MLP to patch embeddings.
+        """Run SDPA over a flattened patch sequence.
 
         Args:
             x: Patch embeddings of shape ``[S, H]`` (``S`` = patches, ``H`` = hidden).
 
         Returns:
-            Block output of shape ``[S, H]``.
+            Attention output of shape ``[S, H]``.
         """
         self.backend_states.append(_sdp_backend_state())
-        q, k, v = (t.unsqueeze(0).unsqueeze(0) for t in self.attn(x).chunk(3, dim=-1))
-        out = F.scaled_dot_product_attention(q, k, v).squeeze(0).squeeze(0)
-        return x + self.mlp(out)
+        q, k, v = (t.unsqueeze(0).unsqueeze(0) for t in self.qkv(x).chunk(3, dim=-1))
+        return self.proj(F.scaled_dot_product_attention(q, k, v).squeeze(0).squeeze(0))
 
 
-class _DropoutVisionBlock(nn.Module):
-    """Minimal vision block with dropout, exercising RNG-state handling across recompute."""
+class _SdpaVisionBlock(nn.Module):
+    """Minimal vision block with ``attn``/``mlp`` submodules for ``apply_submodule_checkpointing``."""
 
-    def __init__(self):
+    def __init__(self, dropout: float = 0.0):
         super().__init__()
-        self.attn = nn.Linear(_D, _D)
-        self.dropout = nn.Dropout(0.5)
-        self.mlp = nn.Linear(_D, _D)
+        self.attn = _RecordingSdpaAttention()
+        self.mlp = nn.Sequential(nn.Linear(_D, _D), nn.Dropout(dropout))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply attention proxy + dropout + MLP to patch embeddings of shape ``[S, H]``."""
-        return x + self.mlp(self.dropout(self.attn(x)))
+        """Apply attention + MLP to patch embeddings of shape ``[S, H]``, returning ``[S, H]``."""
+        return x + self.mlp(self.attn(x))
 
 
-class _VisionModel(nn.Module):
-    def __init__(self, num_blocks: int = 1, block_cls: type[nn.Module] = _RecordingVisionBlock):
-        super().__init__()
-        self.blocks = nn.ModuleList(block_cls() for _ in range(num_blocks))
+def test_snapshot_context_fn_recompute_ctx_restores_captured_backend_set():
+    """The recompute context must re-pin exactly the backend set captured at snapshot time."""
+    with sdpa_kernel([SDPBackend.MATH]):
+        forward_ctx, recompute_ctx = ac.sdpa_backend_snapshot_context_fn()
+        with forward_ctx:
+            # The forward context is a no-op: the ambient forcing stays in effect.
+            assert _sdp_backend_state() == _MATH_ONLY
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply all vision blocks to patch embeddings of shape ``[S, H]``, returning ``[S, H]``."""
-        for block in self.blocks:
-            x = block(x)
-        return x
-
-
-def test_pinned_sdpa_context_fn_yields_identical_backend_sets_for_forward_and_recompute():
-    """Forward and recompute contexts must enable the exact same SDPA backend set."""
-    for backends, expected in (
-        (_DEFAULT_PINNED_BACKENDS, (False, True, True)),
-        ([SDPBackend.MATH], (True, False, False)),
-    ):
-        forward_ctx, recompute_ctx = ac._make_pinned_sdpa_context_fn(backends)()
-
-        states = []
-        for ctx in (forward_ctx, recompute_ctx):
-            with ctx:
-                states.append(_sdp_backend_state())
-        assert states[0] == states[1] == expected
+    # Simulate a divergent backward-time ambient state (the forward pin has exited).
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
+        with recompute_ctx:
+            assert _sdp_backend_state() == _MATH_ONLY
+        # The backward-time ambient state is restored once the recompute exits.
+        assert _sdp_backend_state() == (True, True, False, False)
 
 
-def test_apply_vision_block_checkpointing_recomputes_under_pinned_backends_and_matches_reference():
-    model = _VisionModel()
-    reference = copy.deepcopy(model)
-    block = model.blocks[0]
+def test_submodule_checkpointing_with_snapshot_context_reruns_recompute_under_forward_backends():
+    """Recompute must rerun under the forward-time SDPA backend set even after the pin exits."""
+    block = _SdpaVisionBlock()
+    ac.apply_submodule_checkpointing([block], has_kv_sharing=False, context_fn=ac.sdpa_backend_snapshot_context_fn)
+    assert isinstance(block.attn, CheckpointWrapper)
+    assert isinstance(block.mlp, CheckpointWrapper)
 
-    ac.apply_vision_block_checkpointing(model, [block])
-    assert isinstance(model.blocks[0], CheckpointWrapper)
-    assert ac.unwrap_checkpoint_wrapper(model.blocks[0]) is block
+    attn = ac.unwrap_checkpoint_wrapper(block.attn)
+    with sdpa_kernel([SDPBackend.MATH]):  # ambient forcing active only during the forward
+        out = block(torch.randn(4, _D))
+    out.sum().backward()  # recompute runs here, after the pin has exited
 
-    x = torch.randn(4, _D)
-    out = model(x)
+    # Non-reentrant checkpointing runs the attention forward twice (forward +
+    # backward-time recompute). The snapshot is taken at checkpoint-region entry
+    # (while the ambient pin is still active) and re-pinned for the recompute.
+    assert attn.backend_states == [_MATH_ONLY, _MATH_ONLY]
+    assert block.attn._checkpoint_wrapped_module.qkv.weight.grad is not None
+
+
+def test_submodule_checkpointing_without_snapshot_context_recompute_sees_divergent_backends():
+    """Without the snapshot context_fn, the recompute runs under whatever is ambient at backward time."""
+    block = _SdpaVisionBlock()
+    ac.apply_submodule_checkpointing([block], has_kv_sharing=False)
+
+    attn = ac.unwrap_checkpoint_wrapper(block.attn)
+    with sdpa_kernel([SDPBackend.MATH]):
+        out = block(torch.randn(4, _D))
+    # On fused-CUDA stacks the divergence trips the checkpoint determinism check;
+    # on CPU both passes may dispatch the same kernel and only the recorded flags
+    # diverge. Either way, the forward-time backend set is not preserved.
+    with contextlib.suppress(CheckpointError):
+        out.sum().backward()
+    assert attn.backend_states[0] == _MATH_ONLY
+    assert attn.backend_states[1] != _MATH_ONLY
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Backend-set divergence across checkpoint recompute requires fused CUDA SDPA backends",
+)
+def test_checkpointed_sdpa_replay_faults_without_snapshot_context_and_passes_with_it():
+    """One-sided ambient forcing faults plain checkpoint replay; the snapshot context_fn restores parity."""
+    device = torch.device("cuda")
+    x = torch.randn(4, _D, device=device)
+
+    # WITHOUT the snapshot context_fn: forward under an ambient MATH pin that has
+    # exited by backward time -> the recompute dispatches a fused backend that
+    # saves different tensors -> deterministic CheckpointError.
+    plain = _SdpaVisionBlock().to(device)
+    ac.apply_submodule_checkpointing([plain], has_kv_sharing=False)
+    with sdpa_kernel([SDPBackend.MATH]):
+        out = plain(x)
+    with pytest.raises(CheckpointError):
+        out.sum().backward()
+
+    # WITH the snapshot context_fn: the same one-sided pin replays cleanly, with
+    # gradient parity against an unwrapped reference run entirely under the pin.
+    block = _SdpaVisionBlock().to(device)
+    reference = copy.deepcopy(block)
+    ac.apply_submodule_checkpointing([block], has_kv_sharing=False, context_fn=ac.sdpa_backend_snapshot_context_fn)
+    with sdpa_kernel([SDPBackend.MATH]):
+        out = block(x)
     out.sum().backward()
 
-    # Non-reentrant checkpointing runs the block forward twice (forward + backward
-    # recompute); both runs must see the same default pinned backend set
-    # (flash + mem-efficient enabled, math disabled).
-    assert len(block.backend_states) == 2
-    assert all(state == (False, True, True) for state in block.backend_states)
-
-    # Run the reference under the same pin so the comparison is kernel-identical
-    # (different SDPA backends differ from each other by float noise).
-    ref_ctx, _ = ac._make_pinned_sdpa_context_fn(_DEFAULT_PINNED_BACKENDS)()
-    with ref_ctx:
+    with sdpa_kernel([SDPBackend.MATH]):
         ref_out = reference(x)
         ref_out.sum().backward()
+
     assert torch.allclose(out, ref_out)
-    for got, want in zip(model.parameters(), reference.parameters()):
+    for got, want in zip(block.parameters(), reference.parameters()):
         assert torch.allclose(got.grad, want.grad)
 
 
-def test_apply_vision_block_checkpointing_math_backend_escape_hatch():
-    """``backends=[MATH]`` must pin MATH on both the checkpoint forward and its recompute."""
-    model = _VisionModel()
-    block = model.blocks[0]
-
-    ac.apply_vision_block_checkpointing(model, [block], backends=[SDPBackend.MATH])
-    assert isinstance(model.blocks[0], CheckpointWrapper)
-
-    out = model(torch.randn(4, _D))
-    out.sum().backward()
-
-    assert len(block.backend_states) == 2
-    assert all(state == (True, False, False) for state in block.backend_states)
-    assert block.attn.weight.grad is not None
-
-
-def test_apply_vision_block_checkpointing_preserves_dropout_rng_on_recompute():
+def test_submodule_checkpointing_with_snapshot_context_preserves_dropout_rng_on_recompute():
     """Backward recompute must redraw the forward's dropout mask, or gradients silently corrupt."""
-    model = _VisionModel(block_cls=_DropoutVisionBlock)
+    model = _SdpaVisionBlock(dropout=0.5)
     reference = copy.deepcopy(model)
     model.train()
     reference.train()
 
-    ac.apply_vision_block_checkpointing(model, list(model.blocks))
-    assert isinstance(model.blocks[0], CheckpointWrapper)
+    ac.apply_submodule_checkpointing([model], has_kv_sharing=False, context_fn=ac.sdpa_backend_snapshot_context_fn)
 
     x = torch.randn(64, _D)
     torch.manual_seed(1234)

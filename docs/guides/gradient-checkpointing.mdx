@@ -73,17 +73,17 @@ memory savings are worth. Use `all` when you prefer the maximum
 activation-memory reduction across trainable model parts.
 
 <Note>
-`activation_checkpointing_scope` controls the generic FSDP2/DDP activation
-checkpointing path. Expert-parallel MoE configs (`ep_size > 1`) use the MoE
-parallelizer's activation checkpointing path, which does not read this scope
-field: it checkpoints the text/MoE decoder blocks and, when the model has a
-trainable VLM vision tower, also checkpoints the vision-tower blocks with the
-same per-submodule wrapping (attention/MLP/norms) used on this generic path.
-For environments where ambient SDPA backend forcing does not span the
-checkpoint recompute, `moe_parallel_config.vision_checkpoint_spec: pinned_block`
-instead wraps whole vision blocks and pins the SDPA backend set
-(flash + mem-efficient) on both the checkpoint forward and its recompute.
-Frozen vision towers stay out of activation checkpointing on both paths.
+Expert-parallel MoE configs (`ep_size > 1`) use the MoE parallelizer's
+activation checkpointing path, which respects the same
+`activation_checkpointing_scope` field with the same semantics: `all` (the
+default) checkpoints the text/MoE decoder blocks plus the trainable VLM vision
+tower, `language` the decoder blocks only, and `vision` only the trainable
+vision-tower blocks. Vision-tower blocks get the same per-submodule wrapping
+(attention/MLP/norms) as the generic path, and the SDPA backend set active at
+checkpoint-forward time is automatically snapshotted and restored during the
+backward-time recompute, so ambient backend forcing that does not span the
+recompute cannot fault the replay. Frozen vision towers stay out of activation
+checkpointing on both paths.
 </Note>
 
 <Note>
