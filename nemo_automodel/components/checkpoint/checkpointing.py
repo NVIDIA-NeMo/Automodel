@@ -526,9 +526,7 @@ class Checkpointer:
         )
         # MoE adapters return non-contiguous views; safetensors.save rejects those.
         _materialize_to_hf_views_for_save(state_dict)
-        state_dict = _filter_non_tensor_state_for_dcp(
-            state_dict, checkpoint_path=model_dir, operation="save"
-        )
+        state_dict = _filter_non_tensor_state_for_dcp(state_dict, checkpoint_path=model_dir, operation="save")
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
         fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, state_dict)
@@ -866,9 +864,7 @@ class Checkpointer:
                     missing_checkpoint_keys[:10],
                 )
 
-        state_dict = _filter_non_tensor_state_for_dcp(
-            state_dict, checkpoint_path=model_path, operation="load"
-        )
+        state_dict = _filter_non_tensor_state_for_dcp(state_dict, checkpoint_path=model_path, operation="load")
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
 
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
