@@ -241,7 +241,7 @@ def test_prepare_model_inputs_threads_real_per_layer_inputs():
     cfg.image_token_id = 99
     model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.float32)
     ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
-    prepared = model.prepare_model_inputs_for_cp({"input_ids": ids})
+    prepared = model.prepare_model_inputs_for_cp(ids)
     assert "per_layer_inputs" in prepared
     pli = prepared["per_layer_inputs"]
     # [B, S, num_hidden_layers, hidden_size_per_layer_input]
@@ -249,6 +249,17 @@ def test_prepare_model_inputs_threads_real_per_layer_inputs():
     assert pli.shape == (1, ids.shape[1], tc.num_hidden_layers, tc.hidden_size_per_layer_input)
     # and the model-owned batch-sharding callable is attached for cp_utils.
     assert prepared["cp_sharder"].shard_batch == model._cp_shard_batch
+
+
+def test_prepare_inputs_embeds_for_cp_deprecation_wrapper():
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    expected = torch.randn(1, 4, 8)
+    fake_model = SimpleNamespace(prepare_model_inputs_for_cp=lambda **kwargs: {"inputs_embeds": expected})
+
+    with pytest.warns(DeprecationWarning, match="prepare_model_inputs_for_cp"):
+        actual = Gemma4ForConditionalGeneration.prepare_inputs_embeds_for_cp(fake_model, input_ids)
+
+    assert actual is expected
 
 
 def test_prepare_per_layer_inputs_masks_image_tokens():

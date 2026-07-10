@@ -30,7 +30,12 @@ import torch
 
 # Import module under test
 from nemo_automodel.components.distributed import cp_utils as _cu
-from nemo_automodel.components.distributed.cp_sharder import CPSharder, contiguous_local_indices
+from nemo_automodel.shared.cp_contracts import (
+    CPBatchWithIndices,
+    CPSharder,
+    contiguous_local_indices,
+    round_robin_local_indices,
+)
 
 
 # CPSharder used by the model-owned dispatch tests below (passed as an explicit
@@ -124,7 +129,7 @@ def test_make_cp_batch_and_ctx_no_mesh():
         "labels": labels,
     }
 
-    ctx_obj, new_batch, _ = _cu.make_cp_batch_and_ctx(None, batch, loss_mask=None)
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(None, batch, loss_mask=None)
 
     # Expect the nullcontext *class* (not an instantiated object)
     assert ctx_obj is contextlib.nullcontext
@@ -161,7 +166,7 @@ def test_make_cp_batch_and_ctx_honors_model_sharder_at_cp_size_one():
         layout="native_thd",
     )
 
-    ctx_obj, new_batch, _ = _cu.make_cp_batch_and_ctx(
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(
         device_mesh,
         batch,
         use_te=True,
@@ -187,7 +192,7 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
         "labels": labels,
     }
 
-    ctx_obj, new_batch, _ = _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask, cp_sharder=_contiguous_sharder())
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask, cp_sharder=_contiguous_sharder())
 
     assert ctx_obj is contextlib.nullcontext
 
@@ -242,7 +247,7 @@ def test_make_cp_batch_and_ctx_mm_token_type_ids_do_not_select_manual(monkeypatc
         "mm_token_type_ids": torch.tensor([[0, 1, 1, 0]]),
     }
 
-    ctx_obj, new_batch, _ = _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
 
     assert ctx_obj is contextlib.nullcontext
     assert calls["cp_context"] == "cp_ctx"
@@ -317,7 +322,7 @@ def test_make_cp_batch_and_ctx_3d_mrope_position_ids(monkeypatch):
         "position_ids": position_ids_3d,
     }
 
-    ctx_obj, new_batch, _ = _cu.make_cp_batch_and_ctx(device_mesh, batch, cp_sharder=_contiguous_sharder())
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, cp_sharder=_contiguous_sharder())
 
     assert ctx_obj is contextlib.nullcontext
     assert new_batch["position_ids"].shape == (3, 1, 4)
@@ -366,7 +371,7 @@ def test_make_cp_batch_and_ctx_pops_attention_mask_when_cp_enabled(monkeypatch):
         "attention_mask": torch.ones(1, 3, dtype=torch.long),
     }
 
-    _ctx, new_batch, _ = _cu.make_cp_batch_and_ctx(device_mesh, batch)
+    _ctx, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch)
 
     assert "attention_mask" not in new_batch, "attention_mask should be removed when CP > 1"
 
@@ -642,14 +647,12 @@ def test_magi_dispatches_at_the_te_rung():
         enabled = True
         domain = "llm"
 
-        def make_cp_batch(
-            self, cp_mesh, batch, *, padding_token_id, num_chunks, is_thd, model, return_local_indices=False
-        ):
+        def make_cp_batch(self, cp_mesh, batch, *, padding_token_id, num_chunks, is_thd, model):
             seen.update(cp_mesh=cp_mesh, model=model, is_thd=is_thd, pad=padding_token_id, chunks=num_chunks)
-            return ({"prepared": True}, None) if return_local_indices else {"prepared": True}
+            return CPBatchWithIndices({"prepared": True}, None)
 
     model = SimpleNamespace()  # no prepare_model_inputs_for_cp -> hook path skipped
-    ctx, batch, _ = _cu.prepare_cp_forward(
+    result = _cu.prepare_cp_forward(
         model,
         _DummyDeviceMesh(cp_size=2, tp_size=1),
         {"input_ids": torch.tensor([[1, 2]])},
@@ -658,14 +661,37 @@ def test_magi_dispatches_at_the_te_rung():
         padding_token_id=7,
         num_chunks=3,
     )
-    assert ctx is _ctxlib.nullcontext
-    assert batch == {"prepared": True}
+    assert result.context_factory is _ctxlib.nullcontext
+    assert result.batch == {"prepared": True}
     assert seen["model"] is model
     assert (seen["is_thd"], seen["pad"], seen["chunks"]) == (True, 7, 3)
     # magi prep also runs at cp<=1, like the TE path
     seen.clear()
-    _, batch2, _ = _cu.make_cp_batch_and_ctx(None, {"input_ids": torch.tensor([[1, 2]])}, magi=_FakeMagi())
+    _, batch2 = _cu.make_cp_batch_and_ctx(None, {"input_ids": torch.tensor([[1, 2]])}, magi=_FakeMagi())
     assert batch2 == {"prepared": True} and seen["cp_mesh"] is None
+
+
+def test_prepare_cp_forward_supplies_required_input_ids_binding():
+    """The opaque pre-embed call must still bind models with positional input_ids."""
+
+    class _RequiredInputModel(torch.nn.Module):
+        def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor):
+            return {"inputs_embeds": input_ids.float().unsqueeze(-1), "input_ids": None}
+
+        def forward(self, input_ids: torch.Tensor, **kwargs):
+            assert input_ids is None
+            batch = kwargs.pop("_cp_batch")
+            return self.prepare_model_inputs_for_cp(batch["input_ids"])
+
+    result = _cu.prepare_cp_forward(
+        _RequiredInputModel(),
+        None,
+        {"input_ids": torch.tensor([[1, 2, 3]])},
+        cp_size=2,
+    )
+
+    assert "input_ids" not in result.batch
+    assert result.batch["inputs_embeds"].shape == (1, 3, 1)
 
 
 def test_te_dispatches_through_a_framework_sharder(monkeypatch):
@@ -673,18 +699,18 @@ def test_te_dispatches_through_a_framework_sharder(monkeypatch):
     wraps make_cp_batch_for_te, threading the recipe-static args through."""
     seen = {}
 
-    def fake_make_cp_batch_for_te(
-        cp_mesh, batch, *, padding_token_id, qkv_format, num_chunks, seq_lens_padding_value, return_local_indices=False
+    def fake_make_cp_batch_for_te_with_indices(
+        cp_mesh, batch, *, padding_token_id, qkv_format, num_chunks, seq_lens_padding_value
     ):
         seen.update(
             cp_mesh=cp_mesh, pad=padding_token_id, fmt=qkv_format, chunks=num_chunks, sent=seq_lens_padding_value
         )
-        return ({"thd": True}, None) if return_local_indices else {"thd": True}
+        return CPBatchWithIndices({"thd": True}, None)
 
-    monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
+    monkeypatch.setattr(_cu, "_make_cp_batch_for_te_with_indices", fake_make_cp_batch_for_te_with_indices)
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
-    ctx, batch, _ = _cu.make_cp_batch_and_ctx(
+    ctx, batch = _cu.make_cp_batch_and_ctx(
         device_mesh,
         {"input_ids": torch.tensor([[1, 2]])},
         use_te=True,
@@ -699,7 +725,7 @@ def test_te_dispatches_through_a_framework_sharder(monkeypatch):
 
     # THD conversion also runs at cp<=1 (packing at cp=1), like before.
     seen.clear()
-    _, batch2, _ = _cu.make_cp_batch_and_ctx(None, {"input_ids": torch.tensor([[1, 2]])}, use_te=True)
+    _, batch2 = _cu.make_cp_batch_and_ctx(None, {"input_ids": torch.tensor([[1, 2]])}, use_te=True)
     assert batch2 == {"thd": True} and seen["cp_mesh"] is None
 
 
@@ -709,10 +735,10 @@ def test_te_sharder_captures_partition_indices_at_shard_time(monkeypatch):
     shard, work after it, and reject tensors that don't match the stream."""
     local_indices = torch.tensor([0, 3])  # this rank's tokens in a 4-token stream (cp=2)
 
-    def fake_make_cp_batch_for_te(cp_mesh, batch, *, return_local_indices=False, **kwargs):
-        return ({"thd": True}, local_indices) if return_local_indices else {"thd": True}
+    def fake_make_cp_batch_for_te_with_indices(cp_mesh, batch, **kwargs):
+        return CPBatchWithIndices({"thd": True}, local_indices)
 
-    monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
+    monkeypatch.setattr(_cu, "_make_cp_batch_for_te_with_indices", fake_make_cp_batch_for_te_with_indices)
 
     cp2 = _DummySubMesh(2)
     sharder = _cu._resolve_cp_sharder(
@@ -737,9 +763,9 @@ def test_magi_sharder_captures_dispatch_indices():
         enabled = True
         domain = "llm"
 
-        def make_cp_batch(self, cp_mesh, batch, *, return_local_indices=False, **kwargs):
+        def make_cp_batch(self, cp_mesh, batch, **kwargs):
             prepped = {"prepared": True}
-            return (prepped, torch.tensor([[0, 2]])) if return_local_indices else prepped
+            return CPBatchWithIndices(prepped, torch.tensor([[0, 2]]))
 
     cp2 = _DummySubMesh(2)
     sharder = _cu._resolve_cp_sharder(
@@ -759,14 +785,28 @@ def test_make_cp_batch_for_te_identity_indices_without_cp():
         "seq_lens": torch.tensor([[4]]),
         "seq_lens_padded": torch.tensor([[4]]),
     }
-    out, local_indices = _cu.make_cp_batch_for_te(None, batch, return_local_indices=True)
-    assert torch.equal(local_indices, torch.arange(out["input_ids"].shape[-1]))
+    result = _cu._make_cp_batch_for_te_with_indices(None, batch)
+    assert torch.equal(result.local_indices, torch.arange(result.batch["input_ids"].shape[-1]))
+
+
+def test_make_cp_batch_for_te_embedding_identity_indices_use_token_axis():
+    """At CP1, THD embedding identity indices cover T rather than hidden size H."""
+    batch = {
+        "input_ids": torch.randn(1, 4, 7),
+        "labels": torch.tensor([[10, 20, 30, 40]]),
+        "position_ids": torch.tensor([[0, 1, 2, 3]]),
+        "seq_lens": torch.tensor([[4]]),
+        "seq_lens_padded": torch.tensor([[4]]),
+    }
+
+    result = _cu._make_cp_batch_for_te_with_indices(None, batch)
+
+    assert result.batch["input_ids"].shape == (4, 7)
+    assert torch.equal(result.local_indices, torch.arange(4))
 
 
 def test_resolve_cp_sharder_layers():
     """Resolution order: model-owned > magi > TE > generic round-robin > none."""
-    from nemo_automodel.components.distributed.cp_sharder import round_robin_local_indices
-
     cp2 = _DummySubMesh(2)
     model_sharder = _contiguous_sharder()
     common = dict(magi=None, use_te=False, num_chunks=1, seq_lens_padding_value=-1000, model=None)

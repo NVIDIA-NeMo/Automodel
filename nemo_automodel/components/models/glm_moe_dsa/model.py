@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Optional, Union
 
 import torch
@@ -38,6 +39,7 @@ from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmM
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.cp_contracts import CPPreparedInputs, CPSharder, contiguous_local_indices
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -332,23 +334,23 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def prepare_model_inputs_for_cp(
         self,
-        batch: dict[str, Any],
+        input_ids: torch.Tensor,
         *,
         num_chunks: int = 1,
-    ) -> dict[str, Any]:
+    ) -> CPPreparedInputs:
         """Attach GLM DSA's packed THD context-parallel batch sharder.
 
         Args:
-            batch: The batch dict.
+            input_ids: Full token IDs ``[B, S]`` or packed IDs ``[T]``, where
+                ``B`` is batch size, ``S`` is sequence length, and ``T`` is
+                flattened packed-token count. The model embeds after sharding.
             num_chunks: Number of chunks for load-balanced CP sharding.
+
+        Returns:
+            A typed mapping containing the packed-THD :class:`CPSharder`; no
+            tensor input is copied or mutated by this hook.
         """
-        from functools import partial  # noqa: PLC0415
-
-        from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
-            CPSharder,
-            contiguous_local_indices,
-        )
-
+        del input_ids
         if getattr(self.backend, "attn", None) != "tilelang":
             raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
 
@@ -441,7 +443,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> CausalLMOutputWithPast | tuple[torch.Tensor, ...] | torch.Tensor:
+    ) -> CPPreparedInputs | CausalLMOutputWithPast | tuple[torch.Tensor, ...] | torch.Tensor:
         """Forward pass.
 
         Single process (no pipeline parallelism): returns
@@ -465,9 +467,11 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         # through ``__call__(_pre_embed_only=True)`` before CP sharding so the model
         # can attach its own ``cp_sharder`` (see ``prepare_model_inputs_for_cp``).
         if attn_kwargs.pop("_pre_embed_only", False):
-            return self.prepare_model_inputs_for_cp(
-                attn_kwargs.pop("_cp_batch"), num_chunks=attn_kwargs.pop("num_chunks", 1)
-            )
+            batch = attn_kwargs.pop("_cp_batch")
+            cp_input_ids = batch.get("input_ids")
+            if not isinstance(cp_input_ids, torch.Tensor):
+                raise ValueError("GLM DSA CP preparation requires tensor input_ids")
+            return self.prepare_model_inputs_for_cp(cp_input_ids, num_chunks=attn_kwargs.pop("num_chunks", 1))
 
         output_hidden_states = (
             output_hidden_states

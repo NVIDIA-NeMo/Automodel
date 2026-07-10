@@ -46,6 +46,7 @@ from nemo_automodel.components.models.minimax_m3_vl.vision_encoder import MiniMa
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.cp_contracts import CPPreparedInputs
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -604,10 +605,13 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
 
     def prepare_model_inputs_for_cp(
         self,
-        batch: dict[str, Any],
+        input_ids: torch.Tensor,
         *,
-        num_chunks: int = 1,
-    ) -> dict[str, Any]:
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+    ) -> CPPreparedInputs:
         """Merge vision features into token embeddings BEFORE context-parallel sequence
         sharding.
 
@@ -617,21 +621,20 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         recipe. Mirrors ``step3p7``/``kimi_k25_vl``. Defining this method is also the opt-in
         signal the recipe checks (``hasattr(model, "prepare_model_inputs_for_cp")``).
 
-        Removes the raw input keys it consumed from ``batch``; the dispatcher merges
-        the returned entries on top.
-
         Args:
-            batch: The batch dict (with ``input_ids`` and optional multimodal
-                keys).
-            num_chunks: Number of chunks for load-balanced CP sharding.
+            input_ids: Full token IDs ``[B, S]``, where ``B`` is batch size and
+                ``S`` is sequence length.
+            pixel_values: Optional image pixels in the vision encoder layout.
+            image_grid_thw: Optional image grid rows ``[N_image, 3]``.
+            pixel_values_videos: Optional video pixels in encoder layout.
+            video_grid_thw: Optional video grid rows ``[N_video, 3]``.
+
+        Returns:
+            Full-sequence embeddings ``[B, S, H]``, where ``H`` is hidden size,
+            with consumed raw inputs marked as ``None``.
         """
-        input_ids = batch.get("input_ids")
         if input_ids is None:
             raise ValueError("MiniMax M3 VL CP pre-embedding requires input_ids.")
-        pixel_values = batch.get("pixel_values")
-        image_grid_thw = batch.get("image_grid_thw")
-        pixel_values_videos = batch.get("pixel_values_videos")
-        video_grid_thw = batch.get("video_grid_thw")
         inputs_embeds = self._embed_and_splice(
             input_ids,
             pixel_values=pixel_values,
@@ -643,11 +646,14 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         # removes them from the batch (the hook may receive a copy of the
         # batch dict when FSDP2 casts forward kwargs, so in-place pops are
         # not reliable; the return channel is).
-        consumed = {
-            key: None
-            for key in ("input_ids", "pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw")
+        return {
+            "input_ids": None,
+            "pixel_values": None,
+            "image_grid_thw": None,
+            "pixel_values_videos": None,
+            "video_grid_thw": None,
+            "inputs_embeds": inputs_embeds,
         }
-        return {**consumed, "inputs_embeds": inputs_embeds}
 
     def forward(
         self,
@@ -661,12 +667,22 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         attention_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> CPPreparedInputs | torch.Tensor:
         # CP pre-embed: the recipe calls model(_pre_embed_only=True, **mm_kwargs) when
         # cp_size>1 to splice vision into inputs_embeds before the batch is sequence-
         # sharded. Return early with {"inputs_embeds": ...}; no PP/MTP/decoder work here.
         if kwargs.pop("_pre_embed_only", False):
-            return self.prepare_model_inputs_for_cp(kwargs.pop("_cp_batch"), num_chunks=kwargs.pop("num_chunks", 1))
+            batch = kwargs.pop("_cp_batch")
+            cp_input_ids = batch.get("input_ids")
+            if not isinstance(cp_input_ids, torch.Tensor):
+                raise ValueError("MiniMax M3 VL CP pre-embedding requires tensor input_ids")
+            return self.prepare_model_inputs_for_cp(
+                cp_input_ids,
+                pixel_values=batch.get("pixel_values"),
+                image_grid_thw=batch.get("image_grid_thw"),
+                pixel_values_videos=batch.get("pixel_values_videos"),
+                video_grid_thw=batch.get("video_grid_thw"),
+            )
 
         is_pp_stage = self._is_pipeline_parallel_stage()
 

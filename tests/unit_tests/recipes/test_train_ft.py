@@ -2361,7 +2361,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
         def prepare_model_inputs_for_cp(self, batch, **kwargs):
             self.prepared = True
             self.num_chunks = kwargs.get("num_chunks")
-            from nemo_automodel.components.distributed.cp_sharder import (
+            from nemo_automodel.shared.cp_contracts import (
                 CPSharder,
                 contiguous_local_indices,
             )

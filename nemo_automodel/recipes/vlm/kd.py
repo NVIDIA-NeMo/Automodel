@@ -234,12 +234,13 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             for k, v in batch.items()
         }
 
-        train_ctx, batch, _ = prepare_cp_forward(
+        cp_forward = prepare_cp_forward(
             self.model_parts[0],
             self.device_mesh,
             batch,
             invoke_pre_embed=not self.pp_enabled,
         )
+        train_ctx, batch = cp_forward.context_factory, cp_forward.batch
         # Hidden-size compatibility with the teacher: checked on the (possibly
         # sharded) student embeds — sequence sharding never changes the hidden dim.
         if batch.get("inputs_embeds") is not None:

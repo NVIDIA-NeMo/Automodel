@@ -70,6 +70,7 @@ from nemo_automodel.components.models.qwen3_next.model import Block
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
+from nemo_automodel.shared.cp_contracts import CPPreparedInputs
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .cp_linear_attn import CPAwareGatedDeltaNet
@@ -839,29 +840,43 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
     def prepare_model_inputs_for_cp(
         self,
-        batch: dict[str, Any],
+        input_ids: torch.Tensor,
         *,
-        num_chunks: int = 1,
-    ) -> dict[str, Any]:
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        image_grid_hws: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+    ) -> CPPreparedInputs:
         """Build full-sequence multimodal embeddings and mRoPE positions before CP sharding.
 
-        Removes the raw input keys it consumed from ``batch``; the dispatcher merges
-        the returned entries on top.
+        Token tensors use ``[B, S]``, mRoPE positions use ``[R, B, S]``, and
+        image/video grids use ``[N_media, 2|3]``. Here ``B`` is batch size,
+        ``S`` is sequence length, ``R`` is rotary-axis count, and ``N_media``
+        is image or video count. Returned embeddings are ``[B, S, H]``, where
+        ``H`` is hidden size; consumed media tensors are marked with ``None``.
 
         Args:
-            batch: The batch dict (with ``input_ids`` and optional multimodal
-                keys).
-            num_chunks: Number of chunks for load-balanced CP sharding.
+            input_ids: Full token IDs ``[B, S]``.
+            attention_mask: Optional token mask ``[B, S]``.
+            position_ids: Optional mRoPE positions ``[R, B, S]``.
+            pixel_values: Optional image pixels in the vision encoder's native
+                rank/layout; consumed before CP and never sequence-sharded.
+            pixel_values_videos: Optional video pixels in the vision encoder's
+                native rank/layout; consumed before CP.
+            image_grid_thw: Optional image grid rows ``[N_media, 3]``.
+            image_grid_hws: Optional legacy image grid rows
+                ``[N_media, 2|3]``.
+            video_grid_thw: Optional video grid rows ``[N_media, 3]``.
+            mm_token_type_ids: Optional modality types ``[B, S]``.
+
+        Returns:
+            Typed prepared inputs containing embeddings ``[B, S, H]`` and
+            positions ``[R, B, S]``; consumed raw tensors are ``None`` markers.
         """
-        input_ids = batch.get("input_ids")
-        attention_mask = batch.get("attention_mask")
-        position_ids = batch.get("position_ids")
-        pixel_values = batch.get("pixel_values")
-        pixel_values_videos = batch.get("pixel_values_videos")
-        image_grid_thw = batch.get("image_grid_thw")
-        image_grid_hws = batch.get("image_grid_hws")
-        video_grid_thw = batch.get("video_grid_thw")
-        mm_token_type_ids = batch.get("mm_token_type_ids")
         if input_ids is None:
             raise ValueError("Qwen3.5-MoE CP pre-embedding requires input_ids.")
 
@@ -926,20 +941,17 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         # removes them from the batch (the hook may receive a copy of the
         # batch dict when FSDP2 casts forward kwargs, so in-place pops are
         # not reliable; the return channel is).
-        consumed = {
-            key: None
-            for key in (
-                "input_ids",
-                "pixel_values",
-                "pixel_values_videos",
-                "image_grid_thw",
-                "image_grid_hws",
-                "video_grid_thw",
-                "mm_token_type_ids",
-            )
+        return {
+            "input_ids": None,
+            "pixel_values": None,
+            "pixel_values_videos": None,
+            "image_grid_thw": None,
+            "image_grid_hws": None,
+            "video_grid_thw": None,
+            "mm_token_type_ids": None,
+            "inputs_embeds": inputs_embeds,
+            "position_ids": position_ids,
         }
-
-        return {**consumed, "inputs_embeds": inputs_embeds, "position_ids": position_ids}
 
     def forward(
         self,
@@ -955,7 +967,21 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         **kwargs: Any,
     ):
         if kwargs.pop("_pre_embed_only", False):
-            return self.prepare_model_inputs_for_cp(kwargs.pop("_cp_batch"), num_chunks=kwargs.pop("num_chunks", 1))
+            batch = kwargs.pop("_cp_batch")
+            cp_input_ids = batch.get("input_ids")
+            if not isinstance(cp_input_ids, torch.Tensor):
+                raise ValueError("Qwen3.5-MoE CP pre-embedding requires tensor input_ids")
+            return self.prepare_model_inputs_for_cp(
+                cp_input_ids,
+                attention_mask=batch.get("attention_mask"),
+                position_ids=batch.get("position_ids"),
+                pixel_values=batch.get("pixel_values"),
+                pixel_values_videos=batch.get("pixel_values_videos"),
+                image_grid_thw=batch.get("image_grid_thw"),
+                image_grid_hws=batch.get("image_grid_hws"),
+                video_grid_thw=batch.get("video_grid_thw"),
+                mm_token_type_ids=batch.get("mm_token_type_ids"),
+            )
 
         # Resolve from the text/decoder sub-config for this VL model.
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config

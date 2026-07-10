@@ -19,6 +19,7 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
+import warnings
 from collections.abc import MutableMapping
 from typing import Any, Iterator, Optional, Union
 
@@ -79,16 +80,13 @@ except (ModuleNotFoundError, ImportError, AttributeError):
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.checkpoint.utils import reject_unsupported_untied_word_embeddings
-from nemo_automodel.components.distributed.cp_sharder import (
-    CPSharder,
-    contiguous_local_indices,
-)
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
+from nemo_automodel.shared.cp_contracts import CPPreparedInputs, CPSharder, contiguous_local_indices
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
@@ -1097,7 +1095,16 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         **kwargs: Any,
     ):
         if _pre_embed_only:
-            return self.prepare_model_inputs_for_cp(kwargs.pop("_cp_batch"), num_chunks=kwargs.pop("num_chunks", 1))
+            batch = kwargs.pop("_cp_batch")
+            cp_input_ids = batch.get("input_ids")
+            if not isinstance(cp_input_ids, torch.Tensor):
+                raise ValueError("Gemma4 CP preparation requires tensor input_ids")
+            return self.prepare_model_inputs_for_cp(
+                cp_input_ids,
+                pixel_values=batch.get("pixel_values"),
+                image_position_ids=batch.get("image_position_ids"),
+                mm_token_type_ids=batch.get("mm_token_type_ids"),
+            )
 
         output_hidden_states = (
             output_hidden_states
@@ -1338,31 +1345,36 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
     def prepare_model_inputs_for_cp(
         self,
-        batch: dict[str, Any],
-        *,
-        num_chunks: int = 1,
-    ) -> dict[str, Any]:
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+    ) -> CPPreparedInputs:
         """Prepare Gemma4 embeddings on the full sequence before CP sharding.
 
-        Removes the raw input keys it consumed from ``batch``; the dispatcher merges
-        the returned entries on top.
-
         Args:
-            batch: The batch dict (with ``input_ids`` and optional multimodal
-                keys).
-            num_chunks: Number of chunks for load-balanced CP sharding.
+            input_ids: Full token IDs ``[B, S]``, where ``B`` is batch size and
+                ``S`` is sequence length.
+            pixel_values: Optional image pixels ``[N, C, H_img, W_img]``, where
+                ``N`` is image count, ``C`` is channels, and ``H_img``/``W_img``
+                are image height/width.
+            image_position_ids: Optional image rotary-position tensor in the
+                vision tower's native rank/layout. It is consumed before CP and
+                is not sequence-sharded.
+            mm_token_type_ids: Optional token-type map ``[B, S]``.
+
+        Returns:
+            Full-sequence embeddings ``[B, S, H]``, where ``H`` is hidden size,
+            token metadata, and a contiguous sharder. Consumed raw inputs are
+            marked with ``None``.
         """
-        input_ids = batch.get("input_ids")
-        pixel_values = batch.get("pixel_values")
-        image_position_ids = batch.get("image_position_ids")
-        mm_token_type_ids = batch.get("mm_token_type_ids")
         if input_ids is None:
             raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
 
         special_image_mask = self._get_special_image_mask(input_ids, mm_token_type_ids)
         llm_input_ids = input_ids.masked_fill(special_image_mask, self._get_text_pad_token_id())
         inputs_embeds = self.model.get_input_embeddings()(llm_input_ids)
-        prepared_inputs: dict[str, Any] = {
+        prepared_inputs: CPPreparedInputs = {
             "inputs_embeds": inputs_embeds,
             "mm_token_type_ids": mm_token_type_ids
             if mm_token_type_ids is not None
@@ -1393,9 +1405,52 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         # removes them from the batch (the hook may receive a copy of the
         # batch dict when FSDP2 casts forward kwargs, so in-place pops are
         # not reliable; the return channel is).
-        consumed = {key: None for key in ("input_ids", "pixel_values", "image_position_ids", "mm_token_type_ids")}
+        prepared_inputs.update(
+            input_ids=None,
+            pixel_values=None,
+            image_position_ids=None,
+            mm_token_type_ids=None,
+        )
+        return prepared_inputs
 
-        return {**consumed, **prepared_inputs}
+    def prepare_inputs_embeds_for_cp(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return full-sequence embeddings through the deprecated legacy API.
+
+        Args:
+            input_ids: Token IDs ``[B, S]``, where ``B`` is batch size and
+                ``S`` is sequence length.
+            pixel_values: Optional image pixels in vision-tower layout.
+            image_position_ids: Optional image rotary positions in the vision
+                tower's native layout.
+            mm_token_type_ids: Optional multimodal token types ``[B, S]``.
+
+        Returns:
+            Full embeddings ``[B, S, H]``, where ``H`` is hidden size.
+
+        Deprecated:
+            Use :meth:`prepare_model_inputs_for_cp`. This compatibility path
+            will be removed in the next major release.
+        """
+        warnings.warn(
+            "prepare_inputs_embeds_for_cp is deprecated; use prepare_model_inputs_for_cp",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        inputs_embeds = self.prepare_model_inputs_for_cp(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_position_ids=image_position_ids,
+            mm_token_type_ids=mm_token_type_ids,
+        )["inputs_embeds"]
+        if inputs_embeds is None:
+            raise RuntimeError("Gemma4 CP preparation did not produce inputs_embeds")
+        return inputs_embeds
 
     @torch.no_grad()
     def initialize_weights(

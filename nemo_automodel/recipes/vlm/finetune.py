@@ -905,13 +905,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k in VLM_INPUT_KEYS:
                 if k != "input_ids":
                     batch.pop(k, None)
-        train_ctx, batch, _ = prepare_cp_forward(
+        cp_forward = prepare_cp_forward(
             self.model_parts[0],
             self.device_mesh,
             batch,
             magi=self.magi,
             invoke_pre_embed=_pre_embed_here,
         )
+        train_ctx, batch = cp_forward.context_factory, cp_forward.batch
         labels = batch.pop("labels")
 
         if self.pp_enabled:
@@ -1197,12 +1198,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 }
                 num_label_tokens = (batch["labels"] != -100).sum().item()
 
-                train_ctx, batch, _ = prepare_cp_forward(
+                cp_forward = prepare_cp_forward(
                     self.model_parts[0],
                     self.device_mesh,
                     batch,
                     invoke_pre_embed=not self.pp_enabled,
                 )
+                train_ctx, batch = cp_forward.context_factory, cp_forward.batch
                 labels = batch.pop("labels")
                 with train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the CPSharder contract in components/distributed/cp_sharder.py.
+"""Unit tests for the shared CPSharder contract and batch primitives.
 
 Collectives are not exercised here (CPU CI): the tests cover the pure layout
 math — local index generation, index-based token-tensor shard, gathered-shard
@@ -25,8 +25,11 @@ import contextlib
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
-from nemo_automodel.components.distributed import cp_sharder as cs
+from nemo_automodel.shared import cp_batch as cb
+from nemo_automodel.shared import cp_contracts as cs
 
 
 class _FakeMesh:
@@ -44,6 +47,33 @@ class _FakeMesh:
 
     def get_group(self):
         return None
+
+
+class _ProcessMesh:
+    """Small real-process mesh adapter for the two-rank Gloo test."""
+
+    def size(self) -> int:
+        return dist.get_world_size()
+
+    def get_group(self):
+        return dist.group.WORLD
+
+
+def _run_replicated_gather_backward(rank: int, world_size: int, init_file: str) -> None:
+    """Worker proving replicated losses need CP-size normalization."""
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    try:
+        local = torch.tensor([[float(rank + 1)]], requires_grad=True)
+        indices = torch.tensor([rank], dtype=torch.long)
+        gathered = cs.gather_token_tensor_by_indices(_ProcessMesh(), local, indices, seq_dim=1)
+        torch.testing.assert_close(gathered, torch.tensor([[1.0, 2.0]]))
+
+        # Every rank consumes the same replicated output. Dividing each loss
+        # by CP size counteracts all_gather backward's summed contributions.
+        (gathered.sum() / world_size).backward()
+        torch.testing.assert_close(local.grad, torch.ones_like(local))
+    finally:
+        dist.destroy_process_group()
 
 
 @pytest.fixture(autouse=True)
@@ -128,6 +158,12 @@ def test_gather_token_tensor_identity_without_cp():
     assert cs.gather_token_tensor_by_indices(None, t, torch.arange(6)) is t
 
 
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is unavailable")
+def test_gather_token_tensor_replicated_backward_two_ranks(tmp_path):
+    """Replicated consumers produce unit grads after CP-size loss scaling."""
+    mp.spawn(_run_replicated_gather_backward, args=(2, str(tmp_path / "gloo-init")), nprocs=2, join=True)
+
+
 # ---------------------------------------------------------------------------
 # CPSharder default/override resolution
 # ---------------------------------------------------------------------------
@@ -176,7 +212,7 @@ def test_shard_batch_contiguous_respects_pad_multiple():
         "input_ids": torch.arange(seq).view(1, seq),
         "labels": torch.arange(seq).view(1, seq),
     }
-    ctx, out = cs.shard_batch_contiguous(
+    ctx, out = cb.shard_batch_contiguous(
         _FakeMesh(2, 1),
         None,
         batch,
@@ -198,7 +234,7 @@ def test_shard_batch_contiguous_extra_seq_keys():
         "labels": torch.arange(seq).view(1, seq),
         "vision_ids": torch.arange(seq).view(1, seq),
     }
-    _, out = cs.shard_batch_contiguous(
+    _, out = cb.shard_batch_contiguous(
         _FakeMesh(2, 0),
         None,
         batch,

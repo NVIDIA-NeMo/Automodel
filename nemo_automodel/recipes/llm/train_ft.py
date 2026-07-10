@@ -1158,7 +1158,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         cp_size = getattr(getattr(self, "dist_setup", None), "cp_size", self.cfg.get("distributed.cp_size", 1))
         # Single CP dispatch: magi / model-owned (CPSharder) / TE-THD / generic
         # torch context_parallel.
-        train_ctx, batch, _ = prepare_cp_forward(
+        cp_forward = prepare_cp_forward(
             self.model_parts[0] if hasattr(self, "model_parts") else None,
             self.device_mesh,
             batch,
@@ -1168,6 +1168,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             num_chunks=_num_chunks_value,
             cp_size=cp_size,
         )
+        train_ctx, batch = cp_forward.context_factory, cp_forward.batch
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 

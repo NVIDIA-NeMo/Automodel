@@ -43,6 +43,7 @@ Compress-ratio sliding-window attention is not yet implemented.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Optional, Union
 
 import torch
@@ -84,6 +85,7 @@ from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import Deep
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
+from nemo_automodel.shared.cp_contracts import CPPreparedInputs, CPSharder, contiguous_local_indices
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -832,10 +834,10 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def prepare_model_inputs_for_cp(
         self,
-        batch: dict[str, Any],
+        input_ids: torch.Tensor,
         *,
         num_chunks: int = 1,
-    ) -> dict[str, Any]:
+    ) -> CPPreparedInputs:
         """Model-owned context-parallel batch prep (Miles-style contiguous shard).
 
         Returns a ``CPSharder`` (under the ``"cp_sharder"`` batch key) so
@@ -843,14 +845,18 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         model, with the config-derived per-rank shard multiple bound. DSV4
         embeds internally, so (unlike VLM models) this does not pre-embed --
         it leaves ``input_ids`` for the sharding callable.
+
+        Args:
+            input_ids: Full token IDs ``[B, S]`` or packed IDs ``[T]``, where
+                ``B`` is batch size, ``S`` is sequence length, and ``T`` is
+                flattened packed-token count. Values are not read before shard.
+            num_chunks: Packed THD chunk count bound into the sharder.
+
+        Returns:
+            A typed mapping containing a contiguous :class:`CPSharder`; no
+            tensor input is copied or mutated by this hook.
         """
-        from functools import partial  # noqa: PLC0415
-
-        from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
-            CPSharder,
-            contiguous_local_indices,
-        )
-
+        del input_ids, num_chunks
         return {
             "cp_sharder": CPSharder(
                 shard_batch=partial(
@@ -873,14 +879,16 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
-    ) -> "DeepseekV4CausalLMOutput" | tuple[torch.Tensor, ...] | torch.Tensor:
+    ) -> CPPreparedInputs | "DeepseekV4CausalLMOutput" | tuple[torch.Tensor, ...] | torch.Tensor:
         # Model-owned context-parallel input prep. The recipe routes the batch
         # through ``__call__(_pre_embed_only=True)`` before CP sharding so the model
         # can attach its own ``cp_sharder`` (see ``prepare_model_inputs_for_cp``).
         if attn_kwargs.pop("_pre_embed_only", False):
-            return self.prepare_model_inputs_for_cp(
-                attn_kwargs.pop("_cp_batch"), num_chunks=attn_kwargs.pop("num_chunks", 1)
-            )
+            batch = attn_kwargs.pop("_cp_batch")
+            cp_input_ids = batch.get("input_ids")
+            if not isinstance(cp_input_ids, torch.Tensor):
+                raise ValueError("DeepSeek V4 CP preparation requires tensor input_ids")
+            return self.prepare_model_inputs_for_cp(cp_input_ids, num_chunks=attn_kwargs.pop("num_chunks", 1))
 
         if output_hidden_states is None:
             output_hidden_states = getattr(getattr(self, "config", None), "output_hidden_states", False)

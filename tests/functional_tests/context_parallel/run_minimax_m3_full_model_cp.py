@@ -20,7 +20,7 @@ function it reconstructs with -- self-consistent but blind to layout mismatches)
 drives the WHOLE model exactly as recipes/vlm/finetune.py does under CP:
 
   apply_cp(model, cp_mesh)                      # sets _cp_mesh on the sparse layers
-  train_ctx, batch, _ = make_cp_batch_and_ctx(...) # torch context_parallel shards the seq
+  train_ctx, batch = make_cp_batch_and_ctx(...) # torch context_parallel shards the seq
   with train_ctx(): logits_local = model(**batch)
   logits_full = context_parallel_unshard(...)   # undo the load-balanced layout
 
@@ -173,7 +173,7 @@ def main():
         "labels": input_ids.clone(),  # required by make_cp_batch_and_ctx
         "position_ids": position_ids.clone(),
     }
-    train_ctx, batch, _ = make_cp_batch_and_ctx(device_mesh, batch)
+    train_ctx, batch = make_cp_batch_and_ctx(device_mesh, batch)
     with torch.no_grad(), train_ctx():
         logits_local = _logits(model(input_ids=batch["input_ids"], position_ids=batch["position_ids"])).float()
 

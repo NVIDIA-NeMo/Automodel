@@ -33,7 +33,7 @@ from typing import Any
 
 import torch
 
-from nemo_automodel.components.distributed.cp_sharder import (
+from nemo_automodel.shared.cp_batch import (
     convert_attention_mask_to_padding_mask,
     shard_batch_contiguous,
 )

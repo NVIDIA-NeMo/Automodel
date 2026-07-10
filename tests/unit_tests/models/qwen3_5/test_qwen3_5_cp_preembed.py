@@ -69,13 +69,13 @@ class TestPrepareModelInputsForCP:
     def test_requires_input_ids(self):
         model = _build_model()
         with pytest.raises(ValueError, match="requires input_ids"):
-            model.prepare_model_inputs_for_cp({"input_ids": None})
+            model.prepare_model_inputs_for_cp(None)
 
     def test_text_only_builds_embeds_and_positions(self):
         model = _build_model()
         input_ids = torch.tensor([[5, 6, 7, 8]])
 
-        out = model.prepare_model_inputs_for_cp({"input_ids": input_ids})
+        out = model.prepare_model_inputs_for_cp(input_ids)
 
         # CP linear-attn recovers token order internally; only embeds + positions here.
         assert {k for k, v in out.items() if v is not None} == {"inputs_embeds", "position_ids"}
@@ -94,7 +94,7 @@ class TestPrepareModelInputsForCP:
 
         model = _build_model(rope_index=_rope)
         pos = torch.arange(4).view(1, 4)
-        out = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[5, 6, 7, 8]]), "position_ids": pos})
+        out = model.prepare_model_inputs_for_cp(torch.tensor([[5, 6, 7, 8]]), position_ids=pos)
 
         assert called["count"] == 0, "get_rope_index must not run when position_ids provided"
         assert out["position_ids"] is pos
@@ -109,12 +109,7 @@ class TestPrepareModelInputsForCP:
 
         model = _build_model(rope_index=_rope)
         image_grid_hws = torch.tensor([[2, 2]])  # [N, 2]
-        model.prepare_model_inputs_for_cp(
-            {
-                "input_ids": torch.tensor([[5, 6, 7, 8]]),
-                "image_grid_hws": image_grid_hws,
-            }
-        )
+        model.prepare_model_inputs_for_cp(torch.tensor([[5, 6, 7, 8]]), image_grid_hws=image_grid_hws)
         assert captured["image_grid_thw"].tolist() == [[1, 2, 2]]
 
     def test_image_grid_hws_already_thw_passes_through(self):
@@ -127,12 +122,7 @@ class TestPrepareModelInputsForCP:
 
         model = _build_model(rope_index=_rope)
         image_grid_hws = torch.tensor([[1, 2, 2]])  # [N, 3]
-        model.prepare_model_inputs_for_cp(
-            {
-                "input_ids": torch.tensor([[5, 6, 7, 8]]),
-                "image_grid_hws": image_grid_hws,
-            }
-        )
+        model.prepare_model_inputs_for_cp(torch.tensor([[5, 6, 7, 8]]), image_grid_hws=image_grid_hws)
         assert captured["image_grid_thw"].tolist() == [[1, 2, 2]]
 
     def test_mm_token_type_ids_synthesized_from_token_ids(self):
@@ -144,7 +134,7 @@ class TestPrepareModelInputsForCP:
             return torch.zeros(3, 1, input_ids.shape[1]), torch.zeros(1, 1)
 
         model = _build_model(rope_index=_rope, image_token_id=6, video_token_id=8)
-        model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[5, 6, 7, 8]])})
+        model.prepare_model_inputs_for_cp(torch.tensor([[5, 6, 7, 8]]))
 
         # token 6 -> image (1), token 8 -> video (2), others 0.
         assert captured["mm_token_type_ids"].tolist() == [[0, 1, 0, 2]]
@@ -152,16 +142,16 @@ class TestPrepareModelInputsForCP:
     def test_consumed_keys_removed_from_batch(self):
         """Consumed keys come back as None markers for the dispatcher to remove."""
         model = _build_model()
-        batch = {
-            "input_ids": torch.tensor([[5, 6, 7, 8]]),
-            "mm_token_type_ids": torch.zeros(1, 4, dtype=torch.long),
-            "position_ids": torch.zeros(3, 1, 4, dtype=torch.long),
-        }
-        out = model.prepare_model_inputs_for_cp(batch)
+        position_ids = torch.zeros(3, 1, 4, dtype=torch.long)
+        out = model.prepare_model_inputs_for_cp(
+            torch.tensor([[5, 6, 7, 8]]),
+            mm_token_type_ids=torch.zeros(1, 4, dtype=torch.long),
+            position_ids=position_ids,
+        )
         assert out["input_ids"] is None
         assert out["mm_token_type_ids"] is None
         # position_ids is not consumed into embeds and must survive.
-        assert "position_ids" in batch
+        assert out["position_ids"] is position_ids
 
 
 class TestPopStagedVlmMedia:
@@ -223,12 +213,10 @@ class TestPopStagedVlmMedia:
         ids = torch.tensor([[5, 99, 7]])
         # Pass position_ids so the rope path (covered elsewhere) is skipped here.
         out = model.prepare_model_inputs_for_cp(
-            {
-                "input_ids": ids,
-                "pixel_values": torch.zeros(1, 3, 2, 2),
-                "image_grid_thw": torch.tensor([[1, 2, 2]]),
-                "position_ids": torch.zeros(3, 1, 3, dtype=torch.long),
-            }
+            ids,
+            pixel_values=torch.zeros(1, 3, 2, 2),
+            image_grid_thw=torch.tensor([[1, 2, 2]]),
+            position_ids=torch.zeros(3, 1, 3, dtype=torch.long),
         )
 
         emb = out["inputs_embeds"]
@@ -253,12 +241,10 @@ class TestPopStagedVlmMedia:
 
         ids = torch.tensor([[5, 88, 7]])
         out = model.prepare_model_inputs_for_cp(
-            {
-                "input_ids": ids,
-                "pixel_values_videos": torch.zeros(1, 3, 2, 2),
-                "video_grid_thw": torch.tensor([[1, 2, 2]]),
-                "position_ids": torch.zeros(3, 1, 3, dtype=torch.long),
-            }
+            ids,
+            pixel_values_videos=torch.zeros(1, 3, 2, 2),
+            video_grid_thw=torch.tensor([[1, 2, 2]]),
+            position_ids=torch.zeros(3, 1, 3, dtype=torch.long),
         )
 
         emb = out["inputs_embeds"]
@@ -273,18 +259,18 @@ class TestForwardPreEmbedDispatch:
 
         captured = {}
 
-        def _fake_prepare(batch, *, num_chunks=1, **kwargs):
-            captured["input_ids"] = batch.get("input_ids")
-            captured["pixel_values"] = batch.get("pixel_values")
-            # non-named forward params (e.g. image_grid_hws) ride in the batch dict now
-            captured["kwargs"] = {k: v for k, v in batch.items() if k not in ("input_ids", "pixel_values")}
+        def _fake_prepare(input_ids, *, pixel_values=None, **kwargs):
+            captured["input_ids"] = input_ids
+            captured["pixel_values"] = pixel_values
+            captured["kwargs"] = kwargs
             return sentinel
 
         model.prepare_model_inputs_for_cp = _fake_prepare
 
         input_ids = torch.tensor([[5, 6, 7, 8]])
         pixel_values = torch.randn(4, 8)
-        # The dispatcher hands the whole batch dict through the _cp_batch kwarg.
+        # The dispatcher hands the batch opaquely to forward; forward restores
+        # the hook's explicit tensor arguments.
         out = model.forward(
             _pre_embed_only=True,
             _cp_batch={
