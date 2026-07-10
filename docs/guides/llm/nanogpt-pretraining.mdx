@@ -80,7 +80,7 @@ Consider the following options:
 
 NeMo AutoModel follows a simple but powerful flow for training:
 
-1. A Python recipe script (for example, [`examples/llm_pretrain/pretrain.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_pretrain/pretrain.py)) serves as the entry point that wires up all training components based on a YAML configuration file. Any configuration option can be overridden using CLI arguments (e.g., `--model.name abc`).
+1. The installed `automodel` CLI (`nemo_automodel.cli.app`) is the entry point. It reads the recipe selected by the YAML configuration and wires up the training components. Any configuration option can be overridden using CLI arguments (e.g., `--model.n_layer 6`).
 2. The YAML file describes each component of the training job (such as `model`, `dataset`, `optimizer`, `distributed`, `checkpoint`, and optional `wandb`).
 3. Each component is constructed from its `_target_`, which points to a Python callable (function or class constructor) to instantiate. The remaining keys in that YAML block become keyword arguments for that callable.
 
