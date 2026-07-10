@@ -270,10 +270,12 @@ python examples/dllm_generate/generate.py \
 
 ### Generation Parameters
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--steps` | Number of denoising steps | 128 |
-| `--max_new_tokens` | Maximum tokens to generate | 128 |
-| `--block_size` | Tokens per denoising block | 32 |
-| `--temperature` | Gumbel noise temperature (0 = greedy) | 0.0 |
-| `--remasking` | Confidence scoring strategy for selecting which positions to unmask | `low_confidence` |
+The sampler selected with `--sampler` supplies these preset values. For LLaDA chat and raw generation, the standalone sampler consumes every field shown below and honors its command-line override. LLaDA infilling uses `--steps`, `--block_size`, `--temperature`, and `--remasking` while filling masks already present in the input, so it does not use `--max_new_tokens`. For Nemotron chat and raw generation, the script calls the model's built-in `generate(...)`, which consumes `--max_new_tokens`, `--block_size`, and `--temperature` from this table (as well as `--threshold`, which is not shown). Although `--steps` and `--remasking` are accepted and stored in the Nemotron preset config, the built-in generation path does not use them, so overriding those two flags does not affect that path.
+
+| Parameter | Description | LLaDA default | Nemotron preset |
+|-----------|-------------|---------------|------------------|
+| `--steps` | Number of denoising steps | 128 | 1024 (preset only; unused by built-in generation) |
+| `--max_new_tokens` | Maximum tokens to generate | 128 | 1024 |
+| `--block_size` | Tokens per denoising block | 128 | 32 |
+| `--temperature` | Gumbel noise temperature (0 = greedy) | 0.0 | 0.0 |
+| `--remasking` | Confidence scoring strategy for selecting which positions to unmask | `low_confidence` | `low_confidence` (preset only; unused by built-in generation) |
