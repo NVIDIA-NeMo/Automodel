@@ -94,9 +94,10 @@ def test_anchor_candidate_mask_requires_first_target_in_document():
     _, _, doc_remaining = _uniform_pack_meta(num_docs=2, doc_len=3)
     loss_mask = torch.ones(1, 6)
     valid = build_anchor_candidate_mask(seq_len=6, loss_mask=loss_mask, doc_remaining=doc_remaining)
-    # Candidates are positions 0..4. doc0 = 0,1,2 (last token 2 has no in-doc next -> invalid);
-    # doc1 = 3,4,5 (position 4 is the last valid anchor, 5 is out of candidate range).
-    assert valid[0].tolist() == [True, True, False, True, False]
+    # Candidates are positions 0..4. doc0 = 0,1,2 (position 2 is doc0's last token: its
+    # first target 3 is in the next document -> invalid). doc1 = 3,4,5 (positions 3 and 4
+    # each have an in-document next token; 5 is past the candidate range).
+    assert valid[0].tolist() == [True, True, False, True, True]
 
 
 def test_create_position_ids_uses_per_document_positions():
