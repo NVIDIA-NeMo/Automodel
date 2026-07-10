@@ -415,25 +415,20 @@ class DeepseekV3Eagle3DraftModel(PreTrainedModel):
     ) -> torch.Tensor:
         """Run one EAGLE-3 TTT draft step (eager attention).
 
-        Tensor contracts (batch ``B``, sequence length ``T``):
-
-        - ``input_ids`` ``[B, T]`` long; ``projected_hidden_states`` ``[B, T, H]``
-          (draft hidden size); ``attention_mask`` ``[B, T]`` (1 = real, 0 = pad);
-          ``position_ids`` ``[B, T]`` long or ``None`` (defaults to ``arange``).
-        - ``cache_hidden`` is the EAGLE-3 TTT cache ``[K_list, V_list]``: pass
-          ``[[], []]`` on the first step and the same list on each later step;
-          the attention layer appends per-step K/V. ``None`` allocates a fresh
-          cache (step 0 == a plain causal forward).
-        - ``seq_lens`` ``[B, max_docs]`` long (0-padded per-document lengths that
-          sum to ``T`` per row) turns on sequence packing: Block-1 attention
-          becomes document-level block-causal via
-          :func:`build_block_causal_additive_mask`. The MLA attention is
-          eager-only, so packing takes the eager mask path (no FA2 varlen).
-          Callers must pass per-document ``position_ids`` (reset to
-          ``range(doc_len)`` within each document) so the rotary phase matches the
-          target; the TTT diagonal block is position-wise and stays document-safe.
-          Cross-document TTT supervision is masked by the trainer's
-          ``doc_remaining`` gate, not here.
+        Args (batch ``B``, sequence length ``T``, draft hidden size ``H``):
+            input_ids: ``[B, T]`` long token ids.
+            projected_hidden_states: ``[B, T, H]`` draft-hidden features (``fc`` output).
+            attention_mask: ``[B, T]`` (1 = real, 0 = pad); used on the unpacked path only.
+            position_ids: ``[B, T]`` long, or ``None`` to default to ``arange``.
+                Packing requires per-document positions (reset to ``range(doc_len)``).
+            cache_hidden: EAGLE-3 TTT cache ``[K_list, V_list]`` -- ``[[], []]`` on the
+                first step, the same list on later steps, or ``None`` for a fresh cache.
+            seq_lens: ``[B, max_docs]`` long (0-padded per-document lengths that sum to
+                ``T`` per row) turns on sequence packing -- Block-1 attention becomes
+                document-level block-causal via :func:`build_block_causal_additive_mask`
+                (eager mask path; the MLA attention has no FA2 varlen kernel). The TTT
+                diagonal block is position-wise and stays document-safe; cross-document
+                supervision is masked by the trainer's ``doc_remaining`` gate, not here.
         """
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long).unsqueeze(0)
@@ -442,8 +437,7 @@ class DeepseekV3Eagle3DraftModel(PreTrainedModel):
             cache_hidden = [[], []]
 
         if seq_lens is not None:
-            # Packed: document structure comes from seq_lens (block-causal mask),
-            # so the plain causal + padding mask does not apply.
+            # Packed: document structure comes from seq_lens (block-causal mask).
             causal_mask = build_block_causal_additive_mask(
                 seq_lens,
                 seq_length=input_ids.shape[1],

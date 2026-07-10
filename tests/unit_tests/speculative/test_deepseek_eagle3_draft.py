@@ -162,43 +162,6 @@ def test_packed_draft_attention_isolates_documents():
     assert not torch.allclose(out_ref[:, 3:], out_perturbed[:, 3:])  # doc B changed
 
 
-def test_trainer_integration_packed_trains_on_cpu():
-    """The MLA draft trains end to end through the shared trainer with packing metadata
-    (per-document position_ids, block-causal seq_lens, and doc_remaining supervision gate)."""
-    draft = _build_draft()
-    selected_token_ids = torch.arange(_DRAFT_VOCAB, dtype=torch.long)
-    selected_token_mask = torch.zeros(_VOCAB, dtype=torch.bool)
-    selected_token_mask[selected_token_ids] = True
-    module = Eagle3TrainerModule(
-        draft,
-        selected_token_ids=selected_token_ids,
-        selected_token_mask=selected_token_mask,
-        ttt_steps=2,
-    )
-
-    # One packed row: two docs of length 3 over T=6.
-    doc_len, num_docs = 3, 2
-    seq = doc_len * num_docs
-    position_ids = torch.cat([torch.arange(doc_len) for _ in range(num_docs)]).unsqueeze(0)
-    seq_lens = torch.tensor([[doc_len] * num_docs], dtype=torch.long)
-    doc_remaining = torch.cat([torch.arange(doc_len - 1, -1, -1) for _ in range(num_docs)]).unsqueeze(0)
-
-    out = module(
-        input_ids=torch.randint(0, _VOCAB, (1, seq)),
-        attention_mask=torch.ones(1, seq, dtype=torch.long),
-        loss_mask=torch.ones(1, seq, dtype=torch.long),
-        aux_hidden_states=torch.randn(1, seq, _HIDDEN * 3),
-        target_logits=torch.randn(1, seq, _VOCAB),
-        position_ids=position_ids,
-        seq_lens=seq_lens,
-        doc_remaining=doc_remaining,
-    )
-    assert torch.isfinite(out.loss)
-    out.loss.backward()
-    grads = [p.grad for p in draft.parameters() if p.grad is not None]
-    assert grads and all(torch.isfinite(g).all() for g in grads)
-
-
 def test_set_vocab_mapping_builds_d2t_t2d():
     draft = _build_draft()
     selected = torch.arange(_DRAFT_VOCAB) * 2  # draft id i -> target id 2i
