@@ -226,6 +226,31 @@ def test_target_wrapper_packing_isolates_documents_and_carries_metadata():
     assert not torch.allclose(ref[:, doc_len:], pert[:, doc_len:])
 
 
+def test_unpacked_trainer_does_not_pass_packing_kwargs_to_legacy_draft():
+    """The unpacked path must call the draft with only its original arguments, so the
+    non-Qwen3 DSpark drafts (whose forward has no packing params) keep working.
+
+    A legacy-signature draft raises a sentinel from its body; if the trainer forwarded
+    position_ids/seq_lens/doc_remaining, the call would raise TypeError before the body
+    runs, so observing the sentinel proves only accepted args were passed.
+    """
+
+    class _Reached(Exception):
+        pass
+
+    class _LegacyDraft(torch.nn.Module):
+        def forward(self, input_ids, target_hidden_states, loss_mask, target_last_hidden_states=None):
+            raise _Reached()
+
+    trainer = DSparkTrainerModule(_LegacyDraft(), loss_decay_gamma=4.0)
+    with pytest.raises(_Reached):
+        trainer(
+            input_ids=torch.zeros(1, 4, dtype=torch.long),
+            target_hidden_states=torch.zeros(1, 4, len(TARGET_LAYER_IDS) * HIDDEN),
+            loss_mask=torch.ones(1, 4, dtype=torch.uint8),
+        )
+
+
 def test_recipe_packing_helpers_and_gates():
     from nemo_automodel.recipes.llm.train_dspark import _packing_kwargs, _validate_packing_gates
 

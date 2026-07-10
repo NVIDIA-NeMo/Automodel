@@ -23,6 +23,7 @@ forward hooks, mirroring the DFlash target wrapper.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -188,6 +189,15 @@ class HFDSparkTargetModel:
             # hidden states do not leak across document boundaries.
             if position_ids is None:
                 raise ValueError("DSpark sequence packing requires per-document position_ids, but none were provided.")
+            # ``filter_forward_kwargs`` drops kwargs the target forward does not
+            # declare. If it would drop ``position_ids``, the target falls back to
+            # default arange positions (wrong per-document RoPE) and, on the FA path,
+            # loses the only document-boundary signal. Fail loud instead.
+            if "position_ids" not in inspect.signature(self.model.forward).parameters:
+                raise ValueError(
+                    "DSpark sequence packing requires the target model's forward to accept a "
+                    "`position_ids` argument for per-document positions, but it does not."
+                )
             extra_kwargs["position_ids"] = position_ids
             attn_impl = getattr(self.model.config, "_attn_implementation", None) or ""
             if "flash" in attn_impl:
