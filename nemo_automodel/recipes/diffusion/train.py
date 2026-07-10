@@ -997,15 +997,16 @@ class TrainDiffusionRecipe(BaseRecipe):
             moe_mesh=None,
         )
 
-        dataloader_cfg = self.cfg.get("data.dataloader")
-        if not hasattr(dataloader_cfg, "instantiate"):
-            raise RuntimeError("data.dataloader must be a config node with instantiate()")
-
-        self.dataloader, self.sampler = dataloader_cfg.instantiate(
+        dataloader_config = self.cfg.diffusion_dataloader
+        if dataloader_config is None:
+            raise ValueError("Diffusion training requires a data.dataloader config")
+        dataloader_build = dataloader_config.build(
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             batch_size=self.cfg.get("step_scheduler.local_batch_size"),
         )
+        self.dataloader = dataloader_build.dataloader
+        self.sampler = dataloader_build.sampler
 
         self.raw_steps_per_epoch = len(self.dataloader)
         if self.raw_steps_per_epoch == 0:

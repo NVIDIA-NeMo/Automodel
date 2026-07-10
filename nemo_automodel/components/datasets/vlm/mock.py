@@ -30,6 +30,9 @@ sized from ``max_length`` so that truncation always produces a full-length
 sequence.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -60,6 +63,38 @@ def _generate_response(rng: np.random.Generator, num_words: int) -> str:
     """Generate a dummy response of *num_words* words from a fixed pool."""
     words = [_WORD_POOL[i] for i in rng.integers(0, len(_WORD_POOL), size=num_words)]
     return " ".join(words)
+
+
+@dataclass
+class MockVlmDatasetConfig:
+    """Construction-time configuration for the mock VLM dataset."""
+
+    num_samples: int = 10
+    """Number of synthetic conversation examples to generate."""
+    num_images_per_sample: int = 1
+    """Number of random noise images per user turn."""
+    image_size: tuple[int, int] = (256, 256)
+    """``(width, height)`` of each generated image."""
+    prompt: str = "Describe this image."
+    """Text prompt appended after the image(s) in the user turn."""
+    responses: list[str] | None = None
+    """Optional list of assistant responses, cycled over samples."""
+    max_length: int | None = None
+    """Target sequence length. When set (and ``responses`` is ``None``), drives response word count."""
+    seed: int = 0
+    """Random seed for reproducibility."""
+
+    def build(self) -> list[dict[str, object]]:
+        """Build the mock VLM dataset from this config."""
+        return build_mock_vlm_dataset(
+            num_samples=self.num_samples,
+            num_images_per_sample=self.num_images_per_sample,
+            image_size=self.image_size,
+            prompt=self.prompt,
+            responses=self.responses,
+            max_length=self.max_length,
+            seed=self.seed,
+        )
 
 
 def build_mock_vlm_dataset(
