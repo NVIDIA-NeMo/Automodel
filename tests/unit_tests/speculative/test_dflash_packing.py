@@ -31,6 +31,7 @@ from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetMo
 
 VOCAB = 64
 HIDDEN = 32
+NUM_TARGET_LAYERS = 8
 TARGET_LAYER_IDS = [1, 3, 5]
 BLOCK_SIZE = 4
 MASK_ID = VOCAB - 1
@@ -50,6 +51,9 @@ def _build_trainer(num_anchors=8, attention_backend="sdpa"):
         attention_dropout=0.0,
         tie_word_embeddings=False,
     )
+    cfg.num_target_layers = NUM_TARGET_LAYERS
+    cfg.block_size = BLOCK_SIZE
+    cfg.dflash_config = {"mask_token_id": MASK_ID, "target_layer_ids": TARGET_LAYER_IDS}
     cfg._attn_implementation = attention_backend
     torch.manual_seed(0)
     draft = Qwen3DFlashDraftModel(cfg)
