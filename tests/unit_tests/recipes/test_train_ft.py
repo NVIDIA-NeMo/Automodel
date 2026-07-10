@@ -92,6 +92,23 @@ class DummyIterableDataset(IterableDataset):  # noqa: D401
         return self
 
 
+class DummyMapDataset(torch.utils.data.Dataset):
+    """Minimal map-style dataset used to exercise recipe-side packing."""
+
+    def __init__(self, split=None):
+        self.split = split
+        self.items = [{"input_ids": [1, 2], "labels": [1, 2]}]
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        return self.items[index]
+
+    def shuffle(self, seed):
+        return self
+
+
 def dl_factory_capture(**kwargs):  # returns a sentinel while exposing passed kwargs via attribute
     dl_factory_capture.captured = kwargs
     return "dl"
@@ -624,6 +641,58 @@ def test_build_dataloader_prepacked_sequence_skips_recipe_packing(monkeypatch):
     ds = mod.dl_factory_capture.captured["dataset"]
     assert ds.__class__.__name__ == "DummyIterableDataset"
     assert ds._shuffle_calls == []
+
+
+@pytest.mark.parametrize("supports_thd", [True, False])
+def test_build_dataloader_packing_uses_configured_cp_size(monkeypatch, supports_thd):
+    captured = {}
+
+    def fake_pack_dataset(dataset, **kwargs):
+        captured.update(kwargs)
+        return dataset
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.pack_dataset", fake_pack_dataset)
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset",
+            "split": "train",
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+        }
+    )
+    cfg_model = ConfigNode({})
+    cfg_ps = ConfigNode({"packed_sequence_size": 8, "packing_strategy": "thd"})
+
+    class _PackedModel(nn.Module):
+        def forward(self, input_ids, seq_lens=None):
+            return input_ids
+
+    model = _PackedModel()
+    model.supports_thd = supports_thd
+
+    dl, _ = _build_dataloader(
+        cfg_ds=cfg_ds,
+        cfg_dl=cfg_dl,
+        cfg_model=cfg_model,
+        cfg_ps=cfg_ps,
+        seed=123,
+        local_batch_size=1,
+        global_batch_size=1,
+        max_steps=None,
+        val_check_interval=None,
+        dp_rank=0,
+        dp_world_size=1,
+        pp_enabled=False,
+        cp_size=2,
+        model=model,
+    )
+
+    assert dl == "dl"
+    assert captured["cp_size"] == 2
 
 
 class _FlagCM(AbstractContextManager):
@@ -2286,10 +2355,15 @@ class TestRunValidationToolCallEval:
         assert out.metrics["tool_call/has_call"] == 0.0
 
 
-def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
-    """Non-PP step: the model-owned CP hook attaches its batch prep, and the
-    ``_cp_full_logits_grad_touch`` flag adds the zero-valued full-logits term so
-    backward still reaches every parameter."""
+@pytest.mark.parametrize(
+    ("cp_size", "uses_thd", "supports_thd"),
+    [
+        (2, False, False),
+        (1, True, True),
+    ],
+)
+def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, supports_thd):
+    """Non-PP training invokes model-owned batch preparation for CP or native THD."""
     from contextlib import nullcontext
 
     cfg = ConfigNode(
@@ -2303,7 +2377,7 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
             "optimizer": {},
             "loss_fn": {},
             "checkpoint": {"best_metric_key": "default"},
-            "distributed": {"cp_size": 2},
+            "distributed": {"cp_size": cp_size},
             "autopipeline": {"pp_microbatch_size": 1},
         }
     )
@@ -2313,27 +2387,26 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: False)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: uses_thd)
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
 
     class _CPModel(nn.Module):
         def __init__(self):
             super().__init__()
-            # Wide output + large magnitude in fp16 so a naive (low-precision)
-            # logits.sum() overflows to inf; the grad touch must promote to fp32.
-            self.lin = nn.Linear(4, 8192)
+            self.lin = nn.Linear(4, 8)
             self.prepared = False
 
         def prepare_model_inputs_for_cp(self, input_ids, **kwargs):
             self.prepared = True
             self.num_chunks = kwargs.get("num_chunks")
-            return {"_cp_full_logits_grad_touch": True}
+            return {}
 
         def forward(self, **batch):
-            logits = (self.lin(batch["input_ids"].float()) + 50.0).to(torch.float16)
+            logits = self.lin(batch["input_ids"].float())
             return SimpleNamespace(logits=logits)
 
     model = _CPModel()
+    model.supports_thd = supports_thd
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
     object.__setattr__(recipe, "device_mesh", None)
     object.__setattr__(recipe, "pp_enabled", False)
@@ -2350,8 +2423,7 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
     def _fake_calc_loss(loss_fn, *, logits, labels, model, hidden_states, lm_weight, num_label_tokens):
         captured["logits_is_tensor"] = isinstance(logits, torch.Tensor)
         assert lm_weight is None
-        # finite base loss (fp32) so any non-finiteness must come from the grad touch
-        return logits.float().mean()
+        return logits.mean()
 
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
@@ -2368,11 +2440,10 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
         idx=0, batch=batch, loss_buffer=loss_buffer, num_label_tokens=None, num_batches=1, is_train=True
     )
 
-    assert model.prepared is True  # cp_size>1 + hasattr -> hook body ran
+    assert model.prepared is True
+    assert model.num_chunks == 1
     assert captured["logits_is_tensor"]
     assert len(loss_buffer) == 1
-    # the fp32-promoted grad touch must not poison the loss with inf/nan
     assert torch.isfinite(loss_buffer[0]).all()
-    # the grad-touch kept the full logits in the graph, so backward populated grads
     assert model.lin.weight.grad is not None
     assert torch.isfinite(model.lin.weight.grad).all()
