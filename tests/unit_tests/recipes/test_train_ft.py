@@ -1035,6 +1035,22 @@ def test_nvtx_false_skips_patching(monkeypatch):
     assert patch_calls == []
 
 
+def test_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch):
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+
+    _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
+    dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: SimpleNamespace(_target_="torch.optim.AdamW", build=lambda *a, **k: [dummy_opt])),
+    )
+
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+
+    assert cfg.model.torch_dtype == "float32"
+
+
 def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
     cfg = _minimal_cfg_with_nvtx(nvtx_value=True)
     patch_calls = []

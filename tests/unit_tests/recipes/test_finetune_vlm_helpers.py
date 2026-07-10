@@ -2855,6 +2855,21 @@ def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
     assert cfg.model.backend.rope_fusion is True
 
 
+def test_vlm_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch):
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True)
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: SimpleNamespace(_target_="torch.optim.AdamW", build=lambda *a, **k: [dummy_opt])),
+    )
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert cfg.model.torch_dtype == "float32"
+
+
 def test_vlm_rope_fusion_stays_false_when_already_disabled(monkeypatch):
     """rope_fusion=False should stay False in VLM setup regardless of cp_size."""
     cfg = _minimal_vlm_cfg(cp_size=4, rope_fusion=False)
