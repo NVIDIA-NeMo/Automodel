@@ -31,6 +31,7 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Optional
 
 import mlflow
@@ -141,6 +142,26 @@ def _uses_thd_collater(cfg_dataloader):
     from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
     return getattr(cfg_dataloader, "collate_fn", None) is packed_sequence_thd_collater
+
+
+def _should_pack_validation(cfg: RecipeConfig, model: nn.Module) -> bool:
+    """Return whether validation must use the configured training packer."""
+    if cfg.get("packed_sequence.packed_sequence_size", 0) <= 0:
+        return False
+
+    validation_uses_thd = _uses_thd_collater(cfg.get("validation_dataloader", None))
+    if validation_uses_thd:
+        return True
+
+    model_requires_packing = bool(
+        callable(getattr(model, "should_pack_validation_with_training", None))
+        and model.should_pack_validation_with_training()
+    )
+    magi_backend = (
+        str(cfg.get("model.backend.attn", "")) == "magi" or str(cfg.get("model.attn_implementation", "")) == "magi"
+    )
+    backend_requires_packing = _uses_te_dot_product_attention(cfg.model) or magi_backend or model_requires_packing
+    return backend_requires_packing and _uses_thd_collater(cfg.get("dataloader", None))
 
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
@@ -494,7 +515,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if (
                 self.mesh_context.cp_size > 1
                 and _uses_te_dot_product_attention(self.cfg.model)
-                and _uses_thd_collater(self.cfg.dataloader)
+                and _uses_thd_collater(self.cfg.get("dataloader", None))
             ):
                 pp_microbatch_size = 1
                 pp_batch_size = pp_batch_size // self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
@@ -634,8 +655,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             collate_wrapper=_build_pp_collate_wrapper(self.cfg.model, self.pp_enabled),
         )
         self.dataloader = self.cfg.dataloader.build(**loader_runtime)
+        pack_validation = _should_pack_validation(self.cfg, self.model_parts[0])
         self.val_dataloaders = {
-            name: dl_config.build(**loader_runtime) for name, dl_config in self.cfg.validation_dataloaders.items()
+            name: (dl_config if pack_validation else replace(dl_config, packing=None)).build(**loader_runtime)
+            for name, dl_config in self.cfg.validation_dataloaders.items()
         }
         # Optional tool-call accuracy evaluator for agent SFT runs.
         # Presence of the ``tool_call_eval`` block enables it; absence skips it.
@@ -903,7 +926,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
-        _thd_collater = _uses_thd_collater(self.cfg.dataloader)
+        _thd_collater = _uses_thd_collater(self.cfg.get("dataloader", None))
         # Gate THD/cu_seqlens processing on the dataset being THD-packed, not on TE
         # attention being present on this rank: both TE attention and mamba need
         # cu_seqlens, and gating on attention would drop PP stages with no attention
