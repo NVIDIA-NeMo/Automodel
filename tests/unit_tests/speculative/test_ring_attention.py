@@ -21,9 +21,11 @@ comms are exercised separately by the 2-GPU checks).
 """
 
 import os
+import socket
 
 import pytest
 import torch
+import torch.multiprocessing as mp
 
 from nemo_automodel.components.speculative.eagle.ring_attention import HAVE_FLASH_ATTN
 
@@ -56,41 +58,51 @@ def _eager_cached_reference(q, cache_k, cache_v, scale):
     return out
 
 
-@pytest.fixture()
-def solo_pg():
-    # NCCL (not gloo): the ring backward issues a self send/recv even at world_size=1,
-    # which gloo rejects but NCCL handles.
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29592")
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-    torch.cuda.set_device(0)
-    torch.distributed.init_process_group("nccl", rank=0, world_size=1)
+def _free_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def _ring_worker(rank: int, port: int) -> None:
+    # Run in a spawned child so the process group never collides with one another
+    # test in the suite left initialized. NCCL (not gloo): the ring backward issues
+    # a self send/recv even at world_size=1, which gloo rejects but NCCL handles.
     try:
-        yield torch.distributed.group.WORLD
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(port)
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        torch.cuda.set_device(0)
+        torch.distributed.init_process_group("nccl", rank=0, world_size=1)
+
+        from nemo_automodel.components.speculative.eagle.ring_attention import cached_ring_attention
+
+        torch.manual_seed(0)
+        B, T, H, D, NB = 1, 64, 4, 32, 3
+        dev = torch.device("cuda")
+        scale = D**-0.5
+        q = torch.randn(B, T, H, D, device=dev, dtype=torch.bfloat16, requires_grad=True)
+        ck = [torch.randn(B, T, H, D, device=dev, dtype=torch.bfloat16, requires_grad=True) for _ in range(NB)]
+        cv = [torch.randn(B, T, H, D, device=dev, dtype=torch.bfloat16, requires_grad=True) for _ in range(NB)]
+
+        out = cached_ring_attention(q, ck, cv, torch.distributed.group.WORLD, scale)
+        ref = _eager_cached_reference(q, ck, cv, scale)
+        assert out.shape == ref.shape
+        rel = (out.float() - ref).abs().max() / ref.abs().max().clamp_min(1e-6)
+        assert rel < 2e-2, f"forward mismatch rel={rel.item():.3e}"
+
+        grad_out = torch.randn_like(out)
+        dq = torch.autograd.grad(out.float(), q, grad_out.float(), retain_graph=True)[0]
+        dq_ref = torch.autograd.grad(ref, q, grad_out.float())[0]
+        dq_rel = (dq - dq_ref).abs().max() / dq_ref.abs().max().clamp_min(1e-6)
+        assert dq_rel < 5e-2, f"dq mismatch rel={dq_rel.item():.3e}"
     finally:
-        torch.distributed.destroy_process_group()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
-def test_cached_ring_attention_world1_matches_eager(solo_pg):
-    from nemo_automodel.components.speculative.eagle.ring_attention import cached_ring_attention
-
-    torch.manual_seed(0)
-    B, T, H, D, NB = 1, 64, 4, 32, 3
-    dev = torch.device("cuda")
-    scale = D**-0.5
-    q = torch.randn(B, T, H, D, device=dev, dtype=torch.bfloat16, requires_grad=True)
-    ck = [torch.randn(B, T, H, D, device=dev, dtype=torch.bfloat16, requires_grad=True) for _ in range(NB)]
-    cv = [torch.randn(B, T, H, D, device=dev, dtype=torch.bfloat16, requires_grad=True) for _ in range(NB)]
-
-    out = cached_ring_attention(q, ck, cv, solo_pg, scale)
-    ref = _eager_cached_reference(q, ck, cv, scale)
-    assert out.shape == ref.shape
-    rel = (out.float() - ref).abs().max() / ref.abs().max().clamp_min(1e-6)
-    assert rel < 2e-2, f"forward mismatch rel={rel.item():.3e}"
-
-    grad_out = torch.randn_like(out)
-    dq = torch.autograd.grad(out.float(), q, grad_out.float(), retain_graph=True)[0]
-    dq_ref = torch.autograd.grad(ref, q, grad_out.float())[0]
-    dq_rel = (dq - dq_ref).abs().max() / dq_ref.abs().max().clamp_min(1e-6)
-    assert dq_rel < 5e-2, f"dq mismatch rel={dq_rel.item():.3e}"
+def test_cached_ring_attention_world1_matches_eager():
+    mp.spawn(_ring_worker, args=(_free_port(),), nprocs=1, join=True)

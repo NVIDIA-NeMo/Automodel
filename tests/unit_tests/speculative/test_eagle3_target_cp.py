@@ -34,6 +34,18 @@ from nemo_automodel.components.speculative.eagle.target import HFEagle3TargetMod
 from nemo_automodel.recipes.llm.train_eagle3 import _validate_cp_gates
 
 
+@pytest.fixture(autouse=True)
+def _no_live_process_group(monkeypatch):
+    """Drive the CP paths with fake meshes regardless of suite ordering.
+
+    ``attach_cp_kv_gather_hooks`` only falls back to plain local SDPA while no
+    process group exists. Another test in the suite may leave one initialized, and
+    the hook would then take its live path and call ``get_group()`` on the fake
+    mesh used here, so pin the fallback rather than depend on global state.
+    """
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False, raising=False)
+
+
 def _tiny_target(num_hidden_layers: int = 4) -> LlamaForCausalLM:
     config = LlamaConfig(
         hidden_size=16,
