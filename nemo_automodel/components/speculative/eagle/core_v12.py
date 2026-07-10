@@ -94,18 +94,14 @@ class EagleTrainerModule(nn.Module):
     ) -> EagleStepMetrics:
         """Run one EAGLE-1 / EAGLE-2 training step.
 
-        All per-token tensors are ``[B, T]`` (``input_ids`` / ``loss_mask`` /
-        ``attention_mask`` / ``position_ids`` / ``doc_remaining``) except the
-        ``[B, T, H]`` hidden states and ``[B, T, V]`` ``target_logits``.
-
-        Packing (``seq_lens`` ``[B, max_docs]`` long, per-document lengths summing
-        to ``T``) makes the draft's attention document-level block-causal and its
-        RoPE per-document via ``position_ids``. ``doc_remaining`` ``[B, T]`` (real
-        tokens after each slot within its document) gates supervision: a
-        document's last real token (``doc_remaining == 0``) predicts the *next*
-        document's first token through the wrapper's global left-shift, so it is
-        dropped. This is the single-step reduction of the EAGLE-3 TTT gate
-        (``step_idx < doc_remaining`` at ``step_idx == 0``).
+        Per-token tensors are ``[B, T]`` (``position_ids`` / ``doc_remaining``
+        included) except the ``[B, T, H]`` hidden states and ``[B, T, V]``
+        ``target_logits``; ``seq_lens`` is ``[B, max_docs]``. When packing is on,
+        ``position_ids`` / ``seq_lens`` make the draft block-causal and per-document,
+        and ``doc_remaining`` (real tokens after each slot within its document) gates
+        supervision: a document's last real token (``doc_remaining == 0``) is dropped
+        because the wrapper's global left-shift makes its target the next document's
+        first token.
         """
         if self.training and self.feature_noise > 0:
             # EAGLE feature-noise augmentation (see __init__): add
