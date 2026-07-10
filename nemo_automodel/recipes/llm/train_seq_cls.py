@@ -38,7 +38,6 @@ from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_con
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import (
-    _build_tokenizer,
     _get_model_name,
     build_model,
 )
@@ -126,7 +125,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self.model_parts = [model]
         self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
 
-        _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
+        self.tokenizer = self.cfg.tokenizer.build()
 
         def materialize_loader(config):
             build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
