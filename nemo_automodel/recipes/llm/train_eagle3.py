@@ -173,7 +173,7 @@ def _validate_cp_gates(
         )
     # The draft ring runs on flash-attn's private kernels pinned to the 2.8.x
     # positional signature, so check the version here (not just that it imports).
-    from nemo_automodel.components.distributed.ring_attention import require_flash_attn_version
+    from nemo_automodel.components.speculative.eagle.ring_attention import require_flash_attn_version
 
     require_flash_attn_version()
     # Zig-zag chunks the sequence into 2*cp pieces (rank r owns chunks r and 2*cp-1-r),

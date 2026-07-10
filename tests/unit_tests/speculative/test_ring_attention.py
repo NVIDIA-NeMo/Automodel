@@ -25,7 +25,7 @@ import os
 import pytest
 import torch
 
-from nemo_automodel.components.distributed.ring_attention import HAVE_FLASH_ATTN
+from nemo_automodel.components.speculative.eagle.ring_attention import HAVE_FLASH_ATTN
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not HAVE_FLASH_ATTN,
@@ -73,7 +73,7 @@ def solo_pg():
 
 
 def test_cached_ring_attention_world1_matches_eager(solo_pg):
-    from nemo_automodel.components.distributed.ring_attention import cached_ring_attention
+    from nemo_automodel.components.speculative.eagle.ring_attention import cached_ring_attention
 
     torch.manual_seed(0)
     B, T, H, D, NB = 1, 64, 4, 32, 3

@@ -36,16 +36,16 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.distributed.zigzag_ring_attention import (
+from nemo_automodel.components.speculative.eagle.zigzag_ring_attention import (
     RingComm,
 )
-from nemo_automodel.components.distributed.zigzag_ring_attention import (
+from nemo_automodel.components.speculative.eagle.zigzag_ring_attention import (
     get_half_index as _zz_half_index,
 )
-from nemo_automodel.components.distributed.zigzag_ring_attention import (
+from nemo_automodel.components.speculative.eagle.zigzag_ring_attention import (
     zigzag_ring_flash_attn_varlen_backward as _zz_backward,
 )
-from nemo_automodel.components.distributed.zigzag_ring_attention import (
+from nemo_automodel.components.speculative.eagle.zigzag_ring_attention import (
     zigzag_ring_flash_attn_varlen_forward as _zz_forward,
 )
 from nemo_automodel.shared.import_utils import safe_import

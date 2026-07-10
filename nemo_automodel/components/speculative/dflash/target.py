@@ -72,10 +72,8 @@ class HFDFlashTargetModel:
         self.cp_mesh = cp_mesh
         self._cp_size = cp_mesh.size() if cp_mesh is not None else 1
         if self._cp_size > 1:
-            from nemo_automodel.components.distributed.cp_utils import (
-                attach_context_parallel_hooks,
-                attach_cp_kv_gather_hooks,
-            )
+            from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+            from nemo_automodel.components.speculative.target_cp import attach_cp_kv_gather_hooks
 
             # Strip the 4D mask, and all-gather K/V so each rank attends its local Q
             # against the full sequence -- torch's ring dispatch does not fire for a
@@ -147,7 +145,7 @@ class HFDFlashTargetModel:
             if self._cp_size > 1:
                 # Shard the sequence, run the target as ring attention, then gather the
                 # captured layers (and logits) back to the full sequence.
-                from nemo_automodel.components.distributed.cp_utils import run_target_cp_forward_and_gather
+                from nemo_automodel.components.speculative.target_cp import run_target_cp_forward_and_gather
 
                 def _collect(output):
                     self._check_captured(captured)

@@ -168,10 +168,8 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         self.cp_mesh = cp_mesh
         self._cp_size = cp_mesh.size() if cp_mesh is not None else 1
         if self._cp_size > 1:
-            from nemo_automodel.components.distributed.cp_utils import (
-                attach_context_parallel_hooks,
-                attach_cp_kv_gather_hooks,
-            )
+            from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+            from nemo_automodel.components.speculative.target_cp import attach_cp_kv_gather_hooks
 
             attach_context_parallel_hooks(self.model)
             n_self_attn = sum(1 for name, _ in self.model.named_modules() if name.endswith("self_attn"))
@@ -316,7 +314,7 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
                 # Packing (which needs the 4D block-causal mask) is gated off
                 # upstream, so attention_mask is None and the self_attn hooks force
                 # is_causal.
-                from nemo_automodel.components.distributed.cp_utils import run_target_cp_forward_and_gather
+                from nemo_automodel.components.speculative.target_cp import run_target_cp_forward_and_gather
 
                 def _collect(outputs):
                     raw_logits = outputs.logits if hasattr(outputs, "logits") else outputs

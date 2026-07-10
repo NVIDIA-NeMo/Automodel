@@ -346,7 +346,7 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         diagonals stay local. Inputs are ``[B, H, T_local, D]``; the ring works in
         FlashAttention ``[B, T_local, H, D]`` layout.
         """
-        from nemo_automodel.components.distributed.ring_attention import (
+        from nemo_automodel.components.speculative.eagle.ring_attention import (
             cached_ring_attention,
             cached_zigzag_ring_attention,
         )

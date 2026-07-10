@@ -28,7 +28,7 @@ import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-import nemo_automodel.components.distributed.cp_utils as cp_utils
+import nemo_automodel.components.speculative.target_cp as target_cp
 import nemo_automodel.recipes.llm.train_eagle3 as train_eagle3
 from nemo_automodel.components.speculative.eagle.target import HFEagle3TargetModel
 from nemo_automodel.recipes.llm.train_eagle3 import _validate_cp_gates
@@ -79,10 +79,10 @@ def test_cp_mesh_size_gt_one_attaches_cp_hooks_on_every_self_attn():
 
 
 # --------------------------------------------------------------------------- #
-# cp_utils helpers exist and are wired
+# target_cp helpers exist and are wired
 # --------------------------------------------------------------------------- #
-def test_cp_utils_helpers_importable():
-    from nemo_automodel.components.distributed.cp_utils import gather_cp_seq, make_target_cp_ctx
+def test_target_cp_helpers_importable():
+    from nemo_automodel.components.speculative.target_cp import gather_cp_seq, make_target_cp_ctx
 
     assert callable(make_target_cp_ctx)
     assert callable(gather_cp_seq)
@@ -122,7 +122,7 @@ def test_make_target_cp_ctx_pads_and_generates_position_ids(monkeypatch):
     monkeypatch.setattr("torch.distributed.tensor.experimental.context_parallel", fake_cp)
     mesh = SimpleNamespace(size=lambda: 4)
     input_ids = torch.arange(10).view(1, 10)  # 10 -> pad to 12 (multiple of 4)
-    ctx, ids_buf, pos_buf, orig_len = cp_utils.make_target_cp_ctx(mesh, input_ids, position_ids=None)
+    ctx, ids_buf, pos_buf, orig_len = target_cp.make_target_cp_ctx(mesh, input_ids, position_ids=None)
 
     assert orig_len == 10
     assert ids_buf.shape == (1, 12)
@@ -142,7 +142,7 @@ def test_make_target_cp_ctx_no_pad_clones_and_expands_position_ids(monkeypatch):
     mesh = SimpleNamespace(size=lambda: 2)
     input_ids = torch.arange(16).view(2, 8)  # 8 already a multiple of 2 -> no pad
     pos = torch.arange(8).view(1, 8)
-    ctx, ids_buf, pos_buf, orig_len = cp_utils.make_target_cp_ctx(mesh, input_ids, position_ids=pos)
+    ctx, ids_buf, pos_buf, orig_len = target_cp.make_target_cp_ctx(mesh, input_ids, position_ids=pos)
 
     assert orig_len == 8
     assert ids_buf.shape == (2, 8)
@@ -163,7 +163,7 @@ def test_gather_cp_seq_unshards_and_slices_to_orig_len(monkeypatch):
     mesh = SimpleNamespace(size=lambda: 2)
     aux = torch.randn(1, 8, 4)
     logits = torch.randn(1, 8, 6)
-    out = cp_utils.gather_cp_seq(mesh, [aux, logits], seq_dim=1, orig_len=6)
+    out = target_cp.gather_cp_seq(mesh, [aux, logits], seq_dim=1, orig_len=6)
 
     assert out[0].shape == (1, 6, 4)
     assert out[1].shape == (1, 6, 6)
@@ -186,8 +186,8 @@ def test_generate_batch_cp_branch_gathers_full_sequence(monkeypatch):
     def fake_gather(cp_mesh, tensors, seq_dim, orig_len):
         return [t.narrow(seq_dim, 0, orig_len).contiguous() for t in tensors]
 
-    monkeypatch.setattr(cp_utils, "make_target_cp_ctx", fake_make_ctx)
-    monkeypatch.setattr(cp_utils, "gather_cp_seq", fake_gather)
+    monkeypatch.setattr(target_cp, "make_target_cp_ctx", fake_make_ctx)
+    monkeypatch.setattr(target_cp, "gather_cp_seq", fake_gather)
 
     b, t = 1, 8
     input_ids = torch.randint(0, 64, (b, t))
