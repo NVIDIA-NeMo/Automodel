@@ -24,6 +24,8 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
+from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderBuild
+
 from .text_to_video_dataset import collate_optional_video_fields, load_optional_video_fields
 
 logger = logging.getLogger(__name__)
@@ -219,6 +221,43 @@ def build_node_parallel_sampler(
     )
 
 
+@dataclass
+class MetaFilesDataloaderConfig:
+    """Construction-time configuration for a pre-encoded diffusion dataloader."""
+
+    meta_folder: str
+    shuffle: bool = True
+    num_workers: int = 2
+    device: str = "cpu"
+    transform_text: Callable[[torch.Tensor], torch.Tensor] | None = None
+    transform_video: Callable[[torch.Tensor], torch.Tensor] | None = None
+    filter_fn: Callable[[dict[str, object]], bool] | None = None
+    max_files: int | None = None
+
+    def build(self, *, dp_rank: int, dp_world_size: int, batch_size: int) -> DiffusionDataloaderBuild:
+        """Build the configured metadata dataset, sampler, and dataloader."""
+        dataset = MetaFilesDatasetConfig(
+            meta_folder=self.meta_folder,
+            device=self.device,
+            max_files=self.max_files,
+        ).build(
+            transform_text=self.transform_text,
+            transform_video=self.transform_video,
+            filter_fn=self.filter_fn,
+        )
+        sampler = build_node_parallel_sampler(dataset, dp_rank, dp_world_size, shuffle=self.shuffle)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=sampler is None and self.shuffle,
+            sampler=sampler,
+            num_workers=self.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=self.device == "cpu",
+        )
+        return DiffusionDataloaderBuild(dataloader=dataloader, sampler=sampler)
+
+
 def build_dataloader(
     *,
     meta_folder: str,
@@ -234,29 +273,21 @@ def build_dataloader(
     max_files: Optional[int] = None,
 ) -> Tuple[DataLoader, Optional[DistributedSampler]]:
     """Build a dataloader for pre-encoded diffusion metadata files."""
-    dataset = MetaFilesDataset(
+    result = MetaFilesDataloaderConfig(
         meta_folder=meta_folder,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        device=device,
         transform_text=transform_text,
         transform_video=transform_video,
         filter_fn=filter_fn,
-        device=device,
         max_files=max_files,
-    )
-
-    sampler = build_node_parallel_sampler(dataset, dp_rank, dp_world_size, shuffle=shuffle)
-
-    use_pin_memory = device == "cpu"
-    dataloader = DataLoader(
-        dataset,
+    ).build(
         batch_size=batch_size,
-        shuffle=(sampler is None and shuffle),
-        sampler=sampler,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        pin_memory=use_pin_memory,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
     )
-
-    return dataloader, sampler
+    return result.dataloader, result.sampler
 
 
 def create_dataloader(

@@ -25,7 +25,7 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 import torch.utils.data
@@ -149,6 +149,20 @@ def make_cord_v2_dataset(
     # return dataset.map(format, batched=False, num_proc=8,remove_columns=["ground_truth"])
 
 
+@dataclass
+class MedPixDatasetConfig:
+    """Construction-time configuration for the MedPix dataset."""
+
+    path_or_dataset: str = "medpix-dataset/medpix-dataset"
+    """HuggingFace dataset id or local path for MedPix."""
+    split: str = "train"
+    """Dataset split to load."""
+
+    def build(self) -> object:
+        """Build the lazily decoded MedPix dataset."""
+        return make_medpix_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
+
+
 def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
     """Load and preprocess the MedPix dataset for image-to-text fine-tuning.
 
@@ -190,6 +204,20 @@ def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="
         }
 
     return dataset.with_transform(transform)
+
+
+@dataclass
+class LlavaOnevisionDatasetConfig:
+    """Construction-time configuration for the LLaVA-OneVision dataset."""
+
+    path_or_dataset: str = "liuhaotian/LLaVA-Instruct-150K"
+    """HuggingFace dataset id or local path."""
+    split: str = "train"
+    """Dataset split to load."""
+
+    def build(self) -> list[dict[str, object]]:
+        """Build the LLaVA-OneVision conversation dataset."""
+        return make_llava_onevision_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
 
 def make_llava_onevision_dataset(
@@ -245,6 +273,32 @@ def make_llava_onevision_dataset(
         }
 
     return [format(example) for example in dataset]
+
+
+@dataclass
+class Tulu3MagicoderTextMixDatasetConfig:
+    """Construction-time configuration for the Tulu-3/Magicoder text mixture."""
+
+    tulu_split: str = "train"
+    """Split expression for the Tulu-3 source."""
+    magicoder_split: str = "train"
+    """Split expression for the Magicoder source."""
+    seed: int = 42
+    """Sampling seed for interleaving the two sources."""
+    max_turns: int = 16
+    """Maximum number of turns retained from a Tulu-3 conversation."""
+    limit_total: int | None = None
+    """Optional cap on the merged row count."""
+
+    def build(self) -> list[dict[str, object]]:
+        """Build the text-only Tulu-3/Magicoder mixture."""
+        return make_tulu3_magicoder_text_mix_dataset(
+            tulu_split=self.tulu_split,
+            magicoder_split=self.magicoder_split,
+            seed=self.seed,
+            max_turns=self.max_turns,
+            limit_total=self.limit_total,
+        )
 
 
 def make_tulu3_magicoder_text_mix_dataset(
@@ -838,6 +892,8 @@ class _ExamplesWithStats(list):
 class MetaDatasetConfig:
     """Construction-time configuration for the meta (multi-source) VLM dataset."""
 
+    builds_with_data_parallel_rank: ClassVar[bool] = True
+
     path_or_dataset: str = ""
     """Path to the meta JSON file that defines the datasets to load."""
     dataset_names: list[str] | None = None
@@ -1190,20 +1246,20 @@ class PreTokenizedDatasetWrapperConfig:
     """If ``True``, truncate overlong samples instead of replacing them."""
     inject_fake_images: bool = True
     """If ``True``, inject a fake image into text-only samples for sharded training."""
+    post_tokenize_hook: Callable[[dict[str, object]], dict[str, object]] | None = None
+    """Optional declarative callback applied to each tokenizer result."""
 
     def build(
         self,
         *,
         dataset: torch.utils.data.Dataset | Sequence[dict[str, object]],
         processor: "ProcessorMixin",
-        post_tokenize_hook: Callable[[dict[str, object]], dict[str, object]] | None = None,
     ) -> "PreTokenizedDatasetWrapper":
         """Build a :class:`PreTokenizedDatasetWrapper` from this config.
 
         Args:
             dataset: The raw dataset (conversations) to wrap.
             processor: HuggingFace processor for tokenization.
-            post_tokenize_hook: Optional callable applied to tokenizer output per sample.
         """
         return PreTokenizedDatasetWrapper(
             dataset=dataset,
@@ -1211,7 +1267,7 @@ class PreTokenizedDatasetWrapperConfig:
             max_length=self.max_length,
             max_retries=self.max_retries,
             truncate=self.truncate,
-            post_tokenize_hook=post_tokenize_hook,
+            post_tokenize_hook=self.post_tokenize_hook,
             inject_fake_images=self.inject_fake_images,
         )
 
@@ -1421,22 +1477,6 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
         from nemo_automodel.components.datasets.vlm.collate_fns import make_robust_collate
 
         return make_robust_collate(self, collate_fn, self.max_retries)
-
-
-@dataclass
-class RobustDatasetWrapperConfig:
-    """Construction-time configuration for :class:`RobustDatasetWrapper`."""
-
-    max_retries: int = 10
-    """Number of retry attempts when a sample fails to load."""
-
-    def build(self, *, dataset: torch.utils.data.Dataset | Sequence[dict[str, object]]) -> "RobustDatasetWrapper":
-        """Build a :class:`RobustDatasetWrapper` from this config.
-
-        Args:
-            dataset: The underlying dataset to wrap with retry logic.
-        """
-        return RobustDatasetWrapper(dataset=dataset, max_retries=self.max_retries)
 
 
 class RobustDatasetWrapper(torch.utils.data.Dataset):
