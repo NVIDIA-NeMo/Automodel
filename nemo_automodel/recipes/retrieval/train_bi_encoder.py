@@ -23,7 +23,6 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 import wandb
-from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -285,11 +284,12 @@ class TrainBiEncoderRecipe(BaseRecipe):
             logger=logger,
         )
 
-        # Might be tokenizer or processor (for VLMs)
-        self.tokenizer = self.cfg.tokenizer.instantiate()
-        tokenizer = self.tokenizer.tokenizer if isinstance(self.tokenizer, ProcessorMixin) else self.tokenizer
+        self.tokenizer = self.cfg.tokenizer.build()
+        if self.tokenizer is None:
+            raise ValueError("Retrieval training requires a tokenizer or processor config")
+        tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
         if tokenizer.pad_token is None:
-            tokenizer.pad_token = self.tokenizer.eos_token
+            tokenizer.pad_token = tokenizer.eos_token
             tokenizer.padding_side = "left"
 
         dataloader_config = self.cfg.dataloader
