@@ -22,6 +22,7 @@ import torch.multiprocessing as mp
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.recipes import kd_utils
+from tests.functional_tests.llm_pretrain_and_kd import kd_separate_mesh_test_utils
 from tests.functional_tests.llm_pretrain_and_kd.compare_kd_sep_mesh_losses import _compare_pair
 from tests.functional_tests.llm_pretrain_and_kd.kd_separate_mesh_test_utils import TinyKDDataset
 
@@ -59,6 +60,37 @@ def test_tiny_kd_dataset_preserves_non_chat_first_label_mask():
 
     assert dataset[0]["input_ids"] == list(range(8))
     assert dataset[0]["labels"] == [-100, 2, 3, 4, 5, 6, 7, 8]
+
+
+def test_tiny_kd_sft_dataset_masks_generation_prompt():
+    class Tokenizer:
+        eos_token_id = 2
+
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, return_dict):
+            assert messages == [{"role": "user", "content": "What is KD?"}]
+            assert tokenize is True
+            assert add_generation_prompt is True
+            assert return_dict is False
+            return [10, 11, 12, 13]
+
+        def encode(self, text, *, add_special_tokens):
+            assert text == "KD transfers teacher behavior to a student."
+            assert add_special_tokens is False
+            return [20, 21, 22, 23, 24, 25, 26, 27]
+
+    dataset = kd_separate_mesh_test_utils.make_tiny_kd_sft_dataset(
+        tokenizer=Tokenizer(),
+        prompt="What is KD?",
+        completion="KD transfers teacher behavior to a student.",
+        num_samples=2,
+        seq_length=8,
+    )
+
+    assert dataset[0]["input_ids"] == [10, 11, 12, 13, 20, 21, 22, 23]
+    assert dataset[0]["labels"] == [-100, -100, -100, 20, 21, 22, 23, 24]
+    assert dataset[0]["attention_mask"] == [1] * 8
+    dataset[0]["labels"][3] = -100
+    assert dataset[1]["labels"][3] == 20
 
 
 def test_loss_comparator_rejects_mismatched_kd_settings():

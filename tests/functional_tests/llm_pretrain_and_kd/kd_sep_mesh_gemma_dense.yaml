@@ -76,13 +76,18 @@ optimizer:
   foreach: false
 
 dataset:
-  _target_: tests.functional_tests.llm_pretrain_and_kd.kd_separate_mesh_test_utils.make_tiny_kd_dataset
+  _target_: tests.functional_tests.llm_pretrain_and_kd.kd_separate_mesh_test_utils.make_tiny_kd_sft_dataset
   tokenizer:
     pretrained_model_name_or_path: google/gemma-4-31B-it
   num_samples: 72
-  seq_length: 32
-  repeat_first_sample: true
-  use_chat_template: true
+  seq_length: 64
+  prompt: Explain knowledge distillation and distributed validation.
+  completion: >-
+    ## Knowledge Distillation and Distributed Validation Explained
+
+    Here's a breakdown of Knowledge Distillation and Distributed Validation, explaining what they are, why they are used,
+    and how they support reliable model development. Knowledge distillation transfers behavior from a larger teacher
+    model to a smaller student model, while distributed validation compares losses and gradients across parallel layouts.
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

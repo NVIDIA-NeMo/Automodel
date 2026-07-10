@@ -19,6 +19,7 @@ from __future__ import annotations
 import pathlib
 
 from torch.utils.data import Dataset
+from transformers import PreTrainedTokenizerBase
 
 
 class TinyKDDataset(Dataset):
@@ -77,6 +78,50 @@ class TinyKDDataset(Dataset):
         return len(self.samples)
 
 
+class TinyKDSFTDataset(Dataset):
+    """Deterministic assistant-supervised chat dataset for KD parity tests.
+
+    Args:
+        tokenizer: Tokenizer whose chat template renders the conversation.
+        prompt: User turn text.
+        completion: Assistant turn text.
+        num_samples: Number of identical samples to expose.
+        seq_length: Shifted next-token sequence length.
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        *,
+        prompt: str,
+        completion: str,
+        num_samples: int = 16,
+        seq_length: int = 32,
+    ) -> None:
+        prompt_ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=False,
+        )
+        token_ids = prompt_ids + tokenizer.encode(completion, add_special_tokens=False) + [tokenizer.eos_token_id]
+        if len(token_ids) <= seq_length:
+            raise ValueError(f"SFT conversation produced only {len(token_ids)} tokens for seq_length={seq_length}")
+        window = token_ids[: seq_length + 1]
+        input_ids = window[:-1]
+        labels = window[1:]
+        for label_index in range(min(len(prompt_ids) - 1, len(labels))):
+            labels[label_index] = -100
+        sample = {"input_ids": input_ids, "labels": labels, "attention_mask": [1] * len(input_ids)}
+        self.samples = [{key: list(value) for key, value in sample.items()} for _ in range(num_samples)]
+
+    def __getitem__(self, index: int) -> dict[str, list[int]]:
+        return self.samples[index]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+
 def make_tiny_kd_dataset(
     tokenizer=None,
     num_samples: int = 16,
@@ -93,6 +138,37 @@ def make_tiny_kd_dataset(
         seq_length=seq_length,
         repeat_first_sample=repeat_first_sample,
         use_chat_template=use_chat_template,
+    )
+
+
+def make_tiny_kd_sft_dataset(
+    tokenizer: PreTrainedTokenizerBase | None = None,
+    *,
+    prompt: str,
+    completion: str,
+    num_samples: int = 16,
+    seq_length: int = 32,
+) -> TinyKDSFTDataset:
+    """Build a deterministic assistant-supervised chat dataset.
+
+    Args:
+        tokenizer: Tokenizer whose chat template renders the conversation.
+        prompt: User turn text.
+        completion: Assistant turn text.
+        num_samples: Number of identical samples to expose.
+        seq_length: Shifted next-token sequence length.
+
+    Returns:
+        Dataset containing repeated, assistant-supervised chat samples.
+    """
+    if tokenizer is None:
+        raise ValueError("TinyKDSFTDataset requires a tokenizer")
+    return TinyKDSFTDataset(
+        tokenizer=tokenizer,
+        prompt=prompt,
+        completion=completion,
+        num_samples=num_samples,
+        seq_length=seq_length,
     )
 
 
