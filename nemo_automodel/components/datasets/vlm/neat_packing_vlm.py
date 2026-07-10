@@ -33,11 +33,17 @@ from __future__ import annotations
 import inspect
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.utils.data
+
+if TYPE_CHECKING:
+    from transformers import ProcessorMixin
+
+    from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
 
 from nemo_automodel.components.datasets.llm.neat_packing import (
     greedy_knapsack,
@@ -430,9 +436,9 @@ class PackedDatasetWrapperConfig:
     def build(
         self,
         *,
-        inner_dataset,
+        inner_dataset: "PreTokenizedDatasetWrapper",
         bins: list[list[int]],
-        get_rope_index: Callable | None = None,
+        get_rope_index: Callable[..., object] | None = None,
     ) -> "PackedDatasetWrapper":
         """Build a :class:`PackedDatasetWrapper` from this config.
 
@@ -571,7 +577,14 @@ class NeatPackConfig:
     balance_media_tokens: bool = True
     """If ``True``, use VT-balanced knapsack to distribute visual tokens evenly."""
 
-    def build(self, *, dataset, ds_raw=None, get_rope_index=None, processor=None) -> "PackedDatasetWrapper":
+    def build(
+        self,
+        *,
+        dataset: "PreTokenizedDatasetWrapper",
+        ds_raw: torch.utils.data.Dataset | Sequence[dict[str, object]] | None = None,
+        get_rope_index: Callable[..., object] | None = None,
+        processor: "ProcessorMixin | None" = None,
+    ) -> "PackedDatasetWrapper":
         """Build a neat-packed VLM dataset from this config.
 
         Args:

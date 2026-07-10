@@ -702,13 +702,13 @@ class DeltaLakeDatasetConfig:
 
     table_path: str
     """Path to the Delta Lake table."""
-    columns: Optional[list] = None
+    columns: list[str] | None = None
     """Optional list of column names to read."""
-    storage_options: Optional[Dict[str, str]] = None
+    storage_options: dict[str, str] | None = None
     """Optional dict of storage options for cloud authentication."""
-    version: Optional[int] = None
+    version: int | None = None
     """Optional specific version of the Delta table to read."""
-    sql_query: Optional[str] = None
+    sql_query: str | None = None
     """Optional SQL query applied to the table."""
 
     def build(self) -> "DeltaLakeDataset":

@@ -73,18 +73,18 @@ class MockVlmDatasetConfig:
     """Number of synthetic conversation examples to generate."""
     num_images_per_sample: int = 1
     """Number of random noise images per user turn."""
-    image_size: Tuple[int, int] = (256, 256)
+    image_size: tuple[int, int] = (256, 256)
     """``(width, height)`` of each generated image."""
     prompt: str = "Describe this image."
     """Text prompt appended after the image(s) in the user turn."""
-    responses: Optional[List[str]] = None
+    responses: list[str] | None = None
     """Optional list of assistant responses, cycled over samples."""
-    max_length: Optional[int] = None
+    max_length: int | None = None
     """Target sequence length. When set (and ``responses`` is ``None``), drives response word count."""
     seed: int = 0
     """Random seed for reproducibility."""
 
-    def build(self) -> list:
+    def build(self) -> list[dict[str, object]]:
         """Build the mock VLM dataset from this config."""
         return build_mock_vlm_dataset(
             num_samples=self.num_samples,

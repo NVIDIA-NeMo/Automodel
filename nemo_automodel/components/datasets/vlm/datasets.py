@@ -22,14 +22,19 @@ import os
 import random
 import re
 import time
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.utils.data
 from datasets import Image as HfImage
 from datasets import load_dataset
 from PIL import Image
+
+if TYPE_CHECKING:
+    from transformers import ProcessorMixin
 
 from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
@@ -50,7 +55,7 @@ class RdrDatasetConfig:
     split: str = "train"
     """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
 
-    def build(self) -> list:
+    def build(self) -> list[dict[str, object]]:
         """Build the RDR dataset from this config."""
         return make_rdr_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
@@ -98,7 +103,7 @@ class CordV2DatasetConfig:
     split: str = "train"
     """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
 
-    def build(self) -> list:
+    def build(self) -> list[dict[str, object]]:
         """Build the CORD-V2 dataset from this config."""
         return make_cord_v2_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
@@ -368,7 +373,7 @@ class UnimmChatDatasetConfig:
     split: str = "train"
     """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
 
-    def build(self) -> list:
+    def build(self) -> list[dict[str, object]]:
         """Build the UniMM-Chat dataset from this config."""
         return make_unimm_chat_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
@@ -841,20 +846,24 @@ class MetaDatasetConfig:
     """Dataset split to load (passed through for API consistency)."""
     shard_data: bool = False
     """If ``True``, each rank loads only its ``1/world_size`` slice."""
-    rank: int | None = None
-    """Data-parallel rank. Inferred from ``torch.distributed`` when ``None``."""
-    world_size: int | None = None
-    """Data-parallel world size. Inferred from ``torch.distributed`` when ``None``."""
 
-    def build(self) -> list:
-        """Build the meta VLM dataset from this config."""
+    def build(self, *, rank: int | None = None, world_size: int | None = None) -> list[dict[str, object]]:
+        """Build the meta VLM dataset from this config.
+
+        Args:
+            rank: Runtime data-parallel rank. Inferred from ``torch.distributed`` when ``None``.
+            world_size: Runtime data-parallel world size. Inferred from ``torch.distributed`` when ``None``.
+
+        Returns:
+            Materialized multimodal examples from the selected source datasets.
+        """
         return make_meta_dataset(
             path_or_dataset=self.path_or_dataset,
             dataset_names=self.dataset_names,
             split=self.split,
             shard_data=self.shard_data,
-            rank=self.rank,
-            world_size=self.world_size,
+            rank=rank,
+            world_size=world_size,
         )
 
 
@@ -1182,7 +1191,13 @@ class PreTokenizedDatasetWrapperConfig:
     inject_fake_images: bool = True
     """If ``True``, inject a fake image into text-only samples for sharded training."""
 
-    def build(self, *, dataset, processor, post_tokenize_hook=None) -> "PreTokenizedDatasetWrapper":
+    def build(
+        self,
+        *,
+        dataset: torch.utils.data.Dataset | Sequence[dict[str, object]],
+        processor: "ProcessorMixin",
+        post_tokenize_hook: Callable[[dict[str, object]], dict[str, object]] | None = None,
+    ) -> "PreTokenizedDatasetWrapper":
         """Build a :class:`PreTokenizedDatasetWrapper` from this config.
 
         Args:
@@ -1197,6 +1212,7 @@ class PreTokenizedDatasetWrapperConfig:
             max_retries=self.max_retries,
             truncate=self.truncate,
             post_tokenize_hook=post_tokenize_hook,
+            inject_fake_images=self.inject_fake_images,
         )
 
 
@@ -1414,7 +1430,7 @@ class RobustDatasetWrapperConfig:
     max_retries: int = 10
     """Number of retry attempts when a sample fails to load."""
 
-    def build(self, *, dataset) -> "RobustDatasetWrapper":
+    def build(self, *, dataset: torch.utils.data.Dataset | Sequence[dict[str, object]]) -> "RobustDatasetWrapper":
         """Build a :class:`RobustDatasetWrapper` from this config.
 
         Args:

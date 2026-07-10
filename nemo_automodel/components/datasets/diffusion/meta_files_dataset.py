@@ -37,22 +37,28 @@ class MetaFilesDatasetConfig:
     """Path to the folder containing `.meta` files."""
     device: str = "cpu"
     """Device to load tensors to."""
-    max_files: Optional[int] = None
+    max_files: int | None = None
     """Maximum number of `.meta` files to use (None means no limit)."""
 
     def build(
         self,
         *,
-        transform_text: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        transform_video: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        filter_fn: Optional[Callable[[Dict], bool]] = None,
+        transform_text: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        transform_video: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        filter_fn: Callable[[dict[str, object]], bool] | None = None,
     ) -> "MetaFilesDataset":
         """Build a :class:`MetaFilesDataset` from this :class:`MetaFilesDatasetConfig`.
 
         Args:
-            transform_text: Optional callable applied to text embeddings at load time.
-            transform_video: Optional callable applied to video latents at load time.
+            transform_text: Optional transform of text embeddings shaped ``[1, S, E]``, where ``S`` is text
+                sequence length and ``E`` is embedding width. It must return the same semantic axis order.
+            transform_video: Optional transform of video latents shaped ``[1, C, T, Y, X]``, where ``C`` is
+                latent channels, ``T`` is latent frames, and ``Y``/``X`` are spatial height/width. It must
+                return the same semantic axis order.
             filter_fn: Optional callable that filters samples by their metadata dict.
+
+        Returns:
+            Dataset loading tensors on the configured device.
         """
         return MetaFilesDataset(
             meta_folder=self.meta_folder,

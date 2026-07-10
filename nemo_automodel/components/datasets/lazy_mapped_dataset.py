@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -29,14 +30,22 @@ class LazyMappedDatasetConfig:
     """Construction-time configuration for :class:`LazyMappedDataset`.
 
     ``dataset`` and ``map_fn`` are runtime objects rather than serializable
-    config, so they are passed to :meth:`from_config` directly.
+    config, so they are explicit :meth:`build` arguments.
     """
 
     cache_size: int | None = 10000
     """Number of processed items to cache (``0`` disables caching, ``None`` caches all)."""
 
-    def build(self, *, dataset, map_fn) -> "LazyMappedDataset":
-        """Build a :class:`LazyMappedDataset` from this :class:`LazyMappedDatasetConfig` and runtime ``dataset``/``map_fn``."""
+    def build(self, *, dataset: Dataset, map_fn: Callable[[object], object]) -> "LazyMappedDataset":
+        """Build a lazy mapping wrapper around a runtime dataset and transform.
+
+        Args:
+            dataset: Map-style dataset whose samples are transformed lazily.
+            map_fn: Callable that converts one source sample into one output sample.
+
+        Returns:
+            Lazy mapped dataset with the configured cache size.
+        """
         return LazyMappedDataset(dataset=dataset, map_fn=map_fn, cache_size=self.cache_size)
 
 

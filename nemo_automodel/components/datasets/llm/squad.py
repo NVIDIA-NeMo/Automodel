@@ -15,8 +15,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar
 
 from datasets import load_dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 from nemo_automodel.components.datasets.llm.formatting_utils import (
@@ -143,6 +147,8 @@ def make_squad_dataset(
 class SquadConfig:
     """Construction-time configuration for the SQuAD dataset (tokenizer is a build arg)."""
 
+    accepts_tokenizer: ClassVar[bool] = True
+
     seq_length: int | None = None
     """If set, pad/truncate each example to this length."""
     limit_dataset_samples: int | None = None
@@ -158,7 +164,7 @@ class SquadConfig:
     truncation: bool | str = False
     """Optional truncation strategy."""
 
-    def build(self, *, tokenizer) -> LazyMappedDataset:
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> LazyMappedDataset:
         """Build the SQuAD :class:`LazyMappedDataset` from this :class:`SquadConfig` and a runtime tokenizer."""
         return make_squad_dataset(
             tokenizer=tokenizer,

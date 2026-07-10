@@ -19,9 +19,12 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Iterator, List, Optional, Sequence, Union
 
 from datasets import VerificationMode, load_dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 from torch.utils.data import Dataset
 
 from nemo_automodel.components.datasets.llm.formatting_utils import (
@@ -320,23 +323,25 @@ def _conversations_to_messages(conversations: Any) -> List[Dict[str, Any]]:
 class ChatDatasetConfig:
     """Construction-time configuration for :class:`ChatDataset` (tokenizer is a build arg)."""
 
-    path_or_dataset_id: Union[str, Sequence[str]]
+    accepts_tokenizer: ClassVar[bool] = True
+
+    path_or_dataset_id: str | Sequence[str]
     """HF dataset id, local JSON/JSONL path(s), Parquet file, or Parquet directory."""
-    split: Optional[str] = None
+    split: str | None = None
     """Dataset split or slice (e.g. ``train``, ``train[1024:]``)."""
-    name: Optional[str] = None
+    name: str | None = None
     """Optional Hub subset / config name."""
-    seq_length: Optional[int] = None
+    seq_length: int | None = None
     """Maximum sequence length for padding and truncation in formatting."""
-    padding: Union[str, bool] = "do_not_pad"
+    padding: str | bool = "do_not_pad"
     """Padding mode for ``format_chat_template``."""
-    truncation: Union[str, bool] = "do_not_truncate"
+    truncation: str | bool = "do_not_truncate"
     """Truncation mode for ``format_chat_template``."""
-    start_of_turn_token: Optional[str] = None
+    start_of_turn_token: str | None = None
     """Optional token marking assistant turns for answer-only loss."""
-    chat_template: Optional[str] = None
+    chat_template: str | None = None
     """Optional Jinja template string overriding ``tokenizer.chat_template``."""
-    shuffle_seed: Optional[int] = None
+    shuffle_seed: int | None = None
     """If set, shuffles Hub/Parquet data before applying a split slice."""
     mask_reasoning_content: bool = False
     """If ``True``, exclude rendered reasoning traces from the loss mask."""
@@ -345,7 +350,7 @@ class ChatDatasetConfig:
     skip_invalid_samples: bool = False
     """If ``True``, skip malformed JSONL lines when reading local files."""
 
-    def build(self, *, tokenizer) -> "ChatDataset":
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> "ChatDataset":
         """Build a :class:`ChatDataset` from this :class:`ChatDatasetConfig` and a runtime tokenizer."""
         return ChatDataset(
             path_or_dataset_id=self.path_or_dataset_id,

@@ -238,7 +238,8 @@ def test_make_vision_collator_from_processor_method_returns_bound_method():
             return {"features": features}
 
     processor = FakeProcessor()
-    collator = rc.make_vision_collator_from_processor_method(processor, "process_queries_documents_biencoder")
+    with pytest.deprecated_call(match="use ProcessorMethodCollator"):
+        collator = rc.make_vision_collator_from_processor_method(processor, "process_queries_documents_biencoder")
 
     assert collator.__self__ is processor
     assert collator.__func__ is FakeProcessor.process_queries_documents_biencoder
@@ -266,5 +267,5 @@ def test_processor_method_collator_resolves_method_once():
 
 
 def test_make_vision_collator_from_processor_method_missing_method_raises():
-    with pytest.raises(AttributeError):
+    with pytest.deprecated_call(match="use ProcessorMethodCollator"), pytest.raises(AttributeError):
         rc.make_vision_collator_from_processor_method(object(), "missing_collator")

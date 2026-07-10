@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import logging
 import sys
 import types
@@ -32,10 +33,6 @@ from torch.utils.data import IterableDataset
 from nemo_automodel._transformers.model_init import resolve_sdpa_method
 from nemo_automodel.components.datasets.loader import (
     DataloaderConfig,
-    build_dataloader_config,
-    make_collate_fn,
-    make_dataset_config,
-    make_packing_config,
 )
 from nemo_automodel.components.distributed.utils import dp_eval_sample_shard
 from nemo_automodel.components.eval.tool_call_evaluator import ToolCallAccuracyEvaluator
@@ -50,14 +47,6 @@ from nemo_automodel.recipes.llm.train_ft import (
     build_model,
     compute_trust_remote_code_from_model,
 )
-
-
-def _target_kwargs(node):
-    if node is None:
-        return None, {}
-    if isinstance(node, str):
-        return node, {}
-    return _callable_and_kwargs(node)
 
 
 def _build_loader(
@@ -78,34 +67,30 @@ def _build_loader(
     model=None,
 ):
     """Resolve loader YAML like ``RecipeConfig.dataloader`` and build it."""
-    del global_batch_size, max_steps, val_check_interval
-    target, ds_kwargs = _callable_and_kwargs(cfg_ds)
-    ds_kwargs.pop("tokenizer", None)
-    dataset_config = make_dataset_config(target, ds_kwargs)
-    dl = _as_dict(cfg_dl)
-    dl.pop("_target_", None)
-    collate = make_collate_fn(*_target_kwargs(dl.pop("collate_fn", None)))
-    ps = _as_dict(cfg_ps)
-    packing = None
-    if ps.get("packed_sequence_size", 0) > 0:
-        packing = make_packing_config(ps.pop("packing_strategy", "thd"), ps)
-    config = build_dataloader_config(
-        dataset_config,
-        dataloader=dl,
-        packing=packing,
-        collate_fn=collate,
-        seed=seed,
-        local_batch_size=local_batch_size,
+    raw = ConfigNode(
+        {
+            "dataset": cfg_ds.to_dict(),
+            "dataloader": cfg_dl.to_dict(),
+            "model": cfg_model.to_dict(),
+            "packed_sequence": cfg_ps.to_dict(),
+            "seed": seed,
+            "step_scheduler": {
+                "local_batch_size": local_batch_size,
+                "global_batch_size": global_batch_size,
+                "max_steps": max_steps,
+                "val_every_steps": val_check_interval,
+            },
+        }
     )
-    with patch("nemo_automodel.components.training.rng.ScopedRNG", lambda *a, **k: nullcontext()):
-        loader = config.build(
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            pp_enabled=pp_enabled,
-            model=model,
-            cp_size=cp_size,
-            collate_wrapper=_build_pp_collate_wrapper(cfg_model, pp_enabled),
-        )
+    config = RecipeConfig(raw).dataloader
+    loader = config.build(
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        pp_enabled=pp_enabled,
+        supports_seq_lens=model is None or "seq_lens" in inspect.signature(model.forward).parameters,
+        cp_size=cp_size,
+        collate_wrapper=_build_pp_collate_wrapper(cfg_model, pp_enabled),
+    )
     return loader, None
 
 
@@ -625,6 +610,15 @@ def test_build_dataloader_prepacked_sequence_skips_recipe_packing(monkeypatch):
 
     class _PackedModel(nn.Module):
         def forward(self, input_ids, seq_lens=None):
+            """Return token IDs unchanged.
+
+            Args:
+                input_ids: Token IDs shaped ``[B, S]``, where ``B`` is batch and ``S`` is sequence length.
+                seq_lens: Optional packed lengths shaped ``[B, N]``, where ``N`` is packed sequences per row.
+
+            Returns:
+                The input ``[B, S]`` tensor without copying.
+            """
             return input_ids
 
     dl, tok = _build_loader(
@@ -677,12 +671,29 @@ def test_build_dataloader_packing_uses_configured_cp_size(monkeypatch, supports_
 
         class _PackedModel(nn.Module):
             def forward(self, input_ids, seq_lens=None):
+                """Return token IDs while accepting packed-sequence metadata.
+
+                Args:
+                    input_ids: Token IDs shaped ``[B, S]``, where ``B`` is batch and ``S`` is sequence length.
+                    seq_lens: Optional lengths shaped ``[B, N]``, where ``N`` is packed sequences per row.
+
+                Returns:
+                    The input ``[B, S]`` tensor without copying.
+                """
                 return input_ids
 
     else:
 
         class _PackedModel(nn.Module):
             def forward(self, input_ids):
+                """Return token IDs unchanged.
+
+                Args:
+                    input_ids: Token IDs shaped ``[B, S]``, where ``B`` is batch and ``S`` is sequence length.
+
+                Returns:
+                    The input ``[B, S]`` tensor without copying.
+                """
                 return input_ids
 
     model = _PackedModel()
@@ -835,9 +846,20 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     )
 
     # Data-related stubs: short-circuit the RecipeConfig dataloader resolution + build.
-    monkeypatch.setattr(RecipeConfig, "dataloader", property(lambda self: SimpleNamespace(build=lambda **k: "dl")))
+    monkeypatch.setattr(
+        RecipeConfig,
+        "dataloader",
+        property(
+            lambda self: SimpleNamespace(
+                build=lambda **k: "dl",
+                dataset_builds_on_all_ranks=False,
+                seed=42,
+            )
+        ),
+    )
     monkeypatch.setattr(RecipeConfig, "validation_dataloaders", property(lambda self: {}))
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._build_tokenizer", lambda cfg_model, cfg_ds: ({}, None))
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
         "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
         lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),

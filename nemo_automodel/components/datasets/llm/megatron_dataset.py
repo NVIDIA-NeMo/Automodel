@@ -30,6 +30,7 @@ from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegat
 from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDatasetConfig
 from nemo_automodel.components.datasets.llm.megatron.indexed_dataset import ObjectStorageConfig, _is_object_storage_path
 from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper, get_blend_from_list
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
 
 logger = logging.getLogger(__name__)
 
@@ -41,61 +42,67 @@ class MegatronPretrainingConfig:
     # The Megatron ``BlendedMegatronDatasetBuilder`` synchronizes index-cache construction across *all* ranks
     # via ``torch.distributed.barrier()``. It must therefore run with every rank participating, not behind the
     # ``FirstRankPerNode`` rank-0-first gate the loader applies by default (which would deadlock the builder's
-    # internal collectives). The loader checks this flag and skips that wrapper for Megatron.
-    manages_own_distributed_build: ClassVar[bool] = True
+    # internal collectives). Recipes check this typed capability and do not apply their rank-0-first context.
+    builds_on_all_ranks: ClassVar[bool] = True
+    accepts_tokenizer: ClassVar[bool] = True
+    requires_training_schedule: ClassVar[bool] = True
 
-    paths: Path | List | Dict[str, List]
+    paths: Path | list[str] | dict[str, list[str]]
     """Paths of the data distributions (single path, list, dict, or path to a JSON blend file)."""
     seq_length: int = 2048
     """Sequence length."""
-    micro_batch_size: int = 4
-    """Batch size per GPU."""
-    global_batch_size: int = 8
-    """Global batch size."""
     create_attention_mask: bool = False
     """Whether to generate attention masks (not supported with fused/flash attention)."""
     seed: int = 1234
     """Seed for generating the GPT dataset."""
     split: str = "900,50,50"
     """Comma-separated train/validation/test ratios (unused if ``paths`` is a dict)."""
-    index_mapping_dir: Optional[str] = None
+    index_mapping_dir: str | None = None
     """Directory to write index mapping files."""
     num_dataset_builder_threads: int = 1
     """Number of threads to use for dataset building."""
-    num_train_samples: Optional[int] = None
+    num_train_samples: int | None = None
     """Number of training samples (defaults to total train steps x global batch size)."""
-    num_val_samples: Optional[int] = None
+    num_val_samples: int | None = None
     """Number of validation samples."""
-    num_test_samples: Optional[int] = None
+    num_test_samples: int | None = None
     """Number of test samples."""
-    trainer_max_steps: Optional[int] = None
-    """Maximum training steps (None/-1 uses the full dataset for one epoch)."""
-    trainer_val_check_interval: int = 1000
-    """Interval for validation checks."""
-    trainer_limit_val_batches: Union[int, float] = 1
+    trainer_limit_val_batches: int | float = 1
     """Limit for validation batches."""
-    trainer_limit_test_batches: Union[int, float] = 1
+    trainer_limit_test_batches: int | float = 1
     """Limit for test batches."""
     mmap_bin_files: bool = True
     """Whether to memory-map .bin files."""
-    splits_to_build: Optional[Union[str, List[str]]] = None
+    splits_to_build: str | list[str] | None = None
     """Splits to build (None builds all splits)."""
-    object_storage_config: Optional[Union[Dict, "ObjectStorageConfig"]] = None
+    object_storage_config: dict[str, object] | ObjectStorageConfig | None = None
     """Configuration for reading .bin/.idx files from S3/MSC."""
 
-    def build(self, *, tokenizer=None):
+    def build(
+        self,
+        *,
+        tokenizer: PreTrainedTokenizerBase | None,
+        training_schedule: DatasetBuildSchedule,
+    ) -> object:
         """Build the Megatron pretraining torch ``Dataset`` (for ``DataloaderConfig.dataset_config``).
 
         Constructs the :class:`MegatronPretraining` builder, runs its ``build()``, and returns the requested
-        split via ``get_dataset`` — matching the ``dataset_config.build(**runtime) -> Dataset`` interface the
-        loader uses (consumed with the dataloader's default sampler, like every other dataset).
+        split via ``get_dataset``. Batch sizes and scheduler limits are runtime values owned by the recipe's
+        step scheduler, so they arrive through ``training_schedule`` rather than being duplicated in YAML.
+
+        Args:
+            tokenizer: Runtime tokenizer used by the Megatron GPT dataset.
+            training_schedule: Local/global batch sizes and train/validation cadence from the recipe.
+
+        Returns:
+            Requested Megatron dataset split.
         """
         mp = MegatronPretraining(
             paths=self.paths,
             seq_length=self.seq_length,
             tokenizer=tokenizer,
-            micro_batch_size=self.micro_batch_size,
-            global_batch_size=self.global_batch_size,
+            micro_batch_size=training_schedule.local_batch_size,
+            global_batch_size=training_schedule.global_batch_size,
             create_attention_mask=self.create_attention_mask,
             seed=self.seed,
             split=self.split,
@@ -104,8 +111,10 @@ class MegatronPretrainingConfig:
             num_train_samples=self.num_train_samples,
             num_val_samples=self.num_val_samples,
             num_test_samples=self.num_test_samples,
-            trainer_max_steps=self.trainer_max_steps,
-            trainer_val_check_interval=self.trainer_val_check_interval,
+            trainer_max_steps=training_schedule.max_steps,
+            trainer_val_check_interval=(
+                training_schedule.val_check_interval if training_schedule.val_check_interval is not None else 1000
+            ),
             trainer_limit_val_batches=self.trainer_limit_val_batches,
             trainer_limit_test_batches=self.trainer_limit_test_batches,
             mmap_bin_files=self.mmap_bin_files,
