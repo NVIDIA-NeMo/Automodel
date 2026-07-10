@@ -108,6 +108,44 @@ def test_sdpa_mask_restricts_context_to_anchor_document():
     assert m[0, 4] == neg
 
 
+def test_flex_mask_mod_matches_sdpa_document_restriction():
+    """The flex_attention (default backend) doc-gating must match the dense SDPA mask.
+
+    FlexAttention's kernel is CUDA-only, but its ``mask_mod`` can be materialised on
+    CPU with ``create_mask``; assert the resulting per-token mask equals the SDPA mask
+    so the production-default flex doc-gating branch is covered.
+    """
+    from torch.nn.attention.flex_attention import create_mask
+
+    from nemo_automodel.components.attention.dflash_mask import build_dflash_mask_mod
+
+    ctx_len, bs, num_blocks = 8, BLOCK_SIZE, 2
+    anchors = torch.tensor([[2, 6]], dtype=torch.long)
+    keep = torch.ones(1, num_blocks, dtype=torch.bool)
+    ctx_doc_id = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]], dtype=torch.long)
+    anchor_doc_id = torch.tensor([[0, 1]], dtype=torch.long)
+    q_len, kv_len = num_blocks * bs, ctx_len + num_blocks * bs
+
+    mod = build_dflash_mask_mod(
+        anchors, keep, ctx_len, bs, num_blocks, causal=False, ctx_doc_id=ctx_doc_id, anchor_doc_id=anchor_doc_id
+    )
+    flex_bool = create_mask(mod, 1, 1, q_len, kv_len, device="cpu")[0, 0]
+    sdpa = create_dflash_sdpa_mask(
+        anchors,
+        keep,
+        ctx_len,
+        bs,
+        torch.device("cpu"),
+        torch.float32,
+        ctx_doc_id=ctx_doc_id,
+        anchor_doc_id=anchor_doc_id,
+    )[0, 0]
+    sdpa_bool = sdpa == 0
+    assert torch.equal(flex_bool, sdpa_bool)
+    # And the doc restriction is actually present: doc1 block cannot see doc0 context.
+    assert flex_bool[bs, 4] and not flex_bool[bs, 0]
+
+
 def test_anchor_sampling_keeps_blocks_in_document():
     """With doc_remaining, no sampled anchor's block may cross a document boundary."""
     trainer = _build_trainer()

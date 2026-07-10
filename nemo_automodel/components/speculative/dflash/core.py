@@ -130,6 +130,12 @@ class DFlashTrainerModule(nn.Module):
         ``doc_remaining`` ``[B, S]`` (sequence packing) restricts anchors so the
         whole block stays inside one document (``doc_remaining >= block_size - 1``),
         the per-document analogue of the ``anchor <= seq_len - block_size`` bound.
+        This is required for correctness -- ``_build_block_targets`` gathers labels
+        by absolute offset and does not encode document boundaries, so a block that
+        crossed one would be supervised on the next document's tokens. A side effect
+        is that a packed document shorter than ``block_size`` yields no anchors (the
+        unpacked path still supervises such a short sequence's partial block); pack
+        with documents at least ``block_size`` long to avoid dropping their signal.
         """
         bs = self.block_size
         bsz = loss_mask.shape[0]
