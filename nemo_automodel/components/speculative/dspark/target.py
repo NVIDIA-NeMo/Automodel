@@ -24,23 +24,31 @@ forward hooks, mirroring the DFlash target wrapper.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
 from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 
 
 @dataclass
 class DSparkTargetBatch:
-    """Target-model features needed by the DSpark trainer."""
+    """Target-model features needed by the DSpark trainer.
+
+    ``position_ids`` / ``seq_lens`` / ``doc_remaining`` are ``None`` off the
+    packing path and carry the (unshifted) packing metadata to the trainer on it.
+    """
 
     target_hidden_states: torch.Tensor  # [B, S, len(target_layer_ids) * H]
     target_last_hidden_states: torch.Tensor  # [B, S, H]
     input_ids: torch.Tensor
     loss_mask: torch.Tensor
+    position_ids: Optional[torch.Tensor] = None
+    seq_lens: Optional[torch.Tensor] = None
+    doc_remaining: Optional[torch.Tensor] = None
 
 
 class HFDSparkTargetModel:
@@ -129,6 +137,9 @@ class HFDSparkTargetModel:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        doc_remaining: Optional[torch.Tensor] = None,
         **mm_kwargs: torch.Tensor,
     ) -> DSparkTargetBatch:
         """Run the target model once and capture the DSpark context + last hidden state.
@@ -168,9 +179,40 @@ class HFDSparkTargetModel:
         # last-layer feature (post-norm), matching the HF offset-1 convention.
         handles.append(self._get_final_norm().register_forward_hook(_make_hook("norm")))
 
+        target_attention_mask = attention_mask
+        extra_kwargs: dict[str, torch.Tensor] = {}
+        if seq_lens is not None:
+            # Packing: run the frozen target block-causal (SDPA/eager consume the
+            # [B, 1, S, S] additive mask; FlashAttention infers boundaries from the
+            # per-document position_ids at batch size 1) so the captured context
+            # hidden states do not leak across document boundaries.
+            if position_ids is None:
+                raise ValueError("DSpark sequence packing requires per-document position_ids, but none were provided.")
+            extra_kwargs["position_ids"] = position_ids
+            attn_impl = getattr(self.model.config, "_attn_implementation", None) or ""
+            if "flash" in attn_impl:
+                if input_ids.shape[0] != 1:
+                    raise ValueError(
+                        "DSpark sequence packing with a FlashAttention target only supports "
+                        f"micro_batch_size=1 (got {input_ids.shape[0]}); set micro_batch_size=1 or load "
+                        "the target with attn_implementation='sdpa'."
+                    )
+                target_attention_mask = None
+            else:
+                param_dtype = next(self.model.parameters()).dtype
+                target_attention_mask = build_block_causal_additive_mask(
+                    seq_lens, seq_length=input_ids.shape[1], dtype=param_dtype, device=input_ids.device
+                )
+
         forward_kwargs = filter_forward_kwargs(
             self.model,
-            dict(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, **mm_kwargs),
+            dict(
+                input_ids=input_ids,
+                attention_mask=target_attention_mask,
+                use_cache=False,
+                **extra_kwargs,
+                **mm_kwargs,
+            ),
         )
 
         try:
@@ -197,6 +239,9 @@ class HFDSparkTargetModel:
             target_last_hidden_states=captured["norm"],
             input_ids=input_ids,
             loss_mask=loss_mask,
+            position_ids=position_ids,
+            seq_lens=seq_lens,
+            doc_remaining=doc_remaining,
         )
 
 

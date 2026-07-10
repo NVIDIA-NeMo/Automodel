@@ -67,13 +67,25 @@ class DSparkTrainerModule(nn.Module):
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        doc_remaining: Optional[torch.Tensor] = None,
     ) -> DSparkStepMetrics:
-        """Run the draft on the target supervision and compute the DSpark loss."""
+        """Run the draft on the target supervision and compute the DSpark loss.
+
+        ``position_ids`` / ``seq_lens`` / ``doc_remaining`` (all ``None`` off the
+        packing path) are forwarded to the draft, which keeps each anchor block
+        inside one document (block-causal context, per-document positions, and
+        document-truncated supervision).
+        """
         outputs = self.draft_model(
             input_ids=input_ids,
             target_hidden_states=target_hidden_states,
             loss_mask=loss_mask,
             target_last_hidden_states=target_last_hidden_states,
+            position_ids=position_ids,
+            seq_lens=seq_lens,
+            doc_remaining=doc_remaining,
         )
         loss, terms = compute_dspark_loss(
             outputs=outputs,
