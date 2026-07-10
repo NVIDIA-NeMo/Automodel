@@ -220,22 +220,28 @@ def add_causal_masks_to_batch(batch_dict, model_config):
     return batch_dict
 
 
-def default_collater(batch, pad_seq_len_divisible=None):
+def default_collater(
+    batch: list[dict[str, list[int] | torch.Tensor]],
+    pad_seq_len_divisible: int | None = None,
+) -> dict[str, torch.Tensor]:
     """
     Default batch collator that handles padding and batching.
 
-    Each example's fields are normally ``list[int]`` (``List[List[int]]`` across the batch), which are
-    padded and stacked. Datasets that already yield batched ``torch.Tensor`` fields (e.g.
-    :class:`~nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset`, which emits a
-    fully-formed ``[batch_size, seq_len]`` batch per item) are concatenated along the batch dimension instead,
-    so a single pre-batched example passes through unchanged.
+    Sequence-list fields are padded and stacked. Pre-batched tensor fields are concatenated along their first
+    axis, preserving all trailing axes, dtype, and device.
 
     Args:
-        batch: A batch of examples.
-        pad_seq_len_divisible: If provided, pad sequence length to be divisible by this value.
+        batch: Local examples. A list-valued field has shape ``[S_i]`` for example ``i``, where ``S_i`` is its
+            sequence length, and becomes ``[B, S]`` after padding, where ``B`` is the number of examples and
+            ``S`` is the padded maximum. A tensor-valued field is already batched as ``[B_i, ...]`` with
+            arbitrary trailing axes and becomes ``[sum_i(B_i), ...]``. The optional
+            ``___PAD_TOKEN_IDS___`` entry is removed from the first input mapping in place.
+        pad_seq_len_divisible: If set, round padded ``S`` up to a multiple of this value.
 
     Returns:
-        dict: A dictionary containing batched tensors.
+        Mapping of fields to tensors. List-valued inputs become ``torch.int64`` tensors shaped ``[B, S]``;
+        tensor-valued inputs preserve dtype/device and trailing layout. When ``attention_mask`` or
+        ``input_ids`` is present with shape ``[B, S]``, ``padding_mask`` is a boolean ``[B, S]`` tensor.
     """
     pad_token_ids = batch[0].pop("___PAD_TOKEN_IDS___", None)
     # ans contains a dict with:

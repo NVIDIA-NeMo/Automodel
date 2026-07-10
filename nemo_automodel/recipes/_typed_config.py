@@ -174,47 +174,110 @@ class RecipeConfig:
 
     @cached_property
     def dataloader(self) -> "DataloaderConfig" | None:
-        from nemo_automodel.components.datasets.loader import (
-            build_dataloader_config,
-            make_collate_fn,
-            make_dataset_config,
-            make_packing_config,
-        )
-
         node = self._raw.get("dataset", None)
         if node is None:
             return None
-        target, ds_kwargs = _callable_and_kwargs(node)
-        ds_kwargs.pop("tokenizer", None)  # tokenizer is a runtime build() arg, not a construct kwarg
-        # Resolve dataset._target_ to a typed <Name>Config (or a back-compat shim for a pre-Config target).
-        dataset_config = make_dataset_config(target, ds_kwargs)
-        dl = _as_dict(self._raw.get("dataloader", None))
-        # collate_fn resolves to a callable via a loader-side ``make_*`` registry resolver (registry key /
-        # dotted path / callable). Sampling is not configurable here — every dataset (Megatron included) uses
-        # the dataloader's default distributed / length-grouped sampler.
-        collate = make_collate_fn(*_target_kwargs(dl.pop("collate_fn", None)))
+        return self._resolve_dataloader(node, self._raw.get("dataloader", None))
+
+    def _packing_config(self):
+        """Resolve the recipe's optional sequence-packing strategy config."""
+        from nemo_automodel.components.datasets.loader import make_packing_config
+
         ps = _as_dict(self._raw.get("packed_sequence", None))
-        packing = None
         if ps.get("packed_sequence_size", 0) > 0:
-            packing = make_packing_config(ps.pop("packing_strategy", "thd"), ps)
-        return build_dataloader_config(
-            dataset_config,
-            dataloader=dl,
-            packing=packing,
-            collate_fn=collate,
-            seed=self._raw.get("seed", 42),
+            return make_packing_config(ps.pop("packing_strategy", "thd"), ps)
+        return None
+
+    def _resolve_dataloader(self, dataset_node: Any, dataloader_node: Any) -> "DataloaderConfig":
+        """Resolve YAML dataset/loader blocks into one typed dataloader config."""
+        from torch.utils.data import DataLoader
+        from torchdata.stateful_dataloader import StatefulDataLoader
+
+        from nemo_automodel.components.datasets.llm.megatron.sampler import MegatronSamplerConfig
+        from nemo_automodel.components.datasets.loader import (
+            DataloaderConfig,
+            DatasetBuildSchedule,
+            ScheduledDatasetConfig,
+            make_collate_fn,
+            make_dataset_config,
+        )
+
+        target, dataset_kwargs = _callable_and_kwargs(dataset_node)
+        dataset_kwargs.pop("tokenizer", None)
+        dataset_config = make_dataset_config(target, dataset_kwargs)
+
+        loader_kwargs = _as_dict(dataloader_node)
+        loader_target = loader_kwargs.pop("_target_", None)
+        supported_loader_targets = {
+            None,
+            "torch.utils.data.DataLoader",
+            "torchdata.stateful_dataloader.StatefulDataLoader",
+            DataLoader,
+            StatefulDataLoader,
+        }
+        if loader_target not in supported_loader_targets:
+            raise ValueError(
+                f"Unsupported dataloader _target_ {loader_target!r}; typed recipes use ParallelAwareDataloader"
+            )
+        collate = make_collate_fn(*_target_kwargs(loader_kwargs.pop("collate_fn", None)))
+
+        schedule = DatasetBuildSchedule(
             local_batch_size=self._raw.get("step_scheduler.local_batch_size", 1),
+            global_batch_size=self._raw.get("step_scheduler.global_batch_size", 1),
+            max_steps=self._raw.get("step_scheduler.max_steps", None),
+            val_check_interval=self._raw.get("step_scheduler.val_every_steps", None),
+        )
+        dataloader_type = loader_kwargs.pop("dataloader_type", None)
+        batch_sampler_config = None
+        if isinstance(dataset_config, ScheduledDatasetConfig):
+            if dataloader_type not in (None, "single", "cyclic"):
+                raise ValueError(
+                    f"Unsupported Megatron dataloader_type {dataloader_type!r}; expected 'single' or 'cyclic'"
+                )
+            batch_sampler_config = MegatronSamplerConfig(
+                micro_batch_size=schedule.local_batch_size,
+                global_batch_size=schedule.global_batch_size,
+                dataloader_type=dataloader_type or "single",
+            )
+        elif dataloader_type is not None:
+            raise ValueError("dataloader_type is only supported by Megatron dataset configs")
+
+        config_fields = {
+            "shuffle",
+            "group_by_length",
+            "shuffle_buffer_size",
+            "batch_size",
+            "num_workers",
+            "pin_memory",
+            "persistent_workers",
+            "prefetch_factor",
+            "drop_last",
+        }
+        unknown = sorted(set(loader_kwargs) - config_fields)
+        if unknown:
+            raise TypeError(f"Unexpected dataloader config field(s): {', '.join(unknown)}")
+
+        return DataloaderConfig(
+            dataset_config=dataset_config,
+            packing=self._packing_config(),
+            batch_sampler_config=batch_sampler_config,
+            dataset_build_schedule=schedule if isinstance(dataset_config, ScheduledDatasetConfig) else None,
+            shuffle=loader_kwargs.pop("shuffle", None),
+            group_by_length=loader_kwargs.pop("group_by_length", False),
+            shuffle_buffer_size=loader_kwargs.pop("shuffle_buffer_size", 10000),
+            batch_size=loader_kwargs.pop("batch_size", schedule.local_batch_size),
+            seed=self._raw.get("seed", 42),
+            collate_fn=collate,
+            num_workers=loader_kwargs.pop("num_workers", 0),
+            pin_memory=loader_kwargs.pop("pin_memory", False),
+            persistent_workers=loader_kwargs.pop("persistent_workers", False),
+            prefetch_factor=loader_kwargs.pop("prefetch_factor", None),
+            drop_last=loader_kwargs.pop("drop_last", False),
         )
 
     @cached_property
     def validation_dataloaders(self) -> dict[str, "DataloaderConfig"]:
         """One :class:`DataloaderConfig` per ``validation_dataset*`` block (mirrors :meth:`dataloader`)."""
-        from nemo_automodel.components.datasets.loader import (
-            build_dataloader_config,
-            make_collate_fn,
-            make_dataset_config,
-            make_packing_config,
-        )
 
         def _name(key: str) -> str:
             key = key.replace("validation_dataset", "")
@@ -223,28 +286,12 @@ class RecipeConfig:
             return key or "default"
 
         val_dl_node = self._raw.get("validation_dataloader", None)
-        ps = _as_dict(self._raw.get("packed_sequence", None))
-        packing = None
-        if ps.get("packed_sequence_size", 0) > 0:
-            packing = make_packing_config(ps.pop("packing_strategy", "thd"), ps)
-        out: dict[str, Any] = {}
+        out: dict[str, "DataloaderConfig"] = {}
         for key in filter(lambda k: k.startswith("validation_dataset"), self._raw.to_dict().keys()):
             node = self._raw.get(key, None)
             if node is None:
                 continue
-            target, ds_kwargs = _callable_and_kwargs(node)
-            ds_kwargs.pop("tokenizer", None)
-            dataset_config = make_dataset_config(target, ds_kwargs)
-            dl = _as_dict(val_dl_node)
-            collate = make_collate_fn(*_target_kwargs(dl.pop("collate_fn", None)))
-            out[_name(key)] = build_dataloader_config(
-                dataset_config,
-                dataloader=dl,
-                packing=packing,
-                collate_fn=collate,
-                seed=self._raw.get("seed", 42),
-                local_batch_size=self._raw.get("step_scheduler.local_batch_size", 1),
-            )
+            out[_name(key)] = self._resolve_dataloader(node, val_dl_node)
         return out
 
     @cached_property

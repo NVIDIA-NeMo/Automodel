@@ -311,13 +311,13 @@ def test_make_retrieval_dataset_train_and_eval(tmp_path, monkeypatch):
     train_file = _make_train_file(tmp_path, corpus_dir, data_len=2)
 
     # Train mode: set_transform uses n_passages - 1 negatives
-    ds_train = rd.make_retrieval_dataset(
+    ds_train = rd.RetrievalDatasetConfig(
         data_dir_list=str(train_file),
         data_type="train",
         n_passages=3,
         max_train_samples=1,
         cycle_positive_docs=True,
-    )
+    ).build()
     assert len(ds_train) == 1
     assert hasattr(ds_train, "set_epoch")
     ex = ds_train[0]

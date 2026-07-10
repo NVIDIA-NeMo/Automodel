@@ -57,7 +57,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
-from nemo_automodel.components.distributed.utils import dp_eval_sample_shard, get_sync_ctx
+from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import (
@@ -86,6 +86,7 @@ from nemo_automodel.components.utils.compile_utils import (
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
+    _supports_seq_lens,
     filter_forward_kwargs,
     resolve_trust_remote_code,
 )
@@ -380,6 +381,18 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
 
     def wrapper(base_collate_fn):
         def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
+            """Collate examples and attach pipeline-parallel causal masks.
+
+            Args:
+                batch: Raw examples accepted by ``base_fn``. Standard token-list fields have per-example shape
+                    ``[S_i]`` and pre-batched tensor fields have shape ``[B_i, ...]``, where ``S_i`` is an
+                    example sequence length and ``B_i`` is a source batch size.
+
+            Returns:
+                Collated mapping whose standard token tensors have shape ``[B, S]``, where ``B`` is local batch
+                size and ``S`` is padded sequence length, plus ``causal_mask_mapping`` entries covering the
+                same ``S`` token axis. Other tensor fields preserve the base collator's documented layout.
+            """
             return add_causal_masks_to_batch(base_fn(batch), model_config=config)
 
         return chained_collate_fn
@@ -624,23 +637,31 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
             and self.cfg.get("packed_sequence.packing_strategy", "thd") == "neat"
         ):
-            from nemo_automodel.components.models.common.packing import get_attn_implementation
+            from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
 
             attn_implementation = get_attn_implementation(self.cfg.model)
-        loader_runtime = dict(
-            tokenizer=self.tokenizer,
-            dp_rank=self._get_dp_rank(),
-            dp_world_size=self._get_dp_group_size(),
-            pp_enabled=self.pp_enabled,
-            model=self.model_parts[0],
-            cp_size=self.cfg.get("distributed.cp_size", 1),
-            attn_implementation=attn_implementation,
-            collate_wrapper=_build_pp_collate_wrapper(self.cfg.model, self.pp_enabled),
-        )
-        self.dataloader = self.cfg.dataloader.build(**loader_runtime)
+            configure_packing(attn_implementation=attn_implementation)
+        collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
+
+        def materialize_loader(config):
+            build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
+            with ScopedRNG(seed=config.seed, ranked=True):
+                return config.build(
+                    tokenizer=self.tokenizer,
+                    dataset_build_context=build_context,
+                    dp_rank=self._get_dp_rank(),
+                    dp_world_size=self._get_dp_group_size(),
+                    pp_enabled=self.pp_enabled,
+                    supports_seq_lens=_supports_seq_lens(self.model_parts[0]),
+                    cp_size=self.cfg.get("distributed.cp_size", 1),
+                    attn_implementation=attn_implementation,
+                    collate_wrapper=collate_wrapper,
+                )
+
+        self.dataloader = materialize_loader(self.cfg.dataloader)
         pack_validation = _should_pack_validation(self.cfg, self.model_parts[0])
         self.val_dataloaders = {
-            name: (dl_config if pack_validation else replace(dl_config, packing=None)).build(**loader_runtime)
+            name: materialize_loader(dl_config if pack_validation else replace(dl_config, packing=None))
             for name, dl_config in self.cfg.validation_dataloaders.items()
         }
         # Optional tool-call accuracy evaluator for agent SFT runs.

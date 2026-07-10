@@ -15,25 +15,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, ClassVar, Optional
 
 from datasets import load_dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 
 @dataclass
 class GLUE_MRPCConfig:
     """Construction-time configuration for :class:`GLUE_MRPC`."""
 
+    accepts_tokenizer: ClassVar[bool] = True
+
     split: str = "train"
     """Dataset split to use (e.g. ``train``, ``validation``)."""
-    num_samples_limit: Optional[int] = None
+    num_samples_limit: int | None = None
     """If set, limit the dataset to this many samples via slicing."""
     trust_remote_code: bool = True
     """Forwarded to ``datasets.load_dataset``."""
-    max_length: Optional[int] = 256
+    max_length: int | None = 256
     """Maximum tokenization length (``None`` derives one from the tokenizer)."""
 
-    def build(self, *, tokenizer) -> "GLUE_MRPC":
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> "GLUE_MRPC":
         """Build a :class:`GLUE_MRPC` dataset from this :class:`GLUE_MRPCConfig` and a runtime tokenizer."""
         return GLUE_MRPC(
             tokenizer=tokenizer,

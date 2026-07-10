@@ -57,9 +57,12 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
 
 from datasets import load_dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 from nemo_automodel.components.datasets.llm.formatting_utils import (
@@ -671,19 +674,21 @@ class AgentChatConfig:
     Exactly one of ``dataset_name`` or ``path`` must be set when calling :func:`build`.
     """
 
-    dataset_name: Optional[str] = None
+    accepts_tokenizer: ClassVar[bool] = True
+
+    dataset_name: str | None = None
     """HF Hub dataset id, e.g. ``llamafactory/glaive_toolcall_en``."""
-    path: Optional[Union[str, List[str]]] = None
+    path: str | list[str] | None = None
     """Local JSON/JSONL file path or list of paths."""
     split: str = "train"
     """Dataset split (only used with ``dataset_name``)."""
-    seq_length: Optional[int] = None
+    seq_length: int | None = None
     """Optional max sequence length for the tokenizer."""
-    limit_dataset_samples: Optional[int] = None
+    limit_dataset_samples: int | None = None
     """If set, keep only the first N examples."""
-    padding: Union[str, bool] = False
+    padding: str | bool = False
     """Padding strategy forwarded to the tokenizer."""
-    truncation: Union[str, bool] = False
+    truncation: str | bool = False
     """Truncation strategy forwarded to the tokenizer."""
     mask_reasoning_content: bool = False
     """If True, exclude assistant ``reasoning_content`` tokens from the loss."""
@@ -692,7 +697,7 @@ class AgentChatConfig:
     drop_history_reasoning_content: bool = False
     """If True, strip ``reasoning_content`` from all but the final assistant turn."""
 
-    def build(self, *, tokenizer) -> LazyMappedDataset:
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> LazyMappedDataset:
         """Build the agent chat :class:`LazyMappedDataset` from this :class:`AgentChatConfig` and a runtime tokenizer."""
         return make_agent_chat_dataset(
             tokenizer,

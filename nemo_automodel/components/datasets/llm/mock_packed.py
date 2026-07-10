@@ -16,8 +16,12 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from datasets import Dataset, Features, Sequence, Value
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 
 def make_vocab(vocab_size: int = 100):
@@ -119,7 +123,7 @@ class MockPackedDatasetConfig:
     seed: int = 0
     """Seed for the random generator."""
 
-    def build(self, *, tokenizer=None) -> Dataset:
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None" = None) -> Dataset:
         """Build the mock packed :class:`~datasets.Dataset` from this :class:`MockPackedDatasetConfig`."""
         return build_packed_dataset(
             num_blocks=self.num_blocks,

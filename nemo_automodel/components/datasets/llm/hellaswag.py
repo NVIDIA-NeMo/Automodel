@@ -15,8 +15,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar
 
 from datasets import load_dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.utils import SFTSingleTurnPreprocessor
 
@@ -24,6 +28,8 @@ from nemo_automodel.components.datasets.utils import SFTSingleTurnPreprocessor
 @dataclass
 class HellaSwagConfig:
     """Construction-time configuration for :class:`HellaSwag`."""
+
+    accepts_tokenizer: ClassVar[bool] = True
 
     path_or_dataset: str
     """Path to the dataset or a HuggingFace dataset id."""
@@ -34,7 +40,7 @@ class HellaSwagConfig:
     pad_to_max_length: bool = True
     """Whether to pad sequences to the dataset max length."""
 
-    def build(self, *, tokenizer) -> "HellaSwag":
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> "HellaSwag":
         """Build a :class:`HellaSwag` dataset from this :class:`HellaSwagConfig` and a runtime tokenizer."""
         return HellaSwag(
             path_or_dataset=self.path_or_dataset,

@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import hashlib
-from typing import TYPE_CHECKING, Any, Dict, List, Union
+import warnings
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Union, cast
 
 import torch
 from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase, ProcessorMixin
@@ -314,9 +315,12 @@ class ProcessorMethodCollator:
             tokenizer: Runtime multimodal processor.
             collator_fn_name: Processor method used to collate each batch.
         """
-        self.collate_fn = getattr(tokenizer, collator_fn_name)
+        self.collate_fn = cast(
+            Callable[[list[dict[str, object]]], dict[str, object]],
+            getattr(tokenizer, collator_fn_name),
+        )
 
-    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
+    def __call__(self, batch: list[dict[str, object]]) -> dict[str, object]:
         """Collate retrieval examples with the resolved processor method.
 
         Args:
@@ -328,15 +332,23 @@ class ProcessorMethodCollator:
         return self.collate_fn(batch)
 
 
-def make_vision_collator_from_processor_method(tokenizer: ProcessorMixin, collator_fn_name: str):
+def make_vision_collator_from_processor_method(
+    tokenizer: ProcessorMixin,
+    collator_fn_name: str,
+) -> Callable[[list[dict[str, object]]], dict[str, object]]:
     """
     Turns a method of a processor into a collator function.
 
     Args:
         tokenizer: The processor instance.
-        collator_fn_name: The name of the proceessor method to turn into a collator function.
+        collator_fn_name: The name of the processor method to turn into a collator function.
 
     Returns:
         A collator for vision/multimodal retrieval datasets.
     """
-    return getattr(tokenizer, collator_fn_name)
+    warnings.warn(
+        "make_vision_collator_from_processor_method is deprecated; use ProcessorMethodCollator instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return cast(Callable[[list[dict[str, object]]], dict[str, object]], getattr(tokenizer, collator_fn_name))

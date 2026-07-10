@@ -29,7 +29,7 @@ from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.utils import get_sync_ctx
+from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
@@ -295,19 +295,25 @@ class TrainBiEncoderRecipe(BaseRecipe):
         dataloader_config = self.cfg.dataloader
         if dataloader_config is None:
             raise ValueError("Retrieval training requires a top-level dataset config")
-        loader_runtime = {
-            "tokenizer": self.tokenizer,
-            "dp_rank": self._get_dp_rank(),
-            "dp_world_size": self._get_dp_group_size(),
-        }
-        self.dataloader = dataloader_config.build(**loader_runtime)
+
+        def materialize_loader(config):
+            build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
+            with ScopedRNG(seed=config.seed, ranked=True):
+                return config.build(
+                    tokenizer=self.tokenizer,
+                    dataset_build_context=build_context,
+                    dp_rank=self._get_dp_rank(),
+                    dp_world_size=self._get_dp_group_size(),
+                )
+
+        self.dataloader = materialize_loader(dataloader_config)
         self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
 
         self.val_dataloader = None
         validation_configs = self.cfg.validation_dataloaders
         if validation_configs:
             validation_config = next(iter(validation_configs.values()))
-            self.val_dataloader = validation_config.build(**loader_runtime)
+            self.val_dataloader = materialize_loader(validation_config)
             self.val_n_passages = getattr(validation_config.dataset_config, "n_passages", self.train_n_passages)
 
         self.step_scheduler = self.cfg.step_scheduler.build(

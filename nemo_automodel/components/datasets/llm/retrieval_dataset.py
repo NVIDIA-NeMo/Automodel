@@ -888,7 +888,7 @@ def make_retrieval_dataset(
 class RetrievalDatasetConfig:
     """Construction-time configuration for the retrieval dataset."""
 
-    data_dir_list: Union[List[DataEntry], DataEntry] = None
+    data_dir_list: list[DataEntry] | DataEntry | None = None
     """Path(s) to JSON file(s), ``hf://`` URIs, or dict entries with path and num_samples."""
     model_type: str = "bi_encoder"
     """``bi_encoder`` or ``cross_encoder``."""
@@ -896,18 +896,20 @@ class RetrievalDatasetConfig:
     """Type of data (``train`` or ``eval``)."""
     n_passages: int = 5
     """Number of passages (1 positive + n-1 negatives)."""
-    eval_negative_size: Optional[int] = None
+    eval_negative_size: int | None = None
     """Number of negative documents for evaluation."""
     seed: int = 42
     """Random seed for shuffling / sampling."""
     do_shuffle: bool = False
     """Shuffle dataset rows before subset selection (only when ``max_train_samples`` is set)."""
-    max_train_samples: Optional[int] = None
+    max_train_samples: int | None = None
     """Maximum number of training samples to use."""
     train_data_select_offset: int = 0
     """Offset for selecting training samples."""
     use_dataset_instruction: bool = False
     """Whether to use the instruction from the dataset's metadata."""
+    cycle_positive_docs: bool = False
+    """Whether to rotate through multiple positive documents by epoch during training."""
 
     def build(self) -> Dataset:
         """Build the retrieval :class:`~datasets.Dataset` from this :class:`RetrievalDatasetConfig`."""
@@ -922,6 +924,7 @@ class RetrievalDatasetConfig:
             max_train_samples=self.max_train_samples,
             train_data_select_offset=self.train_data_select_offset,
             use_dataset_instruction=self.use_dataset_instruction,
+            cycle_positive_docs=self.cycle_positive_docs,
         )
 
 

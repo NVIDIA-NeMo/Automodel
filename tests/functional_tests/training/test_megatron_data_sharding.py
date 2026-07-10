@@ -47,8 +47,10 @@ def test_megatron_data_sharding():
     dp_world_size = device_mesh["dp"].size()
     tp_world_size = device_mesh["tp"].size()
 
-    cfg.step_scheduler.max_steps = None
-    cfg.step_scheduler.val_every_steps = 10
+    for key, value in {"max_steps": None, "val_every_steps": 10}.items():
+        if not hasattr(cfg.step_scheduler, key):
+            raise ValueError(f"step_scheduler config has no field {key!r}")
+        setattr(cfg.step_scheduler, key, value)
     # Megatron datasets require a tokenizer; the recipe supplies it via runtime (build(tokenizer=...)),
     # so build it here the same way (from the dataset/model config) instead of relying on the default.
     _, tokenizer = _build_tokenizer(cfg.model, cfg.dataset)

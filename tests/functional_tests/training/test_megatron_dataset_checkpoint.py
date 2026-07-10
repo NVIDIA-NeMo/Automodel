@@ -63,10 +63,16 @@ def test_megatron_dataset_checkpointing():
     )
 
     # Override the example config's batch sizes / schedule with the small values this test needs.
-    cfg.step_scheduler.local_batch_size = 2
-    cfg.step_scheduler.global_batch_size = 4
-    cfg.step_scheduler.max_steps = None
-    cfg.step_scheduler.val_every_steps = 10
+    schedule_overrides = {
+        "local_batch_size": 2,
+        "global_batch_size": 4,
+        "max_steps": None,
+        "val_every_steps": 10,
+    }
+    for key, value in schedule_overrides.items():
+        if not hasattr(cfg.step_scheduler, key):
+            raise ValueError(f"step_scheduler config has no field {key!r}")
+        setattr(cfg.step_scheduler, key, value)
     # Megatron datasets require a tokenizer; the recipe supplies it via runtime (build(tokenizer=...)),
     # so build it here the same way (from the dataset/model config) instead of relying on the default.
     _, tokenizer = _build_tokenizer(cfg.model, cfg.dataset)

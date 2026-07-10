@@ -16,9 +16,12 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional
 
 from datasets import load_dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 from nemo_automodel.components.datasets.llm.formatting_utils import _add_pad_token, format_chat_template
@@ -208,9 +211,11 @@ def make_xlam_dataset(
 class XlamConfig:
     """Construction-time configuration for the xLAM function-calling dataset (tokenizer is a build arg)."""
 
-    seq_length: Optional[int] = None
+    accepts_tokenizer: ClassVar[bool] = True
+
+    seq_length: int | None = None
     """If set, pad/truncate each example to this length."""
-    limit_dataset_samples: Optional[int] = None
+    limit_dataset_samples: int | None = None
     """If set, limit the number of examples loaded from the split."""
     fp8: bool = False
     """Flag reserved for future mixed-precision use (currently unused)."""
@@ -223,7 +228,7 @@ class XlamConfig:
     truncation: bool | str = False
     """Optional truncation strategy."""
 
-    def build(self, *, tokenizer) -> LazyMappedDataset:
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> LazyMappedDataset:
         """Build the xLAM :class:`LazyMappedDataset` from this :class:`XlamConfig` and a runtime tokenizer."""
         return make_xlam_dataset(
             tokenizer=tokenizer,

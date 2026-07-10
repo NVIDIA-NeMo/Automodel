@@ -16,13 +16,19 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar
 
 from torch.utils.data import Dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 
 @dataclass
 class MockSequenceClassificationDatasetConfig:
     """Construction-time configuration for :class:`MockSequenceClassificationDataset`."""
+
+    accepts_tokenizer: ClassVar[bool] = True
 
     num_samples: int = 64
     """Number of synthetic samples to generate."""
@@ -35,7 +41,7 @@ class MockSequenceClassificationDatasetConfig:
     seed: int = 0
     """Seed for the random generator."""
 
-    def build(self, *, tokenizer=None) -> "MockSequenceClassificationDataset":
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None" = None) -> "MockSequenceClassificationDataset":
         """Build a :class:`MockSequenceClassificationDataset` from this :class:`MockSequenceClassificationDatasetConfig`."""
         return MockSequenceClassificationDataset(
             num_samples=self.num_samples,

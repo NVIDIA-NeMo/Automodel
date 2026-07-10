@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, ClassVar, Dict, Iterator, List, Optional, Union
 
 from torch.utils.data import IterableDataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 from nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset import (
     ColumnMappedTextInstructionDataset,
@@ -112,38 +115,40 @@ def _load_streaming_dataset(
 class ColumnMappedTextInstructionIterableDatasetConfig:
     """Construction-time configuration for :class:`ColumnMappedTextInstructionIterableDataset`."""
 
-    path_or_dataset_id: Union[str, List[str]]
+    accepts_tokenizer: ClassVar[bool] = True
+
+    path_or_dataset_id: str | list[str]
     """The path or dataset id of the dataset."""
-    column_mapping: Dict[str, str]
+    column_mapping: dict[str, str]
     """Mapping of logical column roles (context/question/answer) to raw column names."""
-    split: Optional[str] = None
+    split: str | None = None
     """The split of the dataset to load."""
-    name: Optional[str] = None
+    name: str | None = None
     """The name of the dataset configuration/subset to load."""
     answer_only_loss_mask: bool = True
     """Whether to compute the loss mask only on the answer tokens."""
-    seq_length: Optional[int] = None
+    seq_length: int | None = None
     """The sequence length to use for padding."""
-    padding: Union[str, bool] = "do_not_pad"
+    padding: str | bool = "do_not_pad"
     """Padding mode for formatting."""
-    truncation: Union[str, bool] = "do_not_truncate"
+    truncation: str | bool = "do_not_truncate"
     """Truncation mode for formatting."""
-    start_of_turn_token: Optional[str] = None
+    start_of_turn_token: str | None = None
     """Optional token marking assistant turns for answer-only loss."""
-    limit_dataset_samples: Optional[int] = None
+    limit_dataset_samples: int | None = None
     """The number of samples to take from the (streamed) dataset."""
     repeat_on_exhaustion: bool = True
     """Whether to restart iteration when the stream is exhausted."""
     use_hf_chat_template: bool = False
     """Whether to format samples using the tokenizer's chat template."""
-    delta_storage_options: Optional[Dict[str, str]] = None
+    delta_storage_options: dict[str, str] | None = None
     """Storage options forwarded to the Delta Lake reader."""
-    delta_version: Optional[int] = None
+    delta_version: int | None = None
     """Delta Lake table version to read."""
-    delta_sql_query: Optional[str] = None
+    delta_sql_query: str | None = None
     """Optional SQL query applied to the Delta Lake table."""
 
-    def build(self, *, tokenizer) -> "ColumnMappedTextInstructionIterableDataset":
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> "ColumnMappedTextInstructionIterableDataset":
         """Build a :class:`ColumnMappedTextInstructionIterableDataset` from this :class:`ColumnMappedTextInstructionIterableDatasetConfig` and tokenizer."""
         return ColumnMappedTextInstructionIterableDataset(
             path_or_dataset_id=self.path_or_dataset_id,
