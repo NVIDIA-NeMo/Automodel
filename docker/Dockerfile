@@ -202,7 +202,13 @@ RUN git clone --depth 1 --branch v0.17.0 --recurse-submodules --shallow-submodul
     rm -rf /tmp/torchao
 
 # ---- FlashAttention-3 (Hopper-only) + FlashAttention-4 (Hopper + Blackwell) ----
-# Installed AFTER uv sync (same reason as torchao: not resolvable by uv).
+# Installed AFTER uv sync (same reason as torchao: not resolvable by uv), and
+# with `pip` -- NOT `uv pip` -- like the torchao stage above: uv resolves against
+# the venv only and would reinstall torch from PyPI over the base image's torch
+# (FA3's sdist declares a torch dependency; pip sees the system-site torch and
+# leaves it alone; --no-deps additionally guards FA3). Verification uses dist
+# metadata because transformers' is_flash_attn_*_available() requires a visible
+# GPU, which docker builds do not have.
 # FA3 kernels are SM90a-locked (Hopper ISA; they do NOT run on SM100) -- Blackwell
 # is served by FA4, whose CuTe-DSL kernels JIT-compile per-arch at runtime
 # (Sm90 and Sm100 kernel classes ship in the package; no build-time arch work).
@@ -225,15 +231,15 @@ RUN if [ "$INSTALL_FA3" = "true" ] || [ "$INSTALL_FA4" = "true" ]; then \
     if [ "$INSTALL_FA3" = "true" ]; then \
         cd /tmp/fa/hopper && \
         FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=$(nproc) NVCC_THREADS=2 \
-        uv pip install --no-build-isolation . && \
-        python -c "from transformers.utils import is_flash_attn_3_available as f; assert f()"; \
+        pip install --no-cache-dir --no-build-isolation --no-deps . && \
+        python -c "import importlib.metadata as m; print('flash-attn-3', m.version('flash-attn-3'))"; \
     fi && \
     if [ "$INSTALL_FA4" = "true" ]; then \
-        uv pip install /tmp/fa/flash_attn/cute "nvidia-cutlass-dsl[cu13]==4.6.0.dev0" && \
+        pip install --no-cache-dir /tmp/fa/flash_attn/cute "nvidia-cutlass-dsl[cu13]==4.6.0.dev0" && \
         FA2_DIR=$(python -c "import flash_attn, os; print(os.path.dirname(flash_attn.__file__))") && \
         VENV_CUTE=/opt/venv/lib/python3.12/site-packages/flash_attn/cute && \
         { [ -e "$FA2_DIR/cute" ] || ln -s "$VENV_CUTE" "$FA2_DIR/cute"; } && \
-        python -c "from transformers.utils import is_flash_attn_4_available as f; assert f()"; \
+        python -c "import importlib.metadata as m; print('flash-attn-4', m.version('flash-attn-4'))"; \
     fi && \
     rm -rf /tmp/fa
 
