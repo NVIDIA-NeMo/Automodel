@@ -729,25 +729,60 @@ def test_te_sharder_captures_partition_indices_at_shard_time(monkeypatch):
         sharder.shard_token_tensor(cp2, torch.arange(6.0), seq_dim=0)
 
 
-def test_magi_sharder_captures_dispatch_indices():
-    """The magi sharder installs the dispatch-solver index map returned by
-    make_cp_batch (magi's get_position_ids)."""
+class _FakeMagiState:
+    """Fake MagiState whose dispatch returns a fixed local index map."""
 
-    class _FakeMagi:
-        enabled = True
-        domain = "llm"
+    enabled = True
+    domain = "llm"
+    cp_size = 2
 
-        def make_cp_batch(self, cp_mesh, batch, *, return_local_indices=False, **kwargs):
-            prepped = {"prepared": True}
-            return (prepped, torch.tensor([[0, 2]])) if return_local_indices else prepped
+    def __init__(self, local_indices):
+        self._local_indices = local_indices
 
+    def make_cp_batch(self, cp_mesh, batch, *, return_local_indices=False, **kwargs):
+        prepped = {"prepared": True}
+        return (prepped, self._local_indices) if return_local_indices else prepped
+
+
+def test_magi_sharder_captures_hf_dispatch_facts():
+    """Single-sequence HF magi: dispatch pads the tail, so the sharder captures
+    the original length and the verbs work in the caller's [1, S] coordinates."""
+    cp2 = _DummySubMesh(2)
+    # global padded length 4 = 2 local x cp 2; input was [1, 3] -> tail pad of 1
+    sharder = _cu._resolve_cp_sharder(
+        cp2,
+        None,
+        magi=_FakeMagiState(torch.tensor([[0, 2]])),
+        use_te=False,
+        num_chunks=1,
+        seq_lens_padding_value=-1000,
+        model=None,
+    )
+    sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([[1, 2, 3]])})
+    assert (sharder.original_seq_len, sharder.padded_seq_len) == (3, 4)
+    # down: original-length tensor auto-pads then follows the dispatch permutation
+    local = sharder.shard_token_tensor(cp2, torch.tensor([[10.0, 20.0, 30.0]]), fill=0.0)
+    assert torch.equal(local, torch.tensor([[10.0, 30.0]]))
+
+
+def test_magi_sharder_captures_packed_row_shape():
+    """Packed magi over a THD flatten with no extra dispatch pad: the sharder
+    captures the pre-flatten row shape (padded == rows x cols)."""
     cp2 = _DummySubMesh(2)
     sharder = _cu._resolve_cp_sharder(
-        cp2, None, magi=_FakeMagi(), use_te=False, num_chunks=1, seq_lens_padding_value=-1000, model=None
+        cp2,
+        None,
+        magi=_FakeMagiState(torch.tensor([[0, 3]])),
+        use_te=True,
+        num_chunks=1,
+        seq_lens_padding_value=-1000,
+        model=None,
     )
-    sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([[1, 2, 3, 4]])})
-    full = torch.arange(4.0).unsqueeze(0)  # [1, S_padded]
-    assert torch.equal(sharder.shard_token_tensor(cp2, full, seq_dim=1), torch.tensor([[0.0, 2.0]]))
+    sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([[1, 2], [3, 4]])})
+    assert sharder.input_row_shape == (2, 2)
+    assert sharder.padded_seq_len == 4
+    rows = torch.tensor([[10.0, 20.0], [30.0, 40.0]])
+    assert torch.equal(sharder.shard_token_tensor(cp2, rows), torch.tensor([10.0, 40.0]))
 
 
 def test_make_cp_batch_for_te_identity_indices_without_cp():

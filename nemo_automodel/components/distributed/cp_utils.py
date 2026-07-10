@@ -424,6 +424,8 @@ def _resolve_cp_sharder(
         # shard_batch installs the index map it just computed (magi's
         # get_position_ids) on the sharder for the token verbs.
         def _shard_batch_magi(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+            input_ids = batch.get("input_ids")
+            row_shape = tuple(input_ids.shape[:2]) if input_ids is not None and input_ids.dim() >= 2 else None
             prepped, local_indices = magi.make_cp_batch(
                 cp_mesh,
                 batch,
@@ -435,6 +437,17 @@ def _resolve_cp_sharder(
             )
             if local_indices is not None:
                 magi_sharder.local_token_global_indices = captured_token_indices(local_indices)
+                padded = local_indices.numel() * max(getattr(magi, "cp_size", 1) or 1, 1)
+                magi_sharder.padded_seq_len = padded
+                if row_shape is not None:
+                    if padded == row_shape[0] * row_shape[1]:
+                        # Flatten moved no tokens and dispatch added no pad: the
+                        # pre-flatten rows are the caller's coordinate system.
+                        magi_sharder.input_row_shape = row_shape
+                    elif row_shape[0] == 1 and padded >= row_shape[1]:
+                        # Single-sequence HF path: dispatch pads at the tail of
+                        # the global order, so trim restores the original length.
+                        magi_sharder.original_seq_len = row_shape[1]
             return contextlib.nullcontext, prepped
 
         magi_sharder = CPSharder(shard_batch=_shard_batch_magi, local_token_global_indices=None, layout="magi")
