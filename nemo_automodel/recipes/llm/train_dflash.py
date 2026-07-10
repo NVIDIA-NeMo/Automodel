@@ -81,6 +81,38 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
+def _packing_kwargs(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Sequence-packing metadata from a dataloader batch (empty dict when unpacked)."""
+    if "seq_lens" not in batch:
+        return {}
+    return {
+        "position_ids": batch["position_ids"],
+        "seq_lens": batch["seq_lens"],
+        "doc_remaining": batch["doc_remaining"],
+    }
+
+
+def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_size: int) -> None:
+    """Reject sequence-packing configs the DFlash path cannot honor (fail fast at setup).
+
+    Context parallelism shards the sequence and strips the block-causal mask packing
+    relies on, and a FlashAttention target packs documents from per-document
+    ``position_ids`` only at batch size 1.
+    """
+    if cp_size > 1:
+        raise NotImplementedError(
+            "Sequence packing (packed_sequence_size>0) is not supported with context parallelism "
+            "(distributed.cp_size>1) in DFlash; CP shards the sequence and strips the block-causal mask "
+            "packing relies on. Set cp_size=1 or packed_sequence_size=0."
+        )
+    if "flash" in target_attn_impl and micro_batch_size > 1:
+        raise ValueError(
+            "Sequence packing with a FlashAttention target requires micro_batch_size=1 "
+            f"(got {micro_batch_size}); set micro_batch_size=1 or load the target with "
+            "attn_implementation='sdpa'."
+        )
+
+
 def _all_ranks_have_valid(local_has_valid: int, is_ddp: bool, device) -> bool:
     """Min-reduce a per-rank "this micro-batch has valid anchors" flag.
 
@@ -162,6 +194,24 @@ class TrainDFlashRecipe(BaseRecipe):
         self.block_size = int(recipe_cfg.get("block_size", 16))
         self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_config.vocab_size)
 
+        # ``packed_sequence_size > 0`` enables sequence packing; the DFlash target,
+        # block mask, anchor sampling, and draft RoPE all consume the block-causal
+        # packing metadata (position_ids / seq_lens / doc_remaining) the loader emits.
+        packed_sequence_size = int(recipe_cfg.get("packed_sequence_size", 0) or 0)
+        if packed_sequence_size > 0:
+            if type(self) is not TrainDFlashRecipe:
+                # The JetSpec / Domino variants override the trainer forward and
+                # _run_trainer_step without threading packing metadata, so packing
+                # would silently let anchors cross document boundaries there.
+                raise NotImplementedError(
+                    f"Sequence packing (packed_sequence_size>0) is only supported by the base DFlash "
+                    f"recipe, not {type(self).__name__}."
+                )
+            _validate_packing_gates(
+                cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
+                target_attn_impl=getattr(self.target_model.config, "_attn_implementation", None) or "",
+                micro_batch_size=int(recipe_cfg.micro_batch_size),
+            )
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
             tokenizer=self.tokenizer,
@@ -173,6 +223,7 @@ class TrainDFlashRecipe(BaseRecipe):
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            packed_sequence_size=packed_sequence_size,
             dp_mesh=self.dp_mesh,
         )
         self.val_dataloader = None
@@ -188,6 +239,7 @@ class TrainDFlashRecipe(BaseRecipe):
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                packed_sequence_size=packed_sequence_size,
                 dp_mesh=self.dp_mesh,
             )
 
@@ -360,6 +412,9 @@ class TrainDFlashRecipe(BaseRecipe):
             input_ids=target_batch.input_ids,
             hidden_states=target_batch.hidden_states,
             loss_mask=target_batch.loss_mask,
+            position_ids=target_batch.position_ids,
+            seq_lens=target_batch.seq_lens,
+            doc_remaining=target_batch.doc_remaining,
         )
 
     def _log_extra_train_metrics(self, epoch_idx: int) -> None:
@@ -654,6 +709,7 @@ class TrainDFlashRecipe(BaseRecipe):
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     loss_mask=batch["loss_mask"],
+                    **_packing_kwargs(batch),
                 )
                 try:
                     # Route through the same seam as training so subclass-specific
@@ -707,6 +763,7 @@ class TrainDFlashRecipe(BaseRecipe):
                         input_ids=batch["input_ids"],
                         attention_mask=batch["attention_mask"],
                         loss_mask=batch["loss_mask"],
+                        **_packing_kwargs(batch),
                     )
                     sync_grads = should_sync_grads(
                         pending_micro_batches=pending_micro_batches,
