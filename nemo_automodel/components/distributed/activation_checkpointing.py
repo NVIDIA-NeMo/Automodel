@@ -40,6 +40,18 @@ from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint
 logger = logging.getLogger(__name__)
 
 
+def unwrap_checkpoint_wrapper(module: nn.Module) -> nn.Module:
+    """Return the activation-checkpointed module, or the input module if it is not wrapped.
+
+    Args:
+        module: Module that may have been wrapped by ``checkpoint_wrapper``.
+
+    Returns:
+        The inner checkpointed module when present, otherwise ``module``.
+    """
+    return getattr(module, "_checkpoint_wrapped_module", module)
+
+
 def _resolve_torch_op(namespace: str, name: str, overload: str = "default"):
     """Resolve ``torch.ops.<namespace>.<name>.<overload>``, or ``None`` if absent."""
     ns = getattr(torch.ops, namespace, None)
