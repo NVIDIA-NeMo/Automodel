@@ -88,8 +88,25 @@ class EagleTrainerModule(nn.Module):
         input_hidden_states: torch.Tensor,
         target_hidden_states: torch.Tensor,
         target_logits: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> EagleStepMetrics:
-        """Run one EAGLE-1 / EAGLE-2 training step."""
+        """Run one EAGLE-1 / EAGLE-2 training step.
+
+        All per-token tensors are ``[B, T]`` (``input_ids`` / ``loss_mask`` /
+        ``attention_mask`` / ``position_ids`` / ``doc_remaining``) except the
+        ``[B, T, H]`` hidden states and ``[B, T, V]`` ``target_logits``.
+
+        Packing (``seq_lens`` ``[B, max_docs]`` long, per-document lengths summing
+        to ``T``) makes the draft's attention document-level block-causal and its
+        RoPE per-document via ``position_ids``. ``doc_remaining`` ``[B, T]`` (real
+        tokens after each slot within its document) gates supervision: a
+        document's last real token (``doc_remaining == 0``) predicts the *next*
+        document's first token through the wrapper's global left-shift, so it is
+        dropped. This is the single-step reduction of the EAGLE-3 TTT gate
+        (``step_idx < doc_remaining`` at ``step_idx == 0``).
+        """
         if self.training and self.feature_noise > 0:
             # EAGLE feature-noise augmentation (see __init__): add
             # U(-feature_noise, feature_noise) to the draft's input features.
@@ -104,10 +121,16 @@ class EagleTrainerModule(nn.Module):
             input_ids=input_ids,
             target_hidden_states=input_hidden_states,
             attention_mask=attention_mask,
+            position_ids=position_ids,
+            seq_lens=seq_lens,
         )
         predicted_logits = self.compute_logits(predicted_hidden_states)
 
         valid_mask = loss_mask.bool()
+        if doc_remaining is not None:
+            # Packing: drop each document's last real token (doc_remaining == 0),
+            # whose left-shifted supervision target belongs to the next document.
+            valid_mask = valid_mask & (doc_remaining > 0)
         position_mask = valid_mask.unsqueeze(-1)
         valid_tokens = valid_mask.sum()
 

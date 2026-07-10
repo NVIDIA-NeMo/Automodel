@@ -72,6 +72,23 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
+def _packing_kwargs(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Sequence-packing metadata from a dataloader batch (empty dict when unpacked).
+
+    The packed loader (``packed_sequence_size > 0``) emits ``position_ids`` /
+    ``seq_lens`` / ``doc_remaining`` alongside ``input_ids``; the default loader
+    does not. Keyed on ``seq_lens`` so the caller can splat the result into
+    ``HFEagleTargetModel.generate_batch`` unconditionally.
+    """
+    if "seq_lens" not in batch:
+        return {}
+    return {
+        "position_ids": batch["position_ids"],
+        "seq_lens": batch["seq_lens"],
+        "doc_remaining": batch["doc_remaining"],
+    }
+
+
 def _submesh_or_none(device_mesh, name: str):
     """Return the named (flattened) submesh, or None if absent / no mesh.
 
@@ -161,6 +178,12 @@ class TrainEagle1Recipe(BaseRecipe):
         self.target_model.requires_grad_(False)
         self.target_wrapper = HFEagleTargetModel(self.target_model)
 
+        # ``packed_sequence_size > 0`` enables sequence packing (greedy first-fit
+        # of documents into fixed-width rows), removing the padding waste of the
+        # default ``padding="max_length"`` path. The colocated HF target and the
+        # single-step draft both consume the block-causal packing metadata
+        # (position_ids / seq_lens / doc_remaining) the packed loader emits.
+        packed_sequence_size = int(recipe_cfg.get("packed_sequence_size", 0) or 0)
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
             tokenizer=self.tokenizer,
@@ -172,6 +195,7 @@ class TrainEagle1Recipe(BaseRecipe):
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            packed_sequence_size=packed_sequence_size,
             dp_mesh=self.dp_mesh,
         )
         self.val_dataloader = None
@@ -187,6 +211,7 @@ class TrainEagle1Recipe(BaseRecipe):
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                packed_sequence_size=packed_sequence_size,
                 dp_mesh=self.dp_mesh,
             )
 
@@ -604,6 +629,7 @@ class TrainEagle1Recipe(BaseRecipe):
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     loss_mask=batch["loss_mask"],
+                    **_packing_kwargs(batch),
                 )
                 metrics = self.trainer_module(
                     input_ids=target_batch.input_ids,
@@ -612,6 +638,9 @@ class TrainEagle1Recipe(BaseRecipe):
                     input_hidden_states=target_batch.input_hidden_states,
                     target_hidden_states=target_batch.target_hidden_states,
                     target_logits=target_batch.target_logits,
+                    position_ids=target_batch.position_ids,
+                    seq_lens=target_batch.seq_lens,
+                    doc_remaining=target_batch.doc_remaining,
                 )
                 total_loss += metrics.loss.detach()
                 total_acc += metrics.accuracy.detach()
@@ -667,6 +696,7 @@ class TrainEagle1Recipe(BaseRecipe):
                         input_ids=batch["input_ids"],
                         attention_mask=batch["attention_mask"],
                         loss_mask=batch["loss_mask"],
+                        **_packing_kwargs(batch),
                     )
                     # Skip DDP's per-micro-batch all-reduce on every micro-batch
                     # except the one an optimizer step immediately follows; that
@@ -687,6 +717,9 @@ class TrainEagle1Recipe(BaseRecipe):
                             input_hidden_states=target_batch.input_hidden_states,
                             target_hidden_states=target_batch.target_hidden_states,
                             target_logits=target_batch.target_logits,
+                            position_ids=target_batch.position_ids,
+                            seq_lens=target_batch.seq_lens,
+                            doc_remaining=target_batch.doc_remaining,
                         )
                         loss = metrics.loss / self.grad_accumulation_steps
                         loss.backward()
