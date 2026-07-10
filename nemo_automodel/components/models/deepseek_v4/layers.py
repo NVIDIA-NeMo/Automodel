@@ -1090,6 +1090,17 @@ class DeepseekV4HyperConnection(nn.Module):
         self.base = nn.Parameter(torch.empty(mix, dtype=torch.float32))
         self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
+    @torch.no_grad()
+    def init_weights(self, init_std: float) -> None:
+        """Initialize HyperConnection parameters using the DeepSeek-V4 reference scheme.
+
+        Args:
+            init_std: Standard deviation for the ``fn`` weight initialization.
+        """
+        nn.init.normal_(self.fn, mean=0.0, std=init_std)
+        nn.init.zeros_(self.base)
+        nn.init.ones_(self.scale)
+
     def compute_weights(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat = hidden_streams.flatten(start_dim=2).float()  # [B, S, H*D]
         # HC mixer params are kept in fp32 for Sinkhorn stability — cast defensively.
@@ -1147,6 +1158,17 @@ class DeepseekV4HyperHead(nn.Module):
         self.hc_fn = nn.Parameter(torch.empty(self.hc_mult, self.hc_mult * hidden_size, dtype=torch.float32))
         self.hc_base = nn.Parameter(torch.empty(self.hc_mult, dtype=torch.float32))
         self.hc_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+
+    @torch.no_grad()
+    def init_weights(self, init_std: float) -> None:
+        """Initialize HyperHead parameters using the DeepSeek-V4 reference scheme.
+
+        Args:
+            init_std: Standard deviation for the ``hc_fn`` weight initialization.
+        """
+        nn.init.normal_(self.hc_fn, mean=0.0, std=init_std)
+        nn.init.zeros_(self.hc_base)
+        nn.init.ones_(self.hc_scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         flat = x.flatten(2).float()

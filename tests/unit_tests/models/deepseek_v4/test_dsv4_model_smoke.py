@@ -420,6 +420,53 @@ class TestDeepseekV4ModelSmoke:
 
         model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.bfloat16)
 
+    def test_initialize_weights_initializes_all_hyper_connection_parameters(self):
+        cfg = _tiny_config(
+            num_hidden_layers=1,
+            num_hash_layers=0,
+            compress_ratios=[0],
+            num_nextn_predict_layers=1,
+        )
+        model = DeepseekV4ForCausalLM(
+            cfg,
+            backend=BackendConfig(
+                attn="sdpa",
+                linear="torch",
+                rms_norm="torch",
+                rope_fusion=False,
+                enable_hf_state_dict_adapter=False,
+                dispatcher="torch",
+                experts="torch_mm",
+            ),
+        )
+        block = model.model.layers["0"]
+        assert model.mtp is not None
+        mtp_block = model.mtp.layers[0]
+        hyper_modules = (block.attn_hc, block.ffn_hc, mtp_block.attn_hc, mtp_block.ffn_hc)
+        hyper_heads = (model.model.hc_head, mtp_block.hc_head)
+        with torch.no_grad():
+            for module in hyper_modules:
+                module.fn.fill_(float("nan"))
+                module.base.fill_(float("nan"))
+                module.scale.fill_(float("nan"))
+            for head in hyper_heads:
+                head.hc_fn.fill_(float("nan"))
+                head.hc_base.fill_(float("nan"))
+                head.hc_scale.fill_(float("nan"))
+
+        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+
+        for module in hyper_modules:
+            assert torch.isfinite(module.fn).all()
+            assert torch.count_nonzero(module.fn) > 0
+            torch.testing.assert_close(module.base, torch.zeros_like(module.base))
+            torch.testing.assert_close(module.scale, torch.ones_like(module.scale))
+        for head in hyper_heads:
+            assert torch.isfinite(head.hc_fn).all()
+            assert torch.count_nonzero(head.hc_fn) > 0
+            torch.testing.assert_close(head.hc_base, torch.zeros_like(head.hc_base))
+            torch.testing.assert_close(head.hc_scale, torch.ones_like(head.hc_scale))
+
     def test_hash_gate_tid2eid_uses_deepep_runtime_int64_dtype(self):
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=1, compress_ratios=[0])
         model = DeepseekV4ForCausalLM(
@@ -443,6 +490,34 @@ class TestDeepseekV4ModelSmoke:
         gate.set_input_ids(torch.tensor([[1, 2, 3]]))
         _, indices, _ = gate(torch.zeros(3, cfg.hidden_size), torch.ones(3, dtype=torch.bool))
         assert indices.dtype == torch.long
+
+    def test_initialize_weights_builds_valid_hash_routes(self):
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=1, compress_ratios=[0])
+        model = DeepseekV4ForCausalLM(
+            cfg,
+            backend=BackendConfig(
+                attn="sdpa",
+                linear="torch",
+                rms_norm="torch",
+                rope_fusion=False,
+                enable_hf_state_dict_adapter=False,
+                dispatcher="torch",
+                experts="torch_mm",
+            ),
+        )
+        gate = model.model.layers["0"].mlp.gate
+        with torch.no_grad():
+            gate.weight.fill_(float("nan"))
+            gate.tid2eid.zero_()
+
+        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+
+        assert torch.isfinite(gate.weight).all()
+        assert torch.count_nonzero(gate.weight) > 0
+        sorted_routes = gate.tid2eid.sort(dim=-1).values
+        assert torch.all(sorted_routes[:, 1:] != sorted_routes[:, :-1])
+        expert_load = torch.bincount(gate.tid2eid.flatten(), minlength=gate.n_experts)
+        assert expert_load.max() - expert_load.min() <= 1
 
     def test_hc_comb_transpose_used_at_attn_and_mlp_sites(self):
         """Both HC expand sites mix residual streams as ``comb.T @ x``.
