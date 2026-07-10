@@ -54,8 +54,11 @@ from nemo_automodel.recipes.base_recipe import (
     _resolve_restore_from_to_ckpt_dir,
 )
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_compile,
+    apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
+    raise_if_peft_configured,
     should_sync_grads,
 )
 
@@ -101,6 +104,7 @@ class TrainEagle1Recipe(BaseRecipe):
 
         recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
+        raise_if_peft_configured(self.cfg, type(self).__name__)
 
         target_path = recipe_cfg.target_model_name_or_path
         target_config = AutoConfig.from_pretrained(
@@ -197,6 +201,10 @@ class TrainEagle1Recipe(BaseRecipe):
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
+        # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede the DDP wrap.
+        apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
+        # Optional torch.compile of the draft, in place; after the fp8 swap.
+        apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
         # The target's "Model summary" is logged by apply_model_infrastructure when it
         # loads; the draft is built directly, so log its (trainable) summary here too.
         print_trainable_parameters(self.draft_model, name="Draft")
@@ -356,12 +364,17 @@ class TrainEagle1Recipe(BaseRecipe):
         train_loss: float | None = None,
         val_loss: dict[str, float] | None = None,
         best_metric_key: str = "default",
+        is_final_checkpoint: bool = False,
     ) -> None:
         """Persist draft model, optimizer, scheduler, RNG, and EAGLE meta.
 
         Overrides ``BaseRecipe.save_checkpoint`` because EAGLE recipes hold multiple
         ``nn.Module`` attributes (frozen target, target wrapper, trainer module wrapping
         the draft) — only ``draft_model`` should be persisted as the main model.
+
+        ``is_final_checkpoint`` is computed by the caller (this hand-rolled loop
+        has no ``step_scheduler`` for the checkpointer to infer it from);
+        ``save_consolidated: final`` exports HF safetensors only when it is True.
         """
         checkpointer = getattr(self, "checkpointer", None)
         if checkpointer is None or not checkpointer.config.enabled:
@@ -409,8 +422,6 @@ class TrainEagle1Recipe(BaseRecipe):
         if is_dist_initialized:
             dist.barrier()
 
-        step_scheduler = getattr(self, "step_scheduler", None)
-        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
         draft_model = self._module().draft_model
         self.checkpointer.save_model(
             draft_model,
@@ -460,12 +471,15 @@ class TrainEagle1Recipe(BaseRecipe):
         every = getattr(self, "ckpt_every_steps", None)
         if every is None or every <= 0 or self.runtime.global_step % every != 0:
             return False
+        total_optim_steps = getattr(self, "total_optim_steps", None)
+        is_final_checkpoint = total_optim_steps is not None and self.runtime.global_step >= total_optim_steps
         self.save_checkpoint(
             epoch=epoch,
             step=self.runtime.global_step,
             train_loss=None,
             val_loss=None,
             best_metric_key="val_loss",
+            is_final_checkpoint=is_final_checkpoint,
         )
         self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
         return True
@@ -494,6 +508,7 @@ class TrainEagle1Recipe(BaseRecipe):
             train_loss=None,
             val_loss=None,
             best_metric_key="val_loss",
+            is_final_checkpoint=True,
         )
         self._log_saved_checkpoint("final", completed_epochs, gs)
         return True
@@ -794,6 +809,7 @@ class TrainEagle1Recipe(BaseRecipe):
                         train_loss=avg_loss,
                         val_loss=eval_metrics,
                         best_metric_key="val_loss",
+                        is_final_checkpoint=epoch_idx + 1 >= self.num_epochs,
                     )
 
             self._maybe_save_final_checkpoint(self.num_epochs)

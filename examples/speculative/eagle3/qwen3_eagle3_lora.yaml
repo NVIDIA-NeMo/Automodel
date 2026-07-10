@@ -1,0 +1,58 @@
+recipe: TrainEagle3Recipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-8B
+  draft_attn_implementation: flash_attention_2
+  train_data_path: ./cache/dataset/domain-messages
+  val_data_path: null
+  train_split: null
+  val_split: null
+  output_dir: ./outputs/eagle3_qwen3_8b_lora
+  seq_length: 4096
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 0
+  num_epochs: 1
+  ttt_steps: 7
+  draft_vocab_size: 32000
+  freeze_embeddings: true
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+  packed_sequence_size: 4096
+  # LoRA adapts an EXISTING draft; point this at the consolidated safetensors
+  # export of a previously trained draft. A full-FT run writes checkpoints
+  # under `checkpoints/epoch_*_step_*/model/consolidated`, with
+  # `checkpoints/LATEST` symlinked to the newest one.
+  draft_weights_path: ./outputs/eagle3_qwen3_8b_perfectblend/checkpoints/LATEST/model/consolidated
+  # REQUIRED with draft_weights_path + compressed vocab: reuse the BASE run's
+  # cached token mapping. Set the same path in the base run's config so its
+  # mapping is cached here; without it this run rescans the (different)
+  # adaptation dataset, derives a different mapping, and the warm start fails
+  # fast at load (the frozen lm_head rows are tied to the base mapping).
+  selected_token_ids_path: ./outputs/eagle3_qwen3_8b_perfectblend/draft_token_map.pt
+
+# LoRA draft adaptation (same PeftConfig surface as the SFT recipes). The base
+# draft is frozen; only lora_A/lora_B train, and checkpoints store adapters
+# only (adapter_model.safetensors). Merge the adapters into the base draft
+# before serving. Not supported with parallel_drafting (P-EAGLE) or fp8.
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules: '*_proj'
+  dim: 8
+  alpha: 32
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/eagle3_qwen3_8b_lora/checkpoints
+  model_save_format: safetensors

@@ -14,7 +14,23 @@
 
 """CPU coverage for the selective-AC save-set build (FFPA fold-in wiring)."""
 
+from torch import nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
 from nemo_automodel.components.distributed import activation_checkpointing as ac
+
+
+def test_unwrap_checkpoint_wrapper_returns_input_module_when_unwrapped():
+    module = nn.Linear(2, 2)
+
+    assert ac.unwrap_checkpoint_wrapper(module) is module
+
+
+def test_unwrap_checkpoint_wrapper_returns_inner_module_when_wrapped():
+    module = nn.Linear(2, 2)
+    wrapped = checkpoint_wrapper(module)
+
+    assert ac.unwrap_checkpoint_wrapper(wrapped) is module
 
 
 def test_ffpa_forward_ops_folded_into_save_set(monkeypatch):

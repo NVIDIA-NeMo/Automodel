@@ -63,8 +63,11 @@ from nemo_automodel.recipes.base_recipe import (
     _resolve_restore_from_to_ckpt_dir,
 )
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_compile,
+    apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
+    raise_if_peft_configured,
     should_sync_grads,
 )
 
@@ -129,6 +132,7 @@ class TrainDFlashRecipe(BaseRecipe):
 
         recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
+        raise_if_peft_configured(self.cfg, type(self).__name__)
 
         target_path = recipe_cfg.target_model_name_or_path
         target_config = AutoConfig.from_pretrained(
@@ -207,6 +211,10 @@ class TrainDFlashRecipe(BaseRecipe):
         draft_config_obj = Qwen3Config.from_dict(draft_config)
         draft_config_obj._attn_implementation = attention_backend
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede the DDP wrap.
+        apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
+        # Optional torch.compile of the draft, in place; after the fp8 swap.
+        apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
 
         trainer_module = self._build_trainer_module(attention_backend, recipe_cfg).to(self.device)
         if self.dist_env.world_size > 1:
@@ -340,7 +348,10 @@ class TrainDFlashRecipe(BaseRecipe):
             block_size=self.block_size,
             attention_backend=attention_backend,
             num_anchors=int(recipe_cfg.get("num_anchors", 512)),
-            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
+            # Paper default (Appendix A.1) for the shipped block_size=16 configs;
+            # matches DFlashDecayLoss's own default. Set null explicitly in YAML
+            # to disable the position decay (uniform weighting).
+            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", 7.0),
         )
 
     def _run_trainer_step(self, target_batch):
