@@ -31,7 +31,7 @@ from contextlib import AbstractContextManager, nullcontext
 from copy import copy
 from dataclasses import dataclass, field, fields, is_dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast, runtime_checkable
 
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from torch.utils.data.sampler import Sampler
@@ -152,6 +152,8 @@ class PackingConfig:
     """Whether the dataset already contains packed samples and must not be repacked."""
     num_proc: int = 1
     """Number of processes used to pre-tokenize an indexable dataset before packing."""
+    requires_model_configuration: ClassVar[bool] = False
+    """Whether model-side packing hooks must be configured before building the dataset."""
 
     def _pretokenize(self, dataset: object) -> object:
         """Materialize lazy tokenization in parallel when packing can consume the full dataset."""
@@ -234,6 +236,7 @@ class ThdPackingConfig(PackingConfig):
 class NeatPackingConfig(PackingConfig):
     """NEAT (bin-packed) packing paired with ``neat_packed_collater``."""
 
+    requires_model_configuration: ClassVar[bool] = True
     drop_long_samples: bool = True
 
     def build(

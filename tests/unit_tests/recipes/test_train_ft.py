@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import logging
 import sys
 import types
@@ -40,10 +39,9 @@ from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
 from nemo_automodel.components.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
+from nemo_automodel.recipes.llm.config import LlmInputConfig
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
-    _build_pp_collate_wrapper,
-    _should_pack_validation,
     build_model,
     compute_trust_remote_code_from_model,
 )
@@ -82,16 +80,18 @@ def _build_loader(
             },
         }
     )
-    config = RecipeConfig(raw).dataloader
-    loader = config.build(
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        pp_enabled=pp_enabled,
-        supports_seq_lens=model is None or "seq_lens" in inspect.signature(model.forward).parameters,
-        cp_size=cp_size,
-        collate_wrapper=_build_pp_collate_wrapper(cfg_model, pp_enabled),
-    )
-    return loader, None
+    input_config = RecipeConfig(raw).llm_inputs
+    runtime_model = model if model is not None else nn.Module()
+    with patch("nemo_automodel.recipes.llm.config.ScopedRNG", return_value=nullcontext()):
+        pipeline = input_config.build(
+            model=runtime_model,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            pp_enabled=pp_enabled,
+            cp_size=cp_size,
+            tokenizer=None,
+        )
+    return pipeline.train, None
 
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
@@ -322,47 +322,108 @@ def test_validation_dataloaders_skip_packing_without_pack_size():
     assert RecipeConfig(cfg).validation_dataloaders["default"].packing is None
 
 
+def _build_validation_input(config: LlmInputConfig, model: nn.Module) -> DataloaderConfig:
+    """Build an LLM input config with loader construction replaced by its input config."""
+    with (
+        patch("nemo_automodel.recipes.llm.config.FirstRankPerNode", return_value=nullcontext()),
+        patch("nemo_automodel.recipes.llm.config.ScopedRNG", return_value=nullcontext()),
+        patch.object(DataloaderConfig, "build", autospec=True, side_effect=lambda loader, **kwargs: loader),
+    ):
+        return config.build(
+            model=model,
+            tokenizer=None,
+            dp_rank=0,
+            dp_world_size=1,
+        ).validation["default"]
+
+
 @pytest.mark.parametrize("attn", ["magi", "te", "sdpa"])
-def test_should_pack_validation_for_explicit_thd_collater(attn):
-    collate_fn = "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"
-    cfg = RecipeConfig(
-        ConfigNode(
-            {
-                "model": {"backend": {"attn": attn}},
-                "dataloader": {"collate_fn": collate_fn},
-                "validation_dataloader": {"collate_fn": collate_fn},
-                "packed_sequence": {"packed_sequence_size": 1024},
-            }
-        )
-    )
+def test_llm_input_config_packs_validation_for_explicit_thd_collater(attn):
+    from nemo_automodel.components.datasets.loader import ThdPackingConfig
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
-    assert _should_pack_validation(cfg, nn.Module()) is True
+    packing = ThdPackingConfig(packed_sequence_size=1024)
+    train = DataloaderConfig(dataset_config=MagicMock(), packing=packing)
+    validation = DataloaderConfig(dataset_config=MagicMock(), packing=packing, collate_fn=packed_sequence_thd_collater)
+    config = LlmInputConfig(train=train, validation={"default": validation}, attn_implementation=attn)
+
+    assert _build_validation_input(config, nn.Module()).packing is packing
 
 
-def test_should_not_pack_validation_without_pack_size():
-    cfg = RecipeConfig(ConfigNode({"model": {}, "packed_sequence": {"packed_sequence_size": 0}}))
+def test_llm_input_config_does_not_pack_validation_without_training_packing():
+    train = DataloaderConfig(dataset_config=MagicMock())
+    validation = DataloaderConfig(dataset_config=MagicMock())
+    config = LlmInputConfig(train=train, validation={"default": validation})
 
-    assert _should_pack_validation(cfg, nn.Module()) is False
+    assert _build_validation_input(config, nn.Module()).packing is None
 
 
-def test_should_pack_validation_when_model_requires_training_layout():
-    collate_fn = "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"
-    cfg = RecipeConfig(
-        ConfigNode(
-            {
-                "model": {"backend": {"attn": "sdpa"}},
-                "dataloader": {"collate_fn": collate_fn},
-                "validation_dataloader": {},
-                "packed_sequence": {"packed_sequence_size": 1024},
-            }
-        )
-    )
+def test_llm_input_config_packs_validation_when_model_requires_training_layout():
+    from nemo_automodel.components.datasets.loader import ThdPackingConfig
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    packing = ThdPackingConfig(packed_sequence_size=1024)
+    train = DataloaderConfig(dataset_config=MagicMock(), packing=packing, collate_fn=packed_sequence_thd_collater)
+    validation = DataloaderConfig(dataset_config=MagicMock(), packing=packing)
 
     class ModelRequiresPackedValidation(nn.Module):
         def should_pack_validation_with_training(self):
             return True
 
-    assert _should_pack_validation(cfg, ModelRequiresPackedValidation()) is True
+    config = LlmInputConfig(train=train, validation={"default": validation})
+    assert _build_validation_input(config, ModelRequiresPackedValidation()).packing is packing
+
+
+@pytest.mark.parametrize("attn", ["magi", "te"])
+def test_llm_input_config_packs_validation_for_backend_training_layout(attn):
+    from nemo_automodel.components.datasets.loader import ThdPackingConfig
+    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+    packing = ThdPackingConfig(packed_sequence_size=1024)
+    train = DataloaderConfig(dataset_config=MagicMock(), packing=packing, collate_fn=packed_sequence_thd_collater)
+    validation = DataloaderConfig(dataset_config=MagicMock(), packing=packing)
+    config = LlmInputConfig(train=train, validation={"default": validation}, attn_implementation=attn)
+
+    assert _build_validation_input(config, nn.Module()).packing is packing
+
+
+def test_llm_input_config_configures_model_for_neat_packing():
+    from nemo_automodel.components.datasets.loader import NeatPackingConfig
+
+    train = DataloaderConfig(dataset_config=MagicMock(), packing=NeatPackingConfig(packed_sequence_size=1024))
+    config = LlmInputConfig(train=train, validation={}, attn_implementation="flash_attention_2")
+
+    with (
+        patch("nemo_automodel.recipes.llm.config.FirstRankPerNode", return_value=nullcontext()),
+        patch("nemo_automodel.recipes.llm.config.ScopedRNG", return_value=nullcontext()),
+        patch.object(DataloaderConfig, "build", autospec=True, side_effect=lambda loader, **kwargs: loader),
+        patch("nemo_automodel.components.models.common.packing.configure_packing") as configure_packing,
+    ):
+        pipeline = config.build(model=nn.Module(), tokenizer=None, dp_rank=0, dp_world_size=1)
+
+    assert pipeline.train is train
+    configure_packing.assert_called_once_with(attn_implementation="flash_attention_2")
+
+
+def test_llm_input_config_uses_model_local_process_group_for_dataset_build():
+    train = DataloaderConfig(dataset_config=MagicMock())
+    config = LlmInputConfig(train=train, validation={})
+    process_group = MagicMock()
+
+    with (
+        patch("nemo_automodel.recipes.llm.config.FirstRankPerNode", return_value=nullcontext()) as first_rank,
+        patch("nemo_automodel.recipes.llm.config.ScopedRNG", return_value=nullcontext()),
+        patch.object(DataloaderConfig, "build", autospec=True, side_effect=lambda loader, **kwargs: loader),
+    ):
+        config.build(
+            model=nn.Module(),
+            tokenizer=None,
+            dp_rank=0,
+            dp_world_size=1,
+            dataset_build_process_group=process_group,
+        )
+
+    first_rank.assert_called_once_with(group=process_group)
 
 
 class DummyLinear(nn.Module):
@@ -609,6 +670,8 @@ def test_build_dataloader_prepacked_sequence_skips_recipe_packing(monkeypatch):
     cfg_ps = ConfigNode({"packed_sequence_size": 8, "prepacked": True})
 
     class _PackedModel(nn.Module):
+        supports_sequence_packing = True
+
         def forward(self, input_ids, seq_lens=None):
             """Return token IDs unchanged.
 
@@ -670,6 +733,8 @@ def test_build_dataloader_packing_uses_configured_cp_size(monkeypatch, supports_
     if supports_thd:
 
         class _PackedModel(nn.Module):
+            supports_sequence_packing = True
+
             def forward(self, input_ids, seq_lens=None):
                 """Return token IDs while accepting packed-sequence metadata.
 
@@ -685,6 +750,8 @@ def test_build_dataloader_packing_uses_configured_cp_size(monkeypatch, supports_
     else:
 
         class _PackedModel(nn.Module):
+            supports_sequence_packing = False
+
             def forward(self, input_ids):
                 """Return token IDs unchanged.
 
@@ -755,6 +822,8 @@ def test_build_dataloader_parallel_tokenize_gated_on_num_proc(monkeypatch, num_p
     )
 
     class _PackedModel(nn.Module):
+        supports_sequence_packing = True
+
         def forward(self, input_ids, seq_lens=None):
             return input_ids
 
@@ -906,19 +975,18 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         property(lambda self: SimpleNamespace(build=lambda *a, **k: [dummy_opt])),
     )
 
-    # Data-related stubs: short-circuit the RecipeConfig dataloader resolution + build.
+    # Data-related stub: short-circuit the complete typed LLM input build.
     monkeypatch.setattr(
         RecipeConfig,
-        "dataloader",
+        "llm_inputs",
         property(
             lambda self: SimpleNamespace(
-                build=lambda **k: "dl",
-                dataset_builds_on_all_ranks=False,
-                seed=42,
+                build=lambda **k: SimpleNamespace(train="dl", validation={}),
+                requires_pp_thd_microbatch_override=False,
+                uses_thd_collater=False,
             )
         ),
     )
-    monkeypatch.setattr(RecipeConfig, "validation_dataloaders", property(lambda self: {}))
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._build_tokenizer", lambda cfg_model, cfg_ds: ({}, None))
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
@@ -1251,12 +1319,9 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
 
-    # Mock helper functions to avoid needing full config
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: False)
-
     # Create the recipe without calling setup
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    recipe.cfg.__dict__["llm_inputs"] = SimpleNamespace(uses_thd_collater=False)
 
     # Mock out attributes needed for _forward_backward_step
     # Use object.__setattr__ to bypass the state tracking
@@ -1713,7 +1778,7 @@ def test_build_model_and_optimizer_return_values():
 # =============================================================================
 
 
-def _pp_loader(cfg_model, cfg_dl, **patches):
+def _pp_loader(cfg_model, cfg_dl, model):
     """Build a PP-enabled iterable loader and return its resolved ``collate_fn``."""
     cfg_ds = ConfigNode(
         {
@@ -1735,23 +1800,23 @@ def _pp_loader(cfg_model, cfg_dl, **patches):
         dp_rank=0,
         dp_world_size=1,
         pp_enabled=True,
+        model=model,
     )
     return loader.collate_fn
 
 
-def test_pp_autoconfig_failure_skips_masks(caplog):
-    """When AutoConfig.from_pretrained raises, the collate is left unwrapped (warning logged)."""
+def test_pp_model_without_config_skips_masks(caplog):
+    """A live model without config leaves the collate function unwrapped."""
     calls = []
     cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
     cfg_model = ConfigNode({"pretrained_model_name_or_path": "bad/model"})
     with (
-        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", side_effect=OSError("not found")),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
         caplog.at_level(logging.WARNING),
     ):
-        collate_fn = _pp_loader(cfg_model, cfg_dl)
+        collate_fn = _pp_loader(cfg_model, cfg_dl, nn.Module())
 
-    assert "Failed to load model config for causal mask precomputation" in caplog.text
+    assert "live model has no config for causal-mask precomputation" in caplog.text
     collate_fn(["dummy"])
     assert calls == ["base"]
     add_masks.assert_not_called()
@@ -1763,14 +1828,12 @@ def test_pp_deepseek_v4_skips_masks(caplog):
     cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
     cfg_model = ConfigNode({"pretrained_model_name_or_path": "deepseek-ai/DeepSeek-V4-Pro"})
     with (
-        patch(
-            "nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained",
-            return_value=MagicMock(model_type="deepseek_v4"),
-        ),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
         caplog.at_level(logging.INFO),
     ):
-        collate_fn = _pp_loader(cfg_model, cfg_dl)
+        model = nn.Module()
+        model.config = SimpleNamespace(model_type="deepseek_v4")
+        collate_fn = _pp_loader(cfg_model, cfg_dl, model)
 
     collate_fn(["dummy"])
     assert calls == ["base"]
@@ -1778,8 +1841,8 @@ def test_pp_deepseek_v4_skips_masks(caplog):
     assert "Skipping pipeline parallel causal mask precomputation for model_type=deepseek_v4" in caplog.text
 
 
-def test_pp_autoconfig_success_chains_masks():
-    """When AutoConfig succeeds, the resolved collate is wrapped with mask precomputation (base -> masks)."""
+def test_pp_live_model_config_chains_masks():
+    """The live model config wraps the resolved collate with mask precomputation."""
     call_order = []
     cfg_dl = ConfigNode({"collate_fn": lambda b: call_order.append("base") or b, "num_workers": 0})
     cfg_model = ConfigNode({"pretrained_model_name_or_path": "good/model"})
@@ -1789,10 +1852,11 @@ def test_pp_autoconfig_success_chains_masks():
         return batch
 
     with (
-        patch("nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained", return_value=MagicMock()),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch", side_effect=mock_add_masks),
     ):
-        collate_fn = _pp_loader(cfg_model, cfg_dl)
+        model = nn.Module()
+        model.config = SimpleNamespace(model_type="llama")
+        collate_fn = _pp_loader(cfg_model, cfg_dl, model)
 
     collate_fn(["dummy_batch"])
     assert call_order == ["base", "masks"]
@@ -1981,10 +2045,8 @@ class TestRunTrainOptimStepSetsMoEScale:
             lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
         )
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
-        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
-        monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: False)
-
         recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+        recipe.cfg.__dict__["llm_inputs"] = SimpleNamespace(uses_thd_collater=False)
 
         object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
         object.__setattr__(recipe, "device_mesh", None)
@@ -2377,9 +2439,8 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
         lambda *a, **k: SimpleNamespace(world_size=1, is_main=True, device=torch.device("cpu"), rank=0),
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: uses_thd)
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    recipe.cfg.__dict__["llm_inputs"] = SimpleNamespace(uses_thd_collater=uses_thd)
 
     class _CPModel(nn.Module):
         def __init__(self):
