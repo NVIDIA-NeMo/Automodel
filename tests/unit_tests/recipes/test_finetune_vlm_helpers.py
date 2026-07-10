@@ -600,6 +600,24 @@ def test_run_train_step_pp_nonzero_label_tokens_divides(monkeypatch):
 # -----------------------------------------------------------------------------
 
 
+def _test_vlm_dataset(path_or_dataset=None, split=None):
+    return [{"path": path_or_dataset, "split": split}]
+
+
+def _test_vlm_collate(examples, processor=None):
+    return examples
+
+
+def _vlm_dataloader_cfg():
+    return ConfigNode(
+        {
+            "_target_": "torchdata.stateful_dataloader.StatefulDataLoader",
+            "collate_fn": {"_target_": _test_vlm_collate},
+            "num_workers": 0,
+        }
+    )
+
+
 def test_autoprocessor_success():
     """Test successful AutoProcessor creation."""
 
@@ -631,20 +649,8 @@ def test_autoprocessor_exception_handling(caplog):
         mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
 
         # Mock configurations - minimal setup
-        cfg_ds = MagicMock()
-        cfg_ds.instantiate.return_value = []
-        cfg_ds.path_or_dataset = "test/dataset"
-        cfg_ds.get.side_effect = lambda key, default=None: {
-            "pretokenize": False,
-            "packing": None,
-            "max_length": None,
-            "chat_template": None,
-            "preload_media": False,
-        }.get(key, default)
-
-        cfg_dl = MagicMock()
-        cfg_dl.get.return_value = None  # No custom settings
-        cfg_dl.instantiate.return_value = MagicMock()
+        cfg_ds = ConfigNode({"_target_": _test_vlm_dataset, "path_or_dataset": "test/dataset"})
+        cfg_dl = _vlm_dataloader_cfg()
 
         cfg_processor = None  # This triggers the exception path
 
@@ -682,20 +688,8 @@ def test_autoprocessor_retries_on_layer_types_mismatch():
         patch("torch.utils.data.distributed.DistributedSampler"),
         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"MagicMock": MagicMock()}),
     ):
-        cfg_ds = MagicMock()
-        cfg_ds.instantiate.return_value = []
-        cfg_ds.path_or_dataset = "test/dataset"
-        cfg_ds.get.side_effect = lambda key, default=None: {
-            "pretokenize": False,
-            "packing": None,
-            "max_length": None,
-            "chat_template": None,
-            "preload_media": False,
-        }.get(key, default)
-
-        cfg_dl = MagicMock()
-        cfg_dl.get.return_value = None
-        cfg_dl.instantiate.return_value = MagicMock()
+        cfg_ds = ConfigNode({"_target_": _test_vlm_dataset, "path_or_dataset": "test/dataset"})
+        cfg_dl = _vlm_dataloader_cfg()
 
         dataloader, processor = build_dataloader(cfg_ds, cfg_dl, "stepfun-ai/Step-3.5-Flash", None, None, 123, 1)
 
@@ -731,13 +725,8 @@ def test_autoprocessor_loads_inside_first_rank_per_node():
         patch("torch.utils.data.distributed.DistributedSampler"),
         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"NoneType": MagicMock()}),
     ):
-        cfg_ds = MagicMock()
-        cfg_ds.instantiate.return_value = []
-        cfg_ds.path_or_dataset = "test/dataset"
-
-        cfg_dl = MagicMock()
-        cfg_dl.get.return_value = None
-        cfg_dl.instantiate.return_value = MagicMock()
+        cfg_ds = ConfigNode({"_target_": _test_vlm_dataset, "path_or_dataset": "test/dataset"})
+        cfg_dl = _vlm_dataloader_cfg()
 
         build_dataloader(cfg_ds, cfg_dl, "test/model", None, None, 123, 1)
 
@@ -773,20 +762,8 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
 
         # Mock configurations - minimal setup
-        cfg_ds = MagicMock()
-        cfg_ds.instantiate.return_value = []
-        cfg_ds.path_or_dataset = "test/dataset"
-        cfg_ds.get.side_effect = lambda key, default=None: {
-            "pretokenize": False,
-            "packing": None,
-            "max_length": None,
-            "chat_template": None,
-            "preload_media": False,
-        }.get(key, default)
-
-        cfg_dl = MagicMock()
-        cfg_dl.get.return_value = None  # No custom settings
-        cfg_dl.instantiate.return_value = MagicMock()
+        cfg_ds = ConfigNode({"_target_": _test_vlm_dataset, "path_or_dataset": "test/dataset"})
+        cfg_dl = _vlm_dataloader_cfg()
 
         cfg_processor = ProcessorConfig()  # This has to_dict but no instantiate
 
@@ -811,7 +788,7 @@ def test_build_dataloader_chat_template_applied():
 
     def ds_factory(path_or_dataset, split=None):
         ds_calls.append({"path_or_dataset": path_or_dataset, "split": split})
-        return []
+        return [{}]
 
     class DummyProcessor:
         def __init__(self):
@@ -822,11 +799,10 @@ def test_build_dataloader_chat_template_applied():
     cfg_ds = ConfigNode(
         {"_target_": ds_factory, "path_or_dataset": "ds/path", "split": "train", "chat_template": "{{ custom }}"}
     )
-    cfg_dl = MagicMock()
-    cfg_dl.get.return_value = None
-    cfg_dl.instantiate.return_value = MagicMock()
+    cfg_dl = _vlm_dataloader_cfg()
 
     with (
+        pytest.warns(DeprecationWarning, match="RecipeConfig.vlm_dataloader"),
         patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
         patch("torch.utils.data.distributed.DistributedSampler"),
         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}),
@@ -843,7 +819,7 @@ def test_build_dataloader_no_chat_template():
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
     def ds_factory(path_or_dataset, split=None):
-        return []
+        return [{}]
 
     class DummyProcessor:
         def __init__(self):
@@ -852,9 +828,7 @@ def test_build_dataloader_no_chat_template():
 
     processor = DummyProcessor()
     cfg_ds = ConfigNode({"_target_": ds_factory, "path_or_dataset": "ds/path", "split": "train"})
-    cfg_dl = MagicMock()
-    cfg_dl.get.return_value = None
-    cfg_dl.instantiate.return_value = MagicMock()
+    cfg_dl = _vlm_dataloader_cfg()
 
     with (
         patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
@@ -2673,7 +2647,20 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
         property(lambda self: SimpleNamespace(build=lambda *a, **k: [dummy_opt])),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_dataloader", lambda *a, **k: ("dl", "proc"))
+    loader_config = SimpleNamespace(
+        packing=None,
+        resolve_packing_attn_implementation=lambda **kwargs: None,
+        build=lambda **kwargs: SimpleNamespace(dataloader="dl", processor="proc"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.vlm_dataloader",
+        property(lambda self: loader_config),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.vlm_validation_dataloader",
+        property(lambda self: None),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
         "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
         lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
@@ -3025,31 +3012,23 @@ class TestChunkVlmMedia:
 
 
 def _make_packing_cfg(pack_size=128):
-    cfg = MagicMock()
-    cfg.pack_size = pack_size
-    cfg.pretokenize = True
-    cfg.max_length = pack_size
-    cfg.get.side_effect = lambda key, default=None: {
-        "pack_size": pack_size,
-        "drop_long_samples": True,
-        "max_packs": None,
-        "packing_ratio": 1.0,
-        "balance_media_tokens": True,
-        "collate_max_length": None,
-        "post_tokenize_hook_fn": None,
-    }.get(key, default)
-    return cfg
+    return ConfigNode(
+        {
+            "pack_size": pack_size,
+            "pretokenize": True,
+            "max_length": pack_size,
+            "drop_long_samples": True,
+            "max_packs": None,
+            "packing_ratio": 1.0,
+            "balance_media_tokens": True,
+            "collate_max_length": None,
+            "post_tokenize_hook_fn": None,
+        }
+    )
 
 
 def _make_dataset_cfg():
-    cfg = MagicMock(spec=["get", "instantiate", "path_or_dataset"])
-    cfg.get.side_effect = lambda key, default=None: {
-        "path_or_dataset": None,
-        "truncate": True,
-    }.get(key, default)
-    cfg.path_or_dataset = None
-    cfg.instantiate.return_value = []
-    return cfg
+    return ConfigNode({"_target_": _test_vlm_dataset, "truncate": True})
 
 
 def _patches_for_packing(neat_pack_side_effect):
@@ -3067,6 +3046,7 @@ def _patches_for_packing(neat_pack_side_effect):
             "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
             side_effect=neat_pack_side_effect,
         ),
+        patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", return_value=MagicMock()),
         patch("nemo_automodel.components.models.common.packing.configure_packing"),
         patch(
             "nemo_automodel.components.models.common.packing.get_attn_implementation",
@@ -3095,7 +3075,7 @@ def test_build_dataloader_forwards_get_rope_index_to_packing():
             stack.enter_context(cm)
         build_dataloader(
             _make_dataset_cfg(),
-            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            _vlm_dataloader_cfg(),
             "test/model",
             None,
             None,
@@ -3129,7 +3109,7 @@ def test_build_dataloader_default_get_rope_index_is_none():
             stack.enter_context(cm)
         build_dataloader(
             _make_dataset_cfg(),
-            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            _vlm_dataloader_cfg(),
             "test/model",
             None,
             None,
@@ -3163,7 +3143,7 @@ def _run_build_dataloader_capturing_wrapper(dataset_cfg):
         )
         build_dataloader(
             dataset_cfg,
-            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            _vlm_dataloader_cfg(),
             "test/model",
             None,
             None,
@@ -3182,14 +3162,7 @@ def test_build_dataloader_inject_fake_images_defaults_true():
 
 def test_build_dataloader_forwards_inject_fake_images_false():
     """inject_fake_images=False in dataset cfg must reach PreTokenizedDatasetWrapper."""
-    cfg = MagicMock(spec=["get", "instantiate", "path_or_dataset"])
-    cfg.get.side_effect = lambda key, default=None: {
-        "path_or_dataset": None,
-        "truncate": True,
-        "inject_fake_images": False,
-    }.get(key, default)
-    cfg.path_or_dataset = None
-    cfg.instantiate.return_value = []
+    cfg = ConfigNode({"_target_": _test_vlm_dataset, "truncate": True, "inject_fake_images": False})
 
     wrapper_mock = _run_build_dataloader_capturing_wrapper(cfg)
     assert wrapper_mock.call_args.kwargs["inject_fake_images"] is False

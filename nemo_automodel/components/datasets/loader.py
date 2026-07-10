@@ -406,9 +406,15 @@ _DATASET_CONFIGS: dict[str, str] = {
     ),
     f"{_DATASETS}.vlm.datasets.make_rdr_dataset": f"{_DATASETS}.vlm.datasets.RdrDatasetConfig",
     f"{_DATASETS}.vlm.datasets.make_cord_v2_dataset": f"{_DATASETS}.vlm.datasets.CordV2DatasetConfig",
+    f"{_DATASETS}.vlm.datasets.make_medpix_dataset": f"{_DATASETS}.vlm.datasets.MedPixDatasetConfig",
+    f"{_DATASETS}.vlm.datasets.make_llava_onevision_dataset": (f"{_DATASETS}.vlm.datasets.LlavaOnevisionDatasetConfig"),
+    f"{_DATASETS}.vlm.datasets.make_tulu3_magicoder_text_mix_dataset": (
+        f"{_DATASETS}.vlm.datasets.Tulu3MagicoderTextMixDatasetConfig"
+    ),
     f"{_DATASETS}.vlm.datasets.make_unimm_chat_dataset": f"{_DATASETS}.vlm.datasets.UnimmChatDatasetConfig",
     f"{_DATASETS}.vlm.datasets.make_meta_dataset": f"{_DATASETS}.vlm.datasets.MetaDatasetConfig",
     f"{_DATASETS}.vlm.mock.build_mock_vlm_dataset": f"{_DATASETS}.vlm.mock.MockVlmDatasetConfig",
+    f"{_DATASETS}.audio.datasets.make_cv17_dataset": f"{_DATASETS}.audio.datasets.Cv17DatasetConfig",
 }
 
 
@@ -436,9 +442,7 @@ def make_dataset_config(target: object, kwargs: dict[str, object] | None = None)
             raise TypeError(f"{obj.__name__} got unexpected dataset config field(s): {', '.join(unknown)}")
         return cast(DatasetConfig, obj(**kwargs))
     parameters = inspect.signature(obj).parameters
-    accepts_tokenizer = "tokenizer" in parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
-    )
+    accepts_tokenizer = "tokenizer" in parameters
     return _LegacyDatasetConfig(obj, kwargs, accepts_tokenizer=accepts_tokenizer)
 
 

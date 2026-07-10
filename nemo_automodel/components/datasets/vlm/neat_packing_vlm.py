@@ -428,8 +428,6 @@ class PackedDatasetWrapperConfig:
 
     pack_size: int = 2048
     """Target packed sequence length (after autoregressive shift)."""
-    padding_idx: int = 0
-    """Token ID used for padding packed sequences."""
     max_retries: int = 10
     """Max retries when a sample fails to tokenize during materialization."""
 
@@ -438,6 +436,7 @@ class PackedDatasetWrapperConfig:
         *,
         inner_dataset: "PreTokenizedDatasetWrapper",
         bins: list[list[int]],
+        padding_idx: int,
         get_rope_index: Callable[..., object] | None = None,
     ) -> "PackedDatasetWrapper":
         """Build a :class:`PackedDatasetWrapper` from this config.
@@ -445,13 +444,14 @@ class PackedDatasetWrapperConfig:
         Args:
             inner_dataset: The tokenizing dataset (e.g. ``PreTokenizedDatasetWrapper``).
             bins: Bin assignments from ``greedy_knapsack`` / ``neat_pack_dataset_vlm``.
+            padding_idx: Runtime tokenizer padding token ID.
             get_rope_index: Optional ``model.get_rope_index`` callable for mRoPE support.
         """
         return PackedDatasetWrapper(
             inner_dataset=inner_dataset,
             bins=bins,
             pack_size=self.pack_size,
-            padding_idx=self.padding_idx,
+            padding_idx=padding_idx,
             get_rope_index=get_rope_index,
             max_retries=self.max_retries,
         )
@@ -566,8 +566,6 @@ class NeatPackConfig:
 
     pack_size: int = 2048
     """Target packed sequence length (after autoregressive shift)."""
-    padding_idx: int = 0
-    """Token ID used for padding packed sequences."""
     drop_long_samples: bool = False
     """If ``True``, samples whose estimated length exceeds ``pack_size`` are dropped."""
     max_packs: int | None = None
@@ -576,11 +574,16 @@ class NeatPackConfig:
     """Knapsack bin fill ratio. Values below 1.0 leave headroom for estimation errors."""
     balance_media_tokens: bool = True
     """If ``True``, use VT-balanced knapsack to distribute visual tokens evenly."""
+    collate_max_length: int | None = None
+    """Optional maximum padded length used by the packed collator."""
+    attn_implementation: str | None = None
+    """Optional packed-mask backend override used only with context parallelism."""
 
     def build(
         self,
         *,
         dataset: "PreTokenizedDatasetWrapper",
+        padding_idx: int,
         ds_raw: torch.utils.data.Dataset | Sequence[dict[str, object]] | None = None,
         get_rope_index: Callable[..., object] | None = None,
         processor: "ProcessorMixin | None" = None,
@@ -589,6 +592,7 @@ class NeatPackConfig:
 
         Args:
             dataset: ``PreTokenizedDatasetWrapper`` for per-sample tokenization.
+            padding_idx: Runtime tokenizer padding token ID.
             ds_raw: Raw conversations dataset for fast length estimation. Falls back to
                 ``len(dataset)`` when ``None``.
             get_rope_index: Optional ``model.get_rope_index`` callable for mRoPE support.
@@ -597,7 +601,7 @@ class NeatPackConfig:
         return neat_pack_dataset_vlm(
             dataset=dataset,
             pack_size=self.pack_size,
-            padding_idx=self.padding_idx,
+            padding_idx=padding_idx,
             drop_long_samples=self.drop_long_samples,
             max_packs=self.max_packs,
             get_rope_index=get_rope_index,
@@ -803,10 +807,9 @@ def neat_pack_dataset_vlm(
     )
 
     # ── Return lazy dataset ──────────────────────────────────────
-    return PackedDatasetWrapper(
+    return PackedDatasetWrapperConfig(pack_size=pack_size).build(
         inner_dataset=dataset,
         bins=bins,
-        pack_size=pack_size,
         padding_idx=padding_idx,
         get_rope_index=get_rope_index,
     )
