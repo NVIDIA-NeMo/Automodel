@@ -86,6 +86,27 @@ def contiguous_local_indices(cp_mesh, padded_seq_len: int, device: torch.device 
     return torch.arange(start, start + local_len, device=device, dtype=torch.long)
 
 
+def identity_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
+    """Global positions owned by this rank when CP is inactive: all of them.
+
+    Index map of the ``layout="none"`` sharder, so consumers run the same
+    token-verb code path at cp_size <= 1 (shard/gather become identities).
+    """
+    del cp_mesh
+    return torch.arange(padded_seq_len, device=device, dtype=torch.long)
+
+
+def shard_batch_identity(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id: int = 0):
+    """``CPSharder.shard_batch`` for the ``layout="none"`` sharder: a no-op.
+
+    Returned by the dispatch when no CP prep applies (no active CP mesh, no
+    THD/magi packing), so callers hold a working sharder at every cp_size and
+    need no branches.
+    """
+    del cp_mesh, tp_mesh, loss_mask, padding_token_id
+    return contextlib.nullcontext, batch
+
+
 def round_robin_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
     """Global positions owned by this rank under torch ``context_parallel`` load balancing.
 
@@ -254,7 +275,7 @@ class CPSharder:
 
     def gather_token_tensor(self, cp_mesh, tensor: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
         """Differentiably gather a token-aligned local shard to global order."""
-        padded_seq_len = tensor.shape[seq_dim] * cp_mesh.size()
+        padded_seq_len = tensor.shape[seq_dim] * (cp_mesh.size() if cp_mesh is not None else 1)
         indices = self._indices(cp_mesh, padded_seq_len, tensor.device)
         return gather_token_tensor_by_indices(cp_mesh, tensor, indices, seq_dim=seq_dim)
 

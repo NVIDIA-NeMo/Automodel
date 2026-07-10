@@ -267,7 +267,7 @@ def test_make_cp_batch_and_ctx_use_te_routes_to_te_builder():
     dm = _DM(cp=_FakeMesh(size=2))
     # The TE sharder requests the partition indices alongside the batch.
     with mock.patch.object(cu, "make_cp_batch_for_te", return_value=(sentinel, None)) as te:
-        ctx, out = cu.make_cp_batch_and_ctx(dm, {"input_ids": torch.zeros(1, 4, dtype=torch.long)}, use_te=True)
+        ctx, out, _ = cu.make_cp_batch_and_ctx(dm, {"input_ids": torch.zeros(1, 4, dtype=torch.long)}, use_te=True)
     te.assert_called_once()
     assert te.call_args.kwargs["return_local_indices"] is True
     assert out is sentinel

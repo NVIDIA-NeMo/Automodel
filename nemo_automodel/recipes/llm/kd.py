@@ -366,7 +366,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
         labels = batch.pop("labels")
         # KD has not wired model-owned CP; skip the pre-embed hook explicitly.
-        train_ctx, batch = prepare_cp_forward(
+        train_ctx, batch, _ = prepare_cp_forward(
             self.model_parts[0], self.device_mesh, batch, loss_mask=labels, invoke_pre_embed=False
         )
 
@@ -452,7 +452,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             for k, v in batch.items()
         }
         # KD has not wired model-owned CP; skip the pre-embed hook explicitly.
-        train_ctx, batch = prepare_cp_forward(
+        train_ctx, batch, _ = prepare_cp_forward(
             self.model_parts[0],
             self.device_mesh,
             batch,

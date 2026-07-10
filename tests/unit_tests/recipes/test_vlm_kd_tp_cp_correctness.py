@@ -169,7 +169,7 @@ def test_vlm_kd_cp_prepare_feeds_student_inputs_embeds_to_cp_and_teacher(monkeyp
 
     def fake_make_cp_batch_and_ctx(device_mesh, batch, *args, **kwargs):
         make_cp_calls.append((device_mesh, dict(batch)))
-        return nullcontext, batch
+        return nullcontext, batch, None
 
     monkeypatch.setattr(cp_utils_mod, "make_cp_batch_and_ctx", fake_make_cp_batch_and_ctx)
 
@@ -210,7 +210,7 @@ def test_vlm_kd_cp_rejects_teacher_student_hidden_size_mismatch(monkeypatch):
     # sharding is allowed to proceed; only the mismatch error must fire.
     from contextlib import nullcontext
 
-    monkeypatch.setattr(cp_utils_mod, "make_cp_batch_and_ctx", lambda device_mesh, batch, *a, **k: (nullcontext, batch))
+    monkeypatch.setattr(cp_utils_mod, "make_cp_batch_and_ctx", lambda device_mesh, batch, *a, **k: (nullcontext, batch, None))
 
     student = _StudentVLM(hidden_size=8)
     teacher = _TeacherVLM(hidden_size=12)

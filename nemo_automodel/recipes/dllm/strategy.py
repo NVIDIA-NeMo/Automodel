@@ -701,7 +701,7 @@ class DFlashStrategy(DLLMStrategy):
             torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )
         fp8_ctx = recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
-        train_ctx, _ = make_cp_batch_and_ctx(recipe.device_mesh, {})
+        train_ctx, _, _ = make_cp_batch_and_ctx(recipe.device_mesh, {})
 
         with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
             draft_kwargs = dict(

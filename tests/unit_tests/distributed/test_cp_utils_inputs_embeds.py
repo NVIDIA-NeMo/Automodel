@@ -190,7 +190,7 @@ def test_inputs_embeds_no_op_when_cp_size_le_1():
     inputs_embeds = torch.randn(1, 4, 8)
     batch = {"inputs_embeds": inputs_embeds, "labels": torch.zeros(1, 4, dtype=torch.long)}
 
-    ctx, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch)
+    ctx, new_batch, _ = _cu.make_cp_batch_and_ctx(device_mesh, batch)
     assert ctx is contextlib.nullcontext
     assert new_batch is batch
     # Must NOT inject position_ids when CP is off

@@ -234,7 +234,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             for k, v in batch.items()
         }
 
-        train_ctx, batch = prepare_cp_forward(
+        train_ctx, batch, _ = prepare_cp_forward(
             self.model_parts[0],
             self.device_mesh,
             batch,

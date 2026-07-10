@@ -21,7 +21,9 @@ from torch.distributed.device_mesh import DeviceMesh
 from nemo_automodel.components.distributed.cp_sharder import (
     CPSharder,
     captured_token_indices,
+    identity_local_indices,
     round_robin_local_indices,
+    shard_batch_identity,
     shard_batch_load_balanced,
 )
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
@@ -338,7 +340,9 @@ def prepare_cp_forward(
             False for PP stages without embeddings and for KD paths that never
             wired model-owned CP.
     Returns:
-        ``(ctx_factory, batch)``.
+        ``(ctx_factory, batch, sharder)`` — the resolved :class:`CPSharder`
+        (the ``layout="none"`` identity when no CP prep applies), whose token
+        verbs keep per-token tensors aligned with the sharded inputs.
     """
 
     magi_enabled = magi is not None and getattr(magi, "enabled", False)
@@ -390,14 +394,16 @@ def _resolve_cp_sharder(
     num_chunks: int,
     seq_lens_padding_value: int,
     model,
-) -> Optional[CPSharder]:
-    """Resolve the CPSharder for this forward: model-owned > magi > TE > generic.
+) -> CPSharder:
+    """Resolve the CPSharder for this forward: model-owned > magi > TE > generic > none.
 
-    Returns None when no CP prep applies. The model-owned and generic torch
-    ``context_parallel`` paths only shard at cp_size > 1; magi and TE stay
-    active at cp_size <= 1 (THD packing conversion / mask-spec activation), so
-    they resolve regardless of mesh size. The magi and THD token layouts depend
-    on batch content (``cu_seqlens`` partitioning / dispatch solver), not just
+    Always returns a sharder: when no CP prep applies, the ``layout="none"``
+    identity sharder, so callers hold working token verbs at every cp_size and
+    need no branches. The model-owned and generic torch ``context_parallel``
+    paths only shard at cp_size > 1; magi and TE stay active at cp_size <= 1
+    (THD packing conversion / mask-spec activation), so they resolve regardless
+    of mesh size. The magi and THD token layouts depend on batch content
+    (``cu_seqlens`` partitioning / dispatch solver), not just
     ``(cp_mesh, seq_len)``, so their sharders construct without
     ``local_token_global_indices`` and install the index map computed during
     ``shard_batch`` (token verbs raise before the first shard).
@@ -462,7 +468,11 @@ def _resolve_cp_sharder(
             layout="round_robin",
         )
 
-    return None
+    return CPSharder(
+        shard_batch=shard_batch_identity,
+        local_token_global_indices=identity_local_indices,
+        layout="none",
+    )
 
 
 def make_cp_batch_and_ctx(
@@ -495,11 +505,13 @@ def make_cp_batch_and_ctx(
         batch (Dict[str, torch.Tensor]): The input batch containing (string, torch.Tensor)
 
     Returns:
-        tuple (contextmanager, dict[str, torch.Tensor]): The forward context
-        factory (nullcontext when the backend owns its transport or CP is
-        inactive) and the prepared/sharded batch.
+        tuple (contextmanager, dict[str, torch.Tensor], CPSharder): The forward
+        context factory (nullcontext when the backend owns its transport or CP
+        is inactive), the prepared/sharded batch, and the resolved sharder —
+        callers use its token verbs (``shard_token_tensor`` /
+        ``gather_token_tensor``) to keep per-token tensors aligned with the
+        sharded inputs.
     """
-    from contextlib import nullcontext
 
     def _get_submesh(device_mesh, name):
         if name in getattr(device_mesh, "mesh_dim_names", {}):
@@ -518,9 +530,8 @@ def make_cp_batch_and_ctx(
         seq_lens_padding_value=seq_lens_padding_value,
         model=model,
     )
-    if sharder is None:
-        return nullcontext, batch
-    return sharder.shard_batch(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
+    ctx, batch = sharder.shard_batch(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
+    return ctx, batch, sharder
 
 
 def make_cp_batch_for_te(

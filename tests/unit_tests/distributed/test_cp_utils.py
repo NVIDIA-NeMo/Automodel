@@ -124,7 +124,7 @@ def test_make_cp_batch_and_ctx_no_mesh():
         "labels": labels,
     }
 
-    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(None, batch, loss_mask=None)
+    ctx_obj, new_batch, _ = _cu.make_cp_batch_and_ctx(None, batch, loss_mask=None)
 
     # Expect the nullcontext *class* (not an instantiated object)
     assert ctx_obj is contextlib.nullcontext
@@ -149,7 +149,7 @@ def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
         "labels": labels,
     }
 
-    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask, cp_sharder=_contiguous_sharder())
+    ctx_obj, new_batch, _ = _cu.make_cp_batch_and_ctx(device_mesh, batch, loss_mask, cp_sharder=_contiguous_sharder())
 
     assert ctx_obj is contextlib.nullcontext
 
@@ -204,7 +204,7 @@ def test_make_cp_batch_and_ctx_mm_token_type_ids_do_not_select_manual(monkeypatc
         "mm_token_type_ids": torch.tensor([[0, 1, 1, 0]]),
     }
 
-    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
+    ctx_obj, new_batch, _ = _cu.make_cp_batch_and_ctx(device_mesh, batch, padding_token_id=99)
 
     assert ctx_obj is contextlib.nullcontext
     assert calls["cp_context"] == "cp_ctx"
@@ -279,7 +279,7 @@ def test_make_cp_batch_and_ctx_3d_mrope_position_ids(monkeypatch):
         "position_ids": position_ids_3d,
     }
 
-    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, cp_sharder=_contiguous_sharder())
+    ctx_obj, new_batch, _ = _cu.make_cp_batch_and_ctx(device_mesh, batch, cp_sharder=_contiguous_sharder())
 
     assert ctx_obj is contextlib.nullcontext
     assert new_batch["position_ids"].shape == (3, 1, 4)
@@ -328,7 +328,7 @@ def test_make_cp_batch_and_ctx_pops_attention_mask_when_cp_enabled(monkeypatch):
         "attention_mask": torch.ones(1, 3, dtype=torch.long),
     }
 
-    _ctx, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch)
+    _ctx, new_batch, _ = _cu.make_cp_batch_and_ctx(device_mesh, batch)
 
     assert "attention_mask" not in new_batch, "attention_mask should be removed when CP > 1"
 
@@ -611,7 +611,7 @@ def test_magi_dispatches_at_the_te_rung():
             return ({"prepared": True}, None) if return_local_indices else {"prepared": True}
 
     model = SimpleNamespace()  # no prepare_model_inputs_for_cp -> hook path skipped
-    ctx, batch = _cu.prepare_cp_forward(
+    ctx, batch, _ = _cu.prepare_cp_forward(
         model,
         _DummyDeviceMesh(cp_size=2, tp_size=1),
         {"input_ids": torch.tensor([[1, 2]])},
@@ -626,7 +626,7 @@ def test_magi_dispatches_at_the_te_rung():
     assert (seen["is_thd"], seen["pad"], seen["chunks"]) == (True, 7, 3)
     # magi prep also runs at cp<=1, like the TE path
     seen.clear()
-    _, batch2 = _cu.make_cp_batch_and_ctx(None, {"input_ids": torch.tensor([[1, 2]])}, magi=_FakeMagi())
+    _, batch2, _ = _cu.make_cp_batch_and_ctx(None, {"input_ids": torch.tensor([[1, 2]])}, magi=_FakeMagi())
     assert batch2 == {"prepared": True} and seen["cp_mesh"] is None
 
 
@@ -646,7 +646,7 @@ def test_te_dispatches_through_a_framework_sharder(monkeypatch):
     monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
-    ctx, batch = _cu.make_cp_batch_and_ctx(
+    ctx, batch, _ = _cu.make_cp_batch_and_ctx(
         device_mesh,
         {"input_ids": torch.tensor([[1, 2]])},
         use_te=True,
@@ -661,7 +661,7 @@ def test_te_dispatches_through_a_framework_sharder(monkeypatch):
 
     # THD conversion also runs at cp<=1 (packing at cp=1), like before.
     seen.clear()
-    _, batch2 = _cu.make_cp_batch_and_ctx(None, {"input_ids": torch.tensor([[1, 2]])}, use_te=True)
+    _, batch2, _ = _cu.make_cp_batch_and_ctx(None, {"input_ids": torch.tensor([[1, 2]])}, use_te=True)
     assert batch2 == {"thd": True} and seen["cp_mesh"] is None
 
 
@@ -726,7 +726,7 @@ def test_make_cp_batch_for_te_identity_indices_without_cp():
 
 
 def test_resolve_cp_sharder_layers():
-    """Resolution order: model-owned > magi > TE > generic round-robin > None."""
+    """Resolution order: model-owned > magi > TE > generic round-robin > none."""
     from nemo_automodel.components.distributed.cp_sharder import round_robin_local_indices
 
     cp2 = _DummySubMesh(2)
@@ -742,6 +742,14 @@ def test_resolve_cp_sharder_layers():
     assert generic.layout == "round_robin"
     assert generic.shard_batch is _cu.shard_batch_load_balanced
     assert generic.local_token_global_indices is round_robin_local_indices
-    # no CP prep applies
-    assert _cu._resolve_cp_sharder(None, None, **common) is None
-    assert _cu._resolve_cp_sharder(_DummySubMesh(1), None, **common) is None
+    # no CP prep applies -> the identity sharder, so callers never branch
+    for mesh in (None, _DummySubMesh(1)):
+        none_sharder = _cu._resolve_cp_sharder(mesh, None, **common)
+        assert none_sharder.layout == "none"
+        batch = {"input_ids": torch.tensor([[1, 2, 3]])}
+        ctx, out = none_sharder.shard_batch(mesh, None, batch)
+        assert ctx is contextlib.nullcontext and out is batch
+        # token verbs are identities at cp<=1
+        t = torch.randn(1, 6)
+        assert torch.equal(none_sharder.shard_token_tensor(mesh, t), t)
+        assert none_sharder.gather_token_tensor(mesh, t) is t

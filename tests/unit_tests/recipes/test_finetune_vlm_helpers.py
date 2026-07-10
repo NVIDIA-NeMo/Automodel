@@ -420,7 +420,7 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
 
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-        lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+        lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
@@ -1536,7 +1536,7 @@ class TestForwardBackwardStepPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch = {
@@ -1564,7 +1564,7 @@ class TestForwardBackwardStepPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch_size = 4
@@ -1625,7 +1625,7 @@ class TestForwardBackwardStepPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch_size = 4
@@ -1680,7 +1680,7 @@ class TestForwardBackwardStepPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch_size = 4
@@ -1764,7 +1764,7 @@ class TestForwardBackwardStepPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch_size = 4
@@ -1809,7 +1809,7 @@ class TestForwardBackwardStepPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3]])
@@ -1875,7 +1875,7 @@ class TestForwardBackwardStepPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch_size = 4
@@ -1915,7 +1915,7 @@ class TestForwardBackwardStepPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch_size = 4
@@ -1963,7 +1963,7 @@ class TestForwardBackwardStepPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch = {
@@ -1992,7 +1992,7 @@ class TestForwardBackwardStepPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch = {
@@ -2029,7 +2029,7 @@ class TestForwardBackwardStepPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch = {
@@ -2335,7 +2335,7 @@ class TestForwardBackwardStepNonPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
         monkeypatch.setattr(
             "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
@@ -2382,7 +2382,7 @@ class TestForwardBackwardStepNonPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
         monkeypatch.setattr(
             "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
@@ -2425,7 +2425,7 @@ class TestForwardBackwardStepNonPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
         monkeypatch.setattr(
             "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
@@ -2468,7 +2468,7 @@ class TestForwardBackwardStepNonPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch = {
@@ -2502,7 +2502,7 @@ class TestForwardBackwardStepNonPP:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
-            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch),
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         # Batch with nested dict (like attention_mask dict)

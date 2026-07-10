@@ -795,7 +795,7 @@ class MagiState:
             # cu_seqlens -> the magi attn_func builds the per-document mask.
             # position_ids here are per-document RoPE positions, not stream
             # indices, so no index map is exposed.
-            _, batch = make_cp_batch_and_ctx(
+            _, batch, _ = make_cp_batch_and_ctx(
                 device_mesh, batch, use_te=True, padding_token_id=pad_id, num_chunks=num_chunks
             )
         return nullcontext, batch, local_indices
