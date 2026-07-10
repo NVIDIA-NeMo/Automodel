@@ -22,7 +22,8 @@ import math
 import os
 from pathlib import Path
 
-METRICS = ("loss", "ce_loss", "kd_loss")
+METRICS = ("loss", "ce_loss", "kd_loss", "grad_norm")
+RUN_SETTINGS = ("kd_ratio", "temperature")
 
 
 def _read_trace(path: Path) -> list[dict]:
@@ -30,9 +31,9 @@ def _read_trace(path: Path) -> list[dict]:
     if not rows:
         raise ValueError(f"No metrics found in {path}")
     for row in rows:
-        for metric in (*METRICS, "grad_norm"):
-            if not math.isfinite(float(row[metric])):
-                raise ValueError(f"Non-finite {metric} in {path}: {row}")
+        for field in (*METRICS, *RUN_SETTINGS):
+            if not math.isfinite(float(row[field])):
+                raise ValueError(f"Non-finite {field} in {path}: {row}")
         expected = (1.0 - row["kd_ratio"]) * row["ce_loss"] + row["kd_ratio"] * row["kd_loss"]
         if not math.isclose(row["loss"], expected, rel_tol=0.0, abs_tol=1.0e-5):
             raise ValueError(f"Mixed loss identity failed in {path}: {row}")
@@ -52,6 +53,13 @@ def _compare_pair(
     for baseline_row, candidate_row in zip(baseline, candidate):
         if baseline_row["step"] != candidate_row["step"]:
             raise ValueError(f"{label}: step mismatch: {baseline_row['step']} != {candidate_row['step']}")
+        mismatched_settings = {
+            setting: (baseline_row[setting], candidate_row[setting])
+            for setting in RUN_SETTINGS
+            if float(baseline_row[setting]) != float(candidate_row[setting])
+        }
+        if mismatched_settings:
+            raise ValueError(f"{label} step {baseline_row['step']} has mismatched run settings: {mismatched_settings}")
         comparison = {"layout": label, "step": baseline_row["step"]}
         failed = {}
         for metric in METRICS:

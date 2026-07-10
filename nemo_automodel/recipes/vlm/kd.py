@@ -263,10 +263,14 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
     def _get_separate_teacher_logits(self, batch: dict[str, Any]) -> torch.Tensor:
         """Request teacher logits for one student VLM batch.
 
-        Text tensors such as ``input_ids`` and ``labels`` use shape ``[B, S]``;
-        image/video tensors preserve the processor-defined leading dimensions.
-        Returns full teacher logits ``[B, S, V]`` replicated across the student
-        model replica.
+        Args:
+            batch: Mapping containing ``input_ids`` and ``labels`` as tensors of
+                shape ``[batch, sequence]``. Multimodal tensor leaves may have
+                arbitrary rank and axis order and are transported unchanged.
+
+        Returns:
+            Replicated tensor of shape ``[batch, sequence, vocab]`` containing
+            full teacher logits.
         """
         self.kd_mesh_bridge.broadcast_command(RUN_TEACHER)
         teacher_logits = None
@@ -284,12 +288,14 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         """Run one teacher VLM batch and materialize full logits.
 
         Args:
-            batch: Nested multimodal batch. Text tensors use ``[B, S]``;
-                pixel tensors and grid metadata keep the processor-defined
-                layout consumed by ``VLM_INPUT_KEYS``.
+            batch: Mapping containing ``input_ids`` and ``labels`` as tensors of
+                shape ``[batch, sequence]``. Multimodal tensor leaves may have
+                arbitrary rank and axis order; their model processor owns those
+                layouts.
 
         Returns:
-            Detached full teacher logits ``[B, S, V]`` with CP padding removed.
+            Detached tensor of shape ``[batch, sequence, vocab]`` containing
+            full teacher logits with CP padding removed.
         """
         batch = self.kd_mesh_bridge.move_to_device(batch)
         sequence_length = batch["labels"].shape[1]
@@ -340,10 +346,19 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
     ):
         """Run one student VLM microbatch with KD.
 
-        Text tensors in ``batch`` use shape ``[B, S]`` while multimodal tensors
-        preserve their processor-defined layouts. Teacher and student logits
-        have semantic shape ``[B, S, V]`` and may use local TP/CP layouts inside
-        the step.
+        Args:
+            idx: Zero-based accumulation microbatch index.
+            batch: Mapping containing text tensors of shape
+                ``[batch, sequence]``. Multimodal tensor leaves may have
+                arbitrary rank and axis order.
+            loss_buffer: Output list receiving one detached scalar tensor.
+            num_label_tokens: Valid-label count across the optimizer step.
+            num_batches: Number of accumulation microbatches in the step.
+            is_train: Whether to run backward.
+
+        Teacher and student logits have global shape
+        ``[batch, sequence, vocab]`` and may use local TP/CP layouts inside the
+        step.
         """
         separate_teacher_logits = (
             self._get_separate_teacher_logits(batch) if getattr(self, "separate_meshes", False) else None

@@ -315,7 +315,9 @@ class ModelState:
         Load the state dictionary into the model.
 
         Args:
-            state_dict (dict): State dictionary to load.
+            state_dict: Model state mapping whose tensor values may have arbitrary
+                rank and axis order and retain each parameter or buffer's exact
+                shape and DTensor placement.
             strict: Whether missing or unexpected keys should fail the load.
             broadcast_from_rank0: Whether rank 0 owns the full PEFT state dict.
                 Set to ``False`` when every rank in a model-local process group

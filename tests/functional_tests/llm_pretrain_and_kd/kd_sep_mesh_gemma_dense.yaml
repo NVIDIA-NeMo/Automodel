@@ -22,8 +22,9 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: google/gemma-3-270m
+  pretrained_model_name_or_path: google/gemma-4-E2B-it
   torch_dtype: bfloat16
+  force_hf: true
   attn_implementation: eager
 
 teacher_model:
@@ -77,9 +78,11 @@ optimizer:
 dataset:
   _target_: tests.functional_tests.llm_pretrain_and_kd.kd_separate_mesh_test_utils.make_tiny_kd_dataset
   tokenizer:
-    pretrained_model_name_or_path: google/gemma-3-270m
+    pretrained_model_name_or_path: google/gemma-4-31B-it
   num_samples: 72
-  seq_length: 16
+  seq_length: 32
+  repeat_first_sample: true
+  use_chat_template: true
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -91,7 +94,7 @@ wandb:
   entity: Nemo-automodel
   project: kd_sep_mesh
   name: shared_dense_dp8
-  group: gemma3_270m__gemma4_31b
+  group: gemma4_e2b__gemma4_31b
   job_type: parity
   tags: [kd, shared-mesh, dense-teacher, cw-dfw]
   dir: /workspace/results/kd_sep_mesh/wandb

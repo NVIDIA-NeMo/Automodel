@@ -221,13 +221,14 @@ def unshard_context_parallel_tensor(
 
     Args:
         cp_mesh: One-dimensional context-parallel mesh of size ``C``.
-        tensor: Per-rank tensor whose sequence axis is in PyTorch's
-            load-balanced CP layout. Its local sequence extent is ``S / C``.
+        tensor: Tensor of shape ``[..., local_sequence, ...]`` whose sequence
+            axis is selected by ``seq_dim`` and uses PyTorch's load-balanced CP
+            layout.
         seq_dim: Axis containing the local sequence extent.
 
     Returns:
-        Replicated tensor with the same axis order and full sequence extent
-        ``S`` on ``seq_dim``.
+        Replicated tensor of shape ``[..., sequence, ...]`` with the same axis
+        order and full sequence extent on ``seq_dim``.
     """
     if cp_mesh.size() <= 1:
         return tensor
@@ -249,20 +250,21 @@ def make_cp_batch_and_ctx(
 ):
     """Build a context-parallel context and register sequence-bearing batch tensors.
 
-    ``batch`` must contain exactly one primary sequence tensor: ``input_ids``
-    with shape ``[B, S]`` or ``inputs_embeds`` with shape ``[B, S, H]``, where
-    ``B`` is batch, ``S`` is sequence, and ``H`` is hidden size. ``labels`` has
-    shape ``[B, S]``. Standard ``position_ids`` have shape ``[B, S]`` while
-    multimodal RoPE positions may have shape ``[M, B, S]``. The returned
-    context shards registered sequence axes across the CP mesh and leaves the
-    corresponding batch entries in their per-rank local layout.
+    The returned context shards registered sequence axes across the CP mesh and
+    leaves the corresponding batch entries in their per-rank local layout.
 
     Args:
         device_mesh: Device mesh containing optional ``cp`` and ``tp`` axes.
-        batch: Mapping containing the primary sequence tensor, ``labels``, and
-            optional sequence-aligned tensors. Tensor dtype and device are
+        batch: Mapping containing ``input_ids`` as a tensor of shape
+            ``[batch, sequence]`` or ``inputs_embeds`` as a tensor of shape
+            ``[batch, sequence, hidden]``; ``labels`` as a tensor of shape
+            ``[batch, sequence]``; and optional sequence-aligned tensors.
+            Standard ``position_ids`` have shape ``[batch, sequence]`` and
+            multimodal RoPE positions have shape
+            ``[position_channels, batch, sequence]``. Dtype and device are
             preserved.
-        loss_mask: Optional ``[B, S]`` tensor sharded with the labels.
+        loss_mask: Optional tensor of shape ``[batch, sequence]`` sharded with
+            the labels.
         use_te: Whether to convert the batch to Transformer Engine's packed THD
             layout instead of PyTorch's padded CP layout.
         padding_token_id: Token id used when padding ``input_ids``.
@@ -270,16 +272,15 @@ def make_cp_batch_and_ctx(
         seq_lens_padding_value: Sentinel used for padded sequence lengths in
             the TE path.
         extra_seq_buffers: Additional batch keys mapped to their sequence axis.
-            For example, ``{"teacher_logits": 1}`` registers logits with shape
-            ``[B, S, V]``, where ``V`` is vocabulary size. Floating-point extra
-            buffers are zero-padded when CP divisibility requires padding.
+            For example, ``{"teacher_logits": 1}`` registers a tensor of shape
+            ``[batch, sequence, vocab]``. Floating-point extra buffers are
+            zero-padded when CP divisibility requires padding.
 
     Returns:
         A pair of ``(context_factory, batch)``. Calling ``context_factory()``
         enters the CP region. Registered tensors retain their semantic axis
-        order with per-rank local sequence extent ``S / C`` while inside the
-        context, where ``C`` is CP size. With CP size one, the batch is returned
-        unchanged.
+        order with a per-rank ``local_sequence`` extent while inside the context.
+        With CP size one, the batch is returned unchanged.
     """
     from contextlib import nullcontext
 

@@ -481,6 +481,29 @@ def _build_unpacked_gemma4_causal_mask_mapping(
     *,
     is_training: bool,
 ) -> dict[str, torch.Tensor]:
+    """Build full and sliding masks for an unpacked Gemma4 batch.
+
+    Args:
+        config: Gemma4 text configuration consumed by Transformers mask builders.
+        inputs_embeds: Tensor of shape ``[batch, sequence, hidden]`` containing
+            input embeddings.
+        attention_mask: Optional tensor of shape ``[batch, sequence]`` for token
+            masks or ``[batch, 1, query, key]`` for additive masks.
+        past_key_values: Optional Transformers cache for the same batch.
+        position_ids: Optional tensor of shape ``[batch, sequence]`` containing
+            token positions.
+        mm_token_type_ids: Optional tensor of shape ``[batch, sequence]``
+            containing multimodal token types.
+        pixel_values: Optional tensor of shape
+            ``[images, channels, height, width]`` containing image pixels. It is
+            forwarded only to the legacy Gemma4 mask builder.
+        is_training: Whether the owning model is in training mode.
+
+    Returns:
+        Mapping from ``full_attention`` and ``sliding_attention`` to tensors of
+        shape ``[batch, 1, query, key]`` or equivalent block masks produced by
+        the active Transformers implementation.
+    """
     from transformers.models.gemma4 import modeling_gemma4
 
     legacy_mask_mapping = getattr(modeling_gemma4, "create_causal_mask_mapping", None)

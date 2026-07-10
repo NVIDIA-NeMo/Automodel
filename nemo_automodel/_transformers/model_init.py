@@ -374,8 +374,8 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path, process_gr
             snapshot_download(pretrained_model_name_or_path)
 
 
-def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs):
-    """Fully populate HF's dynamic-module (custom code) cache on global rank 0 first.
+def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs, process_group=None):
+    """Fully populate HF's dynamic-module cache on the model-local rank 0 first.
 
     ``get_cached_module_file`` copies a custom-code file plus its *direct* relative
     imports, but ``get_class_in_module`` later validates the *transitive* closure. A
@@ -403,7 +403,7 @@ def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwa
             if isinstance(ref, str) and "." in ref:
                 module_files.add(ref.rsplit(".", 1)[0] + ".py")
     src_py = glob.glob(os.path.join(src_dir, "*.py"))
-    with dist_utils.FirstRankPerNode():
+    with dist_utils.FirstRankPerNode(group=process_group):
         for module_file in module_files:
             try:
                 cached = get_cached_module_file(src_dir, module_file)
@@ -934,7 +934,7 @@ def __init_model(
     # 3. fallback to HF model class wrapped with mixin
     model = None
     # Serialize HF custom-code cache population across ranks to avoid a partial-copy race.
-    _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs)
+    _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs, process_group=process_group)
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
         _setup_bnb_loading_kwargs(kwargs)

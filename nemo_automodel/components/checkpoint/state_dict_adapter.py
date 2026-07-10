@@ -73,5 +73,14 @@ class StateDictAdapter(ABC):
         pass
 
     def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
-        """Return the Hugging Face keys produced by ``to_hf``."""
+        """Return the Hugging Face keys produced by ``to_hf``.
+
+        Args:
+            state_dict: Native model state mapping. Tensor values may have
+                arbitrary rank and axis order and retain their exact parameter
+                or buffer layouts.
+
+        Returns:
+            Hugging Face state-dict keys in adapter iteration order.
+        """
         return list(self.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=False))

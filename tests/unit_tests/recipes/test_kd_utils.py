@@ -22,6 +22,59 @@ import torch.multiprocessing as mp
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.recipes import kd_utils
+from tests.functional_tests.llm_pretrain_and_kd.compare_kd_sep_mesh_losses import _compare_pair
+from tests.functional_tests.llm_pretrain_and_kd.kd_separate_mesh_test_utils import TinyKDDataset
+
+
+def test_tiny_kd_dataset_requests_flat_chat_template_token_ids():
+    class Tokenizer:
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, return_dict):
+            assert messages == [
+                {"role": "user", "content": "Explain knowledge distillation and distributed validation."}
+            ]
+            assert tokenize is True
+            assert add_generation_prompt is True
+            assert return_dict is False
+            return [10, 11, 12, 13]
+
+        def encode(self, text, *, add_special_tokens):
+            assert text.startswith("Knowledge distillation")
+            assert add_special_tokens is False
+            return list(range(20, 84))
+
+    dataset = TinyKDDataset(Tokenizer(), num_samples=1, seq_length=8, use_chat_template=True)
+
+    assert dataset[0]["input_ids"] == [10, 11, 12, 13, 20, 21, 22, 23]
+    assert dataset[0]["labels"] == [-100, -100, -100, 20, 21, 22, 23, 24]
+
+
+def test_tiny_kd_dataset_preserves_non_chat_first_label_mask():
+    class Tokenizer:
+        def encode(self, text, *, add_special_tokens):
+            assert text.startswith("Knowledge distillation")
+            assert add_special_tokens is True
+            return list(range(64))
+
+    dataset = TinyKDDataset(Tokenizer(), num_samples=1, seq_length=8)
+
+    assert dataset[0]["input_ids"] == list(range(8))
+    assert dataset[0]["labels"] == [-100, 2, 3, 4, 5, 6, 7, 8]
+
+
+def test_loss_comparator_rejects_mismatched_kd_settings():
+    baseline = {
+        "step": 0,
+        "loss": 1.0,
+        "ce_loss": 1.0,
+        "kd_loss": 1.0,
+        "grad_norm": 1.0,
+        "kd_ratio": 0.5,
+        "temperature": 1.0,
+    }
+    candidate = baseline | {"temperature": 2.0}
+
+    with pytest.raises(ValueError, match="mismatched run settings"):
+        _compare_pair("teacher_tp2", [baseline], [candidate], 0.01, 0.01)
 
 
 def test_materialize_teacher_logits_unshards_cp_and_removes_padding(monkeypatch):
@@ -37,7 +90,18 @@ def test_materialize_teacher_logits_unshards_cp_and_removes_padding(monkeypatch)
     local = torch.tensor([[[1.0], [2.0]]])
 
     def unshard(mesh, tensor, *, seq_dim):
-        """Expand local ``[B=1, S_local=2, V=1]`` logits to full sequence."""
+        """Expand local logits to the full sequence.
+
+        Args:
+            mesh: Mock context-parallel mesh.
+            tensor: Tensor of shape ``[batch=1, local_sequence=2, vocab=1]``
+                containing local logits.
+            seq_dim: Sequence axis, which must be one.
+
+        Returns:
+            Tensor of shape ``[batch=1, sequence=4, vocab=1]`` containing full
+            logits.
+        """
         assert mesh is cp_mesh
         assert tensor is local
         assert seq_dim == 1
@@ -141,7 +205,15 @@ def test_separate_kd_setup_rejects_ddp(monkeypatch):
 
 
 def _teacher_logits(input_ids: torch.Tensor) -> torch.Tensor:
-    """Return deterministic logits ``[B, S, V=3]`` for ids ``[B, S]``."""
+    """Return deterministic teacher logits.
+
+    Args:
+        input_ids: Tensor of shape ``[batch, sequence]`` containing token ids.
+
+    Returns:
+        Tensor of shape ``[batch, sequence, vocab]`` containing logits with
+        ``vocab = 3``.
+    """
     values = input_ids.float()
     return torch.stack((values * 0.5, values * -0.25 + 1.0, values * 0.125 - 0.5), dim=-1)
 

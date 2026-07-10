@@ -230,6 +230,17 @@ class Gemma4MoEStateDictAdapter(StateDictAdapter):
         return hf_state_dict
 
     def get_hf_state_dict_keys(self, state_dict: dict[str, Any]) -> list[str]:
+        """Return converted keys without gathering real expert weights.
+
+        Args:
+            state_dict: Native Gemma4 state mapping. Expert tensors have shape
+                ``[local_experts, hidden, 2 * expert_hidden]`` for fused gate-up
+                weights or ``[local_experts, expert_hidden, hidden]`` for down
+                weights. Other tensor values retain their model-owned layouts.
+
+        Returns:
+            Hugging Face state-dict keys in adapter iteration order.
+        """
         meta_state_dict = {
             key: torch.empty_like(value, device="meta") if isinstance(value, torch.Tensor) else value
             for key, value in state_dict.items()

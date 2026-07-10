@@ -179,12 +179,13 @@ def _build_teacher_model_with_pp(
         """Capture one teacher PP microbatch.
 
         Args:
-            logits: Last-stage teacher logits ``[B_m, S, V]``, where ``B_m``
-                is pipeline microbatch, ``S`` is sequence, and ``V`` is vocab.
-            target: Labels ``[B_m, S]`` supplied by the schedule and unused here.
+            logits: Tensor of shape ``[microbatch, sequence, vocab]`` containing
+                last-stage teacher logits.
+            target: Tensor of shape ``[microbatch, sequence]`` containing labels
+                supplied by the schedule and unused here.
             **kwargs: Schedule-owned scalar or tensor metadata ignored by the
-                capture path. Tensor metadata, when present, follows the same
-                microbatch axis as ``logits``.
+                capture path. Tensor values may have arbitrary rank and axis
+                order and are not inspected.
 
         Returns:
             Scalar zero tensor on the same dtype and device as ``logits``.
@@ -403,12 +404,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             """Combine CE and KD for one student PP microbatch.
 
             Args:
-                logits: Student logits ``[B_m, S, V]`` or local TP shard
-                    ``[B_m, S, V_local]``.
-                target: Labels ``[B_m, S]`` with ``-100`` ignored.
+                logits: Tensor of global shape
+                    ``[microbatch, sequence, vocab]`` containing student logits.
+                    Under TP, the local tensor has shape
+                    ``[microbatch, sequence, local_vocab]`` with ``Shard(-1)``.
+                target: Tensor of shape ``[microbatch, sequence]`` containing
+                    labels with ``-100`` ignored.
                 **kwargs: Pipeline schedule scalar or tensor metadata. Tensor
-                    metadata, when present, follows the same microbatch axis as
-                    ``logits``.
+                    values may have arbitrary rank and axis order and are not
+                    inspected.
 
             Returns:
                 Scalar mixed CE/KD loss for the microbatch.
@@ -453,9 +457,14 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
     def _get_separate_teacher_logits(self, batch: dict[str, Any]) -> torch.Tensor:
         """Request teacher logits for one student batch.
 
-        ``batch`` contains sequence tensors such as ``input_ids`` and ``labels``
-        with shape ``[B, S]`` plus optional nested tensor metadata. Returns full
-        teacher logits ``[B, S, V]`` replicated across the student replica.
+        Args:
+            batch: Mapping containing ``input_ids`` and ``labels`` as tensors of
+                shape ``[batch, sequence]``. Other tensor leaves may have
+                arbitrary rank and axis order and are transported unchanged.
+
+        Returns:
+            Replicated tensor of shape ``[batch, sequence, vocab]`` containing
+            full teacher logits.
         """
         self.kd_mesh_bridge.broadcast_command(RUN_TEACHER)
         teacher_logits = None
@@ -473,13 +482,14 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         """Run one teacher batch and materialize transport-ready logits.
 
         Args:
-            batch: Nested batch with ``input_ids`` and ``labels`` shaped
-                ``[B, S]`` plus optional model inputs. Tensors may initially
-                reside on CPU.
+            batch: Mapping containing ``input_ids`` and ``labels`` as tensors of
+                shape ``[batch, sequence]``. Other tensor leaves may have
+                arbitrary rank and axis order. Tensors may initially reside on
+                CPU.
 
         Returns:
-            Full detached teacher logits ``[B, S, V]`` on the teacher output
-            rank, otherwise ``None`` for PP ranks without the final stage.
+            Detached tensor of shape ``[batch, sequence, vocab]`` on the teacher
+            output rank, otherwise ``None`` for PP ranks without the final stage.
         """
         batch = self.kd_mesh_bridge.move_to_device(batch)
         sequence_length = batch["labels"].shape[1]
@@ -561,9 +571,17 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
     ):
         """Run one non-PP student microbatch with KD.
 
-        ``batch`` contains ``input_ids`` and ``labels`` shaped ``[B, S]`` plus
-        optional model tensors. Teacher and student logits have semantic shape
-        ``[B, S, V]`` and may use local TP/CP layouts inside the step.
+        Args:
+            idx: Zero-based accumulation microbatch index.
+            batch: Mapping containing ``input_ids`` and ``labels`` as tensors of
+                shape ``[batch, sequence]``. Other tensor leaves may have
+                arbitrary rank and axis order.
+            num_label_tokens: Valid-label count across the optimizer step.
+            num_batches: Number of accumulation microbatches in the step.
+            is_train: Whether to run backward.
+
+        Returns:
+            Tuple of scalar tensors containing detached mixed, KL, and CE loss.
         """
         if self.pp_enabled:
             raise RuntimeError(
@@ -665,9 +683,18 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         Teacher logits from the last PP stage are stored in ``self._current_teacher_logits``
         before the student schedule runs, so ``pp_kd_loss_fn`` can read them.
 
-        ``batch`` contains ``input_ids`` and ``labels`` shaped ``[B, S]`` plus
-        optional model tensors. Transported teacher logits have shape
-        ``[B, S, V]`` and are split into ``[B_m, S, V]`` PP microbatches.
+        Args:
+            idx: Zero-based accumulation microbatch index.
+            batch: Mapping containing ``input_ids`` and ``labels`` as tensors of
+                shape ``[batch, sequence]``. Other tensor leaves may have
+                arbitrary rank and axis order.
+            loss_buffer: Output list receiving one detached scalar tensor.
+            num_label_tokens: Valid-label count across the optimizer step.
+            num_batches: Number of accumulation microbatches in the step.
+            is_train: Whether the pipeline schedule runs backward.
+
+        Transported teacher logits have shape ``[batch, sequence, vocab]`` and
+        are split into ``[microbatch, sequence, vocab]`` pipeline tensors.
         """
         separate_teacher_logits = (
             self._get_separate_teacher_logits(batch) if getattr(self, "separate_meshes", False) else None

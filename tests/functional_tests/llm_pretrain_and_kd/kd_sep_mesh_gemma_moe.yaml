@@ -3,7 +3,7 @@ recipe: KnowledgeDistillationRecipeForNextTokenPrediction
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 1
+  global_batch_size: 8
   local_batch_size: 1
   max_steps: 3
   num_epochs: 1
@@ -22,8 +22,9 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: google/gemma-3-270m
+  pretrained_model_name_or_path: google/gemma-4-E2B-it
   torch_dtype: bfloat16
+  force_hf: true
   attn_implementation: eager
 
 teacher_model:
@@ -31,25 +32,15 @@ teacher_model:
   pretrained_model_name_or_path: google/gemma-4-26B-A4B-it
   torch_dtype: bfloat16
   trust_remote_code: true
+  force_hf: true
   attn_implementation: eager
-  backend:
-    _target_: nemo_automodel.components.models.common.BackendConfig
-    attn: sdpa
-    linear: torch
-    rms_norm: torch
-    rope_fusion: false
-    experts: torch_mm
-    dispatcher: torch
-    fake_balanced_gate: false
-    enable_hf_state_dict_adapter: true
-    enable_fsdp_optimizations: true
 
 offload_teacher_model: false
 separate_meshes: false
 
 distributed:
   strategy: fsdp2
-  dp_size: 1
+  dp_size: 8
   tp_size: 1
   cp_size: 1
   pp_size: 1
@@ -89,10 +80,11 @@ optimizer:
 dataset:
   _target_: tests.functional_tests.llm_pretrain_and_kd.kd_separate_mesh_test_utils.make_tiny_kd_dataset
   tokenizer:
-    pretrained_model_name_or_path: google/gemma-3-270m
-  num_samples: 8
-  seq_length: 16
+    pretrained_model_name_or_path: google/gemma-4-26B-A4B-it
+  num_samples: 24
+  seq_length: 32
   repeat_first_sample: true
+  use_chat_template: true
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -103,8 +95,8 @@ dataloader:
 wandb:
   entity: Nemo-automodel
   project: kd_sep_mesh
-  name: shared_moe_custom_dp1
-  group: gemma3_270m__gemma4_26b_a4b
+  name: shared_moe_hf_dp8
+  group: gemma4_e2b__gemma4_26b_a4b
   job_type: parity
   tags: [kd, shared-mesh, moe-teacher, cw-dfw]
   dir: /workspace/results/kd_sep_mesh/wandb

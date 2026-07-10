@@ -26,7 +26,15 @@ from nemo_automodel.recipes.kd_utils import RUN_TEACHER, KDMeshBridge, create_kd
 
 
 def _teacher_logits(input_ids: torch.Tensor) -> torch.Tensor:
-    """Return deterministic logits ``[B, S, V=3]`` for ids ``[B, S]``."""
+    """Return deterministic teacher logits.
+
+    Args:
+        input_ids: Tensor of shape ``[batch, sequence]`` containing token ids.
+
+    Returns:
+        Tensor of shape ``[batch, sequence, vocab]`` containing logits with
+        ``vocab = 3``.
+    """
     values = input_ids.float()
     return torch.stack((values * 0.5, values * -0.25 + 1.0, values * 0.125 - 0.5), dim=-1)
 

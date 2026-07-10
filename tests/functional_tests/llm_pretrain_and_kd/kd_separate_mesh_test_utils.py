@@ -24,7 +24,14 @@ from torch.utils.data import Dataset
 class TinyKDDataset(Dataset):
     """Small deterministic next-token dataset built from natural text."""
 
-    def __init__(self, tokenizer, num_samples: int = 16, seq_length: int = 8, repeat_first_sample: bool = False):
+    def __init__(
+        self,
+        tokenizer,
+        num_samples: int = 16,
+        seq_length: int = 8,
+        repeat_first_sample: bool = False,
+        use_chat_template: bool = False,
+    ) -> None:
         corpus = (
             "Knowledge distillation trains a compact student model to reproduce useful behavior from a larger "
             "teacher model. The student reads ordinary text, predicts the next token, and learns from both the "
@@ -37,7 +44,18 @@ class TinyKDDataset(Dataset):
             "the source of the discrepancy is understood. Reproducible tests record model versions, cluster topology, "
             "container images, and exact metrics so another engineer can independently verify the result."
         )
-        token_ids = tokenizer.encode(corpus, add_special_tokens=True)
+        if use_chat_template:
+            prompt_ids = tokenizer.apply_chat_template(
+                [{"role": "user", "content": "Explain knowledge distillation and distributed validation."}],
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=False,
+            )
+            token_ids = prompt_ids + tokenizer.encode(corpus, add_special_tokens=False)
+            first_supervised_token = len(prompt_ids)
+        else:
+            token_ids = tokenizer.encode(corpus, add_special_tokens=True)
+            first_supervised_token = 2
         if len(token_ids) <= seq_length:
             raise ValueError(f"Natural-text fixture produced only {len(token_ids)} tokens for seq_length={seq_length}")
 
@@ -47,7 +65,9 @@ class TinyKDDataset(Dataset):
             window = token_ids[start : start + seq_length + 1]
             input_ids = window[:-1]
             labels = window[1:]
-            labels[0] = -100
+            masked_label_count = max(0, min(first_supervised_token - start - 1, len(labels)))
+            for label_index in range(masked_label_count):
+                labels[label_index] = -100
             self.samples.append({"input_ids": input_ids, "labels": labels})
 
     def __getitem__(self, index: int) -> dict[str, list[int]]:
@@ -58,7 +78,11 @@ class TinyKDDataset(Dataset):
 
 
 def make_tiny_kd_dataset(
-    tokenizer=None, num_samples: int = 16, seq_length: int = 8, repeat_first_sample: bool = False
+    tokenizer=None,
+    num_samples: int = 16,
+    seq_length: int = 8,
+    repeat_first_sample: bool = False,
+    use_chat_template: bool = False,
 ) -> TinyKDDataset:
     """Build the deterministic tokenizer-encoded test dataset."""
     if tokenizer is None:
@@ -68,6 +92,7 @@ def make_tiny_kd_dataset(
         num_samples=num_samples,
         seq_length=seq_length,
         repeat_first_sample=repeat_first_sample,
+        use_chat_template=use_chat_template,
     )
 
 

@@ -68,12 +68,8 @@ def _barrier_with_timeout(timeout: timedelta, group: dist.ProcessGroup | None = 
         return True
 
     if group is not None:
-        try:
-            dist.barrier(group=group)
-            return True
-        except Exception as e:
-            logger.warning(f"Barrier failed: {e}")
-            return False
+        dist.barrier(group=group)
+        return True
 
     # Use Gloo group for barrier operations
     gloo_group = _create_gloo_group()
