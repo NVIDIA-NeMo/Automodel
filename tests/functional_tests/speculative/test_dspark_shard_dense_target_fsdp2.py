@@ -33,7 +33,6 @@ Requires 2 GPUs (FlexAttention has no CPU backward); spawns its own NCCL ranks.
 """
 
 import os
-import socket
 
 import pytest
 import torch
@@ -114,17 +113,13 @@ def _capture(wrapper: HFDSparkTargetModel, input_ids: torch.Tensor):
     return wrapper.generate_batch(input_ids=input_ids, attention_mask=ones, loss_mask=ones)
 
 
-def _rank_worker(rank: int, world_size: int, port: int, model_dir: str) -> None:
+def _rank_worker(rank: int, world_size: int, init_file: str, model_dir: str) -> None:
     """One NCCL rank of the sharded dense-target smoke (spawned; must be top-level)."""
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     dtype = torch.bfloat16
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    dist.init_process_group("nccl", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     try:
         # 1. Sharded loading through the same path the recipe uses for
         # shard_dense_target (ConfigNode top-level config, default FSDP2 block).
@@ -209,8 +204,5 @@ def test_shard_dense_target_two_rank_contract(tmp_path):
     model_dir = str(tmp_path / "tiny_qwen3_target")
     AutoModelForCausalLM.from_config(_tiny_config()).to(torch.bfloat16).save_pretrained(model_dir)
 
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-
-    mp.spawn(_rank_worker, args=(_WORLD_SIZE, port, model_dir), nprocs=_WORLD_SIZE, join=True)
+    init_file = str(tmp_path / "dist_init")
+    mp.spawn(_rank_worker, args=(_WORLD_SIZE, init_file, model_dir), nprocs=_WORLD_SIZE, join=True)

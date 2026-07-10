@@ -255,11 +255,8 @@ def _distributed_cfg_to_dict(cfg: Any | None) -> dict:
         return cfg.copy()
     distributed_cfg = getattr(cfg, "distributed", None)
     if distributed_cfg is None:
-        # No ``distributed:`` block on a config object: treat it as an empty (default
-        # FSDP2) configuration rather than raising ``AttributeError``. This lets a caller
-        # that opts into sharding without an explicit block (e.g. dspark
-        # ``shard_dense_target`` on a config that omits ``distributed:``) fall back to the
-        # default mesh.
+        # A config object without a ``distributed:`` block defaults to the empty
+        # (default FSDP2) configuration, matching the dict path above.
         return {}
     return distributed_cfg.to_dict() if hasattr(distributed_cfg, "to_dict") else dict(distributed_cfg)
 

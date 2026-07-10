@@ -357,20 +357,18 @@ class TrainDSparkRecipe(BaseRecipe):
         on more than one rank; otherwise the request is ignored with a warning and the target
         stays replicated.
 
-        Only a pure FSDP2 data-parallel topology is supported: any model-parallel axis
-        (``tp_size`` / ``pp_size`` / ``cp_size`` / ``ep_size`` > 1) raises. DSpark's
-        forward-hook hidden-state capture needs one non-pipelined ``model(...)`` call per
-        rank; with ``pp_size > 1`` AutoModel returns an ``AutoPipeline`` instead of a module,
-        and the other axes are untested for the frozen dense target here.
-
         Raises:
-            ValueError: if ``shard_dense_target`` is requested together with a
-                model-parallel axis (``tp_size``/``pp_size``/``cp_size``/``ep_size`` > 1).
+            ValueError: if ``shard_dense_target`` is requested together with a model-parallel
+                axis (``tp_size``/``pp_size``/``cp_size``/``ep_size`` > 1). DSpark's
+                forward-hook hidden-state capture needs one non-pipelined ``model(...)`` call
+                per rank (``pp_size > 1`` builds an ``AutoPipeline`` instead of a module), and
+                the other axes are untested for the frozen dense target here.
         """
         if not bool(recipe_cfg.get("shard_dense_target", False)):
             return False
         distributed_cfg = self.cfg.get("distributed", None) or {}
-        strategy = distributed_cfg.get("strategy", "fsdp2")
+        # Case-fold to match parse_distributed_section's strategy normalization.
+        strategy = str(distributed_cfg.get("strategy", "fsdp2")).lower()
         if self.dist_env.world_size <= 1 or strategy != "fsdp2":
             if self.dist_env.is_main:
                 logger.warning(
@@ -420,9 +418,6 @@ class TrainDSparkRecipe(BaseRecipe):
         is_glm_5_2_target = target_model_type == _GLM_5_2_MODEL_TYPE
         is_gemma4_target = target_model_type in _GEMMA4_MODEL_TYPES
         is_minimax_m3_target = target_model_type in _MINIMAX_M3_MODEL_TYPES
-        # Set when a dense target is loaded FSDP2-sharded via distributed_setup (opt-in); its
-        # embed_tokens / lm_head then come back as DTensors and need gathering for the draft.
-        dense_target_sharded = False
         self.cached_target_path = recipe_cfg.get("cached_target_path", None)
         is_multimodal = bool(recipe_cfg.get("multimodal", False))
         if is_multimodal and not is_minimax_m3_target:
@@ -576,25 +571,15 @@ class TrainDSparkRecipe(BaseRecipe):
                         self.cfg,
                         world_size=self.dist_env.world_size,
                     )
-                    self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
-                        target_path,
-                        trust_remote_code=trust_remote_code,
-                        torch_dtype=self.compute_dtype,
-                        force_hf=bool(recipe_cfg.get("target_force_hf", False)),
-                        distributed_setup=self.distributed_setup,
-                        **target_kwargs,
-                    )
-                    dense_target_sharded = True
-                    # A distributed-setup-loaded model already lands correctly placed
-                    # (sharded as DTensors); a blanket .to(device) afterward is redundant.
-                else:
-                    self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
-                        target_path,
-                        trust_remote_code=trust_remote_code,
-                        torch_dtype=self.compute_dtype,
-                        force_hf=bool(recipe_cfg.get("target_force_hf", False)),
-                        **target_kwargs,
-                    )
+                self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
+                    target_path,
+                    trust_remote_code=trust_remote_code,
+                    torch_dtype=self.compute_dtype,
+                    force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+                    distributed_setup=self.distributed_setup,
+                    **target_kwargs,
+                )
+                if self.distributed_setup is None:
                     self.target_model.to(self.device)
             else:
                 self.target_model = None
@@ -790,12 +775,11 @@ class TrainDSparkRecipe(BaseRecipe):
         if embed_src is None or head_src is None:
             embed_src = self.target_wrapper.get_input_embeddings()
             head_src = self.target_wrapper.get_output_embeddings()
-        if (
-            is_deepseek_v4_target or is_glm_5_2_target or is_minimax_m3_target or dense_target_sharded
-        ) and self.cached_target_path is None:
-            # The MoE / VL targets, and an FSDP2-sharded dense target, store embed_tokens /
-            # lm_head as expert-parallel / FSDP-sharded DTensors; gather them to full tensors
-            # before the draft copies them.
+        if self.distributed_setup is not None:
+            # Every distributed-setup-loaded target (MoE / VL / sharded dense) stores
+            # embed_tokens / lm_head as expert-parallel / FSDP-sharded DTensors; gather
+            # them to full tensors before the draft copies them. The offline cached path
+            # never builds a distributed setup, so it is excluded by construction.
             embed_src = gather_full_weight_module(embed_src)
             head_src = gather_full_weight_module(head_src)
         self.draft_model.initialize_embeddings_and_head(
