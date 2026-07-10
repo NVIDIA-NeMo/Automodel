@@ -142,6 +142,71 @@ def test_sharder_default_shard_token_tensor_uses_indices():
     torch.testing.assert_close(local, full[:, 4:])
 
 
+def test_shard_batch_contiguous_records_shard_facts():
+    """record_on captures original/padded lengths so the token verbs accept
+    caller-coordinate tensors and reject mismatched ones."""
+    sharder = cs.CPSharder(
+        shard_batch=None,
+        local_token_global_indices=cs.contiguous_local_indices,
+        layout="contiguous",
+    )
+    mesh = _FakeMesh(2, 0)
+    batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
+    cs.shard_batch_contiguous(mesh, None, batch, record_on=sharder)  # pads 6 -> 8
+
+    assert (sharder.original_seq_len, sharder.padded_seq_len) == (6, 8)
+    # down: unpadded tensor auto-pads with the explicit fill, rank 0 owns [0:4]
+    local = sharder.shard_token_tensor(mesh, torch.arange(6.0).unsqueeze(0), fill=-1.0)
+    assert torch.equal(local, torch.tensor([[0.0, 1.0, 2.0, 3.0]]))
+    # the pad_multiple silent-misalignment window is closed: a plausible but
+    # wrong length raises even though it divides cp_size
+    with pytest.raises(ValueError, match="padded_seq_len=8"):
+        sharder.shard_token_tensor(mesh, torch.zeros(1, 4))
+    # up: trim validates the gathered length against the captured facts (no
+    # collective runs in this single-process test, so the gather stays local
+    # and the guard must fire rather than mis-trim)
+    with pytest.raises(ValueError, match="captured padded_seq_len 8"):
+        sharder.gather_token_tensor(mesh, torch.zeros(1, 4), trim=True)
+
+
+def test_sharder_repositioned_layout_round_trips_input_coordinates():
+    """A captured position map (DSV4 packed repad) lets both verbs work in the
+    caller's [B, S_in] coordinates: real tokens land on their repositioned
+    columns and dropped input pad slots come back as fill."""
+    # input row: [a, b, PAD] -> rebuilt row: [a, b, X, X] (doc re-padded to 4)
+    positions = torch.tensor([[0, 1, -1]])
+    sharder = cs.CPSharder(
+        shard_batch=None,
+        local_token_global_indices=cs.contiguous_local_indices,
+        layout="contiguous",
+        original_seq_len=None,
+        padded_seq_len=4,
+        input_token_stream_positions=positions,
+    )
+    mesh = _FakeMesh(2, 0)  # rank 0 owns columns [0:2]
+    local = sharder.shard_token_tensor(mesh, torch.tensor([[10.0, 20.0, 99.0]]), fill=0.0)
+    assert torch.equal(local, torch.tensor([[10.0, 20.0]]))
+    with pytest.raises(ValueError, match="fill"):
+        sharder.shard_token_tensor(mesh, torch.tensor([[10.0, 20.0, 99.0]]))
+
+    # up: gather (identity at cp<=1 here) then map back to input coordinates
+    full_rows = torch.tensor([[10.0, 20.0, 7.0, 7.0]])
+    out = sharder.gather_token_tensor(_FakeMesh(1), full_rows, trim=True, fill=-5.0)
+    assert torch.equal(out, torch.tensor([[10.0, 20.0, -5.0]]))
+    with pytest.raises(ValueError, match="fill"):
+        sharder.gather_token_tensor(_FakeMesh(1), full_rows, trim=True)
+
+
+def test_gather_trim_raises_without_captured_facts():
+    sharder = cs.CPSharder(
+        shard_batch=None,
+        local_token_global_indices=cs.contiguous_local_indices,
+        layout="contiguous",
+    )
+    with pytest.raises(NotImplementedError, match="captured no original-coordinate facts"):
+        sharder.gather_token_tensor(_FakeMesh(1), torch.zeros(1, 4), trim=True)
+
+
 def test_captured_token_indices_validates_stream_length():
     # Captured maps flatten + cast to long, and reject a padded_seq_len that
     # does not match the partition they were captured from.

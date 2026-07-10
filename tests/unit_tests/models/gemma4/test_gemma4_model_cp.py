@@ -608,7 +608,10 @@ def test_prepare_model_inputs_attaches_cp_shard_batch_fn():
     model = Gemma4ForConditionalGeneration(_cfg(enable_moe_block=False), backend=_backend()).to(torch.bfloat16)
     prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[1, 2, 3, 4]])})
     # The model attaches its own bound batch-sharding callable (model-owned install seam).
-    assert prepared["cp_sharder"].shard_batch == model._cp_shard_batch
+    # shard_batch is the model's bound sharding callable, wrapped so it
+    # records its shard facts on the sharder it belongs to.
+    assert prepared["cp_sharder"].shard_batch.func == model._cp_shard_batch
+    assert prepared["cp_sharder"].shard_batch.keywords["record_on"] is prepared["cp_sharder"]
 
 
 # ---------------------------------------------------------------------------

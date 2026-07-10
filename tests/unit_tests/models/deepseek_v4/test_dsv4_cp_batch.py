@@ -354,7 +354,7 @@ def test_repad_packed_inputs_embeds_and_loss_mask_with_1d_lengths():
         "seq_lens_padded": torch.tensor([2]),
     }
 
-    out, loss_mask = cpmod._repad_dsv4_packed_batch(
+    out, loss_mask, _ = cpmod._repad_dsv4_packed_batch(
         batch,
         cp_size=2,
         pad_multiple=2,
@@ -373,6 +373,30 @@ def test_repad_packed_inputs_embeds_and_loss_mask_with_1d_lengths():
         cpmod._pad_1d([7], 3),
         torch.tensor([7, cpmod._SEQ_LENS_PADDING_VALUE, cpmod._SEQ_LENS_PADDING_VALUE]),
     )
+
+
+def test_repad_packed_batch_returns_input_position_map():
+    """The repad emits the input->rebuilt-row position map: real tokens point at
+    their new columns, dropped input pad slots stay -1."""
+    # Two docs in one row: [d0 d0 P | d1] with old per-doc pad after doc 0.
+    batch = {
+        "input_ids": torch.tensor([[10, 11, 99, 20]]),
+        "labels": torch.tensor([[10, 11, -100, 20]]),
+        "seq_lens": torch.tensor([[2, 1]]),
+        "seq_lens_padded": torch.tensor([[3, 1]]),
+    }
+    out, _, input_positions = cpmod._repad_dsv4_packed_batch(
+        batch,
+        cp_size=1,
+        pad_multiple=2,
+        padding_token_id=99,
+    )
+    # Rebuilt row: doc0 padded to 2 -> [0:2]; doc1 padded to 2 -> [2:4].
+    torch.testing.assert_close(input_positions, torch.tensor([[0, 1, -1, 2]]))
+    # Sanity: the map really points at the rebuilt token positions.
+    rebuilt = out["input_ids"][0]
+    assert rebuilt[input_positions[0, 0]].item() == 10
+    assert rebuilt[input_positions[0, 3]].item() == 20
 
 
 def test_repad_packed_batch_validates_labels_and_metadata_extent():

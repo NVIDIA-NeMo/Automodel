@@ -23,7 +23,6 @@ from nemo_automodel.components.distributed.cp_sharder import (
     captured_token_indices,
     identity_local_indices,
     round_robin_local_indices,
-    shard_batch_identity,
     shard_batch_load_balanced,
 )
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
@@ -444,8 +443,12 @@ def _resolve_cp_sharder(
     if use_te:
         # The THD partition is data-dependent (cu_seqlens), so shard_batch
         # installs the index map it just computed on the sharder for the token
-        # verbs (chunked streams carry none).
+        # verbs (chunked streams carry none). The BSHD->THD flatten is a pure
+        # reshape, so the pre-flatten row shape is the caller's coordinate
+        # system and the stream length is rows x cols.
         def _shard_batch_te(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+            input_ids = batch.get("input_ids")
+            row_shape = tuple(input_ids.shape[:2]) if input_ids is not None and input_ids.dim() >= 2 else None
             prepped, local_indices = make_cp_batch_for_te(
                 cp_mesh,
                 batch,
@@ -457,23 +460,51 @@ def _resolve_cp_sharder(
             )
             if local_indices is not None:
                 te_sharder.local_token_global_indices = captured_token_indices(local_indices)
+                if row_shape is not None:
+                    te_sharder.input_row_shape = row_shape
+                    te_sharder.padded_seq_len = row_shape[0] * row_shape[1]
             return contextlib.nullcontext, prepped
 
         te_sharder = CPSharder(shard_batch=_shard_batch_te, local_token_global_indices=None, layout="thd")
         return te_sharder
 
     if cp_active:
-        return CPSharder(
-            shard_batch=shard_batch_load_balanced,
+        # torch context_parallel pads inside shard_batch but slices at
+        # ctx-enter, so the primary length right after the call IS the padded
+        # global length.
+        def _shard_batch_round_robin(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+            primary = batch.get("inputs_embeds", batch.get("input_ids"))
+            original = primary.shape[1] if primary is not None else None
+            ctx, prepped = shard_batch_load_balanced(
+                cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id
+            )
+            post = prepped.get("inputs_embeds", prepped.get("input_ids"))
+            rr_sharder.original_seq_len = original
+            rr_sharder.padded_seq_len = post.shape[1] if post is not None else None
+            return ctx, prepped
+
+        rr_sharder = CPSharder(
+            shard_batch=_shard_batch_round_robin,
             local_token_global_indices=round_robin_local_indices,
             layout="round_robin",
         )
+        return rr_sharder
 
-    return CPSharder(
-        shard_batch=shard_batch_identity,
+    # No CP prep applies: the identity sharder, so callers hold working token
+    # verbs at every cp_size. Lengths are captured for trim/fill symmetry with
+    # the sharding layouts (original == padded: nothing was padded).
+    def _shard_batch_none(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+        primary = batch.get("inputs_embeds", batch.get("input_ids"))
+        if primary is not None and primary.dim() >= 2:
+            none_sharder.original_seq_len = none_sharder.padded_seq_len = primary.shape[1]
+        return contextlib.nullcontext, batch
+
+    none_sharder = CPSharder(
+        shard_batch=_shard_batch_none,
         local_token_global_indices=identity_local_indices,
         layout="none",
     )
+    return none_sharder
 
 
 def make_cp_batch_and_ctx(

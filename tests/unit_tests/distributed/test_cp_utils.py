@@ -763,6 +763,67 @@ def test_make_cp_batch_for_te_identity_indices_without_cp():
     assert torch.equal(local_indices, torch.arange(out["input_ids"].shape[-1]))
 
 
+def test_round_robin_sharder_captures_lengths_and_pads_token_tensors(monkeypatch):
+    """The generic sharder captures original/padded lengths at shard time so the
+    token verbs accept caller-coordinate tensors: unpadded down (with explicit
+    fill), trimmed back up, and loud errors on mismatched lengths."""
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", lambda **kw: "cp_ctx")
+    monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: contextlib.nullcontext)
+
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
+    batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
+    _, _, sharder = _cu.make_cp_batch_and_ctx(device_mesh, batch)  # pads 6 -> 8 (2*cp)
+
+    assert (sharder.original_seq_len, sharder.padded_seq_len) == (6, 8)
+    # down: unpadded [1, 6] advantages ride with an explicit fill
+    local = sharder.shard_token_tensor(device_mesh["cp"], torch.arange(6.0).unsqueeze(0), fill=0.0)
+    # rank 0 under 2*cp=4 chunks of len 2: chunks 0 and 3 -> positions [0,1,6,7]
+    assert torch.equal(local, torch.tensor([[0.0, 1.0, 0.0, 0.0]]))
+    # mismatched length is loud, not silently mis-sharded
+    with pytest.raises(ValueError, match="padded_seq_len=8"):
+        sharder.shard_token_tensor(device_mesh["cp"], torch.zeros(1, 7), fill=0.0)
+    # unpadded without fill is loud too
+    with pytest.raises(ValueError, match="fill"):
+        sharder.shard_token_tensor(device_mesh["cp"], torch.zeros(1, 6))
+
+
+def test_none_sharder_captures_lengths_for_trim():
+    """At cp<=1 nothing is padded, so trim is the identity — same caller code
+    path as the sharding layouts."""
+    device_mesh = _DummyDeviceMesh(cp_size=1, tp_size=1)
+    batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
+    _, _, sharder = _cu.make_cp_batch_and_ctx(device_mesh, batch)
+    assert (sharder.original_seq_len, sharder.padded_seq_len) == (6, 6)
+    t = torch.randn(1, 6)
+    assert torch.equal(sharder.gather_token_tensor(device_mesh["cp"], t, trim=True), t)
+
+
+def test_te_sharder_captures_row_shape(monkeypatch):
+    """The THD flatten is a pure reshape, so the sharder captures the
+    pre-flatten row shape and the verbs translate between row and stream
+    coordinates."""
+    local_indices = torch.tensor([0, 1, 2, 3])  # identity partition (cp fake)
+
+    def fake_make_cp_batch_for_te(cp_mesh, batch, *, return_local_indices=False, **kwargs):
+        return ({"thd": True}, local_indices) if return_local_indices else {"thd": True}
+
+    monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
+
+    cp1 = _DummySubMesh(1)
+    sharder = _cu._resolve_cp_sharder(
+        cp1, None, magi=None, use_te=True, num_chunks=1, seq_lens_padding_value=-1000, model=None
+    )
+    sharder.shard_batch(cp1, None, {"input_ids": torch.arange(4).view(2, 2)})
+    assert sharder.input_row_shape == (2, 2)
+    assert sharder.padded_seq_len == 4
+
+    # down: row-coordinate [2, 2] flattens to the stream before sharding
+    rows = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    assert torch.equal(sharder.shard_token_tensor(cp1, rows), torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    # up: gather restores the row coordinate
+    assert torch.equal(sharder.gather_token_tensor(cp1, torch.tensor([1.0, 2.0, 3.0, 4.0]), seq_dim=0, trim=True), rows)
+
+
 def test_resolve_cp_sharder_layers():
     """Resolution order: model-owned > magi > TE > generic round-robin > none."""
     from nemo_automodel.components.distributed.cp_sharder import round_robin_local_indices
@@ -779,7 +840,6 @@ def test_resolve_cp_sharder_layers():
     # generic torch context_parallel is the framework default at cp>1
     generic = _cu._resolve_cp_sharder(cp2, None, **common)
     assert generic.layout == "round_robin"
-    assert generic.shard_batch is _cu.shard_batch_load_balanced
     assert generic.local_token_global_indices is round_robin_local_indices
     # no CP prep applies -> the identity sharder, so callers never branch
     for mesh in (None, _DummySubMesh(1)):
@@ -788,7 +848,7 @@ def test_resolve_cp_sharder_layers():
         batch = {"input_ids": torch.tensor([[1, 2, 3]])}
         ctx, out = none_sharder.shard_batch(mesh, None, batch)
         assert ctx is contextlib.nullcontext and out is batch
-        # token verbs are identities at cp<=1
-        t = torch.randn(1, 6)
+        # token verbs are identities at cp<=1 (lengths were captured: 3 == 3)
+        t = torch.randn(1, 3)
         assert torch.equal(none_sharder.shard_token_tensor(mesh, t), t)
         assert none_sharder.gather_token_tensor(mesh, t) is t

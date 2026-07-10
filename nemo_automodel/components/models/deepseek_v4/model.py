@@ -851,17 +851,20 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             contiguous_local_indices,
         )
 
-        return {
-            "cp_sharder": CPSharder(
-                shard_batch=partial(
-                    make_dsv4_contiguous_shard_cp_batch_and_ctx,
-                    pad_multiple=dsv4_cp_local_seq_multiple(self.config),
-                    sync_packed_length=self.backend.dispatcher == "hybridep",
-                ),
-                local_token_global_indices=contiguous_local_indices,
-                layout="contiguous",
-            ),
-        }
+        # Two-step construction so shard_batch records its shard facts
+        # (lengths; the packed repad position map) on the sharder it belongs to.
+        cp_sharder = CPSharder(
+            shard_batch=None,
+            local_token_global_indices=contiguous_local_indices,
+            layout="contiguous",
+        )
+        cp_sharder.shard_batch = partial(
+            make_dsv4_contiguous_shard_cp_batch_and_ctx,
+            pad_multiple=dsv4_cp_local_seq_multiple(self.config),
+            sync_packed_length=self.backend.dispatcher == "hybridep",
+            record_on=cp_sharder,
+        )
+        return {"cp_sharder": cp_sharder}
 
     def forward(
         self,

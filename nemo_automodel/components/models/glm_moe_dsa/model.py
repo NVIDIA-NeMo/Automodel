@@ -352,18 +352,21 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if getattr(self.backend, "attn", None) != "tilelang":
             raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
 
-        return {
-            "cp_sharder": CPSharder(
-                shard_batch=partial(
-                    make_glm_dsa_packed_cp_batch_and_ctx,
-                    num_chunks=int(num_chunks),
-                ),
-                # Contiguous over the packed THD token axis: rank r keeps
-                # tokens [r * T/cp, (r + 1) * T/cp).
-                local_token_global_indices=contiguous_local_indices,
-                layout="packed_thd",
-            ),
-        }
+        # Two-step construction so shard_batch records its shard facts (the
+        # pre-flatten row shape / stream length) on the sharder it belongs to.
+        cp_sharder = CPSharder(
+            shard_batch=None,
+            # Contiguous over the packed THD token axis: rank r keeps
+            # tokens [r * T/cp, (r + 1) * T/cp).
+            local_token_global_indices=contiguous_local_indices,
+            layout="packed_thd",
+        )
+        cp_sharder.shard_batch = partial(
+            make_glm_dsa_packed_cp_batch_and_ctx,
+            num_chunks=int(num_chunks),
+            record_on=cp_sharder,
+        )
+        return {"cp_sharder": cp_sharder}
 
     def _is_pipeline_parallel_stage(self) -> bool:
         """True when this module is a trimmed pipeline-parallel stage (not the whole model)."""

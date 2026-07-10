@@ -100,6 +100,7 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
     padding_token_id: int = 0,
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
+    record_on=None,
 ):
     """Convert packed GLM DSA batches to THD and keep a contiguous query shard per CP rank.
 
@@ -109,6 +110,14 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
     top-k window.
     """
     del tp_mesh, loss_mask
+
+    # The BSHD->THD flatten is a pure reshape: the pre-flatten rows are the
+    # caller's coordinate system and the stream length is rows x cols. Chunked
+    # streams (num_chunks > 1) are per-chunk token spaces and capture nothing.
+    input_ids = batch.get("input_ids")
+    if record_on is not None and num_chunks <= 1 and input_ids is not None and input_ids.dim() >= 2:
+        record_on.input_row_shape = tuple(input_ids.shape[:2])
+        record_on.padded_seq_len = input_ids.shape[0] * input_ids.shape[1]
 
     thd_batch = split_batch_into_thd_chunks(
         batch,

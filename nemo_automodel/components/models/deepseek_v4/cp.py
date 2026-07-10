@@ -254,7 +254,7 @@ def _repad_dsv4_packed_batch(
     padding_token_id: int,
     sync_packed_length: bool = False,
     loss_mask: torch.Tensor | None = None,
-) -> tuple[dict, torch.Tensor | None]:
+) -> tuple[dict, torch.Tensor | None, torch.Tensor]:
     """Insert DSV4 compression-safe padding into packed BSHD rows before CP slicing.
 
     The generic packed dataset may pad each packed sequence only for TE CP. DSV4
@@ -287,6 +287,10 @@ def _repad_dsv4_packed_batch(
         raise KeyError("DSV4 context parallelism requires `labels` in the batch.")
 
     batch_size = primary.shape[0]
+    # Per-row map from input position to rebuilt-row column (-1 = input pad
+    # slot whose token was dropped); the CPSharder token verbs restore the
+    # caller's coordinates through it.
+    input_positions = torch.full((batch_size, primary.shape[1]), -1, dtype=torch.long, device=primary.device)
     rebuilt_primary = []
     rebuilt_labels = []
     rebuilt_loss_mask = [] if loss_mask is not None else None
@@ -312,6 +316,7 @@ def _repad_dsv4_packed_batch(
         row_seq_lens = []
         row_padded_lens = []
         old_offset = 0
+        new_offset = 0
 
         for doc_idx, real_len in enumerate(real_lengths):
             old_padded_len = max(padded_lengths[doc_idx], real_len)
@@ -350,9 +355,15 @@ def _repad_dsv4_packed_batch(
                 )
             )
             seq_id_parts.append(torch.full((new_padded_len,), doc_idx + 1, dtype=torch.long, device=primary.device))
+            # Input->output position map for this document's real tokens; the
+            # dropped input pad slots keep -1 (see input_positions init).
+            input_positions[batch_idx, old_offset : old_offset + real_len] = torch.arange(
+                new_offset, new_offset + real_len, device=primary.device
+            )
             row_seq_lens.append(real_len)
             row_padded_lens.append(new_padded_len)
             old_offset += old_padded_len
+            new_offset += new_padded_len
 
         rebuilt_primary.append(torch.cat(primary_parts, dim=0))
         rebuilt_labels.append(torch.cat(label_parts, dim=0))
@@ -407,7 +418,7 @@ def _repad_dsv4_packed_batch(
 
     if loss_mask is not None and rebuilt_loss_mask is not None:
         loss_mask = _right_pad_rows(rebuilt_loss_mask, 0)
-    return batch, loss_mask
+    return batch, loss_mask, input_positions
 
 
 def make_dsv4_contiguous_shard_cp_batch_and_ctx(
@@ -419,6 +430,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     padding_token_id: int = 0,
     pad_multiple: int | None = None,
     sync_packed_length: bool = False,
+    record_on=None,
 ):
     """Contiguously shard a batch for DeepSeek V4 Miles-style context parallelism.
 
@@ -460,11 +472,12 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
             "pre-flattened `cu_seqlens` batches should use the TE CP path."
         )
 
+    input_positions = None
     if packed:
         # Preserve the packed-document boundaries while the shared contiguous
         # sharder handles the common padding/slicing mechanics.
         convert_attention_mask_to_padding_mask(batch)
-        batch, loss_mask = _repad_dsv4_packed_batch(
+        batch, loss_mask, input_positions = _repad_dsv4_packed_batch(
             batch,
             cp_size=cp_size,
             pad_multiple=local_multiple,
@@ -482,7 +495,13 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
         pad_multiple=local_multiple,
         extra_seq_keys={"packed_seq_ids": 1} if packed else None,
         extra_pad_values={"packed_seq_ids": 0} if packed else None,
+        record_on=record_on,
     )
+    if packed and record_on is not None:
+        # The repad rebuilt the rows, so no single original length exists; the
+        # caller's coordinates are restored through the position map instead.
+        record_on.original_seq_len = None
+        record_on.input_token_stream_positions = input_positions
     # Hand the CP process group to the model forward (read from attn_kwargs) so
     # DSV4 attention all-gathers K/V across CP ranks. Not a tensor -> not sharded.
     batch["_dsv4_cp_group"] = cp_mesh.get_group()

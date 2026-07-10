@@ -96,17 +96,6 @@ def identity_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | 
     return torch.arange(padded_seq_len, device=device, dtype=torch.long)
 
 
-def shard_batch_identity(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id: int = 0):
-    """``CPSharder.shard_batch`` for the ``layout="none"`` sharder: a no-op.
-
-    Returned by the dispatch when no CP prep applies (no active CP mesh, no
-    THD/magi packing), so callers hold a working sharder at every cp_size and
-    need no branches.
-    """
-    del cp_mesh, tp_mesh, loss_mask, padding_token_id
-    return contextlib.nullcontext, batch
-
-
 def round_robin_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
     """Global positions owned by this rank under torch ``context_parallel`` load balancing.
 
@@ -251,11 +240,29 @@ class CPSharder:
             :func:`captured_token_indices`); their token verbs raise until the
             first shard.
         layout: Diagnostic label; never branched on by framework code.
+        original_seq_len: Pre-pad sequence length captured at shard time; None
+            when the layout has no single original length (packed streams).
+        padded_seq_len: Post-pad global sequence length captured at shard time;
+            the token verbs validate tensor lengths against it.
+        input_row_shape: For flat-stream (THD) layouts, the ``[B, S]`` shape of
+            the pre-flatten input rows; the verbs translate between row and
+            stream coordinates with it (the flatten moves no tokens).
+        input_token_stream_positions: For layouts that reposition tokens (DSV4
+            packed repad), the per-row map from input position to padded output
+            column (-1 = an input pad slot whose token was dropped).
     """
 
     shard_batch: Callable[..., tuple[Callable, dict[str, Any]]]
     local_token_global_indices: Callable[..., torch.Tensor] | None
     layout: str = "custom"
+    # Facts captured while shard_batch runs (framework sharders are built per
+    # resolution, model sharders per hook call, so captures never leak across
+    # steps). They let the token verbs accept/return tensors in the CALLER's
+    # coordinates: pad is an internal detail of the CP layout.
+    original_seq_len: int | None = None  # pre-pad length along seq_dim; None when no single value exists (packed)
+    padded_seq_len: int | None = None  # post-pad global length; validation anchor for the token verbs
+    input_row_shape: tuple[int, ...] | None = None  # [B, S] of pre-flatten rows for flat-stream (THD) layouts
+    input_token_stream_positions: torch.Tensor | None = None  # [B, S_in] -> padded column; -1 = dropped input pad
 
     def _indices(self, cp_mesh, padded_seq_len: int, device) -> torch.Tensor:
         if self.local_token_global_indices is None:
@@ -265,19 +272,99 @@ class CPSharder:
             )
         return self.local_token_global_indices(cp_mesh, padded_seq_len, device)
 
-    def shard_token_tensor(self, cp_mesh, tensor: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
+    def shard_token_tensor(
+        self, cp_mesh, tensor: torch.Tensor, seq_dim: int = 1, fill: float | int | None = None
+    ) -> torch.Tensor:
         """Shard a full-length token-aligned tensor exactly like the model inputs.
 
-        ``tensor`` must already be padded to the CP-padded sequence length.
+        When shard facts were captured (after the first ``shard_batch``), the
+        caller may pass tensors in its own coordinates and the verb applies the
+        same transform the batch went through:
+
+        - ``[B, S_in]`` tensors on a repositioned-row layout (captured position
+          map, e.g. DSV4 packed repad) are scattered into the padded rows,
+          ``fill`` filling the pad slots;
+        - tensors matching the captured pre-flatten ``input_row_shape`` on a
+          flat-stream (THD) layout are flattened first (the returned shard is
+          in the model's local stream coordinate);
+        - tensors of ``original_seq_len`` are right-padded to
+          ``padded_seq_len`` with the explicit ``fill`` value;
+        - tensors already at ``padded_seq_len`` shard directly.
+
+        Any other length raises instead of silently sharding the wrong slice.
         """
+        if self.input_token_stream_positions is not None and tuple(tensor.shape) == tuple(
+            self.input_token_stream_positions.shape
+        ):
+            if fill is None:
+                raise ValueError("sharding an input-coordinate tensor on a repositioned layout requires `fill`")
+            positions = self.input_token_stream_positions.to(tensor.device)
+            valid = positions >= 0
+            padded = torch.full((tensor.shape[0], self.padded_seq_len), fill, dtype=tensor.dtype, device=tensor.device)
+            padded[valid.nonzero(as_tuple=True)[0], positions[valid]] = tensor[valid]
+            tensor, seq_dim = padded, 1
+        elif self.input_row_shape is not None and tuple(tensor.shape[: len(self.input_row_shape)]) == tuple(
+            self.input_row_shape
+        ):
+            tensor = tensor.reshape(-1, *tensor.shape[len(self.input_row_shape) :])
+            seq_dim = 0
+
+        length = tensor.shape[seq_dim]
+        if self.padded_seq_len is not None and length != self.padded_seq_len:
+            if fill is not None and self.original_seq_len is not None and length == self.original_seq_len:
+                tensor = _pad_tensor_seq_dim_(tensor, seq_dim, self.padded_seq_len - length, fill)
+            else:
+                raise ValueError(
+                    f"CPSharder(layout={self.layout!r}) sharded a batch of padded_seq_len={self.padded_seq_len} "
+                    f"(original_seq_len={self.original_seq_len}), got a tensor of length {length} on dim {seq_dim}. "
+                    "Pass the original-length tensor with an explicit `fill`, or pre-pad it yourself."
+                )
         indices = self._indices(cp_mesh, tensor.shape[seq_dim], tensor.device)
         return shard_token_tensor_by_indices(tensor, indices, seq_dim=seq_dim)
 
-    def gather_token_tensor(self, cp_mesh, tensor: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
-        """Differentiably gather a token-aligned local shard to global order."""
+    def gather_token_tensor(
+        self,
+        cp_mesh,
+        tensor: torch.Tensor,
+        seq_dim: int = 1,
+        trim: bool = False,
+        fill: float | int | None = None,
+    ) -> torch.Tensor:
+        """Differentiably gather a token-aligned local shard to global order.
+
+        With ``trim=True`` the result is returned in the caller's original
+        coordinates using the facts captured at shard time: sliced back to
+        ``original_seq_len``, un-flattened to ``input_row_shape`` (THD), or
+        mapped through the captured position map (``fill`` for input positions
+        whose tokens were dropped, e.g. re-padded pack slots). Raises when no
+        facts were captured (nothing to trim to).
+        """
         padded_seq_len = tensor.shape[seq_dim] * (cp_mesh.size() if cp_mesh is not None else 1)
         indices = self._indices(cp_mesh, padded_seq_len, tensor.device)
-        return gather_token_tensor_by_indices(cp_mesh, tensor, indices, seq_dim=seq_dim)
+        full = gather_token_tensor_by_indices(cp_mesh, tensor, indices, seq_dim=seq_dim)
+        if not trim:
+            return full
+        if self.padded_seq_len is not None and full.shape[seq_dim] != self.padded_seq_len:
+            raise ValueError(
+                f"gathered length {full.shape[seq_dim]} on dim {seq_dim} != captured "
+                f"padded_seq_len {self.padded_seq_len}; the local shard does not match "
+                "the batch this sharder last sharded (or no collective ran)."
+            )
+        if self.input_token_stream_positions is not None:
+            if fill is None:
+                raise ValueError("trimming to input coordinates on a repositioned layout requires `fill`")
+            positions = self.input_token_stream_positions.to(full.device)
+            out = full.gather(1, positions.clamp(min=0).to(torch.long))
+            return out.masked_fill(positions < 0, fill)
+        if self.input_row_shape is not None:
+            return full.reshape(*self.input_row_shape, *full.shape[seq_dim + 1 :])
+        if self.original_seq_len is not None:
+            return full.narrow(seq_dim, 0, self.original_seq_len)
+        raise NotImplementedError(
+            f"CPSharder(layout={self.layout!r}) captured no original-coordinate facts; "
+            "gather with trim=False and restore the layout with the batch metadata "
+            "(padding_mask / cu_seqlens)."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +466,7 @@ def shard_batch_contiguous(
     pad_multiple: int = 1,
     extra_seq_keys: dict[str, int] | None = None,
     extra_pad_values: dict[str, Any] | None = None,
+    record_on: "CPSharder | None" = None,
 ):
     """Prepare and contiguously shard a batch for model-owned CP.
 
@@ -399,13 +487,16 @@ def shard_batch_contiguous(
         extra_seq_keys: Model-specific per-token batch keys to pad and shard,
             mapped to their sequence dim (e.g. Gemma4 vision group ids).
         extra_pad_values: Pad sentinels for ``extra_seq_keys`` (default 0).
+        record_on: Optional CPSharder receiving the shard facts
+            (``original_seq_len`` / ``padded_seq_len``) for its token verbs;
+            the owning model passes the sharder it constructed.
 
     Returns:
         ``(contextlib.nullcontext, batch)`` — transport lives in the model's
         own attention, so no CP context manager is needed.
     """
     primary_key, seq_len, labels, position_ids, pos_seq_dim, loss_mask = _prepare_contiguous_cp_batch(batch, loss_mask)
-    return _make_contiguous_shard_cp_batch(
+    ctx, batch = _make_contiguous_shard_cp_batch(
         cp_mesh,
         batch,
         primary_key=primary_key,
@@ -419,6 +510,10 @@ def shard_batch_contiguous(
         extra_seq_keys=extra_seq_keys,
         extra_pad_values=extra_pad_values,
     )
+    if record_on is not None:
+        record_on.original_seq_len = seq_len
+        record_on.padded_seq_len = batch[primary_key].shape[1] * cp_mesh.size()
+    return ctx, batch
 
 
 def _make_contiguous_shard_cp_batch(
