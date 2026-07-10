@@ -316,8 +316,18 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
         cos, sin = self.rotary_emb(combined_states, position_ids + step_idx)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         k, v = self._repeat_kv(k, v)
-        cache_k.append(k)
-        cache_v.append(v)
+        if self._cp_group is not None:
+            # Under CP the ring is the cache's only consumer, and it wants
+            # FlashAttention ``[B, T, H, D]`` blocks in the compute dtype (RoPE
+            # upcast q/k to fp32). Convert this step's block once here instead of
+            # re-converting every cached block on every TTT step, which would copy
+            # the cache O(ttt_steps^2) times across the recurrence.
+            dt = self.o_proj.weight.dtype
+            cache_k.append(k.transpose(1, 2).contiguous().to(dt))
+            cache_v.append(v.transpose(1, 2).contiguous().to(dt))
+        else:
+            cache_k.append(k)
+            cache_v.append(v)
 
         if self._cp_group is not None:
             attn_output = self._cp_ring_attention_forward(q, cache_k, cache_v, batch_size, seq_len)
@@ -343,22 +353,19 @@ class Eagle3LlamaAttention(_PeagleAttentionMixin, nn.Module):
 
         The sequence is sharded across ``self._cp_group``; block-0 (``Q @ K_0^T``,
         causal over the full sequence) runs as a ring while the per-position TTT
-        diagonals stay local. Inputs are ``[B, H, T_local, D]``; the ring works in
-        FlashAttention ``[B, T_local, H, D]`` layout.
+        diagonals stay local. ``q`` arrives as ``[B, H, T_local, D]``; the cache
+        blocks are already in the ring's FlashAttention ``[B, T_local, H, D]``
+        layout and compute dtype (converted once at append time), so only ``q`` --
+        fresh each TTT step -- is converted here.
         """
         from nemo_automodel.components.speculative.eagle.ring_attention import (
             cached_ring_attention,
             cached_zigzag_ring_attention,
         )
 
-        # RoPE upcasts q/k to fp32; the ring uses FlashAttention (fp16/bf16 only), so
-        # cast to the module's compute dtype (matches the plain FA2 path).
-        dt = self.o_proj.weight.dtype
-        qf = q.transpose(1, 2).contiguous().to(dt)
-        ckf = [t.transpose(1, 2).contiguous().to(dt) for t in cache_k]
-        cvf = [t.transpose(1, 2).contiguous().to(dt) for t in cache_v]
+        qf = q.transpose(1, 2).contiguous().to(self.o_proj.weight.dtype)
         ring = cached_zigzag_ring_attention if self._cp_zigzag else cached_ring_attention
-        out = ring(qf, ckf, cvf, self._cp_group, self.scaling)  # [B, T, H, D]
+        out = ring(qf, cache_k, cache_v, self._cp_group, self.scaling)  # [B, T, H, D]
         return out.reshape(batch_size, seq_len, -1)
 
     def _eager_attention_forward(
