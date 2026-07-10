@@ -137,6 +137,44 @@ def test_make_cp_batch_and_ctx_no_mesh():
         pass  # nothing should happen
 
 
+def test_make_cp_batch_and_ctx_honors_model_sharder_at_cp_size_one():
+    """Native packed models still need their batch transform without CP sharding."""
+    device_mesh = _DummyDeviceMesh(cp_size=1, tp_size=1)
+    called = False
+
+    def make_native_batch(cp_mesh, tp_mesh, batch, **kwargs):
+        nonlocal called
+        called = True
+        assert cp_mesh.size() == 1
+        assert tp_mesh.size() == 1
+        assert kwargs["padding_token_id"] == 99
+        batch["native_thd"] = True
+        return contextlib.nullcontext, batch
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": torch.tensor([[1, 2, 3, 4]]),
+    }
+    sharder = CPSharder(
+        shard_batch=make_native_batch,
+        local_token_global_indices=contiguous_local_indices,
+        layout="native_thd",
+    )
+
+    ctx_obj, new_batch, _ = _cu.make_cp_batch_and_ctx(
+        device_mesh,
+        batch,
+        use_te=True,
+        padding_token_id=99,
+        cp_sharder=sharder,
+    )
+
+    assert called
+    assert ctx_obj is contextlib.nullcontext
+    assert new_batch is batch
+    assert new_batch["native_thd"] is True
+
+
 def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     """Verify correct interaction when Context-Parallelism *is* enabled."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # CP enabled (>1)
@@ -733,10 +771,11 @@ def test_resolve_cp_sharder_layers():
     model_sharder = _contiguous_sharder()
     common = dict(magi=None, use_te=False, num_chunks=1, seq_lens_padding_value=-1000, model=None)
 
-    # model-owned wins over everything when CP is active
+    # model-owned wins over everything, including native THD prep at cp<=1
     assert _cu._resolve_cp_sharder(cp2, model_sharder, **{**common, "use_te": True}) is model_sharder
-    # ...but only shards at cp>1: at cp<=1 the TE rung still resolves
-    assert _cu._resolve_cp_sharder(None, model_sharder, **{**common, "use_te": True}).layout == "thd"
+    assert _cu._resolve_cp_sharder(None, model_sharder, **{**common, "use_te": True}) is model_sharder
+    # TE resolves at cp<=1 when no model-owned sharder is present
+    assert _cu._resolve_cp_sharder(None, None, **{**common, "use_te": True}).layout == "thd"
     # generic torch context_parallel is the framework default at cp>1
     generic = _cu._resolve_cp_sharder(cp2, None, **common)
     assert generic.layout == "round_robin"

@@ -34,6 +34,7 @@ import torch
 import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
+from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
@@ -45,17 +46,20 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     save_config,
 )
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
-from nemo_automodel.components.datasets.llm.formatting_utils import (
-    _has_chat_template,
-    _resolve_chat_template,
+from nemo_automodel.components.datasets.llm.dspark_cache import (
+    DTYPE_MAP,
+    build_cached_dspark_dataloader,
+    read_manifest,
+    read_target_weight_modules,
 )
+from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.datasets.vlm.dspark_collate import build_dspark_vlm_dataloader
 from nemo_automodel.components.distributed.activation_checkpointing import (
     apply_selective_checkpointing_to_layers,
     apply_submodule_checkpointing,
     is_selective_activation_checkpointing,
 )
+from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -65,6 +69,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.minimax_m3_vl.processing import build_minimax_m3_vl_processor
 from nemo_automodel.components.optim.optimizer import build_optimizer
+from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
 from nemo_automodel.components.speculative.dspark.config import (
     build_deepseek_v4_draft_config,
     build_gemma4_draft_config,
@@ -72,33 +77,54 @@ from nemo_automodel.components.speculative.dspark.config import (
     build_minimax_m3_draft_config,
 )
 from nemo_automodel.components.speculative.dspark.core import DSparkTrainerModule
-from nemo_automodel.components.speculative.dspark.draft_gemma4 import Gemma4DSparkModel
-from nemo_automodel.components.speculative.dspark.draft_minimax_m3 import MiniMaxM3DSparkModel
 from nemo_automodel.components.speculative.dspark.registry import (
     build_target_layer_ids,
     resolve_dspark_draft_spec,
 )
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    DEEPSEEK_V4_MODEL_TYPE as _DEEPSEEK_V4_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    GEMMA4_MODEL_TYPES as _GEMMA4_MODEL_TYPES,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    GLM_5_2_MODEL_TYPE as _GLM_5_2_MODEL_TYPE,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    MINIMAX_M3_MODEL_TYPES as _MINIMAX_M3_MODEL_TYPES,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    apply_target_chat_template as _apply_target_chat_template,
+)
+from nemo_automodel.components.speculative.dspark.target_utils import (
+    read_target_model_type as _read_target_model_type,
+)
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS
-from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, parse_distributed_section
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
     _is_checkpoint_model_config_compatible,
     _resolve_restore_from_to_ckpt_dir,
 )
+from nemo_automodel.recipes.llm._dspark_target_build import (
+    build_deepseek_v4_target,
+    build_glm_5_2_target,
+    gather_full_weight_module,
+    repair_glm_5_2_qk_rope_head_dim,
+    resolve_reduced_target_layers,
+)
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_compile,
+    apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
+    raise_if_peft_configured,
 )
 
 logger = logging.getLogger(__name__)
-
-_GEMMA4_MODEL_TYPES = ("gemma4", "gemma4_unified")
-_MINIMAX_M3_MODEL_TYPES = ("minimax_m3_vl",)
-_DEEPSEEK_V4_MODEL_TYPE = "deepseek_v4"
-_GLM_5_2_MODEL_TYPE = "glm_moe_dsa"
 
 _DSPARK_MM_KEYS = tuple(k for k in VLM_INPUT_KEYS if k != "input_ids")
 
@@ -120,63 +146,6 @@ class _DraftArgs(dict):
             return self[key]
         except KeyError as exc:  # pragma: no cover - defensive
             raise AttributeError(key) from exc
-
-
-def _read_target_model_type(target_path: str, trust_remote_code: bool) -> str:
-    """Return the HF ``model_type`` for a target without instantiating the model.
-
-    DeepSeek V4's ``model_type`` ("deepseek_v4") is a custom architecture that stock
-    ``AutoConfig`` may not recognize, so read it straight from the raw config dict
-    (which never requires the type to be registered). Falls back to ``AutoConfig``
-    for any path ``get_config_dict`` cannot resolve.
-    """
-    try:
-        config_dict, _ = PretrainedConfig.get_config_dict(target_path, trust_remote_code=trust_remote_code)
-        model_type = config_dict.get("model_type")
-        if model_type:
-            return str(model_type)
-    except (OSError, ValueError, KeyError):
-        pass
-    config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
-    return str(getattr(config, "model_type", "") or "")
-
-
-def _gather_full_weight_module(module):
-    """Return an object exposing a full (non-DTensor) ``.weight`` tensor.
-
-    The expert-parallel / FSDP-sharded DeepSeek V4 target stores ``embed_tokens`` and
-    ``lm_head`` weights as DTensors, while the draft copies them into plain Parameters.
-    Gather the sharded weight to a full tensor first (an all-gather, so every rank must
-    call this in lockstep); non-sharded targets (Qwen3, Gemma4) pass through unchanged.
-    """
-    weight = getattr(module, "weight", None)
-    if weight is not None and hasattr(weight, "full_tensor"):
-        return SimpleNamespace(weight=weight.full_tensor())
-    return module
-
-
-def _apply_target_chat_template(tokenizer, chat_template):
-    """Attach a chat template to the target tokenizer for messages-format DSpark data.
-
-    DSpark renders ``messages`` rows with the tokenizer's chat template, but some
-    targets (e.g. DeepSeek-V4-Flash) ship none. ``recipe_args.chat_template`` (an
-    inline Jinja string or a path to a template / tokenizer_config json) overrides
-    it; it must match the template the training responses were generated with and
-    should mark the assistant span with ``{% generation %}`` so only those tokens
-    carry loss. If no template is supplied and the tokenizer has none, raise rather
-    than silently producing an empty / wrong loss mask.
-    """
-    if chat_template is not None:
-        tokenizer.chat_template = _resolve_chat_template(str(chat_template))
-        return
-    if not _has_chat_template(tokenizer):
-        raise ValueError(
-            "The target tokenizer has no chat template and recipe_args.chat_template "
-            "was not set. DSpark trains on 'messages'-format data, which needs a chat "
-            "template (e.g. DeepSeek-V4-Flash ships none). Set recipe_args.chat_template "
-            "to an inline Jinja string or a template file that matches how the training "
-            "responses were generated."
-        )
 
 
 def _resolve_wandb_kwargs(wandb_cfg: dict) -> dict | None:
@@ -274,49 +243,6 @@ def _resolve_warmup_steps(warmup_ratio: float, total_optim_steps: int, min_warmu
     return max(min_warmup_steps, int(warmup_ratio * total_optim_steps))
 
 
-def _resolve_reduced_target_layers(checkpoint_num_layers, requested):
-    """Validate the optional ``target_num_hidden_layers`` diagnostic override.
-
-    Returns the reduced layer count (an int in ``[1, checkpoint_num_layers]``) or
-    ``None`` when unset. Loading fewer layers lets the full EP / hidden-capture /
-    draft path run on one node (the full DeepSeek-V4-Flash target OOMs at load on a
-    single 8x80GB box); a draft trained against any reduced target is not usable.
-    """
-    if requested is None:
-        return None
-    n = int(requested)
-    if n < 1 or n > checkpoint_num_layers:
-        raise ValueError(
-            f"target_num_hidden_layers={n} must be in [1, {checkpoint_num_layers}] (the checkpoint's depth)."
-        )
-    return n
-
-
-def _repair_glm_5_2_qk_rope_head_dim(target_config, raw_config_dict: dict) -> None:
-    """Restore a ``qk_rope_head_dim`` clobbered by the HF ``head_dim`` attribute map.
-
-    The published GLM-5.2 config carries ``head_dim: 192`` (the attention-kernel head
-    dim) alongside ``qk_rope_head_dim: 64``, and ``GlmMoeDsaConfig``'s
-    ``attribute_map = {"head_dim": "qk_rope_head_dim"}`` lets the former clobber the
-    latter on load: the loaded config reports ``qk_rope_head_dim=192``, so
-    ``kv_a_proj_with_mqa`` builds ``kv_lora_rank + 192 = 704`` wide while the
-    checkpoint ships ``512 + 64 = 576`` and shape validation fails. Restore the raw
-    checkpoint value (the GLM finetune examples apply the same correction via a
-    ``config: head_dim: 64`` override). No-op when the raw config omits the field or
-    the loaded value already matches (e.g. a locally repaired checkpoint view).
-    """
-    raw_qk_rope = raw_config_dict.get("qk_rope_head_dim")
-    if raw_qk_rope is None or int(target_config.qk_rope_head_dim) == int(raw_qk_rope):
-        return
-    logger.warning(
-        "GLM-5.2 config head_dim clobbered qk_rope_head_dim (loaded %s) via the HF attribute_map; "
-        "restoring qk_rope_head_dim=%s from the raw checkpoint config.",
-        target_config.qk_rope_head_dim,
-        raw_qk_rope,
-    )
-    target_config.qk_rope_head_dim = int(raw_qk_rope)
-
-
 def _apply_draft_activation_checkpointing(draft_model: torch.nn.Module, mode: bool | str) -> None:
     """Apply the recipe's AC mode to the trainable DSpark draft before FSDP."""
     if not mode or (isinstance(mode, str) and mode.lower() == "false"):
@@ -335,11 +261,156 @@ def _apply_draft_activation_checkpointing(draft_model: torch.nn.Module, mode: bo
         logger.info("Enabled full activation checkpointing on %d draft layers", len(layers))
 
 
+def _validate_cached_dspark_manifest(
+    cache_dir: str,
+    manifest: dict,
+    target_config,
+    target_layer_ids: list[int],
+    *,
+    target_model: str,
+    target_model_type: str,
+    seq_length: int,
+    compute_dtype: torch.dtype,
+) -> None:
+    """Validate that a DSpark offline cache matches the configured target/draft run."""
+    if str(manifest["target_model"]) != str(target_model):
+        logger.warning(
+            "DSpark cache at %s was built for target_model=%r, but this run configured target_model=%r. "
+            "Continuing because raw paths can differ across machines; structural cache fields will still be "
+            "validated.",
+            cache_dir,
+            manifest["target_model"],
+            target_model,
+        )
+    if str(manifest["target_model_type"]) != str(target_model_type):
+        raise ValueError(
+            f"DSpark cache at {cache_dir} was built for target_model_type={manifest['target_model_type']!r}, "
+            f"but the configured target has model_type={target_model_type!r}."
+        )
+    if int(manifest["target_vocab_size"]) != int(target_config.vocab_size):
+        raise ValueError(
+            f"DSpark cache at {cache_dir} was built for target_vocab_size={manifest['target_vocab_size']}, "
+            f"but the configured target has {target_config.vocab_size}. The cache does not match this target."
+        )
+    hidden_size = int(target_config.hidden_size)
+    if int(manifest["hidden_size"]) != hidden_size:
+        raise ValueError(
+            f"DSpark cache at {cache_dir} was built for hidden_size={manifest['hidden_size']}, "
+            f"but the configured target has hidden_size={hidden_size}."
+        )
+    if int(manifest["num_hidden_layers"]) != int(target_config.num_hidden_layers):
+        raise ValueError(
+            f"DSpark cache at {cache_dir} was built for num_hidden_layers={manifest['num_hidden_layers']}, "
+            f"but the configured target has num_hidden_layers={target_config.num_hidden_layers}."
+        )
+    if int(manifest["seq_length"]) != int(seq_length):
+        raise ValueError(
+            f"DSpark cache at {cache_dir} was built for seq_length={manifest['seq_length']}, "
+            f"but this run configured seq_length={seq_length}."
+        )
+    cache_dtype = DTYPE_MAP.get(str(manifest["dtype"]))
+    if cache_dtype is None:
+        raise ValueError(f"DSpark cache at {cache_dir} has unsupported dtype={manifest['dtype']!r}.")
+    if compute_dtype == torch.float32 and cache_dtype != torch.float32:
+        raise ValueError(
+            f"DSpark cache at {cache_dir} stores dtype={manifest['dtype']}, but CPU cached training "
+            "requires fp32 cache tensors. Regenerate with --dtype fp32 or train on CUDA."
+        )
+    expected_hidden_dim = hidden_size * len(target_layer_ids)
+    if int(manifest["target_hidden_dim"]) != expected_hidden_dim:
+        raise ValueError(
+            f"DSpark cache at {cache_dir} has target_hidden_dim={manifest['target_hidden_dim']}, "
+            f"but the configured target/layers need {expected_hidden_dim} "
+            f"(hidden_size {hidden_size} x {len(target_layer_ids)} target layers)."
+        )
+    if int(manifest["target_last_hidden_dim"]) != hidden_size:
+        raise ValueError(
+            f"DSpark cache at {cache_dir} has target_last_hidden_dim={manifest['target_last_hidden_dim']}, "
+            f"but the configured target has hidden_size={hidden_size}."
+        )
+    recorded_layer_ids = [int(x) for x in manifest["target_layer_ids"]]
+    if recorded_layer_ids != list(target_layer_ids):
+        raise ValueError(
+            f"DSpark cache at {cache_dir} was built for target_layer_ids={recorded_layer_ids}, "
+            f"but this run requested target_layer_ids={target_layer_ids}."
+        )
+
+
+def _distributed_section_dict(cfg) -> dict:
+    """Return the ``distributed:`` section of a top-level recipe config as a plain dict.
+
+    A missing block yields ``{}``, i.e. the default FSDP2 configuration; this keeps the
+    fail-loud missing-block contract of ``create_distributed_setup_from_config`` intact
+    for callers that require an explicit block.
+    """
+    section = cfg.get("distributed", None)
+    if section is None:
+        return {}
+    return section.to_dict() if hasattr(section, "to_dict") else dict(section)
+
+
 class TrainDSparkRecipe(BaseRecipe):
     """Recipe for DSpark draft-model training on Qwen3, Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 VL targets."""
 
     def __init__(self, cfg):
         self.cfg = cfg
+
+    def _should_shard_dense_target(self, recipe_cfg) -> bool:
+        """Whether to load a frozen dense target FSDP2-sharded via the standard distributed setup.
+
+        Opt-in (``recipe_args.shard_dense_target``, default ``False``). A dense target
+        (Qwen3 / Gemma4) is otherwise loaded whole and replicated on every rank. For a large
+        dense target (e.g. Gemma4-31B) the frozen target is ~62 GiB, leaving no room for the
+        draft's training activations, so training OOMs at the first backward on 80 GiB GPUs.
+        Loading it through ``create_distributed_setup_from_config`` +
+        ``NeMoAutoModelForCausalLM.from_pretrained(distributed_setup=...)`` FSDP2-shards it
+        across the mesh, the same path the MoE / VL targets already use.
+
+        A small target (e.g. Qwen3-0.6B) stays replicated by default, since sharding a target
+        that already fits is pure all-gather overhead. Requires ``distributed.strategy='fsdp2'``
+        on more than one rank; otherwise the request is ignored with a warning and the target
+        stays replicated.
+
+        Raises:
+            ValueError: if ``shard_dense_target`` is requested together with a model-parallel
+                or replication axis (``tp_size``/``pp_size``/``cp_size``/``ep_size``/
+                ``dp_replicate_size`` > 1). DSpark's forward-hook hidden-state capture needs
+                one non-pipelined ``model(...)`` call per rank (``pp_size > 1`` builds an
+                ``AutoPipeline`` instead of a module), the other model-parallel axes are
+                untested for the frozen dense target here, and HSDP replication re-replicates
+                the target across the replicate dimension, defeating the sharding.
+        """
+        if not bool(recipe_cfg.get("shard_dense_target", False)):
+            return False
+        # Reuse the canonical distributed-section parser (strategy case-folding, YAML-null
+        # axis defaulting) instead of re-reading the raw block, so the gate cannot drift
+        # from what create_distributed_setup_from_config later builds.
+        parsed = parse_distributed_section(_distributed_section_dict(self.cfg))
+        if self.dist_env.world_size <= 1 or not isinstance(parsed["strategy_config"], FSDP2Config):
+            if self.dist_env.is_main:
+                logger.warning(
+                    "recipe_args.shard_dense_target=true is ignored: it requires "
+                    "distributed.strategy='fsdp2' on more than one rank (got strategy=%s, "
+                    "world_size=%d); the dense target stays replicated per rank.",
+                    type(parsed["strategy_config"]).__name__,
+                    self.dist_env.world_size,
+                )
+            return False
+        unsupported = {
+            axis: parsed[axis]
+            for axis in ("tp_size", "pp_size", "cp_size", "ep_size", "dp_replicate_size")
+            if (parsed[axis] or 1) != 1
+        }
+        if unsupported:
+            raise ValueError(
+                f"recipe_args.shard_dense_target=true only supports a pure FSDP2 data-parallel "
+                f"topology (tp_size=pp_size=cp_size=ep_size=dp_replicate_size=1), got {unsupported}. "
+                f"DSpark's hidden-state capture needs one non-pipelined model call per rank "
+                f"(pp_size>1 builds an AutoPipeline the target wrapper cannot run), the remaining "
+                f"model-parallel axes are unsupported for the frozen dense target, and HSDP "
+                f"replication re-replicates the target, defeating the sharding."
+            )
+        return True
 
     def setup(self):
         """Build the target model, DSpark draft, data, optimizer, and trainer module."""
@@ -351,6 +422,7 @@ class TrainDSparkRecipe(BaseRecipe):
 
         recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
+        raise_if_peft_configured(self.cfg, type(self).__name__)
         # The draft is sharded directly with fully_shard over the default world
         # mesh (no explicit MeshContext), so _dp_allreduce reduces over the world group.
         # A DeepSeek V4 target additionally needs its own expert-parallel / FSDP mesh,
@@ -365,6 +437,7 @@ class TrainDSparkRecipe(BaseRecipe):
         is_glm_5_2_target = target_model_type == _GLM_5_2_MODEL_TYPE
         is_gemma4_target = target_model_type in _GEMMA4_MODEL_TYPES
         is_minimax_m3_target = target_model_type in _MINIMAX_M3_MODEL_TYPES
+        self.cached_target_path = recipe_cfg.get("cached_target_path", None)
         is_multimodal = bool(recipe_cfg.get("multimodal", False))
         if is_multimodal and not is_minimax_m3_target:
             raise ValueError(
@@ -373,19 +446,39 @@ class TrainDSparkRecipe(BaseRecipe):
             )
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(target_path, trust_remote_code=trust_remote_code)
-        # DSpark renders 'messages'-format data with the tokenizer's chat template;
-        # some targets (e.g. DeepSeek-V4-Flash) ship none, so recipe_args.chat_template
-        # supplies / overrides it (see the helper for the matching + loss-span rules).
-        _apply_target_chat_template(self.tokenizer, recipe_cfg.get("chat_template", None))
+        chat_template = recipe_cfg.get("chat_template", None)
+        # Online DSpark renders 'messages'-format data here and needs the tokenizer's
+        # chat template. Offline cached training consumes already-tokenized cache
+        # tensors, so a missing template should not block training; still apply an
+        # explicit override so saved checkpoints carry the requested tokenizer state.
+        if self.cached_target_path is None or chat_template is not None:
+            _apply_target_chat_template(self.tokenizer, chat_template)
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
         if is_deepseek_v4_target:
-            # Full V4-Flash target loaded with the same expert-parallel / FSDP and
-            # FP8-dequant path as the V4 finetune recipe, so the 256 experts shard
-            # across ranks instead of replicating per rank.
-            target_config, self.target_model = self._build_deepseek_v4_target(
-                target_path, recipe_cfg, trust_remote_code
-            )
+            if self.cached_target_path is None:
+                # Full V4-Flash target loaded with the same expert-parallel / FSDP and
+                # FP8-dequant path as the V4 finetune recipe, so the 256 experts shard
+                # across ranks instead of replicating per rank.
+                target_config, self.target_model, self.distributed_setup = build_deepseek_v4_target(
+                    cfg=self.cfg,
+                    world_size=self.dist_env.world_size,
+                    device=self.device,
+                    compute_dtype=self.compute_dtype,
+                    target_path=target_path,
+                    recipe_cfg=recipe_cfg,
+                    trust_remote_code=trust_remote_code,
+                )
+            else:
+                target_config = DeepseekV4Config.from_pretrained(
+                    target_path, name_or_path=target_path, num_nextn_predict_layers=0
+                )
+                n_reduced = resolve_reduced_target_layers(
+                    target_config.num_hidden_layers, recipe_cfg.get("target_num_hidden_layers", None)
+                )
+                if n_reduced is not None:
+                    target_config.num_hidden_layers = n_reduced
+                self.target_model = None
             architectures = list(getattr(target_config, "architectures", None) or ["DeepseekV4ForCausalLM"])
         elif is_minimax_m3_target:
             # MiniMax M3 VL is a ~400B-parameter MoE VLM: load it frozen through the
@@ -397,7 +490,7 @@ class TrainDSparkRecipe(BaseRecipe):
             # shard the parameter memory (see the example yaml for the tradeoff).
             target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
             target_text_overrides = {"num_mtp_modules": 0}
-            n_reduced = _resolve_reduced_target_layers(
+            n_reduced = resolve_reduced_target_layers(
                 target_config.text_config.num_hidden_layers,
                 recipe_cfg.get("target_num_hidden_layers", None),
             )
@@ -410,64 +503,109 @@ class TrainDSparkRecipe(BaseRecipe):
                 )
                 target_config.text_config.num_hidden_layers = n_reduced
                 target_text_overrides["num_hidden_layers"] = n_reduced
-            architectures = getattr(target_config, "architectures", []) or []
-            self.distributed_setup = create_distributed_setup_from_config(
-                self.cfg,
-                world_size=self.dist_env.world_size,
+            architectures = list(
+                getattr(target_config, "architectures", None) or ["MiniMaxM3SparseForConditionalGeneration"]
             )
-            backend = BackendConfig(
-                # M3's sparse-attention layers emit an additive float bias from the
-                # DSA indexer that only SDPA's explicit-mask path accepts; TE's
-                # DotProductAttention treats attention_mask as a boolean padding
-                # mask and crashes on the float bias.
-                attn="sdpa",
-                # The target is frozen / forward-only here, so there is no
-                # throughput reason to pay TE's integration complexity, and plain
-                # linears keep embed_tokens/lm_head as plain-shaped weights.
-                linear="torch",
-                rms_norm="torch_fp32",
-                rope_fusion=False,
-                experts=str(recipe_cfg.get("target_experts", "gmm")),
-                dispatcher="hybridep",
-                enable_hf_state_dict_adapter=True,
-                enable_fsdp_optimizations=True,
-            )
-            self.target_model = NeMoAutoModelForImageTextToText.from_pretrained(
-                target_path,
-                trust_remote_code=trust_remote_code,
-                torch_dtype=self.compute_dtype,
-                distributed_setup=self.distributed_setup,
-                backend=backend,
-                # The released bf16 checkpoint ships no real MTP weights despite the
-                # config declaring some, and DSpark trains its own separate draft
-                # regardless, so disable the target's native MTP modules.
-                text_config=target_text_overrides,
-            )
-            # A distributed-setup-loaded model already lands correctly placed
-            # (sharded as DTensors); a blanket .to(device) afterward is redundant.
+            if self.cached_target_path is None:
+                self.distributed_setup = create_distributed_setup_from_config(
+                    self.cfg,
+                    world_size=self.dist_env.world_size,
+                )
+                backend = BackendConfig(
+                    # M3's sparse-attention layers emit an additive float bias from the
+                    # DSA indexer that only SDPA's explicit-mask path accepts; TE's
+                    # DotProductAttention treats attention_mask as a boolean padding
+                    # mask and crashes on the float bias.
+                    attn="sdpa",
+                    # The target is frozen / forward-only here, so there is no
+                    # throughput reason to pay TE's integration complexity, and plain
+                    # linears keep embed_tokens/lm_head as plain-shaped weights.
+                    linear="torch",
+                    rms_norm="torch_fp32",
+                    rope_fusion=False,
+                    experts=str(recipe_cfg.get("target_experts", "gmm")),
+                    dispatcher="hybridep",
+                    enable_hf_state_dict_adapter=True,
+                    enable_fsdp_optimizations=True,
+                )
+                self.target_model = NeMoAutoModelForImageTextToText.from_pretrained(
+                    target_path,
+                    trust_remote_code=trust_remote_code,
+                    torch_dtype=self.compute_dtype,
+                    distributed_setup=self.distributed_setup,
+                    backend=backend,
+                    # The released bf16 checkpoint ships no real MTP weights despite the
+                    # config declaring some, and DSpark trains its own separate draft
+                    # regardless, so disable the target's native MTP modules.
+                    text_config=target_text_overrides,
+                )
+                # A distributed-setup-loaded model already lands correctly placed
+                # (sharded as DTensors); a blanket .to(device) afterward is redundant.
+            else:
+                self.target_model = None
         elif is_glm_5_2_target:
-            # GLM-5.2 (GlmMoeDsaForCausalLM) is a ~355B-parameter MLA + DSA MoE LM: load
-            # it frozen through the same expert-parallel / FSDP distributed path the GLM
-            # finetune recipe uses, sharding the 256 routed experts across ranks instead
-            # of replicating per rank.
-            target_config, self.target_model = self._build_glm_5_2_target(target_path, recipe_cfg, trust_remote_code)
+            if self.cached_target_path is None:
+                # GLM-5.2 (GlmMoeDsaForCausalLM) is a ~355B-parameter MLA + DSA MoE LM: load
+                # it frozen through the same expert-parallel / FSDP distributed path the GLM
+                # finetune recipe uses, sharding the 256 routed experts across ranks instead
+                # of replicating per rank.
+                target_config, self.target_model, self.distributed_setup = build_glm_5_2_target(
+                    cfg=self.cfg,
+                    world_size=self.dist_env.world_size,
+                    device=self.device,
+                    compute_dtype=self.compute_dtype,
+                    target_path=target_path,
+                    recipe_cfg=recipe_cfg,
+                    trust_remote_code=trust_remote_code,
+                )
+            else:
+                target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+                raw_config_dict, _ = PretrainedConfig.get_config_dict(target_path, trust_remote_code=trust_remote_code)
+                repair_glm_5_2_qk_rope_head_dim(target_config, raw_config_dict)
+                n_reduced = resolve_reduced_target_layers(
+                    target_config.num_hidden_layers,
+                    recipe_cfg.get("target_num_hidden_layers", None),
+                )
+                if n_reduced is not None:
+                    target_config.num_hidden_layers = n_reduced
+                self.target_model = None
             architectures = list(getattr(target_config, "architectures", None) or ["GlmMoeDsaForCausalLM"])
         else:
             target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
             architectures = getattr(target_config, "architectures", []) or []
-            target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
-            target_kwargs = {}
-            if target_attn_implementation is not None:
-                target_kwargs["attn_implementation"] = target_attn_implementation
-            self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
-                target_path,
-                trust_remote_code=trust_remote_code,
-                torch_dtype=self.compute_dtype,
-                force_hf=bool(recipe_cfg.get("target_force_hf", False)),
-                **target_kwargs,
-            )
-            self.target_model.to(self.device)
-        self.target_model.requires_grad_(False)
+            is_gemma4_target = getattr(target_config, "model_type", "") in _GEMMA4_MODEL_TYPES
+
+            if self.cached_target_path is None:
+                target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
+                target_kwargs = {}
+                if target_attn_implementation is not None:
+                    target_kwargs["attn_implementation"] = target_attn_implementation
+                if self._should_shard_dense_target(recipe_cfg):
+                    # Load the frozen dense target FSDP2-sharded through the standard distributed
+                    # setup (device mesh + FSDP2 policy, then a root fully_shard on load), the same
+                    # path the MoE / VL targets use, instead of replicating the whole target on
+                    # every rank. embed_tokens / lm_head come back as sharded DTensors and are
+                    # gathered to full tensors before the draft copies them (see below).
+                    # A config without a distributed: block resolves to the default FSDP2 setup
+                    # (the helper's cfg=None path) instead of failing on the missing attribute.
+                    self.distributed_setup = create_distributed_setup_from_config(
+                        self.cfg if self.cfg.get("distributed", None) is not None else None,
+                        world_size=self.dist_env.world_size,
+                    )
+                self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
+                    target_path,
+                    trust_remote_code=trust_remote_code,
+                    torch_dtype=self.compute_dtype,
+                    force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+                    distributed_setup=self.distributed_setup,
+                    **target_kwargs,
+                )
+                if self.distributed_setup is None:
+                    self.target_model.to(self.device)
+            else:
+                self.target_model = None
+        if self.target_model is not None:
+            self.target_model.requires_grad_(False)
 
         # Resolve the captured target layers once and share them between the
         # target wrapper (what to capture) and the draft config (the ``fc`` input
@@ -481,69 +619,111 @@ class TrainDSparkRecipe(BaseRecipe):
             recipe_cfg.get("target_layer_ids", None)
             or build_target_layer_ids(num_target_layers, draft_num_hidden_layers)
         )
+        target_layer_ids = validate_target_layer_ids(target_layer_ids, num_target_layers)
         # HFDSparkTargetModel validates target_layer_ids against the actual (possibly
         # reduced) layer count via common.validate_target_layer_ids, which also accepts
         # -1 (the embedding output) and enforces strictly-increasing ids.
-        self.target_wrapper = HFDSparkTargetModel(self.target_model, target_layer_ids=target_layer_ids)
+        self.target_layer_ids = target_layer_ids
+        self.target_wrapper = (
+            HFDSparkTargetModel(self.target_model, target_layer_ids=target_layer_ids)
+            if self.target_model is not None
+            else None
+        )
 
         self.block_size = int(recipe_cfg.get("block_size", 7))
         self.num_anchors = int(recipe_cfg.get("num_anchors", 512))
         self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_text_config.vocab_size)
 
-        if is_multimodal:
-            # MiniMax M3's vision_tower is its own FSDP2-sharded unit, so a batch
-            # mixing text-only and image-containing samples across DP ranks would
-            # desync the FSDP2 all-gather collective and hang training.
-            # dspark_vlm_collate_fn injects a masked fake image into any text-only
-            # example (mirroring default_collate_fn's own fake-image handling),
-            # so mixed corpora are safe here without any dataset curation.
-            self.processor = build_minimax_m3_vl_processor(target_path, trust_remote_code=trust_remote_code)
-            self.train_dataloader = build_dspark_vlm_dataloader(
-                dataset_cfg=self.cfg.dataset,
-                processor=self.processor,
-                batch_size=recipe_cfg.micro_batch_size,
-                max_length=recipe_cfg.seq_length,
-                shuffle=True,
-                num_workers=recipe_cfg.get("num_workers", 0),
-                distributed=self.dist_env.world_size > 1,
-            )
-            self.val_dataloader = None
-            if self.cfg.get("val_dataset", None) is not None:
-                self.val_dataloader = build_dspark_vlm_dataloader(
-                    dataset_cfg=self.cfg.val_dataset,
+        embed_src = None
+        head_src = None
+        if self.cached_target_path is None:
+            if is_multimodal:
+                # MiniMax M3's vision_tower is its own FSDP2-sharded unit, so a batch
+                # mixing text-only and image-containing samples across DP ranks would
+                # desync the FSDP2 all-gather collective and hang training.
+                # dspark_vlm_collate_fn injects a masked fake image into any text-only
+                # example (mirroring default_collate_fn's own fake-image handling),
+                # so mixed corpora are safe here without any dataset curation.
+                self.processor = build_minimax_m3_vl_processor(target_path, trust_remote_code=trust_remote_code)
+                self.train_dataloader = build_dspark_vlm_dataloader(
+                    dataset_cfg=self.cfg.dataset,
                     processor=self.processor,
                     batch_size=recipe_cfg.micro_batch_size,
                     max_length=recipe_cfg.seq_length,
-                    shuffle=False,
+                    shuffle=True,
                     num_workers=recipe_cfg.get("num_workers", 0),
                     distributed=self.dist_env.world_size > 1,
                 )
-        else:
-            self.train_dataloader = build_eagle3_dataloader(
-                data_path=recipe_cfg.train_data_path,
-                tokenizer=self.tokenizer,
-                seq_length=recipe_cfg.seq_length,
-                batch_size=recipe_cfg.micro_batch_size,
-                shuffle=True,
-                num_workers=recipe_cfg.get("num_workers", 0),
-                split=recipe_cfg.get("train_split", None),
-                distributed=self.dist_env.world_size > 1,
-                shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
-                mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
-            )
-            self.val_dataloader = None
-            if recipe_cfg.get("val_data_path", None):
-                self.val_dataloader = build_eagle3_dataloader(
-                    data_path=recipe_cfg.val_data_path,
+                self.val_dataloader = None
+                if self.cfg.get("val_dataset", None) is not None:
+                    self.val_dataloader = build_dspark_vlm_dataloader(
+                        dataset_cfg=self.cfg.val_dataset,
+                        processor=self.processor,
+                        batch_size=recipe_cfg.micro_batch_size,
+                        max_length=recipe_cfg.seq_length,
+                        shuffle=False,
+                        num_workers=recipe_cfg.get("num_workers", 0),
+                        distributed=self.dist_env.world_size > 1,
+                    )
+            else:
+                self.train_dataloader = build_eagle3_dataloader(
+                    data_path=recipe_cfg.train_data_path,
                     tokenizer=self.tokenizer,
                     seq_length=recipe_cfg.seq_length,
                     batch_size=recipe_cfg.micro_batch_size,
-                    shuffle=False,
+                    shuffle=True,
                     num_workers=recipe_cfg.get("num_workers", 0),
-                    split=recipe_cfg.get("val_split", None),
+                    split=recipe_cfg.get("train_split", None),
                     distributed=self.dist_env.world_size > 1,
                     shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                     mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                )
+                self.val_dataloader = None
+                if recipe_cfg.get("val_data_path", None):
+                    self.val_dataloader = build_eagle3_dataloader(
+                        data_path=recipe_cfg.val_data_path,
+                        tokenizer=self.tokenizer,
+                        seq_length=recipe_cfg.seq_length,
+                        batch_size=recipe_cfg.micro_batch_size,
+                        shuffle=False,
+                        num_workers=recipe_cfg.get("num_workers", 0),
+                        split=recipe_cfg.get("val_split", None),
+                        distributed=self.dist_env.world_size > 1,
+                        shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+                        mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                    )
+        else:
+            manifest = read_manifest(self.cached_target_path)
+            _validate_cached_dspark_manifest(
+                self.cached_target_path,
+                manifest,
+                target_text_config,
+                target_layer_ids,
+                target_model=target_path,
+                target_model_type=target_model_type,
+                seq_length=recipe_cfg.seq_length,
+                compute_dtype=self.compute_dtype,
+            )
+            embed_src, head_src = read_target_weight_modules(self.cached_target_path)
+            self.train_dataloader = build_cached_dspark_dataloader(
+                cache_dir=self.cached_target_path,
+                batch_size=recipe_cfg.micro_batch_size,
+                shuffle=True,
+                num_workers=recipe_cfg.get("num_workers", 0),
+                distributed=self.dist_env.world_size > 1,
+            )
+            self.val_dataloader = None
+            if (
+                recipe_cfg.get("val_data_path", None) is not None or self.cfg.get("val_dataset", None) is not None
+            ) and self.dist_env.is_main:
+                logger.warning(
+                    "DSpark cached_target_path is set; validation data is ignored because the target model is not loaded."
+                )
+            if self.dist_env.is_main:
+                logger.info(
+                    "DSpark OFFLINE cache: streaming %d precomputed samples from %s (target model not loaded).",
+                    len(self.train_dataloader.dataset),
+                    self.cached_target_path,
                 )
 
         # The Qwen3 / Gemma4 drafts consume a flex_attention BlockMask during training.
@@ -573,22 +753,18 @@ class TrainDSparkRecipe(BaseRecipe):
                 # The V4 draft is always dense and fixes _attn_implementation to "sdpa"
                 # inside the builder, so it is not overridden by attention_backend.
                 draft_config_obj = build_deepseek_v4_draft_config(target_config, margs)
-                draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
             elif is_glm_5_2_target:
                 # The GLM draft is always dense and fixes _attn_implementation to "sdpa"
                 # inside the builder, so it is not overridden by attention_backend.
                 draft_config_obj = build_glm_5_2_draft_config(target_config, margs)
-                draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
             elif is_minimax_m3_target:
                 # MiniMax M3 draft is built from the target's text sub-config (text_config).
                 draft_config_obj = build_minimax_m3_draft_config(target_config, margs)
                 draft_config_obj._attn_implementation = attention_backend
-                draft_cls = MiniMaxM3DSparkModel
             else:
                 # Gemma4 draft is built from the target's text sub-config (text_config).
                 draft_config_obj = build_gemma4_draft_config(target_config, margs)
                 draft_config_obj._attn_implementation = attention_backend
-                draft_cls = Gemma4DSparkModel
         else:
             # Qwen3-style draft: a small non-causal stack reusing the target's
             # architecture defaults plus the DSpark-specific fields.
@@ -612,23 +788,30 @@ class TrainDSparkRecipe(BaseRecipe):
             draft_config["tie_word_embeddings"] = False
             draft_config_obj = Qwen3Config.from_dict(draft_config)
             draft_config_obj._attn_implementation = attention_backend
-            draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
 
+        draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
         self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
 
         # training only the backbone, fc, Markov head, and confidence head.
-        embed_src = self.target_wrapper.get_input_embeddings()
-        head_src = self.target_wrapper.get_output_embeddings()
-        if is_deepseek_v4_target or is_glm_5_2_target or is_minimax_m3_target:
-            # The V4 / GLM / MiniMax M3 target's embed_tokens / lm_head are expert-parallel /
-            # FSDP-sharded DTensors; gather them to full tensors before the draft copies them.
-            embed_src = _gather_full_weight_module(embed_src)
-            head_src = _gather_full_weight_module(head_src)
+        if embed_src is None or head_src is None:
+            embed_src = self.target_wrapper.get_input_embeddings()
+            head_src = self.target_wrapper.get_output_embeddings()
+        if self.distributed_setup is not None:
+            # Every distributed-setup-loaded target (MoE / VL / sharded dense) stores
+            # embed_tokens / lm_head as expert-parallel / FSDP-sharded DTensors; gather
+            # them to full tensors before the draft copies them. The offline cached path
+            # never builds a distributed setup, so it is excluded by construction.
+            embed_src = gather_full_weight_module(embed_src)
+            head_src = gather_full_weight_module(head_src)
         self.draft_model.initialize_embeddings_and_head(
             embed_tokens=embed_src,
             lm_head=head_src,
             freeze=bool(recipe_cfg.get("freeze_embeddings", True)),
         )
+        # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede AC and the FSDP2/DDP wrap.
+        apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
+        # Optional torch.compile of the draft, in place; after the fp8 swap.
+        apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
 
         dist_cfg = self.cfg.get("distributed", None)
         activation_checkpointing = dist_cfg.get("activation_checkpointing", False) if dist_cfg is not None else False
@@ -646,7 +829,8 @@ class TrainDSparkRecipe(BaseRecipe):
         # Multi-GPU strategy: FSDP2 (default) shards the draft per block, or DDP.
         self.parallel_strategy = "ddp"
         if self.dist_env.world_size > 1:
-            strategy = dist_cfg.get("strategy", "fsdp2") if dist_cfg is not None else "fsdp2"
+            # Case-fold to match parse_distributed_section's strategy normalization.
+            strategy = str(dist_cfg.get("strategy", "fsdp2")).lower() if dist_cfg is not None else "fsdp2"
             self.parallel_strategy = strategy
             if strategy == "fsdp2":
                 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -666,6 +850,14 @@ class TrainDSparkRecipe(BaseRecipe):
             else:
                 raise ValueError(f"Unsupported distributed.strategy={strategy!r}; use 'fsdp2' or 'ddp'.")
         self.trainer_module = trainer_module
+        # FP8 + FSDP2 float8 all-gather: amortize the per-parameter dynamic-scale
+        # computation into one call after each optimizer step (mirrors train_ft).
+        # apply_fp8_to_model already resolved whether per-step scale precompute
+        # applies (enabled + tensorwise + fp8 all-gather) onto the draft module;
+        # reuse that instead of re-deriving from raw YAML.
+        self._precompute_fp8_scales = self.parallel_strategy == "fsdp2" and bool(
+            getattr(self.draft_model, "precompute_float8_dynamic_scale_for_fsdp", False)
+        )
 
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
@@ -745,173 +937,6 @@ class TrainDSparkRecipe(BaseRecipe):
             )
         return mask_token_id
 
-    def _build_deepseek_v4_target(self, target_path, recipe_cfg, trust_remote_code):
-        """Load the full DeepSeek V4 target as a frozen, expert-parallel / FSDP model.
-
-        Mirrors the V4 finetune recipe's model build: an expert-parallel / FSDP
-        distributed setup (device_mesh + moe_mesh, derived from the recipe's
-        ``distributed`` block) shards the 256 experts across ranks while the
-        ``enable_hf_state_dict_adapter`` path dequantizes the FP8 base weights on load.
-        The target is MTP-free (``num_nextn_predict_layers=0``) because the draft
-        consumes hidden states only, and is returned frozen for inference.
-
-        Returns the resolved ``DeepseekV4Config`` and the sharded target model.
-        """
-        if self.device.type != "cuda":
-            raise RuntimeError(
-                "DeepSeek V4 DSpark target training requires CUDA: the target is loaded "
-                "with the expert-parallel / FSDP distributed path."
-            )
-        # Build the device_mesh + moe_mesh from the recipe's `distributed` block
-        # (strategy, ep_size, moe, ...). DeepseekV4Config.from_pretrained is used
-        # because the custom V4 model_type is not registered with stock AutoConfig.
-        self.distributed_setup = create_distributed_setup_from_config(
-            self.cfg,
-            world_size=self.dist_env.world_size,
-        )
-        # Pass name_or_path explicitly (as the V4 finetune recipe does) so from_config
-        # resolves the base checkpoint to load and dequantize from.
-        target_config = DeepseekV4Config.from_pretrained(
-            target_path, name_or_path=target_path, num_nextn_predict_layers=0
-        )
-        # Diagnostic / CI knob: a full 43-layer V4-Flash target dequantizes to
-        # ~63 GiB of experts per rank at ep_size=8 and does NOT fit on a single
-        # 8x80GB node (it OOMs in the expert dequant before the first forward).
-        # Shrinking the layer count loads only the first N layers, so the entire
-        # EP / hidden-capture / draft-training path can be exercised end to end on
-        # one node. ``target_layer_ids`` must then point at layers that exist in
-        # the reduced stack (e.g. [1, 2, 3] for N=4). This is a validation aid:
-        # a draft trained against a reduced target is not a usable drafter for the
-        # full model. Leave it unset for real training (use multi-node ep_size).
-        n_reduced = _resolve_reduced_target_layers(
-            target_config.num_hidden_layers, recipe_cfg.get("target_num_hidden_layers", None)
-        )
-        if n_reduced is not None:
-            logger.warning(
-                "Reducing the DeepSeek V4 target from %d to %d layers "
-                "(target_num_hidden_layers): diagnostic/CI only, not a usable drafter.",
-                target_config.num_hidden_layers,
-                n_reduced,
-            )
-            target_config.num_hidden_layers = n_reduced
-        backend = self._build_deepseek_v4_backend(recipe_cfg)
-        target_model = NeMoAutoModelForCausalLM.from_config(
-            config=target_config,
-            backend=backend,
-            distributed_setup=self.distributed_setup,
-            load_base_model=True,
-            torch_dtype=self.compute_dtype,
-            trust_remote_code=trust_remote_code,
-        )
-        return target_config, target_model
-
-    @staticmethod
-    def _build_deepseek_v4_backend(recipe_cfg) -> BackendConfig:
-        """Build the V4 target BackendConfig (TileLang attention, hybrid-EP, FP8 adapter).
-
-        Matches the V4 finetune recipe's backend: dense linears and fp32 RMSNorm on
-        torch, the ``torch_mm`` grouped-expert GEMM, the hybrid-EP token dispatcher, and
-        the HF state-dict adapter that dequantizes the FP8 base checkpoint on load.
-        """
-        return BackendConfig(
-            attn=str(recipe_cfg.get("target_attn_backend", "tilelang")),
-            linear="torch",
-            rms_norm="torch_fp32",
-            rope_fusion=False,
-            dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
-            experts=str(recipe_cfg.get("target_experts", "torch_mm")),
-            enable_hf_state_dict_adapter=True,
-            enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
-        )
-
-    def _build_glm_5_2_target(self, target_path, recipe_cfg, trust_remote_code):
-        """Load the full GLM-5.2 target as a frozen, expert-parallel / FSDP model.
-
-        Mirrors ``_build_deepseek_v4_target``: an expert-parallel / FSDP distributed
-        setup (derived from the recipe's ``distributed`` block) shards the 256 routed
-        experts across ranks. GLM-5.2's ``model_type`` is registered, so ``AutoConfig``
-        resolves it directly (unlike DeepSeek V4), but the model must still be built
-        with ``from_config`` + ``load_base_model=True``: ``from_pretrained`` re-reads
-        the checkpoint's own config and silently rebuilds the full 78-layer target,
-        discarding the ``target_num_hidden_layers`` reduction (which OOMs on one node).
-        ``from_config`` keeps the (possibly reduced, repaired) config and still loads
-        the checkpoint weights, resolved via ``config.name_or_path``.
-
-        DSpark's forward-hook hidden-state capture needs one non-pipelined
-        ``self.model(...)`` call, so ``pp_size`` must be 1 in the recipe's
-        ``distributed:`` block; use a larger ``ep_size`` instead of PP to shard the
-        parameter memory.
-
-        Returns the resolved (repaired) target config and the sharded target model.
-        """
-        if self.device.type != "cuda":
-            raise RuntimeError(
-                "GLM-5.2 DSpark target training requires CUDA: the target is loaded "
-                "with the expert-parallel / FSDP distributed path."
-            )
-        target_config = AutoConfig.from_pretrained(target_path, trust_remote_code=trust_remote_code)
-        # The published config's head_dim=192 clobbers qk_rope_head_dim on load via the
-        # HF attribute_map, breaking checkpoint shape validation (see the helper).
-        raw_config_dict, _ = PretrainedConfig.get_config_dict(target_path, trust_remote_code=trust_remote_code)
-        _repair_glm_5_2_qk_rope_head_dim(target_config, raw_config_dict)
-        n_reduced = _resolve_reduced_target_layers(
-            target_config.num_hidden_layers,
-            recipe_cfg.get("target_num_hidden_layers", None),
-        )
-        if n_reduced is not None:
-            logger.warning(
-                "Reducing the GLM-5.2 target from %d to %d layers "
-                "(target_num_hidden_layers): diagnostic/CI only, not a usable drafter.",
-                target_config.num_hidden_layers,
-                n_reduced,
-            )
-            target_config.num_hidden_layers = n_reduced
-        self.distributed_setup = create_distributed_setup_from_config(
-            self.cfg,
-            world_size=self.dist_env.world_size,
-        )
-        backend = self._build_glm_5_2_backend(recipe_cfg)
-        target_model = NeMoAutoModelForCausalLM.from_config(
-            config=target_config,
-            backend=backend,
-            distributed_setup=self.distributed_setup,
-            load_base_model=True,
-            torch_dtype=self.compute_dtype,
-            trust_remote_code=trust_remote_code,
-        )
-        return target_config, target_model
-
-    @staticmethod
-    def _build_glm_5_2_backend(recipe_cfg) -> BackendConfig:
-        """Build the GLM-5.2 target BackendConfig (mirrors the GLM finetune recipe).
-
-        Dense linears and fp32 RMSNorm on torch, an fp32 router gate (the GLM/DeepSeek-V3
-        top-k routing is fp32 for stability), the ``torch_mm`` grouped-expert GEMM, the
-        hybrid-EP token dispatcher, and the HF state-dict adapter that maps (and
-        dequantizes, when the base checkpoint is FP8) the HF weights on load. The target
-        is frozen / forward-only, so SDPA attention is used by default (the DSA indexer
-        emits an additive float bias that SDPA's explicit-mask path accepts);
-        ``target_attn_backend=tilelang`` switches to the fused sparse kernels when a
-        TileLang build is available. ``target_experts`` defaults to ``torch_mm`` (like
-        the V4 DSpark backend) because ``gmm`` needs the optional ``grouped_gemm``
-        package, which the current AutoModel image does not ship (it fails with
-        ``NameError: ops is not defined``).
-        """
-        return BackendConfig(
-            attn=str(recipe_cfg.get("target_attn_backend", "sdpa")),
-            # The target is frozen / forward-only, so plain torch linears (which also keep
-            # embed_tokens / lm_head as plain-shaped weights) are used, matching the V4 /
-            # MiniMax M3 frozen-target backends.
-            linear="torch",
-            rms_norm="torch_fp32",
-            rope_fusion=False,
-            gate_precision="float32",
-            dispatcher=str(recipe_cfg.get("target_dispatcher", "hybridep")),
-            experts=str(recipe_cfg.get("target_experts", "torch_mm")),
-            enable_hf_state_dict_adapter=True,
-            enable_fsdp_optimizations=bool(recipe_cfg.get("target_enable_fsdp_optimizations", True)),
-        )
-
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the EAGLE / DFlash recipes."""
         ckpt_cfg = self.cfg.get("checkpoint", None)
@@ -946,6 +971,12 @@ class TrainDSparkRecipe(BaseRecipe):
             if isinstance(self.trainer_module, DistributedDataParallel)
             else self.trainer_module
         )
+
+    def _maybe_precompute_fp8_scales(self) -> None:
+        """Precompute float8 dynamic scales after an optimizer step (FSDP2 fp8 all-gather only)."""
+        if not getattr(self, "_precompute_fp8_scales", False):
+            return
+        precompute_float8_dynamic_scale_for_fsdp(self._module())
 
     def save_checkpoint(
         self,
@@ -1042,7 +1073,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 "block_size": self.block_size,
                 "num_anchors": self.num_anchors,
                 "mask_token_id": self.mask_token_id,
-                "target_layer_ids": list(self.target_wrapper.target_layer_ids),
+                "target_layer_ids": list(self.target_layer_ids),
             },
             os.path.join(path, "dspark_meta.pt"),
         )
@@ -1103,6 +1134,31 @@ class TrainDSparkRecipe(BaseRecipe):
         if self.dist_env.is_main and ckpt_cfg is not None and ckpt_cfg.enabled:
             logger.info("Saved %s checkpoint to %s/epoch_%d_step_%d", kind, ckpt_cfg.checkpoint_dir, epoch, step)
 
+    def _forward_batch(self, batch):
+        """Run one batch through live target capture or the offline cache."""
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        if self.target_wrapper is None:
+            batch["target_hidden_states"] = batch["target_hidden_states"].to(self.compute_dtype)
+            batch["target_last_hidden_states"] = batch["target_last_hidden_states"].to(self.compute_dtype)
+            return self.trainer_module(
+                input_ids=batch["input_ids"],
+                target_hidden_states=batch["target_hidden_states"],
+                loss_mask=batch["loss_mask"],
+                target_last_hidden_states=batch["target_last_hidden_states"],
+            )
+        target_batch = self.target_wrapper.generate_batch(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            loss_mask=batch["loss_mask"],
+            **_extract_mm_kwargs(batch),
+        )
+        return self.trainer_module(
+            input_ids=target_batch.input_ids,
+            target_hidden_states=target_batch.target_hidden_states,
+            loss_mask=target_batch.loss_mask,
+            target_last_hidden_states=target_batch.target_last_hidden_states,
+        )
+
     def _maybe_save_step_checkpoint(self, epoch: int) -> bool:
         """Save a checkpoint mid-epoch when ``ckpt_every_steps`` is configured."""
         every = getattr(self, "ckpt_every_steps", None)
@@ -1141,19 +1197,7 @@ class TrainDSparkRecipe(BaseRecipe):
         total_batches = torch.zeros((), device=self.device)
         with torch.no_grad():
             for batch in self.val_dataloader:
-                batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-                target_batch = self.target_wrapper.generate_batch(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    loss_mask=batch["loss_mask"],
-                    **_extract_mm_kwargs(batch),
-                )
-                metrics = self.trainer_module(
-                    input_ids=target_batch.input_ids,
-                    target_hidden_states=target_batch.target_hidden_states,
-                    loss_mask=target_batch.loss_mask,
-                    target_last_hidden_states=target_batch.target_last_hidden_states,
-                )
+                metrics = self._forward_batch(batch)
                 total_loss += metrics.loss.detach()
                 total_batches += 1
         total_loss = self._dp_allreduce(total_loss)
@@ -1209,24 +1253,12 @@ class TrainDSparkRecipe(BaseRecipe):
                 num_batches = len(self.train_dataloader)
                 for batch_idx, batch in enumerate(self.train_dataloader):
                     last_batch_idx = batch_idx
-                    batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-                    target_batch = self.target_wrapper.generate_batch(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        loss_mask=batch["loss_mask"],
-                        **_extract_mm_kwargs(batch),
-                    )
                     is_optim_step = (pending_micro_batches + 1 == self.grad_accumulation_steps) or (
                         batch_idx == num_batches - 1
                     )
                     # get_sync_ctx handles both DDP (no_sync) and FSDP2 (set_requires_gradient_sync).
                     with get_sync_ctx(self.trainer_module, is_optim_step, self.defer_fsdp_grad_sync):
-                        metrics = self.trainer_module(
-                            input_ids=target_batch.input_ids,
-                            target_hidden_states=target_batch.target_hidden_states,
-                            loss_mask=target_batch.loss_mask,
-                            target_last_hidden_states=target_batch.target_last_hidden_states,
-                        )
+                        metrics = self._forward_batch(batch)
                         loss = metrics.loss / self.grad_accumulation_steps
                         loss.backward()
 
@@ -1244,6 +1276,7 @@ class TrainDSparkRecipe(BaseRecipe):
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
                         self.lr_scheduler.step()
+                        self._maybe_precompute_fp8_scales()
                         self.runtime.global_step += 1
                         if pbar is not None:
                             pbar.update(1)
@@ -1317,6 +1350,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.lr_scheduler.step()
+                    self._maybe_precompute_fp8_scales()
                     self.runtime.global_step += 1
                     if pbar is not None:
                         pbar.update(1)

@@ -100,6 +100,16 @@ def test_jetspec_target_wrapper_captures_logits():
     assert wrapper.target_layer_ids == TARGET_LAYER_IDS
 
 
+def test_build_dflash_config_stamps_causal():
+    """JetSpec stamps causal=true so serving engines match its causal in-block attention."""
+    recipe = _jetspec_recipe()
+    recipe.mask_token_id = 151669
+    cfg = recipe._build_dflash_config({}, TARGET_LAYER_IDS)
+    assert cfg["causal"] is True
+    assert cfg["mask_token_id"] == 151669
+    assert cfg["target_layer_ids"] == TARGET_LAYER_IDS
+
+
 def test_build_trainer_module_is_jetspec():
     recipe = _jetspec_recipe()
     module = recipe._build_trainer_module("sdpa", {"num_anchors": 7, "kd_temperature": 2.0, "kd_chunk_size": 64})

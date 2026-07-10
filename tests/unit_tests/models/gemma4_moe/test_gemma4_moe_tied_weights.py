@@ -24,6 +24,7 @@ that behavior for both the tied and untied configs.
 Runs on CPU (no CUDA / TE / DeepEP required).
 """
 
+import pytest
 import torch
 import torch.nn as nn
 from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig
@@ -104,11 +105,10 @@ def test_tied_lm_head_survives_initialize_weights():
     assert lm_head.dtype == torch.bfloat16
 
 
-def test_untied_lm_head_is_separate():
-    """tie_word_embeddings=False: lm_head must keep its own storage."""
-    model = _build(tie_word_embeddings=False)
-    assert model.lm_head.weight is not model.model.language_model.embed_tokens.weight
-    assert model.lm_head.weight.data_ptr() != model.model.language_model.embed_tokens.weight.data_ptr()
+def test_untied_construction_is_rejected():
+    """Gemma4 is tied by default; tie_word_embeddings=False is rejected at construction."""
+    with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=False"):
+        _build(tie_word_embeddings=False)
 
 
 def test_tie_weights_hook_reties_to_active_embedding():
@@ -127,18 +127,11 @@ def test_tie_weights_hook_reties_to_active_embedding():
     assert model.lm_head.weight is model.model.language_model.embed_tokens.weight
 
 
-def test_tie_weights_hook_is_noop_when_untied():
-    """tie_weights() must not alias storage when the config requests untied embeddings."""
-    model = _build(tie_word_embeddings=False)
-    model.tie_weights()
-    assert model.lm_head.weight is not model.model.language_model.embed_tokens.weight
-
-
 def test_top_level_flag_controls_tie_when_flags_disagree():
     """The controlling flag is top-level Gemma4Config.tie_word_embeddings, not text_config (matches HF)."""
-    # top-level True wins over text_config False -> tied
+    # top-level True wins over text_config False -> tied (constructs, shares storage)
     tied = _build(tie_word_embeddings=True, text_tie=False)
     assert tied.lm_head.weight is tied.model.language_model.embed_tokens.weight
-    # top-level False wins over text_config True -> untied
-    untied = _build(tie_word_embeddings=False, text_tie=True)
-    assert untied.lm_head.weight is not untied.model.language_model.embed_tokens.weight
+    # top-level False is the controlling flag -> untie is rejected even when text_config is True
+    with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=False"):
+        _build(tie_word_embeddings=False, text_tie=True)
