@@ -227,7 +227,10 @@ class GPT2LMHeadModel(nn.Module):
         # Initialize parameters following GPT-2 scheme
         self._init_weights()
 
-    def forward(self, input_ids: torch.LongTensor) -> torch.Tensor:  # (B, T) → (B, T, V)
+    def initialize_weights(self):
+        self._init_weights()
+
+    def forward(self, input_ids: torch.LongTensor, **kwargs) -> torch.Tensor:  # (B, T) → (B, T, V)
         batch_size, seq_len = input_ids.shape
 
         if seq_len > self.wpe.num_embeddings:
@@ -351,7 +354,7 @@ Alternatively, target a specific architecture:
 
 ```yaml
 model:
-  _target_: transformers.GPT2LMHeadModel.from_config
+  _target_: transformers.GPT2LMHeadModel
   config:
     _target_: transformers.GPT2Config
     n_layer: 12
@@ -362,7 +365,7 @@ model:
 
 <Note>
 - The `model._target_` may reference an import path or a local Python file using the `path.py:object` form.
-- Any nested mapping that includes `_target_` (e.g., `config:`) is instantiated first and its result is passed upward. This is how the Hugging Face `from_config` pattern works.
+- Any nested mapping that includes `_target_` (e.g., `config:`) is instantiated first and its result is passed upward. This supports both Hugging Face `from_config` callables and direct architecture constructors.
 - You can keep using the same training recipe (optimizer, data, distributed settings); only the `model:` block changes.
 
 </Note>
