@@ -20,8 +20,8 @@ recipe body only ever sees typed component configs and calls
 ``self.cfg.<section>.build(...)`` directly.
 
 Known sections are exposed as cached, typed attributes that own a ``build()``:
-``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler`` map to component config
-dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
+``wandb``/``mlflow``/``tokenizer``/``step_scheduler``/``lr_scheduler`` map to
+component config dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
 ``build_optimizer_config`` / ``build_loss_config`` (which own a ``build()``),
@@ -49,6 +49,7 @@ from nemo_automodel.components.optim.optimizer import LRSchedulerConfig
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
 
 if TYPE_CHECKING:
+    from nemo_automodel._transformers.tokenizer_config import TokenizerConfig
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderConfig
@@ -63,6 +64,7 @@ if TYPE_CHECKING:
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
 # to ``StepSchedulerConfig.build(...)`` separately (not config fields).
 _STEP_SCHEDULER_RUNTIME_KEYS = ("local_batch_size", "dp_size", "dataloader")
+_MISSING = object()
 
 
 def _section_kwargs(node: Any) -> dict[str, Any]:
@@ -113,6 +115,8 @@ def _target_kwargs(node: Any) -> tuple[Any, dict[str, Any]]:
 
 
 def _model_name_from_cfg(cfg_model: Any) -> str | None:
+    if cfg_model is None:
+        return None
     pretrained = cfg_model.get("pretrained_model_name_or_path", None)
     if pretrained is not None:
         return pretrained
@@ -124,11 +128,31 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
     return None
 
 
+def _trust_remote_code_from_model(cfg_model: Any) -> bool:
+    """Resolve the tokenizer's remote-code policy from the model config."""
+    if cfg_model is None:
+        return False
+
+    direct = cfg_model.get("trust_remote_code", _MISSING)
+    if direct is not _MISSING:
+        return bool(direct)
+
+    nested = cfg_model.get("config", None)
+    if nested is not None and not isinstance(nested, str):
+        nested_value = nested.get("trust_remote_code", _MISSING)
+        if nested_value is not _MISSING:
+            return bool(nested_value)
+
+    from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code
+
+    return resolve_trust_remote_code(_model_name_from_cfg(cfg_model))
+
+
 class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
-    ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
-    ``loss_fn`` and ``checkpoint`` are exposed as typed objects that own a
+    ``wandb``, ``mlflow``, ``tokenizer``, ``step_scheduler``, ``lr_scheduler``,
+    ``optimizer``, ``loss_fn`` and ``checkpoint`` are exposed as typed objects that own a
     ``.build(...)`` (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
     ``checkpoint`` a
@@ -176,6 +200,46 @@ class RecipeConfig:
             return None
         factory, kwargs = _callable_and_kwargs(node)
         return build_optimizer_config(factory, kwargs)
+
+    @cached_property
+    def tokenizer(self) -> "TokenizerConfig":
+        """Resolve the recipe's tokenizer or processor factory configuration."""
+        from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+        from nemo_automodel._transformers.tokenizer_config import TokenizerConfig
+
+        dataset_node = self._raw.get("dataset", None)
+        dataset_has_tokenizer = dataset_node is not None and "tokenizer" in _as_dict(dataset_node)
+        raw_has_tokenizer = "tokenizer" in self._raw.to_dict()
+
+        if dataset_has_tokenizer:
+            node = dataset_node.get("tokenizer", None)
+            inject_model_trust = True
+        elif raw_has_tokenizer:
+            node = self._raw.get("tokenizer", None)
+            inject_model_trust = False
+        else:
+            model_name = _model_name_from_cfg(self._raw.get("model", None))
+            if model_name is None:
+                return TokenizerConfig()
+            return TokenizerConfig(
+                factory=NeMoAutoTokenizer.from_pretrained,
+                kwargs={
+                    "pretrained_model_name_or_path": model_name,
+                    "trust_remote_code": _trust_remote_code_from_model(self._raw.get("model", None)),
+                },
+            )
+
+        if node is None:
+            return TokenizerConfig()
+
+        kwargs = _as_dict(node)
+        target = kwargs.pop("_target_", None)
+        factory = NeMoAutoTokenizer.from_pretrained if target is None else target
+        if not callable(factory):
+            raise TypeError(f"Tokenizer _target_ must resolve to a callable, got {factory!r}")
+        if inject_model_trust:
+            kwargs.setdefault("trust_remote_code", _trust_remote_code_from_model(self._raw.get("model", None)))
+        return TokenizerConfig(factory=factory, kwargs=kwargs)
 
     @cached_property
     def dataloader(self) -> "DataloaderConfig" | None:

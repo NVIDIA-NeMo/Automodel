@@ -43,7 +43,6 @@ from nemo_automodel.recipes.llm.config import LlmInputConfig
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     build_model,
-    compute_trust_remote_code_from_model,
 )
 
 
@@ -903,7 +902,11 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
             )
         ),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._build_tokenizer", lambda cfg_model, cfg_ds: ({}, None))
+    monkeypatch.setattr(
+        RecipeConfig,
+        "tokenizer",
+        property(lambda self: SimpleNamespace(build=lambda: None)),
+    )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
         "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
@@ -1105,37 +1108,98 @@ def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     trainer._maybe_collect_garbage.assert_called_once()
 
 
-def test_compute_trust_remote_code_prefers_cfg_flag():
-    cfg_model = ConfigNode({"trust_remote_code": False, "pretrained_model_name_or_path": "ignored"})
-
-    with patch("nemo_automodel.recipes.llm.train_ft.resolve_trust_remote_code") as mock_resolve:
-        result = compute_trust_remote_code_from_model(cfg_model)
-
-    assert result is False
-    mock_resolve.assert_not_called()
-
-
-def test_compute_trust_remote_code_prefers_nested_config():
-    cfg_model = ConfigNode({"config": {"trust_remote_code": True}})
-
-    with patch("nemo_automodel.recipes.llm.train_ft.resolve_trust_remote_code") as mock_resolve:
-        result = compute_trust_remote_code_from_model(cfg_model)
-
-    assert result is True
-    mock_resolve.assert_not_called()
-
-
-def test_compute_trust_remote_code_falls_back_to_resolve():
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": "nvidia/foo"})
+def test_tokenizer_config_uses_model_fallback_and_direct_trust_policy():
+    tokenizer = object()
+    raw = ConfigNode(
+        {
+            "model": {"pretrained_model_name_or_path": "org/model", "trust_remote_code": False},
+            "dataset": {"_target_": DummyMapDataset},
+        }
+    )
 
     with patch(
-        "nemo_automodel.recipes.llm.train_ft.resolve_trust_remote_code",
-        return_value=True,
-    ) as mock_resolve:
-        result = compute_trust_remote_code_from_model(cfg_model)
+        "nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained",
+        return_value=tokenizer,
+    ) as from_pretrained:
+        built = RecipeConfig(raw).tokenizer.build()
 
-    assert result is True
-    mock_resolve.assert_called_once_with("nvidia/foo")
+    assert built is tokenizer
+    from_pretrained.assert_called_once_with(
+        pretrained_model_name_or_path="org/model",
+        trust_remote_code=False,
+    )
+
+
+def test_tokenizer_config_without_model_or_explicit_factory_is_disabled():
+    raw = ConfigNode({"dataset": {"_target_": DummyMapDataset}})
+
+    assert RecipeConfig(raw).tokenizer.build() is None
+
+
+def test_tokenizer_config_uses_default_remote_code_policy_for_nvidia_model():
+    raw = ConfigNode(
+        {
+            "model": {"pretrained_model_name_or_path": "nvidia/model"},
+            "dataset": {"_target_": DummyMapDataset},
+        }
+    )
+
+    assert RecipeConfig(raw).tokenizer.kwargs["trust_remote_code"] is True
+
+
+def test_tokenizer_config_injects_nested_model_trust_into_dataset_factory():
+    calls = {}
+    tokenizer = object()
+
+    def factory(**kwargs):
+        calls.update(kwargs)
+        return tokenizer
+
+    raw = ConfigNode(
+        {
+            "model": {"config": {"trust_remote_code": True}},
+            "dataset": {"_target_": DummyMapDataset, "tokenizer": {"_target_": factory, "revision": "main"}},
+        }
+    )
+
+    assert RecipeConfig(raw).tokenizer.build() is tokenizer
+    assert calls == {"revision": "main", "trust_remote_code": True}
+
+
+def test_tokenizer_config_explicit_dataset_null_overrides_top_level_factory():
+    top_level_factory = MagicMock(return_value=object())
+    raw = ConfigNode(
+        {
+            "model": {"pretrained_model_name_or_path": "org/model"},
+            "tokenizer": {"_target_": top_level_factory},
+            "dataset": {"_target_": DummyMapDataset, "tokenizer": None},
+        }
+    )
+
+    assert RecipeConfig(raw).tokenizer.build() is None
+    top_level_factory.assert_not_called()
+
+
+def test_tokenizer_config_builds_top_level_processor_without_recipe_dispatch():
+    calls = {}
+    processor = object()
+
+    def factory(**kwargs):
+        calls.update(kwargs)
+        return processor
+
+    raw = ConfigNode(
+        {
+            "model": {"pretrained_model_name_or_path": "org/model", "trust_remote_code": True},
+            "tokenizer": {"_target_": factory, "pretrained_model_name_or_path": "org/processor"},
+            "dataset": {"_target_": DummyMapDataset},
+        }
+    )
+
+    config = RecipeConfig(raw).tokenizer
+    assert config.build() is processor
+    assert calls == {"pretrained_model_name_or_path": "org/processor"}
+    assert config.kwargs == {"pretrained_model_name_or_path": "org/processor"}
 
 
 # -----------------

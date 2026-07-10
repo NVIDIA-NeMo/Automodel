@@ -26,7 +26,6 @@ except ImportError:
     pass
 
 import gc
-import inspect
 import logging
 import pathlib
 import time
@@ -41,7 +40,6 @@ from huggingface_hub import constants as hf_constants
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
-from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.infrastructure import (
     apply_model_infrastructure,
     instantiate_infrastructure,
@@ -85,7 +83,6 @@ from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
     filter_forward_kwargs,
-    resolve_trust_remote_code,
 )
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
 from nemo_automodel.recipes._typed_config import RecipeConfig
@@ -247,51 +244,6 @@ def build_model(
         logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
 
     return model
-
-
-def compute_trust_remote_code_from_model(cfg_model):
-    """Compute the value of trust_remote_code based on the model configuration.
-
-    Args:
-        cfg_model (ConfigNode): Model configuration.
-
-    Returns:
-        bool: Whether to trust remote code.
-    """
-    if hasattr(cfg_model, "trust_remote_code"):
-        return getattr(cfg_model, "trust_remote_code")
-    elif hasattr(cfg_model, "config") and hasattr(cfg_model.config, "trust_remote_code"):
-        return getattr(cfg_model.config, "trust_remote_code")
-    return resolve_trust_remote_code(_get_model_name(cfg_model))
-
-
-def _build_tokenizer(cfg_model, cfg_ds):
-    trust_remote_code = compute_trust_remote_code_from_model(cfg_model)
-    # if tokenizer is not provided, use the model config to instantiate it
-    if "tokenizer" not in cfg_ds and _get_model_name(cfg_model) is not None:
-        logging.info("Using model config to instantiate tokenizer")
-        tokenizer = NeMoAutoTokenizer.from_pretrained(_get_model_name(cfg_model), trust_remote_code=trust_remote_code)
-    elif cfg_ds.get("tokenizer", None) is None:
-        tokenizer = None
-    elif "_target_" not in cfg_ds.tokenizer:
-        tokenizer_dict = cfg_ds.tokenizer.to_dict()
-        trust_remote_code = tokenizer_dict.pop("trust_remote_code", trust_remote_code)
-        tokenizer = NeMoAutoTokenizer.from_pretrained(**tokenizer_dict, trust_remote_code=trust_remote_code)
-    else:
-        trust_remote_code = cfg_ds.tokenizer.to_dict().pop("trust_remote_code", trust_remote_code)
-        tokenizer = cfg_ds.tokenizer.instantiate(trust_remote_code=trust_remote_code)
-
-    # Finally, check if the dataset target accepts a tokenizer parameter
-    kwargs = {}
-    if tokenizer is not None and callable(cfg_ds._target_):
-        try:
-            sig = inspect.signature(cfg_ds._target_)
-            if "tokenizer" in sig.parameters:
-                kwargs["tokenizer"] = tokenizer
-        except (ValueError, TypeError):
-            # If we can't get the signature, skip adding tokenizer
-            pass
-    return kwargs, tokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -519,9 +471,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     f"      attn: te"
                 )
 
-        # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
-        # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
-        _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
+        self.tokenizer = self.cfg.tokenizer.build()
         input_pipeline = self.cfg.llm_inputs.build(
             model=self.model_parts[0],
             tokenizer=self.tokenizer,
