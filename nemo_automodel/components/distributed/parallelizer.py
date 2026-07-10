@@ -1189,13 +1189,17 @@ def get_hf_tp_shard_plan(model):
         model_prefix = "model.language_model"
 
     elif model_cls == Gemma3ForConditionalGeneration:
-        # In transformers v5, Gemma3 uses 'model' instead of 'language_model'
-        if _is_transformers_v5_or_higher():
-            inner_model = model.model
-            model_prefix = "model"
-        else:
+        # Gemma3 releases before the mid-4.x VLM standardization hang the text
+        # tower off a top-level `language_model`; later releases nest everything
+        # under the shared `model` backbone. Resolve structurally via registered
+        # child modules (not `hasattr`) because standardized 4.x releases keep a
+        # deprecated `language_model` alias property on the wrapper class.
+        if any(name == "language_model" for name, _ in model.named_children()):
             inner_model = model.language_model
             model_prefix = "language_model"
+        else:
+            inner_model = model.model
+            model_prefix = "model"
 
     elif model_cls == Llama4ForConditionalGeneration:
         inner_model = model.language_model.model
@@ -1596,51 +1600,51 @@ def _extend_layers(layers: List[nn.Module], modules: Sequence[nn.Module]) -> Non
 
 
 def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
-    # Gemma3 / Qwen2-VL layer paths depend on transformers version: v5 nests
-    # both towers under the shared `model.` backbone. The Gemma3 v5 vision
-    # entry lists both CLIP/SigLIP shapes because v5 flattened the tower
-    # (`vision_tower.encoder`) after dropping the inner `vision_model` module;
-    # only one candidate resolves on any given version (verified empirically on
-    # transformers 5.8.1 / 5.12.1: `model.language_model.layers` +
-    # `model.vision_tower.encoder.layers`).
-    _gemma3_layers = (
-        {
-            "language": ["model.layers", "model.language_model.layers"],
-            "vision": [
-                "model.vision_tower.vision_model.encoder.layers",
-                "model.vision_tower.encoder.layers",
-            ],
-        }
-        if _is_transformers_v5_or_higher()
-        else {
-            "language": ["language_model.layers"],
-            "vision": ["vision_tower.vision_model.encoder.layers"],
-        }
-    )
-    # Verified on transformers 5.8.1 / 5.12.1: `model.language_model.layers` +
-    # `model.visual.blocks` (the v4 paths no longer resolve, which silently
-    # disabled activation checkpointing and layer-based sharding).
-    _qwen2_vl_layers = (
-        {
-            "language": ["model.language_model.layers"],
-            "vision": ["model.visual.blocks"],
-        }
-        if _is_transformers_v5_or_higher()
-        else {
-            "language": ["language_model.layers"],
-            "vision": ["visual.blocks"],
-        }
-    )
-    # Llava-family vision towers moved under `model.` in transformers v5 and
-    # the CLIP tower was flattened (no inner `vision_model`); both candidates
-    # are listed and only one resolves per version (verified on 5.8.1 / 5.12.1:
-    # `model.vision_tower.encoder.layers`). The language path was already
-    # v5-style.
-    _llava_layers = {
-        "language": ["model.language_model.layers"],
+    # Each group lists every known location of its layer container across
+    # transformers releases; ``_extract_model_layer_groups`` takes the first
+    # candidate that resolves, so the specs need no version gating. The VLM
+    # module-tree standardization landed mid-4.x (not at the v5 boundary), so
+    # gating paths on ``transformers.__version__`` picks wrong paths for parts
+    # of the 4.x line. The shapes below were verified by meta-instantiating
+    # each class on transformers 4.51.3, 4.57.1, 5.8.1 and 5.12.1.
+    #
+    # Gemma3 tree history:
+    #   pre-standardization (verified 4.51.3):
+    #     `language_model.model.layers` + `vision_tower.vision_model.encoder.layers`
+    #   standardized 4.x (verified 4.57.1):
+    #     `model.language_model.layers` + `model.vision_tower.vision_model.encoder.layers`
+    #   v5 (verified 5.8.1 / 5.12.1): `model.language_model.layers` +
+    #     `model.vision_tower.encoder.layers` (SigLIP tower flattened, no inner
+    #     `vision_model`).
+    # Canonical paths come first: standardized 4.x releases keep deprecated
+    # top-level alias properties (`language_model`, `vision_tower`) that also
+    # resolve, and first-match-wins must not pick the alias.
+    _gemma3_layers = {
+        "language": ["model.language_model.layers", "language_model.model.layers"],
         "vision": [
             "model.vision_tower.vision_model.encoder.layers",
             "model.vision_tower.encoder.layers",
+            "vision_tower.vision_model.encoder.layers",
+        ],
+    }
+    # Qwen2-VL / Qwen2.5-VL tree history:
+    #   pre-standardization (verified 4.51.3): `model.layers` + `visual.blocks`
+    #   standardized 4.x and v5 (verified 4.57.1 / 5.8.1 / 5.12.1):
+    #     `model.language_model.layers` + `model.visual.blocks` (4.x also keeps
+    #     deprecated top-level `language_model` / `visual` alias properties).
+    _qwen2_vl_layers = {
+        "language": ["model.language_model.layers", "model.layers"],
+        "vision": ["model.visual.blocks", "visual.blocks"],
+    }
+    # Llava family: same tree history as Gemma3 (CLIP instead of SigLIP tower),
+    # verified on the same versions for Llava/LlavaNext/LlavaNextVideo/
+    # LlavaOnevision.
+    _llava_layers = {
+        "language": ["model.language_model.layers", "language_model.model.layers"],
+        "vision": [
+            "model.vision_tower.vision_model.encoder.layers",
+            "model.vision_tower.encoder.layers",
+            "vision_tower.vision_model.encoder.layers",
         ],
     }
     return {
@@ -1761,7 +1765,15 @@ def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
     if layer_group_specs is not None:
         for group_name, fqns in layer_group_specs.items():
             layers: List[nn.Module] = []
-            _extend_layers(layers, _reduce_attrs(model, fqns))
+            # Candidate FQNs are alternative locations of the same container
+            # across transformers versions; take the first that resolves so
+            # deprecated alias properties (e.g. top-level `visual` on
+            # standardized 4.x Qwen2-VL aliasing `model.visual`) cannot
+            # double-count layers.
+            for fqn in fqns:
+                _extend_layers(layers, _reduce_attrs(model, [fqn]))
+                if layers:
+                    break
             if layers:
                 layer_groups[group_name] = layers
         if not layer_groups:
