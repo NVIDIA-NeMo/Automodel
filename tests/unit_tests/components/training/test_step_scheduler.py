@@ -13,9 +13,12 @@
 # limitations under the License.
 
 import pytest
+import os
+import signal as _signal
 
 from nemo_automodel.components.training.step_scheduler import (
     StepScheduler,
+    StepSchedulerConfig,
     _calculate_max_steps,
 )
 
@@ -514,3 +517,146 @@ def test_save_checkpoint_every_epoch_false_preserves_periodic_checkpoints():
     # Periodic at step 4 (step%5==4), last step at 9
     # Epoch boundaries at 3 and 7 should NOT trigger
     assert ckpt_trigger_steps == [4, 9]
+
+
+# ---------------------------------------------------------------------------
+# Preemption checkpointing
+# ---------------------------------------------------------------------------
+
+
+def _make_scheduler(**overrides):
+    kwargs = dict(
+        global_batch_size=2,
+        local_batch_size=1,
+        dp_size=2,
+        dataloader=SizedDataLoader(num_batches=8),
+        ckpt_every_steps=1000,
+        num_epochs=1,
+    )
+    kwargs.update(overrides)
+    return StepScheduler(**kwargs)
+
+
+def test_preemption_disable_installs_no_handler():
+    """preemption_signal=None must not touch signal handlers and never report sigterm."""
+    original = _signal.getsignal(_signal.SIGTERM)
+    scheduler = _make_scheduler(preemption_signal=None)
+    assert scheduler.sig_handler is None
+    assert _signal.getsignal(_signal.SIGTERM) is original
+    assert scheduler.sigterm_received is False
+    assert scheduler.is_ckpt_step is False
+
+
+def test_preemption_invalid_signal_name_raises():
+    with pytest.raises(ValueError):
+        _make_scheduler(preemption_signal="SIGTYPO")
+
+
+def test_preemption_signal_triggers_checkpoint_and_stops_iteration():
+    """
+    Delivering the configured signal mid-training must make is_ckpt_step
+    True at the nest step boundary, stop iteration, and leave a resumable state_dict.
+    """
+    scheduler = _make_scheduler(preemption_signal="SIGUSR1")
+    try:
+        steps_run = 0
+        for _batches in scheduler:
+            steps_run += 1
+            if steps_run == 2:
+                os.kill(os.getpid(), _signal.SIGUSR1)
+                # Recipes consult is_ckpt_step once per step; mirrors train loop.
+            if scheduler.is_ckpt_step:
+                break_step = scheduler.step
+                assert scheduler.sigterm_flag is True
+                break
+        else:
+            pytest.fail("is_ckpt_step never become True after signal delivery")
+        assert steps_run == 2
+        # state_dict stores step + 1 so the resumed run continues after the
+        # preemption checkpoint instead of repeating the step.
+        assert scheduler.state_dict()["step"] == break_step + 1
+    finally:
+        scheduler.sig_handler.release()
+
+
+def test_preemption_iteration_stops_without_explicit_break():
+    """__iter__ must terminate on its own once the flag is observed."""
+    scheduler = _make_scheduler(preemption_signal="SIGUSR1")
+    try:
+        seen = []
+        for _batches in scheduler:
+            seen.append(scheduler.step)
+            os.kill(os.getpid(), _signal.SIGUSR1)
+            assert scheduler.is_ckpt_step is True
+        assert seen == [0]
+    finally:
+        scheduler.sig_handler.release()
+
+
+def test_preemption_poll_is_cached_once_per_step():
+    """
+    sigterm_received must issue at most one cross-rank poll per step, no matter
+    how many properties consult it within the step.
+    """
+    scheduler = _make_scheduler(preemption_signal="SIGUSR1")
+    try:
+        calls = {"n": 0}
+        real = scheduler.sig_handler.signals_received
+
+        def counting():
+            calls["n"] += 1
+            return real()
+
+        scheduler.sig_handler.signals_received = counting
+
+        # Multiple accesses at the same step -> exactly one poll.
+        _ = scheduler.is_val_step
+        _ = scheduler.is_ckpt_step
+        _ = scheduler.sigterm_received
+        assert calls["n"] == 1
+    finally:
+        scheduler.sig_handler.release()
+
+
+def test_preemption_flag_is_sticky_and_stops_polling():
+    """once set, the flag stays True with no further collective calls."""
+    scheduler = _make_scheduler(preemption_signal="SIGUSR1")
+    try:
+        os.kill(os.getpid(), _signal.SIGUSR1)
+        assert scheduler.sigterm_received is True
+
+        calls = {"n": 0}
+
+        def counting():
+            calls["n"] += 1
+            return [True]
+
+        scheduler.sig_handler.signals_received = counting
+        scheduler.step += 1
+        assert scheduler.sigterm_received is True
+        assert calls["n"] == 0
+    finally:
+        scheduler.sig_handler.release()
+
+
+def test_step_scheduler_config_exposes_preemption_signal():
+    """The tupes config must plub preemption_signal through build()."""
+    cfg = StepSchedulerConfig(
+        global_batch_size=2,
+        num_epochs=1,
+        preemption_signal=None,
+    )
+    scheduler = cfg.build(SizedDataLoader(num_batches=4), dp_group_size=2, local_batch_size=1)
+    assert scheduler.sig_handler is None
+
+    cfg = StepSchedulerConfig(
+        global_batch_size=2,
+        num_epochs=1,
+        preemption_signal="SIGUSR2",
+    )
+    scheduler = cfg.build(SizedDataLoader(num_batches=4), dp_group_size=2, local_batch_size=1)
+    try:
+        assert scheduler.sig_handler is not None
+        assert scheduler.sig_handler.sigs == [_signal.SIGUSR2]
+    finally:
+        scheduler.sig_handler.release()

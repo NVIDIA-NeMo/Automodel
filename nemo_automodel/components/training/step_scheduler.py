@@ -15,13 +15,14 @@
 from __future__ import annotations
 
 import logging
+import signal
 from dataclasses import asdict, dataclass
 from math import ceil
 from typing import TYPE_CHECKING, Optional
 
 from torch.distributed.checkpoint.stateful import Stateful
 
-from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
+from nemo_automodel.components.training.signal_handler import DistributedSignalHandler, SignalLike
 
 if TYPE_CHECKING:
     from torch.utils.data import DataLoader
@@ -72,6 +73,7 @@ class StepScheduler(Stateful):
         start_epoch: int = 0,
         num_epochs: Optional[int] = None,
         max_steps: Optional[int] = None,
+        preemption_signal: Optional[SignalLike | list[SignalLike]] = signal.SIGTERM,
     ):
         """
         Initialize the StepScheduler.
@@ -170,8 +172,12 @@ class StepScheduler(Stateful):
         self.ckpt_every_steps = ckpt_every_steps
         self.save_checkpoint_every_epoch = save_checkpoint_every_epoch
 
-        self.sig_handler = DistributedSignalHandler().__enter__()
+        if preemption_signal is None:
+            self.sig_handler = None
+        else:
+            self.sig_handler = DistributedSignalHandler(sig=preemption_signal).__enter__()
         self.sigterm_flag = False
+        self._sig_polled_step: Optional[int] = None
 
     def __iter__(self):
         """
@@ -281,7 +287,14 @@ class StepScheduler(Stateful):
         """
         Returns whether SIGTERM was received.
         """
-        self.sigterm_flag = self.sigterm_flag or any(self.sig_handler.signals_received())
+        if self.sigterm_flag:
+            return True
+        if self.sig_handler is None:
+            return False
+        if self._sig_polled_step == self.step:
+            return False
+        self._sig_polled_step = self.step
+        self.sigterm_flag = any(self.sig_handler.signals_received())
         return self.sigterm_flag
 
     @property
@@ -365,6 +378,7 @@ class StepSchedulerConfig:
     gc_every_steps: int | None = None
     start_step: int = 0
     start_epoch: int = 0
+    preemption_signal: int | str | list[int | str] | None = "SIGTERM"
 
     def build(self, dataloader: DataLoader, dp_group_size: int, local_batch_size: int) -> StepScheduler:
         """Build the step scheduler.
