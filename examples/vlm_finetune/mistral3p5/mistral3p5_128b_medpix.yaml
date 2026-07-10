@@ -49,7 +49,7 @@ model:
   torch_dtype: torch.bfloat16
   attn_implementation: eager
 
-processor:
+tokenizer:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: mistralai/Mistral-Medium-3.5-128B
 

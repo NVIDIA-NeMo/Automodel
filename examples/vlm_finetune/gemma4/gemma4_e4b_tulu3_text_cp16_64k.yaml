@@ -69,7 +69,7 @@ model:
     use_cache: false
     output_hidden_states: true
 
-processor:
+tokenizer:
   padding_side: right
 
 checkpoint:

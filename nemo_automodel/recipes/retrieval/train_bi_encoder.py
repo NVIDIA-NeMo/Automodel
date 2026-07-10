@@ -28,14 +28,13 @@ from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
+from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
-from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -61,17 +60,6 @@ def _get_autocast_ctx(distributed_config):
     if autocast_dtype is None or not torch.cuda.is_available():
         return nullcontext()
     return torch.autocast(device_type="cuda", dtype=autocast_dtype)
-
-
-def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
-    """Return infrastructure kwargs forwarded to model instantiation."""
-    kwargs = {
-        "distributed_setup": distributed_setup,
-        "peft_config": peft_config,
-    }
-    if cfg.get("compile", None) is not None:
-        kwargs["compile_config"] = build_compile_config(cfg.compile)
-    return kwargs
 
 
 def contrastive_scores_and_labels(
@@ -216,9 +204,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = self.cfg.wandb.build(
-                run_config=self.cfg.to_dict(), model_name=self.cfg.model.pretrained_model_name_or_path
-            )
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=self.cfg.model.model_name)
             logging.info("🚀 View run at {}".format(run.url))
 
         self._log_experiment_details()
@@ -245,11 +231,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
             moe_mesh=self.moe_mesh,
         )
 
-        with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
-            kwargs = _get_model_instantiate_kwargs(self.cfg, self.distributed_setup, self.peft_config)
-            model = self.cfg.model.instantiate(
-                **kwargs,
-            )
+        model = self.cfg.model.build(
+            peft_config=self.peft_config,
+            distributed_setup=self.distributed_setup,
+        )
 
         self.model_parts = [model]
         self.pp = None
@@ -292,28 +277,20 @@ class TrainBiEncoderRecipe(BaseRecipe):
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.padding_side = "left"
 
-        dataloader_config = self.cfg.dataloader
-        if dataloader_config is None:
+        input_config = self.cfg.dataloader
+        if input_config is None:
             raise ValueError("Retrieval training requires a top-level dataset config")
-
-        def materialize_loader(config):
-            build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
-            with ScopedRNG(seed=config.seed, ranked=True):
-                return config.build(
-                    tokenizer=self.tokenizer,
-                    dataset_build_context=build_context,
-                    dp_rank=self._get_dp_rank(),
-                    dp_world_size=self._get_dp_group_size(),
-                )
-
-        self.dataloader = materialize_loader(dataloader_config)
-        self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
-
-        self.val_dataloader = None
-        validation_configs = self.cfg.validation_dataloaders
-        if validation_configs:
-            validation_config = next(iter(validation_configs.values()))
-            self.val_dataloader = materialize_loader(validation_config)
+        input_pipeline = input_config.build(
+            model=model,
+            tokenizer=self.tokenizer,
+            dp_rank=self._get_dp_rank(),
+            dp_world_size=self._get_dp_group_size(),
+        )
+        self.dataloader = input_pipeline.train
+        self.train_n_passages = getattr(input_config.train.dataset_config, "n_passages", 1)
+        self.val_dataloader = next(iter(input_pipeline.validation.values()), None)
+        if input_config.validation:
+            validation_config = next(iter(input_config.validation.values()))
             self.val_n_passages = getattr(validation_config.dataset_config, "n_passages", self.train_n_passages)
 
         self.step_scheduler = self.cfg.step_scheduler.build(

@@ -45,7 +45,7 @@ model:
   # on 2 nodes (activation does not shard across DP). Irrelevant to CP parity.
   num_nextn_predict_layers: 0
 
-processor:
+tokenizer:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.6-27B
 

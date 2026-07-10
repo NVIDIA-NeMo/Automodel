@@ -58,6 +58,7 @@ from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa:
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG  # noqa: E402
 from nemo_automodel.components.training.step_scheduler import StepScheduler  # noqa: E402
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config  # noqa: E402
+from nemo_automodel.recipes._typed_config import RecipeConfig  # noqa: E402
 from nemo_automodel.recipes.base_recipe import BaseRecipe  # noqa: E402
 
 try:
@@ -468,16 +469,9 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 init_seed=self.global_seed,
             )
         elif model_init_mode == "auto":
-            from nemo_automodel.recipes.vlm.finetune import build_model as build_vlm_model
-
             logger.info("Loading BAGEL through AutoModel (artifact_source=%s, stage=%d)", artifact_path, stage)
-            model = build_vlm_model(
-                cfg_model=self.cfg.model,
-                cfg_freeze=self.cfg.get("freeze_config", None),
-                cfg_peft=self.cfg.get("peft", None),
-                seed=self.global_seed,
-                cfg_fp8=self.cfg.get("fp8", None),
-                cfg_compile=self.cfg.get("compile", None),
+            model = RecipeConfig(self.cfg).model.build(
+                peft_config=self.cfg.instantiate_path("peft"),
                 distributed_setup=self.distributed_setup,
             )
         else:

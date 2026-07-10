@@ -44,7 +44,7 @@ model:
   # AutoConfig still demands trust_remote_code=True when auto_map is present.
   trust_remote_code: true
 
-processor:
+tokenizer:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: lmms-lab/LLaVA-OneVision-1.5-8B-Instruct
   trust_remote_code: true

@@ -53,6 +53,7 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DistributedSetup
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -67,7 +68,8 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, filter_forward_kwargs
-from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, build_model, calculate_loss
+from nemo_automodel.recipes.model_config import ModelConfig
+from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, calculate_loss
 
 logger = logging.getLogger(__name__)
 
@@ -80,39 +82,30 @@ def _build_kd_loss_fn(cfg_kd):
 
 
 def _build_teacher_model(
-    cfg_teacher,
-    cfg_freeze,
-    seed: int,
+    model_config: ModelConfig | None,
     distributed_setup: DistributedSetup | None = None,
-    device=None,
+    device: torch.device | str | None = None,
 ) -> torch.nn.Module:
     """Build and initialize the teacher VLM for knowledge distillation.
 
-    Uses the same ``build_model`` as the student but without PEFT, FP8, or QAT
-    since the teacher should be frozen in full precision.
+    Uses the same config-owned construction as the student but without PEFT,
+    FP8, or QAT since the teacher should be frozen in full precision.
 
     Args:
-        cfg_teacher: Configuration for teacher model instantiation.
-        cfg_freeze: Freeze configuration for the teacher model.
-        seed: Random seed for reproducibility.
+        model_config: Typed teacher-model construction config.
         distributed_setup: Resolved distributed topology and policy object.
         device: Device to place the teacher model on.
 
     Returns:
         The frozen teacher model ready for inference.
     """
-    assert cfg_teacher is not None, "`teacher_model` section missing from YAML config"
+    if model_config is None:
+        raise ValueError("`teacher_model` section missing from YAML config")
     logger.info("Instantiating teacher VLM model")
 
-    teacher_model = build_model(
-        cfg_teacher,
-        cfg_freeze=cfg_freeze,
-        cfg_peft=None,
-        seed=seed,
-        cfg_fp8=None,
-        cfg_compile=None,
-        distributed_setup=distributed_setup,
-    )
+    teacher_model = model_config.build(distributed_setup=distributed_setup)
+    if isinstance(teacher_model, AutoPipeline):
+        raise TypeError("VLM KD does not support a pipeline-parallel teacher")
 
     if device is not None:
         teacher_model = teacher_model.to(device)
@@ -196,9 +189,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         teacher_device = self.dist_env.device if not self._offload_teacher_model else "cpu"
 
         self.teacher_model = _build_teacher_model(
-            cfg_teacher=self.cfg.get("teacher_model", None),
-            cfg_freeze=self.cfg.get("teacher_freeze_config", None),
-            seed=self.cfg.get("seed", 42),
+            model_config=self.cfg.teacher_model,
             distributed_setup=getattr(self, "distributed_setup", None),
             device=teacher_device,
         )

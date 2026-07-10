@@ -105,10 +105,10 @@ def test_recipe_config_resolves_top_level_retrieval_dataset_and_collator():
     ).dataloader
 
     assert config is not None
-    assert isinstance(config.dataset_config, RetrievalDatasetConfig)
-    assert config.dataset_config.n_passages == 3
-    assert isinstance(config.collate_fn, CollatorConfig)
-    assert config.batch_size == 2
+    assert isinstance(config.train.dataset_config, RetrievalDatasetConfig)
+    assert config.train.dataset_config.n_passages == 3
+    assert isinstance(config.train.collate_fn, CollatorConfig)
+    assert config.train.batch_size == 2
 
 
 def test_legacy_inline_retrieval_target_uses_exact_typed_config():
@@ -126,7 +126,7 @@ def test_legacy_inline_retrieval_target_uses_exact_typed_config():
     ).dataloader
 
     assert config is not None
-    assert isinstance(config.dataset_config, InlineRetrievalDatasetConfig)
+    assert isinstance(config.train.dataset_config, InlineRetrievalDatasetConfig)
 
 
 def test_recipe_config_rejects_unknown_dataset_field():
@@ -177,13 +177,13 @@ def test_megatron_loader_preserves_schedule_and_sampler_config():
     ).dataloader
 
     assert config is not None
-    assert config.dataset_builds_on_all_ranks is True
-    assert config.dataset_build_schedule.local_batch_size == 2
-    assert config.dataset_build_schedule.global_batch_size == 16
-    assert config.dataset_build_schedule.max_steps == 50
-    assert config.dataset_build_schedule.val_check_interval == 5
-    assert isinstance(config.batch_sampler_config, MegatronSamplerConfig)
-    assert next(iter(config.batch_sampler_config.build(dataset_len=32, rank=1, world_size=2))) == [2, 3]
+    assert config.train.dataset_builds_on_all_ranks is True
+    assert config.train.dataset_build_schedule.local_batch_size == 2
+    assert config.train.dataset_build_schedule.global_batch_size == 16
+    assert config.train.dataset_build_schedule.max_steps == 50
+    assert config.train.dataset_build_schedule.val_check_interval == 5
+    assert isinstance(config.train.batch_sampler_config, MegatronSamplerConfig)
+    assert next(iter(config.train.batch_sampler_config.build(dataset_len=32, rank=1, world_size=2))) == [2, 3]
 
 
 def test_iterable_shuffle_failure_is_not_silently_ignored():

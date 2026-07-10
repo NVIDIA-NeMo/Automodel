@@ -48,7 +48,7 @@ model:
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
-processor:
+tokenizer:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
 

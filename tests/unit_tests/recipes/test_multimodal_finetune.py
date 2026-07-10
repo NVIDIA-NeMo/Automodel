@@ -16,15 +16,19 @@ import ast
 from pathlib import Path
 
 
-def test_bagel_auto_model_path_uses_distributed_setup_kwarg():
-    """BAGEL's AutoModel path must match the shared VLM build_model API."""
+def test_bagel_auto_model_path_uses_shared_model_config():
+    """BAGEL's AutoModel path must use the shared config-owned model API."""
     recipe_path = Path(__file__).resolve().parents[3] / "nemo_automodel/recipes/multimodal/finetune.py"
     tree = ast.parse(recipe_path.read_text())
 
     calls = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "build_vlm_model"
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "build"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "model"
     ]
     assert len(calls) == 1
 

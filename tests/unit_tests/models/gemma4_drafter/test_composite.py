@@ -414,9 +414,8 @@ class TestCompositeGuards:
 
     def test_pretrained_alias_forwarded_as_base_path(self, monkeypatch, device_and_dtype):
         """``pretrained_model_name_or_path`` is accepted as an alias for
-        ``base_path`` so the recipe's ``_get_model_name`` (which reads
-        ``cfg.model.pretrained_model_name_or_path``) keeps finding the
-        processor without splitting the joint config into two paths."""
+        ``base_path`` so the shared recipe model/tokenizer boundary can find
+        the processor without splitting the joint config into two paths."""
         device, dtype = device_and_dtype
         captured: dict = {}
 

@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
-from transformers import PreTrainedTokenizerBase, ProcessorMixin
+from transformers import AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
 
 TokenizerLike = PreTrainedTokenizerBase | ProcessorMixin
 TokenizerFactory = Callable[..., TokenizerLike]
@@ -46,7 +46,19 @@ class TokenizerConfig:
         """
         if self.factory is None:
             return None
-        return self.factory(**dict(self.kwargs))
+        try:
+            return self.factory(**dict(self.kwargs))
+        except Exception as exc:
+            message = str(exc)
+            is_layer_types_validation = "num_hidden_layers" in message and (
+                "layer_types" in message or "layer types" in message
+            )
+            if self.factory != AutoProcessor.from_pretrained or not is_layer_types_validation:
+                raise
+            from nemo_automodel._transformers.v4_patches.layer_types import relax_layer_types_validator
+
+            relax_layer_types_validator()
+            return self.factory(**dict(self.kwargs))
 
 
 __all__ = ["TokenizerConfig", "TokenizerFactory", "TokenizerLike"]

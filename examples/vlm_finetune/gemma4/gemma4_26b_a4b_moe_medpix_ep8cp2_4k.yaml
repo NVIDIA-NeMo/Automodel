@@ -59,7 +59,7 @@ model:
   text_config:
     use_cache: false
 
-processor:
+tokenizer:
   padding_side: right
 
 checkpoint:

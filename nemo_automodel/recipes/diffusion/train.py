@@ -720,7 +720,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                 current_name = self.cfg.get("wandb.name", None)
                 if current_name is not None and not str(current_name).endswith(f"_{stage_for_wandb}"):
                     self.cfg.wandb.name = f"{current_name}_{stage_for_wandb}"
-            model_name = _model_name_from_cfg(self.cfg.model) if "model" in self.cfg else None
+            model_name = _model_name_from_cfg(self.cfg.get("model", None)) if "model" in self.cfg else None
             run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=model_name)
             if run is not None:
                 logging.info("🚀 View run at {}".format(run.url))

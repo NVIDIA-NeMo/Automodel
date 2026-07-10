@@ -42,8 +42,8 @@ from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callab
 from nemo_automodel.recipes.llm.config import LlmInputConfig
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
-    build_model,
 )
+from nemo_automodel.recipes.model_config import ModelConfig
 
 
 def _build_loader(
@@ -79,7 +79,7 @@ def _build_loader(
             },
         }
     )
-    input_config = RecipeConfig(raw).llm_inputs
+    input_config = RecipeConfig(raw).dataloader
     runtime_model = model if model is not None else nn.Module()
     with patch("nemo_automodel.recipes.llm.config.ScopedRNG", return_value=nullcontext()):
         pipeline = input_config.build(
@@ -237,9 +237,9 @@ def test_validation_dataloaders_pp_enabled(caplog):
     )
 
     with caplog.at_level(logging.WARNING):
-        result = RecipeConfig(cfg).validation_dataloaders
+        result = RecipeConfig(cfg).dataloader
 
-    assert result == {}
+    assert result is None
 
 
 def test_validation_dataloaders_collects_and_names_properly():
@@ -256,6 +256,7 @@ def test_validation_dataloaders_collects_and_names_properly():
                 "max_steps": 123,
                 "val_every_steps": 10,
             },
+            "dataset": {"_target_": ds_target},
             # Keys to be discovered via cfg.to_dict().keys()
             "validation_dataset": {"_target_": ds_target},
             "validation_dataset_val": {"_target_": ds_target},
@@ -263,7 +264,7 @@ def test_validation_dataloaders_collects_and_names_properly():
         }
     )
 
-    result = RecipeConfig(cfg).validation_dataloaders
+    result = RecipeConfig(cfg).dataloader.validation
 
     assert set(result.keys()) == {"default", "val", "test"}
     assert all(isinstance(v, DataloaderConfig) for v in result.values())
@@ -274,22 +275,24 @@ def test_validation_dataloaders_no_validation_keys():
     cfg = ConfigNode(
         {
             "model": {},
+            "dataset": {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"},
             "validation_dataloader": {},
         }
     )
 
-    assert RecipeConfig(cfg).validation_dataloaders == {}
+    assert RecipeConfig(cfg).dataloader.validation == {}
 
 
 def test_validation_dataloaders_no_validation_config():
     cfg = ConfigNode(
         {
             "model": {},
+            "dataset": {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"},
             "dataloader": {},
         }
     )
 
-    assert RecipeConfig(cfg).validation_dataloaders == {}
+    assert RecipeConfig(cfg).dataloader.validation == {}
 
 
 @pytest.mark.parametrize("attn", ["magi", "te", "sdpa"])
@@ -297,6 +300,7 @@ def test_validation_dataloaders_pack_configured_sequences(attn):
     cfg = ConfigNode(
         {
             "model": {"backend": {"attn": attn}},
+            "dataset": {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"},
             "dataloader": {},
             "validation_dataloader": {},
             "packed_sequence": {"packed_sequence_size": 1024},
@@ -304,13 +308,14 @@ def test_validation_dataloaders_pack_configured_sequences(attn):
         }
     )
 
-    assert RecipeConfig(cfg).validation_dataloaders["default"].packing is not None
+    assert RecipeConfig(cfg).dataloader.validation["default"].packing is not None
 
 
 def test_validation_dataloaders_skip_packing_without_pack_size():
     cfg = ConfigNode(
         {
             "model": {"backend": {"attn": "sdpa"}},
+            "dataset": {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"},
             "dataloader": {},
             "validation_dataloader": {},
             "packed_sequence": {"packed_sequence_size": 0},
@@ -318,7 +323,7 @@ def test_validation_dataloaders_skip_packing_without_pack_size():
         }
     )
 
-    assert RecipeConfig(cfg).validation_dataloaders["default"].packing is None
+    assert RecipeConfig(cfg).dataloader.validation["default"].packing is None
 
 
 def _build_validation_input(config: LlmInputConfig, model: nn.Module) -> DataloaderConfig:
@@ -476,6 +481,11 @@ class DummyModelConfig:
         return str(getattr(self, key, default))
 
 
+def _custom_model_build_config(cfg_model, *, seed: int) -> ModelConfig:
+    """Wrap a legacy test factory in the typed custom-model construction config."""
+    return ModelConfig(model_factory=cfg_model.instantiate, seed=seed)
+
+
 def test_peft_with_pipeline_parallelism_enabled(caplog):
     """Test that _apply_peft_and_lower_precision disables triton with PP."""
     from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
@@ -526,11 +536,7 @@ def test_peft_without_pipeline_parallelism(caplog):
                             mock_shard.return_value = sharded_model
                             with caplog.at_level(logging.INFO):
                                 # This should work fine without PP
-                                model = build_model(
-                                    cfg_model=cfg_model,
-                                    cfg_peft=cfg_peft,
-                                    seed=42,
-                                )
+                                model = _custom_model_build_config(cfg_model, seed=42).build(peft_config=cfg_peft)
                                 _ = build_optimizer(model, cfg_opt, None, None)
 
                             # Verify that apply_lora was called
@@ -798,11 +804,7 @@ def test_force_hf_true_disables_meta_init(monkeypatch):
     monkeypatch.setattr("nemo_automodel._transformers.infrastructure.print_trainable_parameters", lambda *a, **k: None)
 
     # Call under test
-    model = build_model(
-        cfg_model=cfg_model,
-        cfg_peft=cfg_peft,
-        seed=123,
-    )
+    model = _custom_model_build_config(cfg_model, seed=123).build(peft_config=cfg_peft)
     optimizer = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated
@@ -882,8 +884,9 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     dummy_model = DummyModel()
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
     monkeypatch.setattr(
-        "nemo_automodel.recipes.llm.train_ft.build_model",
-        lambda *a, **k: dummy_model,
+        RecipeConfig,
+        "model",
+        property(lambda self: SimpleNamespace(build=lambda **kwargs: dummy_model)),
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
@@ -893,7 +896,7 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     # Data-related stub: short-circuit the complete typed LLM input build.
     monkeypatch.setattr(
         RecipeConfig,
-        "llm_inputs",
+        "dataloader",
         property(
             lambda self: SimpleNamespace(
                 build=lambda **k: SimpleNamespace(train="dl", validation={}),
@@ -1049,7 +1052,11 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
         return [dummy_opt]
 
     # Override the default stubs to return a pipeline-wrapped model
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", _build_model_stub)
+    monkeypatch.setattr(
+        RecipeConfig,
+        "model",
+        property(lambda self: SimpleNamespace(build=_build_model_stub)),
+    )
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
         property(lambda self: SimpleNamespace(build=_build_optimizer_stub)),
@@ -1263,7 +1270,7 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
 
     # Create the recipe without calling setup
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    recipe.cfg.__dict__["llm_inputs"] = SimpleNamespace(uses_thd_collater=False)
+    recipe.cfg.__dict__["dataloader"] = SimpleNamespace(uses_thd_collater=False)
 
     # Mock out attributes needed for _forward_backward_step
     # Use object.__setattr__ to bypass the state tracking
@@ -1581,11 +1588,7 @@ def test_build_model_state_dict_keys_uses_adapter(caplog):
         with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
             with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
                 with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
-                    model = build_model(
-                        cfg_model=cfg_model,
-                        cfg_peft=cfg_peft,
-                        seed=42,
-                    )
+                    model = _custom_model_build_config(cfg_model, seed=42).build(peft_config=cfg_peft)
                     optimizer = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated
@@ -1605,11 +1608,7 @@ def test_build_model_state_dict_keys_without_adapter():
         with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
             with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
                 with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
-                    model = build_model(
-                        cfg_model=cfg_model,
-                        cfg_peft=cfg_peft,
-                        seed=42,
-                    )
+                    model = _custom_model_build_config(cfg_model, seed=42).build(peft_config=cfg_peft)
                     optimizer = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated
@@ -1644,11 +1643,7 @@ def test_build_model_with_quantized_model_config():
         with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
             with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
                 with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
-                    model = build_model(
-                        cfg_model=cfg_model,
-                        cfg_peft=cfg_peft,
-                        seed=42,
-                    )
+                    model = _custom_model_build_config(cfg_model, seed=42).build(peft_config=cfg_peft)
                     _ = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated with quantization config
@@ -1668,11 +1663,7 @@ def test_build_model_without_quant_config():
         with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
             with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
                 with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
-                    model = build_model(
-                        cfg_model=cfg_model,
-                        cfg_peft=cfg_peft,
-                        seed=42,
-                    )
+                    model = _custom_model_build_config(cfg_model, seed=42).build(peft_config=cfg_peft)
                     _ = build_optimizer(model, cfg_opt, None, None)
 
     # Model should be instantiated without quantization config
@@ -1695,11 +1686,7 @@ def test_build_model_and_optimizer_return_values():
         with patch("nemo_automodel._transformers.infrastructure._supports_logits_to_keep", return_value=True):
             with patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"):
                 with patch("nemo_automodel._transformers.infrastructure.print_trainable_parameters"):
-                    model = build_model(
-                        cfg_model=cfg_model,
-                        cfg_peft=None,
-                        seed=42,
-                    )
+                    model = _custom_model_build_config(cfg_model, seed=42).build()
                     optimizer = build_optimizer(model, cfg_opt, None, None)
 
     assert model is not None
@@ -1710,10 +1697,6 @@ def test_build_model_and_optimizer_return_values():
 # Tests for optimizer dtype string resolution in build_optimizer
 # =============================================================================
 
-
-# =============================================================================
-# Tests for _get_model_name helper
-# =============================================================================
 
 # =============================================================================
 # Tests for PP mask precomputation guard in the loader build
@@ -1802,41 +1785,6 @@ def test_pp_live_model_config_chains_masks():
 
     collate_fn(["dummy_batch"])
     assert call_order == ["base", "masks"]
-
-
-@pytest.mark.parametrize(
-    "cfg_attrs,expected",
-    [
-        # String config
-        ({"config": "org/model-name"}, "org/model-name"),
-        # Direct pretrained_model_name_or_path
-        ({"pretrained_model_name_or_path": "direct/model"}, "direct/model"),
-        # Not found - returns None
-        ({}, None),
-    ],
-)
-def test_get_model_name(cfg_attrs, expected):
-    """Test _get_model_name extracts model name from various config structures."""
-    from nemo_automodel.recipes.llm.train_ft import _get_model_name
-
-    cfg_model = SimpleNamespace(**cfg_attrs)
-    cfg_model.get = lambda key, default=None: getattr(cfg_model, key, default)
-
-    result = _get_model_name(cfg_model)
-    assert result == expected
-
-
-def test_get_model_name_from_nested_config():
-    """Test _get_model_name extracts from nested config.pretrained_model_name_or_path."""
-    from nemo_automodel.recipes.llm.train_ft import _get_model_name
-
-    inner_config = SimpleNamespace(pretrained_model_name_or_path="nested/model")
-    inner_config.get = lambda key, default=None: getattr(inner_config, key, default)
-    cfg_model = SimpleNamespace(config=inner_config)
-    cfg_model.get = lambda key, default=None: getattr(cfg_model, key, default)
-
-    result = _get_model_name(cfg_model)
-    assert result == "nested/model"
 
 
 # ---------------------------------------------------------------------------
@@ -1988,7 +1936,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         )
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
         recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-        recipe.cfg.__dict__["llm_inputs"] = SimpleNamespace(uses_thd_collater=False)
+        recipe.cfg.__dict__["dataloader"] = SimpleNamespace(uses_thd_collater=False)
 
         object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
         object.__setattr__(recipe, "device_mesh", None)
@@ -2107,15 +2055,15 @@ def _patch_setup_minimals_with_cp(monkeypatch, cp_size):
     )
 
 
-def test_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
-    """rope_fusion should be set to False during setup when cp_size > 1."""
+def test_rope_fusion_declarative_config_preserved_when_cp_gt_1(monkeypatch):
+    """Runtime CP policy must not mutate the serialized rope_fusion setting."""
     cfg = _minimal_cfg_with_rope_fusion(cp_size=2, rope_fusion=True)
     _patch_setup_minimals_with_cp(monkeypatch, cp_size=2)
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
 
-    assert cfg.model.backend.rope_fusion is False
+    assert cfg.model.backend.rope_fusion is True
 
 
 def test_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
@@ -2382,7 +2330,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    recipe.cfg.__dict__["llm_inputs"] = SimpleNamespace(uses_thd_collater=uses_thd)
+    recipe.cfg.__dict__["dataloader"] = SimpleNamespace(uses_thd_collater=uses_thd)
 
     class _CPModel(nn.Module):
         def __init__(self):

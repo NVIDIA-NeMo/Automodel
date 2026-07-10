@@ -52,7 +52,7 @@ model:
     enable_fsdp_optimizations: true
     # NOTE: the router gate is forced to fp32 by the model regardless of backend.
 
-processor:
+tokenizer:
   # The checkpoint bundles its processor (auto_map -> processing_minimax.MiniMaxVLProcessor)
   # but its remote-code __init__ drops chat_template during from_pretrained, so this
   # helper loads it via AutoProcessor (trust_remote_code) and reattaches chat_template.jinja.

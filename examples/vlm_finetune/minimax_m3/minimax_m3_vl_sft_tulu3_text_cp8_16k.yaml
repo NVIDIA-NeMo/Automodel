@@ -73,7 +73,7 @@ model:
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
-processor:
+tokenizer:
   _target_: nemo_automodel.components.models.minimax_m3_vl.processing.build_minimax_m3_vl_processor
   pretrained_model_name_or_path: MiniMaxAI/MiniMax-M3
   trust_remote_code: true

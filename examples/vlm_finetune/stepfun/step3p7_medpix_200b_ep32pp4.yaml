@@ -50,7 +50,7 @@ model:
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
-processor:
+tokenizer:
   _target_: nemo_automodel.components.models.step3p7.processing_step3.Step3VLProcessor.from_pretrained
   pretrained_model_name_or_path: stepfun-ai/Step-3.7-Flash
   trust_remote_code: false

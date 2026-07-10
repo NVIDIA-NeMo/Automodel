@@ -52,7 +52,7 @@ peft:
   alpha: 128
   use_triton: true
 
-processor:
+tokenizer:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
   trust_remote_code: true

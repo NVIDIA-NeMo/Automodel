@@ -693,15 +693,18 @@ class BaseRecipe:
         """Log metadata and config on main rank using YAML markers."""
         if not getattr(self, "dist_env", None) or not getattr(self.dist_env, "is_main", False):
             return
+        cfg_get = getattr(getattr(self, "cfg", None), "get", lambda *_: None)
         details = {
             "Timestamp": datetime.now().isoformat(timespec="seconds"),
             "User": getpass.getuser(),
             "Host": socket.gethostname(),
             "World size": getattr(self.dist_env, "world_size", None),
-            "Backend": getattr(getattr(self, "cfg", {}), "get", lambda *_: None)("dist_env.backend", "nccl"),
+            "Backend": cfg_get("dist_env.backend", "nccl"),
             "Recipe": self.__class__.__name__,
-            "Model name": getattr(getattr(self, "cfg", None), "model", None)
-            and getattr(self.cfg.model, "pretrained_model_name_or_path", None),
+            "Model name": cfg_get(
+                "model.pretrained_model_name_or_path",
+                cfg_get("model.config.pretrained_model_name_or_path", None),
+            ),
         }
         try:
             details_yaml = yaml.safe_dump(details, sort_keys=False, default_flow_style=False).strip()

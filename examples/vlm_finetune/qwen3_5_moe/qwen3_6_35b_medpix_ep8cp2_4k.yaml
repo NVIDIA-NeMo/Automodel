@@ -43,7 +43,7 @@ model:
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
 
-processor:
+tokenizer:
   _target_: transformers.AutoProcessor.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.6-35B-A3B
 
