@@ -247,6 +247,98 @@ def test_trainer_integration_trains_on_cpu():
     assert grads and all(torch.isfinite(g).all() for g in grads)
 
 
+def test_packing_matches_padding_loss_and_grads():
+    """Golden parity: packing N docs into one row == N padded single-doc rows.
+
+    Target-free draft-level check: identical per-document aux hidden states and
+    target logits are fed in two layouts through the shared Eagle3TrainerModule --
+      * padding: ``[D, T]`` with each doc's ``L`` real tokens padded to ``T``
+        (per-row causal + padding mask, ``loss_mask``-shift TTT gating);
+      * packing: the same docs as ``[1, T]`` (``D * L == T``) with per-document
+        position_ids, the MLA block-causal mask, and ``doc_remaining`` gating.
+    Both supervise the identical (doc, position, TTT step) triples against
+    identical targets, so loss and every gradient match (CPU/fp32, tight tol).
+    """
+    num_docs, doc_len = 3, 8
+    total = num_docs * doc_len  # packed row width T
+    config = _build_config()
+    config.draft_vocab_size = _VOCAB  # full vocab so every position is supervised
+    config.max_position_embeddings = total
+
+    def build_trainer():
+        torch.manual_seed(123)  # identical draft init for both layouts
+        draft = DeepseekV3Eagle3DraftModel(config).to(torch.float32)
+        selected_token_ids = torch.arange(_VOCAB, dtype=torch.long)
+        selected_token_mask = torch.ones(_VOCAB, dtype=torch.bool)
+        return Eagle3TrainerModule(
+            draft,
+            selected_token_ids=selected_token_ids,
+            selected_token_mask=selected_token_mask,
+            ttt_steps=3,
+        )
+
+    torch.manual_seed(7)
+    doc_ids = [torch.randint(0, _VOCAB, (doc_len,)) for _ in range(num_docs)]
+    doc_aux = [torch.randn(doc_len, _HIDDEN * 3) for _ in range(num_docs)]
+    doc_logits = [torch.randn(doc_len, _VOCAB) for _ in range(num_docs)]
+
+    # Layout A: D padded single-document rows.
+    ids_a = torch.zeros(num_docs, total, dtype=torch.long)
+    aux_a = torch.zeros(num_docs, total, _HIDDEN * 3)
+    logits_a = torch.zeros(num_docs, total, _VOCAB)
+    loss_a = torch.zeros(num_docs, total, dtype=torch.long)
+    attn_a = torch.zeros(num_docs, total, dtype=torch.long)
+    for d in range(num_docs):
+        ids_a[d, :doc_len] = doc_ids[d]
+        aux_a[d, :doc_len] = doc_aux[d]
+        logits_a[d, :doc_len] = doc_logits[d]
+        # Supervise every real token except the doc's last one, which has no
+        # in-document next-token label. In the packed layout that same boundary
+        # is enforced by ``doc_remaining`` (== 0 at each doc's last slot), so this
+        # keeps both layouts on the identical supervised (doc, slot, step) triples.
+        loss_a[d, : doc_len - 1] = 1
+        attn_a[d, :doc_len] = 1
+    trainer_a = build_trainer()
+    metrics_a = trainer_a(
+        input_ids=ids_a,
+        attention_mask=attn_a,
+        loss_mask=loss_a,
+        aux_hidden_states=aux_a,
+        target_logits=logits_a,
+    )
+    metrics_a.loss.backward()
+    grads_a = {n: p.grad.clone() for n, p in trainer_a.named_parameters() if p.grad is not None}
+
+    # Layout B: the same documents packed into one row (no padding).
+    ids_b = torch.cat(doc_ids).unsqueeze(0)
+    aux_b = torch.cat(doc_aux).unsqueeze(0)
+    logits_b = torch.cat(doc_logits).unsqueeze(0)
+    loss_b = torch.ones(1, total, dtype=torch.long)
+    attn_b = torch.ones(1, total, dtype=torch.long)
+    position_ids = torch.cat([torch.arange(doc_len) for _ in range(num_docs)]).unsqueeze(0)
+    doc_remaining = torch.cat([torch.arange(doc_len - 1, -1, -1) for _ in range(num_docs)]).unsqueeze(0)
+    seq_lens = torch.tensor([[doc_len] * num_docs], dtype=torch.long)
+    trainer_b = build_trainer()
+    metrics_b = trainer_b(
+        input_ids=ids_b,
+        attention_mask=attn_b,
+        loss_mask=loss_b,
+        aux_hidden_states=aux_b,
+        target_logits=logits_b,
+        position_ids=position_ids,
+        seq_lens=seq_lens,
+        doc_remaining=doc_remaining,
+    )
+    metrics_b.loss.backward()
+    grads_b = {n: p.grad.clone() for n, p in trainer_b.named_parameters() if p.grad is not None}
+
+    assert metrics_a.valid_tokens.item() == metrics_b.valid_tokens.item()
+    torch.testing.assert_close(metrics_a.loss, metrics_b.loss, rtol=1e-4, atol=1e-5)
+    assert set(grads_a) == set(grads_b)
+    for name in grads_a:
+        torch.testing.assert_close(grads_a[name], grads_b[name], rtol=1e-4, atol=1e-5, msg=f"grad mismatch: {name}")
+
+
 def test_rope_freqs_stays_fp32_after_bf16_cast():
     """``draft.to(bf16)`` must not round the MLA RoPE frequencies.
 
