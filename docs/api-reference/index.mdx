@@ -19,5 +19,5 @@ This reference is built from docstrings in the [source code](https://github.com/
 | `nemo_automodel.components.checkpoint` | Async DCP and SafeTensors checkpointing |
 | `nemo_automodel.components.quantization` | FP8, QAT, calibration |
 | `nemo_automodel.components._peft` | LoRA, QLoRA adapters |
-| `nemo_automodel.components.launcher` | Slurm and SkyPilot job submission |
-| `nemo_automodel.cli` | `automodel <command> <domain> -c <config.yaml>` entry point |
+| `nemo_automodel.components.launcher` | Interactive, SkyPilot, and NeMo-Run job launchers; Slurm jobs use the repository's `slurm.sub` script |
+| `nemo_automodel.cli` | `automodel <config.yaml> [--nproc-per-node N] [--key.subkey=override ...]` entry point |
