@@ -16,6 +16,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -103,19 +104,50 @@ class _TextOnlyModel(nn.Module):
         self.model = _LanguageModel()
 
 
-def test_apply_ac_checkpoints_trainable_vision_blocks():
+def _assert_submodule_wrapped(visual: nn.Module) -> None:
+    """Assert the default spec: blocks stay unwrapped, attention + MLP checkpoint-wrapped."""
+    for block in visual.blocks:
+        assert not isinstance(block, CheckpointWrapper)
+        assert isinstance(block.attn, CheckpointWrapper)
+        assert isinstance(block.mlp, CheckpointWrapper)
+
+
+def test_apply_ac_checkpoints_trainable_vision_submodules_by_default():
     model = Qwen3VLMoeForConditionalGeneration()
 
     moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2)
 
-    assert all(isinstance(block, CheckpointWrapper) for block in model.model.visual.blocks)
+    # Default spec matches the generic FSDP2/DDP path: per-submodule wrapping
+    # (attention included -- SDPA/flash replay inside checkpoint backward is safe).
+    _assert_submodule_wrapped(model.model.visual)
     assert all(isinstance(layer, CheckpointWrapper) for layer in model.model.language_model.layers)
 
     # The wrapped tower must recompute cleanly: forward + backward produce grads.
     out = model.model.visual(torch.randn(4, _DIM))
     out.sum().backward()
+    qkv_weight = model.model.visual.blocks[0].attn._checkpoint_wrapped_module.qkv.weight
+    assert qkv_weight.grad is not None
+
+
+def test_apply_ac_pinned_block_spec_wraps_whole_vision_blocks():
+    model = Qwen3VLMoeForConditionalGeneration()
+
+    moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2, vision_checkpoint_spec="pinned_block")
+
+    assert all(isinstance(block, CheckpointWrapper) for block in model.model.visual.blocks)
+    assert all(isinstance(layer, CheckpointWrapper) for layer in model.model.language_model.layers)
+
+    out = model.model.visual(torch.randn(4, _DIM))
+    out.sum().backward()
     qkv_weight = model.model.visual.blocks[0]._checkpoint_wrapped_module.attn.qkv.weight
     assert qkv_weight.grad is not None
+
+
+def test_apply_ac_rejects_unknown_vision_checkpoint_spec():
+    model = Qwen3VLMoeForConditionalGeneration()
+
+    with pytest.raises(ValueError, match="vision_checkpoint_spec"):
+        moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2, vision_checkpoint_spec="mlp_only")
 
 
 def test_apply_ac_skips_frozen_vision_tower():
@@ -125,29 +157,30 @@ def test_apply_ac_skips_frozen_vision_tower():
 
     moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2)
 
-    assert all(not isinstance(block, CheckpointWrapper) for block in model.model.visual.blocks)
+    for block in model.model.visual.blocks:
+        assert not isinstance(block, CheckpointWrapper)
+        assert not isinstance(block.attn, CheckpointWrapper)
+        assert not isinstance(block.mlp, CheckpointWrapper)
     assert all(isinstance(layer, CheckpointWrapper) for layer in model.model.language_model.layers)
 
 
-def test_apply_ac_selective_also_checkpoints_vision_blocks():
+def test_apply_ac_selective_also_checkpoints_vision_submodules():
     model = Qwen3VLMoeForConditionalGeneration()
 
     moe_parallelizer.apply_ac(model, selective=True)
 
-    assert all(isinstance(block, CheckpointWrapper) for block in model.model.visual.blocks)
+    _assert_submodule_wrapped(model.model.visual)
     assert all(isinstance(layer, CheckpointWrapper) for layer in model.model.language_model.layers)
 
 
-def test_apply_ac_flash_attention_vision_tower_wraps_mlp_only():
+def test_apply_ac_flash_attention_vision_tower_also_wraps_attention():
+    """FA replay inside checkpoint backward is safe; FA-configured towers get the full default spec."""
     model = Qwen3VLMoeForConditionalGeneration()
     model.config = SimpleNamespace(vision_config=SimpleNamespace(_attn_implementation="flash_attention_2"))
 
     moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2)
 
-    for block in model.model.visual.blocks:
-        assert not isinstance(block, CheckpointWrapper)
-        assert isinstance(block.mlp, CheckpointWrapper)
-        assert not isinstance(block.attn, CheckpointWrapper)
+    _assert_submodule_wrapped(model.model.visual)
 
 
 def test_apply_ac_leaves_text_only_models_unchanged():

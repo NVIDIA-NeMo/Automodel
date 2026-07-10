@@ -77,9 +77,13 @@ activation-memory reduction across trainable model parts.
 checkpointing path. Expert-parallel MoE configs (`ep_size > 1`) use the MoE
 parallelizer's activation checkpointing path, which does not read this scope
 field: it checkpoints the text/MoE decoder blocks and, when the model has a
-trainable VLM vision tower, also checkpoints the vision-tower blocks with a
-recompute-safe spec. Frozen vision towers stay out of activation
-checkpointing on both paths.
+trainable VLM vision tower, also checkpoints the vision-tower blocks with the
+same per-submodule wrapping (attention/MLP/norms) used on this generic path.
+For environments where ambient SDPA backend forcing does not span the
+checkpoint recompute, `moe_parallel_config.vision_checkpoint_spec: pinned_block`
+instead wraps whole vision blocks and pins the SDPA backend set
+(flash + mem-efficient) on both the checkpoint forward and its recompute.
+Frozen vision towers stay out of activation checkpointing on both paths.
 </Note>
 
 <Note>
