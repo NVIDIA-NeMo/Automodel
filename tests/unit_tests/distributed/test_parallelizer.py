@@ -2221,8 +2221,23 @@ class TestExtractModelLayers:
         assert len(result) == 4
         assert all(r is layers[i] for i, r in enumerate(result))
 
-    def test_multi_fqn_flattens_each_modulelist(self):
-        """Qwen2.5-VL entry ``["language_model.layers", "visual.blocks"]``.
+    def _attach_qwen_vl_towers(self, model, lang, vis, *, v5):
+        """Attach Qwen2-VL-style towers, either v4 top-level or v5 under ``model.``."""
+        language_model = nn.Module()
+        language_model.layers = lang
+        visual = nn.Module()
+        visual.blocks = vis
+        if v5:
+            inner = nn.Module()
+            inner.language_model = language_model
+            inner.visual = visual
+            model.model = inner
+        else:
+            model.language_model = language_model
+            model.visual = visual
+
+    def test_multi_fqn_flattens_each_modulelist(self, monkeypatch):
+        """Qwen2.5-VL v4 entry ``["language_model.layers", "visual.blocks"]``.
 
         Both FQNs resolve to ModuleLists; both must be flattened so all decoder
         and vision blocks appear as individual elements in the final list.
@@ -2231,15 +2246,11 @@ class TestExtractModelLayers:
             Qwen2_5_VLForConditionalGeneration,
         )
 
+        monkeypatch.setattr(parallelizer, "_is_transformers_v5_or_higher", lambda: False)
         model = self._bare_instance(Qwen2_5_VLForConditionalGeneration)
         lang = self._make_layers(5)
         vis = self._make_layers(2)
-        language_model = nn.Module()
-        language_model.layers = lang
-        model.language_model = language_model
-        visual = nn.Module()
-        visual.blocks = vis
-        model.visual = visual
+        self._attach_qwen_vl_towers(model, lang, vis, v5=False)
 
         result = _extract_model_layers(model)
 
@@ -2247,6 +2258,120 @@ class TestExtractModelLayers:
         assert [id(r) for r in result[:5]] == [id(item) for item in lang]
         assert [id(r) for r in result[5:]] == [id(item) for item in vis]
         assert not any(isinstance(r, nn.ModuleList) for r in result)
+
+    def test_qwen2_vl_v5_module_tree_extracts_language_and_vision_groups(self, monkeypatch):
+        """Transformers v5 nests the Qwen2-VL towers under ``model.``.
+
+        The spec must resolve ``model.language_model.layers`` and
+        ``model.visual.blocks``; with the stale v4-only FQNs extraction returned
+        ``{}`` and activation checkpointing was a silent no-op.
+        """
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+            Qwen2_5_VLForConditionalGeneration,
+        )
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        monkeypatch.setattr(parallelizer, "_is_transformers_v5_or_higher", lambda: True)
+        for cls in (Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration):
+            model = self._bare_instance(cls)
+            lang = self._make_layers(3)
+            vis = self._make_layers(2)
+            self._attach_qwen_vl_towers(model, lang, vis, v5=True)
+
+            groups = _extract_model_layer_groups(model)
+
+            assert set(groups) == {"language", "vision"}, cls.__name__
+            assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+            assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    def test_gemma3_v5_module_tree_extracts_language_and_vision_groups(self, monkeypatch):
+        """Gemma3 on transformers v5 (verified on 5.8.1/5.12.1) exposes
+        ``model.language_model.layers`` and the flattened
+        ``model.vision_tower.encoder.layers``; the earlier v5 spec pointed at
+        ``model.layers``/``model.vision_tower.vision_model.encoder.layers`` and
+        resolved nothing.
+        """
+        monkeypatch.setattr(parallelizer, "_is_transformers_v5_or_higher", lambda: True)
+        model = self._bare_instance(Gemma3ForConditionalGeneration)
+        lang = self._make_layers(3)
+        vis = self._make_layers(2)
+        inner = nn.Module()
+        inner.language_model = nn.Module()
+        inner.language_model.layers = lang
+        inner.vision_tower = nn.Module()
+        inner.vision_tower.encoder = nn.Module()
+        inner.vision_tower.encoder.layers = vis
+        model.model = inner
+
+        groups = _extract_model_layer_groups(model)
+
+        assert set(groups) == {"language", "vision"}
+        assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+        assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    def test_llava_v5_module_tree_extracts_vision_group(self):
+        """Llava-family vision towers moved under ``model.`` in transformers v5
+        with a flattened CLIP tower (``vision_tower.encoder.layers``); the stale
+        ``vision_tower.vision_model.encoder.layers`` FQN silently dropped the
+        vision group while language still resolved.
+        """
+        from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+        from transformers.models.llava_next.modeling_llava_next import (
+            LlavaNextForConditionalGeneration,
+        )
+        from transformers.models.llava_next_video.modeling_llava_next_video import (
+            LlavaNextVideoForConditionalGeneration,
+        )
+        from transformers.models.llava_onevision.modeling_llava_onevision import (
+            LlavaOnevisionForConditionalGeneration,
+        )
+
+        for cls in (
+            LlavaForConditionalGeneration,
+            LlavaNextForConditionalGeneration,
+            LlavaNextVideoForConditionalGeneration,
+            LlavaOnevisionForConditionalGeneration,
+        ):
+            model = self._bare_instance(cls)
+            lang = self._make_layers(3)
+            vis = self._make_layers(2)
+            inner = nn.Module()
+            inner.language_model = nn.Module()
+            inner.language_model.layers = lang
+            inner.vision_tower = nn.Module()
+            inner.vision_tower.encoder = nn.Module()
+            inner.vision_tower.encoder.layers = vis
+            model.model = inner
+
+            groups = _extract_model_layer_groups(model)
+
+            assert set(groups) == {"language", "vision"}, cls.__name__
+            assert [id(m) for m in groups["vision"]] == [id(item) for item in vis], cls.__name__
+
+    def test_spec_resolving_no_modules_warns_and_returns_empty(self, monkeypatch, caplog):
+        """A mapped model class whose spec FQNs all fail to resolve must warn.
+
+        This is the transformers-version-drift failure mode: extraction used to
+        return ``{}`` silently and activation checkpointing became a no-op.
+        """
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        monkeypatch.setattr(parallelizer, "_is_transformers_v5_or_higher", lambda: True)
+        # v4-style tree while the v5 spec is active -> nothing resolves.
+        model = self._bare_instance(Qwen2VLForConditionalGeneration)
+        self._attach_qwen_vl_towers(model, self._make_layers(2), self._make_layers(2), v5=False)
+
+        with caplog.at_level("WARNING", logger=parallelizer.logger.name):
+            groups = _extract_model_layer_groups(model)
+
+        assert groups == {}
+        assert "Qwen2VLForConditionalGeneration" in caplog.text
+        assert "model.language_model.layers" in caplog.text
+        assert "model.visual.blocks" in caplog.text
 
     def test_moduledict_layer_container_flattens(self):
         """PP post-split: ``_reduce_attrs`` returns a ModuleDict.

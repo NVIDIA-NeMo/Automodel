@@ -1596,11 +1596,20 @@ def _extend_layers(layers: List[nn.Module], modules: Sequence[nn.Module]) -> Non
 
 
 def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
-    # Gemma3 layer paths depend on transformers version
+    # Gemma3 / Qwen2-VL layer paths depend on transformers version: v5 nests
+    # both towers under the shared `model.` backbone. The Gemma3 v5 vision
+    # entry lists both CLIP/SigLIP shapes because v5 flattened the tower
+    # (`vision_tower.encoder`) after dropping the inner `vision_model` module;
+    # only one candidate resolves on any given version (verified empirically on
+    # transformers 5.8.1 / 5.12.1: `model.language_model.layers` +
+    # `model.vision_tower.encoder.layers`).
     _gemma3_layers = (
         {
-            "language": ["model.layers"],
-            "vision": ["model.vision_tower.vision_model.encoder.layers"],
+            "language": ["model.layers", "model.language_model.layers"],
+            "vision": [
+                "model.vision_tower.vision_model.encoder.layers",
+                "model.vision_tower.encoder.layers",
+            ],
         }
         if _is_transformers_v5_or_higher()
         else {
@@ -1608,37 +1617,45 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
             "vision": ["vision_tower.vision_model.encoder.layers"],
         }
     )
+    # Verified on transformers 5.8.1 / 5.12.1: `model.language_model.layers` +
+    # `model.visual.blocks` (the v4 paths no longer resolve, which silently
+    # disabled activation checkpointing and layer-based sharding).
+    _qwen2_vl_layers = (
+        {
+            "language": ["model.language_model.layers"],
+            "vision": ["model.visual.blocks"],
+        }
+        if _is_transformers_v5_or_higher()
+        else {
+            "language": ["language_model.layers"],
+            "vision": ["visual.blocks"],
+        }
+    )
+    # Llava-family vision towers moved under `model.` in transformers v5 and
+    # the CLIP tower was flattened (no inner `vision_model`); both candidates
+    # are listed and only one resolves per version (verified on 5.8.1 / 5.12.1:
+    # `model.vision_tower.encoder.layers`). The language path was already
+    # v5-style.
+    _llava_layers = {
+        "language": ["model.language_model.layers"],
+        "vision": [
+            "model.vision_tower.vision_model.encoder.layers",
+            "model.vision_tower.encoder.layers",
+        ],
+    }
     return {
         Gemma3ForConditionalGeneration: _gemma3_layers,
-        Qwen2_5_VLForConditionalGeneration: {
-            "language": ["language_model.layers"],
-            "vision": ["visual.blocks"],
-        },
-        Qwen2VLForConditionalGeneration: {
-            "language": ["language_model.layers"],
-            "vision": ["visual.blocks"],
-        },
+        Qwen2_5_VLForConditionalGeneration: _qwen2_vl_layers,
+        Qwen2VLForConditionalGeneration: _qwen2_vl_layers,
         # Note: `model.` is not a mistake here, it's the full fqn.
         SmolVLMForConditionalGeneration: {
             "language": ["model.text_model.layers"],
             "vision": ["model.vision_model.encoder.layers"],
         },
-        LlavaForConditionalGeneration: {
-            "language": ["model.language_model.layers"],
-            "vision": ["vision_tower.vision_model.encoder.layers"],
-        },
-        LlavaNextForConditionalGeneration: {
-            "language": ["model.language_model.layers"],
-            "vision": ["vision_tower.vision_model.encoder.layers"],
-        },
-        LlavaNextVideoForConditionalGeneration: {
-            "language": ["model.language_model.layers"],
-            "vision": ["vision_tower.vision_model.encoder.layers"],
-        },
-        LlavaOnevisionForConditionalGeneration: {
-            "language": ["model.language_model.layers"],
-            "vision": ["vision_tower.vision_model.encoder.layers"],
-        },
+        LlavaForConditionalGeneration: _llava_layers,
+        LlavaNextForConditionalGeneration: _llava_layers,
+        LlavaNextVideoForConditionalGeneration: _llava_layers,
+        LlavaOnevisionForConditionalGeneration: _llava_layers,
         Mistral3ForConditionalGeneration: {
             "language": ["model.language_model.layers"],
             "vision": [
@@ -1747,6 +1764,14 @@ def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
             _extend_layers(layers, _reduce_attrs(model, fqns))
             if layers:
                 layer_groups[group_name] = layers
+        if not layer_groups:
+            logger.warning(
+                "Layer-group spec for %s resolved no modules: none of the expected FQNs %s exist in the "
+                "model tree (likely transformers version drift). Activation checkpointing and layer-based "
+                "sharding will skip this model until the spec is updated.",
+                model_cls.__name__,
+                {group_name: list(fqns) for group_name, fqns in layer_group_specs.items()},
+            )
     elif hasattr(model, "model") and hasattr(model.model, "layers"):
         # Default case for all other models (assumed to be a causal LM).
         layer_groups["language"] = (
