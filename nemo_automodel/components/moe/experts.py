@@ -39,7 +39,6 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 
-
 _MOE_LOOP_EXPERT_CHUNK_TOKENS = 4096
 
 # ── EP variable-length collective helpers ──
