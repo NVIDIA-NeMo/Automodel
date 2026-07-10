@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import yaml
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.loss.kd_loss import KDLoss
@@ -25,6 +27,19 @@ from nemo_automodel.recipes import kd_utils
 from tests.functional_tests.llm_pretrain_and_kd import kd_separate_mesh_test_utils
 from tests.functional_tests.llm_pretrain_and_kd.compare_kd_sep_mesh_losses import _compare_pair
 from tests.functional_tests.llm_pretrain_and_kd.kd_separate_mesh_test_utils import TinyKDDataset
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_KD_FP32_MASTER_YAMLS = (
+    "examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_cp2.yaml",
+    "examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_pp2.yaml",
+    "examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_tp2.yaml",
+    "examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd_separate_mesh_teacher_cp2.yaml",
+    "examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd_separate_mesh_teacher_dp2.yaml",
+    "examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd_separate_mesh_teacher_tp2.yaml",
+    "tests/functional_tests/llm_pretrain_and_kd/kd_separate_mesh.yaml",
+    "tests/functional_tests/llm_pretrain_and_kd/kd_sep_mesh_gemma_dense.yaml",
+    "tests/functional_tests/llm_pretrain_and_kd/kd_sep_mesh_gemma_moe.yaml",
+)
 
 
 def test_tiny_kd_dataset_requests_flat_chat_template_token_ids():
@@ -91,6 +106,19 @@ def test_tiny_kd_sft_dataset_masks_generation_prompt():
     assert dataset[0]["attention_mask"] == [1] * 8
     dataset[0]["labels"][3] = -100
     assert dataset[1]["labels"][3] == 20
+
+
+def test_kd_yamls_use_fp32_optimizer_master_weights():
+    for relative_path in _KD_FP32_MASTER_YAMLS:
+        cfg = yaml.safe_load((_REPO_ROOT / relative_path).read_text())
+
+        optimizer = cfg["optimizer"]
+        assert optimizer["_target_"] == "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam"
+        assert optimizer["master_weights"] is True
+        assert optimizer["master_weight_dtype"] == "torch.float32"
+
+        assert cfg["model"]["torch_dtype"] == "bfloat16"
+        assert cfg["teacher_model"]["torch_dtype"] == "bfloat16"
 
 
 def test_loss_comparator_rejects_mismatched_kd_settings():
