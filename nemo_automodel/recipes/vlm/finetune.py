@@ -568,7 +568,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         if dataloader_config.packing is not None:
             configure_packing(attn_implementation=packing_attn_implementation)
-        dataset_build_context = nullcontext() if getattr(self, "separate_meshes", False) else FirstRankPerNode()
+        process_group = getattr(self.mesh_context, "process_group", None)
+        dataset_build_context = FirstRankPerNode(group=process_group)
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             dataloader_build = dataloader_config.build(
                 pretrained_model_name_or_path=_get_model_name(self.cfg.model),
@@ -587,7 +588,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.val_dataloader = None
         validation_config = self.cfg.vlm_validation_dataloader
         if validation_config is not None:
-            validation_build_context = nullcontext() if getattr(self, "separate_meshes", False) else FirstRankPerNode()
+            validation_build_context = FirstRankPerNode(group=process_group)
             with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
                 validation_build = validation_config.build(
                     pretrained_model_name_or_path=_get_model_name(self.cfg.model),

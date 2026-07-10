@@ -107,7 +107,7 @@ class DistributedSignalHandler:
     def __init__(
         self,
         sig: int = signal.SIGTERM,
-        group: Optional[torch.distributed.ProcessGroup] = None,
+        group: torch.distributed.ProcessGroup | None = None,
     ) -> None:
         """
         Constructor for the DistributedSignalHandler.
@@ -124,7 +124,7 @@ class DistributedSignalHandler:
 
     def signals_received(self) -> list[bool]:
         """
-        Check if any rank in the default group received the signal.
+        Check if any rank in the configured group received the signal.
 
         Uses all_gather to collect the signal status from all ranks.
 

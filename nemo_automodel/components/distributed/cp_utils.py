@@ -211,6 +211,32 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             target.register_forward_hook(_post_hook, always_call=True)
 
 
+def unshard_context_parallel_tensor(
+    cp_mesh: DeviceMesh,
+    tensor: torch.Tensor,
+    *,
+    seq_dim: int,
+) -> torch.Tensor:
+    """Restore a tensor from PyTorch's load-balanced context-parallel layout.
+
+    Args:
+        cp_mesh: One-dimensional context-parallel mesh of size ``C``.
+        tensor: Per-rank tensor whose sequence axis is in PyTorch's
+            load-balanced CP layout. Its local sequence extent is ``S / C``.
+        seq_dim: Axis containing the local sequence extent.
+
+    Returns:
+        Replicated tensor with the same axis order and full sequence extent
+        ``S`` on ``seq_dim``.
+    """
+    if cp_mesh.size() <= 1:
+        return tensor
+    from torch.distributed.tensor.experimental._attention import context_parallel_unshard
+
+    (unsharded,) = context_parallel_unshard(cp_mesh, [tensor], seq_dims=[seq_dim])
+    return unsharded
+
+
 def make_cp_batch_and_ctx(
     device_mesh,
     batch,
@@ -221,19 +247,39 @@ def make_cp_batch_and_ctx(
     seq_lens_padding_value: int = -1000,
     extra_seq_buffers: dict[str, int] | None = None,
 ):
-    """
-    Build a CP context manager and shards a batch. If the input device_mesh is None or the size
-    of the context_parallel submesh is 1, this function is effectively a no-op.
+    """Build a context-parallel context and register sequence-bearing batch tensors.
+
+    ``batch`` must contain exactly one primary sequence tensor: ``input_ids``
+    with shape ``[B, S]`` or ``inputs_embeds`` with shape ``[B, S, H]``, where
+    ``B`` is batch, ``S`` is sequence, and ``H`` is hidden size. ``labels`` has
+    shape ``[B, S]``. Standard ``position_ids`` have shape ``[B, S]`` while
+    multimodal RoPE positions may have shape ``[M, B, S]``. The returned
+    context shards registered sequence axes across the CP mesh and leaves the
+    corresponding batch entries in their per-rank local layout.
 
     Args:
-        cp_mesh (DeviceMesh): The device mesh for context parallel.
-        batch (Dict[str, torch.Tensor]): The input batch containing (string, torch.Tensor)
+        device_mesh: Device mesh containing optional ``cp`` and ``tp`` axes.
+        batch: Mapping containing the primary sequence tensor, ``labels``, and
+            optional sequence-aligned tensors. Tensor dtype and device are
+            preserved.
+        loss_mask: Optional ``[B, S]`` tensor sharded with the labels.
+        use_te: Whether to convert the batch to Transformer Engine's packed THD
+            layout instead of PyTorch's padded CP layout.
+        padding_token_id: Token id used when padding ``input_ids``.
+        num_chunks: Number of packed THD chunks for the TE path.
+        seq_lens_padding_value: Sentinel used for padded sequence lengths in
+            the TE path.
+        extra_seq_buffers: Additional batch keys mapped to their sequence axis.
+            For example, ``{"teacher_logits": 1}`` registers logits with shape
+            ``[B, S, V]``, where ``V`` is vocabulary size. Floating-point extra
+            buffers are zero-padded when CP divisibility requires padding.
 
     Returns:
-        tuple (contextmanager, dict[str, torch.Tensor]): Returns a tuple with a context manager
-        and a new batch. The context manager is either nullcontext (no CP) or CP context manager as
-        returned by `create_context_parallel_ctx`. The batch has also been passed to
-        `create_context_parallel_ctx` and is accordingly sharded.
+        A pair of ``(context_factory, batch)``. Calling ``context_factory()``
+        enters the CP region. Registered tensors retain their semantic axis
+        order with per-rank local sequence extent ``S / C`` while inside the
+        context, where ``C`` is CP size. With CP size one, the batch is returned
+        unchanged.
     """
     from contextlib import nullcontext
 

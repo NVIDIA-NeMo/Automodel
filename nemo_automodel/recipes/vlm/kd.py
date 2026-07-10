@@ -46,9 +46,7 @@ from contextlib import nullcontext
 from typing import Any, Optional
 
 import torch
-import torch.distributed as dist
 import wandb
-from torch.distributed.tensor import DTensor, Shard
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -60,6 +58,7 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.training.rng import ScopedRNG
+from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     count_tail_padding,
@@ -79,30 +78,6 @@ from nemo_automodel.recipes.kd_utils import (
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, build_model, calculate_loss
 
 logger = logging.getLogger(__name__)
-
-
-def _move_to_device(value: Any, device: torch.device) -> Any:
-    if isinstance(value, torch.Tensor):
-        return value.to(device, non_blocking=True)
-    if isinstance(value, dict):
-        return {key: _move_to_device(item, device) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_move_to_device(item, device) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_move_to_device(item, device) for item in value)
-    return value
-
-
-def _match_student_vocab_shard(student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
-    if not isinstance(student_logits, DTensor):
-        return teacher_logits
-    vocab_dim = student_logits.ndim - 1
-    for mesh_dim, placement in enumerate(student_logits.placements):
-        if isinstance(placement, Shard) and placement.dim in {-1, vocab_dim}:
-            group = student_logits.device_mesh.get_group(mesh_dim)
-            chunks = torch.tensor_split(teacher_logits, dist.get_world_size(group), dim=-1)
-            return chunks[dist.get_rank(group)].contiguous()
-    return teacher_logits
 
 
 def _build_kd_loss_fn(cfg_kd):
@@ -286,6 +261,13 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         logger.info(f"Knowledge-distillation enabled: ratio={self.kd_ratio}, T={temperature}")
 
     def _get_separate_teacher_logits(self, batch: dict[str, Any]) -> torch.Tensor:
+        """Request teacher logits for one student VLM batch.
+
+        Text tensors such as ``input_ids`` and ``labels`` use shape ``[B, S]``;
+        image/video tensors preserve the processor-defined leading dimensions.
+        Returns full teacher logits ``[B, S, V]`` replicated across the student
+        model replica.
+        """
         self.kd_mesh_bridge.broadcast_command(RUN_TEACHER)
         teacher_logits = None
         for wave in range(self.kd_mesh_bridge.num_waves):
@@ -299,7 +281,17 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
     @torch.no_grad()
     def _teacher_forward_separate(self, batch: dict[str, Any]) -> torch.Tensor:
-        batch = _move_to_device(batch, self.dist_env.device)
+        """Run one teacher VLM batch and materialize full logits.
+
+        Args:
+            batch: Nested multimodal batch. Text tensors use ``[B, S]``;
+                pixel tensors and grid metadata keep the processor-defined
+                layout consumed by ``VLM_INPUT_KEYS``.
+
+        Returns:
+            Detached full teacher logits ``[B, S, V]`` with CP padding removed.
+        """
+        batch = self.kd_mesh_bridge.move_to_device(batch)
         sequence_length = batch["labels"].shape[1]
         model = self.teacher_model
         cp_active = (
@@ -326,13 +318,15 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         )
 
     def _run_teacher_worker(self) -> None:
-        while self.kd_mesh_bridge.broadcast_command() == RUN_TEACHER:
-            for wave in range(self.kd_mesh_bridge.num_waves):
-                batch = self.kd_mesh_bridge.send_batch(wave, None)
-                if batch is None:
-                    raise RuntimeError("Teacher rank did not receive a batch from the student mesh")
-                logits = self._teacher_forward_separate(batch)
-                self.kd_mesh_bridge.send_logits(wave, logits)
+        """Serve teacher forwards until the student mesh broadcasts stop."""
+        with DistributedSignalHandler(group=self.kd_mesh_bridge.teacher_group):
+            while self.kd_mesh_bridge.broadcast_command() == RUN_TEACHER:
+                for wave in range(self.kd_mesh_bridge.num_waves):
+                    batch = self.kd_mesh_bridge.send_batch(wave, None)
+                    if batch is None:
+                        raise RuntimeError("Teacher rank did not receive a batch from the student mesh")
+                    logits = self._teacher_forward_separate(batch)
+                    self.kd_mesh_bridge.send_logits(wave, logits)
 
     def _forward_backward_step(
         self,
@@ -344,7 +338,13 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         num_batches,
         is_train: bool = True,
     ):
-        """Override the forward backward step to include knowledge distillation loss."""
+        """Run one student VLM microbatch with KD.
+
+        Text tensors in ``batch`` use shape ``[B, S]`` while multimodal tensors
+        preserve their processor-defined layouts. Teacher and student logits
+        have semantic shape ``[B, S, V]`` and may use local TP/CP layouts inside
+        the step.
+        """
         separate_teacher_logits = (
             self._get_separate_teacher_logits(batch) if getattr(self, "separate_meshes", False) else None
         )
@@ -422,7 +422,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
             student_logits = getattr(student_out, "logits", student_out)
             if separate_teacher_logits is not None:
-                teacher_logits = _match_student_vocab_shard(student_logits, teacher_logits)
+                teacher_logits = self.kd_mesh_bridge.match_student_vocab_shard(student_logits, teacher_logits)
             hidden_states = (
                 student_out.hidden_states[-1] if getattr(student_out, "hidden_states", None) is not None else None
             )

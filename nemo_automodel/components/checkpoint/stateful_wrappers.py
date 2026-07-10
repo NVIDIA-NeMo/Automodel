@@ -305,12 +305,21 @@ class ModelState:
 
         return model_state_dict
 
-    def load_state_dict(self, state_dict: dict[str, Any], strict: bool = True) -> None:
+    def load_state_dict(
+        self,
+        state_dict: dict[str, Any],
+        strict: bool = True,
+        broadcast_from_rank0: bool = True,
+    ) -> None:
         """
         Load the state dictionary into the model.
 
         Args:
             state_dict (dict): State dictionary to load.
+            strict: Whether missing or unexpected keys should fail the load.
+            broadcast_from_rank0: Whether rank 0 owns the full PEFT state dict.
+                Set to ``False`` when every rank in a model-local process group
+                loaded the adapter independently.
         """
         if self.is_init_step:
             self._set_base_model_state_dict(state_dict)
@@ -333,7 +342,11 @@ class ModelState:
                 for model_part in self.model:
                     _set_peft_state_dict(model_part, state_dict)
                 return
-            options = StateDictOptions(strict=False, broadcast_from_rank0=True, full_state_dict=True)
+            options = StateDictOptions(
+                strict=False,
+                broadcast_from_rank0=broadcast_from_rank0,
+                full_state_dict=True,
+            )
 
         # If we intentionally skipped saving "lm_head.weight" (tied embeddings)
         # PyTorch will complain during load even with strict=False.

@@ -41,12 +41,11 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Any, Dict, Optional
 
 import torch
-import torch.distributed as dist
 import wandb
-from torch.distributed.tensor import DTensor, Shard
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -59,6 +58,7 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.utils import calculate_loss
 from nemo_automodel.components.training.rng import ScopedRNG
+from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     count_tail_padding,
@@ -84,31 +84,6 @@ from nemo_automodel.recipes.llm.train_ft import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _move_to_device(value: Any, device: torch.device) -> Any:
-    if isinstance(value, torch.Tensor):
-        return value.to(device, non_blocking=True)
-    if isinstance(value, dict):
-        return {key: _move_to_device(item, device) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_move_to_device(item, device) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_move_to_device(item, device) for item in value)
-    return value
-
-
-def _match_student_vocab_shard(student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
-    """Slice full teacher logits to the student's vocab shard when TP is active."""
-    if not isinstance(student_logits, DTensor):
-        return teacher_logits
-    vocab_dim = student_logits.ndim - 1
-    for mesh_dim, placement in enumerate(student_logits.placements):
-        if isinstance(placement, Shard) and placement.dim in {-1, vocab_dim}:
-            group = student_logits.device_mesh.get_group(mesh_dim)
-            chunks = torch.tensor_split(teacher_logits, dist.get_world_size(group), dim=-1)
-            return chunks[dist.get_rank(group)].contiguous()
-    return teacher_logits
 
 
 def _build_kd_loss_fn(cfg_kd):
@@ -201,6 +176,19 @@ def _build_teacher_model_with_pp(
     teacher_logits_capture = [None]
 
     def _teacher_capture_loss_fn(logits, target, **kwargs):
+        """Capture one teacher PP microbatch.
+
+        Args:
+            logits: Last-stage teacher logits ``[B_m, S, V]``, where ``B_m``
+                is pipeline microbatch, ``S`` is sequence, and ``V`` is vocab.
+            target: Labels ``[B_m, S]`` supplied by the schedule and unused here.
+            **kwargs: Schedule-owned scalar or tensor metadata ignored by the
+                capture path. Tensor metadata, when present, follows the same
+                microbatch axis as ``logits``.
+
+        Returns:
+            Scalar zero tensor on the same dtype and device as ``logits``.
+        """
         if teacher_logits_capture[0] is None:
             teacher_logits_capture[0] = []
         teacher_logits_capture[0].append(logits.detach().clone())
@@ -310,8 +298,11 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             raise ValueError(
                 "Separate-mesh PP KD requires local_batch_size to be divisible by teacher pp_microbatch_size"
             )
-        self.pipeline_config.pp_batch_size = pp_batch_size
-        self.pipeline_config.pp_microbatch_size = pp_microbatch_size
+        self.pipeline_config = replace(
+            self.pipeline_config,
+            pp_batch_size=pp_batch_size,
+            pp_microbatch_size=pp_microbatch_size,
+        )
 
     def setup(self):  # noqa: C901 – same complexity as parent
         """Build student & teacher, dataloaders, optimizers, etc."""
@@ -409,6 +400,19 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         recipe_ref = self
 
         def pp_kd_loss_fn(logits, target, **kwargs):
+            """Combine CE and KD for one student PP microbatch.
+
+            Args:
+                logits: Student logits ``[B_m, S, V]`` or local TP shard
+                    ``[B_m, S, V_local]``.
+                target: Labels ``[B_m, S]`` with ``-100`` ignored.
+                **kwargs: Pipeline schedule scalar or tensor metadata. Tensor
+                    metadata, when present, follows the same microbatch axis as
+                    ``logits``.
+
+            Returns:
+                Scalar mixed CE/KD loss for the microbatch.
+            """
             teacher_logits = getattr(recipe_ref, "_current_teacher_logits", None)
             if teacher_logits is None:
                 raise RuntimeError(
@@ -420,7 +424,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                     raise RuntimeError("KD loss wrapper received more student than teacher microbatches")
                 teacher_logits = teacher_logits.pop(0)
             if getattr(recipe_ref, "separate_meshes", False):
-                teacher_logits = _match_student_vocab_shard(logits, teacher_logits)
+                teacher_logits = recipe_ref.kd_mesh_bridge.match_student_vocab_shard(logits, teacher_logits)
             # num_label_tokens is None because
             # _run_train_optim_step_pp applies scale_grads_and_clip_grad_norm
             # (which divides grads by num_label_tokens/dp_group_size) and
@@ -447,6 +451,12 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         return pp_kd_loss_fn
 
     def _get_separate_teacher_logits(self, batch: dict[str, Any]) -> torch.Tensor:
+        """Request teacher logits for one student batch.
+
+        ``batch`` contains sequence tensors such as ``input_ids`` and ``labels``
+        with shape ``[B, S]`` plus optional nested tensor metadata. Returns full
+        teacher logits ``[B, S, V]`` replicated across the student replica.
+        """
         self.kd_mesh_bridge.broadcast_command(RUN_TEACHER)
         teacher_logits = None
         for wave in range(self.kd_mesh_bridge.num_waves):
@@ -460,7 +470,18 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
     @torch.no_grad()
     def _teacher_forward_separate(self, batch: dict[str, Any]) -> torch.Tensor | None:
-        batch = _move_to_device(batch, self.dist_env.device)
+        """Run one teacher batch and materialize transport-ready logits.
+
+        Args:
+            batch: Nested batch with ``input_ids`` and ``labels`` shaped
+                ``[B, S]`` plus optional model inputs. Tensors may initially
+                reside on CPU.
+
+        Returns:
+            Full detached teacher logits ``[B, S, V]`` on the teacher output
+            rank, otherwise ``None`` for PP ranks without the final stage.
+        """
+        batch = self.kd_mesh_bridge.move_to_device(batch)
         sequence_length = batch["labels"].shape[1]
         train_ctx, batch = make_cp_batch_and_ctx(
             self.device_mesh,
@@ -519,13 +540,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         )
 
     def _run_teacher_worker(self) -> None:
-        while self.kd_mesh_bridge.broadcast_command() == RUN_TEACHER:
-            for wave in range(self.kd_mesh_bridge.num_waves):
-                batch = self.kd_mesh_bridge.send_batch(wave, None)
-                if batch is None:
-                    raise RuntimeError("Teacher rank did not receive a batch from the student mesh")
-                logits = self._teacher_forward_separate(batch)
-                self.kd_mesh_bridge.send_logits(wave, logits)
+        """Serve teacher forwards until the student mesh broadcasts stop."""
+        with DistributedSignalHandler(group=self.kd_mesh_bridge.teacher_group):
+            while self.kd_mesh_bridge.broadcast_command() == RUN_TEACHER:
+                for wave in range(self.kd_mesh_bridge.num_waves):
+                    batch = self.kd_mesh_bridge.send_batch(wave, None)
+                    if batch is None:
+                        raise RuntimeError("Teacher rank did not receive a batch from the student mesh")
+                    logits = self._teacher_forward_separate(batch)
+                    self.kd_mesh_bridge.send_logits(wave, logits)
 
     def _forward_backward_step(
         self,
@@ -536,7 +559,12 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         num_batches,
         is_train: bool = True,
     ):
-        """Override the forward backward step to include knowledge distillation loss."""
+        """Run one non-PP student microbatch with KD.
+
+        ``batch`` contains ``input_ids`` and ``labels`` shaped ``[B, S]`` plus
+        optional model tensors. Teacher and student logits have semantic shape
+        ``[B, S, V]`` and may use local TP/CP layouts inside the step.
+        """
         if self.pp_enabled:
             raise RuntimeError(
                 "_forward_backward_step should not be called when pp_enabled; use _forward_backward_step_pp instead."
@@ -592,7 +620,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
             student_logits = getattr(student_out, "logits", student_out)  # shape (B, S, V)
             if separate_teacher_logits is not None:
-                teacher_logits = _match_student_vocab_shard(student_logits, teacher_logits)
+                teacher_logits = self.kd_mesh_bridge.match_student_vocab_shard(student_logits, teacher_logits)
 
             # Cross-entropy loss against true labels (skip when kd_ratio >= 1.0).
             if self.kd_ratio >= 1.0:
@@ -636,6 +664,10 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
         Teacher logits from the last PP stage are stored in ``self._current_teacher_logits``
         before the student schedule runs, so ``pp_kd_loss_fn`` can read them.
+
+        ``batch`` contains ``input_ids`` and ``labels`` shaped ``[B, S]`` plus
+        optional model tensors. Transported teacher logits have shape
+        ``[B, S, V]`` and are split into ``[B_m, S, V]`` PP microbatches.
         """
         separate_teacher_logits = (
             self._get_separate_teacher_logits(batch) if getattr(self, "separate_meshes", False) else None

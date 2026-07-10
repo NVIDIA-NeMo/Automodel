@@ -73,7 +73,7 @@ class StepScheduler(Stateful):
         start_epoch: int = 0,
         num_epochs: Optional[int] = None,
         max_steps: Optional[int] = None,
-        process_group: Optional[ProcessGroup] = None,
+        process_group: ProcessGroup | None = None,
     ):
         """
         Initialize the StepScheduler.

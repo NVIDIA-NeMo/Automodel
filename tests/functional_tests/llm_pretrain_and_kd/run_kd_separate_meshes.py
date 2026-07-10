@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import json
-import os
 
 import torch
 import torch.distributed as dist
@@ -27,24 +26,19 @@ from nemo_automodel.recipes.kd_utils import RUN_TEACHER, KDMeshBridge, create_kd
 
 
 def _teacher_logits(input_ids: torch.Tensor) -> torch.Tensor:
+    """Return deterministic logits ``[B, S, V=3]`` for ids ``[B, S]``."""
     values = input_ids.float()
     return torch.stack((values * 0.5, values * -0.25 + 1.0, values * 0.125 - 0.5), dim=-1)
 
 
 def main() -> None:
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend)
+    dist.init_process_group(backend="gloo")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     if world_size != 4:
         raise ValueError(f"This smoke test requires 4 ranks, got {world_size}")
 
-    if backend == "nccl":
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank)
-    else:
-        device = torch.device("cpu")
+    device = torch.device("cpu")
 
     cfg = {
         "separate_meshes": True,

@@ -22,9 +22,10 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.distributed.config import DDPConfig, DistributedSetup
+from nemo_automodel.components.distributed.cp_utils import unshard_context_parallel_tensor
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, parse_distributed_section
 
 RUN_TEACHER = 1
@@ -37,14 +38,25 @@ def materialize_teacher_logits(
     device_mesh: Any,
     sequence_length: int,
 ) -> torch.Tensor:
-    """Reconstruct full teacher logits across TP and CP before mesh transport."""
+    """Reconstruct full teacher logits across TP and CP before mesh transport.
+
+    Args:
+        logits: Teacher logits with global semantic shape ``[B, S, V]``, where
+            ``B`` is batch, ``S`` is sequence, and ``V`` is vocabulary. The
+            tensor may be a TP vocab-sharded ``DTensor`` and/or have a per-rank
+            load-balanced CP sequence extent.
+        device_mesh: Teacher mesh containing optional ``tp`` and ``cp`` axes.
+        sequence_length: Unpadded global sequence length to retain.
+
+    Returns:
+        Detached contiguous tensor of shape ``[B, sequence_length, V]``
+        replicated on every rank in the teacher model replica.
+    """
     if isinstance(logits, DTensor):
         logits = logits.full_tensor()
     mesh_dim_names = getattr(device_mesh, "mesh_dim_names", ())
     if device_mesh is not None and "cp" in mesh_dim_names and device_mesh["cp"].size() > 1:
-        from torch.distributed.tensor.experimental._attention import context_parallel_unshard
-
-        (logits,) = context_parallel_unshard(device_mesh["cp"], [logits], seq_dims=[1])
+        logits = unshard_context_parallel_tensor(device_mesh["cp"], logits, seq_dim=1)
     return logits.narrow(1, 0, sequence_length).detach().contiguous()
 
 
@@ -63,6 +75,8 @@ def _mesh_size(distributed_cfg: Any, *, label: str) -> int:
     cfg_dict = _section_to_dict(distributed_cfg)
     parsed = parse_distributed_section(cfg_dict)
     sizes = parsed["parallelism_sizes"]
+    if sizes.ep_size > 1:
+        raise ValueError(f"{label}.ep_size > 1 is not supported with separate KD meshes")
     if sizes.dp_size is None:
         raise ValueError(
             f"{label}.dp_size must be set when separate_meshes=true so the non-overlapping rank split is explicit"
@@ -182,6 +196,12 @@ def _model_replicas(setup: DistributedSetup) -> list[_Replica]:
 
 
 def _tree_spec(value: Any, tensors: list[torch.Tensor]) -> Any:
+    """Describe a nested value while extracting tensor leaves without copies.
+
+    Tensor leaves may have arbitrary rank and axis semantics; each leaf's exact
+    shape and dtype are recorded for allocation on receiving ranks. ``tensors``
+    is populated with aliases of the original leaves in traversal order.
+    """
     if isinstance(value, torch.Tensor):
         index = len(tensors)
         tensors.append(value)
@@ -196,6 +216,11 @@ def _tree_spec(value: Any, tensors: list[torch.Tensor]) -> Any:
 
 
 def _tree_from_spec(spec: Any, tensors: list[torch.Tensor]) -> Any:
+    """Rebuild a nested value from tensor leaves described by ``_tree_spec``.
+
+    Tensor leaves preserve the exact shapes and dtypes encoded in ``spec`` and
+    alias the corresponding entries in ``tensors``.
+    """
     kind = spec[0]
     if kind == "tensor":
         return tensors[spec[1]]
@@ -258,6 +283,52 @@ class KDMeshBridge:
     def is_teacher(self) -> bool:
         return self.rank in self.teacher_ranks
 
+    def move_to_device(self, value: Any) -> Any:
+        """Move every tensor leaf in a nested value to the bridge device.
+
+        Tensor leaves may have arbitrary shapes and axis order. The returned
+        tensors preserve shape and dtype, move to ``self.device``, and do not
+        mutate the input containers. Tensors already on the device may be
+        returned unchanged.
+        """
+        if isinstance(value, torch.Tensor):
+            return value.to(self.device, non_blocking=True)
+        if isinstance(value, dict):
+            return {key: self.move_to_device(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.move_to_device(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.move_to_device(item) for item in value)
+        return value
+
+    @staticmethod
+    def match_student_vocab_shard(
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Match full teacher logits to a TP-sharded student vocabulary.
+
+        Args:
+            student_logits: Student logits with global semantic shape
+                ``[B, S, V]``. A vocab-sharded ``DTensor`` has local shape
+                ``[B, S, V_local]`` and a ``Shard(-1)`` placement on its TP axis.
+            teacher_logits: Replicated teacher logits of shape ``[B, S, V]``.
+
+        Returns:
+            Replicated teacher logits unchanged for a non-TP student, otherwise
+            the contiguous local vocabulary slice ``[B, S, V_local]`` matching
+            this rank's student-logit shard.
+        """
+        if not isinstance(student_logits, DTensor):
+            return teacher_logits
+        vocab_dim = student_logits.ndim - 1
+        for mesh_dim, placement in enumerate(student_logits.placements):
+            if isinstance(placement, Shard) and placement.dim in {-1, vocab_dim}:
+                group = student_logits.device_mesh.get_group(mesh_dim)
+                chunks = torch.tensor_split(teacher_logits, dist.get_world_size(group), dim=-1)
+                return chunks[dist.get_rank(group)].contiguous()
+        return teacher_logits
+
     def broadcast_command(self, command: int | None = None) -> int:
         value = command if self.rank == self.student_ranks[0] else 0
         tensor = torch.tensor(value, dtype=torch.int32, device=self.device)
@@ -269,6 +340,13 @@ class KDMeshBridge:
         dist.barrier(group=self.control_group)
 
     def _broadcast_tree(self, value: Any, route: _Route) -> Any:
+        """Broadcast a nested tensor tree along one route.
+
+        Tensor leaves may have arbitrary shapes and axis order. Receiving ranks
+        allocate exact-shape tensors on ``self.device`` and own their storage;
+        the source rank may reuse its contiguous input tensor. Source dtypes are
+        preserved.
+        """
         if self.rank not in route.ranks:
             return None
         source_tensors: list[torch.Tensor] = []
@@ -302,6 +380,11 @@ class KDMeshBridge:
         return _tree_from_spec(spec, tensors)
 
     def send_batch(self, wave: int, batch: Any | None) -> Any | None:
+        """Send one nested batch from each active student replica to a teacher.
+
+        Batch tensor leaves preserve their original shapes and axis order. Only
+        ranks in the teacher replica assigned to ``wave`` receive a batch.
+        """
         teacher_batch = None
         for route in self.input_routes[wave]:
             received = self._broadcast_tree(batch if self.rank == route.src else None, route)
@@ -310,6 +393,17 @@ class KDMeshBridge:
         return teacher_batch
 
     def send_logits(self, wave: int, logits: torch.Tensor | None) -> torch.Tensor | None:
+        """Send full teacher logits back to the assigned student replica.
+
+        Args:
+            wave: Routing wave index.
+            logits: Full replicated teacher logits ``[B, S, V]`` on the
+                teacher output rank, otherwise ``None``.
+
+        Returns:
+            Replicated logits ``[B, S, V]`` on ranks in the assigned student
+            replica, otherwise ``None``.
+        """
         student_logits = None
         for route in self.output_routes[wave]:
             received = self._broadcast_tree(logits if self.rank == route.src else None, route)

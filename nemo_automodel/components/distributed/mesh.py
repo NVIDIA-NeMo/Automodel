@@ -105,12 +105,14 @@ class MeshContext:
     Attributes:
         device_mesh: Device mesh for distributed training.
         moe_mesh: MoE-specific device mesh.
+        process_group: Optional model-local group for recipe-level collectives
+            that must not involve ranks outside this mesh.
     """
 
     # runtime mesh references
     device_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
     moe_mesh: Optional["DeviceMesh"] = field(default=None, repr=False)
-    process_group: Optional["ProcessGroup"] = field(default=None, repr=False)
+    process_group: "ProcessGroup | None" = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _validate_mesh_axis_names(self)

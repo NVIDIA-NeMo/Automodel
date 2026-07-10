@@ -285,6 +285,19 @@ class _AsyncSaveContext:
     staging_active: bool = False
 
 
+def _new_gloo_process_group(
+    process_group: torch.distributed.ProcessGroup | None,
+) -> torch.distributed.ProcessGroup:
+    """Create a Gloo group with the same membership as ``process_group``."""
+    if process_group is None:
+        return torch.distributed.new_group(backend="gloo")
+    return torch.distributed.new_group(
+        ranks=torch.distributed.get_process_group_ranks(process_group),
+        backend="gloo",
+        use_local_synchronization=True,
+    )
+
+
 def _should_write_hf_metadata(config: CheckpointingConfig) -> bool:
     """Whether to write HF metadata/artifacts for a checkpoint."""
     return config.model_save_format == SerializationFormat.SAFETENSORS and not config.is_peft
@@ -390,7 +403,7 @@ class Checkpointer:
         tp_rank: int,
         pp_rank: int,
         moe_mesh: Optional[DeviceMesh] = None,
-        process_group: Optional[torch.distributed.ProcessGroup] = None,
+        process_group: torch.distributed.ProcessGroup | None = None,
     ) -> None:
         """
         Initialize the checkpointer.
@@ -416,8 +429,8 @@ class Checkpointer:
         if self.config.is_async:
             self._model_ctx.stager = DefaultStager()
             self._optim_ctx.stager = DefaultStager()
-            self._model_ctx.process_group = torch.distributed.new_group(backend="gloo")
-            self._optim_ctx.process_group = torch.distributed.new_group(backend="gloo")
+            self._model_ctx.process_group = _new_gloo_process_group(process_group)
+            self._optim_ctx.process_group = _new_gloo_process_group(process_group)
 
         self._addons = []
         if _should_write_hf_metadata(self.config):
@@ -502,6 +515,7 @@ class Checkpointer:
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 original_model_path=self._get_original_model_path(model_state),
                 v4_compatible=self.config.v4_compatible,
+                process_group=self.process_group,
             )
         self._maybe_write_offline_consolidation_script(model_dir)
 
@@ -511,7 +525,11 @@ class Checkpointer:
         self._model_ctx.future = self._do_save(state_dict, model_dir, storage_writer)
 
         for addon in self._addons:
-            addon.post_save(consolidated_path=consolidated_dir, hf_metadata_path=hf_metadata_dir)
+            addon.post_save(
+                consolidated_path=consolidated_dir,
+                hf_metadata_path=hf_metadata_dir,
+                process_group=self.process_group,
+            )
 
         if consolidate_on_all_ranks:
             consolidate_safetensors_files_on_every_rank(
@@ -522,6 +540,7 @@ class Checkpointer:
                 use_staging=self.config.staging_dir is not None,
                 staging_dir=self.config.staging_dir,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
+                process_group=self.process_group,
             )
             if self.config.diffusers_compatible:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -848,6 +867,7 @@ class Checkpointer:
         model_state.load_state_dict(
             state_dict,
             strict=not (len(model_state.model) > 1 or has_state_dict_adapter or allow_checkpoint_key_subset),
+            broadcast_from_rank0=self.process_group is None,
         )
 
         del state_dict
@@ -1112,6 +1132,11 @@ class Checkpointer:
             self._model_ctx.stager.close()
         if self._optim_ctx.stager is not None:
             self._optim_ctx.stager.close()
+        if torch.distributed.is_initialized():
+            for context in (self._model_ctx, self._optim_ctx):
+                if context.process_group is not None:
+                    torch.distributed.destroy_process_group(context.process_group)
+                    context.process_group = None
 
     def _do_load(
         self,
@@ -1165,10 +1190,10 @@ class Checkpointer:
         is_model = True if "/model" in path else False
         # PEFT saving is done on rank0 so it is a special case
         if self.config.is_peft and is_model:
-            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank(group=self.process_group) == 0:
                 _save_safetensors(state_dict, _adapter_path(path))
             if torch.distributed.is_initialized():
-                torch.distributed.barrier()
+                torch.distributed.barrier(group=self.process_group)
             return
 
         ret = None
@@ -1602,12 +1627,13 @@ def save_config(config: dict[str, Any], weights_path: str) -> None:
             yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
 
-def _ensure_dirs(*dirs: Optional[str], process_group: Optional[torch.distributed.ProcessGroup] = None) -> None:
+def _ensure_dirs(*dirs: Optional[str], process_group: torch.distributed.ProcessGroup | None = None) -> None:
     """
     Create directories on all ranks and synchronize across ranks.
 
     Args:
         *dirs: One or more directory paths that should exist.
+        process_group: Ranks that must observe the directories before continuing.
     """
     for d in dirs:
         if d:
