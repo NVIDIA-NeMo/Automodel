@@ -25,11 +25,13 @@ of each anchor.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.nn.attention.flex_attention import BlockMask
+
+if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
 
 from nemo_automodel.components.attention.dflash_mask import (
     create_dflash_block_mask,
@@ -225,19 +227,29 @@ class DFlashTrainerModule(nn.Module):
         anchor_positions: torch.Tensor,
         block_keep_mask: torch.Tensor,
         seq_len: int,
+        label_start: int = 0,
+        doc_remaining: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per-block ground-truth tokens and the supervised-position mask.
 
         Returns ``(label_indices, target_ids, block_mask)`` each of shape
         ``[B, N, block_size]``. ``label_indices[..., k]`` is the sequence position
-        block position ``k`` predicts (``anchor + k``); ``block_mask`` is the product
-        of block validity, in-bounds, and the gathered loss mask. Shared by the
-        block-wise trainers (DFlash here, JetSpec) so the label/mask gathering lives
-        in one place.
+        block position ``k`` predicts (``anchor + label_start + k``); ``block_mask``
+        is the product of block validity, in-bounds, and the gathered loss mask.
+        Shared by the block-wise trainers (DFlash, JetSpec, and Domino, which passes
+        ``label_start=1`` for ``shift_label``) so the label/mask gathering lives in
+        one place. Under packing, ``doc_remaining`` ``[B, S]`` truncates labels at
+        the anchor's document boundary: anchor sampling only keeps offsets up to
+        ``block_size - 1`` inside the anchor's document, and a shifted label window
+        (``label_start > 0``) reaches one past that guarantee.
         """
         n = anchor_positions.size(1)
-        label_indices = anchor_positions.unsqueeze(-1) + self._block_offsets  # [B, N, bs]
+        label_offsets = self._block_offsets + label_start  # [1, 1, bs]
+        label_indices = anchor_positions.unsqueeze(-1) + label_offsets  # [B, N, bs]
         valid_label_mask = label_indices < seq_len
+        if doc_remaining is not None:
+            doc_rem_at_anchor = torch.gather(doc_remaining, 1, anchor_positions.clamp(min=0)).unsqueeze(-1)
+            valid_label_mask = valid_label_mask & (label_offsets <= doc_rem_at_anchor)
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
         target_ids = torch.gather(input_ids.unsqueeze(1).expand(-1, n, -1), 2, safe_label_indices)
         gathered_loss_mask = torch.gather(loss_mask.unsqueeze(1).expand(-1, n, -1), 2, safe_label_indices)

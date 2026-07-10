@@ -306,22 +306,19 @@ class DominoTrainerModule(DFlashTrainerModule):
             attention_mask=dflash_attn_mask,
         )
 
-        # --- Labels: block position k predicts anchor + label_start + k ---
+        # --- Labels: block position k predicts anchor + label_start + k. The shared
+        # builder bounds labels at the sequence end and (under packing) at the
+        # anchor's document boundary, which shift_label's last label can cross.
         label_start = 1 if self.shift_label else 0
-        label_offsets = torch.arange(label_start, label_start + self.block_size, device=device).view(1, 1, -1)
-        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
-        valid_label_mask = label_indices < seq_len
-        if doc_remaining is not None:
-            # Packing: anchor sampling only guarantees positions up to
-            # anchor + block_size - 1 stay in the anchor's document, but with
-            # ``shift_label`` the last label sits at anchor + block_size; truncate
-            # any label past the document boundary so no block is supervised on
-            # the next document's tokens.
-            doc_rem_at_anchor = torch.gather(doc_remaining, 1, anchor_positions.clamp(min=0)).unsqueeze(-1)
-            valid_label_mask = valid_label_mask & (label_offsets <= doc_rem_at_anchor)
-        safe_target_indices = label_indices.clamp(max=seq_len - 1)
-        n = anchor_positions.size(1)
-        target_ids = torch.gather(input_ids.unsqueeze(1).expand(-1, n, -1), 2, safe_target_indices)
+        _, target_ids, block_mask = self._build_block_targets(
+            input_ids,
+            loss_mask,
+            anchor_positions,
+            block_keep_mask,
+            seq_len,
+            label_start=label_start,
+            doc_remaining=doc_remaining,
+        )
 
         bsz, n, bs = target_ids.shape
         # A tensor-parallel target's lm_head is column-parallel and returns
@@ -341,14 +338,12 @@ class DominoTrainerModule(DFlashTrainerModule):
             target_ids=target_ids,
         ).reshape(bsz, n * bs, -1)
 
-        # --- Weight mask: block validity * bounds * (exclude anchor) * loss_mask ---
-        weight_mask = block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
-        weight_mask = weight_mask * valid_label_mask.float()
+        # --- Weight mask: block validity * bounds * (exclude anchor) * loss_mask.
+        # ``block_mask`` already carries validity, bounds, and the loss mask.
+        weight_mask = block_mask
         if not self.shift_label:
             pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
             weight_mask = weight_mask * (pos_in_block > 0).float()
-        gathered_loss_mask = torch.gather(loss_mask.unsqueeze(1).expand(-1, n, -1), 2, safe_target_indices)
-        weight_mask = weight_mask * gathered_loss_mask
 
         # Binary eval mask (pre-decay) for accuracy / acceptance-length stats. The
         # decay below rebinds weight_mask to a fresh tensor (out-of-place), so these
