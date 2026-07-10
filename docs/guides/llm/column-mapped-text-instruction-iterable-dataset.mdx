@@ -21,7 +21,7 @@ If you do *not* need streaming (and you want `len(ds)` / `ds[i]`), use [`ColumnM
 
 - **Iterable**: you iterate (`for sample in ds:`); you cannot rely on `len(ds)` or `ds[i]`.
 - **Always streaming**: there is no `streaming=` flag; it is always enabled.
-- **Repeat behavior**: by default, `repeat_on_exhaustion=True` (infinite stream). Set `repeat_on_exhaustion=False` to do a single pass.
+- **Repeat behavior**: `repeat_on_exhaustion=True` is currently the only supported mode, so the dataset restarts after the underlying stream is exhausted. Single-pass mode is not supported.
 - **(Optional) sharding/shuffle helpers**: use `.shard(num_shards, index)` / `.shuffle(buffer_size, seed)` when supported by the underlying backend.
 
 The column mapping and tokenization logic are shared with `ColumnMappedTextInstructionDataset`. See [Tokenization Paths](/datasets/columnmapped-dataset#tokenization-paths) for details on output fields (`input_ids`, `labels`, `attention_mask`) and masking behavior.
@@ -48,7 +48,6 @@ ds = ColumnMappedTextInstructionIterableDataset(
     tokenizer=tokenizer,
     # Optional:
     # limit_dataset_samples=10_000,
-    # repeat_on_exhaustion=False,   # do one pass instead of infinite stream
 )
 
 sample = next(iter(ds))
@@ -219,7 +218,7 @@ dataset:
 | `padding`               | `"do_not_pad"` | Padding strategy passed to the tokenizer. |
 | `truncation`            | `"do_not_truncate"` | Truncation strategy passed to the tokenizer. |
 | `limit_dataset_samples` | `None`  | Optionally limit the stream to the first \(N\) samples (best-effort; depends on backend). |
-| `repeat_on_exhaustion`  | `True`  | If `True`, restart the stream on exhaustion (useful for step-based training). |
+| `repeat_on_exhaustion`  | `True`  | Restart the stream on exhaustion (useful for step-based training). `True` is currently the only supported value; `False` raises `ValueError`. |
 | `delta_storage_options` | `None`  | Storage/auth options for Delta Lake backends (Databricks, S3, Azure, GCS). |
 | `delta_version`         | `None`  | Specific Delta table version to read. |
 | `delta_sql_query`       | `None`  | SQL query to generate rows for Delta sources (Spark / Databricks SQL only). |
