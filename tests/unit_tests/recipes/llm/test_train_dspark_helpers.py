@@ -850,3 +850,24 @@ def test_should_shard_dense_target_ignored_on_single_rank():
 def test_should_shard_dense_target_ignored_on_ddp():
     recipe = _make_shard_recipe(strategy="ddp")
     assert recipe._should_shard_dense_target({"shard_dense_target": True}) is False
+
+
+@pytest.mark.parametrize("axis", ["tp_size", "pp_size", "cp_size", "ep_size"])
+def test_should_shard_dense_target_rejects_model_parallel_axes(axis):
+    # Only a pure FSDP2 data-parallel topology is supported: pp_size>1 builds an
+    # AutoPipeline the target wrapper cannot run, and tp/cp/ep are untested here.
+    recipe = TrainDSparkRecipe({"distributed": {"strategy": "fsdp2", axis: 2}})
+    recipe.dist_env = SimpleNamespace(world_size=8, is_main=True)
+    recipe.compute_dtype = torch.bfloat16
+    with pytest.raises(ValueError, match=axis):
+        recipe._should_shard_dense_target({"shard_dense_target": True})
+
+
+def test_should_shard_dense_target_allows_explicit_unit_or_null_axes():
+    # Explicit 1s or YAML nulls on the model-parallel axes are the supported topology.
+    recipe = TrainDSparkRecipe(
+        {"distributed": {"strategy": "fsdp2", "tp_size": 1, "pp_size": None, "cp_size": 1, "ep_size": None}}
+    )
+    recipe.dist_env = SimpleNamespace(world_size=8, is_main=True)
+    recipe.compute_dtype = torch.bfloat16
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True

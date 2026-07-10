@@ -356,10 +356,21 @@ class TrainDSparkRecipe(BaseRecipe):
         that already fits is pure all-gather overhead. Requires ``distributed.strategy='fsdp2'``
         on more than one rank; otherwise the request is ignored with a warning and the target
         stays replicated.
+
+        Only a pure FSDP2 data-parallel topology is supported: any model-parallel axis
+        (``tp_size`` / ``pp_size`` / ``cp_size`` / ``ep_size`` > 1) raises. DSpark's
+        forward-hook hidden-state capture needs one non-pipelined ``model(...)`` call per
+        rank; with ``pp_size > 1`` AutoModel returns an ``AutoPipeline`` instead of a module,
+        and the other axes are untested for the frozen dense target here.
+
+        Raises:
+            ValueError: if ``shard_dense_target`` is requested together with a
+                model-parallel axis (``tp_size``/``pp_size``/``cp_size``/``ep_size`` > 1).
         """
         if not bool(recipe_cfg.get("shard_dense_target", False)):
             return False
-        strategy = (self.cfg.get("distributed", None) or {}).get("strategy", "fsdp2")
+        distributed_cfg = self.cfg.get("distributed", None) or {}
+        strategy = distributed_cfg.get("strategy", "fsdp2")
         if self.dist_env.world_size <= 1 or strategy != "fsdp2":
             if self.dist_env.is_main:
                 logger.warning(
@@ -370,6 +381,18 @@ class TrainDSparkRecipe(BaseRecipe):
                     self.dist_env.world_size,
                 )
             return False
+        model_parallel_axes = {
+            axis: int(distributed_cfg.get(axis, None) or 1) for axis in ("tp_size", "pp_size", "cp_size", "ep_size")
+        }
+        unsupported = {axis: size for axis, size in model_parallel_axes.items() if size != 1}
+        if unsupported:
+            raise ValueError(
+                f"recipe_args.shard_dense_target=true only supports a pure FSDP2 data-parallel "
+                f"topology (tp_size=pp_size=cp_size=ep_size=1), got {unsupported}. DSpark's "
+                f"hidden-state capture needs one non-pipelined model call per rank (pp_size>1 "
+                f"builds an AutoPipeline the target wrapper cannot run), and the remaining "
+                f"model-parallel axes are unsupported for the frozen dense target."
+            )
         return True
 
     def setup(self):
