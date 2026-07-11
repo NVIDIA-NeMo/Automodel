@@ -399,7 +399,25 @@ def build_block_causal_additive_mask(
     positions are ``finfo(dtype).min``. ``seq_lens`` is the ``[B, max_docs]``
     0-padded per-document length tensor; each row's non-zero entries sum to
     ``seq_length`` (trailing pad folded into the final document).
+
+    Raises ``ValueError`` if ``seq_lens`` is not 2D or any row does not sum to
+    ``seq_length`` -- a malformed row would otherwise silently misbucket the
+    boundary ``cumsum`` (e.g. isolating the final token into a phantom document)
+    and train the draft on wrong-context supervision with no error. This mirrors
+    the fail-loud sum check the FlashAttention varlen path already performs in
+    ``_seq_lens_to_cu_seqlens``.
     """
+    if seq_lens.dim() != 2:
+        raise ValueError(
+            f"build_block_causal_additive_mask expects a 2D [B, max_docs] seq_lens tensor, "
+            f"got shape {tuple(seq_lens.shape)}."
+        )
+    row_sums = seq_lens.sum(dim=1)
+    if not bool(torch.all(row_sums == seq_length)):
+        raise ValueError(
+            f"Packed seq_lens rows must each sum to seq_length={seq_length} (trailing pad folded "
+            f"into the last document), got row sums {row_sums.tolist()}."
+        )
     min_value = torch.finfo(dtype).min
     seq_lens = seq_lens.to(device)
     positions = torch.arange(seq_length, device=device)
