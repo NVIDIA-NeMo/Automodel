@@ -36,25 +36,28 @@ from nemo_automodel.components.speculative.dspark.loss import compute_dspark_los
 class DSparkStepMetrics:
     """Per-step training outputs for the DSpark draft.
 
-    Beyond the loss and its three terms, this carries acceptance diagnostics that
-    the recipe logs: ``accept_rate`` (mean per-token acceptance probability),
-    ``tau`` (expected accepted block length), and the confidence-head calibration
-    error/bias against the measured acceptance rate. ``accept_rate_per_pos_num`` /
-    ``accept_rate_per_pos_den`` are the ``[block_size]`` unreduced sums the recipe
-    DP-all-reduces into the per-position ``accept_rate@k`` curve.
+    Beyond the loss and its three terms, this carries the acceptance diagnostics as
+    unreduced ``(num, den)`` sums so the recipe can reduce both across the log
+    window and the DP group and form the exact global ratio once: acceptance rate
+    (the ``[block_size]`` per-position ``accept_rate@k`` sums, whose totals also
+    give the aggregate ``accept_rate``), ``tau`` (expected accepted block length),
+    and the confidence-head calibration error/bias against the measured acceptance
+    rate. A denominator is zero when the diagnostic was not computed (e.g. no
+    confidence head, or no teacher signal), which the recipe uses to skip logging.
     """
 
     loss: torch.Tensor
     ce_loss: torch.Tensor
     l1_loss: torch.Tensor
     confidence_loss: torch.Tensor
-    accept_rate: torch.Tensor
-    tau: torch.Tensor
-    confidence_abs_error: torch.Tensor
-    confidence_bias: torch.Tensor
-    confidence_cumprod_bias: torch.Tensor
     accept_rate_per_pos_num: torch.Tensor
     accept_rate_per_pos_den: torch.Tensor
+    tau_num: torch.Tensor
+    tau_den: torch.Tensor
+    confidence_abs_error_num: torch.Tensor
+    confidence_bias_num: torch.Tensor
+    confidence_cumprod_bias_num: torch.Tensor
+    confidence_diag_den: torch.Tensor
 
 
 class DSparkTrainerModule(nn.Module):
@@ -103,13 +106,14 @@ class DSparkTrainerModule(nn.Module):
             ce_loss=terms["ce_loss"],
             l1_loss=terms["l1_loss"],
             confidence_loss=terms["confidence_loss"],
-            accept_rate=terms["accept_rate"],
-            tau=terms["tau"],
-            confidence_abs_error=terms["confidence_abs_error"],
-            confidence_bias=terms["confidence_bias"],
-            confidence_cumprod_bias=terms["confidence_cumprod_bias"],
             accept_rate_per_pos_num=terms["accept_rate_per_pos_num"],
             accept_rate_per_pos_den=terms["accept_rate_per_pos_den"],
+            tau_num=terms["tau_num"],
+            tau_den=terms["tau_den"],
+            confidence_abs_error_num=terms["confidence_abs_error_num"],
+            confidence_bias_num=terms["confidence_bias_num"],
+            confidence_cumprod_bias_num=terms["confidence_cumprod_bias_num"],
+            confidence_diag_den=terms["confidence_diag_den"],
         )
 
 

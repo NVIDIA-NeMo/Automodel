@@ -82,12 +82,13 @@ def test_trainer_module_forward_returns_finite_metrics():
         out.ce_loss,
         out.l1_loss,
         out.confidence_loss,
-        out.accept_rate,
-        out.tau,
-        out.confidence_abs_error,
-        out.confidence_bias,
-        out.confidence_cumprod_bias,
         out.accept_rate_per_pos_num,
         out.accept_rate_per_pos_den,
+        out.tau_num,
+        out.tau_den,
+        out.confidence_abs_error_num,
+        out.confidence_bias_num,
+        out.confidence_cumprod_bias_num,
+        out.confidence_diag_den,
     ):
         assert torch.isfinite(term).all()

@@ -122,18 +122,17 @@ def _collect_acceptance_diagnostics(
 ) -> dict[str, torch.Tensor]:
     """Per-batch numerator/denominator sums for the acceptance diagnostics.
 
-    ``accept_rate_3d`` is the TV-derived per-token acceptance probability. Sums
-    are returned unreduced; the caller forms local ratios and the recipe averages
-    them across the log window and the data-parallel group, matching how the
-    CE/TV/confidence losses are already logged. Returns zeros when no teacher
-    signal is available (``accept_rate_3d is None``).
+    ``accept_rate_3d`` is the TV-derived per-token acceptance probability. Every
+    diagnostic is returned as an unreduced ``(num, den)`` sum; the recipe sums both
+    across the log window and the data-parallel group and forms the global ratio
+    once (``sum(num) / sum(den)``), so per-micro-batch token-count imbalance never
+    biases the reported value. Returns zero sums when no teacher signal is
+    available (``accept_rate_3d is None``).
     """
     zero = outputs.draft_logits.new_zeros((), dtype=torch.float32)
     block_size = outputs.draft_logits.shape[2]
     pos_zero = outputs.draft_logits.new_zeros((block_size,), dtype=torch.float32)
     terms = {
-        "accept_rate_num": zero,
-        "accept_rate_den": zero,
         "accept_rate_pos_num": pos_zero,
         "accept_rate_pos_den": pos_zero,
         "tau_num": zero,
@@ -148,10 +147,9 @@ def _collect_acceptance_diagnostics(
 
     eval_mask = outputs.eval_mask.to(torch.float32)
     valid_accept_rate = accept_rate_3d * eval_mask
-    terms["accept_rate_num"] = valid_accept_rate.sum()
-    terms["accept_rate_den"] = eval_mask.sum()
     # Per-block-position acceptance (accept_rate@k): sum over (batch, blocks) so the
-    # recipe can DP-all-reduce the numerator/denominator and form a global per-k ratio.
+    # recipe can DP-all-reduce the numerator/denominator and form a global per-k
+    # ratio; the aggregate accept_rate is just sum(num)/sum(den) over positions.
     terms["accept_rate_pos_num"] = valid_accept_rate.sum(dim=(0, 1))
     terms["accept_rate_pos_den"] = eval_mask.sum(dim=(0, 1))
 
@@ -324,21 +322,24 @@ def compute_dspark_loss(
         world_size=world_size,
     )
     if return_terms:
+        # The losses are already-normalized scalars, so they are logged as a
+        # window mean. The acceptance diagnostics are returned as unreduced
+        # (num, den) sums instead: the recipe reduces both across the window and
+        # the DP group and divides once, giving the exact global ratio (and a
+        # tau that never dips below its definitional floor of 1).
         terms = {
             "loss": local_loss.detach(),
             "ce_loss": local_ce_loss.detach(),
             "l1_loss": local_l1_loss.detach(),
             "confidence_loss": local_confidence_loss.detach(),
-            "accept_rate": loss_terms["accept_rate_num"] / (loss_terms["accept_rate_den"] + 1e-6),
-            "tau": loss_terms["tau_num"] / (loss_terms["tau_den"] + 1e-6),
-            "confidence_abs_error": loss_terms["confidence_abs_error_num"] / (loss_terms["confidence_diag_den"] + 1e-6),
-            "confidence_bias": loss_terms["confidence_bias_num"] / (loss_terms["confidence_diag_den"] + 1e-6),
-            "confidence_cumprod_bias": loss_terms["confidence_cumprod_bias_num"]
-            / (loss_terms["confidence_diag_den"] + 1e-6),
-            # Unreduced per-position sums: the recipe DP-all-reduces these and forms
-            # accept_rate@k = sum(num) / sum(den) across ranks and the log window.
             "accept_rate_per_pos_num": loss_terms["accept_rate_pos_num"],
             "accept_rate_per_pos_den": loss_terms["accept_rate_pos_den"],
+            "tau_num": loss_terms["tau_num"],
+            "tau_den": loss_terms["tau_den"],
+            "confidence_abs_error_num": loss_terms["confidence_abs_error_num"],
+            "confidence_bias_num": loss_terms["confidence_bias_num"],
+            "confidence_cumprod_bias_num": loss_terms["confidence_cumprod_bias_num"],
+            "confidence_diag_den": loss_terms["confidence_diag_den"],
         }
         return backward_loss, terms
     return backward_loss

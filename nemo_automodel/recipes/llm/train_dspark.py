@@ -1244,11 +1244,16 @@ class TrainDSparkRecipe(BaseRecipe):
                 running_ce = 0.0
                 running_l1 = 0.0
                 running_conf = 0.0
-                running_accept = 0.0
-                running_tau = 0.0
-                running_conf_abs_err = 0.0
-                running_conf_bias = 0.0
-                running_conf_cumprod_bias = 0.0
+                # Acceptance diagnostics accumulate as (num, den) sums, not per-step
+                # ratios: reducing the sums and dividing once gives the exact global
+                # ratio regardless of per-micro-batch token imbalance, and keeps tau at
+                # its >= 1 floor even when a micro-batch contributes no valid blocks.
+                running_tau_num = 0.0
+                running_tau_den = 0.0
+                running_conf_abs_err_num = 0.0
+                running_conf_bias_num = 0.0
+                running_conf_cumprod_bias_num = 0.0
+                running_conf_diag_den = 0.0
                 running_accept_pos_num = torch.zeros(self.block_size, device=self.device)
                 running_accept_pos_den = torch.zeros(self.block_size, device=self.device)
                 running_micro = 0
@@ -1273,11 +1278,12 @@ class TrainDSparkRecipe(BaseRecipe):
                     running_ce += metrics.ce_loss.detach().item()
                     running_l1 += metrics.l1_loss.detach().item()
                     running_conf += metrics.confidence_loss.detach().item()
-                    running_accept += metrics.accept_rate.detach().item()
-                    running_tau += metrics.tau.detach().item()
-                    running_conf_abs_err += metrics.confidence_abs_error.detach().item()
-                    running_conf_bias += metrics.confidence_bias.detach().item()
-                    running_conf_cumprod_bias += metrics.confidence_cumprod_bias.detach().item()
+                    running_tau_num += metrics.tau_num.detach().item()
+                    running_tau_den += metrics.tau_den.detach().item()
+                    running_conf_abs_err_num += metrics.confidence_abs_error_num.detach().item()
+                    running_conf_bias_num += metrics.confidence_bias_num.detach().item()
+                    running_conf_cumprod_bias_num += metrics.confidence_cumprod_bias_num.detach().item()
+                    running_conf_diag_den += metrics.confidence_diag_den.detach().item()
                     running_accept_pos_num += metrics.accept_rate_per_pos_num.detach()
                     running_accept_pos_den += metrics.accept_rate_per_pos_den.detach()
                     running_micro += 1
@@ -1299,22 +1305,24 @@ class TrainDSparkRecipe(BaseRecipe):
                         self._maybe_save_step_checkpoint(epoch_idx)
 
                         if self.runtime.global_step % self.log_every_steps == 0:
-                            # One collective: window sums of the loss terms and the
-                            # acceptance diagnostics (scalars + the per-position accept_rate
-                            # numerator/denominator) plus the micro-batch count, summed across
-                            # DP ranks, then divided -> global means. Concatenating the
-                            # per-position sums keeps this to a single all-reduce.
+                            # One collective: the loss window sums and micro-batch count,
+                            # the acceptance-diagnostic (num, den) sums, and the per-position
+                            # accept sums, concatenated so a single all-reduce covers them.
+                            # Losses divide by the micro-batch count (window mean of already
+                            # normalized values); the diagnostics divide num by den for the
+                            # exact global ratio.
                             scalars = torch.tensor(
                                 [
                                     running_loss,
                                     running_ce,
                                     running_l1,
                                     running_conf,
-                                    running_accept,
-                                    running_tau,
-                                    running_conf_abs_err,
-                                    running_conf_bias,
-                                    running_conf_cumprod_bias,
+                                    running_tau_num,
+                                    running_tau_den,
+                                    running_conf_abs_err_num,
+                                    running_conf_bias_num,
+                                    running_conf_cumprod_bias_num,
+                                    running_conf_diag_den,
                                     float(running_micro),
                                 ],
                                 device=self.device,
@@ -1324,27 +1332,35 @@ class TrainDSparkRecipe(BaseRecipe):
                                 torch.cat([scalars, running_accept_pos_num, running_accept_pos_den])
                             )
                             n_scalars = scalars.numel()
-                            window = reduced[:n_scalars].tolist()
+                            w = reduced[:n_scalars].tolist()
                             pos_num = reduced[n_scalars : n_scalars + self.block_size]
                             pos_den = reduced[n_scalars + self.block_size :]
-                            count = max(1.0, window[-1])
+                            count = max(1.0, w[10])
                             avg = {
-                                "loss": window[0] / count,
-                                "ce_loss": window[1] / count,
-                                "l1_loss": window[2] / count,
-                                "confidence_loss": window[3] / count,
-                                "accept_rate": window[4] / count,
-                                "tau": window[5] / count,
-                                "confidence_abs_error": window[6] / count,
-                                "confidence_bias": window[7] / count,
-                                "confidence_cumprod_bias": window[8] / count,
+                                "loss": w[0] / count,
+                                "ce_loss": w[1] / count,
+                                "l1_loss": w[2] / count,
+                                "confidence_loss": w[3] / count,
                             }
-                            # accept_rate@k is the global per-position ratio sum(num)/sum(den).
-                            for k, rate in enumerate((pos_num / pos_den.clamp_min(1.0)).tolist()):
-                                avg[f"accept_rate@{k}"] = rate
+                            # Log a diagnostic only when it was measured this window (its
+                            # denominator is positive), so an ablation without the TV signal
+                            # or the confidence head shows no curve rather than a flat zero
+                            # that reads like collapsed acceptance.
+                            accept_den = pos_den.sum().item()
+                            if accept_den > 0:
+                                avg["accept_rate"] = pos_num.sum().item() / accept_den
+                                for k, rate in enumerate((pos_num / pos_den.clamp_min(1.0)).tolist()):
+                                    avg[f"accept_rate@{k}"] = rate
+                            if w[5] > 0:
+                                avg["tau"] = w[4] / w[5]
+                            if w[9] > 0:
+                                avg["confidence_abs_error"] = w[6] / w[9]
+                                avg["confidence_bias"] = w[7] / w[9]
+                                avg["confidence_cumprod_bias"] = w[8] / w[9]
                             running_loss = running_ce = running_l1 = running_conf = 0.0
-                            running_accept = running_tau = 0.0
-                            running_conf_abs_err = running_conf_bias = running_conf_cumprod_bias = 0.0
+                            running_tau_num = running_tau_den = 0.0
+                            running_conf_abs_err_num = running_conf_bias_num = 0.0
+                            running_conf_cumprod_bias_num = running_conf_diag_den = 0.0
                             running_accept_pos_num = torch.zeros(self.block_size, device=self.device)
                             running_accept_pos_den = torch.zeros(self.block_size, device=self.device)
                             running_micro = 0
@@ -1358,36 +1374,32 @@ class TrainDSparkRecipe(BaseRecipe):
                                         metrics={**avg, "lr": current_lr, "mem": mem},
                                     )
                                 )
+                                # ``avg`` renames l1_loss -> tv_loss and carries only the
+                                # diagnostics measured this window, so mirror its keys under
+                                # the train/ prefix rather than hard-coding each one.
                                 wandb_metrics = {
-                                    "train/loss": avg["loss"],
-                                    "train/ce_loss": avg["ce_loss"],
-                                    "train/tv_loss": avg["l1_loss"],
-                                    "train/confidence_loss": avg["confidence_loss"],
-                                    "train/accept_rate": avg["accept_rate"],
-                                    "train/tau": avg["tau"],
-                                    "train/confidence_abs_error": avg["confidence_abs_error"],
-                                    "train/confidence_bias": avg["confidence_bias"],
-                                    "train/confidence_cumprod_bias": avg["confidence_cumprod_bias"],
-                                    "train/lr": current_lr,
-                                    "train/mem_gib": mem,
-                                    "train/epoch": epoch_idx,
+                                    "train/tv_loss" if key == "l1_loss" else f"train/{key}": value
+                                    for key, value in avg.items()
                                 }
-                                for k in range(self.block_size):
-                                    wandb_metrics[f"train/accept_rate@{k}"] = avg[f"accept_rate@{k}"]
+                                wandb_metrics.update(
+                                    {"train/lr": current_lr, "train/mem_gib": mem, "train/epoch": epoch_idx}
+                                )
                                 self._wandb_log(wandb_metrics, step=self.runtime.global_step)
                                 if pbar is not None:
                                     pbar.set_postfix(loss=f"{avg['loss']:.4f}", lr=f"{current_lr:.2e}")
+                                accept = avg.get("accept_rate")
+                                tau = avg.get("tau")
                                 logger.info(
                                     "step %d | epoch %d | loss %.4f | ce %.4f | tv %.4f | conf %.4f | "
-                                    "accept %.3f | tau %.2f | lr %.2e | mem %.2f GiB",
+                                    "accept %s | tau %s | lr %.2e | mem %.2f GiB",
                                     self.runtime.global_step,
                                     epoch_idx,
                                     avg["loss"],
                                     avg["ce_loss"],
                                     avg["l1_loss"],
                                     avg["confidence_loss"],
-                                    avg["accept_rate"],
-                                    avg["tau"],
+                                    "n/a" if accept is None else f"{accept:.3f}",
+                                    "n/a" if tau is None else f"{tau:.2f}",
                                     current_lr,
                                     mem,
                                 )
