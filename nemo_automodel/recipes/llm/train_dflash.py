@@ -315,7 +315,11 @@ class TrainDFlashRecipe(BaseRecipe):
         self._resume_epoch = 0
         self._skipped_micro_batches = 0
 
-        self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)), ranked=self.dist_env.world_size > 1)
+        # Seed by the dp coordinate, not the global rank: the draft is replicated
+        # across cp (and tp) ranks and must sample the SAME anchor positions each
+        # step, else the replicas diverge. _get_dp_rank() returns the global rank
+        # when there is no mesh, so the plain data-parallel path is unchanged.
+        self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)) + self._get_dp_rank(), ranked=False)
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
@@ -341,11 +345,43 @@ class TrainDFlashRecipe(BaseRecipe):
         self.dist_setup = None
         self.device_mesh = None
         self.dp_mesh = None
+        # The target forward runs CP on "cp" (long-context memory relief); the draft,
+        # dataloader sampler, and checkpointer key on "dp" (which excludes cp/tp, so
+        # cp ranks in a dp group share data and draft weights). None without a mesh.
+        self.cp_mesh = None
         if self.cfg.get("distributed", None) is not None:
             self.dist_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
             self.device_mesh = self.dist_setup.mesh_context.device_mesh
             self.dp_mesh = _submesh_or_none(self.device_mesh, "dp")
+            self.cp_mesh = _submesh_or_none(self.device_mesh, "cp")
             target_kwargs["distributed_setup"] = self.dist_setup
+            # CP gathers the target's captured layers back to the full sequence; that
+            # gather does not yet handle a TP-sharded (DTensor) sequence, so the two
+            # can't be combined. TP alone (draft replicated over "dp") is fine.
+            cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+            if cp_size > 1 and int(self.cfg.get("distributed.tp_size", 1) or 1) > 1:
+                raise NotImplementedError(
+                    "Context parallelism (cp_size>1) combined with tensor parallelism (tp_size>1) is not "
+                    "yet supported for DFlash; the CP sequence gather does not handle a TP-sharded target "
+                    "output. Set tp_size=1 or cp_size=1."
+                )
+            # The CP hook intercepts the target's F.scaled_dot_product_attention call, so
+            # the target must run HuggingFace SDPA: force_hf picks the HF class and
+            # target_attn_implementation=sdpa keeps it off FA2 (the HF auto-select default
+            # when flash-attn is installed), which would bypass the hook and leave each rank
+            # attending only its own shard.
+            if cp_size > 1:
+                if not bool(recipe_cfg.get("target_force_hf", False)):
+                    raise NotImplementedError(
+                        "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
+                        "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
+                    )
+                if recipe_cfg.get("target_attn_implementation", None) != "sdpa":
+                    raise NotImplementedError(
+                        "Context parallelism (cp_size>1) requires recipe_args.target_attn_implementation=sdpa; "
+                        "any other backend (e.g. flash_attention_2) bypasses the K/V-gather hook, so each rank "
+                        "silently attends only its own shard."
+                    )
         target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
         if self.dist_setup is None:
             # ``nn.Module.to`` is in-place; the sharded path is already placed by
@@ -373,7 +409,9 @@ class TrainDFlashRecipe(BaseRecipe):
         Subclasses override to capture extra teacher signals (e.g. JetSpec also
         captures the target logits for its forward-KL distillation).
         """
-        return HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids)
+        return HFDFlashTargetModel(
+            self.target_model, target_layer_ids=target_layer_ids, cp_mesh=getattr(self, "cp_mesh", None)
+        )
 
     def _build_dflash_config(self, recipe_cfg, target_layer_ids: list[int]) -> dict:
         """Build the draft ``dflash_config`` block. Subclasses extend it (e.g. Domino)."""
@@ -549,7 +587,12 @@ class TrainDFlashRecipe(BaseRecipe):
             is_final_checkpoint=is_final_checkpoint,
         )
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
-        self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
+        # The checkpointer keys the rng file on dp_rank, but cp peers share a dp_rank
+        # (and, being seeded per dp_rank, hold identical rng state), so every peer would
+        # torch.save the same rng_dp_rank_N.pt and race on a shared FS; let only the
+        # first cp peer write it.
+        if self.cp_mesh is None or self.cp_mesh.get_local_rank() == 0:
+            self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
         if is_rank_0:
             self._save_extra_state(path, epoch=epoch)
