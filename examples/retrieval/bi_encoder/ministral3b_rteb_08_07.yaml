@@ -88,6 +88,8 @@ dataloader:
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/finqa_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/finqa_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/finqa_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/finqa_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/finqa_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/medquad_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/jaquad_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/wikisql_sql_retrieval_qwen3_8B_0_95_perc.json
@@ -95,10 +97,6 @@ dataloader:
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_stackoverflow_qa_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_codetrans_dl_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_codetrans_contest_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_acord_expert_score2plus_20260521_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_acord_expert_score2plus_20260521_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_acord_expert_score2plus_20260521_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_acord_expert_score2plus_20260521_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_acord_expert_score2plus_20260521_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legalquad_eval_like_gptoss_1600_20260522_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legalquad_eval_like_gemma_shortq_1200_20260522_qwen3_8B_0_95_perc.json
@@ -113,12 +111,12 @@ dataloader:
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/hc3finance_eval_like_qwen35_v3_3200_20260524_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/ds1000retrieval_scistack_qwen_next_3200_20260523_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/ds1000retrieval_scistack_gptoss_2400_20260523_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/ds1000retrieval_scistack_gptoss_2400_20260523_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/ds1000retrieval_longquery_qwen_next_3200_20260523_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/chatdoctor_eval_like_gemma_noisy_1600_20260524_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/chatdoctor_eval_like_qwen235b_noisy_2400_20260525_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_fresh_20260522_110925_autoresearch_iter_006_financebenchretrieval_alt_model_sdg_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/curev1_autoresearch_20260523_iter_006_curev1_eval_like_seed_sdg_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/appsretrieval_fewshot_coir_qwen_next_9600_20260605_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/appsretrieval_fewshot_coir_qwen_next_9600_20260605_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_eval_like_gptoss_profile_v2_3200_20260521_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_eval_like_nemotron_super_profile_v2_1200_20260521_qwen3_8B_0_95_perc.json
@@ -157,25 +155,14 @@ dataloader:
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mlqa_zh_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_aws_sc_1000_nemotron_ultra_nvfp4_20260613_qwen3_8B_0_95_perc_unrolled.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_aws_sc_1000_nemotron_ultra_nvfp4_20260613_qwen3_8B_0_95_perc_unrolled.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_aws_sc_1000_nemotron_ultra_nvfp4_20260613_qwen3_8B_0_95_perc_unrolled.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_aws_sc_1000_nemotron_ultra_nvfp4_20260613_qwen3_8B_0_95_perc_unrolled.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_aws_sc_1000_nemotron_ultra_nvfp4_20260613_qwen3_8B_0_95_perc_unrolled.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_statutes_aws_sc_1000_nemotron_ultra_nvfp4_20260613_qwen3_8B_0_95_perc_unrolled.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_casedocs_aws_sc_shared_3000_nemotron_ultra_nvfp4_20260613_qwen3_8B_0_95_perc_unrolled.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_casedocs_aws_sc_shared_3000_nemotron_ultra_nvfp4_20260613_qwen3_8B_0_95_perc_unrolled.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/aila_casedocs_aws_sc_shared_3000_nemotron_ultra_nvfp4_20260613_qwen3_8B_0_95_perc_unrolled.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/retrieval_from_scratch_100k_4model_20260612_qwen3_8B_0_95_perc_gptoss20b_filtered.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mbppretrieval_benchmark_synth_v2_4870_20260615_qwen3_8B_0_95_perc_clean.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/multihiertt_query_only_v213p155_union_dedup_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/coir_apps_train5k_codeprompt_20260616_qwen3_8B_codeprompt_30hn_nemotron3ultra_seq_false_negative_strict_top10_repeat.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/coir_apps_train5k_codeprompt_20260616_qwen3_8B_codeprompt_30hn_nemotron3ultra_seq_false_negative_strict_top10_repeat.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_train_v4_legalbench_unfair_tos_qwen3_8B_0_95_perc_nemotron3ultra_nvfp4_fneg_filtered_10neg.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_train_v4_legalbench_unfair_tos_qwen3_8B_0_95_perc_nemotron3ultra_nvfp4_fneg_filtered_10neg.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_train_v4_legalbench_unfair_tos_qwen3_8B_0_95_perc_nemotron3ultra_nvfp4_fneg_filtered_10neg.json
-      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_train_v4_legalbench_unfair_tos_qwen3_8B_0_95_perc_nemotron3ultra_nvfp4_fneg_filtered_10neg.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_train_v4_legalbench_unfair_tos_qwen3_8B_0_95_perc_nemotron3ultra_nvfp4_fneg_filtered_10neg.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/quality_filter/retrieval_from_scratch_100k_4model_20260614_judge_gptoss20b_20260615/retrieval_from_scratch_100k_4model_20260614_qwen3_8B_0_95_perc_judge_gptoss20b_filtered.json
-      - /home/rosmulski/scratch/shared_datasets/swebench_train_code_retrieval_positive_only_github_issue_instruct_qwen3_8b_5hn_0p95_perc.json
       - /home/rosmulski/scratch/shared_datasets/swebench_train_code_retrieval_positive_only_github_issue_instruct_qwen3_8b_5hn_0p95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/english_healthcare1_autoresearch_20260625_iter_008_englishhealthcare1retrieval_prompt_improved_sdg_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/japanese_legal1_private_local_autoresearch_20260625_iter_003_more_synthetic_qnext_6400_sdg_1gpu_qwen3_8B_0_95_perc.json
@@ -196,7 +183,35 @@ dataloader:
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_apps_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_apps_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_apps_qwen3_8B_0_95_perc.json
-      - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_apps_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/retrieval_from_scratch_200k_english_fuzzy94_4model_plus_qwen36_20260626_qwen3_8B_20hn_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/appsretrieval_eval_like_qwen_next_2400_20260522_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/appsretrieval_codeforces_v2_qwen36_27b_3200_20260522_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/appsretrieval_codeforces_v2_qwen_next_3200_20260522_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/appsretrieval_eval_like_qwen_next_cfstyle_1600_20260522_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/appsretrieval_eval_like_gptoss_2400_20260522_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_multihiertt_iter2_iter3_ultra_nvfp4_sdg_filtered_kept_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_multihiertt_iter2_iter3_ultra_nvfp4_sdg_filtered_kept_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_multihiertt_iter2_iter3_ultra_nvfp4_sdg_filtered_kept_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/apps_retrieval_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/apps_retrieval_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/ds1000_retrieval_weak_case_sdg_20260711.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/german_healthcare1_eval_like_2k_nemotron3ultra_nvfp4_20260711_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/elastic_kb_eval_like_qwen_next_support_2000_20260711_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/cnn_dailymail_1_0_0_train_7k_ar_ara_Arab_nemotron3ultra_nvfp4_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/cnn_dailymail_1_0_0_train_6472_zh_zho_Hans_nemotron3ultra_nvfp4_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/cnn_dailymail_1_0_0_train_7k_en_eng_Latn_original_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/cnn_dailymail_1_0_0_train_6817_fr_fra_Latn_nemotron3ultra_nvfp4_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/cnn_dailymail_1_0_0_train_5196_ru_rus_Cyrl_nemotron3ultra_nvfp4_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/cnn_dailymail_1_0_0_train_7k_es_spa_Latn_nemotron3ultra_nvfp4_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/cnn_dailymail_1_0_0_train_7k_pt_por_Latn_nemotron3ultra_nvfp4_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/cnn_dailymail_1_0_0_train_5182_sw_swa_Latn_nemotron3ultra_nvfp4_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/cnn_dailymail_1_0_0_train_6144_hi_hin_Deva_nemotron3ultra_nvfp4_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/cnn_dailymail_1_0_0_train_6028_ur_urd_Arab_nemotron3ultra_nvfp4_qwen3_8B_0_95_perc.json
     data_type: train
     n_passages: 5
     seed: 42
