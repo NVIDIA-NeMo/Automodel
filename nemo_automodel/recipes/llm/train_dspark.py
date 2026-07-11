@@ -61,6 +61,7 @@ from nemo_automodel.components.distributed.activation_checkpointing import (
 )
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
@@ -429,6 +430,12 @@ class TrainDSparkRecipe(BaseRecipe):
         # kept in self.distributed_setup and used only to load and shard that target.
         self.device_mesh = None
         self.distributed_setup = None
+        # Populated only under context parallelism (cp_size>1): the frozen target
+        # runs CP on "cp", while the draft, dataloader sampler, and checkpointer key
+        # on "dp" (which excludes cp, so cp ranks in a dp group share data and draft
+        # weights). Left None otherwise, preserving the plain world-sharded path.
+        self.cp_mesh = None
+        self.dp_mesh = None
 
         target_path = recipe_cfg.target_model_name_or_path
         trust_remote_code = bool(recipe_cfg.get("trust_remote_code", False))
@@ -444,6 +451,41 @@ class TrainDSparkRecipe(BaseRecipe):
                 f"recipe_args.multimodal=true is only supported for a MiniMax M3 VL target "
                 f"(model_type in {_MINIMAX_M3_MODEL_TYPES}), got model_type={target_model_type!r}."
             )
+
+        # Context parallelism (long-context memory relief): shard only the frozen
+        # target forward along the sequence and gather the captured hidden states
+        # back to the full sequence, so the draft's anchor/block masks stay intact.
+        # Restricted to the dense Qwen3-style target -- the DeepSeek V4 / GLM-5.2 /
+        # Gemma4 / MiniMax M3 targets already run under their own expert-parallel /
+        # FSDP mesh, which CP is not composed with here.
+        cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
+        if cp_size > 1:
+            if is_deepseek_v4_target or is_glm_5_2_target or is_gemma4_target or is_minimax_m3_target:
+                raise NotImplementedError(
+                    "Context parallelism (cp_size>1) is only supported for the dense Qwen3-style DSpark "
+                    "target; the DeepSeek V4 / GLM-5.2 / Gemma4 / MiniMax M3 targets already run under "
+                    "their own expert-parallel / FSDP mesh. Set cp_size=1 for those."
+                )
+            # The CP hook intercepts the target's F.scaled_dot_product_attention call, so
+            # the target must run HuggingFace SDPA: force_hf picks the HF class and
+            # target_attn_implementation=sdpa keeps it off FA2 (the HF auto-select default
+            # when flash-attn is installed), which would bypass the hook and leave each rank
+            # attending only its own shard.
+            if not bool(recipe_cfg.get("target_force_hf", False)):
+                raise NotImplementedError(
+                    "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
+                    "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
+                )
+            if recipe_cfg.get("target_attn_implementation", None) != "sdpa":
+                raise NotImplementedError(
+                    "Context parallelism (cp_size>1) requires recipe_args.target_attn_implementation=sdpa; "
+                    "any other backend (e.g. flash_attention_2) bypasses the K/V-gather hook, so each rank "
+                    "silently attends only its own shard."
+                )
+            self.distributed_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+            self.device_mesh = self.distributed_setup.mesh_context.device_mesh
+            self.cp_mesh = get_flat_mesh(self.device_mesh, "cp")
+            self.dp_mesh = get_flat_mesh(self.device_mesh, "dp")
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(target_path, trust_remote_code=trust_remote_code)
         chat_template = recipe_cfg.get("chat_template", None)
@@ -625,7 +667,7 @@ class TrainDSparkRecipe(BaseRecipe):
         # -1 (the embedding output) and enforces strictly-increasing ids.
         self.target_layer_ids = target_layer_ids
         self.target_wrapper = (
-            HFDSparkTargetModel(self.target_model, target_layer_ids=target_layer_ids)
+            HFDSparkTargetModel(self.target_model, target_layer_ids=target_layer_ids, cp_mesh=self.cp_mesh)
             if self.target_model is not None
             else None
         )
@@ -677,6 +719,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     distributed=self.dist_env.world_size > 1,
                     shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                     mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                    dp_mesh=self.dp_mesh,
                 )
                 self.val_dataloader = None
                 if recipe_cfg.get("val_data_path", None):
@@ -836,9 +879,14 @@ class TrainDSparkRecipe(BaseRecipe):
                 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
                 mp_policy = MixedPrecisionPolicy(param_dtype=self.compute_dtype, reduce_dtype=torch.float32)
+                # Shard over "dp" (not the world) under CP so the draft stays replicated
+                # across cp ranks; without a mesh (cp_size=1) this is the world default.
+                shard_kwargs = {"mp_policy": mp_policy}
+                if self.dp_mesh is not None:
+                    shard_kwargs["mesh"] = self.dp_mesh
                 for layer in trainer_module.draft_model.layers:
-                    fully_shard(layer, mp_policy=mp_policy)
-                fully_shard(trainer_module, mp_policy=mp_policy)
+                    fully_shard(layer, **shard_kwargs)
+                fully_shard(trainer_module, **shard_kwargs)
             elif strategy == "ddp":
                 trainer_module = DistributedDataParallel(
                     trainer_module,
@@ -846,6 +894,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     output_device=self.device.index if self.device.type == "cuda" else None,
                     broadcast_buffers=False,
                     find_unused_parameters=False,
+                    process_group=self.dp_mesh.get_group() if self.dp_mesh is not None else None,
                 )
             else:
                 raise ValueError(f"Unsupported distributed.strategy={strategy!r}; use 'fsdp2' or 'ddp'.")
@@ -861,7 +910,7 @@ class TrainDSparkRecipe(BaseRecipe):
 
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
-        self.optimizer = _build_dspark_optimizer(self.trainer_module, opt_cfg, device_mesh=None)
+        self.optimizer = _build_dspark_optimizer(self.trainer_module, opt_cfg, device_mesh=self.dp_mesh)
         logger.info(
             "Optimizer=%s lr=%.3e master_weights=%s master_weight_dtype=%s "
             "store_param_remainders=%s exp_avg_dtype=%s exp_avg_sq_dtype=%s",
@@ -902,7 +951,11 @@ class TrainDSparkRecipe(BaseRecipe):
         self.runtime = SimpleNamespace(global_step=0)
         self._resume_epoch = 0
 
-        self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)), ranked=self.dist_env.world_size > 1)
+        # Seed by the dp coordinate, not the global rank: under CP the draft is
+        # replicated across cp ranks and must sample the SAME anchor positions each
+        # step, else the replicas diverge. _get_dp_rank() returns the global rank
+        # when there is no mesh, so the plain world-sharded path is unchanged.
+        self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)) + self._get_dp_rank(), ranked=False)
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
@@ -960,7 +1013,10 @@ class TrainDSparkRecipe(BaseRecipe):
             ckpt_kwargs["model_state_dict_keys"] = draft_state_dict_keys
 
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
-        dp_rank = dist.get_rank() if dist.is_initialized() else 0
+        # Under CP the draft is replicated across cp ranks, so key the shard on the dp
+        # coordinate (identical for cp peers) rather than the global rank. Without a
+        # mesh (cp_size=1) this returns the global rank, unchanged.
+        dp_rank = self._get_dp_rank()
         self.checkpointer = Checkpointer(
             config=self.checkpoint_config, dp_rank=dp_rank, tp_rank=0, pp_rank=0, moe_mesh=None
         )
@@ -1041,7 +1097,12 @@ class TrainDSparkRecipe(BaseRecipe):
             is_final_checkpoint=is_final_checkpoint,
         )
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
-        self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
+        # The checkpointer keys the rng file on dp_rank, but cp peers share a dp_rank
+        # (and, being seeded per dp_rank, hold identical rng state), so every peer would
+        # torch.save the same rng_dp_rank_N.pt and race on a shared FS; let only the
+        # first cp peer write it.
+        if self.cp_mesh is None or self.cp_mesh.get_local_rank() == 0:
+            self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
         if is_rank_0:
             self._save_extra_state(path, epoch=epoch)
