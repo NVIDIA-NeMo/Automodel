@@ -233,8 +233,7 @@ class BackendConfig:
         # in some models. See #3027. This is the one chokepoint every BackendConfig passes
         # through, so it also overrides an explicit rope_fusion=True from a recipe/config.
         if self.rope_fusion:
-            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                logger.warning("rope_fusion is temporarily force-disabled globally (see #3027).")
+            logger.warning("rope_fusion is temporarily force-disabled globally (see #3027).")
         self.rope_fusion = False
 
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
