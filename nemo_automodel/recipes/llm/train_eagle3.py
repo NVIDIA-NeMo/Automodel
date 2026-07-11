@@ -576,7 +576,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 ttt_steps=recipe_cfg.ttt_steps,
                 cp_group=self.cp_group,
                 cp_zigzag=self.cp_zigzag,
-                lk_loss_type=lk_loss_type if lk_loss_type is None else str(lk_loss_type),
+                lk_loss_type=None if lk_loss_type is None else str(lk_loss_type),
                 lk_kl_scale=float(recipe_cfg.get("lk_kl_scale", 1.0)),
                 lk_kl_decay=float(recipe_cfg.get("lk_kl_decay", 3.0)),
             ).to(self.device)

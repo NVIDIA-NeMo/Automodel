@@ -244,7 +244,7 @@ def test_vp_noise_embed_fills_visible_prefix_with_real_tokens():
     trainer.embed_tokens = torch.nn.Embedding(VOCAB + seq_len + 1, 1)
     with torch.no_grad():
         trainer.embed_tokens.weight.copy_(torch.arange(VOCAB + seq_len + 1).view(-1, 1).float())
-    emb = trainer._create_noise_embed(input_ids, anchors, keep, prefix_lengths=prefixes)
+    emb = trainer._create_vp_noise_embed(input_ids, anchors, keep, prefixes)
     ids = emb.view(1, -1).round().long()
     # block 0 valid with prefix 3: positions 0..2 hold input_ids[0, 2:5], position 3 MASK.
     assert ids[0, :3].tolist() == input_ids[0, 2:5].tolist()

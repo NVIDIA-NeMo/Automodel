@@ -185,7 +185,7 @@ class DFlashTrainerModule(nn.Module):
         if max_prefix <= min_prefix:
             return torch.full((bsz, n_blocks), min_prefix, dtype=torch.long, device=device)
         prefix_ids = torch.arange(min_prefix, max_prefix + 1, device=device, dtype=torch.float32)
-        weights = torch.pow(torch.tensor(self.prefix_weight_base, device=device), prefix_ids)
+        weights = self.prefix_weight_base**prefix_ids
         samples = torch.multinomial(weights, num_samples=bsz * n_blocks, replacement=True)
         return samples.view(bsz, n_blocks) + min_prefix
 
@@ -196,8 +196,35 @@ class DFlashTrainerModule(nn.Module):
         pos_ids = anchor_positions.unsqueeze(-1) + offsets
         return pos_ids.view(bsz, -1)
 
-    def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask, prefix_lengths=None):
-        """Embed the draft blocks: a visible prefix of real tokens, then ``MASK``.
+    def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
+        """Embed each block as ``[anchor_token, MASK, MASK, ...]`` (invalid blocks all MASK)."""
+        bsz, seq_len = input_ids.shape
+        n = anchor_positions.shape[1]
+        bs = self.block_size
+        device = input_ids.device
+
+        noise_ids = torch.full((bsz, n * bs), self.mask_token_id, dtype=torch.long, device=device)
+        block_starts = (torch.arange(n, device=device) * bs).unsqueeze(0).expand(bsz, -1)
+
+        valid_anchor_positions = anchor_positions.clamp(0, seq_len - 1)
+        anchor_tokens = torch.gather(input_ids, 1, valid_anchor_positions)
+
+        flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, n)
+        noise_ids[flat_batch_idx, block_starts] = torch.where(
+            block_keep_mask,
+            anchor_tokens,
+            torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
+        )
+        # A tensor-parallel target's embed_tokens is vocab-parallel and returns a
+        # DTensor; gather it so the (plain) draft can consume the noise embedding.
+        return _to_full_tensor(self.embed_tokens(noise_ids))
+
+    def _create_vp_noise_embed(self, input_ids, anchor_positions, block_keep_mask, prefix_lengths):
+        """Embed the draft blocks with a visible prefix of real tokens, then ``MASK``.
+
+        The variable-prefix analogue of :meth:`_create_noise_embed`: block
+        positions ``< prefix_lengths`` hold the real sequence tokens, the rest
+        (and every position of an invalid block) hold ``MASK``.
 
         Args:
             input_ids: Long tensor of shape ``[batch, sequence]``.
@@ -205,40 +232,22 @@ class DFlashTrainerModule(nn.Module):
                 start position in the sequence.
             block_keep_mask: Bool tensor of shape ``[batch, blocks]``; invalid
                 (padding) blocks are embedded as all ``MASK``.
-            prefix_lengths: Optional long tensor of shape ``[batch, blocks]``. When
-                ``None`` (fixed-anchor DFlash) only block position 0 holds the real
-                anchor token. Otherwise (variable-prefix) block positions
-                ``< prefix_lengths`` hold the real sequence tokens.
+            prefix_lengths: Long tensor of shape ``[batch, blocks]``; this block's
+                visible-prefix length.
 
         Returns:
             noise_embedding: Tensor of shape ``[batch, blocks * block_size, hidden]``.
         """
         bsz, seq_len = input_ids.shape
         n = anchor_positions.shape[1]
-        bs = self.block_size
-        device = input_ids.device
 
-        if prefix_lengths is None:
-            noise_ids = torch.full((bsz, n * bs), self.mask_token_id, dtype=torch.long, device=device)
-            block_starts = (torch.arange(n, device=device) * bs).unsqueeze(0).expand(bsz, -1)
-
-            valid_anchor_positions = anchor_positions.clamp(0, seq_len - 1)
-            anchor_tokens = torch.gather(input_ids, 1, valid_anchor_positions)
-
-            flat_batch_idx = torch.arange(bsz, device=device).unsqueeze(1).expand(bsz, n)
-            noise_ids[flat_batch_idx, block_starts] = torch.where(
-                block_keep_mask,
-                anchor_tokens,
-                torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
-            )
-        else:
-            token_positions = anchor_positions.unsqueeze(-1) + self._block_offsets  # [B, N, bs]
-            safe_positions = token_positions.clamp(0, seq_len - 1)
-            real_tokens = torch.gather(input_ids.unsqueeze(1).expand(-1, n, -1), 2, safe_positions)
-            visible_prefix = self._block_offsets < prefix_lengths.unsqueeze(-1)
-            fill_mask = visible_prefix & block_keep_mask.unsqueeze(-1) & (token_positions < seq_len)
-            mask_tokens = torch.full_like(real_tokens, self.mask_token_id)
-            noise_ids = torch.where(fill_mask, real_tokens, mask_tokens).view(bsz, n * bs)
+        token_positions = anchor_positions.unsqueeze(-1) + self._block_offsets  # [B, N, bs]
+        safe_positions = token_positions.clamp(0, seq_len - 1)
+        real_tokens = torch.gather(input_ids.unsqueeze(1).expand(-1, n, -1), 2, safe_positions)
+        visible_prefix = self._block_offsets < prefix_lengths.unsqueeze(-1)
+        fill_mask = visible_prefix & block_keep_mask.unsqueeze(-1) & (token_positions < seq_len)
+        mask_tokens = torch.full_like(real_tokens, self.mask_token_id)
+        noise_ids = torch.where(fill_mask, real_tokens, mask_tokens).view(bsz, n * self.block_size)
         # A tensor-parallel target's embed_tokens is vocab-parallel and returns a
         # DTensor; gather it so the (plain) draft can consume the noise embedding.
         return _to_full_tensor(self.embed_tokens(noise_ids))
@@ -280,12 +289,11 @@ class DFlashTrainerModule(nn.Module):
         device = input_ids.device
 
         anchor_positions, block_keep_mask = self._sample_anchor_positions(seq_len, loss_mask, device)
-        prefix_lengths = None
         if self.loss_type == "variable_prefix":
             prefix_lengths = self._sample_prefix_lengths(bsz, anchor_positions.shape[1], device)
-        noise_embedding = self._create_noise_embed(
-            input_ids, anchor_positions, block_keep_mask, prefix_lengths=prefix_lengths
-        )
+            noise_embedding = self._create_vp_noise_embed(input_ids, anchor_positions, block_keep_mask, prefix_lengths)
+        else:
+            noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
 
         context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         draft_position_ids = self._create_position_ids(anchor_positions)
@@ -351,7 +359,9 @@ class DFlashTrainerModule(nn.Module):
         ``w_k = exp(-(k - l) / gamma)`` for block position ``k >= l``
         (``loss_decay_gamma=None`` disables decay). The loss is the weighted mean
         ``sum(nll * w) / sum(w)``, mirroring the fixed-anchor path's
-        ``normalize="mean"``.
+        ``normalize="mean"``. Assumes every ``prefix_lengths`` entry is at least
+        ``min(2, block_size - 1)`` (what :meth:`_sample_prefix_lengths` produces),
+        so the leading always-visible positions can be sliced off before the CE.
 
         Args:
             logits: Tensor of shape ``[batch, blocks, block_size, vocab]``.
@@ -366,16 +376,24 @@ class DFlashTrainerModule(nn.Module):
             DFlashStepMetrics with the weighted-mean loss, the argmax accuracy
             over supervised positions, and the supervised-position count.
         """
-        supervised = block_mask * (self._block_offsets >= prefix_lengths.unsqueeze(-1)).float()
+        # Positions below the minimum prefix are visible in every block; drop them
+        # before the CE like the fixed-anchor path drops position 0.
+        min_prefix = min(2, self.block_size - 1)
+        offsets = self._block_offsets[..., min_prefix:]
+        logits = logits[:, :, min_prefix:, :]
+        target_ids = target_ids[:, :, min_prefix:]
+        block_mask = block_mask[:, :, min_prefix:]
+
+        supervised = block_mask * (offsets >= prefix_lengths.unsqueeze(-1)).float()
         weights = supervised
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            effective_pos = (self._block_offsets.float() - prefix_lengths.unsqueeze(-1).float()).clamp(min=0)
+            effective_pos = (offsets - prefix_lengths.unsqueeze(-1)).clamp(min=0).float()
             weights = supervised * torch.exp(-effective_pos / self.loss_decay_gamma)
 
         vocab = logits.shape[-1]
-        token_nll = F.cross_entropy(
-            logits.reshape(-1, vocab).float(), target_ids.reshape(-1), reduction="none"
-        ).view_as(supervised)
+        token_nll = F.cross_entropy(logits.reshape(-1, vocab), target_ids.reshape(-1), reduction="none").view_as(
+            supervised
+        )
         loss = (token_nll * weights).sum() / (weights.sum() + 1e-6)
 
         valid_tokens = supervised.sum()
