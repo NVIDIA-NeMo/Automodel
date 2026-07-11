@@ -619,7 +619,18 @@ if HAVE_DEEP_EP_V2:
         async_finish=False,
         allocate_on_comm_stream=False,
     ):
-        """Perform fused dispatch with DeepEP V2 ElasticBuffer."""
+        """Perform fused dispatch with DeepEP V2 ElasticBuffer.
+
+        Args:
+            x: Input tensor [num_tokens, hidden_size], hidden_size divisible by 256
+            token_indices: Token routing indices [num_tokens, topk]
+            token_probs: Token routing probabilities [num_tokens, topk]
+            num_experts: Number of experts
+            group: Process group
+
+        Returns:
+            Result of DeepEPV2FusedDispatch
+        """
         return DeepEPV2FusedDispatch.apply(
             x.contiguous(),
             token_indices,
@@ -637,7 +648,16 @@ if HAVE_DEEP_EP_V2:
         async_finish=False,
         allocate_on_comm_stream=False,
     ):
-        """Perform fused combine with DeepEP V2 ElasticBuffer."""
+        """Perform fused combine with DeepEP V2 ElasticBuffer.
+
+        Args:
+            x: Per-expert output tensor [num_recv_tokens, hidden_size]
+            group: Process group
+            handle: Communication handle from the paired dispatch
+
+        Returns:
+            Result of DeepEPV2FusedCombine
+        """
         return DeepEPV2FusedCombine.apply(
             x,
             group,
