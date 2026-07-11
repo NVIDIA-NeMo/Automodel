@@ -191,17 +191,17 @@ def resolve_signal(sig: SignalLike) -> signal.Signals:
 
     Accepts integers (e.g. "15"), "signal.Signals" members (e.g. "signal.SIGTERM")
     and case-insensitive string names with or without the "SIG" prefix (e.g. "SIGTERM",
-    "sigusr1", "USR2"). String support allows the pre-emption signal to be configured form YAML.
+    "sigusr1", "USR2"). String support allows the pre-emption signal to be form YAML.
 
     Args:
         sig: The signal specification to resolve.
 
     Returns:
-        The corresponding "singal.Signals" member.
+        The corresponding "signal.Signals" member.
 
     Raises:
         ValueError: If the specification does not name a valid signal.
-        TypeError: If "SIG" is not an int, str, or "signal.Signals".
+        TypeError: If sig is not an int, str, or "signal.Signals".
     """
 
     if isinstance(sig, signal.Signals):
@@ -210,7 +210,7 @@ def resolve_signal(sig: SignalLike) -> signal.Signals:
         try:
             return signal.Signals(sig)
         except ValueError as e:
-            raise ValueError(f"Invalid signal number; {sig}") from e
+            raise ValueError(f"Invalid signal number: {sig}") from e
     if isinstance(sig, str):
         name = sig.strip().upper()
         if not name.startswith("SIG"):

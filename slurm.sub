@@ -92,3 +92,30 @@ srun \
             --rdzv_backend=c10d \
             --rdzv_endpoint=\${MASTER_ADDR}:\${MASTER_PORT} \
             -m nemo_automodel.cli.app ${CONFIG}"
+SRUN_PID=$!
+
+# Forward SIGUSR1 to the training worker processes on this node only.
+# Deliberately NOT signalled: srun (would propagate to torchrun on every
+# node) and torchrun itself (terminates on unhandled USR1, and slurmstepd
+# then SIGKILLs the whole step cgroup).  Signalling the local workers is
+# sufficient: DistributedSignalHandler all_gathers the flag, so every rank
+# checkpoints at the next step boundary once any single rank sees the signal.
+forward_preemption_signal() {
+    echo "[$(date)] SIGUSR1 from SLURM; forwarding to local training workers"
+    for pid in $(pgrep -u "$(id -un)" -f "nemo_automodel.cli.app"); do
+        # Skip the torchrun launcher (its cmdline also contains the module name).
+        if ! tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -q torchrun; then
+            kill -USR1 "${pid}" 2>/dev/null || true
+        fi
+    done
+}
+trap forward_preemption_signal USR1
+
+# First wait returns early (128+SIGUSR1) if the trap fires; the second wait
+# collects srun's real exit status after the graceful shutdown completes.
+wait ${SRUN_PID}
+trap - USR1
+wait ${SRUN_PID}
+EXIT_CODE=$?
+echo "[$(date)] srun exited with status ${EXIT_CODE}"
+exit ${EXIT_CODE}
