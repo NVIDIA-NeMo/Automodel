@@ -42,12 +42,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import signal
+import socket
 import subprocess
 import sys
 import time
 import urllib.request
 from argparse import Namespace
 from dataclasses import asdict, dataclass, fields
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +94,7 @@ class DecodeEvalConfig:
     target_model: str
     input_data: str
     output_dir: str
+    num_speculative_tokens: int
     num_prompts: int = 32
     concurrency: int = 8
     max_new_tokens: int = 256
@@ -100,15 +105,21 @@ class DecodeEvalConfig:
     split: str = "train"
     dataset_name: str | None = None
     shuffle_seed: int = 42
-    port: int = 8199
+    port: int = 0
     gpu_memory_utilization: float = 0.8
-    num_speculative_tokens: int | None = None
     max_model_len: int | None = None
     trust_remote_code: bool = False
     timeout_s: float = 1800.0
 
 
-def resolve_decode_eval_config(recipe_cfg, *, default_target: str, default_input_data: str, output_dir: str):
+def resolve_decode_eval_config(
+    recipe_cfg: Any,
+    *,
+    default_target: str,
+    default_input_data: str | None,
+    default_num_speculative_tokens: int,
+    output_dir: str,
+) -> DecodeEvalConfig | None:
     """Read the optional ``decode_eval:`` block from ``recipe_args``.
 
     Returns ``None`` when the block is absent or ``every_steps`` is unset/0
@@ -123,13 +134,30 @@ def resolve_decode_eval_config(recipe_cfg, *, default_target: str, default_input
     every_steps = int(block.get("every_steps", 0) or 0)
     if every_steps <= 0:
         return None
+    block = block.to_dict() if hasattr(block, "to_dict") else dict(block)
+    unknown = set(block) - {field.name for field in fields(DecodeEvalConfig)}
+    if unknown:
+        raise ValueError(f"Unknown decode_eval option(s): {', '.join(sorted(unknown))}")
     cuda_visible_devices = block.get("cuda_visible_devices", None)
     if cuda_visible_devices is None or str(cuda_visible_devices) == "":
         raise ValueError(
             "decode_eval.cuda_visible_devices is required: the eval engine needs a GPU the training "
             "job does not use (e.g. reserve one card and shrink the torchrun world accordingly)."
         )
-    required = {"every_steps", "cuda_visible_devices", "target_model", "input_data", "output_dir"}
+    input_data = block.get("input_data", None) or default_input_data
+    if not input_data:
+        raise ValueError("decode_eval.input_data is required when recipe_args.train_data_path is not set.")
+    num_speculative_tokens = int(block.get("num_speculative_tokens", None) or default_num_speculative_tokens)
+    if num_speculative_tokens <= 0:
+        raise ValueError("decode_eval.num_speculative_tokens must be greater than 0.")
+    required = {
+        "every_steps",
+        "cuda_visible_devices",
+        "target_model",
+        "input_data",
+        "output_dir",
+        "num_speculative_tokens",
+    }
     overrides = {}
     for field in fields(DecodeEvalConfig):
         if field.name in required:
@@ -141,8 +169,9 @@ def resolve_decode_eval_config(recipe_cfg, *, default_target: str, default_input
         every_steps=every_steps,
         cuda_visible_devices=str(cuda_visible_devices),
         target_model=str(block.get("target_model", None) or default_target),
-        input_data=str(block.get("input_data", None) or default_input_data),
+        input_data=str(input_data),
         output_dir=os.path.join(output_dir, "decode_eval"),
+        num_speculative_tokens=num_speculative_tokens,
         **overrides,
     )
 
@@ -199,10 +228,62 @@ class DecodeEvalRunner:
     def __init__(self, config: DecodeEvalConfig):
         self.config = config
         self._proc: subprocess.Popen | None = None
+        self._worker_log_path: str | None = None
         self._launched_for_step = -1
         self._last_bucket = 0
         self._collected: set[str] = set()
         os.makedirs(config.output_dir, exist_ok=True)
+        for _, step_dir in self._step_dirs():
+            result_path = os.path.join(config.output_dir, step_dir, _RESULT_FILENAME)
+            if os.path.exists(result_path):
+                self._collected.add(result_path)
+                self._cleanup_snapshot(os.path.join(config.output_dir, step_dir))
+
+    def _step_dirs(self) -> list[tuple[int, str]]:
+        """Return valid step directories in numeric order, ignoring stray names."""
+        try:
+            entries = os.listdir(self.config.output_dir)
+        except FileNotFoundError:
+            return []
+        parsed = []
+        for entry in entries:
+            if not entry.startswith("step_"):
+                continue
+            try:
+                parsed.append((int(entry.split("_", 1)[1]), entry))
+            except ValueError:
+                logger.warning("decode_eval: ignoring invalid step directory %s", entry)
+        return sorted(parsed)
+
+    @staticmethod
+    def _cleanup_snapshot(step_dir: str) -> None:
+        """Remove heavyweight weights after an eval no longer needs them."""
+        try:
+            shutil.rmtree(os.path.join(step_dir, "model"))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception("decode_eval: failed to remove snapshot under %s", step_dir)
+
+    def _reap_finished_worker(self) -> None:
+        """Report a completed worker and release its Popen state."""
+        if self._proc is None:
+            return
+        return_code = self._proc.poll()
+        if return_code is None:
+            return
+        if return_code != 0:
+            logger.error(
+                "decode_eval: worker for step %d exited with code %d; see %s",
+                self._launched_for_step,
+                return_code,
+                self._worker_log_path,
+            )
+            self._cleanup_snapshot(os.path.join(self.config.output_dir, f"step_{self._launched_for_step}"))
+        else:
+            logger.info("decode_eval: worker for step %d completed", self._launched_for_step)
+        self._proc = None
+        self._worker_log_path = None
 
     def due(self, global_step: int) -> bool:
         """Whether a new eval should launch at this optimizer step."""
@@ -212,6 +293,7 @@ class DecodeEvalRunner:
         """Snapshot the draft and launch the worker if the cadence is due and no eval is running."""
         if not self.due(global_step):
             return False
+        self._reap_finished_worker()
         if self._proc is not None and self._proc.poll() is None:
             logger.info(
                 "decode_eval: previous eval (step %d) still running, skipping launch at step %d",
@@ -219,39 +301,52 @@ class DecodeEvalRunner:
                 global_step,
             )
             return False
-        self._last_bucket = global_step // self.config.every_steps
         step_dir = os.path.join(self.config.output_dir, f"step_{global_step}")
         os.makedirs(step_dir, exist_ok=True)
-        export_draft_snapshot(draft_model, step_dir)
-        # The full config crosses the subprocess boundary as a JSON sidecar next
-        # to the snapshot (one declaration site, and a debugging record of what
-        # the eval ran with); the argv carries only the per-launch paths.
-        config_json = os.path.join(step_dir, _CONFIG_FILENAME)
-        with open(config_json, "w") as f:
-            json.dump(asdict(self.config), f, indent=2)
-        argv = [
-            sys.executable,
-            "-m",
-            "nemo_automodel.components.speculative.decode_eval",
-            "--config-json",
-            config_json,
-            "--draft",
-            step_dir,
-            "--step",
-            str(global_step),
-            "--result-json",
-            os.path.join(step_dir, _RESULT_FILENAME),
-        ]
-        log_path = os.path.join(step_dir, _WORKER_LOG_FILENAME)
-        with open(log_path, "ab") as log_file:
-            self._proc = subprocess.Popen(
-                argv,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                env=_worker_env(self.config.cuda_visible_devices),
-                start_new_session=True,
-            )
+        result_path = os.path.join(step_dir, _RESULT_FILENAME)
+        for stale_path in (result_path, result_path + ".tmp"):
+            try:
+                os.remove(stale_path)
+            except FileNotFoundError:
+                pass
+        self._collected.discard(result_path)
+        self._cleanup_snapshot(step_dir)
+        try:
+            export_draft_snapshot(draft_model, step_dir)
+            # The full config crosses the subprocess boundary as a JSON sidecar next
+            # to the snapshot (one declaration site, and a debugging record of what
+            # the eval ran with); the argv carries only the per-launch paths.
+            config_json = os.path.join(step_dir, _CONFIG_FILENAME)
+            with open(config_json, "w") as f:
+                json.dump(asdict(self.config), f, indent=2)
+            argv = [
+                sys.executable,
+                "-m",
+                "nemo_automodel.components.speculative.decode_eval",
+                "--config-json",
+                config_json,
+                "--draft",
+                step_dir,
+                "--step",
+                str(global_step),
+                "--result-json",
+                result_path,
+            ]
+            log_path = os.path.join(step_dir, _WORKER_LOG_FILENAME)
+            with open(log_path, "ab") as log_file:
+                self._proc = subprocess.Popen(
+                    argv,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    env=_worker_env(self.config.cuda_visible_devices),
+                    start_new_session=True,
+                )
+        except Exception:
+            self._cleanup_snapshot(step_dir)
+            raise
+        self._last_bucket = global_step // self.config.every_steps
         self._launched_for_step = global_step
+        self._worker_log_path = log_path
         logger.info(
             "decode_eval: launched eval for step %d on CUDA_VISIBLE_DEVICES=%s (pid %d, log %s)",
             global_step,
@@ -263,23 +358,21 @@ class DecodeEvalRunner:
 
     def collect(self) -> list[dict]:
         """Return finished, not-yet-reported eval results in snapshot-step order."""
+        self._reap_finished_worker()
         results = []
-        try:
-            step_dirs = sorted(
-                (d for d in os.listdir(self.config.output_dir) if d.startswith("step_")),
-                key=lambda d: int(d.split("_", 1)[1]),
-            )
-        except (FileNotFoundError, ValueError):
-            return results
-        for step_dir in step_dirs:
+        for step, step_dir in self._step_dirs():
             path = os.path.join(self.config.output_dir, step_dir, _RESULT_FILENAME)
             if path in self._collected or not os.path.exists(path):
                 continue
             try:
                 with open(path) as f:
-                    results.append(json.load(f))
+                    result = json.load(f)
+                if result.get("step") != step:
+                    raise ValueError(f"result step {result.get('step')!r} does not match directory step {step}")
+                results.append(result)
                 self._collected.add(path)
-            except (OSError, json.JSONDecodeError):
+                self._cleanup_snapshot(os.path.join(self.config.output_dir, step_dir))
+            except (OSError, ValueError, json.JSONDecodeError):
                 logger.warning("decode_eval: unreadable result %s, will retry next collect", path)
         return results
 
@@ -290,14 +383,28 @@ class DecodeEvalRunner:
             try:
                 # The worker was started in its own session; signal the whole
                 # group so the vLLM server child goes down with it.
-                os.killpg(os.getpgid(self._proc.pid), 15)
+                process_group = os.getpgid(self._proc.pid)
+                os.killpg(process_group, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
+                process_group = None
                 self._proc.terminate()
             try:
                 self._proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                self._proc.kill()
+                if process_group is not None:
+                    try:
+                        os.killpg(process_group, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        self._proc.kill()
+                else:
+                    self._proc.kill()
+                self._proc.wait()
+        elif self._proc is not None:
+            self._reap_finished_worker()
+        if self._launched_for_step >= 0:
+            self._cleanup_snapshot(os.path.join(self.config.output_dir, f"step_{self._launched_for_step}"))
         self._proc = None
+        self._worker_log_path = None
 
 
 # --------------------------------------------------------------------------- #
@@ -320,6 +427,16 @@ def _wait_for_server(server: str, proc: subprocess.Popen, timeout_s: float) -> N
             pass
         time.sleep(3)
     raise TimeoutError(f"vLLM server did not become healthy within {timeout_s:.0f}s")
+
+
+def _resolve_worker_port(configured_port: int) -> int:
+    """Choose an unused loopback port, or fail if an explicit port is occupied."""
+    with socket.socket() as sock:
+        try:
+            sock.bind(("127.0.0.1", configured_port))
+        except OSError as exc:
+            raise RuntimeError(f"decode_eval port {configured_port} is already in use") from exc
+        return int(sock.getsockname()[1])
 
 
 def _build_parser():
@@ -391,6 +508,7 @@ def main(argv=None) -> int:
     args = _build_parser().parse_args(argv)
     with open(args.config_json) as f:
         cfg = DecodeEvalConfig(**json.load(f))
+    cfg.port = _resolve_worker_port(cfg.port)
     server = f"http://127.0.0.1:{cfg.port}"
     serve_argv = _serve_argv(cfg, args.draft)
     print(f"decode_eval worker: starting engine: {' '.join(serve_argv)}", flush=True)

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +30,7 @@ from nemo_automodel.components.speculative.decode_eval import (
     DecodeEvalConfig,
     DecodeEvalRunner,
     _bench_args,
+    _resolve_worker_port,
     _serve_argv,
     _worker_env,
     export_draft_snapshot,
@@ -43,6 +46,7 @@ def _config(tmp_path, **overrides):
         target_model="/models/target",
         input_data="/data/train.jsonl",
         output_dir=str(tmp_path / "decode_eval"),
+        num_speculative_tokens=7,
     )
     kwargs.update(overrides)
     return DecodeEvalConfig(**kwargs)
@@ -50,30 +54,84 @@ def _config(tmp_path, **overrides):
 
 def test_resolve_returns_none_when_absent_or_disabled(tmp_path):
     assert (
-        resolve_decode_eval_config({}, default_target="/t", default_input_data="/d", output_dir=str(tmp_path)) is None
+        resolve_decode_eval_config(
+            {},
+            default_target="/t",
+            default_input_data="/d",
+            default_num_speculative_tokens=4,
+            output_dir=str(tmp_path),
+        )
+        is None
     )
     cfg = {"decode_eval": {"every_steps": 0, "cuda_visible_devices": "7"}}
     assert (
-        resolve_decode_eval_config(cfg, default_target="/t", default_input_data="/d", output_dir=str(tmp_path)) is None
+        resolve_decode_eval_config(
+            cfg,
+            default_target="/t",
+            default_input_data="/d",
+            default_num_speculative_tokens=4,
+            output_dir=str(tmp_path),
+        )
+        is None
     )
 
 
 def test_resolve_requires_reserved_gpu(tmp_path):
     cfg = {"decode_eval": {"every_steps": 100}}
     with pytest.raises(ValueError, match="cuda_visible_devices"):
-        resolve_decode_eval_config(cfg, default_target="/t", default_input_data="/d", output_dir=str(tmp_path))
+        resolve_decode_eval_config(
+            cfg,
+            default_target="/t",
+            default_input_data="/d",
+            default_num_speculative_tokens=4,
+            output_dir=str(tmp_path),
+        )
 
 
 def test_resolve_fills_defaults_from_recipe(tmp_path):
     cfg = {"decode_eval": {"every_steps": 250, "cuda_visible_devices": 6}}
     resolved = resolve_decode_eval_config(
-        cfg, default_target="/models/qwen", default_input_data="/data/messages", output_dir=str(tmp_path)
+        cfg,
+        default_target="/models/qwen",
+        default_input_data="/data/messages",
+        default_num_speculative_tokens=7,
+        output_dir=str(tmp_path),
     )
     assert resolved.every_steps == 250
     assert resolved.cuda_visible_devices == "6"
     assert resolved.target_model == "/models/qwen"
     assert resolved.input_data == "/data/messages"
     assert resolved.output_dir == os.path.join(str(tmp_path), "decode_eval")
+    assert resolved.num_speculative_tokens == 7
+    assert resolved.port == 0
+
+
+def test_resolve_validates_input_tokens_and_unknown_options(tmp_path):
+    base = {"every_steps": 10, "cuda_visible_devices": "7"}
+    with pytest.raises(ValueError, match="input_data"):
+        resolve_decode_eval_config(
+            {"decode_eval": base},
+            default_target="/t",
+            default_input_data=None,
+            default_num_speculative_tokens=4,
+            output_dir=str(tmp_path),
+        )
+    with pytest.raises(ValueError, match="num_speculative_tokens"):
+        resolve_decode_eval_config(
+            {"decode_eval": {**base, "num_speculative_tokens": 0}},
+            default_target="/t",
+            default_input_data="/d",
+            default_num_speculative_tokens=0,
+            output_dir=str(tmp_path),
+        )
+    with pytest.raises(ValueError, match="num_prompt"):
+        resolve_decode_eval_config(
+            {"decode_eval": {**base, "num_prompt": 8}},
+            default_target="/t",
+            default_input_data="/d",
+            default_num_speculative_tokens=4,
+            output_dir=str(tmp_path),
+        )
 
 
 def test_export_draft_snapshot_is_serve_resolvable(tmp_path):
@@ -112,12 +170,29 @@ def test_worker_env_scrubs_torchrun_state(monkeypatch):
 
 
 class _FakeProc:
-    def __init__(self, alive=True, pid=4242):
+    def __init__(self, alive=True, pid=4242, return_code=0):
         self._alive = alive
         self.pid = pid
+        self.returncode = None if alive else return_code
+        self.terminated = False
+        self.killed = False
 
     def poll(self):
-        return None if self._alive else 0
+        return None if self._alive else self.returncode
+
+    def wait(self, timeout=None):
+        self._alive = False
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+        self._alive = False
+        self.returncode = -9
 
 
 def _runner_with_fake_launch(tmp_path, monkeypatch, launched):
@@ -146,6 +221,7 @@ def test_runner_launches_on_cadence_and_skips_while_running(tmp_path, monkeypatc
     # boundary launches again.
     assert not runner.maybe_launch(20, model)
     runner._proc._alive = False
+    runner._proc.returncode = 0
     assert runner.maybe_launch(30, model)
 
     popen_calls = [entry for entry in launched if entry[0] == "popen"]
@@ -181,6 +257,89 @@ def test_runner_collect_returns_each_result_once(tmp_path):
     assert [r["step"] for r in second] == [20]
 
 
+def test_runner_resume_ignores_old_results_and_removes_snapshot(tmp_path):
+    cfg = _config(tmp_path)
+    step_dir = os.path.join(cfg.output_dir, "step_10")
+    os.makedirs(os.path.join(step_dir, "model"))
+    result_path = os.path.join(step_dir, "result.json")
+    with open(result_path, "w") as f:
+        json.dump({"step": 10, "accept_length": 1.5}, f)
+
+    runner = DecodeEvalRunner(cfg)
+
+    assert runner.collect() == []
+    assert not os.path.exists(os.path.join(step_dir, "model"))
+
+
+def test_runner_ignores_invalid_step_directory(tmp_path):
+    runner = DecodeEvalRunner(_config(tmp_path))
+    os.makedirs(os.path.join(runner.config.output_dir, "step_final"))
+    step_dir = os.path.join(runner.config.output_dir, "step_20")
+    os.makedirs(step_dir)
+    with open(os.path.join(step_dir, "result.json"), "w") as f:
+        json.dump({"step": 20, "accept_length": 2.0}, f)
+
+    assert [result["step"] for result in runner.collect()] == [20]
+
+
+def test_failed_launch_retries_same_bucket_and_cleans_snapshot(tmp_path, monkeypatch):
+    runner = DecodeEvalRunner(_config(tmp_path))
+    step_dir = os.path.join(runner.config.output_dir, "step_10")
+
+    def _export(_model, out_dir):
+        os.makedirs(os.path.join(out_dir, "model"))
+        raise RuntimeError("snapshot failed")
+
+    monkeypatch.setattr("nemo_automodel.components.speculative.decode_eval.export_draft_snapshot", _export)
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        runner.maybe_launch(10, object())
+
+    assert runner.due(10)
+    assert not os.path.exists(os.path.join(step_dir, "model"))
+
+
+def test_failed_worker_is_reported_and_snapshot_removed(tmp_path, caplog):
+    runner = DecodeEvalRunner(_config(tmp_path))
+    step_dir = os.path.join(runner.config.output_dir, "step_10")
+    os.makedirs(os.path.join(step_dir, "model"))
+    runner._proc = _FakeProc(alive=False, return_code=2)
+    runner._launched_for_step = 10
+    runner._worker_log_path = os.path.join(step_dir, "worker.log")
+
+    runner.collect()
+
+    assert "exited with code 2" in caplog.text
+    assert runner._proc is None
+    assert not os.path.exists(os.path.join(step_dir, "model"))
+
+
+def test_shutdown_escalates_to_process_group_kill(tmp_path, monkeypatch):
+    runner = DecodeEvalRunner(_config(tmp_path))
+    step_dir = os.path.join(runner.config.output_dir, "step_10")
+    os.makedirs(os.path.join(step_dir, "model"))
+    runner._launched_for_step = 10
+    proc = _FakeProc()
+    wait_calls = []
+
+    def _wait(timeout=None):
+        wait_calls.append(timeout)
+        if len(wait_calls) == 1:
+            raise subprocess.TimeoutExpired("worker", 30)
+        return 0
+
+    proc.wait = _wait
+    runner._proc = proc
+    signals = []
+    monkeypatch.setattr(os, "getpgid", lambda _pid: 99)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signals.append((pgid, sig)))
+
+    runner.shutdown()
+
+    assert signals[0][0] == signals[1][0] == 99
+    assert signals[0][1] != signals[1][1]
+    assert not os.path.exists(os.path.join(step_dir, "model"))
+
+
 def test_serve_argv_builds_speculative_server_command(tmp_path, monkeypatch):
     """The worker must drive serve_vllm's library surface, not reimplement it."""
     seen = {}
@@ -197,6 +356,17 @@ def test_serve_argv_builds_speculative_server_command(tmp_path, monkeypatch):
     assert seen["draft"] == str(tmp_path / "step_10")
     assert seen["port"] == 8199
     assert seen["host"] == "127.0.0.1"
+    assert seen["num_speculative_tokens"] == 7
+
+
+def test_worker_port_auto_selects_and_rejects_collision():
+    port = _resolve_worker_port(0)
+    assert port > 0
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        occupied = sock.getsockname()[1]
+        with pytest.raises(RuntimeError, match="already in use"):
+            _resolve_worker_port(occupied)
 
 
 def test_bench_args_carry_workload_settings(tmp_path):
@@ -255,3 +425,41 @@ def test_recipe_hook_noop_without_runner():
 
     recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
     recipe._maybe_run_decode_eval()  # must not raise (bare object, no setup)
+
+
+def test_recipe_hook_can_collect_without_launching():
+    from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
+
+    recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
+    recipe.runtime = SimpleNamespace(global_step=42)
+    recipe._wandb_log = lambda *_args, **_kwargs: None
+
+    class _StubRunner:
+        def collect(self):
+            return []
+
+        def maybe_launch(self, *_args):
+            raise AssertionError("final collection must not launch a worker")
+
+    recipe.decode_eval_runner = _StubRunner()
+    recipe._maybe_run_decode_eval(launch=False)
+
+
+def test_recipe_hook_contains_optional_eval_failures(caplog):
+    from nemo_automodel.recipes.llm.train_eagle3 import TrainEagle3Recipe
+
+    recipe = TrainEagle3Recipe.__new__(TrainEagle3Recipe)
+    recipe.runtime = SimpleNamespace(global_step=42)
+    recipe.draft_model = object()
+
+    class _StubRunner:
+        def collect(self):
+            return []
+
+        def maybe_launch(self, *_args):
+            raise RuntimeError("snapshot failed")
+
+    recipe.decode_eval_runner = _StubRunner()
+    recipe._maybe_run_decode_eval()
+
+    assert "training continues" in caplog.text

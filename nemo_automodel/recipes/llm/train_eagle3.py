@@ -673,7 +673,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         decode_eval_config = resolve_decode_eval_config(
             recipe_cfg,
             default_target=str(target_path),
-            default_input_data=str(recipe_cfg.train_data_path),
+            default_input_data=recipe_cfg.get("train_data_path", None),
+            default_num_speculative_tokens=int(
+                recipe_cfg.get("num_depths", 8) if parallel_drafting else recipe_cfg.ttt_steps
+            ),
             output_dir=str(self.output_dir),
         )
         if decode_eval_config is not None:
@@ -685,7 +688,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             if self.dist_env.is_main:
                 self.decode_eval_runner = DecodeEvalRunner(decode_eval_config)
 
-    def _maybe_run_decode_eval(self) -> None:
+    def _maybe_run_decode_eval(self, *, launch: bool = True) -> None:
         """Rank-0 log-point hook: collect finished decode-eval results, launch the next one when due.
 
         Runs outside any collective path (pure subprocess/file I/O), so only
@@ -716,10 +719,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     },
                     step=self.runtime.global_step,
                 )
-        try:
-            runner.maybe_launch(self.runtime.global_step, self.draft_model)
-        except OSError:
-            logger.exception("decode_eval: launch failed at step %d; training continues", self.runtime.global_step)
+        if launch:
+            try:
+                runner.maybe_launch(self.runtime.global_step, self.draft_model)
+            except Exception:
+                logger.exception("decode_eval: launch failed at step %d; training continues", self.runtime.global_step)
 
     def _setup_online_target(self, recipe_cfg, target_path, target_config):
         """Live path: load the target model and build the live dataloader.
@@ -1598,7 +1602,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if getattr(self, "target_wrapper", None) is not None:
             _best_effort("closing target backend", self.target_wrapper.close)
         if getattr(self, "decode_eval_runner", None) is not None:
-            _best_effort("collecting final decode-eval results", self._maybe_run_decode_eval)
+            _best_effort("collecting final decode-eval results", lambda: self._maybe_run_decode_eval(launch=False))
             _best_effort("stopping decode-eval worker", self.decode_eval_runner.shutdown)
         if getattr(self, "wandb_run", None) is not None:
             _best_effort("finishing W&B run", self.wandb_run.finish)
