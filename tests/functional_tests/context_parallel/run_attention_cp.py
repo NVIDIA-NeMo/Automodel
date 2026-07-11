@@ -81,6 +81,21 @@ def get_rank():
     return 0
 
 
+def _relative_l2_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    """Compute relative L2 error in FP32.
+
+    Args:
+        actual: Tensor of arbitrary shape produced by the context-parallel path.
+        expected: Tensor of the same shape produced by the non-CP reference path.
+
+    Returns:
+        Scalar relative L2 error.
+    """
+    error = actual.float() - expected.float()
+    denominator = torch.linalg.vector_norm(expected.float()).clamp_min(torch.finfo(torch.float32).tiny)
+    return float((torch.linalg.vector_norm(error) / denominator).item())
+
+
 def init_distributed():
     """Initialize distributed environment."""
     if not is_distributed():
@@ -252,9 +267,10 @@ def get_model_config_and_attention(model_type, device):
         )
 
         backend = BackendConfig(
-            linear="torch",
+            linear="te",
             attn="te",
-            rms_norm="torch",
+            rms_norm="torch_fp32",
+            rope_fusion=True,
             experts="torch",
             dispatcher="torch",
             fake_balanced_gate=False,
@@ -304,9 +320,10 @@ def get_model_config_and_attention(model_type, device):
         )
 
         backend = BackendConfig(
-            linear="torch",
+            linear="te",
             attn="te",
-            rms_norm="torch",
+            rms_norm="torch_fp32",
+            rope_fusion=True,
             experts="torch",
             dispatcher="torch",
             fake_balanced_gate=False,
@@ -707,6 +724,20 @@ def _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device, attn
                 break
     if param_grad_cp is not None:
         dist.all_reduce(param_grad_cp, op=dist.ReduceOp.SUM)
+
+    relative_l2_errors = {
+        "output": _relative_l2_error(output_with_cp_full, output_baseline),
+        "input_grad": _relative_l2_error(grad_with_cp_full, grad_baseline),
+        "param_grad": _relative_l2_error(param_grad_cp, param_grad_baseline),
+    }
+    if rank == 0:
+        print("Relative L2 errors - " + ", ".join(f"{name}: {error:.6g}" for name, error in relative_l2_errors.items()))
+    # CP changes attention accumulation order, but aggregate forward/backward drift must stay below 1%.
+    relative_l2_tolerance = 0.01
+    if any(error > relative_l2_tolerance for error in relative_l2_errors.values()):
+        raise AssertionError(
+            f"[thd_te][Rank {rank}] Relative L2 error exceeds {relative_l2_tolerance}: {relative_l2_errors}"
+        )
 
     return _compare_results(
         "thd_te",

@@ -57,7 +57,7 @@ model:
     rms_norm: torch_fp32
     experts: torch_mm
     dispatcher: deepep
-    rope_fusion: false
+    rope_fusion: true  # TE >= 2.14.1 supports fused RoPE for packed THD sequences.
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 

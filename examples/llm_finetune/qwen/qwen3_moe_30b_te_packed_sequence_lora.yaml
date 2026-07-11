@@ -47,12 +47,7 @@ model:
     dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
-    # Fused TE RoPE emits NaN/Inf on the query in THD (packed-sequence) mode, which
-    # NaNs the step-0 gradient, corrupts all weights through the optimizer step, and
-    # collapses MoE routing onto a single EP rank at step 1 -- surfacing as a CUDA OOM
-    # in the DeepEP token-permute (the OOM is a symptom, not the cause). Use the bounded
-    # fp32 non-fused RoPE path instead. Same root cause/fix as #2675 (Moonlight, GLM-4.7).
-    rope_fusion: false
+    rope_fusion: true  # TE >= 2.14.1 supports fused RoPE for packed THD sequences.
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig

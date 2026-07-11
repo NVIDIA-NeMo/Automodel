@@ -2032,7 +2032,7 @@ class TestRunTrainOptimStepSetsMoEScale:
 
 
 # -----------------------------------------------------------------------------
-# rope_fusion disabled when cp > 1
+# rope_fusion preserved with context parallelism
 # -----------------------------------------------------------------------------
 
 
@@ -2075,15 +2075,15 @@ def _patch_setup_minimals_with_cp(monkeypatch, cp_size):
     )
 
 
-def test_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
-    """rope_fusion should be set to False during setup when cp_size > 1."""
+def test_rope_fusion_unchanged_when_cp_gt_1(monkeypatch):
+    """rope_fusion should remain enabled when cp_size > 1."""
     cfg = _minimal_cfg_with_rope_fusion(cp_size=2, rope_fusion=True)
     _patch_setup_minimals_with_cp(monkeypatch, cp_size=2)
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
 
-    assert cfg.model.backend.rope_fusion is False
+    assert cfg.model.backend.rope_fusion is True
 
 
 def test_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):

@@ -27,6 +27,7 @@ CP_NEMOTRON_V3_MAMBA_TEST_FILENAME = "L2_CP_NemotronV3_Mamba_Test.sh"
 CP_NEMOTRON_V3_ATTENTION_TEST_FILENAME = "L2_CP_NemotronV3_Attention_Test.sh"
 CP_NEMOTRON_V3_HYBRID_TEST_FILENAME = "L2_CP_NemotronV3_Hybrid_Test.sh"
 CP_QWEN3_5_MOE_LINEAR_ATTN_TEST_FILENAME = "L2_CP_Qwen3_5MoE_LinearAttn_Test.sh"
+TE_ROPE_THD_TEST_FILENAME = "L2_TE_RoPE_THD_Test.sh"
 
 
 class TestContextParallelAttention:
@@ -55,3 +56,7 @@ class TestContextParallelAttention:
     def test_cp_qwen3_5_moe_linear_attn(self):
         """Test Qwen3.5 MoE linear attention (GatedDeltaNet) with CP=1 vs CP=2."""
         run_test_script(TEST_FOLDER, CP_QWEN3_5_MOE_LINEAR_ATTN_TEST_FILENAME)
+
+    def test_te_rope_thd(self):
+        """Test fused TE RoPE forward/backward against an FP32 THD reference."""
+        run_test_script(TEST_FOLDER, TE_ROPE_THD_TEST_FILENAME)

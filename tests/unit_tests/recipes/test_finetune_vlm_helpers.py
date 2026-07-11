@@ -2618,7 +2618,7 @@ def test_vlm_build_model_accepts_multimodal_lm_entry_points(entry_point):
 
 
 # -----------------------------------------------------------------------------
-# rope_fusion disabled when cp > 1
+# rope_fusion preserved with context parallelism
 # -----------------------------------------------------------------------------
 
 
@@ -2731,15 +2731,15 @@ def _minimal_vlm_cfg(cp_size: int, rope_fusion: bool):
     )
 
 
-def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
-    """rope_fusion should be set to False during VLM setup when cp_size > 1."""
+def test_vlm_rope_fusion_unchanged_when_cp_gt_1(monkeypatch):
+    """rope_fusion should remain enabled during VLM setup when cp_size > 1."""
     cfg = _minimal_vlm_cfg(cp_size=2, rope_fusion=True)
     _patch_vlm_setup_minimals(monkeypatch, cp_size=2)
 
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
 
-    assert cfg.model.backend.rope_fusion is False
+    assert cfg.model.backend.rope_fusion is True
 
 
 def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
