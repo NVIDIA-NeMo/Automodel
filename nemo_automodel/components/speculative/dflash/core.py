@@ -122,11 +122,16 @@ class DFlashTrainerModule(nn.Module):
         self.loss_decay_gamma = loss_decay_gamma
         self.loss_type = loss_type
         self.prefix_weight_base = float(prefix_weight_base)
+        # Smallest visible-prefix length variable-prefix training samples (and the
+        # slice point of its loss); single source of truth for both methods.
+        self._min_prefix = min(2, block_size - 1)
 
-        # Block-wise decay-weighted CE. ``normalize="mean"`` gives a local
-        # per-micro-batch decay-weighted mean; ``loss_decay_gamma=None`` disables
-        # decay (uniform weights).
-        self.loss_fn = DFlashDecayLoss(loss_gamma=loss_decay_gamma, normalize="mean")
+        # Block-wise decay-weighted CE for the fixed-anchor objective.
+        # ``normalize="mean"`` gives a local per-micro-batch decay-weighted mean;
+        # ``loss_decay_gamma=None`` disables decay (uniform weights). The
+        # variable-prefix objective needs per-block data-dependent weights and
+        # computes its loss inline instead (see _variable_prefix_loss).
+        self.loss_fn = DFlashDecayLoss(loss_gamma=loss_decay_gamma, normalize="mean") if loss_type == "dflash" else None
 
         # Per-block offset constant (block_size,) for label gathering / position ids.
         self.register_buffer("_block_offsets", torch.arange(block_size).view(1, 1, -1), persistent=False)
@@ -180,7 +185,7 @@ class DFlashTrainerModule(nn.Module):
         Returns:
             prefix_lengths: Long tensor of shape ``[batch, blocks]``.
         """
-        min_prefix = min(2, self.block_size - 1)
+        min_prefix = self._min_prefix
         max_prefix = self.block_size - 1
         if max_prefix <= min_prefix:
             return torch.full((bsz, n_blocks), min_prefix, dtype=torch.long, device=device)
@@ -335,7 +340,9 @@ class DFlashTrainerModule(nn.Module):
         pred_targets = target_ids[:, :, 1:].reshape(bsz, n * (bs - 1))
         pred_mask = block_mask[:, :, 1:].reshape(bsz, n * (bs - 1))
 
-        loss_out = self.loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, block_size=bs)
+        loss_fn = self.loss_fn
+        assert loss_fn is not None, "loss_fn is always constructed for loss_type='dflash'"
+        loss_out = loss_fn(pred_logits, pred_targets, pred_mask, num_tokens=None, block_size=bs)
 
         count_per_pos = loss_out.draft_count_per_pos
         valid_tokens = count_per_pos.sum()
@@ -378,7 +385,7 @@ class DFlashTrainerModule(nn.Module):
         """
         # Positions below the minimum prefix are visible in every block; drop them
         # before the CE like the fixed-anchor path drops position 0.
-        min_prefix = min(2, self.block_size - 1)
+        min_prefix = self._min_prefix
         offsets = self._block_offsets[..., min_prefix:]
         logits = logits[:, :, min_prefix:, :]
         target_ids = target_ids[:, :, min_prefix:]

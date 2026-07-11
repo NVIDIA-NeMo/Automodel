@@ -64,6 +64,11 @@ class TrainJetSpecRecipe(TrainDFlashRecipe):
 
     def _build_trainer_module(self, attention_backend: str, recipe_cfg):
         """Build the JetSpec trainer wrapper (causal parallel drafting + forward-KL)."""
+        if (recipe_cfg.get("loss_type", None) or "dflash") != "dflash":
+            raise ValueError(
+                "loss_type is only supported by the DFlash recipe; the JetSpec trainer has its own "
+                "forward-KL objective and would silently ignore it."
+            )
         return JetSpecTrainerModule(
             draft_model=self.draft_model,
             target_lm_head=self.target_model.get_output_embeddings(),

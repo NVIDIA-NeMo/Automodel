@@ -249,8 +249,14 @@ class Eagle3TrainerModule(nn.Module):
         super().__init__()
         if lk_loss_type is not None and lk_loss_type not in _LK_LOSS_TYPES:
             raise ValueError(f"lk_loss_type must be one of {_LK_LOSS_TYPES} or None, got {lk_loss_type!r}")
-        if lk_kl_scale < 0 or lk_kl_decay < 0:
-            raise ValueError(f"lk_kl_scale and lk_kl_decay must be >= 0, got {lk_kl_scale} and {lk_kl_decay}")
+        # kl_weight = lk_kl_scale * exp(-lk_kl_decay * acceptance) <= lk_kl_scale, so
+        # capping the scale at 1 keeps the (1 - kl_weight) acceptance coefficient
+        # non-negative; a scale above 1 would sign-flip it early in training and
+        # reward LOWER acceptance.
+        if not 0 <= lk_kl_scale <= 1:
+            raise ValueError(f"lk_kl_scale must be in [0, 1], got {lk_kl_scale}")
+        if lk_kl_decay < 0:
+            raise ValueError(f"lk_kl_decay must be >= 0, got {lk_kl_decay}")
         # The forward pass weighs each TTT step by ``0.8 ** i`` and divides
         # the running loss by ``sum_{i=0}^{ttt_steps-1} 0.8 ** i``. With
         # ``ttt_steps <= 0`` the loop never runs and the divisor is zero,
@@ -303,7 +309,8 @@ class Eagle3TrainerModule(nn.Module):
           ``kl_weight = lk_kl_scale * exp(-lk_kl_decay * mean(alpha).detach())``;
           the weight is detached so gradients flow only through the two terms, and
           training shifts from distillation toward direct acceptance as the draft
-          improves.
+          improves. A step with zero supervised positions returns 0, matching the
+          soft-CE path.
 
         Under CP every masked mean is renormalized over the full sequence via
         :func:`_cp_global_step_loss`, so the mixing weight and the loss match the
@@ -338,11 +345,17 @@ class Eagle3TrainerModule(nn.Module):
             target_probs=target_probs,
             position_mask=position_mask,
         )
+        supervised_count = position_mask.sum().detach().clone()
         if self.cp_group is not None:
             acceptance = _cp_global_step_loss(acceptance, position_mask, self.cp_group)
             soft_ce = _cp_global_step_loss(soft_ce, position_mask, self.cp_group)
+            dist.all_reduce(supervised_count, op=dist.ReduceOp.SUM, group=self.cp_group)
         kl_weight = self.lk_kl_scale * torch.exp(-self.lk_kl_decay * acceptance.detach())
-        return kl_weight * soft_ce + (1.0 - kl_weight) * (1.0 - acceptance)
+        # A step with no supervised positions must contribute 0 like the soft-CE
+        # path; without the gate its acceptance term would add the gradient-free
+        # constant (1 - lk_kl_scale) and inflate the logged loss.
+        has_supervision = (supervised_count > 0).to(soft_ce.dtype)
+        return has_supervision * (kl_weight * soft_ce + (1.0 - kl_weight) * (1.0 - acceptance))
 
     def forward(
         self,

@@ -321,3 +321,12 @@ def test_build_trainer_module_wires_loss_type_and_prefix_weight_base():
     module = recipe._build_trainer_module("sdpa", {"loss_type": "variable_prefix", "prefix_weight_base": 0.8})
     assert module.loss_type == "variable_prefix"
     assert module.prefix_weight_base == 0.8
+
+
+def test_build_trainer_module_loss_type_null_falls_back_to_default():
+    """An explicit ``loss_type: null`` in YAML must select the default objective
+    (mirroring loss_decay_gamma's documented null convention), not crash on the
+    string "None"."""
+    recipe = _bare_dflash_recipe()
+    module = recipe._build_trainer_module("sdpa", {"loss_type": None})
+    assert module.loss_type == "dflash"

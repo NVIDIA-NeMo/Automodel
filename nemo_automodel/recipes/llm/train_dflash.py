@@ -390,7 +390,9 @@ class TrainDFlashRecipe(BaseRecipe):
             # matches DFlashDecayLoss's own default. Set null explicitly in YAML
             # to disable the position decay (uniform weighting).
             loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", 7.0),
-            loss_type=str(recipe_cfg.get("loss_type", "dflash")),
+            # ``or`` folds an explicit ``loss_type: null`` back to the default,
+            # matching the null convention of loss_decay_gamma above.
+            loss_type=str(recipe_cfg.get("loss_type", None) or "dflash"),
             prefix_weight_base=float(recipe_cfg.get("prefix_weight_base", 0.9)),
         )
 

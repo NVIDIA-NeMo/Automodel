@@ -1482,7 +1482,11 @@ def test_lk_loss_rejects_unknown_type_and_negative_knobs():
         _lk_trainer(draft, "bogus")
     with pytest.raises(ValueError, match="lk_kl_scale"):
         _lk_trainer(draft, "lambda", lk_kl_scale=-0.5)
+    # A scale above 1 would make kl_weight exceed 1 early in training and
+    # sign-flip the (1 - kl_weight) acceptance coefficient.
     with pytest.raises(ValueError, match="lk_kl_scale"):
+        _lk_trainer(draft, "lambda", lk_kl_scale=1.5)
+    with pytest.raises(ValueError, match="lk_kl_decay"):
         _lk_trainer(draft, "lambda", lk_kl_decay=-1.0)
 
 
@@ -1575,3 +1579,15 @@ def test_lk_lambda_zero_decay_full_scale_reduces_to_soft_ce_plus_zero_weighting(
     loss = trainer._lk_step_loss(logits, target_probs, position_mask)
     expected = masked_soft_cross_entropy(logits=logits, target_probs=target_probs, position_mask=position_mask)
     torch.testing.assert_close(loss, expected)
+
+
+def test_lk_lambda_zero_supervision_step_is_zero():
+    """A step with no supervised positions must contribute 0 like the soft-CE
+    path, not the gradient-free constant (1 - lk_kl_scale)."""
+    draft = _build_tiny_draft_model()
+    trainer = _lk_trainer(draft, "lambda", lk_kl_scale=0.3)
+    logits = torch.randn(1, 4, draft.config.draft_vocab_size)
+    target_probs = torch.softmax(torch.randn(1, 4, draft.config.draft_vocab_size), dim=-1)
+    position_mask = torch.zeros(1, 4, 1, dtype=torch.bool)
+    loss = trainer._lk_step_loss(logits, target_probs, position_mask)
+    torch.testing.assert_close(loss, torch.zeros(()))
