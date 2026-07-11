@@ -67,13 +67,15 @@ print(sample.keys())  # input_ids / labels / attention_mask (and ___PAD_TOKEN_ID
 Install the basic Delta Lake reader:
 
 ```bash
-pip install deltalake
+uv venv
+source .venv/bin/activate
+uv pip install "deltalake"
 ```
 
 For **Unity Catalog access outside of Spark** (optional), install:
 
 ```bash
-pip install databricks-sql-connector
+uv pip install "databricks-sql-connector"
 ```
 
 ### Local Delta Table

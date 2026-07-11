@@ -105,6 +105,8 @@ The `cli` optional dependency extra adds NeMo Run. PyYAML is declared in both
 the package's base dependencies and the `cli` extra:
 
 ```bash
+uv venv
+source .venv/bin/activate
 uv pip install "nemo-automodel[cli]"
 ```
 
@@ -119,14 +121,16 @@ imageio-ffmpeg) are now opt-in extras, installed neither by default nor in the
 Docker container.
 
 ```bash
-pip install "nemo-automodel[vlm,vlm-media]"              # VLM video / Qwen / Mistral
-pip install "nemo-automodel[diffusion,diffusion-media]"  # diffusion preprocessing / export
+uv venv
+source .venv/bin/activate
+uv pip install "nemo-automodel[vlm,vlm-media]"              # VLM video / Qwen / Mistral
+uv pip install "nemo-automodel[diffusion,diffusion-media]"  # diffusion preprocessing / export
 ```
 
 Two consequences when upgrading:
 
 - `[vlm]` alone no longer trains Qwen2.5-VL, Qwen3-Omni, or Mistral VLMs — add `vlm-media`.
-- `[all]` no longer includes the media extras — add them with `pip install nemo-automodel[media]`.
+- `[all]` no longer includes the media extras — add them with `uv pip install "nemo-automodel[media]"` in the activated environment.
 
 See the [Installation Guide](/get-started/installation#media-extras-video--image-decode) for details.
 

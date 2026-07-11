@@ -14,7 +14,7 @@ In this guide, we will use an interactive environment to install NeMo AutoModel 
 cd /path/to/workspace/ # specify to your path as needed.
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel/
-pip install -e ".[all]"    # installs NeMo AutoModel + optional extras
+uv sync --locked --all-groups --extra all
 ```
 
 <Note>
@@ -415,21 +415,11 @@ Scale **width/depth**, `batch_size`, or `seq_len` as needed - the recipe is mode
 ## Launch Training
 
 ```bash
-# Single-GPU run (good for local testing)
-python examples/llm_pretrain/pretrain.py \
-  --config examples/llm_pretrain/nanogpt_pretrain.yaml
+# Single GPU
+uv run automodel examples/llm_pretrain/nanogpt_pretrain.yaml
 
-# Multi-GPU (e.g., 8x H100)
-torchrun --standalone --nproc-per-node 8 \
-  examples/llm_pretrain/pretrain.py \
-  --config examples/llm_pretrain/nanogpt_pretrain.yaml
-
-# Using the automodel CLI:
-# single-GPU
-automodel examples/llm_pretrain/nanogpt_pretrain.yaml
-
-# multi-GPU (8 GPUs)
-automodel --nproc-per-node 8 examples/llm_pretrain/nanogpt_pretrain.yaml
+# Multi-GPU (8 GPUs)
+uv run automodel examples/llm_pretrain/nanogpt_pretrain.yaml --nproc-per-node 8
 ```
 <Tip>
 Adjust the `distributed` section in the YAML config to change between DDP, FSDP2, etc.

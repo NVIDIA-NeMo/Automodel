@@ -14,7 +14,7 @@ This guide shows how to train a sequence classification model using the `TrainFi
 Use the example config for GLUE MRPC with RoBERTa-large + LoRA:
 
 ```bash
-python3 examples/llm_seq_cls/seq_cls.py --config examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
+automodel examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
 ```
 
 - Loads `roberta-large` with `num_labels: 2`
@@ -112,9 +112,9 @@ optimizer:
 - `dim` (rank), `alpha`, `dropout`: tune per model/compute budget. Values `dim=8, alpha=16, dropout=0.1` are a good starting point for RoBERTa.
 - The recipe automatically applies the adapters; no additional code changes are required.
 
-## Running with torchrun
+## Running on Multiple GPUs
 
 ```bash
-torchrun --nproc-per-node=2 examples/llm_seq_cls/seq_cls.py --config examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
+automodel examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml --nproc-per-node 2
 ```
 You can adjust the number of GPUs as necessary using the `--nproc-per-node` knob.

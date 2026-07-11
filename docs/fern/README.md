@@ -47,9 +47,9 @@ make docs-check
 | Resource | Link |
 |---|---|
 | Fern docs (overview, writing, configuration) | https://buildwithfern.com/learn/docs |
-| Fern CLI reference | https://buildwithfern.com/learn/cli |
+| Fern CLI reference | https://buildwithfern.com/learn/cli-api-reference/cli-reference/commands |
 | MDX components (Cards, Callouts, Tabs, …) | https://buildwithfern.com/learn/docs/writing-content/components |
-| Frontmatter fields | https://buildwithfern.com/learn/docs/writing-content/frontmatter |
+| Frontmatter fields | https://buildwithfern.com/learn/docs/configuration/page-level-settings |
 | Versioning | https://buildwithfern.com/learn/docs/building-your-docs/versioning |
 | Redirects | https://buildwithfern.com/learn/docs/configuration/site-level-settings#redirects-configuration |
 | `libraries:` (Python autodoc) | https://buildwithfern.com/learn/docs/api-references/library-reference |
