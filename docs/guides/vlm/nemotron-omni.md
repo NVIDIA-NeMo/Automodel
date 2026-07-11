@@ -57,14 +57,16 @@ The **base model** produces free-form descriptions. After fine-tuning, it output
 ```bash
 # Inside the NeMo AutoModel container (26.04+):
 cd /opt/Automodel
+uv pip install --python /opt/venv/bin/python ".[vlm-media]"
 
 # Or from a source checkout:
-git clone -b nemotron-omni ssh://git@gitlab-master.nvidia.com:12051/huiyingl/automodel-omni.git
-cd automodel-omni
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv sync --locked --all-groups --all-extras
 ```
 
 <Note>
-NemotronOmni requires `mamba_ssm` and `causal_conv1d` (the `cuda` extra, pre-built in the NeMo AutoModel container) plus `decord` for video reading. Since the FFmpeg media split, `decord` is **no longer bundled in the container** — add it via the `vlm-media` extra: `pip install "nemo-automodel[vlm-media]"`.
+NemotronOmni requires `mamba_ssm` and `causal_conv1d` (the `cuda` extra, pre-built in the NeMo AutoModel container) plus `decord` for video reading. Since the FFmpeg media split, `decord` is **no longer bundled in the container**; the setup commands above add the required `vlm-media` dependencies.
 </Note>
 
 ---
