@@ -164,6 +164,24 @@ def _compute_target_distribution(
     return target_probs, position_mask
 
 
+_LK_LOSS_TYPES = ("alpha", "lambda")
+
+
+def _masked_mean(values: torch.Tensor, position_mask: torch.Tensor) -> torch.Tensor:
+    """Mean of ``values`` over the supervised positions.
+
+    Args:
+        values: Tensor of shape ``[batch, sequence]``; a per-position quantity.
+        position_mask: Bool tensor of shape ``[batch, sequence, 1]``; True where
+            the position is supervised.
+
+    Returns:
+        Scalar tensor; the masked mean (zero when no position is supervised).
+    """
+    mask = position_mask.squeeze(-1).to(values.dtype)
+    return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
+
 @dataclass
 class Eagle3StepMetrics:
     """Aggregated metrics from one EAGLE-3 training step.
@@ -224,8 +242,15 @@ class Eagle3TrainerModule(nn.Module):
         ttt_steps: int,
         cp_group=None,
         cp_zigzag: bool = False,
+        lk_loss_type: str | None = None,
+        lk_kl_scale: float = 1.0,
+        lk_kl_decay: float = 3.0,
     ):
         super().__init__()
+        if lk_loss_type is not None and lk_loss_type not in _LK_LOSS_TYPES:
+            raise ValueError(f"lk_loss_type must be one of {_LK_LOSS_TYPES} or None, got {lk_loss_type!r}")
+        if lk_kl_scale < 0 or lk_kl_decay < 0:
+            raise ValueError(f"lk_kl_scale and lk_kl_decay must be >= 0, got {lk_kl_scale} and {lk_kl_decay}")
         # The forward pass weighs each TTT step by ``0.8 ** i`` and divides
         # the running loss by ``sum_{i=0}^{ttt_steps-1} 0.8 ** i``. With
         # ``ttt_steps <= 0`` the loop never runs and the divisor is zero,
@@ -249,6 +274,75 @@ class Eagle3TrainerModule(nn.Module):
         # Whether the cp sharding is the load-balanced zig-zag layout (selects the
         # matching two-neighbour boundary shift) vs the contiguous layout.
         self.cp_zigzag = cp_zigzag
+        # LK loss (arXiv:2602.23881): replace the per-step soft-CE with a direct
+        # acceptance-rate objective. None keeps the standard soft-CE loss;
+        # "alpha" is the pure acceptance likelihood -mean(log alpha); "lambda"
+        # adaptively mixes soft-CE with (1 - alpha) via
+        # kl_weight = lk_kl_scale * exp(-lk_kl_decay * alpha.detach()).
+        self.lk_loss_type = lk_loss_type
+        self.lk_kl_scale = float(lk_kl_scale)
+        self.lk_kl_decay = float(lk_kl_decay)
+
+    def _lk_step_loss(
+        self,
+        logits: torch.Tensor,
+        target_probs: torch.Tensor,
+        position_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """One TTT step of the LK acceptance-rate loss (arXiv:2602.23881).
+
+        The per-token expected acceptance under speculative sampling is the
+        min-overlap of the two distributions, ``alpha = sum_v min(p_target, p_draft)``,
+        computed over the draft vocabulary (both inputs already live there).
+
+        * ``"alpha"``: the pure acceptance likelihood ``-mean(log alpha)``; the log
+          is taken per token before the masked mean, with zero-acceptance tokens
+          contributing zero (they carry no usable gradient direction).
+        * ``"lambda"``: the adaptive hybrid
+          ``kl_weight * soft_ce + (1 - kl_weight) * (1 - mean(alpha))`` with
+          ``kl_weight = lk_kl_scale * exp(-lk_kl_decay * mean(alpha).detach())``;
+          the weight is detached so gradients flow only through the two terms, and
+          training shifts from distillation toward direct acceptance as the draft
+          improves.
+
+        Under CP every masked mean is renormalized over the full sequence via
+        :func:`_cp_global_step_loss`, so the mixing weight and the loss match the
+        single-rank run.
+
+        Args:
+            logits: Tensor of shape ``[batch, sequence, draft_vocab]``; draft logits.
+            target_probs: Tensor of shape ``[batch, sequence, draft_vocab]``; target
+                distribution restricted to the draft vocabulary.
+            position_mask: Bool tensor of shape ``[batch, sequence, 1]``; True where
+                the position is supervised this step.
+
+        Returns:
+            Scalar loss tensor for this TTT step.
+        """
+        draft_probs = torch.softmax(logits.float(), dim=-1)
+        accept = torch.minimum(target_probs, draft_probs).sum(dim=-1)  # [B, S]
+
+        if self.lk_loss_type == "alpha":
+            # clamp_min inside the log keeps the discarded branch of the where
+            # from emitting an inf that would NaN the backward at alpha == 0.
+            safe_log = torch.log(accept.clamp_min(torch.finfo(accept.dtype).tiny))
+            log_accept = torch.where(accept > 0, safe_log, torch.zeros_like(accept))
+            log_acceptance = _masked_mean(log_accept, position_mask)
+            if self.cp_group is not None:
+                log_acceptance = _cp_global_step_loss(log_acceptance, position_mask, self.cp_group)
+            return -log_acceptance
+
+        acceptance = _masked_mean(accept, position_mask)
+        soft_ce = masked_soft_cross_entropy(
+            logits=logits,
+            target_probs=target_probs,
+            position_mask=position_mask,
+        )
+        if self.cp_group is not None:
+            acceptance = _cp_global_step_loss(acceptance, position_mask, self.cp_group)
+            soft_ce = _cp_global_step_loss(soft_ce, position_mask, self.cp_group)
+        kl_weight = self.lk_kl_scale * torch.exp(-self.lk_kl_decay * acceptance.detach())
+        return kl_weight * soft_ce + (1.0 - kl_weight) * (1.0 - acceptance)
 
     def forward(
         self,
@@ -367,16 +461,19 @@ class Eagle3TrainerModule(nn.Module):
                 step_position_mask = cur_position_mask & in_doc.unsqueeze(-1)
                 chain_valid = chain_valid & in_doc
 
-            step_loss = masked_soft_cross_entropy(
-                logits=logits,
-                target_probs=cur_target_probs,
-                position_mask=step_position_mask,
-            )
-            # Under CP each rank sees only its sequence shard; renormalize the step
-            # loss over the full cp sequence so the value and gradient match the
-            # single-GPU run (the draft grads are then summed across cp by the recipe).
-            if self.cp_group is not None:
-                step_loss = _cp_global_step_loss(step_loss, step_position_mask, self.cp_group)
+            if self.lk_loss_type is None:
+                step_loss = masked_soft_cross_entropy(
+                    logits=logits,
+                    target_probs=cur_target_probs,
+                    position_mask=step_position_mask,
+                )
+                # Under CP each rank sees only its sequence shard; renormalize the step
+                # loss over the full cp sequence so the value and gradient match the
+                # single-GPU run (the draft grads are then summed across cp by the recipe).
+                if self.cp_group is not None:
+                    step_loss = _cp_global_step_loss(step_loss, step_position_mask, self.cp_group)
+            else:
+                step_loss = self._lk_step_loss(logits, cur_target_probs, step_position_mask)
             running_loss = running_loss + step_loss * (0.8**step_idx)
 
             valid_mask = step_position_mask.squeeze(-1).bool()
