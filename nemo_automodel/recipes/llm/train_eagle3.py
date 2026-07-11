@@ -51,6 +51,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
+from nemo_automodel.components.speculative.decode_eval import DecodeEvalRunner, resolve_decode_eval_config
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
     HFEagle3TargetModel,
@@ -663,6 +664,62 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 self.cfg.to_dict(),
                 default_name="eagle3_" + str(target_path).rstrip("/").split("/")[-1],
             )
+
+        # Optional periodic real-acceptance-length eval (rank 0 only): snapshot
+        # the current draft on a cadence and measure accept_length inside an
+        # actual vLLM speculative server on a reserved GPU, asynchronously to
+        # training. Logged as train/tau_real next to the simulated tau_sim.
+        self.decode_eval_runner = None
+        decode_eval_config = resolve_decode_eval_config(
+            recipe_cfg,
+            default_target=str(target_path),
+            default_input_data=str(recipe_cfg.train_data_path),
+            output_dir=str(self.output_dir),
+        )
+        if decode_eval_config is not None:
+            if getattr(self, "peft_config", None) is not None:
+                raise ValueError(
+                    "decode_eval is not supported with peft: the draft snapshot would need an adapter "
+                    "merge per eval; bench a merged checkpoint offline instead."
+                )
+            if self.dist_env.is_main:
+                self.decode_eval_runner = DecodeEvalRunner(decode_eval_config)
+
+    def _maybe_run_decode_eval(self) -> None:
+        """Rank-0 log-point hook: collect finished decode-eval results, launch the next one when due.
+
+        Runs outside any collective path (pure subprocess/file I/O), so only
+        rank 0 calls it. Results are logged at the CURRENT optimizer step (wandb
+        steps must not go backwards); ``train/tau_real_step`` records the step
+        the evaluated snapshot was actually taken at.
+        """
+        # getattr: bare recipe objects in the loop unit tests skip setup().
+        runner = getattr(self, "decode_eval_runner", None)
+        if runner is None:
+            return
+        for result in runner.collect():
+            accept_length = result.get("accept_length", None)
+            logger.info(
+                "decode_eval: step=%s accept_length=%s acceptance_rate=%s completed=%s failed=%s",
+                result.get("step"),
+                "n/a" if accept_length is None else f"{accept_length:.4f}",
+                result.get("acceptance_rate"),
+                result.get("completed"),
+                result.get("failed"),
+            )
+            if accept_length is not None:
+                self._wandb_log(
+                    {
+                        "train/tau_real": accept_length,
+                        "train/tau_real_step": result.get("step"),
+                        "train/tau_real_acceptance_rate": result.get("acceptance_rate"),
+                    },
+                    step=self.runtime.global_step,
+                )
+        try:
+            runner.maybe_launch(self.runtime.global_step, self.draft_model)
+        except OSError:
+            logger.exception("decode_eval: launch failed at step %d; training continues", self.runtime.global_step)
 
     def _setup_online_target(self, recipe_cfg, target_path, target_config):
         """Live path: load the target model and build the live dataloader.
@@ -1540,6 +1597,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         """
         if getattr(self, "target_wrapper", None) is not None:
             _best_effort("closing target backend", self.target_wrapper.close)
+        if getattr(self, "decode_eval_runner", None) is not None:
+            _best_effort("collecting final decode-eval results", self._maybe_run_decode_eval)
+            _best_effort("stopping decode-eval worker", self.decode_eval_runner.shutdown)
         if getattr(self, "wandb_run", None) is not None:
             _best_effort("finishing W&B run", self.wandb_run.finish)
 
@@ -1652,6 +1712,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                             if tau_sim is not None:
                                 wandb_data["train/tau_sim"] = tau_sim
                             self._wandb_log(wandb_data, step=self.runtime.global_step)
+                            self._maybe_run_decode_eval()
                         running_loss.zero_()
                         running_acc.zero_()
                         if running_step_prefix is not None:
