@@ -37,7 +37,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
     SaveConsolidatedMode,
-    _checkpoint_metadata_uses_split_moe_experts,
     _divide_keys_by_size,
     _equally_divide_layers,
     _is_custom_model,
@@ -443,30 +442,6 @@ def test_summarize_state_dict_key_diff_limits_examples():
     assert summary["missing_count"] == 4
     assert summary["unexpected_count"] == 1
     assert summary["missing_examples"] == ["a", "b"]
-
-
-@pytest.mark.parametrize(
-    ("metadata_keys", "expected"),
-    [
-        (
-            {
-                "model.layers.0.mlp.experts.0.gate_proj.weight",
-                "model.layers.0.mlp.experts.0.up_proj.weight",
-                "model.layers.0.mlp.experts.0.down_proj.weight",
-            },
-            True,
-        ),
-        (
-            {
-                "model.layers.0.mlp.experts.gate_up_proj",
-                "model.layers.0.mlp.experts.down_proj",
-            },
-            False,
-        ),
-    ],
-)
-def test_checkpoint_metadata_detects_split_moe_experts(metadata_keys, expected):
-    assert _checkpoint_metadata_uses_split_moe_experts(metadata_keys) is expected
 
 
 # =============================================================================
@@ -1013,7 +988,7 @@ class TestLoadModelCustomModelGuard:
             patch(
                 "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
                 side_effect=lambda m, sd, **kw: sd,
-            ) as mock_adapt_to_hf,
+            ),
             patch(
                 "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
                 side_effect=lambda m, sd, **kw: sd,
@@ -1031,79 +1006,6 @@ class TestLoadModelCustomModelGuard:
         mock_load_full.assert_not_called()
         # DCP path should be used
         mock_dcp_load.assert_called_once()
-        assert mock_adapt_to_hf.call_args.kwargs["source_checkpoint"] is False
-
-    @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
-    @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")
-    @patch("nemo_automodel.components.checkpoint.checkpointing._load_full_state_dict_into_model")
-    @pytest.mark.parametrize(
-        ("metadata_keys", "expected_source_checkpoint"),
-        [
-            (
-                {
-                    "model.layers.0.mlp.experts.0.gate_proj.weight",
-                    "model.layers.0.mlp.experts.0.up_proj.weight",
-                    "model.layers.0.mlp.experts.0.down_proj.weight",
-                },
-                True,
-            ),
-            (
-                {
-                    "model.layers.0.mlp.experts.gate_up_proj",
-                    "model.layers.0.mlp.experts.down_proj",
-                },
-                False,
-            ),
-        ],
-    )
-    def test_state_dict_adapter_source_checkpoint_follows_metadata(
-        self,
-        mock_load_full,
-        mock_load_hf,
-        mock_is_st,
-        metadata_keys,
-        expected_source_checkpoint,
-    ):
-        checkpointer = self._make_checkpointer()
-
-        CustomModel = type("CustomModel", (torch.nn.Module,), {})
-        CustomModel.__module__ = "nemo_automodel.components.models.qwen3_moe.model"
-        model = CustomModel()
-        model.layer = torch.nn.Linear(4, 4)
-        model.state_dict_adapter = object()
-
-        mock_state_dict = {
-            "model.layers.0.mlp.experts.gate_and_up_projs": torch.randn(4, 64, 128),
-            "model.layers.0.mlp.experts.down_projs": torch.randn(4, 64, 64),
-        }
-
-        with (
-            patch("os.path.exists", return_value=True),
-            patch("torch.distributed.is_initialized", return_value=False),
-            patch.dict("os.environ", {"WORLD_SIZE": "2"}),
-            patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as MockModelState,
-            patch(
-                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
-                side_effect=lambda m, sd, **kw: sd,
-            ) as mock_adapt_to_hf,
-            patch(
-                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
-                side_effect=lambda m, sd, **kw: sd,
-            ),
-            patch(
-                "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
-                return_value=metadata_keys,
-            ),
-            patch.object(checkpointer, "_do_load", return_value=mock_state_dict),
-            patch.object(checkpointer, "_get_storage_reader", return_value=None),
-        ):
-            mock_model_state = MockModelState.return_value
-            mock_model_state.model = [model]
-            mock_model_state.state_dict.return_value = mock_state_dict
-
-            checkpointer.load_model(model, model_path="/fake/path", is_init_step=True)
-
-        assert mock_adapt_to_hf.call_args.kwargs["source_checkpoint"] is expected_source_checkpoint
 
     @patch("nemo_automodel.components.checkpoint.checkpointing._is_safetensors_checkpoint", return_value=True)
     @patch("nemo_automodel.components.checkpoint.checkpointing._load_hf_checkpoint_preserving_dtype")

@@ -12,15 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_moe.state_dict_adapter import Qwen3MoeStateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
+from nemo_automodel.components.models.common import BackendConfig
+
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 
 @pytest.fixture
@@ -83,9 +86,7 @@ def adapter(config, moe_config, backend_config):
 
 class TestInitialization:
     def test_sets_expected_attributes(self, config, moe_config, backend_config):
-        adapter = Qwen3MoeStateDictAdapter(
-            config=config, moe_config=moe_config, backend=backend_config, dtype=torch.float16
-        )
+        adapter = Qwen3MoeStateDictAdapter(config=config, moe_config=moe_config, backend=backend_config, dtype=torch.float16)
 
         assert adapter.config is config
         assert adapter.moe_config is moe_config
@@ -95,48 +96,19 @@ class TestInitialization:
 
 
 class TestToHF:
-    def test_exports_grouped_expert_tensors(self, adapter):
-        gate_and_up = torch.randn(4, 64, 128)
-        down = torch.randn(4, 64, 64)
+    def test_merges_experts_into_individual_tensors(self, adapter):
         state_dict = {
-            "model.layers.0.mlp.experts.gate_and_up_projs": gate_and_up,
-            "model.layers.0.mlp.experts.down_projs": down,
+            "model.layers.0.mlp.experts.gate_and_up_projs": torch.randn(4, 64, 128),
+            "model.layers.0.mlp.experts.down_projs": torch.randn(4, 64, 64),
         }
 
         out = adapter.to_hf(state_dict)
 
         keys = set(out.keys())
-        assert "model.layers.0.mlp.experts.gate_up_proj" in keys
-        assert "model.layers.0.mlp.experts.down_proj" in keys
-        torch.testing.assert_close(out["model.layers.0.mlp.experts.gate_up_proj"], gate_and_up.transpose(1, 2))
-        torch.testing.assert_close(out["model.layers.0.mlp.experts.down_proj"], down.transpose(1, 2))
+        assert "model.layers.0.mlp.experts.0.gate_proj.weight" in keys
+        assert "model.layers.0.mlp.experts.0.up_proj.weight" in keys
+        assert "model.layers.0.mlp.experts.0.down_proj.weight" in keys
         assert not any(k.endswith("gate_and_up_projs") or k.endswith("down_projs") for k in keys)
-
-    def test_explicit_legacy_mode_exports_split_expert_tensors(self, adapter):
-        state_dict = {
-            "model.layers.0.mlp.experts.gate_and_up_projs": torch.randn(4, 64, 128),
-            "model.layers.0.mlp.experts.down_projs": torch.randn(4, 64, 64),
-        }
-
-        out = adapter.to_hf(state_dict, v4_compatible=True)
-
-        keys = set(out.keys())
-        assert "model.layers.0.mlp.experts.0.gate_proj.weight" in keys
-        assert "model.layers.0.mlp.experts.0.up_proj.weight" in keys
-        assert "model.layers.0.mlp.experts.0.down_proj.weight" in keys
-
-    def test_source_checkpoint_load_exports_split_expert_tensors(self, adapter):
-        state_dict = {
-            "model.layers.0.mlp.experts.gate_and_up_projs": torch.randn(4, 64, 128),
-            "model.layers.0.mlp.experts.down_projs": torch.randn(4, 64, 64),
-        }
-
-        out = adapter.to_hf(state_dict, source_checkpoint=True)
-
-        keys = set(out.keys())
-        assert "model.layers.0.mlp.experts.0.gate_proj.weight" in keys
-        assert "model.layers.0.mlp.experts.0.up_proj.weight" in keys
-        assert "model.layers.0.mlp.experts.0.down_proj.weight" in keys
 
     def test_respects_exclude_regex(self, adapter):
         state_dict = {
@@ -152,8 +124,18 @@ class TestToHF:
 class TestFromHF:
     def test_detects_model_prefix(self, adapter):
         hf_state = {
-            "model.layers.0.mlp.experts.gate_up_proj": torch.randn(4, 128, 64),
-            "model.layers.0.mlp.experts.down_proj": torch.randn(4, 64, 64),
+            "model.layers.0.mlp.experts.0.gate_proj.weight": torch.randn(64, 32),
+            "model.layers.0.mlp.experts.0.up_proj.weight": torch.randn(64, 32),
+            "model.layers.0.mlp.experts.0.down_proj.weight": torch.randn(32, 64),
+            "model.layers.0.mlp.experts.1.gate_proj.weight": torch.randn(64, 32),
+            "model.layers.0.mlp.experts.1.up_proj.weight": torch.randn(64, 32),
+            "model.layers.0.mlp.experts.1.down_proj.weight": torch.randn(32, 64),
+            "model.layers.0.mlp.experts.2.gate_proj.weight": torch.randn(64, 32),
+            "model.layers.0.mlp.experts.2.up_proj.weight": torch.randn(64, 32),
+            "model.layers.0.mlp.experts.2.down_proj.weight": torch.randn(32, 64),
+            "model.layers.0.mlp.experts.3.gate_proj.weight": torch.randn(64, 32),
+            "model.layers.0.mlp.experts.3.up_proj.weight": torch.randn(64, 32),
+            "model.layers.0.mlp.experts.3.down_proj.weight": torch.randn(32, 64),
         }
 
         adapter.from_hf(hf_state)
@@ -171,19 +153,6 @@ class TestFromHF:
         # Router keys remain untouched because Qwen3 MoE uses pure MoE layers
         assert "model.layers.0.mlp.router.weight" in out
         assert "model.layers.0.mlp.router.bias" in out
-
-    def test_converts_grouped_expert_weights(self, adapter):
-        gate_up = torch.randn(4, 128, 64)
-        down = torch.randn(4, 64, 64)
-        hf_state = {
-            "model.layers.0.mlp.experts.gate_up_proj": gate_up,
-            "model.layers.0.mlp.experts.down_proj": down,
-        }
-
-        out = adapter.from_hf(hf_state)
-
-        torch.testing.assert_close(out["model.layers.0.mlp.experts.gate_and_up_projs"], gate_up.transpose(1, 2))
-        torch.testing.assert_close(out["model.layers.0.mlp.experts.down_projs"], down.transpose(1, 2))
 
     def test_combines_expert_weights_when_all_available(self, adapter):
         hf_state = {
@@ -214,44 +183,64 @@ class TestConvertSingleTensorToHf:
         tensor = torch.randn(4, 64, 128)
         fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
 
-        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
+            mock_convert.return_value = [
+                ("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(64, 64)),
+                ("model.layers.0.mlp.experts.0.up_proj.weight", torch.randn(64, 64)),
+            ]
 
-        assert len(result) == 1
-        assert result[0][0] == "model.layers.0.mlp.experts.gate_up_proj"
-        torch.testing.assert_close(result[0][1], tensor.transpose(1, 2))
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+            mock_convert.assert_called_once_with(fqn, tensor)
+            assert len(result) == 2
+            assert result[0][0] == "model.layers.0.mlp.experts.0.gate_proj.weight"
+            assert result[1][0] == "model.layers.0.mlp.experts.0.up_proj.weight"
 
     def test_non_expert_tensor_conversion(self, adapter):
         tensor = torch.randn(64, 64)
         fqn = "model.layers.0.attention.weight"
 
-        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
+            mock_convert.return_value = None
 
-        assert len(result) == 1
-        assert result[0][0] == fqn
-        assert torch.equal(result[0][1], tensor)
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+
+            assert len(result) == 1
+            assert result[0][0] == fqn
+            assert torch.equal(result[0][1], tensor)
 
     def test_exclude_key_regex(self, adapter):
         tensor = torch.randn(64, 64)
         fqn = "exclude_this.weight"
 
-        result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
 
-        assert len(result) == 0
+            assert len(result) == 0
 
     def test_expert_tensor_with_exclude_regex(self, adapter):
         tensor = torch.randn(4, 64, 128)
         fqn = "model.layers.0.mlp.experts.gate_and_up_projs"
 
-        result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r".*gate_up_proj")
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts') as mock_convert:
+            mock_convert.return_value = [
+                ("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(64, 64)),
+                ("exclude_me.weight", torch.randn(64, 64)),
+            ]
 
-        assert len(result) == 0
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=r"exclude.*")
+
+            assert len(result) == 1
+            assert result[0][0] == "model.layers.0.mlp.experts.0.gate_proj.weight"
+            assert "exclude_me.weight" not in [k for k, _ in result]
 
     def test_preserves_tensor_identity_for_non_experts(self, adapter):
         tensor = torch.randn(64, 64)
         fqn = "model.layers.0.self_attn.q_proj.weight"
 
-        result = adapter.convert_single_tensor_to_hf(fqn, tensor)
+        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+            result = adapter.convert_single_tensor_to_hf(fqn, tensor)
 
-        assert len(result) == 1
-        assert result[0][0] == fqn
-        assert result[0][1] is tensor
+            assert len(result) == 1
+            assert result[0][0] == fqn
+            assert result[0][1] is tensor
