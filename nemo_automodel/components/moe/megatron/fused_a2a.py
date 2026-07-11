@@ -423,7 +423,21 @@ class DeepEPV2FusedDispatch(torch.autograd.Function):
         async_finish=False,
         allocate_on_comm_stream=False,
     ):
-        """Forward pass of DeepEP V2 fused dispatch."""
+        """Forward pass of DeepEP V2 fused dispatch.
+
+        Args:
+            x: Input tokens [num_max_tokens_per_rank, hidden_size], hidden_size divisible by 256
+            token_indices: Routed expert ids [num_max_tokens_per_rank, topk]
+            token_probs: Routing probabilities [num_max_tokens_per_rank, topk]
+            num_experts: Number of experts
+            group: Process group
+            async_finish: Overlap communication with the compute stream
+            allocate_on_comm_stream: Allocate outputs on the communication stream
+
+        Returns:
+            Tuple ``(recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)``
+            where ``recv_x`` is ``[num_recv_tokens, hidden_size]`` packed per local expert.
+        """
         num_topk = token_indices.shape[1]
         num_max_tokens_per_rank = x.size(0)
         if _deepep_v2_buffer is None:
@@ -463,7 +477,19 @@ class DeepEPV2FusedDispatch(torch.autograd.Function):
         grad_tokens_per_expert,
         grad_handle,
     ):
-        """Backward pass of DeepEP V2 fused dispatch."""
+        """Backward pass of DeepEP V2 fused dispatch.
+
+        Args:
+            grad_output: Gradient w.r.t. ``recv_x`` [num_recv_tokens, hidden_size]
+            grad_token_indices: Unused (indices are non-differentiable)
+            grad_token_probs: Gradient w.r.t. ``recv_token_probs`` [num_recv_tokens, topk]
+            grad_tokens_per_expert: Unused (counts are non-differentiable)
+            grad_handle: Unused (handle is non-differentiable)
+
+        Returns:
+            Gradients aligned to the forward inputs; ``grad_x`` is
+            ``[num_max_tokens_per_rank, hidden_size]``, the rest are ``None``.
+        """
         handle = _restore_deepep_v2_handle(ctx)
         grad_x, grad_token_probs, after_event = _deepep_v2_buffer.combine(
             grad_output.contiguous(),
@@ -499,7 +525,19 @@ class DeepEPV2FusedCombine(torch.autograd.Function):
         async_finish=False,
         allocate_on_comm_stream=False,
     ):
-        """Forward pass of DeepEP V2 fused combine."""
+        """Forward pass of DeepEP V2 fused combine.
+
+        Args:
+            x: Per-expert output tokens [num_recv_tokens, hidden_size]
+            group: Process group (unused; routing is carried by ``handle``)
+            handle: Communication handle from the paired dispatch
+            async_finish: Overlap communication with the compute stream
+            allocate_on_comm_stream: Allocate outputs on the communication stream
+
+        Returns:
+            Tuple ``(combined_x, None)`` where ``combined_x`` is
+            ``[num_max_tokens_per_rank, hidden_size]`` restored to the source ranks.
+        """
         del group
         combined_x, _, after_event = _deepep_v2_buffer.combine(
             x.contiguous(),
@@ -519,7 +557,16 @@ class DeepEPV2FusedCombine(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output, _grad_event=None):
-        """Backward pass of DeepEP V2 fused combine."""
+        """Backward pass of DeepEP V2 fused combine.
+
+        Args:
+            grad_output: Gradient w.r.t. ``combined_x`` [num_max_tokens_per_rank, hidden_size]
+            _grad_event: Unused (paired with the non-differentiable second output)
+
+        Returns:
+            Gradients aligned to the forward inputs; ``grad_x`` is
+            ``[num_recv_tokens, hidden_size]``, the rest are ``None``.
+        """
         handle = _restore_deepep_v2_handle(ctx)
         grad_x, _, _, _, after_event = _deepep_v2_buffer.dispatch(
             grad_output.contiguous(),
