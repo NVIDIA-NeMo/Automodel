@@ -152,6 +152,11 @@ def test_runner_launches_on_cadence_and_skips_while_running(tmp_path, monkeypatc
     assert len(popen_calls) == 2
     argv = popen_calls[0][1]
     assert "--step" in argv and argv[argv.index("--step") + 1] == "10"
+    config_json = argv[argv.index("--config-json") + 1]
+    with open(config_json) as f:
+        sidecar = json.load(f)
+    assert sidecar["cuda_visible_devices"] == "7"
+    assert sidecar["target_model"] == "/models/target"
     assert popen_calls[0][2]["env"]["CUDA_VISIBLE_DEVICES"] == "7"
     assert popen_calls[0][2]["start_new_session"] is True
 
@@ -185,16 +190,8 @@ def test_serve_argv_builds_speculative_server_command(tmp_path, monkeypatch):
         return ["python", "-m", "vllm.entrypoints.openai.api_server"]
 
     monkeypatch.setattr("nemo_automodel.components.speculative.serve_vllm.build_vllm_argv", _fake_build)
-    args = SimpleNamespace(
-        target="/models/target",
-        draft=str(tmp_path / "step_10"),
-        num_speculative_tokens=None,
-        port=8199,
-        gpu_memory_utilization=0.8,
-        max_model_len=None,
-        trust_remote_code=False,
-    )
-    argv = _serve_argv(args)
+    cfg = _config(tmp_path, port=8199)
+    argv = _serve_argv(cfg, str(tmp_path / "step_10"))
     assert argv[0] == "python"
     assert seen["target"] == "/models/target"
     assert seen["draft"] == str(tmp_path / "step_10")
@@ -202,28 +199,23 @@ def test_serve_argv_builds_speculative_server_command(tmp_path, monkeypatch):
     assert seen["host"] == "127.0.0.1"
 
 
-def test_bench_args_carry_workload_settings():
-    args = SimpleNamespace(
-        target="/models/target",
-        input_data="/data/train.jsonl",
-        num_prompts=16,
-        concurrency=4,
-        max_new_tokens=128,
-        temperature=0.0,
-        top_p=1.0,
-        messages_column="messages",
-        prompt_column=None,
-        split="train",
-        dataset_name=None,
-        shuffle_seed=42,
-        timeout_s=600.0,
-    )
-    bench = _bench_args(args, "http://127.0.0.1:8199")
+def test_bench_args_carry_workload_settings(tmp_path):
+    cfg = _config(tmp_path, num_prompts=16, concurrency=4, max_new_tokens=128, timeout_s=600.0)
+    bench = _bench_args(cfg, "http://127.0.0.1:8199")
     assert bench.server == "http://127.0.0.1:8199"
     assert bench.model == "/models/target"
     assert bench.num_prompts == 16
     assert bench.baseline_server is None
     assert bench.prompt_context_column is None
+
+
+def test_config_json_roundtrips_through_the_worker_boundary(tmp_path):
+    """The sidecar the launcher writes must reconstruct the exact config."""
+    import dataclasses
+
+    cfg = _config(tmp_path, num_prompts=7, prompt_column="question")
+    rebuilt = DecodeEvalConfig(**json.loads(json.dumps(dataclasses.asdict(cfg))))
+    assert rebuilt == cfg
 
 
 def test_recipe_hook_collects_logs_and_launches(monkeypatch):

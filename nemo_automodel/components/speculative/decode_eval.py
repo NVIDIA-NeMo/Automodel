@@ -46,12 +46,13 @@ import subprocess
 import sys
 import time
 import urllib.request
-from dataclasses import dataclass
 from argparse import Namespace
+from dataclasses import asdict, dataclass, fields
 
 logger = logging.getLogger(__name__)
 
 _RESULT_FILENAME = "result.json"
+_CONFIG_FILENAME = "decode_eval_config.json"
 _WORKER_LOG_FILENAME = "worker.log"
 
 # torchrun / elastic / rank state that must NOT leak into the worker: vLLM would
@@ -113,7 +114,8 @@ def resolve_decode_eval_config(recipe_cfg, *, default_target: str, default_input
     Returns ``None`` when the block is absent or ``every_steps`` is unset/0
     (feature disabled). Raises on a partially-configured block so a typo'd GPU
     reservation fails at setup rather than silently evaluating on a training
-    GPU.
+    GPU. Field defaults live on :class:`DecodeEvalConfig` only; the block just
+    overrides the fields it sets.
     """
     block = recipe_cfg.get("decode_eval", None)
     if block is None:
@@ -127,28 +129,21 @@ def resolve_decode_eval_config(recipe_cfg, *, default_target: str, default_input
             "decode_eval.cuda_visible_devices is required: the eval engine needs a GPU the training "
             "job does not use (e.g. reserve one card and shrink the torchrun world accordingly)."
         )
+    required = {"every_steps", "cuda_visible_devices", "target_model", "input_data", "output_dir"}
+    overrides = {}
+    for field in fields(DecodeEvalConfig):
+        if field.name in required:
+            continue
+        value = block.get(field.name, None)
+        if value is not None:
+            overrides[field.name] = value
     return DecodeEvalConfig(
         every_steps=every_steps,
         cuda_visible_devices=str(cuda_visible_devices),
         target_model=str(block.get("target_model", None) or default_target),
         input_data=str(block.get("input_data", None) or default_input_data),
         output_dir=os.path.join(output_dir, "decode_eval"),
-        num_prompts=int(block.get("num_prompts", 32)),
-        concurrency=int(block.get("concurrency", 8)),
-        max_new_tokens=int(block.get("max_new_tokens", 256)),
-        temperature=float(block.get("temperature", 0.0)),
-        top_p=float(block.get("top_p", 1.0)),
-        messages_column=str(block.get("messages_column", "messages")),
-        prompt_column=block.get("prompt_column", None),
-        split=str(block.get("split", "train")),
-        dataset_name=block.get("dataset_name", None),
-        shuffle_seed=int(block.get("shuffle_seed", 42)),
-        port=int(block.get("port", 8199)),
-        gpu_memory_utilization=float(block.get("gpu_memory_utilization", 0.8)),
-        num_speculative_tokens=block.get("num_speculative_tokens", None),
-        max_model_len=block.get("max_model_len", None),
-        trust_remote_code=bool(block.get("trust_remote_code", False)),
-        timeout_s=float(block.get("timeout_s", 1800.0)),
+        **overrides,
     )
 
 
@@ -159,6 +154,10 @@ def export_draft_snapshot(draft_model, out_dir: str) -> str:
     the same layout the final checkpoint's consolidated export uses, so
     ``serve_vllm.resolve_draft_artifacts`` can consume it directly (the
     d2t/t2d vocab-mapping buffers ride along in the state dict).
+
+    Assumes the draft is replicated on the calling rank (the EAGLE-3 draft
+    trains under DDP, so rank 0 holds the full weights); a sharded draft would
+    snapshot an incomplete state dict.
 
     Args:
         draft_model: the (unwrapped) draft ``nn.Module``; its parameter and
@@ -207,8 +206,7 @@ class DecodeEvalRunner:
 
     def due(self, global_step: int) -> bool:
         """Whether a new eval should launch at this optimizer step."""
-        bucket = global_step // self.config.every_steps
-        return bucket > self._last_bucket
+        return global_step // self.config.every_steps > self._last_bucket
 
     def maybe_launch(self, global_step: int, draft_model) -> bool:
         """Snapshot the draft and launch the worker if the cadence is due and no eval is running."""
@@ -225,68 +223,39 @@ class DecodeEvalRunner:
         step_dir = os.path.join(self.config.output_dir, f"step_{global_step}")
         os.makedirs(step_dir, exist_ok=True)
         export_draft_snapshot(draft_model, step_dir)
-        cfg = self.config
+        # The full config crosses the subprocess boundary as a JSON sidecar next
+        # to the snapshot (one declaration site, and a debugging record of what
+        # the eval ran with); the argv carries only the per-launch paths.
+        config_json = os.path.join(step_dir, _CONFIG_FILENAME)
+        with open(config_json, "w") as f:
+            json.dump(asdict(self.config), f, indent=2)
         argv = [
             sys.executable,
             "-m",
             "nemo_automodel.components.speculative.decode_eval",
+            "--config-json",
+            config_json,
             "--draft",
             step_dir,
-            "--target",
-            cfg.target_model,
             "--step",
             str(global_step),
             "--result-json",
             os.path.join(step_dir, _RESULT_FILENAME),
-            "--input-data",
-            cfg.input_data,
-            "--num-prompts",
-            str(cfg.num_prompts),
-            "--concurrency",
-            str(cfg.concurrency),
-            "--max-new-tokens",
-            str(cfg.max_new_tokens),
-            "--temperature",
-            str(cfg.temperature),
-            "--top-p",
-            str(cfg.top_p),
-            "--messages-column",
-            cfg.messages_column,
-            "--split",
-            cfg.split,
-            "--shuffle-seed",
-            str(cfg.shuffle_seed),
-            "--port",
-            str(cfg.port),
-            "--gpu-memory-utilization",
-            str(cfg.gpu_memory_utilization),
-            "--timeout-s",
-            str(cfg.timeout_s),
         ]
-        if cfg.prompt_column:
-            argv += ["--prompt-column", str(cfg.prompt_column)]
-        if cfg.dataset_name:
-            argv += ["--dataset-name", str(cfg.dataset_name)]
-        if cfg.num_speculative_tokens is not None:
-            argv += ["--num-speculative-tokens", str(cfg.num_speculative_tokens)]
-        if cfg.max_model_len is not None:
-            argv += ["--max-model-len", str(cfg.max_model_len)]
-        if cfg.trust_remote_code:
-            argv += ["--trust-remote-code"]
         log_path = os.path.join(step_dir, _WORKER_LOG_FILENAME)
         with open(log_path, "ab") as log_file:
             self._proc = subprocess.Popen(
                 argv,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
-                env=_worker_env(cfg.cuda_visible_devices),
+                env=_worker_env(self.config.cuda_visible_devices),
                 start_new_session=True,
             )
         self._launched_for_step = global_step
         logger.info(
             "decode_eval: launched eval for step %d on CUDA_VISIBLE_DEVICES=%s (pid %d, log %s)",
             global_step,
-            cfg.cuda_visible_devices,
+            self.config.cuda_visible_devices,
             self._proc.pid,
             log_path,
         )
@@ -359,73 +328,56 @@ def _build_parser():
     parser = argparse.ArgumentParser(
         description="decode_eval worker: serve the draft snapshot and measure accept length"
     )
-    parser.add_argument("--draft", required=True)
-    parser.add_argument("--target", required=True)
+    parser.add_argument("--config-json", required=True, help="JSON dump of DecodeEvalConfig (written at launch)")
+    parser.add_argument("--draft", required=True, help="snapshot dir containing model/consolidated")
     parser.add_argument("--step", type=int, required=True)
     parser.add_argument("--result-json", required=True)
-    parser.add_argument("--input-data", required=True)
-    parser.add_argument("--num-prompts", type=int, default=32)
-    parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--messages-column", default="messages")
-    parser.add_argument("--prompt-column", default=None)
-    parser.add_argument("--split", default="train")
-    parser.add_argument("--dataset-name", default=None)
-    parser.add_argument("--shuffle-seed", type=int, default=42)
-    parser.add_argument("--port", type=int, default=8199)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
-    parser.add_argument("--num-speculative-tokens", type=int, default=None)
-    parser.add_argument("--max-model-len", type=int, default=None)
-    parser.add_argument("--trust-remote-code", action="store_true")
-    parser.add_argument("--timeout-s", type=float, default=1800.0)
     return parser
 
 
-def _serve_argv(args) -> list[str]:
+def _serve_argv(cfg: DecodeEvalConfig, draft: str) -> list[str]:
     """Build the vLLM api_server argv for the snapshot via the serve_vllm library surface."""
     from nemo_automodel.components.speculative.serve_vllm import build_vllm_argv
 
     serve_args = Namespace(
-        target=args.target,
-        draft=args.draft,
+        target=cfg.target_model,
+        draft=draft,
         method=None,
-        num_speculative_tokens=args.num_speculative_tokens,
+        num_speculative_tokens=cfg.num_speculative_tokens,
         dflash_causal=False,
         host="127.0.0.1",
-        port=args.port,
+        port=cfg.port,
         tp_size=1,
         draft_tp_size=1,
-        gpu_memory_utilization=args.gpu_memory_utilization,
+        gpu_memory_utilization=cfg.gpu_memory_utilization,
         dtype="bfloat16",
-        max_model_len=args.max_model_len,
-        trust_remote_code=args.trust_remote_code,
+        max_model_len=cfg.max_model_len,
+        trust_remote_code=cfg.trust_remote_code,
         print_only=False,
         extra=[],
     )
     return build_vllm_argv(serve_args)
 
 
-def _bench_args(args, server: str):
+def _bench_args(cfg: DecodeEvalConfig, server: str) -> Namespace:
     """Assemble the bench_vllm._run_summary argument namespace."""
     return Namespace(
         server=server,
-        model=args.target,
-        input_data=args.input_data,
-        num_prompts=args.num_prompts,
-        concurrency=args.concurrency,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        messages_column=args.messages_column,
-        prompt_column=args.prompt_column,
+        model=cfg.target_model,
+        input_data=cfg.input_data,
+        num_prompts=cfg.num_prompts,
+        concurrency=cfg.concurrency,
+        max_new_tokens=cfg.max_new_tokens,
+        temperature=cfg.temperature,
+        top_p=cfg.top_p,
+        messages_column=cfg.messages_column,
+        prompt_column=cfg.prompt_column,
         prompt_context_column=None,
-        split=args.split,
-        dataset_name=args.dataset_name,
-        shuffle_seed=args.shuffle_seed,
+        split=cfg.split,
+        dataset_name=cfg.dataset_name,
+        shuffle_seed=cfg.shuffle_seed,
         baseline_server=None,
-        timeout_s=args.timeout_s,
+        timeout_s=cfg.timeout_s,
         max_retries=2,
     )
 
@@ -437,13 +389,15 @@ def main(argv=None) -> int:
     from nemo_automodel.components.speculative.bench_vllm import _run_summary
 
     args = _build_parser().parse_args(argv)
-    server = f"http://127.0.0.1:{args.port}"
-    serve_argv = _serve_argv(args)
+    with open(args.config_json) as f:
+        cfg = DecodeEvalConfig(**json.load(f))
+    server = f"http://127.0.0.1:{cfg.port}"
+    serve_argv = _serve_argv(cfg, args.draft)
     print(f"decode_eval worker: starting engine: {' '.join(serve_argv)}", flush=True)
     proc = subprocess.Popen(serve_argv)
     try:
-        _wait_for_server(server, proc, args.timeout_s)
-        summary = asyncio.run(_run_summary(_bench_args(args, server)))
+        _wait_for_server(server, proc, cfg.timeout_s)
+        summary = asyncio.run(_run_summary(_bench_args(cfg, server)))
         if summary is None:
             raise RuntimeError("bench returned no summary (no prompts loaded?)")
         result = {"step": args.step, **summary}
