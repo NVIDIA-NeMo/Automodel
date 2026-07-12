@@ -126,13 +126,25 @@ def _submesh_or_none(device_mesh, name: str):
         return None
 
 
-def _validate_cp_gates(cp_size: int, backend: str, packed_sequence_size: int) -> None:
+def _validate_cp_gates(
+    cp_size: int,
+    backend: str,
+    packed_sequence_size: int,
+    target_force_hf: bool = False,
+    target_attn_implementation: str | None = None,
+    seq_length: int | None = None,
+    cp_zigzag: bool = False,
+) -> None:
     """Reject context-parallel combinations the EAGLE-3 target path cannot honor.
 
     CP shards the target forward along the sequence and forces ``is_causal`` (the
     self_attn hooks strip the attention_mask), so it is incompatible with sequence
     packing (which needs the 4D block-causal mask) and with the remote backend
-    (whose target runs out-of-process).
+    (whose target runs out-of-process). Under CP the frozen target must route
+    through HuggingFace ``F.scaled_dot_product_attention`` -- that is the call the
+    K/V-gather hook intercepts -- and the draft runs the flash-attn ring, so all of
+    the target-backend / kernel / divisibility preconditions are checked here so a
+    misconfig fails at setup rather than mid-forward.
     """
     if cp_size > 1 and backend == "remote":
         raise NotImplementedError(
@@ -144,6 +156,33 @@ def _validate_cp_gates(cp_size: int, backend: str, packed_sequence_size: int) ->
             "Context parallelism (cp_size>1) is not yet supported with sequence packing; CP "
             "strips the 4D block-causal mask that packing relies on. Set cp_size=1 or "
             "packed_sequence_size=0."
+        )
+    if cp_size <= 1:
+        return
+    if not target_force_hf:
+        raise NotImplementedError(
+            "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
+            "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
+        )
+    if target_attn_implementation != "sdpa":
+        raise NotImplementedError(
+            "Context parallelism (cp_size>1) requires recipe_args.target_attn_implementation=sdpa. "
+            "The K/V-gather hook intercepts F.scaled_dot_product_attention; any other backend "
+            "(e.g. flash_attention_2, the HF auto-select default when flash-attn is installed) "
+            "bypasses the hook, so each rank silently attends only its own shard."
+        )
+    # The draft ring runs on flash-attn's private kernels pinned to the 2.8.x
+    # positional signature, so check the version here (not just that it imports).
+    from nemo_automodel.components.speculative.eagle.ring_attention import require_flash_attn_version
+
+    require_flash_attn_version()
+    # Zig-zag chunks the sequence into 2*cp pieces (rank r owns chunks r and 2*cp-1-r),
+    # so it needs divisibility by 2*cp_size; the contiguous shard needs only cp_size.
+    divisor = 2 * cp_size if cp_zigzag else cp_size
+    if seq_length is not None and seq_length % divisor != 0:
+        raise ValueError(
+            f"Context parallelism ({'zig-zag' if cp_zigzag else 'contiguous'}) requires seq_length "
+            f"({seq_length}) divisible by {divisor}."
         )
 
 
@@ -178,7 +217,7 @@ def _best_effort(label: str, fn) -> None:
         logger.exception("error %s during cleanup", label)
 
 
-def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_size: int) -> None:
+def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_size: int, lk_loss_type=None) -> None:
     """Reject P-EAGLE (parallel_drafting) combinations its trainer cannot honor.
 
     ``PEagleTrainerModule.forward`` consumes the live colocated target's full-vocab
@@ -207,6 +246,12 @@ def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_siz
             "parallel_drafting (P-EAGLE) does not support sequence packing (packed_sequence_size>0); "
             "the P-EAGLE forward does not accept the per-document packing metadata "
             "(position_ids/seq_lens/doc_remaining)."
+        )
+    if lk_loss_type is not None:
+        raise NotImplementedError(
+            "parallel_drafting (P-EAGLE) does not support lk_loss_type; the LK acceptance objective "
+            "lives in the EAGLE-3 TTT trainer, and the P-EAGLE partitioned KL path has no per-step "
+            "acceptance term."
         )
 
 
@@ -383,6 +428,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 backend=recipe_cfg.get("target_model_backend", "colocated"),
                 cached_target_path=self.cached_target_path,
                 packed_sequence_size=int(recipe_cfg.get("packed_sequence_size", 0) or 0),
+                lk_loss_type=recipe_cfg.get("lk_loss_type", None),
             )
         self.dist_setup = None
         self.distributed_config = None
@@ -395,6 +441,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if self.cached_target_path is None:
             selected_token_ids, selected_token_mask = self._setup_online_target(recipe_cfg, target_path, target_config)
         else:
+            # The cached-target path never builds a cp mesh (only the colocated
+            # target does), so cp_size>1 here would silently fall back to plain DP
+            # -- the draft would train unsharded while the user asked for CP.
+            if int(self.cfg.get("distributed.cp_size", 1) or 1) > 1:
+                raise NotImplementedError(
+                    "Context parallelism (cp_size>1) is not supported with a cached target; the "
+                    "cached path does not build a cp mesh. Use the colocated target or set cp_size=1."
+                )
             selected_token_ids, selected_token_mask = self._setup_cached_target(recipe_cfg, target_config)
 
         draft_config = target_config.to_dict()
@@ -491,16 +545,40 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # loads; the draft is built directly, so log its (trainable) summary here too.
         print_trainable_parameters(self.draft_model, name="Draft")
 
+        # Draft context parallelism: run the draft sequence-sharded across the cp group
+        # (ring attention over the full sequence). The trainer needs the cp group for
+        # the TTT left-shift (cross-rank boundary) and the loss normalization; every
+        # draft attention gets the differentiable ring installed.
+        self.cp_group = None
+        if self.cp_mesh is not None and self.cp_mesh.size() > 1:
+            self.cp_group = self.cp_mesh.get_group()
+        # Load-balanced zig-zag sharding for the draft cp ring (vs the default
+        # contiguous shard, which leaves the last rank doing ~2x the causal work).
+        self.cp_zigzag = bool(recipe_cfg.get("cp_zigzag", False))
+
+        lk_loss_type = recipe_cfg.get("lk_loss_type", None)
+
         if parallel_drafting:
+            if self.cp_group is not None:
+                raise NotImplementedError("Context parallelism is not supported with parallel drafting (P-EAGLE).")
             trainer_module = self.build_peagle_trainer(
                 recipe_cfg, selected_token_ids, selected_token_mask, mask_token_id
             )
         else:
+            if self.cp_group is not None:
+                from nemo_automodel.components.speculative.eagle.draft_llama import attach_eagle3_cp_attention
+
+                attach_eagle3_cp_attention(self.draft_model, self.cp_group, zigzag=self.cp_zigzag)
             trainer_module = Eagle3TrainerModule(
                 self.draft_model,
                 selected_token_ids=selected_token_ids,
                 selected_token_mask=selected_token_mask,
                 ttt_steps=recipe_cfg.ttt_steps,
+                cp_group=self.cp_group,
+                cp_zigzag=self.cp_zigzag,
+                lk_loss_type=None if lk_loss_type is None else str(lk_loss_type),
+                lk_kl_scale=float(recipe_cfg.get("lk_kl_scale", 1.0)),
+                lk_kl_decay=float(recipe_cfg.get("lk_kl_decay", 3.0)),
             ).to(self.device)
         if self.dist_env.world_size > 1:
             # Under context parallelism the draft is replicated across cp ranks
@@ -638,7 +716,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # submeshes are only built later, inside the colocated path).
         cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
         tp_size = int(self.cfg.get("distributed.tp_size", 1) or 1)
-        _validate_cp_gates(cp_size, backend, packed_sequence_size)
+        _validate_cp_gates(
+            cp_size,
+            backend,
+            packed_sequence_size,
+            target_force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            target_attn_implementation=recipe_cfg.get("target_attn_implementation", None),
+            seq_length=int(recipe_cfg.get("seq_length", 0) or 0) or None,
+            cp_zigzag=bool(recipe_cfg.get("cp_zigzag", False)),
+        )
         _validate_tp_gates(tp_size, backend, cp_size)
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
@@ -916,6 +1002,64 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             )
         return selected_token_ids, selected_token_mask
 
+    def _maybe_shard_cp(self, inputs: dict) -> dict:
+        """Shard the draft supervision along the sequence for context parallelism.
+
+        The target emits full-sequence aux/logits (gathered); the draft runs sharded,
+        so gather every ``[B, S, ...]`` tensor to this rank's cp shard (via a global
+        index) and inject the matching global ``position_ids``. The index is the
+        contiguous shard by default, or the load-balanced zig-zag layout (rank ``r``
+        owns chunks ``r`` and ``2*cp-1-r``) when ``cp_zigzag``. No-op without CP.
+        """
+        if getattr(self, "cp_group", None) is None:
+            return inputs
+        cp_size = self.cp_mesh.size()
+        cp_rank = self.cp_mesh.get_local_rank()
+        seq_len = inputs["input_ids"].shape[1]
+        device = inputs["input_ids"].device
+        if getattr(self, "cp_zigzag", False):
+            if seq_len % (2 * cp_size) != 0:
+                raise ValueError(
+                    f"Zig-zag context parallelism requires seq_length ({seq_len}) divisible by "
+                    f"2*cp_size ({2 * cp_size})."
+                )
+            c = seq_len // (2 * cp_size)
+            idx = torch.cat(
+                (
+                    torch.arange(cp_rank * c, (cp_rank + 1) * c, device=device),
+                    torch.arange((2 * cp_size - 1 - cp_rank) * c, (2 * cp_size - cp_rank) * c, device=device),
+                )
+            )
+        else:
+            if seq_len % cp_size != 0:
+                raise ValueError(
+                    f"Context parallelism requires seq_length ({seq_len}) divisible by cp_size ({cp_size})."
+                )
+            local = seq_len // cp_size
+            idx = torch.arange(cp_rank * local, (cp_rank + 1) * local, device=device)
+        out = {
+            k: (
+                v.index_select(1, idx).contiguous()
+                if (torch.is_tensor(v) and v.dim() >= 2 and v.shape[1] == seq_len)
+                else v
+            )
+            for k, v in inputs.items()
+        }
+        out["position_ids"] = idx.unsqueeze(0).expand(inputs["input_ids"].shape[0], -1)
+        return out
+
+    def _all_reduce_draft_grads_over_cp(self) -> None:
+        """Sum the draft gradients over the cp group before the optimizer step.
+
+        The draft runs sequence-sharded across cp, so each rank holds only its shard's
+        gradient contribution; summing yields the full-sequence gradient (the loss is
+        already globally normalized by the trainer). DDP has averaged over dp, and
+        sum-over-cp / avg-over-dp commute, so the cp replicas end up identical.
+        """
+        for p in self._module().parameters():
+            if p.grad is not None:
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=self.cp_group)
+
     def _forward_batch(self, batch, target_batch=None):
         """Run the trainer module for one batch, from the live target or the cache.
 
@@ -924,7 +1068,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         and self-contained, so the raw ``batch`` is not needed.
         """
         if target_batch is not None:
-            return self.trainer_module(**target_batch.to_trainer_inputs())
+            return self.trainer_module(**self._maybe_shard_cp(target_batch.to_trainer_inputs()))
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         # Sequence-packing metadata (present only when packed_sequence_size > 0).
         packing_kwargs = {}
@@ -938,13 +1082,17 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             # Offline cache: the supervision is already in the batch.
             batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
             return self.trainer_module(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                loss_mask=batch["loss_mask"],
-                aux_hidden_states=batch["aux_hidden_states"],
-                target_probs=batch["target_probs"],
-                position_mask=batch["position_mask"],
-                **packing_kwargs,
+                **self._maybe_shard_cp(
+                    {
+                        "input_ids": batch["input_ids"],
+                        "attention_mask": batch["attention_mask"],
+                        "loss_mask": batch["loss_mask"],
+                        "aux_hidden_states": batch["aux_hidden_states"],
+                        "target_probs": batch["target_probs"],
+                        "position_mask": batch["position_mask"],
+                        **packing_kwargs,
+                    }
+                )
             )
         target_batch = self.target_wrapper.generate_batch(
             input_ids=batch["input_ids"],
@@ -952,7 +1100,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             loss_mask=batch["loss_mask"],
             **packing_kwargs,
         )
-        return self.trainer_module(**target_batch.to_trainer_inputs())
+        return self.trainer_module(**self._maybe_shard_cp(target_batch.to_trainer_inputs()))
 
     def _prefetched_batches(self, dataloader):
         """Yield ``(batch, target_batch)`` keeping up to ``target_prefetch_depth``
@@ -1470,6 +1618,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 pending_micro_batches += 1
 
                 if pending_micro_batches == self.grad_accumulation_steps:
+                    if getattr(self, "cp_group", None) is not None:
+                        self._all_reduce_draft_grads_over_cp()
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.lr_scheduler.step()
@@ -1535,6 +1685,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             # step; rescale by the inverse so the trailing step's gradient
             # is on the same scale as every other step.
             if pending_micro_batches > 0:
+                # Sum the draft grads over cp first (as in the full-window step above);
+                # otherwise the trailing step applies per-rank partial gradients and the
+                # cp replicas of the draft desync permanently from here on.
+                if getattr(self, "cp_group", None) is not None:
+                    self._all_reduce_draft_grads_over_cp()
                 scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                 for p in self.trainer_module.parameters():
                     if p.grad is not None:
