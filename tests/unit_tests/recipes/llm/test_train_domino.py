@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
@@ -197,3 +198,13 @@ def test_main_runs_setup_then_loop(monkeypatch):
     monkeypatch.setattr(TrainDominoRecipe, "run_train_validation_loop", lambda self: calls.append("loop"))
     train_domino.main("cfg.yaml")
     assert calls == ["setup", "loop"]
+
+
+def test_build_trainer_module_rejects_loss_type():
+    """The DFlash loss_type knob must fail loudly here instead of being
+    silently ignored (Domino has its own dual-logit objective)."""
+    recipe = _recipe()
+    recipe.draft_model = _domino_draft(shift_label=True)
+    recipe.mask_token_id = MASK_ID
+    with pytest.raises(ValueError, match="loss_type"):
+        recipe._build_trainer_module("sdpa", {"loss_type": "variable_prefix"})

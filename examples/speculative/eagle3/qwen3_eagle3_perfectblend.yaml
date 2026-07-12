@@ -18,6 +18,10 @@ recipe_args:
   num_workers: 0
   num_epochs: 1
   ttt_steps: 7
+  # lk_loss_type: null              # null (soft-CE), "alpha" (-mean(log acceptance)), or "lambda"
+  #                                 # (adaptive mix: kl_weight*soft_ce + (1-kl_weight)*(1-acceptance))
+  # lk_kl_scale: 1.0                # lambda only: kl_weight = lk_kl_scale * exp(-lk_kl_decay * acceptance)
+  # lk_kl_decay: 3.0
   draft_vocab_size: 32000
   freeze_embeddings: true
   trust_remote_code: false

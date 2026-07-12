@@ -54,6 +54,11 @@ class TrainDominoRecipe(TrainDFlashRecipe):
 
     def _build_trainer_module(self, attention_backend: str, recipe_cfg):
         """Build the Domino trainer wrapper on the (Domino-head-enabled) DFlash draft."""
+        if (recipe_cfg.get("loss_type", None) or "dflash") != "dflash":
+            raise ValueError(
+                "loss_type is only supported by the DFlash recipe; the Domino trainer has its own "
+                "dual-logit objective and would silently ignore it."
+            )
         return DominoTrainerModule(
             draft_model=self.draft_model,
             target_lm_head=self.target_model.get_output_embeddings(),
