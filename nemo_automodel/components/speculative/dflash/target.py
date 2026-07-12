@@ -162,6 +162,12 @@ class HFDFlashTargetModel:
         }
         target_attention_mask = attention_mask
         if seq_lens is not None:
+            if self._cp_size > 1:
+                raise ValueError(
+                    "DFlash sequence packing is not supported together with context parallelism "
+                    "(cp_size > 1): the CP target forward replaces the attention mask with a global "
+                    "causal mask and cannot honor per-document block-causal boundaries."
+                )
             if position_ids is None or "position_ids" not in forward_params:
                 raise ValueError(
                     "DFlash sequence packing requires per-document position_ids, but none were provided "
