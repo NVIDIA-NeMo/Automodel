@@ -181,6 +181,9 @@ def _eval_self(trainer, num_batches):
                 input_ids=kw["input_ids"],
                 hidden_states=kw["input_ids"],
                 loss_mask=kw["loss_mask"],
+                position_ids=None,
+                seq_lens=None,
+                doc_remaining=None,
             )
         ),
     )

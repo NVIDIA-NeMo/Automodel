@@ -29,10 +29,16 @@ from typing import Optional, Sequence
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
+
 
 @dataclass
 class DFlashTargetBatch:
-    """Target-model context features needed by the DFlash trainer."""
+    """Target-model context features needed by the DFlash trainer.
+
+    ``position_ids`` / ``seq_lens`` / ``doc_remaining`` are ``None`` off the
+    packing path and carry the (unshifted) packing metadata to the trainer on it.
+    """
 
     hidden_states: torch.Tensor  # [B, S, len(target_layer_ids) * H]
     input_ids: torch.Tensor
@@ -42,6 +48,9 @@ class DFlashTargetBatch:
     # built with ``capture_logits=True`` (JetSpec's forward-KL distillation needs
     # the teacher distribution; DFlash's hard-label CE does not). ``None`` otherwise.
     logits: Optional[torch.Tensor] = None
+    position_ids: Optional[torch.Tensor] = None
+    seq_lens: Optional[torch.Tensor] = None
+    doc_remaining: Optional[torch.Tensor] = None
 
 
 class HFDFlashTargetModel:
@@ -121,8 +130,19 @@ class HFDFlashTargetModel:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        doc_remaining: Optional[torch.Tensor] = None,
     ) -> DFlashTargetBatch:
-        """Run the target model and capture the selected layers' hidden states as context."""
+        """Run the target model and capture the selected layers' hidden states as context.
+
+        With ``seq_lens`` (``[B, max_docs]``, per-document lengths summing to ``S``)
+        the target runs with a document-level block-causal mask and per-document
+        ``position_ids`` so the captured context hidden states do not leak across
+        document boundaries (SDPA/eager consume the ``[B, 1, S, S]`` block-causal
+        additive mask; FlashAttention infers boundaries from ``position_ids`` at batch
+        size 1). The packing metadata is carried through to the trainer unchanged.
+        """
         layers = self._get_transformer_layers()
         captured: dict[int, torch.Tensor] = {}
         handles = []
@@ -140,6 +160,34 @@ class HFDFlashTargetModel:
         extra_kwargs = {
             name: False for name in ("output_hidden_states", "output_attentions", "use_cache") if name in forward_params
         }
+        target_attention_mask = attention_mask
+        if seq_lens is not None:
+            if self._cp_size > 1:
+                raise ValueError(
+                    "DFlash sequence packing is not supported together with context parallelism "
+                    "(cp_size > 1): the CP target forward replaces the attention mask with a global "
+                    "causal mask and cannot honor per-document block-causal boundaries."
+                )
+            if position_ids is None or "position_ids" not in forward_params:
+                raise ValueError(
+                    "DFlash sequence packing requires per-document position_ids, but none were provided "
+                    "or the target model's forward does not accept a `position_ids` argument."
+                )
+            extra_kwargs["position_ids"] = position_ids
+            attn_impl = getattr(self.model.config, "_attn_implementation", None) or ""
+            if "flash" in attn_impl:
+                if input_ids.shape[0] != 1:
+                    raise ValueError(
+                        "DFlash sequence packing with a FlashAttention target only supports "
+                        f"micro_batch_size=1 (got {input_ids.shape[0]}); set micro_batch_size=1 or load "
+                        "the target with attn_implementation='sdpa'."
+                    )
+                target_attention_mask = None
+            else:
+                param_dtype = next(self.model.parameters()).dtype
+                target_attention_mask = build_block_causal_additive_mask(
+                    seq_lens, seq_length=input_ids.shape[1], dtype=param_dtype, device=input_ids.device
+                )
         order = list(self.target_layer_ids)
         try:
             if self._cp_size > 1:
@@ -161,7 +209,7 @@ class HFDFlashTargetModel:
                     captured[layer_id] = gathered[i]
                 logits = gathered[-1] if self.capture_logits else None
             else:
-                output = self.model(input_ids=input_ids, attention_mask=attention_mask, **extra_kwargs)
+                output = self.model(input_ids=input_ids, attention_mask=target_attention_mask, **extra_kwargs)
                 self._check_captured(captured)
                 # The target forward already computed the LM-head logits; keep them only
                 # when a distillation trainer (JetSpec) asked for the teacher distribution.
@@ -178,4 +226,7 @@ class HFDFlashTargetModel:
             attention_mask=attention_mask,
             loss_mask=loss_mask,
             logits=logits,
+            position_ids=position_ids,
+            seq_lens=seq_lens,
+            doc_remaining=doc_remaining,
         )

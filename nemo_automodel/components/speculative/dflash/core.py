@@ -52,6 +52,18 @@ from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 
+def _context_doc_ids(seq_lens: torch.Tensor, seq_len: int, device: torch.device) -> torch.Tensor:
+    """Per-context-token document id ``[B, S]`` from packed ``seq_lens`` ``[B, max_docs]``.
+
+    Mirrors the ``doc_id`` construction in ``build_block_causal_additive_mask``: a
+    token's id is the number of document boundaries at or before its position, so
+    0-length padding entries never split a real document.
+    """
+    boundaries = seq_lens.to(device).cumsum(dim=1)  # [B, max_docs]
+    positions = torch.arange(seq_len, device=device)
+    return (boundaries.unsqueeze(1) <= positions.view(1, -1, 1)).sum(dim=2)
+
+
 def _to_full_tensor(tensor: torch.Tensor) -> torch.Tensor:
     """Materialise a (possibly tensor-parallel) tensor as a plain local tensor.
 
@@ -137,14 +149,34 @@ class DFlashTrainerModule(nn.Module):
         self.register_buffer("_block_offsets", torch.arange(block_size).view(1, 1, -1), persistent=False)
 
     def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+        self,
+        seq_len: int,
+        loss_mask: torch.Tensor,
+        device: torch.device,
+        doc_remaining: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Randomly sample anchor positions per sample; returns ``(anchors, keep_mask)``."""
+        """Randomly sample anchor positions per sample; returns ``(anchors, keep_mask)``.
+
+        ``doc_remaining`` ``[B, S]`` (sequence packing) restricts anchors so the
+        whole block stays inside one document (``doc_remaining >= block_size - 1``),
+        the per-document analogue of the ``anchor <= seq_len - block_size`` bound.
+        This is required for correctness -- ``_build_block_targets`` gathers labels
+        by absolute offset and does not encode document boundaries, so a block that
+        crossed one would be supervised on the next document's tokens. A side effect
+        is that a packed document shorter than ``block_size`` yields no anchors (the
+        unpacked path still supervises such a short sequence's partial block); pack
+        with documents at least ``block_size`` long to avoid dropping their signal.
+        """
         bs = self.block_size
         bsz = loss_mask.shape[0]
         max_anchor = max(seq_len - bs, 0)
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
+        if doc_remaining is not None:
+            # Keep the block within the anchor's document: its last predicted
+            # token (anchor + block_size - 1) must still be a real token of that
+            # document, i.e. at least block_size - 1 real tokens follow the anchor.
+            valid = valid & (doc_remaining[:, : max_anchor + 1] >= bs - 1)
         valid_counts = valid.sum(dim=1)
         # ``valid`` already restricts positions to ``[0, seq_len - block_size]``, so
         # every valid position has room for a full block and is a legitimate anchor.
@@ -194,11 +226,24 @@ class DFlashTrainerModule(nn.Module):
         samples = torch.multinomial(weights, num_samples=bsz * n_blocks, replacement=True)
         return samples.view(bsz, n_blocks) + min_prefix
 
-    def _create_position_ids(self, anchor_positions: torch.Tensor) -> torch.Tensor:
-        """Absolute position ids for the parallel draft blocks (anchor + offset)."""
+    def _create_position_ids(
+        self, anchor_positions: torch.Tensor, context_position_ids: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Position ids for the parallel draft blocks (anchor position + offset).
+
+        Without packing the anchor's position equals its row index, so the block
+        positions are ``anchor + offset``. Under packing ``context_position_ids``
+        ``[B, S]`` holds per-document reset positions, so the block's base position
+        is gathered from it at the anchor (``context_position_ids[anchor] + offset``)
+        to keep the draft's RoPE phase document-local.
+        """
         bsz = anchor_positions.shape[0]
         offsets = torch.arange(self.block_size, device=anchor_positions.device).view(1, 1, -1)
-        pos_ids = anchor_positions.unsqueeze(-1) + offsets
+        if context_position_ids is None:
+            base = anchor_positions.unsqueeze(-1)
+        else:
+            base = torch.gather(context_position_ids, 1, anchor_positions.clamp(min=0)).unsqueeze(-1)
+        pos_ids = base + offsets
         return pos_ids.view(bsz, -1)
 
     def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
@@ -288,29 +333,62 @@ class DFlashTrainerModule(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        doc_remaining: Optional[torch.Tensor] = None,
     ) -> DFlashStepMetrics:
-        """Parallel block-wise training forward pass."""
+        """Parallel block-wise training forward pass.
+
+        Sequence packing (``position_ids`` ``[B, S]`` per-document reset positions,
+        ``seq_lens`` ``[B, max_docs]`` document lengths, ``doc_remaining`` ``[B, S]``)
+        keeps every block inside one document: anchors are constrained so the block
+        does not cross a boundary, the block's context prefix attends only within the
+        anchor's document, and the draft's RoPE uses the per-document positions.
+        """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
+        packed = seq_lens is not None
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(seq_len, loss_mask, device)
+        anchor_positions, block_keep_mask = self._sample_anchor_positions(
+            seq_len, loss_mask, device, doc_remaining=doc_remaining if packed else None
+        )
         if self.loss_type == "variable_prefix":
             prefix_lengths = self._sample_prefix_lengths(bsz, anchor_positions.shape[1], device)
             noise_embedding = self._create_vp_noise_embed(input_ids, anchor_positions, block_keep_mask, prefix_lengths)
         else:
             noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
 
-        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        draft_position_ids = self._create_position_ids(anchor_positions)
+        if packed:
+            context_position_ids = position_ids
+            ctx_doc_id = _context_doc_ids(seq_lens, seq_len, device)
+            anchor_doc_id = torch.gather(ctx_doc_id, 1, anchor_positions.clamp(min=0))
+        else:
+            context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            ctx_doc_id = None
+            anchor_doc_id = None
+        draft_position_ids = self._create_position_ids(anchor_positions, context_position_ids if packed else None)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
         if self.attention_backend == "flex_attention":
             dflash_attn_mask = create_dflash_block_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device
+                anchor_positions,
+                block_keep_mask,
+                seq_len,
+                self.block_size,
+                device,
+                ctx_doc_id=ctx_doc_id,
+                anchor_doc_id=anchor_doc_id,
             )
         else:
             dflash_attn_mask = create_dflash_sdpa_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device, dtype=noise_embedding.dtype
+                anchor_positions,
+                block_keep_mask,
+                seq_len,
+                self.block_size,
+                device,
+                dtype=noise_embedding.dtype,
+                ctx_doc_id=ctx_doc_id,
+                anchor_doc_id=anchor_doc_id,
             )
 
         output_hidden = self.draft_model(
