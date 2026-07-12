@@ -199,14 +199,6 @@ class TrainDFlashRecipe(BaseRecipe):
         # packing metadata (position_ids / seq_lens / doc_remaining) the loader emits.
         packed_sequence_size = int(recipe_cfg.get("packed_sequence_size", 0) or 0)
         if packed_sequence_size > 0:
-            if type(self) is not TrainDFlashRecipe:
-                # The JetSpec / Domino variants override the trainer forward and
-                # _run_trainer_step without threading packing metadata, so packing
-                # would silently let anchors cross document boundaries there.
-                raise NotImplementedError(
-                    f"Sequence packing (packed_sequence_size>0) is only supported by the base DFlash "
-                    f"recipe, not {type(self).__name__}."
-                )
             _validate_packing_gates(
                 cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
                 target_attn_impl=getattr(self.target_model.config, "_attn_implementation", None) or "",
