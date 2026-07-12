@@ -191,7 +191,7 @@ def resolve_signal(sig: SignalLike) -> signal.Signals:
 
     Accepts integers (e.g. "15"), "signal.Signals" members (e.g. "signal.SIGTERM")
     and case-insensitive string names with or without the "SIG" prefix (e.g. "SIGTERM",
-    "sigusr1", "USR2"). String support allows the pre-emption signal to be form YAML.
+    "sigusr1", "USR2"). String support allows the pre-emption signal to be configured form YAML.
 
     Args:
         sig: The signal specification to resolve.

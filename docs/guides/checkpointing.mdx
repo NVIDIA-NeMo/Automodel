@@ -317,6 +317,94 @@ NeMo AutoModel can write checkpoints asynchronously to reduce training stalls ca
 - **Requirements**: PyTorch ≥ 2.9.0. If an older version is detected, async mode is automatically disabled.
 - **Behavior**: At most one checkpoint uploads at a time; the next save waits for the previous upload to finish. The `LATEST` symlink is updated after the async save completes (may be deferred until the next save call). During PEFT, adapter model files are written synchronously on rank 0; optimizer states can still use async.
 
+## Preemption Checkpointing
+
+Using shared clusters, jobs can be preempted or reach their wall-time limits
+before training finishes. NeMo AutoModel can catch an operating-system signal
+sent ahead of the shutdown, save a checkpoint at the next step boundary, and
+exit gracefully. That way training can resume from the moment of preemption
+instead of the last periodic checkpoint.
+
+```yaml
+step_scheduler:
+  ...
+  preemption_signal: SIGUSR1   # default: SIGTERM
+```
+
+`preemption_signal` accepts:
+
+- A signal name as a string, case-insensitive, with or without the `SIG`
+  prefix (`"SIGUSR1"`, `"usr1"`, and `"SIGTERM"` are all valid).
+- A signal number (e.g. `15`).
+- A list of any of the above to watch multiple signals at once, for example
+  `["SIGUSR1", "SIGTERM"]`.
+- `null` to disable preemption handling entirely.
+
+By default, `SIGTERM` is watched, so runs already checkpoint on a polite
+termination request without any configuration.
+
+### How It Works
+
+When any rank receives the configured signal, the signal handler records it
+locally. The flags are then gathered across ranks at the next step boundary,
+so every rank observes the preemption at the same step. All the ranks write
+a checkpoint together and shut down cleanly. This means it is sufficient
+for the signal to reach a single rank — for example, only the workers on one
+node.
+
+Since the checkpoint is written at a step boundary, the delay between signal
+delivery and the checkpoint is at most one training step. Set the signal lead
+time to cover one step plus the time to write a checkpoint for your model
+size and storage backend.
+
+If the signal arrives while the final steps of a run are completing, the run
+finishes normally and writes its regular final checkpoint, so no separate
+preemption checkpoint is made.
+
+### Slurm Usage
+
+The reference `slurm.sub` submission script demonstrates the full setup. Slurm
+delivers the warning signal to the batch script via the `--signal` directive:
+
+```bash
+#SBATCH --signal=B:USR1@300   # send USR1 to the batch script 300s before the time limit
+```
+
+The `B:` prefix is required: it delivers the signal to the batch script only.
+The batch script then forwards `SIGUSR1` to the local training worker
+processes. The workers must be signalled directly rather than `srun` or
+`torchrun`, because `torchrun` terminates on an unhandled `USR1`, taking the
+job down before a checkpoint can be written. Forwarding to the workers on the
+batch node alone is sufficient — the all-gather propagates the flag to every
+rank on every node.
+
+To test preemption behavior without waiting for a time limit, deliver the
+signal manually to a running job's batch script:
+
+```bash
+scancel --batch --signal=USR1 <jobid>
+```
+
+> **Note:** `--signal=B:USR1@<sec>` guarantees the warning before a
+> *wall-time* termination. Whether the same warning is delivered on a
+> *scheduler preemption* (e.g. a higher-priority job taking the nodes) depends
+> on the cluster's Slurm configuration (`GraceTime` on the partition and
+> `PreemptParameters=send_user_signal`). Ask your cluster administrator if
+> preemption-triggered signals are required.
+
+### Resuming After Preemption
+
+A preemption checkpoint is a regular checkpoint: the `LATEST` symbolic link is
+updated to point to it. Resubmitting the same job resumes from the preempted
+step with model, optimizer, and scheduler state intact.
+
+<Note>
+Signals that arrive before training starts (during model loading or dataloader
+construction) cannot trigger a checkpoint, since the signal handler is
+installed when the step scheduler is created and there is no training state to
+save at that point.
+</Note>
+
 ## Advanced Usage: Save Additional States
 You can also save additional states in NeMo AutoModel. By default, we also automatically checkpoint the `dataloader`, `rng`, and `step_scheduler` states which are necessary to resume training accurately. In full, a Safetensors consolidated checkpoint will look like this:
 
