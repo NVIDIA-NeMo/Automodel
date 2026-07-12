@@ -293,7 +293,7 @@ class DominoTrainerModule(DFlashTrainerModule):
         _, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask = (
+        anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, _ = (
             self._prepare_block_inputs(
                 input_ids, loss_mask, position_ids=position_ids, seq_lens=seq_lens, doc_remaining=doc_remaining
             )

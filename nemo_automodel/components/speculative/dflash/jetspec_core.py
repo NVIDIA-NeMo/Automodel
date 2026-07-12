@@ -156,13 +156,15 @@ class JetSpecTrainerModule(DFlashTrainerModule):
         bsz, seq_len = input_ids.shape
         bs = self.block_size
 
-        anchor_positions, block_keep_mask, noise_embedding, full_position_ids, attn_mask = self._prepare_block_inputs(
-            input_ids,
-            loss_mask,
-            position_ids=position_ids,
-            seq_lens=seq_lens,
-            doc_remaining=doc_remaining,
-            causal=True,
+        anchor_positions, block_keep_mask, noise_embedding, full_position_ids, attn_mask, _ = (
+            self._prepare_block_inputs(
+                input_ids,
+                loss_mask,
+                position_ids=position_ids,
+                seq_lens=seq_lens,
+                doc_remaining=doc_remaining,
+                causal=True,
+            )
         )
         n = anchor_positions.size(1)
         label_indices, target_ids, block_mask = self._build_block_targets(
