@@ -218,7 +218,7 @@ def _best_effort(label: str, fn) -> None:
         logger.exception("error %s during cleanup", label)
 
 
-def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_size: int) -> None:
+def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_size: int, lk_loss_type=None) -> None:
     """Reject P-EAGLE (parallel_drafting) combinations its trainer cannot honor.
 
     ``PEagleTrainerModule.forward`` consumes the live colocated target's full-vocab
@@ -247,6 +247,12 @@ def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_siz
             "parallel_drafting (P-EAGLE) does not support sequence packing (packed_sequence_size>0); "
             "the P-EAGLE forward does not accept the per-document packing metadata "
             "(position_ids/seq_lens/doc_remaining)."
+        )
+    if lk_loss_type is not None:
+        raise NotImplementedError(
+            "parallel_drafting (P-EAGLE) does not support lk_loss_type; the LK acceptance objective "
+            "lives in the EAGLE-3 TTT trainer, and the P-EAGLE partitioned KL path has no per-step "
+            "acceptance term."
         )
 
 
@@ -423,6 +429,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 backend=recipe_cfg.get("target_model_backend", "colocated"),
                 cached_target_path=self.cached_target_path,
                 packed_sequence_size=int(recipe_cfg.get("packed_sequence_size", 0) or 0),
+                lk_loss_type=recipe_cfg.get("lk_loss_type", None),
             )
         self.dist_setup = None
         self.distributed_config = None
@@ -550,6 +557,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # contiguous shard, which leaves the last rank doing ~2x the causal work).
         self.cp_zigzag = bool(recipe_cfg.get("cp_zigzag", False))
 
+        lk_loss_type = recipe_cfg.get("lk_loss_type", None)
+
         if parallel_drafting:
             if self.cp_group is not None:
                 raise NotImplementedError("Context parallelism is not supported with parallel drafting (P-EAGLE).")
@@ -568,6 +577,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 ttt_steps=recipe_cfg.ttt_steps,
                 cp_group=self.cp_group,
                 cp_zigzag=self.cp_zigzag,
+                lk_loss_type=None if lk_loss_type is None else str(lk_loss_type),
+                lk_kl_scale=float(recipe_cfg.get("lk_kl_scale", 1.0)),
+                lk_kl_decay=float(recipe_cfg.get("lk_kl_decay", 3.0)),
             ).to(self.device)
         if self.dist_env.world_size > 1:
             # Under context parallelism the draft is replicated across cp ranks
