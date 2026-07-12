@@ -166,7 +166,6 @@ def create_causal_mask_mapping(
         "config": model_config,
         "inputs_embeds": torch.empty((batch_size, seq_len), device=device),
         "attention_mask": attention_mask,
-        "cache_position": position_ids[0],  # Use first row (all rows identical for non-padded data)
         "past_key_values": None,  # Training only
         "position_ids": position_ids,
     }

@@ -150,7 +150,6 @@ def _passthrough_create_causal_mask(
         config=config,
         inputs_embeds=embeds,
         attention_mask=attention_mask,
-        cache_position=cache_position,
         past_key_values=past_key_values,
         position_ids=position_ids,
         **kwargs,

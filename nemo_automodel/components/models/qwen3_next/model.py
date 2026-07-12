@@ -21,6 +21,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 
 from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
+from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -110,7 +111,7 @@ class Block(nn.Module):
         # ``self.mlp`` may be wrapped by activation checkpointing (submodule-level
         # AC), so inspect the underlying module to pick the dense (no padding_mask)
         # vs MoE (padding_mask) call signature, but invoke the wrapped module.
-        mlp = getattr(self.mlp, "_checkpoint_wrapped_module", self.mlp)
+        mlp = unwrap_checkpoint_wrapper(self.mlp)
         if isinstance(mlp, MLP):
             return self.mlp(x)
         else:

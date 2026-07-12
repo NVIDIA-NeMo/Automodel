@@ -50,6 +50,17 @@ recipe_args:
   markov_rank: 256
   markov_head_type: vanilla           # vanilla | gated | rnn
 
+  # OFFLINE path: precompute the target supervision once, then stream it here
+  # without loading/running the target model during draft training:
+  #
+  #   python -m nemo_automodel.components.speculative.precompute_dspark \
+  #     --target-model Qwen/Qwen3-0.6B \
+  #     --input-data /path/to/perfectblend_qwen3-0.6b_regen.jsonl \
+  #     --output-dir /data/dspark_cache/qwen3_0.6b \
+  #     --seq-length 4096 --target-layer-ids 1 7 14 21 27
+  #
+  # cached_target_path: /data/dspark_cache/qwen3_0.6b
+
   # --- confidence head (scheduled verification) ---
   confidence_head_alpha: 1.0          # > 0 enables the confidence head
   confidence_head_with_markov: true
