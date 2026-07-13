@@ -389,50 +389,71 @@ def build_dataloader(
                 )
                 _pad_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
                 _collate_max_length = packing_cfg.get("collate_max_length", None)
-                # The packed collater builds a dense [B, 1, S, S] block-causal mask for
-                # sdpa/eager but keeps a cheap indexed [B, S] mask for flash_attention_2.
-                # At long context (e.g. 128k) the dense mask is ~S^2 bytes/sample and
-                # OOMs the dataloader workers. ``packed_sequence.attn_implementation``
-                # overrides the mask form: set it to "flash_attention_2" for
-                # context-parallel runs, where the attention mask is stripped before the
-                # model anyway (document boundaries are recovered from position_ids), so
-                # the indexed form is both sufficient and orders of magnitude cheaper.
-                # Attn computation still uses the model's backend; the attn_implementation
-                # attribute in packing_cfg only switches the collater mask format. It is
-                # therefore only safe to diverge from the model backend when cp>1, where the
-                # mask is stripped before the model. Without CP the collater mask must match
-                # the model backend, so ignore the override (and warn) and fall back to it.
-                cp_size = (
-                    device_mesh["cp"].size()
-                    if device_mesh is not None and "cp" in getattr(device_mesh, "mesh_dim_names", ())
-                    else 1
-                )
-                _model_attn_impl = get_attn_implementation(cfg_model)
-                _pack_attn_override = packing_cfg.get("attn_implementation", None)
-                if _pack_attn_override is not None and cp_size > 1:
-                    _attn_impl = _pack_attn_override
-                else:
-                    if _pack_attn_override not in (None, _model_attn_impl):
-                        logging.warning(
-                            "Ignoring packed_sequence.attn_implementation=%r at cp_size=1: the packed "
-                            "mask format must match the model attention backend (%r) when the mask is "
-                            "not stripped by context parallelism.",
-                            _pack_attn_override,
-                            _model_attn_impl,
-                        )
-                    _attn_impl = _model_attn_impl
-
-                configure_packing(attn_implementation=_attn_impl)
-                logging.info(f"Configured VLM neat packing for attn_implementation={_attn_impl}")
-
-                collate_fn = lambda examples, _pi=_pad_id, _ml=_collate_max_length, _ai=_attn_impl: (
-                    neat_packed_vlm_collater(
-                        examples,
-                        padding_idx=_pi,
-                        max_length=_ml,
-                        attn_implementation=_ai,
+                # ``packing_format`` selects the packed collater. "neat" (default) keeps the
+                # HF flash-attention indexed-mask path below; "thd" emits Transformer Engine
+                # THD (qkv_format=thd, seq_lens) for models that declare supports_thd (e.g.
+                # Qwen3-VL-MoE) and is converted downstream by process_input_for_thd. THD
+                # carries document boundaries in seq_lens, so it needs neither the indexed
+                # attention mask nor configure_packing's HF unpad/mask patches.
+                _packing_format = packing_cfg.get("packing_format", "neat")
+                if _packing_format == "thd":
+                    from nemo_automodel.components.datasets.vlm.collate_fns import (
+                        packed_sequence_thd_vlm_collater,
                     )
-                )
+
+                    logging.info("Configured VLM THD packing (Transformer Engine, qkv_format=thd)")
+                    collate_fn = lambda examples, _pi=_pad_id, _ml=_collate_max_length: (
+                        packed_sequence_thd_vlm_collater(
+                            examples,
+                            padding_idx=_pi,
+                            max_length=_ml,
+                        )
+                    )
+                else:
+                    # The packed collater builds a dense [B, 1, S, S] block-causal mask for
+                    # sdpa/eager but keeps a cheap indexed [B, S] mask for flash_attention_2.
+                    # At long context (e.g. 128k) the dense mask is ~S^2 bytes/sample and
+                    # OOMs the dataloader workers. ``packed_sequence.attn_implementation``
+                    # overrides the mask form: set it to "flash_attention_2" for
+                    # context-parallel runs, where the attention mask is stripped before the
+                    # model anyway (document boundaries are recovered from position_ids), so
+                    # the indexed form is both sufficient and orders of magnitude cheaper.
+                    # Attn computation still uses the model's backend; the attn_implementation
+                    # attribute in packing_cfg only switches the collater mask format. It is
+                    # therefore only safe to diverge from the model backend when cp>1, where the
+                    # mask is stripped before the model. Without CP the collater mask must match
+                    # the model backend, so ignore the override (and warn) and fall back to it.
+                    cp_size = (
+                        device_mesh["cp"].size()
+                        if device_mesh is not None and "cp" in getattr(device_mesh, "mesh_dim_names", ())
+                        else 1
+                    )
+                    _model_attn_impl = get_attn_implementation(cfg_model)
+                    _pack_attn_override = packing_cfg.get("attn_implementation", None)
+                    if _pack_attn_override is not None and cp_size > 1:
+                        _attn_impl = _pack_attn_override
+                    else:
+                        if _pack_attn_override not in (None, _model_attn_impl):
+                            logging.warning(
+                                "Ignoring packed_sequence.attn_implementation=%r at cp_size=1: the packed "
+                                "mask format must match the model attention backend (%r) when the mask is "
+                                "not stripped by context parallelism.",
+                                _pack_attn_override,
+                                _model_attn_impl,
+                            )
+                        _attn_impl = _model_attn_impl
+
+                    configure_packing(attn_implementation=_attn_impl)
+                    logging.info(f"Configured VLM neat packing for attn_implementation={_attn_impl}")
+
+                    collate_fn = lambda examples, _pi=_pad_id, _ml=_collate_max_length, _ai=_attn_impl: (
+                        neat_packed_vlm_collater(
+                            examples,
+                            padding_idx=_pi,
+                            max_length=_ml,
+                            attn_implementation=_ai,
+                        )
+                    )
             else:
                 collate_cfg = cfg_dl.get("collate_fn", None)
                 if collate_cfg:
@@ -916,6 +937,23 @@ class FinetuneRecipeForVLM(BaseRecipe):
             train_ctx, batch = self.magi.prepare_vlm_batch(
                 self.model_parts[0], batch
             )  # pragma: no cover - requires GPU + magi_attention
+        elif batch.get("qkv_format", None) == "thd":
+            # THD packed VLM path (packing_format="thd"): convert BSHD -> THD
+            # (flatten token axes, build cu_seqlens from seq_lens) via Transformer
+            # Engine even without context parallelism. process_input_for_thd only
+            # reshapes token-shaped fields and drops other tensors, so pop the
+            # non-token fields (media such as pixel_values/image_grid_thw) first
+            # and restore them after the conversion.
+            _thd_keys = {"input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded", "qkv_format"}
+            _extras = {k: batch.pop(k) for k in list(batch) if k not in _thd_keys}
+            _pad_id = getattr(getattr(self.processor, "tokenizer", None), "pad_token_id", 0) or 0
+            train_ctx, batch = make_cp_batch_and_ctx(
+                self.device_mesh,
+                batch,
+                use_te=True,
+                padding_token_id=_pad_id,
+            )
+            batch.update(_extras)
         else:
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
