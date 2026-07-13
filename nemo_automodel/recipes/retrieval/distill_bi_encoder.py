@@ -40,7 +40,7 @@ def _cfg_get_path(cfg, path: str, default=None):
         value = cfg.get(path, None)
         if value is not None:
             return value
-    except Exception:
+    except (AttributeError, KeyError, TypeError):
         pass
 
     cur = cfg
@@ -49,7 +49,7 @@ def _cfg_get_path(cfg, path: str, default=None):
             return default
         try:
             cur = cur.get(part, None)
-        except Exception:
+        except (AttributeError, KeyError, TypeError):
             cur = getattr(cur, part, None)
     return default if cur is None else cur
 
