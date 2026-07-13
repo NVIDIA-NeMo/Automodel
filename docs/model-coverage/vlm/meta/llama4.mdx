@@ -35,24 +35,19 @@ description: ""
 
 Install NeMo AutoModel and follow the fine-tuning guide to configure a recipe for this model.
 
-**1. Install** ([full instructions](/get-started/installation)):
-
-```bash
-pip install nemo-automodel
-```
-
-**2. Clone the repo** to get example recipes you can adapt:
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
+uv sync --locked --all-groups --all-extras
 ```
 
-**3. Fine-tune** by adapting a base VLM recipe — override the model ID on the CLI:
+**2. Fine-tune** by adapting a base VLM recipe — override the model ID on the CLI:
 
 ```bash
-automodel --nproc-per-node=8 examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml \
-  --model.pretrained_model_name_or_path <MODEL_HF_ID>
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml \
+  --model.pretrained_model_name_or_path "<MODEL_HF_ID>"
 ```
 
 Replace `<MODEL_HF_ID>` with the model ID from **Example HF Models** above.
@@ -77,7 +72,7 @@ cd /opt/Automodel
 
 ```bash
 automodel --nproc-per-node=8 examples/vlm_finetune/gemma3/gemma3_vl_4b_cord_v2.yaml \
-  --model.pretrained_model_name_or_path <MODEL_HF_ID>
+  --model.pretrained_model_name_or_path "<MODEL_HF_ID>"
 ```
 </Accordion>
 

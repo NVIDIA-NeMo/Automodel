@@ -198,7 +198,8 @@ uv venv
 # Choose ONE:
 uv sync --frozen  # LLM recipes (default)
 # uv sync --frozen --extra vlm --extra vlm-media  # VLM recipes (Qwen/Mistral/Omni need vlm-media for video/vision; fixes: ImportError: qwen_vl_utils is not installed)
-# uv sync --frozen --extra cuda  # Optional CUDA deps (e.g., Transformer Engine, bitsandbytes)
+# uv sync --frozen --extra cuda  # Optional CUDA deps (e.g., Transformer Engine, Mamba SSM)
+# uv sync --frozen --extra cuda_source  # Optional bitsandbytes dependency
 # uv sync --frozen --extra all  # Most optional deps (includes `vlm` and `cuda`; NOTE: excludes media — add --extra media for video/image decode)
 # uv sync --frozen --all-extras  # Everything (includes `fa`, `moe`, `media`, etc.)
 
@@ -224,7 +225,7 @@ uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml --npr
 ```
 
 > [!TIP]
-> **Login-node / CI installs:** If you only need to submit jobs (SLURM, k8s, NeMo-Run) and don't need to train locally, install the lightweight CLI package: `pip install nemo-automodel[cli]`
+> **NeMo-Run submission:** The `cli` extra adds NeMo Run to the base package: `uv pip install "nemo-automodel[cli]"`. It is additive; the base package still installs its core training dependencies, including PyTorch.
 
 
 ## LLM Pre-training

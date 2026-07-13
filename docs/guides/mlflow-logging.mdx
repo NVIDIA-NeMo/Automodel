@@ -19,11 +19,11 @@ With MLflow integration, you can:
 
 Before using MLflow logging in NeMo AutoModel, ensure you have:
 
-1. **MLflow installed**: MLflow is installed with `nemo-automodel` by default. If you see an import error in your environment, install it manually:
+1. **MLflow installed**: MLflow is installed with `nemo-automodel` by default. If you see an import error in a released-package environment, recreate that environment and install NeMo AutoModel there:
    ```bash
-   pip install mlflow
-   # or:
-   uv pip install mlflow
+   uv venv
+   source .venv/bin/activate
+   uv pip install "nemo-automodel"
    ```
 
 2. **MLflow tracking server** (optional): For production use, set up a tracking server to centralize experiment data. For local development, MLflow will use a local file-based store by default.
@@ -231,11 +231,11 @@ If you see an import error:
 ImportError: MLflow is not installed. Please install it (e.g. pip install mlflow).
 ```
 
-Install MLflow:
+Recreate the released-package environment so its declared MLflow dependency is installed:
 ```bash
-pip install mlflow
-# or:
-uv pip install mlflow
+uv venv
+source .venv/bin/activate
+uv pip install "nemo-automodel"
 ```
 
 ### Connection Issues
