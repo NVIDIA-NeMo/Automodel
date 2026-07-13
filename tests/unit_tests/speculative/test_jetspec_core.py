@@ -21,7 +21,7 @@ import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.loss.kd_loss import KDLoss
-from nemo_automodel.components.speculative.dflash import jetspec_core
+from nemo_automodel.components.speculative.dflash import core as dflash_core
 from nemo_automodel.components.speculative.dflash.core import NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.components.speculative.dflash.jetspec_core import JetSpecStepMetrics, JetSpecTrainerModule
@@ -210,13 +210,13 @@ def test_gather_teacher_logits_alignment():
 def test_forward_passes_causal_mask(monkeypatch):
     """JetSpec must build the block mask with causal=True (its defining change)."""
     seen = {}
-    real = jetspec_core.create_dflash_sdpa_mask
+    real = dflash_core.create_dflash_sdpa_mask
 
     def _spy(*args, **kwargs):
         seen["causal"] = kwargs.get("causal")
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(jetspec_core, "create_dflash_sdpa_mask", _spy)
+    monkeypatch.setattr(dflash_core, "create_dflash_sdpa_mask", _spy)
     trainer = _build_trainer(attention_backend="sdpa")
     input_ids, hidden, loss_mask, target_logits = _inputs()
     trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask, target_logits=target_logits)
@@ -237,7 +237,7 @@ def test_forward_flex_backend_builds_causal_block_mask(monkeypatch):
         seen["causal"] = kwargs.get("causal")
         return "sentinel-block-mask"
 
-    monkeypatch.setattr(jetspec_core, "create_dflash_block_mask", _spy_block_mask)
+    monkeypatch.setattr(dflash_core, "create_dflash_block_mask", _spy_block_mask)
     trainer = _build_trainer(attention_backend="flex_attention")
     # Bypass the (CUDA-only) flex attention kernel: the draft just echoes a
     # zero hidden of the noise-block shape so lm_head / loss still run on CPU.

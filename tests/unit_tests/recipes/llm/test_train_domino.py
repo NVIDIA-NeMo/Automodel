@@ -145,6 +145,9 @@ def test_run_trainer_step_injects_lambda_base():
         input_ids=torch.zeros(1, 4, dtype=torch.long),
         hidden_states=torch.zeros(1, 4, 8),
         loss_mask=torch.ones(1, 4),
+        position_ids=None,
+        seq_lens=None,
+        doc_remaining=None,
     )
     out = recipe._run_trainer_step(target_batch)
     # global_step 50 / (100 * 1.0) -> lambda_base 0.5.

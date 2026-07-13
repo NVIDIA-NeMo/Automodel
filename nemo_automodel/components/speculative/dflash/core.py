@@ -38,11 +38,14 @@ Two training objectives are supported via ``loss_type``:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
 
 from nemo_automodel.components.attention.dflash_mask import (
     create_dflash_block_mask,
@@ -309,45 +312,84 @@ class DFlashTrainerModule(nn.Module):
         anchor_positions: torch.Tensor,
         block_keep_mask: torch.Tensor,
         seq_len: int,
+        label_start: int = 0,
+        doc_remaining: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per-block ground-truth tokens and the supervised-position mask.
 
         Returns ``(label_indices, target_ids, block_mask)`` each of shape
         ``[B, N, block_size]``. ``label_indices[..., k]`` is the sequence position
-        block position ``k`` predicts (``anchor + k``); ``block_mask`` is the product
-        of block validity, in-bounds, and the gathered loss mask. Shared by the
-        block-wise trainers (DFlash here, JetSpec) so the label/mask gathering lives
-        in one place.
+        block position ``k`` predicts (``anchor + label_start + k``); ``block_mask``
+        is the product of block validity, in-bounds, and the gathered loss mask.
+        Shared by the block-wise trainers (DFlash, JetSpec, and Domino, which passes
+        ``label_start=1`` for ``shift_label``) so the label/mask gathering lives in
+        one place. Under packing, ``doc_remaining`` ``[B, S]`` truncates labels at
+        the anchor's document boundary: anchor sampling only keeps offsets up to
+        ``block_size - 1`` inside the anchor's document, and a shifted label window
+        (``label_start > 0``) reaches one past that guarantee.
         """
         n = anchor_positions.size(1)
-        label_indices = anchor_positions.unsqueeze(-1) + self._block_offsets  # [B, N, bs]
+        label_offsets = self._block_offsets + label_start  # [1, 1, bs]
+        label_indices = anchor_positions.unsqueeze(-1) + label_offsets  # [B, N, bs]
         valid_label_mask = label_indices < seq_len
+        if doc_remaining is not None:
+            doc_rem_at_anchor = torch.gather(doc_remaining, 1, anchor_positions.clamp(min=0)).unsqueeze(-1)
+            valid_label_mask = valid_label_mask & (label_offsets <= doc_rem_at_anchor)
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
         target_ids = torch.gather(input_ids.unsqueeze(1).expand(-1, n, -1), 2, safe_label_indices)
         gathered_loss_mask = torch.gather(loss_mask.unsqueeze(1).expand(-1, n, -1), 2, safe_label_indices)
         block_mask = block_keep_mask.unsqueeze(-1).float() * valid_label_mask.float() * gathered_loss_mask
         return label_indices, target_ids, block_mask
 
-    def forward(
+    def _prepare_block_inputs(
         self,
         input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        doc_remaining: Optional[torch.Tensor] = None,
-    ) -> DFlashStepMetrics:
-        """Parallel block-wise training forward pass.
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
+        causal: bool = False,
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, "torch.Tensor | BlockMask", Optional[torch.Tensor]
+    ]:
+        """Shared block-drafting prologue: anchors, noise embedding, positions, mask.
 
-        Sequence packing (``position_ids`` ``[B, S]`` per-document reset positions,
-        ``seq_lens`` ``[B, max_docs]`` document lengths, ``doc_remaining`` ``[B, S]``)
-        keeps every block inside one document: anchors are constrained so the block
-        does not cross a boundary, the block's context prefix attends only within the
-        anchor's document, and the draft's RoPE uses the per-document positions.
+        Centralises the sequence-packing handling for every block-wise trainer
+        (DFlash and its Domino / JetSpec subclasses): anchors are sampled so each
+        block stays inside one document, the block's context prefix is restricted
+        to its anchor's document, and the draft RoPE uses per-document positions.
+
+        Under ``loss_type="variable_prefix"`` the block embedding shows a sampled
+        real-token prefix (``_create_vp_noise_embed``) instead of the single anchor
+        token, and the sampled ``prefix_lengths`` are returned for the loss; every
+        other ``loss_type`` returns ``prefix_lengths=None``.
+
+        Args:
+            input_ids:     ``[B, S]`` context token ids (long).
+            loss_mask:     ``[B, S]`` supervised-token mask.
+            position_ids:  ``[B, S]`` per-document reset positions (packing), or ``None``.
+            seq_lens:      ``[B, max_docs]`` packed document lengths, or ``None`` (unpacked).
+            doc_remaining: ``[B, S]`` remaining real tokens of each position's document.
+            causal:        When True, build the in-block-causal (JetSpec) mask instead
+                of the bidirectional (DFlash / Domino) one.
+
+        Returns:
+            ``(anchor_positions [B, N], block_keep_mask [B, N], noise_embedding
+            [B, N*block_size, H], full_position_ids [B, S + N*block_size],
+            attention mask, prefix_lengths [B, N] or None)``; the mask is a flex
+            ``BlockMask`` or a dense additive ``[B, 1, N*block_size, S + N*block_size]``
+            tensor, per backend.
         """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         packed = seq_lens is not None
+        if packed and (position_ids is None or doc_remaining is None):
+            # A partial set would silently drop the in-document anchor constraint
+            # (cross-document supervision) or the per-document RoPE positions.
+            raise ValueError(
+                "Sequence packing requires position_ids, seq_lens, and doc_remaining together; "
+                "got seq_lens without the other packing metadata."
+            )
 
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
             seq_len, loss_mask, device, doc_remaining=doc_remaining if packed else None
@@ -356,6 +398,7 @@ class DFlashTrainerModule(nn.Module):
             prefix_lengths = self._sample_prefix_lengths(bsz, anchor_positions.shape[1], device)
             noise_embedding = self._create_vp_noise_embed(input_ids, anchor_positions, block_keep_mask, prefix_lengths)
         else:
+            prefix_lengths = None
             noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
 
         if packed:
@@ -370,26 +413,54 @@ class DFlashTrainerModule(nn.Module):
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
         if self.attention_backend == "flex_attention":
-            dflash_attn_mask = create_dflash_block_mask(
+            attn_mask = create_dflash_block_mask(
                 anchor_positions,
                 block_keep_mask,
                 seq_len,
                 self.block_size,
                 device,
+                causal=causal,
                 ctx_doc_id=ctx_doc_id,
                 anchor_doc_id=anchor_doc_id,
             )
         else:
-            dflash_attn_mask = create_dflash_sdpa_mask(
+            attn_mask = create_dflash_sdpa_mask(
                 anchor_positions,
                 block_keep_mask,
                 seq_len,
                 self.block_size,
                 device,
                 dtype=noise_embedding.dtype,
+                causal=causal,
                 ctx_doc_id=ctx_doc_id,
                 anchor_doc_id=anchor_doc_id,
             )
+        return anchor_positions, block_keep_mask, noise_embedding, full_position_ids, attn_mask, prefix_lengths
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        loss_mask: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
+    ) -> DFlashStepMetrics:
+        """Parallel block-wise training forward pass.
+
+        Sequence packing (``position_ids`` ``[B, S]`` per-document reset positions,
+        ``seq_lens`` ``[B, max_docs]`` document lengths, ``doc_remaining`` ``[B, S]``)
+        keeps every block inside one document: anchors are constrained so the block
+        does not cross a boundary, the block's context prefix attends only within the
+        anchor's document, and the draft's RoPE uses the per-document positions.
+        """
+        bsz, seq_len = input_ids.shape
+
+        anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, prefix_lengths = (
+            self._prepare_block_inputs(
+                input_ids, loss_mask, position_ids=position_ids, seq_lens=seq_lens, doc_remaining=doc_remaining
+            )
+        )
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
