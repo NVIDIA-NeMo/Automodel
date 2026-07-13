@@ -195,11 +195,36 @@ See the pattern files for detailed implementation guidance:
 
 ### 2.3 Causal LM weight tying
 
-For any CausalLM-style class whose config can enable `tie_word_embeddings`,
-make tying explicit: declare `_tied_weights_keys`, implement `tie_weights()`
-with the actual `lm_head` and input-embedding FQNs, and add tiny tests for
-tied and untied configs. Do not tie architectures with intentionally separate
-heads, asymmetric vocab sizes, or stages that do not own both tensors.
+Every registered class that owns or builds an `lm_head` MUST declare a
+`tie_word_embeddings_support: TieSupport` class attribute (`BOTH` / `TIED_ONLY` /
+`UNTIED_ONLY`, from `nemo_automodel.components.checkpoint.utils`) and call
+`reject_unsupported_tie_word_embeddings(type(self), config)` at the top of
+`__init__` — on the *original* config, before any `text_config` /
+`thinker_config` unwrap or `super().__init__()` — so an unsupported request fails
+fast. A registry-iterating test enforces the declaration; because the guard
+defaults *undeclared* classes to `BOTH`, a missing declaration is caught only by
+that test. Classes that own no causal head (retrieval encoders, VLM containers)
+go on that test's explicit, commented exempt list instead.
+
+Choose the policy from the architecture, not a bare config default (a bare
+`Mistral3Config()` resolves tied although its served checkpoint is untied):
+
+- `BOTH` is an affirmative claim that the non-default direction is a validated
+  load path. Make tying explicit: declare `_tied_weights_keys`, implement
+  `tie_weights()` with the actual `lm_head` and input-embedding FQNs (re-tie to
+  the active embedding after any `language_model` swap), and add tiny tied+untied
+  alias tests.
+- `TIED_ONLY` / `UNTIED_ONLY` when only one direction ships; add a rejection test
+  for the unsupported value.
+
+Do not tie architectures with intentionally separate heads, asymmetric vocab
+sizes, or stages that do not own both tensors.
+
+`NeMoAutoModel*.from_pretrained` additionally rejects loading a checkpoint whose
+`tie_word_embeddings` is flipped from the value it was saved with (both
+directions). If a model ships its own `from_pretrained` classmethod that bypasses
+the `NeMoAuto*` bridge, call `reject_tie_word_embeddings_flip(checkpoint_config,
+requested_config, model_class_name)` there so the per-checkpoint guard still runs.
 
 ### 2.4 MoE state-dict adapter checklist
 
@@ -395,6 +420,8 @@ that only surface in a full parity comparison.
 - [ ] Registered in `MODEL_ARCH_MAPPING` in `_transformers/registry.py`
 - [ ] Registered custom config in `_CUSTOM_CONFIG_REGISTRATIONS` (if applicable)
 - [ ] Declared `ModelCapabilities` nested dataclass (static) OR `get_capabilities(cls, config)` classmethod (variant dispatch, e.g. ERNIE-4.5 MoE vs dense) — never both, never neither
+- [ ] Declared `tie_word_embeddings_support: TieSupport` and called `reject_unsupported_tie_word_embeddings(type(self), config)` at the top of `__init__` (or added the class to the registry test's exempt list if it owns no lm_head); for `BOTH` add explicit `_tied_weights_keys` + `tie_weights()` + tied/untied tests, otherwise a rejection test — see §2.3
+- [ ] For any model-owned `from_pretrained` that bypasses the `NeMoAuto*` bridge, called `reject_tie_word_embeddings_flip(...)` — see §2.3
 - [ ] Created example YAML config
 - [ ] Verified model loads via `NeMoAutoModelForCausalLM.from_pretrained()`
 - [ ] Created unit tests (forward shape, state_dict round-trip)
