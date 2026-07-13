@@ -22,9 +22,14 @@ import torch.nn as nn
 
 from nemo_automodel.components.distributed.parallelizer import (
     DefaultParallelizationStrategy,
-    NemotronHParallelizationStrategy,
     fsdp2_strategy_parallelize,
     get_parallelization_strategy,
+)
+from nemo_automodel.components.models.nemotron_v3.parallelizer import (
+    NemotronHParallelizationStrategy,
+)
+from nemo_automodel.components.models.nemotron_v3.parallelizer import (
+    get_parallelization_strategy as get_nemotron_parallelization_strategy,
 )
 
 
@@ -53,6 +58,7 @@ class MockNemotronModel(nn.Module):
         self.backbone = nn.Module()
         self.backbone.layers = nn.ModuleList([self._create_layer() for _ in range(2)])
         self.__class__.__name__ = "NemotronHForCausalLM"
+        self._nemo_parallelization_strategy_factory = get_nemotron_parallelization_strategy
 
     def _create_layer(self):
         layer = nn.Module()
@@ -110,11 +116,11 @@ def test_strategy_selection_nemotron_model():
 
 @patch("torch.distributed.get_process_group_ranks", return_value=[0])
 @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
-@patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively")
+@patch("nemo_automodel.components.distributed.parallelizer.DefaultParallelizationStrategy._shard_modules_recursively")
 @patch("nemo_automodel.components.distributed.parallelizer._extract_model_layer_groups")
-@patch("nemo_automodel.components.distributed.parallelizer._get_parallel_plan")
+@patch("nemo_automodel.components.distributed.parallelizer.get_tp_plan")
 def test_backward_compatibility_standard_model(
-    mock_get_plan, mock_extract_layer_groups, mock_apply_fsdp, mock_fully_shard, mock_gpgr, mock_device_mesh
+    mock_get_plan, mock_extract_layer_groups, mock_shard_modules, mock_fully_shard, mock_gpgr, mock_device_mesh
 ):
     """Test that the refactored code maintains backward compatibility for standard models."""
     mock_fully_shard.side_effect = lambda model, **kwargs: model
@@ -135,7 +141,7 @@ def test_backward_compatibility_standard_model(
 
     # Should have called the expected functions for standard flow
     mock_extract_layer_groups.assert_called_once_with(model)
-    mock_apply_fsdp.assert_called_once()
+    mock_shard_modules.assert_called_once()
     mock_fully_shard.assert_called()
 
 
@@ -204,12 +210,14 @@ def test_no_runtime_errors_with_different_model_types(mock_device_mesh):
         ),
         patch("nemo_automodel.components.distributed.parallelizer.parallelize_module"),
     ):
-        with patch("nemo_automodel.components.distributed.parallelizer.apply_fsdp2_sharding_recursively"):
+        with patch(
+            "nemo_automodel.components.distributed.parallelizer.DefaultParallelizationStrategy._shard_modules_recursively"
+        ):
             with patch(
                 "nemo_automodel.components.distributed.parallelizer._extract_model_layer_groups",
                 return_value={"language": []},
             ):
-                with patch("nemo_automodel.components.distributed.parallelizer._get_parallel_plan", return_value={}):
+                with patch("nemo_automodel.components.distributed.parallelizer.get_tp_plan", return_value={}):
                     # Test standard model
                     standard_model = MockStandardModel()
                     result1 = fsdp2_strategy_parallelize(

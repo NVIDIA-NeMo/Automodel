@@ -49,14 +49,10 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
-from nemo_automodel.components.distributed import DistributedSetup, ParallelismSizes, parallelizer
+from nemo_automodel.components.distributed import DistributedSetup, ParallelismSizes
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
-from nemo_automodel.components.distributed.parallelizer import (
-    HunyuanParallelizationStrategy,
-    WanParallelizationStrategy,
-)
 from nemo_automodel.shared.import_utils import safe_import_te
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -139,10 +135,16 @@ def _import_diffusers_class(class_name: str):
     return getattr(diffusers, class_name)
 
 
-def _init_parallelizer():
-    """Register custom parallelization strategies."""
-    parallelizer.PARALLELIZATION_STRATEGIES["WanTransformer3DModel"] = WanParallelizationStrategy()
-    parallelizer.PARALLELIZATION_STRATEGIES["HunyuanVideo15Transformer3DModel"] = HunyuanParallelizationStrategy()
+def _attach_diffusion_parallelization_strategy(module: nn.Module) -> None:
+    """Attach a Diffusers strategy only for the upstream models that need one."""
+    if type(module).__name__ not in {"WanTransformer3DModel", "HunyuanVideo15Transformer3DModel"}:
+        return
+
+    from nemo_automodel._diffusers.parallelizer import get_parallelization_strategy
+
+    strategy = get_parallelization_strategy(module)
+    if strategy is not None:
+        module._nemo_parallelization_strategy = strategy
 
 
 def _choose_device(device: Optional[torch.device]) -> torch.device:
@@ -485,13 +487,12 @@ def _apply_parallelization(
         return created_managers
 
     assert torch.distributed.is_initialized(), "Distributed environment must be initialized for parallelization"
-    _init_parallelizer()
-
     for comp_name, comp_module in _iter_pipeline_modules(pipe):
         manager_args = parallel_scheme.get(comp_name)
         if manager_args is None:
             continue
         logger.info("[INFO] Applying parallelization to %s", comp_name)
+        _attach_diffusion_parallelization_strategy(comp_module)
         manager = _create_parallel_manager(manager_args)
         created_managers[comp_name] = manager
         parallel_module = manager.parallelize(comp_module)

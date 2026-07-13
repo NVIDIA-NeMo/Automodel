@@ -1009,3 +1009,13 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
 
 ModelClass = DeepseekV4ForCausalLM
+
+
+def _get_nemo_parallelization_strategy():
+    """Load the DeepSeek-V4 FSDP2 strategy only when parallelization is requested."""
+    from .parallelizer import get_parallelization_strategy
+
+    return get_parallelization_strategy()
+
+
+DeepseekV4ForCausalLM._nemo_parallelization_strategy_factory = staticmethod(_get_nemo_parallelization_strategy)

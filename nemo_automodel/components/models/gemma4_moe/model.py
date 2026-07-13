@@ -1419,3 +1419,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
 if _GEMMA4_HF_AVAILABLE:
     ModelClass = Gemma4ForConditionalGeneration
+
+    def _get_nemo_tp_plan(model, *, sequence_parallel: bool = False):
+        """Load the Gemma4 tensor-parallel plan only when it is requested."""
+        from .parallelizer import get_tp_plan
+
+        return get_tp_plan(model, sequence_parallel=sequence_parallel)
+
+    Gemma4ForConditionalGeneration._nemo_tp_plan_factory = staticmethod(_get_nemo_tp_plan)

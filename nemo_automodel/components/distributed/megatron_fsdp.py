@@ -22,9 +22,9 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.config import MegatronFSDPConfig
 from nemo_automodel.components.distributed.parallelizer import (
-    _get_parallel_plan,
     megatron_fsdp_strategy_parallelize,
 )
+from nemo_automodel.components.distributed.tp_plan import get_tp_plan
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.config import DistributedConfig
@@ -122,7 +122,7 @@ class MegatronFSDPManager:
 
         if self.device_mesh["tp"].size() > 1:
             # Delegate plan selection to central helper. MegatronFSDP currently does not support SP.
-            tp_shard_plan = _get_parallel_plan(
+            tp_shard_plan = get_tp_plan(
                 model,
                 sequence_parallel=False,  # explicit: SP not supported here
                 tp_shard_plan=None,

@@ -646,3 +646,13 @@ _register_ministral3_with_transformers()
 # via torch.set_default_dtype() context. By not exporting it, the model goes through
 # HF's Auto class path which properly respects torch_dtype.
 ModelClass = Ministral3ForCausalLM
+
+
+def _get_nemo_tp_plan(model, *, sequence_parallel: bool = False):
+    """Load the Ministral3 tensor-parallel plan only when requested."""
+    from .parallelizer import get_tp_plan
+
+    return get_tp_plan(model, sequence_parallel=sequence_parallel)
+
+
+Ministral3ForCausalLM._nemo_tp_plan_factory = staticmethod(_get_nemo_tp_plan)

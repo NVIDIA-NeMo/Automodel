@@ -29,10 +29,6 @@ from nemo_automodel._transformers.capabilities import (
     attach_capabilities_and_validate,
     validate_for_mesh,
 )
-from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
-
-_PARALLELIZE_PATH = "nemo_automodel.components.distributed.optimized_tp_plans.PARALLELIZE_FUNCTIONS"
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -186,9 +182,8 @@ class TestAttachCapabilities:
 
     def test_attach_and_validate_calls_validation(self):
         model = _Bare()
-        with patch(_PARALLELIZE_PATH, {}):
-            with pytest.raises(ValueError, match="no TP plan"):
-                attach_capabilities_and_validate(model, _mesh(tp=2))
+        with pytest.raises(ValueError, match="no TP plan"):
+            attach_capabilities_and_validate(model, _mesh(tp=2))
 
 
 # ---------------------------------------------------------------------------
@@ -197,23 +192,21 @@ class TestAttachCapabilities:
 
 
 class TestModelSupportsTP:
-    def test_tp_true_with_optimized_plan(self):
+    def test_tp_true_with_model_local_plan(self):
         model = _Bare()
+        model._nemo_tp_plan_factory = lambda target, *, sequence_parallel: {}
         _attach(model)
-        with patch(_PARALLELIZE_PATH, {_get_class_qualname(_Bare): lambda model, sp: {}}):
-            assert model.supports.supports_tp is True
+        assert model.supports.supports_tp is True
 
     def test_tp_true_with_hf_native_plan(self):
         model = _WithTP()
         _attach(model)
-        with patch(_PARALLELIZE_PATH, {}):
-            assert model.supports.supports_tp is True
+        assert model.supports.supports_tp is True
 
     def test_tp_false_without_plan(self):
         model = _Bare()
         _attach(model)
-        with patch(_PARALLELIZE_PATH, {}):
-            assert model.supports.supports_tp is False
+        assert model.supports.supports_tp is False
 
 
 class TestModelSupportsTHD:
@@ -468,8 +461,7 @@ class TestModelSupportsRepr:
     def test_repr(self):
         model = _Bare()
         _attach(model)
-        with patch(_PARALLELIZE_PATH, {}):
-            r = repr(model.supports)
+        r = repr(model.supports)
         assert "ModelSupports(" in r
         assert "tp=" in r
         assert "pp=" in r
@@ -484,15 +476,13 @@ class TestValidateForMesh:
     def test_tp_fails(self):
         model = _Bare()
         _attach(model)
-        with patch(_PARALLELIZE_PATH, {}):
-            with pytest.raises(ValueError, match="Tensor parallelism.*no TP plan"):
-                validate_for_mesh(model, _mesh(tp=2))
+        with pytest.raises(ValueError, match="Tensor parallelism.*no TP plan"):
+            validate_for_mesh(model, _mesh(tp=2))
 
     def test_tp_passes_with_plan(self):
         model = _WithTP()
         _attach(model)
-        with patch(_PARALLELIZE_PATH, {}):
-            validate_for_mesh(model, _mesh(tp=2))
+        validate_for_mesh(model, _mesh(tp=2))
 
     def test_pp_fails(self):
         model = _Bare()
@@ -583,14 +573,13 @@ class TestValidateForMesh:
     def test_multiple_errors(self):
         model = _Bare()
         _attach(model)
-        with patch(_PARALLELIZE_PATH, {}):
-            with pytest.raises(ValueError) as exc_info:
-                validate_for_mesh(model, _mesh(tp=2, pp=4, ep=2, cp=2))
-            msg = str(exc_info.value)
-            assert "no TP plan" in msg
-            assert "_pp_plan" in msg
-            assert "MoE" in msg
-            assert "Context parallelism" in msg
+        with pytest.raises(ValueError) as exc_info:
+            validate_for_mesh(model, _mesh(tp=2, pp=4, ep=2, cp=2))
+        msg = str(exc_info.value)
+        assert "no TP plan" in msg
+        assert "_pp_plan" in msg
+        assert "MoE" in msg
+        assert "Context parallelism" in msg
 
     def test_no_mesh_is_noop(self):
         model = _Bare()

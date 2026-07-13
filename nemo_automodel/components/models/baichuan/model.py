@@ -623,3 +623,13 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
 
 
 ModelClass = BaichuanForCausalLM
+
+
+def _get_nemo_tp_plan(model, *, sequence_parallel: bool = False):
+    """Load Baichuan's tensor-parallel plan only when requested."""
+    from .parallelizer import get_tp_plan
+
+    return get_tp_plan(model, sequence_parallel=sequence_parallel)
+
+
+BaichuanForCausalLM._nemo_tp_plan_factory = staticmethod(_get_nemo_tp_plan)

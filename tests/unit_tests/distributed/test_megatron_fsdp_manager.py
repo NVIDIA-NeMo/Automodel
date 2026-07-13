@@ -16,7 +16,6 @@
 import logging
 from unittest.mock import MagicMock
 
-import pytest
 import torch
 
 from nemo_automodel.components.distributed import megatron_fsdp as mfsdp
@@ -91,7 +90,7 @@ def test_parallelize_world_size_gt_one_selects_tp_plan_passes_dims_and_warns_on_
     tp_plan = {"some.layer": object()}
     get_plan_mock = MagicMock(return_value=tp_plan)
     strat_mock = MagicMock(return_value=("parallel_model", "parallel_opt"))
-    monkeypatch.setattr(mfsdp, "_get_parallel_plan", get_plan_mock, raising=True)
+    monkeypatch.setattr(mfsdp, "get_tp_plan", get_plan_mock, raising=True)
     monkeypatch.setattr(mfsdp, "megatron_fsdp_strategy_parallelize", strat_mock, raising=True)
 
     mgr = _make_manager(mesh, activation_checkpointing=True, zero_dp_strategy=2)
@@ -134,7 +133,7 @@ def test_parallelize_world_size_gt_one_skips_tp_plan_when_tp_size_is_one(monkeyp
 
     get_plan_mock = MagicMock()
     strat_mock = MagicMock(return_value=("m", "o"))
-    monkeypatch.setattr(mfsdp, "_get_parallel_plan", get_plan_mock, raising=True)
+    monkeypatch.setattr(mfsdp, "get_tp_plan", get_plan_mock, raising=True)
     monkeypatch.setattr(mfsdp, "megatron_fsdp_strategy_parallelize", strat_mock, raising=True)
 
     mgr = _make_manager(mesh)

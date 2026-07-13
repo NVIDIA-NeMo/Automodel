@@ -117,9 +117,7 @@ def _build_fork_model(text_cfg: dict):
         DiffusionGemmaForBlockDiffusion,
     )
 
-    config = DiffusionGemmaConfig(
-        text_config=dict(text_cfg), vision_config=_tiny_vision_config_dict(), canvas_length=8
-    )
+    config = DiffusionGemmaConfig(text_config=dict(text_cfg), vision_config=_tiny_vision_config_dict(), canvas_length=8)
     config._attn_implementation = "eager"
     model = DiffusionGemmaForBlockDiffusion(config).to(torch.float32).eval()
     return model, config
@@ -133,9 +131,7 @@ def _build_native_model(text_cfg: dict):
 
     # The native model now reuses the fork's config; self_conditioning/freeze_router are
     # model-construction flags (not strict config fields), so pass them to the model.
-    config = DiffusionGemmaConfig(
-        text_config=dict(text_cfg), vision_config=_tiny_vision_config_dict(), canvas_length=8
-    )
+    config = DiffusionGemmaConfig(text_config=dict(text_cfg), vision_config=_tiny_vision_config_dict(), canvas_length=8)
     backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch_fp32", enable_hf_state_dict_adapter=True)
     model = (
         DiffusionGemmaForBlockDiffusion(config, backend=backend, self_conditioning=True, freeze_router=False)
@@ -222,9 +218,7 @@ def test_forward_parity_with_fork():
             if "decoder_input_ids" in inspect.signature(fork_model.forward).parameters
             else "canvas_ids"
         )
-        fork_out = fork_model(
-            input_ids=input_ids, self_conditioning_logits=None, **{canvas_kwarg: canvas_ids}
-        )
+        fork_out = fork_model(input_ids=input_ids, self_conditioning_logits=None, **{canvas_kwarg: canvas_ids})
         fork_logits = fork_out.logits
 
         # Native: drive the building blocks with the fork's inference mask
