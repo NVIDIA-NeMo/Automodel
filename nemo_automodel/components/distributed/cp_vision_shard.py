@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -72,6 +73,7 @@ logger = logging.getLogger(__name__)
 _LOGGED_ONCE = False
 _LOGGED_SMALL_FALLBACK = False
 _LOGGED_CUDA_GRID_HOST_SYNC = False
+_LOGGED_COST_ALPHAS: set[tuple[str, int, str]] = set()
 
 
 @dataclass(frozen=True)
@@ -294,7 +296,146 @@ def _min_shard_tokens() -> int:
         return 2048
 
 
-def _contiguous_balanced_bounds(patches: torch.Tensor, world: int) -> list[int] | None:
+def _config_value(source: object, name: str) -> object | None:
+    if isinstance(source, Mapping):
+        return source.get(name)
+    return getattr(source, name, None)
+
+
+def _infer_vision_hidden_size(source: object | None) -> int | None:
+    """Best-effort vision-width discovery without depending on model class names.
+
+    Supported VLMs expose the width in different places: Qwen vision towers use
+    ``visual.config.hidden_size``, while Nemotron Omni's multimodal config uses
+    ``vit_hidden_size`` and RADIO-style towers may expose ``embed_dim``.  Prefer
+    explicitly vision-named fields and nested vision configs over a root
+    ``hidden_size`` so a text-model width is not accidentally selected.
+
+    Args:
+        source: A model, module, or config object (or a ``Mapping``) that may
+            carry the vision width somewhere in its attributes/children.
+
+    Returns:
+        The discovered positive width, or ``None`` when no vision width is found.
+    """
+    visited: set[int] = set()
+
+    def _positive_int(value: object | None) -> int | None:
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _walk(current: object | None, depth: int) -> int | None:
+        if current is None or depth > 6:
+            return None
+        direct = _positive_int(current)
+        if direct is not None:
+            return direct
+        identity = id(current)
+        if identity in visited:
+            return None
+        visited.add(identity)
+
+        for name in ("vit_hidden_size", "vision_hidden_size", "embed_dim"):
+            found = _positive_int(_config_value(current, name))
+            if found is not None:
+                return found
+
+        # Search vision-specific children before accepting a generic hidden size.
+        for name in (
+            "vision_config",
+            "visual",
+            "vision_model",
+            "radio_model",
+            "patch_generator",
+            "config",
+            "module",
+            "_orig_mod",
+            "_fsdp_wrapped_module",
+            "model",
+        ):
+            child = _config_value(current, name)
+            if child is current:
+                continue
+            found = _walk(child, depth + 1)
+            if found is not None:
+                return found
+
+        for name in ("hidden_size", "d_model"):
+            found = _positive_int(_config_value(current, name))
+            if found is not None:
+                return found
+        return None
+
+    return _walk(source, 0)
+
+
+def _vision_cost_alpha(source: object | None = None) -> int:
+    """Resolve the linear term in the vision partition cost ``p*(p+alpha)``.
+
+    A non-negative integer in ``NEMO_CP_SHARD_VISION_COST_ALPHA`` is an exact
+    override (``0`` selects the legacy pure-quadratic model).  With the variable
+    unset or set to ``auto``, use ``3 * vision_hidden_size``: the three Q/K/V
+    projections are a portable proxy for linear per-patch ViT work.  Unknown
+    architectures safely retain the legacy ``alpha=0`` behavior.
+
+    Args:
+        source: Object to infer the vision width from when in ``auto`` mode.
+
+    Returns:
+        The resolved non-negative ``alpha``.
+    """
+    raw = os.environ.get("NEMO_CP_SHARD_VISION_COST_ALPHA")
+    mode = "auto"
+    alpha: int | None = None
+    if raw is not None and raw.strip() and raw.strip().lower() != "auto":
+        try:
+            parsed = int(raw)
+            if parsed < 0:
+                raise ValueError
+            alpha = parsed
+            mode = "override"
+        except ValueError:
+            logger.warning(
+                "invalid NEMO_CP_SHARD_VISION_COST_ALPHA=%r; using auto",
+                raw,
+            )
+
+    hidden_size = _infer_vision_hidden_size(source)
+    if alpha is None:
+        alpha = 3 * hidden_size if hidden_size is not None else 0
+        mode = "auto" if hidden_size is not None else "legacy-fallback"
+
+    if source is not None:
+        model_name = type(source).__name__
+        log_key = (model_name, alpha, mode)
+        if log_key not in _LOGGED_COST_ALPHAS:
+            _LOGGED_COST_ALPHAS.add(log_key)
+            if mode == "auto":
+                detail = f"auto: 3 x vision hidden_size {hidden_size}"
+            elif mode == "override":
+                detail = "environment override"
+            else:
+                detail = "vision width unavailable; legacy fallback"
+            logger.info(
+                "vision partition cost alpha=%d (%s) for %s",
+                alpha,
+                detail,
+                model_name,
+            )
+    return alpha
+
+
+def _contiguous_balanced_bounds(
+    patches: torch.Tensor,
+    world: int,
+    *,
+    cost_alpha_source: object | None = None,
+) -> list[int] | None:
     """Partition ``len(patches)`` entries into ``world`` CONTIGUOUS groups balanced by
     approximate vision-attention cost, with >=1 entry per group.
 
@@ -310,6 +451,15 @@ def _contiguous_balanced_bounds(patches: torch.Tensor, world: int) -> list[int] 
     original entry order with no reshuffle.  Deterministic: ``patches`` is identical on
     every rank, so all ranks compute the same partition (and thus the same per-rank token
     counts they need to unpack the all-gather).
+
+    Cost model: ``p*(p + alpha)``.  An explicit ``NEMO_CP_SHARD_VISION_COST_ALPHA``
+    integer wins; otherwise ``alpha`` is inferred as ``3 * vision_hidden_size`` from
+    ``cost_alpha_source``.  The quadratic term is per-frame attention; ``alpha*p`` adds
+    the LINEAR per-patch work (qkv/MLP projections) that the pure quadratic ignores --
+    without it, packs mixing big image frames with many small video frames heap the small
+    frames onto few ranks (attention-cost-"balanced" but frame-count- and wall-clock-
+    imbalanced).  Unknown architectures fall back to ``alpha=0``.  Partition-only choice:
+    forward/grad are identical for any cuts.
     """
     n = int(patches.shape[0])
     if n < world:
@@ -321,7 +471,8 @@ def _contiguous_balanced_bounds(patches: torch.Tensor, world: int) -> list[int] 
     # host sync + Python bisect is both cheap and device-agnostic.
     import bisect
 
-    costs = [int(x) * int(x) for x in patches.tolist()]
+    alpha = _vision_cost_alpha(cost_alpha_source)
+    costs = [int(x) * (int(x) + alpha) for x in patches.tolist()]
     if any(value <= 0 for value in costs):
         raise ValueError("partition costs must be positive")
     cum = []
@@ -492,7 +643,11 @@ def maybe_distribute_visual(
             f_hw.append((sms, sms))
         cuts = list(range(world + 1))  # exactly one frame unit per rank
     else:
-        cuts = _contiguous_balanced_bounds(torch.tensor(f_patches, dtype=torch.long), world)
+        cuts = _contiguous_balanced_bounds(
+            torch.tensor(f_patches, dtype=torch.long),
+            world,
+            cost_alpha_source=visual,
+        )
         if cuts is None:  # n_units == 0 (no frames) -> replicate (keeps collectives uniform)
             return visual(
                 pixel_values,

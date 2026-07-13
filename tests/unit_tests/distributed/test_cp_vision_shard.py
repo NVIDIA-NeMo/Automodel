@@ -135,6 +135,107 @@ def test_partition_none_when_fewer_entries_than_ranks():
     assert vs._contiguous_balanced_bounds(patches, 4) is None
 
 
+@pytest.mark.parametrize(
+    ("source", "expected_hidden", "expected_alpha"),
+    [
+        # Qwen3-VL / Qwen3.5 visual modules expose visual.config.hidden_size.
+        (SimpleNamespace(config=SimpleNamespace(hidden_size=1152)), 1152, 3456),
+        # Composite VLM configs must prefer vision_config over the text width.
+        (
+            SimpleNamespace(
+                hidden_size=7168,
+                vision_config=SimpleNamespace(hidden_size=1024),
+            ),
+            1024,
+            3072,
+        ),
+        # Nemotron Omni uses vit_hidden_size on the multimodal config.
+        (
+            SimpleNamespace(
+                vit_hidden_size=1280,
+                llm_config=SimpleNamespace(hidden_size=7168),
+            ),
+            1280,
+            3840,
+        ),
+        # RADIO-style patch generators commonly call the same width embed_dim.
+        (SimpleNamespace(patch_generator=SimpleNamespace(embed_dim=768)), 768, 2304),
+    ],
+)
+def test_auto_cost_alpha_discovers_supported_vision_widths(monkeypatch, source, expected_hidden, expected_alpha):
+    monkeypatch.delenv("NEMO_CP_SHARD_VISION_COST_ALPHA", raising=False)
+
+    assert vs._infer_vision_hidden_size(source) == expected_hidden
+    assert vs._vision_cost_alpha(source) == expected_alpha
+
+
+def test_cost_alpha_override_and_unknown_model_fallback(monkeypatch):
+    qwen_visual = SimpleNamespace(config=SimpleNamespace(hidden_size=1152))
+
+    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "777")
+    assert vs._vision_cost_alpha(qwen_visual) == 777
+    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "0")
+    assert vs._vision_cost_alpha(qwen_visual) == 0
+
+    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "auto")
+    assert vs._vision_cost_alpha(qwen_visual) == 3456
+    assert vs._vision_cost_alpha(SimpleNamespace()) == 0
+
+    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "not-a-number")
+    assert vs._vision_cost_alpha(qwen_visual) == 3456
+
+
+def test_partition_cost_alpha_flattens_mixed_frame_sizes(monkeypatch):
+    """NEMO_CP_SHARD_VISION_COST_ALPHA adds the linear per-patch term to the cost.
+
+    A pack mixing a few BIG image frames with many small video frames is the pathological
+    case for the pure ``p**2`` model: one big frame "costs" as much as thousands of small
+    ones, so the small frames heap onto few ranks. Setting the alpha to the linear
+    per-patch proxy (~3x ViT hidden) flattens the frame-count imbalance. This test pins the
+    partition-level behavior.
+    """
+    world = 8
+    patches = torch.tensor([1024] * 4 + [112] * 400, dtype=torch.long)  # 4 big + 400 small
+
+    monkeypatch.delenv("NEMO_CP_SHARD_VISION_COST_ALPHA", raising=False)
+    cuts0 = vs._contiguous_balanced_bounds(patches, world)
+    per0 = [cuts0[r + 1] - cuts0[r] for r in range(world)]
+
+    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "3456")
+    cuts_a = vs._contiguous_balanced_bounds(patches, world)
+    per_a = [cuts_a[r + 1] - cuts_a[r] for r in range(world)]
+
+    # default (unset) keeps the original pure-quadratic partition: heavily skewed
+    ratio0 = max(per0) / max(min(per0), 1)
+    ratio_a = max(per_a) / max(min(per_a), 1)
+    assert ratio0 > 10
+    # alpha=3456 flattens the frame-count imbalance by an order of magnitude
+    assert ratio_a < ratio0 / 10
+    # both are valid contiguous complete partitions
+    for cuts in (cuts0, cuts_a):
+        assert cuts[0] == 0 and cuts[-1] == len(patches) and len(cuts) == world + 1
+
+    # invalid env value falls back to alpha=0 (identical to default partition)
+    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "not-a-number")
+    assert vs._contiguous_balanced_bounds(patches, world) == cuts0
+
+
+def test_partition_uses_model_aware_alpha_by_default(monkeypatch):
+    patches = torch.tensor([1024] * 4 + [112] * 400, dtype=torch.long)
+    qwen_visual = SimpleNamespace(config=SimpleNamespace(hidden_size=1152))
+
+    monkeypatch.delenv("NEMO_CP_SHARD_VISION_COST_ALPHA", raising=False)
+    auto = vs._contiguous_balanced_bounds(
+        patches,
+        8,
+        cost_alpha_source=qwen_visual,
+    )
+    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "3456")
+    explicit = vs._contiguous_balanced_bounds(patches, 8)
+
+    assert auto == explicit
+
+
 # ======================================================================================
 # B. THE math: visual(full) == concat_r visual(slice_r), forward AND vision-param grad
 # ======================================================================================
