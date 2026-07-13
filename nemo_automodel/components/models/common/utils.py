@@ -679,15 +679,24 @@ def _restore_fp32_tensor_snapshots(
         param.data = snapshot.to(dtype=torch.float32)
 
     for name, snapshot in buffer_snapshots.items():
-        # ActivationWrapper https://github.com/pytorch/pytorch/blob/d84328bd3473e0527989398bfbb88ef2d94ca0a4/torch/distributed/algorithms/_checkpoint/checkpoint_wrapper.py#L25
-        # forwards __getattr__ / __setattr__ to the wrapped module,
-        # so we need to remove the `._checkpoint_wrapped_module`` suffix
-        name = name.replace("._checkpoint_wrapped_module", "")
-        module_name, _, buffer_name = name.rpartition(".")
-        module = model.get_submodule(module_name) if module_name else model
-        if buffer_name not in module._buffers:
-            continue
-        module._buffers[buffer_name] = snapshot.to(dtype=torch.float32)
+        # ActivationWrapper forwards __getattr__ / __setattr__ to the wrapped
+        # module. Try the literal FQN first for buffers registered on the wrapped
+        # leaf, then strip the wrapper alias as a fallback for forwarded names.
+        candidate_names = [name]
+        stripped_name = name.replace("._checkpoint_wrapped_module", "")
+        if stripped_name != name:
+            candidate_names.append(stripped_name)
+
+        for candidate_name in candidate_names:
+            module_name, _, buffer_name = candidate_name.rpartition(".")
+            try:
+                module = model.get_submodule(module_name) if module_name else model
+            except AttributeError:
+                continue
+            if buffer_name not in module._buffers:
+                continue
+            module._buffers[buffer_name] = snapshot.to(dtype=torch.float32)
+            break
 
 
 def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:
