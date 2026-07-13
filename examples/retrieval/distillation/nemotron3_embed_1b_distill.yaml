@@ -13,7 +13,7 @@ step_scheduler:
   global_batch_size: 64
   local_batch_size: 4
   ckpt_every_steps: 500
-  num_epochs: 3
+  num_epochs: 1
 
 model:
   _target_: nemo_automodel._transformers.retrieval.RetrieverStudentWithProjection.build
