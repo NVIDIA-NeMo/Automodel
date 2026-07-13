@@ -178,13 +178,30 @@ class MegatronFSDPManager:
 def fully_shard_optimizer(
     model: nn.Module, optimizer: torch.optim.Optimizer, preproc_state_dict_for_dcp_ckpt: bool = True
 ) -> torch.optim.Optimizer:
-    """ """
+    """Register an already-built optimizer with a MegatronFSDP-wrapped model.
+
+    Megatron-FSDP 0.5.0's ``fully_shard_optimizer`` recovers the owning
+    ``MegatronFSDP`` from a ``_megatron_fsdp_model`` attribute that
+    ``MegatronFSDP.__init__`` stamps onto each distributed ``Parameter``. That
+    attribute is a plain Python attribute and does not survive operations that
+    rebuild ``Parameter`` objects (e.g. the dtype/device cast the ``from_pretrained``
+    load path performs after wrapping). The combined ``fully_shard(model, optimizer)``
+    entry point never hits this because it registers the optimizer in the same call,
+    before any such op runs; the recipe's separate build-model-then-build-optimizer
+    order does, leaving ``fully_shard_optimizer`` unable to find the reference and
+    aborting before the first optimizer step. Re-stamp the reference (mirroring the
+    wheel's own ``__init__`` logic) on the current distributed params right before
+    deferred sharding so the separate sequence matches the combined entry point.
+    """
     if not isinstance(model, MegatronFSDP):
         return optimizer
     if not HAS_MEGATRON_FSDP:
         raise ImportError(
             "MegatronFSDP is not installed, please visit https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/distributed/fsdp/src for more information"
         )
+    model._replace_param_with_distributed_if_needed()
+    for param in model.parameters():
+        param._megatron_fsdp_model = model
     return megatron_fsdp_fully_shard_optimizer(optimizer)
 
 
