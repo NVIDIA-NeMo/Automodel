@@ -228,6 +228,26 @@ def test_reject_unsupported_tie_word_embeddings_defaults_to_both():
     checkpoint_utils.reject_unsupported_tie_word_embeddings(_Undeclared, SimpleNamespace(tie_word_embeddings=False))
 
 
+def test_reject_tie_word_embeddings_flip_raises_on_mismatch():
+    """from_pretrained flip guard rejects a requested tie value differing from the checkpoint's."""
+    tied = SimpleNamespace(tie_word_embeddings=True)
+    untied = SimpleNamespace(tie_word_embeddings=False)
+    # untied checkpoint, tied requested
+    with pytest.raises(NotImplementedError, match="flipping the flag is not supported"):
+        checkpoint_utils.reject_tie_word_embeddings_flip(untied, tied, "LlamaForCausalLM")
+    # tied checkpoint, untied requested (both directions rejected)
+    with pytest.raises(NotImplementedError, match="flipping the flag is not supported"):
+        checkpoint_utils.reject_tie_word_embeddings_flip(tied, untied, "LlamaForCausalLM")
+
+
+def test_reject_tie_word_embeddings_flip_noop_when_matching():
+    """No raise when the requested value matches the checkpoint's (either direction)."""
+    for tie in (True, False):
+        checkpoint_utils.reject_tie_word_embeddings_flip(
+            SimpleNamespace(tie_word_embeddings=tie), SimpleNamespace(tie_word_embeddings=tie), "LlamaForCausalLM"
+        )
+
+
 class _DraftLikeModel(nn.Module):
     """Minimal stand-in for an EAGLE-3 draft model.
 

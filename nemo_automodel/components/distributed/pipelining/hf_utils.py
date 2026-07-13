@@ -737,7 +737,9 @@ def validate_hf_model_for_pipeline_support(model: torch.nn.Module) -> None:
             )
             if weights_tied:
                 issues.append(
-                    "tie_word_embeddings=True is not supported for pipelining. Use separate input/output embeddings."
+                    "Pipeline parallelism does not support tie_word_embeddings=True, and overriding "
+                    "it to tie_word_embeddings=False is not supported either. Train this model with "
+                    "another supported parallelism strategy (e.g., FSDP2) instead."
                 )
         if getattr(config, "is_encoder_decoder", False):
             issues.append("Encoder-Decoder models with cross-attention are not supported yet for pipeline parallelism.")

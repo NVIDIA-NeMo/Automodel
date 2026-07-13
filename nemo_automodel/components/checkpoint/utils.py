@@ -254,6 +254,42 @@ def reject_unsupported_tie_word_embeddings(model_cls: type, config: object) -> N
         )
 
 
+def reject_tie_word_embeddings_flip(checkpoint_config: object, requested_config: object, model_class_name: str) -> None:
+    """Reject loading a checkpoint with ``tie_word_embeddings`` flipped from its own value.
+
+    The class-level :class:`TieSupport` declaration cannot catch flipping the flag away
+    from a *specific* checkpoint's value (a ``BOTH`` class accepts either) -- that is a
+    ``(checkpoint, requested)`` property. NeMo AutoModel respects the checkpoint's tie
+    semantics, so a mismatch in either direction is rejected:
+
+    - untied checkpoint requested tied -> would silently discard the trained ``lm_head``;
+    - tied checkpoint requested untied -> would leave a randomly-initialized ``lm_head``
+      (the adapters' embed->head copy is gated on the flag).
+
+    Only applies to ``from_pretrained`` (there is a loaded checkpoint to compare against);
+    ``from_config`` / scratch has no checkpoint, so the user's config is authoritative.
+
+    Args:
+        checkpoint_config: The config parsed from the checkpoint, before user overrides.
+        requested_config: The config after user overrides are applied.
+        model_class_name: The resolved model class name, used to select the controlling
+            flag (both configs are resolved with the same name for a consistent compare).
+
+    Raises:
+        NotImplementedError: if the controlling ``tie_word_embeddings`` flag differs
+            between the checkpoint and the requested config.
+    """
+    checkpoint_tied = get_controlling_tie_word_embeddings(checkpoint_config, model_class_name)
+    requested_tied = get_controlling_tie_word_embeddings(requested_config, model_class_name)
+    if checkpoint_tied != requested_tied:
+        raise NotImplementedError(
+            f"{model_class_name}: requested tie_word_embeddings={requested_tied} but the checkpoint "
+            f"declares tie_word_embeddings={checkpoint_tied}. NeMo AutoModel respects the checkpoint's "
+            f"tie semantics; flipping the flag is not supported (it would leave a randomly-initialized "
+            f"or discarded lm_head). Load the checkpoint with its own tie_word_embeddings value."
+        )
+
+
 def _normalize_param_name(name: str) -> str:
     """Strip wrapper-specific prefixes from a parameter name."""
     return name.replace("_orig_mod.", "")
