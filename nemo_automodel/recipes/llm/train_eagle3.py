@@ -772,7 +772,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             self.regen_runner = RegenRunner(regen_config)
 
     def _maybe_run_regen(self) -> None:
-        """Rank-0 log-point hook: launch a regeneration cycle when the cadence is due."""
+        """Window-boundary hook: launch a regeneration cycle when the cadence is due.
+
+        Called at every grad-accum window boundary (not just log points) so the
+        launch cadence follows ``regen.every_steps`` regardless of
+        ``log_every_steps``. A no-op on non-main ranks, where ``regen_runner``
+        is ``None``.
+        """
         runner = getattr(self, "regen_runner", None)
         if runner is None:
             return
@@ -1869,7 +1875,6 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                                     wandb_data["train/tau_sim"] = tau_sim
                                 self._wandb_log(wandb_data, step=self.runtime.global_step)
                                 self._maybe_run_decode_eval()
-                                self._maybe_run_regen()
                             running_loss.zero_()
                             running_acc.zero_()
                             if running_step_prefix is not None:
@@ -1885,6 +1890,12 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                         if self.runtime.global_step >= self.total_optim_steps:
                             reached_budget = True
                             break
+                        # The regen launch cadence is checked at every window
+                        # boundary (not inside the log gate above) so it honors
+                        # ``regen.every_steps`` independently of ``log_every_steps``;
+                        # after the budget break so the terminal step never spawns a
+                        # cycle nothing will consume. No-op off rank 0.
+                        self._maybe_run_regen()
                         if self._maybe_swap_regen_dataloader():
                             break
                 else:

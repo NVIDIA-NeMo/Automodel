@@ -285,6 +285,27 @@ def test_single_epoch_swaps_mid_run_and_stops_at_budget(tmp_path, monkeypatch):
     assert swapped_dirs == ["/regen/cycle_10/shards"]
 
 
+def test_regen_launch_cadence_independent_of_log_every_steps(tmp_path):
+    # The launch-cadence check runs at every optimizer-step boundary, not only at
+    # log points: with log_every_steps far above the step budget, maybe_launch
+    # must still be consulted at every non-terminal step.
+    recipe = _loop_recipe(tmp_path, num_samples=8, grad_accum=2, num_epochs=1)  # 4 optimizer steps
+    recipe.log_every_steps = 100
+    recipe._regen_enabled = True
+
+    launch_steps = []
+    recipe.regen_runner = SimpleNamespace(
+        maybe_launch=lambda step: launch_steps.append(step),
+        take_ready_shards=lambda: None,
+        shutdown=lambda: None,
+    )
+
+    recipe.run_train_validation_loop()
+
+    # Every window boundary except the terminal (budget) step checks the cadence.
+    assert launch_steps == [1, 2, 3]
+
+
 def test_prefetch_drains_in_flight_requests_on_early_break(tmp_path):
     # A mid-epoch swap breaks the consumer loop; the prefetch generator must drain
     # (await) every dispatched-but-unconsumed request so the one-in-flight-per-server
