@@ -204,7 +204,7 @@ nemo_run:
 For a working local two-process launch, omit `nemo_run:` and use AutoModel's interactive launcher:
 
 ```bash
-automodel your_config.yaml --nproc-per-node 2
+uv run automodel your_config.yaml --nproc-per-node 2
 ```
 
 ## Monitor and Manage Jobs
@@ -247,5 +247,5 @@ automodel config_with_nemo_run.yaml \
 | **Infrastructure** | Current documented AutoModel path: Slurm; NeMo-Run has other backends with the limitations above | Public cloud (AWS, GCP, Azure) | On-prem HPC |
 | **Container support** | Backend-specific; the documented Slurm path uses Pyxis/Enroot | N/A (cloud VMs) | Manual (in sbatch script) |
 | **Setup required** | Locked AutoModel environment + a named non-local executor definition; Kubeflow needs its extra and PVC path work | Cloud credentials + `sky check` | Cluster access + sbatch script |
-| **Job submission** | `automodel config.yaml` for the compatible Slurm path | `automodel config.yaml` | `sbatch slurm.sub` |
+| **Job submission** | `uv run automodel config.yaml` for the compatible Slurm path | `uv run automodel config.yaml` | `sbatch slurm.sub` |
 | **Good for** | Reusable Slurm executor configuration through the current AutoModel integration | Cloud burst, cost optimization, spot instances | Direct Slurm scripts, full control over sbatch |
