@@ -153,7 +153,7 @@ public AMI IHM corpus. Defaults:
 | `freeze_config`    | `freeze_vision_tower=true`, `freeze_audio_tower=false`, `freeze_language_model=false`  |
 | `step_scheduler`   | `global_batch_size=64`, `local_batch_size=8`, `ckpt_every_steps=200`, `num_epochs=1`   |
 | `optimizer`        | `AdamW(lr=2.0e-5, betas=[0.9, 0.95], weight_decay=0.0)`                                |
-| `checkpoint`       | `result/checkpoints/...`, `model_save_format=safetensors`, `save_consolidated=true`    |
+| `checkpoint`       | `result/checkpoints/...`, `model_save_format=safetensors`, `save_consolidated=final`   |
 | `dataset`          | `make_hf_audio_asr_dataset(path_or_dataset="edinburghcstr/ami", name="ihm")`           |
 
 `peft:` is intentionally omitted — both the language model and the audio
@@ -183,7 +183,12 @@ dry run.
 
 ### What Gets Saved
 
-The config uses the legacy boolean `save_consolidated: true`, which normalizes to `every`. Therefore every intermediate checkpoint written at `ckpt_every_steps` includes a consolidated HF export:
+The config uses `save_consolidated: final`. Every checkpoint written at
+`ckpt_every_steps` contains the full restart state and sharded model weights,
+plus a generated `model/consolidate.sh` helper. Only the final checkpoint is
+exported inline to `model/consolidated/`. To export an intermediate checkpoint
+for Hugging Face-compatible inference tools, run that checkpoint's helper
+after training.
 
 ```
 epoch_E_step_S/
@@ -194,8 +199,9 @@ epoch_E_step_S/
 ├── rng/                       # PyTorch + numpy + python RNG state
 ├── step_scheduler.pt
 └── model/
+    ├── consolidate.sh                                  # exports this checkpoint on demand
     ├── shard-XXXXX-model-00001-of-00001.safetensors  # DCP sharded
-    ├── consolidated/                                  # HF-format export
+    ├── consolidated/                                  # final checkpoint only, or after consolidate.sh
     │   ├── config.json                               # thinker subtree only
     │   ├── model.safetensors.index.json
     │   ├── model-00001-of-00013.safetensors
@@ -203,7 +209,9 @@ epoch_E_step_S/
     └── chat_template.jinja, tokenizer*.json, processor_config.json
 ```
 
-The `consolidated/` directory is the artifact to use for inference. It already
+The final checkpoint's `consolidated/` directory is the artifact to use for
+inference. Intermediate checkpoints can produce the same directory after
+running `bash <ckpt>/model/consolidate.sh`. The exported directory already
 holds the trained weights and the right tokenizer + processor — but its
 `config.json` describes the *thinker sub-model only*
 (`model_type=qwen3_omni_moe_thinker`), which neither `transformers.AutoConfig`
@@ -255,9 +263,9 @@ materialisation.
 
 ```bash
 python tools/wrap_thinker_ckpt_as_omni.py \
-    --ckpt-dir   result/checkpoints/<run>/epoch_0_step_199/model/consolidated \
+    --ckpt-dir   result/checkpoints/<run>/epoch_0_step_<final>/model/consolidated \
     --base-dir   ~/.cache/huggingface/hub/models--Qwen--Qwen3-Omni-30B-A3B-Instruct/snapshots/<rev> \
-    --out-dir    /tmp/qwen3_omni_asr_step_199_wrapped
+    --out-dir    /tmp/qwen3_omni_asr_final_wrapped
 ```
 
 The output directory is a drop-in replacement for the public Qwen3-Omni
