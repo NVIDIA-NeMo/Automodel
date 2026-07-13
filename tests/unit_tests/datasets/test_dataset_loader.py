@@ -111,6 +111,77 @@ def test_recipe_config_resolves_top_level_retrieval_dataset_and_collator():
     assert config.batch_size == 2
 
 
+def test_recipe_config_supports_legacy_nested_dataset():
+    raw = ConfigNode(
+        {
+            "dataloader": {
+                "dataset": {
+                    "_target_": "nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig",
+                    "data_dir_list": ["train.jsonl"],
+                    "n_passages": 3,
+                },
+                "batch_size": 2,
+            }
+        }
+    )
+
+    with pytest.warns(FutureWarning, match="dataloader.dataset.*top-level `dataset`"):
+        config = RecipeConfig(raw).dataloader
+
+    assert config is not None
+    assert isinstance(config.dataset_config, RetrievalDatasetConfig)
+    assert config.dataset_config.n_passages == 3
+    assert config.batch_size == 2
+
+
+def test_recipe_config_prefers_top_level_dataset_over_legacy_nested_dataset():
+    raw = ConfigNode(
+        {
+            "dataset": {
+                "_target_": "nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig",
+                "data_dir_list": ["top-level.jsonl"],
+                "n_passages": 5,
+            },
+            "dataloader": {
+                "dataset": {
+                    "_target_": "nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig",
+                    "data_dir_list": ["nested.jsonl"],
+                    "n_passages": 2,
+                }
+            },
+        }
+    )
+
+    with pytest.warns(FutureWarning, match="dataloader.dataset.*top-level `dataset`"):
+        config = RecipeConfig(raw).dataloader
+
+    assert config is not None
+    assert config.dataset_config.data_dir_list == ["top-level.jsonl"]
+    assert config.dataset_config.n_passages == 5
+
+
+def test_recipe_config_supports_legacy_nested_validation_dataset():
+    raw = ConfigNode(
+        {
+            "validation_dataloader": {
+                "dataset": {
+                    "_target_": "nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig",
+                    "data_dir_list": ["validation.jsonl"],
+                    "n_passages": 4,
+                },
+                "batch_size": 2,
+            }
+        }
+    )
+
+    with pytest.warns(FutureWarning, match="validation_dataloader.dataset.*top-level `validation_dataset`"):
+        configs = RecipeConfig(raw).validation_dataloaders
+
+    assert set(configs) == {"default"}
+    assert configs["default"].dataset_config.n_passages == 4
+    assert configs["default"].batch_size == 2
+
+
 def test_legacy_inline_retrieval_target_uses_exact_typed_config():
     config = RecipeConfig(
         ConfigNode(

@@ -39,6 +39,7 @@ YAML-free.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass
 from functools import cached_property
@@ -178,10 +179,30 @@ class RecipeConfig:
 
     @cached_property
     def dataloader(self) -> "DataloaderConfig" | None:
-        node = self._raw.get("dataset", None)
-        if node is None:
+        dataset_node, dataloader_node = self._dataset_and_dataloader_nodes()
+        if dataset_node is None:
             return None
-        return self._resolve_dataloader(node, self._raw.get("dataloader", None))
+        return self._resolve_dataloader(dataset_node, dataloader_node)
+
+    def _dataset_and_dataloader_nodes(
+        self,
+        *,
+        dataset_key: str = "dataset",
+        dataloader_key: str = "dataloader",
+    ) -> tuple[Any | None, dict[str, Any]]:
+        """Return separate dataset and dataloader nodes, accepting the legacy nested dataset form."""
+        dataset_node = self._raw.get(dataset_key, None)
+        dataloader_node = _as_dict(self._raw.get(dataloader_key, None))
+        nested_dataset_node = dataloader_node.pop("dataset", None)
+        if nested_dataset_node is not None:
+            warnings.warn(
+                f"`{dataloader_key}.dataset` is deprecated; move it to the top-level `{dataset_key}` field.",
+                FutureWarning,
+                stacklevel=3,
+            )
+            if dataset_node is None:
+                dataset_node = nested_dataset_node
+        return dataset_node, dataloader_node
 
     def _packing_config(self):
         """Resolve the recipe's optional sequence-packing strategy config."""
@@ -289,14 +310,17 @@ class RecipeConfig:
                 key = key[1:]
             return key or "default"
 
-        val_dl_node = self._raw.get("validation_dataloader", None)
-        out: dict[str, "DataloaderConfig"] = {}
+        default_node, val_dl_node = self._dataset_and_dataloader_nodes(
+            dataset_key="validation_dataset",
+            dataloader_key="validation_dataloader",
+        )
+        dataset_nodes = {"default": default_node} if default_node is not None else {}
         for key in filter(lambda k: k.startswith("validation_dataset"), self._raw.to_dict().keys()):
             node = self._raw.get(key, None)
             if node is None:
                 continue
-            out[_name(key)] = self._resolve_dataloader(node, val_dl_node)
-        return out
+            dataset_nodes[_name(key)] = node
+        return {name: self._resolve_dataloader(node, val_dl_node) for name, node in dataset_nodes.items()}
 
     @staticmethod
     def _resolve_vlm_processor(node: Any) -> "VlmProcessorConfig":
