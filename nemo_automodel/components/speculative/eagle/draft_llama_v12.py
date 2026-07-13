@@ -22,10 +22,13 @@ compatibility.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig, PreTrainedModel
 
+from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
 from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
@@ -199,15 +202,42 @@ class LlamaEagleDraftModel(PreTrainedModel):
         input_ids: torch.Tensor,
         target_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Predict the next-step target hidden state for each position.
+
+        Args (batch ``B``, sequence length ``T``, hidden size ``H``):
+            input_ids: ``[B, T]`` long token ids.
+            target_hidden_states: ``[B, T, H]`` target hidden features fed to the draft.
+            attention_mask: ``[B, T]`` (1 = real, 0 = pad); used on the unpacked path only.
+            position_ids: ``[B, T]`` long, or ``None`` to default to ``arange``.
+                Packing requires per-document positions (reset to ``range(doc_len)``).
+            seq_lens: ``[B, max_docs]`` long (0-padded per-document lengths that sum to
+                ``T`` per row) turns on sequence packing -- attention becomes
+                document-level block-causal via :func:`build_block_causal_additive_mask`
+                instead of the plain causal + padding mask, and RoPE uses the per-document
+                ``position_ids`` so each document is rotated from its own origin.
+        """
         inputs_embeds = self.embed_tokens(input_ids).to(target_hidden_states.dtype)
         hidden_states = self.fc(torch.cat((inputs_embeds, target_hidden_states), dim=-1))
 
         batch_size, seq_len, _ = hidden_states.shape
-        position_ids = (
-            torch.arange(seq_len, device=hidden_states.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-        )
-        causal_mask = _build_causal_mask(attention_mask, hidden_states.dtype)
+        if seq_lens is not None and position_ids is None:
+            raise ValueError(
+                "LlamaEagleDraftModel: sequence packing (seq_lens) requires per-document position_ids "
+                "(reset to range(doc_len) within each document), but none were provided."
+            )
+        if position_ids is None:
+            position_ids = (
+                torch.arange(seq_len, device=hidden_states.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+            )
+        if seq_lens is not None:
+            causal_mask = build_block_causal_additive_mask(
+                seq_lens, seq_length=seq_len, dtype=hidden_states.dtype, device=hidden_states.device
+            )
+        else:
+            causal_mask = _build_causal_mask(attention_mask, hidden_states.dtype)
 
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_mask=causal_mask, position_ids=position_ids)

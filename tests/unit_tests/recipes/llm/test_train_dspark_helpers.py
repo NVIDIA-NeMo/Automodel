@@ -55,6 +55,7 @@ from nemo_automodel.recipes.llm._dspark_target_build import (
     resolve_reduced_target_layers,
 )
 from nemo_automodel.recipes.llm.train_dspark import (
+    _add_accept_rate_per_position,
     TrainDSparkRecipe,
     _apply_draft_activation_checkpointing,
     _apply_target_chat_template,
@@ -71,6 +72,18 @@ JINJA = (
     "{{ bos_token }}{% for m in messages %}{% if m['role'] == 'assistant' %}"
     "{% generation %}{{ m['content'] }}{% endgeneration %}{% endif %}{% endfor %}"
 )
+
+
+def test_accept_rate_per_position_omits_unmeasured_positions():
+    metrics = {}
+
+    _add_accept_rate_per_position(
+        metrics,
+        accept_num=torch.tensor([3.0, 1.0, 0.0]),
+        accept_den=torch.tensor([4.0, 2.0, 0.0]),
+    )
+
+    assert metrics == {"accept_rate@0": 0.75, "accept_rate@1": 0.5}
 
 
 def _tok(chat_template=None):

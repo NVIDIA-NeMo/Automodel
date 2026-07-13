@@ -41,10 +41,18 @@ if TYPE_CHECKING:
 
     from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
+_TORCH_2_7_1 = (2, 7, 1)
+_TORCH_2_9 = (2, 9)
+
+
+def _is_leq_torch_2_7_1() -> bool:
+    """Check if the current torch version is less than or equal to 2.7.1."""
+    return parse(torch.__version__).release <= _TORCH_2_7_1
+
 
 def _is_geq_torch_2_9() -> bool:
     """Check if the current torch version is greater than or equal to 2.9.0."""
-    return parse(torch.__version__).base_version >= "2.9.0"
+    return parse(torch.__version__).release >= _TORCH_2_9
 
 
 class SaveConsolidatedMode(str, Enum):
