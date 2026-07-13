@@ -679,6 +679,10 @@ def _restore_fp32_tensor_snapshots(
         param.data = snapshot.to(dtype=torch.float32)
 
     for name, snapshot in buffer_snapshots.items():
+        # ActivationWrapper https://github.com/pytorch/pytorch/blob/d84328bd3473e0527989398bfbb88ef2d94ca0a4/torch/distributed/algorithms/_checkpoint/checkpoint_wrapper.py#L25
+        # forwards __getattr__ / __setattr__ to the wrapped module,
+        # so we need to remove the `._checkpoint_wrapped_module`` suffix
+        name = name.replace("._checkpoint_wrapped_module", "")
         module_name, _, buffer_name = name.rpartition(".")
         module = model.get_submodule(module_name) if module_name else model
         if buffer_name not in module._buffers:
