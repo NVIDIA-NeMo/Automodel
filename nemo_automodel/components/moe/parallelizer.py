@@ -208,13 +208,20 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
             )
 
 
-_VISION_TOWER_ATTRS = ("visual", "vision_tower", "vision_model", "vit_model")
+_VISION_TOWER_ATTRS = (
+    "visual",
+    "vision_tower",
+    "vision_model",
+    "vit_model",
+    "audio_tower",
+    "audio_model",
+)
 
 
 def _has_trainable_vision_tower(model: nn.Module) -> bool:
-    """Return whether the model (or its inner ``.model``) exposes a trainable vision tower.
+    """Return whether the model (or its inner ``.model``) exposes a trainable vision/audio tower.
 
-    Deliberately a cheap duck-typed gate, not a second owner of the vision
+    Deliberately a cheap duck-typed gate, not a second owner of the tower
     mapping: it only decides whether importing the heavy, transformers-aware
     dense parallelizer is worthwhile, while the dense parallelizer's per-model
     layer-group mapping remains the sole owner of which blocks get wrapped.
@@ -251,12 +258,13 @@ def _apply_vision_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> None:
     Args:
         model: Root model owning the tower(s) to checkpoint.
         scopes: Normalized activation-checkpointing scope tuple. ``("all",)``
-            selects the vision group; otherwise only the named non-language
-            groups are selected, with ``multimodal`` expanding to vision +
-            audio. Groups the model does not expose are simply absent.
+            selects the vision and audio groups (matching the generic path's
+            scope filter); otherwise only the named non-language groups are
+            selected, with ``multimodal`` expanding to vision + audio. Groups
+            the model does not expose are simply absent.
     """
     if scopes == ("all",):
-        group_names: tuple[str, ...] = ("vision",)
+        group_names: tuple[str, ...] = ("vision", "audio")
     else:
         group_names = tuple(
             dict.fromkeys(
