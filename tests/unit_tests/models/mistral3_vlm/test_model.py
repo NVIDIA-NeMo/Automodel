@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 from transformers import Mistral3Config
 
-from nemo_automodel.components.checkpoint.utils import TieSupport
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_tie_word_embeddings_flip
 from nemo_automodel.components.models.mistral3_vlm.model import (
     Mistral3FP8VLMForConditionalGeneration,
     _rotary_reinit_self_hook,
@@ -290,7 +290,8 @@ class TestTieWordEmbeddings:
     (Mistral-Medium-3.5-128B, Devstral-24B) checkpoints, so it declares BOTH and
     construction must honor the config flag either way — no construction-time
     rejection. Per-checkpoint enforcement (rejecting a flag flipped away from the
-    checkpoint's value) is the from_pretrained flip guard's job, tested separately.
+    checkpoint's value) is the from_pretrained flip guard's job, covered by
+    test_from_pretrained_flip_guard_rejects_tie_mismatch below.
     """
 
     def test_declares_both(self):
@@ -303,3 +304,16 @@ class TestTieWordEmbeddings:
     def test_untied_config_has_separate_lm_head(self):
         model = Mistral3FP8VLMForConditionalGeneration(_tiny_vlm_config(tie_word_embeddings=False))
         assert model.get_input_embeddings().weight is not model.get_output_embeddings().weight
+
+    def test_from_pretrained_flip_guard_rejects_tie_mismatch(self):
+        # Layer 2: as a BOTH class it relies on the from_pretrained flip guard to enforce
+        # each checkpoint's own tie value. The resolver reads the top-level flag for this
+        # class, so a top-level mismatch must be rejected in either direction.
+        cls_name = "Mistral3FP8VLMForConditionalGeneration"
+        untied = SimpleNamespace(tie_word_embeddings=False)
+        tied = SimpleNamespace(tie_word_embeddings=True)
+        with pytest.raises(NotImplementedError, match="flipping the flag is not supported"):
+            reject_tie_word_embeddings_flip(untied, tied, cls_name)
+        with pytest.raises(NotImplementedError, match="flipping the flag is not supported"):
+            reject_tie_word_embeddings_flip(tied, untied, cls_name)
+        reject_tie_word_embeddings_flip(untied, untied, cls_name)  # matching value -> no raise
