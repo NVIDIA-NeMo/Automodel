@@ -84,20 +84,26 @@ The media extras (`vlm-media`, `diffusion-media`, `media`) bundle FFmpeg and are
 deliberately **excluded from `all`** and from the container image — add them
 explicitly for video/image decode.
 
-### Option 3: pip
+### Option 3: uv pip
 
 Full install (matches `uv sync --extra all`):
 
 ```bash
-pip install -e ".[all]"
+uv venv
+source .venv/bin/activate
+uv pip install -e ".[all]"
 ```
 
-Login-node / submitter-only install — lightweight package for SLURM, k8s, or
-NeMo-Run job submission without local CUDA deps:
+To add NeMo Run submission support to the base package:
 
 ```bash
-pip install nemo-automodel[cli]
+uv venv
+source .venv/bin/activate
+uv pip install "nemo-automodel[cli]"
 ```
+
+The `cli` extra is additive: it adds `nemo-run` but does not remove the base
+package's core training dependencies, including PyTorch.
 
 ## Package Management
 
@@ -120,31 +126,20 @@ export HF_HOME="/path/to/hf_cache" # Hugging Face cache directory
 
 ## CLI Usage
 
-The entry point is `automodel` (defined at `nemo_automodel._cli.app:main`).
+The entry point is `automodel` (defined at `nemo_automodel.cli.app:main`).
 
-Pattern: `automodel <command> <domain> -c <config.yaml>`
+Pattern: `automodel <config.yaml> [--nproc-per-node N] [--key.subkey value ...]`
 
 ```bash
-# LLM
-automodel finetune llm -c examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml
-automodel pretrain llm -c config.yaml
-automodel kd llm -c config.yaml
-automodel benchmark llm -c config.yaml
-
-# VLM
-automodel finetune vlm -c config.yaml
-
-# Diffusion
-automodel finetune diffusion -c config.yaml
-
-# Retrieval
-automodel finetune retrieval -c config.yaml
+# The YAML's recipe field selects LLM, VLM, diffusion, or retrieval behavior.
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 8
 ```
 
 Override any config value from the CLI:
 
 ```bash
-automodel finetune llm -c config.yaml --model.name_or_path meta-llama/Llama-3.2-1B
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+    --model.pretrained_model_name_or_path meta-llama/Llama-3.2-1B
 ```
 
 ## Common Pitfalls
