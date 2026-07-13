@@ -13,7 +13,7 @@ Add the `activation_checkpointing: true` flag under your distributed strategy.
 Example (snippet):
 
 ```yaml
-# examples/llm_finetune/llama_3_2_1b_my_finetune.yaml
+# Add this field to the `distributed` section of your recipe config.
 ...
 
 # FSDP2 (use strategy name; optional parallelism sizes)
@@ -166,16 +166,19 @@ LC-CE and gradient checkpointing target **different memory hot-spots** (output l
 2. **Throughput vs. Batch Size**: The goal is usually to _increase batch size_ or _sequence length_ while keeping throughput constant.
 
 ## Verify It Works
-Run your training script and inspect the peak memory:
+Run a checked-in recipe config with activation checkpointing enabled and inspect the peak memory:
 ```bash
 
 # If running on 8x GPUs
-automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+  --nproc-per-node 8 \
+  --distributed.activation_checkpointing true
 
 # If running on 1x GPU
-automodel examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml
+automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+  --distributed.activation_checkpointing true
 ```
-If you run with the above settings (activation ckpt = on, lc-ce = on, fsdp = on), look for a log line similar to:
+Compare the peak memory with the same command run without the override. The exact value depends on the model, batch size, sequence length, loss, and hardware. Look for the memory field in a log line similar to:
 ```
-... | mem 7.30 GiB | ...
+... | mem <peak-memory> GiB | ...
 ```

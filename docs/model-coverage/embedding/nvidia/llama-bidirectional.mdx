@@ -56,23 +56,18 @@ The bi-encoder supports multiple pooling strategies to aggregate token represent
 
 ## Try with NeMo AutoModel
 
-**1. Install NeMo AutoModel**. Refer to the ([Installation Guide](/get-started/installation)) for information:
-
-```bash
-uv pip install nemo-automodel
-```
-
-**2. Clone the repo** to get the example recipes:
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
+uv sync --locked --all-groups --all-extras
 ```
 
-**3. Run the recipe** from inside the repo:
+**2. Run the recipe** from inside the repo:
 
 ```bash
-torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/llama3_2_1b.yaml
+uv run automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
 ```
 
 <Accordion title="Run with Docker">
@@ -94,7 +89,7 @@ cd /opt/Automodel
 **3. Run the recipe**:
 
 ```bash
-torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/llama3_2_1b.yaml
+automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
 ```
 </Accordion>
 
