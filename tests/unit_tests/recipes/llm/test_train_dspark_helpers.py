@@ -33,6 +33,9 @@ Covers the recipe-level glue added for the DeepSeek-V4-Flash target:
   documentation-only ``enable`` flag is stripped before forwarding to
   ``wandb.init`` and gates whether to log at all; ``_init_dspark_wandb`` also
   gates on rank (``is_main``) and block presence.
+- ``_DSparkMetricWindow``: the log window packs into one all-reduce and unpacks
+  back to the logged metrics, dividing the acceptance diagnostics once so they
+  stay the exact global ratio across DP ranks.
 
 (target_layer_ids range/-1/ordering validation is covered by the shared
 ``common.validate_target_layer_ids``, which HFDSparkTargetModel already calls.)
@@ -49,6 +52,7 @@ from transformers import Qwen3Config
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest, write_shard, write_target_weights
+from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics
 from nemo_automodel.recipes.llm import train_dspark
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_backend,
@@ -57,11 +61,13 @@ from nemo_automodel.recipes.llm._dspark_target_build import (
     resolve_reduced_target_layers,
 )
 from nemo_automodel.recipes.llm.train_dspark import (
+    _DSPARK_WINDOW_SCALARS,
     TrainDSparkRecipe,
     _add_accept_rate_per_position,
     _apply_draft_activation_checkpointing,
     _apply_target_chat_template,
     _build_dspark_optimizer,
+    _DSparkMetricWindow,
     _extract_mm_kwargs,
     _init_dspark_wandb,
     _resolve_dspark_optimizer_spec,
@@ -1016,6 +1022,144 @@ def test_should_shard_dense_target_allows_explicit_unit_or_null_axes():
     assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True
 
 
+# ---------------------------------------------------------------------------
+# _DSparkMetricWindow
+# ---------------------------------------------------------------------------
+
+
+def _step_metrics(*, accept_num, accept_den, **scalars):
+    """One micro-batch of DSparkStepMetrics; unnamed scalars default to zero."""
+    values = {name: 0.0 for name in _DSPARK_WINDOW_SCALARS if name != "num_micro_batches"}
+    values.update(scalars)
+    return DSparkStepMetrics(
+        accept_rate_per_pos_num=torch.tensor(accept_num, dtype=torch.float32),
+        accept_rate_per_pos_den=torch.tensor(accept_den, dtype=torch.float32),
+        **{name: torch.tensor(value, dtype=torch.float32) for name, value in values.items()},
+    )
+
+
+def test_metric_window_pack_layout():
+    window = _DSparkMetricWindow(block_size=3)
+    window.add(_step_metrics(accept_num=[1.0, 2.0, 3.0], accept_den=[4.0, 5.0, 6.0], loss=7.0))
+    packed = window.pack()
+
+    n = len(_DSPARK_WINDOW_SCALARS)
+    assert packed.numel() == n + 2 * 3
+    assert packed[_DSPARK_WINDOW_SCALARS.index("loss")].item() == 7.0
+    assert packed[_DSPARK_WINDOW_SCALARS.index("num_micro_batches")].item() == 1.0
+    assert packed[n : n + 3].tolist() == [1.0, 2.0, 3.0]
+    assert packed[n + 3 :].tolist() == [4.0, 5.0, 6.0]
+
+
+def test_metric_window_unpack_averages_losses_and_divides_diagnostics_once():
+    window = _DSparkMetricWindow(block_size=2)
+    window.add(
+        _step_metrics(
+            accept_num=[2.0, 1.0],
+            accept_den=[4.0, 4.0],
+            loss=1.0,
+            ce_loss=0.5,
+            l1_loss=0.25,
+            confidence_loss=0.125,
+            tau_num=3.0,
+            tau_den=2.0,
+            confidence_abs_error_num=0.4,
+            confidence_bias_num=-0.2,
+            confidence_cumprod_bias_num=0.1,
+            confidence_diag_den=2.0,
+        )
+    )
+    window.add(
+        _step_metrics(
+            accept_num=[3.0, 0.0],
+            accept_den=[4.0, 4.0],
+            loss=3.0,
+            ce_loss=1.5,
+            l1_loss=0.75,
+            confidence_loss=0.375,
+            tau_num=1.0,
+            tau_den=2.0,
+            confidence_abs_error_num=0.2,
+            confidence_bias_num=0.4,
+            confidence_cumprod_bias_num=0.3,
+            confidence_diag_den=2.0,
+        )
+    )
+
+    avg = window.unpack(window.pack())
+
+    assert avg["loss"] == pytest.approx(2.0)
+    assert avg["ce_loss"] == pytest.approx(1.0)
+    assert avg["l1_loss"] == pytest.approx(0.5)
+    assert avg["confidence_loss"] == pytest.approx(0.25)
+    assert avg["accept_rate"] == pytest.approx(6.0 / 16.0)
+    assert avg["accept_rate@0"] == pytest.approx(5.0 / 8.0)
+    assert avg["accept_rate@1"] == pytest.approx(1.0 / 8.0)
+    assert avg["tau"] == pytest.approx(1.0)
+    assert avg["confidence_abs_error"] == pytest.approx(0.15)
+    assert avg["confidence_bias"] == pytest.approx(0.05)
+    assert avg["confidence_cumprod_bias"] == pytest.approx(0.1)
+
+
+def test_metric_window_reduces_as_ratio_of_sums_across_ranks():
+    rank0 = _DSparkMetricWindow(block_size=1)
+    rank0.add(_step_metrics(accept_num=[3.0], accept_den=[3.0], loss=1.0, tau_num=4.0, tau_den=2.0))
+    rank0.add(_step_metrics(accept_num=[0.0], accept_den=[0.0], loss=1.0))
+    rank1 = _DSparkMetricWindow(block_size=1)
+    rank1.add(_step_metrics(accept_num=[0.0], accept_den=[1.0], loss=3.0, tau_num=1.0, tau_den=1.0))
+
+    avg = rank0.unpack(rank0.pack() + rank1.pack())
+
+    assert avg["accept_rate"] == pytest.approx(3.0 / 4.0)
+    assert avg["tau"] == pytest.approx(5.0 / 3.0)
+    assert avg["loss"] == pytest.approx(5.0 / 3.0)
+
+
+def test_metric_window_omits_unmeasured_diagnostics():
+    window = _DSparkMetricWindow(block_size=2)
+    window.add(_step_metrics(accept_num=[0.0, 0.0], accept_den=[0.0, 0.0], loss=2.0))
+
+    avg = window.unpack(window.pack())
+
+    assert avg["loss"] == pytest.approx(2.0)
+    for key in ("accept_rate", "accept_rate@0", "tau", "confidence_abs_error", "confidence_bias"):
+        assert key not in avg
+
+
+def test_metric_window_omits_only_the_unmeasured_positions():
+    window = _DSparkMetricWindow(block_size=3)
+    window.add(_step_metrics(accept_num=[3.0, 1.0, 0.0], accept_den=[4.0, 4.0, 0.0], loss=1.0))
+
+    avg = window.unpack(window.pack())
+
+    assert avg["accept_rate@0"] == pytest.approx(0.75)
+    assert avg["accept_rate@1"] == pytest.approx(0.25)
+    assert "accept_rate@2" not in avg
+
+
+def test_metric_window_reset_clears_the_window():
+    window = _DSparkMetricWindow(block_size=2)
+    window.add(_step_metrics(accept_num=[1.0, 1.0], accept_den=[2.0, 2.0], loss=4.0, tau_num=1.0, tau_den=1.0))
+    window.reset()
+
+    avg = window.unpack(window.pack())
+
+    assert avg["loss"] == 0.0
+    assert "accept_rate" not in avg
+    assert "tau" not in avg
+
+
+def test_metric_window_unpack_rejects_mismatched_length():
+    window = _DSparkMetricWindow(block_size=4)
+    with pytest.raises(ValueError, match="expected"):
+        window.unpack(window.pack()[:-1])
+
+
+# ---------------------------------------------------------------------------
+# _load_extra_state (resume guard)
+# ---------------------------------------------------------------------------
+
+
 def _dspark_resume_self(mask_token_id=7):
     return SimpleNamespace(
         runtime=SimpleNamespace(global_step=0),
@@ -1040,12 +1184,6 @@ def test_dspark_load_extra_state_restores_step_and_epoch(tmp_path):
 
 
 def test_dspark_load_extra_state_raises_on_mask_token_id_mismatch(tmp_path):
-    """A resume YAML whose mask_token_id disagrees with the checkpoint must fail loudly.
-
-    The draft's ``embed_tokens`` row at this id is the learned "predict here"
-    signal, so resuming at a different id trains against an untrained row and
-    degrades acceptance silently.
-    """
     ckpt_dir = _write_dspark_meta(tmp_path, mask_token_id=7)
     obj = _dspark_resume_self(mask_token_id=99)
     with pytest.raises(ValueError, match="mask_token_id mismatch on resume"):
@@ -1053,7 +1191,6 @@ def test_dspark_load_extra_state_raises_on_mask_token_id_mismatch(tmp_path):
 
 
 def test_dspark_load_extra_state_accepts_legacy_meta_without_mask_token_id(tmp_path):
-    """Checkpoints saved before mask_token_id was persisted skip the check."""
     torch.save({"global_step": 3, "epoch": 1}, tmp_path / "dspark_meta.pt")
     obj = _dspark_resume_self(mask_token_id=99)
     TrainDSparkRecipe._load_extra_state(obj, str(tmp_path))
