@@ -171,6 +171,8 @@ packed_sequence:
    # Set packed_sequence_size > 0 to run with packed sequences
    packed_sequence_size: 1024
    packing_strategy: thd
+   # Optional: tokenize the dataset across this many processes before packing
+   num_proc: 8
 ```
 
 The `packed_sequence` block accepts these settings:
@@ -179,6 +181,7 @@ The `packed_sequence` block accepts these settings:
 - **prepacked**: If `true`, treats the dataset as already packed and skips recipe-side packing.
 - **max_packs**: Optionally caps how many packed samples are created.
 - **drop_long_samples**: For `neat`, drops samples longer than `packed_sequence_size` when `true`; otherwise the packer raises an error.
+- **num_proc**: Number of worker processes used to tokenize the dataset before packing. Packing first runs one full pass over the dataset, which tokenizes every sample serially; setting `num_proc > 1` front-loads that tokenization across processes (identical, order-preserving output). Defaults to `1` (serial). The speedup grows with per-sample tokenization cost (long multi-turn chats, heavy chat templates) and available CPU cores. This runs independently on each data-parallel rank, so size it so `local_ranks * num_proc` does not oversubscribe the node's CPUs.
 
 ## Troubleshooting Tips
 
