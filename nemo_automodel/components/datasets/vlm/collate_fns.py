@@ -1492,10 +1492,9 @@ def neat_packed_vlm_collater(
     use_flash = attn_implementation == "flash_attention_2"
 
     # Determine pad target: fixed max_length or batch-dynamic
-    batch_max = max(
+    max_len = max_length if max_length is not None else max(
         x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor) else len(x["input_ids"]) for x in batch
     )
-    max_len = max_length if max_length is not None else batch_max
 
     def _pad_1d(tensor, pad_value, target_len):
         """Pad a 1D tensor to target_len."""
@@ -1624,16 +1623,18 @@ def packed_sequence_thd_vlm_collater(
     )
     max_len = max_length if max_length is not None else batch_max
 
-    def _pad_1d(tensor, pad_value, target_len):
-        """Pad a 1D tensor of shape ``[seq]`` to ``[target_len]``."""
+    def _pad_seq(tensor, pad_value, target_len, seq_dim=-1):
+        """Pad ``tensor`` along ``seq_dim`` to ``target_len`` with ``pad_value``."""
         t = torch.as_tensor(tensor)
-        pad_len = target_len - t.shape[0]
-        if pad_len > 0:
-            return torch.cat([t, torch.full((pad_len,), pad_value, dtype=t.dtype)])
-        return t
+        pad_len = target_len - t.shape[seq_dim]
+        if pad_len <= 0:
+            return t
+        shape = list(t.shape)
+        shape[seq_dim] = pad_len
+        return torch.cat([t, torch.full(shape, pad_value, dtype=t.dtype)], dim=seq_dim)
 
-    input_ids = torch.stack([_pad_1d(x["input_ids"], padding_idx, max_len) for x in batch])
-    labels = torch.stack([_pad_1d(x["labels"], LABEL_PAD, max_len) for x in batch])
+    input_ids = torch.stack([_pad_seq(x["input_ids"], padding_idx, max_len) for x in batch])
+    labels = torch.stack([_pad_seq(x["labels"], LABEL_PAD, max_len) for x in batch])
 
     seq_lens_list: list[list[int]] = []
     seq_lens_padded_list: list[list[int]] = []
@@ -1653,18 +1654,10 @@ def packed_sequence_thd_vlm_collater(
 
     pos_sample = torch.as_tensor(batch[0]["position_ids"])
     if pos_sample.ndim == 2:
-
-        def _pad_mrope(pos, target_len):
-            """Pad an mRoPE position tensor of shape ``[3, seq]`` to ``[3, target_len]``."""
-            t = torch.as_tensor(pos)
-            pad_len = target_len - t.shape[1]
-            if pad_len > 0:
-                return torch.cat([t, torch.zeros(t.shape[0], pad_len, dtype=t.dtype)], dim=1)
-            return t
-
-        position_ids = torch.stack([_pad_mrope(x["position_ids"], max_len) for x in batch], dim=1)
+        # mRoPE [n_rope, seq]: pad along the seq axis, then stack on a new batch axis.
+        position_ids = torch.stack([_pad_seq(x["position_ids"], 0, max_len, seq_dim=1) for x in batch], dim=1)
     else:
-        position_ids = torch.stack([_pad_1d(x["position_ids"], 0, max_len) for x in batch])
+        position_ids = torch.stack([_pad_seq(x["position_ids"], 0, max_len) for x in batch])
 
     result: Dict[str, Any] = {
         "input_ids": input_ids,

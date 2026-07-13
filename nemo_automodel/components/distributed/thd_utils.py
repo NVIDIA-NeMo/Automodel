@@ -191,8 +191,12 @@ def process_input_for_thd(
     if max_seqlen is not None:
         result["max_seqlen"] = max_seqlen
 
+    # Pass through any field this function neither transforms nor consumes (e.g.
+    # VLM media tensors like pixel_values / image_grid_thw), tensor or not, so
+    # callers don't need to pop and restore them around the THD conversion.
+    _consumed = {"seq_lens", "seq_lens_padded"}
     for key, value in batch.items():
-        if key not in result and not isinstance(value, torch.Tensor):
+        if key not in result and key not in _consumed:
             result[key] = value
 
     return result

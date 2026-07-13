@@ -940,17 +940,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
         elif batch.get("qkv_format", None) == "thd":
             # THD packed VLM path (packing_format="thd"): convert BSHD -> THD
             # (flatten token axes, build cu_seqlens from seq_lens) via Transformer
-            # Engine even without context parallelism. process_input_for_thd only
-            # reshapes token-shaped fields and drops other tensors, so pop the
-            # non-token fields (media such as pixel_values/image_grid_thw) first
-            # and restore them after the conversion.
+            # Engine even without context parallelism. process_input_for_thd passes
+            # media tensors (pixel_values / image_grid_thw / ...) through unchanged.
             if self.mesh_context.cp_size > 1:
                 raise NotImplementedError(
                     "THD packing (packing_format='thd') for VLM currently supports cp_size=1 only; "
                     "context-parallel THD for mRoPE VLMs is not yet implemented."
                 )
-            _thd_keys = {"input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded", "qkv_format"}
-            _extras = {k: batch.pop(k) for k in list(batch) if k not in _thd_keys}
             _pad_id = getattr(getattr(self.processor, "tokenizer", None), "pad_token_id", 0) or 0
             train_ctx, batch = make_cp_batch_and_ctx(
                 self.device_mesh,
@@ -958,7 +954,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 use_te=True,
                 padding_token_id=_pad_id,
             )
-            batch.update(_extras)
         else:
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")
