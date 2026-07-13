@@ -73,6 +73,7 @@ except (ModuleNotFoundError, ImportError):
     ScaledWordEmbedding = _make_missing("ScaledWordEmbedding")
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
@@ -356,6 +357,9 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
     _keep_in_fp32_modules = ["rotary_emb"]
     _no_split_modules = ["DiffusionGemmaMoEDecoderLayer"]
     _tied_weights_keys = ["lm_head.weight"]
+    # lm_head is hard-tied to the shared embedding; the adapter drops it on export
+    # and rebuilds it from the embedding on load, so untying is unsupported.
+    tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
 
     @classmethod
     def get_capabilities(cls, config: "DiffusionGemmaConfig") -> "ModelCapabilities":
@@ -394,6 +398,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
     ):
         if not _TRANSFORMERS_AVAILABLE:
             raise UnavailableError("transformers is not available; cannot construct DiffusionGemmaForBlockDiffusion.")
+        reject_unsupported_tie_word_embeddings(type(self), config)
         # ``canvas_length`` is a declared field on the reference config (and round-trips),
         # so a YAML/from_pretrained override is written back onto it. The training-only
         # flags are NOT reference-config fields (it is a strict dataclass), so they live on

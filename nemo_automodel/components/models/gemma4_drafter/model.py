@@ -22,6 +22,7 @@ name for the model registry.
 
 from dataclasses import dataclass
 
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 
@@ -54,6 +55,13 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
             * the architecture can be registered in NeMo's ``MODEL_ARCH_MAPPING``
               under a stable native class name.
         """
+
+        # Only tied Gemma4 assistant checkpoints ship; untying is unsupported.
+        tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
+
+        def __init__(self, config: Gemma4AssistantConfig, *args, **kwargs):
+            reject_unsupported_tie_word_embeddings(type(self), config)
+            super().__init__(config, *args, **kwargs)
 
         @dataclass(frozen=True)
         class ModelCapabilities:

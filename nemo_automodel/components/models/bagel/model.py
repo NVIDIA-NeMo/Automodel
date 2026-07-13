@@ -37,6 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
+from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.bagel.attention_masks import create_sparse_mask
 from nemo_automodel.components.models.bagel.configuration import BagelConfig
 from nemo_automodel.components.models.bagel.connector import BagelMultiModalProjector
@@ -213,6 +214,9 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
     """
 
     config_class = BagelConfig
+    # BAGEL's served checkpoints are untied; the tie flag lives on the nested
+    # text_config (aliased as llm_config), and the inner Qwen2 LM owns the head.
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -225,6 +229,10 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
 
     def __init__(self, config: BagelConfig) -> None:
         super().__init__()
+        # Also covers the build_bagel_from_hf_backbones registry-bypass path, which
+        # constructs this class directly. Reads the nested text_config tie flag via
+        # the resolver's get_text_config fallback (BagelConfig has no top-level flag).
+        reject_unsupported_tie_word_embeddings(type(self), config)
         _prepare_config_for_stage(config)
         self.config = config
         self.model = BagelModel(config)
