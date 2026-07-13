@@ -191,6 +191,8 @@ def _eval_self(trainer, num_batches):
     # training (so subclasses inject their extra inputs); bind the base seam, which
     # forwards (input_ids, hidden_states, loss_mask) to the trainer module.
     obj._run_trainer_step = TrainDFlashRecipe._run_trainer_step.__get__(obj)
+    # Single-process stand-in for BaseRecipe._dp_allreduce (a SUM across DP ranks).
+    obj._dp_allreduce = lambda tensor: tensor
     return obj
 
 
@@ -202,17 +204,20 @@ def test_run_eval_returns_none_without_val_dataloader():
 def test_run_eval_skips_short_micro_batches():
     trainer = _StubTrainerModule(
         [
-            SimpleNamespace(loss=torch.tensor(1.0), accuracy=torch.tensor(0.5)),
+            SimpleNamespace(loss=torch.tensor(1.0), correct=torch.tensor(1.0), valid_tokens=torch.tensor(2.0)),
             NoValidAnchorsError("all samples too short"),
-            SimpleNamespace(loss=torch.tensor(3.0), accuracy=torch.tensor(1.0)),
+            SimpleNamespace(loss=torch.tensor(3.0), correct=torch.tensor(3.0), valid_tokens=torch.tensor(3.0)),
         ]
     )
     obj = _eval_self(trainer, num_batches=3)
 
     metrics = TrainDFlashRecipe._run_eval(obj)
 
-    # The short batch is skipped without counting: averages are over 2 batches.
-    assert metrics == {"val_loss": 2.0, "val_accuracy": 0.75}
+    # The short batch is skipped without counting, so the loss averages over the two
+    # kept batches. Accuracy divides the summed counts once -- (1+3)/(2+3) = 0.8 --
+    # rather than averaging the per-batch ratios (0.5, 1.0), which would give 0.75
+    # and is exactly the bias that appears once valid_tokens differs across ranks.
+    assert metrics == pytest.approx({"val_loss": 2.0, "val_accuracy": 0.8})
     assert trainer.mode_calls == ["eval", "train"]
 
 

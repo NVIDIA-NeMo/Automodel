@@ -740,7 +740,8 @@ class TrainDFlashRecipe(BaseRecipe):
             return None
         self.trainer_module.eval()
         total_loss = torch.zeros((), device=self.device)
-        total_acc = torch.zeros((), device=self.device)
+        total_correct = torch.zeros((), device=self.device)
+        total_valid = torch.zeros((), device=self.device)
         total_batches = torch.zeros((), device=self.device)
         with torch.no_grad():
             for batch in self.val_dataloader:
@@ -760,15 +761,20 @@ class TrainDFlashRecipe(BaseRecipe):
                     # skip it without counting, mirroring the training loop.
                     continue
                 total_loss += metrics.loss.detach()
-                total_acc += metrics.accuracy.detach()
+                total_correct += metrics.correct.detach()
+                total_valid += metrics.valid_tokens.detach()
                 total_batches += 1
         total_loss = _all_reduce_mean(total_loss)
-        total_acc = _all_reduce_mean(total_acc)
         total_batches = _all_reduce_mean(total_batches)
+        # Accuracy is a ratio: SUM-reduce its numerator and denominator and divide
+        # once. Averaging the per-rank ratios instead would bias the result, since
+        # valid_tokens differs per rank (anchors are sampled per sample). Mirrors
+        # the draft_acc reduction in recipes/dllm/train_ft.py.
+        counts = self._dp_allreduce(torch.stack([total_correct, total_valid]))
         self.trainer_module.train()
         return {
             "val_loss": (total_loss / total_batches.clamp_min(1)).item(),
-            "val_accuracy": (total_acc / total_batches.clamp_min(1)).item(),
+            "val_accuracy": (counts[0] / counts[1].clamp_min(1)).item(),
         }
 
     def run_train_validation_loop(self):
@@ -787,7 +793,8 @@ class TrainDFlashRecipe(BaseRecipe):
                     self.train_dataloader.sampler.set_epoch(epoch_idx)
 
                 running_loss = 0.0
-                running_acc = 0.0
+                running_correct = 0.0
+                running_valid = 0.0
                 running_micro = 0
                 epoch_loss = 0.0
                 micro_step = 0
@@ -834,7 +841,8 @@ class TrainDFlashRecipe(BaseRecipe):
                         continue
 
                     running_loss += metrics.loss.detach().item()
-                    running_acc += metrics.accuracy.detach().item()
+                    running_correct += metrics.correct.detach().item()
+                    running_valid += metrics.valid_tokens.detach().item()
                     running_micro += 1
                     epoch_loss += metrics.loss.detach().item()
                     micro_step += 1
@@ -852,32 +860,43 @@ class TrainDFlashRecipe(BaseRecipe):
                         pending_micro_batches = 0
                         self._maybe_save_step_checkpoint(epoch_idx)
 
-                        if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
-                            # Average over the micro-batches accumulated since the last
-                            # log, not over optimizer steps: with grad_accumulation_steps>1
-                            # (or skipped short micro-batches) the two differ, and dividing
-                            # by log_every_steps would inflate the reported loss/acc.
-                            avg_loss = running_loss / max(1, running_micro)
-                            avg_acc = running_acc / max(1, running_micro)
-                            current_lr = self.lr_scheduler.get_last_lr()[0]
-                            if pbar is not None:
-                                pbar.set_postfix(
-                                    loss=f"{avg_loss:.4f}",
-                                    acc=f"{avg_acc:.4f}",
-                                    lr=f"{current_lr:.2e}",
+                        if self.runtime.global_step % self.log_every_steps == 0:
+                            # One collective, entered by every rank, so it cannot sit
+                            # inside the rank-0 logging guard below. Loss averages over
+                            # the micro-batches accumulated since the last log, not over
+                            # optimizer steps: with grad_accumulation_steps>1 (or skipped
+                            # short micro-batches) the two differ. Accuracy is a ratio, so
+                            # it divides the summed counts once instead of averaging the
+                            # per-rank ratios, which would be biased because valid_tokens
+                            # differs across ranks.
+                            window = self._dp_allreduce(
+                                torch.tensor(
+                                    [running_loss, running_correct, running_valid, float(running_micro)],
+                                    device=self.device,
+                                    dtype=torch.float32,
                                 )
-                            logger.info(
-                                "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
-                                epoch_idx,
-                                self.runtime.global_step,
-                                avg_loss,
-                                avg_acc,
-                                current_lr,
-                            )
-                            self._log_extra_train_metrics(epoch_idx)
-                            running_loss = 0.0
-                            running_acc = 0.0
+                            ).tolist()
+                            avg_loss = window[0] / max(1.0, window[3])
+                            avg_acc = window[1] / max(1.0, window[2])
+                            running_loss = running_correct = running_valid = 0.0
                             running_micro = 0
+                            if self.dist_env.is_main:
+                                current_lr = self.lr_scheduler.get_last_lr()[0]
+                                if pbar is not None:
+                                    pbar.set_postfix(
+                                        loss=f"{avg_loss:.4f}",
+                                        acc=f"{avg_acc:.4f}",
+                                        lr=f"{current_lr:.2e}",
+                                    )
+                                logger.info(
+                                    "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
+                                    epoch_idx,
+                                    self.runtime.global_step,
+                                    avg_loss,
+                                    avg_acc,
+                                    current_lr,
+                                )
+                                self._log_extra_train_metrics(epoch_idx)
 
                 # Flush the trailing partial accumulation window (see EAGLE recipes
                 # for the rescale rationale).

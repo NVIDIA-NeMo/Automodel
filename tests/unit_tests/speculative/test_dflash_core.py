@@ -31,9 +31,7 @@ BLOCK_SIZE = 4
 MASK_ID = VOCAB - 1
 
 
-def _build_trainer(
-    num_anchors=8, loss_decay_gamma=None, loss_type="dflash", dpace_alpha=0.5, attention_backend="sdpa"
-):
+def _build_trainer(num_anchors=8, loss_decay_gamma=None, loss_type="dflash", dpace_alpha=0.5, attention_backend="sdpa"):
     cfg = Qwen3Config(
         vocab_size=VOCAB,
         hidden_size=HIDDEN,
@@ -295,6 +293,8 @@ def test_variable_prefix_loss_matches_naive_reference():
     expected_valid = supervised.sum()
     torch.testing.assert_close(out.valid_tokens, expected_valid)
     expected_correct = ((logits.argmax(-1) == target_ids).float() * supervised).sum()
+    # The raw counts are what recipes SUM-reduce across ranks to get a global accuracy.
+    torch.testing.assert_close(out.correct, expected_correct)
     torch.testing.assert_close(out.accuracy, expected_correct / (expected_valid + 1e-6))
 
 

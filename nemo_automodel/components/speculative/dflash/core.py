@@ -95,11 +95,19 @@ class NoValidAnchorsError(ValueError):
 
 @dataclass
 class DFlashStepMetrics:
-    """Per-step training outputs for the DFlash draft."""
+    """Per-step training outputs for the DFlash draft.
+
+    ``correct`` and ``valid_tokens`` are the raw per-rank counts behind
+    ``accuracy``. Recipes log the global accuracy by SUM-reducing both across the
+    DP group and dividing once; a mean of the per-rank ``accuracy`` ratios would
+    be biased whenever ``valid_tokens`` differs across ranks (it always does --
+    anchors are sampled per sample).
+    """
 
     loss: torch.Tensor
     accuracy: torch.Tensor
     valid_tokens: torch.Tensor
+    correct: torch.Tensor
 
 
 # DFlashDecayLoss owns the fixed-anchor objectives (``dflash`` plus the D-PACE
@@ -514,10 +522,14 @@ class DFlashTrainerModule(nn.Module):
 
         count_per_pos = loss_out.draft_count_per_pos
         valid_tokens = count_per_pos.sum()
-        accuracy = loss_out.draft_correct_per_pos.sum() / (valid_tokens + 1e-6)
+        correct = loss_out.draft_correct_per_pos.sum()
+        accuracy = correct / (valid_tokens + 1e-6)
 
         return DFlashStepMetrics(
-            loss=loss_out.total_loss, accuracy=accuracy.detach(), valid_tokens=valid_tokens.detach()
+            loss=loss_out.total_loss,
+            accuracy=accuracy.detach(),
+            valid_tokens=valid_tokens.detach(),
+            correct=correct.detach(),
         )
 
     def _variable_prefix_loss(
@@ -574,4 +586,9 @@ class DFlashTrainerModule(nn.Module):
         valid_tokens = supervised.sum()
         correct = ((logits.argmax(dim=-1) == target_ids).float() * supervised).sum()
         accuracy = correct / (valid_tokens + 1e-6)
-        return DFlashStepMetrics(loss=loss, accuracy=accuracy.detach(), valid_tokens=valid_tokens.detach())
+        return DFlashStepMetrics(
+            loss=loss,
+            accuracy=accuracy.detach(),
+            valid_tokens=valid_tokens.detach(),
+            correct=correct.detach(),
+        )
