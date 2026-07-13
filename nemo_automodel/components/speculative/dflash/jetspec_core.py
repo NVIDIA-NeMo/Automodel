@@ -47,10 +47,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.attention.dflash_mask import (
-    create_dflash_block_mask,
-    create_dflash_sdpa_mask,
-)
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.speculative.dflash.core import (
     DFlashTrainerModule,
@@ -142,18 +138,34 @@ class JetSpecTrainerModule(DFlashTrainerModule):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_logits: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> JetSpecStepMetrics:
         """Causal parallel block-wise forward with a forward-KL distillation loss.
 
         ``target_logits`` is the frozen target's full-vocab logits ``[B, S, V]``
         (captured by ``HFDFlashTargetModel(capture_logits=True)``); it supplies the
-        teacher distribution for every supervised draft position.
+        teacher distribution for every supervised draft position. Under sequence
+        packing (``position_ids`` / ``seq_lens`` / ``doc_remaining``, see
+        ``DFlashTrainerModule.forward``) the target runs block-causal, so the
+        teacher logits gathered below are document-local, and the anchor sampling
+        keeps every gathered teacher position (up to ``anchor + block_size - 2``)
+        inside the anchor's document.
         """
         bsz, seq_len = input_ids.shape
-        device = input_ids.device
         bs = self.block_size
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(seq_len, loss_mask, device)
+        anchor_positions, block_keep_mask, noise_embedding, full_position_ids, attn_mask, _ = (
+            self._prepare_block_inputs(
+                input_ids,
+                loss_mask,
+                position_ids=position_ids,
+                seq_lens=seq_lens,
+                doc_remaining=doc_remaining,
+                causal=True,
+            )
+        )
         n = anchor_positions.size(1)
         label_indices, target_ids, block_mask = self._build_block_targets(
             input_ids, loss_mask, anchor_positions, block_keep_mask, seq_len
@@ -166,18 +178,6 @@ class JetSpecTrainerModule(DFlashTrainerModule):
             # Anchors exist but none has a supervised continuation (every predicted
             # position is loss-masked); nothing to distill. Skip like a short batch.
             raise NoValidAnchorsError("No supervised draft positions in this batch.")
-
-        noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
-        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-
-        if self.attention_backend == "flex_attention":
-            attn_mask = create_dflash_block_mask(anchor_positions, block_keep_mask, seq_len, bs, device, causal=True)
-        else:
-            attn_mask = create_dflash_sdpa_mask(
-                anchor_positions, block_keep_mask, seq_len, bs, device, dtype=noise_embedding.dtype, causal=True
-            )
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,

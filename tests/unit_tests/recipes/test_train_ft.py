@@ -983,6 +983,44 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
     ]
 
 
+class _StageWithLogitsToKeep(nn.Module):
+    def forward(self, input_ids=None, logits_to_keep=0, **kwargs):
+        return None
+
+
+class _StageNoLogitsToKeep(nn.Module):
+    def forward(self, input_ids=None, **kwargs):
+        return None
+
+
+@pytest.mark.parametrize(
+    "has_logits_to_keep, has_marker, pp_enabled, expect_fused",
+    [
+        (True, True, True, True),  # PP generic patched forward -> fused CE kept
+        (False, True, True, False),  # PP, no logits_to_keep -> fall back
+        (True, False, True, False),  # PP, logits_to_keep but no hidden-states marker (MoE/custom) -> fall back
+        (True, False, False, True),  # non-PP: the hidden-states marker gate does not apply -> fused CE kept
+    ],
+)
+def test_maybe_downgrade_loss_fn(has_logits_to_keep, has_marker, pp_enabled, expect_fused):
+    """FusedLinearCrossEntropy survives only when the probed stage module supports
+    logits_to_keep and (under PP) advertises hidden-states emission via
+    _pp_return_hidden_states_supported; otherwise it downgrades to MaskedCrossEntropy."""
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
+
+    probe = (_StageWithLogitsToKeep if has_logits_to_keep else _StageNoLogitsToKeep)()
+    if has_marker:
+        probe._pp_return_hidden_states_supported = True  # set by patch_hf_model_for_pp on the generic forward
+
+    result = _maybe_downgrade_loss_fn(FusedLinearCrossEntropy(), probe, pp_enabled=pp_enabled)
+
+    assert isinstance(result, FusedLinearCrossEntropy) is expect_fused
+    if not expect_fused:
+        assert isinstance(result, MaskedCrossEntropy)
+
+
 def test_run_train_validation_loop_calls_gc_hook_once_per_step():
     class _OneStepScheduler:
         def __init__(self):
