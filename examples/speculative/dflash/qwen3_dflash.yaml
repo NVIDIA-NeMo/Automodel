@@ -31,8 +31,14 @@ recipe_args:
   block_size: 16                      # tokens drafted in parallel per block
   num_anchors: 512                    # blocks sampled per sequence per step
   loss_decay_gamma: 7.0               # block-position loss decay: exp(-(k-1)/gamma)
-  # loss_type: dflash                 # dflash | dpace | dpace-cumulative-confidence-only | dpace-continuation-value-only
-  # dpace_alpha: 0.5                  # smoothing alpha for D-PACE loss variants
+  # loss_type: dflash                 # "dflash" (fixed anchor), a D-PACE variant ("dpace",
+  #                                   # "dpace-cumulative-confidence-only", "dpace-continuation-value-only":
+  #                                   # same block, CE reweighted by the draft's own confidence), or
+  #                                   # "variable_prefix" (D2SD VP-Drafter: per-block visible prefix sampled
+  #                                   # ~ prefix_weight_base**l, only the masked suffix is supervised, decay
+  #                                   # re-anchored at the prefix)
+  # dpace_alpha: 0.5                  # smoothing alpha for the D-PACE confidence products
+  # prefix_weight_base: 0.9           # truncated-geometric prior base for variable_prefix (<1 favors short)
   mask_token_id: 151669               # REQUIRED: token used for non-anchor block positions.
   #                                   # Pick a reserved / unused token id (do NOT rely on pad:
   #                                   # pad often aliases eos, which silently degrades quality).

@@ -995,6 +995,15 @@ def _tie_weights_nemo(model):
     if not hasattr(model, "_nemo_tied_weights_keys"):
         return
 
+    # Only re-tie when the controlling config flag actually requests tied
+    # embeddings. ``_nemo_tied_weights_keys`` names the *candidate* tied keys
+    # (pre-v5 list-form ``_tied_weights_keys`` semantics); it does not mean the
+    # model is tied. Re-tying an untied model here would alias away the trained
+    # ``lm_head.weight`` that ``from_pretrained`` just loaded (see #2941).
+    config = getattr(model, "config", None)
+    if config is not None and not checkpoint_utils.get_controlling_tie_word_embeddings(config, type(model).__name__):
+        return
+
     def get_module_by_fqn(model, fqn):
         from functools import reduce
 

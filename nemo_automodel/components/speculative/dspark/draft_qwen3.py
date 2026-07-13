@@ -35,6 +35,7 @@ from nemo_automodel.components.speculative.dspark.common import (
     AcceptRatePredictor,
     DSparkForwardOutput,
     build_eval_mask,
+    context_doc_ids,
     create_noise_embed,
     create_position_ids,
     pin_rope_inv_freq_fp32,
@@ -382,15 +383,28 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        doc_remaining: Optional[torch.Tensor] = None,
     ) -> DSparkForwardOutput:
+        """Run one DSpark training forward.
+
+        Sequence packing (``position_ids`` ``[B, S]`` per-document reset positions,
+        ``seq_lens`` ``[B, max_docs]``, ``doc_remaining`` ``[B, S]``) keeps every block
+        inside its anchor's document: the anchor's first target must be in-document,
+        the block's context prefix and supervision are restricted to that document,
+        and the draft's RoPE uses the per-document positions.
+        """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
+        packed = seq_lens is not None
 
         anchor_positions, block_keep_mask = sample_anchor_positions(
             seq_len=seq_len,
             loss_mask=loss_mask,
             num_anchors=self.num_anchors,
             device=device,
+            doc_remaining=doc_remaining if packed else None,
         )
         noise_embedding = create_noise_embed(
             self.embed_tokens,
@@ -400,16 +414,38 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             mask_token_id=self.mask_token_id,
             block_size=self.block_size,
         )
-        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        draft_position_ids = create_position_ids(anchor_positions, self.block_size)
+        if packed:
+            context_position_ids = position_ids
+            ctx_doc_id = context_doc_ids(seq_lens, seq_len, device)
+            anchor_doc_id = torch.gather(ctx_doc_id, 1, anchor_positions)
+        else:
+            context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            ctx_doc_id = None
+            anchor_doc_id = None
+        draft_position_ids = create_position_ids(
+            anchor_positions, self.block_size, context_position_ids if packed else None
+        )
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
         if self.config._attn_implementation == "flex_attention":
             dspark_attn_mask = create_dflash_block_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device
+                anchor_positions,
+                block_keep_mask,
+                seq_len,
+                self.block_size,
+                device,
+                ctx_doc_id=ctx_doc_id,
+                anchor_doc_id=anchor_doc_id,
             )
         else:
             dspark_attn_mask = create_dflash_sdpa_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device, noise_embedding.dtype
+                anchor_positions,
+                block_keep_mask,
+                seq_len,
+                self.block_size,
+                device,
+                noise_embedding.dtype,
+                ctx_doc_id=ctx_doc_id,
+                anchor_doc_id=anchor_doc_id,
             )
         output_hidden = self._forward_backbone(
             position_ids=full_position_ids,
@@ -459,6 +495,8 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             label_indices=label_indices,
             safe_label_indices=safe_label_indices,
             block_keep_mask=block_keep_mask,
+            doc_remaining=doc_remaining if packed else None,
+            anchor_positions=anchor_positions if packed else None,
         )
         anchor_token_ids = torch.gather(
             input_ids,

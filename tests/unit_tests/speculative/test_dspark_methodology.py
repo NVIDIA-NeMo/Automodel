@@ -23,6 +23,7 @@ CPU: the objective and the sampler are plain tensor math (no FlexAttention).
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel.components.speculative.dspark import loss as loss_module
 from nemo_automodel.components.speculative.dspark.common import (
     DSparkForwardOutput,
     build_anchor_candidate_mask,
@@ -161,6 +162,110 @@ def test_total_variation_term_zero_when_draft_matches_target():
     # Draft == target -> TV distance 0 -> the l1 term and the total loss are 0.
     assert terms["l1_loss"].item() == 0.0
     assert loss.item() == 0.0
+
+
+def test_acceptance_rate_and_tau_match_reference():
+    """accept_rate is the eval-masked mean TV acceptance; tau is the expected
+    accepted block length (running product over the block, plus the anchor)."""
+    torch.manual_seed(5)
+    draft_logits = torch.randn(1, 1, 3, 5)
+    aligned = torch.randn(1, 1, 3, 5)
+    target_ids = torch.zeros(1, 1, 3, dtype=torch.long)
+    eval_mask = torch.ones(1, 1, 3, dtype=torch.bool)
+    block_keep_mask = torch.ones(1, 1, dtype=torch.bool)
+
+    _, terms = compute_dspark_loss(
+        outputs=_output(
+            draft_logits=draft_logits,
+            target_ids=target_ids,
+            eval_mask=eval_mask,
+            block_keep_mask=block_keep_mask,
+            aligned_target_logits=aligned,
+        ),
+        loss_decay_gamma=None,
+        ce_loss_alpha=0.0,
+        l1_loss_alpha=1.0,
+        confidence_head_alpha=0.0,
+        return_terms=True,
+    )
+
+    tv = (draft_logits.softmax(-1) - aligned.softmax(-1)).abs().sum(-1)
+    accept = (1.0 - 0.5 * tv).clamp(0.0, 1.0)
+    mask = eval_mask.float()
+    # Diagnostics are returned as (num, den) sums; the recipe reduces then divides.
+    # Per-position sums are the DP-reduced ingredients of accept_rate@k, and their
+    # totals give the aggregate accept_rate.
+    assert torch.allclose(terms["accept_rate_per_pos_num"], (accept * mask).sum(dim=(0, 1)), atol=1e-6)
+    assert torch.allclose(terms["accept_rate_per_pos_den"], mask.sum(dim=(0, 1)), atol=1e-6)
+    expected_accept = (accept * mask).sum() / (mask.sum() + 1e-6)
+    got_accept = terms["accept_rate_per_pos_num"].sum() / terms["accept_rate_per_pos_den"].sum()
+    assert torch.allclose(got_accept, expected_accept, atol=1e-6)
+    expected_tau = accept[0, 0].cumprod(0).sum() + 1.0
+    assert torch.allclose(terms["tau_num"] / terms["tau_den"], expected_tau, atol=1e-6)
+
+
+def test_confidence_calibration_matches_reference():
+    """The confidence diagnostics are the eval-masked mean absolute error and
+    signed bias of the confidence head against the measured acceptance rate."""
+    torch.manual_seed(6)
+    draft_logits = torch.randn(1, 1, 3, 5)
+    aligned = torch.randn(1, 1, 3, 5)
+    confidence_pred = torch.randn(1, 1, 3)
+    target_ids = torch.zeros(1, 1, 3, dtype=torch.long)
+    eval_mask = torch.ones(1, 1, 3, dtype=torch.bool)
+    block_keep_mask = torch.ones(1, 1, dtype=torch.bool)
+
+    _, terms = compute_dspark_loss(
+        outputs=_output(
+            draft_logits=draft_logits,
+            target_ids=target_ids,
+            eval_mask=eval_mask,
+            block_keep_mask=block_keep_mask,
+            confidence_pred=confidence_pred,
+            aligned_target_logits=aligned,
+        ),
+        loss_decay_gamma=None,
+        ce_loss_alpha=0.0,
+        l1_loss_alpha=0.0,
+        confidence_head_alpha=1.0,
+        return_terms=True,
+    )
+
+    tv = (draft_logits.softmax(-1) - aligned.softmax(-1)).abs().sum(-1)
+    accept = (1.0 - 0.5 * tv).clamp(0.0, 1.0)
+    mask = eval_mask.float()
+    confidence_probs = confidence_pred.sigmoid()
+    error = confidence_probs - accept
+    den = terms["confidence_diag_den"]
+    assert torch.allclose(den, mask.sum(), atol=1e-6)
+    assert torch.allclose(terms["confidence_abs_error_num"], (error.abs() * mask).sum(), atol=1e-6)
+    assert torch.allclose(terms["confidence_bias_num"], (error * mask).sum(), atol=1e-6)
+    # Cumulative (prefix-survival) calibration bias: prefix products of the
+    # confidence probs vs the measured acceptance, weighted then summed.
+    conf_prefix = (confidence_probs * mask).cumprod(dim=-1)
+    target_prefix = (accept * mask).cumprod(dim=-1)
+    expected_cumprod = ((conf_prefix - target_prefix) * mask).sum()
+    assert torch.allclose(terms["confidence_cumprod_bias_num"], expected_cumprod, atol=1e-6)
+
+
+def test_chunked_probability_distance_matches_reference_and_gradient():
+    torch.manual_seed(4)
+    draft = torch.randn(2, 2, 3, 7, requires_grad=True)
+    target = torch.randn_like(draft)
+    chunked = loss_module._compute_l1_dist_per_token(
+        draft_logits=draft,
+        aligned_target_logits=target,
+        chunk_size=2,
+    )
+    expected = (draft.softmax(dim=-1) - target.softmax(dim=-1)).abs().sum(dim=-1)
+
+    torch.testing.assert_close(chunked, expected)
+    chunked.sum().backward()
+    chunked_grad = draft.grad.detach().clone()
+
+    draft.grad = None
+    expected.sum().backward()
+    torch.testing.assert_close(draft.grad, chunked_grad)
 
 
 def test_anchor_candidates_require_two_consecutive_supervised_tokens():

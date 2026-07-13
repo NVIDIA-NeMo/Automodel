@@ -48,11 +48,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nemo_automodel.components.attention.dflash_mask import (
-    create_dflash_block_mask,
-    create_dflash_sdpa_mask,
-)
-from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule
+from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, _to_full_tensor
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 
@@ -189,14 +185,17 @@ class DominoTrainerModule(DFlashTrainerModule):
     ) -> torch.Tensor:
         """Add the GRU-conditioned low-rank correction to the suffix base logits."""
         bsz, n, bs = target_ids.shape
+        # A tensor-parallel target's embed_tokens is vocab-parallel and returns a
+        # DTensor; gather it so the (plain) GRU consumes a plain tensor. ``prev_ids``
+        # already equals ``target_ids`` when not ``shift_label`` (set by
+        # ``_build_domino_head_inputs``), so one embed call covers both branches.
+        block_emb = _to_full_tensor(self.embed_tokens(prev_ids))
         if self.shift_label:
-            block_emb = self.embed_tokens(prev_ids)
             gru_inputs = block_emb.reshape(bsz * n, bs, -1)
             gru_out, _ = self.draft_model.prefix_gru(gru_inputs)
             gru_out = gru_out.reshape(bsz, n, bs, -1)
             prefix_states = gru_out[:, :, self._suffix_start :, :]
         else:
-            block_emb = self.embed_tokens(target_ids)
             gru_inputs = block_emb[:, :, : bs - 1, :].reshape(bsz * n, bs - 1, -1)
             gru_out, _ = self.draft_model.prefix_gru(gru_inputs)
             gru_out = gru_out.reshape(bsz, n, bs - 1, -1)
@@ -279,26 +278,26 @@ class DominoTrainerModule(DFlashTrainerModule):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         lambda_base: float = 0.0,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> DominoStepMetrics:
-        """Parallel block-wise training forward with the Domino correction head."""
-        bsz, seq_len = input_ids.shape
+        """Parallel block-wise training forward with the Domino correction head.
+
+        Sequence packing (``position_ids`` ``[B, S]`` per-document reset positions,
+        ``seq_lens`` ``[B, max_docs]`` document lengths, ``doc_remaining`` ``[B, S]``)
+        is handled by the shared DFlash prologue; ``shift_label`` labels reaching
+        one past the block (``anchor + block_size``) are truncated at the anchor's
+        document boundary by ``_build_block_targets``.
+        """
+        _, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(seq_len, loss_mask, device)
-        noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
-
-        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-
-        if self.attention_backend == "flex_attention":
-            dflash_attn_mask = create_dflash_block_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device
+        anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, _ = (
+            self._prepare_block_inputs(
+                input_ids, loss_mask, position_ids=position_ids, seq_lens=seq_lens, doc_remaining=doc_remaining
             )
-        else:
-            dflash_attn_mask = create_dflash_sdpa_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device, dtype=noise_embedding.dtype
-            )
+        )
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
@@ -307,17 +306,24 @@ class DominoTrainerModule(DFlashTrainerModule):
             attention_mask=dflash_attn_mask,
         )
 
-        # --- Labels: block position k predicts anchor + label_start + k ---
+        # --- Labels: block position k predicts anchor + label_start + k. The shared
+        # builder bounds labels at the sequence end and (under packing) at the
+        # anchor's document boundary, which shift_label's last label can cross.
         label_start = 1 if self.shift_label else 0
-        label_offsets = torch.arange(label_start, label_start + self.block_size, device=device).view(1, 1, -1)
-        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
-        valid_label_mask = label_indices < seq_len
-        safe_target_indices = label_indices.clamp(max=seq_len - 1)
-        n = anchor_positions.size(1)
-        target_ids = torch.gather(input_ids.unsqueeze(1).expand(-1, n, -1), 2, safe_target_indices)
+        _, target_ids, block_mask = self._build_block_targets(
+            input_ids,
+            loss_mask,
+            anchor_positions,
+            block_keep_mask,
+            seq_len,
+            label_start=label_start,
+            doc_remaining=doc_remaining,
+        )
 
         bsz, n, bs = target_ids.shape
-        base_logits = self.lm_head(output_hidden)
+        # A tensor-parallel target's lm_head is column-parallel and returns
+        # vocab-sharded (DTensor) logits; gather to a full tensor for the loss.
+        base_logits = _to_full_tensor(self.lm_head(output_hidden))
         hidden4d, prev_ids = self._build_domino_head_inputs(
             input_ids=input_ids,
             anchor_positions=anchor_positions,
@@ -332,14 +338,12 @@ class DominoTrainerModule(DFlashTrainerModule):
             target_ids=target_ids,
         ).reshape(bsz, n * bs, -1)
 
-        # --- Weight mask: block validity * bounds * (exclude anchor) * loss_mask ---
-        weight_mask = block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
-        weight_mask = weight_mask * valid_label_mask.float()
+        # --- Weight mask: ``block_mask`` (block validity * bounds * loss_mask),
+        # plus the anchor-position exclusion when labels are not shifted.
+        weight_mask = block_mask
         if not self.shift_label:
             pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
             weight_mask = weight_mask * (pos_in_block > 0).float()
-        gathered_loss_mask = torch.gather(loss_mask.unsqueeze(1).expand(-1, n, -1), 2, safe_target_indices)
-        weight_mask = weight_mask * gathered_loss_mask
 
         # Binary eval mask (pre-decay) for accuracy / acceptance-length stats. The
         # decay below rebinds weight_mask to a fresh tensor (out-of-place), so these

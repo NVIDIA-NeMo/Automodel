@@ -54,6 +54,11 @@ class TrainDominoRecipe(TrainDFlashRecipe):
 
     def _build_trainer_module(self, attention_backend: str, recipe_cfg):
         """Build the Domino trainer wrapper on the (Domino-head-enabled) DFlash draft."""
+        if (recipe_cfg.get("loss_type", None) or "dflash") != "dflash":
+            raise ValueError(
+                "loss_type is only supported by the DFlash recipe; the Domino trainer has its own "
+                "dual-logit objective and would silently ignore it."
+            )
         return DominoTrainerModule(
             draft_model=self.draft_model,
             target_lm_head=self.target_model.get_output_embeddings(),
@@ -62,7 +67,10 @@ class TrainDominoRecipe(TrainDFlashRecipe):
             block_size=self.block_size,
             attention_backend=attention_backend,
             num_anchors=int(recipe_cfg.get("num_anchors", 512)),
-            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
+            # Paper default (Appendix A.1) for the shipped block_size=16 configs;
+            # matches DFlashDecayLoss's own default. Set null explicitly in YAML
+            # to disable the position decay (uniform weighting).
+            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", 7.0),
             shift_label=self.draft_model.shift_label,
         )
 
@@ -87,6 +95,9 @@ class TrainDominoRecipe(TrainDFlashRecipe):
             hidden_states=target_batch.hidden_states,
             loss_mask=target_batch.loss_mask,
             lambda_base=lambda_base,
+            position_ids=target_batch.position_ids,
+            seq_lens=target_batch.seq_lens,
+            doc_remaining=target_batch.doc_remaining,
         )
         self._last_domino_metrics = metrics
         return metrics
