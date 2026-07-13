@@ -542,6 +542,8 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
             reporting_loss = reporting_loss / self._get_dp_group_size(include_cp=True)
         reporting_loss_val = reporting_loss.cpu().item()
+        self.loss_average_window.append(reporting_loss_val)
+        average_loss = sum(self.loss_average_window) / len(self.loss_average_window)
 
         component_means: dict[str, float] = {}
         if self._loss_component_buffer:
@@ -559,6 +561,7 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
 
         metrics = {
             "loss": reporting_loss_val,
+            "loss_avg_window": average_loss,
             "grad_norm": grad_norm,
             "lr": lr,
             "mem": mem_allocated,
