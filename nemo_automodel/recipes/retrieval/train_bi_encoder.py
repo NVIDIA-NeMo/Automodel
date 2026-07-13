@@ -321,27 +321,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.model_parts = [model]
         self.pp = None
 
-        # Apply weight decay only to non-bias/non-norm params
-        decay_params = []
-        no_decay_params = []
-        for name, param in self.model_parts[0].named_parameters():
-            if not param.requires_grad:
-                continue
-            name_l = name.lower()
-            if name.endswith(".bias") or ("norm" in name_l):
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-
-        assert decay_params or no_decay_params, "no trainable parameters found"
-
-        param_groups = []
-        if decay_params:
-            param_groups.append({"params": decay_params})
-        if no_decay_params:
-            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
-
-        logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
+        param_groups = self._build_optimizer_param_groups()
         optimizer = self.cfg.optimizer.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
         self.optimizer = [optimizer]
         warn_if_torch_adam_with_bf16_params(

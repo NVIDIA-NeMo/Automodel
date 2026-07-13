@@ -140,7 +140,7 @@ def _mirror_hf_metadata(src_model_dir: Path, dst_dir: Path, *, overwrite: bool =
 
 
 def _strip_student_prefix(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Return the HF backbone tensors from a StudentWithProjection checkpoint."""
+    """Return the HF backbone tensors from a RetrieverStudentWithProjection checkpoint."""
     prefixes = ("student.model.", "module.student.model.", "model.")
     for prefix in prefixes:
         filtered = {key[len(prefix) :]: value for key, value in state.items() if key.startswith(prefix)}
@@ -210,9 +210,9 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
         if not isinstance(model_target, str):
             model_target = getattr(model_target, "__qualname__", str(model_target))
 
-        if "StudentWithProjection" not in model_target:
+        if "RetrieverStudentWithProjection" not in model_target:
             logger.warning(
-                "EmbeddingDistillRecipe expects model to be StudentWithProjection; got %s",
+                "EmbeddingDistillRecipe expects model to be RetrieverStudentWithProjection; got %s",
                 model_target or "<unknown>",
             )
 
@@ -230,9 +230,7 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
         else:
             with torch.random.fork_rng(enabled=False):
                 self.teacher_model = self.cfg.teacher_model.instantiate(
-                    device_mesh=self.device_mesh,
-                    moe_mesh=self.moe_mesh,
-                    distributed_config=self.distributed_config,
+                    distributed_setup=self.distributed_setup,
                     peft_config=None,
                 )
             self.teacher_model.eval()

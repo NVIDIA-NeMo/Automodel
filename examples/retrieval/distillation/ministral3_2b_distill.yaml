@@ -1,3 +1,6 @@
+# Usage (8 GPUs, single node):
+#   automodel --nproc-per-node 8 examples/retrieval/distillation/ministral3_2b_distill.yaml
+
 recipe: EmbeddingDistillRecipe
 
 seed: 42
@@ -10,13 +13,13 @@ step_scheduler:
   global_batch_size: 64
   local_batch_size: 4
   ckpt_every_steps: 500
-  num_epochs: 1
+  num_epochs: 3
 
 model:
-  _target_: nemo_automodel.components.models.biencoder.student_with_projection.StudentWithProjection.build
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/llmservice/users/viraman/ministral3/2B_pruned_model_rank
-  teacher_hidden_size: 3072
-  pooling: last
+  _target_: nemo_automodel._transformers.retrieval.RetrieverStudentWithProjection.build
+  pretrained_model_name_or_path: <your_path>
+  teacher_hidden_size: 4096
+  pooling: avg
   l2_normalize: false
   capture_layers: []
   trust_remote_code: true
@@ -24,9 +27,9 @@ model:
   attn_implementation: flash_attention_2
 
 teacher_model:
-  _target_: nemo_automodel.components.models.biencoder.student_with_projection.TeacherEmbeddingEncoder.build
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/llmservice/users/ybabakhin/model_checkpoints/best_models/ministral3_3B_bidirectional_instruct_release_lr_2e-6_last_pooling_03-04-150645/LATEST/model/consolidated
-  pooling: last
+  _target_: nemo_automodel._transformers.retrieval.RetrieverTeacherEmbeddingEncoder.build
+  pretrained_model_name_or_path: <your_path>
+  pooling: avg
   l2_normalize: false
   capture_layers: []
   trust_remote_code: true
@@ -35,7 +38,7 @@ teacher_model:
 
 tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
-  pretrained_model_name_or_path: /lustre/fsw/portfolios/llmservice/users/ybabakhin/model_checkpoints/best_models/ministral3_3B_bidirectional_instruct_release_lr_2e-6_last_pooling_03-04-150645/LATEST/model/consolidated
+  pretrained_model_name_or_path: <your_path>
   add_eos_token: false
   padding_side: left
   force_hf: true
@@ -45,12 +48,13 @@ dataloader:
   dataset:
     _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
     model_type: bi_encoder
-    data_dir_list:
-      - /lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/01_datasets/03_training_datasets/nqsh_shuffled_50k.json
-    data_type: train
     n_passages: 5
     seed: 42
     do_shuffle: true
+    data_type: train
+    data_dir_list:
+      - hf://nvidia/embed-nemotron-dataset-v1/FEVER # 50k
+      - hf://nvidia/embed-nemotron-dataset-v1/SyntheticClassificationData # 100k
   collate_fn:
     _target_: nemo_automodel.components.datasets.llm.BiEncoderDistillCollator
     q_max_len: 512
@@ -61,6 +65,10 @@ dataloader:
   shuffle: true
   num_workers: 2
 
+# ------------------------------------------------------------------------
+# Loss building blocks (instances are built whether or not their weight is
+# active, so the recipe-level weights below drive the actual loss mix).
+# ------------------------------------------------------------------------
 distill_loss:
   _target_: nemo_automodel.components.loss.embedding_distill.EmbeddingDistillLoss
   reduction: mean
@@ -69,25 +77,6 @@ mse_loss:
   _target_: nemo_automodel.components.loss.embedding_distill.EmbeddingMSELoss
   normalize: false
   reduction: mean
-
-score_loss:
-  _target_: nemo_automodel.components.loss.embedding_distill.ScoreDistillLoss
-  temperature: 0.02
-
-intermediate_loss:
-  _target_: nemo_automodel.components.loss.intermediate_distill.IntermediateDistillLoss
-  layer_pairs: []
-  loss_type: mse
-  normalize: false
-
-infonce_loss:
-  _target_: nemo_automodel.components.loss.infonce.InfoNCELoss
-  temperature: 0.05
-  learnable_temperature: false
-  direction: q2d
-  use_in_batch_negatives: true
-  normalize: true
-  cross_device_negatives: true
 
 infonce_distill_loss:
   _target_: nemo_automodel.components.loss.infonce.InfoNCEDistillLoss
@@ -98,19 +87,18 @@ infonce_distill_loss:
   divergence: kl
   cross_device_negatives: true
 
+# ------------------------------------------------------------------------
+# Active loss mix example:
+#   total = 1.0 * cosine + 1.0 * mse + 0 * nce_distill
+# (i.e. Cosine similarity + MSE alignment + InfoNCE-distill listwise KD)
+# ------------------------------------------------------------------------
 distill_loss_weight: 1.0
-mse_loss_weight: 0.0
-score_loss_weight: 0.0
-intermediate_loss_weight: 0.0
-nce_loss_weight: 0.0
-nce_distill_loss_weight: 1.0
-
-layer_pairs: []
-projection_lr: null
+mse_loss_weight: 1.0
+nce_distill_loss_weight: 0.0
 
 optimizer:
   _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
-  lr: 1.0e-4
+  lr: 1.0e-5
   weight_decay: 0.01
   adam_w_mode: true
   bias_correction: true
@@ -132,6 +120,6 @@ distributed:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /lustre/fsw/portfolios/llmservice/users/viraman/Automodel/runs/retrieval_distill_automodel/checkpoints
+  checkpoint_dir: <your_path>
   model_save_format: safetensors
   save_consolidated: true
