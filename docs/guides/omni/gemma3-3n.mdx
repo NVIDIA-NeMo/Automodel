@@ -200,7 +200,7 @@ The LoRA configuration excludes vision components and the language-model head fr
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   match_all_linear: False
-  exclude_modules:  # exclude all vision modules and lm_head
+  exclude_modules:  # exclude vision, audio and lm_head modules
     - "*vision_tower*"
     - "*vision*"
     - "*visual*"
