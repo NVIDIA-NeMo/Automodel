@@ -208,7 +208,7 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
             )
 
 
-_VISION_TOWER_ATTRS = (
+_MULTIMODAL_TOWER_ATTRS = (
     "visual",
     "vision_tower",
     "vision_model",
@@ -218,7 +218,7 @@ _VISION_TOWER_ATTRS = (
 )
 
 
-def _has_trainable_vision_tower(model: nn.Module) -> bool:
+def _has_trainable_multimodal_tower(model: nn.Module) -> bool:
     """Return whether the model (or its inner ``.model``) exposes a trainable vision/audio tower.
 
     Deliberately a cheap duck-typed gate, not a second owner of the tower
@@ -232,7 +232,7 @@ def _has_trainable_vision_tower(model: nn.Module) -> bool:
     for owner in (model, getattr(model, "model", None)):
         if owner is None:
             continue
-        for attr in _VISION_TOWER_ATTRS:
+        for attr in _MULTIMODAL_TOWER_ATTRS:
             tower = getattr(owner, attr, None)
             if tower is None or not hasattr(tower, "parameters"):
                 continue
@@ -241,8 +241,8 @@ def _has_trainable_vision_tower(model: nn.Module) -> bool:
     return False
 
 
-def _apply_vision_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> None:
-    """Checkpoint trainable VLM vision-tower blocks on the expert-parallel path.
+def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> None:
+    """Checkpoint trainable multimodal (vision/audio) tower blocks on the expert-parallel path.
 
     ``apply_ac`` iterates only the text/MTP decoder stack
     (``_iter_transformer_and_mtp_blocks``), and the generic FSDP2 scope
@@ -274,7 +274,7 @@ def _apply_vision_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> None:
                 if name != "language"
             )
         )
-    if not group_names or not _has_trainable_vision_tower(model):
+    if not group_names or not _has_trainable_multimodal_tower(model):
         return
 
     # Lazy imports keep the heavy, transformers-aware dense parallelizer module
@@ -294,7 +294,7 @@ def _apply_vision_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> None:
     ]
     if not tower_layers:
         logger.info(
-            "No trainable vision blocks selected by activation checkpointing scope %s; "
+            "No trainable multimodal tower blocks selected by activation checkpointing scope %s; "
             "skipping vision-tower activation checkpointing.",
             scopes,
         )
@@ -375,13 +375,13 @@ def apply_ac(
                 # enabled, so it is a no-op for every other mode.
                 setattr(block, SELECTIVE_AC_WRAPPER_FLAG, True)
                 parent_layers.register_module(layer_id, block)
-        _apply_vision_tower_ac(model, scopes)
+        _apply_multimodal_tower_ac(model, scopes)
         return
 
     if not checkpoint_decoder:
         # Vision-only (or otherwise non-language) scope: skip decoder checkpointing
         # entirely, including the hidden_size/num_experts derivation it needs.
-        _apply_vision_tower_ac(model, scopes)
+        _apply_multimodal_tower_ac(model, scopes)
         return
 
     # Derive hidden_size and num_experts from model.config if not provided
@@ -463,7 +463,7 @@ def apply_ac(
 
         parent_layers.register_module(layer_id, block)
 
-    _apply_vision_tower_ac(model, scopes)
+    _apply_multimodal_tower_ac(model, scopes)
 
 
 def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):
