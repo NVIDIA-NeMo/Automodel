@@ -170,12 +170,15 @@ To enable packed sequences, add these keys to your recipe's YAML config:
 packed_sequence:
    # Set packed_sequence_size > 0 to run with packed sequences
    packed_sequence_size: 1024
-   split_across_pack: False
+   packing_strategy: thd
 ```
 
-The `packed_sequence` has two options:
+The `packed_sequence` block accepts these settings:
 - **packed_sequence_size**: Defines the total token length of each packed sequence, higher values require higher GPU memory usage.
-- **split_across_pack**: If two will split a sequence across different packed sequences.
+- **packing_strategy**: Selects `thd` (the default sequence-length-aware format) or `neat`. With `thd`, AutoModel disables packing when the model does not support `seq_lens`.
+- **prepacked**: If `true`, treats the dataset as already packed and skips recipe-side packing.
+- **max_packs**: Optionally caps how many packed samples are created.
+- **drop_long_samples**: For `neat`, drops samples longer than `packed_sequence_size` when `true`; otherwise the packer raises an error.
 
 ## Troubleshooting Tips
 
