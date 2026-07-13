@@ -66,6 +66,11 @@ def test_every_registered_lm_head_class_declares_tie_support():
             f"Add `tie_word_embeddings_support: TieSupport = TieSupport.<BOTH|TIED_ONLY|UNTIED_ONLY>` "
             f"to the class, or add it to _TIE_SUPPORT_EXEMPT with a reason if it owns no causal lm_head."
         )
+        if support in (TieSupport.BOTH, TieSupport.TIED_ONLY):
+            assert callable(cls.__dict__.get("tie_weights")), (
+                f"{class_name} declares {support.name} but does not define a model-local tie_weights(). "
+                "Implement the exact lm_head/input-embedding alias instead of relying on an inherited HF method."
+            )
         checked += 1
     assert checked > 0, "no registered classes were checked — MODEL_ARCH_MAPPING import likely broke"
 

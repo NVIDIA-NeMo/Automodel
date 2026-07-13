@@ -884,6 +884,11 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=True)
 
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        """Tie ``lm_head`` to the active VLM text embedding when requested."""
+        if getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.language_model.embed_tokens.weight
+
     def _pop_staged_vlm_media(
         self,
         input_ids: torch.Tensor | None,

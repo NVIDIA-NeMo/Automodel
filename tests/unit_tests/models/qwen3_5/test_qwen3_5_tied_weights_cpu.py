@@ -25,6 +25,7 @@ Its ``tie_weights()`` re-ties to the active backbone embedding when tie=True.
 Runs on CPU (torch backends, no TE / DeepEP).
 """
 
+import torch.nn as nn
 from transformers.models.qwen3_5.configuration_qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5TextConfig,
@@ -107,6 +108,15 @@ class TestQwen3_5CausalTieWeights:
 class TestQwen3_5ConditionalGenerationTieWeights:
     def test_tied_reties_to_active_backbone_after_swap(self):
         model = Qwen3_5ForConditionalGeneration(_tiny_vlm_config(tie_word_embeddings=True), backend=_backend())
+        assert model.lm_head.weight is model.model.language_model.embed_tokens.weight
+
+    def test_tie_weights_restores_post_swap_alias(self):
+        model = Qwen3_5ForConditionalGeneration(_tiny_vlm_config(tie_word_embeddings=True), backend=_backend())
+        model.lm_head.weight = nn.Parameter(model.lm_head.weight.detach().clone())
+        assert model.lm_head.weight is not model.model.language_model.embed_tokens.weight
+
+        model.tie_weights()
+
         assert model.lm_head.weight is model.model.language_model.embed_tokens.weight
 
     def test_untied_has_separate_lm_head(self):

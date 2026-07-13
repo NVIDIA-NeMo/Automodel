@@ -356,7 +356,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
     # modules afterwards (see llama/rope_utils.py).
     _keep_in_fp32_modules = ["rotary_emb"]
     _no_split_modules = ["DiffusionGemmaMoEDecoderLayer"]
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     # lm_head is hard-tied to the shared embedding; the adapter drops it on export
     # and rebuilds it from the embedding on load, so untying is unsupported.
     tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
@@ -433,9 +433,7 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
 
         self.model = DiffusionGemmaBackbone(text_config, self.backend, moe_config=moe_config)
         self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
-        # lm_head is tied to the shared embedding (HF resolves this via
-        # _tied_weights_keys + get_output_embeddings).
-        self.lm_head.weight = self.model.embed_tokens.weight
+        self.tie_weights()
 
         # Expose moe_config for the MoE parallelizer assertion path.
         self.moe_config = self.model.moe_config
@@ -463,6 +461,10 @@ class DiffusionGemmaForBlockDiffusion(HFCheckpointingMixin, MoEFSDPSyncMixin, Pr
 
     def get_output_embeddings(self) -> nn.Module:
         return self.lm_head
+
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        """Tie ``lm_head`` to the shared diffusion text embedding."""
+        self.lm_head.weight = self.model.embed_tokens.weight
 
     def freeze_router_params(self) -> None:
         """Freeze the MoE router/gate (design v2 item 9).

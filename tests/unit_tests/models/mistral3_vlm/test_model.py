@@ -301,6 +301,15 @@ class TestTieWordEmbeddings:
         model = Mistral3FP8VLMForConditionalGeneration(_tiny_vlm_config(tie_word_embeddings=True))
         assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
 
+    def test_tie_weights_restores_tied_alias(self):
+        model = Mistral3FP8VLMForConditionalGeneration(_tiny_vlm_config(tie_word_embeddings=True))
+        model.lm_head.weight = nn.Parameter(model.lm_head.weight.detach().clone())
+        assert model.get_input_embeddings().weight is not model.get_output_embeddings().weight
+
+        model.tie_weights()
+
+        assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
+
     def test_untied_config_has_separate_lm_head(self):
         model = Mistral3FP8VLMForConditionalGeneration(_tiny_vlm_config(tie_word_embeddings=False))
         assert model.get_input_embeddings().weight is not model.get_output_embeddings().weight

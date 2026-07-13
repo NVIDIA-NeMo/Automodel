@@ -58,10 +58,16 @@ if _GEMMA4_ASSISTANT_HF_AVAILABLE:
 
         # Only tied Gemma4 assistant checkpoints ship; untying is unsupported.
         tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
+        _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
         def __init__(self, config: Gemma4AssistantConfig, *args, **kwargs):
             reject_unsupported_tie_word_embeddings(type(self), config)
             super().__init__(config, *args, **kwargs)
+            self.tie_weights()
+
+        def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+            """Tie ``lm_head`` to the drafter token embedding."""
+            self.lm_head.weight = self.model.embed_tokens.weight
 
         @dataclass(frozen=True)
         class ModelCapabilities:
