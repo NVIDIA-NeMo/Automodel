@@ -190,9 +190,35 @@ def _resolve_source_load_dtype(model_kwargs: dict) -> torch.dtype:
     return torch_dtype
 
 
+def _get_trust_remote_code_attn_implementation(
+    pretrained_model_name_or_path: str | Path,
+    *,
+    revision: str | None = None,
+    token: str | bool | None = None,
+) -> str:
+    """Select the vanilla-HF attention implementation for a remote-code model."""
+    from transformers import AutoConfig
+
+    config_kwargs: dict[str, str | bool] = {"trust_remote_code": True}
+    if revision is not None:
+        config_kwargs["revision"] = revision
+    if token is not None:
+        config_kwargs["token"] = token
+    config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
+
+    # Nemotron-H's remote-code attention passes an ordinary padding mask through
+    # HF's FlashAttention varlen/unpadding path. That path raises a
+    # vectorized_gather_kernel index-OOB device assert for Nemotron-3 Super.
+    # PyTorch SDPA uses its optimized CUDA dispatcher while avoiding the
+    # incompatible varlen route. Other remote-code models (notably
+    # Nemotron-Flash) still require FA2.
+    return "sdpa" if config.model_type == "nemotron_h" else "flash_attention_2"
+
+
 def _hf_source_load_kwargs(
     model_kwargs: dict,
     *,
+    pretrained_model_name_or_path: str | Path,
     source_dtype: torch.dtype,
     trust_remote_code: bool,
     experts_implementation: str | None,
@@ -211,8 +237,12 @@ def _hf_source_load_kwargs(
     hf_kwargs = {k: v for k, v in model_kwargs.items() if k in hf_allowed_keys}
     hf_kwargs["torch_dtype"] = source_dtype
     hf_kwargs["trust_remote_code"] = trust_remote_code or bool(hf_kwargs.get("trust_remote_code", False))
-    if trust_remote_code and "attn_implementation" not in hf_kwargs:
-        hf_kwargs["attn_implementation"] = "flash_attention_2"
+    if hf_kwargs["trust_remote_code"] and "attn_implementation" not in hf_kwargs:
+        hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(
+            pretrained_model_name_or_path,
+            revision=hf_kwargs.get("revision"),
+            token=hf_kwargs.get("token"),
+        )
     if experts_implementation and not trust_remote_code:
         hf_kwargs["experts_implementation"] = experts_implementation
         hf_kwargs["trust_remote_code"] = False
@@ -412,6 +442,7 @@ def _prepare_source_load_reference_rank0(
     device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
     hf_kwargs = _hf_source_load_kwargs(
         model_kwargs,
+        pretrained_model_name_or_path=original_pretrained_path,
         source_dtype=source_dtype,
         trust_remote_code=trust_remote_code,
         experts_implementation=experts_implementation,
@@ -960,13 +991,12 @@ def test_checkpoint_robustness():
             _no_meta = nullcontext()
 
         hf_kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code)
-        # Nemotron-Flash's config ships ``attn_implementation="fused_mha"`` which
-        # transformers 5.x rejects in ``_check_and_adjust_attn_implementation``
-        # (only ``eager`` + registered ALL_ATTENTION_FUNCTIONS keys are accepted).
-        # Force a universally accepted impl; Nemotron-Flash routes
-        # ``flash_attention_2`` through its own fused path internally.
+        # Remote-code models can ship attention names that transformers 5.x
+        # rejects. Select a supported implementation while keeping Nemotron-H
+        # off HF's incompatible FlashAttention varlen path.
         if trust_remote_code and "attn_implementation" not in hf_kwargs:
-            hf_kwargs["attn_implementation"] = "flash_attention_2"
+            config_path = original_pretrained_path if is_peft else consolidated_dir
+            hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(config_path)
         if experts_implementation and not trust_remote_code:
             hf_kwargs["experts_implementation"] = experts_implementation
             hf_kwargs["trust_remote_code"] = False
