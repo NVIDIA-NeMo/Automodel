@@ -111,7 +111,7 @@ def _coerce_param_group_overrides(overrides: list[Any]) -> list[ParamGroupOverri
 
 
 def _build_param_groups(
-    named_params: list[tuple[str, torch.Tensor]],
+    named_params: list[tuple[str, torch.nn.Parameter]],
     overrides: list[ParamGroupOverride],
 ) -> list[dict[str, Any]]:
     """Partition ``named_params`` into optimizer groups by name-pattern ``overrides``.
@@ -136,8 +136,8 @@ def _build_param_groups(
         (unmatched) group first.
     """
     compiled = [re.compile(override.pattern) for override in overrides]
-    default_params: list[torch.Tensor] = []
-    matched_params: list[list[torch.Tensor]] = [[] for _ in overrides]
+    default_params: list[torch.nn.Parameter] = []
+    matched_params: list[list[torch.nn.Parameter]] = [[] for _ in overrides]
     for name, param in named_params:
         for idx, regex in enumerate(compiled):
             if regex.search(name):
