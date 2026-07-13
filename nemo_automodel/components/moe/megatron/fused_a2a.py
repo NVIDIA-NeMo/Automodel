@@ -17,15 +17,59 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import atexit
+import importlib
 import os
+import shutil
+from pathlib import Path
 
-try:
-    from deep_ep import Buffer
-    from deep_ep.utils import EventHandle, EventOverlap
+import torch
 
-    HAVE_DEEP_EP = True
-except ImportError:
-    HAVE_DEEP_EP = False
+from nemo_automodel.shared.import_utils import safe_import_from
+
+
+def _safe_import_first_symbol(module_names: tuple[str, ...], symbol: str):
+    """Import the first available symbol from several optional module layouts."""
+    for module_name in module_names:
+        try:
+            module = importlib.import_module(module_name)
+            return True, getattr(module, symbol)
+        except (AttributeError, ImportError):
+            continue
+    return safe_import_from(module_names[-1], symbol)
+
+
+HAVE_DEEP_EP, Buffer = _safe_import_first_symbol(
+    (
+        "deep_ep.legacy",
+        "deep_ep.buffers.legacy",
+        "deep_ep",
+    ),
+    "Buffer",
+)
+HAVE_DEEP_EP_V2, ElasticBuffer = _safe_import_first_symbol(
+    (
+        "deep_ep",
+        "deep_ep.buffers.elastic",
+    ),
+    "ElasticBuffer",
+)
+_, EventHandle = _safe_import_first_symbol(
+    (
+        "deep_ep",
+        "deep_ep.utils",
+        "deep_ep.utils.event",
+    ),
+    "EventHandle",
+)
+_, EventOverlap = _safe_import_first_symbol(
+    (
+        "deep_ep",
+        "deep_ep.utils",
+        "deep_ep.utils.event",
+    ),
+    "EventOverlap",
+)
 
 try:
     import importlib.util
@@ -42,11 +86,25 @@ try:
 except ImportError:
     HAVE_UCCL_EP = False
 
-import torch
-
 _buffer = None
+_deepep_v2_buffer = None
+_deepep_v2_num_sms = 0
+_deepep_v2_num_qps = 0
 _nvshmem_available = None
 _uccl_buffer = None
+
+_DEEPEP_V2_HANDLE_TENSOR_FIELDS = (
+    "topk_idx",
+    "psum_num_recv_tokens_per_scaleup_rank",
+    "psum_num_recv_tokens_per_expert",
+    "recv_src_metadata",
+    "dst_buffer_slot_idx",
+    "token_metadata_at_forward",
+    "channel_linked_list",
+    # DeepEP >= 2.1.0 (099d5f2): consumed by cached dispatch in the combine
+    # backward; absent on older revs, tolerated via getattr default.
+    "num_unaligned_recv_tokens_per_expert",
+)
 
 
 def _is_nvshmem_available() -> bool:
@@ -134,6 +192,75 @@ def free_buffer() -> None:
         except Exception:  # pragma: no cover - best effort
             pass
         _buffer = None
+
+
+def destroy_deepep_v2_buffer() -> None:
+    """Explicitly destroy the DeepEP V2 ElasticBuffer if one is allocated."""
+    global _deepep_v2_buffer
+
+    if _deepep_v2_buffer is not None:
+        try:
+            _deepep_v2_buffer.destroy()
+        except Exception:  # pragma: no cover - best effort
+            pass
+    _deepep_v2_buffer = None
+
+
+def _warmup_deepep_v2_group(group: torch.distributed.ProcessGroup) -> None:
+    """Materialize the EP group's NCCL communicator before ElasticBuffer reads it."""
+    warmup = torch.empty(1, device=torch.cuda.current_device())
+    work = torch.distributed.all_reduce(warmup, group=group, async_op=True)
+    work.wait()
+
+
+def init_deepep_v2_buffer(
+    group: torch.distributed.ProcessGroup,
+    num_max_tokens_per_rank: int,
+    hidden: int,
+    num_topk: int,
+) -> None:
+    """Initialize the process-global DeepEP V2 ElasticBuffer."""
+    global _deepep_v2_buffer
+
+    if hidden % 256 != 0:
+        raise ValueError(f"DeepEP V2 requires a hidden dimension divisible by 256, got {hidden}.")
+    if _deepep_v2_buffer is not None:
+        return
+
+    _warmup_deepep_v2_group(group)
+    # GDAKI allocates num_allocated_qps * num_scaleout_ranks * 2 QPs per rank. The
+    # library default (65/129) is independent of EP size and overflows the NIC QP
+    # pool at high scaleout (DOCA_ERROR_FULL, e.g. EP256 / 32 nodes). Allow an
+    # explicit cap; 0 / unset keeps the library default.
+    elastic_kwargs = {}
+    num_allocated_qps = int(os.environ.get("DISPATCHER_NUM_ALLOCATED_QPS", "0") or "0")
+    if num_allocated_qps > 0:
+        elastic_kwargs["num_allocated_qps"] = num_allocated_qps
+    _deepep_v2_buffer = ElasticBuffer(
+        group,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        hidden=hidden,
+        num_topk=num_topk,
+        num_gpu_timeout_secs=300,
+        explicitly_destroy=True,
+        **elastic_kwargs,
+    )
+
+
+def _save_deepep_v2_handle(ctx, handle) -> None:
+    """Save ElasticBuffer handle tensors for non-reentrant checkpoint replay."""
+    ctx.handle = handle
+    ctx.handle_tensor_fields = tuple(
+        field for field in _DEEPEP_V2_HANDLE_TENSOR_FIELDS if getattr(handle, field, None) is not None
+    )
+    ctx.save_for_backward(*(getattr(handle, field) for field in ctx.handle_tensor_fields))
+
+
+def _restore_deepep_v2_handle(ctx):
+    """Restore checkpoint-recomputed tensors onto the original ElasticBuffer handle."""
+    for field, tensor in zip(ctx.handle_tensor_fields, ctx.saved_tensors, strict=True):
+        setattr(ctx.handle, field, tensor)
+    return ctx.handle
 
 
 class FusedDispatch(torch.autograd.Function):
@@ -282,6 +409,178 @@ class FusedCombine(torch.autograd.Function):
         return grad_x, None, None, None, None
 
 
+class DeepEPV2FusedDispatch(torch.autograd.Function):
+    """Fused dispatch operation using DeepEP V2 ElasticBuffer."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """Forward pass of DeepEP V2 fused dispatch.
+
+        Args:
+            x: Input tokens [num_max_tokens_per_rank, hidden_size], hidden_size divisible by 256
+            token_indices: Routed expert ids [num_max_tokens_per_rank, topk]
+            token_probs: Routing probabilities [num_max_tokens_per_rank, topk]
+            num_experts: Number of experts
+            group: Process group
+            async_finish: Overlap communication with the compute stream
+            allocate_on_comm_stream: Allocate outputs on the communication stream
+
+        Returns:
+            Tuple ``(recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)``
+            where ``recv_x`` is ``[num_recv_tokens, hidden_size]`` packed per local expert.
+        """
+        num_topk = token_indices.shape[1]
+        num_max_tokens_per_rank = x.size(0)
+        if _deepep_v2_buffer is None:
+            init_deepep_v2_buffer(
+                group,
+                num_max_tokens_per_rank,
+                x.size(1),
+                num_topk,
+            )
+        recv_x, recv_token_indices, recv_token_probs, handle, after_event = _deepep_v2_buffer.dispatch(
+            x,
+            topk_idx=token_indices,
+            topk_weights=token_probs,
+            num_experts=num_experts,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_sms=_deepep_v2_num_sms,
+            num_qps=_deepep_v2_num_qps,
+            async_with_compute_stream=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        if async_finish:
+            after_event.current_stream_wait()
+
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        _save_deepep_v2_handle(ctx, handle)
+        tokens_per_expert = torch.as_tensor(handle.num_recv_tokens_per_expert_list, dtype=torch.int64)
+
+        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output,
+        grad_token_indices,
+        grad_token_probs,
+        grad_tokens_per_expert,
+        grad_handle,
+    ):
+        """Backward pass of DeepEP V2 fused dispatch.
+
+        Args:
+            grad_output: Gradient w.r.t. ``recv_x`` [num_recv_tokens, hidden_size]
+            grad_token_indices: Unused (indices are non-differentiable)
+            grad_token_probs: Gradient w.r.t. ``recv_token_probs`` [num_recv_tokens, topk]
+            grad_tokens_per_expert: Unused (counts are non-differentiable)
+            grad_handle: Unused (handle is non-differentiable)
+
+        Returns:
+            Gradients aligned to the forward inputs; ``grad_x`` is
+            ``[num_max_tokens_per_rank, hidden_size]``, the rest are ``None``.
+        """
+        handle = _restore_deepep_v2_handle(ctx)
+        grad_x, grad_token_probs, after_event = _deepep_v2_buffer.combine(
+            grad_output.contiguous(),
+            handle,
+            topk_weights=grad_token_probs.float() if grad_token_probs is not None else None,
+            num_sms=_deepep_v2_num_sms,
+            num_qps=_deepep_v2_num_qps,
+            async_with_compute_stream=ctx.async_finish,
+            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        )
+        if ctx.async_finish:
+            after_event.current_stream_wait()
+        return (
+            grad_x,
+            None,
+            grad_token_probs,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class DeepEPV2FusedCombine(torch.autograd.Function):
+    """Fused combine operation using DeepEP V2 ElasticBuffer."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        group,
+        handle,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """Forward pass of DeepEP V2 fused combine.
+
+        Args:
+            x: Per-expert output tokens [num_recv_tokens, hidden_size]
+            group: Process group (unused; routing is carried by ``handle``)
+            handle: Communication handle from the paired dispatch
+            async_finish: Overlap communication with the compute stream
+            allocate_on_comm_stream: Allocate outputs on the communication stream
+
+        Returns:
+            Tuple ``(combined_x, None)`` where ``combined_x`` is
+            ``[num_max_tokens_per_rank, hidden_size]`` restored to the source ranks.
+        """
+        del group
+        combined_x, _, after_event = _deepep_v2_buffer.combine(
+            x.contiguous(),
+            handle=handle,
+            num_sms=_deepep_v2_num_sms,
+            num_qps=_deepep_v2_num_qps,
+            async_with_compute_stream=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        if async_finish:
+            after_event.current_stream_wait()
+
+        ctx.async_finish = async_finish
+        ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        _save_deepep_v2_handle(ctx, handle)
+        return combined_x, None
+
+    @staticmethod
+    def backward(ctx, grad_output, _grad_event=None):
+        """Backward pass of DeepEP V2 fused combine.
+
+        Args:
+            grad_output: Gradient w.r.t. ``combined_x`` [num_max_tokens_per_rank, hidden_size]
+            _grad_event: Unused (paired with the non-differentiable second output)
+
+        Returns:
+            Gradients aligned to the forward inputs; ``grad_x`` is
+            ``[num_recv_tokens, hidden_size]``, the rest are ``None``.
+        """
+        handle = _restore_deepep_v2_handle(ctx)
+        grad_x, _, _, _, after_event = _deepep_v2_buffer.dispatch(
+            grad_output.contiguous(),
+            handle=handle,
+            num_sms=handle.num_sms,
+            num_qps=_deepep_v2_num_qps,
+            async_with_compute_stream=ctx.async_finish,
+            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+        )
+        if ctx.async_finish:
+            after_event.current_stream_wait()
+        return grad_x, None, None, None, None
+
+
 if HAVE_DEEP_EP:
 
     def fused_dispatch(
@@ -330,14 +629,93 @@ if HAVE_DEEP_EP:
         """
         return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
 
-    def set_deepep_num_sms(num_sms):
-        """Sets the number of SMs to use for DeepEP."""
-        Buffer.set_num_sms(num_sms)
-
 else:
     fused_dispatch = None
     fused_combine = None
-    set_deepep_num_sms = None
+
+
+def set_deepep_num_sms(num_sms):
+    """Set the number of SMs used by the legacy DeepEP Buffer."""
+    if HAVE_DEEP_EP:
+        Buffer.set_num_sms(num_sms)
+
+
+def set_deepep_v2_num_sms(num_sms):
+    """Set the number of SMs passed to DeepEP V2 ElasticBuffer operations."""
+    global _deepep_v2_num_sms
+    _deepep_v2_num_sms = num_sms
+
+
+def set_deepep_v2_num_qps(num_qps):
+    """Set the number of QPs passed to DeepEP V2 ElasticBuffer operations."""
+    global _deepep_v2_num_qps
+    _deepep_v2_num_qps = num_qps
+
+
+atexit.register(destroy_deepep_v2_buffer)
+
+
+if HAVE_DEEP_EP_V2:
+
+    def deepep_v2_fused_dispatch(
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """Perform fused dispatch with DeepEP V2 ElasticBuffer.
+
+        Args:
+            x: Input tensor [num_tokens, hidden_size], hidden_size divisible by 256
+            token_indices: Token routing indices [num_tokens, topk]
+            token_probs: Token routing probabilities [num_tokens, topk]
+            num_experts: Number of experts
+            group: Process group
+
+        Returns:
+            Result of DeepEPV2FusedDispatch
+        """
+        return DeepEPV2FusedDispatch.apply(
+            x.contiguous(),
+            token_indices,
+            token_probs,
+            num_experts,
+            group,
+            async_finish,
+            allocate_on_comm_stream,
+        )
+
+    def deepep_v2_fused_combine(
+        x,
+        group,
+        handle,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """Perform fused combine with DeepEP V2 ElasticBuffer.
+
+        Args:
+            x: Per-expert output tensor [num_recv_tokens, hidden_size]
+            group: Process group
+            handle: Communication handle from the paired dispatch
+
+        Returns:
+            Result of DeepEPV2FusedCombine
+        """
+        return DeepEPV2FusedCombine.apply(
+            x,
+            group,
+            handle,
+            async_finish,
+            allocate_on_comm_stream,
+        )
+
+else:
+    deepep_v2_fused_dispatch = None
+    deepep_v2_fused_combine = None
 
 
 # HybridEP support
@@ -349,6 +727,34 @@ except ImportError:
     HAVE_HYBRIDEP = False
 
 _hybrid_ep_buffer = None
+
+
+def _sync_hybridep_jit_cache(*, persist: bool) -> None:
+    """Bridge HybridEP's process-local JIT directory to a persistent cache.
+
+    ``load_cached_kernels`` only scans ``proc-<pid>``, so a new process cannot
+    reuse kernels from an earlier launch without staging them into that directory.
+    """
+    cache_root = os.environ.get("HYBRID_EP_CACHE_DIR")
+    if not cache_root:
+        return
+
+    jit_dir = Path(cache_root).expanduser() / ".deepep" / "hybrid_ep" / "jit"
+    stable_dir, process_dir = jit_dir / "kernel-cache", jit_dir / f"proc-{os.getpid()}"
+    source_dir, destination_dir = (process_dir, stable_dir) if persist else (stable_dir, process_dir)
+    if source_dir.is_dir():
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        for kernel in source_dir.glob("*.so"):
+            try:
+                os.link(kernel, destination_dir / kernel.name)
+            except OSError:
+                # Cache reuse is an optimization and must not prevent training.
+                pass
+    if persist:
+        shutil.rmtree(process_dir, ignore_errors=True)
+
+
+atexit.register(_sync_hybridep_jit_cache, persist=True)
 
 
 def init_hybrid_ep_buffer(
@@ -377,6 +783,7 @@ def init_hybrid_ep_buffer(
     """
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
+    _sync_hybridep_jit_cache(persist=False)
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
@@ -385,6 +792,7 @@ def init_hybrid_ep_buffer(
         use_fp8=fp8_dispatch,
         num_sms_dispatch_api=num_sms_dispatch_api,
         num_sms_combine_api=num_sms_combine_api,
+        load_cached_kernels=True,
     )
 
 
@@ -456,7 +864,10 @@ class HybridEPDispatch(torch.autograd.Function):
         """Backward pass of fused dispatch of the HybridEP backend."""
         handle = ctx.handle
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
+            hidden=grad_x,
+            probs=grad_probs,
+            handle=handle,
+            pad_multiple=ctx.pad_multiple,
         )
         return combined_hidden, None, combined_probs, None, None, None, None, None, None
 
@@ -468,7 +879,9 @@ class HybridEPCombine(torch.autograd.Function):
     def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None):
         """Forward pass of fused combine of the HybridEP backend."""
         combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=x, handle=handle, pad_multiple=pad_multiple
+            hidden=x,
+            handle=handle,
+            pad_multiple=pad_multiple,
         )
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple

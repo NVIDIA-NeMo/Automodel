@@ -86,12 +86,20 @@ def _configure_fsdp_module(
     fsdp_module.set_requires_gradient_sync(requires_gradient_sync)
 
 
+def _run_post_backward_hooks_for_state(fsdp_state: Any) -> Callable:
+    for state in fsdp_state._state_ctx.all_states:
+        fsdp_param_groups = getattr(state, "_fsdp_param_groups", None)
+        if not isinstance(fsdp_param_groups, (list, tuple)):
+            fsdp_param_group = getattr(state, "_fsdp_param_group", None)
+            fsdp_param_groups = () if fsdp_param_group is None else (fsdp_param_group,)
+        for fsdp_param_group in fsdp_param_groups:
+            fsdp_param_group.post_backward()
+    return fsdp_state._root_post_backward_final_callback
+
+
 def _run_post_backward_hooks(fsdp_module: FSDPModule) -> Callable:
     fsdp_state = fully_shard.state(fsdp_module)  # type: ignore[attr-defined]
-    for state in fsdp_state._state_ctx.all_states:
-        if state._fsdp_param_group:
-            state._fsdp_param_group.post_backward()
-    return fsdp_state._root_post_backward_final_callback
+    return _run_post_backward_hooks_for_state(fsdp_state)
 
 
 class MoEFSDPSyncMixin:
@@ -107,9 +115,8 @@ class MoEFSDPSyncMixin:
       sync and resharding before the last backward pass. FSDP's autograd hooks automatically
       handle post-backward synchronization and resharding.
     - With pipeline parallelism (PP): FSDP state management is handled by patching
-      _PipelineStageBase.backward_maybe_with_nosync (see patched_backward_maybe_with_nosync
-      below). The patch disables sync/resharding for all backwards except the last
-      one before optimizer step, where it manually triggers post-backward hooks and resharding.
+      _PipelineStageBase.backward_maybe_with_nosync. Backward accumulates without sync,
+      then the last backward for each stage finalizes its nested FSDP modules.
     """
 
     def prepare_for_grad_accumulation(self, pp_enabled: bool = False) -> None:
@@ -175,7 +182,6 @@ def _disable_fsdp_for_moe_module(module: torch.nn.Module) -> None:
 def _run_post_backward_for_moe_module(module: torch.nn.Module) -> None:
     fsdp_modules = list(_iter_fsdp_modules(module))
 
-    # Enable sync for all modules
     for fsdp_module in fsdp_modules:
         _configure_fsdp_module(
             fsdp_module,
@@ -184,10 +190,15 @@ def _run_post_backward_for_moe_module(module: torch.nn.Module) -> None:
             requires_gradient_sync=True,
         )
 
-    # Run post-backward hooks
     root_callbacks = []
+    state_context_ids = set()
     for fsdp_module in fsdp_modules:
-        root_callbacks.append(_run_post_backward_hooks(fsdp_module))
+        fsdp_state = fully_shard.state(fsdp_module)  # type: ignore[attr-defined]
+        state_context_id = id(fsdp_state._state_ctx)
+        if state_context_id in state_context_ids:
+            continue
+        state_context_ids.add(state_context_id)
+        root_callbacks.append(_run_post_backward_hooks_for_state(fsdp_state))
 
     for root_callback in root_callbacks:
         root_callback()
@@ -254,7 +265,8 @@ def patched_backward_maybe_with_nosync(
                 result = perform_backward(backward_type)()
     # If submod is a FSDP module
     elif isinstance(self.submod, FSDPModule):
-        if getattr(self, "_reduce_grad_per_microbatch", False):
+        reduce_grad_per_microbatch = getattr(self, "_reduce_grad_per_microbatch", False)
+        if reduce_grad_per_microbatch:
             self.submod.set_is_last_backward(True)
             self.submod.set_reshard_after_backward(True)
             self.submod.set_requires_gradient_sync(True)
@@ -263,23 +275,15 @@ def patched_backward_maybe_with_nosync(
             self.submod.set_reshard_after_backward(False)
             self.submod.set_requires_gradient_sync(False)
         result = perform_backward(backward_type)()
-        if last_backward:
-            # Manually call post backward for FSDP
-            def run_post_backward(fsdp_module: FSDPModule) -> None:
-                fsdp_module.set_is_last_backward(True)
-                fsdp_module.set_reshard_after_backward(True)
-                fsdp_module.set_requires_gradient_sync(True)
-                fsdp_state = fully_shard.state(fsdp_module)  # type: ignore[attr-defined]
-                for state in fsdp_state._state_ctx.all_states:
-                    if state._fsdp_param_group:
-                        state._fsdp_param_group.post_backward()
-
-                # it would be much better if pipelining backward invoked .backward so autograd hooks
-                # worked and modules like DDP/FSDP behaved as expected.  Working around this for the time being,
-                # we need to call this too to ensure FSDP syncs its grad reduction ops back to the default stream.
-                fsdp_state._root_post_backward_final_callback()
-
-            run_post_backward(self.submod)
+        if last_backward and not reduce_grad_per_microbatch:
+            _configure_fsdp_module(
+                self.submod,
+                is_last_backward=True,
+                reshard_after_backward=True,
+                requires_gradient_sync=True,
+            )
+            root_callback = _run_post_backward_hooks(self.submod)
+            root_callback()
     # If submod is a MoEFSDPSyncMixin, use the MoE-specific FSDP functions
     elif isinstance(self.submod, MoEFSDPSyncMixin):
         _disable_fsdp_for_moe_module(self.submod)

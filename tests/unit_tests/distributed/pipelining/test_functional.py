@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import types
 from unittest.mock import MagicMock, Mock, patch
 
@@ -25,6 +26,8 @@ from torch.distributed.pipelining.schedules import (
 from nemo_automodel.components.distributed.pipelining.functional import (
     _get_hidden_and_vocab_size,
     _precompute_stage_shapes,
+    _use_static_pipeline_stage_metadata,
+    _warmup_pipeline_stage_neighbors,
     _wrap_stage_forward_to_emit_tensor,
     build_pipeline_schedule,
     calculate_virtual_stages,
@@ -884,9 +887,10 @@ class TestPrecomputeStageShapes:
         out_call = stage._configure_outputs_meta.call_args[0][0]
         assert out_call[0].shape == (2, 16, 64)
 
+    @patch("nemo_automodel.components.distributed.pipelining.functional._warmup_pipeline_stage_neighbors")
     @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")
     @patch("nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule")
-    def test_pipeline_model_with_seq_len(self, mock_build_schedule, mock_split_stages):
+    def test_pipeline_model_with_seq_len(self, mock_build_schedule, mock_split_stages, mock_warmup_neighbors):
         """Test that pipeline_model calls _precompute_stage_shapes when seq_len is provided."""
         mock_world_mesh = MagicMock()
         mock_pp_mesh = Mock()
@@ -898,8 +902,13 @@ class TestPrecomputeStageShapes:
 
         mock_stage1 = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
         mock_stage2 = self._make_stage(is_first=False, is_last=True, has_lm_head=True)
-        mock_split_stages.return_value = ([mock_stage1, mock_stage2], [Mock(), Mock()])
+        mock_split_stages.return_value = (
+            [mock_stage1, mock_stage2],
+            [mock_stage1.submod, mock_stage2.submod],
+        )
         mock_build_schedule.return_value = Mock()
+        mock_parallelize_fn = Mock()
+        mock_parallelize_fn.side_effect = lambda model_part, **_kwargs: model_part
 
         pipeline_model(
             model=mock_model,
@@ -914,6 +923,7 @@ class TestPrecomputeStageShapes:
             local_batch_size=8,
             device=torch.device("cuda:0"),
             seq_len=16,
+            parallelize_fn=mock_parallelize_fn,
         )
 
         # Verify shapes were precomputed
@@ -921,6 +931,8 @@ class TestPrecomputeStageShapes:
         assert mock_stage1.inputs_meta[0].shape == (2, 16)  # input_ids for first stage
         assert mock_stage2.inputs_meta is not None
         assert mock_stage2.inputs_meta[0].shape == (2, 16, 64)  # hidden_states
+        assert all(call.kwargs["num_max_tokens_per_rank"] == 32 for call in mock_parallelize_fn.call_args_list)
+        mock_warmup_neighbors.assert_called_once_with(mock_stage1)
 
     @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")
     @patch("nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule")
@@ -957,6 +969,89 @@ class TestPrecomputeStageShapes:
 
         # inputs_meta should remain None (serial shape inference at runtime)
         assert mock_stage.inputs_meta is None
+
+
+@pytest.mark.skipif(
+    not hasattr(importlib.import_module("torch.distributed.pipelining._utils"), "InferenceMode"),
+    reason="requires the torch>=2.12 pipelining InferenceMode internals",
+)
+class TestStaticPipelineStageMetadata:
+    """Test the Torch 2.12 static metadata warm-up compatibility path."""
+
+    @pytest.mark.parametrize(
+        ("group_rank", "send_peers", "recv_peers"),
+        [(0, [1, 3], [1, 3]), (1, [0, 2], [0, 2])],
+    )
+    @patch("nemo_automodel.components.distributed.pipelining.functional.time.sleep")
+    @patch("torch.cuda.device_count", return_value=8)
+    @patch("torch.distributed.get_process_group_ranks", return_value=[8, 72, 136, 200])
+    @patch("torch.distributed.pipelining._utils.InferenceMode.needs_dynamic", return_value=False)
+    @patch("torch.cuda.synchronize")
+    @patch("torch.distributed.irecv")
+    @patch("torch.distributed.isend")
+    def test_warms_neighbor_communicators(
+        self,
+        isend,
+        irecv,
+        synchronize,
+        _needs_dynamic,
+        _get_group_ranks,
+        _device_count,
+        sleep,
+        group_rank,
+        send_peers,
+        recv_peers,
+    ):
+        from torch.distributed.pipelining._utils import InferenceMode
+
+        class Schedule:
+            _has_backward = True
+
+            def _warmup_p2p(self):
+                raise AssertionError("native Torch 2.12 warm-up should be replaced")
+
+        class Stage:
+            _user_meta = object()
+            _inference_mode = None
+            device = torch.device("cpu")
+            group = Mock()
+            group_size = 4
+
+        Stage.group.rank.return_value = group_rank
+        schedule = Schedule()
+        stages = [Stage(), Stage()]
+
+        _warmup_pipeline_stage_neighbors(stages[0])
+        _use_static_pipeline_stage_metadata(schedule, stages)
+        schedule._warmup_p2p(stages, has_backward=True, p2p_done=False)
+
+        assert all(stage._inference_mode == InferenceMode.STATIC for stage in stages)
+        assert [mock_call.kwargs["group_dst"] for mock_call in isend.call_args_list] == send_peers
+        assert [mock_call.kwargs["group_src"] for mock_call in irecv.call_args_list] == recv_peers
+        assert all(mock_call.kwargs["group"] is stages[0].group for mock_call in isend.call_args_list)
+        assert all(mock_call.kwargs["group"] is stages[0].group for mock_call in irecv.call_args_list)
+        assert isend.return_value.wait.call_count == len(send_peers)
+        assert irecv.return_value.wait.call_count == len(recv_peers)
+        synchronize.assert_called_once_with(stages[0].device)
+        sleep.assert_called_once_with(2)
+
+    @patch("torch.distributed.pipelining._utils.InferenceMode.needs_dynamic", return_value=True)
+    def test_keeps_native_warmup_for_dynamic_metadata(self, _needs_dynamic):
+        class Schedule:
+            _has_backward = True
+
+            def _warmup_p2p(self):
+                return "native"
+
+        class Stage:
+            _user_meta = object()
+
+        schedule = Schedule()
+        original_warmup = schedule._warmup_p2p
+
+        _use_static_pipeline_stage_metadata(schedule, [Stage()])
+
+        assert schedule._warmup_p2p == original_warmup
 
 
 class TestGetHiddenAndVocabSize:

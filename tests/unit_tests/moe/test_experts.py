@@ -761,6 +761,27 @@ class TestGroupedExpertsDeepEP:
             assert experts.ep_rank == 0
             mock_init_buffer.assert_called_once_with(mock_mesh.get_group.return_value)
 
+    def test_grouped_experts_deepep_v2_preinitializes_buffer(self, moe_config):
+        """Test that a known PP token capacity initializes ElasticBuffer during sharding."""
+        experts = GroupedExpertsDeepEP(moe_config, dispatcher_backend="deepep_v2")
+        mock_mesh = Mock()
+        mock_mesh.size.return_value = 2
+        mock_mesh.get_local_rank.return_value = 0
+        mock_mesh.get_group.return_value = Mock()
+
+        with (
+            patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher", return_value=Mock()),
+            patch("nemo_automodel.components.moe.megatron.fused_a2a.init_deepep_v2_buffer") as mock_init_buffer,
+        ):
+            experts.init_token_dispatcher(mock_mesh, num_max_tokens_per_rank=4096)
+
+        mock_init_buffer.assert_called_once_with(
+            mock_mesh.get_group.return_value,
+            4096,
+            moe_config.expert_dim,
+            moe_config.n_activated_experts,
+        )
+
     def test_grouped_experts_deepep_apply_bias_no_bias(self, moe_config):
         """Test _apply_bias method with no bias."""
         _ = GroupedExpertsDeepEP(moe_config)
@@ -809,12 +830,14 @@ class TestGroupedExpertsDeepEP:
             moe_config,
             dispatcher_backend="hybridep",
             dispatcher_num_sms=24,
+            dispatcher_num_qps=33,
             dispatcher_share_token_dispatcher=False,
             dispatcher_async_dispatch=True,
         )
 
         assert experts.dispatcher_backend == "hybridep"
         assert experts.dispatcher_num_sms == 24
+        assert experts.dispatcher_num_qps == 33
         assert experts.dispatcher_share_token_dispatcher is False
         assert experts.dispatcher_async_dispatch is True
         assert experts.config == moe_config
@@ -825,6 +848,7 @@ class TestGroupedExpertsDeepEP:
             moe_config,
             dispatcher_backend="hybridep",
             dispatcher_num_sms=24,
+            dispatcher_num_qps=33,
             dispatcher_share_token_dispatcher=False,
             dispatcher_async_dispatch=True,
         )
@@ -847,6 +871,7 @@ class TestGroupedExpertsDeepEP:
             assert config_arg.moe_flex_dispatcher_backend == "hybridep"
             assert config_arg.moe_hybridep_num_sms == 24
             assert config_arg.moe_deepep_num_sms == 24
+            assert config_arg.moe_deepep_num_qps == 33
             assert config_arg.moe_share_token_dispatcher is False
             assert config_arg.moe_deepep_async_dispatch is True
 
