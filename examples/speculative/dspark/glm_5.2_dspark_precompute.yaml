@@ -1,0 +1,72 @@
+# Distributed DSpark offline precompute for a GLM-5.2 (GlmMoeDsaForCausalLM) target.
+#
+# PHASE 1 of the two-phase offline flow for a target too large to fit on one node. It
+# loads the full GLM-5.2 target frozen through the SAME expert-parallel + FSDP2 path as
+# online training (the 256 routed experts shard across ranks, FP8 base weights dequantize
+# on load), runs it once over the dataset, and writes the DSpark cache (per-layer + final
+# target hidden states, plus target embed_tokens / lm_head) to `cache_output_dir`.
+#
+# PHASE 2 is normal DSpark draft training that streams this cache with NO live target:
+# point `glm_5.2_dspark.yaml`'s `recipe_args.cached_target_path` at the same directory.
+#
+# ---------------------------------------------------------------------------
+# HARDWARE: same as online GLM-5.2 training -- the target must fit across the mesh.
+# ep_size MUST divide n_routed_experts (256) and equal world_size (nnodes * 8): valid
+# ep_size 8/16/32/64. Each rank forwards its OWN contiguous slice of the dataset and
+# writes its own global shards into the shared cache_output_dir (no post-hoc merge).
+# ---------------------------------------------------------------------------
+#
+# LAUNCH (8 nodes, ep_size=64). Run the SAME command on every node, varying only
+# --node-rank; node 0 is the rendezvous master:
+#   torchrun --nnodes=8 --node-rank=0 --nproc_per_node=8 \
+#     --master-addr=<NODE0_IP> --master-port=29500 \
+#     -m nemo_automodel.recipes.llm.precompute_dspark_dist \
+#     -c examples/speculative/dspark/glm_5.2_dspark_precompute.yaml
+#
+# To sanity-check on ONE node, set recipe_args.target_num_hidden_layers small (e.g. 4)
+# and target_layer_ids to layers in the reduced stack (e.g. [1, 2, 3]); the resulting
+# cache is a validation aid only, not usable for a real drafter.
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1                 # keep PP off: the target wrapper hooks a single (non-pipelined) model
+  ep_size: 64                # = world_size (8 nodes x 8). Must divide n_routed_experts (256)
+  activation_checkpointing: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+recipe_args:
+  target_model_name_or_path: zai-org/GLM-5.2
+  train_data_path: /path/to/open-perfectblend-direct-clean
+  train_split: "train[4096:]"
+  seq_length: 4096
+  micro_batch_size: 1
+  num_workers: 2
+  shuffle_seed: 42
+  trust_remote_code: false
+
+  # --- offline cache output (PHASE 2 reads this as cached_target_path) ---
+  cache_output_dir: ./outputs/dspark_glm_5.2_cache
+  cache_dtype: bf16          # bf16 | fp16 | fp32
+  cache_shard_size: 256      # samples per shard; must be a multiple of micro_batch_size
+
+  # --- captured target features (must match PHASE-2 training) ---
+  # GLM-5.2 ships a chat template in its tokenizer, so recipe_args.chat_template is not
+  # required here; set it only to override the tokenizer's own template.
+  target_layer_ids: [75, 76, 77]   # 3 late feature layers of the full 78-layer GLM-5.2 target
+  draft_num_hidden_layers: 3       # only used to derive default target_layer_ids when unset
+
+  # --- frozen GLM-5.2 target backend (mirrors the online GLM DSpark backend) ---
+  target_attn_backend: sdpa        # switch to `tilelang` for the fused sparse kernels when available
+  target_dispatcher: hybridep      # MoE token dispatcher for the sharded experts
+  target_experts: torch_mm         # grouped-expert GEMM backend
+  target_enable_fsdp_optimizations: true
+
+  # target_num_hidden_layers: 4    # single-node validation only (see header); set target_layer_ids to match

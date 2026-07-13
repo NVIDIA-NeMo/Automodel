@@ -814,6 +814,19 @@ class TestPrecomputeStageShapes:
         out_call = stage._configure_outputs_meta.call_args[0][0]
         assert out_call[0].shape == (2, 16, 64)
 
+    def test_last_stage_fused_ce_emits_hidden_states(self):
+        """Fused-CE last stage keeps lm_head but skips its projection, so its
+        output is [mb, seq_len, hidden] rather than [mb, seq_len, vocab]."""
+        stage = self._make_stage(is_first=False, is_last=True, has_lm_head=True)
+        stage.submod._pp_return_hidden_states = True
+        config = self._make_config(hidden_size=64, vocab_size=128)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        out_call = stage._configure_outputs_meta.call_args[0][0]
+        # Last dim is hidden (64), not vocab (128): the flag skips the lm_head projection
+        assert out_call[0].shape == (2, 16, 64)
+
     def test_multi_stage_pipeline(self):
         """Test with 3 stages (first, middle, last with lm_head)."""
         stages = [

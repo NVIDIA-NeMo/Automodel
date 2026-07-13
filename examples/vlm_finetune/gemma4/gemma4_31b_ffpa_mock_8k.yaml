@@ -83,6 +83,10 @@ dataset:
   image_size: [896, 896]
   max_length: 8192
   seed: 42
+  # This non-packed recipe feeds raw conversations to gemma4_prefix_collate_fn
+  # (seqlen controlled via collate_fn.max_length), so do NOT pre-tokenize --
+  # PreTokenizedDatasetWrapper would drop the "conversation" key the collate needs.
+  pretokenize: false
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
@@ -91,6 +95,7 @@ validation_dataset:
   image_size: [896, 896]
   max_length: 8192
   seed: 43
+  pretokenize: false
 
 # Gemma4 FFPA without CP does not support sequence packing, so seqlen is controlled
 # exclusively via collate_fn.max_length (forwarded to the HF processor with

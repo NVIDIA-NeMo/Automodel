@@ -2213,6 +2213,11 @@ def _load_hf_safetensors_checkpoint(model_path: str) -> Optional[dict[str, torch
     return out if out else None
 
 
+# Public alias: external consumers (e.g. the EAGLE-3 draft warm start) load
+# consolidated safetensors exports through this stable name.
+load_hf_safetensors_state_dict = _load_hf_safetensors_checkpoint
+
+
 def _load_hf_bin_checkpoint(model_path: str, weights_only: bool = True) -> Optional[dict[str, torch.Tensor]]:
     """
     Load a HuggingFace .bin checkpoint into a state dict.

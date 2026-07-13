@@ -13,7 +13,7 @@ Add the `activation_checkpointing: true` flag under your distributed strategy.
 Example (snippet):
 
 ```yaml
-# examples/llm_finetune/llama_3_2_1b_my_finetune.yaml
+# Add this field to the `distributed` section of your recipe config.
 ...
 
 # FSDP2 (use strategy name; optional parallelism sizes)
@@ -41,6 +41,60 @@ distributed:
 ```
 
 Use `true` or `full` for full activation checkpointing. Use `selective` for PyTorch selective activation checkpointing on FSDP2 or DDP configs. Selective checkpointing saves expensive operations such as attention, collectives, and part of the matrix multiplications while recomputing cheaper operations during backward.
+
+### Scope Activation Checkpointing
+
+For multimodal and VLM models, AutoModel can checkpoint only selected model
+parts. Use `activation_checkpointing_scope` with FSDP2 or DDP when you want to
+keep the memory/speed profile focused on part of the model:
+
+```yaml
+distributed:
+  strategy: fsdp2
+  activation_checkpointing: true
+  activation_checkpointing_scope: language
+```
+
+Valid scopes are `all`, `language`, `vision`, `audio`, and `multimodal`.
+`all` is the default. `multimodal` means the non-language towers currently
+identified by AutoModel, such as vision and audio. You can also pass a list,
+for example:
+
+```yaml
+distributed:
+  strategy: fsdp2
+  activation_checkpointing: true
+  activation_checkpointing_scope: [language, vision]
+```
+
+Use a narrower scope when only part of a multimodal model is memory-limited or
+when checkpointing trainable vision/audio towers costs more throughput than the
+memory savings are worth. Use `all` when you prefer the maximum
+activation-memory reduction across trainable model parts.
+
+<Note>
+`activation_checkpointing_scope` controls the generic FSDP2/DDP activation
+checkpointing path. Expert-parallel MoE configs (`ep_size > 1`) use the MoE
+parallelizer's activation checkpointing path, which currently checkpoints the
+text/MoE decoder blocks and does not use this scope to include VLM vision
+towers.
+</Note>
+
+<Note>
+If a vision, audio, or other tower is fully frozen, AutoModel leaves it out of
+activation checkpointing. This avoids extra recomputation for model parts that
+do not need parameter gradients. Layers with trainable adapters, such as LoRA,
+can still be checkpointed when their model part is selected by the scope because
+those adapter weights need gradients.
+</Note>
+
+Programmatically, pass the scope on the strategy config:
+
+```python
+from nemo_automodel.components.distributed.config import FSDP2Config
+
+strategy = FSDP2Config(activation_checkpointing_scope="language")
+```
 
 <Note>
 `selective` is supported for FSDP2 and DDP. Megatron-FSDP raises an error when `selective` is requested. KV-sharing models (e.g., Gemma4) automatically fall back to sub-module checkpointing, because attention cannot be recomputed through the KV cache.
@@ -112,16 +166,19 @@ LC-CE and gradient checkpointing target **different memory hot-spots** (output l
 2. **Throughput vs. Batch Size**: The goal is usually to _increase batch size_ or _sequence length_ while keeping throughput constant.
 
 ## Verify It Works
-Run your training script and inspect the peak memory:
+Run a checked-in recipe config with activation checkpointing enabled and inspect the peak memory:
 ```bash
 
 # If running on 8x GPUs
-automodel --nproc-per-node=8 examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+  --nproc-per-node 8 \
+  --distributed.activation_checkpointing true
 
 # If running on 1x GPU
-automodel examples/llm_finetune/llama3_2/llama_3_2_1b_my_finetune.yaml
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+  --distributed.activation_checkpointing true
 ```
-If you run with the above settings (activation ckpt = on, lc-ce = on, fsdp = on), look for a log line similar to:
+Compare the peak memory with the same command run without the override. The exact value depends on the model, batch size, sequence length, loss, and hardware. Look for the memory field in a log line similar to:
 ```
-... | mem 7.30 GiB | ...
+... | mem <peak-memory> GiB | ...
 ```
