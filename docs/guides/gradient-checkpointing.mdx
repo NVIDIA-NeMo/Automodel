@@ -78,12 +78,10 @@ activation checkpointing path, which respects the same
 `activation_checkpointing_scope` field with the same semantics: `all` (the
 default) checkpoints the text/MoE decoder blocks plus the trainable VLM vision
 tower, `language` the decoder blocks only, and `vision` only the trainable
-vision-tower blocks. Vision-tower blocks get the same per-submodule wrapping
-(attention/MLP/norms) as the generic path, and the SDPA backend set active at
-checkpoint-forward time is automatically snapshotted and restored during the
-backward-time recompute, so ambient backend forcing that does not span the
-recompute cannot fault the replay. Frozen vision towers stay out of activation
-checkpointing on both paths.
+vision-tower blocks. Vision-tower checkpointing behaves the same as on the
+generic path and works with any attention backend; no additional configuration
+is needed. Frozen vision towers stay out of activation checkpointing on both
+paths.
 </Note>
 
 <Note>
