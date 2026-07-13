@@ -76,12 +76,12 @@ activation-memory reduction across trainable model parts.
 Expert-parallel MoE configs (`ep_size > 1`) use the MoE parallelizer's
 activation checkpointing path, which respects the same
 `activation_checkpointing_scope` field with the same semantics: `all` (the
-default) checkpoints the text/MoE decoder blocks plus the trainable VLM vision
-tower, `language` the decoder blocks only, and `vision` only the trainable
-vision-tower blocks. Vision-tower checkpointing behaves the same as on the
-generic path and works with any attention backend; no additional configuration
-is needed. Frozen vision towers stay out of activation checkpointing on both
-paths.
+default) checkpoints the text/MoE decoder blocks plus any trainable
+multimodal towers (vision, audio), `language` the decoder blocks only, and
+`vision`, `audio`, or `multimodal` only the selected trainable tower blocks.
+Tower checkpointing behaves the same as on the generic path and works with
+any attention backend; no additional configuration is needed. Frozen towers
+stay out of activation checkpointing on both paths.
 </Note>
 
 <Note>
