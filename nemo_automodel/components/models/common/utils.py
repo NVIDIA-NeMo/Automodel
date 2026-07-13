@@ -228,6 +228,14 @@ class BackendConfig:
     compile_attn: bool = False
 
     def __post_init__(self):
+        # TEMPORARY: force TE fused RoPE off globally. The fused kernel computes cos/sin
+        # in fp32 in-kernel while HF/vLLM rotate with bf16 tables, breaking logprob parity
+        # in some models. See #3027. This is the one chokepoint every BackendConfig passes
+        # through, so it also overrides an explicit rope_fusion=True from a recipe/config.
+        if self.rope_fusion:
+            logger.warning("rope_fusion is temporarily force-disabled globally (see #3027).")
+        self.rope_fusion = False
+
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
         if isinstance(self.te_fp8, dict):
             self.te_fp8 = TEFp8Config(**self.te_fp8)
