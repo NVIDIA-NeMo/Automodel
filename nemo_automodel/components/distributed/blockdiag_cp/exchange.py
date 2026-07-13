@@ -212,6 +212,19 @@ def _blockdiag_halo_attention(query, key, value, doc_ids, group, plan, gm, row_o
     local_meta = dict(gm)
     local_meta["s_first"] = 0
     local_meta["real_end"] = recv_count + n_real
+    gm.setdefault(
+        "_needed_only_diagnostic",
+        {
+            "path": "halo",
+            "rank": rank,
+            "world": world,
+            "row_offset": row_offset,
+            "recv_count": recv_count,
+            "max_halo": max_halo,
+            "key_needed_len": int(key_needed.shape[2]),
+            "kernel_meta": gm.get("_validation_snapshot"),
+        },
+    )
     return _cp_blockdiag_varlen(
         query,
         key_needed,
@@ -362,6 +375,20 @@ def _blockdiag_a2a_attention(query, key, value, doc_ids, group, plan, gm, row_of
     local_meta = dict(gm)
     local_meta["s_first"] = 0
     local_meta["real_end"] = needed_len
+    gm.setdefault(
+        "_needed_only_diagnostic",
+        {
+            "path": "a2a",
+            "rank": rank,
+            "world": world,
+            "row_offset": row_offset,
+            "needed_len": needed_len,
+            "in_splits": list(in_splits),
+            "out_splits": list(out_splits),
+            "key_needed_len": int(key_needed.shape[2]),
+            "kernel_meta": gm.get("_validation_snapshot"),
+        },
+    )
     return _cp_blockdiag_varlen(
         query,
         key_needed,

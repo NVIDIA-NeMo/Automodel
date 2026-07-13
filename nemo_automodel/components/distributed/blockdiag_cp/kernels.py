@@ -179,6 +179,25 @@ def _varlen_metadata_unavailable_reason(
         k_offsets = meta["cu_k"].detach().cpu().tolist()
         q_lens = [b - a for a, b in zip(q_offsets, q_offsets[1:])]
         k_lens = [b - a for a, b in zip(k_offsets, k_offsets[1:])]
+        # Retain a host-only forensic snapshot. If a CUDA kernel reports an
+        # asynchronous illegal address at the following collective consensus,
+        # the CUDA context is already poisoned and copying cu_seqlens there is
+        # no longer possible. This compact snapshot lets that error name the
+        # exact shape without adding another synchronization on the hot path.
+        meta["_validation_snapshot"] = {
+            "n_real": n_real,
+            "query_len": query_len,
+            "key_len": key_len,
+            "s_first": s_first,
+            "real_end": real_end,
+            "max_q": max_q,
+            "max_k": max_k,
+            "first_q": int(meta.get("first_q", 0)),
+            "first_k": int(meta.get("first_k", 0)),
+            "max_tail": int(meta.get("max_tail", 0)),
+            "cu_q": q_offsets,
+            "cu_k": k_offsets,
+        }
         if q_offsets[0] != 0 or k_offsets[0] != 0:
             reason = "cu_q and cu_k must start at zero"
         elif any(length <= 0 for length in q_lens + k_lens):

@@ -116,7 +116,7 @@ def _needed_only_preflight(
     return all_available, reason
 
 
-def _needed_only_kernel_succeeded_on_all_ranks(out, group, device) -> bool:
+def _needed_only_kernel_succeeded_on_all_ranks(out, group, device, *, diagnostic=None) -> bool:
     """Make a rank-local varlen result safe to act on collectively.
 
     In particular, an all-padding rank returns a zero tensor without invoking
@@ -125,7 +125,26 @@ def _needed_only_kernel_succeeded_on_all_ranks(out, group, device) -> bool:
     """
     succeeded = out is not None
     if torch.distributed.is_initialized() and torch.distributed.get_world_size(group) > 1:
-        status = torch.tensor(int(succeeded), dtype=torch.int32, device=device)
+        try:
+            status = torch.tensor(int(succeeded), dtype=torch.int32, device=device)
+        except Exception as exc:
+            # CUDA launches are asynchronous: a bad attention kernel commonly
+            # surfaces here rather than at its Python call. Use a plain stderr
+            # print because rank-filtered logging may suppress nonzero ranks.
+            import sys
+
+            try:
+                global_rank = torch.distributed.get_rank()
+            except Exception:
+                global_rank = -1
+            print(
+                "CP_NEEDED_ONLY_ASYNC_ERROR "
+                f"global_rank={global_rank} device={device} "
+                f"error={exc!r} diagnostic={diagnostic!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
         torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MIN, group=group)
         succeeded = bool(status.item())
     return succeeded
@@ -290,7 +309,12 @@ def cp_blockdiag_sdpa(
             out = exchange._blockdiag_a2a_attention(
                 query, key, value, doc_ids, group, plan, gm, offset, scale, attn_backend
             )
-        if _needed_only_kernel_succeeded_on_all_ranks(out, group, query.device):
+        if _needed_only_kernel_succeeded_on_all_ranks(
+            out,
+            group,
+            query.device,
+            diagnostic=gm.get("_needed_only_diagnostic") if gm is not None else None,
+        ):
             assert out is not None
             return out
         # The needed-only KV collective has already executed. An all-padding
