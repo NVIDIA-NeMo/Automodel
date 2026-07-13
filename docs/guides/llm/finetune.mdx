@@ -798,6 +798,23 @@ optimizer:
 
 For the fine-tuning recipe itself, see [`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py). For more example configs, browse [`examples/llm_finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune).
 
+### Per-Parameter-Group Learning Rate
+
+To give a subset of parameters a different learning rate or weight decay (for example, a smaller learning rate for MoE router parameters), add `param_group_overrides` to the `optimizer` block. Each entry matches parameters by name and applies a multiplier that the LR scheduler folds into that group every step:
+
+```yaml
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2.0e-5
+  weight_decay: 0.01
+  param_group_overrides:
+    - pattern: "router"     # Python regex matched against each parameter name (re.search)
+      lr_mult: 0.1          # this group trains at 0.1 x the scheduled learning rate
+      wd_mult: 1.0          # (optional) multiplier for weight decay; defaults to 1.0
+```
+
+Each parameter joins the group of the **first** override whose `pattern` matches its name; parameters matching no pattern keep the base learning rate. A pattern that matches nothing is skipped with a warning. This works for the standard `torch.optim` optimizers; Dion-family optimizers do their own parameter grouping and ignore `param_group_overrides`.
+
 ## Distributed Training: TP, PP, CP, and EP
 
 The `distributed:` section controls how the model and data are split across GPUs. NeMo AutoModel supports four parallelism dimensions, each of which slices the workload differently:

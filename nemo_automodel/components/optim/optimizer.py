@@ -41,6 +41,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -67,6 +68,110 @@ _DTYPE_FIELDS = ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype")
 # ---------------------------------------------------------------------------
 
 
+# Config fields that are not optimizer-constructor kwargs and must be stripped
+# from ``asdict(self)`` before splatting into the underlying optimizer.
+_NON_CONSTRUCTOR_FIELDS = frozenset({"param_group_overrides"})
+
+
+@dataclass
+class ParamGroupOverride:
+    """Per-parameter-group learning-rate / weight-decay override.
+
+    Parameters whose (module-qualified) name matches :attr:`pattern` are placed
+    in their own optimizer parameter group carrying :attr:`lr_mult` /
+    :attr:`wd_mult`, which the LR scheduler multiplies into the group's learning
+    rate and weight decay every step (see
+    :meth:`OptimizerParamScheduler.step`). This mirrors Megatron-LM's per-group
+    ``lr_mult`` scaling of ``max_lr`` / ``min_lr``.
+
+    Attributes:
+        pattern: Python regular expression matched against each parameter name
+            with :func:`re.search` (so a plain substring like ``"router"`` also
+            works).
+        lr_mult: Multiplier applied to this group's learning rate.
+        wd_mult: Multiplier applied to this group's weight decay.
+    """
+
+    pattern: str
+    lr_mult: float = 1.0
+    wd_mult: float = 1.0
+
+
+def _coerce_param_group_overrides(overrides: list[Any]) -> list[ParamGroupOverride]:
+    """Coerce a list of dicts (as delivered by YAML) or objects into ``ParamGroupOverride``."""
+    coerced: list[ParamGroupOverride] = []
+    for override in overrides:
+        if isinstance(override, ParamGroupOverride):
+            coerced.append(override)
+        elif isinstance(override, dict):
+            coerced.append(ParamGroupOverride(**override))
+        else:
+            raise TypeError(f"param_group_overrides entries must be dict or ParamGroupOverride, got {override!r}")
+    return coerced
+
+
+def _build_param_groups(
+    named_params: list[tuple[str, torch.Tensor]],
+    overrides: list[ParamGroupOverride],
+) -> list[dict[str, Any]]:
+    """Partition ``named_params`` into optimizer groups by name-pattern ``overrides``.
+
+    Each parameter joins the group of the first override whose ``pattern`` matches
+    its name; unmatched parameters form the default group. Override groups carry
+    only ``lr_mult`` / ``wd_mult`` (read by :meth:`OptimizerParamScheduler.step`),
+    not a pre-scaled ``lr`` / ``weight_decay``: every group therefore inherits the
+    optimizer's base ``lr`` / ``weight_decay`` at construction, and the scheduler
+    (which calls ``step(0)`` on init) applies the multipliers. Keeping the stored
+    ``lr`` unscaled is what lets ``LRSchedulerConfig.build`` read an accurate base
+    LR from ``param_groups[0]`` even when the default group is empty. Empty groups
+    (a pattern matching nothing) are dropped with a warning.
+
+    Args:
+        named_params: ``(name, parameter)`` pairs for the trainable params of one
+            model part.
+        overrides: The per-group overrides to apply, in priority order.
+
+    Returns:
+        A list of parameter-group dicts suitable for a torch optimizer, default
+        (unmatched) group first.
+    """
+    compiled = [re.compile(override.pattern) for override in overrides]
+    default_params: list[torch.Tensor] = []
+    matched_params: list[list[torch.Tensor]] = [[] for _ in overrides]
+    for name, param in named_params:
+        for idx, regex in enumerate(compiled):
+            if regex.search(name):
+                matched_params[idx].append(param)
+                break
+        else:
+            default_params.append(param)
+
+    groups: list[dict[str, Any]] = []
+    if default_params:
+        groups.append({"params": default_params})
+    for idx, override in enumerate(overrides):
+        if not matched_params[idx]:
+            logger.warning("param_group_overrides pattern %r matched no parameters; skipping", override.pattern)
+            continue
+        groups.append({"params": matched_params[idx], "lr_mult": override.lr_mult, "wd_mult": override.wd_mult})
+    return groups
+
+
+def _trainable_params_or_groups(part: torch.nn.Module, overrides: list[ParamGroupOverride]) -> list:
+    """Return one model part's trainable params, grouped by ``overrides`` when set.
+
+    Without overrides this is the flat trainable-parameter list (unchanged
+    behavior); with overrides it is the list of parameter-group dicts from
+    :func:`_build_param_groups`.
+    """
+    named_params = [(name, p) for name, p in part.named_parameters() if p.requires_grad]
+    if not named_params:
+        raise ValueError("optimizer received no trainable parameters")
+    if overrides:
+        return _build_param_groups(named_params, overrides)
+    return [p for _, p in named_params]
+
+
 @dataclass
 class OptimizerConfig:
     """Base optimizer config.
@@ -74,8 +179,8 @@ class OptimizerConfig:
     Subclasses expose their full field surface and implement
     :meth:`_build_optimizer`, the per-part hook that constructs a single
     optimizer from a list of parameters.  :meth:`build` owns the shared
-    orchestration (per-part loop, TP ``foreach``) and is rarely overridden —
-    only by configs whose construction does not fit the
+    orchestration (per-part loop, TP ``foreach``, per-group LR overrides) and is
+    rarely overridden — only by configs whose construction does not fit the
     ``parameters -> optimizer`` shape (e.g. :class:`MuonConfig`).  Megatron-FSDP
     optimizer sharding is no longer applied here; the recipe layer re-applies it
     via ``shard_optimizers_for_megatron_fsdp(...)``.
@@ -84,6 +189,16 @@ class OptimizerConfig:
     # Whether this optimizer can be sharded for Megatron-FSDP. The recipe layer
     # reads this to decide whether to shard the built optimizers.
     supports_megatron_fsdp_sharding: ClassVar[bool] = True
+
+    # Per-group LR/WD overrides matched by parameter name. Empty = single group
+    # (unchanged behavior). Honored by the standard torch optimizers (typed configs
+    # and the factory path). Dion-family configs do their own grouping and warn if
+    # this is set.
+    param_group_overrides: list[ParamGroupOverride] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # YAML delivers overrides as plain dicts; coerce them to the typed form.
+        self.param_group_overrides = _coerce_param_group_overrides(self.param_group_overrides)
 
     def build(
         self,
@@ -94,9 +209,10 @@ class OptimizerConfig:
     ) -> list[torch.optim.Optimizer]:
         """Build one optimizer per ``model.parts`` (or ``[model]``).
 
-        Applies the shared per-part concern (TP ``foreach`` disabling) and
-        delegates the actual optimizer instantiation to :meth:`_build_optimizer`.
-        Megatron-FSDP optimizer sharding is applied by the recipe layer, not here.
+        Applies the shared per-part concerns (TP ``foreach`` disabling, per-group
+        LR/WD overrides) and delegates the actual optimizer instantiation to
+        :meth:`_build_optimizer`. Megatron-FSDP optimizer sharding is applied by
+        the recipe layer, not here.
 
         Args:
             model: Model (or model with ``.parts``) to optimize.
@@ -110,15 +226,18 @@ class OptimizerConfig:
         foreach = _foreach_for_mesh(device_mesh)
         optimizers: list[torch.optim.Optimizer] = []
         for part in getattr(model, "parts", [model]):
-            trainable_params = [p for p in part.parameters() if p.requires_grad]
-            assert len(trainable_params) > 0, "trainable_params cannot be empty"
-            optimizers.append(self._build_optimizer(trainable_params, foreach=foreach))
+            params = _trainable_params_or_groups(part, self.param_group_overrides)
+            optimizers.append(self._build_optimizer(params, foreach=foreach))
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
 
     def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
         """Construct a single optimizer for ``params`` (one model part)."""
         raise NotImplementedError(f"{type(self).__name__} must implement _build_optimizer()")
+
+    def _constructor_kwargs(self) -> dict[str, Any]:
+        """``asdict(self)`` with non-constructor (grouping) fields removed."""
+        return {k: v for k, v in asdict(self).items() if k not in _NON_CONSTRUCTOR_FIELDS}
 
     def build_from_param_groups(
         self,
@@ -144,7 +263,7 @@ class AdamConfig(OptimizerConfig):
     def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
         return torch.optim.Adam(
             params,
-            **asdict(self),
+            **self._constructor_kwargs(),
             foreach=foreach,
         )
 
@@ -163,7 +282,7 @@ class AdamWConfig(OptimizerConfig):
     def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
         return torch.optim.AdamW(
             params,
-            **asdict(self),
+            **self._constructor_kwargs(),
             # foreach and fused are mutually exclusive; only pass foreach when not fused.
             foreach=foreach and not self.fused,
         )
@@ -185,7 +304,7 @@ class FusedAdamConfig(OptimizerConfig):
     def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
         from transformer_engine.pytorch.optimizers import FusedAdam
 
-        kwargs = asdict(self)
+        kwargs = self._constructor_kwargs()
         master_weight_dtype = kwargs.pop("master_weight_dtype", None)
         if master_weight_dtype is not None:
             master_weight_dtype = dtype_from_str(master_weight_dtype)
@@ -205,7 +324,7 @@ class FlashAdamWConfig(OptimizerConfig):
     def _build_optimizer(self, params, *, foreach: bool | None = None) -> torch.optim.Optimizer:
         from flashoptim import FlashAdamW
 
-        return FlashAdamW(params, **asdict(self))
+        return FlashAdamW(params, **self._constructor_kwargs())
 
 
 # Fields consumed by build_dion_optimizer for parameter grouping; these are NOT dion
@@ -253,12 +372,18 @@ class _DionConfigBase(OptimizerConfig):
         device_mesh: DeviceMesh | None = None,
         is_peft: bool = False,
     ) -> list[torch.optim.Optimizer]:
+        if self.param_group_overrides:
+            logger.warning("param_group_overrides is ignored by Dion-family optimizers, which do their own grouping")
         optimizers: list[torch.optim.Optimizer] = []
         for part in getattr(model, "parts", [model]):
             param_groups, mesh_kwargs = build_dion_optimizer(
                 self, part, device_mesh=device_mesh, mesh_kwarg=self._mesh_kwarg
             )
-            ctor_kwargs = {k: v for k, v in asdict(self).items() if k not in _DION_GROUPING_FIELDS}
+            ctor_kwargs = {
+                k: v
+                for k, v in asdict(self).items()
+                if k not in _DION_GROUPING_FIELDS and k not in _NON_CONSTRUCTOR_FIELDS
+            }
             opt = self._make_optimizer(param_groups, {**ctor_kwargs, **mesh_kwargs})
             optimizers.append(opt)
         return optimizers
@@ -355,7 +480,9 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
     Hyperparameters live in :attr:`kwargs`; the inherited ``lr``/``weight_decay``
     fields are unused.  The factory is called as ``factory(params=..., **kwargs)``;
     Dion-family optimizers (which need parameter grouping) should use the typed
-    :class:`MuonConfig` instead.
+    :class:`MuonConfig` instead.  A ``param_group_overrides`` entry in
+    :attr:`kwargs` is consumed here (not forwarded to the factory) to drive
+    per-group LR/WD, matching the typed-config behavior.
     """
 
     factory: Callable[..., torch.optim.Optimizer] | None = None
@@ -372,6 +499,13 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
         foreach = _foreach_for_mesh(device_mesh)
 
         kwargs = dict(self.kwargs)
+        # For the factory path, per-group overrides normally arrive inside ``kwargs``
+        # (like every other hyperparameter, since the typed ``lr``/``weight_decay``
+        # fields are unused here); pop them so they drive grouping rather than being
+        # forwarded to the optimizer constructor. Fall back to the inherited field
+        # so an override set either way is honored.
+        kwargs_overrides = kwargs.pop("param_group_overrides", [])
+        overrides = self.param_group_overrides or _coerce_param_group_overrides(kwargs_overrides)
         for attr in _DTYPE_FIELDS:
             val = kwargs.get(attr, None)
             if isinstance(val, str):
@@ -384,9 +518,8 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
 
         optimizers: list[torch.optim.Optimizer] = []
         for part in getattr(model, "parts", [model]):
-            trainable_params = [p for p in part.parameters() if p.requires_grad]
-            assert len(trainable_params) > 0, "trainable_params cannot be empty"
-            optimizers.append(self.factory(params=trainable_params, **kwargs))
+            params = _trainable_params_or_groups(part, overrides)
+            optimizers.append(self.factory(params=params, **kwargs))
         warn_if_torch_adam_with_bf16_params(optimizer=optimizers, is_peft=is_peft, context="optim", logger=logger)
         return optimizers
 
