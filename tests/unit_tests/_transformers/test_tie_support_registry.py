@@ -24,7 +24,7 @@ declare a policy or be listed in the explicit, commented exemption below.
 import importlib
 
 from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
-from nemo_automodel.components.checkpoint.utils import TieSupport
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 
 # Registered classes that do NOT own a causal LM head and are therefore exempt from
 # declaring ``tie_word_embeddings_support``. Keep this explicit and commented so a

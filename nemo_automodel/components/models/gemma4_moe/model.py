@@ -78,9 +78,12 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     CausalLMOutputWithPast = _make_missing("CausalLMOutputWithPast")
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig

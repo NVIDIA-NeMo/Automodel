@@ -23,10 +23,13 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import roll_tensor
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 from nemo_automodel.components.models.step3p5.model import Step3p5Model

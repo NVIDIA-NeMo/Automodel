@@ -42,13 +42,16 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config

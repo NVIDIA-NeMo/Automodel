@@ -20,7 +20,6 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -28,6 +27,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,

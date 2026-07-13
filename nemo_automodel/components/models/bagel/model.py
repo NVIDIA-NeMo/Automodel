@@ -37,7 +37,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.bagel.attention_masks import create_sparse_mask
 from nemo_automodel.components.models.bagel.configuration import BagelConfig
 from nemo_automodel.components.models.bagel.connector import BagelMultiModalProjector
@@ -51,6 +50,10 @@ from nemo_automodel.components.models.bagel.state_dict_adapter import (
     load_bagel_checkpoint_state_dict,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 
 logger = logging.getLogger(__name__)
 

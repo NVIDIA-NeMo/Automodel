@@ -22,8 +22,11 @@ name for the model registry.
 
 from dataclasses import dataclass
 
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 
 

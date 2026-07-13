@@ -67,6 +67,7 @@ from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     is_gated_delta_net_fp32_param_key,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import get_controlling_tie_word_embeddings
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -1001,7 +1002,7 @@ def _tie_weights_nemo(model):
     # model is tied. Re-tying an untied model here would alias away the trained
     # ``lm_head.weight`` that ``from_pretrained`` just loaded (see #2941).
     config = getattr(model, "config", None)
-    if config is not None and not checkpoint_utils.get_controlling_tie_word_embeddings(config, type(model).__name__):
+    if config is not None and not get_controlling_tie_word_embeddings(config):
         return
 
     def get_module_by_fqn(model, fqn):

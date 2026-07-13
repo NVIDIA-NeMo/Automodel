@@ -22,12 +22,15 @@ from transformers import AutoConfig
 from transformers.generation import GenerationConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     HFCheckpointingMixin,
     initialize_linear_module,
     initialize_rms_norm_module,
+)
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Block

@@ -43,7 +43,7 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration as _HFMistral3ForConditionalGeneration,
 )
 
-from nemo_automodel.components.checkpoint.utils import TieSupport
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
     Mistral3FP8StateDictAdapter,

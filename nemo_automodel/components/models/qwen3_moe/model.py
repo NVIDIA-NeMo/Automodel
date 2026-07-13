@@ -20,7 +20,6 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -29,6 +28,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.qwen3_moe.layers import Qwen3MoeAttention

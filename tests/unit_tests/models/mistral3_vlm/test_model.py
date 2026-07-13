@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 from transformers import Mistral3Config
 
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_tie_word_embeddings_flip
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport, reject_tie_word_embeddings_flip
 from nemo_automodel.components.models.mistral3_vlm.model import (
     Mistral3FP8VLMForConditionalGeneration,
     _rotary_reinit_self_hook,

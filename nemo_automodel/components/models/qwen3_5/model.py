@@ -38,11 +38,11 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Model as HFQwen3_5Model,
 )
 
-from nemo_automodel.components.checkpoint.utils import TieSupport
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule, roll_tensor
 from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm

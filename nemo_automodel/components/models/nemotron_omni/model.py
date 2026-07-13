@@ -34,9 +34,12 @@ from transformers import AutoConfig, AutoModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.nemotron_v3.model import (
     NemotronHForCausalLM as NemotronV3ForCausalLM,

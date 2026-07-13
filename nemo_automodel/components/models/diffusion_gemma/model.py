@@ -73,9 +73,12 @@ except (ModuleNotFoundError, ImportError):
     ScaledWordEmbedding = _make_missing("ScaledWordEmbedding")
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin

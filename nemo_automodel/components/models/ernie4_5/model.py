@@ -28,7 +28,6 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -36,6 +35,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.ernie4_5.rope_utils import Ernie4_5RotaryEmbedding, apply_rotary_pos_emb
 from nemo_automodel.components.models.ernie4_5.state_dict_adapter import (
     Ernie4_5_MoeStateDictAdapter,

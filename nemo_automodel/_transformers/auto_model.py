@@ -97,7 +97,7 @@ from nemo_automodel._transformers.model_init import (
     no_hf_meta_device,
     resolve_sdpa_method,
 )
-from nemo_automodel.components.checkpoint.utils import reject_tie_word_embeddings_flip
+from nemo_automodel.components.models.common.tie_word_embeddings import reject_tie_word_embeddings_flip
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
     from transformers.cache_utils import StaticCache

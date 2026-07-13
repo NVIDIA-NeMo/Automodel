@@ -19,8 +19,11 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     cast_model_to_dtype,

@@ -26,12 +26,15 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
     get_rope_config,
     initialize_rms_norm_module,
+)
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
 )
 from nemo_automodel.components.models.deepseek_v3.model import (
     Block,

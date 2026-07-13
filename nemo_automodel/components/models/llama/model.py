@@ -45,13 +45,13 @@ from transformers.models.llama.modeling_llama import eager_attention_forward
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
-from nemo_automodel.components.checkpoint.utils import TieSupport
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,

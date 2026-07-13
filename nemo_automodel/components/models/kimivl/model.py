@@ -108,8 +108,11 @@ class KimiVLConfig(PretrainedConfig):
         return output
 
 
-from nemo_automodel.components.checkpoint.utils import TieSupport, reject_unsupported_tie_word_embeddings
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits, initialize_linear_module
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.deepseek_v3.model import DeepseekV3Model
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids
 from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
