@@ -944,7 +944,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             # reshapes token-shaped fields and drops other tensors, so pop the
             # non-token fields (media such as pixel_values/image_grid_thw) first
             # and restore them after the conversion.
-            if cp_size > 1:
+            if self.mesh_context.cp_size > 1:
                 raise NotImplementedError(
                     "THD packing (packing_format='thd') for VLM currently supports cp_size=1 only; "
                     "context-parallel THD for mRoPE VLMs is not yet implemented."
