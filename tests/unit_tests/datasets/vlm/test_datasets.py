@@ -1668,3 +1668,11 @@ class TestPreTokenizedDatasetWrapperInjectFakeImages:
 
         assert inject_calls == [], "injection must be skipped when inject_fake_images=False"
         assert mask_calls == [], "no masking when nothing was injected"
+
+    def test_config_forwards_inject_fake_images(self):
+        wrapper = ds.PreTokenizedDatasetWrapperConfig(inject_fake_images=False).build(
+            dataset=self._make_dataset(),
+            processor=_FakeProcessor(),
+        )
+
+        assert wrapper.inject_fake_images is False
