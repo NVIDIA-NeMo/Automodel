@@ -300,15 +300,14 @@ def test_end_to_end_robustness_peft_disables_triton(tmp_path):
     assert resolved["peft"]["use_triton"] is False
 
 
-def test_end_to_end_robustness_qwen3_moe_deepep_sets_ci_hf_tolerance(tmp_path):
-    """The Qwen3-MoE DeepEP HF tolerance is CI-only and stays out of the recipe body."""
-    recipe = tmp_path / "qwen3_moe_30b_te_deepep.yaml"
-    recipe.write_text(
-        "step_scheduler: {global_batch_size: 8}\n"
-        "ci:\n"
-        "  recipe_owner: t\n"
-        "  checkpoint_robustness:\n"
-        "    hf_kl_threshold: 1e-2\n"
+def test_end_to_end_robustness_qwen3_moe_deepep_recipe_declares_ci_hf_tolerance(tmp_path):
+    """The Qwen3-MoE DeepEP HF tolerance is recipe-owned and stays out of the top-level config."""
+    recipe = (
+        Path(__file__).resolve().parents[3]
+        / "examples"
+        / "llm_finetune"
+        / "qwen"
+        / "qwen3_moe_30b_te_deepep.yaml"
     )
     out = tmp_path / "resolved.yaml"
     env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": "t1"}
