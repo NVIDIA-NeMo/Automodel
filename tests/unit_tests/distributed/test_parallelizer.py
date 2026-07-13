@@ -778,7 +778,11 @@ class TestMegatronFSDPStrategyParallelize:
         dropped_warnings = [record for record in caplog.records if "check_for_nan_in_grad" in record.getMessage()]
         assert len(dropped_warnings) == 1
         assert dropped_warnings[0].levelno == logging.WARNING
-        assert "report_nan_in_param_grad" in dropped_warnings[0].getMessage()
+        message = dropped_warnings[0].getMessage()
+        assert "report_nan_in_param_grad" in message
+        # The warning must make the breaking behavior loud: NaN checking is now off.
+        assert "no-op" in message
+        assert "DISABLED" in message
 
     def test_megatron_fsdp_unknown_precision_api_fails_closed(self):
         def unknown_fully_shard(**kwargs):

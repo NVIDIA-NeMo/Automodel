@@ -2220,9 +2220,9 @@ def _megatron_fsdp_compat_kwargs(
     if check_for_nan_in_grad and not _megatron_fsdp_nan_check_noop_warned:
         _megatron_fsdp_nan_check_noop_warned = True
         logger.warning(
-            "check_for_nan_in_grad=True has no effect with megatron-fsdp==0.5.0: it removed the "
-            "legacy buffer-level NaN check. Set report_nan_in_param_grad=True to opt into its "
-            "per-parameter NaN check instead."
+            "check_for_nan_in_grad=True is a no-op with megatron-fsdp==0.5.0, which removed the "
+            "legacy buffer-level NaN check: gradient NaN checking is now DISABLED. Set "
+            "report_nan_in_param_grad=True to restore per-parameter gradient NaN checking."
         )
     return {
         "mixed_precision_policy": MegatronFSDPMixedPrecisionPolicy(
@@ -2286,11 +2286,15 @@ def megatron_fsdp_strategy_parallelize(
         overlap_param_gather (bool): If True, overlap parameter gathering with
             forward computation.
         check_for_nan_in_grad (bool): Legacy buffer-level gradient NaN check.
-            megatron-fsdp 0.5.0 removed the check, so a truthy value has no
-            effect and is warned about once per process; use
-            ``report_nan_in_param_grad`` instead.
+            BREAKING CHANGE on megatron-fsdp 0.5.0: this flag is a no-op,
+            preserved only for config compatibility. 0.5.0 removed the
+            buffer-level NaN check entirely, so gradient NaN checking is now OFF
+            regardless of this value; a truthy value is dropped with a one-time
+            warning per process. Enable ``report_nan_in_param_grad`` to restore
+            gradient NaN checking.
         report_nan_in_param_grad (bool): Whether Megatron-FSDP should perform
-            its precise per-parameter gradient NaN check. Disabled by default
+            its precise per-parameter gradient NaN check. This is the 0.5.0
+            replacement for ``check_for_nan_in_grad`` and is disabled by default
             because it can significantly reduce training throughput.
         average_in_collective (bool): Perform gradient averaging inside the
             collective operation instead of dividing afterward.
