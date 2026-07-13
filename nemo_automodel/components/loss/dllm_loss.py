@@ -388,12 +388,13 @@ class DFlashDecayLoss(nn.Module):
             The chunked path is plain autograd, so FSDP2 handles it correctly.
         chunk_size: Number of predicted positions per chunk in the chunked
             linear-CE path. Smaller = lower peak memory, more recompute.
-        normalize: Loss denominator, applied identically to every ``loss_type``.
-            ``"tokens"`` (default) divides the weighted sum by ``num_tokens``, a
-            global all-reduced count that keeps the loss consistent across DP
-            replicas and grad-accum. ``"mean"`` divides by the effective weight
-            sum (``(w_k * block_mask).sum()`` for dflash, ``(block_mask *
-            dpace_weights).sum()`` for D-PACE) for a per-call weighted mean.
+        normalize: Loss denominator. ``"tokens"`` (default) divides the weighted
+            sum by ``num_tokens``, a global all-reduced count that keeps the loss
+            consistent across DP replicas and grad-accum. ``"mean"`` divides by
+            the effective weight sum ``(w_k * block_mask).sum()`` for dflash, and
+            by the batch size for D-PACE -- whose weights carry the objective's
+            signal, so a weight-sum denominator would cancel it (and, being
+            per-rank, would bias the DP gradient average).
         loss_type: Loss variant. ``"dflash"`` keeps the original decay-weighted
             cross entropy. The ``"dpace*"`` variants use detached Dynamic
             Position-Aware Cross-Entropy weights (D-PACE, arXiv:2605.18810).
@@ -473,11 +474,11 @@ class DFlashDecayLoss(nn.Module):
     ) -> DLLMLossOutput:
         """Build per-position weights, then sum and normalise.
 
-        ``loss_type`` selects only the weights (decay for ``"dflash"``, detached
-        D-PACE confidence for the ``"dpace*"`` variants). The denominator is
-        governed by ``normalize`` / ``num_tokens`` for **every** variant, so
-        switching ``loss_type`` does not silently change the loss scale or break
-        DP / grad-accumulation consistency.
+        ``loss_type`` selects the weights (decay for ``"dflash"``, detached D-PACE
+        confidence for the ``"dpace*"`` variants). ``normalize`` / ``num_tokens``
+        select the denominator, which is always data-independent for D-PACE (the
+        global ``num_tokens``, or the batch size) so the DP gradient average stays
+        exact and the objective's weight magnitudes are preserved.
         """
         _, T = token_nll.shape
         block_mask = block_mask.to(token_nll.dtype)
@@ -509,7 +510,17 @@ class DFlashDecayLoss(nn.Module):
 
         loss = (token_nll * weights).sum()
         if self.normalize == "mean":
-            loss = loss / (weights.sum() + 1e-6)
+            if self.loss_type in _DPACE_LOSS_TYPES:
+                # D-PACE is a weighted *sum*: the weight magnitude is the signal
+                # (the expected accepted-prefix length), so dividing by the weight
+                # sum would cancel exactly the variation the objective encodes.
+                # It would also desync the DP gradient average -- that stays exact
+                # only when every rank divides by the same constant, and the D-PACE
+                # weights are data-dependent. Normalize per sequence instead, which
+                # is what the reference implementation does.
+                loss = loss / max(float(token_nll.shape[0]), 1.0)
+            else:
+                loss = loss / (weights.sum() + 1e-6)
         elif num_tokens is not None:
             loss = loss / max(float(num_tokens), 1.0)
         return DLLMLossOutput(
