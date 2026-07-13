@@ -1707,6 +1707,12 @@ fi
                 num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
                 fqn_to_file_index_mapping = _equally_divide_layers(num_shards, pre_shard_hf_state_dict_keys)
             else:
+                # Decide whether the size metadata collective is needed from inputs that are
+                # identical on every PP rank. Rank-local exclusions below must not control
+                # collective participation, or one stage could wait forever for another.
+                fallback_key_sizes = None
+                if set(fqn_to_file_index_mapping).isdisjoint(pre_shard_hf_state_dict_keys):
+                    fallback_key_sizes = _collect_global_tensor_sizes(state_dict, self.pp_group)
                 # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
                 # however, HF initializes buffers with persistent=False, so we need to make sure these
                 # buffer keys are not saved during checkpointing
@@ -1722,6 +1728,24 @@ fi
                 excluded_keys.update(keys_to_remove)
                 for key in keys_to_remove:
                     fqn_to_file_index_mapping.pop(key, None)
+                if not fqn_to_file_index_mapping:
+                    fallback_keys = [
+                        key
+                        for key in (pre_shard_hf_state_dict_keys or list(state_dict.keys()))
+                        if key not in excluded_keys
+                    ]
+                    fqn_to_file_index_mapping = _divide_keys_by_size(
+                        fallback_keys,
+                        state_dict,
+                        _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES,
+                        key_size_mapping=fallback_key_sizes,
+                    )
+                    if is_rank_0():
+                        logger.info(
+                            "Original HF shard mapping for %s contained no exported model keys; using size-based "
+                            "consolidated shard mapping instead.",
+                            self.config.model_repo_id,
+                        )
         else:
             pre_shard_hf_state_dict_keys = getattr(model, "_pre_shard_hf_state_dict_keys", None)
             if pre_shard_hf_state_dict_keys is None:
@@ -1731,6 +1755,7 @@ fi
                 fallback_keys,
                 state_dict,
                 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES,
+                key_size_mapping=_collect_global_tensor_sizes(state_dict, self.pp_group),
             )
             num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
             if is_rank_0():
@@ -1746,7 +1771,7 @@ fi
         # These will go to the same file as the last file (or file 1 for single-file models).
         # The global keys keep mappings complete under PP, while the current keys preserve
         # parameters registered after parallelization, such as test- or application-owned weights.
-        # Use default of 1 when mapping is empty (e.g., encoder models with different key prefixes)
+        # Use default of 1 only when the exported state dict itself has no mapped tensor keys.
         default_index = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
 
         # add any additional keys that are not in the base checkpoint
@@ -2569,8 +2594,24 @@ def _divide_keys_by_size(
     keys: list[str],
     state_dict: dict[str, torch.Tensor],
     target_shard_bytes: int,
+    key_size_mapping: dict[str, int] | None = None,
 ) -> dict[str, int]:
-    """Assign keys to deterministic size-based shards."""
+    """Assign keys to deterministic size-based shards.
+
+    Args:
+        keys: Ordered tensor names to assign.
+        state_dict: Mapping of tensor names to tensors of arbitrary shape. Tensor values are read only for their
+            logical byte sizes when ``key_size_mapping`` is not provided.
+        target_shard_bytes: Positive target size for each shard in bytes.
+        key_size_mapping: Optional mapping of tensor names to logical byte sizes, including tensors not present in
+            the rank-local ``state_dict``.
+
+    Returns:
+        Mapping from every input key to a positive, one-based shard index.
+
+    Raises:
+        ValueError: If ``target_shard_bytes`` is not positive.
+    """
     if target_shard_bytes <= 0:
         raise ValueError(f"target_shard_bytes must be > 0, got {target_shard_bytes}")
 
@@ -2580,7 +2621,13 @@ def _divide_keys_by_size(
 
     for key in keys:
         tensor = state_dict.get(key)
-        tensor_bytes = estimate_tensor_bytes(tensor) if tensor is not None else 0
+        tensor_bytes = (
+            key_size_mapping.get(key, 0)
+            if key_size_mapping is not None
+            else estimate_tensor_bytes(tensor)
+            if tensor is not None
+            else 0
+        )
         if current_shard_bytes > 0 and current_shard_bytes + tensor_bytes > target_shard_bytes:
             current_shard += 1
             current_shard_bytes = 0
@@ -2589,6 +2636,52 @@ def _divide_keys_by_size(
         current_shard_bytes += tensor_bytes
 
     return fqn_to_index_mapping
+
+
+def _collect_global_tensor_sizes(
+    state_dict: dict[str, torch.Tensor],
+    process_group: torch.distributed.ProcessGroup | None,
+) -> dict[str, int]:
+    """Collect logical tensor sizes across pipeline stages without moving tensor data.
+
+    Args:
+        state_dict: Mapping of tensor names to rank-local tensors of arbitrary shape. Tensors remain on their
+            existing devices and are inspected only for element count and element size.
+        process_group: Pipeline-parallel process group whose ranks collectively own the logical state dict, or
+            ``None`` for a local-only size mapping.
+
+    Returns:
+        Mapping from tensor names to logical byte sizes, merged across all ranks in ``process_group``.
+
+    Raises:
+        RuntimeError: If a participating pipeline rank does not provide its size mapping.
+        ValueError: If pipeline ranks report different logical sizes for the same tensor name.
+    """
+    local_sizes = {key: estimate_tensor_bytes(tensor) for key, tensor in state_dict.items()}
+    if (
+        process_group is None
+        or not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size(group=process_group) == 1
+    ):
+        return local_sizes
+
+    world_size = torch.distributed.get_world_size(group=process_group)
+    gathered_sizes: list[dict[str, int] | None] = [None] * world_size
+    torch.distributed.all_gather_object(gathered_sizes, local_sizes, group=process_group)
+
+    global_sizes: dict[str, int] = {}
+    for rank, rank_sizes in enumerate(gathered_sizes):
+        if rank_sizes is None:
+            raise RuntimeError(f"Pipeline rank {rank} did not provide tensor sizes for consolidated export")
+        for key, tensor_bytes in rank_sizes.items():
+            if key in global_sizes and global_sizes[key] != tensor_bytes:
+                raise ValueError(
+                    f"Conflicting logical sizes for {key!r} across pipeline ranks: "
+                    f"{global_sizes[key]} and {tensor_bytes} bytes"
+                )
+            global_sizes[key] = tensor_bytes
+    return global_sizes
 
 
 def _model_has_dtensors(module: nn.Module) -> bool:
