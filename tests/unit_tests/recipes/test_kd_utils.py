@@ -330,6 +330,9 @@ def _run_kd_bridge_worker(rank: int, world_size: int, init_file: str) -> None:
             )
             checkpointer.close()
         bridge.synchronize()
+        # Synchronize the default group before tearing it down. The bridge barrier
+        # uses a separate Gloo group, so it does not order default-group cleanup.
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
