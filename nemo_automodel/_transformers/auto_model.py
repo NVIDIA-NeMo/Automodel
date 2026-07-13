@@ -27,6 +27,7 @@ Heavy-lifting helpers live in sibling modules:
 import gc
 import inspect
 import logging
+import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -260,16 +261,21 @@ def _maybe_reject_tie_word_embeddings_flip(pretrained_model_name_or_path, hf_con
 
     Re-reads the checkpoint's raw config (no user value-overrides) and compares its
     controlling tie flag to the requested ``hf_config`` via
-    :func:`reject_tie_word_embeddings_flip`. Conservative by design: only runs for a
-    string checkpoint path and silently returns if the raw config cannot be re-read, so
-    it never blocks a load except on a genuine flip.
+    :func:`reject_tie_word_embeddings_flip`. Conservative by design: path-like sources
+    are normalized with :func:`os.fspath`, non-path sources are skipped, and it silently
+    returns if the raw config cannot be re-read, so it never blocks a load except on a
+    genuine flip.
 
     Args:
-        pretrained_model_name_or_path: The from_pretrained source (only str paths checked).
+        pretrained_model_name_or_path: The from_pretrained source (``str`` and
+            ``os.PathLike`` are checked; anything else is skipped).
         hf_config: The resolved config with user overrides applied (the requested value).
         kwargs: The from_pretrained kwargs (hub-locating keys are reused for the raw load).
     """
+    if isinstance(pretrained_model_name_or_path, os.PathLike):
+        pretrained_model_name_or_path = os.fspath(pretrained_model_name_or_path)
     if not isinstance(pretrained_model_name_or_path, str):
+        # Non-path source (e.g. bytes fspath or preloaded object): nothing to re-read.
         return
     hub_kwargs = {k: kwargs[k] for k in _AUTO_CONFIG_HUB_KWARG_KEYS if k in kwargs}
     try:
