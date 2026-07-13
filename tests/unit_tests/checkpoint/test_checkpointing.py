@@ -511,6 +511,64 @@ def test_missing_original_hf_index_uses_size_based_consolidated_mapping(tmp_path
     assert "2 output shard(s)" in caplog.text
 
 
+def test_fully_pruned_original_index_uses_size_based_consolidated_mapping(tmp_path, caplog):
+    class FakeTensor:
+        def __init__(self, bytes_: int):
+            self.bytes = bytes_
+
+        def numel(self):
+            return self.bytes
+
+        def element_size(self):
+            return 1
+
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="mistralai/Ministral-3-3B-Instruct-2512",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    state_dict = {
+        "layers.0.weight": FakeTensor(4 * 1024**3),
+        "layers.1.weight": FakeTensor(4 * 1024**3),
+    }
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="ministral3"),
+        _pre_shard_hf_state_dict_keys=list(state_dict),
+    )
+    model_state = SimpleNamespace(model=[model], has_local_tied_lm_head=False, lm_head_param_name=None)
+    parent_vlm_mapping = {
+        "language_model.layers.0.weight": 1,
+        "language_model.layers.1.weight": 2,
+        "vision_tower.weight": 2,
+    }
+    caplog.set_level(logging.INFO)
+
+    with (
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+            return_value=str(tmp_path / "source"),
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint.checkpointing.get_fqn_to_file_index_mapping",
+            return_value=parent_vlm_mapping,
+        ),
+    ):
+        mapping = checkpointer._maybe_build_consolidated_index(model_state, state_dict)
+
+    assert mapping == {
+        "layers.0.weight": 1,
+        "layers.1.weight": 2,
+    }
+    assert "contained no exported model keys" in caplog.text
+
+
 def test_normalize_dtype_mapping_to_state_dict_keys_uses_hf_base_model_prefix():
     dtype_mapping = {
         "h.0.ln_1.weight": "BF16",
