@@ -15,6 +15,7 @@
 """Functional tests for retrieval backbone extraction."""
 
 import json
+import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -248,3 +249,170 @@ def test_extract_submodel_without_config_raises():
 
     with pytest.raises(ValueError, match="has no .config attribute"):
         _extract_submodel(model, "language_model")
+
+
+def test_load_encoder_config_merges_v5_retrieval_metadata(tmp_path):
+    """v4-compatible exports keep AutoModel metadata in config.v5.json."""
+    from nemo_automodel._transformers.retrieval import _load_encoder_config
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "bert"}))
+    (tmp_path / "config.v5.json").write_text(
+        json.dumps(
+            {
+                "model_type": "bert",
+                "nemo_retrieval": {"task": "embedding", "pooling": "last", "l2_normalize": False},
+            }
+        )
+    )
+
+    config = _load_encoder_config(str(tmp_path))
+
+    assert config.nemo_retrieval == {"task": "embedding", "pooling": "last", "l2_normalize": False}
+
+
+def test_load_encoder_config_merges_local_subfolder_v5_retrieval_metadata(tmp_path):
+    """Local exports with a subfolder keep metadata beside the loaded config."""
+    from nemo_automodel._transformers.retrieval import _load_encoder_config
+
+    model_subfolder = tmp_path / "model"
+    model_subfolder.mkdir()
+    (model_subfolder / "config.json").write_text(json.dumps({"model_type": "bert"}))
+    (model_subfolder / "config.v5.json").write_text(
+        json.dumps(
+            {
+                "model_type": "bert",
+                "nemo_retrieval": {"task": "embedding", "pooling": "weighted_avg", "l2_normalize": False},
+            }
+        )
+    )
+
+    config = _load_encoder_config(str(tmp_path), subfolder="model")
+
+    assert config.nemo_retrieval == {"task": "embedding", "pooling": "weighted_avg", "l2_normalize": False}
+
+
+def test_load_encoder_config_merges_hub_v5_retrieval_metadata(monkeypatch, tmp_path):
+    """Hub exports can recover AutoModel metadata from config.v5.json sidecars."""
+    from nemo_automodel._transformers import retrieval
+
+    v5_config_path = tmp_path / "config.v5.json"
+    v5_config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "bert",
+                "nemo_retrieval": {"task": "embedding", "pooling": "cls", "l2_normalize": True},
+            }
+        )
+    )
+    captured = {}
+
+    class FakeConfig:
+        model_type = "bert"
+
+    def fake_config_from_pretrained(model_name_or_path, **kwargs):
+        captured["config"] = {"model_name_or_path": model_name_or_path, "kwargs": kwargs}
+        return FakeConfig()
+
+    def fake_hf_hub_download(repo_id, filename, **kwargs):
+        captured["hub"] = {"repo_id": repo_id, "filename": filename, "kwargs": kwargs}
+        return str(v5_config_path)
+
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", fake_config_from_pretrained)
+    monkeypatch.setattr(retrieval, "hf_hub_download", fake_hf_hub_download)
+
+    config = retrieval._load_encoder_config(
+        "nvidia/example-retriever",
+        trust_remote_code=True,
+        revision="main",
+        token="token",
+        torch_dtype="auto",
+    )
+
+    assert captured["config"]["kwargs"]["trust_remote_code"] is True
+    assert captured["config"]["kwargs"]["revision"] == "main"
+    assert "torch_dtype" not in captured["config"]["kwargs"]
+    assert captured["hub"] == {
+        "repo_id": "nvidia/example-retriever",
+        "filename": "config.v5.json",
+        "kwargs": {"revision": "main", "token": "token"},
+    }
+    assert config.nemo_retrieval == {"task": "embedding", "pooling": "cls", "l2_normalize": True}
+
+
+def test_load_encoder_config_warns_on_unexpected_hub_sidecar_failure(monkeypatch, caplog):
+    """Transient Hub/cache failures should not silently fall back to defaults."""
+    from nemo_automodel._transformers import retrieval
+
+    class FakeConfig:
+        model_type = "bert"
+
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", lambda *_, **__: FakeConfig())
+    monkeypatch.setattr(retrieval, "hf_hub_download", lambda *_, **__: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    caplog.set_level(logging.WARNING, logger="nemo_automodel._transformers.retrieval")
+    config = retrieval._load_encoder_config("nvidia/example-retriever")
+
+    assert not hasattr(config, "nemo_retrieval")
+    assert "Unable to load config.v5.json" in caplog.text
+
+
+def test_nemo_auto_biencoder_defaults_do_not_override_saved_metadata(monkeypatch):
+    """The public AutoModel entry point should defer pooling/l2 defaults to the saved config."""
+    from nemo_automodel._transformers import auto_model
+
+    captured = {}
+
+    def fake_base_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        captured["pretrained_model_name_or_path"] = pretrained_model_name_or_path
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(
+        auto_model._NeMoAutoModelForRetrievalBase,
+        "from_pretrained",
+        classmethod(fake_base_from_pretrained),
+    )
+
+    auto_model.NeMoAutoModelBiEncoder.from_pretrained("saved-export")
+
+    assert captured["pretrained_model_name_or_path"] == "saved-export"
+    assert captured["kwargs"]["pooling"] is None
+    assert captured["kwargs"]["l2_normalize"] is None
+
+
+def test_biencoder_build_applies_saved_retrieval_metadata(monkeypatch):
+    """BiEncoderModel.build should use pooling/l2 metadata loaded from the saved config."""
+    from nemo_automodel._transformers import retrieval
+
+    class FakeConfig:
+        name_or_path = "saved-export"
+        nemo_retrieval = {"task": "embedding", "pooling": "last", "l2_normalize": False}
+
+    class FakeModel:
+        config = FakeConfig()
+
+    config = FakeConfig()
+    captured = {}
+
+    def fake_build_encoder_backbone(model_name_or_path, task, **kwargs):
+        captured["model_name_or_path"] = model_name_or_path
+        captured["task"] = task
+        captured["pooling"] = kwargs.get("pooling")
+        captured["loaded_config"] = kwargs.get("loaded_config")
+        return FakeModel()
+
+    monkeypatch.setattr(retrieval, "_load_encoder_config", lambda *_, **__: config)
+    monkeypatch.setattr(retrieval, "build_encoder_backbone", fake_build_encoder_backbone)
+
+    model = retrieval.BiEncoderModel.build("saved-export")
+
+    assert model.pooling == "last"
+    assert model.l2_normalize is False
+    assert captured == {
+        "model_name_or_path": "saved-export",
+        "task": "embedding",
+        "pooling": "last",
+        "loaded_config": config,
+    }
+    assert model.config.nemo_retrieval["pooling"] == "last"
+    assert model.config.nemo_retrieval["l2_normalize"] is False

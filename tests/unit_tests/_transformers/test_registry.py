@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import types
 
 import pytest
@@ -300,6 +301,23 @@ def test_custom_config_registrations_in_config_mapping():
         f"CONFIG_MAPPING. The _register_custom_configs() call at module level may "
         f"have failed for these entries."
     )
+
+
+def test_retrieval_bidirectional_configs_resolve_from_pretrained(tmp_path):
+    """Saved retrieval exports must be loadable in fresh processes through AutoConfig."""
+    from transformers import AutoConfig
+
+    from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS
+
+    for model_type in ("llama_bidirec", "ministral3_bidirec"):
+        assert model_type in _CUSTOM_CONFIG_REGISTRATIONS
+        model_dir = tmp_path / model_type
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": model_type}))
+
+        config = AutoConfig.from_pretrained(model_dir)
+
+        assert config.model_type == model_type
 
 
 def test_kimi_k25_arch_alias_in_model_arch_mapping():
