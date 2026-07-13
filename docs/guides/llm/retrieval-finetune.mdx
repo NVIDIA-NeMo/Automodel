@@ -195,10 +195,12 @@ The training recipe does not load a separate qrels file. Materialize qrels into 
 For training, `pos_doc[0]` is the supervised positive. For mining, keep every known positive for the query in `pos_doc`
 so the miner can exclude those IDs; it does not read an external qrels file. If you expand multi-positive queries into
 one row per positive, make sure sibling positives are removed from `neg_doc` and audited out of mined negatives before
-training. The helper in `examples/retrieval/data_utils/unroll_pos_docs.py` writes `original_question_id` so mined outputs
-can still be joined back to the original qrels. Also keep sibling-positive rows out of the same in-batch-negative
-training batch, disable distributed in-batch negatives, or add qrels-aware sampling/masking. Keep the original qrels for
-offline Recall@K, MRR@K, and nDCG@K evaluation.
+training. For a multi-positive input row, `examples/retrieval/data_utils/unroll_pos_docs.py` emits only a suffixed
+`question_id` plus `question`, `corpus_id`, `pos_doc`, and `neg_doc`; it does not add `original_question_id`. Keep a
+separate mapping from each suffixed ID to its source question if you need that lineage. The current miner also normalizes
+rows to the required retrieval fields and does not preserve extra row metadata. Also keep sibling-positive rows out of
+the same in-batch-negative training batch, disable distributed in-batch negatives, or add qrels-aware sampling/masking.
+Keep the original qrels for offline Recall@K, MRR@K, and nDCG@K evaluation.
 
 ## Minimal Config Anatomy
 
@@ -331,9 +333,11 @@ dataloader:
 Important knobs:
 
 - `pooling`: controls how token hidden states become one embedding. Common single-vector choices are `avg`, `cls`,
-  `last`, and `weighted_avg`. The hard-negative miner supports only single-vector pooling modes; do not mine with
-  `colbert` pooling, which returns token-level embeddings.
-- `l2_normalize`: normalizes embeddings before scoring. When enabled, the recipe divides scores by `temperature`.
+  `last`, and `weighted_avg`. The shipped hard-negative miner currently loads the bi-encoder wrapper with its default
+  `avg` pooling and does not expose a mining override. Do not use it for a model trained with a different pooling mode or
+  with `colbert` pooling, which returns token-level embeddings.
+- `l2_normalize`: normalizes embeddings before scoring. When enabled, the recipe divides scores by `temperature`. The
+  shipped miner currently uses the bi-encoder wrapper default, `true`, and does not expose a mining override.
 - `q_max_len` and `p_max_len`: set separate truncation lengths for queries and passages.
 - `query_prefix` and `passage_prefix`: add task-specific text before tokenization. Keep these aligned between training,
   hard-negative mining, and inference.
@@ -559,33 +563,33 @@ memory and want maximum adaptation.
 After an initial bi-encoder run, mine harder negatives with the consolidated encoder checkpoint. Hard-negative mining
 expects the corpus ID-based retrieval JSON format described in the dataset guide, not the inline JSONL shortcut. The
 input must reference one corpus so the miner can build a passage embedding cache, retrieve candidates, and write mined
-negatives back to each query. Every row's `corpus_id` must match that single loaded corpus, and each mining row must have
-a unique `question_id`; mismatched corpus IDs and duplicate question IDs are rejected before mining.
+negatives back to each query. The miner enforces that the file resolves to exactly one corpus, but it does not verify that
+every row's `corpus_id` matches that corpus or that `question_id` values are unique. Validate those invariants before
+mining. Duplicate question IDs overwrite one another in the miner's result lookup.
 
-The quickstart configs use `hf://` sources for the first train/eval path. The miner currently reads a local
-corpus-backed retrieval JSON file instead of `hf://` URIs directly. For a train -> mine -> retrain loop, first
-materialize or preprocess your selected HF subset into the corpus ID JSON schema from
-[Retrieval Dataset](/datasets/retrieval-dataset), then set `--mining.train_qa_file_path` to that local JSON file.
-
-For an AutoModel-schema HF subset such as `FEVER`, materialize one corpus-backed mining input with:
+The bi-encoder quickstart uses `hf://` sources; the cross-encoder quickstart already uses local retrieval JSON paths. The
+miner currently reads a local corpus-backed retrieval JSON file instead of `hf://` URIs directly. For
+`nvidia/embed-nemotron-dataset-v1`, restore the maintained local layout with:
 
 ```bash
-uv run python examples/retrieval/data_utils/materialize_hf_retrieval_subset.py \
-  nvidia/embed-nemotron-dataset-v1 \
-  FEVER \
-  /path/to/retrieval-data/fever-mining
+uv run python examples/retrieval/bi_encoder/llama_embed_nemotron_8b/data_preparation.py \
+  --download-path ./embed_nemotron_dataset_v1
 ```
 
-This writes `/path/to/retrieval-data/fever-mining/train.json` and a local `FEVER_corpus/` directory. Run the command
-once per subset/corpus that you want to mine; the helper intentionally processes one corpus per run and refuses to write
-into a non-empty output directory unless you pass `--overwrite`. With `--overwrite`, it writes replacement files in
-temporary paths and swaps them in only after the new subset has loaded and serialized successfully. The mining examples
-below use that local `train.json` path.
+The script has no subset selector. It scans the repository and restores every discovered directory containing a
+`corpus.parquet`. For each discovered subset `<name>`, it writes
+`./embed_nemotron_dataset_v1/<name>/<name>.json` and
+`./embed_nemotron_dataset_v1/<name>/corpus/train.parquet`; the JSON stores the corpus directory as an absolute path. For
+example, use `./embed_nemotron_dataset_v1/FEVER/FEVER.json` as the FEVER mining input. The maintained
+`examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml` recipe consumes this same output
+layout through its `data_dir_list` entries.
 
-The default bi-encoder example trains from both `FEVER` and `SyntheticClassificationData`. For a full train -> mine ->
-retrain loop, materialize and mine each subset separately, give each mined output and embedding cache its own run-specific
-path, then list all mined JSON files in the next config's `data_dir_list`. Replacing a multi-source config with only one
-mined file intentionally trains on that subset only.
+Before launching the miner, load the resulting JSON with the retrieval dataset path or a short smoke run to verify the
+schema and document IDs. The `llama3_2_1b.yaml` quickstart trains from both `FEVER` and
+`SyntheticClassificationData`; the maintained Llama-Embed-Nemotron recipe lists all of its restored training subsets.
+For a full train -> mine -> retrain loop, mine each desired restored subset separately, give each mined output and
+embedding cache its own run-specific path, then list all mined JSON files in the next config's `data_dir_list`. Replacing
+a multi-source config with only one mined file intentionally trains on that subset only.
 
 This single-node example uses `--standalone`:
 
@@ -593,8 +597,8 @@ This single-node example uses `--standalone`:
 uv run torchrun --standalone --nproc_per_node=8 examples/retrieval/data_utils/mine_hard_negatives.py \
   --config examples/retrieval/data_utils/mining_config.yaml \
   --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/model/consolidated \
-  --mining.train_qa_file_path /path/to/retrieval-data/fever-mining/train.json \
-  --mining.train_file_output_path /path/to/retrieval-data/fever-mined/train.json \
+  --mining.train_qa_file_path ./embed_nemotron_dataset_v1/FEVER/FEVER.json \
+  --mining.train_file_output_path /path/to/retrieval-data/mined/FEVER/train.json \
   --mining.cache_embeddings_dir /shared/path/to/cache/llama3_2_1b_fever_mine_v1 \
   --mining.query_prefix "query: " \
   --mining.passage_prefix "passage: " \
@@ -617,8 +621,8 @@ uv run torchrun \
   examples/retrieval/data_utils/mine_hard_negatives.py \
   --config examples/retrieval/data_utils/mining_config.yaml \
   --mining.model_name_or_path ./output/llama3_2_1b_encoder/checkpoints/epoch_0_step_499/model/consolidated \
-  --mining.train_qa_file_path /path/to/retrieval-data/fever-mining/train.json \
-  --mining.train_file_output_path /path/to/retrieval-data/fever-mined/train.json \
+  --mining.train_qa_file_path ./embed_nemotron_dataset_v1/FEVER/FEVER.json \
+  --mining.train_file_output_path /path/to/retrieval-data/mined/FEVER/train.json \
   --mining.cache_embeddings_dir /shared/path/to/cache/llama3_2_1b_fever_mine_v1 \
   --mining.query_prefix "query: " \
   --mining.passage_prefix "passage: " \
@@ -629,19 +633,22 @@ uv run torchrun \
 
 Replace `epoch_0_step_499` with the explicit checkpoint directory that you want to mine from. If you only have
 `LATEST.txt`, read it first and substitute the resolved `epoch_*_step_*` directory; the mining script loads the
-Hugging Face export directly and does not apply AutoModel's checkpoint resolver. The miner refuses to overwrite an
-existing `train_file_output_path` by default. Choose a new output path for each mining run, or pass
-`--mining.overwrite_output true` only when replacing that file is intentional. If the output JSON is written to a
-different directory from the input JSON, the miner rewrites relative `corpus` paths so retraining still resolves the
-original corpus.
+Hugging Face export directly and does not apply AutoModel's checkpoint resolver. The miner creates the output parent
+directory and opens `train_file_output_path` with write mode, so an existing file is replaced without prompting. It has no
+`overwrite_output` setting. Use a new run-specific output path and check that it does not exist before launch. The miner
+preserves the input's top-level `corpus` value without rewriting relative paths; if the output JSON moves to a different
+directory, use an absolute corpus path or arrange the output directory so the unchanged relative path still resolves.
 
-Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
+Key mining settings accepted by the recipe (the checked-in
+`examples/retrieval/data_utils/mining_config.yaml` supplies defaults for most of them):
 
-- `hard_negatives_to_mine`: target number of negatives to add per query. The miner can return fewer when the corpus has
-  too few valid candidates or margin filtering removes high-scoring candidates. Audit per-query counts before training.
+- `hard_negatives_to_mine`: maximum number of mined negatives to add per query. The miner can return fewer when the corpus
+  has too few non-positive candidates. Margin-filtered candidates are down-scored to `-inf` but can still appear in the
+  top-k result when too few finite candidates remain, so inspect scores and per-query counts before training.
 - `hard_neg_margin` and `hard_neg_margin_type`: filter near-positive candidates. With `hard_neg_margin_type: perc`,
-  candidates scoring above `min_positive_score * hard_neg_margin` are removed; with `abs`, candidates scoring above
-  `min_positive_score - hard_neg_margin` are removed. Inspect mined samples when positive scores are low or negative.
+  candidates scoring above `min_positive_score * hard_neg_margin` are set to `-inf`; with `abs`, candidates scoring
+  above `min_positive_score - hard_neg_margin` are set to `-inf`. Inspect mined samples when positive scores are low or
+  negative.
 - `query_prefix` and `passage_prefix`: keep these semantically consistent with the bi-encoder training config. The
   miner concatenates prefixes directly, while `BiEncoderCollator` inserts a space after non-empty prefixes; include the
   trailing space in mining prefixes. The miner supports static prefixes only. If training used
@@ -653,35 +660,27 @@ Key mining settings in `examples/retrieval/data_utils/mining_config.yaml`:
   to tokenizer defaults, which can differ from the training config.
 - `use_negatives_from_file`: include existing negatives from the input file when mining. Existing negatives are prepended
   to the output and mined negatives are appended, so deduplicate and audit the output before using it for training.
-- `overwrite_output`: defaults to `false`. Set it to `true` only when you intentionally want to replace an existing
-  mined output file; the input and output paths must still be different.
 - `attn_implementation`: optional model-loading escape hatch for mining exports that need `sdpa`, `eager`, or
   `flash_attention_2` pinned.
 - `cache_embeddings_dir`: required for distributed mining so ranks can share cached passage embeddings. Rank `0`
   assembles the final embedding cache and score outputs, so plan memory and local disk accordingly. In multi-node
   mining, this must be a shared writable path mounted at the same location on every node; node-local cache paths leave
   rank `0` unable to read remote-rank shards.
-- Cache reuse: use a fresh cache directory for each model, dataset, prefix, sequence length, `corpus_chunk_size`, and
-  world-size combination. The miner validates cache metadata and loads the consolidated arrays to verify fingerprint,
-  shape, and readability before reusing a consolidated cache. The fingerprint includes the mining input file, local
-  model/tokenizer path state, ordered document IDs/content, and embedding settings.
-- `load_embeddings_from_cache`: set this to `true` only when you intentionally want to reuse every cached query shard,
-  corpus chunk, and consolidated embedding file from the same
-  model/input/prefix/length/`corpus_chunk_size`/world-size run. Fresh run-specific paths are still easier to reason
-  about, especially for mutable Hub IDs or paths that are overwritten in place.
+- Cache reuse: use a new empty cache directory for every model, mining input, prefix, sequence length,
+  `corpus_chunk_size`, and world-size combination. Query shards and corpus chunks are reused when their expected filenames
+  already exist, even when `load_embeddings_from_cache` is `false`. The miner validates rank-shard row counts during
+  assembly, but it does not store or compare a fingerprint for the model, input rows, corpus content, or embedding
+  settings.
+- `load_embeddings_from_cache`: when `true`, rank `0` reuses consolidated `query_embeddings.npz` and
+  `passage_embeddings.npz` if both files exist. The miner loads the first array from each archive without checking it
+  against the current input or configuration. Set this only for an unchanged run, and prefer a new cache path whenever
+  any input or setting changed.
 
-`pooling` and `l2_normalize` are saved bi-encoder wrapper metadata, not `mining.*` config fields. Do not pass
-`--mining.pooling` or `--mining.l2_normalize`; the miner rejects unknown mining keys. Mine from a saved bi-encoder export
-produced with the wrapper settings you want. For an older export that does not carry this metadata, write a new export
-before mining:
-
-```bash
-uv run python examples/retrieval/data_utils/export_biencoder_with_metadata.py \
-  /path/to/export_without_metadata \
-  /path/to/export_for_mining \
-  --pooling last \
-  --no-l2-normalize
-```
+`pooling` and `l2_normalize` are not `mining.*` config fields. Unknown mining keys are ignored rather than applied, so do
+not pass `--mining.pooling` or `--mining.l2_normalize`. The current miner calls
+`NeMoAutoModelBiEncoder.from_pretrained` without those arguments and therefore uses the wrapper defaults (`avg` and
+`true`). Use this helper only when those settings match training. For other settings, use a custom mining workflow that
+loads the encoder with the required wrapper arguments; AutoModel does not ship a metadata-retrofit exporter.
 
 Hard-negative mining parallelizes embedding generation across ranks, but the final exact scoring step still runs on
 rank `0` and materializes the full document embedding matrix there. For very large corpora, use a smaller mining slice
@@ -693,39 +692,15 @@ listed in each input row's `pos_doc`, but it cannot read an external qrels file 
 duplicate. Put all known positive IDs for the query in the mining input, deduplicate the corpus, inspect mined samples,
 filter duplicate IDs and non-finite scores such as `-inf` from mined outputs, and avoid mining from validation or test
 corpora. If you unroll multi-positive training data, mine from rows that still carry every known positive in `pos_doc`;
-otherwise sibling positives can be mined as false negatives. Custom row-level metadata from the input JSON is preserved
-in the mined output, while `neg_doc` and positive-document scores are refreshed.
+otherwise sibling positives can be mined as false negatives. The miner rebuilds each row from the normalized retrieval
+fields, refreshes `neg_doc` and positive-document scores, and drops extra row-level metadata such as
+`original_question_id`.
 
-Run the audit utility before reusing mined output:
-
-```bash
-uv run python examples/retrieval/data_utils/audit_mined_negatives.py \
-  /path/to/mined.json \
-  --min-negatives 1 \
-  --allow-findings
-```
-
-`--allow-findings` keeps this first inspection command from failing the shell when it finds issues. Omit it in CI or
-quality gates when findings should fail the job. `--min-negatives 1` flags rows that would fail or become degenerate
-when retraining with `n_passages > 1`; increase it if your next training config requires more distinct negatives before
-oversampling.
-
-If the report only contains issues that you want to drop automatically, write a cleaned copy:
-
-```bash
-uv run python examples/retrieval/data_utils/audit_mined_negatives.py \
-  /path/to/mined.json \
-  --drop-invalid-negatives \
-  --min-negatives 1 \
-  --output /path/to/mined_audited.json
-```
-
-With `--drop-invalid-negatives --output`, the command exits successfully when the cleaned output has no remaining audit
-findings and still satisfies `--min-negatives` if you set it. The audit flags missing or non-finite positive scores, and
-flags and drops negatives whose IDs also appear in the row's `pos_doc`, duplicate negative IDs in the same row, missing
-negative scores, and non-finite negative scores.
-The cleaned output preserves query lineage fields such as `original_question_id`, so unrolled examples remain traceable
-to their source question.
+AutoModel does not ship a mined-negative audit or cleanup utility. Before using the output for training, validate it with
+your own data-quality tooling. At minimum, require unique question and corpus document IDs, confirm every row references
+the single declared corpus, check that positive and negative IDs exist, reject positive/negative overlap and duplicate
+negative IDs, reject missing or non-finite scores, and require enough distinct negatives for the next config's
+`n_passages`. Keep any query-lineage mapping outside the mined JSON because the miner does not preserve extra row fields.
 
 ## Save, Resume, and Use the Checkpoint
 

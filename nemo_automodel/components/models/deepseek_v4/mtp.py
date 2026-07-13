@@ -185,8 +185,11 @@ class DeepseekV4MTPBlock(nn.Module):
         with target_device:
             nn.init.trunc_normal_(self.e_proj.weight, mean=0.0, std=init_std)
             nn.init.trunc_normal_(self.h_proj.weight, mean=0.0, std=init_std)
-        self.self_attn.init_weights(target_device)
-        self.mlp.init_weights(target_device)
+        self.self_attn.init_weights(target_device, init_std=init_std)
+        self.mlp.init_weights(target_device, init_std=init_std)
+        self.attn_hc.init_weights(init_std)
+        self.ffn_hc.init_weights(init_std)
+        self.hc_head.init_weights(init_std)
 
 
 class DeepseekV4MTPModule(nn.Module):

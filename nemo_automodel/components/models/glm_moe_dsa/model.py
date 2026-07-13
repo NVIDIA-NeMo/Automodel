@@ -267,6 +267,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = True
+        supports_thd: bool = True
 
     @classmethod
     def from_config(
@@ -343,7 +344,6 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 make_glm_dsa_packed_cp_batch_and_ctx,
                 num_chunks=int(kwargs.get("num_chunks", 1)),
             ),
-            "_cp_full_logits_grad_touch": True,
         }
 
     def _is_pipeline_parallel_stage(self) -> bool:
