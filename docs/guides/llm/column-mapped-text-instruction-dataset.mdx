@@ -101,7 +101,8 @@ In the following section, we demonstrate how to load the instruction-tuning corp
 [`Muennighoff/natural-instructions`](https://huggingface.co/datasets/Muennighoff/natural-instructions).
 The dataset schema is `{task_name, id, definition, inputs, targets}`.
 
-The following are examples from the training split:
+The following abbreviated rows are illustrative examples of that schema. Their
+IDs and text are not copied from the live training split:
 
 ```json
 {
@@ -165,7 +166,7 @@ dataset:
 </Note>
 
 <Note>
-Delta Lake / Databricks (including `delta_sql_query` and authentication) is supported only by `ColumnMappedTextInstructionIterableDataset`. See [`column-mapped-text-instruction-iterable-dataset.md`](/datasets/columnmapped-iterable) for details.
+Delta Lake / Databricks (including `delta_sql_query` and authentication) is supported only by `ColumnMappedTextInstructionIterableDataset`. See [`column-mapped-text-instruction-iterable-dataset.mdx`](/datasets/columnmapped-iterable) for details.
 
 </Note>
 
@@ -209,17 +210,16 @@ In both cases, `labels` are the next-token targets (shifted by one relative to `
 ## Parameter Requirements
 
 The following section lists important requirements and caveats for correct usage.
-- `column_mapping` must include `answer`, and must include at least one of `context` or `question` (2- or 3-column mapping only).
-- If `use_hf_chat_template=True`, the tokenizer must support chat templates (`chat_template` + `apply_chat_template`).
+- A 2-column `column_mapping` must have exactly the logical keys `{answer, context}` or `{answer, question}`. A 3-column mapping must have exactly `{context, question, answer}`. Each value names the corresponding source-dataset column.
+- If `use_hf_chat_template=True`, the dataset uses the tokenizer's chat template when `chat_template` is present and `apply_chat_template` is callable; otherwise it falls back to plain prompt/completion formatting.
 
 ---
 ## Slurm Configuration for Distributed Training
 
-For distributed training on Slurm clusters, add a `slurm` section to your YAML configuration. This section configures the Slurm batch job parameters and automatically generates the appropriate `#SBATCH` directives.
+For distributed training on Slurm clusters, use the checked-in root-level `slurm.sub` script and submit it directly with `sbatch`. Recipe YAML does not select a Slurm launcher or generate `#SBATCH` directives.
 
 ### Slurm Configuration
 
-SLURM jobs are submitted with `sbatch` directly — no YAML section needed.
 Copy the reference script, set the `CONFIG` variable to your YAML, and submit:
 
 ```sh
@@ -235,18 +235,23 @@ full examples (Pyxis, bare-metal, Apptainer).
 ### Multi-Node Slurm Configuration
 
 <Note>
-**Multi-Node Training**: When using Hugging Face datasets in multi-node setups, you need shared storage accessible by all nodes. Set `HF_DATASETS_CACHE` to a shared directory in your sbatch script (e.g., `export HF_DATASETS_CACHE=/shared/hf_cache`) to ensure all nodes can access the cached datasets.
+**Multi-Node Training**: A shared Hugging Face cache is optional. Using a shared
+`HF_HOME` or `HF_DATASETS_CACHE` directory is recommended when available because
+it avoids duplicate downloads across nodes. Alternatively, each node can use its
+own reachable cache and network access.
 
 </Note>
 
 When using multiple nodes with Hugging Face datasets:
 
-1. **Shared Storage**: Ensure all nodes can access the same storage paths
-2. **HF Cache**: Export `HF_HOME` and `HF_DATASETS_CACHE` in your sbatch script pointing to shared directories
-3. **Mounts**: Add shared directories as container mounts in your sbatch script
+1. **Dataset access**: Give every node network access to the dataset or a populated node-local cache
+2. **Optional shared cache**: To avoid duplicate downloads, point `HF_HOME` or `HF_DATASETS_CACHE` at a shared directory
+3. **Mounts**: If you use shared storage inside a container, mount that directory on every node
 
-Configure all of this in your sbatch script (`my_cluster.sub`), not in the YAML.
+Set cache environment variables and container mounts in your sbatch script
+(`my_cluster.sub`), not in the recipe YAML. Network access is a cluster property.
 
 ---
 ### That's It!
-With the mapping specified, the rest of the NeMo Automodel pipeline (pre-tokenization, packing, collate-fn, *etc.*) works as usual.
+With the mapping specified, the dataset tokenizes each sample lazily when
+`ds[i]` is accessed; downstream packing and collation then work as usual.

@@ -29,7 +29,7 @@ dataset:
 - Factory: `nemo_automodel.components.datasets.llm.squad.make_squad_dataset`
 - Use case: instruction/QA tuning with either prompt-and-answer formatting or chat-template formatting
 <Note>
-- If the tokenizer has a chat template and you want answer-only loss, you must provide `start_of_turn_token`.
+- If the tokenizer has a usable chat template, `make_squad_dataset` uses it automatically and masks non-answer tokens. Otherwise it uses prompt-and-answer formatting.
 - Optional `seq_length` can be used for padding/truncation.
 
 </Note>
@@ -39,7 +39,6 @@ dataset:
   _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
   split: train
   dataset_name: rajpurkar/squad
-  start_of_turn_token: "<|assistant|>"
 ```
 
 - **ColumnMappedTextInstructionDataset (generic instruction SFT)**
@@ -47,10 +46,9 @@ dataset:
   - Use case: quickly adapt instruction datasets by mapping your schema's columns to `context`, `question`, `answer`
   - Sources: local JSON/JSONL or Hugging Face Hub dataset ID
   - Notes:
-    - For tokenizers with chat templates and answer-only loss, you may set `answer_only_loss_mask: true` and provide `start_of_turn_token`.
-    - Supports streaming mode for large datasets (see [Streaming Datasets](#streaming-datasets) section below).
+    - Set `use_hf_chat_template: true` to opt into a usable tokenizer chat template. With `answer_only_loss_mask: true`, the dataset masks non-answer tokens; without a usable template it falls back to prompt-and-answer formatting.
     - Map-style, non-streaming dataset (supports `len(ds)` and `ds[i]`)
-    - For streaming (including Delta Lake / Databricks), use `ColumnMappedTextInstructionIterableDataset`
+    - For streaming (including Delta Lake / Databricks), use `ColumnMappedTextInstructionIterableDataset` (see [Streaming Datasets](#streaming-datasets)).
   - Example YAML:
 ```yaml
 dataset:
@@ -62,7 +60,7 @@ dataset:
     question: inputs
     answer: targets
   answer_only_loss_mask: true
-  start_of_turn_token: "<|assistant|>"
+  use_hf_chat_template: true
 ```
 See the detailed guide, [Column-Mapped Text Instruction Dataset](/datasets/columnmapped-dataset), for more information.
 
@@ -78,7 +76,6 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](/datasets/colum
     - `seq_length`: maximum sequence length for padding/truncation
     - `padding`: padding strategy ("do_not_pad", "max_length", etc.)
     - `truncation`: truncation strategy ("do_not_truncate", "longest_first", etc.)
-    - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
     - `chat_template`: optional override for tokenizer's chat template
     - `skip_invalid_samples`: if `true`, skip malformed JSONL lines when reading local files (warnings log skip counts); default `false` fails fast on a bad line
   - Notes:
@@ -99,7 +96,6 @@ See the detailed guide, [Column-Mapped Text Instruction Dataset](/datasets/colum
   - `seq_length`: maximum sequence length for padding/truncation
   - `padding`: padding strategy ("do_not_pad", "max_length", etc.)
   - `truncation`: truncation strategy ("do_not_truncate", "longest_first", etc.)
-  - `start_of_turn_token`: token marking assistant response start (for answer-only loss)
   - `chat_template`: optional override for tokenizer's chat template
   - `mask_reasoning_content`: optionally exclude rendered `reasoning_content` tokens from loss
   - `skip_invalid_samples`: if `true`, skip malformed JSONL lines when reading local files (warnings log skip counts); default `false` fails fast on a bad line
@@ -126,7 +122,6 @@ dataset:
     _target_: transformers.AutoTokenizer.from_pretrained
     pretrained_model_name_or_path: google/functiongemma-270m-it
   seq_length: 2048
-  start_of_turn_token: "<start_of_turn>"
   mask_reasoning_content: false
   skip_invalid_samples: false
 ```
@@ -335,7 +330,7 @@ dataset:
     question: inputs
     answer: targets
   answer_only_loss_mask: true
-  start_of_turn_token: "<|assistant|>"
+  use_hf_chat_template: true
 ```
 
 For Hugging Face datasets loaded directly, set `streaming=True`:
@@ -417,7 +412,7 @@ dataset:
     question: prompt
     answer: completion
   answer_only_loss_mask: true
-  start_of_turn_token: "<|assistant|>"
+  use_hf_chat_template: true
   repeat_on_exhaustion: true  # Automatically restart when stream ends
 
 dataloader:
@@ -436,9 +431,11 @@ This configuration:
 To reduce padding and improve throughput with variable-length sequences:
 ```yaml
 packed_sequence:
-  packed_sequence_size: 8192   # > 0 enables packing
-  split_across_pack: false
+  packed_sequence_size: 8192   # > 0 enables packing; 0 disables it
+  packing_strategy: thd        # Optional; defaults to THD packing
 ```
+The fine-tuning recipe passes these settings to its packed-dataset path. For THD packing, it disables packing when the model does not support `seq_lens`.
+
 Use a collator that pads to an FP8-friendly multiple when training with FP8:
 ```yaml
 dataloader:
@@ -453,13 +450,13 @@ dataloader:
 ## VLM Datasets (Vision/Audio + Language)
 VLM datasets are represented as conversations (message lists) that combine text with images or audio and are processed with the model's `AutoProcessor.apply_chat_template` and a suitable collate function.
 
-Built-in dataset makers (return lists of `conversation` dicts):
+Built-in dataset makers return a Python list or a Hugging Face `Dataset`; each yielded sample includes a `conversation` field:
 - **RDR items**: `nemo_automodel.components.datasets.vlm.datasets.make_rdr_dataset` (HF: `quintend/rdr-items`)
 - **CORD-V2 receipts (Consolidated Receipt Dataset for Post-OCR Parsing)**: `nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset` (HF: `naver-clova-ix/cord-v2`)
 - **MedPix-VQA (Medical Pixel Question Answering)**: `nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset`
 - **CommonVoice 17 (CV17) (audio)**: `nemo_automodel.components.datasets.audio.datasets.make_cv17_dataset`
 
-Each example follows the conversation schema expected by `apply_chat_template`, e.g.:
+RDR and CORD-V2 return lists. MedPix and CommonVoice 17 return Hugging Face `Dataset` objects with lazy transforms. Each sample follows the conversation schema expected by `apply_chat_template`, e.g.:
 ```python
 {
   "conversation": [
@@ -503,7 +500,7 @@ dataloader:
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.qwen2_5_collate_fn
 ```
-If you want answer-only loss masking, provide a model-appropriate `start_of_response_token` to the collate function.
+Answer-only loss masking is built into the supported VLM collators. They derive assistant regions from the processor's chat template with `build_labels_from_template`; `start_of_response_token` is not a collate argument.
 
 See [Gemma-3n](/recipes-e2e-examples/gemma-3-3n) and [VLM dataset](/datasets/multi-modal-dataset) for end-to-end examples.
 
@@ -587,7 +584,7 @@ dataset:
     question: inputs
     answer: targets
   answer_only_loss_mask: true
-  start_of_turn_token: "<|assistant|>"
+  use_hf_chat_template: true
 ```
 
 ### Implement a Minimal Custom Class Pattern (LLM Completion)
@@ -610,7 +607,7 @@ class MyCompletionDataset:
 Then reference your class with `_target_` in YAML.
 
 ### Important Considerations
-- **Chat templates**: If your tokenizer has a chat template and you want answer-only loss, provide the correct `start_of_turn_token` (LLM) or `start_of_response_token` (VLM collate functions).
+- **Chat templates**: SQuAD uses a tokenizer chat template automatically when available. Column-mapped datasets opt in with `use_hf_chat_template: true`; `ChatDataset` derives assistant masking from the tokenizer's chat template. VLM collators derive assistant labels from the processor template and do not accept `start_of_response_token`.
 - **Padding for FP8**: If training with FP8, set `pad_seq_len_divisible: 16` in your collate function to align sequence lengths.
 - **Packed sequences**: Prefer packed sequences for throughput when fine-tuning LLMs on variable-length corpora.
 - **Validation**: You can define a separate `validation_dataset` and `validation_dataloader` block mirroring your training config.
