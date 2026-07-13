@@ -306,28 +306,14 @@ def _disable_dynamo_lru_cache() -> None:
         logger.debug("Could not disable dynamo LRU cache for selective AC + compile.", exc_info=True)
 
 
-def _registered_child_name(module: nn.Module, attr: str, child: nn.Module) -> str | None:
-    if module._modules.get(attr) is child:
-        return attr
-    for child_name, registered_child in module._modules.items():
-        if registered_child is child:
-            return child_name
-    return None
-
-
 def _wrap_first_existing_attr(module: nn.Module, attr_names: tuple[str, ...], *, skip: bool = False) -> int:
-    """Checkpoint-wrap the first matching registered child attr on ``module``."""
+    """Checkpoint-wrap the first matching child attr on ``module``."""
     if skip:
         return 0
     for attr in attr_names:
         child = getattr(module, attr, None)
         if isinstance(child, nn.Module):
-            child_name = _registered_child_name(module, attr, child)
-            if child_name is None:
-                continue
-            if hasattr(child, "_checkpoint_wrapped_module"):
-                return 0
-            setattr(module, child_name, checkpoint_wrapper(child))
+            setattr(module, attr, checkpoint_wrapper(child))
             return 1
     return 0
 
