@@ -170,12 +170,12 @@ Run a checked-in recipe config with activation checkpointing enabled and inspect
 ```bash
 
 # If running on 8x GPUs
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --nproc-per-node 8 \
   --distributed.activation_checkpointing true
 
 # If running on 1x GPU
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --distributed.activation_checkpointing true
 ```
 Compare the peak memory with the same command run without the override. The exact value depends on the model, batch size, sequence length, loss, and hardware. Look for the memory field in a log line similar to:

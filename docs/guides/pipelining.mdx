@@ -632,7 +632,7 @@ support PP. For recipe-driven model implementations, use a model with a `_pp_pla
 For an FSDP2 config whose model supports PP, use command-line overrides such as:
 
 ```bash
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --nproc-per-node 2 \
     --step_scheduler.local_batch_size 8 \
     --distributed.strategy fsdp2 \
@@ -675,7 +675,7 @@ distributed:
 
 #### Pipeline + Data Parallelism (4 GPUs Total)
 ```bash
-automodel your_config.yaml \
+uv run automodel your_config.yaml \
     --nproc-per-node 4 \
     --distributed.pp_size 2 \
     --distributed.dp_size 2 \
@@ -684,7 +684,7 @@ automodel your_config.yaml \
 
 #### Pipeline + Tensor Parallelism (4 GPUs Total)
 ```bash
-automodel your_config.yaml \
+uv run automodel your_config.yaml \
     --nproc-per-node 4 \
     --distributed.pp_size 2 \
     --distributed.tp_size 2 \
@@ -693,7 +693,7 @@ automodel your_config.yaml \
 
 #### Full Hybrid: PP + DP + TP (8 GPUs Total)
 ```bash
-automodel your_config.yaml \
+uv run automodel your_config.yaml \
     --nproc-per-node 8 \
     --distributed.pp_size 2 \
     --distributed.dp_size 2 \
@@ -791,7 +791,7 @@ lr_scheduler:
 Run training with:
 ```bash
 # Run with 2 GPUs for 2-way pipeline parallelism
-automodel config.yaml --nproc-per-node 2
+uv run automodel config.yaml --nproc-per-node 2
 ```
 
 ## Troubleshooting

@@ -112,7 +112,7 @@ To run any of these FP8 training recipes, use the following command:
 
 ```bash
 CONFIG_PATH=examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml
-automodel --nproc-per-node=8 "$CONFIG_PATH"
+uv run automodel --nproc-per-node=8 "$CONFIG_PATH"
 ```
 
 For example, to train Llama 3.1 8B with FP8:
