@@ -267,6 +267,9 @@ def split_batch_into_thd_chunks(
         >>> # result['cu_seqlens'][0]: tensor([0, 6, 12], dtype=torch.int32)
         >>> # result['cu_seqlens'][1]: tensor([0, 6, 12], dtype=torch.int32)
     """
+    # NOTE: 3D mRoPE position_ids ([n_rope, batch, seq]) are only validated for the
+    # num_chunks<=1 path (cp_size=1). The multi-chunk stacking below has not been
+    # validated for mRoPE and should not be used for VLM+CP/PP THD yet.
     if num_chunks <= 1:
         return process_input_for_thd(batch, seq_lens_padding_value, padding_token_id)
 

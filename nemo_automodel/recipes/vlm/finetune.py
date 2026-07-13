@@ -944,6 +944,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             # reshapes token-shaped fields and drops other tensors, so pop the
             # non-token fields (media such as pixel_values/image_grid_thw) first
             # and restore them after the conversion.
+            if cp_size > 1:
+                raise NotImplementedError(
+                    "THD packing (packing_format='thd') for VLM currently supports cp_size=1 only; "
+                    "context-parallel THD for mRoPE VLMs is not yet implemented."
+                )
             _thd_keys = {"input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded", "qkv_format"}
             _extras = {k: batch.pop(k) for k in list(batch) if k not in _thd_keys}
             _pad_id = getattr(getattr(self.processor, "tokenizer", None), "pad_token_id", 0) or 0
