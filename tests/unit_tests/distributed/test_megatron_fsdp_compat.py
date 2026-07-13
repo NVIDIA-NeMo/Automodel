@@ -1009,7 +1009,7 @@ def test_050_shipped_fingerprints_match_installed_wheel_and_patch_installs():
 
 
 @requires_real_megatron_fsdp_050
-def test_050_compat_kwargs_select_modern_branch_for_installed_wheel():
+def test_050_compat_kwargs_translate_precision_controls_for_installed_wheel():
     megatron_fsdp = importlib.import_module("megatron_fsdp")
     from nemo_automodel.components.distributed.parallelizer import _megatron_fsdp_compat_kwargs
 

@@ -311,10 +311,11 @@ class MegatronFSDPConfig:
         preserve_fp32_weights (bool): Preserve fp32 weights if True.
         overlap_grad_reduce (bool): Overlap gradient reduction if True.
         overlap_param_gather (bool): Overlap parameter gathering if True.
-        check_for_nan_in_grad (bool): Enable the legacy buffer-level gradient NaN
-            check on Megatron-FSDP releases that expose it.
-        report_nan_in_param_grad (bool): Enable the current precise per-parameter
-            gradient NaN check. This can significantly reduce training throughput.
+        check_for_nan_in_grad (bool): Legacy buffer-level gradient NaN check.
+            megatron-fsdp 0.5.0 removed the check, so a truthy value has no effect
+            and is warned about once; use report_nan_in_param_grad instead.
+        report_nan_in_param_grad (bool): Enable the precise per-parameter gradient
+            NaN check. This can significantly reduce training throughput.
         average_in_collective (bool): Average in collective if True.
         disable_bucketing (bool): Disable bucketing if True.
         calculate_per_token_loss (bool): Calculate per token loss if True.

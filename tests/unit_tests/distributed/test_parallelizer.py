@@ -392,14 +392,23 @@ def mock_optimized_tp_plans(monkeypatch):
         yield mock_plans
 
 
+class FakeMegatronFSDPMixedPrecisionPolicy:
+    """Stand-in for megatron_fsdp.MixedPrecisionPolicy (megatron-fsdp==0.5.0)."""
+
+    def __init__(self, *, main_params_dtype, main_grads_dtype, grad_comm_dtype):
+        self.main_params_dtype = main_params_dtype
+        self.main_grads_dtype = main_grads_dtype
+        self.grad_comm_dtype = grad_comm_dtype
+
+
 class TestMegatronFSDPStrategyParallelize:
     """Test suite for megatron_fsdp_strategy_parallelize function."""
 
     @pytest.fixture
     def mock_megatron_fsdp_env(self, monkeypatch):
-        """Mock Megatron FSDP environment and dependencies."""
+        """Mock Megatron FSDP environment and dependencies (megatron-fsdp==0.5.0 API)."""
 
-        def legacy_fully_shard(
+        def fully_shard_050(
             *,
             module,
             optimizer,
@@ -409,11 +418,10 @@ class TestMegatronFSDPStrategyParallelize:
             tp_dim,
             zero_dp_strategy,
             init_model_with_meta_device,
-            grad_reduce_in_fp32,
-            preserve_fp32_weights,
+            mixed_precision_policy,
             overlap_grad_reduce,
             overlap_param_gather,
-            check_for_nan_in_grad,
+            report_nan_in_param_grad,
             average_in_collective,
             disable_bucketing,
             calculate_per_token_loss,
@@ -430,11 +438,10 @@ class TestMegatronFSDPStrategyParallelize:
                 tp_dim,
                 zero_dp_strategy,
                 init_model_with_meta_device,
-                grad_reduce_in_fp32,
-                preserve_fp32_weights,
+                mixed_precision_policy,
                 overlap_grad_reduce,
                 overlap_param_gather,
-                check_for_nan_in_grad,
+                report_nan_in_param_grad,
                 average_in_collective,
                 disable_bucketing,
                 calculate_per_token_loss,
@@ -446,13 +453,19 @@ class TestMegatronFSDPStrategyParallelize:
         # Mock megatron_fsdp module
         megatron_fsdp_mock = SimpleNamespace()
         megatron_fsdp_mock.fully_shard = create_autospec(
-            legacy_fully_shard,
+            fully_shard_050,
             return_value=(MagicMock(), None),
         )
 
         # Mock HAVE_MEGATRON_FSDP flag
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.HAVE_MEGATRON_FSDP", True, raising=False
+        )
+        monkeypatch.setattr(
+            parallelizer,
+            "MegatronFSDPMixedPrecisionPolicy",
+            FakeMegatronFSDPMixedPrecisionPolicy,
+            raising=True,
         )
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.megatron_fsdp_fully_shard",
@@ -623,7 +636,7 @@ class TestMegatronFSDPStrategyParallelize:
     @pytest.mark.parametrize("preserve_fp32_weights", [False, True])
     @pytest.mark.parametrize("check_for_nan_in_grad", [False, True])
     @pytest.mark.parametrize("report_nan_in_param_grad", [False, True])
-    def test_megatron_fsdp_current_precision_controls_preserve_legacy_semantics(
+    def test_megatron_fsdp_precision_controls_translate_to_050_api(
         self,
         monkeypatch,
         grad_reduce_in_fp32,
@@ -631,29 +644,17 @@ class TestMegatronFSDPStrategyParallelize:
         check_for_nan_in_grad,
         report_nan_in_param_grad,
     ):
-        class FakeMixedPrecisionPolicy:
-            def __init__(
-                self,
-                *,
-                main_params_dtype,
-                main_grads_dtype,
-                grad_comm_dtype,
-            ):
-                self.main_params_dtype = main_params_dtype
-                self.main_grads_dtype = main_grads_dtype
-                self.grad_comm_dtype = grad_comm_dtype
-
-        def modern_fully_shard(*, mixed_precision_policy, report_nan_in_param_grad):
+        def fully_shard_050(*, mixed_precision_policy, report_nan_in_param_grad):
             del mixed_precision_policy, report_nan_in_param_grad
 
         monkeypatch.setattr(
             parallelizer,
             "MegatronFSDPMixedPrecisionPolicy",
-            FakeMixedPrecisionPolicy,
+            FakeMegatronFSDPMixedPrecisionPolicy,
             raising=True,
         )
         kwargs = _megatron_fsdp_compat_kwargs(
-            modern_fully_shard,
+            fully_shard_050,
             grad_reduce_in_fp32=grad_reduce_in_fp32,
             preserve_fp32_weights=preserve_fp32_weights,
             check_for_nan_in_grad=check_for_nan_in_grad,
@@ -670,7 +671,9 @@ class TestMegatronFSDPStrategyParallelize:
         assert policy.grad_comm_dtype is None
         assert kwargs["report_nan_in_param_grad"] is report_nan_in_param_grad
 
-    def test_megatron_fsdp_legacy_precision_controls_remain_unchanged(self):
+    def test_megatron_fsdp_legacy_precision_api_fails_loudly(self):
+        """Pre-0.5.0 fully_shard signatures are unsupported and must not be translated."""
+
         def legacy_fully_shard(
             *,
             grad_reduce_in_fp32,
@@ -679,17 +682,35 @@ class TestMegatronFSDPStrategyParallelize:
         ):
             del grad_reduce_in_fp32, preserve_fp32_weights, check_for_nan_in_grad
 
-        assert _megatron_fsdp_compat_kwargs(
-            legacy_fully_shard,
-            grad_reduce_in_fp32=True,
-            preserve_fp32_weights=False,
-            check_for_nan_in_grad=True,
-            report_nan_in_param_grad=False,
-        ) == {
-            "grad_reduce_in_fp32": True,
-            "preserve_fp32_weights": False,
-            "check_for_nan_in_grad": True,
-        }
+        with pytest.raises(RuntimeError, match=r"requires megatron-fsdp==0\.5\.0"):
+            _megatron_fsdp_compat_kwargs(
+                legacy_fully_shard,
+                grad_reduce_in_fp32=True,
+                preserve_fp32_weights=False,
+                check_for_nan_in_grad=True,
+                report_nan_in_param_grad=False,
+            )
+
+    def test_megatron_fsdp_missing_mixed_precision_policy_fails_loudly(self, monkeypatch):
+        """When MixedPrecisionPolicy is unavailable, constructing it names the required version."""
+        from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
+
+        placeholder = UnavailableMeta(
+            "MixedPrecisionPolicy", (), {"_msg": parallelizer._MEGATRON_FSDP_050_REQUIRED_MSG}
+        )
+        monkeypatch.setattr(parallelizer, "MegatronFSDPMixedPrecisionPolicy", placeholder, raising=True)
+
+        def fully_shard_050(*, mixed_precision_policy, report_nan_in_param_grad):
+            del mixed_precision_policy, report_nan_in_param_grad
+
+        with pytest.raises(UnavailableError, match=r"requires megatron-fsdp==0\.5\.0"):
+            _megatron_fsdp_compat_kwargs(
+                fully_shard_050,
+                grad_reduce_in_fp32=False,
+                preserve_fp32_weights=False,
+                check_for_nan_in_grad=False,
+                report_nan_in_param_grad=False,
+            )
 
     def test_megatron_fsdp_dp1_skips_wrapper_and_compat_patch(self, mock_megatron_fsdp_env):
         """dp==1 (e.g. world=2, tp=2) returns the TP-only model without fully_shard.
@@ -724,27 +745,23 @@ class TestMegatronFSDPStrategyParallelize:
         assert result_model is model
         assert result_optimizer is optimizer
 
-    def test_megatron_fsdp_modern_branch_warns_once_when_nan_check_is_dropped(self, monkeypatch, caplog):
-        """The modern API has no buffer-level NaN check; dropping it warns exactly once."""
+    def test_megatron_fsdp_warns_once_when_nan_check_is_dropped(self, monkeypatch, caplog):
+        """megatron-fsdp 0.5.0 has no buffer-level NaN check; dropping it warns exactly once."""
 
-        class FakeMixedPrecisionPolicy:
-            def __init__(self, *, main_params_dtype, main_grads_dtype, grad_comm_dtype):
-                del main_params_dtype, main_grads_dtype, grad_comm_dtype
-
-        def modern_fully_shard(*, mixed_precision_policy, report_nan_in_param_grad):
+        def fully_shard_050(*, mixed_precision_policy, report_nan_in_param_grad):
             del mixed_precision_policy, report_nan_in_param_grad
 
         monkeypatch.setattr(
             parallelizer,
             "MegatronFSDPMixedPrecisionPolicy",
-            FakeMixedPrecisionPolicy,
+            FakeMegatronFSDPMixedPrecisionPolicy,
             raising=True,
         )
         monkeypatch.setattr(parallelizer, "_megatron_fsdp_nan_check_noop_warned", False, raising=True)
 
         def modern_kwargs(check_for_nan_in_grad):
             return _megatron_fsdp_compat_kwargs(
-                modern_fully_shard,
+                fully_shard_050,
                 grad_reduce_in_fp32=False,
                 preserve_fp32_weights=False,
                 check_for_nan_in_grad=check_for_nan_in_grad,
@@ -767,7 +784,10 @@ class TestMegatronFSDPStrategyParallelize:
         def unknown_fully_shard(**kwargs):
             del kwargs
 
-        with pytest.raises(RuntimeError, match="unsupported Megatron-FSDP fully_shard API"):
+        with pytest.raises(
+            RuntimeError,
+            match=r"unsupported Megatron-FSDP fully_shard API: NeMo Automodel requires megatron-fsdp==0\.5\.0",
+        ):
             _megatron_fsdp_compat_kwargs(
                 unknown_fully_shard,
                 grad_reduce_in_fp32=False,
@@ -785,18 +805,6 @@ class TestMegatronFSDPStrategyParallelize:
         with_optimizer,
     ):
         calls = []
-
-        class FakeMixedPrecisionPolicy:
-            def __init__(
-                self,
-                *,
-                main_params_dtype,
-                main_grads_dtype,
-                grad_comm_dtype,
-            ):
-                self.main_params_dtype = main_params_dtype
-                self.main_grads_dtype = main_grads_dtype
-                self.grad_comm_dtype = grad_comm_dtype
 
         class ShardedModel:
             def __init__(self):
@@ -852,12 +860,6 @@ class TestMegatronFSDPStrategyParallelize:
             calls.append(locals())
             return ShardedModel(), optimizer
 
-        monkeypatch.setattr(
-            parallelizer,
-            "MegatronFSDPMixedPrecisionPolicy",
-            FakeMixedPrecisionPolicy,
-            raising=True,
-        )
         monkeypatch.setattr(
             parallelizer,
             "megatron_fsdp_fully_shard_model",
