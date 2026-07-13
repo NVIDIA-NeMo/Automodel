@@ -51,6 +51,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
+from nemo_automodel.components.speculative.decode_eval import DecodeEvalRunner, resolve_decode_eval_config
 from nemo_automodel.components.speculative.eagle import (
     Eagle3TrainerModule,
     HFEagle3TargetModel,
@@ -58,6 +59,7 @@ from nemo_automodel.components.speculative.eagle import (
 )
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle3_draft_spec
 from nemo_automodel.components.speculative.eagle.remote import RemoteEagle3TargetModel
+from nemo_automodel.components.speculative.regen_loop import RegenRunner, resolve_regen_config
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
@@ -126,13 +128,25 @@ def _submesh_or_none(device_mesh, name: str):
         return None
 
 
-def _validate_cp_gates(cp_size: int, backend: str, packed_sequence_size: int) -> None:
+def _validate_cp_gates(
+    cp_size: int,
+    backend: str,
+    packed_sequence_size: int,
+    target_force_hf: bool = False,
+    target_attn_implementation: str | None = None,
+    seq_length: int | None = None,
+    cp_zigzag: bool = False,
+) -> None:
     """Reject context-parallel combinations the EAGLE-3 target path cannot honor.
 
     CP shards the target forward along the sequence and forces ``is_causal`` (the
     self_attn hooks strip the attention_mask), so it is incompatible with sequence
     packing (which needs the 4D block-causal mask) and with the remote backend
-    (whose target runs out-of-process).
+    (whose target runs out-of-process). Under CP the frozen target must route
+    through HuggingFace ``F.scaled_dot_product_attention`` -- that is the call the
+    K/V-gather hook intercepts -- and the draft runs the flash-attn ring, so all of
+    the target-backend / kernel / divisibility preconditions are checked here so a
+    misconfig fails at setup rather than mid-forward.
     """
     if cp_size > 1 and backend == "remote":
         raise NotImplementedError(
@@ -144,6 +158,33 @@ def _validate_cp_gates(cp_size: int, backend: str, packed_sequence_size: int) ->
             "Context parallelism (cp_size>1) is not yet supported with sequence packing; CP "
             "strips the 4D block-causal mask that packing relies on. Set cp_size=1 or "
             "packed_sequence_size=0."
+        )
+    if cp_size <= 1:
+        return
+    if not target_force_hf:
+        raise NotImplementedError(
+            "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
+            "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
+        )
+    if target_attn_implementation != "sdpa":
+        raise NotImplementedError(
+            "Context parallelism (cp_size>1) requires recipe_args.target_attn_implementation=sdpa. "
+            "The K/V-gather hook intercepts F.scaled_dot_product_attention; any other backend "
+            "(e.g. flash_attention_2, the HF auto-select default when flash-attn is installed) "
+            "bypasses the hook, so each rank silently attends only its own shard."
+        )
+    # The draft ring runs on flash-attn's private kernels pinned to the 2.8.x
+    # positional signature, so check the version here (not just that it imports).
+    from nemo_automodel.components.speculative.eagle.ring_attention import require_flash_attn_version
+
+    require_flash_attn_version()
+    # Zig-zag chunks the sequence into 2*cp pieces (rank r owns chunks r and 2*cp-1-r),
+    # so it needs divisibility by 2*cp_size; the contiguous shard needs only cp_size.
+    divisor = 2 * cp_size if cp_zigzag else cp_size
+    if seq_length is not None and seq_length % divisor != 0:
+        raise ValueError(
+            f"Context parallelism ({'zig-zag' if cp_zigzag else 'contiguous'}) requires seq_length "
+            f"({seq_length}) divisible by {divisor}."
         )
 
 
@@ -178,7 +219,7 @@ def _best_effort(label: str, fn) -> None:
         logger.exception("error %s during cleanup", label)
 
 
-def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_size: int) -> None:
+def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_size: int, lk_loss_type=None) -> None:
     """Reject P-EAGLE (parallel_drafting) combinations its trainer cannot honor.
 
     ``PEagleTrainerModule.forward`` consumes the live colocated target's full-vocab
@@ -207,6 +248,12 @@ def _validate_peagle_gates(backend: str, cached_target_path, packed_sequence_siz
             "parallel_drafting (P-EAGLE) does not support sequence packing (packed_sequence_size>0); "
             "the P-EAGLE forward does not accept the per-document packing metadata "
             "(position_ids/seq_lens/doc_remaining)."
+        )
+    if lk_loss_type is not None:
+        raise NotImplementedError(
+            "parallel_drafting (P-EAGLE) does not support lk_loss_type; the LK acceptance objective "
+            "lives in the EAGLE-3 TTT trainer, and the P-EAGLE partitioned KL path has no per-step "
+            "acceptance term."
         )
 
 
@@ -383,6 +430,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 backend=recipe_cfg.get("target_model_backend", "colocated"),
                 cached_target_path=self.cached_target_path,
                 packed_sequence_size=int(recipe_cfg.get("packed_sequence_size", 0) or 0),
+                lk_loss_type=recipe_cfg.get("lk_loss_type", None),
             )
         self.dist_setup = None
         self.distributed_config = None
@@ -395,6 +443,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if self.cached_target_path is None:
             selected_token_ids, selected_token_mask = self._setup_online_target(recipe_cfg, target_path, target_config)
         else:
+            # The cached-target path never builds a cp mesh (only the colocated
+            # target does), so cp_size>1 here would silently fall back to plain DP
+            # -- the draft would train unsharded while the user asked for CP.
+            if int(self.cfg.get("distributed.cp_size", 1) or 1) > 1:
+                raise NotImplementedError(
+                    "Context parallelism (cp_size>1) is not supported with a cached target; the "
+                    "cached path does not build a cp mesh. Use the colocated target or set cp_size=1."
+                )
             selected_token_ids, selected_token_mask = self._setup_cached_target(recipe_cfg, target_config)
 
         draft_config = target_config.to_dict()
@@ -491,16 +547,40 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # loads; the draft is built directly, so log its (trainable) summary here too.
         print_trainable_parameters(self.draft_model, name="Draft")
 
+        # Draft context parallelism: run the draft sequence-sharded across the cp group
+        # (ring attention over the full sequence). The trainer needs the cp group for
+        # the TTT left-shift (cross-rank boundary) and the loss normalization; every
+        # draft attention gets the differentiable ring installed.
+        self.cp_group = None
+        if self.cp_mesh is not None and self.cp_mesh.size() > 1:
+            self.cp_group = self.cp_mesh.get_group()
+        # Load-balanced zig-zag sharding for the draft cp ring (vs the default
+        # contiguous shard, which leaves the last rank doing ~2x the causal work).
+        self.cp_zigzag = bool(recipe_cfg.get("cp_zigzag", False))
+
+        lk_loss_type = recipe_cfg.get("lk_loss_type", None)
+
         if parallel_drafting:
+            if self.cp_group is not None:
+                raise NotImplementedError("Context parallelism is not supported with parallel drafting (P-EAGLE).")
             trainer_module = self.build_peagle_trainer(
                 recipe_cfg, selected_token_ids, selected_token_mask, mask_token_id
             )
         else:
+            if self.cp_group is not None:
+                from nemo_automodel.components.speculative.eagle.draft_llama import attach_eagle3_cp_attention
+
+                attach_eagle3_cp_attention(self.draft_model, self.cp_group, zigzag=self.cp_zigzag)
             trainer_module = Eagle3TrainerModule(
                 self.draft_model,
                 selected_token_ids=selected_token_ids,
                 selected_token_mask=selected_token_mask,
                 ttt_steps=recipe_cfg.ttt_steps,
+                cp_group=self.cp_group,
+                cp_zigzag=self.cp_zigzag,
+                lk_loss_type=None if lk_loss_type is None else str(lk_loss_type),
+                lk_kl_scale=float(recipe_cfg.get("lk_kl_scale", 1.0)),
+                lk_kl_decay=float(recipe_cfg.get("lk_kl_decay", 3.0)),
             ).to(self.device)
         if self.dist_env.world_size > 1:
             # Under context parallelism the draft is replicated across cp ranks
@@ -577,6 +657,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.total_optim_steps = total_optim_steps
         self.warmup_steps = warmup_steps
         self.min_lr_ratio = min_lr_ratio
+        # Baseline segment length; the on-policy regen swap warns if a regenerated
+        # cycle differs from it, since the fixed LR horizon assumes an unchanged
+        # per-pass step count (see ``_maybe_swap_regen_dataloader``).
+        self._orig_batches_per_epoch = num_batches_per_epoch
 
         self.runtime = SimpleNamespace(global_step=0)
         self._resume_epoch = 0
@@ -597,6 +681,172 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 self.cfg.to_dict(),
                 default_name="eagle3_" + str(target_path).rstrip("/").split("/")[-1],
             )
+
+        # Optional periodic real-acceptance-length eval (rank 0 only): snapshot
+        # the current draft on a cadence and measure accept_length inside an
+        # actual vLLM speculative server on a reserved GPU, asynchronously to
+        # training. Logged as train/tau_real next to the simulated tau_sim.
+        self.decode_eval_runner = None
+        decode_eval_config = resolve_decode_eval_config(
+            recipe_cfg,
+            default_target=str(target_path),
+            default_input_data=recipe_cfg.get("train_data_path", None),
+            default_num_speculative_tokens=int(
+                recipe_cfg.get("num_depths", 8) if parallel_drafting else recipe_cfg.ttt_steps
+            ),
+            output_dir=str(self.output_dir),
+        )
+        if decode_eval_config is not None:
+            if getattr(self, "peft_config", None) is not None:
+                raise ValueError(
+                    "decode_eval is not supported with peft: the draft snapshot would need an adapter "
+                    "merge per eval; bench a merged checkpoint offline instead."
+                )
+            if self.dist_env.is_main:
+                self.decode_eval_runner = DecodeEvalRunner(decode_eval_config)
+
+    def _maybe_run_decode_eval(self, *, launch: bool = True) -> None:
+        """Rank-0 log-point hook: collect finished decode-eval results, launch the next one when due.
+
+        Runs outside any collective path (pure subprocess/file I/O), so only
+        rank 0 calls it. Results are logged at the CURRENT optimizer step (wandb
+        steps must not go backwards); ``train/tau_real_step`` records the step
+        the evaluated snapshot was actually taken at.
+        """
+        # getattr: bare recipe objects in the loop unit tests skip setup().
+        runner = getattr(self, "decode_eval_runner", None)
+        if runner is None:
+            return
+        for result in runner.collect():
+            accept_length = result.get("accept_length", None)
+            logger.info(
+                "decode_eval: step=%s accept_length=%s acceptance_rate=%s completed=%s failed=%s",
+                result.get("step"),
+                "n/a" if accept_length is None else f"{accept_length:.4f}",
+                result.get("acceptance_rate"),
+                result.get("completed"),
+                result.get("failed"),
+            )
+            if accept_length is not None:
+                self._wandb_log(
+                    {
+                        "train/tau_real": accept_length,
+                        "train/tau_real_step": result.get("step"),
+                        "train/tau_real_acceptance_rate": result.get("acceptance_rate"),
+                    },
+                    step=self.runtime.global_step,
+                )
+        if launch:
+            try:
+                runner.maybe_launch(self.runtime.global_step, self.draft_model)
+            except Exception:
+                logger.exception("decode_eval: launch failed at step %d; training continues", self.runtime.global_step)
+
+    def _setup_regen(self, recipe_cfg, target_path) -> None:
+        """Build the optional on-policy regeneration runner (rank 0, online path only).
+
+        The runner is only constructed on rank 0 (it owns the worker subprocess);
+        every rank participates in the epoch-boundary dataloader swap via the
+        broadcast in :meth:`_maybe_swap_regen_dataloader`, so all ranks must know
+        whether the feature is enabled. ``_regen_enabled`` carries that flag.
+        """
+        self.regen_runner = None
+        self._regen_enabled = False
+        # Derive output_dir from recipe_cfg rather than self.output_dir: this runs
+        # inside _setup_online_target, before the setup body assigns self.output_dir.
+        regen_config = resolve_regen_config(
+            recipe_cfg,
+            default_target=str(target_path),
+            default_input_data=recipe_cfg.get("train_data_path", None),
+            output_dir=str(recipe_cfg.get("output_dir")),
+        )
+        if regen_config is None:
+            return
+        if getattr(self, "peft_config", None) is not None:
+            raise ValueError(
+                "regen is not supported with peft: the LoRA draft is orthogonal to target regeneration; "
+                "regenerate the dataset offline instead."
+            )
+        self._regen_enabled = True
+        if self.dist_env.is_main:
+            self.regen_runner = RegenRunner(regen_config)
+
+    def _maybe_run_regen(self) -> None:
+        """Window-boundary hook: launch a regeneration cycle when the cadence is due.
+
+        Called at every grad-accum window boundary (not just log points) so the
+        launch cadence follows ``regen.every_steps`` regardless of
+        ``log_every_steps``. A no-op on non-main ranks, where ``regen_runner``
+        is ``None``.
+        """
+        runner = getattr(self, "regen_runner", None)
+        if runner is None:
+            return
+        try:
+            runner.maybe_launch(self.runtime.global_step)
+        except Exception:
+            logger.exception("regen: launch failed at step %d; training continues", self.runtime.global_step)
+
+    def _build_train_dataloader(self, data_path, split):
+        """Build the train dataloader from ``self.cfg.recipe_args``.
+
+        Reused by the on-policy regen loop to rebuild the train dataloader against a
+        fresh shard directory with identical settings (only ``data_path``/``split`` vary).
+        """
+        recipe_cfg = self.cfg.recipe_args
+        return build_eagle3_dataloader(
+            data_path=data_path,
+            tokenizer=self.tokenizer,
+            seq_length=recipe_cfg.seq_length,
+            batch_size=recipe_cfg.micro_batch_size,
+            shuffle=recipe_cfg.get("train_shuffle", True),
+            num_workers=recipe_cfg.get("num_workers", 0),
+            split=split,
+            distributed=self.dist_env.world_size > 1,
+            shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            packed_sequence_size=recipe_cfg.get("packed_sequence_size", 0),
+            dp_mesh=self.dp_mesh,
+        )
+
+    def _maybe_swap_regen_dataloader(self) -> bool:
+        """Swap the train dataloader to the newest ready regenerated shard dir; return whether a swap happened.
+
+        Rank 0 decides which directory (if any) is ready and broadcasts it; every
+        rank then rebuilds its dataloader against the same shared-filesystem path
+        so the distributed sampler stays consistent. Called at a grad-accum window
+        boundary (``pending_micro_batches == 0``), so there is no partial window to
+        flush; the caller ends the current segment and rebinds when this returns
+        ``True``. The regenerated slice is expected to keep the original prompt
+        count so steps-per-epoch (and the fixed LR horizon) stay coherent; a
+        differing length is warned about rather than silently trusted.
+        """
+        if not getattr(self, "_regen_enabled", False):
+            return False
+        new_dir: str | None = None
+        if self.dist_env.is_main and self.regen_runner is not None:
+            new_dir = self.regen_runner.take_ready_shards()
+        if self.dist_env.world_size > 1:
+            box = [new_dir]
+            dist.broadcast_object_list(box, src=0)
+            new_dir = box[0]
+        if new_dir is None:
+            return False
+        logger.info("regen: swapping train dataloader to regenerated shards at %s", new_dir)
+        self.train_dataloader = self._build_train_dataloader(new_dir, split=None)
+        orig = getattr(self, "_orig_batches_per_epoch", None)
+        try:
+            new_len = len(self.train_dataloader)
+        except TypeError:
+            new_len = None
+        if orig and new_len is not None and new_len != orig:
+            logger.warning(
+                "regen: regenerated dataloader has %d batches vs the original %d; the fixed LR horizon "
+                "(total_optim_steps) assumes an unchanged per-pass step count, so the cosine schedule may drift.",
+                new_len,
+                orig,
+            )
+        return True
 
     def _setup_online_target(self, recipe_cfg, target_path, target_config):
         """Live path: load the target model and build the live dataloader.
@@ -638,7 +888,15 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # submeshes are only built later, inside the colocated path).
         cp_size = int(self.cfg.get("distributed.cp_size", 1) or 1)
         tp_size = int(self.cfg.get("distributed.tp_size", 1) or 1)
-        _validate_cp_gates(cp_size, backend, packed_sequence_size)
+        _validate_cp_gates(
+            cp_size,
+            backend,
+            packed_sequence_size,
+            target_force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+            target_attn_implementation=recipe_cfg.get("target_attn_implementation", None),
+            seq_length=int(recipe_cfg.get("seq_length", 0) or 0) or None,
+            cp_zigzag=bool(recipe_cfg.get("cp_zigzag", False)),
+        )
         _validate_tp_gates(tp_size, backend, cp_size)
         if backend == "remote":
             self._setup_remote_target(recipe_cfg)
@@ -649,20 +907,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         else:  # colocated
             self._setup_colocated_target(recipe_cfg, target_path)
 
-        self.train_dataloader = build_eagle3_dataloader(
-            data_path=recipe_cfg.train_data_path,
-            tokenizer=self.tokenizer,
-            seq_length=recipe_cfg.seq_length,
-            batch_size=recipe_cfg.micro_batch_size,
-            shuffle=recipe_cfg.get("train_shuffle", True),
-            num_workers=recipe_cfg.get("num_workers", 0),
-            split=recipe_cfg.get("train_split", None),
-            distributed=self.dist_env.world_size > 1,
-            shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
-            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
-            packed_sequence_size=packed_sequence_size,
-            dp_mesh=self.dp_mesh,
+        self.train_dataloader = self._build_train_dataloader(
+            recipe_cfg.train_data_path,
+            recipe_cfg.get("train_split", None),
         )
+        self._setup_regen(recipe_cfg, target_path)
         self.val_dataloader = None
         if recipe_cfg.get("val_data_path", None):
             self.val_dataloader = build_eagle3_dataloader(
@@ -916,6 +1165,64 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             )
         return selected_token_ids, selected_token_mask
 
+    def _maybe_shard_cp(self, inputs: dict) -> dict:
+        """Shard the draft supervision along the sequence for context parallelism.
+
+        The target emits full-sequence aux/logits (gathered); the draft runs sharded,
+        so gather every ``[B, S, ...]`` tensor to this rank's cp shard (via a global
+        index) and inject the matching global ``position_ids``. The index is the
+        contiguous shard by default, or the load-balanced zig-zag layout (rank ``r``
+        owns chunks ``r`` and ``2*cp-1-r``) when ``cp_zigzag``. No-op without CP.
+        """
+        if getattr(self, "cp_group", None) is None:
+            return inputs
+        cp_size = self.cp_mesh.size()
+        cp_rank = self.cp_mesh.get_local_rank()
+        seq_len = inputs["input_ids"].shape[1]
+        device = inputs["input_ids"].device
+        if getattr(self, "cp_zigzag", False):
+            if seq_len % (2 * cp_size) != 0:
+                raise ValueError(
+                    f"Zig-zag context parallelism requires seq_length ({seq_len}) divisible by "
+                    f"2*cp_size ({2 * cp_size})."
+                )
+            c = seq_len // (2 * cp_size)
+            idx = torch.cat(
+                (
+                    torch.arange(cp_rank * c, (cp_rank + 1) * c, device=device),
+                    torch.arange((2 * cp_size - 1 - cp_rank) * c, (2 * cp_size - cp_rank) * c, device=device),
+                )
+            )
+        else:
+            if seq_len % cp_size != 0:
+                raise ValueError(
+                    f"Context parallelism requires seq_length ({seq_len}) divisible by cp_size ({cp_size})."
+                )
+            local = seq_len // cp_size
+            idx = torch.arange(cp_rank * local, (cp_rank + 1) * local, device=device)
+        out = {
+            k: (
+                v.index_select(1, idx).contiguous()
+                if (torch.is_tensor(v) and v.dim() >= 2 and v.shape[1] == seq_len)
+                else v
+            )
+            for k, v in inputs.items()
+        }
+        out["position_ids"] = idx.unsqueeze(0).expand(inputs["input_ids"].shape[0], -1)
+        return out
+
+    def _all_reduce_draft_grads_over_cp(self) -> None:
+        """Sum the draft gradients over the cp group before the optimizer step.
+
+        The draft runs sequence-sharded across cp, so each rank holds only its shard's
+        gradient contribution; summing yields the full-sequence gradient (the loss is
+        already globally normalized by the trainer). DDP has averaged over dp, and
+        sum-over-cp / avg-over-dp commute, so the cp replicas end up identical.
+        """
+        for p in self._module().parameters():
+            if p.grad is not None:
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=self.cp_group)
+
     def _forward_batch(self, batch, target_batch=None):
         """Run the trainer module for one batch, from the live target or the cache.
 
@@ -924,7 +1231,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         and self-contained, so the raw ``batch`` is not needed.
         """
         if target_batch is not None:
-            return self.trainer_module(**target_batch.to_trainer_inputs())
+            return self.trainer_module(**self._maybe_shard_cp(target_batch.to_trainer_inputs()))
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         # Sequence-packing metadata (present only when packed_sequence_size > 0).
         packing_kwargs = {}
@@ -938,13 +1245,17 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             # Offline cache: the supervision is already in the batch.
             batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
             return self.trainer_module(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                loss_mask=batch["loss_mask"],
-                aux_hidden_states=batch["aux_hidden_states"],
-                target_probs=batch["target_probs"],
-                position_mask=batch["position_mask"],
-                **packing_kwargs,
+                **self._maybe_shard_cp(
+                    {
+                        "input_ids": batch["input_ids"],
+                        "attention_mask": batch["attention_mask"],
+                        "loss_mask": batch["loss_mask"],
+                        "aux_hidden_states": batch["aux_hidden_states"],
+                        "target_probs": batch["target_probs"],
+                        "position_mask": batch["position_mask"],
+                        **packing_kwargs,
+                    }
+                )
             )
         target_batch = self.target_wrapper.generate_batch(
             input_ids=batch["input_ids"],
@@ -952,7 +1263,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             loss_mask=batch["loss_mask"],
             **packing_kwargs,
         )
-        return self.trainer_module(**target_batch.to_trainer_inputs())
+        return self.trainer_module(**self._maybe_shard_cp(target_batch.to_trainer_inputs()))
 
     def _prefetched_batches(self, dataloader):
         """Yield ``(batch, target_batch)`` keeping up to ``target_prefetch_depth``
@@ -982,16 +1293,26 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 queue.append((batch, handle))
 
         fill()
-        while queue:
-            batch, handle = queue.popleft()
-            target_batch = handle.result()
-            # Refill only after the popped request completed: round-robin makes
-            # its server the next dispatch target, so refilling before the
-            # result would put a second request in flight on a busy server and
-            # break the one-in-flight-per-server invariant that NCCL recv
-            # ordering and the server's hook-based aux capture rely on.
-            fill()
-            yield batch, target_batch
+        try:
+            while queue:
+                batch, handle = queue.popleft()
+                target_batch = handle.result()
+                # Refill only after the popped request completed: round-robin makes
+                # its server the next dispatch target, so refilling before the
+                # result would put a second request in flight on a busy server and
+                # break the one-in-flight-per-server invariant that NCCL recv
+                # ordering and the server's hook-based aux capture rely on.
+                fill()
+                yield batch, target_batch
+        finally:
+            # If the consumer stops early (a mid-epoch regen swap breaks the loop),
+            # the generator is closed with in-flight requests still queued. Drain
+            # (await) them and discard the results: leaving requests un-awaited
+            # would corrupt the one-in-flight-per-server recv ordering for the next
+            # segment, and the batches are stale off-policy data not worth training on.
+            while queue:
+                _, pending_handle = queue.popleft()
+                pending_handle.result()
 
     def _build_checkpointer(self, target_path: str) -> None:
         """Build the checkpointer using the same plumbing as the standard recipes."""
@@ -1291,6 +1612,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             meta = torch.load(meta_path, weights_only=False, map_location="cpu")
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
+            # Align the regen launch cadence to the restored step so resume does not
+            # immediately fire a redundant cycle for an already-covered region.
+            regen_runner = getattr(self, "regen_runner", None)
+            if regen_runner is not None:
+                regen_runner.resume_from_step(self.runtime.global_step)
             ids = meta.get("selected_token_ids")
             mask = meta.get("selected_token_mask")
             if ids is not None and mask is not None:
@@ -1378,7 +1704,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
 
         pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
         try:
-            self._train_epochs(start_epoch, batches_per_epoch, is_ddp, pbar)
+            self._train_epochs(start_epoch, is_ddp, pbar)
             self._maybe_save_final_checkpoint(self.num_epochs)
             self._finalize_pending_checkpoint()
             if self.dist_env.is_main:
@@ -1404,16 +1730,30 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         """
         if getattr(self, "target_wrapper", None) is not None:
             _best_effort("closing target backend", self.target_wrapper.close)
+        if getattr(self, "decode_eval_runner", None) is not None:
+            _best_effort("collecting final decode-eval results", lambda: self._maybe_run_decode_eval(launch=False))
+            _best_effort("stopping decode-eval worker", self.decode_eval_runner.shutdown)
+        if getattr(self, "regen_runner", None) is not None:
+            _best_effort("stopping regen worker", self.regen_runner.shutdown)
         if getattr(self, "wandb_run", None) is not None:
             _best_effort("finishing W&B run", self.wandb_run.finish)
 
-    def _train_epochs(self, start_epoch, batches_per_epoch, is_ddp, pbar=None):
+    def _train_epochs(self, start_epoch, is_ddp, pbar=None):
         """Run the epoch loop (extracted so :meth:`run_train_validation_loop` can
-        wrap it in ``try/finally`` and guarantee teardown on any exit path)."""
-        for epoch in range(start_epoch, self.num_epochs):
-            if hasattr(self.train_dataloader.sampler, "set_epoch"):
-                self.train_dataloader.sampler.set_epoch(epoch)
+        wrap it in ``try/finally`` and guarantee teardown on any exit path).
 
+        The run is step-budget driven: it stops when ``global_step`` reaches
+        ``total_optim_steps`` (the horizon the LR schedule was calibrated on), not
+        when the epoch range is exhausted. With on-policy regen enabled an epoch is
+        split into *segments* -- one contiguous pass over each bound dataloader --
+        and a swap to freshly regenerated shards ends the current segment and rebinds
+        a new one. Swaps happen only at a grad-accum window boundary
+        (``pending_micro_batches == 0``), so there is never a partial window to flush
+        or an un-synced gradient at the swap point; the trailing flush below then
+        only ever runs for the single segment that ends by dataloader exhaustion.
+        """
+        reached_budget = False
+        for epoch in range(start_epoch, self.num_epochs):
             running_loss = torch.zeros((), device=self.device)
             running_acc = torch.zeros((), device=self.device)
             # Per-TTT-step prefix-hit/valid counts for the simulated accept
@@ -1427,99 +1767,142 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
 
             batches_processed = 0
             pending_micro_batches = 0
-            # With prefetch the supervision is fetched asynchronously and paired
-            # with its batch; otherwise the target runs inline (target_batch=None).
-            if self.target_prefetch_depth > 0:
-                batch_source = enumerate(self._prefetched_batches(self.train_dataloader))
-            else:
-                batch_source = ((i, (b, None)) for i, b in enumerate(self.train_dataloader))
-            for batch_idx, (batch, target_batch) in batch_source:
-                if self._peagle_partitioned:
-                    # P-EAGLE sequence partitioning owns its per-segment backward
-                    # and its own no_sync (the all-reduce fires on the last
-                    # segment), so it runs outside the grad-accum sync context.
-                    metrics = self._peagle_partitioned_step(batch)
+
+            # Segment loop: one contiguous pass over the currently-bound dataloader.
+            # A mid-epoch swap to regenerated shards ends the segment and rebinds a
+            # new one (``segment_done`` stays False so the while re-enters); the
+            # epoch's pass is complete only when a dataloader is exhausted without a
+            # swap (the ``for ... else`` path).
+            segment_done = False
+            while not segment_done and not reached_budget:
+                if hasattr(self.train_dataloader.sampler, "set_epoch"):
+                    self.train_dataloader.sampler.set_epoch(epoch)
+                # Recompute the length every segment: after a swap the regen loader
+                # may differ, and should_sync_grads keys the segment's final (partial)
+                # window off it -- a stale value would run the trailing flush on
+                # un-all-reduced gradients and silently desync the DDP replicas.
+                try:
+                    seg_batches_per_epoch = len(self.train_dataloader)
+                except TypeError:
+                    seg_batches_per_epoch = None
+                # With prefetch the supervision is fetched asynchronously and paired
+                # with its batch; otherwise the target runs inline (target_batch=None).
+                if self.target_prefetch_depth > 0:
+                    batch_source = enumerate(self._prefetched_batches(self.train_dataloader))
                 else:
-                    # Skip DDP's per-micro-batch all-reduce on every micro-batch
-                    # except the one an optimizer step immediately follows; that
-                    # step's all-reduce covers the whole locally-accumulated window.
-                    sync_grads = should_sync_grads(
-                        pending_micro_batches=pending_micro_batches,
-                        grad_accumulation_steps=self.grad_accumulation_steps,
-                        batch_idx=batch_idx,
-                        batches_per_epoch=batches_per_epoch,
-                        is_ddp=is_ddp,
-                    )
-                    sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
-                    with sync_ctx:
-                        metrics = self._forward_batch(batch, target_batch)
-                        loss = metrics.loss / float(self.grad_accumulation_steps)
-                        loss.backward()
+                    batch_source = ((i, (b, None)) for i, b in enumerate(self.train_dataloader))
+                for batch_idx, (batch, target_batch) in batch_source:
+                    if self._peagle_partitioned:
+                        # P-EAGLE sequence partitioning owns its per-segment backward
+                        # and its own no_sync (the all-reduce fires on the last
+                        # segment), so it runs outside the grad-accum sync context.
+                        metrics = self._peagle_partitioned_step(batch)
+                    else:
+                        # Skip DDP's per-micro-batch all-reduce on every micro-batch
+                        # except the one an optimizer step immediately follows; that
+                        # step's all-reduce covers the whole locally-accumulated window.
+                        sync_grads = should_sync_grads(
+                            pending_micro_batches=pending_micro_batches,
+                            grad_accumulation_steps=self.grad_accumulation_steps,
+                            batch_idx=batch_idx,
+                            batches_per_epoch=seg_batches_per_epoch,
+                            is_ddp=is_ddp,
+                        )
+                        sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
+                        with sync_ctx:
+                            metrics = self._forward_batch(batch, target_batch)
+                            loss = metrics.loss / float(self.grad_accumulation_steps)
+                            loss.backward()
 
-                running_loss = running_loss + metrics.loss.detach()
-                running_acc = running_acc + metrics.accuracy.detach()
-                step_prefix_hits = getattr(metrics, "step_prefix_hits", None)
-                if step_prefix_hits is not None:
-                    if running_step_prefix is None:
-                        running_step_prefix = torch.zeros_like(step_prefix_hits, dtype=torch.float32)
-                        running_step_valid = torch.zeros_like(running_step_prefix)
-                    running_step_prefix += step_prefix_hits.float()
-                    running_step_valid += metrics.step_valid.float()
-                running_steps += 1
-                batches_processed = batch_idx + 1
-                pending_micro_batches += 1
+                    running_loss = running_loss + metrics.loss.detach()
+                    running_acc = running_acc + metrics.accuracy.detach()
+                    step_prefix_hits = getattr(metrics, "step_prefix_hits", None)
+                    if step_prefix_hits is not None:
+                        if running_step_prefix is None:
+                            running_step_prefix = torch.zeros_like(step_prefix_hits, dtype=torch.float32)
+                            running_step_valid = torch.zeros_like(running_step_prefix)
+                        running_step_prefix += step_prefix_hits.float()
+                        running_step_valid += metrics.step_valid.float()
+                    running_steps += 1
+                    batches_processed += 1
+                    pending_micro_batches += 1
 
-                if pending_micro_batches == self.grad_accumulation_steps:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
-                    self.lr_scheduler.step()
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.runtime.global_step += 1
-                    if pbar is not None:
-                        pbar.update(1)
-                    pending_micro_batches = 0
-                    self._maybe_save_step_checkpoint(epoch)
+                    if pending_micro_batches == self.grad_accumulation_steps:
+                        if getattr(self, "cp_group", None) is not None:
+                            self._all_reduce_draft_grads_over_cp()
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                        self.optimizer.step()
+                        self.lr_scheduler.step()
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self.runtime.global_step += 1
+                        if pbar is not None:
+                            pbar.update(1)
+                        pending_micro_batches = 0
+                        self._maybe_save_step_checkpoint(epoch)
 
-                    if self.runtime.global_step % self.log_every_steps == 0:
-                        mean_loss = _all_reduce_mean(running_loss / max(running_steps, 1))
-                        mean_acc = _all_reduce_mean(running_acc / max(running_steps, 1))
-                        tau_sim = _window_tau_sim(running_step_prefix, running_step_valid)
-                        current_lr = self.lr_scheduler.get_last_lr()[0]
-                        if self.dist_env.is_main:
-                            if pbar is not None:
-                                postfix = {
-                                    "loss": f"{mean_loss.item():.4f}",
-                                    "acc": f"{mean_acc.item():.4f}",
-                                    "lr": f"{current_lr:.2e}",
+                        if self.runtime.global_step % self.log_every_steps == 0:
+                            mean_loss = _all_reduce_mean(running_loss / max(running_steps, 1))
+                            mean_acc = _all_reduce_mean(running_acc / max(running_steps, 1))
+                            tau_sim = _window_tau_sim(running_step_prefix, running_step_valid)
+                            current_lr = self.lr_scheduler.get_last_lr()[0]
+                            if self.dist_env.is_main:
+                                if pbar is not None:
+                                    postfix = {
+                                        "loss": f"{mean_loss.item():.4f}",
+                                        "acc": f"{mean_acc.item():.4f}",
+                                        "lr": f"{current_lr:.2e}",
+                                    }
+                                    if tau_sim is not None:
+                                        postfix["tau"] = f"{tau_sim:.2f}"
+                                    pbar.set_postfix(**postfix)
+                                logger.info(
+                                    "epoch=%s step=%s train_loss=%.6f train_acc=%.6f%s lr=%.3e",
+                                    epoch,
+                                    self.runtime.global_step,
+                                    mean_loss.item(),
+                                    mean_acc.item(),
+                                    "" if tau_sim is None else f" train_tau_sim={tau_sim:.4f}",
+                                    current_lr,
+                                )
+                                wandb_data = {
+                                    "train/loss": mean_loss.item(),
+                                    "train/accuracy": mean_acc.item(),
+                                    "train/lr": current_lr,
+                                    "train/grad_norm": float(grad_norm),
+                                    "train/epoch": epoch,
                                 }
                                 if tau_sim is not None:
-                                    postfix["tau"] = f"{tau_sim:.2f}"
-                                pbar.set_postfix(**postfix)
-                            logger.info(
-                                "epoch=%s step=%s train_loss=%.6f train_acc=%.6f%s lr=%.3e",
-                                epoch,
-                                self.runtime.global_step,
-                                mean_loss.item(),
-                                mean_acc.item(),
-                                "" if tau_sim is None else f" train_tau_sim={tau_sim:.4f}",
-                                current_lr,
-                            )
-                            wandb_data = {
-                                "train/loss": mean_loss.item(),
-                                "train/accuracy": mean_acc.item(),
-                                "train/lr": current_lr,
-                                "train/grad_norm": float(grad_norm),
-                                "train/epoch": epoch,
-                            }
-                            if tau_sim is not None:
-                                wandb_data["train/tau_sim"] = tau_sim
-                            self._wandb_log(wandb_data, step=self.runtime.global_step)
-                        running_loss.zero_()
-                        running_acc.zero_()
-                        if running_step_prefix is not None:
-                            running_step_prefix.zero_()
-                            running_step_valid.zero_()
-                        running_steps = 0
+                                    wandb_data["train/tau_sim"] = tau_sim
+                                self._wandb_log(wandb_data, step=self.runtime.global_step)
+                                self._maybe_run_decode_eval()
+                            running_loss.zero_()
+                            running_acc.zero_()
+                            if running_step_prefix is not None:
+                                running_step_prefix.zero_()
+                                running_step_valid.zero_()
+                            running_steps = 0
+
+                        # Grad-accum window boundary (pending==0, gradients clean):
+                        # the only safe point to stop on the step budget or swap in
+                        # freshly regenerated data. Both branch on ``global_step``,
+                        # which is identical on every rank, so the collective swap
+                        # broadcast stays lockstep.
+                        if self.runtime.global_step >= self.total_optim_steps:
+                            reached_budget = True
+                            break
+                        # The regen launch cadence is checked at every window
+                        # boundary (not inside the log gate above) so it honors
+                        # ``regen.every_steps`` independently of ``log_every_steps``;
+                        # after the budget break so the terminal step never spawns a
+                        # cycle nothing will consume. No-op off rank 0.
+                        self._maybe_run_regen()
+                        if self._maybe_swap_regen_dataloader():
+                            break
+                else:
+                    # Dataloader exhausted with no swap and no budget stop: this
+                    # epoch's pass is complete (its trailing partial window, if any,
+                    # is flushed below).
+                    segment_done = True
 
             # Flush the trailing partial accumulation window. When
             # ``batches_per_epoch`` is not a multiple of
@@ -1535,6 +1918,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             # step; rescale by the inverse so the trailing step's gradient
             # is on the same scale as every other step.
             if pending_micro_batches > 0:
+                # Sum the draft grads over cp first (as in the full-window step above);
+                # otherwise the trailing step applies per-rank partial gradients and the
+                # cp replicas of the draft desync permanently from here on.
+                if getattr(self, "cp_group", None) is not None:
+                    self._all_reduce_draft_grads_over_cp()
                 scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
                 for p in self.trainer_module.parameters():
                     if p.grad is not None:
@@ -1619,6 +2007,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     is_final_checkpoint=epoch + 1 >= self.num_epochs,
                 )
                 self._log_saved_checkpoint("epoch", epoch + 1, self.runtime.global_step)
+
+            if reached_budget:
+                # Step budget reached (with regen, one epoch is split into many
+                # segments, so the budget -- not the epoch range -- is the stop).
+                break
 
 
 def main(config_path=None):
