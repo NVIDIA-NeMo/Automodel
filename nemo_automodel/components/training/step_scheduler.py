@@ -73,7 +73,7 @@ class StepScheduler(Stateful):
         start_epoch: int = 0,
         num_epochs: Optional[int] = None,
         max_steps: Optional[int] = None,
-        preemption_signal: Optional[SignalLike | list[SignalLike]] = signal.SIGTERM,
+        preemption_signal: SignalLike | list[SignalLike] | None = signal.SIGTERM,
     ):
         """
         Initialize the StepScheduler.
@@ -96,6 +96,10 @@ class StepScheduler(Stateful):
             start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
             num_epochs (Optional[int]): Total number of epochs. Default: None or calculated from max_steps if num_epochs is None or 10 if max_steps and num_epochs are both None.
             max_steps (Optional[int]): Maximum number of steps to run. If None, calculated from num_epochs.
+            preemption_signal (Optional[SignalLike | list[SignalLike]]): Signal(s) that trigger a graceful
+                preemption checkpoint, each given as a signal number, name (e.g. "SIGTERM"), or
+                ``signal.Signals`` member. When ``None``, no signal handler is installed and preemption
+                checkpointing is disabled. Default: ``signal.SIGTERM``.
         """
         if global_batch_size <= 0:
             raise ValueError(f"global_batch_size must be greater than 0, got {global_batch_size}")
@@ -365,6 +369,9 @@ class StepSchedulerConfig:
             ``None`` disables manual GC.
         start_step: Initial global step (for checkpoint resume).
         start_epoch: Initial epoch (for checkpoint resume).
+        preemption_signal: Signal(s) that trigger a graceful preemption checkpoint, each given as
+            a signal number, name (e.g. ``"SIGTERM"``), or a list thereof.  ``None`` disables
+            preemption checkpointing.  Default: ``"SIGTERM"``.
     """
 
     global_batch_size: int = 32

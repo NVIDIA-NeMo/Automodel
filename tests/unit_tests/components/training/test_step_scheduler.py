@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 import os
 import signal as _signal
+
+import pytest
 
 from nemo_automodel.components.training.step_scheduler import (
     StepScheduler,
@@ -555,7 +556,7 @@ def test_preemption_invalid_signal_name_raises():
 def test_preemption_signal_triggers_checkpoint_and_stops_iteration():
     """
     Delivering the configured signal mid-training must make is_ckpt_step
-    True at the nest step boundary, stop iteration, and leave a resumable state_dict.
+    True at the next step boundary, stop iteration, and leave a resumable state_dict.
     """
     scheduler = _make_scheduler(preemption_signal="SIGUSR1")
     try:
@@ -570,7 +571,7 @@ def test_preemption_signal_triggers_checkpoint_and_stops_iteration():
                 assert scheduler.sigterm_flag is True
                 break
         else:
-            pytest.fail("is_ckpt_step never become True after signal delivery")
+            pytest.fail("is_ckpt_step never becomes True after signal delivery")
         assert steps_run == 2
         # state_dict stores step + 1 so the resumed run continues after the
         # preemption checkpoint instead of repeating the step.
@@ -640,7 +641,7 @@ def test_preemption_flag_is_sticky_and_stops_polling():
 
 
 def test_step_scheduler_config_exposes_preemption_signal():
-    """The tupes config must plub preemption_signal through build()."""
+    """The typed config must plumb preemption_signal through build()."""
     cfg = StepSchedulerConfig(
         global_batch_size=2,
         num_epochs=1,

@@ -163,7 +163,7 @@ def test_signals_received_aggregates(monkeypatch):
     ],
 )
 def test_resolve_signal_valid(spec, expected):
-    """ressolve_singal accepts names (with/without SIG prefix), ints and Signals members."""
+    """resolve_signal accepts names (with/without SIG prefix), ints and Signals members."""
     assert sutils.resolve_signal(spec) is expected
 
 
@@ -189,8 +189,8 @@ def test_resolve_signal_invalid_type():
 
 def test_signal_handler_multiple_signals_install_and_restore():
     """
-    A handler canfigured iwth several signals must install a handler for eeach
-    and resotre all originals on exit. Receiving any one of the signals must
+    A handler configured with several signals must install a handler for each
+    and restore all originals on exit. Receiving any one of the signals must
     set the flag.
     """
     sigs = [signal.SIGUSR1, signal.SIGUSR2]
@@ -208,7 +208,7 @@ def test_signal_handler_multiple_signals_install_and_restore():
 
 def test_signal_handler_string_signal_real_delivery():
     """
-    End-to-end: configure by string name, deliver a real signal with os.skill,
+    End-to-end: configure by string name, deliver a real signal with os.kill,
     and verify signals_received reports it (single-process fallback path).
     """
     import os

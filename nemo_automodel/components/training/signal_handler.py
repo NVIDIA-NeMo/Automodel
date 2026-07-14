@@ -15,12 +15,13 @@
 import logging
 import signal
 import types
-from typing import Any, Optional, Sequence, Union
+from collections.abc import Sequence
+from typing import Any, Optional
 
 import torch
 import torch.distributed
 
-SignalLike = Union[int, str, signal.Signals]
+SignalLike = int | str | signal.Signals
 
 
 def get_device(local_rank: Optional[int] = None) -> torch.device:
@@ -100,16 +101,19 @@ class DistributedSignalHandler:
     The original signal handler is restored upon exiting the context.
 
     Args:
-        sig: The signal number to handle (e.g., signal.SIGTERM).
-             Defaults to signal.SIGTERM.
+        sig: One or more signals to handle, each given as a signal number,
+            name (e.g. "SIGTERM"), or ``signal.Signals`` member. Accepts a
+            single value or a sequence. Defaults to signal.SIGTERM.
     """
 
-    def __init__(self, sig: Union[SignalLike, Sequence[SignalLike]] = signal.SIGTERM) -> None:
+    def __init__(self, sig: SignalLike | Sequence[SignalLike] = signal.SIGTERM) -> None:
         """
         Constructor for the DistributedSignalHandler.
 
         Args:
-            sig (int, optional): The signal to handle. Defaults to signal.SIGTERM.
+            sig (SignalLike | Sequence[SignalLike], optional): One or more signals to handle, each
+                given as a signal number, name (e.g. "SIGTERM"), or ``signal.Signals`` member.
+                Defaults to signal.SIGTERM.
         """
         specs = sig if isinstance(sig, (list, tuple)) else [sig]
         sigs = [resolve_signal(s) for s in specs]
@@ -123,7 +127,7 @@ class DistributedSignalHandler:
         self.original_handlers = {}
 
     @property
-    def sig(self):
+    def sig(self) -> signal.Signals:
         """Backward-compatible accessor for the first configured signal."""
         return self.sigs[0]
 
@@ -191,7 +195,7 @@ def resolve_signal(sig: SignalLike) -> signal.Signals:
 
     Accepts integers (e.g. "15"), "signal.Signals" members (e.g. "signal.SIGTERM")
     and case-insensitive string names with or without the "SIG" prefix (e.g. "SIGTERM",
-    "sigusr1", "USR2"). String support allows the pre-emption signal to be configured form YAML.
+    "sigusr1", "USR2"). String support allows the pre-emption signal to be configured from YAML.
 
     Args:
         sig: The signal specification to resolve.
@@ -206,6 +210,10 @@ def resolve_signal(sig: SignalLike) -> signal.Signals:
 
     if isinstance(sig, signal.Signals):
         return sig
+    if isinstance(sig, bool):
+        # bool is a subclass of int; reject it before the int branch so
+        # True/False don't silently resolve to SIGHUP / an invalid number.
+        raise TypeError(f"Signal must be an int, str or signal.Signals, got bool: {sig!r}")
     if isinstance(sig, int):
         try:
             return signal.Signals(sig)

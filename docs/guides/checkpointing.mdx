@@ -32,11 +32,7 @@ checkpoint:
                              # Other modes: false (sharded only) or every/true (export every checkpoint).
     ...
 ```
-> **Note:** `save_consolidated` accepts:
-> - `final` (recommended): keep intermediate checkpoints sharded and export consolidated HF weights only for the final checkpoint.
-> - `false`: save sharded checkpoints only. Run the generated `model/consolidate.sh` helper later if you need HF weights.
-> - `every` (or legacy `true`): export consolidated HF weights during every checkpoint save. Use this only when every checkpoint must be immediately loadable by HF tools.
->
+
 `save_consolidated` accepts the following values:
 
 - `final` (recommended): Keep intermediate checkpoints sharded and export consolidated Hugging Face weights only for the final checkpoint.
@@ -46,10 +42,6 @@ checkpoint:
 AutoModel writes a `model/consolidate.sh` helper next to Safetensors model shards. Use this helper to create a Hugging Face-compatible `model/consolidated/` directory after training for `save_consolidated: false` checkpoints, or for earlier checkpoints when using `save_consolidated: final`. Creating consolidated Hugging Face weights requires `model_save_format: safetensors`.
 
 <Note>
-The optimizer states are _always_ saved in DCP (`.distcp` extension) format.
-
-<Note>
-
 The optimizer states are _always_ saved in DCP (`.distcp` extension) format.
 
 </Note>
@@ -82,10 +74,6 @@ automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
     --checkpoint.model_save_format safetensors \
     --checkpoint.save_consolidated final
 ```
-
-<Note>
-In the above command we used the [`llama3_2_1b_squad.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/492add84a2b9d495946fe211c28973cd00051f3e/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) config as a running example, adjust as necessary to your case.
-More config examples can be found in our [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
 
 <Note>
 
@@ -185,8 +173,6 @@ PEFT checkpoints save adapter files directly under `model/` and do not generate 
 ### Why Consolidated Adapter Checkpoints?
 Because the PEFT state is so lightweight, sharded checkpointing adds unnecessary overhead. Instead, NeMo AutoModel automatically saves a compact Hugging Face-compatible adapter checkpoint when using PEFT. This makes it:
 
-- easier to manage and share (just the adapters),
-- compatible with Hugging Face Transformers out of the box,
 - Easier to manage and share (just the adapters).
 - Compatible with Hugging Face Transformers out of the box.
 - Ideal for deployment and downstream evaluation.
@@ -315,9 +301,6 @@ automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
 ```
 
 When using a custom path, make sure the corresponding host directory is mounted into the container with `-v`.
-
-<Tip>
-Mount additional host directories for datasets and the Hugging Face model cache to avoid re-downloading large models across container restarts. See the [Installation Guide](/get-started/installation) for a complete `docker run` example with all recommended mounts.
 
 <Tip>
 
