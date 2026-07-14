@@ -14,6 +14,7 @@ import torch
 import torch.distributed
 from torch.nn.parallel import DistributedDataParallel
 
+from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.embedding_distill import EmbeddingDistillLoss, EmbeddingMSELoss, ScoreDistillLoss
@@ -243,19 +244,6 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
         self.infonce_loss = _build_or_none(self.cfg.get("infonce_loss", None))
         self.infonce_distill_loss = _build_or_none(self.cfg.get("infonce_distill_loss", None))
 
-        if self.distill_loss is None:
-            self.distill_loss = EmbeddingDistillLoss(reduction="mean")
-        if self.mse_loss is None:
-            self.mse_loss = EmbeddingMSELoss(normalize=False, reduction="mean")
-        if self.score_loss is None:
-            self.score_loss = ScoreDistillLoss(temperature=float(self.cfg.get("score_temperature", 0.02)))
-        if self.intermediate_loss is None:
-            self.intermediate_loss = IntermediateDistillLoss(layer_pairs=[])
-        if self.infonce_loss is None:
-            self.infonce_loss = InfoNCELoss()
-        if self.infonce_distill_loss is None:
-            self.infonce_distill_loss = InfoNCEDistillLoss()
-
         self.loss_weights = {
             "distill": float(self.cfg.get("distill_loss_weight", 1.0)),
             "mse": float(self.cfg.get("mse_loss_weight", 0.0)),
@@ -265,9 +253,50 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
             "nce_kd": float(self.cfg.get("nce_distill_loss_weight", 0.0)),
         }
 
+        # Parse layer_pairs before building loss defaults so the default
+        # IntermediateDistillLoss can be wired with the same pairs used to attach
+        # the capture hooks below.
         self.layer_pairs = [tuple(int(x) for x in pair) for pair in self.cfg.get("layer_pairs", [])]
         if self.loss_weights["intermediate"] > 0 and not self.layer_pairs:
             raise ValueError("intermediate_loss_weight > 0 requires non-empty layer_pairs in config")
+
+        if self.distill_loss is None:
+            self.distill_loss = EmbeddingDistillLoss(reduction="mean")
+        if self.mse_loss is None:
+            self.mse_loss = EmbeddingMSELoss(normalize=False, reduction="mean")
+        if self.score_loss is None:
+            self.score_loss = ScoreDistillLoss(temperature=float(self.cfg.get("score_temperature", 0.02)))
+        if self.intermediate_loss is None:
+            self.intermediate_loss = IntermediateDistillLoss(layer_pairs=self.layer_pairs)
+        if self.infonce_loss is None:
+            self.infonce_loss = InfoNCELoss()
+        if self.infonce_distill_loss is None:
+            self.infonce_distill_loss = InfoNCEDistillLoss()
+
+        # Guard against a configured intermediate loss whose layer_pairs are empty
+        # while the weight is active: hooks would fire but the loss would silently
+        # short-circuit to zero (contributing no gradient).
+        if self.loss_weights["intermediate"] > 0:
+            loss_pairs = getattr(self.intermediate_loss, "layer_pairs", None)
+            if not loss_pairs:
+                raise ValueError(
+                    "intermediate_loss_weight > 0 but intermediate_loss has empty layer_pairs; "
+                    "set layer_pairs on the intermediate_loss config or omit it to inherit the top-level layer_pairs."
+                )
+            # The capture hooks below are attached only for the top-level
+            # layer_pairs. Any layer the loss reads that is not captured would
+            # raise at lookup time, so require the loss pairs to reference only
+            # captured student/teacher layers.
+            captured_student = {s for s, _ in self.layer_pairs}
+            captured_teacher = {t for _, t in self.layer_pairs}
+            missing_student = sorted({s for s, _ in loss_pairs} - captured_student)
+            missing_teacher = sorted({t for _, t in loss_pairs} - captured_teacher)
+            if missing_student or missing_teacher:
+                raise ValueError(
+                    "intermediate_loss.layer_pairs reference layers that the top-level layer_pairs do not "
+                    f"capture (missing student layers={missing_student}, teacher layers={missing_teacher}); "
+                    "align intermediate_loss.layer_pairs with the top-level layer_pairs or omit it to inherit them."
+                )
         if self.use_cached_teacher and self.loss_weights["intermediate"] > 0:
             raise ValueError(
                 "intermediate_loss_weight > 0 is not supported with cached teacher embeddings; "
@@ -632,3 +661,15 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
 
         meta = {"epoch": epoch, "step": step}
         (legacy_ckpt / "meta.json").write_text(json.dumps(meta, indent=2))
+
+
+def main(default_config_path="examples/retrieval/distillation/ministral3_2b_distill.yaml"):
+    """Entry point: load config, build the distillation recipe, and run training."""
+    cfg = parse_args_and_load_config(default_config_path)
+    recipe = EmbeddingDistillRecipe(cfg)
+    recipe.setup()
+    recipe.run_train_validation_loop()
+
+
+if __name__ == "__main__":
+    main()

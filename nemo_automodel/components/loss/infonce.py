@@ -160,18 +160,25 @@ def infonce_distill_loss(
             s_n = F.normalize(s_n, dim=-1)
             t_n = F.normalize(t_n, dim=-1)
 
-    def _build_logits(query: torch.Tensor, doc: torch.Tensor, neg: torch.Tensor | None) -> torch.Tensor:
+    def _build_logits(
+        query: torch.Tensor, doc: torch.Tensor, neg: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if use_in_batch_negatives:
             logits = query @ doc.T
         else:
             logits = (query * doc).sum(dim=-1, keepdim=True)
+        # In-batch / positive columns are always real candidates.
+        valid = torch.ones_like(logits, dtype=torch.bool)
         if neg is not None:
             sim_qn = torch.einsum("bd,bkd->bk", query, neg)
+            neg_valid = torch.ones_like(sim_qn, dtype=torch.bool)
             if hard_negatives_mask is not None:
                 pad = hard_negatives_mask.to(sim_qn.dtype) == 0
                 sim_qn = sim_qn.masked_fill(pad, float("-inf"))
+                neg_valid = ~pad
             logits = torch.cat([logits, sim_qn], dim=-1)
-        return logits
+            valid = torch.cat([valid, neg_valid], dim=-1)
+        return logits, valid
 
     def _one_direction(
         s_query: torch.Tensor,
@@ -181,21 +188,35 @@ def infonce_distill_loss(
         t_doc: torch.Tensor,
         t_neg: torch.Tensor | None,
     ) -> torch.Tensor:
-        s_logits = _build_logits(s_query, s_doc, s_neg) / temperature
+        s_logits, valid = _build_logits(s_query, s_doc, s_neg)
+        s_logits = s_logits / temperature
         with torch.no_grad():
-            t_logits = _build_logits(t_query, t_doc, t_neg) / temperature
+            t_logits, _ = _build_logits(t_query, t_doc, t_neg)
+            t_logits = t_logits / temperature
+
+        if divergence == "mse":
+            p_s = F.softmax(s_logits, dim=-1)
+            p_t = F.softmax(t_logits, dim=-1)
+            return F.mse_loss(p_s, p_t, reduction="sum") / s_logits.shape[0]
+
+        log_p_s = F.log_softmax(s_logits, dim=-1)
+        with torch.no_grad():
+            log_p_t = F.log_softmax(t_logits, dim=-1)
+            p_t = log_p_t.exp()
 
         if divergence == "kl":
-            log_p_s = F.log_softmax(s_logits, dim=-1)
-            p_t = F.softmax(t_logits, dim=-1)
-            return F.kl_div(log_p_s, p_t, reduction="batchmean")
-        if divergence == "ce":
-            log_p_s = F.log_softmax(s_logits, dim=-1)
-            p_t = F.softmax(t_logits, dim=-1)
-            return -(p_t * log_p_s).sum(dim=-1).mean()
-        p_s = F.softmax(s_logits, dim=-1)
-        p_t = F.softmax(t_logits, dim=-1)
-        return F.mse_loss(p_s, p_t, reduction="sum") / s_logits.shape[0]
+            # Manual KL (batchmean) so padded columns can be masked before the
+            # reduction. F.kl_div sums internally and computes log(target) on the
+            # exact-zero teacher probs at padded positions, so it cannot avoid the
+            # 0 * -inf -> NaN that ragged hard-negative batches produce.
+            term = p_t * (log_p_t - log_p_s)
+        else:  # ce
+            term = -(p_t * log_p_s)
+        # Padded candidates carry zero teacher probability and must contribute
+        # nothing; masking the per-element term drops the 0 * -inf NaN while the
+        # detached teacher keeps the gradient into log_p_s finite.
+        term = torch.where(valid, term, term.new_zeros(()))
+        return term.sum(dim=-1).mean()
 
     if direction == "q2d":
         return _one_direction(s_q, s_d, s_n, t_q, t_d, t_n)
