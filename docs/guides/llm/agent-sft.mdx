@@ -276,19 +276,25 @@ Validation:
   step 500 | val_loss 0.16 | tool_call/accuracy 0.83
 ```
 
-Checkpoints are written under the configured `checkpoint_dir`, each with an HF-compatible `model/consolidated/` directory and `LATEST` / `LOWEST_VAL` symlinks.
+The example does not override checkpoint settings, so checkpoints are written under the default `checkpoints/` root with `save_consolidated: final`. Every Safetensors checkpoint includes `model/consolidate.sh`, but only the final checkpoint is exported inline to `model/consolidated/`. The root also contains `LATEST` and `LOWEST_VAL` symlinks.
 
 ---
 
 ## Step 5 — Evaluate the Fine-Tuned Model
 
-Load the consolidated checkpoint (HF-compatible) and re-run the Step 2 prompt; the fine-tuned model should now emit a clean tool call:
+`LOWEST_VAL` can point to an intermediate sharded checkpoint. Consolidate that checkpoint before loading it with Hugging Face:
+
+```bash
+bash checkpoints/LOWEST_VAL/model/consolidate.sh
+```
+
+Then load the generated HF-compatible directory and re-run the Step 2 prompt; the fine-tuned model should now emit a clean tool call:
 
 ```python
 import os, torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-CKPT = os.path.realpath("agent_checkpoints/qwen2_5_3b_glaive/LOWEST_VAL")
+CKPT = os.path.realpath("checkpoints/LOWEST_VAL")
 consolidated = os.path.join(CKPT, "model", "consolidated")
 
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B")
