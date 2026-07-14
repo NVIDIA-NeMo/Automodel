@@ -21,6 +21,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import yaml
 
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.recipes import kd_utils
@@ -295,6 +296,11 @@ def _run_kd_bridge_worker(rank: int, world_size: int, init_file: str) -> None:
         bridge = kd_utils.KDMeshBridge(setups, device=torch.device("cpu"))
         checkpointer = None
         batch = None
+        checkpoint_config = CheckpointingConfig(enabled=False, is_async=True)
+        async_process_groups = checkpoint_config.initialize_async_process_groups(
+            setups.student_ranks,
+            is_member=bridge.is_student,
+        )
         if bridge.is_student:
             input_ids = torch.tensor([[rank + 1, rank + 2]], dtype=torch.long)
             batch = {"input_ids": input_ids, "labels": input_ids.clone()}
@@ -319,15 +325,14 @@ def _run_kd_bridge_worker(rank: int, world_size: int, init_file: str) -> None:
             assert scale.grad is not None and torch.isfinite(scale.grad)
 
             from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
-            from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 
-            checkpoint_config = CheckpointingConfig(enabled=False, is_async=True)
             checkpointer = Checkpointer(
                 checkpoint_config,
                 dp_rank=rank,
                 tp_rank=0,
                 pp_rank=0,
                 process_group=bridge.student_group,
+                async_process_groups=async_process_groups,
             )
         bridge.synchronize()
         if checkpointer is not None:

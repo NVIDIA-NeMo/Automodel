@@ -585,6 +585,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
             moe_mesh=self.moe_mesh,
+            process_group=getattr(self.mesh_context, "process_group", None),
+            async_process_groups=getattr(self, "_checkpoint_async_process_groups", None),
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
@@ -672,9 +674,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         def materialize_loader(config):
             process_group = getattr(self.mesh_context, "process_group", None)
             build_context = (
-                nullcontext()
-                if config.dataset_builds_on_all_ranks
-                else FirstRankPerNode(group=process_group)
+                nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode(group=process_group)
             )
             with ScopedRNG(seed=config.seed, ranked=True):
                 return config.build(

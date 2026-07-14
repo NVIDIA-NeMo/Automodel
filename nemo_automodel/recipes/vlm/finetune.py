@@ -505,6 +505,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
             moe_mesh=self.moe_mesh,
+            process_group=getattr(self.mesh_context, "process_group", None),
+            async_process_groups=getattr(self, "_checkpoint_async_process_groups", None),
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
