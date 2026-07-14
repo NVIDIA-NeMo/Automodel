@@ -78,6 +78,29 @@ redirects:
     destination: "/nemo/automodel/v0.4"
   - source: "/nemo/automodel/0.4/index"
     destination: "/nemo/automodel/v0.4"
+  # Preserve the auto-generated Fern routes replaced by explicit model slugs.
+  # Versioned rules keep readers on their selected documentation train; the
+  # unversioned rules preserve direct links emitted by earlier Fern builds.
+  - source: "/nemo/automodel/:version/model-coverage/vision-language-models/ministral-3-vl"
+    destination: "/nemo/automodel/:version/model-coverage/vision-language-models/ministral3-vl"
+  - source: "/nemo/automodel/model-coverage/vision-language-models/ministral-3-vl"
+    destination: "/nemo/automodel/model-coverage/vision-language-models/ministral3-vl"
+  - source: "/nemo/automodel/:version/model-coverage/vision-language-models/intern-vl"
+    destination: "/nemo/automodel/:version/model-coverage/vision-language-models/internvl"
+  - source: "/nemo/automodel/model-coverage/vision-language-models/intern-vl"
+    destination: "/nemo/automodel/model-coverage/vision-language-models/internvl"
+  - source: "/nemo/automodel/:version/model-coverage/vision-language-models/smol-vlm"
+    destination: "/nemo/automodel/:version/model-coverage/vision-language-models/smolvlm"
+  - source: "/nemo/automodel/model-coverage/vision-language-models/smol-vlm"
+    destination: "/nemo/automodel/model-coverage/vision-language-models/smolvlm"
+  - source: "/nemo/automodel/:version/model-coverage/vision-language-models/l-la-va"
+    destination: "/nemo/automodel/:version/model-coverage/vision-language-models/llava"
+  - source: "/nemo/automodel/model-coverage/vision-language-models/l-la-va"
+    destination: "/nemo/automodel/model-coverage/vision-language-models/llava"
+  - source: "/nemo/automodel/:version/model-coverage/vision-language-models/l-la-va-one-vision"
+    destination: "/nemo/automodel/:version/model-coverage/vision-language-models/llava-onevision"
+  - source: "/nemo/automodel/model-coverage/vision-language-models/l-la-va-one-vision"
+    destination: "/nemo/automodel/model-coverage/vision-language-models/llava-onevision"
   # Older un-migrated versions (0.3.0, 0.2.0, 0.1.0) — fold all paths into
   # /latest/<same-path>. We don't host their content trees on Fern; this
   # keeps old bookmarks and search-engine results landing on the closest
