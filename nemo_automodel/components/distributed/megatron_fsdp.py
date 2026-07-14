@@ -205,6 +205,62 @@ def fully_shard_optimizer(
     return megatron_fsdp_fully_shard_optimizer(optimizer)
 
 
+def snapshot_distributed_param_attrs(model: nn.Module) -> "dict[str, dict] | None":
+    """Snapshot the per-parameter attributes Megatron-FSDP stamps on distributed params.
+
+    ``MegatronFSDP.__init__`` decorates each distributed ``Parameter`` with plain
+    Python attributes that later training steps depend on: ``_megatron_fsdp_model``
+    (owning-model back-ref used by :func:`fully_shard_optimizer`), ``_is_shared``
+    (set on tied parameters so ``_grad_acc`` routes their gradients through the root
+    hook instead of double-accumulating), ``orig_param``/``megatron_fsdp_dist_index``/
+    ``megatron_fsdp_slice`` and the ``reset_attribute`` closure. These attributes live
+    in the ``Parameter.__dict__`` and are silently dropped by any post-wrap operation
+    that rebuilds ``Parameter`` objects -- e.g. the ``from_pretrained`` checkpoint
+    reload and the ``lm_head`` re-tie the recipe performs after wrapping. Capture them
+    here, keyed by parameter name (object identity does not survive the rebuild), so
+    :func:`restore_distributed_param_attrs` can re-apply them afterwards.
+
+    ``remove_duplicate=False`` is required so tied parameters (e.g. ``lm_head.weight``
+    aliasing ``model.embed_tokens.weight``) are captured under every name they appear
+    under, including the ``_is_shared`` marker Megatron-FSDP places on the tied alias.
+
+    Args:
+        model: The (possibly Megatron-FSDP-wrapped) model to snapshot.
+
+    Returns:
+        A mapping from parameter name to a copy of its ``__dict__``, or ``None`` when
+        ``model`` is not a Megatron-FSDP model (nothing to snapshot).
+    """
+    if not HAS_MEGATRON_FSDP or not isinstance(model, MegatronFSDP):
+        return None
+    return {name: dict(param.__dict__) for name, param in model.module.named_parameters(remove_duplicate=False)}
+
+
+def restore_distributed_param_attrs(model: nn.Module, snapshot: "dict[str, dict] | None") -> None:
+    """Re-apply Megatron-FSDP per-parameter attributes dropped by a post-wrap rebuild.
+
+    Companion to :func:`snapshot_distributed_param_attrs`. For each current parameter
+    (matched by name, since the rebuild replaced the objects) it restores any snapshot
+    attribute the rebuilt parameter is missing, following the fix suggested by the
+    Megatron-FSDP maintainer on NVIDIA/Megatron-LM#5790: only attributes absent on the
+    new parameter are copied, so genuinely re-derived state is never clobbered.
+
+    Args:
+        model: The Megatron-FSDP-wrapped model whose parameters were rebuilt.
+        snapshot: The mapping returned by :func:`snapshot_distributed_param_attrs`, or
+            ``None`` (no-op).
+    """
+    if snapshot is None or not HAS_MEGATRON_FSDP or not isinstance(model, MegatronFSDP):
+        return
+    for name, param in model.module.named_parameters(remove_duplicate=False):
+        saved = snapshot.get(name)
+        if not saved:
+            continue
+        for key, val in saved.items():
+            if not hasattr(param, key):
+                setattr(param, key, val)
+
+
 def maybe_shard_optimizer(
     model_part: nn.Module,
     optimizer: torch.optim.Optimizer,
