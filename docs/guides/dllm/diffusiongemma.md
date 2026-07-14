@@ -4,65 +4,66 @@
 
 **DiffusionGemma** is a block-diffusion language model. Unlike an autoregressive (AR)
 model that generates one token at a time left-to-right, a block-diffusion model fills in
-a block of response tokens (a "canvas") by **iteratively denoising** it: the canvas starts
-as noise and is refined over several passes, conditioned on the prompt.
+a block of response tokens (a "canvas") by iteratively denoising the canvas. The canvas
+starts as noise and is refined over several passes, conditioned on the prompt.
 
-This guide covers **supervised fine-tuning (SFT)** of the DiffusionGemma **26B-A4B** model
-(a Mixture-of-Experts model with 26B total / ~4B active parameters) in NeMo AutoModel,
-with both **full fine-tuning** and **LoRA**.
+This guide covers **Supervised Fine-Tuning (SFT)** of the DiffusionGemma **26B-A4B** model,
+which is a Mixture-of-Experts (MoE) model with 26B total and approximately 4B active parameters,
+using NeMo AutoModel with both full fine-tuning and Low-Rank Adaptation (LoRA).
 
 The released checkpoint is available on the Hugging Face Hub:
 [`google/diffusiongemma-26B-A4B-it`](https://huggingface.co/google/diffusiongemma-26B-A4B-it).
 
-### Workflow overview
+### Workflow Overview
 
-| Step | What you do |
-|------|-------------|
-| 1. Install | Install NeMo AutoModel (pip or container) |
-| 2. Configure | Pick an example YAML (full SFT or LoRA) and set your dataset |
-| 3. Train | Launch with `torchrun` on 8 GPUs |
-| 4. Inspect | Read the training/diffusion loss curves |
+| Step | What You Do |
+| :--- | :--- |
+| 1. Install | Install NeMo AutoModel using pip or a container |
+| 2. Configure | Select an example YAML configuration file for full SFT or LoRA, and specify your dataset |
+| 3. Train | Launch training with `torchrun` on eight GPUs |
+| 4. Inspect | Read the training and diffusion loss curves |
 
 ## Model Overview
 
-DiffusionGemma couples a **causal encoder** with a **bidirectional decoder**:
+DiffusionGemma combines a causal encoder and a bidirectional decoder:
 
-- **Encoder** reads the clean prompt + response sequence with causal attention.
-- **Decoder** denoises the **canvas** — the response region — with bidirectional
-  (block-causal) attention, predicting the clean token at every canvas position.
+- **Encoder**: Reads the clean prompt and response sequence with causal attention.
+- **Decoder**: Denoises the canvas (the response region) with bidirectional,
+  block-causal attention, predicting the clean token at every canvas position.
 
-Key training mechanics, all handled by the `DiffusionGemmaSFTRecipe`:
+The `DiffusionGemmaSFTRecipe` handles the following key training mechanics:
 
-- **Uniform-random corruption.** For each example a corruption level `t ~ U(eps, 1)`
-  is sampled; supervised canvas positions are independently replaced with **uniform random
-  vocabulary tokens** (there is no `[MASK]` token). The model learns to recover the clean
-  token at every supervised canvas position.
-- **Self-conditioning.** The decoder optionally conditions on its own previous prediction,
-  mixed in per example during training.
-- **Frozen router.** The MoE router is kept frozen during SFT; experts and dense layers
-  are trained (full SFT) or adapted via LoRA.
-- **Single-turn SFT.** The loss supervises the final response turn; multi-turn histories
+- **Uniform-random corruption**: For each example, a corruption level
+  $t \sim U(\text{eps}, 1)$ is sampled, and supervised canvas positions are independently
+  replaced with uniform random vocabulary tokens (no `[MASK]` token is used). The model
+  learns to recover the clean token at every supervised canvas position.
+- **Self-conditioning**: The decoder optionally conditions on its own previous prediction,
+  which is mixed in per example during training.
+- **Frozen router**: The MoE router is kept frozen during SFT, and experts and dense layers
+  are trained (full SFT) or adapted using LoRA.
+- **Single-turn SFT**: The loss supervises the final response turn, and multi-turn histories
   are masked.
 
-The recipe runs with **FSDP2 + expert parallelism (EP=8)** and **mixed precision**
-(fp32 master weights, bf16 compute), with a canvas length of 256.
+The recipe runs with **Fully Sharded Data Parallel 2 (FSDP2) and expert parallelism (EP=8)**
+and mixed precision (FP32 master weights and BF16 compute) with a canvas length of 256.
 
 ## Launch Training
 
-DiffusionGemma SFT runs on a single 8-GPU node (EP=8). Two example configs are provided
-under `examples/dllm_sft/`:
+DiffusionGemma SFT runs on a single eight-GPU node (EP=8). Two example configuration files
+are provided in the `examples/dllm_sft/` directory:
 
-| Config | Description |
-|--------|-------------|
-| [`diffusion_gemma_sft.yaml`](../../../examples/dllm_sft/diffusion_gemma_sft.yaml) | Full fine-tune on [GSM8K](https://huggingface.co/datasets/openai/gsm8k) |
-| [`diffusion_gemma_lora.yaml`](../../../examples/dllm_sft/diffusion_gemma_lora.yaml) | LoRA fine-tune  |
+| Configuration File | Description |
+| :--- | :--- |
+| [`diffusion_gemma_sft.yaml`](../../../examples/dllm_sft/diffusion_gemma_sft.yaml) | Full fine-tuning on the [GSM8K](https://huggingface.co/datasets/openai/gsm8k) dataset |
+| [`diffusion_gemma_lora.yaml`](../../../examples/dllm_sft/diffusion_gemma_lora.yaml) | LoRA fine-tuning |
 
-Both pull the checkpoint from the Hugging Face Hub
-(`google/diffusiongemma-26B-A4B-it`) automatically. GSM8K is consumed in OpenAI
-chat-messages format, so generate the JSONL once before launching:
+Both configurations automatically pull the checkpoint from the Hugging Face Hub
+(`google/diffusiongemma-26B-A4B-it`). Because the GSM8K dataset is consumed in the OpenAI
+chat-messages format, you must generate the JSONL file (`./gsm8k_chat_train.jsonl`) before
+launching training:
 
 ```bash
-python examples/dllm_sft/prep_gsm8k.py        # writes ./gsm8k_chat_train.jsonl
+python examples/dllm_sft/prep_gsm8k.py
 ```
 
 **Full SFT:**
@@ -84,7 +85,8 @@ torchrun --standalone --nproc-per-node=8 \
 
 ## Training Results
 
-The SFT and LoRA training curves on GSM8K (first 200 steps) are shown below.
+The following sections show the SFT and LoRA training curves on the GSM8K dataset for the
+first 200 steps.
 
 **SFT**
 
