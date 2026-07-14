@@ -249,6 +249,28 @@ config state or cache runtime objects on the serializable config.
 
 ---
 
+## Fern Documentation Link Contract
+
+- Links between Fern documentation pages in MDX use version-agnostic,
+  site-root paths such as `/model-coverage/large-language-models/llama`. These
+  are Fern routes, not repository-relative paths. They intentionally do not
+  navigate from GitHub's rendered source view.
+- Do not replace Fern inter-page links with file-relative `.mdx` paths such as
+  `./meta/llama.mdx`; Fern does not support file-relative inter-page links.
+  File-relative paths remain correct for images and other page-scoped media.
+- New pages targeted by an internal link must have an explicit `slug:` in the
+  applicable version navigation YAML. Always pin slugs for display names with
+  acronyms, mixed capitalization, punctuation, or numbers; Fern's generated
+  slug may not match the intended URL.
+- Treat an MDX link and its navigation `slug:` as one contract. Keep the slug
+  identical in every active version YAML that mounts that page. When changing
+  a published slug, preserve the former versioned and unversioned routes with
+  redirects in `docs/fern/docs.yml`.
+- Read `.agents/contributor-skills/fern-docs/SKILL.md` before changing Fern
+  content, navigation, slugs, redirects, or versions.
+
+---
+
 ## Available Skills
 
 Skill files give step-by-step instructions an AI agent can follow. Public
