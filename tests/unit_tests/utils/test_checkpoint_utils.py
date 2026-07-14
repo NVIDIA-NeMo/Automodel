@@ -88,6 +88,44 @@ def test_is_tied_word_embeddings_handles_missing_config():
     assert checkpoint_utils.is_tied_word_embeddings(model) is False
 
 
+def test_is_tied_word_embeddings_uses_one_direction_policy_over_outer_config():
+    """A fixed model policy wins over a misleading composite outer flag."""
+
+    class UntiedOnlyModel(nn.Module):
+        tie_word_embeddings_support = tie_utils.TieSupport.UNTIED_ONLY
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(
+                tie_word_embeddings=True,
+                text_config=SimpleNamespace(tie_word_embeddings=False),
+            )
+
+    class TiedOnlyModel(nn.Module):
+        tie_word_embeddings_support = tie_utils.TieSupport.TIED_ONLY
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(tie_word_embeddings=False)
+
+    assert checkpoint_utils.is_tied_word_embeddings(UntiedOnlyModel()) is False
+    assert checkpoint_utils.is_tied_word_embeddings(TiedOnlyModel()) is True
+
+
+def test_is_tied_word_embeddings_both_follows_outer_config():
+    """A BOTH model still resolves its per-checkpoint top-level flag."""
+
+    class BothModel(nn.Module):
+        tie_word_embeddings_support = tie_utils.TieSupport.BOTH
+
+        def __init__(self, tied: bool) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(tie_word_embeddings=tied)
+
+    assert checkpoint_utils.is_tied_word_embeddings(BothModel(tied=True)) is True
+    assert checkpoint_utils.is_tied_word_embeddings(BothModel(tied=False)) is False
+
+
 def test_is_tied_word_embeddings_qwen3_omni_moe_follows_top_level():
     """Qwen3OmniMoeThinker reports its top-level config intent.
 

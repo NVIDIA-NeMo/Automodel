@@ -49,7 +49,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
 # Use shared rope_utils (same implementation as Llama, supports both config formats)
@@ -394,6 +397,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         config: Qwen2Config,
         backend: Optional[BackendConfig] = None,
     ):
+        reject_unsupported_tie_word_embeddings(type(self), config)
         warn_deprecated_model_class("Qwen2ForCausalLM")
         super().__init__(config)
         self.backend = backend or BackendConfig()

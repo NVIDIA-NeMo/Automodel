@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_utils import _get_resolved_checkpoint_files, load_state_dict
 
-from nemo_automodel.components.models.common.tie_word_embeddings import get_controlling_tie_word_embeddings
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport, get_controlling_tie_word_embeddings
 
 
 def get_rank_safe() -> int:
@@ -104,12 +104,10 @@ def resolve_trust_remote_code(pretrained_model_name_or_path):
 
 
 def is_tied_word_embeddings(model: nn.Module) -> bool:
-    """
-    Check if the model's word embeddings are tied.
+    """Check whether the model's word embeddings are tied.
 
-    Delegates to :func:`get_controlling_tie_word_embeddings`, which follows HF's
-    top-level-first tying semantics (replacing the previous ``text_config``-first
-    resolution).
+    A one-direction :class:`TieSupport` policy is authoritative. Only ``BOTH``
+    models and undeclared Hugging Face models need their config flag resolved.
 
     Args:
         model (nn.Module): The model to check.
@@ -117,6 +115,15 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
     Returns:
         bool: True if the model's word embeddings are tied, False otherwise.
     """
+    support = getattr(model, "tie_word_embeddings_support", None)
+    # Composite VLM configs can expose an outer tie flag that does not describe
+    # the text head (for example Mistral4). No current BOTH VLM has that exception:
+    # they all honor the outer flag, so a model-owned resolver is not needed yet.
+    if support is TieSupport.TIED_ONLY:
+        return True
+    if support is TieSupport.UNTIED_ONLY:
+        return False
+
     config = getattr(model, "config", None)
     if config is None:
         return False

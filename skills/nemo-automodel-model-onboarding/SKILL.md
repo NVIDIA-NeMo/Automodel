@@ -213,6 +213,11 @@ configs, not from a bare config constructor:
 - `TIED_ONLY`: only a tied configuration is supported.
 - `UNTIED_ONLY`: only an untied configuration is supported.
 
+Runtime helpers must treat `TIED_ONLY` and `UNTIED_ONLY` as authoritative and
+only resolve a per-checkpoint config flag for `BOTH`. All current `BOTH` VLMs
+honor the outer `tie_word_embeddings` flag, so do not add a model-specific
+resolver until a supported `BOTH` model actually requires another config path.
+
 For `BOTH` and `TIED_ONLY`, always declare `_tied_weights_keys` and implement
 `tie_weights()` with the actual `lm_head` and input-embedding FQNs. Do not rely
 on inherited Hugging Face tying, and re-tie after any language-model swap.

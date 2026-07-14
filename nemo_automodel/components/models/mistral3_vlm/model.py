@@ -43,7 +43,10 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration as _HFMistral3ForConditionalGeneration,
 )
 
-from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
     Mistral3FP8StateDictAdapter,
@@ -138,6 +141,7 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
         supports_ep: bool = False
 
     def __init__(self, config: PretrainedConfig):
+        reject_unsupported_tie_word_embeddings(type(self), config)
         # HF's Mistral3ForConditionalGeneration.__init__ consults
         # ``config.quantization_config`` and swaps nn.Linear → FP8Linear for
         # every language_model Linear. FP8Linear registers a 0-d

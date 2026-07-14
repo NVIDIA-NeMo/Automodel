@@ -42,7 +42,10 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule, roll_tensor
 from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
-from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
@@ -630,6 +633,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         num_nextn_predict_layers: int | None = None,
         **kwargs: Any,
     ) -> None:
+        reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__()
         del kwargs
         self.config = config
@@ -839,6 +843,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         num_nextn_predict_layers: int | None = None,
         **kwargs: Any,
     ) -> None:
+        reject_unsupported_tie_word_embeddings(type(self), config)
         del kwargs
         super().__init__(config)
         self.backend = _qwen3_5_backend(backend)
