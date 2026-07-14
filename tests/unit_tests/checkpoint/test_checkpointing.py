@@ -45,6 +45,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _equally_divide_layers,
     _is_custom_model,
     _model_has_dtensors,
+    _new_gloo_process_group,
     _normalize_dtype_mapping_to_state_dict_keys,
     _reinit_non_persistent_buffers,
     _should_write_consolidated_safetensors,
@@ -62,6 +63,21 @@ from nemo_automodel.components.checkpoint.utils import (
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
+
+
+def test_new_gloo_process_group_preserves_subset_membership():
+    """Async checkpoint groups use only the supplied model-process ranks."""
+    model_group = object()
+    gloo_group = object()
+    with (
+        patch("torch.distributed.get_process_group_ranks", return_value=[2, 3]) as get_ranks,
+        patch("torch.distributed.new_group", return_value=gloo_group) as new_group,
+    ):
+        result = _new_gloo_process_group(model_group)
+
+    assert result is gloo_group
+    get_ranks.assert_called_once_with(model_group)
+    new_group.assert_called_once_with(ranks=[2, 3], backend="gloo", use_local_synchronization=True)
 
 
 def _make_keys(count: int) -> list[str]:

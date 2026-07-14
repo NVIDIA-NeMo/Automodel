@@ -21,7 +21,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import yaml
 
-from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.recipes import kd_utils
@@ -294,7 +293,6 @@ def _run_kd_bridge_worker(rank: int, world_size: int, init_file: str) -> None:
         }
         setups = kd_utils.create_kd_distributed_setups(cfg, world_size=world_size)
         bridge = kd_utils.KDMeshBridge(setups, device=torch.device("cpu"))
-        checkpointer = None
         batch = None
         if bridge.is_student:
             input_ids = torch.tensor([[rank + 1, rank + 2]], dtype=torch.long)
@@ -319,26 +317,9 @@ def _run_kd_bridge_worker(rank: int, world_size: int, init_file: str) -> None:
             assert torch.isfinite(loss)
             assert scale.grad is not None and torch.isfinite(scale.grad)
 
-            from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
-
-            checkpoint_config = CheckpointingConfig(enabled=False, is_async=True)
-
-            checkpointer = Checkpointer(
-                checkpoint_config,
-                dp_rank=rank,
-                tp_rank=0,
-                pp_rank=0,
-                process_group=bridge.student_group,
-            )
         bridge.synchronize()
-        # Barrier completion only guarantees every rank entered the collective;
-        # use the default group to ensure teacher ranks have returned before
-        # students destroy their async checkpoint groups.
-        dist.barrier()
-        if checkpointer is not None:
-            checkpointer.close()
-        # Hold teacher ranks until the student-only checkpoint groups are closed
-        # before tearing down the default process group.
+        # Ensure every worker has returned from the bridge barrier before the
+        # default process group is destroyed in ``finally``.
         dist.barrier()
     finally:
         dist.destroy_process_group()
