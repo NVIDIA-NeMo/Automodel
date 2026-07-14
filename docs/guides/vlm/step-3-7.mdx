@@ -40,7 +40,7 @@ For a full walkthrough of how multimodal datasets are preprocessed and integrate
 
 ## Launch Training
 
-This documentation-only branch does not add a ready-to-use recipe YAML. A future recipe should use `stepfun-ai/Step-3.7-Flash` as both the model and processor checkpoint and should be sized for a large VLM MoE run with pipeline parallelism and expert parallelism.
+Use the checked-in [full SFT recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml) or [LoRA recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml). Both use `stepfun-ai/Step-3.7-Flash` for the model and processor and configure pipeline and expert parallelism for this large VLM MoE.
 
 NeMo AutoModel supports several ways to launch training: the AutoModel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on Slurm batch jobs, multi-node configuration, and environment variables, see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
 

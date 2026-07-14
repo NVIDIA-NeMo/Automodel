@@ -47,7 +47,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: result/checkpoints/qwen2_5_omni_asr_ami_7b
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2

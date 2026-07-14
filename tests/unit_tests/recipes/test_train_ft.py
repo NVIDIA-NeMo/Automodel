@@ -695,6 +695,65 @@ def test_build_dataloader_packing_uses_configured_cp_size(monkeypatch, supports_
     assert captured["cp_size"] == 2
 
 
+# (num_proc, max_packs, expect_parallel): parallel only when num_proc>1 AND max_packs unset
+# (max_packs relies on the serial pass' lazy early-stop, so it stays serial).
+@pytest.mark.parametrize(
+    "num_proc,max_packs,expect_parallel",
+    [(2, None, True), (1, None, False), (2, 5, False)],
+)
+def test_build_dataloader_parallel_tokenize_gated_on_num_proc(monkeypatch, num_proc, max_packs, expect_parallel):
+    """num_proc>1 pre-tokenizes in parallel and feeds the result to packing; else it does not."""
+    calls = {"tokenize": 0}
+    packed_input = {}
+
+    def fake_tokenize_parallel(dataset, num_proc):
+        calls["tokenize"] += 1
+        calls["num_proc"] = num_proc
+        return "MATERIALIZED"
+
+    def fake_pack_dataset(dataset, **kwargs):
+        packed_input["dataset"] = dataset
+        return dataset
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.tokenize_dataset_parallel", fake_tokenize_parallel)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.pack_dataset", fake_pack_dataset)
+
+    cfg_ds = ConfigNode({"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset", "split": "train"})
+    cfg_dl = ConfigNode({"_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture", "num_workers": 0})
+    cfg_model = ConfigNode({})
+    cfg_ps = ConfigNode(
+        {"packed_sequence_size": 8, "packing_strategy": "thd", "num_proc": num_proc, "max_packs": max_packs}
+    )
+
+    class _PackedModel(nn.Module):
+        def forward(self, input_ids, seq_lens=None):
+            return input_ids
+
+    _build_dataloader(
+        cfg_ds=cfg_ds,
+        cfg_dl=cfg_dl,
+        cfg_model=cfg_model,
+        cfg_ps=cfg_ps,
+        seed=123,
+        local_batch_size=1,
+        global_batch_size=1,
+        max_steps=None,
+        val_check_interval=None,
+        dp_rank=0,
+        dp_world_size=1,
+        pp_enabled=False,
+        cp_size=1,
+        model=_PackedModel(),
+    )
+
+    if expect_parallel:
+        assert calls["tokenize"] == 1 and calls["num_proc"] == num_proc
+        assert packed_input["dataset"] == "MATERIALIZED"
+    else:
+        assert calls["tokenize"] == 0
+        assert packed_input["dataset"].__class__.__name__ == "DummyMapDataset"
+
+
 class _FlagCM(AbstractContextManager):
     """Simple context manager that flips a flag on enter/exit."""
 
@@ -981,6 +1040,44 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
         (parts[0], "PipelineStage_0"),
         (parts[1], "PipelineStage_1"),
     ]
+
+
+class _StageWithLogitsToKeep(nn.Module):
+    def forward(self, input_ids=None, logits_to_keep=0, **kwargs):
+        return None
+
+
+class _StageNoLogitsToKeep(nn.Module):
+    def forward(self, input_ids=None, **kwargs):
+        return None
+
+
+@pytest.mark.parametrize(
+    "has_logits_to_keep, has_marker, pp_enabled, expect_fused",
+    [
+        (True, True, True, True),  # PP generic patched forward -> fused CE kept
+        (False, True, True, False),  # PP, no logits_to_keep -> fall back
+        (True, False, True, False),  # PP, logits_to_keep but no hidden-states marker (MoE/custom) -> fall back
+        (True, False, False, True),  # non-PP: the hidden-states marker gate does not apply -> fused CE kept
+    ],
+)
+def test_maybe_downgrade_loss_fn(has_logits_to_keep, has_marker, pp_enabled, expect_fused):
+    """FusedLinearCrossEntropy survives only when the probed stage module supports
+    logits_to_keep and (under PP) advertises hidden-states emission via
+    _pp_return_hidden_states_supported; otherwise it downgrades to MaskedCrossEntropy."""
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
+
+    probe = (_StageWithLogitsToKeep if has_logits_to_keep else _StageNoLogitsToKeep)()
+    if has_marker:
+        probe._pp_return_hidden_states_supported = True  # set by patch_hf_model_for_pp on the generic forward
+
+    result = _maybe_downgrade_loss_fn(FusedLinearCrossEntropy(), probe, pp_enabled=pp_enabled)
+
+    assert isinstance(result, FusedLinearCrossEntropy) is expect_fused
+    if not expect_fused:
+        assert isinstance(result, MaskedCrossEntropy)
 
 
 def test_run_train_validation_loop_calls_gc_hook_once_per_step():

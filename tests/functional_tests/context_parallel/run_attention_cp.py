@@ -274,7 +274,11 @@ def get_model_config_and_attention(model_type, device):
         from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 
         def get_freqs_cis(position_ids, qkv_format, cp_size=1):
-            return position_ids_to_freqs_cis(rope, position_ids, qkv_format, cp_size=cp_size)
+            # Build freqs in the layout the (possibly globally-disabled, see #3027) fused-RoPE
+            # setting actually uses, so the frequencies match the attention's RoPE path.
+            return position_ids_to_freqs_cis(
+                rope, position_ids, qkv_format, for_fused_rope=backend.rope_fusion, cp_size=cp_size
+            )
 
     elif model_type == "deepseek_v3":
         from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
@@ -327,7 +331,7 @@ def get_model_config_and_attention(model_type, device):
 
         def get_freqs_cis(position_ids, qkv_format, cp_size=1):
             return freqs_cis_from_position_ids(
-                position_ids, rope_freqs, qkv_format=qkv_format, for_fused_rope=True, cp_size=cp_size
+                position_ids, rope_freqs, qkv_format=qkv_format, for_fused_rope=backend.rope_fusion, cp_size=cp_size
             )
 
     elif model_type == "nemotron_v3":
