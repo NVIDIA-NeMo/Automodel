@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
+import types
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1055,7 +1057,7 @@ def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
 
     cfg_model = InvalidModelConfig()
 
-    with pytest.raises(ValueError, match="VLM finetuning requires NeMoAutoModelForImageTextToText"):
+    with pytest.raises(ValueError, match="VLM finetuning requires a recipe-compatible model target"):
         build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -2615,6 +2617,96 @@ def test_vlm_build_model_accepts_multimodal_lm_entry_points(entry_point):
         )
 
     assert model is not None
+
+
+_GEMMA4_COMPOSITE_MOD = "nemo_automodel.components.models.gemma4_drafter.composite"
+
+
+def _target_owner_names(targets):
+    """Class names of the objects that own each allowlisted classmethod target."""
+    names = set()
+    for t in targets:
+        owner = getattr(t, "__self__", None)
+        if owner is not None:
+            names.add(getattr(owner, "__name__", str(owner)))
+    return names
+
+
+class TestRecipeTargetAllowlist:
+    """Coverage for the recipe-side model-target allowlist that ``build_model``
+    gates on (``_accepted_targets`` / ``_is_recipe_target`` in
+    ``recipes/vlm/finetune.py``).
+
+    ``_accepted_targets`` adds the optional Gemma4 composite behind a
+    ``try/except ImportError``. Existing ``build_model`` tests only exercise
+    whichever branch matches the installed deps, so these tests force *both*
+    branches (import present and absent) deterministically, plus the
+    ``target is None`` short-circuit -- all without depending on whether the
+    optional ``transformers.models.gemma4_assistant`` dep is installed.
+    """
+
+    def test_accepted_targets_contains_all_nemo_auto_entrypoints(self):
+        from nemo_automodel._transformers import (
+            NeMoAutoModelForCausalLM,
+            NeMoAutoModelForImageTextToText,
+            NeMoAutoModelForMultimodalLM,
+        )
+        from nemo_automodel.recipes.vlm.finetune import _accepted_targets
+
+        targets = _accepted_targets()
+        assert isinstance(targets, set)
+        for cls in (
+            NeMoAutoModelForCausalLM,
+            NeMoAutoModelForImageTextToText,
+            NeMoAutoModelForMultimodalLM,
+        ):
+            assert cls.from_pretrained in targets
+            assert cls.from_config in targets
+
+    def test_accepted_targets_missing_gemma4_dep_takes_except_branch(self, monkeypatch):
+        """Force the optional composite import to fail: the ``except ImportError``
+        branch runs and the set still holds the NeMoAuto entrypoints while the
+        Gemma4 composite is absent."""
+        from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+        from nemo_automodel.recipes.vlm.finetune import _accepted_targets
+
+        # A ``None`` entry in sys.modules makes ``from <mod> import X`` raise ImportError.
+        monkeypatch.setitem(sys.modules, _GEMMA4_COMPOSITE_MOD, None)
+
+        targets = _accepted_targets()
+        assert NeMoAutoModelForCausalLM.from_pretrained in targets
+        assert "Gemma4WithDrafter" not in _target_owner_names(targets)
+
+    def test_accepted_targets_present_gemma4_dep_adds_composite(self, monkeypatch):
+        """Inject a fake composite module so the ``accepted.add(...)`` branch runs
+        regardless of whether the real optional dep is installed."""
+        from nemo_automodel.recipes.vlm.finetune import _accepted_targets
+
+        class Gemma4WithDrafter:
+            @classmethod
+            def from_pretrained(cls):
+                return cls()
+
+        fake_mod = types.ModuleType(_GEMMA4_COMPOSITE_MOD)
+        fake_mod.Gemma4WithDrafter = Gemma4WithDrafter
+        monkeypatch.setitem(sys.modules, _GEMMA4_COMPOSITE_MOD, fake_mod)
+
+        targets = _accepted_targets()
+        assert Gemma4WithDrafter.from_pretrained in targets
+
+    def test_is_recipe_target_none_returns_false(self):
+        from nemo_automodel.recipes.vlm.finetune import _is_recipe_target
+
+        assert _is_recipe_target(None) is False
+
+    def test_is_recipe_target_accepts_nemo_auto_and_rejects_others(self):
+        from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+        from nemo_automodel.recipes.vlm.finetune import _is_recipe_target
+
+        assert _is_recipe_target(NeMoAutoModelForImageTextToText.from_pretrained) is True
+        assert _is_recipe_target(NeMoAutoModelForImageTextToText.from_config) is True
+        assert _is_recipe_target("some.invalid.Target") is False
+        assert _is_recipe_target(lambda: None) is False
 
 
 # -----------------------------------------------------------------------------
