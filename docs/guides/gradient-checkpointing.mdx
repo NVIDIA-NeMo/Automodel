@@ -73,11 +73,15 @@ memory savings are worth. Use `all` when you prefer the maximum
 activation-memory reduction across trainable model parts.
 
 <Note>
-`activation_checkpointing_scope` controls the generic FSDP2/DDP activation
-checkpointing path. Expert-parallel MoE configs (`ep_size > 1`) use the MoE
-parallelizer's activation checkpointing path, which currently checkpoints the
-text/MoE decoder blocks and does not use this scope to include VLM vision
-towers.
+Expert-parallel MoE configs (`ep_size > 1`) use the MoE parallelizer's
+activation checkpointing path, which respects the same
+`activation_checkpointing_scope` field with the same semantics: `all` (the
+default) checkpoints the text/MoE decoder blocks plus any trainable
+multimodal towers (vision, audio), `language` the decoder blocks only, and
+`vision`, `audio`, or `multimodal` only the selected trainable tower blocks.
+Tower checkpointing behaves the same as on the generic path and works with
+any attention backend; no additional configuration is needed. Frozen towers
+stay out of activation checkpointing on both paths.
 </Note>
 
 <Note>
@@ -170,12 +174,12 @@ Run a checked-in recipe config with activation checkpointing enabled and inspect
 ```bash
 
 # If running on 8x GPUs
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --nproc-per-node 8 \
   --distributed.activation_checkpointing true
 
 # If running on 1x GPU
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
   --distributed.activation_checkpointing true
 ```
 Compare the peak memory with the same command run without the override. The exact value depends on the model, batch size, sequence length, loss, and hardware. Look for the memory field in a log line similar to:

@@ -128,17 +128,17 @@ export HF_HOME="/path/to/hf_cache" # Hugging Face cache directory
 
 The entry point is `automodel` (defined at `nemo_automodel.cli.app:main`).
 
-Pattern: `automodel <config.yaml> [--nproc-per-node N] [--key.subkey value ...]`
+Pattern: `uv run automodel <config.yaml> [--nproc-per-node N] [--key.subkey value ...]`
 
 ```bash
 # The YAML's recipe field selects LLM, VLM, diffusion, or retrieval behavior.
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 8
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 8
 ```
 
 Override any config value from the CLI:
 
 ```bash
-automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --model.pretrained_model_name_or_path meta-llama/Llama-3.2-1B
 ```
 
