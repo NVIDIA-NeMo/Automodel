@@ -14,13 +14,31 @@
 
 """Fail-closed compatibility fixes for published Megatron-FSDP releases.
 
-The four rewrite pipelines (``make_fsdp_dtensor``,
-``StorageResizeBasedBucketAllocator.free``, ``MegatronFSDP.forward``, and
-``ParamAndGradBuffer.update_main_grads``) intentionally repeat the same
+The three rewrite pipelines (``make_fsdp_dtensor``, ``MegatronFSDP.forward``,
+and ``ParamAndGradBuffer.update_main_grads``) intentionally repeat the same
 validate/rewrite/compile/verify structure so each stays independently
 auditable against its wheel fingerprints. Consolidating them behind a single
 patch-spec dataclass is a planned follow-up, expected to land together with
 retiring the 0.5.0 pin rather than in this compatibility pass.
+
+Bug-3 (the temporary all-gather bucket use-after-free race in
+``StorageResizeBasedBucketAllocator.free``, filed as NVIDIA/Megatron-LM#5788)
+is deliberately not worked around here. The only correct fix is event-based
+synchronization -- record a CUDA event on the consuming stream after the
+parameter views are last read and gate the storage free on that specific
+event -- but neither the consumer stream/event nor a separate free stream is
+reachable from the allocator's ``free(self, bucket_id)`` seam: the ``Bucket``
+carries only its ``data`` tensor, and the sole synchronization primitive the
+wheel tracks for parameter buckets (``param_gather_event``) gates the gather,
+not consumption. Recording an event there would require replicating the
+deferred-free queue the wheel already uses for gradient buckets across
+``all_gather_params``/``release_bucket``/the pipeline -- Megatron-FSDP-owned
+infrastructure spanning several functions, not a locked source substitution.
+The previously shipped ``record_stream`` workaround defers the caching
+allocator's reclamation until the whole compute stream drains, inflating peak
+memory under FSDP's per-layer budget, so per the maintainer's guidance
+(@cspades on NVIDIA/Megatron-LM#5788) shipping it is worse than deferring the
+fix upstream where the stream/event context lives.
 """
 
 from __future__ import annotations
@@ -68,29 +86,6 @@ _MEGATRON_FSDP_TP_DTENSOR_PARAMETERS = (
         False,
     ),
 )
-_MEGATRON_FSDP_STREAM_LIFETIME_SOURCE_SHA256 = "f3b415af19bb05dfaabf0554912649d419ecf988bd0b33ba343b4e111704c7fe"
-_MEGATRON_FSDP_STREAM_LIFETIME_PATCHED_SOURCE_SHA256 = (
-    "cf09e406110776cc52a6363147a69f0959fa7de1acecc347949e4dc6d4a38324"
-)
-_MEGATRON_FSDP_STREAM_LIFETIME_PATCH_MARKER = "_nemo_automodel_megatron_fsdp_050_stream_lifetime"
-_MEGATRON_FSDP_STREAM_LIFETIME_ORIGINAL_SOURCE_MARKER = (
-    "_nemo_automodel_megatron_fsdp_050_stream_lifetime_official_source"
-)
-_MEGATRON_FSDP_STREAM_LIFETIME_QUALNAME = "StorageResizeBasedBucketAllocator.free"
-_MEGATRON_FSDP_STREAM_LIFETIME_FIRSTLINENO = 550
-_MEGATRON_FSDP_STREAM_LIFETIME_PARAMETERS = (
-    ("self", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
-    ("bucket_id", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
-)
-_MEGATRON_FSDP_STREAM_LIFETIME_BROKEN_BLOCK = """\
-        if bucket_id in self.buckets:
-            _free_storage(self.buckets[bucket_id].data)
-"""
-_MEGATRON_FSDP_STREAM_LIFETIME_FIXED_BLOCK = """\
-        if bucket_id in self.buckets:
-            self.buckets[bucket_id].data.record_stream(torch.cuda.current_stream())
-            _free_storage(self.buckets[bucket_id].data)
-"""
 _MEGATRON_FSDP_ROOT_FORWARD_SOURCE_SHA256 = "91536b19302a1835813ad29adfddf00d6fc8fed885e4acf753098bb15964b7b3"
 _MEGATRON_FSDP_ROOT_FORWARD_PATCHED_SOURCE_SHA256 = "973faf4ddc3568f59b1e21472b9a599442033835c68d144461dc51f934f12687"
 _MEGATRON_FSDP_ROOT_FORWARD_PATCH_MARKER = "_nemo_automodel_megatron_fsdp_050_root_forward_hooks"
@@ -243,18 +238,6 @@ def _megatron_fsdp_make_fsdp_dtensor_abi(function: Any) -> tuple[tuple[str, Any,
     return tuple((parameter.name, parameter.kind, parameter.default) for parameter in parameters)
 
 
-def _megatron_fsdp_storage_resize_free_abi(function: Any) -> tuple[tuple[str, Any, Any], ...]:
-    """Return the allocator ABI that the stream-lifetime fix relies on."""
-    try:
-        parameters = inspect.signature(function).parameters.values()
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(
-            "cannot inspect Megatron-FSDP StorageResizeBasedBucketAllocator.free; "
-            "refusing the stream-lifetime compatibility patch"
-        ) from exc
-    return tuple((parameter.name, parameter.kind, parameter.default) for parameter in parameters)
-
-
 def _megatron_fsdp_root_forward_abi(function: Any) -> tuple[tuple[str, Any, Any], ...]:
     """Return the wrapper-forward ABI that the root-hook fix relies on."""
     try:
@@ -292,30 +275,6 @@ def _validate_megatron_fsdp_make_fsdp_dtensor_structure(module: ModuleType, func
         raise RuntimeError(
             "Megatron-FSDP 0.5.0 make_fsdp_dtensor module/source structure differs; "
             "refusing to patch an unknown implementation"
-        )
-
-
-def _validate_megatron_fsdp_storage_resize_free_structure(
-    module: ModuleType,
-    allocator_type: type,
-    function: Any,
-) -> None:
-    """Reject allocator methods that are not the locked wheel's implementation."""
-    source_file = inspect.getsourcefile(function)
-    if (
-        getattr(module, "__name__", None) != _MEGATRON_FSDP_TP_DTENSOR_MODULE
-        or getattr(allocator_type, "__module__", None) != _MEGATRON_FSDP_TP_DTENSOR_MODULE
-        or getattr(allocator_type, "__qualname__", None) != "StorageResizeBasedBucketAllocator"
-        or getattr(function, "__module__", None) != _MEGATRON_FSDP_TP_DTENSOR_MODULE
-        or getattr(function, "__qualname__", None) != _MEGATRON_FSDP_STREAM_LIFETIME_QUALNAME
-        or function.__code__.co_firstlineno != _MEGATRON_FSDP_STREAM_LIFETIME_FIRSTLINENO
-        or getattr(allocator_type, "free", None) is not function
-        or source_file is None
-        or Path(source_file).name != _MEGATRON_FSDP_TP_DTENSOR_SOURCE_BASENAME
-    ):
-        raise RuntimeError(
-            "Megatron-FSDP 0.5.0 StorageResizeBasedBucketAllocator.free module/source "
-            "structure differs; refusing to patch an unknown implementation"
         )
 
 
@@ -394,39 +353,6 @@ def _locked_megatron_fsdp_patched_source(function: Any) -> str:
     if patched_source_sha256 != _MEGATRON_FSDP_TP_DTENSOR_PATCHED_SOURCE_SHA256:
         raise RuntimeError(
             "Megatron-FSDP 0.5.0 patched source fingerprint differs; refusing an unverified runtime patch"
-        )
-    return patched_source
-
-
-def _locked_megatron_fsdp_stream_lifetime_patched_source(function: Any) -> str:
-    """Read and rewrite the exact official allocator method, without mutation."""
-    try:
-        source = inspect.getsource(function)
-    except (OSError, TypeError) as exc:
-        raise RuntimeError(
-            "cannot read Megatron-FSDP 0.5.0 StorageResizeBasedBucketAllocator.free "
-            "source; refusing an unverified runtime patch"
-        ) from exc
-    source_sha256 = hashlib.sha256(source.encode()).hexdigest()
-    if source_sha256 != _MEGATRON_FSDP_STREAM_LIFETIME_SOURCE_SHA256:
-        raise RuntimeError(
-            "Megatron-FSDP 0.5.0 StorageResizeBasedBucketAllocator.free source does "
-            "not match the official wheel; refusing to patch an unknown implementation "
-            f"(source_sha256={source_sha256})"
-        )
-    if source.count(_MEGATRON_FSDP_STREAM_LIFETIME_BROKEN_BLOCK) != 1:
-        raise RuntimeError(
-            "Megatron-FSDP 0.5.0 temporary-bucket release structure changed; refusing an ambiguous runtime patch"
-        )
-    patched_source = source.replace(
-        _MEGATRON_FSDP_STREAM_LIFETIME_BROKEN_BLOCK,
-        _MEGATRON_FSDP_STREAM_LIFETIME_FIXED_BLOCK,
-    )
-    patched_source_sha256 = hashlib.sha256(patched_source.encode()).hexdigest()
-    if patched_source_sha256 != _MEGATRON_FSDP_STREAM_LIFETIME_PATCHED_SOURCE_SHA256:
-        raise RuntimeError(
-            "Megatron-FSDP 0.5.0 stream-lifetime patched source fingerprint differs; "
-            "refusing an unverified runtime patch"
         )
     return patched_source
 
@@ -511,31 +437,6 @@ def _compile_megatron_fsdp_patched_function(module: ModuleType, function: Any, p
     expected = namespace["make_fsdp_dtensor"]
     if _megatron_fsdp_make_fsdp_dtensor_abi(expected) != _MEGATRON_FSDP_TP_DTENSOR_PARAMETERS:
         raise RuntimeError("compiled Megatron-FSDP compatibility function changed its ABI")
-    return expected
-
-
-def _compile_megatron_fsdp_stream_lifetime_patched_function(
-    module: ModuleType,
-    function: Any,
-    patched_source: str,
-) -> Any:
-    """Compile the expected allocator method in the running interpreter and module ABI."""
-    namespace: dict[str, Any] = {}
-    exec(
-        compile(
-            "\n" * (function.__code__.co_firstlineno - 1) + textwrap.dedent(patched_source),
-            function.__code__.co_filename,
-            "exec",
-            dont_inherit=True,
-        ),
-        vars(module),
-        namespace,
-    )
-    expected = namespace["free"]
-    expected.__module__ = _MEGATRON_FSDP_TP_DTENSOR_MODULE
-    expected.__qualname__ = _MEGATRON_FSDP_STREAM_LIFETIME_QUALNAME
-    if _megatron_fsdp_storage_resize_free_abi(expected) != _MEGATRON_FSDP_STREAM_LIFETIME_PARAMETERS:
-        raise RuntimeError("compiled Megatron-FSDP stream-lifetime compatibility method changed its ABI")
     return expected
 
 
@@ -631,11 +532,7 @@ def _patch_megatron_fsdp_050_tp_dtensor_reshape(
     This is deliberately an exact, fail-closed source compatibility patch.
     It runs before TP mutates the model, accepts only the locked 0.5.0 ABI and
     official function fingerprints, and refuses unknown releases or source
-    changes instead of executing a guessed rewrite. It also records the
-    current compute stream before a temporary all-gather bucket is resized to
-    zero. The wheel allocates those buckets on a dedicated parameter-gather
-    stream; without ``record_stream`` the CUDA caching allocator may recycle
-    storage while a TP/FSDP compute kernel still consumes a parameter view.
+    changes instead of executing a guessed rewrite.
 
     The published wrapper also invokes ``self.module.forward(...)`` directly,
     bypassing the root module's registered pre-forward hook. Root-owned shallow
@@ -648,9 +545,14 @@ def _patch_megatron_fsdp_050_tp_dtensor_reshape(
     every optimizer step after the first. Reuse the same rank-local shape
     helper there so rowwise TP gradients retain their local trailing dimension.
 
-    All four rewrites are validated and compiled before any is installed. Any
+    All three rewrites are validated and compiled before any is installed. Any
     installation/status failure restores every original callable and removes
     the temporary helper, so a process can never continue with a partial set.
+
+    Bug-3 (the temporary all-gather bucket use-after-free race in
+    ``StorageResizeBasedBucketAllocator.free``, NVIDIA/Megatron-LM#5788) is
+    intentionally not patched here; see the module docstring for why the
+    correct event-based fix belongs upstream.
     """
     if package_version is None:
         try:
@@ -671,16 +573,6 @@ def _patch_megatron_fsdp_050_tp_dtensor_reshape(
     function = getattr(param_and_grad_buffer, "make_fsdp_dtensor", None)
     if function is None:
         raise RuntimeError("Megatron-FSDP 0.5.0 has no make_fsdp_dtensor; refusing to patch an unknown ABI")
-    allocator_type = getattr(param_and_grad_buffer, "StorageResizeBasedBucketAllocator", None)
-    if not isinstance(allocator_type, type):
-        raise RuntimeError(
-            "Megatron-FSDP 0.5.0 has no StorageResizeBasedBucketAllocator; refusing to patch an unknown ABI"
-        )
-    allocator_free = getattr(allocator_type, "free", None)
-    if allocator_free is None:
-        raise RuntimeError(
-            "Megatron-FSDP 0.5.0 has no StorageResizeBasedBucketAllocator.free; refusing to patch an unknown ABI"
-        )
     wrapper_type = getattr(megatron_fsdp_module, _MEGATRON_FSDP_ROOT_FORWARD_CLASS, None)
     if not isinstance(wrapper_type, type):
         raise RuntimeError("Megatron-FSDP 0.5.0 has no MegatronFSDP class; refusing to patch an unknown ABI")
@@ -697,7 +589,6 @@ def _patch_megatron_fsdp_050_tp_dtensor_reshape(
         )
 
     marker = getattr(function, _MEGATRON_FSDP_TP_DTENSOR_PATCH_MARKER, None)
-    stream_marker = getattr(allocator_free, _MEGATRON_FSDP_STREAM_LIFETIME_PATCH_MARKER, None)
     root_forward_marker = getattr(wrapper_forward, _MEGATRON_FSDP_ROOT_FORWARD_PATCH_MARKER, None)
     update_main_grads_marker = getattr(
         update_main_grads,
@@ -706,7 +597,6 @@ def _patch_megatron_fsdp_050_tp_dtensor_reshape(
     )
     if (
         marker == _MEGATRON_FSDP_TP_DTENSOR_PATCHED_SOURCE_SHA256
-        and stream_marker == _MEGATRON_FSDP_STREAM_LIFETIME_PATCHED_SOURCE_SHA256
         and root_forward_marker == _MEGATRON_FSDP_ROOT_FORWARD_PATCHED_SOURCE_SHA256
         and update_main_grads_marker == _MEGATRON_FSDP_UPDATE_MAIN_GRADS_PATCHED_SOURCE_SHA256
     ):
@@ -716,12 +606,7 @@ def _patch_megatron_fsdp_050_tp_dtensor_reshape(
             megatron_fsdp_module=megatron_fsdp_module,
         )
         return
-    if (
-        marker is not None
-        or stream_marker is not None
-        or root_forward_marker is not None
-        or update_main_grads_marker is not None
-    ):
+    if marker is not None or root_forward_marker is not None or update_main_grads_marker is not None:
         raise RuntimeError(
             "Megatron-FSDP 0.5.0 has an unknown or partial compatibility marker set; refusing to stack runtime patches"
         )
@@ -734,18 +619,6 @@ def _patch_megatron_fsdp_050_tp_dtensor_reshape(
         )
     _validate_megatron_fsdp_make_fsdp_dtensor_structure(param_and_grad_buffer, function)
     patched_source = _locked_megatron_fsdp_patched_source(function)
-    stream_abi = _megatron_fsdp_storage_resize_free_abi(allocator_free)
-    if stream_abi != _MEGATRON_FSDP_STREAM_LIFETIME_PARAMETERS:
-        raise RuntimeError(
-            "unsupported Megatron-FSDP 0.5.0 StorageResizeBasedBucketAllocator.free ABI; "
-            f"expected {_MEGATRON_FSDP_STREAM_LIFETIME_PARAMETERS!r}, got {stream_abi!r}"
-        )
-    _validate_megatron_fsdp_storage_resize_free_structure(
-        param_and_grad_buffer,
-        allocator_type,
-        allocator_free,
-    )
-    stream_patched_source = _locked_megatron_fsdp_stream_lifetime_patched_source(allocator_free)
     root_forward_abi = _megatron_fsdp_root_forward_abi(wrapper_forward)
     if root_forward_abi != _MEGATRON_FSDP_ROOT_FORWARD_PARAMETERS:
         raise RuntimeError(
@@ -788,11 +661,6 @@ def _patch_megatron_fsdp_050_tp_dtensor_reshape(
         function,
         patched_source,
     )
-    patched_free = _compile_megatron_fsdp_stream_lifetime_patched_function(
-        param_and_grad_buffer,
-        allocator_free,
-        stream_patched_source,
-    )
     patched_forward = _compile_megatron_fsdp_root_forward_patched_function(
         megatron_fsdp_module,
         wrapper_forward,
@@ -805,8 +673,6 @@ def _patch_megatron_fsdp_050_tp_dtensor_reshape(
     )
     if _megatron_fsdp_make_fsdp_dtensor_abi(patched) != abi:
         raise RuntimeError("patched Megatron-FSDP make_fsdp_dtensor changed its ABI")
-    if _megatron_fsdp_storage_resize_free_abi(patched_free) != stream_abi:
-        raise RuntimeError("patched Megatron-FSDP StorageResizeBasedBucketAllocator.free changed its ABI")
     if _megatron_fsdp_root_forward_abi(patched_forward) != root_forward_abi:
         raise RuntimeError("patched Megatron-FSDP MegatronFSDP.forward changed its ABI")
     if _megatron_fsdp_update_main_grads_abi(patched_update_main_grads) != update_main_grads_abi:
@@ -820,16 +686,6 @@ def _patch_megatron_fsdp_050_tp_dtensor_reshape(
         patched,
         _MEGATRON_FSDP_TP_DTENSOR_ORIGINAL_SOURCE_MARKER,
         _MEGATRON_FSDP_TP_DTENSOR_SOURCE_SHA256,
-    )
-    setattr(
-        patched_free,
-        _MEGATRON_FSDP_STREAM_LIFETIME_PATCH_MARKER,
-        _MEGATRON_FSDP_STREAM_LIFETIME_PATCHED_SOURCE_SHA256,
-    )
-    setattr(
-        patched_free,
-        _MEGATRON_FSDP_STREAM_LIFETIME_ORIGINAL_SOURCE_MARKER,
-        _MEGATRON_FSDP_STREAM_LIFETIME_SOURCE_SHA256,
     )
     setattr(
         patched_forward,
@@ -855,7 +711,6 @@ def _patch_megatron_fsdp_050_tp_dtensor_reshape(
     try:
         module_globals[_MEGATRON_FSDP_TP_DTENSOR_HELPER] = local_param_shape
         param_and_grad_buffer.make_fsdp_dtensor = patched
-        allocator_type.free = patched_free
         wrapper_type.forward = patched_forward
         buffer_type.update_main_grads = patched_update_main_grads
         _megatron_fsdp_050_tp_dtensor_patch_status(
@@ -865,7 +720,6 @@ def _patch_megatron_fsdp_050_tp_dtensor_reshape(
         )
     except Exception:
         param_and_grad_buffer.make_fsdp_dtensor = function
-        allocator_type.free = allocator_free
         wrapper_type.forward = wrapper_forward
         buffer_type.update_main_grads = update_main_grads
         module_globals.pop(_MEGATRON_FSDP_TP_DTENSOR_HELPER, None)
@@ -873,7 +727,7 @@ def _patch_megatron_fsdp_050_tp_dtensor_reshape(
 
     logger.warning(
         "Applied the fingerprint-guarded Megatron-FSDP 0.5.0 Torch-native TP "
-        "local-shape, temporary-bucket stream-lifetime, root-forward-hook, and cached-main-gradient compatibility fixes"
+        "local-shape, root-forward-hook, and cached-main-gradient compatibility fixes"
     )
 
 
@@ -921,56 +775,6 @@ def _megatron_fsdp_050_tp_dtensor_patch_status(
     if _code_object_summary(function.__code__) != _code_object_summary(expected_function.__code__):
         raise RuntimeError("patched Megatron-FSDP make_fsdp_dtensor code differs from the locked local-shape rewrite")
     _validate_megatron_fsdp_local_shape_helper(param_and_grad_buffer, function)
-
-    allocator_type = getattr(param_and_grad_buffer, "StorageResizeBasedBucketAllocator", None)
-    if not isinstance(allocator_type, type):
-        raise RuntimeError(
-            "Megatron-FSDP stream-lifetime compatibility evidence has no StorageResizeBasedBucketAllocator"
-        )
-    allocator_free = getattr(allocator_type, "free", None)
-    if allocator_free is None:
-        raise RuntimeError("Megatron-FSDP stream-lifetime compatibility evidence has no allocator free method")
-    stream_marker = getattr(
-        allocator_free,
-        _MEGATRON_FSDP_STREAM_LIFETIME_PATCH_MARKER,
-        None,
-    )
-    stream_original_source = getattr(
-        allocator_free,
-        _MEGATRON_FSDP_STREAM_LIFETIME_ORIGINAL_SOURCE_MARKER,
-        None,
-    )
-    if (
-        stream_marker != _MEGATRON_FSDP_STREAM_LIFETIME_PATCHED_SOURCE_SHA256
-        or stream_original_source != _MEGATRON_FSDP_STREAM_LIFETIME_SOURCE_SHA256
-    ):
-        raise RuntimeError("Megatron-FSDP 0.5.0 temporary-bucket stream-lifetime compatibility patch is not active")
-    if _megatron_fsdp_storage_resize_free_abi(allocator_free) != _MEGATRON_FSDP_STREAM_LIFETIME_PARAMETERS:
-        raise RuntimeError(
-            "patched Megatron-FSDP StorageResizeBasedBucketAllocator.free no longer has the verified ABI"
-        )
-    _validate_megatron_fsdp_storage_resize_free_structure(
-        param_and_grad_buffer,
-        allocator_type,
-        allocator_free,
-    )
-    stream_patched_source = _locked_megatron_fsdp_stream_lifetime_patched_source(allocator_free)
-    expected_allocator_free = _compile_megatron_fsdp_stream_lifetime_patched_function(
-        param_and_grad_buffer,
-        allocator_free,
-        stream_patched_source,
-    )
-    if _code_object_summary(allocator_free.__code__) != _code_object_summary(expected_allocator_free.__code__):
-        raise RuntimeError(
-            "patched Megatron-FSDP StorageResizeBasedBucketAllocator.free code differs "
-            "from the locked stream-lifetime rewrite"
-        )
-    if (
-        allocator_free.__globals__ is not vars(param_and_grad_buffer)
-        or allocator_free.__globals__.get("torch") is not getattr(param_and_grad_buffer, "torch", None)
-        or allocator_free.__globals__.get("_free_storage") is not getattr(param_and_grad_buffer, "_free_storage", None)
-    ):
-        raise RuntimeError("patched Megatron-FSDP StorageResizeBasedBucketAllocator.free has mutated global bindings")
 
     wrapper_type = getattr(megatron_fsdp_module, _MEGATRON_FSDP_ROOT_FORWARD_CLASS, None)
     if not isinstance(wrapper_type, type):
@@ -1065,10 +869,6 @@ def _megatron_fsdp_050_tp_dtensor_patch_status(
         "patched_source_sha256": _MEGATRON_FSDP_TP_DTENSOR_PATCHED_SOURCE_SHA256,
         "patch_marker": str(marker),
         "tp_local_shape_active": True,
-        "stream_lifetime_official_source_sha256": _MEGATRON_FSDP_STREAM_LIFETIME_SOURCE_SHA256,
-        "stream_lifetime_patched_source_sha256": (_MEGATRON_FSDP_STREAM_LIFETIME_PATCHED_SOURCE_SHA256),
-        "stream_lifetime_patch_marker": str(stream_marker),
-        "stream_lifetime_active": True,
         "root_forward_official_source_sha256": _MEGATRON_FSDP_ROOT_FORWARD_SOURCE_SHA256,
         "root_forward_patched_source_sha256": _MEGATRON_FSDP_ROOT_FORWARD_PATCHED_SOURCE_SHA256,
         "root_forward_patch_marker": str(root_forward_marker),

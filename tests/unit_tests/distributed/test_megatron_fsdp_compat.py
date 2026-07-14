@@ -56,15 +56,6 @@ def make_fsdp_dtensor(
     return local_tensor.view(local_shape)
 
 
-class _StorageResizeBasedBucketAllocatorFixture:
-    def free(self, bucket_id: int):
-        """
-        free a temporary bucket.
-        """
-        if bucket_id in self.buckets:
-            _free_storage(self.buckets[bucket_id].data)
-
-
 class _MegatronFSDPFixture:
     def forward(self, *inputs, **kwargs):
         """
@@ -89,10 +80,6 @@ class _ParamAndGradBufferFixture:
                 self.dist_main_grad[name]._local_tensor = optimizer_grad.view(local_shape)
 
 
-def _free_storage(_tensor):
-    """Fixture binding replaced on the synthetic module when semantics are tested."""
-
-
 class _FakeDTensor:
     def __init__(self, global_shape, local_shape):
         self.shape = torch.Size(global_shape)
@@ -100,21 +87,6 @@ class _FakeDTensor:
 
     def to_local(self):
         return self._local
-
-
-def _fixture_allocator_type():
-    original = _StorageResizeBasedBucketAllocatorFixture.free
-    free = FunctionType(
-        original.__code__,
-        original.__globals__,
-        name=original.__name__,
-        argdefs=original.__defaults__,
-        closure=original.__closure__,
-    )
-    free.__annotations__ = dict(original.__annotations__)
-    free.__kwdefaults__ = original.__kwdefaults__
-    free.__qualname__ = "StorageResizeBasedBucketAllocator.free"
-    return type("StorageResizeBasedBucketAllocator", (), {"free": free})
 
 
 def _fixture_wrapper_type():
@@ -151,10 +123,8 @@ def _fixture_module(function=make_fsdp_dtensor):
     module = ModuleType("megatron_fsdp.param_and_grad_buffer_fixture")
     module.DTensor = _FakeDTensor
     module.make_fsdp_dtensor = function
-    module.StorageResizeBasedBucketAllocator = _fixture_allocator_type()
     module.ParamAndGradBuffer = _fixture_param_and_grad_buffer_type()
     module.torch = torch
-    module._free_storage = _free_storage
     root_module = ModuleType("megatron_fsdp.megatron_fsdp_fixture")
     root_module.MegatronFSDP = _fixture_wrapper_type()
     root_module.torch = torch
@@ -176,20 +146,6 @@ def _accept_fixture_structure(monkeypatch, module, function=make_fsdp_dtensor):
         function.__code__.co_firstlineno,
     )
     monkeypatch.setattr(function, "__module__", module.__name__)
-    allocator_type = module.StorageResizeBasedBucketAllocator
-    allocator_free = allocator_type.free
-    monkeypatch.setattr(allocator_type, "__module__", module.__name__)
-    monkeypatch.setattr(allocator_free, "__module__", module.__name__)
-    monkeypatch.setattr(
-        compat,
-        "_MEGATRON_FSDP_STREAM_LIFETIME_QUALNAME",
-        allocator_free.__qualname__,
-    )
-    monkeypatch.setattr(
-        compat,
-        "_MEGATRON_FSDP_STREAM_LIFETIME_FIRSTLINENO",
-        allocator_free.__code__.co_firstlineno,
-    )
     root_module = module._root_forward_module
     wrapper_type = root_module.MegatronFSDP
     wrapper_forward = wrapper_type.forward
@@ -223,13 +179,12 @@ def _accept_fixture_structure(monkeypatch, module, function=make_fsdp_dtensor):
     )
     monkeypatch.setattr(buffer_type, "__module__", module.__name__)
     monkeypatch.setattr(update_main_grads, "__module__", module.__name__)
-    return allocator_free
 
 
 def _lock_fixture_sources(monkeypatch, module):
     source = inspect.getsource(make_fsdp_dtensor)
     original = module.make_fsdp_dtensor
-    original_free = _accept_fixture_structure(monkeypatch, module)
+    _accept_fixture_structure(monkeypatch, module)
     monkeypatch.setattr(
         compat,
         "_MEGATRON_FSDP_TP_DTENSOR_SOURCE_SHA256",
@@ -242,22 +197,6 @@ def _lock_fixture_sources(monkeypatch, module):
             source.replace(
                 compat._MEGATRON_FSDP_TP_DTENSOR_BROKEN_BLOCK,
                 compat._MEGATRON_FSDP_TP_DTENSOR_FIXED_BLOCK,
-            ).encode()
-        ).hexdigest(),
-    )
-    free_source = inspect.getsource(original_free)
-    monkeypatch.setattr(
-        compat,
-        "_MEGATRON_FSDP_STREAM_LIFETIME_SOURCE_SHA256",
-        hashlib.sha256(free_source.encode()).hexdigest(),
-    )
-    monkeypatch.setattr(
-        compat,
-        "_MEGATRON_FSDP_STREAM_LIFETIME_PATCHED_SOURCE_SHA256",
-        hashlib.sha256(
-            free_source.replace(
-                compat._MEGATRON_FSDP_STREAM_LIFETIME_BROKEN_BLOCK,
-                compat._MEGATRON_FSDP_STREAM_LIFETIME_FIXED_BLOCK,
             ).encode()
         ).hexdigest(),
     )
@@ -304,12 +243,12 @@ def _lock_fixture_sources(monkeypatch, module):
         return real_import_module(name)
 
     monkeypatch.setattr(compat.importlib, "import_module", import_fixture)
-    return original, original_free, original_forward, original_update_main_grads
+    return original, original_forward, original_update_main_grads
 
 
 def _patch_fixture(monkeypatch):
     module = _fixture_module()
-    original, original_free, _original_forward, _original_update_main_grads = _lock_fixture_sources(
+    original, _original_forward, _original_update_main_grads = _lock_fixture_sources(
         monkeypatch,
         module,
     )
@@ -318,11 +257,11 @@ def _patch_fixture(monkeypatch):
         param_and_grad_buffer=module,
         megatron_fsdp_module=module._root_forward_module,
     )
-    return module, original, original_free
+    return module, original
 
 
 def test_050_patch_uses_tp_local_trailing_shape(monkeypatch):
-    module, _original, _original_free = _patch_fixture(monkeypatch)
+    module, _original = _patch_fixture(monkeypatch)
 
     # Rowwise TP exposes global (8, 16), local (8, 8). Cover both observed
     # no-unit slices (0/16/40) and the Linear-unit 24-element slice. The old
@@ -351,10 +290,6 @@ def test_050_patch_uses_tp_local_trailing_shape(monkeypatch):
         "patched_source_sha256": compat._MEGATRON_FSDP_TP_DTENSOR_PATCHED_SOURCE_SHA256,
         "patch_marker": compat._MEGATRON_FSDP_TP_DTENSOR_PATCHED_SOURCE_SHA256,
         "tp_local_shape_active": True,
-        "stream_lifetime_official_source_sha256": (compat._MEGATRON_FSDP_STREAM_LIFETIME_SOURCE_SHA256),
-        "stream_lifetime_patched_source_sha256": (compat._MEGATRON_FSDP_STREAM_LIFETIME_PATCHED_SOURCE_SHA256),
-        "stream_lifetime_patch_marker": (compat._MEGATRON_FSDP_STREAM_LIFETIME_PATCHED_SOURCE_SHA256),
-        "stream_lifetime_active": True,
         "root_forward_official_source_sha256": compat._MEGATRON_FSDP_ROOT_FORWARD_SOURCE_SHA256,
         "root_forward_patched_source_sha256": compat._MEGATRON_FSDP_ROOT_FORWARD_PATCHED_SOURCE_SHA256,
         "root_forward_patch_marker": compat._MEGATRON_FSDP_ROOT_FORWARD_PATCHED_SOURCE_SHA256,
@@ -376,7 +311,7 @@ def test_050_patch_uses_tp_local_trailing_shape(monkeypatch):
 
 
 def test_050_cached_main_grad_update_uses_tp_local_trailing_shape(monkeypatch):
-    module, _original, _original_free = _patch_fixture(monkeypatch)
+    module, _original = _patch_fixture(monkeypatch)
     buffer = module.ParamAndGradBuffer()
     buffer.dist_main_grad = {
         "rowwise": SimpleNamespace(_local_tensor=None),
@@ -400,39 +335,8 @@ def test_050_cached_main_grad_update_uses_tp_local_trailing_shape(monkeypatch):
     assert buffer.dist_main_grad["vector"]._local_tensor.shape == (3,)
 
 
-def test_050_stream_lifetime_records_current_stream_before_storage_free(monkeypatch):
-    module, _original, _original_free = _patch_fixture(monkeypatch)
-    events = []
-    current_stream = object()
-
-    class _Cuda:
-        @staticmethod
-        def current_stream():
-            events.append(("current_stream", current_stream))
-            return current_stream
-
-    class _BucketData:
-        def record_stream(self, stream):
-            events.append(("record_stream", stream))
-
-    data = _BucketData()
-    module.torch = SimpleNamespace(cuda=_Cuda())
-    module._free_storage = lambda tensor: events.append(("free_storage", tensor))
-    allocator = module.StorageResizeBasedBucketAllocator()
-    allocator.buckets = {7: SimpleNamespace(data=data)}
-
-    allocator.free(7)
-
-    assert events == [
-        ("current_stream", current_stream),
-        ("record_stream", current_stream),
-        ("free_storage", data),
-    ]
-    assert allocator.buckets[7].data is data
-
-
 def test_050_root_forward_invokes_registered_root_hooks(monkeypatch):
-    module, _original, _original_free = _patch_fixture(monkeypatch)
+    module, _original = _patch_fixture(monkeypatch)
     events = []
 
     class _Root(torch.nn.Module):
@@ -465,7 +369,7 @@ def test_050_root_forward_invokes_registered_root_hooks(monkeypatch):
 
 
 def test_050_root_forward_no_grad_does_not_trigger_backward_hooks(monkeypatch):
-    module, _original, _original_free = _patch_fixture(monkeypatch)
+    module, _original = _patch_fixture(monkeypatch)
     events = []
 
     class _Root(torch.nn.Module):
@@ -508,7 +412,7 @@ def test_050_root_forward_no_grad_does_not_trigger_backward_hooks(monkeypatch):
 def test_050_root_forward_checkpoint_recompute_notifies_backward_once(monkeypatch, use_reentrant):
     from torch.utils.checkpoint import checkpoint
 
-    module, _original, _original_free = _patch_fixture(monkeypatch)
+    module, _original = _patch_fixture(monkeypatch)
     events = []
 
     class _Root(torch.nn.Module):
@@ -536,27 +440,9 @@ def test_050_root_forward_checkpoint_recompute_notifies_backward_once(monkeypatc
     assert sum(event[0] == "backward_hook" for event in events) == 1
 
 
-def test_050_status_and_idempotent_patch_reject_stream_free_code_rollback(monkeypatch):
-    module, _original, original_free = _patch_fixture(monkeypatch)
-    module.StorageResizeBasedBucketAllocator.free.__code__ = original_free.__code__
-
-    with pytest.raises(RuntimeError, match="code differs from the locked stream-lifetime"):
-        compat._megatron_fsdp_050_tp_dtensor_patch_status(
-            package_version="0.5.0",
-            param_and_grad_buffer=module,
-            megatron_fsdp_module=module._root_forward_module,
-        )
-    with pytest.raises(RuntimeError, match="code differs from the locked stream-lifetime"):
-        compat._patch_megatron_fsdp_050_tp_dtensor_reshape(
-            package_version="0.5.0",
-            param_and_grad_buffer=module,
-            megatron_fsdp_module=module._root_forward_module,
-        )
-
-
 def test_050_status_and_idempotent_patch_reject_root_forward_code_rollback(monkeypatch):
     module = _fixture_module()
-    _original, _original_free, original_forward, _original_update_main_grads = _lock_fixture_sources(
+    _original, original_forward, _original_update_main_grads = _lock_fixture_sources(
         monkeypatch,
         module,
     )
@@ -583,7 +469,7 @@ def test_050_status_and_idempotent_patch_reject_root_forward_code_rollback(monke
 
 def test_050_status_and_idempotent_patch_reject_update_main_grads_code_rollback(monkeypatch):
     module = _fixture_module()
-    _original, _original_free, _original_forward, original_update_main_grads = _lock_fixture_sources(
+    _original, _original_forward, original_update_main_grads = _lock_fixture_sources(
         monkeypatch,
         module,
     )
@@ -609,7 +495,7 @@ def test_050_status_and_idempotent_patch_reject_update_main_grads_code_rollback(
 
 
 def test_050_status_rejects_update_main_grads_global_rebinding(monkeypatch):
-    module, _original, _original_free = _patch_fixture(monkeypatch)
+    module, _original = _patch_fixture(monkeypatch)
     patched = module.ParamAndGradBuffer.update_main_grads
     rebound = FunctionType(
         patched.__code__,
@@ -643,7 +529,7 @@ def test_050_status_rejects_update_main_grads_global_rebinding(monkeypatch):
 
 def test_050_set_installation_rolls_back_all_callables_on_status_failure(monkeypatch):
     module = _fixture_module()
-    original, original_free, original_forward, original_update_main_grads = _lock_fixture_sources(
+    original, original_forward, original_update_main_grads = _lock_fixture_sources(
         monkeypatch,
         module,
     )
@@ -664,14 +550,13 @@ def test_050_set_installation_rolls_back_all_callables_on_status_failure(monkeyp
         )
 
     assert module.make_fsdp_dtensor is original
-    assert module.StorageResizeBasedBucketAllocator.free is original_free
     assert module._root_forward_module.MegatronFSDP.forward is original_forward
     assert module.ParamAndGradBuffer.update_main_grads is original_update_main_grads
     assert not hasattr(module, compat._MEGATRON_FSDP_TP_DTENSOR_HELPER)
 
 
 def test_050_status_and_idempotent_patch_reject_function_code_rollback(monkeypatch):
-    module, original, _original_free = _patch_fixture(monkeypatch)
+    module, original = _patch_fixture(monkeypatch)
     module.make_fsdp_dtensor.__code__ = original.__code__
 
     with pytest.raises(RuntimeError, match="code differs from the locked"):
@@ -696,7 +581,7 @@ def _global_shape_helper_code(dtensor_type):
 
 
 def test_050_status_and_idempotent_patch_reject_helper_code_mutation(monkeypatch):
-    module, _original, _original_free = _patch_fixture(monkeypatch)
+    module, _original = _patch_fixture(monkeypatch)
     helper = getattr(module, compat._MEGATRON_FSDP_TP_DTENSOR_HELPER)
     helper.__code__ = _global_shape_helper_code(module.DTensor)
 
@@ -713,7 +598,7 @@ def test_050_status_and_idempotent_patch_reject_helper_code_mutation(monkeypatch
 
 
 def test_050_status_and_idempotent_patch_reject_global_helper_replacement(monkeypatch):
-    module, _original, _original_free = _patch_fixture(monkeypatch)
+    module, _original = _patch_fixture(monkeypatch)
 
     def global_shape(param):
         return tuple(param.shape)
@@ -810,20 +695,6 @@ def _configure_process_local_fixture():
         ).encode()
     ).hexdigest()
     function.__module__ = module.__name__
-    allocator_type = module.StorageResizeBasedBucketAllocator
-    allocator_free = allocator_type.free
-    allocator_type.__module__ = module.__name__
-    allocator_free.__module__ = module.__name__
-    free_source = inspect.getsource(allocator_free)
-    compat._MEGATRON_FSDP_STREAM_LIFETIME_QUALNAME = allocator_free.__qualname__
-    compat._MEGATRON_FSDP_STREAM_LIFETIME_FIRSTLINENO = allocator_free.__code__.co_firstlineno
-    compat._MEGATRON_FSDP_STREAM_LIFETIME_SOURCE_SHA256 = hashlib.sha256(free_source.encode()).hexdigest()
-    compat._MEGATRON_FSDP_STREAM_LIFETIME_PATCHED_SOURCE_SHA256 = hashlib.sha256(
-        free_source.replace(
-            compat._MEGATRON_FSDP_STREAM_LIFETIME_BROKEN_BLOCK,
-            compat._MEGATRON_FSDP_STREAM_LIFETIME_FIXED_BLOCK,
-        ).encode()
-    ).hexdigest()
     root_module = module._root_forward_module
     wrapper_type = root_module.MegatronFSDP
     wrapper_forward = wrapper_type.forward
@@ -882,8 +753,8 @@ def _gloo_rank_skew_worker(rank, world_size, rendezvous):
         module = _configure_process_local_fixture()
         if rank == 0:
             setattr(
-                module.StorageResizeBasedBucketAllocator.free,
-                compat._MEGATRON_FSDP_STREAM_LIFETIME_PATCH_MARKER,
+                module.make_fsdp_dtensor,
+                compat._MEGATRON_FSDP_TP_DTENSOR_PATCH_MARKER,
                 "rank-zero-invalid-marker",
             )
         try:
@@ -966,13 +837,6 @@ def test_050_shipped_fingerprints_match_installed_wheel_and_patch_installs():
             compat._MEGATRON_FSDP_TP_DTENSOR_SOURCE_SHA256,
             compat._MEGATRON_FSDP_TP_DTENSOR_QUALNAME,
             compat._MEGATRON_FSDP_TP_DTENSOR_FIRSTLINENO,
-        ),
-        (
-            param_and_grad_buffer.StorageResizeBasedBucketAllocator.free,
-            compat._MEGATRON_FSDP_STREAM_LIFETIME_PATCH_MARKER,
-            compat._MEGATRON_FSDP_STREAM_LIFETIME_SOURCE_SHA256,
-            compat._MEGATRON_FSDP_STREAM_LIFETIME_QUALNAME,
-            compat._MEGATRON_FSDP_STREAM_LIFETIME_FIRSTLINENO,
         ),
         (
             megatron_fsdp_module.MegatronFSDP.forward,
