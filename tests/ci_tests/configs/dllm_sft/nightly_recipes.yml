@@ -31,8 +31,5 @@ configs:
   # -- Nemotron-Labs-Diffusion: hybrid block-diffusion, `nemotron` sampler --
   - nemotron_labs_diffusion_sft.yaml   # nvidia/Nemotron-Labs-Diffusion-8B-Base (8B, seq 8192, tp2)
 
-  # diffusion_gemma_sft.yaml is intentionally excluded for now: the
-  # google/diffusiongemma-26B-A4B-it model requires a newer transformers (HF)
-  # version than the current CI image pins, so it won't load until the image is
-  # bumped. The launcher already train-only-handles it (+ GSM8K prep), so it can
-  # be re-added here once the transformers pin is updated.
+  # -- DiffusionGemma: block-diffusion, train-only --
+  - diffusion_gemma_sft.yaml   # google/diffusiongemma-26B-A4B-it (26B-A4B, seq 1024, ep8)
