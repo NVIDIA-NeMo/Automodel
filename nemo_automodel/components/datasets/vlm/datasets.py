@@ -427,6 +427,40 @@ def make_tulu3_magicoder_text_mix_dataset(
     return out
 
 
+def make_tulu3_dataset(
+    path_or_dataset: str = "allenai/tulu-3-sft-mixture",
+    split: str = "train",
+    **kwargs,
+):
+    """Load ``allenai/tulu-3-sft-mixture`` directly from the HF Hub as text-only conversations.
+
+    This avoids the meta-JSON + JSONL data-prep step required by
+    :func:`make_meta_dataset`: point the recipe's ``dataset._target_`` at this
+    function and the Tulu-3 split is pulled straight from the Hub. Each row's
+    ``messages`` field is converted with the same helper the meta-JSON path uses
+    (:func:`_convert_sharegpt_to_conversation`), so the resulting data composition is
+    **identical** to dumping the split to JSONL and loading it via
+    :func:`make_meta_dataset`: no turn cap, ``system`` turns dropped, every row kept
+    in the original split order. Conversations are text-only (no ``image`` entries),
+    so batches carry no ``pixel_values`` / vision tensors.
+
+    The returned dataset stays Arrow-backed (``map``) so the full ~939k-row split is
+    not copied into a Python list.
+
+    Args:
+        path_or_dataset: HF Hub id (or local path) of the Tulu-3 SFT mixture.
+        split: HF split expression (e.g. ``"train"`` or ``"train[:50000]"``).
+        **kwargs: Ignored. Accepted so recipe-level dataset keys (e.g. ``truncate``)
+            that are forwarded to the dataset target do not raise.
+
+    Returns:
+        datasets.Dataset: Rows with a single ``conversation`` column, each a list of
+        ``{"role": "user"|"assistant", "content": [{"type": "text", "text": ...}]}`` turns.
+    """
+    dataset = load_dataset(path_or_dataset, split=split)
+    return dataset.map(_convert_sharegpt_to_conversation, remove_columns=dataset.column_names)
+
+
 @dataclass
 class UnimmChatDatasetConfig:
     """Construction-time configuration for the UniMM-Chat dataset."""

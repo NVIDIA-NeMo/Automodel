@@ -33,7 +33,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 from torch.utils.data.sampler import Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -150,6 +150,29 @@ class PackingConfig:
     max_packs: int | None = None
     prepacked: bool = False
     """Whether the dataset already contains packed samples and must not be repacked."""
+    num_proc: int = 1
+    """Number of processes used to pre-tokenize an indexable dataset before packing."""
+
+    def _pretokenize(self, dataset: object) -> object:
+        """Materialize lazy tokenization in parallel when packing can consume the full dataset."""
+        can_pretokenize = (
+            self.num_proc > 1
+            and isinstance(dataset, Dataset)
+            and not isinstance(dataset, IterableDataset)
+            and self.max_packs is None
+        )
+        if can_pretokenize:
+            from nemo_automodel.components.datasets.llm.packed_sequence import tokenize_dataset_parallel
+
+            logger.info("Pre-tokenizing dataset with num_proc=%s before packing", self.num_proc)
+            return tokenize_dataset_parallel(dataset, num_proc=self.num_proc)
+        if self.num_proc > 1:
+            logger.info(
+                "num_proc=%s set but skipping parallel pre-tokenization: it requires an indexable "
+                "map-style dataset and an unset max_packs; falling back to serial packing.",
+                self.num_proc,
+            )
+        return dataset
 
     def build(
         self,
@@ -195,6 +218,7 @@ class ThdPackingConfig(PackingConfig):
         logger.info(f"THD-packing dataset with size: {self.packed_sequence_size}")
         if hasattr(dataset, "shuffle"):
             dataset = dataset.shuffle(seed)
+        dataset = self._pretokenize(dataset)
         dataset = pack_dataset(
             dataset,
             split=split,
@@ -231,6 +255,7 @@ class NeatPackingConfig(PackingConfig):
         logger.info(f"NEAT-packing dataset with size: {self.packed_sequence_size}")
         if hasattr(dataset, "shuffle"):
             dataset = dataset.shuffle(seed)
+        dataset = self._pretokenize(dataset)
         dataset = neat_pack_dataset(
             dataset,
             split=split,

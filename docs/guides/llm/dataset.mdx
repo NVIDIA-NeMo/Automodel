@@ -3,17 +3,17 @@ title: "Integrate Your Own Text Dataset"
 description: ""
 position: 2
 ---
-This guide shows you how to integrate your own dataset into NeMo Automodel for training. You'll learn about two main dataset types: **completion datasets** for language modeling (like [HellaSwag](https://huggingface.co/datasets/rowan/hellaswag)) and **instruction datasets** for question-answering tasks (like [SQuAD](https://huggingface.co/datasets/rajpurkar/squad)). We'll cover how to create custom datasets by implementing the required methods and preprocessing functions, and finally show you how to specify your own data logic using YAML configuration with file paths—allowing you to define custom dataset processing without modifying the main codebase.
+This guide shows you how to integrate your own dataset into NeMo AutoModel for training. You will learn about two main dataset types: **completion datasets** for language modeling (such as [HellaSwag](https://huggingface.co/datasets/rowan/hellaswag)) and **instruction datasets** for question-answering tasks (such as [SQuAD](https://huggingface.co/datasets/rajpurkar/squad)). This guide covers how to create custom datasets by implementing the required methods and preprocessing functions, and finally shows you how to specify your own data logic using YAML configuration with file paths, allowing you to define custom dataset processing without modifying the main codebase.
 
 ## Quick Start Summary
-| **Type**        |  **Use Case**    | **Example** | **Preprocessor**               | **Section**              |
-| --------------- | ------------------ | -------------- | --------------------------------- | --------------------------- |
-| ✍️ Completion   | Language modeling  | HellaSwag      | `SFTSingleTurnPreprocessor`       | [Jump](#completion-datasets)  |
-| 🗣️ Instruction  | Question answering | SQuAD          | `make_*` function                 | [Jump](#instruction-datasets) |
+| Type | Use Case | Example | Preprocessor | Section |
+| :--- | :--- | :--- | :--- | :--- |
+| Completion | Language Modeling | HellaSwag | `SFTSingleTurnPreprocessor` | [Jump](#completion-datasets) |
+| Instruction | Question Answering | SQuAD | `make_*` Function | [Jump](#instruction-datasets) |
 
 ## Types of Supported Datasets
 
-NeMo Automodel supports a variety of datasets, depending on the task.
+NeMo AutoModel supports a variety of datasets, depending on the task.
 ### Completion Datasets
 
 **Completion datasets** are single text sequences designed for language modeling where the model learns to predict the next token given a context. These datasets typically contain a context (prompt) and a target (completion) that the model should learn to generate.
@@ -24,7 +24,7 @@ The [HellaSwag](https://huggingface.co/datasets/rowan/hellaswag) dataset is a po
 
 **HellaSwag dataset structure:**
 - **Context (`ctx`)**: A situation or scenario description
-- **Endings**: Multiple possible completions (4 options)
+- **Endings**: Multiple possible completions (four options)
 - **Label**: Index of the correct ending
 
 **Example:**
@@ -39,19 +39,19 @@ Endings: [
 Label: 0  # First ending is correct
 ```
 
-#### Preprocessing with SFTSingleTurnPreprocessor
+#### Preprocess with SFTSingleTurnPreprocessor
 
-NeMo Automodel provides the `SFTSingleTurnPreprocessor` class to handle completion datasets. This processor:
+NeMo AutoModel provides the `SFTSingleTurnPreprocessor` class to handle completion datasets. This processor:
 
 1. **Extracts context and target** using `get_context()` and `get_target()`.
-2. **Tokenizes and cleans** context and target separately.
-3. **Concatenates** them into one sequence.
-4. **Creates loss mask**: `-100` for context, target IDs for target.
-5. **Pads** sequences to equal length.
+2. **Tokenizes and cleans** the context and target separately.
+3. **Concatenates** the context and target into one sequence.
+4. **Creates a loss mask** with `-100` for the context and target IDs for the target.
+5. **Pads** the sequences to an equal length.
 
 #### Create Your Own Completion Dataset
 
-To adapt your dataset into this format, define a class like this:
+To adapt your dataset into this format, define a class such as the following:
 
 ```python
 from datasets import load_dataset
@@ -119,11 +119,11 @@ def make_my_instruction_dataset(
     )
 ```
 
-## YAML-based Custom Dataset Configuration
+## YAML-Based Custom Dataset Configuration
 
-NeMo Automodel supports YAML-based dataset specification using the _target_ key. This lets you reference dataset-building classes or functions using either:
+NeMo AutoModel supports YAML-based dataset specification using the `_target_` key. This allows you to reference dataset-building classes or functions using either of the following methods:
 
-- 1. Python Dotted Path
+1. **Python Dotted Path**
 
 ```yaml
 dataset:
@@ -132,13 +132,13 @@ dataset:
   split: train
 ```
 
-- 2. File Path + Function Name
+2. **File Path and Function Name**
 
 ```
 <file-path>:<function-name>
 ```
 
-Where:
+where:
 - `<file-path>`: The absolute path to a Python file containing your dataset function
 - `<function-name>`: The name of the function to call from that file
 
@@ -147,23 +147,24 @@ dataset:
   _target_: /path/to/your/custom_dataset.py:build_my_dataset
   num_blocks: 111
 ```
-This will call `build_my_dataset()` from the specified file with the other keys (e.g., num_blocks) as arguments. This approach allows you to integrate custom datasets via config alone—no need to alter the codebase or package structure.
+This calls `build_my_dataset()` from the specified file with the other keys (such as `num_blocks`) as arguments. This approach allows you to integrate custom datasets using configuration alone, with no need to alter the codebase or package structure.
 
 ## Packed Sequence Support in NeMo AutoModel
-NeMo AutoModel supports **packed sequences**, a technique to optimize training with variable-length sequences (e.g., text) by minimizing padding.
+NeMo AutoModel supports **packed sequences**, which is a technique to optimize training with variable-length sequences (such as text) by minimizing padding.
 
-### What is a Packed Sequence?
-Instead of padding each sequence to a fixed length (wasting computation on `[PAD]` tokens), packed sequences:
+### What Is a Packed Sequence?
+Instead of padding each sequence to a fixed length, which wastes computation on `[PAD]` tokens, packed sequences perform the following actions:
 - Concatenate short sequences into a single continuous sequence.
-- Separate sequences with special tokens (e.g., `[EOS]`).
-- Track lengths via a "attention mask" to prevent cross-sequence information leakage.
+- Separate sequences with special tokens (such as `[EOS]`).
+- Track lengths using an "attention mask" to prevent cross-sequence information leakage.
 
 ### Benefits
-- Reduces redundant computation on padding tokens leading to faster training.
-- Enables larger effective batch sizes leading to better GPU utilization.
-- Especially useful for language modeling and text datasets.
+Packed sequences offer the following benefits:
+- They reduce redundant computation on padding tokens, which leads to faster training.
+- They enable larger effective batch sizes, which leads to better GPU utilization.
+- They are especially useful for language modeling and text datasets.
 
-### Enable Packed Sequences in NeMo Automodel
+### Enable Packed Sequences in NeMo AutoModel
 
 To enable packed sequences, add these keys to your recipe's YAML config:
 ```
@@ -171,17 +172,20 @@ packed_sequence:
    # Set packed_sequence_size > 0 to run with packed sequences
    packed_sequence_size: 1024
    packing_strategy: thd
+   # Optional: tokenize the dataset across this many processes before packing
+   num_proc: 8
 ```
 
-The `packed_sequence` block accepts these settings:
-- **packed_sequence_size**: Defines the total token length of each packed sequence, higher values require higher GPU memory usage.
+The `packed_sequence` block accepts the following settings:
+- **packed_sequence_size**: Defines the total token length of each packed sequence. Higher values require more GPU memory.
 - **packing_strategy**: Selects `thd` (the default sequence-length-aware format) or `neat`. With `thd`, AutoModel disables packing when the model does not support `seq_lens`.
 - **prepacked**: If `true`, treats the dataset as already packed and skips recipe-side packing.
-- **max_packs**: Optionally caps how many packed samples are created.
-- **drop_long_samples**: For `neat`, drops samples longer than `packed_sequence_size` when `true`; otherwise the packer raises an error.
+- **max_packs**: Optionally caps the number of packed samples created.
+- **drop_long_samples**: For `neat`, drops samples longer than `packed_sequence_size` when `true`. Otherwise, the packer raises an error.
+- **num_proc**: Specifies the number of worker processes used to tokenize the dataset before packing. Packing first runs one full pass over the dataset, which tokenizes every sample serially. Setting `num_proc > 1` front-loads that tokenization across processes, producing identical, order-preserving output. This defaults to `1` (serial). The speedup grows with the per-sample tokenization cost (such as long multi-turn chats and heavy chat templates) and available CPU cores. This runs independently on each data-parallel rank, so configure it so that `local_ranks * num_proc` does not oversubscribe the node's CPUs.
 
 ## Troubleshooting Tips
 
 - **Tokenization Mismatch?** Ensure your tokenizer aligns with the model's expected inputs.
-- **Dataset too large?** Use `limit_dataset_samples` in your YAML config to load a subset, useful for quick debugging.
+- **Dataset too large?** Use `limit_dataset_samples` in your YAML config to load a subset, which is useful for quick debugging.
 - **Loss not decreasing?** Verify that your loss mask correctly ignores prompt tokens.

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 from nemo_automodel.components.datasets.lazy_mapped_dataset import LazyMappedDataset
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
+    _resolve_chat_template,
     format_chat_template,
     format_prompt_completion,
 )
@@ -81,6 +82,7 @@ def make_squad_dataset(
     dataset_name="squad",
     padding=False,
     truncation=False,
+    chat_template: str | None = None,
 ):
     """
     Load and preprocess a SQuAD-style QA dataset for model fine-tuning.
@@ -107,6 +109,7 @@ def make_squad_dataset(
             (default "rajpurkar/squad").
         padding (Optional[str|bool]): Optional padding strategy.
         truncation (Optional[str|bool]): Optional truncation strategy.
+        chat_template: Optional Jinja template string or path overriding ``tokenizer.chat_template``.
 
     Returns:
         A Hugginggth Face Dataset where each example is a dict with keys:
@@ -124,6 +127,8 @@ def make_squad_dataset(
     dataset = load_dataset(dataset_name, split=split)
 
     # format the dataset
+    if chat_template is not None:
+        tokenizer.chat_template = _resolve_chat_template(chat_template)
     chat_template = getattr(tokenizer, "chat_template", None)
     eos_token_id = getattr(tokenizer, "eos_token_id", 0)
     # if pad_token_id is not set, use eos_token_id
