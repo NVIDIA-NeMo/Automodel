@@ -33,8 +33,9 @@ from nemo_automodel.components.distributed import cp_utils as _cu
 
 
 class _DummySubMesh:
-    def __init__(self, size: int):
+    def __init__(self, size: int, local_rank: int = 0):
         self._size = size
+        self._local_rank = local_rank
 
     def size(self) -> int:
         return self._size
@@ -42,13 +43,28 @@ class _DummySubMesh:
     def get_group(self):
         return None
 
+    def get_local_rank(self) -> int:
+        return self._local_rank
+
 
 class _DummyDeviceMesh(dict):
-    def __init__(self, cp_size: int, tp_size: int):
+    def __init__(self, cp_size: int, tp_size: int, cp_rank: int = 0):
         super().__init__()
-        self["cp"] = _DummySubMesh(cp_size)
+        self["cp"] = _DummySubMesh(cp_size, cp_rank)
         self["tp"] = _DummySubMesh(tp_size)
         self.mesh_dim_names = ["cp", "tp"]
+
+
+class _DummyHSDPDeviceMesh(_DummyDeviceMesh):
+    def __init__(self, root_rank: int, cp_rank: int):
+        super().__init__(cp_size=2, tp_size=1, cp_rank=cp_rank)
+        self["dp_replicate"] = _DummySubMesh(2)
+        self["dp_shard"] = _DummySubMesh(2)
+        self.mesh_dim_names = ["dp_replicate", "dp_shard", "cp", "tp"]
+        self._root_rank = root_rank
+
+    def get_local_rank(self) -> int:
+        return self._root_rank
 
 
 def test_xor_assertion_neither_present(monkeypatch):
@@ -96,6 +112,137 @@ def test_inputs_embeds_path_uses_embeds_as_primary_seq_tensor(monkeypatch):
     cp_buffers = captured["cp_buffers"]
     assert cp_buffers[0] is inputs_embeds, "primary cp buffer must be inputs_embeds"
     assert cp_buffers[1] is labels
+
+
+def test_inputs_embeds_with_grad_is_sharded_out_of_place(monkeypatch):
+    """Grad-bearing embeds must bypass context_parallel's in-place resize."""
+    captured = {}
+
+    def _fake_create_ctx(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
+    monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: "ctx")
+
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1, cp_rank=1)
+    full_sequence = torch.arange(8.0, requires_grad=True)
+    inputs_embeds = full_sequence.view(1, 8, 1)
+    batch = {
+        "inputs_embeds": inputs_embeds,
+        "labels": torch.arange(8).view(1, 8),
+    }
+
+    _cu.make_cp_batch_and_ctx(device_mesh, batch)
+
+    assert all(not buffer.requires_grad for buffer in captured["cp_buffers"])
+    assert torch.equal(batch["inputs_embeds"].flatten(), torch.tensor([2.0, 3.0, 4.0, 5.0]))
+
+    batch["inputs_embeds"].sum().backward()
+    assert torch.equal(full_sequence.grad, torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0]))
+
+
+@pytest.mark.parametrize(
+    ("root_rank", "cp_rank", "expected"),
+    [
+        (0, 0, [0.0, 1.0, 6.0, 7.0]),
+        (3, 1, [2.0, 3.0, 4.0, 5.0]),
+        (4, 0, [0.0, 1.0, 6.0, 7.0]),
+        (7, 1, [2.0, 3.0, 4.0, 5.0]),
+    ],
+)
+def test_inputs_embeds_grad_sharding_uses_cp_submesh_rank_under_hsdp(monkeypatch, root_rank, cp_rank, expected):
+    """HSDP root coordinates must not affect the rank used for CP sharding."""
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", lambda **kw: object())
+    monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: "ctx")
+
+    device_mesh = _DummyHSDPDeviceMesh(root_rank=root_rank, cp_rank=cp_rank)
+    full_sequence = torch.arange(8.0, requires_grad=True)
+    batch = {
+        "inputs_embeds": full_sequence.view(1, 8, 1),
+        "labels": torch.arange(8).view(1, 8),
+    }
+
+    _cu.make_cp_batch_and_ctx(device_mesh, batch)
+
+    assert batch["inputs_embeds"].flatten().tolist() == expected
+
+
+def test_inputs_embeds_with_grad_and_cp_padding_preserves_global_token_mean(monkeypatch):
+    """Uneven valid-token counts across padded CP shards must not bias gradients."""
+    # Stress the production padding branch with 200 appended rows. CP=128
+    # requires a multiple of 256 (2 * cp_size), so 56 valid rows become 256.
+    # This leaves 72 CP ranks with no valid labels at all.
+    cp_size = 128
+    sequence_length = 56
+    padded_sequence_length = 256
+    padding_length = padded_sequence_length - sequence_length
+    hidden_size = 3
+    initial_weight = torch.arange(sequence_length * hidden_size, dtype=torch.float64).view(sequence_length, hidden_size)
+    initial_weight = initial_weight / 13.0
+    input_ids = torch.arange(sequence_length).unsqueeze(0)
+    full_labels = torch.arange(sequence_length).unsqueeze(0)
+
+    local_losses = []
+    scaled_local_gradients = []
+    for cp_rank in range(cp_size):
+        captured = {}
+
+        def _fake_create_ctx(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+        monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
+        monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: "ctx")
+
+        embedding = torch.nn.Embedding(sequence_length, hidden_size, dtype=torch.float64)
+        with torch.no_grad():
+            embedding.weight.copy_(initial_weight)
+        batch = {
+            "inputs_embeds": embedding(input_ids),
+            "labels": full_labels.clone(),
+        }
+
+        _cu.make_cp_batch_and_ctx(_DummyDeviceMesh(cp_size=cp_size, tp_size=1, cp_rank=cp_rank), batch)
+
+        # The grad-bearing primary tensor is already sharded out of place. The
+        # ordinary labels remain in PyTorch's buffer list; independently apply
+        # the same head-tail indices that the real CP context uses.
+        padded_labels = captured["cp_buffers"][0]
+        assert padded_labels.shape == (1, padded_sequence_length)
+        assert torch.count_nonzero(padded_labels[:, sequence_length:] != -100) == 0
+        assert padded_labels[:, sequence_length:].numel() == padding_length
+
+        shard_indices = torch.tensor([cp_rank, 2 * cp_size - cp_rank - 1])
+        local_labels = padded_labels.index_select(1, shard_indices)
+
+        local_inputs = batch["inputs_embeds"]
+        assert local_inputs.shape == (1, 2, hidden_size)
+        local_inputs.retain_grad()
+        valid = local_labels != -100
+        per_token_loss = (local_inputs.sum(dim=-1) + 0.75).square()
+        local_loss = per_token_loss[valid].sum() / sequence_length
+        (local_loss * cp_size).backward()
+
+        assert torch.count_nonzero(local_inputs.grad[~valid]) == 0
+        local_losses.append(local_loss.detach())
+        scaled_local_gradients.append(embedding.weight.grad.detach().clone())
+
+    # FSDP averages gradients over DP*CP. The recipe multiplies each local
+    # backward loss by that same size, so averaging these scaled rank-local
+    # gradients must recover the full-sequence valid-token mean.
+    candidate_loss = torch.stack(local_losses).sum()
+    candidate_gradient = torch.stack(scaled_local_gradients).mean(dim=0)
+
+    reference_embedding = torch.nn.Embedding(sequence_length, hidden_size, dtype=torch.float64)
+    with torch.no_grad():
+        reference_embedding.weight.copy_(initial_weight)
+    reference_inputs = reference_embedding(input_ids)
+    reference_loss = (reference_inputs.sum(dim=-1) + 0.75).square().sum() / sequence_length
+    reference_loss.backward()
+
+    torch.testing.assert_close(candidate_loss, reference_loss)
+    torch.testing.assert_close(candidate_gradient, reference_embedding.weight.grad)
 
 
 def test_input_ids_path_unchanged(monkeypatch):
