@@ -1818,6 +1818,22 @@ def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
     return layer_groups
 
 
+def get_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
+    """Return transformer layers grouped by model role (e.g. ``language``, ``vision``).
+
+    Public accessor over the per-model layer-group mapping used for FSDP wrapping
+    and activation checkpointing, so other components (e.g. the MoE parallelizer)
+    can consume the grouping without importing private helpers.
+
+    Args:
+        model: Root model to extract grouped layers from.
+
+    Returns:
+        Mapping from group name to the list of transformer blocks in that group.
+    """
+    return _extract_model_layer_groups(model)
+
+
 def _extract_model_layers(model: nn.Module) -> List[nn.Module]:
     """
     Extract layers from different model architectures for parallelization.
