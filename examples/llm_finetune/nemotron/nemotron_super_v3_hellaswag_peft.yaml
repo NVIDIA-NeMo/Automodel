@@ -111,6 +111,7 @@ ci:
   vllm_deploy: true
   vllm_smoke_test: true
   vllm_deploy_gpus: 8  # the 120B BF16 model requires TP=8 for vLLM deployment
+  vllm_enable_expert_parallel: true  # shard MoE experts across the vLLM TP group
   recipe_owner: adil-a
   time: "00:25:00"
   checkpoint_robustness:
