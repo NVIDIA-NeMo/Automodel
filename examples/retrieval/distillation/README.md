@@ -3,7 +3,7 @@
 Run the baseline Stage-1 style recipe:
 
 ```bash
-automodel --nproc-per-node 8 examples/retrieval/distillation/ministral3_2b_distill.yaml
+automodel --nproc-per-node 8 examples/retrieval/distillation/nemotron3_embed_1b_distill.yaml  
 ```
 
 The recipe writes both:
