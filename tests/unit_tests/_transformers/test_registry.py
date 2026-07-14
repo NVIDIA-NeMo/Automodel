@@ -302,6 +302,42 @@ def test_custom_config_registrations_in_config_mapping():
     )
 
 
+def test_kimi_k2_config_loads_without_trust_remote_code(tmp_path):
+    """Kimi-K2 uses DeepseekV3Config and should not require remote config code."""
+    import json
+
+    from transformers import AutoConfig
+
+    import nemo_automodel._transformers.registry  # noqa: F401
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV3ForCausalLM"],
+                "auto_map": {
+                    "AutoConfig": "configuration_deepseek.DeepseekV3Config",
+                    "AutoModel": "modeling_deepseek.DeepseekV3Model",
+                    "AutoModelForCausalLM": "modeling_deepseek.DeepseekV3ForCausalLM",
+                },
+                "hidden_size": 64,
+                "model_type": "kimi_k2",
+                "num_attention_heads": 8,
+                "num_hidden_layers": 2,
+                "vocab_size": 256,
+            }
+        )
+    )
+
+    cfg = AutoConfig.from_pretrained(tmp_path, trust_remote_code=False)
+
+    from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+
+    assert type(cfg).__name__ == "KimiK2Config"
+    assert isinstance(cfg, DeepseekV3Config)
+    assert cfg.model_type == "kimi_k2"
+    assert cfg.architectures == ["DeepseekV3ForCausalLM"]
+
+
 def test_kimi_k25_arch_alias_in_model_arch_mapping():
     """KimiK25ForConditionalGeneration (checkpoint arch) must map to KimiK25VLForConditionalGeneration."""
     from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
