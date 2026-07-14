@@ -1492,8 +1492,12 @@ def neat_packed_vlm_collater(
     use_flash = attn_implementation == "flash_attention_2"
 
     # Determine pad target: fixed max_length or batch-dynamic
-    max_len = max_length if max_length is not None else max(
-        x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor) else len(x["input_ids"]) for x in batch
+    max_len = (
+        max_length
+        if max_length is not None
+        else max(
+            x["input_ids"].shape[-1] if isinstance(x["input_ids"], torch.Tensor) else len(x["input_ids"]) for x in batch
+        )
     )
 
     def _pad_1d(tensor, pad_value, target_len):
