@@ -374,6 +374,56 @@ def _cleanup_source_load_sync(cfg) -> None:
         pass
 
 
+def _hf_reload_sync_paths(cfg) -> tuple[Path, Path]:
+    """Return sync directory and done path for the rank-0-only HF reload."""
+    checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
+    sync_dir = checkpoint_dir.parent / f".hf_reload_{_source_load_run_id()}"
+    return sync_dir, sync_dir / "done"
+
+
+def _wait_for_hf_reload_rank0(done_path: Path) -> None:
+    """Wait without an active collective for rank 0 to finish the vanilla-HF reload."""
+    timeout_s = int(os.environ.get("HF_RELOAD_TIMEOUT_SECONDS", "1800"))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if done_path.exists():
+            return
+        time.sleep(5)
+    raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 vanilla-HF reload")
+
+
+def _prepare_hf_reload_sync(cfg) -> tuple[Path, Path] | None:
+    """Prepare ranks for a long rank-0-only HF reload without starting an NCCL wait."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return None
+
+    sync_dir, done_path = _hf_reload_sync_paths(cfg)
+    if _rank0():
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        done_path.unlink(missing_ok=True)
+    _barrier()  # ensure all ranks released recipe memory and rank 0 reset the marker
+    if not _rank0():
+        _wait_for_hf_reload_rank0(done_path)
+    return sync_dir, done_path
+
+
+def _finish_hf_reload_sync(sync_paths: tuple[Path, Path] | None) -> None:
+    """Release waiting ranks and synchronize after the rank-0-only HF reload."""
+    if sync_paths is None:
+        return
+
+    sync_dir, done_path = sync_paths
+    if _rank0():
+        done_path.write_text("ok\n")
+    _barrier()
+    if _rank0():
+        done_path.unlink(missing_ok=True)
+        try:
+            sync_dir.rmdir()
+        except OSError:
+            pass
+
+
 def _prepare_source_load_reference(
     cfg,
     input_ids: list[int],
@@ -967,7 +1017,7 @@ def test_checkpoint_robustness():
     # Phase 4: Load into vanilla HF (rank 0 only)
     _release_recipe_memory(restored_trainer)
     del restored_trainer
-    _barrier()  # ensure all ranks free memory before rank 0 loads HF model
+    hf_reload_sync_paths = _prepare_hf_reload_sync(cfg)
 
     if skip_hf_reload:
         if _rank0():
@@ -1096,7 +1146,7 @@ def test_checkpoint_robustness():
             f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
         )
 
-    _barrier()
+    _finish_hf_reload_sync(hf_reload_sync_paths)
 
     # Phase 5 (optional): Cross-TP — reload consolidated with a different TP size
     if cross_tp_size > 0 and not is_peft:
