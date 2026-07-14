@@ -5,7 +5,7 @@ position: 2
 ---
 ## Introduction
 
-Pretrained language models are general-purpose: they know a lot about language but nothing about your particular domain, terminology, or task. Fine-tuning bridges that gap — you fine-tune the model on your own examples so it produces answers that are accurate and relevant for your use case, without the cost of training a model from scratch. The result is a model optimized for your data that you can evaluate, publish, and deploy. This guide walks you through that process end-to-end with NeMo AutoModel — from installation through training, evaluation, and deployment — using [Meta LLaMA 3.2 1B](https://huggingface.co/meta-llama/Llama-3.2-1B) and the [SQuAD v1.1](https://huggingface.co/datasets/rajpurkar/squad) dataset as a running example.
+Pretrained language models are general-purpose: they know a lot about language but nothing about your particular domain, terminology, or task. Fine-tuning bridges that gap. You fine-tune the model on your own examples so it produces answers that are accurate and relevant for your use case, without the cost of training a model from scratch. The result is a model optimized for your data that you can evaluate, publish, and deploy. This guide walks you through that process end-to-end with NeMo AutoModel (from installation through training, evaluation, and deployment) using [Meta Llama 3.2 1B](https://huggingface.co/meta-llama/Llama-3.2-1B) and the [SQuAD v1.1](https://huggingface.co/datasets/rajpurkar/squad) dataset as a running example.
 
 NeMo AutoModel supports two fine-tuning modes:
 
@@ -48,7 +48,7 @@ docker run --gpus all -it --rm --shm-size=8g -v $(pwd)/checkpoints:/tmp/checkpoi
 ```
 
 <Info>
-Docker containers are ephemeral — files written inside the container are lost when it stops. The `-v` flag in the `docker run` command above bind-mounts a local `checkpoints/` directory into the container so that saved checkpoints persist across runs. For more details, see [Save Checkpoints When Using Docker](/development/checkpointing#save-checkpoints-when-using-docker).
+Docker containers are ephemeral, and files written inside the container are lost when it stops. The `-v` flag in the `docker run` command above bind-mounts a local `checkpoints/` directory into the container so that saved checkpoints persist across runs. For more details, see [Save Checkpoints When Using Docker](/development/checkpointing#save-checkpoints-when-using-docker).
 
 </Info>
 
@@ -56,7 +56,7 @@ For the full set of installation methods, see the [installation guide](/get-star
 
 ## Configure Your Training Recipe
 
-Training is configured through a [YAML](https://en.wikipedia.org/wiki/YAML) config file with three required sections — **model**, **dataset**, and **step_scheduler** — plus an optional **peft** section. The sections below walk through each one. For the complete copy-pastable file, see [Full Config YAML](#full-config-yaml).
+Training is configured through a [YAML](https://en.wikipedia.org/wiki/YAML) configuration file with three required sections (model, dataset, and step_scheduler) plus an optional **peft** section. The following sections explain each one. For the complete copy-pastable file, see [Full Config YAML](#full-config-yaml).
 
 Under the hood, both SFT and PEFT are executed by a **recipe**: a self-contained Python class that wires together model loading, dataset preparation, training, checkpointing, and logging. The fine-tuning recipe is [`TrainFinetuneRecipeForNextTokenPrediction`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py). The config file tells the recipe *what* to build; the recipe decides *how* to build it.
 
@@ -81,7 +81,7 @@ optimizer = Adam(lr=1.0e-5, weight_decay=0)
 The `_target_` value is a **dotted Python import path**: the same string you would use in an `import` statement. The framework resolves it at runtime by importing the module and looking up the attribute. This means you can point `_target_` at any class constructor or factory function, and the remaining keys become its arguments.
 
 <Tip>
-To discover which parameters a section accepts, look up the Python signature of its `_target_`. For instance, `torch.optim.Adam` accepts `lr`, `betas`, `eps`, and `weight_decay` — those are the keys you can set in the YAML.
+To discover which parameters a section accepts, look up the Python signature of its `_target_`. For example, `torch.optim.Adam` accepts `lr`, `betas`, `eps`, and `weight_decay`. These are the keys you can set in the YAML.
 
 </Tip>
 
@@ -118,12 +118,12 @@ cfg.model     cfg.optimizer cfg.dataset   cfg.loss_fn
 
 Each builder function calls **`.instantiate()`** on its config section. `.instantiate()` does two things:
 
-1. **Resolves `_target_`** — imports the Python path and obtains the callable (class or function).
-2. **Calls it** — passes every other key in the section as a keyword argument.
+1. **Resolves `_target_`**: Imports the Python path and obtains the callable (class or function).
+2. **Calls it**: Passes every other key in the section as a keyword argument.
 
 Nested `_target_` blocks (like `collate_fn` inside `dataloader`) are recursively instantiated the same way.
 
-**The `recipe` key.** Every config file includes a top-level `recipe` key that tells the CLI *which recipe class* to run. You can write it as a **short name** or as a **fully-qualified Python path** — both resolve to the same class:
+**The `recipe` key.** Every config file includes a top-level `recipe` key that tells the CLI *which recipe class* to run. You can write it as a **short name** or as a **fully-qualified Python path**, and both resolve to the same class:
 
 ```yaml
 # Short name (the CLI looks up the class automatically)
@@ -133,9 +133,9 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 recipe: nemo_automodel.recipes.llm.train_ft.TrainFinetuneRecipeForNextTokenPrediction
 ```
 
-The short name form is a convenience — the CLI scans all recipe modules under `nemo_automodel.recipes` and matches the bare class name. If you invoke the recipe script directly with `torchrun` instead of the `automodel` CLI, the `recipe` key is not required because the script itself *is* the recipe.
+The short name form is a convenience. The CLI scans all recipe modules under `nemo_automodel.recipes` and matches the bare class name. If you invoke the recipe script directly with `torchrun` instead of the `automodel` CLI, the `recipe` key is not required because the script itself *is* the recipe.
 
-**Not every section uses `_target_`.** Some sections like `step_scheduler`, `distributed`, and `checkpoint` are plain key-value groups consumed directly by the recipe — they control training schedule, parallelism strategy, and checkpoint behavior without instantiating a Python object.
+**Not every section uses `_target_`.** Some sections like `step_scheduler`, `distributed`, and `checkpoint` are plain key-value groups consumed directly by the recipe. They control training schedule, parallelism strategy, and checkpoint behavior without instantiating a Python object.
 </Accordion>
 
 ### Model
@@ -185,7 +185,7 @@ validation_dataset:
 | `_target_` | Points to [`make_squad_dataset`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/datasets/llm/squad.py) — a factory function that downloads the SQuAD dataset, tokenizes it, and returns a `torch.utils.data.Dataset`. To use a different dataset, change `_target_` to a different factory function (see [Integrate Your Own Text Dataset](/datasets/text-dataset)). |
 | `dataset_name`, `split` | Keyword arguments passed to `make_squad_dataset`. Each dataset factory defines its own parameters — check the function signature to see what's available. |
 
-This guide uses **SQuAD v1.1** as a running example. Swap the dataset by changing `_target_` and the dataset arguments — see [Integrate Your Own Text Dataset](/datasets/text-dataset) and [Dataset Overview: LLM, VLM, and Retrieval Datasets](/datasets/overview).
+This guide uses **SQuAD v1.1** as a running example. Swap the dataset by changing `_target_` and the dataset arguments. See [Integrate Your Own Text Dataset](/datasets/text-dataset) and [Dataset Overview: LLM, VLM, and Retrieval Datasets](/datasets/overview).
 
 <Accordion title="About SQuAD v1.1">
 The Stanford Question Answering Dataset (SQuAD) is a reading comprehension dataset where each example consists of a Wikipedia passage, a question, and an answer span. SQuAD v1.1 guarantees all questions are answerable from the context, making it suitable for straightforward fine-tuning.
@@ -200,7 +200,7 @@ Example:
 ```
 </Accordion>
 
-### PEFT (Optional)
+### Optional PEFT
 
 ```yaml
 peft:
@@ -217,13 +217,13 @@ peft:
 | `dim` | The low-rank dimension *r* — controls adapter capacity. Larger values learn more but use more memory. |
 | `alpha` | Scaling factor applied to the adapter output (`alpha / dim`). Higher values give adapters more influence during training. |
 
-Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run SFT instead — see [Switch Between SFT and PEFT](#switch-between-sft-and-peft).
+Including a `peft:` section enables LoRA fine-tuning. Remove it entirely to run SFT instead. See [Switch Between SFT and PEFT](#switch-between-sft-and-peft).
 
-#### QLoRA (Quantized Low-Rank Adaptation)
+#### QLoRA for Quantized Low-Rank Adaptation
 
 If GPU memory is a constraint, [QLoRA](https://arxiv.org/abs/2305.14314) combines LoRA with 4-bit NormalFloat (NF4) quantization to reduce memory usage by up to 75% compared to full-parameter SFT in 16-bit precision, while maintaining comparable quality to standard LoRA.
 
-To enable QLoRA, add a `quantization:` section alongside the `peft:` section in your config. Note two differences from the standard PEFT config above: `target_modules` uses the broader `"*_proj"` pattern to apply LoRA to all projection layers (wider coverage compensates for precision loss from 4-bit weights), and `dim` is increased from 8 to 16 for additional adapter capacity.
+To enable QLoRA, add a `quantization:` section alongside the `peft:` section in your configuration. Note two differences from the standard PEFT configuration previously described. `target_modules` uses the broader `"*_proj"` pattern to apply LoRA to all projection layers (wider coverage compensates for precision loss from 4-bit weights), and `dim` is increased from 8 to 16 for additional adapter capacity.
 
 ```yaml
 model:
@@ -250,15 +250,16 @@ quantization:
 
 ```yaml
 step_scheduler:
-  num_epochs: 1     # Will train over the dataset once.
+  num_epochs: 1     # Will train over the dataset for one epoch.
 ```
 
-Unlike the sections above, `step_scheduler` has **no `_target_`** — it is not instantiated into a Python object. Instead, the recipe reads its keys directly to control the training loop (how many epochs to run, when to checkpoint, when to validate). This is typical of sections that configure *behavior* rather than *components*.
+Unlike the sections above, `step_scheduler` has **no `_target_`**. It is not instantiated into a Python object. Instead, the recipe reads its keys directly to control the training loop (how many epochs to run, when to checkpoint, and when to validate). This is typical of sections that configure *behavior* rather than *components*.
 
-All other settings (distributed strategy, optimizer, checkpointing, logging) use sensible defaults. See the [Full Configuration Reference](#full-configuration-reference) to customize them.
+All other settings (distributed strategy, optimizer, checkpointing, and logging) use sensible defaults. See the [Full Configuration Reference](#full-configuration-reference) to customize them.
 
 <Note>
 Most example recipes use bf16 training by default for memory and throughput. If you are running long fine-tuning, especially full-parameter SFT, and need higher-precision optimizer state, configure it explicitly instead of assuming it from the mixed-precision compute policy. See the [mixed-precision training guide](/development/mixed-precision-training) for the recommended TE and torch AdamW patterns.
+
 </Note>
 
 ### Full Config YAML
@@ -300,11 +301,11 @@ You can run the recipe using the AutoModel CLI or directly with `torchrun` (adva
 automodel --nproc-per-node=8 finetune_config.yaml
 ```
 
-The `--nproc-per-node=8` flag specifies the number of GPUs per node. Adjust as needed (for a single GPU, omit the `--nproc-per-node` option).
+The `--nproc-per-node=8` flag specifies the number of GPUs per node. Adjust as needed. For a single GPU, omit the `--nproc-per-node` option.
 
 ### Invoke the Recipe Script Directly (Advanced)
 
-Alternatively, you can invoke the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html), as shown below.
+Alternatively, you can invoke the recipe [script](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py) directly using [torchrun](https://docs.pytorch.org/docs/stable/elastic/run.html) as shown below.
 
 ``` bash
 torchrun --nproc-per-node=8 nemo_automodel/recipes/llm/train_ft.py -c finetune_config.yaml
@@ -328,11 +329,11 @@ Saving checkpoint to checkpoints/epoch_0_step_20
 INFO:root:[val] step 20 | epoch 0 | loss 0.2469
 ```
 
-Each log line reports the current loss, gradient norm, peak GPU memory, and tokens per second (TPS). Small fluctuations between steps (e.g., 0.2057 to 0.2557 above) are normal — look at the overall downward trend rather than individual values.
+Each log line reports the current loss, gradient norm, peak GPU memory, and tokens per second (TPS). Small fluctuations between steps (for example, 0.2057 to 0.2557) are normal. Look at the overall downward trend rather than individual values.
 
 ### Checkpoint Contents
 
-Checkpoints are saved as Hugging Face-compatible safetensors. By default, SFT writes sharded model weights plus a generated `model/consolidate.sh` helper; run the helper after training to create `model/consolidated/` for Transformers, vLLM, lm-eval-harness, and other Hugging Face ecosystem tools. You can also set `save_consolidated: final` to export consolidated HF weights only for the final checkpoint. Use `save_consolidated: every` (or legacy `true`) only when you intentionally want inline HF export at every checkpoint save. **PEFT checkpoints** contain only the adapter weights (~MBs instead of GBs) and are saved directly under `model/`. They do not use `model/consolidate.sh` — at inference time you must load the original base model and apply the adapter on top. This distinction affects every downstream step (inference, publishing, deployment).
+Checkpoints are saved as Hugging Face-compatible safetensors. By default, SFT writes sharded model weights plus a generated `model/consolidate.sh` helper. Run the helper after training to create `model/consolidated/` for Transformers, vLLM, lm-eval-harness, and other Hugging Face ecosystem tools. You can also set `save_consolidated: final` to export consolidated HF weights only for the final checkpoint. Use `save_consolidated: every` (or legacy `true`) only when you intentionally want inline HF export at every checkpoint save. **PEFT checkpoints** contain only the adapter weights (megabytes instead of gigabytes) and are saved directly under `model/`. They do not use `model/consolidate.sh`. At inference time you must load the original base model and apply the adapter on top. This distinction affects every downstream step (inference, publishing, and deployment).
 
 <Accordion title="Checkpoint Directory Structure">
 **SFT checkpoint:**
@@ -446,7 +447,7 @@ print(tokenizer.decode(output[0], skip_special_tokens=True))
 
 ## Evaluate the Fine-Tuned Model
 
-### During Training: Validation Loss
+### Validation Loss During Training
 
 The recipe automatically computes validation loss at the interval set by `val_every_steps`. Look for `[val]` lines in the training log:
 
@@ -454,11 +455,11 @@ The recipe automatically computes validation loss at the interval set by `val_ev
 INFO:root:[val] step 20 | epoch 0 | loss 0.2469
 ```
 
-A decreasing validation loss across checkpoints indicates the model is learning. If validation loss plateaus or increases while training loss continues to drop, the model may be overfitting — consider stopping earlier or reducing the learning rate.
+A decreasing validation loss across checkpoints indicates the model is learning. If validation loss plateaus or increases while training loss continues to drop, the model might be overfitting, so consider stopping earlier or reducing the learning rate.
 
-### After Training: lm-eval-harness
+### Post-Training Evaluation Using lm-eval-harness
 
-For task-specific benchmarks (e.g., MMLU, GSM8K, HellaSwag accuracy), use [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness) with the fine-tuned checkpoint. For SFT runs with `save_consolidated: false`, run `bash checkpoints/epoch_0_step_20/model/consolidate.sh` before pointing evaluation at `model/consolidated/`:
+For task-specific benchmarks (such as MMLU, GSM8K, and HellaSwag accuracy), use [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness) with the fine-tuned checkpoint. For SFT runs with `save_consolidated: false`, run `bash checkpoints/epoch_0_step_20/model/consolidate.sh` before pointing evaluation at `model/consolidated/`:
 
 ```bash
 pip install lm-eval
@@ -551,7 +552,7 @@ model = PeftModel.from_pretrained(model, "your-username/llama3.2_1b-lora-squad")
 [vLLM](https://github.com/vllm-project/vllm) is an efficient inference engine for production deployment of LLMs.
 
 <Note>
-Make sure vLLM is installed (`pip install vllm`, or use an environment that includes it).
+Ensure vLLM is installed (`pip install vllm`, or use an environment that includes it).
 
 </Note>
 
@@ -573,10 +574,11 @@ print(f"Generated text: {outputs[0].outputs[0].text}")
 
 ### PEFT Adapter with vLLM
 
-PEFT adapter serving uses the `vLLMHFExporter` class, which is provided by the `nemo` package — a separate dependency from `nemo-automodel`.
+PEFT adapter serving uses the `vLLMHFExporter` class, which is provided by the `nemo` package (a separate dependency from `nemo-automodel`).
 
 <Info>
 Install both packages before proceeding:
+
 ```bash
 pip install nemo vllm
 ```
@@ -629,8 +631,8 @@ All other config sections remain the same for both modes.
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 # Training Schedule
-# Controls epoch count, batch sizes, and how often to checkpoint / validate.
-# No _target_ — these are plain values read directly by the recipe.
+# Controls epoch count, batch sizes, and how often to checkpoint and validate.
+# No _target_ (these are plain values read directly by the recipe).
 step_scheduler:
   grad_acc_steps: 4       # number of micro-batches accumulated before each optimizer
                           # step. Effective batch = grad_acc_steps × batch_size.
@@ -640,7 +642,7 @@ step_scheduler:
 
 # Process Group
 # Initializes the PyTorch distributed process group.
-# No _target_ — consumed directly by the recipe.
+# No _target_ (consumed directly by the recipe).
 # You normally would not need to tune this.
 dist_env:
   backend: nccl           # communication backend: "nccl" (GPU, recommended) or "gloo" (CPU)
@@ -649,7 +651,7 @@ dist_env:
 
 # Distributed Strategy
 # Determines how model weights, data, and compute are split across GPUs.
-# No _target_ — consumed directly by the recipe.
+# No _target_ (consumed directly by the recipe).
 # See "Distributed Training: TP, PP, CP, and EP" in Advanced Topics for details.
 distributed:
   strategy: fsdp2         # parallelism strategy: "fsdp2" (recommended), "megatron_fsdp",
@@ -661,7 +663,7 @@ distributed:
                           # Set to 2, 4, or 8 if the model doesn't fit on one GPU.
                           # Should divide evenly into the number of attention heads.
   cp_size: 1              # context-parallel size: splits the input sequence across GPUs.
-                          # Increase for very long contexts (e.g. 32k+ tokens).
+                          # Increase for very long contexts (e.g., 32k+ tokens).
   sequence_parallel: false # when true, extends TP to also shard activations along
                           # the sequence dimension for additional memory savings
 
@@ -676,8 +678,8 @@ rng:
 
 # Model
 # _target_ → NeMoAutoModelForCausalLM.from_pretrained: downloads (or loads from
-# cache) a pretrained HuggingFace model and wraps it with NeMo distributed-training
-# support. Any from_pretrained kwarg is accepted (cache_dir, torch_dtype, etc.).
+# cache) a pretrained Hugging Face model and wraps it with NeMo distributed-training
+# support. Any from_pretrained kwarg is accepted (such as cache_dir and torch_dtype).
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
@@ -698,7 +700,7 @@ peft:
                            # (requires the triton package)
 
 # Checkpointing
-# No _target_ — plain key-value group consumed by the recipe.
+# No _target_ (plain key-value group consumed by the recipe).
 checkpoint:
   enabled: true            # set to false to skip saving checkpoints entirely
   checkpoint_dir: checkpoints/  # output directory. Docker users: bind-mount this path
@@ -761,8 +763,8 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 # Optimizer
-# _target_ → torch.optim.Adam: any torch.optim class can be used here (e.g.
-# AdamW, SGD). All remaining keys become kwargs to the constructor.
+# _target_ → torch.optim.Adam: any torch.optim class can be used here (such as
+# AdamW and SGD). All remaining keys become kwargs to the constructor.
 optimizer:
   _target_: torch.optim.Adam
   lr: 1.0e-5               # learning rate — the most important hyperparameter to tune
@@ -815,17 +817,17 @@ optimizer:
 
 Each parameter joins the group of the **first** override whose `pattern` matches its name; parameters matching no pattern keep the base learning rate. A pattern that matches nothing is skipped with a warning. This works for the standard `torch.optim` optimizers; Dion-family optimizers do their own parameter grouping and ignore `param_group_overrides`.
 
-## Distributed Training: TP, PP, CP, and EP
+## Distributed Training with TP, PP, CP, and EP
 
 The `distributed:` section controls how the model and data are split across GPUs. NeMo AutoModel supports four parallelism dimensions, each of which slices the workload differently:
 
 | Dimension | Key | What it shards | When to use |
 |-----------|-----|---------------|-------------|
-| **Data Parallel (DP)** | `dp_size` | Replicates the model on each group of GPUs; each replica trains on a different data batch. | Default. Scales batch size linearly with GPU count. |
-| **Tensor Parallel (TP)** | `tp_size` | Splits individual weight matrices (attention, MLP) across GPUs within a node. | Model is too large to fit on a single GPU, or you want to reduce per-GPU memory at the cost of extra communication. |
-| **Pipeline Parallel (PP)** | `pp_size` | Assigns different *layers* (stages) to different GPUs and pipelines micro-batches through them. | Very deep models that don't fit even with TP, or multi-node training where TP's all-reduce is too expensive across nodes. |
-| **Context Parallel (CP)** | `cp_size` | Splits the input *sequence* across GPUs so each GPU processes a portion of the context. | Very long sequences that exceed single-GPU memory. |
-| **Expert Parallel (EP)** | `ep_size` | Distributes MoE experts across GPUs so each GPU holds a subset of experts. | Mixture-of-Experts models only. |
+| **Data Parallelism (DP)** | `dp_size` | Replicates the model on each group of GPUs; each replica trains on a different data batch. | Default. Scales batch size linearly with GPU count. |
+| **Tensor Parallelism (TP)** | `tp_size` | Splits individual weight matrices (attention, MLP) across GPUs within a node. | Model is too large to fit on a single GPU, or you want to reduce per-GPU memory at the cost of extra communication. |
+| **Pipeline Parallelism (PP)** | `pp_size` | Assigns different *layers* (stages) to different GPUs and pipelines micro-batches through them. | Very deep models that do not fit even with TP, or multi-node training where TP's all-reduce is too expensive across nodes. |
+| **Context Parallelism (CP)** | `cp_size` | Splits the input *sequence* across GPUs so each GPU processes a portion of the context. | Very long sequences that exceed single-GPU memory. |
+| **Expert Parallelism (EP)** | `ep_size` | Distributes MoE experts across GPUs so each GPU holds a subset of experts. | Mixture-of-Experts models only. |
 
 These dimensions compose with each other. The relationship between them and total GPU count is:
 
@@ -839,9 +841,9 @@ When `dp_size` is set to `null` (the default), it is inferred automatically:
 dp_size = world_size ÷ (tp_size × cp_size × pp_size)
 ```
 
-EP does not appear in this formula — experts are distributed across the DP×CP rank groups, with the constraint that `(dp_size × cp_size)` must be divisible by `ep_size`.
+EP does not appear in this formula. Experts are distributed across the DP×CP rank groups, with the constraint that `(dp_size × cp_size)` must be divisible by `ep_size`.
 
-#### Data Parallel (default)
+#### Data Parallelism as the Default
 
 Data parallelism is the default. With `strategy: fsdp2`, FSDP2 shards both model parameters and optimizer states across the DP group, so memory usage shrinks as you add GPUs:
 
@@ -855,7 +857,7 @@ distributed:
 
 #### Tensor Parallelism
 
-TP splits weight matrices across GPUs within a single node. Set `tp_size` to the number of GPUs you want to shard over (typically 2, 4, or 8 — should divide evenly into the number of attention heads):
+TP splits weight matrices across GPUs within a single node. Set `tp_size` to the number of GPUs you want to shard over (typically 2, 4, or 8, and should divide evenly into the number of attention heads):
 
 ```yaml
 distributed:
@@ -901,7 +903,7 @@ PP requires the model to define a `_pp_plan` that tells the framework how to spl
 
 #### Context Parallelism
 
-CP splits the sequence across GPUs — useful for very long contexts that exceed single-GPU memory. Set `cp_size` to the desired split factor:
+CP splits the sequence across GPUs, which is useful for very long contexts that exceed single-GPU memory. Set `cp_size` to the target split factor:
 
 ```yaml
 distributed:
@@ -912,11 +914,11 @@ distributed:
 ```
 
 <Info>
-When `cp_size > 1`, fused RoPE is automatically disabled. Some models also require the Transformer Engine (TE) attention backend for CP with packed sequences — the framework will raise an error with instructions if this applies.
+When `cp_size > 1`, fused RoPE is automatically disabled. Some models also require the Transformer Engine (TE) attention backend for CP with packed sequences. The framework will raise an error with instructions if this applies.
 
 </Info>
 
-#### Expert Parallelism (MoE models)
+#### Expert Parallelism for MoE Models
 
 EP distributes MoE experts across GPUs. Set `ep_size` to the number of GPUs that share the full set of experts:
 
@@ -930,7 +932,7 @@ distributed:
   activation_checkpointing: true
 ```
 
-EP only applies to Mixture-of-Experts models (e.g. Qwen3-MoE, Mixtral, DeepSeek-V3). For dense models, leave `ep_size` at `1` or omit it.
+EP only applies to Mixture-of-Experts models (such as Qwen3-MoE, Mixtral, and DeepSeek-V3). For dense models, leave `ep_size` at `1` or omit it.
 
 #### Combine Multiple Dimensions
 
@@ -950,13 +952,13 @@ distributed:
 When choosing a combination, keep these rules in mind:
 
 - **`world_size` must divide evenly** into `pp_size × tp_size × cp_size` (the remainder becomes `dp_size`).
-- **`(dp_size × cp_size) % ep_size == 0`** — EP shares the DP×CP groups.
-- **TP within a node, PP across nodes** is the typical layout — TP requires fast NVLink bandwidth, while PP tolerates higher latency.
-- **Start simple.** Use DP-only first. Add TP if the model doesn't fit on one GPU. Add PP for very large models. Add CP for long sequences. Add EP only for MoE architectures.
+- **`(dp_size × cp_size) % ep_size == 0`**, where EP shares the DP×CP groups.
+- **TP within a node, PP across nodes** is the typical layout. TP requires fast NVLink bandwidth, whereas PP tolerates higher latency.
+- **Start simple.** Use DP-only first. Add TP if the model does not fit on one GPU. Add PP for very large models. Add CP for long sequences. Add EP only for MoE architectures.
 
 ## Next Steps
 
-- [Integrate Your Own Text Dataset](/datasets/text-dataset) — swap the SQuAD example for your own data.
-- [Recipes and End-to-End Examples](/recipes-e2e-examples/overview) — browse the full set of recipes available in NeMo AutoModel. See also the [`examples/llm_finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune) directory for ready-to-run configs.
-- [Dataset Overview: LLM, VLM, and Retrieval Datasets](/datasets/overview) — see all supported dataset types across LLM, VLM, and retrieval tasks.
-- [Knowledge Distillation](/recipes-e2e-examples/knowledge-distillation) — distill a fine-tuned model into a smaller one.
+- [Integrate Your Own Text Dataset](/datasets/text-dataset) to swap the SQuAD example for your own data.
+- [Recipes and End-to-End Examples](/recipes-e2e-examples/overview) to browse the full set of recipes available in NeMo AutoModel. See also the [`examples/llm_finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune) directory for ready-to-run configurations.
+- [Dataset Overview: LLM, VLM, and Retrieval Datasets](/datasets/overview) to see all supported dataset types across LLM, VLM, and retrieval tasks.
+- [Knowledge Distillation](/recipes-e2e-examples/knowledge-distillation) to distill a fine-tuned model into a smaller one.
