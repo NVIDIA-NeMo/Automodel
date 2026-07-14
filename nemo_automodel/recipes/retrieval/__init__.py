@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .mine_hard_negatives import MineHardNegativesRecipe
 from .distill_bi_encoder import EmbeddingDistillRecipe
+from .mine_hard_negatives import MineHardNegativesRecipe
 from .train_bi_encoder import TrainBiEncoderRecipe
 from .train_cross_encoder import TrainCrossEncoderRecipe
 

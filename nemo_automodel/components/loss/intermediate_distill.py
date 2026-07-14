@@ -102,7 +102,9 @@ def _lookup_layer(hidden_states: HiddenStatesLike, idx: int, side: str) -> torch
     try:
         return hidden_states[idx]
     except (IndexError, KeyError):
-        available = sorted(hidden_states.keys()) if isinstance(hidden_states, Mapping) else list(range(len(hidden_states)))
+        available = (
+            sorted(hidden_states.keys()) if isinstance(hidden_states, Mapping) else list(range(len(hidden_states)))
+        )
         raise IndexError(
             f"intermediate_loss_function: {side} layer index {idx} not available (have layers {available})"
         ) from None
@@ -121,7 +123,11 @@ def intermediate_loss_function(
 ) -> torch.Tensor:
     """Per-token feature distillation between matched student/teacher layers."""
     if len(layer_pairs) == 0:
-        ref_iter = iter(student_hidden_states.values()) if isinstance(student_hidden_states, Mapping) else iter(student_hidden_states)
+        ref_iter = (
+            iter(student_hidden_states.values())
+            if isinstance(student_hidden_states, Mapping)
+            else iter(student_hidden_states)
+        )
         try:
             ref = next(ref_iter)
         except StopIteration:
@@ -162,9 +168,7 @@ def intermediate_loss_function(
         return stacked.mean()
     if reduction == "sum":
         return stacked.sum()
-    raise ValueError(
-        f"intermediate_loss_function: unknown reduction {reduction!r}; expected 'mean' or 'sum'."
-    )
+    raise ValueError(f"intermediate_loss_function: unknown reduction {reduction!r}; expected 'mean' or 'sum'.")
 
 
 def intermediate_loss_pair(

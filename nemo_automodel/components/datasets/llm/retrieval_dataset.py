@@ -16,10 +16,10 @@ import json
 import logging
 import os
 import random
-from pathlib import Path
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
 
 from datasets import Dataset, concatenate_datasets, load_dataset
@@ -632,9 +632,9 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
             cur_pos_neg_doc += [negatives[n_id] for n_id in cur_neg_ids]
 
         cur_pos_neg_doc_batch.append(cur_pos_neg_doc)
-        cur_pos_neg_doc_id_batch.append([
-            d["id"] if isinstance(d, dict) and "id" in d else str(d) for d in cur_pos_neg_doc
-        ])
+        cur_pos_neg_doc_id_batch.append(
+            [d["id"] if isinstance(d, dict) and "id" in d else str(d) for d in cur_pos_neg_doc]
+        )
 
     # Extract text and images from corpus
     cur_pos_neg_text_batch = []

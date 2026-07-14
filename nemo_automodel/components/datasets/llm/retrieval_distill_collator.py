@@ -57,14 +57,10 @@ class CachedTeacherEmbeddings:
         self._docs = np.load(docs_path, mmap_mode="r")
         if self._queries.shape != (self.num_queries, self.dim):
             raise RuntimeError(
-                f"queries.npy shape {self._queries.shape} does not match "
-                f"index ({self.num_queries}, {self.dim})"
+                f"queries.npy shape {self._queries.shape} does not match index ({self.num_queries}, {self.dim})"
             )
         if self._docs.shape != (self.num_docs, self.dim):
-            raise RuntimeError(
-                f"docs.npy shape {self._docs.shape} does not match "
-                f"index ({self.num_docs}, {self.dim})"
-            )
+            raise RuntimeError(f"docs.npy shape {self._docs.shape} does not match index ({self.num_docs}, {self.dim})")
 
     def lookup_queries(self, texts: list[str]) -> np.ndarray:
         rows = np.empty(len(texts), dtype=np.int64)
@@ -74,8 +70,7 @@ class CachedTeacherEmbeddings:
                 rows[i] = self.query_hashes[h]
             except KeyError as e:
                 raise KeyError(
-                    f"Query text not found in teacher cache {self.cache_dir} "
-                    f"(hash={h[:12]}). Text: {text[:80]!r}..."
+                    f"Query text not found in teacher cache {self.cache_dir} (hash={h[:12]}). Text: {text[:80]!r}..."
                 ) from e
         return self._queries[rows]
 
@@ -87,8 +82,7 @@ class CachedTeacherEmbeddings:
                 rows[i] = self.doc_hashes[h]
             except KeyError as e:
                 raise KeyError(
-                    f"Document text not found in teacher cache {self.cache_dir} "
-                    f"(hash={h[:12]}). Text: {text[:80]!r}..."
+                    f"Document text not found in teacher cache {self.cache_dir} (hash={h[:12]}). Text: {text[:80]!r}..."
                 ) from e
         return self._docs[rows]
 
@@ -217,9 +211,7 @@ class BiEncoderDistillCollator:
         raw_pos_docs = [docs[0] for docs in doc_lists]
 
         neg_lists_raw = [docs[1:] for docs in doc_lists]
-        neg_lists = [
-            [self._apply_passage_prefix(n, pi) for n in negs] for negs, pi in zip(neg_lists_raw, passage_inst)
-        ]
+        neg_lists = [[self._apply_passage_prefix(n, pi) for n in negs] for negs, pi in zip(neg_lists_raw, passage_inst)]
 
         q_enc = self.tokenizer(
             query_texts,

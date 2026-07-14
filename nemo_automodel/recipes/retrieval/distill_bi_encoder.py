@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import time
 from contextlib import nullcontext
@@ -268,9 +267,7 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
 
         self.layer_pairs = [tuple(int(x) for x in pair) for pair in self.cfg.get("layer_pairs", [])]
         if self.loss_weights["intermediate"] > 0 and not self.layer_pairs:
-            raise ValueError(
-                "intermediate_loss_weight > 0 requires non-empty layer_pairs in config"
-            )
+            raise ValueError("intermediate_loss_weight > 0 requires non-empty layer_pairs in config")
         if self.use_cached_teacher and self.loss_weights["intermediate"] > 0:
             raise ValueError(
                 "intermediate_loss_weight > 0 is not supported with cached teacher embeddings; "
@@ -440,9 +437,13 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
                         t_n_pool = t_n_pool.view(bsz, num_neg, t_n_pool.shape[-1])
 
             zero = s_q_proj.new_zeros(())
-            l_distill = self.distill_loss(s_q_proj, t_q_pool, s_d_proj, t_d_pool) if self.loss_weights["distill"] > 0 else zero
+            l_distill = (
+                self.distill_loss(s_q_proj, t_q_pool, s_d_proj, t_d_pool) if self.loss_weights["distill"] > 0 else zero
+            )
             l_mse = self.mse_loss(s_q_proj, t_q_pool, s_d_proj, t_d_pool) if self.loss_weights["mse"] > 0 else zero
-            l_score = self.score_loss(s_q_pool, t_q_pool, s_d_pool, t_d_pool) if self.loss_weights["score"] > 0 else zero
+            l_score = (
+                self.score_loss(s_q_pool, t_q_pool, s_d_pool, t_d_pool) if self.loss_weights["score"] > 0 else zero
+            )
 
             if self.loss_weights["intermediate"] > 0:
                 l_inter = self.intermediate_loss(

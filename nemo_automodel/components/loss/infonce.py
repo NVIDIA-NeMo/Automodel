@@ -201,9 +201,7 @@ def infonce_distill_loss(
         return _one_direction(s_q, s_d, s_n, t_q, t_d, t_n)
     if direction == "d2q":
         return _one_direction(s_d, s_q, None, t_d, t_q, None)
-    return 0.5 * (
-        _one_direction(s_q, s_d, s_n, t_q, t_d, t_n) + _one_direction(s_d, s_q, None, t_d, t_q, None)
-    )
+    return 0.5 * (_one_direction(s_q, s_d, s_n, t_q, t_d, t_n) + _one_direction(s_d, s_q, None, t_d, t_q, None))
 
 
 class InfoNCELoss(nn.Module):
