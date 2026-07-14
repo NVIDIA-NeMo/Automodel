@@ -347,6 +347,10 @@ def instantiate_infrastructure(
         parallelize_fn = partial(
             parallelize_model,
             activation_checkpointing=activation_checkpointing,
+            # The AC scope lives on the strategy config (normalized in its
+            # __post_init__); thread it through so expert-parallel configs keep
+            # scope parity with the generic FSDP2/DDP path.
+            activation_checkpointing_scope=getattr(distributed_config, "activation_checkpointing_scope", "all"),
             **moe_kwargs,
         )
     elif autopipeline is not None and model_wrapper is not None:

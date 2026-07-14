@@ -66,8 +66,9 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_meta_dataset
-  path_or_dataset: logs/gemma4_tulu3_seqpack_cp/data/tulu3_train_meta.json
+  # Pull Tulu-3 straight from the HF Hub (no meta-JSON / JSONL data-prep step).
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_dataset
+  path_or_dataset: allenai/tulu-3-sft-mixture
   split: train
   truncate: false
 
@@ -100,9 +101,7 @@ freeze_config:
 
 wandb:
   enable: false
-  project: huiyingl_workspace
-  entity: Nemo-automodel
-  name: gemma4_31b_tulu3_text_cp8_16k
-  group: gemma4_31b_tulu3_text_cp8_16k
-  tags: [gemma4-31b, tulu3, text-only, dense, cp8, 16k, single-node]
-  dir: logs/gemma4_31b_tulu3_text_cp8_16k/wandb
+  project: <your_wandb_project>
+  entity: <your_wandb_entity>
+  name: <your_wandb_name>
+  dir: <your_wandb_save_dir>

@@ -382,6 +382,17 @@ def _distributed_section_dict(cfg) -> dict:
     return section.to_dict() if hasattr(section, "to_dict") else dict(section)
 
 
+def _add_accept_rate_per_position(
+    metrics: dict[str, float],
+    accept_num: torch.Tensor,
+    accept_den: torch.Tensor,
+) -> None:
+    """Add measured per-position acceptance rates to a metrics dictionary."""
+    for position, (num, den) in enumerate(zip(accept_num.tolist(), accept_den.tolist())):
+        if den > 0:
+            metrics[f"accept_rate@{position}"] = num / den
+
+
 class TrainDSparkRecipe(BaseRecipe):
     """Recipe for DSpark draft-model training on Qwen3, Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 VL targets."""
 
@@ -1469,8 +1480,7 @@ class TrainDSparkRecipe(BaseRecipe):
                             accept_den = pos_den.sum().item()
                             if accept_den > 0:
                                 avg["accept_rate"] = pos_num.sum().item() / accept_den
-                                for k, rate in enumerate((pos_num / pos_den.clamp_min(1.0)).tolist()):
-                                    avg[f"accept_rate@{k}"] = rate
+                                _add_accept_rate_per_position(avg, pos_num, pos_den)
                             if w[5] > 0:
                                 avg["tau"] = w[4] / w[5]
                             if w[9] > 0:
