@@ -293,6 +293,7 @@ def _run_kd_bridge_worker(rank: int, world_size: int, init_file: str) -> None:
         }
         setups = kd_utils.create_kd_distributed_setups(cfg, world_size=world_size)
         bridge = kd_utils.KDMeshBridge(setups, device=torch.device("cpu"))
+        checkpointer = None
         batch = None
         if bridge.is_student:
             input_ids = torch.tensor([[rank + 1, rank + 2]], dtype=torch.long)
@@ -328,10 +329,11 @@ def _run_kd_bridge_worker(rank: int, world_size: int, init_file: str) -> None:
                 pp_rank=0,
                 process_group=bridge.student_group,
             )
-            checkpointer.close()
         bridge.synchronize()
-        # Synchronize the default group before tearing it down. The bridge barrier
-        # uses a separate Gloo group, so it does not order default-group cleanup.
+        if checkpointer is not None:
+            checkpointer.close()
+        # Hold teacher ranks until the student-only checkpoint groups are closed
+        # before tearing down the default process group.
         dist.barrier()
     finally:
         dist.destroy_process_group()
