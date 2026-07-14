@@ -15,6 +15,7 @@
 from dataclasses import dataclass
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.vlm.datasets import CordV2DatasetConfig
 from nemo_automodel.components.datasets.vlm.loader import (
     VlmCollatorConfig,
     VlmDataloaderConfig,
@@ -83,6 +84,26 @@ def test_recipe_config_separates_vlm_dataset_wrapper_and_packing_fields():
     assert config.packing.pack_size == 128
     assert config.packing.packing_ratio == 0.9
     assert config.packing.collate_max_length == 128
+
+
+def test_recipe_config_accepts_cord_v2_sample_limit():
+    config = RecipeConfig(
+        ConfigNode(
+            {
+                "dataset": {
+                    "_target_": "nemo_automodel.components.datasets.vlm.datasets.make_cord_v2_dataset",
+                    "limit_dataset_samples": 100,
+                },
+                "dataloader": {
+                    "_target_": "torchdata.stateful_dataloader.StatefulDataLoader",
+                    "num_workers": 0,
+                },
+            }
+        )
+    ).vlm_dataloader
+
+    assert isinstance(config.dataset_config, CordV2DatasetConfig)
+    assert config.dataset_config.limit_dataset_samples == 100
 
 
 def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterates():

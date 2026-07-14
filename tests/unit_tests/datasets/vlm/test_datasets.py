@@ -138,6 +138,27 @@ def test_make_cord_v2_dataset(monkeypatch, stub_json2token, ground_key, wrapper)
         assert call["sort_json_key"] is True
 
 
+def test_cord_v2_dataset_config_limits_samples(monkeypatch):
+    requested_splits = []
+    fake_ds = [
+        {
+            "image": "img_1337",
+            "ground_truth": json.dumps({"gt_parse": {"answer": 42}}),
+        }
+    ]
+
+    def load_dataset(_path_or_dataset, *, split):
+        requested_splits.append(split)
+        return fake_ds
+
+    monkeypatch.setattr(ds, "load_dataset", load_dataset)
+
+    result = ds.CordV2DatasetConfig(limit_dataset_samples=100).build()
+
+    assert requested_splits == ["train[:100]"]
+    assert len(result) == 1
+
+
 def test_make_medpix_dataset(monkeypatch):
     """End-to-end sanity check for `make_medpix_dataset`.
 

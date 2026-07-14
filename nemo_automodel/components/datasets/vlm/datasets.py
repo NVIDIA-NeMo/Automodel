@@ -102,18 +102,27 @@ class CordV2DatasetConfig:
     """HuggingFace dataset id or local path for the CORD-V2 dataset."""
     split: str = "train"
     """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
+    limit_dataset_samples: int | None = None
+    """Optional maximum number of samples to load."""
 
     def build(self) -> list[dict[str, object]]:
         """Build the CORD-V2 dataset from this config."""
-        return make_cord_v2_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
+        return make_cord_v2_dataset(
+            path_or_dataset=self.path_or_dataset,
+            split=self.split,
+            limit_dataset_samples=self.limit_dataset_samples,
+        )
 
 
 def make_cord_v2_dataset(
     path_or_dataset="naver-clova-ix/cord-v2",
     split="train",
+    limit_dataset_samples: int | None = None,
     **kwargs,
 ):
     """Load and preprocess the CORD-V2 dataset for image-to-text fine-tuning."""
+    if limit_dataset_samples is not None:
+        split = f"{split}[:{limit_dataset_samples}]"
     dataset = load_dataset(path_or_dataset, split=split)
 
     def format(example):
