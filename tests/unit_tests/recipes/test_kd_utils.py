@@ -296,11 +296,6 @@ def _run_kd_bridge_worker(rank: int, world_size: int, init_file: str) -> None:
         bridge = kd_utils.KDMeshBridge(setups, device=torch.device("cpu"))
         checkpointer = None
         batch = None
-        checkpoint_config = CheckpointingConfig(enabled=False, is_async=True)
-        async_process_groups = checkpoint_config.initialize_async_process_groups(
-            setups.student_ranks,
-            is_member=bridge.is_student,
-        )
         if bridge.is_student:
             input_ids = torch.tensor([[rank + 1, rank + 2]], dtype=torch.long)
             batch = {"input_ids": input_ids, "labels": input_ids.clone()}
@@ -326,15 +321,20 @@ def _run_kd_bridge_worker(rank: int, world_size: int, init_file: str) -> None:
 
             from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
+            checkpoint_config = CheckpointingConfig(enabled=False, is_async=True)
+
             checkpointer = Checkpointer(
                 checkpoint_config,
                 dp_rank=rank,
                 tp_rank=0,
                 pp_rank=0,
                 process_group=bridge.student_group,
-                async_process_groups=async_process_groups,
             )
         bridge.synchronize()
+        # Barrier completion only guarantees every rank entered the collective;
+        # use the default group to ensure teacher ranks have returned before
+        # students destroy their async checkpoint groups.
+        dist.barrier()
         if checkpointer is not None:
             checkpointer.close()
         # Hold teacher ranks until the student-only checkpoint groups are closed

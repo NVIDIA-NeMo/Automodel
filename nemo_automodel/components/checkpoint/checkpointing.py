@@ -404,7 +404,6 @@ class Checkpointer:
         pp_rank: int,
         moe_mesh: Optional[DeviceMesh] = None,
         process_group: torch.distributed.ProcessGroup | None = None,
-        async_process_groups: tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup] | None = None,
     ) -> None:
         """
         Initialize the checkpointer.
@@ -416,8 +415,6 @@ class Checkpointer:
             pp_rank: Pipeline parallel rank for the current process.
             moe_mesh: Optional device mesh used for MoE when adapting state dicts.
             process_group: Process group used for distributed checkpoint collectives.
-            async_process_groups: Optional pre-created model and optimizer Gloo
-                groups used by asynchronous checkpointing.
         """
         self.config = config
         self.moe_mesh = moe_mesh
@@ -432,12 +429,8 @@ class Checkpointer:
         if self.config.is_async:
             self._model_ctx.stager = DefaultStager()
             self._optim_ctx.stager = DefaultStager()
-            if async_process_groups is None:
-                async_process_groups = (
-                    _new_gloo_process_group(process_group),
-                    _new_gloo_process_group(process_group),
-                )
-            self._model_ctx.process_group, self._optim_ctx.process_group = async_process_groups
+            self._model_ctx.process_group = _new_gloo_process_group(process_group)
+            self._optim_ctx.process_group = _new_gloo_process_group(process_group)
 
         self._addons = []
         if _should_write_hf_metadata(self.config):

@@ -187,7 +187,6 @@ class CheckpointingConfig:
         pp_rank: int,
         moe_mesh: DeviceMesh | None = None,
         process_group: ProcessGroup | None = None,
-        async_process_groups: tuple[ProcessGroup, ProcessGroup] | None = None,
     ) -> Checkpointer:
         """Build the :class:`Checkpointer` engine for this config.
 
@@ -201,8 +200,6 @@ class CheckpointingConfig:
             pp_rank: Pipeline-parallel rank.
             moe_mesh: Optional device mesh for MoE checkpointing.
             process_group: Process group used for distributed checkpoint collectives.
-            async_process_groups: Optional pre-created model and optimizer Gloo
-                groups used by asynchronous checkpointing.
 
         Returns:
             Configured :class:`Checkpointer`.
@@ -216,35 +213,7 @@ class CheckpointingConfig:
             pp_rank=pp_rank,
             moe_mesh=moe_mesh,
             process_group=process_group,
-            async_process_groups=async_process_groups,
         )
-
-    def initialize_async_process_groups(
-        self,
-        ranks: tuple[int, ...],
-        *,
-        is_member: bool,
-    ) -> tuple[ProcessGroup, ProcessGroup] | None:
-        """Collectively create async checkpoint groups for a subset of ranks.
-
-        Every rank in the default process group must call this method in the
-        same order. Non-members participate in group creation but receive no
-        runtime objects to pass to a checkpointer.
-
-        Args:
-            ranks: Global ranks that own the checkpointer.
-            is_member: Whether the current rank belongs to ``ranks``.
-
-        Returns:
-            Model and optimizer Gloo groups on members, otherwise ``None``.
-        """
-        if not self.is_async:
-            return None
-        model_group = torch.distributed.new_group(ranks=list(ranks), backend="gloo")
-        optim_group = torch.distributed.new_group(ranks=list(ranks), backend="gloo")
-        if not is_member:
-            return None
-        return model_group, optim_group
 
 
 __all__ = ["CheckpointingConfig", "SaveConsolidatedMode"]

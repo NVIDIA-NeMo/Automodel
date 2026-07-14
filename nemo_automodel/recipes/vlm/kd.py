@@ -199,10 +199,6 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             return self.kd_distributed_setups.student
         self.kd_mesh_bridge = KDMeshBridge(self.kd_distributed_setups, device=self.dist_env.device)
         self._training_process_group = self.kd_mesh_bridge.student_group
-        self._checkpoint_async_process_groups = self.cfg.checkpoint.initialize_async_process_groups(
-            self.kd_distributed_setups.student_ranks,
-            is_member=self.kd_mesh_bridge.is_student,
-        )
         if self.kd_mesh_bridge.is_student:
             setup = self.kd_distributed_setups.student
             setup.mesh_context.process_group = self.kd_mesh_bridge.student_group
