@@ -28,6 +28,8 @@ EXAMPLE_TEMPLATE = {"text": "", "image": "", "nr_ocr": ""}
 
 _OVERSAMPLING_WARNED_CORPORA: set[str] = set()
 
+_VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
+
 
 class AbstractDataset(ABC):
     """Interface for corpus datasets addressable by document id."""
@@ -61,6 +63,73 @@ class TextQADataset(AbstractDataset):
         return sorted(list(self.docid2idx.keys()))
 
 
+class ColPaliDataset(AbstractDataset):
+    """Load ColPali corpus documents from a dataset path."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = load_dataset(path)["train"]
+        docid2idx = {}
+        for idx, docid in enumerate(self.data["image_filename"]):
+            docid2idx[str(docid)] = idx
+        self.docid2idx = docid2idx
+
+    def get_document_by_id(self, id):
+        example = deepcopy(EXAMPLE_TEMPLATE)
+        doc = self.data[self.docid2idx[id]]
+        example["image"] = doc["image"]
+        if "nr_ocr" in doc:
+            example["nr_ocr"] = doc["nr_ocr"]
+        if "complex_ocr" in doc:
+            example["complex_ocr"] = doc["complex_ocr"]
+        return example
+
+    def get_all_ids(self):
+        return sorted(list(self.docid2idx.keys()))
+
+
+class WikiSSNQDataset(AbstractDataset):
+    """Load Wiki-SS corpus documents from a dataset path."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = load_dataset(path)["train"]
+        docid2idx = {}
+        for idx, docid in enumerate(self.data["docid"]):
+            docid2idx[str(docid)] = idx
+        self.docid2idx = docid2idx
+
+    def get_document_by_id(self, id):
+        example = deepcopy(EXAMPLE_TEMPLATE)
+        doc = self.data[self.docid2idx[id]]
+        example["image"] = doc["image"]
+        if "nr_ocr" in doc:
+            example["nr_ocr"] = doc["nr_ocr"]
+        if "complex_ocr" in doc:
+            example["complex_ocr"] = doc["complex_ocr"]
+        return example
+
+    def get_all_ids(self):
+        return sorted(list(self.docid2idx.keys()))
+
+
+class DocMatixDataset(AbstractDataset):
+    """Load DocMatix corpus documents from a dataset path."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = load_dataset(path, "images")["train"]
+
+    def get_document_by_id(self, id):
+        example = deepcopy(EXAMPLE_TEMPLATE)
+        example_idx, image_idx = id.split("_")
+        example["image"] = self.data[int(example_idx)]["images"][int(image_idx)]
+        return example
+
+    def get_all_ids(self):
+        return [str(x) + "_" + str(0) for x in list(range(len(self.data)))]
+
+
 class HFCorpusDataset(AbstractDataset):
     """Wraps an already-loaded HuggingFace Dataset as a corpus (in-memory, no local Parquet)."""
 
@@ -80,6 +149,9 @@ class HFCorpusDataset(AbstractDataset):
 
 DATASETS = {
     "TextQADataset": TextQADataset,
+    "ColPaliDataset": ColPaliDataset,
+    "WikiSSNQDataset": WikiSSNQDataset,
+    "DocMatixDataset": DocMatixDataset,
 }
 
 
@@ -502,7 +574,7 @@ def _load_hf_sources(hf_entries: List[Tuple[Optional[int], str]], seed: int = 42
     return Dataset.from_list(hf_data), corpus_dict
 
 
-def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
+def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False, epoch: int = 0):
     """
     Transform function to convert from raw format to training format.
 
@@ -511,6 +583,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         num_neg_docs: Number of negative documents to use
         corpus_dict: Dictionary mapping corpus_id to corpus objects
         use_dataset_instruction: Whether to use instruction from dataset's metadata
+        epoch: Current epoch for cycling through positive documents
     """
     # Handle both batched and single examples
     is_batched = isinstance(examples["question"], list)
@@ -530,10 +603,10 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
     for i_example in range(len(questions)):
         cur_pos_neg_doc = []
 
-        # Get one positive doc (take first one)
+        # Get one positive doc (cycle through positives based on epoch)
         positives = batch_positives[i_example]
         if isinstance(positives, list) and len(positives) > 0:
-            cur_pos_neg_doc.append(positives[0])
+            cur_pos_neg_doc.append(positives[epoch % len(positives)])
         else:
             cur_pos_neg_doc.append(positives)
 
@@ -622,42 +695,63 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
     return result
 
 
-def _cross_encoder_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
+def _cross_encoder_transform_func(
+    examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False, epoch: int = 0
+):
     """
     Transform function to convert from raw format to cross-encoder training format.
     """
     from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import flatten_bi_encoder_to_cross_encoder
 
-    data = _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction)
+    data = _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction, epoch=epoch)
     return flatten_bi_encoder_to_cross_encoder(data)
 
 
-def _create_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
-    """Create transform function with specified number of negative documents."""
+class RetrievalTransform:
+    """Stateful transform for retrieval datasets with epoch-based positive cycling.
 
-    def transform(examples):
+    This class encapsulates the transform state (epoch, corpus_dict, etc.) and
+    provides a clean interface for updating the epoch without recreating the transform.
+    """
+
+    def __init__(
+        self,
+        num_neg_docs: int,
+        corpus_dict: dict,
+        use_dataset_instruction: bool = False,
+        model_type: str = "bi_encoder",
+        cycle_positive_docs: bool = False,
+    ):
+        if model_type not in _VALID_MODEL_TYPES:
+            raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
+        self.num_neg_docs = num_neg_docs
+        self.corpus_dict = corpus_dict
+        self.use_dataset_instruction = use_dataset_instruction
+        self.model_type = model_type
+        self.cycle_positive_docs = cycle_positive_docs
+        self.epoch = 0
+
+    def __call__(self, examples):
+        epoch = self.epoch if self.cycle_positive_docs else 0
+        if self.model_type == "cross_encoder":
+            return _cross_encoder_transform_func(
+                examples,
+                num_neg_docs=self.num_neg_docs,
+                corpus_dict=self.corpus_dict,
+                use_dataset_instruction=self.use_dataset_instruction,
+                epoch=epoch,
+            )
         return _transform_func(
             examples,
-            num_neg_docs=num_neg_docs,
-            corpus_dict=corpus_dict,
-            use_dataset_instruction=use_dataset_instruction,
+            num_neg_docs=self.num_neg_docs,
+            corpus_dict=self.corpus_dict,
+            use_dataset_instruction=self.use_dataset_instruction,
+            epoch=epoch,
         )
 
-    return transform
-
-
-def _create_cross_encoder_transform_func(num_neg_docs, corpus_dict, use_dataset_instruction: bool = False):
-    """Create cross-encoder transform function with specified number of negative documents."""
-
-    def transform(examples):
-        return _cross_encoder_transform_func(
-            examples,
-            num_neg_docs=num_neg_docs,
-            corpus_dict=corpus_dict,
-            use_dataset_instruction=use_dataset_instruction,
-        )
-
-    return transform
+    def set_epoch(self, epoch: int):
+        """Update the epoch for positive document cycling."""
+        self.epoch = epoch
 
 
 def make_retrieval_dataset(
@@ -671,6 +765,7 @@ def make_retrieval_dataset(
     max_train_samples: int = None,
     train_data_select_offset: int = 0,
     use_dataset_instruction: bool = False,
+    cycle_positive_docs: bool = False,
 ):
     """
     Load and return dataset in retrieval format for encoder training.
@@ -696,6 +791,9 @@ def make_retrieval_dataset(
         max_train_samples: Maximum number of training samples to use
         train_data_select_offset: Offset for selecting training samples
         use_dataset_instruction: Whether to use instruction from dataset's metadata
+        cycle_positive_docs: Whether training should cycle through positive documents across epochs.
+            Defaults to ``False`` (always use the first positive document). Set to ``True`` only
+            when a query has multiple positive documents and you want to rotate through them by epoch.
 
     Returns:
         A HuggingFace Dataset where each example is a dict with keys:
@@ -714,7 +812,6 @@ def make_retrieval_dataset(
         which is more efficient for batch padding and supports dynamic processing.
     """
 
-    _VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
     if model_type not in _VALID_MODEL_TYPES:
         raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
 
@@ -751,11 +848,6 @@ def make_retrieval_dataset(
 
     logging.info(f"Loaded dataset with {len(dataset)} examples")
 
-    if model_type == "cross_encoder":
-        transform_factory = _create_cross_encoder_transform_func
-    else:
-        transform_factory = _create_transform_func
-
     if data_type == "train":
         if max_train_samples is not None:
             if do_shuffle:
@@ -765,12 +857,24 @@ def make_retrieval_dataset(
             )
 
         negative_size = n_passages - 1
-        dataset.set_transform(transform_factory(negative_size, corpus_dict, use_dataset_instruction))
+        transform = RetrievalTransform(
+            negative_size, corpus_dict, use_dataset_instruction, model_type, cycle_positive_docs
+        )
+        dataset.set_transform(transform)
+        if cycle_positive_docs:
+            # NOTE: set_epoch is monkey-patched onto this Dataset instance. It is only
+            # reachable as long as the recipe uses this exact object. If the dataset is
+            # later wrapped/copied (e.g. IterableDataset.from_generator), re-expose
+            # set_epoch on the wrapper or move the epoch into a dataset wrapper class.
+            dataset.set_epoch = transform.set_epoch
 
     elif data_type == "eval":
         if eval_negative_size is None:
             eval_negative_size = n_passages - 1
-        dataset.set_transform(transform_factory(eval_negative_size, corpus_dict, use_dataset_instruction))
+        transform = RetrievalTransform(
+            eval_negative_size, corpus_dict, use_dataset_instruction, model_type, cycle_positive_docs
+        )
+        dataset.set_transform(transform)
 
     else:
         raise ValueError(f"Invalid data type: {data_type}")

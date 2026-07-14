@@ -147,8 +147,68 @@ def _run_apply_model_infrastructure(*, is_meta_device, load_base_model, model_wr
         return result, mock_ckpt
 
 
+def test_apply_model_infrastructure_handles_unwrapped_single_rank_ddp_model():
+    """Single-rank DDP skips wrapping, so the returned model may not have ``.module``."""
+    from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+    from nemo_automodel.components.distributed.ddp import DDPManager
+
+    model = _DummyModel()
+    model_wrapper = object.__new__(DDPManager)
+
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._shard_ep_fsdp", return_value=model),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+    ):
+        mock_ckpt = MockCheckpointer.return_value
+        mock_ckpt.config = MagicMock()
+        mock_ckpt.config.dequantize_base_checkpoint = False
+
+        result = apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=model_wrapper,
+        )
+
+    assert result is model
+    assert hasattr(model, "_pre_shard_hf_state_dict_keys")
+
+
 class TestApplyModelInfrastructurePostShardInit:
     """Tests for initialize_model_weights being called in apply_model_infrastructure."""
+
+    def test_load_only_checkpointer_disables_consolidated_export(self):
+        """Infrastructure checkpointer loads base weights only and should not warn about consolidated saves."""
+        from nemo_automodel._transformers.infrastructure import apply_model_infrastructure
+
+        model = _DummyModel()
+
+        with (
+            patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+            patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+            patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+            patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+            patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+        ):
+            mock_ckpt = MockCheckpointer.return_value
+            mock_ckpt.config = MagicMock()
+            mock_ckpt.config.dequantize_base_checkpoint = False
+
+            apply_model_infrastructure(
+                model=model,
+                is_meta_device=True,
+                device=torch.device("cpu"),
+                load_base_model=True,
+                pretrained_model_name_or_path="test/model",
+            )
+
+        checkpoint_config = MockCheckpointer.call_args.args[0]
+        assert checkpoint_config.save_consolidated.value == "false"
 
     def test_from_config_meta_calls_initialize_model_weights(self):
         """from_config path (load_base_model=False) on meta device should call initialize_model_weights."""
@@ -540,3 +600,58 @@ class TestFromConfigLoadBaseModelKwarg:
 
         _, build_kwargs = mock_build.call_args
         assert build_kwargs["load_base_model"] is True
+
+
+def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
+    """When mesh.cp_size>1 and attention is non-TE, apply_model_infrastructure
+    attaches the mask-strip CP hook to every model part.
+    The DTensor-SDPA hook is gated on torch.compile; this case has no compile
+    (model_wrapper=None), so it is not attached.
+    Guards infrastructure.py:apply_model_infrastructure CP branch."""
+    from nemo_automodel._transformers import infrastructure as infra
+
+    model = _DummyModel()
+    mesh = SimpleNamespace(
+        cp_size=2,
+        pp_size=1,
+        tp_size=1,
+        ep_size=1,
+        dp_size=1,
+        dp_shard_size=1,
+        dp_replicate_size=1,
+        device_mesh={"cp": SimpleNamespace(size=lambda: 2)},
+        moe_mesh=None,
+    )
+
+    attached = {"ctx": 0, "attn": 0}
+
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._uses_te_attention", return_value=False),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+        patch(
+            "nemo_automodel.components.distributed.cp_utils.attach_context_parallel_hooks",
+            side_effect=lambda mp: attached.__setitem__("ctx", attached["ctx"] + 1),
+        ),
+        patch(
+            "nemo_automodel.components.distributed.cp_utils.attach_cp_sdpa_hooks",
+            side_effect=lambda mp, cp_mesh: attached.__setitem__("attn", attached["attn"] + 1),
+        ),
+    ):
+        mock_ckpt = MockCheckpointer.return_value
+        mock_ckpt.config = MagicMock()
+        mock_ckpt.config.dequantize_base_checkpoint = False
+        infra.apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=None,
+            mesh=mesh,
+            pretrained_model_name_or_path="",
+        )
+
+    assert attached == {"ctx": 1, "attn": 0}

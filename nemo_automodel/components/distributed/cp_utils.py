@@ -231,6 +231,13 @@ def make_cp_batch_and_ctx(
     cp_mesh = _get_submesh(device_mesh, "cp")
     tp_mesh = _get_submesh(device_mesh, "tp")
 
+    # A model that owns its CP attention can attach a batch-sharding callable to
+    # the batch in its pre-embed step. Honor it instead of the default
+    # load-balanced context_parallel path so the implementation stays with the model.
+    cp_make_batch_fn = batch.pop("_cp_make_batch_fn", None)
+    if cp_make_batch_fn is not None:
+        return cp_make_batch_fn(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
+
     if use_te:
         return nullcontext, make_cp_batch_for_te(
             cp_mesh,

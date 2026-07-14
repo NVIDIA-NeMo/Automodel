@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
+from dataclasses import asdict, dataclass
 from math import ceil
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from torch.distributed.checkpoint.stateful import Stateful
 
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
+
+if TYPE_CHECKING:
+    from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +66,7 @@ class StepScheduler(Stateful):
         save_checkpoint_every_epoch: bool = True,
         val_every_steps: Optional[int] = None,
         log_remote_every_steps: int = 1,
+        loss_average_window_steps: int = 50,
         gc_every_steps: Optional[int] = None,
         start_step: int = 0,
         start_epoch: int = 0,
@@ -81,6 +88,7 @@ class StepScheduler(Stateful):
                 Default: True.
             val_every_steps (Optional[int]): Number of training steps between validation.
             log_remote_every_steps (int): Frequency of remote logging (e.g., WandB, MLflow). Default: 1 (every step).
+            loss_average_window_steps (int): Rolling window size for averaged training loss metrics.
             gc_every_steps (Optional[int]): Frequency of manual garbage collection steps.
             start_step (int): Initial global step. Used when resuming from checkpoint. Default: 0.
             start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
@@ -136,6 +144,9 @@ class StepScheduler(Stateful):
         self.log_remote_every_steps = log_remote_every_steps
         if log_remote_every_steps <= 0:
             raise ValueError(f"log_remote_every_steps must be greater than 0, got {log_remote_every_steps}")
+        self.loss_average_window_steps = loss_average_window_steps
+        if loss_average_window_steps <= 0:
+            raise ValueError(f"loss_average_window_steps must be greater than 0, got {loss_average_window_steps}")
         self.gc_every_steps = gc_every_steps
         if gc_every_steps is not None and gc_every_steps <= 0:
             raise ValueError(f"gc_every_steps must be greater than 0 if not None, got {gc_every_steps}")
@@ -235,11 +246,26 @@ class StepScheduler(Stateful):
     @property
     def is_last_step(self):
         """
-        Returns whether the training is finished.
+        Returns whether the current step is the final training step.
+
+        Training stops at whichever comes first: reaching ``max_steps`` or
+        exhausting the configured number of epochs (see ``__iter__`` and
+        ``epochs``). ``max_steps`` alone is therefore not enough to detect the
+        end -- a small dataset can run out of epochs long before ``max_steps``
+        is hit (e.g. ``max_steps=100`` with only 60 steps' worth of data). In
+        that case the last batch of the last epoch is the final step. Detect it
+        so the final checkpoint and consolidated export -- which key off this
+        flag (see ``is_ckpt_step`` and the recipes' ``is_final_checkpoint``) --
+        are still written.
         """
         # we +1 here because the step is incremented after
         # the batch is yielded in the tail handling of __iter__
-        return self.step + 1 >= self.max_steps
+        if self.step + 1 >= self.max_steps:
+            return True
+        # Last batch of the last epoch when epochs are exhausted before max_steps.
+        if self.num_epochs is not None and self.epoch + 1 >= self.num_epochs:
+            return self.is_last_batch
+        return False
 
     @property
     def is_last_batch(self):
@@ -293,3 +319,66 @@ class StepScheduler(Stateful):
             s (dict): Dictionary containing 'step' and 'epoch'.
         """
         self.step, self.epoch = s["step"], s["epoch"]
+
+
+# ---------------------------------------------------------------------------
+# Typed config + builder
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StepSchedulerConfig:
+    """User-facing step scheduler configuration.
+
+    These fields correspond to the YAML-configurable parameters of the
+    training loop.  Runtime-only values (``dataloader``, ``dp_size``,
+    ``local_batch_size``) are passed separately to ``build_step_scheduler``.
+
+    Attributes:
+        global_batch_size: Total samples per optimizer step across all GPUs.
+        num_epochs: Number of training epochs.  When ``None`` the builder
+            derives it from ``max_steps``.  Default: 10.
+        max_steps: Hard cap on optimizer steps.  ``None`` means derive from
+            ``num_epochs * epoch_len``.
+        ckpt_every_steps: Save a checkpoint every N optimizer steps.
+            ``None`` defaults to once per epoch.
+        save_checkpoint_every_epoch: Also checkpoint at every epoch boundary.
+        val_every_steps: Run validation every N optimizer steps.
+            ``None`` disables periodic validation.
+        log_remote_every_steps: Log to WandB / MLflow every N steps.
+        loss_average_window_steps: Rolling window size for averaged training loss
+            metrics.
+        gc_every_steps: Force ``gc.collect()`` every N steps.
+            ``None`` disables manual GC.
+        start_step: Initial global step (for checkpoint resume).
+        start_epoch: Initial epoch (for checkpoint resume).
+    """
+
+    global_batch_size: int = 32
+    num_epochs: int | None = 10
+    max_steps: int | None = None
+    ckpt_every_steps: int | None = 100
+    save_checkpoint_every_epoch: bool = True
+    val_every_steps: int | None = None
+    log_remote_every_steps: int = 1
+    loss_average_window_steps: int = 50
+    gc_every_steps: int | None = None
+    start_step: int = 0
+    start_epoch: int = 0
+
+    def build(self, dataloader: DataLoader, dp_group_size: int, local_batch_size: int) -> StepScheduler:
+        """Build the step scheduler.
+
+        Args:
+            dataloader: The training dataloader.
+            dp_group_size: The size of the data parallel group.
+            local_batch_size: The size of the local batch.
+
+        Returns:
+            Configured StepScheduler.
+        """
+        kwargs = asdict(self)
+        kwargs["local_batch_size"] = local_batch_size
+        kwargs["dp_size"] = dp_group_size
+        kwargs["dataloader"] = dataloader
+        return StepScheduler(**kwargs)

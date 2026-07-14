@@ -28,12 +28,13 @@ from torch.distributed.tensor.parallel import (
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
 
+import nemo_automodel.components.distributed.parallelizer as parallelizer
 from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
-
-# Import the function under test
 from nemo_automodel.components.distributed.parallelizer import (
     _attention_is_head_sharded,
+    _extract_model_layer_groups,
     _extract_model_layers,
+    _filter_layer_groups_for_activation_checkpointing,
     _get_parallel_plan,
     _update_attention_head_counts_for_tp,
     apply_fsdp2_sharding_recursively,
@@ -41,6 +42,45 @@ from nemo_automodel.components.distributed.parallelizer import (
     import_class_from_path,
     megatron_fsdp_strategy_parallelize,
 )
+
+
+def test_fsdp_accumulated_grad_guard_only_handles_missing_unsharded_param(monkeypatch):
+    """The FSDP2 guard only handles the exact missing lazy unsharded tensor case."""
+    calls = {"count": 0}
+
+    class FakeFSDPParam:
+        def __init__(self, mode="ok"):
+            self.mode = mode
+
+        def to_accumulated_grad_if_needed(self):
+            calls["count"] += 1
+            if self.mode == "missing":
+                return self._unsharded_param.grad
+            if self.mode == "other":
+                raise AttributeError("different attribute")
+            return "called"
+
+    fake_module = SimpleNamespace(FSDPParam=FakeFSDPParam)
+    monkeypatch.setitem(sys.modules, "torch.distributed.fsdp._fully_shard._fsdp_param", fake_module)
+
+    parallelizer._patch_fsdp_accumulated_grad_guard()
+
+    param = FakeFSDPParam()
+    assert param.to_accumulated_grad_if_needed() == "called"
+    assert calls["count"] == 1
+
+    param.mode = "missing"
+    assert param.to_accumulated_grad_if_needed() is None
+    assert calls["count"] == 2
+
+    param.mode = "other"
+    with pytest.raises(AttributeError, match="different attribute"):
+        param.to_accumulated_grad_if_needed()
+    assert calls["count"] == 3
+
+    wrapped = FakeFSDPParam.to_accumulated_grad_if_needed
+    parallelizer._patch_fsdp_accumulated_grad_guard()
+    assert FakeFSDPParam.to_accumulated_grad_if_needed is wrapped
 
 
 class MockModel(nn.Module):
@@ -147,6 +187,40 @@ def create_gemma3_mock():
     # Create an instance of the hybrid class
     mock = MockGemma3ModelWithTypeCheck()
     return mock
+
+
+class _CheckpointWrapped(nn.Module):
+    """Minimal checkpoint wrapper used by BAGEL activation-checkpointing tests."""
+
+    def __init__(self, inner, **kwargs):
+        super().__init__()
+        self._checkpoint_wrapped_module = inner
+        self.kwargs = kwargs
+
+    def forward(self, x):
+        return self._checkpoint_wrapped_module(x)
+
+
+def _make_bagel_model(num_language_layers: int = 2, num_vision_layers: int = 3):
+    """Build the nested layer containers used by BAGEL without importing BAGEL."""
+
+    class BagelForUnifiedMultimodal(nn.Module):
+        """Stand-in with the exact class name used by the production mapper."""
+
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.language_model = nn.Module()
+            self.model.language_model.model = nn.Module()
+            self.model.language_model.model.layers = nn.ModuleList([_FakeLayer() for _ in range(num_language_layers)])
+            self.model.vit_model = nn.Module()
+            self.model.vit_model.vision_model = nn.Module()
+            self.model.vit_model.vision_model.encoder = nn.Module()
+            self.model.vit_model.vision_model.encoder.layers = nn.ModuleList(
+                [_FakeLayer() for _ in range(num_vision_layers)]
+            )
+
+    return BagelForUnifiedMultimodal()
 
 
 @pytest.fixture
@@ -275,6 +349,13 @@ def mock_distributed_env(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
+        checkpoint_wrapper_mock.checkpoint_wrapper,
+        raising=False,
+    )
+    # Whole-block/sub-module wrapping now lives in activation_checkpointing.py and
+    # uses that module's checkpoint_wrapper, so patch it there too.
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
         checkpoint_wrapper_mock.checkpoint_wrapper,
         raising=False,
     )
@@ -678,6 +759,42 @@ class TestGetHfTpShardPlan:
         with pytest.raises(ValueError, match="Unknown parallel style"):
             get_hf_tp_shard_plan(model)
 
+    @staticmethod
+    def _bare_gemma3():
+        """Gemma3 instance with exact class identity but no HF ``__init__``."""
+        model = Gemma3ForConditionalGeneration.__new__(Gemma3ForConditionalGeneration)
+        nn.Module.__init__(model)
+        return model
+
+    def test_gemma3_pre_standardization_tree_uses_language_model_prefix(self):
+        """Old Gemma3 (transformers <= 4.51) hangs the text tower off a top-level
+        ``language_model``; the prefix must follow the registered child module,
+        not a transformers version gate.
+        """
+        model = self._bare_gemma3()
+        language_model = nn.Module()
+        language_model._tp_plan = {"model.layers.0.self_attn.q_proj": "colwise"}
+        model.language_model = language_model
+
+        result = get_hf_tp_shard_plan(model)
+
+        assert isinstance(result["language_model.model.layers.0.self_attn.q_proj"], ColwiseParallel)
+        assert "language_model.embed_tokens" in result
+
+    def test_gemma3_standardized_tree_uses_model_prefix(self):
+        """Standardized Gemma3 (transformers >= 4.52, incl. v5) nests everything
+        under ``model``; the prefix must resolve structurally to ``model``.
+        """
+        model = self._bare_gemma3()
+        inner = nn.Module()
+        inner._tp_plan = {"language_model.layers.0.self_attn.q_proj": "colwise"}
+        model.model = inner
+
+        result = get_hf_tp_shard_plan(model)
+
+        assert isinstance(result["model.language_model.layers.0.self_attn.q_proj"], ColwiseParallel)
+        assert "model.embed_tokens" in result
+
 
 class TestApplyFsdpShardingRecursively:
     """Test class for apply_fsdp2_sharding_recursively utility function."""
@@ -780,6 +897,32 @@ class TestApplyFsdpShardingRecursively:
         for call in calls:
             args, kwargs = call
             assert kwargs["offload_policy"] is None
+
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    def test_apply_fsdp_sharding_module_list_respects_explicit_reshard_override(
+        self, mock_fully_shard, mock_module_list, mock_mesh, mock_mp_policy, mock_offload_policy
+    ):
+        """Test apply_fsdp2_sharding_recursively with an explicit reshard override."""
+        mock_mesh.mesh_dim_names = ("dp", "tp")
+
+        def mock_shard(x, **kwargs):
+            x.set_modules_to_forward_prefetch = MagicMock()
+            x.set_modules_to_backward_prefetch = MagicMock()
+            return x
+
+        mock_fully_shard.side_effect = mock_shard
+
+        apply_fsdp2_sharding_recursively(
+            module=mock_module_list,
+            mesh=mock_mesh,
+            mp_policy=mock_mp_policy,
+            offload_policy=mock_offload_policy,
+            reshard_after_forward=False,
+        )
+
+        assert mock_fully_shard.call_count == 3
+        for call in mock_fully_shard.call_args_list:
+            assert call.kwargs["reshard_after_forward"] is False
 
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     def test_apply_fsdp_sharding_regular_module(
@@ -1265,6 +1408,10 @@ class TestActivationCheckpointingKVSharing:
                 super().__init__()
                 self._inner = inner
 
+            @property
+            def _checkpoint_wrapped_module(self):
+                return self._inner
+
             def forward(self, x):
                 return self._inner(x)
 
@@ -1272,6 +1419,10 @@ class TestActivationCheckpointingKVSharing:
 
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper",
+            lambda module, **kwargs: _Wrapped(module),
+        )
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
             _Wrapped,
         )
         monkeypatch.setattr(
@@ -1287,7 +1438,7 @@ class TestActivationCheckpointingKVSharing:
             lambda mesh, *a, **kw: MagicMock(),
         )
 
-    def _run_parallelize(self, model, activation_checkpointing=True):
+    def _run_parallelize(self, model, activation_checkpointing=True, activation_checkpointing_scope="all"):
         """Invoke the strategy under test and return the model."""
         from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
@@ -1300,6 +1451,7 @@ class TestActivationCheckpointingKVSharing:
             model=model,
             device_mesh=mesh,
             activation_checkpointing=activation_checkpointing,
+            activation_checkpointing_scope=activation_checkpointing_scope,
         )
 
     # ------------------------------------------------------------------ #
@@ -1339,8 +1491,8 @@ class TestActivationCheckpointingKVSharing:
     def test_no_config_does_not_crash(self, monkeypatch):
         """Model without a config attribute must not raise."""
         monkeypatch.setattr(
-            "nemo_automodel.components.distributed.parallelizer._extract_model_layers",
-            lambda m: [],
+            "nemo_automodel.components.distributed.parallelizer._extract_model_layer_groups",
+            lambda m: {},
         )
         model = nn.Module()
         model.forward = lambda x: x  # type: ignore[attr-defined]
@@ -1388,6 +1540,163 @@ class TestActivationCheckpointingKVSharing:
                 assert isinstance(layer.input_layernorm, self._Wrapped)
                 assert isinstance(layer.post_attention_layernorm, self._Wrapped)
 
+    def test_vision_style_child_names_are_wrapped(self):
+        """Vision/Ministral-style blocks use ``attention`` and ``feed_forward`` names."""
+
+        class _VisionStyleLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attention = nn.Linear(16, 16)
+                self.feed_forward = nn.Linear(16, 16)
+                self.attention_norm = nn.Linear(16, 16)
+                self.ffn_norm = nn.Linear(16, 16)
+
+            def forward(self, x):
+                return x
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.model.layers = nn.ModuleList([_VisionStyleLayer() for _ in range(2)])
+
+        self._run_parallelize(model)
+
+        for layer in model.model.layers:
+            assert isinstance(layer.attention, self._Wrapped)
+            assert isinstance(layer.feed_forward, self._Wrapped)
+            assert isinstance(layer.attention_norm, self._Wrapped)
+            assert isinstance(layer.ffn_norm, self._Wrapped)
+
+    def test_qwen_clip_style_vision_child_names_are_wrapped(self):
+        """Qwen/SigLIP/CLIP-style vision blocks use ``attn`` or layer/norm pairs."""
+
+        class _QwenStyleLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = nn.Linear(16, 16)
+                self.mlp = nn.Linear(16, 16)
+                self.norm1 = nn.Linear(16, 16)
+                self.norm2 = nn.Linear(16, 16)
+
+            def forward(self, x):
+                return x
+
+        class _ClipStyleLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = nn.Linear(16, 16)
+                self.mlp = nn.Linear(16, 16)
+                self.layer_norm1 = nn.Linear(16, 16)
+                self.layer_norm2 = nn.Linear(16, 16)
+
+            def forward(self, x):
+                return x
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.model.layers = nn.ModuleList([_QwenStyleLayer(), _ClipStyleLayer()])
+
+        self._run_parallelize(model)
+
+        qwen_layer = model.model.layers[0]
+        assert isinstance(qwen_layer.attn, self._Wrapped)
+        assert isinstance(qwen_layer.mlp, self._Wrapped)
+        assert isinstance(qwen_layer.norm1, self._Wrapped)
+        assert isinstance(qwen_layer.norm2, self._Wrapped)
+
+        clip_layer = model.model.layers[1]
+        assert isinstance(clip_layer.self_attn, self._Wrapped)
+        assert isinstance(clip_layer.mlp, self._Wrapped)
+        assert isinstance(clip_layer.layer_norm1, self._Wrapped)
+        assert isinstance(clip_layer.layer_norm2, self._Wrapped)
+
+    def test_activation_checkpointing_scope_language_only(self):
+        """``language`` scope leaves extracted vision layers unwrapped."""
+
+        class LlamaNemotronVLModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = nn.ModuleList([_FakeLayer()])
+                self.vision_model = nn.Module()
+                self.vision_model.vision_model = nn.Module()
+                self.vision_model.vision_model.encoder = nn.Module()
+                self.vision_model.vision_model.encoder.layers = nn.ModuleList([_FakeLayer()])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = LlamaNemotronVLModel()
+                self.config = SimpleNamespace(use_cache=True, text_config=SimpleNamespace(num_kv_shared_layers=0))
+
+            def forward(self, x):
+                return x
+
+        model = BiEncoderModel()
+        self._run_parallelize(model, activation_checkpointing_scope="language")
+
+        language_layer = model.model.language_model.layers[0]
+        vision_layer = model.model.vision_model.vision_model.encoder.layers[0]
+        assert isinstance(language_layer.mlp, self._Wrapped)
+        assert not isinstance(vision_layer.mlp, self._Wrapped)
+
+    def test_activation_checkpointing_scope_all_wraps_custom_vlm_language_and_vision(self):
+        """Default ``all`` scope should not let the retrieval wrapper hide the vision tower."""
+
+        class LlamaNemotronVLModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = nn.ModuleList([_FakeLayer()])
+                self.vision_model = nn.Module()
+                self.vision_model.vision_model = nn.Module()
+                self.vision_model.vision_model.encoder = nn.Module()
+                self.vision_model.vision_model.encoder.layers = nn.ModuleList([_FakeLayer()])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = LlamaNemotronVLModel()
+                self.config = SimpleNamespace(use_cache=True, text_config=SimpleNamespace(num_kv_shared_layers=0))
+
+            def forward(self, x):
+                return x
+
+        model = BiEncoderModel()
+        self._run_parallelize(model)
+
+        language_layer = model.model.language_model.layers[0]
+        vision_layer = model.model.vision_model.vision_model.encoder.layers[0]
+        assert isinstance(language_layer.mlp, self._Wrapped)
+        assert isinstance(vision_layer.mlp, self._Wrapped)
+
+    def test_activation_checkpointing_scope_vision_only(self):
+        """``vision`` scope leaves extracted language layers unwrapped."""
+
+        class LlamaNemotronVLModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = nn.ModuleList([_FakeLayer()])
+                self.vision_model = nn.Module()
+                self.vision_model.vision_model = nn.Module()
+                self.vision_model.vision_model.encoder = nn.Module()
+                self.vision_model.vision_model.encoder.layers = nn.ModuleList([_FakeLayer()])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = LlamaNemotronVLModel()
+                self.config = SimpleNamespace(use_cache=True, text_config=SimpleNamespace(num_kv_shared_layers=0))
+
+            def forward(self, x):
+                return x
+
+        model = BiEncoderModel()
+        self._run_parallelize(model, activation_checkpointing_scope="vision")
+
+        language_layer = model.model.language_model.layers[0]
+        vision_layer = model.model.vision_model.vision_model.encoder.layers[0]
+        assert not isinstance(language_layer.mlp, self._Wrapped)
+        assert isinstance(vision_layer.mlp, self._Wrapped)
+
     def test_no_wrapping_without_activation_checkpointing(self):
         """When activation_checkpointing=False, nothing is wrapped."""
         model = _make_model_for_ac(num_kv_shared_layers=0)
@@ -1396,6 +1705,59 @@ class TestActivationCheckpointingKVSharing:
             assert not isinstance(layer.mlp, self._Wrapped)
             assert not isinstance(layer.self_attn, self._Wrapped)
         assert model.config.use_cache is True  # untouched
+
+    def test_selective_checkpointing_wraps_whole_layers(self, monkeypatch):
+        """Selective activation checkpointing wraps full transformer blocks."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
+
+        calls = []
+
+        def fake_checkpoint_wrapper(module, **kwargs):
+            calls.append((module, kwargs))
+            return self._Wrapped(module)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
+            fake_checkpoint_wrapper,
+        )
+
+        from nemo_automodel.components.distributed.activation_checkpointing import SELECTIVE_AC_WRAPPER_FLAG
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        self._run_parallelize(model, activation_checkpointing="selective")
+
+        assert len(calls) == len(model.model.layers)
+        for layer in model.model.layers:
+            assert isinstance(layer, self._Wrapped)
+            # Wrapper is tagged so the per-layer compile step compiles it OUTER.
+            assert getattr(layer, SELECTIVE_AC_WRAPPER_FLAG, False) is True
+        for _, kwargs in calls:
+            assert kwargs["checkpoint_impl"] == CheckpointImpl.NO_REENTRANT
+            assert kwargs["preserve_rng_state"] is True
+            assert callable(kwargs["context_fn"])
+
+    def test_selective_checkpointing_kv_sharing_falls_back_to_submodule_wrapping(self):
+        """KV-shared models cannot checkpoint the whole block because attention mutates cache."""
+        model = _make_model_for_ac(use_cache=True, num_kv_shared_layers=20)
+        self._run_parallelize(model, activation_checkpointing="selective")
+
+        for layer in model.model.layers:
+            assert not isinstance(layer, self._Wrapped)
+            assert isinstance(layer.mlp, self._Wrapped)
+            assert not isinstance(layer.self_attn, self._Wrapped)
+            assert isinstance(layer.input_layernorm, self._Wrapped)
+            assert isinstance(layer.post_attention_layernorm, self._Wrapped)
+
+    def test_bagel_parallelize_uses_full_layer_checkpointing(self):
+        """BAGEL wraps whole Qwen/SigLIP layers through the special AC path."""
+        model = _make_bagel_model(num_language_layers=2, num_vision_layers=2)
+
+        self._run_parallelize(model, activation_checkpointing=True)
+
+        language_layers = model.model.language_model.model.layers
+        vision_layers = model.model.vit_model.vision_model.encoder.layers
+        assert all(isinstance(layer, self._Wrapped) for layer in language_layers)
+        assert all(isinstance(layer, self._Wrapped) for layer in vision_layers)
 
     # ------------------------------------------------------------------ #
     # HF native gradient-checkpointing path
@@ -1519,6 +1881,311 @@ class TestActivationCheckpointingKVSharing:
             gradient_checkpointing_kwargs={"use_reentrant": True}
         )
 
+    def test_hf_native_grad_ckpt_skips_frozen_layers(self, monkeypatch):
+        """Frozen layers force scoped submodule wrapping instead of whole-model HF native GC."""
+        model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=0)
+        model.model.layers[0].requires_grad_(False)
+
+        self._run_parallelize(model)
+
+        model.gradient_checkpointing_enable.assert_not_called()
+        assert not isinstance(model.model.layers[0].mlp, self._Wrapped)
+        assert isinstance(model.model.layers[1].mlp, self._Wrapped)
+
+
+class TestSelectiveCheckpointNumerics:
+    """Real forward/backward parity for the selective-AC op policy.
+
+    These tests use the *real* torch checkpoint primitives (no mocked
+    ``checkpoint_wrapper``) so they exercise the policy returned by
+    ``make_selective_checkpoint_context_fn``. The policy saves every other
+    matmul, so the per-pass matmul counter must be keyed on
+    ``ctx.is_recompute``. A single shared counter continues from the forward
+    count into recompute and flips the save/recompute parity whenever a region
+    has an odd number of matmuls, silently corrupting gradients.
+    """
+
+    class _MatmulBlock(nn.Module):
+        def __init__(self, dim: int, num_linears: int):
+            super().__init__()
+            self.linears = nn.ModuleList([nn.Linear(dim, dim) for _ in range(num_linears)])
+
+        def forward(self, x):
+            for linear in self.linears:
+                x = torch.relu(linear(x))
+            return x
+
+    def _assert_grads_match_baseline(self, num_linears: int):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            checkpoint_wrapper,
+        )
+
+        from nemo_automodel.components.distributed.activation_checkpointing import (
+            make_selective_checkpoint_context_fn,
+        )
+
+        torch.manual_seed(0)
+        dim = 8
+        baseline = self._MatmulBlock(dim, num_linears)
+
+        wrapped_inner = self._MatmulBlock(dim, num_linears)
+        wrapped_inner.load_state_dict(baseline.state_dict())
+        wrapped = checkpoint_wrapper(
+            wrapped_inner,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            context_fn=make_selective_checkpoint_context_fn(),
+            preserve_rng_state=True,
+        )
+
+        x = torch.randn(4, dim)
+
+        out_base = baseline(x.clone())
+        out_base.sum().backward()
+
+        out_wrapped = wrapped(x.clone())
+        out_wrapped.sum().backward()
+
+        torch.testing.assert_close(out_wrapped, out_base)
+        for (name, p_base), (_, p_wrap) in zip(baseline.named_parameters(), wrapped_inner.named_parameters()):
+            torch.testing.assert_close(p_wrap.grad, p_base.grad, msg=f"grad mismatch for {name}")
+
+    def test_gradients_match_with_odd_matmul_count(self):
+        """Regression: an odd number of matmuls must not flip recompute parity."""
+        self._assert_grads_match_baseline(num_linears=3)
+
+    def test_gradients_match_with_even_matmul_count(self):
+        """Even matmul count is the easy case and must also stay correct."""
+        self._assert_grads_match_baseline(num_linears=4)
+
+
+class TestSelectiveCheckpointCompile:
+    """``_apply_per_layer_compile`` must compile selective-AC wrappers OUTER.
+
+    Selective AC wraps the whole block, so torch.compile must compile the
+    wrapper (not the unwrapped inner layer) for the partitioner to honor the
+    SAC recompute tags. Non-selective layer-level wrappers (PP path) are still
+    unwrapped and the decoder layer is compiled directly.
+    """
+
+    class _Block(nn.Module):
+        def __init__(self, dim: int = 8):
+            super().__init__()
+            self.fc = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.fc(x)
+
+    def _build_model(self, *, tag: bool):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            checkpoint_wrapper,
+        )
+
+        from nemo_automodel.components.distributed.activation_checkpointing import SELECTIVE_AC_WRAPPER_FLAG
+
+        layers = nn.ModuleList()
+        for _ in range(2):
+            wrapper = checkpoint_wrapper(self._Block(), checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+            if tag:
+                setattr(wrapper, SELECTIVE_AC_WRAPPER_FLAG, True)
+            layers.append(wrapper)
+        inner = nn.Module()
+        inner.layers = layers
+        model = nn.Module()
+        model.model = inner
+        return model
+
+    def _run_compile(self, model, monkeypatch):
+        import nemo_automodel.components.distributed.parallelizer as parallelizer
+
+        monkeypatch.setattr(parallelizer, "_patch_dtensor_spec_hash_for_symint", lambda: None)
+        compiled = []
+        monkeypatch.setattr(torch.nn.Module, "compile", lambda self, *a, **k: compiled.append(self))
+        parallelizer._apply_per_layer_compile(model)
+        return compiled
+
+    def test_tagged_selective_wrapper_compiled_outer(self, monkeypatch):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        model = self._build_model(tag=True)
+        compiled = self._run_compile(model, monkeypatch)
+
+        assert len(compiled) == 2
+        for m in compiled:
+            assert isinstance(m, CheckpointWrapper), "selective wrapper must be compiled, not unwrapped"
+
+    def test_untagged_wrapper_compiled_inner(self, monkeypatch):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        model = self._build_model(tag=False)
+        compiled = self._run_compile(model, monkeypatch)
+
+        assert len(compiled) == 2
+        for m in compiled:
+            assert not isinstance(m, CheckpointWrapper)
+            assert isinstance(m, self._Block), "non-selective wrapper must be unwrapped before compile"
+
+    def test_disable_dynamo_lru_cache_is_best_effort(self, monkeypatch):
+        """Missing private dynamo API must not raise."""
+        import nemo_automodel.components.distributed.activation_checkpointing as ac
+
+        monkeypatch.delattr(torch._C._dynamo.eval_frame, "_set_lru_cache", raising=False)
+        ac._disable_dynamo_lru_cache()  # should not raise
+
+
+class TestSingleGpuActivationCheckpointing:
+    """FSDP2Manager single-GPU (world_size==1) activation-checkpointing behavior."""
+
+    def _make_manager(self, monkeypatch, activation_checkpointing):
+        import nemo_automodel.components.distributed.fsdp2 as fsdp2_mod
+        from nemo_automodel.components.distributed.config import FSDP2Config
+
+        monkeypatch.setattr(fsdp2_mod, "get_world_size_safe", lambda: 1)
+        config = FSDP2Config(activation_checkpointing=activation_checkpointing)
+        return fsdp2_mod.FSDP2Manager(config, device_mesh=MagicMock())
+
+    def test_selective_wraps_layers_on_single_gpu(self, monkeypatch):
+        """Selective AC is honored on a single GPU (not silently full-checkpointed)."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        from nemo_automodel.components.distributed.activation_checkpointing import SELECTIVE_AC_WRAPPER_FLAG
+
+        manager = self._make_manager(monkeypatch, "selective")
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        manager.parallelize(model)
+
+        for layer in model.model.layers:
+            assert isinstance(layer, CheckpointWrapper)
+            assert getattr(layer, SELECTIVE_AC_WRAPPER_FLAG, False) is True
+        assert model.config.use_cache is False
+
+    def test_selective_kv_sharing_falls_back_on_single_gpu(self, monkeypatch):
+        """KV-shared models fall back to sub-module checkpointing, not whole-block."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        manager = self._make_manager(monkeypatch, "selective")
+        model = _make_model_for_ac(num_kv_shared_layers=20)
+        manager.parallelize(model)
+
+        for layer in model.model.layers:
+            assert not isinstance(layer, CheckpointWrapper)
+            assert isinstance(layer.mlp, CheckpointWrapper)
+            assert not isinstance(layer.self_attn, CheckpointWrapper)
+
+    def test_full_wraps_layers_on_single_gpu_without_hf_native(self, monkeypatch):
+        """Non-selective AC wraps layers on single GPU when the model is not an HF native GC candidate."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+        manager = self._make_manager(monkeypatch, True)
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.gradient_checkpointing_enable = MagicMock()
+        manager.parallelize(model)
+
+        model.gradient_checkpointing_enable.assert_not_called()
+        for layer in model.model.layers:
+            assert not isinstance(layer, CheckpointWrapper)
+            assert isinstance(layer.mlp, CheckpointWrapper)
+            assert isinstance(layer.self_attn, CheckpointWrapper)
+
+
+class TestSelectiveCheckpointSaveOps:
+    """Tests for the TorchTitan-style save-op set used by selective AC."""
+
+    def test_matmul_ops_alternate_mm_linear_and_grouped_mm(self):
+        """mm/linear and the MoE grouped-GEMM variants alternate; addmm/bmm are always saved."""
+        from nemo_automodel.components.distributed.activation_checkpointing import _SELECTIVE_AC_MATMUL_OPS
+
+        # mm and linear always exist; grouped-GEMM variants are version-dependent.
+        assert torch.ops.aten.mm.default in _SELECTIVE_AC_MATMUL_OPS
+        assert torch.ops.aten.linear.default in _SELECTIVE_AC_MATMUL_OPS
+        # addmm/bmm must NOT alternate (they are always-saved).
+        assert torch.ops.aten.addmm.default not in _SELECTIVE_AC_MATMUL_OPS
+        assert torch.ops.aten.bmm.default not in _SELECTIVE_AC_MATMUL_OPS
+        # When available, the grouped-GEMM op (expert compute) alternates so it is
+        # not unconditionally recomputed under EP.
+        grouped_mm = getattr(torch.ops.aten, "_grouped_mm", None)
+        if grouped_mm is not None:
+            assert grouped_mm.default in _SELECTIVE_AC_MATMUL_OPS
+
+    def test_save_ops_include_compute_and_comm_ops(self):
+        """The save-set covers matmuls, attention, and communication collectives."""
+        from nemo_automodel.components.distributed.activation_checkpointing import _SELECTIVE_AC_MUST_SAVE_OPS
+
+        expected = [
+            torch.ops.aten.mm.default,
+            torch.ops.aten.addmm.default,
+            torch.ops.aten.bmm.default,
+            torch.ops.aten.linear.default,
+            torch.ops.aten._scaled_dot_product_flash_attention.default,
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            torch.ops._c10d_functional.all_to_all_single.default,
+        ]
+        for op in expected:
+            assert op in _SELECTIVE_AC_MUST_SAVE_OPS, f"{op} missing from save-op set"
+
+    def test_save_ops_seeded_from_partitioner(self):
+        """The set is seeded from PyTorch's compute-intensive op list, not hardcoded."""
+        from nemo_automodel.components.distributed.activation_checkpointing import _default_compute_intensive_ops
+
+        seeded = _default_compute_intensive_ops()
+        assert isinstance(seeded, tuple)
+        # mm is compute-intensive in every supported torch version.
+        assert torch.ops.aten.mm.default in seeded
+
+    def test_build_save_ops_falls_back_without_partitioner(self, monkeypatch):
+        """If the private partitioner API is unavailable, the curated supplement still applies."""
+        import nemo_automodel.components.distributed.activation_checkpointing as ac
+
+        monkeypatch.setattr(ac, "_default_compute_intensive_ops", lambda: ())
+        save_ops = ac._build_selective_ac_save_ops()
+        # Curated supplement still provides the core matmul + attention ops.
+        assert torch.ops.aten.mm.default in save_ops
+        assert torch.ops.aten.addmm.default in save_ops
+        assert torch.ops.aten.bmm.default in save_ops
+        assert torch.ops.aten._scaled_dot_product_flash_attention.default in save_ops
+
+    def test_resolve_op_attr_returns_none_for_missing(self):
+        """Optional/absent ops resolve to None instead of raising."""
+        from nemo_automodel.components.distributed.activation_checkpointing import _resolve_op_attr
+
+        assert _resolve_op_attr(torch.ops, "definitely_not_a_namespace.foo.default") is None
+        assert _resolve_op_attr(torch, "_higher_order_ops.flex_attention") is not None
+
+    def test_trace_logs_each_op_once_with_verdict(self, caplog):
+        """The opt-in policy trace logs each unique op a single time with its verdict."""
+        import logging as _logging
+
+        from torch.utils.checkpoint import CheckpointPolicy
+
+        import nemo_automodel.components.distributed.activation_checkpointing as ac
+
+        ac._SELECTIVE_AC_TRACE_SEEN.clear()
+        with patch.object(ac, "_SELECTIVE_AC_TRACE", True):
+            with caplog.at_level(_logging.INFO, logger=ac.__name__):
+                ac._maybe_trace_selective_ac_decision(
+                    torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE, True, is_recompute=False
+                )
+                # Duplicate of the same op must not log a second time.
+                ac._maybe_trace_selective_ac_decision(
+                    torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE, True, is_recompute=False
+                )
+                ac._maybe_trace_selective_ac_decision(
+                    torch.ops._c10d_functional.all_to_all_single.default,
+                    CheckpointPolicy.MUST_SAVE,
+                    False,
+                    is_recompute=False,
+                )
+                ac._maybe_trace_selective_ac_decision(
+                    torch.ops.aten.add.Tensor, CheckpointPolicy.PREFER_RECOMPUTE, False, is_recompute=False
+                )
+
+        lines = [r.getMessage() for r in caplog.records if "[selective-ac]" in r.getMessage()]
+        assert len(lines) == 3  # mm logged once (dedup), all_to_all, add
+        assert any("ALTERNATE" in ln and "mm" in ln for ln in lines)
+        assert any("SAVE" in ln and "all_to_all_single" in ln for ln in lines)
+        assert any("RECOMPUTE" in ln and "add" in ln for ln in lines)
+
 
 class TestExtractModelLayers:
     """Tests for ``_extract_model_layers`` flattening of ModuleList results.
@@ -1590,11 +2257,70 @@ class TestExtractModelLayers:
         assert len(result) == 4
         assert all(r is layers[i] for i, r in enumerate(result))
 
-    def test_multi_fqn_flattens_each_modulelist(self):
-        """Qwen2.5-VL entry ``["language_model.layers", "visual.blocks"]``.
+    def _attach_qwen_vl_towers(self, model, lang, vis, *, nested):
+        """Attach Qwen2-VL-style towers for one historical tree shape.
 
-        Both FQNs resolve to ModuleLists; both must be flattened so all decoder
-        and vision blocks appear as individual elements in the final list.
+        ``nested=True`` builds the standardized tree (transformers >= 4.52,
+        incl. v5): ``model.language_model.layers`` + ``model.visual.blocks``.
+        ``nested=False`` builds the pre-standardization tree (<= 4.51):
+        ``model.layers`` + top-level ``visual.blocks``.
+        """
+        visual = nn.Module()
+        visual.blocks = vis
+        if nested:
+            language_model = nn.Module()
+            language_model.layers = lang
+            inner = nn.Module()
+            inner.language_model = language_model
+            inner.visual = visual
+            model.model = inner
+        else:
+            text_model = nn.Module()
+            text_model.layers = lang
+            model.model = text_model
+            model.visual = visual
+
+    @staticmethod
+    def _attach_language_vision_towers(model, lang, vis, *, shape):
+        """Attach Gemma3/Llava-style towers for one historical tree ``shape``.
+
+        ``"pre_standardization"`` (<= 4.51): ``language_model.model.layers`` +
+        ``vision_tower.vision_model.encoder.layers``.
+        ``"standardized_v4"`` (4.52-4.x): ``model.language_model.layers`` +
+        ``model.vision_tower.vision_model.encoder.layers``.
+        ``"v5"`` (>= 5.0): ``model.language_model.layers`` +
+        ``model.vision_tower.encoder.layers`` (flattened tower).
+        """
+        if shape == "pre_standardization":
+            language_model = nn.Module()
+            language_model.model = nn.Module()
+            language_model.model.layers = lang
+            vision_tower = nn.Module()
+            vision_tower.vision_model = nn.Module()
+            vision_tower.vision_model.encoder = nn.Module()
+            vision_tower.vision_model.encoder.layers = vis
+            model.language_model = language_model
+            model.vision_tower = vision_tower
+            return
+        inner = nn.Module()
+        inner.language_model = nn.Module()
+        inner.language_model.layers = lang
+        inner.vision_tower = nn.Module()
+        if shape == "standardized_v4":
+            inner.vision_tower.vision_model = nn.Module()
+            inner.vision_tower.vision_model.encoder = nn.Module()
+            inner.vision_tower.vision_model.encoder.layers = vis
+        else:  # v5: flattened tower, no inner `vision_model`.
+            inner.vision_tower.encoder = nn.Module()
+            inner.vision_tower.encoder.layers = vis
+        model.model = inner
+
+    def test_multi_fqn_flattens_each_modulelist(self):
+        """Qwen2.5-VL pre-standardization tree (``model.layers`` + ``visual.blocks``).
+
+        Both groups resolve to ModuleLists; both must be flattened so all
+        decoder and vision blocks appear as individual elements in the final
+        list.
         """
         from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
             Qwen2_5_VLForConditionalGeneration,
@@ -1603,12 +2329,7 @@ class TestExtractModelLayers:
         model = self._bare_instance(Qwen2_5_VLForConditionalGeneration)
         lang = self._make_layers(5)
         vis = self._make_layers(2)
-        language_model = nn.Module()
-        language_model.layers = lang
-        model.language_model = language_model
-        visual = nn.Module()
-        visual.blocks = vis
-        model.visual = visual
+        self._attach_qwen_vl_towers(model, lang, vis, nested=False)
 
         result = _extract_model_layers(model)
 
@@ -1616,6 +2337,139 @@ class TestExtractModelLayers:
         assert [id(r) for r in result[:5]] == [id(item) for item in lang]
         assert [id(r) for r in result[5:]] == [id(item) for item in vis]
         assert not any(isinstance(r, nn.ModuleList) for r in result)
+
+    @pytest.mark.parametrize("nested", [False, True], ids=["pre_standardization", "standardized"])
+    def test_qwen2_vl_tree_shapes_extract_language_and_vision_groups(self, nested):
+        """Every historical Qwen2-VL tree must resolve structurally, no version gate.
+
+        Pre-standardization (verified transformers 4.51.3): ``model.layers`` +
+        ``visual.blocks``. Standardized (verified 4.57.1/5.8.1/5.12.1):
+        ``model.language_model.layers`` + ``model.visual.blocks``. Version-gated
+        FQNs picked the wrong tree for parts of the 4.x line and silently
+        disabled activation checkpointing.
+        """
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+            Qwen2_5_VLForConditionalGeneration,
+        )
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        for cls in (Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration):
+            model = self._bare_instance(cls)
+            lang = self._make_layers(3)
+            vis = self._make_layers(2)
+            self._attach_qwen_vl_towers(model, lang, vis, nested=nested)
+
+            groups = _extract_model_layer_groups(model)
+
+            assert set(groups) == {"language", "vision"}, cls.__name__
+            assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+            assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    def test_qwen2_vl_deprecation_aliases_do_not_double_count_layers(self):
+        """Standardized 4.x keeps deprecated top-level ``visual``/``language_model``
+        aliases for the nested towers; first-match resolution must count each
+        layer exactly once even when the historical FQN also resolves.
+        """
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        model = self._bare_instance(Qwen2VLForConditionalGeneration)
+        lang = self._make_layers(3)
+        vis = self._make_layers(2)
+        self._attach_qwen_vl_towers(model, lang, vis, nested=True)
+        # Simulate the transformers 4.52-4.x deprecation aliases: the same
+        # towers are reachable at the historical top-level paths too.
+        model.visual = model.model.visual
+        model.language_model = model.model.language_model
+
+        groups = _extract_model_layer_groups(model)
+
+        assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+        assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    @pytest.mark.parametrize("shape", ["pre_standardization", "standardized_v4", "v5"])
+    def test_gemma3_tree_shapes_extract_language_and_vision_groups(self, shape):
+        """Every historical Gemma3 tree must resolve structurally, no version gate.
+
+        Shapes verified by meta-instantiation: ``language_model.model.layers`` +
+        ``vision_tower.vision_model.encoder.layers`` on 4.51.3,
+        ``model.language_model.layers`` +
+        ``model.vision_tower.vision_model.encoder.layers`` on 4.57.1, and
+        ``model.language_model.layers`` + ``model.vision_tower.encoder.layers``
+        on 5.8.1/5.12.1.
+        """
+        model = self._bare_instance(Gemma3ForConditionalGeneration)
+        lang = self._make_layers(3)
+        vis = self._make_layers(2)
+        self._attach_language_vision_towers(model, lang, vis, shape=shape)
+
+        groups = _extract_model_layer_groups(model)
+
+        assert set(groups) == {"language", "vision"}
+        assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+        assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    @pytest.mark.parametrize("shape", ["pre_standardization", "standardized_v4", "v5"])
+    def test_llava_tree_shapes_extract_language_and_vision_groups(self, shape):
+        """Llava-family trees share the Gemma3 lineage (CLIP instead of SigLIP);
+        each historical shape must resolve structurally for every Llava class.
+        """
+        from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+        from transformers.models.llava_next.modeling_llava_next import (
+            LlavaNextForConditionalGeneration,
+        )
+        from transformers.models.llava_next_video.modeling_llava_next_video import (
+            LlavaNextVideoForConditionalGeneration,
+        )
+        from transformers.models.llava_onevision.modeling_llava_onevision import (
+            LlavaOnevisionForConditionalGeneration,
+        )
+
+        for cls in (
+            LlavaForConditionalGeneration,
+            LlavaNextForConditionalGeneration,
+            LlavaNextVideoForConditionalGeneration,
+            LlavaOnevisionForConditionalGeneration,
+        ):
+            model = self._bare_instance(cls)
+            lang = self._make_layers(3)
+            vis = self._make_layers(2)
+            self._attach_language_vision_towers(model, lang, vis, shape=shape)
+
+            groups = _extract_model_layer_groups(model)
+
+            assert set(groups) == {"language", "vision"}, cls.__name__
+            assert [id(m) for m in groups["language"]] == [id(item) for item in lang], cls.__name__
+            assert [id(m) for m in groups["vision"]] == [id(item) for item in vis], cls.__name__
+
+    def test_spec_resolving_no_modules_warns_and_returns_empty(self, caplog):
+        """A mapped model class whose spec FQNs all fail to resolve must warn.
+
+        This is the transformers-version-drift failure mode: extraction used to
+        return ``{}`` silently and activation checkpointing became a no-op.
+        """
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        # A tree that matches no known Qwen2-VL shape: top-level
+        # `language_model.layers` (never a registered module path for this
+        # class; it only ever existed as a deprecation alias).
+        model = self._bare_instance(Qwen2VLForConditionalGeneration)
+        language_model = nn.Module()
+        language_model.layers = self._make_layers(2)
+        model.language_model = language_model
+
+        with caplog.at_level("WARNING", logger=parallelizer.logger.name):
+            groups = _extract_model_layer_groups(model)
+
+        assert groups == {}
+        assert "Qwen2VLForConditionalGeneration" in caplog.text
+        assert "model.language_model.layers" in caplog.text
+        assert "model.visual.blocks" in caplog.text
 
     def test_moduledict_layer_container_flattens(self):
         """PP post-split: ``_reduce_attrs`` returns a ModuleDict.
@@ -1718,3 +2572,222 @@ class TestExtractModelLayers:
         # 3 text-decoder + 2 vision tower layers, all flattened.
         assert len(result) == 5
         assert not any(isinstance(r, nn.ModuleList) for r in result)
+
+    def test_retrieval_wrapper_unwraps_llama_nemotron_vl_groups(self):
+        """Retrieval wrappers should not fall back to the largest-layer heuristic."""
+
+        class LlamaNemotronVLModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = self._mklayers(4)
+                self.vision_model = nn.Module()
+                self.vision_model.vision_model = nn.Module()
+                self.vision_model.vision_model.encoder = nn.Module()
+                self.vision_model.vision_model.encoder.layers = self._mklayers(2)
+
+            @staticmethod
+            def _mklayers(n):
+                return nn.ModuleList([_FakeLayer() for _ in range(n)])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = LlamaNemotronVLModel()
+
+        model = BiEncoderModel()
+
+        groups = _extract_model_layer_groups(model)
+        result = _extract_model_layers(model)
+
+        assert set(groups) == {"language", "vision"}
+        assert len(groups["language"]) == 4
+        assert len(groups["vision"]) == 2
+        assert result == groups["language"] + groups["vision"]
+
+    def test_retrieval_wrapper_unwraps_ministral_bidirectional_language_layers(self):
+        """The mainline Ministral bidirectional text encoder remains language-only."""
+
+        class Ministral3BidirectionalModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([_FakeLayer() for _ in range(3)])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Ministral3BidirectionalModel()
+
+        model = BiEncoderModel()
+
+        groups = _extract_model_layer_groups(model)
+        result = _extract_model_layers(model)
+
+        assert set(groups) == {"language"}
+        assert len(groups["language"]) == 3
+        assert result == groups["language"]
+
+    def test_activation_checkpointing_scope_filtering(self):
+        language = [_FakeLayer(), _FakeLayer()]
+        vision = [_FakeLayer()]
+        audio = [_FakeLayer()]
+        vision[0].requires_grad_(False)
+
+        groups = {"language": language, "vision": vision, "audio": audio}
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "language")
+        assert scopes == ("language",)
+        assert selected == language
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "multimodal")
+        assert scopes == ("multimodal",)
+        assert selected == audio
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, ["language", "vision"])
+        assert scopes == ("language", "vision")
+        assert selected == language
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "all")
+        assert scopes == ("all",)
+        assert selected == language + audio
+
+    def test_activation_checkpointing_scope_filtering_warns_when_scope_has_only_frozen_layers(self, caplog):
+        vision = [_FakeLayer()]
+        vision[0].requires_grad_(False)
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing({"vision": vision}, "vision")
+
+        assert scopes == ("vision",)
+        assert selected == []
+        assert "selected no layers" in caplog.text
+
+    def test_string_keyed_new_vlm_families_extract_language_and_vision_layers(self):
+        """Native VLM families in examples should not fall back to the largest-layer heuristic."""
+
+        def _layers(count):
+            return nn.ModuleList([_FakeLayer() for _ in range(count)])
+
+        def _assert_counts(model, language_count, vision_count):
+            groups = _extract_model_layer_groups(model)
+            result = _extract_model_layers(model)
+            assert set(groups) == {"language", "vision"}
+            assert len(groups["language"]) == language_count
+            assert len(groups["vision"]) == vision_count
+            assert result == groups["language"] + groups["vision"]
+
+        class KimiVLForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(3)
+                self.model.vision_tower = nn.Module()
+                self.model.vision_tower.encoder = nn.Module()
+                self.model.vision_tower.encoder.blocks = _layers(2)
+
+        class KimiK25VLForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(4)
+                self.model.vision_tower = nn.Module()
+                self.model.vision_tower.encoder = nn.Module()
+                self.model.vision_tower.encoder.blocks = _layers(2)
+
+        class MiniMaxM3SparseForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleDict({str(i): _FakeLayer() for i in range(5)})
+                self.vision_tower = nn.Module()
+                self.vision_tower.vision_model = nn.Module()
+                self.vision_tower.vision_model.encoder = nn.Module()
+                self.vision_tower.vision_model.encoder.layers = _layers(2)
+
+        class Qwen3_5MoeForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(6)
+                self.model.visual = nn.Module()
+                self.model.visual.blocks = _layers(3)
+
+        class Qwen3VLMoeForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(8)
+                self.model.visual = nn.Module()
+                self.model.visual.blocks = _layers(3)
+
+        class Step3p7ForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(7)
+                self.model.vision_model = nn.Module()
+                self.model.vision_model.transformer = nn.Module()
+                self.model.vision_model.transformer.resblocks = _layers(2)
+
+        _assert_counts(KimiVLForConditionalGeneration(), 3, 2)
+        _assert_counts(KimiK25VLForConditionalGeneration(), 4, 2)
+        _assert_counts(MiniMaxM3SparseForConditionalGeneration(), 5, 2)
+        _assert_counts(Qwen3_5MoeForConditionalGeneration(), 6, 3)
+        _assert_counts(Qwen3VLMoeForConditionalGeneration(), 8, 3)
+        _assert_counts(Step3p7ForConditionalGeneration(), 7, 2)
+
+    def test_string_keyed_bagel_extracts_language_and_vision_layers(self):
+        """BAGEL exposes Qwen decoder layers and SigLIP encoder layers."""
+        model = _make_bagel_model(num_language_layers=2, num_vision_layers=3)
+
+        result = _extract_model_layers(model)
+
+        language_layers = model.model.language_model.model.layers
+        vision_layers = model.model.vit_model.vision_model.encoder.layers
+        assert len(result) == 5
+        assert [id(r) for r in result[:2]] == [id(layer) for layer in language_layers]
+        assert [id(r) for r in result[2:]] == [id(layer) for layer in vision_layers]
+
+
+class TestBagelFullLayerActivationCheckpointing:
+    """Tests for native BAGEL-style whole-layer activation checkpointing."""
+
+    def test_get_module_by_fqn_resolves_nested_module_and_missing_path(self):
+        """Nested FQN lookup returns the module or None for missing paths."""
+        model = _make_bagel_model()
+
+        result = parallelizer._get_module_by_fqn(model, "model.vit_model.vision_model.encoder.layers")
+
+        assert result is model.model.vit_model.vision_model.encoder.layers
+        assert parallelizer._get_module_by_fqn(model, "model.missing.layers") is None
+
+    def test_apply_bagel_full_layer_activation_checkpointing_wraps_each_layer(self, monkeypatch):
+        """BAGEL wraps Qwen and SigLIP layers once and skips already wrapped layers."""
+        model = _make_bagel_model(num_language_layers=2, num_vision_layers=3)
+        wrap_calls = []
+
+        def _fake_checkpoint_wrapper(module, **kwargs):
+            wrap_calls.append((module, kwargs))
+            return _CheckpointWrapped(module, **kwargs)
+
+        monkeypatch.setattr(parallelizer, "checkpoint_wrapper", _fake_checkpoint_wrapper)
+
+        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(model) is True
+
+        language_layers = model.model.language_model.model.layers
+        vision_layers = model.model.vit_model.vision_model.encoder.layers
+        wrapped_layers = list(language_layers) + list(vision_layers)
+        assert len(wrap_calls) == 5
+        assert all(isinstance(layer, _CheckpointWrapped) for layer in wrapped_layers)
+        assert all(call_kwargs["checkpoint_impl"].name == "NO_REENTRANT" for _, call_kwargs in wrap_calls)
+
+        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(model) is False
+        assert len(wrap_calls) == 5
+
+    def test_apply_bagel_full_layer_activation_checkpointing_ignores_other_models(self):
+        """Non-BAGEL models continue through the generic checkpointing path."""
+        assert parallelizer._apply_bagel_full_layer_activation_checkpointing(nn.Module()) is False

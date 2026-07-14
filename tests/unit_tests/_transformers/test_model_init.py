@@ -214,6 +214,77 @@ class TestGetHfConfigNestedKwargs:
         assert "text_config" not in call_kwargs
         assert call_kwargs["output_hidden_states"] is True
 
+    @patch("nemo_automodel._transformers.model_init.resolve_trust_remote_code", return_value=False)
+    @patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained")
+    def test_dict_config_override_folded_into_auto_config(self, mock_from_pretrained, mock_trust):
+        """A plain-dict ``config`` (from --model.config.*) must be applied as overrides,
+        not returned verbatim. Regression for NVBugs 6259955 Defect 2: a dict config flipped
+        custom-model dispatch to the stock-HF path (get_architectures(dict) -> None)."""
+        built = MagicMock()
+        mock_from_pretrained.return_value = built
+
+        result = get_hf_config(
+            "fake/model",
+            attn_implementation="eager",
+            config={"num_hidden_layers": 16},
+        )
+
+        # The dict must NOT be returned as-is; a real config object is built instead.
+        assert result is built
+        call_kwargs = mock_from_pretrained.call_args[1]
+        # The override keys are folded into the AutoConfig.from_pretrained call ...
+        assert call_kwargs["num_hidden_layers"] == 16
+        # ... and the raw ``config`` dict is not forwarded as a kwarg.
+        assert "config" not in call_kwargs
+
+
+class TestDictConfigOverrideKeepsCustomPath:
+    """NVBugs 6259955 Defect 2: --model.config.* overrides must not flip dispatch off the
+    custom model path, and the dict ``config`` must not reach the model constructor."""
+
+    def _make_config(self):
+        config = MagicMock()
+        config.architectures = ["SomeModel"]
+        config.torch_dtype = "bfloat16"
+        config.name_or_path = "fake/model"
+        return config
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init.get_hf_config")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_dict_config_not_forwarded_to_custom_init(self, mock_resolve_cls, mock_get_hf_config, _mock_download):
+        hf_config = self._make_config()
+        mock_get_hf_config.return_value = hf_config
+
+        captured_kwargs = {}
+        captured_args = {}
+
+        def fake_model_cls(config, **kwargs):
+            captured_args["config"] = config
+            captured_kwargs.update(kwargs)
+            return MagicMock()
+
+        fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
+        mock_resolve_cls.return_value = fake_model_cls
+
+        is_custom, _ = _init_model(
+            cls=MagicMock(),
+            pretrained_model_name_or_path_or_config="fake/model",
+            attn_implementation="flash_attention_2",
+            torch_dtype="auto",
+            quantization_config=None,
+            force_hf=False,
+            backend={"attn": "sdpa"},
+            config={"num_hidden_layers": 16},
+        )
+
+        # Custom path stays selected (dispatch did not flip to stock-HF) ...
+        assert is_custom is True
+        assert captured_args["config"] is hf_config
+        # ... and the dict ``config`` override never reaches the constructor (would
+        # otherwise collide with the positional config and/or raise TypeError).
+        assert "config" not in captured_kwargs
+
 
 class TestSetupBnbLoadingKwargs:
     """_setup_bnb_loading_kwargs sets a per-GPU device_map and disables HF async weight loading."""
@@ -632,3 +703,85 @@ class TestTryGetRemoteCodeModelCls:
         cfg.auto_map = {"AutoModelForCausalLM": "modeling.MyModel"}
         result = _try_get_remote_code_model_cls(cfg, "/some/path", "AutoModelForCausalLM", {})
         assert result is None
+
+
+class TestTieWeightsNemoConfigGate:
+    """_tie_weights_nemo must honor the controlling tie_word_embeddings flag (#2941).
+
+    ``_nemo_tied_weights_keys`` names the candidate tied keys (pre-v5 list-form
+    ``_tied_weights_keys`` semantics); it does not mean the model is tied.
+    Re-tying an untied model aliases away the trained ``lm_head.weight`` that
+    ``from_pretrained`` just loaded.
+    """
+
+    @staticmethod
+    def _make_model(tie: bool | None) -> nn.Module:
+        from transformers import PretrainedConfig
+
+        class _TinyModel(nn.Module):
+            _nemo_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.embed_tokens = nn.Embedding(10, 4)
+                self.lm_head = nn.Linear(4, 10, bias=False)
+
+        model = _TinyModel()
+        if tie is not None:
+            model.config = PretrainedConfig(tie_word_embeddings=tie)
+        return model
+
+    def test_untied_config_keeps_separate_lm_head(self):
+        """tie_word_embeddings=False: the loaded lm_head must not be aliased away."""
+        from nemo_automodel._transformers.model_init import _tie_weights_nemo
+
+        model = self._make_model(tie=False)
+        lm_head_before = model.lm_head.weight.detach().clone()
+
+        _tie_weights_nemo(model)
+
+        assert model.lm_head.weight is not model.model.embed_tokens.weight
+        assert model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr()
+        torch.testing.assert_close(model.lm_head.weight, lm_head_before)
+
+    def test_tied_config_reties(self):
+        """tie_word_embeddings=True: keep the #1817 re-tie behavior."""
+        from nemo_automodel._transformers.model_init import _tie_weights_nemo
+
+        model = self._make_model(tie=True)
+        _tie_weights_nemo(model)
+
+        assert model.lm_head.weight is model.model.embed_tokens.weight
+
+    def test_missing_config_still_reties(self):
+        """No config attribute: fall back to the conservative #1817 re-tie."""
+        from nemo_automodel._transformers.model_init import _tie_weights_nemo
+
+        model = self._make_model(tie=None)
+        _tie_weights_nemo(model)
+
+        assert model.lm_head.weight is model.model.embed_tokens.weight
+
+    def test_untied_state_dict_roundtrip_is_lossless(self):
+        """Resume scenario: distinct lm_head/embed weights must survive construct-then-load.
+
+        Before the fix, construction aliased both params to one storage, so
+        ``load_state_dict`` wrote both checkpoint tensors into the same memory
+        (last writer wins) — corrupting embeddings and/or head on resume.
+        """
+        from nemo_automodel._transformers.model_init import _tie_weights_nemo
+
+        source = self._make_model(tie=False)
+        with torch.no_grad():
+            source.model.embed_tokens.weight.uniform_(-1.0, 1.0)
+            source.lm_head.weight.uniform_(-1.0, 1.0)
+        checkpoint = {k: v.detach().clone() for k, v in source.state_dict().items()}
+
+        resumed = self._make_model(tie=False)
+        _tie_weights_nemo(resumed)  # runs at the end of _init_model, before checkpoint load
+        resumed.load_state_dict(checkpoint)
+
+        torch.testing.assert_close(resumed.lm_head.weight, checkpoint["lm_head.weight"])
+        torch.testing.assert_close(resumed.model.embed_tokens.weight, checkpoint["model.embed_tokens.weight"])
+        assert resumed.lm_head.weight.data_ptr() != resumed.model.embed_tokens.weight.data_ptr()

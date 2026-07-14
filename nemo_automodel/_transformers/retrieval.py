@@ -167,7 +167,7 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
             sequence_lengths = attention_mask.sum(dim=1) - 1
             batch_size = last_hidden.shape[0]
             emb = last_hidden[torch.arange(batch_size, device=last_hidden.device), sequence_lengths]
-    elif pool_type == "colbert":
+    elif pool_type in {"colbert", "multi_vector"}:
         emb = last_hidden
     else:
         raise ValueError(f"pool_type {pool_type} not supported")
@@ -305,6 +305,9 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
             - ``checkpointer``: a Checkpointer instance for distributed saves.
             - ``peft_config``: PEFT configuration (forwarded to checkpointer).
             - ``tokenizer``: tokenizer instance (forwarded to checkpointer).
+            - ``is_final_checkpoint``: Whether this is the final scheduled
+              training checkpoint. Defaults to ``False`` for direct callers
+              that do not have recipe step-scheduler context.
     """
     checkpointer = kwargs.get("checkpointer", None)
     if checkpointer is not None:
@@ -313,6 +316,7 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
             weights_path=save_directory,
             peft_config=kwargs.get("peft_config", None),
             tokenizer=kwargs.get("tokenizer", None),
+            is_final_checkpoint=kwargs.get("is_final_checkpoint", False),
         )
         return
 
@@ -328,11 +332,15 @@ _LLAMA_TASKS = {
 _MINISTRAL3_BIDIREC_TASKS = {
     "embedding": "Ministral3BidirectionalModel",
 }
+_LLAMA_NEMOTRON_VL_TASKS = {
+    "embedding": "LlamaNemotronVLModel",
+}
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
     "ministral3": _MINISTRAL3_BIDIREC_TASKS,
     "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
+    "llama_nemotron_vl": _LLAMA_NEMOTRON_VL_TASKS,
 }
 
 
@@ -359,12 +367,14 @@ class BiEncoderModel(nn.Module):
         pooling: str = "avg",
         l2_normalize: bool = True,
         do_distributed_inbatch_negative: bool = False,
+        detach_distributed_inbatch_negatives: bool = True,
     ):
         super().__init__()
         _init_encoder_common(self, model)
         self.pooling = pooling
         self.l2_normalize = l2_normalize
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
+        self.detach_distributed_inbatch_negatives = detach_distributed_inbatch_negatives
 
     @classmethod
     def build(
@@ -374,6 +384,7 @@ class BiEncoderModel(nn.Module):
         pooling: str = "avg",
         l2_normalize: bool = True,
         do_distributed_inbatch_negative: bool = False,
+        detach_distributed_inbatch_negatives: bool = True,
         trust_remote_code: bool = False,
         **hf_kwargs,
     ):
@@ -393,6 +404,7 @@ class BiEncoderModel(nn.Module):
             pooling=pooling,
             l2_normalize=l2_normalize,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
+            detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
         )
 
     def save_pretrained(self, save_directory: str, **kwargs):
@@ -410,11 +422,16 @@ class BiEncoderModel(nn.Module):
         if not input_dict:
             return None
 
-        if "token_type_ids" not in inspect.getfullargspec(self.model.forward).args and "token_type_ids" in input_dict:
+        forward_args = inspect.getfullargspec(self.model.forward).args
+        if "token_type_ids" not in forward_args and "token_type_ids" in input_dict:
             input_dict = {k: v for k, v in input_dict.items() if k != "token_type_ids"}
 
+        model_inputs = {k: v for k, v in input_dict.items() if k not in ["kd_labels", "run_dummy_vision"]}
+        if "run_dummy_vision" in forward_args and "run_dummy_vision" in input_dict:
+            model_inputs["run_dummy_vision"] = input_dict["run_dummy_vision"]
+
         outputs = self.model(
-            **{k: v for k, v in input_dict.items() if k not in ["kd_labels"]},
+            **model_inputs,
             return_dict=True,
             output_hidden_states=True,
         )

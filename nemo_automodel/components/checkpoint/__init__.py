@@ -11,14 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import torch
-from packaging.version import parse as vparse
-
 from ._torch_backports import apply_async_checkpoint_patch as _nemo__apply_async_patch
 from ._torch_backports import apply_patches as _nemo__apply_patches
+from .config import CheckpointingConfig, _is_geq_torch_2_9, _is_leq_torch_2_7_1
 
-if vparse(torch.__version__).base_version <= "2.7.1":
+__all__ = ["CheckpointingConfig"]
+
+if _is_leq_torch_2_7_1():
     _nemo__apply_patches()
 
-if vparse(torch.__version__).base_version >= "2.9.0":
+if _is_geq_torch_2_9():
     _nemo__apply_async_patch()

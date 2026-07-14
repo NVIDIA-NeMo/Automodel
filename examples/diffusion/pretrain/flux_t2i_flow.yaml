@@ -79,11 +79,12 @@ checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
   diffusers_compatible: true
   restore_from:
 
 wandb:
+  enable: false
   project: flux-pretraining
   mode: online
   name: flux_pretrain_ddp_test_run_1

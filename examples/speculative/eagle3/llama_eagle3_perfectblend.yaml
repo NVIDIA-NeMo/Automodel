@@ -7,17 +7,11 @@ dist_env:
 recipe_args:
   target_model_name_or_path: meta-llama/Llama-3.1-8B-Instruct
 
-  # ``frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct`` is
-  # distributed with a ``conversations`` column, but ChatDataset expects
-  # ``messages``. Before pointing the recipe at the dataset, rename the
-  # column locally (one-liner shown below) and pass the rewritten
-  # directory or HF dataset ID here.
-  #
-  #   python -c "import pandas as pd; from pathlib import Path; \
-  #              src = Path('<download_dir>'); dst = Path('<output_dir>'); \
-  #              dst.mkdir(parents=True, exist_ok=True); \
-  #              [pd.read_parquet(f).rename(columns={'conversations': 'messages'}) \
-  #               .to_parquet(dst / f.name, index=False) for f in sorted(src.glob('train-*.parquet'))]"
+  # ``frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct`` ships its
+  # turns under a ``conversations`` column instead of ``messages``. ChatDataset
+  # now auto-converts a ``conversations`` column (ShareGPT ``{from, value}`` or
+  # OpenAI ``{role, content}``) into the ``messages`` schema, so the dataset can
+  # be pointed at directly -- no local column rename needed.
   train_data_path: frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct
   val_data_path: null
 
@@ -31,6 +25,11 @@ recipe_args:
   output_dir: ./outputs/eagle3_llama_perfectblend
 
   seq_length: 2048
+
+  # Sequence packing (EAGLE-3, colocated backend only). > 0 packs variable-length
+  # samples into rows of this width with per-document block-causal attention,
+  # removing padding waste. Set to seq_length (or larger); 0 disables.
+  packed_sequence_size: 2048
 
   # 8 GPUs * micro_batch=1 * grad_accum=4 -> effective batch 32.
   micro_batch_size: 1

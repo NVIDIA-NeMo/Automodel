@@ -37,18 +37,23 @@ rng:
   ranked: true
 
 model:
+  # mistralai/Ministral-3-3B-Instruct-2512 is a per-tensor FP8 checkpoint
+  # (Mistral3ForConditionalGeneration / ministral3 text backbone). Automodel's
+  # custom Mistral3FP8VLMForConditionalGeneration claims it via the mistral3_vlm
+  # resolver hook and dequantizes FP8 -> bf16 inside the DCP load via its
+  # state_dict_adapter; LoRA then attaches to the resulting bf16 Linears. No
+  # explicit quantization_config is needed -- passing one would force HF's
+  # FineGrainedFP8 loader, which breaks on per-tensor (scalar) scales under
+  # transformers 5.8.1.
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: mistralai/Ministral-3-3B-Instruct-2512
   torch_dtype: bf16
-  quantization_config:
-    _target_: transformers.FineGrainedFP8Config
-    dequantize: true
 
 checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: safetensors # torch_save or safetensors
-  save_consolidated: true # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: true
 
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
@@ -119,11 +124,18 @@ ci:
   known_issue_id: AM-154
   allow_failure: true
   checkpoint_robustness:
+    check_source_load_parity: true
     hf_kl_threshold: 5e-3
+    source_load_kl_threshold: 5e-3
+    source_load_cosine_threshold: 0.9995
     distributed.tp_size: 2
     tokenizer_name: mistralai/Ministral-3-3B-Instruct-2512
     dataset.limit_dataset_samples: 500
     validation_dataset.limit_dataset_samples: 500
+    # Vanilla HF reload starts from the original FP8 base model and requires
+    # HF's finegrained-fp8 runtime kernels. Phase 3 still verifies Automodel
+    # checkpoint reload for the PEFT adapter.
+    skip_hf_reload: true
     # vision_tower params receive no grads from text-only batches, so Adam
     # never materialises per-param `step` state for them; DCP resume load is
     # strict and fails with `Missing key ... optim.state.model.vision_tower.*`.

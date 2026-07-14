@@ -2,7 +2,6 @@
 
 [Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash) is Stepfun AI's 198B-A13B Mixture-of-Experts vision-language model. It extends the Step-3.5-Flash language architecture with native vision support for image and video understanding, with an emphasis on agentic developer workflows and stable tool calling.
 
-:::{card}
 | | |
 |---|---|
 | **Task** | Image-Text-to-Text / Video-Text-to-Text |
@@ -12,7 +11,6 @@
 | **Context Window** | 256k tokens |
 | **Precision** | BF16 and FP8 planned for Day 0; NVFP4 best effort |
 | **HF Org** | [stepfun-ai](https://huggingface.co/stepfun-ai) |
-:::
 
 ## Positioning
 
@@ -43,7 +41,8 @@ Step-3.7-Flash is positioned as a multimodal foundation model for agents and age
 
 ## Example Recipes
 
-This documentation-only branch does not add a recipe YAML.
+- [Full SFT — MedPix, EP32 + PP4](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_ep32pp4.yaml)
+- [LoRA — MedPix, PP8 + EP8](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/stepfun/step3p7_medpix_200b_lora_pp8ep8_8node.yaml)
 
 See the [Step-3.7-Flash fine-tuning guide](../../../guides/vlm/step-3-7.md) for the expected training setup and launch notes.
 

@@ -13,10 +13,14 @@
 # limitations under the License.
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
+
+from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
+from nemo_automodel.components.distributed.mesh import ParallelismSizes
 
 # Check if diffusers can be imported properly (may fail due to peft/transformers incompatibility)
 try:
@@ -29,6 +33,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 MODULE_PATH = "nemo_automodel._diffusers.auto_diffusion_pipeline"
+
+
+@pytest.fixture(autouse=True)
+def _no_hf_cache_resolution():
+    """Keep unit tests offline.
+
+    ``from_pretrained``/``from_config`` resolve the repo id to a local HF
+    snapshot dir via ``resolve_diffusion_model_dir``. Tests pass fake repo ids
+    (e.g. ``"dummy"``), so leaving this unmocked makes the helper hit the Hub.
+    Pass the id through unchanged instead.
+    """
+    with patch(f"{MODULE_PATH}.resolve_diffusion_model_dir", side_effect=lambda model_id: model_id):
+        yield
 
 
 class DummyModule(torch.nn.Module):
@@ -173,6 +190,145 @@ def test_ensure_params_trainable_returns_correct_count():
 
 
 # =============================================================================
+# FP8/linear helper tests
+# =============================================================================
+
+
+def test_is_fp8_training_safe_linear_accepts_multiple_of_16_shapes():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _is_fp8_training_safe_linear
+
+    assert _is_fp8_training_safe_linear("block.attn.to_q", torch.nn.Linear(32, 64))
+
+
+@pytest.mark.parametrize(
+    ("name", "linear"),
+    [
+        ("block.attn.to_q", torch.nn.Linear(30, 64)),
+        ("time_text_embed.proj", torch.nn.Linear(32, 64)),
+        ("norm_out.linear", torch.nn.Linear(32, 64)),
+        ("block.norm.linear", torch.nn.Linear(32, 64)),
+    ],
+)
+def test_is_fp8_training_safe_linear_rejects_known_unsafe_cases(name, linear):
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _is_fp8_training_safe_linear
+
+    assert not _is_fp8_training_safe_linear(name, linear)
+
+
+def test_replace_linear_with_transformer_engine_copies_weights_and_skips_unsafe_modules():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _replace_linear_with_transformer_engine
+
+    class FakeTransformerEngineLinear(torch.nn.Linear):
+        def __init__(self, in_features, out_features, bias=True, device=None, params_dtype=None):
+            super().__init__(in_features, out_features, bias=bias, device=device, dtype=params_dtype)
+
+    class MixedLinearModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.safe = torch.nn.Linear(16, 32)
+            self.unsafe = torch.nn.Linear(15, 32, bias=False)
+            self.nested = torch.nn.Sequential(torch.nn.Linear(16, 16, bias=False))
+
+    module = MixedLinearModule()
+    module.eval()
+    safe_weight = module.safe.weight.detach().clone()
+    nested_weight = module.nested[0].weight.detach().clone()
+    module.safe.weight.requires_grad_(False)
+
+    fake_transformer_engine = SimpleNamespace(pytorch=SimpleNamespace(Linear=FakeTransformerEngineLinear))
+    with patch(f"{MODULE_PATH}.safe_import_te", return_value=(True, fake_transformer_engine)):
+        converted = _replace_linear_with_transformer_engine(module, "transformer", fp8_safe_only=True)
+
+    assert converted == 2
+    assert isinstance(module.safe, FakeTransformerEngineLinear)
+    assert isinstance(module.nested[0], FakeTransformerEngineLinear)
+    assert isinstance(module.unsafe, torch.nn.Linear)
+    assert not isinstance(module.unsafe, FakeTransformerEngineLinear)
+    assert not module.safe.training
+    assert not module.safe.weight.requires_grad
+    assert torch.allclose(module.safe.weight, safe_weight)
+    assert torch.allclose(module.nested[0].weight, nested_weight)
+
+
+def test_replace_linear_with_transformer_engine_requires_optional_dependency():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _replace_linear_with_transformer_engine
+
+    with patch(f"{MODULE_PATH}.safe_import_te", return_value=(False, None)):
+        with pytest.raises(ImportError, match="transformer_engine.pytorch"):
+            _replace_linear_with_transformer_engine(DummyModule(), "transformer")
+
+
+def test_compact_fused_qkv_projection_modules_removes_only_fused_original_projections():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _compact_fused_qkv_projection_modules
+
+    class AttentionModule(torch.nn.Module):
+        def __init__(self, *, fused_projections):
+            super().__init__()
+            self.fused_projections = fused_projections
+            self.to_qkv = torch.nn.Linear(2, 6, bias=False)
+            self.to_q = torch.nn.Linear(2, 2, bias=False)
+            self.to_k = torch.nn.Linear(2, 2, bias=False)
+            self.to_v = torch.nn.Linear(2, 2, bias=False)
+            self.to_added_qkv = torch.nn.Linear(2, 6, bias=False)
+            self.add_q_proj = torch.nn.Linear(2, 2, bias=False)
+            self.add_k_proj = torch.nn.Linear(2, 2, bias=False)
+            self.add_v_proj = torch.nn.Linear(2, 2, bias=False)
+
+    module = torch.nn.Module()
+    module.fused = AttentionModule(fused_projections=True)
+    module.unfused = AttentionModule(fused_projections=False)
+    expected_removed_parameters = sum(
+        parameter.numel()
+        for projection_name in ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj")
+        for parameter in getattr(module.fused, projection_name).parameters()
+    )
+
+    removed_modules, removed_parameters = _compact_fused_qkv_projection_modules(module, "transformer")
+
+    assert removed_modules == 6
+    assert removed_parameters == expected_removed_parameters
+    for projection_name in ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj"):
+        assert not hasattr(module.fused, projection_name)
+        assert hasattr(module.unfused, projection_name)
+    assert hasattr(module.fused, "to_qkv")
+    assert hasattr(module.fused, "to_added_qkv")
+
+
+def test_fuse_transformer_qkv_projections_calls_hook_and_counts_fused_modules():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _fuse_transformer_qkv_projections
+
+    class AttentionModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fused_projections = False
+
+    class TransformerModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn1 = AttentionModule()
+            self.attn2 = AttentionModule()
+
+        def fuse_qkv_projections(self):
+            self.attn1.fused_projections = True
+            self.attn2.fused_projections = True
+
+    transformer = TransformerModule()
+
+    fused = _fuse_transformer_qkv_projections(transformer, "transformer")
+
+    assert fused == 2
+    assert transformer.attn1.fused_projections
+    assert transformer.attn2.fused_projections
+
+
+def test_fuse_transformer_qkv_projections_requires_diffusers_hook():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _fuse_transformer_qkv_projections
+
+    with pytest.raises(AttributeError, match="fuse_qkv_projections"):
+        _fuse_transformer_qkv_projections(DummyModule(), "transformer")
+
+
+# =============================================================================
 # PipelineSpec tests
 # =============================================================================
 
@@ -223,61 +379,103 @@ def test_pipeline_spec_validate_for_from_config_passes_with_cls():
 def test_create_parallel_manager_fsdp2_default():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
+    mock_config = Mock()
     mock_mesh = Mock()
     mock_moe_mesh = Mock()
+    mock_setup = SimpleNamespace(
+        strategy_config=mock_config,
+        mesh_context=SimpleNamespace(device_mesh=mock_mesh, moe_mesh=mock_moe_mesh),
+    )
     with (
         patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
-        patch(f"{MODULE_PATH}.FSDP2Config") as MockConfig,
-        patch(f"{MODULE_PATH}.create_device_mesh", return_value=(mock_mesh, mock_moe_mesh)),
+        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup,
     ):
         MockFSDP2.return_value = Mock()
         manager = _create_parallel_manager({"world_size": 1})
 
-    MockConfig.assert_called_once()
-    MockFSDP2.assert_called_once_with(MockConfig.return_value, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
+    MockBuildSetup.assert_called_once()
+    assert MockBuildSetup.call_args.kwargs["world_size"] == 1
+    MockFSDP2.assert_called_once_with(mock_config, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
     assert manager is MockFSDP2.return_value
 
 
 def test_create_parallel_manager_ddp():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
+    mock_config = Mock()
+    mock_setup = SimpleNamespace(strategy_config=mock_config)
     with (
         patch(f"{MODULE_PATH}.DDPManager") as MockDDP,
-        patch(f"{MODULE_PATH}.DDPConfig") as MockConfig,
+        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup,
     ):
         MockDDP.return_value = Mock()
         manager = _create_parallel_manager({"_manager_type": "ddp", "some_arg": "value"})
 
-    MockConfig.assert_called_once_with(activation_checkpointing=False, backend="nccl")
-    MockDDP.assert_called_once_with(MockConfig.return_value)
+    MockBuildSetup.assert_called_once()
+    build_kwargs = MockBuildSetup.call_args.kwargs
+    assert isinstance(build_kwargs["strategy"], DDPConfig)
+    assert build_kwargs["parallelism_sizes"] == ParallelismSizes()
+    assert build_kwargs["world_size"] is None
+    assert build_kwargs["activation_checkpointing"] is False
+    assert not hasattr(build_kwargs["strategy"], "backend")
+    assert build_kwargs["strategy"].find_unused_parameters is False
+    MockDDP.assert_called_once_with(mock_config)
+    assert manager is MockDDP.return_value
+
+
+def test_create_parallel_manager_ddp_passes_find_unused_parameters():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
+
+    mock_config = Mock()
+    mock_setup = SimpleNamespace(strategy_config=mock_config)
+    with (
+        patch(f"{MODULE_PATH}.DDPManager") as MockDDP,
+        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup,
+    ):
+        MockDDP.return_value = Mock()
+        manager = _create_parallel_manager({"_manager_type": "ddp", "find_unused_parameters": True})
+
+    MockBuildSetup.assert_called_once()
+    build_kwargs = MockBuildSetup.call_args.kwargs
+    assert isinstance(build_kwargs["strategy"], DDPConfig)
+    assert build_kwargs["strategy"].find_unused_parameters is True
+    MockDDP.assert_called_once_with(mock_config)
     assert manager is MockDDP.return_value
 
 
 def test_create_parallel_manager_explicit_fsdp2():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
+    mock_config = Mock()
     mock_mesh = Mock()
     mock_moe_mesh = Mock()
+    mock_setup = SimpleNamespace(
+        strategy_config=mock_config,
+        mesh_context=SimpleNamespace(device_mesh=mock_mesh, moe_mesh=mock_moe_mesh),
+    )
     with (
         patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
-        patch(f"{MODULE_PATH}.FSDP2Config") as MockConfig,
-        patch(f"{MODULE_PATH}.create_device_mesh", return_value=(mock_mesh, mock_moe_mesh)),
+        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup),
     ):
         MockFSDP2.return_value = Mock()
         _create_parallel_manager({"_manager_type": "fsdp2", "world_size": 1})
 
-    MockFSDP2.assert_called_once_with(MockConfig.return_value, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
+    MockFSDP2.assert_called_once_with(mock_config, device_mesh=mock_mesh, moe_mesh=mock_moe_mesh)
 
 
 def test_create_parallel_manager_fsdp2_passes_perf_options():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
 
+    mock_config = Mock()
     mock_mesh = Mock()
     mock_moe_mesh = Mock()
+    mock_setup = SimpleNamespace(
+        strategy_config=mock_config,
+        mesh_context=SimpleNamespace(device_mesh=mock_mesh, moe_mesh=mock_moe_mesh),
+    )
     with (
         patch(f"{MODULE_PATH}.FSDP2Manager") as MockFSDP2,
-        patch(f"{MODULE_PATH}.FSDP2Config") as MockConfig,
-        patch(f"{MODULE_PATH}.create_device_mesh", return_value=(mock_mesh, mock_moe_mesh)),
+        patch(f"{MODULE_PATH}.DistributedSetup.build", return_value=mock_setup) as MockBuildSetup,
     ):
         MockFSDP2.return_value = Mock()
         _create_parallel_manager(
@@ -296,16 +494,17 @@ def test_create_parallel_manager_fsdp2_passes_perf_options():
             }
         )
 
-    config_kwargs = MockConfig.call_args.kwargs
-    assert config_kwargs["sequence_parallel"] is True
-    assert config_kwargs["tp_plan"] == {"layer": "colwise"}
-    assert config_kwargs["patch_is_packed_sequence"] is True
-    assert config_kwargs["defer_fsdp_grad_sync"] is False
-    assert config_kwargs["enable_async_tensor_parallel"] is True
-    assert config_kwargs["enable_compile"] is True
-    assert config_kwargs["enable_fsdp2_prefetch"] is True
-    assert config_kwargs["fsdp2_backward_prefetch_depth"] == 4
-    assert config_kwargs["fsdp2_forward_prefetch_depth"] == 3
+    strategy_config = MockBuildSetup.call_args.kwargs["strategy"]
+    assert isinstance(strategy_config, FSDP2Config)
+    assert strategy_config.sequence_parallel is True
+    assert strategy_config.tp_plan == {"layer": "colwise"}
+    assert strategy_config.patch_is_packed_sequence is True
+    assert strategy_config.defer_fsdp_grad_sync is False
+    assert strategy_config.enable_async_tensor_parallel is True
+    assert strategy_config.enable_compile is True
+    assert strategy_config.enable_fsdp2_prefetch is True
+    assert strategy_config.fsdp2_backward_prefetch_depth == 4
+    assert strategy_config.fsdp2_forward_prefetch_depth == 3
 
 
 def test_create_parallel_manager_unknown_type_raises():
@@ -313,6 +512,13 @@ def test_create_parallel_manager_unknown_type_raises():
 
     with pytest.raises(ValueError, match="Unknown manager type"):
         _create_parallel_manager({"_manager_type": "unknown"})
+
+
+def test_create_parallel_manager_rejects_backend_option():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _create_parallel_manager
+
+    with pytest.raises(ValueError, match="backend is not a parallel manager option"):
+        _create_parallel_manager({"_manager_type": "ddp", "backend": "gloo"})
 
 
 def test_create_parallel_manager_does_not_mutate_input():
@@ -571,6 +777,51 @@ def test_from_pretrained_components_to_load_filters_modules():
     assert mock_move.call_args[0][0] is unet
 
 
+def test_from_pretrained_applies_transformer_qkv_and_te_options():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    transformer = DummyModule()
+    dummy_pipe = DummyPipeline({"transformer": transformer, "text_encoder": DummyModule()})
+    mock_diffusion_pipeline = MagicMock()
+    mock_diffusion_pipeline.from_pretrained.return_value = dummy_pipe
+
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
+        patch(f"{MODULE_PATH}._fuse_transformer_qkv_projections") as mock_fuse,
+        patch(f"{MODULE_PATH}._replace_linear_with_transformer_engine") as mock_replace_linear,
+    ):
+        NeMoAutoDiffusionPipeline.from_pretrained(
+            "dummy",
+            move_to_device=False,
+            fuse_qkv_projections=True,
+            compact_fused_qkv_projections=True,
+            transformer_engine_linear=True,
+            transformer_engine_fp8_safe_only=True,
+        )
+
+    mock_fuse.assert_called_once_with(transformer, "transformer", compact=True)
+    mock_replace_linear.assert_called_once_with(transformer, "transformer", fp8_safe_only=True)
+
+
+def test_from_pretrained_rejects_compact_qkv_without_fusion():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    mock_diffusion_pipeline = MagicMock()
+    mock_diffusion_pipeline.from_pretrained.return_value = DummyPipeline({"transformer": DummyModule()})
+
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
+    ):
+        with pytest.raises(ValueError, match="compact_fused_qkv_projections=true"):
+            NeMoAutoDiffusionPipeline.from_pretrained(
+                "dummy",
+                move_to_device=False,
+                compact_fused_qkv_projections=True,
+            )
+
+
 # =============================================================================
 # from_config tests
 # =============================================================================
@@ -619,6 +870,26 @@ def test_from_config_raises_without_transformer_cls():
             NeMoAutoDiffusionPipeline.from_config("dummy", pipeline_spec={})
 
 
+def test_from_config_rejects_compact_qkv_without_fusion():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    mock_transformer_cls = MagicMock()
+    mock_transformer_cls.load_config.return_value = {}
+    mock_transformer_cls.from_config.return_value = DummyModule()
+
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}._import_diffusers_class", return_value=mock_transformer_cls),
+    ):
+        with pytest.raises(ValueError, match="compact_fused_qkv_projections=true"):
+            NeMoAutoDiffusionPipeline.from_config(
+                "model-id",
+                pipeline_spec={"transformer_cls": "FakeTransformer"},
+                move_to_device=False,
+                compact_fused_qkv_projections=True,
+            )
+
+
 def test_from_config_full_pipeline_mode():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 
@@ -664,7 +935,7 @@ def test_from_config_full_pipeline_mode():
 def test_import_diffusers_class_success():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _import_diffusers_class
 
-    with patch("diffusers.SomeClass", create=True, new="sentinel"):
+    with patch.dict("sys.modules", {"diffusers": SimpleNamespace(SomeClass="sentinel")}):
         result = _import_diffusers_class("SomeClass")
     assert result == "sentinel"
 
@@ -672,7 +943,10 @@ def test_import_diffusers_class_success():
 def test_import_diffusers_class_missing_raises():
     from nemo_automodel._diffusers.auto_diffusion_pipeline import _import_diffusers_class
 
-    with pytest.raises(ImportError, match="not found in diffusers"):
+    with (
+        patch.dict("sys.modules", {"diffusers": SimpleNamespace()}),
+        pytest.raises(ImportError, match="not found in diffusers"),
+    ):
         _import_diffusers_class("NonExistentClassName12345")
 
 
@@ -697,3 +971,69 @@ def test_pipeline_wrapper_components_excludes_none():
 
     pipe = NeMoAutoDiffusionPipeline(transformer=None)
     assert "transformer" not in pipe.components
+
+
+# =============================================================================
+# _select_active_transformer tests (Wan2.2 two-transformer pipeline)
+# =============================================================================
+
+
+def test_select_active_transformer_invalid_value_raises():
+    """Anything other than 'transformer' / 'transformer_2' must be rejected."""
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _select_active_transformer
+
+    pipe = DummyPipeline({"transformer": DummyModule(), "transformer_2": DummyModule()})
+    with pytest.raises(ValueError, match="active_transformer must be"):
+        _select_active_transformer(pipe, "transformer_3")
+
+
+def test_select_active_transformer_2_on_pipeline_without_t2_raises():
+    """Requesting transformer_2 from a single-transformer pipeline (e.g. Wan2.1)
+    must raise — silently falling back would mask configuration mistakes."""
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _select_active_transformer
+
+    pipe = DummyPipeline({"transformer": DummyModule()})
+    with pytest.raises(AttributeError, match="transformer_2"):
+        _select_active_transformer(pipe, "transformer_2")
+
+
+def test_select_active_transformer_2_swaps_into_transformer_slot():
+    """For Wan2.2 low-noise stage: transformer_2's module moves to pipe.transformer
+    and pipe.transformer_2 becomes None so subsequent FSDP2/device placement
+    only touches one model."""
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _select_active_transformer
+
+    t1, t2 = DummyModule(), DummyModule()
+    pipe = DummyPipeline({"transformer": t1, "transformer_2": t2})
+
+    _select_active_transformer(pipe, "transformer_2")
+
+    assert pipe.transformer is t2
+    assert pipe.transformer_2 is None
+
+
+def test_select_active_transformer_drops_transformer_2():
+    """For Wan2.2 high-noise stage: transformer stays put, transformer_2 is
+    cleared to None so it does not consume GPU memory or get sharded."""
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _select_active_transformer
+
+    t1, t2 = DummyModule(), DummyModule()
+    pipe = DummyPipeline({"transformer": t1, "transformer_2": t2})
+
+    _select_active_transformer(pipe, "transformer")
+
+    assert pipe.transformer is t1
+    assert pipe.transformer_2 is None
+
+
+def test_select_active_transformer_noop_on_single_transformer_pipeline():
+    """active_transformer='transformer' on a pipeline that has no transformer_2
+    attribute at all (e.g. Wan2.1 / FLUX) must be a no-op, not an error."""
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _select_active_transformer
+
+    t1 = DummyModule()
+    pipe = DummyPipeline({"transformer": t1})
+
+    _select_active_transformer(pipe, "transformer")
+
+    assert pipe.transformer is t1

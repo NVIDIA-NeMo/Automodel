@@ -12,13 +12,77 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 from transformers.modeling_utils import _get_resolved_checkpoint_files, load_state_dict
+
+
+def get_rank_safe() -> int:
+    """Return the current distributed rank, defaulting to 0 when not initialized."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return int(os.environ.get("RANK", "0"))
+
+
+def get_world_size_safe() -> int:
+    """Return the current distributed world size, defaulting to 1 when not initialized."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def is_rank_0() -> bool:
+    """Return True on the main rank."""
+    return get_rank_safe() == 0
+
+
+def estimate_tensor_bytes(tensor: torch.Tensor) -> int:
+    """Estimate logical bytes in a tensor without materializing it."""
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+def estimate_state_dict_bytes(state_dict: dict[str, torch.Tensor]) -> int | None:
+    """Estimate logical bytes in a state dict without materializing tensors."""
+    total = 0
+    try:
+        for tensor in state_dict.values():
+            total += estimate_tensor_bytes(tensor)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    return total
+
+
+def get_safetensors_index_total_size(index_path: str | None) -> int | None:
+    """Return the total checkpoint size recorded in a Hugging Face safetensors index."""
+    if index_path is None:
+        return None
+    index_file = Path(index_path)
+    if index_file.is_dir():
+        index_file = index_file / "model.safetensors.index.json"
+    try:
+        with open(index_file) as f:
+            index = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    total_size = index.get("metadata", {}).get("total_size")
+    return total_size if isinstance(total_size, int) else None
+
+
+def format_bytes(num_bytes: int) -> str:
+    """Format bytes as a human-readable GiB value."""
+    return f"{num_bytes / 1024**3:.1f} GiB"
+
+
+def format_output_file_count(count: int) -> str:
+    """Format the output shard count for user-facing log messages."""
+    return f"{count} output {'file' if count == 1 else 'files'}"
 
 
 def resolve_trust_remote_code(pretrained_model_name_or_path):
@@ -37,9 +101,71 @@ def resolve_trust_remote_code(pretrained_model_name_or_path):
     return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
 
 
+def get_controlling_tie_word_embeddings(config: object, model_class_name: str) -> bool:
+    """Resolve the ``tie_word_embeddings`` flag that actually controls lm_head tying.
+
+    HF ties ``lm_head`` based on the *top-level* config flag, not a nested
+    ``text_config`` (verified by construction for Gemma4 and Mistral3 under
+    transformers 5.8.1: the top-level flag decides tying regardless of the nested
+    value). So prefer the top-level flag, and only fall back to ``text_config``
+    for configs that don't expose a top-level ``tie_word_embeddings``.
+
+    Omni "thinker" models are the exception: the full wrapper config
+    (``Qwen2_5OmniConfig`` / ``Qwen3OmniMoeConfig``) does not expose
+    ``tie_word_embeddings`` at the top level at all -- the controlling flag lives
+    on ``config.thinker_config`` -- so unwrap to it for those classes.
+
+    Args:
+        config: The model's config (or anything exposing ``tie_word_embeddings``
+            and optionally ``get_text_config``).
+        model_class_name: ``type(model).__name__`` of the owning model class.
+
+    Returns:
+        bool: The controlling ``tie_word_embeddings`` value.
+    """
+    # Omni "thinker" models: the controlling flag lives on the thinker config.
+    # A full wrapper config (e.g. ``Qwen2_5OmniConfig`` / ``Qwen3OmniMoeConfig``)
+    # does not expose ``tie_word_embeddings`` at the top level at all -- it nests
+    # under ``config.thinker_config`` -- so unwrap to it when present. When the
+    # thinker config itself is passed, ``thinker_config`` is absent and we read
+    # its own top-level flag.
+    omni_thinker_models = (
+        "Qwen2_5OmniThinkerForConditionalGeneration",
+        "Qwen3OmniMoeThinkerForConditionalGeneration",
+    )
+    if any(name in model_class_name for name in omni_thinker_models):
+        thinker_config = getattr(config, "thinker_config", config)
+        return bool(getattr(thinker_config, "tie_word_embeddings", False))
+
+    # Other composite models whose top-level config owns the lm_head tying
+    # decision; their nested ``text_config`` flag can disagree and must be ignored.
+    # Return the top-level flag (not a forced ``False``) so a constructor guard can
+    # still see and reject an unsupported ``top-level=True``. The checkpoint save
+    # path stays safe through the storage-based ``has_local_tied_lm_head()`` check,
+    # which only drops ``lm_head.weight`` when the tensors actually share storage.
+    composite_top_level_models = (
+        "Mistral3FP8VLMForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+    )
+    if any(name in model_class_name for name in composite_top_level_models):
+        return bool(getattr(config, "tie_word_embeddings", False))
+
+    # General rule: the top-level config wins when it exposes the flag.
+    if hasattr(config, "tie_word_embeddings"):
+        return bool(config.tie_word_embeddings)
+
+    # Fallback only for configs that do not expose a top-level tie flag.
+    text_config = getattr(config, "get_text_config", lambda: None)()
+    return bool(getattr(text_config, "tie_word_embeddings", False))
+
+
 def is_tied_word_embeddings(model: nn.Module) -> bool:
     """
     Check if the model's word embeddings are tied.
+
+    Delegates to :func:`get_controlling_tie_word_embeddings`, which follows HF's
+    top-level-first tying semantics (replacing the previous ``text_config``-first
+    resolution).
 
     Args:
         model (nn.Module): The model to check.
@@ -47,17 +173,65 @@ def is_tied_word_embeddings(model: nn.Module) -> bool:
     Returns:
         bool: True if the model's word embeddings are tied, False otherwise.
     """
-    non_tied_lm_head_models = {
-        "Qwen3OmniMoeThinkerForConditionalGeneration",  # complicated config structure
-        "Qwen3VLMoeForConditionalGeneration",  # top-level lm_head is untied despite nested text config
-    }
-    model_class_name = type(model).__name__
-    for m in non_tied_lm_head_models:
-        if m in model_class_name:
-            return False
     config = getattr(model, "config", None)
-    text_config = getattr(config, "get_text_config", lambda: None)()
-    return bool(getattr(text_config, "tie_word_embeddings", getattr(config, "tie_word_embeddings", False)))
+    if config is None:
+        return False
+    return get_controlling_tie_word_embeddings(config, type(model).__name__)
+
+
+def reject_unsupported_tied_word_embeddings(config: object, model_class_name: str) -> None:
+    """Reject ``tie_word_embeddings=True`` for models whose HF default is untied.
+
+    Separate-head architectures (HF default: distinct input/output embeddings)
+    don't build a shared ``lm_head``, so honoring ``tie_word_embeddings=True``
+    would silently leave a randomly-initialized head or require materializing a
+    tied weight NeMo does not support. Reject it explicitly with a clear message
+    instead of pretending to support it.
+
+    Uses :func:`get_controlling_tie_word_embeddings`, so composite VLM/omni configs
+    are read from the controlling top-level flag rather than a nested
+    ``text_config``.
+
+    Args:
+        config: The model's config.
+        model_class_name: ``type(self).__name__`` of the constructing model.
+
+    Raises:
+        NotImplementedError: if the controlling ``tie_word_embeddings`` flag is set.
+    """
+    if get_controlling_tie_word_embeddings(config, model_class_name):
+        raise NotImplementedError(
+            f"{model_class_name} has separate input and output embeddings and does not "
+            f"support tie_word_embeddings=True. The Hugging Face default for this "
+            f"architecture is untied; set tie_word_embeddings=False."
+        )
+
+
+def reject_unsupported_untied_word_embeddings(config: object, model_class_name: str) -> None:
+    """Reject ``tie_word_embeddings=False`` for models whose HF default is tied.
+
+    Tied-by-default architectures share ``lm_head`` with the input embedding and
+    ship checkpoints without a separate ``lm_head.weight``. Honoring
+    ``tie_word_embeddings=False`` would require materializing a distinct
+    ``lm_head`` NeMo does not build (and a tied checkpoint has no weights for it),
+    so reject it explicitly instead of running with a randomly-initialized head.
+
+    The mirror of :func:`reject_unsupported_tied_word_embeddings`; both read the
+    controlling flag via :func:`get_controlling_tie_word_embeddings`.
+
+    Args:
+        config: The model's config.
+        model_class_name: ``type(self).__name__`` of the constructing model.
+
+    Raises:
+        NotImplementedError: if the controlling ``tie_word_embeddings`` flag evaluates to ``False``.
+    """
+    if not get_controlling_tie_word_embeddings(config, model_class_name):
+        raise NotImplementedError(
+            f"{model_class_name} ties its input and output embeddings and does not "
+            f"support tie_word_embeddings=False. The Hugging Face default for this "
+            f"architecture is tied; set tie_word_embeddings=True."
+        )
 
 
 def _normalize_param_name(name: str) -> str:
@@ -171,29 +345,25 @@ def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | No
 
 
 def has_local_tied_lm_head(model: nn.Module) -> bool:
-    """Return whether the current model partition can locally satisfy a tied LM head.
+    """Return whether the current model partition has an actual tied LM head.
 
-    This is intentionally stricter than ``is_tied_word_embeddings()``: pipeline
-    stages often keep the config flag set to ``True`` even though ``lm_head`` and
-    ``embed_tokens`` live on different partitions and therefore cannot be
-    reconstructed from each other locally.
-
-    Note: we purposefully do NOT check ``lm_head.weight is embed_tokens.weight``.
-    After FSDP/TP sharding both are wrapped into separate ``DTensor``s and the
-    ``is``-identity is broken, but HF's ``tie_weights()`` can still relink them
-    locally on load. The only case we actually need to distinguish is "is the
-    embedding source present on this partition at all?", which answers "can we
-    safely omit ``lm_head.weight`` during save and rematerialize on load?".
+    This is stricter than ``is_tied_word_embeddings()``: pipeline stages often
+    keep the config flag set to ``True`` even when ``lm_head`` and
+    ``embed_tokens`` live on different partitions. Some custom models can also
+    declare tied embeddings in config without actually aliasing the parameters.
+    In that case omitting ``lm_head.weight`` from a checkpoint loses trained
+    state, so only treat it as safely tied when the local tensors share storage.
 
     Args:
         model: Model or pipeline stage to inspect.
 
     Returns:
-        ``True`` when the model is configured with tied word embeddings AND
-        both the local ``lm_head`` and the input embedding live on this
-        partition. ``False`` when the config isn't tied, or when the local
-        partition is missing one of the two (typical for PP non-last / non-first
-        stages).
+        ``True`` when the model is configured with tied word embeddings, both
+        the local ``lm_head`` and the input embedding live on this partition,
+        and the two tensors share local storage. ``False`` when the config
+        isn't tied, the local partition is missing one of the two (typical for
+        PP non-last / non-first stages), or the tensors are separate despite
+        matching shapes.
     """
     if not is_tied_word_embeddings(model):
         return False
@@ -211,7 +381,102 @@ def has_local_tied_lm_head(model: nn.Module) -> bool:
     # producing a strict-load shape mismatch on resume.
     if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
         return False
-    return True
+    return _same_tensor_storage(lm_head_weight, input_embeddings_weight)
+
+
+def _get_module_by_normalized_name(model: nn.Module, normalized_module_name: str) -> nn.Module | None:
+    """Return a module by FQN after applying wrapper-prefix normalization."""
+    if normalized_module_name == "":
+        return model
+    for name, module in model.named_modules():
+        if _normalize_param_name(name) == normalized_module_name:
+            return module
+    return None
+
+
+def ensure_tied_lm_head(model: nn.Module) -> bool:
+    """Ensure a local tied LM head actually aliases the input embedding.
+
+    Hugging Face ``tie_weights()`` is the first choice because model classes can
+    have custom tying rules. The direct assignment fallback handles wrapped
+    models whose generic ``tie_weights()`` no longer reaches the local
+    ``lm_head``/embedding pair after sharding.
+
+    Args:
+        model: Model or pipeline stage to inspect and update.
+
+    Returns:
+        ``True`` if the local ``lm_head`` and input embedding are tied after the
+        call, otherwise ``False``.
+    """
+    if not is_tied_word_embeddings(model):
+        return False
+    if has_local_tied_lm_head(model):
+        return True
+
+    lm_head_weight, lm_head_param_name = get_lm_head_weight_and_name(model)
+    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
+    if lm_head_weight is not None and input_embeddings_weight is not None:
+        if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
+            return False
+
+    tie_weights = getattr(model, "tie_weights", None)
+    if callable(tie_weights):
+        try:
+            tie_weights()
+        except AttributeError:
+            pass
+        if has_local_tied_lm_head(model):
+            return True
+
+    lm_head_weight, lm_head_param_name = get_lm_head_weight_and_name(model)
+    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
+    if lm_head_weight is None or lm_head_param_name is None or input_embeddings_weight is None:
+        return False
+    if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
+        return False
+
+    lm_head_module_name = lm_head_param_name.rsplit(".", 1)[0]
+    lm_head_module = _get_module_by_normalized_name(model, lm_head_module_name)
+    if lm_head_module is None or not hasattr(lm_head_module, "weight"):
+        return False
+
+    try:
+        lm_head_module.weight = input_embeddings_weight
+    except (AttributeError, TypeError, RuntimeError):
+        return False
+
+    return has_local_tied_lm_head(model)
+
+
+def _same_tensor_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Return whether two tensors are aliases of the same local storage."""
+    if left is right:
+        return True
+
+    def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        to_local = getattr(tensor, "to_local", None)
+        if callable(to_local):
+            try:
+                return to_local()
+            except RuntimeError:
+                return tensor
+        return tensor
+
+    left_local = _local_tensor(left)
+    right_local = _local_tensor(right)
+    if left_local is right_local:
+        return True
+    if left_local.device.type == "meta" or right_local.device.type == "meta":
+        return False
+
+    try:
+        return (
+            left_local.untyped_storage().data_ptr() == right_local.untyped_storage().data_ptr()
+            and left_local.storage_offset() == right_local.storage_offset()
+        )
+    except RuntimeError:
+        return False
 
 
 def materialize_missing_tied_lm_head(

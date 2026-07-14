@@ -74,7 +74,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: false
 
 distributed:
   strategy: fsdp2
@@ -152,3 +152,8 @@ lr_scheduler:
   lr_decay_style: cosine
   lr_warmup_steps: 500
   min_lr: 0.0
+
+ci:
+  # pp_size(8) * ep_size(16) = 128 GPUs => 16 nodes (8 H100/node).
+  recipe_owner: hemildesai
+  nodes: 16

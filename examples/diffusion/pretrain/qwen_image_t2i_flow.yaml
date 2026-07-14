@@ -74,11 +74,12 @@ checkpoint:
   enabled: true
   checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
   diffusers_compatible: true
   restore_from:
 
 wandb:
+  enable: false
   project: qwen-image-pretraining
   mode: online
   name: qwen_image_pretrain_run_1

@@ -15,7 +15,7 @@ model:
   attn_implementation: sdpa
   backend:
     _target_: nemo_automodel.components.models.common.utils.BackendConfig
-    enable_deepep: false
+    dispatcher: torch
 distributed:
   _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
   dp_size: 1
@@ -46,7 +46,7 @@ checkpoint:
   enabled: true
   model_save_format: safetensors
   checkpoint_dir: ./checkpoints
-  save_consolidated: true
+  save_consolidated: final
   dequantize_base_checkpoint: true
 dataset:
   _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
