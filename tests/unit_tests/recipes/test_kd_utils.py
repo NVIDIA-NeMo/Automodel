@@ -264,6 +264,174 @@ def test_separate_kd_setup_rejects_ddp(monkeypatch):
         kd_utils.create_kd_distributed_setups(cfg, world_size=4)
 
 
+def test_model_replicas_resolves_dp_pipeline_endpoints():
+    mesh = SimpleNamespace(
+        mesh_dim_names=("dp", "pp", "tp"),
+        mesh=torch.arange(8).reshape(2, 2, 2),
+    )
+    setup = SimpleNamespace(mesh_context=SimpleNamespace(device_mesh=mesh))
+
+    replicas = kd_utils._model_replicas(setup)
+
+    assert replicas == [
+        kd_utils._Replica(ranks=(0, 1, 2, 3), input_rank=0, output_rank=2),
+        kd_utils._Replica(ranks=(4, 5, 6, 7), input_rank=4, output_rank=6),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("device_mesh", "message"),
+    [
+        (None, "require a DeviceMesh"),
+        (SimpleNamespace(mesh_dim_names=("tp",), mesh=torch.arange(2)), "no data-parallel axis"),
+    ],
+)
+def test_model_replicas_rejects_missing_mesh_contract(device_mesh, message):
+    setup = SimpleNamespace(mesh_context=SimpleNamespace(device_mesh=device_mesh))
+
+    with pytest.raises(ValueError, match=message):
+        kd_utils._model_replicas(setup)
+
+
+def test_tree_spec_round_trip_preserves_nested_tensor_leaves():
+    first = torch.arange(4).reshape(2, 2)
+    second = torch.tensor([3.0])
+    value = {"items": [first, ("label", second)], "count": 2}
+    tensors = []
+
+    spec = kd_utils._tree_spec(value, tensors)
+    rebuilt = kd_utils._tree_from_spec(spec, tensors)
+
+    assert tensors == [first, second]
+    assert rebuilt["items"][0] is first
+    assert rebuilt["items"][1] == ("label", second)
+    assert rebuilt["count"] == 2
+
+
+def test_kd_mesh_bridge_builds_routes_and_moves_nested_values(monkeypatch):
+    student_replicas = [
+        kd_utils._Replica((0,), 0, 0),
+        kd_utils._Replica((1,), 1, 1),
+    ]
+    teacher_replicas = [kd_utils._Replica((2, 3), 2, 2)]
+    groups = []
+
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "new_group", lambda *, ranks: groups.append(tuple(ranks)) or object())
+    monkeypatch.setattr(kd_utils, "_model_replicas", lambda setup: setup.replicas)
+    setups = SimpleNamespace(
+        separate=True,
+        student_ranks=(0, 1),
+        teacher_ranks=(2, 3),
+        student=SimpleNamespace(replicas=student_replicas),
+        teacher=SimpleNamespace(replicas=teacher_replicas),
+    )
+
+    bridge = kd_utils.KDMeshBridge(setups, device=torch.device("cpu"))
+    nested = {"tensor": torch.ones(2), "items": [torch.zeros(1), ("value",)]}
+    moved = bridge.move_to_device(nested)
+
+    assert bridge.is_student
+    assert not bridge.is_teacher
+    assert bridge.num_waves == 2
+    assert [route.src for wave in bridge.input_routes for route in wave] == [0, 1]
+    assert [route.src for wave in bridge.output_routes for route in wave] == [2, 2]
+    assert groups == [(0, 1, 2, 3), (0, 1), (2, 3), (0, 2, 3), (2, 0), (1, 2, 3), (2, 1)]
+    assert moved is not nested
+    assert moved["tensor"].device.type == "cpu"
+    assert moved["items"][1] == ("value",)
+
+
+def test_kd_mesh_bridge_command_sync_and_non_dtensor_vocab(monkeypatch):
+    bridge = object.__new__(kd_utils.KDMeshBridge)
+    bridge.rank = 0
+    bridge.student_ranks = (0, 1)
+    bridge.teacher_ranks = (2, 3)
+    bridge.device = torch.device("cpu")
+    bridge.control_group = object()
+    broadcasts = []
+    barriers = []
+    monkeypatch.setattr(dist, "broadcast", lambda tensor, **kwargs: broadcasts.append((tensor.clone(), kwargs)))
+    monkeypatch.setattr(dist, "barrier", lambda **kwargs: barriers.append(kwargs))
+
+    assert bridge.broadcast_command(kd_utils.RUN_TEACHER) == kd_utils.RUN_TEACHER
+    bridge.synchronize()
+    teacher_logits = torch.randn(1, 2, 3)
+    assert bridge.match_student_vocab_shard(torch.randn(1, 2, 3), teacher_logits) is teacher_logits
+    assert broadcasts[0][1] == {"src": 0, "group": bridge.control_group}
+    assert barriers == [{"group": bridge.control_group}]
+
+
+def test_match_student_vocab_shard_selects_local_dtensor_chunk(monkeypatch):
+    class FakeShard:
+        def __init__(self, dim):
+            self.dim = dim
+
+    class FakeDTensor:
+        ndim = 3
+        placements = (FakeShard(-1),)
+        device_mesh = SimpleNamespace(get_group=lambda mesh_dim: f"group-{mesh_dim}")
+
+    monkeypatch.setattr(kd_utils, "DTensor", FakeDTensor)
+    monkeypatch.setattr(kd_utils, "Shard", FakeShard)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 1)
+    teacher_logits = torch.arange(8).reshape(1, 2, 4)
+
+    result = kd_utils.KDMeshBridge.match_student_vocab_shard(FakeDTensor(), teacher_logits)
+
+    assert torch.equal(result, teacher_logits[..., 2:])
+    assert result.is_contiguous()
+
+
+def test_broadcast_tree_covers_source_receiver_and_nonmember(monkeypatch):
+    bridge = object.__new__(kd_utils.KDMeshBridge)
+    bridge.device = torch.device("cpu")
+    route = kd_utils._Route(src=0, ranks=(0, 1), group=object())
+    value = {"items": [torch.ones(2), (torch.zeros(1),)], "label": "x"}
+    calls = []
+
+    bridge.rank = 0
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda objects, **kwargs: calls.append((objects[0], kwargs)))
+    monkeypatch.setattr(dist, "broadcast", lambda tensor, **kwargs: calls.append((tensor.clone(), kwargs)))
+    source_result = bridge._broadcast_tree(value, route)
+
+    spec_tensors = []
+    spec = kd_utils._tree_spec(value, spec_tensors)
+
+    def receive_spec(objects, **kwargs):
+        objects[0] = spec
+
+    bridge.rank = 1
+    monkeypatch.setattr(dist, "broadcast_object_list", receive_spec)
+    receiver_result = bridge._broadcast_tree(None, route)
+    bridge.rank = 3
+    nonmember_result = bridge._broadcast_tree(None, route)
+
+    assert torch.equal(source_result["items"][0], value["items"][0])
+    assert receiver_result["items"][0].shape == (2,)
+    assert receiver_result["items"][1][0].shape == (1,)
+    assert receiver_result["label"] == "x"
+    assert nonmember_result is None
+    assert calls[0][1] == {"src": 0, "group": route.group, "device": bridge.device}
+
+
+def test_send_batch_and_logits_select_current_role_routes(monkeypatch):
+    route = kd_utils._Route(src=0, ranks=(0, 2), group=object())
+    bridge = object.__new__(kd_utils.KDMeshBridge)
+    bridge.input_routes = [[route]]
+    bridge.output_routes = [[route]]
+    bridge.student_ranks = (0, 1)
+    bridge.teacher_ranks = (2, 3)
+    monkeypatch.setattr(bridge, "_broadcast_tree", lambda value, selected_route: value or "received")
+
+    bridge.rank = 2
+    assert bridge.send_batch(0, None) == "received"
+    bridge.rank = 0
+    logits = torch.ones(1)
+    assert bridge.send_logits(0, logits) is logits
+
+
 def _teacher_logits(input_ids: torch.Tensor) -> torch.Tensor:
     """Return deterministic teacher logits.
 
