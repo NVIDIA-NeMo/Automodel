@@ -106,17 +106,20 @@ class SampleRefQueue:
         visibility_timeout: How long a leased-but-not-acked ref can live
             before reclaim. Defaults to 30s; production deployments
             normally key this off the recipe's per-step budget.
-        high_watermark_bytes: Resident-byte threshold above which
-            :meth:`put_blocks_until_below` blocks. Defaults to
-            ``0.75 * store.health().capacity_bytes`` when the store caps
-            bytes; a fixed value overrides.
-        low_watermark_bytes: Resident-byte threshold below which
-            :meth:`put_blocks_until_below` resumes after pausing. Defaults
-            to ``0.25 * store.health().capacity_bytes`` when the store
-            caps bytes.
+        high_watermark_bytes: Optional resident-byte threshold for
+            pausing. When ``None`` (default), the queue defers to
+            :attr:`StoreHealth.high_watermark_hit` (i.e. the store's own
+            configured threshold). When set, the queue pauses whenever
+            ``StoreHealth.resident_bytes >= high_watermark_bytes``.
+        low_watermark_bytes: Optional resident-byte threshold for
+            resuming. When ``None`` (default), the queue defers to
+            :attr:`StoreHealth.low_watermark_hit`. When set, the queue
+            resumes only after ``StoreHealth.resident_bytes <=
+            low_watermark_bytes``. Must be strictly less than
+            ``high_watermark_bytes`` so the hysteresis band is
+            non-empty.
         on_pause / on_resume: Optional callbacks fired when the queue
-            transitions high-watermark-paused -> resumed and back. Wired
-            into the trainer's progress log in PR 2; kept minimal here.
+            transitions high-watermark-paused -> resumed and back.
 
     Thread safety: a single :class:`threading.Lock` protects every list /
     counter, so a multi-producer / multi-consumer deployment works as long
@@ -133,6 +136,19 @@ class SampleRefQueue:
         on_pause: Callable[[StoreHealth], None] | None = None,
         on_resume: Callable[[StoreHealth], None] | None = None,
     ) -> None:
+        if high_watermark_bytes is not None and high_watermark_bytes <= 0:
+            raise ValueError(f"high_watermark_bytes must be positive, got {high_watermark_bytes}")
+        if low_watermark_bytes is not None and low_watermark_bytes < 0:
+            raise ValueError(f"low_watermark_bytes must be non-negative, got {low_watermark_bytes}")
+        if (
+            high_watermark_bytes is not None
+            and low_watermark_bytes is not None
+            and low_watermark_bytes >= high_watermark_bytes
+        ):
+            raise ValueError(
+                f"low_watermark_bytes must be strictly less than high_watermark_bytes; "
+                f"got low={low_watermark_bytes} high={high_watermark_bytes}"
+            )
         self._store = store
         self._vt = visibility_timeout or VisibilityTimeout()
         self._high_bytes = high_watermark_bytes
@@ -146,6 +162,43 @@ class SampleRefQueue:
         self._producer_paused = False
         self._put_cv = threading.Condition(self._lock)
         self._closed = False
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether :meth:`close` has been called on this queue.
+
+        Consumers that pull :meth:`acquire` and receive ``None`` use
+        this to disambiguate "drained, stop" (``is_closed is True``)
+        from "transient empty poll, retry" (``is_closed is False``).
+        Mirrors the Python ``queue.Queue`` separation between
+        ``empty()`` and the lifecycle-shutdown signal.
+        """
+        return self._closed
+
+    def _should_pause(self, health: StoreHealth) -> bool:
+        """Whether the producer should pause against ``health``.
+
+        When the queue ctor was given an explicit
+        ``high_watermark_bytes``, that threshold wins; otherwise the
+        decision defers to :attr:`StoreHealth.high_watermark_hit`
+        (i.e. the store's own configured threshold).
+        """
+        if self._high_bytes is not None:
+            return health.resident_bytes >= self._high_bytes
+        return health.high_watermark_hit
+
+    def _should_resume(self, health: StoreHealth) -> bool:
+        """Whether the producer should resume against ``health``.
+
+        When the queue ctor was given an explicit
+        ``low_watermark_bytes``, that threshold wins; otherwise the
+        decision defers to :attr:`StoreHealth.low_watermark_hit`.
+        Hysteresis is preserved either way: resume crosses the low
+        threshold, pause crosses the high threshold.
+        """
+        if self._low_bytes is not None:
+            return health.resident_bytes <= self._low_bytes
+        return health.low_watermark_hit
 
     # --- produce side -------------------------------------------------------
 
@@ -168,10 +221,13 @@ class SampleRefQueue:
     def put_blocks_until_below(self, ref: SampleRef, *, poll_interval: float = 0.05) -> None:
         """Enqueue ``ref``, blocking the producer while the store is over its high watermark.
 
-        The producer is paused when :attr:`StoreHealth.high_watermark_hit`
-        is true, and only resumed when :attr:`StoreHealth.low_watermark_hit`
-        flips to true. The hysteresis band between the two is what prevents
-        flapping.
+        The producer is paused when :meth:`_should_pause` returns ``True``
+        (resident crossed the high threshold) and only resumed when
+        :meth:`_should_resume` returns ``True`` (resident dropped back
+        below the low threshold). In the band between the two
+        thresholds the producer's existing paused / unpaused state is
+        preserved -- that hysteresis is what prevents flapping when the
+        producer is sitting near the high watermark.
 
         Args:
             ref: The reference to enqueue.
@@ -189,9 +245,8 @@ class SampleRefQueue:
                 if self._closed:
                     raise RuntimeError("SampleRefQueue is closed while put was waiting on backpressure")
                 health = self._store.health()
-                if not health.high_watermark_hit:
-                    # Resume-side transition only fires when we were paused.
-                    if self._producer_paused:
+                if self._producer_paused:
+                    if self._should_resume(health):
                         logger.info(
                             "SampleRefQueue producer resumed below low watermark (resident=%d capacity=%d)",
                             health.resident_bytes,
@@ -203,31 +258,50 @@ class SampleRefQueue:
                                 self._on_resume(health)
                             except Exception:
                                 logger.exception("on_resume callback raised; continuing")
-                    self._pending.append(ref)
-                    self._sample_counters.setdefault(ref.sample_id, 0)
-                    logger.debug("SampleRefQueue put sample_id=%s pending=%d", ref.sample_id, len(self._pending))
-                    return
-                if not self._producer_paused:
-                    logger.info(
-                        "SampleRefQueue producer paused at high watermark (resident=%d capacity=%d)",
-                        health.resident_bytes,
-                        health.capacity_bytes,
-                    )
-                    self._producer_paused = True
-                    if self._on_pause is not None:
-                        try:
-                            self._on_pause(health)
-                        except Exception:
-                            logger.exception("on_pause callback raised; continuing")
+                        self._pending.append(ref)
+                        self._sample_counters.setdefault(ref.sample_id, 0)
+                        logger.debug(
+                            "SampleRefQueue put sample_id=%s pending=%d",
+                            ref.sample_id,
+                            len(self._pending),
+                        )
+                        return
+                else:
+                    if self._should_pause(health):
+                        logger.info(
+                            "SampleRefQueue producer paused at high watermark (resident=%d capacity=%d)",
+                            health.resident_bytes,
+                            health.capacity_bytes,
+                        )
+                        self._producer_paused = True
+                        if self._on_pause is not None:
+                            try:
+                                self._on_pause(health)
+                            except Exception:
+                                logger.exception("on_pause callback raised; continuing")
+                    else:
+                        self._pending.append(ref)
+                        self._sample_counters.setdefault(ref.sample_id, 0)
+                        logger.debug(
+                            "SampleRefQueue put sample_id=%s pending=%d",
+                            ref.sample_id,
+                            len(self._pending),
+                        )
+                        return
                 self._put_cv.wait(timeout=poll_interval)
-            # Brief lock release is implicit via Condition.wait returning
-            # after either the timeout or a notify (which we don't emit
-            # externally; the wake-up cadence is poll-driven).
 
     # --- consume side -------------------------------------------------------
 
     def acquire(self, *, poll_interval: float = 0.05) -> Lease | None:
-        """Lease the next ref; returns ``None`` once shutdown drains the queue.
+        """Lease the next ref; returns ``None`` when nothing is ready.
+
+        ``None`` is returned in two situations, which consumers
+        disambiguate with :attr:`is_closed`:
+
+        - ``is_closed is True``: the queue has been shut down and is
+          drained. The consumer should stop iterating.
+        - ``is_closed is False``: a transient empty poll (the producer
+          is briefly behind). The consumer should retry.
 
         The returned :class:`Lease` is the only sanctioned way to access
         the ref's tensors -- :class:`FeatureStore.get` requires a :class:`SampleRef`,
@@ -273,6 +347,12 @@ class SampleRefQueue:
                     lease.ref.sample_id,
                 )
                 return
+            # Drop the per-sample redelivery counter so it cannot grow
+            # without bound across a long streaming run. ``fail`` and
+            # ``reclaim_expired`` re-set the counter when they re-add a
+            # sample to pending, so this stays consistent with the
+            # redelivery bookkeeping.
+            self._sample_counters.pop(lease.ref.sample_id, None)
             # Wake up a producer that might have been waiting for the
             # store to drain below the high watermark.
             self._put_cv.notify_all()

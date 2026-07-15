@@ -256,7 +256,7 @@ def test_queue_pause_and_resume_callbacks_fire_on_watermark_transitions() -> Non
         high_watermark_bytes=128 * 1024,
         low_watermark_bytes=32 * 1024,
     )
-    _put(big_store, "warm", n_floats=4 * 1024)  # ~16 KB
+    ref_warm = _put(big_store, "warm", n_floats=4 * 1024)  # ~16 KB
     pause_log = []
     resume_log = []
 
@@ -271,8 +271,15 @@ def test_queue_pause_and_resume_callbacks_fire_on_watermark_transitions() -> Non
 
     def drainer() -> None:
         time.sleep(0.05)
-        out, h = big_store.get(ref_pause)
-        big_store.release(h)
+        # Drop both warm and p1 so the post-state resident bytes drop
+        # strictly below the low watermark -- that is what the
+        # hysteresis-aware resume condition needs. With only p1
+        # released, resident lands at ~32 KiB which equals the low
+        # watermark and the producer correctly stays paused.
+        _, h_warm = big_store.get(ref_warm)
+        _, h_p1 = big_store.get(ref_pause)
+        big_store.release(h_p1)
+        big_store.release(h_warm)
 
     t = threading.Thread(target=drainer)
     t.start()
@@ -288,7 +295,9 @@ def test_queue_pause_and_resume_callbacks_fire_on_watermark_transitions() -> Non
     # reading, otherwise the hysteresis is broken.
     assert pause_log[0] > resume_log[-1]
     assert pause_log[0] >= 128 * 1024  # paused for the configured high watermark
-    assert resume_log[-1] <= big_store.health().resident_bytes + 32 * 1024  # within 1 sample's worth
+    # After releasing both warm and p1, only ``extra`` is left (~16 KiB);
+    # the resume callback fires at resident_bytes <= low_watermark_bytes.
+    assert resume_log[-1] <= 32 * 1024
 
 
 # --- 6. close ------------------------------------------------------------
@@ -298,6 +307,143 @@ def test_queue_close_makes_acquire_return_none(store: LocalFeatureStore) -> None
     q = SampleRefQueue(store)
     q.close()
     assert q.acquire() is None
+
+
+def test_queue_is_closed_property_distinguishes_lifecycle_from_empty_poll(
+    store: LocalFeatureStore,
+) -> None:
+    """Consumers reading ``acquire() == None`` need to know which case they hit.
+
+    ``None`` on a still-open queue means "transient empty, retry";
+    ``None`` on a closed queue means "drained, stop". :attr:`is_closed`
+    is the canonical signal -- the property returns ``False`` until
+    :meth:`close` runs and ``True`` after.
+    """
+    q = SampleRefQueue(store)
+    assert q.is_closed is False
+    lease = q.acquire()
+    assert lease is None
+    assert q.is_closed is False  # empty poll, NOT shutdown
+
+    q.close()
+    assert q.is_closed is True
+    lease = q.acquire()
+    assert lease is None  # shutdown, drain done
+
+
+# --- 7. ack counter cleanup -----------------------------------------------
+
+
+def test_queue_ack_drops_sample_counter_entry(store: LocalFeatureStore) -> None:
+    """``_sample_counters`` must not grow unbounded across long runs.
+
+    Every successful ack (no pending redelivery) should remove the
+    sample-id key from the counter dict. Putting + acking the same
+    sample repeatedly must leave the counter empty.
+    """
+    q = SampleRefQueue(store)
+    ref = _put(store, "s1", n_floats=64)
+    q.put(ref)
+    lease = q.acquire()
+    assert lease is not None
+    assert lease.redelivery_count == 0
+    q.ack(lease)
+    # The counter entry must be popped on ack; if it survived, a long
+    # run with many unique sample_ids would leak unboundedly.
+    assert "s1" not in q._sample_counters  # noqa: SLF001 -- inspecting internals on purpose
+
+
+def test_queue_ack_after_fail_preserves_counter_until_terminal_ack(
+    store: LocalFeatureStore,
+) -> None:
+    """``fail`` re-enqueues with an incremented counter; the entry stays
+    until the final ack that drops the sample for good."""
+    q = SampleRefQueue(store)
+    ref = _put(store, "s1", n_floats=64)
+    q.put(ref)
+    lease1 = q.acquire()
+    assert lease1 is not None
+    q.fail(lease1)
+    lease2 = q.acquire()
+    assert lease2 is not None
+    assert lease2.redelivery_count == 1
+    q.ack(lease2)
+    assert "s1" not in q._sample_counters  # noqa: SLF001
+
+
+# --- 8. explicit high/low_watermark_bytes ctor args ------------------------
+
+
+def test_queue_with_explicit_watermark_bytes_overrides_store_defaults() -> None:
+    """The queue's ctor thresholds must take effect, not silently defer
+    to the store's defaults."""
+    store = LocalFeatureStore(
+        max_samples=16,
+        max_bytes=512 * 1024,
+        # store defaults: pause at 384 KiB, resume at 64 KiB
+        high_watermark_bytes=384 * 1024,
+        low_watermark_bytes=64 * 1024,
+    )
+    # queue overrides: pause at 256 KiB, resume at 128 KiB
+    SampleRefQueue(
+        store,
+        high_watermark_bytes=256 * 1024,
+        low_watermark_bytes=128 * 1024,
+    )
+    # Fill to ~192 KiB: below the queue's high (256), above its low (128).
+    # With deferred-to-store behavior, this would be PAUSED (192 > 64 = store's low is hit).
+    # With explicit queue thresholds, this stays UNPAUSED.
+    _put(store, "warm", n_floats=24 * 1024)  # ~96 KiB
+    _put(store, "p1", n_floats=24 * 1024)  # total ~192 KiB
+    pause_log = []
+    q2 = SampleRefQueue(store, on_pause=lambda h: pause_log.append(h.resident_bytes))
+    ref_extra = _put(store, "extra", n_floats=4 * 1024)
+    # Producer should NOT pause: resident ~208 KiB, below queue high=256 KiB.
+    q2.put(ref_extra)
+    assert pause_log == []  # queue's explicit threshold was honored, not the store's
+
+
+def test_queue_rejects_misconfigured_watermark_bytes() -> None:
+    store = LocalFeatureStore()
+    with pytest.raises(ValueError, match="strictly less than"):
+        SampleRefQueue(
+            store,
+            high_watermark_bytes=128 * 1024,
+            low_watermark_bytes=128 * 1024,
+        )
+    with pytest.raises(ValueError, match="strictly less than"):
+        SampleRefQueue(
+            store,
+            high_watermark_bytes=128 * 1024,
+            low_watermark_bytes=256 * 1024,
+        )
+    with pytest.raises(ValueError, match="positive"):
+        SampleRefQueue(store, high_watermark_bytes=0)
+    with pytest.raises(ValueError, match="non-negative"):
+        SampleRefQueue(store, low_watermark_bytes=-1)
+
+
+def test_queue_hysteresis_preserves_state_in_band(store: LocalFeatureStore) -> None:
+    """A producer at resident just below high stays UNPAUSED; one at
+    resident just above low stays PAUSED. The band itself preserves
+    the producer's existing state, which is what prevents flapping."""
+    _put(store, "warm", n_floats=4 * 1024)  # ~16 KiB; resident=16 KiB
+    pause_log = []
+    q2 = SampleRefQueue(
+        store,
+        high_watermark_bytes=128 * 1024,
+        low_watermark_bytes=32 * 1024,
+        on_pause=lambda h: pause_log.append(h.resident_bytes),
+    )
+    # Resident 16 KiB is below high AND above low: in the band.
+    # Producer is not currently paused, so it stays unpaused.
+    ref_extra = _put(store, "extra", n_floats=4 * 1024)
+    q2.put(ref_extra)
+    assert pause_log == []
+    # Producer state stays unpaused; the next put should also succeed.
+    ref_extra2 = _put(store, "extra2", n_floats=4 * 1024)
+    q2.put(ref_extra2)
+    assert pause_log == []
 
 
 def test_queue_close_after_close_is_safe(store: LocalFeatureStore) -> None:
