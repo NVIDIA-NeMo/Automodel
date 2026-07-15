@@ -35,6 +35,7 @@ from nemo_automodel.components.moe.layers import (
     MoE,
 )
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
+from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -755,8 +756,6 @@ def parallelize_model(
             ", ".join(sorted(model_parallel_plan)),
         )
         parallelize_module(model, tp_mesh, model_parallel_plan)
-        from nemo_automodel.components.checkpoint.utils import ensure_tied_lm_head
-
         ensure_tied_lm_head(model)
 
     cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1

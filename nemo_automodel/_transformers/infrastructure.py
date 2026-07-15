@@ -43,7 +43,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     _maybe_adapt_state_dict_to_hf,
 )
-from nemo_automodel.components.checkpoint.utils import ensure_tied_lm_head
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
     DistributedStrategyConfig,
@@ -74,6 +73,7 @@ from nemo_automodel.components.utils.model_utils import (
     init_empty_weights,
     print_trainable_parameters,
 )
+from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
 if TYPE_CHECKING:
     from torchao.quantization.qat.linear import Int4WeightOnlyQATQuantizer, Int8DynActInt4WeightQATQuantizer

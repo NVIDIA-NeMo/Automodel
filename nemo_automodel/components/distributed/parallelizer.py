@@ -71,6 +71,7 @@ from nemo_automodel.components.distributed.config import (
     normalize_activation_checkpointing_scope,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
+from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
 
 def _is_transformers_v5_or_higher() -> bool:
@@ -348,8 +349,6 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                 # Restore an architectural embedding/head alias before FSDP
                 # records ownership; re-tying after FSDP can leave two roots
                 # that disagree about the shared parameter.
-                from nemo_automodel.components.checkpoint.utils import ensure_tied_lm_head
-
                 ensure_tied_lm_head(model)
                 if _attention_is_head_sharded(model_parallel_plan):
                     _update_attention_head_counts_for_tp(model, tp_mesh.size())

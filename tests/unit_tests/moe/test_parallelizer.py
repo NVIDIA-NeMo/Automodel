@@ -326,14 +326,6 @@ def _import_parallelizer_with_stubs(monkeypatch):
         parallel_styles_stub,
     )
 
-    checkpoint_utils_stub = types.ModuleType("nemo_automodel.components.checkpoint.utils")
-    checkpoint_utils_stub.ensure_tied_lm_head = lambda model: False
-    monkeypatch.setitem(
-        sys.modules,
-        "nemo_automodel.components.checkpoint.utils",
-        checkpoint_utils_stub,
-    )
-
     return importlib.import_module("nemo_automodel.components.moe.parallelizer")
 
 
@@ -1188,8 +1180,7 @@ def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
     monkeypatch.setattr(P, "apply_ep", MagicMock(side_effect=lambda *args, **kwargs: calls.append("ep")))
     monkeypatch.setattr(P, "apply_ac", MagicMock(side_effect=lambda *args, **kwargs: calls.append("ac")))
     monkeypatch.setattr(P, "apply_fsdp", MagicMock(side_effect=lambda *args, **kwargs: calls.append("fsdp")))
-    checkpoint_utils = sys.modules["nemo_automodel.components.checkpoint.utils"]
-    checkpoint_utils.ensure_tied_lm_head = MagicMock(side_effect=lambda model: calls.append("tie"))
+    monkeypatch.setattr(P, "ensure_tied_lm_head", MagicMock(side_effect=lambda model: calls.append("tie")))
 
     world_mesh = FakeWorldMesh(
         {"tp": 2, "cp": 2, ("dp",): 2},
