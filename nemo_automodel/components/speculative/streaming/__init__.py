@@ -36,6 +36,10 @@ This package owns:
   with visibility-timeout reclaim and watermark-based backpressure.
 """
 
+from nemo_automodel.components.speculative.streaming.async_pipeline import (
+    AsyncFeaturePipeline,
+    PromptSource,
+)
 from nemo_automodel.components.speculative.streaming.queue import (
     Lease,
     SampleRefQueue,
@@ -53,15 +57,19 @@ from nemo_automodel.components.speculative.streaming.store import (
     StoreHealth,
 )
 from nemo_automodel.components.speculative.streaming.stores.local import LocalFeatureStore
+from nemo_automodel.components.speculative.streaming.stores.shared_dir import SharedDirFeatureStore
 
 __all__ = [
+    "AsyncFeaturePipeline",
     "FeatureAlgorithm",
     "FeatureSpec",
     "FeatureStore",
     "Lease",
     "LocalFeatureStore",
+    "PromptSource",
     "SampleRef",
     "SampleRefQueue",
+    "SharedDirFeatureStore",
     "StoreHandle",
     "StoreHealth",
     "VisibilityTimeout",
