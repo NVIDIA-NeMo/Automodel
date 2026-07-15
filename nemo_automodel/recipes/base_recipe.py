@@ -871,56 +871,62 @@ class BaseRecipe:
         garbage_collector.run(step_scheduler.step)
 
     def _get_dp_group(self, include_cp: bool = False):
-        if not self.device_mesh:
+        device_mesh = getattr(self, "device_mesh", None)
+        if not device_mesh:
             return None
 
-        dp_mesh = get_flat_mesh(self.device_mesh, "dp")
-        if include_cp and self.device_mesh["cp"].size() > 1:
-            dp_mesh = get_flat_mesh(self.device_mesh, "dp_cp")
+        dp_mesh = get_flat_mesh(device_mesh, "dp")
+        if include_cp and device_mesh["cp"].size() > 1:
+            dp_mesh = get_flat_mesh(device_mesh, "dp_cp")
         if dp_mesh.size() == 1:
             return None
         return dp_mesh.get_group()
 
     def _get_dp_group_size(self, include_cp: bool = False):
-        if not self.device_mesh:
+        device_mesh = getattr(self, "device_mesh", None)
+        if not device_mesh:
             if dist.is_initialized():
                 return dist.get_world_size()
             return 1
 
-        dp_mesh = get_flat_mesh(self.device_mesh, "dp")
-        if include_cp and self.device_mesh["cp"].size() > 1:
-            dp_mesh = get_flat_mesh(self.device_mesh, "dp_cp")
+        dp_mesh = get_flat_mesh(device_mesh, "dp")
+        if include_cp and device_mesh["cp"].size() > 1:
+            dp_mesh = get_flat_mesh(device_mesh, "dp_cp")
         return dp_mesh.size()
 
     def _get_cp_group_size(self):
-        if not self.device_mesh or self.device_mesh["cp"].size() == 1:
+        device_mesh = getattr(self, "device_mesh", None)
+        if not device_mesh or device_mesh["cp"].size() == 1:
             return 1
-        return self.device_mesh["cp"].size()
+        return device_mesh["cp"].size()
 
     def _get_dp_rank(self, include_cp: bool = False):
-        if not self.device_mesh:
+        device_mesh = getattr(self, "device_mesh", None)
+        if not device_mesh:
             # For DDP without a device mesh, the global rank is the DP rank.
             if dist.is_initialized():
                 return dist.get_rank()
             return 0
 
-        dp_mesh = get_flat_mesh(self.device_mesh, "dp")
-        if include_cp and self.device_mesh["cp"].size() > 1:
-            dp_mesh = get_flat_mesh(self.device_mesh, "dp_cp")
+        dp_mesh = get_flat_mesh(device_mesh, "dp")
+        if include_cp and device_mesh["cp"].size() > 1:
+            dp_mesh = get_flat_mesh(device_mesh, "dp_cp")
         if dp_mesh.size() == 1:
             return 0
         return dp_mesh.get_local_rank()
 
     def _get_tp_rank(self):
-        if not self.device_mesh or self.device_mesh["tp"].size() == 1:
+        device_mesh = getattr(self, "device_mesh", None)
+        if not device_mesh or device_mesh["tp"].size() == 1:
             return 0
-        return self.device_mesh.get_local_rank("tp")
+        return device_mesh.get_local_rank("tp")
 
     def _get_pp_rank(self):
         # PP is a special case because it'll only be present in the device mesh if pp is enabled
-        if not self.device_mesh or "pp" not in self.device_mesh.mesh_dim_names or self.device_mesh["pp"].size() == 1:
+        device_mesh = getattr(self, "device_mesh", None)
+        if not device_mesh or "pp" not in device_mesh.mesh_dim_names or device_mesh["pp"].size() == 1:
             return 0
-        return self.device_mesh.get_local_rank("pp")
+        return device_mesh.get_local_rank("pp")
 
     def _get_pp_group(self):
         """Return the pipeline-parallel process group, or None when pp is disabled.
@@ -936,7 +942,7 @@ class BaseRecipe:
 
     def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)
-        if self.device_mesh and dp_group is None:
+        if getattr(self, "device_mesh", None) and dp_group is None:
             return tensor
         if dp_group is not None or dist.is_initialized():
             if not tensor.is_cuda and torch.cuda.is_available():

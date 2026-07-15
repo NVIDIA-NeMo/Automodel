@@ -868,7 +868,9 @@ class TrainEagle1Recipe(BaseRecipe):
 
             self._maybe_save_final_checkpoint(self.num_epochs)
             self._finalize_pending_checkpoint()
-            self.checkpointer.close()
+            checkpointer = getattr(self, "checkpointer", None)
+            if checkpointer is not None:
+                checkpointer.close()
         finally:
             if pbar is not None:
                 pbar.close()

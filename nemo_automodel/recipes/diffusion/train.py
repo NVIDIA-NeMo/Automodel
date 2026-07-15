@@ -1278,7 +1278,9 @@ class TrainDiffusionRecipe(BaseRecipe):
                 wandb.finish()
 
         self._finalize_pending_checkpoint()
-        self.checkpointer.close()
+        checkpointer = getattr(self, "checkpointer", None)
+        if checkpointer is not None:
+            checkpointer.close()
         logging.info("[INFO] Training complete!")
 
     def _get_dp_rank(self, include_cp: bool = False) -> int:

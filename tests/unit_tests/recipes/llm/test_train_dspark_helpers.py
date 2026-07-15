@@ -237,6 +237,8 @@ def test_run_train_validation_loop_finalizes_before_close():
     obj.dist_env = SimpleNamespace(is_main=False)
     obj.total_optim_steps = 1
     obj.runtime = SimpleNamespace(global_step=1)
+    obj.block_size = 1
+    obj.device = torch.device("cpu")
     obj.train_dataloader = []
     obj._make_progress_bar = lambda **kwargs: FakePbar()
     obj._run_eval = lambda: None

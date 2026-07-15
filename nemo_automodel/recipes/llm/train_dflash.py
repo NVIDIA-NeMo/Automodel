@@ -611,7 +611,8 @@ class TrainDFlashRecipe(BaseRecipe):
         # (and, being seeded per dp_rank, hold identical rng state), so every peer would
         # torch.save the same rng_dp_rank_N.pt and race on a shared FS; let only the
         # first cp peer write it.
-        if self.cp_mesh is None or self.cp_mesh.get_local_rank() == 0:
+        cp_mesh = getattr(self, "cp_mesh", None)
+        if cp_mesh is None or cp_mesh.get_local_rank() == 0:
             self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
         if is_rank_0:
