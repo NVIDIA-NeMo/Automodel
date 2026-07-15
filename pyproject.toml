@@ -138,6 +138,10 @@ ffpa = ["ffpa-attn>=0.1.19", "nvidia-cutlass-dsl>=4.5.1,<4.6"]
 fla = [
     "flash-linear-attention>=0.4.2",
 ]
+magi = [
+    "magi_attention @ git+https://github.com/SandAI-org/MagiAttention.git@d7ea8afd44c790b65fab68a04a6a0fdd5adbf182",
+    "versioningit",
+]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata
     "databricks-sql-connector>=3.0.0",  # For Unity Catalog streaming access
@@ -189,6 +193,7 @@ all = [
     "nemo_automodel[diffusion]",
     "nemo_automodel[extra]",
     "nemo_automodel[fla]",
+    "nemo_automodel[magi]",
     "nemo_automodel[s3]",
     "nemo_automodel[vlm]",
 ]
@@ -235,6 +240,7 @@ no-build-isolation-package = [
     "deep_ep",
     "flash-attn",
     "flash-attn-3",  # FA3: source build from Dao-AILab/flash-attention hopper/ (needs image torch)
+    "magi_attention",
     "mamba-ssm",
     "nv-grouped-gemm",
     "transformer-engine",
@@ -320,6 +326,12 @@ explicit = true
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]
 deep_ep = [{ requirement = "torch", match-runtime = true }]
+magi_attention = [
+    "ninja",
+    "packaging",
+    "versioningit",
+    "wheel",
+]
 transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 nv_grouped_gemm = ["setuptools"]
@@ -330,6 +342,11 @@ name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
 version = "v1.2.1+7febc6e"
 requires-dist = ["torch", "packaging", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "magi_attention"
+version = "1.1.1"
+requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "nv_grouped_gemm"
