@@ -932,14 +932,15 @@ class TrainDFlashRecipe(BaseRecipe):
                                 current_lr,
                             )
                             self._log_extra_train_metrics(epoch_idx)
-                            wandb_data = {
-                                "train/loss": avg_loss,
-                                "train/accuracy": avg_acc,
-                                "train/lr": current_lr,
-                                "train/epoch": epoch_idx,
-                            }
-                            wandb_data.update(self._extra_train_wandb_metrics(metrics))
-                            self._wandb_log(wandb_data, step=self.runtime.global_step)
+                            if getattr(self, "wandb_run", None) is not None:
+                                wandb_data = {
+                                    "train/loss": avg_loss,
+                                    "train/accuracy": avg_acc,
+                                    "train/lr": current_lr,
+                                    "train/epoch": epoch_idx,
+                                }
+                                wandb_data.update(self._extra_train_wandb_metrics(metrics))
+                                self._wandb_log(wandb_data, step=self.runtime.global_step)
                             running_loss = 0.0
                             running_acc = 0.0
                             running_micro = 0
