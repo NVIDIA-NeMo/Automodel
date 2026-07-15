@@ -28,7 +28,8 @@ recipe: FinetuneRecipeForVLM
 
 step_scheduler:
   global_batch_size: 256
-  local_batch_size: 1
+  # Must be >= pp_size so each rank splits into >= pp_size pipeline microbatches.
+  local_batch_size: 8
   ckpt_every_steps: 500
   val_every_steps: 50
   num_epochs: 2
