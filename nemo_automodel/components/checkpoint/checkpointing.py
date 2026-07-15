@@ -264,6 +264,56 @@ def _get_checkpoint_metadata_keys(
     return set(metadata.state_dict_metadata.keys())
 
 
+def _is_dcp_tensor_like_state_value(value: Any) -> bool:
+    """Return whether a state-dict value can be handled directly by DCP."""
+    if isinstance(value, torch.Tensor):
+        return True
+    # DTensor-like values expose ``to_local`` and are handled elsewhere in the
+    # checkpointing stack, so keep them in DCP state even when torch.distributed
+    # tensor classes are not imported directly here.
+    to_local = getattr(value, "to_local", None)
+    return callable(to_local)
+
+
+def _filter_non_tensor_state_for_dcp(
+    state_dict: dict[str, Any],
+    *,
+    checkpoint_path: str,
+    operation: str,
+) -> dict[str, Any]:
+    """Drop non tensor-like entries before DCP planning.
+
+    DCP is used here to save or load tensor-like model state. Python objects
+    such as module extra state can appear in some adapted state dicts, but DCP
+    planning may need to pickle state and can fail before any tensor operation
+    starts. Filtering those entries keeps DCP planning focused on tensor-like
+    values; dropped entries are logged and remain at their current in-memory
+    state on load.
+    """
+    tensor_state_dict: dict[str, Any] = {}
+    dropped_entries: list[str] = []
+
+    for key, value in state_dict.items():
+        if _is_dcp_tensor_like_state_value(value):
+            tensor_state_dict[key] = value
+            continue
+
+        value_type = type(value)
+        dropped_entries.append(f"{key}:{value_type.__module__}.{value_type.__qualname__}")
+
+    if not dropped_entries:
+        return state_dict
+
+    logger.warning(
+        "Dropping %d non-tensor state_dict entries before DCP %s for %s (examples=%s).",
+        len(dropped_entries),
+        operation,
+        checkpoint_path,
+        dropped_entries[:20],
+    )
+    return tensor_state_dict
+
+
 if _is_geq_torch_2_9():
     from torch.distributed.checkpoint.staging import DefaultStager
     from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType, AsyncSaveResponse
@@ -476,6 +526,7 @@ class Checkpointer:
         )
         # MoE adapters return non-contiguous views; safetensors.save rejects those.
         _materialize_to_hf_views_for_save(state_dict)
+        state_dict = _filter_non_tensor_state_for_dcp(state_dict, checkpoint_path=model_dir, operation="save")
         # Build the consolidated model.safetensors.index.json if needed
         fqn_to_file_index_mapping = self._maybe_build_consolidated_index(model_state, state_dict)
         fqn_to_dtype_mapping = self._maybe_build_original_dtype_mapping(model_state, state_dict)
@@ -813,6 +864,7 @@ class Checkpointer:
                     missing_checkpoint_keys[:10],
                 )
 
+        state_dict = _filter_non_tensor_state_for_dcp(state_dict, checkpoint_path=model_path, operation="load")
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
 
         if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
