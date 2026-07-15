@@ -309,6 +309,7 @@ def test_kimi_k2_config_loads_without_trust_remote_code(tmp_path):
     from transformers import AutoConfig
 
     import nemo_automodel._transformers.registry  # noqa: F401
+    from nemo_automodel.components.models.kimi_k2.config import KimiK2Config
 
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -332,7 +333,7 @@ def test_kimi_k2_config_loads_without_trust_remote_code(tmp_path):
 
     from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-    assert type(cfg).__name__ == "KimiK2Config"
+    assert isinstance(cfg, KimiK2Config)
     assert isinstance(cfg, DeepseekV3Config)
     assert cfg.model_type == "kimi_k2"
     assert cfg.architectures == ["DeepseekV3ForCausalLM"]
