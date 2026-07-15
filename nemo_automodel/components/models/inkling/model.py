@@ -46,6 +46,11 @@ from .state_dict_adapter import InklingStateDictAdapter
 class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditionalGeneration, MoEFSDPSyncMixin):
     """Inkling VLM with expert-parallel MoE feed-forwards."""
 
+    # VLM under pipeline parallelism: keep this model's own forward so pixel_values
+    # reach the vision tower (otherwise patch_hf_model_for_pp swaps in the generic
+    # CausalLM forward and drops them). Mirrors qwen3_vl_moe.
+    _pp_keep_self_forward: bool = True
+
     # Preserve HF's fp32-pinned short-conv modules and additionally pin the router
     # correction bias: bf16 rounding of either flips numerics / expert selection.
     _keep_in_fp32_modules_strict = [
