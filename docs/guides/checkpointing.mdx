@@ -65,7 +65,7 @@ checkpoint:
   max_recent_checkpoints: 2
 ```
 
-`max_recent_checkpoints` controls how many of the most recent checkpoint directories are retained by step. It is not a hard cap on the total number of checkpoint directories: checkpoint-root pointers such as `LATEST`, `LOWEST_VAL`, and other top-level symlinks or symlink-fallback pointer text files protect their targets in addition to the recent window. This keeps resume-from-latest behavior reliable while preserving explicitly referenced checkpoints such as the best validation checkpoint.
+`max_recent_checkpoints` controls how many recent checkpoint directories are retained by step. It is not a hard cap on the total number of checkpoint directories. Checkpoint-root pointers, including `LATEST`, `LOWEST_VAL`, other top-level symlinks, and pointer `.txt` fallback files, protect their targets in addition to the recent window. This keeps resume-from-latest behavior reliable and preserves explicitly referenced checkpoints, such as the best validation checkpoint.
 
 For example, if `max_recent_checkpoints: 2` and `LOWEST_VAL` points to an older checkpoint outside the most recent two saves, NeMo AutoModel keeps the two most recent checkpoints plus the `LOWEST_VAL` target.
 
@@ -340,7 +340,9 @@ NeMo AutoModel can write checkpoints asynchronously to reduce training stalls ca
   ```
 - **Enable** (CLI): add `--checkpoint.is_async True` to your run command.
 - **Requirements**: PyTorch ≥ 2.9.0. If an older version is detected, async mode is automatically disabled.
-- **Behavior**: At most one checkpoint uploads at a time; the next save waits for the previous upload to finish. The `LATEST` symlink is updated after the async save completes, which may be deferred until the next save call for intermediate checkpoints. At shutdown, recipes wait for the final async checkpoint and publish `LATEST` before closing the checkpointer. During PEFT, adapter model files are written synchronously on rank 0; optimizer states can still use async.
+- **Behavior**: At most one checkpoint is written at a time. The next save waits for the previous write to finish.
+- **Publication**: The `LATEST` symlink is updated after the async save completes, which can be deferred until the next save call for intermediate checkpoints. Before shutdown completes, recipes wait for the final async checkpoint and publish `LATEST` before closing the checkpointer.
+- **PEFT**: Adapter model files are written synchronously on rank 0; optimizer states can still use async.
 
 ## Advanced Usage: Save Additional States
 You can also save additional states in NeMo AutoModel. By default, we also automatically checkpoint the `dataloader`, `rng`, and `step_scheduler` states which are necessary to resume training accurately. In full, a Safetensors consolidated checkpoint will look like this:
