@@ -345,6 +345,8 @@ class ChatDatasetConfig:
     """If set, shuffles Hub/Parquet data before applying a split slice."""
     mask_reasoning_content: bool = False
     """If ``True``, exclude rendered reasoning traces from the loss mask."""
+    mask_history: bool = False
+    """If ``True``, supervise only the final assistant turn."""
     unshifted: bool = False
     """Passed through to ``format_chat_template``."""
     skip_invalid_samples: bool = False
@@ -364,6 +366,7 @@ class ChatDatasetConfig:
             chat_template=self.chat_template,
             shuffle_seed=self.shuffle_seed,
             mask_reasoning_content=self.mask_reasoning_content,
+            mask_history=self.mask_history,
             unshifted=self.unshifted,
             skip_invalid_samples=self.skip_invalid_samples,
         )

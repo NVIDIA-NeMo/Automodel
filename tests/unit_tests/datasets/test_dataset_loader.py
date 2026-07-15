@@ -12,21 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+import inspect
+from dataclasses import dataclass, fields
 
 import pytest
 import torch
 from torch.utils.data import IterableDataset
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.llm import agent_chat, chat_dataset, squad
 from nemo_automodel.components.datasets.llm.megatron.sampler import MegatronSamplerConfig
 from nemo_automodel.components.datasets.llm.retrieval_dataset import RetrievalDatasetConfig
 from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import InlineRetrievalDatasetConfig
 from nemo_automodel.components.datasets.loader import (
+    _DATASET_CONFIGS,
     CollatorConfig,
     DataloaderConfig,
     ParallelAwareDataloader,
     ThdPackingConfig,
+    _resolve_target,
     make_collate_fn,
     make_packing_config,
 )
@@ -51,6 +55,57 @@ class StaticDatasetConfig:
 
     def build(self) -> object:
         return self.values
+
+
+@pytest.mark.parametrize(("legacy_target", "config_target"), _DATASET_CONFIGS.items())
+def test_legacy_dataset_registration_preserves_public_parameter_parity(legacy_target, config_target):
+    legacy_factory = _resolve_target(legacy_target, {})
+    config_type = _resolve_target(config_target, {})
+    legacy_parameters = {
+        name
+        for name, parameter in inspect.signature(legacy_factory).parameters.items()
+        if name != "self" and parameter.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    }
+    config_fields = {field.name for field in fields(config_type)}
+    runtime_parameters = set(inspect.signature(config_type.build).parameters) - {"self"}
+
+    # Megatron's legacy builder accepted schedule values separately. The typed config deliberately receives
+    # their DatasetBuildSchedule owner as one runtime build argument instead of duplicating them in YAML.
+    if legacy_target == "nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining":
+        runtime_parameters.update(
+            {"micro_batch_size", "global_batch_size", "trainer_max_steps", "trainer_val_check_interval"}
+        )
+
+    missing = legacy_parameters - config_fields - runtime_parameters
+    assert not missing, f"{config_target} does not preserve legacy parameter(s): {', '.join(sorted(missing))}"
+
+
+def test_typed_dataset_configs_forward_reviewed_legacy_parameters(monkeypatch):
+    forwarded = {}
+
+    def capture_chat_dataset(**kwargs):
+        forwarded["chat"] = kwargs
+        return "chat"
+
+    def capture_squad_dataset(**kwargs):
+        forwarded["squad"] = kwargs
+        return "squad"
+
+    def capture_agent_chat_dataset(tokenizer, **kwargs):
+        forwarded["agent"] = {"tokenizer": tokenizer, **kwargs}
+        return "agent"
+
+    monkeypatch.setattr(chat_dataset, "ChatDataset", capture_chat_dataset)
+    monkeypatch.setattr(squad, "make_squad_dataset", capture_squad_dataset)
+    monkeypatch.setattr(agent_chat, "make_agent_chat_dataset", capture_agent_chat_dataset)
+    tokenizer = object()
+
+    assert chat_dataset.ChatDatasetConfig("data.jsonl", mask_history=True).build(tokenizer=tokenizer) == "chat"
+    assert squad.SquadConfig(chat_template="template.jinja").build(tokenizer=tokenizer) == "squad"
+    assert agent_chat.AgentChatConfig(path="data.jsonl", truncate_history=True).build(tokenizer=tokenizer) == "agent"
+    assert forwarded["chat"]["mask_history"] is True
+    assert forwarded["squad"]["chat_template"] == "template.jinja"
+    assert forwarded["agent"]["truncate_history"] is True
 
 
 def test_collator_config_builds_class_once_with_runtime_tokenizer():

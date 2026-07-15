@@ -168,6 +168,8 @@ class SquadConfig:
     """Optional padding strategy."""
     truncation: bool | str = False
     """Optional truncation strategy."""
+    chat_template: str | None = None
+    """Optional Jinja template string or path overriding ``tokenizer.chat_template``."""
 
     def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> LazyMappedDataset:
         """Build the SQuAD :class:`LazyMappedDataset` from this :class:`SquadConfig` and a runtime tokenizer."""
@@ -180,4 +182,5 @@ class SquadConfig:
             dataset_name=self.dataset_name,
             padding=self.padding,
             truncation=self.truncation,
+            chat_template=self.chat_template,
         )

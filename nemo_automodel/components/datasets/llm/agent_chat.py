@@ -696,6 +696,8 @@ class AgentChatConfig:
     """If True, supervise only the final assistant turn of each dialogue."""
     drop_history_reasoning_content: bool = False
     """If True, strip ``reasoning_content`` from all but the final assistant turn."""
+    truncate_history: bool = False
+    """If True, drop oldest exchanges until the dialogue fits ``seq_length``."""
 
     def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> LazyMappedDataset:
         """Build the agent chat :class:`LazyMappedDataset` from this :class:`AgentChatConfig` and a runtime tokenizer."""
@@ -711,4 +713,5 @@ class AgentChatConfig:
             mask_reasoning_content=self.mask_reasoning_content,
             train_on_last_turn_only=self.train_on_last_turn_only,
             drop_history_reasoning_content=self.drop_history_reasoning_content,
+            truncate_history=self.truncate_history,
         )
