@@ -19,6 +19,7 @@ import pathlib
 import time
 from collections import deque
 from contextlib import nullcontext
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -225,6 +226,31 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         self.temperature = self.cfg.get("temperature", 1.0)
 
+    def _build_optimizer_param_groups(self) -> list[dict[str, Any]]:
+        """Build optimizer parameter groups for trainable model parameters."""
+        model = self.model_parts[0]
+        decay_params = []
+        no_decay_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            name_l = name.lower()
+            if name.endswith(".bias") or ("norm" in name_l):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        assert decay_params or no_decay_params, "no trainable parameters found"
+
+        param_groups = []
+        if decay_params:
+            param_groups.append({"params": decay_params})
+        if no_decay_params:
+            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+
+        logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
+        return param_groups
+
     def setup(self):
         """Build all components needed for training/validation/logging/checkpointing."""
         torch.cuda.reset_peak_memory_stats()
@@ -295,27 +321,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.model_parts = [model]
         self.pp = None
 
-        # Apply weight decay only to non-bias/non-norm params
-        decay_params = []
-        no_decay_params = []
-        for name, param in self.model_parts[0].named_parameters():
-            if not param.requires_grad:
-                continue
-            name_l = name.lower()
-            if name.endswith(".bias") or ("norm" in name_l):
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-
-        assert decay_params or no_decay_params, "no trainable parameters found"
-
-        param_groups = []
-        if decay_params:
-            param_groups.append({"params": decay_params})
-        if no_decay_params:
-            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
-
-        logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
+        param_groups = self._build_optimizer_param_groups()
         optimizer = self.cfg.optimizer.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
         self.optimizer = [optimizer]
         warn_if_torch_adam_with_bf16_params(
@@ -586,6 +592,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
             metrics=metrics,
         )
 
+    def _extract_scoring_reps(self, model_output):
+        """Return the embedding tensor used for validation scoring from a forward output.
+
+        The base bi-encoder forward returns an embedding tensor directly. Subclasses whose
+        forward returns a richer structure (e.g. the distillation student, which returns
+        ``(pooled, projected, intermediate_outputs)``) should override this to select the
+        tensor to score with.
+        """
+        return model_output
+
     def _run_validation_epoch(self, val_dataloader):
         """Run validation for one epoch and compute loss, accuracy@1, and MRR."""
         with ScopedRNG(seed=1, ranked=True):
@@ -604,8 +620,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     query, passage = _unpack_qp(batch)
 
                     model = self.model_parts[0]
-                    q_reps = model(query)
-                    p_reps = model(passage)
+                    q_reps = self._extract_scoring_reps(model(query))
+                    p_reps = self._extract_scoring_reps(model(passage))
 
                     if _uses_multi_vector_scoring(model):
                         scores, labels = maxsim_scores_and_labels(
