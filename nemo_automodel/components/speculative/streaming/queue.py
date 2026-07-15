@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -58,11 +58,11 @@ logger = logging.getLogger(__name__)
 class VisibilityTimeout:
     """How long an unacked :class:`Lease` is allowed to live before reclaim.
 
-    The minimum value is ``1.0`` second -- tighter intervals generate
-    spurious reclaim on contended machines, where one consumer is merely
-    slow rather than crashed. The maximum is unbounded; in practice the
-    producer reads ``acquire()`` round-trip times to pick something
-    workable per deployment.
+    Any positive value is accepted (sub-second values are useful in
+    tests). Production deployments typically pick something an order of
+    magnitude larger than the recipe's per-step budget so a slow but
+    healthy consumer does not see its leases reclaimed out from under
+    it.
     """
 
     seconds: float = 30.0

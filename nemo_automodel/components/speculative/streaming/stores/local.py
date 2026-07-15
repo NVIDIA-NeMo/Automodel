@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -160,12 +160,46 @@ class LocalFeatureStore(FeatureStore):
     ) -> SampleRef:
         """Store ``tensors`` under ``sample_id`` and return a tensor-free :class:`SampleRef`.
 
+        Args:
+            sample_id: Stable identifier within ``run_id``. Must be unique
+                in this store at put time; duplicates raise ``ValueError``.
+            tensors: Feature-name to tensor mapping. The store detaches,
+                clones, and makes each tensor contiguous before stashing it,
+                so the producer may keep mutating its source tensors after
+                the put returns without disturbing what a later
+                :meth:`get` hands out. The shape and dtype of each tensor
+                are captured into the returned :class:`SampleRef`'s
+                ``feature_specs``; the consumer uses those specs to
+                preallocate the receive buffer at :meth:`get` time, so
+                changing ``tensors[name].shape`` or ``dtype`` between put
+                and get without updating the ref will surface as a
+                ``RuntimeError`` on materialization.
+            run_id: Same value on every ref of one run; surfaces on the
+                :class:`SampleRef.run_id` so producers and consumers can
+                verify they are talking about the same run.
+            algorithm: Which draft family produced this sample; gates the
+                :class:`SampleRef` required-features check.
+            schema_version: Bumped whenever the producer's feature set or
+                layout for ``algorithm`` changes incompatibly.
+            target_model_version: Monotonically increasing identifier of
+                the target-model weights.
+            draft_weight_version: Same idea for the draft model's weights.
+            num_tokens: Sum of attended tokens; used by the consumer for
+                empty / short loss-mask neutralization.
+
+        Returns:
+            A tensor-free :class:`SampleRef` carrying the per-feature
+            ``feature_keys`` and ``feature_specs``. No tensor reachable
+            from this object.
+
         Raises:
             MemoryError: if the put would exceed ``max_samples`` or
                 ``max_bytes``. The producer is expected to retry after the
                 store drains below the low watermark (see
                 :meth:`health`).
             RuntimeError: if the store has been closed.
+            ValueError: on bad input (empty sample id, empty tensors map,
+                duplicate sample id).
         """
         if not sample_id:
             raise ValueError("sample_id must be a non-empty str")
@@ -219,6 +253,36 @@ class LocalFeatureStore(FeatureStore):
         ref: SampleRef,
         device: torch.device | str | None = None,
     ) -> tuple[dict[str, torch.Tensor], StoreHandle]:
+        """Materialize ``ref``'s features on ``device`` and hand back a :class:`StoreHandle`.
+
+        Args:
+            ref: The reference returned by :meth:`put` (typically via a
+                queue lease). ``ref.store_uri`` MUST equal this store's
+                :attr:`store_uri`; a mismatch raises ``KeyError`` so a
+                consumer cannot accidentally materialize a foreign ref.
+            device: Optional target device. ``None`` returns each feature
+                on the device it was put on; a non-``None`` value
+                materializes every feature on that device via
+                ``Tensor.to(device)`` (a no-op when already in place).
+
+        Returns:
+            A ``(tensors, handle)`` pair. ``tensors`` is a
+            ``dict[str, torch.Tensor]`` keyed by feature name in
+            :attr:`SampleRef.feature_names` insertion order (one entry
+            per feature). Each tensor is a fresh ``clone`` of the stored
+            data on the requested device; the consumer may mutate it
+            in place. ``handle`` must be handed to :meth:`release` once
+            the consumer is done so the store can drop the cached copy
+            and decrement its resident-byte counter.
+
+        Raises:
+            KeyError: when ``ref.store_uri`` does not match this store,
+                or when ``ref.sample_id`` is no longer present (released
+                or never put).
+            RuntimeError: when the stored tensor's shape or dtype
+                differs from what the ref claims, or the store has been
+                closed.
+        """
         if ref.store_uri != self.store_uri:
             raise KeyError(
                 f"SampleRef.store_uri {ref.store_uri!r} does not match this store's URI {self.store_uri!r}; "
