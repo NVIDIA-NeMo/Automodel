@@ -30,11 +30,10 @@ from nemo_automodel.components.models.llama_bidirectional.model import (
 from nemo_automodel.components.models.ministral_bidirectional.model import Ministral3BidirectionalModel
 
 
-@pytest.mark.parametrize("model_type", ["llama_nemotron_vl", "eagle_lamma_biencoder"])
-def test_llama_nemotron_vl_supported_backbone_for_embedding(model_type):
+def test_llama_nemotron_vl_supported_backbone_for_embedding():
     from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
 
-    assert SUPPORTED_BACKBONES[model_type]["embedding"] == "LlamaNemotronVLModel"
+    assert SUPPORTED_BACKBONES["llama_nemotron_vl"]["embedding"] == "LlamaNemotronVLModel"
 
 
 def test_biencoder_build_applies_optimized_vl_flags(monkeypatch):

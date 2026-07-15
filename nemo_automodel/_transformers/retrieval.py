@@ -354,8 +354,6 @@ SUPPORTED_BACKBONES = {
     "ministral3": _MINISTRAL3_BIDIREC_TASKS,
     "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
     "llama_nemotron_vl": _LLAMA_NEMOTRON_VL_TASKS,
-    # Legacy Eagle checkpoints published this misspelled model type.
-    "eagle_lamma_biencoder": _LLAMA_NEMOTRON_VL_TASKS,
 }
 
 
