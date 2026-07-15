@@ -15,6 +15,8 @@
 """Unit tests for Ministral3 bidirectional encoder (retrieval / bi-encoder path)."""
 
 import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -27,6 +29,7 @@ pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not ava
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import BiEncoderModel, _init_encoder_common, configure_encoder_metadata
 from nemo_automodel.components.models.ministral_bidirectional.model import (
+    Mistral3BidirectionalModel,
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
 )
@@ -381,3 +384,19 @@ def test_init_encoder_common_name_or_path_ministral_retrieval():
     _init_encoder_common(encoder, backbone)
 
     assert "ministral_bidirectional" in encoder.name_or_path
+
+
+def test_mistral3_vlm_liger_patch_targets_text_tower():
+    """Only the compatible text kernels are enabled for the bidirectional VLM."""
+    language_model = object()
+    model = SimpleNamespace(language_model=language_model)
+    liger_kernel_transformers = SimpleNamespace(apply_liger_kernel_to_mistral=MagicMock())
+
+    Mistral3BidirectionalModel._nemo_apply_liger_kernel(model, liger_kernel_transformers)
+
+    liger_kernel_transformers.apply_liger_kernel_to_mistral.assert_called_once_with(
+        model=language_model,
+        rope=False,
+        cross_entropy=False,
+        fused_linear_cross_entropy=False,
+    )

@@ -15,14 +15,14 @@ from transformers import AutoConfig, AutoModel
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_bidirectional_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalProjector
-from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
 from transformers.models.ministral3.configuration_ministral3 import Ministral3Config
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Model
-from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
+from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
+from transformers.models.mistral3.modeling_mistral3 import Mistral3Model, Mistral3MultiModalProjector
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
+
 
 class Ministral3BidirectionalConfig(Ministral3Config):
     """Configuration for Ministral3BidirectionalModel with pooling and temperature settings."""
@@ -128,7 +128,6 @@ class Ministral3BidirectionalModel(Ministral3Model):
         )
 
 
-
 class Mistral3BidirectionalConfig(Mistral3Config):
     """Configuration for Mistral3BidirectionalModel with pooling and temperature settings."""
 
@@ -145,7 +144,7 @@ class Mistral3BidirectionalConfig(Mistral3Config):
             if isinstance(self.text_config, dict):
                 self.text_config["pooling"] = value
             else:
-                self.text_config.pooling =value
+                self.text_config.pooling = value
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -174,7 +173,6 @@ class Mistral3BidirectionalModel(Mistral3Model):
 
     config_class = Mistral3BidirectionalConfig
 
-
     def __init__(self, config):
         super().__init__(config)
         self.vision_tower = AutoModel.from_config(config.vision_config)
@@ -182,8 +180,17 @@ class Mistral3BidirectionalModel(Mistral3Model):
         self.language_model = Ministral3BidirectionalModel(config.text_config)
         self.post_init()
 
+    def _nemo_apply_liger_kernel(self, liger_kernel_transformers) -> None:
+        """Apply compatible Liger kernels to the Ministral text tower only."""
+        liger_kernel_transformers.apply_liger_kernel_to_mistral(
+            model=self.language_model,
+            rope=False,
+            cross_entropy=False,
+            fused_linear_cross_entropy=False,
+        )
+
     def build_collator(self, processor=None, **kwargs):
-        """Dummy method that matches the interface for evaluation, returning the processor argunment as the model collator for data loading."""	
+        """Dummy method that matches the interface for evaluation, returning the processor argunment as the model collator for data loading."""
         return processor
 
 

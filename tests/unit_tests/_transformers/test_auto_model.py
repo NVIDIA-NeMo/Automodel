@@ -615,6 +615,30 @@ def test_patch_liger_kernel_success(monkeypatch):
     attn_mock.assert_not_called()
 
 
+def test_patch_liger_kernel_uses_model_owned_hook(monkeypatch):
+    """Composite models can own their model-specific Liger policy."""
+    import nemo_automodel._transformers.kernel_patches as tgt
+
+    apply_mock, _ = prepare_env(monkeypatch, tgt, has_liger=True, apply_ok=True)
+
+    class ModelOwnedLigerPatch(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.liger_patch = MagicMock()
+
+        def _nemo_apply_liger_kernel(self, liger_kernel_transformers):
+            self.liger_patch(liger_kernel_transformers)
+
+    backbone = ModelOwnedLigerPatch()
+    model = torch.nn.Module()
+    model.model = backbone
+    patched = tgt._patch_liger_kernel(model)
+
+    assert patched is model
+    apply_mock.assert_not_called()
+    backbone.liger_patch.assert_called_once_with(tgt.liger_kernel_trf)
+
+
 def test_liger_not_available(monkeypatch):
     """
     Asked for Liger but HAS_LIGER_KERNEL is False.
