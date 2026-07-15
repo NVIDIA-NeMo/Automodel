@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -23,6 +24,7 @@ HAVE_CUDA = torch.cuda.is_available()
 SKIP_TE_TESTS = not (HAVE_TE and HAVE_CUDA)
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.moe import experts as experts_module
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
@@ -67,6 +69,46 @@ def moe_config():
         activation_limit=7.0,
         dtype=torch.bfloat16,
     )
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_all_gather_concat_varlen_backward_reduces_chunks(monkeypatch, rank):
+    gathered_lens = [2, 0, 3]
+    grad_output = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    original_grad_output = grad_output.clone()
+    reduce_scale = 7.0
+    all_reduce_shapes = []
+    process_group = object()
+
+    monkeypatch.setattr(
+        experts_module,
+        "_ALL_GATHER_CONCAT_VARLEN_BACKWARD_CHUNK_TOKENS",
+        2,
+    )
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        assert op == experts_module.dist.ReduceOp.SUM
+        assert group is process_group
+        assert tensor.is_contiguous()
+        all_reduce_shapes.append(tuple(tensor.shape))
+        tensor.mul_(reduce_scale)
+
+    monkeypatch.setattr(experts_module.dist, "all_reduce", fake_all_reduce)
+
+    ctx = SimpleNamespace(group=process_group, gathered_lens=gathered_lens, rank=rank)
+    actual, *_ = experts_module._AllGatherConcatVarlenFn.backward(ctx, grad_output)
+
+    start = sum(gathered_lens[:rank])
+    local_len = gathered_lens[rank]
+    expected = original_grad_output.narrow(0, start, local_len).contiguous() * reduce_scale
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(grad_output, original_grad_output)
+    assert all_reduce_shapes == [
+        (2, 4),
+        (2, 4),
+        (1, 4),
+    ]
+    assert tuple(grad_output.shape) not in all_reduce_shapes
 
 
 class TestActivationFunctions:
