@@ -58,6 +58,9 @@ def truncated_config(num_layers: int) -> InklingConfig:
     # Drop the multi-token-prediction head (not instantiated by the model class).
     tc.num_mtp_layers = None
     tc.mtp_local_layer_ids = None
+    # Pin the same attention backend on both HF and NeMo (both reuse HF attention).
+    cfg._attn_implementation = "eager"
+    tc._attn_implementation = "eager"
     return cfg
 
 
