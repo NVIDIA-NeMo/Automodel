@@ -1,14 +1,16 @@
 # Retrieval Distillation (Automodel)
 
-Run the baseline Stage-1 style recipe:
+Edit `nemotron3_embed_1b_distill.yaml` to set your dataset paths, checkpoint directory, model settings, and hyperparameters before running.
+
+You can run the distillation training via the command below:
 
 ```bash
 automodel --nproc-per-node 8 examples/retrieval/distillation/nemotron3_embed_1b_distill.yaml  
 ```
 
-The recipe writes both:
+Training writes checkpoints under `<checkpoint_dir>` in two formats:
 
 - `epoch_<E>_step_<S>/...` standard Automodel checkpoints
-- `step_<S>/student` + `step_<S>/projection.pt` legacy-compatible HF checkpoint/sidecar
-
-
+- Legacy-compatible HF export under `<checkpoint_dir>/step_<S>/`:
+  - `<checkpoint_dir>/step_<S>/student/` — student encoder checkpoint
+  - `<checkpoint_dir>/step_<S>/projection.pt` — distillation projection head (sidecar)
