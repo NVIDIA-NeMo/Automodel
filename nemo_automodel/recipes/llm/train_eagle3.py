@@ -409,6 +409,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # ``DraftSpec``) in ``components/speculative/eagle/registry.py``;
         # no recipe change required.
         draft_spec = resolve_eagle3_draft_spec(architectures)
+        # The EAGLE-3 draft mirrors only the text decoder. For a multimodal target
+        # that config is nested under ``text_config`` (a top-level ``Gemma4Config``
+        # has no ``vocab_size`` / ``hidden_size`` / ``num_hidden_layers`` at all);
+        # text-only targets have none, so fall back to the config itself. Every
+        # draft-side dimension (vocab_size, hidden_size, heads, head_dim, rope, ...)
+        # is read from this base config.
+        _text_config = getattr(target_config, "text_config", None)
+        draft_base_config = _text_config if _text_config is not None else target_config
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(
             target_path,
@@ -441,7 +449,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.cp_mesh = None
         self.dp_mesh = None
         if self.cached_target_path is None:
-            selected_token_ids, selected_token_mask = self._setup_online_target(recipe_cfg, target_path, target_config)
+            selected_token_ids, selected_token_mask = self._setup_online_target(
+                recipe_cfg, target_path, draft_base_config
+            )
         else:
             # The cached-target path never builds a cp mesh (only the colocated
             # target does), so cp_size>1 here would silently fall back to plain DP
@@ -451,11 +461,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     "Context parallelism (cp_size>1) is not supported with a cached target; the "
                     "cached path does not build a cp mesh. Use the colocated target or set cp_size=1."
                 )
-            selected_token_ids, selected_token_mask = self._setup_cached_target(recipe_cfg, target_config)
+            selected_token_ids, selected_token_mask = self._setup_cached_target(recipe_cfg, draft_base_config)
 
-        draft_config = target_config.to_dict()
+        draft_config = draft_base_config.to_dict()
         draft_config["draft_vocab_size"] = int(selected_token_ids.numel())
-        draft_config["target_hidden_size"] = target_config.hidden_size
+        draft_config["target_hidden_size"] = draft_base_config.hidden_size
         draft_config["architectures"] = ["LlamaEagle3DraftModel"]
         # The draft owns an independent ``lm_head`` whose vocab can differ
         # from ``embed_tokens`` (vocab shrinking, ``draft_vocab_size <
@@ -492,16 +502,16 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         draft_config["parallel_drafting"] = parallel_drafting
         mask_token_id = None
         if parallel_drafting:
-            mask_token_id = self._configure_peagle_draft_config(recipe_cfg, draft_config, target_config)
+            mask_token_id = self._configure_peagle_draft_config(recipe_cfg, draft_config, draft_base_config)
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
         # to bf16 while ``nn.Linear`` defaults to fp32, and ``model.fc`` errors
         # with ``expected mat1 and mat2 to have the same dtype``.
-        # Reuse the target's concrete config class (LlamaConfig / Phi3Config / ...)
-        # so architecture-specific defaults like attention_bias and head_dim
-        # flow into the draft.
-        draft_config_obj = type(target_config).from_dict(draft_config)
+        # Reuse the base config's concrete class (LlamaConfig / Phi3Config /
+        # Gemma4TextConfig / ...) so architecture-specific defaults like
+        # attention_bias and head_dim flow into the draft.
+        draft_config_obj = type(draft_base_config).from_dict(draft_config)
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         # Seed draft embeddings from the target: directly from the live target,
         # or from the embeddings stored alongside the offline cache.
@@ -848,7 +858,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             )
         return True
 
-    def _setup_online_target(self, recipe_cfg, target_path, target_config):
+    def _setup_online_target(self, recipe_cfg, target_path, draft_base_config):
         """Live path: load the target model and build the live dataloader.
 
         Sets ``self.target_model`` / ``self.target_wrapper`` /
@@ -942,7 +952,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # mapping -- so the cache only matters for cold starts.
         selected_token_ids, selected_token_mask = load_or_build_eagle3_token_mapping(
             self.train_dataloader,
-            target_vocab_size=target_config.vocab_size,
+            target_vocab_size=draft_base_config.vocab_size,
             draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
             special_token_ids=special_token_ids,
             cache_path=recipe_cfg.get("selected_token_ids_path", None),
@@ -1115,7 +1125,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             logger.info("Capping target_prefetch_depth %d -> %d (one in-flight request per server).", depth, capped)
         return capped
 
-    def _setup_cached_target(self, recipe_cfg, target_config):
+    def _setup_cached_target(self, recipe_cfg, draft_base_config):
         """Offline path: stream a precomputed cache; no target model is loaded.
 
         Reads the cache manifest for the draft-vocab mapping and loads the stored
@@ -1128,24 +1138,24 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.target_model = None
         self.target_wrapper = None
         manifest = read_manifest(self.cached_target_path)
-        if int(manifest["target_vocab_size"]) != int(target_config.vocab_size):
+        if int(manifest["target_vocab_size"]) != int(draft_base_config.vocab_size):
             raise ValueError(
                 f"EAGLE-3 cache at {self.cached_target_path} was built for target_vocab_size="
-                f"{manifest['target_vocab_size']}, but the configured target has {target_config.vocab_size}. "
+                f"{manifest['target_vocab_size']}, but the configured target has {draft_base_config.vocab_size}. "
                 "The cache does not match this target."
             )
         # The draft's ``fc`` consumes ``target_hidden_size * 3`` aux features; a
         # cache from a different-width target would otherwise crash deep inside
         # ``fc`` with a confusing shape error.
-        expected_aux_dim = int(target_config.hidden_size) * 3
+        expected_aux_dim = int(draft_base_config.hidden_size) * 3
         if int(manifest["aux_hidden_dim"]) != expected_aux_dim:
             raise ValueError(
                 f"EAGLE-3 cache at {self.cached_target_path} has aux_hidden_dim={manifest['aux_hidden_dim']}, "
-                f"but the configured target needs {expected_aux_dim} (hidden_size {target_config.hidden_size} x 3 "
+                f"but the configured target needs {expected_aux_dim} (hidden_size {draft_base_config.hidden_size} x 3 "
                 "aux layers). The cache was built for a different target."
             )
         selected_token_ids = torch.tensor(manifest["selected_token_ids"], dtype=torch.long)
-        selected_token_mask = torch.zeros(int(target_config.vocab_size), dtype=torch.bool)
+        selected_token_mask = torch.zeros(int(draft_base_config.vocab_size), dtype=torch.bool)
         selected_token_mask[selected_token_ids] = True
         self._cached_embed_source = SimpleNamespace(weight=read_target_embeddings(self.cached_target_path))
 
