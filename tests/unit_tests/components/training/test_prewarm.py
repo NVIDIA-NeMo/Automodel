@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +24,6 @@ from nemo_automodel.components.training import prewarm
 from nemo_automodel.components.training.prewarm import (
     PrewarmConfig,
     _collect_gdn_autotune_shapes,
-    _dry_run_warmup,
     _prewarm_comm_groups,
     _prewarm_cublas_backward,
     _prewarm_fla_gdn_autotune,
@@ -42,107 +42,6 @@ class _FakeGDN(torch.nn.Module):
         self.head_v_dim = head_v_dim
         self.in_proj_qkv = torch.nn.Linear(4, 4)
         self.chunk_gated_delta_rule = object()  # presence is what the discovery checks
-
-
-class _TinyLM(torch.nn.Module):
-    """Tiny embedding + linear-head language model for dry-run tests."""
-
-    def __init__(self, vocab_size: int = 32, hidden: int = 8):
-        super().__init__()
-        self.embed = torch.nn.Embedding(vocab_size, hidden)
-        self.lm_head = torch.nn.Linear(hidden, vocab_size)
-
-    def get_input_embeddings(self) -> torch.nn.Embedding:
-        return self.embed
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Compute logits.
-
-        Args:
-            input_ids: Token ids of shape ``[B, S]`` (B = batch, S = sequence).
-
-        Returns:
-            Logits of shape ``[B, S, V]`` (V = vocab size).
-        """
-        return self.lm_head(self.embed(input_ids))
-
-
-class _TinyBNLM(_TinyLM):
-    """Tiny LM with a BatchNorm layer whose running stats mutate on training-mode forwards."""
-
-    def __init__(self, vocab_size: int = 32, hidden: int = 8):
-        super().__init__(vocab_size, hidden)
-        self.bn = torch.nn.BatchNorm1d(hidden)
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Compute logits through embedding, BatchNorm, and the LM head.
-
-        Args:
-            input_ids: Token ids of shape ``[B, S]`` (B = batch, S = sequence).
-
-        Returns:
-            Logits of shape ``[B, S, V]`` (V = vocab size).
-        """
-        hidden = self.embed(input_ids)
-        hidden = self.bn(hidden.transpose(1, 2)).transpose(1, 2)
-        return self.lm_head(hidden)
-
-
-class _TinyGatedLM(torch.nn.Module):
-    """Tiny LM routing through a real MoE ``Gate`` with a positive bias-update factor.
-
-    In training mode every forward accumulates expert load on the gate for the
-    next ``update_bias()`` call, which is exactly the stateful path a dry-run
-    warmup must not leak into.
-    """
-
-    def __init__(self, vocab_size: int = 32, hidden: int = 8):
-        super().__init__()
-        from nemo_automodel.components.moe.config import MoEConfig
-        from nemo_automodel.components.moe.layers import Gate
-
-        self.embed = torch.nn.Embedding(vocab_size, hidden)
-        self.gate = Gate(
-            MoEConfig(
-                n_routed_experts=4,
-                n_shared_experts=0,
-                n_activated_experts=2,
-                n_expert_groups=1,
-                n_limited_groups=1,
-                train_gate=True,
-                gate_bias_update_factor=0.1,
-                aux_loss_coeff=0.0,
-                score_func="sigmoid",
-                route_scale=1.0,
-                dim=hidden,
-                inter_dim=16,
-                moe_inter_dim=16,
-                norm_topk_prob=False,
-                dtype=torch.float32,
-            )
-        )
-        with torch.no_grad():
-            self.gate.weight.normal_(0, 0.02)
-        self.lm_head = torch.nn.Linear(hidden, vocab_size)
-
-    def get_input_embeddings(self) -> torch.nn.Embedding:
-        return self.embed
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Compute logits with hidden states scaled by the gate's routing weights.
-
-        Args:
-            input_ids: Token ids of shape ``[B, S]`` (B = batch, S = sequence).
-
-        Returns:
-            Logits of shape ``[B, S, V]`` (V = vocab size).
-        """
-        hidden = self.embed(input_ids)
-        flat = hidden.reshape(-1, hidden.size(-1))
-        token_mask = torch.ones(flat.size(0), dtype=torch.bool, device=flat.device)
-        weights, _, _ = self.gate(flat, token_mask, cp_mesh=None)
-        scale = weights.sum(dim=-1).reshape(hidden.shape[0], hidden.shape[1], 1)
-        return self.lm_head(hidden * scale)
 
 
 @pytest.fixture
@@ -167,7 +66,6 @@ def test_prewarm_config_defaults_all_off():
     assert cfg.cublas_backward is False
     assert cfg.fla_gdn_autotune is False
     assert cfg.comm_groups is False
-    assert cfg.dry_run is False
 
 
 def test_apply_runs_only_enabled_prewarms(monkeypatch):
@@ -184,16 +82,11 @@ def test_apply_runs_only_enabled_prewarms(monkeypatch):
         "nemo_automodel.components.training.prewarm._prewarm_comm_groups",
         lambda model_parts, device, pp_mesh=None: calls.append(("comm", pp_mesh)),
     )
-    monkeypatch.setattr(
-        "nemo_automodel.components.training.prewarm._dry_run_warmup",
-        lambda model_parts, device, pp_enabled=False: calls.append(("dry_run", pp_enabled)),
-    )
 
     PrewarmConfig(cublas_backward=True, comm_groups=True).apply(
         model_parts=[torch.nn.Linear(2, 2)],
         device=torch.device("cpu"),
         pp_mesh="pp-mesh",
-        pp_enabled=False,
     )
     assert calls == [("cublas", torch.device("cpu")), ("comm", "pp-mesh")]
 
@@ -202,15 +95,41 @@ def test_apply_runs_only_enabled_prewarms(monkeypatch):
     assert calls == []
 
 
+def test_apply_continues_after_prewarm_failures(monkeypatch, caplog):
+    calls = []
+
+    def fail(label):
+        def _raise(*args, **kwargs):
+            calls.append(label)
+            raise RuntimeError(label)
+
+        return _raise
+
+    monkeypatch.setattr(prewarm, "_prewarm_cublas_backward", fail("cublas"))
+    monkeypatch.setattr(prewarm, "_prewarm_fla_gdn_autotune", fail("fla"))
+    monkeypatch.setattr(prewarm, "_prewarm_comm_groups", fail("comm"))
+
+    with caplog.at_level(logging.ERROR, logger=prewarm.__name__):
+        PrewarmConfig(cublas_backward=True, fla_gdn_autotune=True, comm_groups=True).apply(
+            model_parts=[torch.nn.Linear(2, 2)],
+            device=torch.device("cpu"),
+        )
+
+    assert calls == ["cublas", "fla", "comm"]
+    assert "cuBLAS backward prewarm failed" in caplog.text
+    assert "fla GDN autotune prewarm failed" in caplog.text
+    assert "Communication-group prewarm failed" in caplog.text
+
+
 def test_recipe_config_exposes_typed_prewarm_section():
     from nemo_automodel.recipes._typed_config import RecipeConfig
 
-    cfg = RecipeConfig({"prewarm": {"cublas_backward": True, "dry_run": True}})
+    cfg = RecipeConfig({"prewarm": {"cublas_backward": True, "comm_groups": True}})
     prewarm = cfg.prewarm
     assert isinstance(prewarm, PrewarmConfig)
     assert prewarm.cublas_backward is True
     assert prewarm.fla_gdn_autotune is False
-    assert prewarm.dry_run is True
+    assert prewarm.comm_groups is True
 
     assert RecipeConfig({}).prewarm is None
 
@@ -233,8 +152,11 @@ def test_cublas_prewarm_skips_without_cuda_device():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-def test_cublas_prewarm_runs_on_gpu():
-    assert _prewarm_cublas_backward(torch.device("cuda", torch.cuda.current_device())) is True
+def test_cublas_prewarm_runs_without_advancing_rng_on_gpu():
+    device = torch.device("cuda", torch.cuda.current_device())
+    rng_before = torch.cuda.get_rng_state(device)
+    assert _prewarm_cublas_backward(device) is True
+    assert torch.equal(torch.cuda.get_rng_state(device), rng_before)
 
 
 # ---------------------------------------------------------------------------
@@ -273,11 +195,13 @@ def test_fla_prewarm_skips_without_gdn_modules():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-def test_fla_prewarm_populates_autotune_cache_on_gpu():
+def test_fla_prewarm_populates_cache_without_advancing_rng_on_gpu():
     pytest.importorskip("fla")
     device = torch.device("cuda", torch.cuda.current_device())
     module = _FakeGDN(num_v_heads=2, head_k_dim=64, head_v_dim=64).to(device, torch.bfloat16)
+    rng_before = torch.cuda.get_rng_state(device)
     assert _prewarm_fla_gdn_autotune([module], device) is True
+    assert torch.equal(torch.cuda.get_rng_state(device), rng_before)
 
 
 def test_triton_kernel_accepts_unwraps_wrappers_and_validates_args():
@@ -354,75 +278,39 @@ def test_comm_groups_prewarm_ignores_regular_tensors(single_rank_gloo):
     assert _prewarm_comm_groups([torch.nn.Linear(4, 4)], torch.device("cpu")) == 0
 
 
-# ---------------------------------------------------------------------------
-# Dry-run warmup (RFC)
-# ---------------------------------------------------------------------------
+def _run_two_rank_comm_group_prewarm(rank: int, world_size: int, init_file: str) -> None:
+    """Exercise sharded and pipeline groups with real two-rank collectives."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
-
-def test_dry_run_warmup_skips_when_pp_enabled():
-    assert _dry_run_warmup([_TinyLM()], torch.device("cpu"), pp_enabled=True) is False
-
-
-def test_dry_run_warmup_is_side_effect_free_on_cpu():
-    model = _TinyLM()
-    params_before = {name: p.detach().clone() for name, p in model.named_parameters()}
-    rng_before = torch.get_rng_state()
-
-    assert _dry_run_warmup([model], torch.device("cpu"), seq_len=8) is True
-
-    for name, p in model.named_parameters():
-        assert p.grad is None, f"{name} kept a gradient after the dry run"
-        assert torch.equal(p.detach(), params_before[name]), f"{name} changed during the dry run"
-    assert torch.equal(torch.get_rng_state(), rng_before)
-
-
-def test_dry_run_warmup_restores_buffers_of_stateful_modules():
-    model = _TinyBNLM()
-    model.train()
-    buffers_before = {name: buf.detach().clone() for name, buf in model.named_buffers()}
-    assert buffers_before, "test model must have stateful buffers"
-
-    assert _dry_run_warmup([model], torch.device("cpu"), seq_len=8) is True
-
-    for name, buf in model.named_buffers():
-        assert torch.equal(buf, buffers_before[name]), f"buffer {name} changed during the dry run"
-
-
-def test_dry_run_warmup_resets_gate_expert_load_accumulator():
-    model = _TinyGatedLM()
-    model.train()
-    assert model.gate._cumulative_expert_load is None
-
-    assert _dry_run_warmup([model], torch.device("cpu"), seq_len=8) is True
-
-    assert model.gate._cumulative_expert_load is None, (
-        "the dry run leaked expert load into the accumulator consumed by the first real update_bias()"
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
     )
-    assert all(p.grad is None for p in model.parameters())
+    try:
+        mesh = init_device_mesh("cpu", (world_size,))
 
-    # Sanity check that the dry run exercised the stateful path: an ordinary
-    # training-mode forward does accumulate expert load on this model.
-    model(input_ids=torch.randint(0, 32, (1, 8)))
-    assert model.gate._cumulative_expert_load is not None
+        sharded = torch.nn.Linear(4, 4, bias=False)
+        sharded.weight = torch.nn.Parameter(distribute_tensor(sharded.weight.detach(), mesh, [Shard(0)]))
+        assert _prewarm_comm_groups([sharded], torch.device("cpu")) == 1
 
+        replicated = torch.nn.Linear(4, 4, bias=False)
+        replicated.weight = torch.nn.Parameter(distribute_tensor(replicated.weight.detach(), mesh, [Replicate()]))
+        assert _prewarm_comm_groups([replicated], torch.device("cpu"), pp_mesh=mesh) == 1
 
-def test_dry_run_warmup_swallows_forward_failures():
-    class _Broken(_TinyLM):
-        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-            """Raise unconditionally; ``input_ids`` is an unused ``[B, S]`` id tensor."""
-            raise RuntimeError("boom")
-
-    assert _dry_run_warmup([_Broken()], torch.device("cpu")) is False
-
-
-def test_dry_run_warmup_skips_without_vocab_size():
-    model = torch.nn.Linear(4, 4)  # no config and no get_input_embeddings
-    assert _dry_run_warmup([model], torch.device("cpu")) is False
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-def test_dry_run_warmup_runs_on_gpu():
-    device = torch.device("cuda", torch.cuda.current_device())
-    model = _TinyLM().to(device)
-    assert _dry_run_warmup([model], device, seq_len=8) is True
-    assert all(p.grad is None for p in model.parameters())
+def test_comm_groups_prewarm_warms_groups_on_two_ranks(tmp_path):
+    init_file = tmp_path / "prewarm_pg"
+    torch.multiprocessing.spawn(
+        _run_two_rank_comm_group_prewarm,
+        args=(2, str(init_file)),
+        nprocs=2,
+        join=True,
+    )

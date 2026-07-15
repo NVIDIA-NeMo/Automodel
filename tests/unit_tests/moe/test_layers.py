@@ -1007,21 +1007,6 @@ class TestGate:
         # Cumulative load should be reset
         assert gate._cumulative_expert_load is None
 
-    def test_gate_reset_cumulative_expert_load(self, moe_config, device):
-        """reset_cumulative_expert_load drops the pending accumulator consumed by update_bias."""
-        moe_config.gate_bias_update_factor = 0.1
-        gate = Gate(moe_config)
-        gate = gate.to(device)
-        gate.train()
-
-        gate._cumulative_expert_load = torch.rand(moe_config.n_routed_experts, device=device)
-        gate.reset_cumulative_expert_load()
-        assert gate._cumulative_expert_load is None
-
-        # No-op when nothing has accumulated.
-        gate.reset_cumulative_expert_load()
-        assert gate._cumulative_expert_load is None
-
     def test_gate_init_weights(self, moe_config, device):
         """Test Gate weight initialization."""
         gate = Gate(moe_config)

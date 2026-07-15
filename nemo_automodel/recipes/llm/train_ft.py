@@ -855,7 +855,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 model_parts=self.model_parts,
                 device=self.dist_env.device,
                 pp_mesh=(self.device_mesh["pp"] if self.pp_enabled and self.device_mesh is not None else None),
-                pp_enabled=self.pp_enabled,
             )
 
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)

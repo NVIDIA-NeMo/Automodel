@@ -38,9 +38,10 @@ Prewarms are opt-in from the recipe config::
       cublas_backward: true
       fla_gdn_autotune: true
       comm_groups: true
-      dry_run: false  # RFC, see _dry_run_warmup
 
 All prewarms are best-effort: failures are logged and never abort setup.
+Warmups that generate synthetic inputs preserve the PyTorch RNG state so
+enabling them does not change the subsequent training trajectory.
 """
 
 from __future__ import annotations
@@ -70,14 +71,11 @@ class PrewarmConfig:
             model.
         comm_groups: Eagerly create the NCCL communicators that grad-norm
             clipping will use on its first collective.
-        dry_run: [RFC] Run one tiny synthetic forward+backward through the
-            model to warm every lazily-initialized component at once.
     """
 
     cublas_backward: bool = False
     fla_gdn_autotune: bool = False
     comm_groups: bool = False
-    dry_run: bool = False
 
     def apply(
         self,
@@ -85,7 +83,6 @@ class PrewarmConfig:
         model_parts: list[torch.nn.Module],
         device: torch.device | int | str | None,
         pp_mesh: DeviceMesh | None = None,
-        pp_enabled: bool = False,
     ) -> None:
         """Run the enabled prewarms.
 
@@ -96,16 +93,22 @@ class PrewarmConfig:
             pp_mesh: The pipeline-parallel submesh, if pipeline parallelism is
                 enabled (its process group is warmed for the grad-norm
                 all-reduce).
-            pp_enabled: Whether pipeline parallelism is enabled.
         """
         if self.cublas_backward:
-            _prewarm_cublas_backward(device)
+            try:
+                _prewarm_cublas_backward(device)
+            except Exception:
+                logger.exception("cuBLAS backward prewarm failed; continuing without it.")
         if self.fla_gdn_autotune:
-            _prewarm_fla_gdn_autotune(model_parts, device)
+            try:
+                _prewarm_fla_gdn_autotune(model_parts, device)
+            except Exception:
+                logger.exception("fla GDN autotune prewarm failed; continuing without it.")
         if self.comm_groups:
-            _prewarm_comm_groups(model_parts, device, pp_mesh=pp_mesh)
-        if self.dry_run:
-            _dry_run_warmup(model_parts, device, pp_enabled=pp_enabled)
+            try:
+                _prewarm_comm_groups(model_parts, device, pp_mesh=pp_mesh)
+            except Exception:
+                logger.exception("Communication-group prewarm failed; continuing without it.")
 
 
 def _resolve_cuda_device(device: torch.device | int | str | None, label: str) -> torch.device | None:
@@ -144,7 +147,8 @@ def _prewarm_cublas_backward(device: torch.device | int | str | None, size: int 
         return False
 
     try:
-        with torch.enable_grad():
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        with torch.random.fork_rng(devices=[device_index]), torch.enable_grad():
             for dtype in (torch.float32, torch.bfloat16):
                 lhs = torch.randn((size, size), device=device, dtype=dtype, requires_grad=True)
                 rhs = torch.randn((size, size), device=device, dtype=dtype, requires_grad=True)
@@ -524,23 +528,25 @@ def _prewarm_fla_gdn_end_to_end(
         return False
 
     ran = False
-    for (num_heads, head_k_dim, head_v_dim, dtype), module_name in shapes.items():
-        q = k = v = g = beta = out = None
-        try:
-            q = torch.randn((1, seq_len, num_heads, head_k_dim), device=device, dtype=dtype, requires_grad=True)
-            k = torch.randn((1, seq_len, num_heads, head_k_dim), device=device, dtype=dtype, requires_grad=True)
-            v = torch.randn((1, seq_len, num_heads, head_v_dim), device=device, dtype=dtype, requires_grad=True)
-            g = torch.zeros((1, seq_len, num_heads), device=device, dtype=torch.float32, requires_grad=True)
-            beta = torch.full((1, seq_len, num_heads), 0.5, device=device, dtype=dtype, requires_grad=True)
-            out, _ = chunk_gated_delta_rule(q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)
-            out.sum().backward()
-            torch.cuda.synchronize(device)
-            ran = True
-        except Exception:
-            logger.exception("fla GDN end-to-end prewarm failed for %s; continuing.", module_name)
-        finally:
-            del q, k, v, g, beta, out
-            torch.cuda.empty_cache()
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    with torch.random.fork_rng(devices=[device_index]):
+        for (num_heads, head_k_dim, head_v_dim, dtype), module_name in shapes.items():
+            q = k = v = g = beta = out = None
+            try:
+                q = torch.randn((1, seq_len, num_heads, head_k_dim), device=device, dtype=dtype, requires_grad=True)
+                k = torch.randn((1, seq_len, num_heads, head_k_dim), device=device, dtype=dtype, requires_grad=True)
+                v = torch.randn((1, seq_len, num_heads, head_v_dim), device=device, dtype=dtype, requires_grad=True)
+                g = torch.zeros((1, seq_len, num_heads), device=device, dtype=torch.float32, requires_grad=True)
+                beta = torch.full((1, seq_len, num_heads), 0.5, device=device, dtype=dtype, requires_grad=True)
+                out, _ = chunk_gated_delta_rule(q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True)
+                out.sum().backward()
+                torch.cuda.synchronize(device)
+                ran = True
+            except Exception:
+                logger.exception("fla GDN end-to-end prewarm failed for %s; continuing.", module_name)
+            finally:
+                del q, k, v, g, beta, out
+                torch.cuda.empty_cache()
 
     logger.info("Finished fla GDN autotune prewarm.")
     return ran
@@ -621,119 +627,3 @@ def _prewarm_comm_groups(
         torch.cuda.synchronize(device)
     logger.info("Prewarmed %d process group(s) for grad-norm clipping.", len(groups))
     return len(groups)
-
-
-def _dry_run_warmup(
-    model_parts: list[torch.nn.Module],
-    device: torch.device | int | str | None,
-    *,
-    seq_len: int = 64,
-    pp_enabled: bool = False,
-) -> bool:
-    """[RFC] Run one tiny synthetic forward+backward through the model at setup time.
-
-    The targeted prewarms above each address one lazy-initialization source; a
-    dry-run step is the general answer: it exercises the model's real fwd+bwd
-    call graph, so every lazily-initialized kernel library, Triton autotune
-    cache, and gradient-reduction communicator (e.g. FSDP reduce-scatter) used
-    by training is warmed with a tiny input while the allocator pool is empty.
-
-    The dry run is side-effect free with respect to training state:
-
-    - gradients are discarded with ``zero_grad(set_to_none=True)`` afterwards.
-      (The loss is also scaled by zero so most produced gradients are
-      numerically zero, but that alone is not a guarantee: the MoE aux-loss
-      backward, ``MoEAuxLossAutoScaler``, injects a fixed gradient scale
-      regardless of the incoming grad -- the ``zero_grad`` reset is what
-      restores the pre-dry-run state);
-    - no optimizer step runs;
-    - module buffers (e.g. BatchNorm running statistics) are snapshotted
-      before the forward and restored afterwards;
-    - MoE router gates that accumulate expert load for the correction-bias
-      update during training-mode forwards are reset via their public
-      ``reset_cumulative_expert_load`` hook (matched structurally, since
-      components must not import each other);
-    - RNG state (CPU and the target CUDA device) is forked and restored, so
-      data order and dropout draws in real training are unchanged.
-
-    Known limitations (why this is an RFC):
-
-    - Pipeline parallelism is skipped: a synthetic microbatch must flow
-      through the PP schedule for stage-boundary communicators to warm, which
-      needs recipe-level integration rather than a plain ``model(...)`` call.
-    - Models whose forward requires more than ``input_ids`` (e.g.
-      vision-language models needing pixel inputs) are only warmed as far as
-      the forward gets; failures are logged and ignored.
-    - A tiny dense synthetic batch may not reach code paths gated on real
-      data (packed-sequence branches, MoE expert-routing spread).
-
-    Args:
-        model_parts: Model parts; only ``model_parts[0]`` is used (single-part
-            models when PP is disabled).
-        device: Device for the synthetic ``[1, seq_len]`` ``input_ids`` batch;
-            falls back to the current CUDA device (or CPU) when None.
-        seq_len: Sequence length of the synthetic batch.
-        pp_enabled: Whether pipeline parallelism is enabled (skips the dry run).
-
-    Returns:
-        True if the dry run completed, False if it was skipped or failed.
-    """
-    if pp_enabled:
-        logger.warning("Skipping dry-run warmup: pipeline parallelism is not supported yet.")
-        return False
-    if not model_parts:
-        return False
-
-    model = model_parts[0]
-    if device is None:
-        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-    device = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
-
-    vocab_size = getattr(getattr(model, "config", None), "vocab_size", None)
-    if vocab_size is None and hasattr(model, "get_input_embeddings"):
-        vocab_size = getattr(model.get_input_embeddings(), "num_embeddings", None)
-    if vocab_size is None:
-        logger.warning("Skipping dry-run warmup: could not determine vocab size.")
-        return False
-
-    # Snapshot module buffers so the restore below erases any in-place buffer
-    # mutation done by the dry-run forward (BatchNorm running stats, ...).
-    buffer_snapshot = [(buf, buf.detach().clone()) for part in model_parts for buf in part.buffers()]
-
-    fork_devices = [device] if device.type == "cuda" else []
-    try:
-        with torch.random.fork_rng(devices=fork_devices):
-            input_ids = torch.randint(0, int(vocab_size), (1, seq_len), device=device)
-            output = model(input_ids=input_ids)
-            logits = getattr(output, "logits", None)
-            if logits is None:
-                logits = output[0] if isinstance(output, (tuple, list)) else output
-            # Zero-scaled loss: the backward kernels and gradient-reduction
-            # collectives all run, but the produced gradients are unused and
-            # discarded by the zero_grad reset below.
-            (logits.float().sum() * 0.0).backward()
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-    except Exception:
-        logger.exception("Dry-run warmup failed; continuing without it.")
-        return False
-    finally:
-        with torch.no_grad():
-            for buf, saved in buffer_snapshot:
-                buf.copy_(saved)
-        for part in model_parts:
-            part.zero_grad(set_to_none=True)
-            for module in part.modules():
-                # MoE router gates accumulate expert load on every
-                # training-mode forward; drop what the dry run added so the
-                # first real correction-bias update only sees real routing
-                # statistics. Matched structurally: components must not
-                # import each other, so Gate cannot be imported here.
-                reset_expert_load = getattr(module, "reset_cumulative_expert_load", None)
-                if callable(reset_expert_load):
-                    reset_expert_load()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-    logger.info("Finished dry-run warmup (seq_len=%d).", seq_len)
-    return True

@@ -522,18 +522,6 @@ class Gate(nn.Module):
             self.e_score_correction_bias_master += bias_update * self.bias_update_factor
             self.e_score_correction_bias.copy_(self.e_score_correction_bias_master)
 
-    def reset_cumulative_expert_load(self) -> None:
-        """
-        Discards the expert load accumulated for the next correction-bias update.
-
-        Every training-mode forward with ``bias_update_factor > 0`` adds its
-        expert load to the accumulator consumed by :meth:`update_bias`. Call
-        this after forwards that are not part of training (e.g. a setup-time
-        dry-run warmup) so their routing statistics do not skew the first real
-        bias update.
-        """
-        self._cumulative_expert_load = None
-
     def _compute_expert_load(
         self,
         indices: torch.Tensor,
