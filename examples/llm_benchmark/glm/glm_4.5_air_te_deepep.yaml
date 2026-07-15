@@ -100,13 +100,22 @@ dataloader:
   num_workers: 0
 
 optimizer:
-  _target_: torch.optim.Adam
+  # Transformer Engine FusedAdam. On torch>=2.12 (container 26.06), native
+  # torch.optim.Adam runs a slow path on FSDP2-sharded (DTensor) bf16 params —
+  # its foreach/fused fast paths are silently disabled for DTensors — which
+  # roughly doubles the optimizer step vs container 26.04 (torch 2.11) and is
+  # the dominant cause of the 26.06 step-time regression for this recipe.
+  # TE FusedAdam bypasses that path and restores optimizer step time.
+  # master_weights=false keeps the existing bf16 optimizer-state semantics
+  # (FusedAdam's default requires fp32/fp16 master weights).
+  _target_: nemo_automodel.components.optim.optimizer.FusedAdamConfig
   betas:
   - 0.9
   - 0.999
   eps: 1e-8
   lr: 0.0001
   weight_decay: 0
+  master_weights: false
 
 
 ci:
