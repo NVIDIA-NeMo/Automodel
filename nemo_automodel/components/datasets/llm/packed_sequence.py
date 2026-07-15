@@ -24,6 +24,72 @@ CROSS_ENTROPY_IGNORE_IDX = -100
 PACK_TYPE = dict[str, torch.Tensor | list[int]]
 
 
+def _materialize_row(index_row: dict[str, int], dataset: "torch.utils.data.Dataset") -> dict:
+    """Return ``dataset[i]`` for the row's ``__index__`` (a ``datasets.Dataset.map`` worker).
+
+    The row is produced by the dataset's own ``__getitem__``, so any per-index
+    behavior (e.g. a sample-skipping fallback) is preserved exactly rather than
+    re-implemented.
+
+    Args:
+        index_row: A single mapped row holding the integer ``"__index__"``.
+        dataset: The map-style dataset to index.
+
+    Returns:
+        The tokenized sample dict ``dataset[index_row["__index__"]]``.
+    """
+    return dataset[index_row["__index__"]]
+
+
+def tokenize_dataset_parallel(dataset: "torch.utils.data.Dataset", num_proc: int) -> Dataset:
+    """Pre-tokenize a map-style dataset in parallel before packing.
+
+    Iterating a lazily-tokenizing dataset (e.g. ``ChatDataset``) tokenizes each
+    sample serially in a single process, which dominates the cost of preparing a
+    packed dataset. This helper front-loads that work by calling the dataset's
+    own ``__getitem__`` over ``range(len(dataset))`` with ``num_proc`` worker
+    processes and returns a HuggingFace ``Dataset`` of the tokenized rows in
+    original order. The result can be handed to :func:`pack_dataset` (or
+    ``neat_pack_dataset``) unchanged.
+
+    Caveats (the caller in ``build_dataloader`` gates on the first three):
+
+    - ``dataset`` must be indexable (``__len__`` + ``__getitem__``) and its
+      ``__getitem__`` must be a deterministic pure function of the index. Rows
+      are produced in ``num_proc`` separate worker processes, so a
+      ``__getitem__`` that consults process-global state (RNG-driven
+      augmentation, counters) would diverge from serial iteration.
+    - Does not honor ``max_packs``: the whole dataset is tokenized up front,
+      whereas serial packing stops early once ``max_packs`` is reached.
+    - ``dataset`` is pickled into every worker via ``fn_kwargs``. This is cheap
+      for the Arrow-backed datasets used here (``self.dataset`` pickles as an
+      mmap reference), but an in-memory (list-backed) dataset is copied once per
+      worker, so size ``num_proc`` for the node's memory as well as its CPUs.
+    - Runs independently on each data-parallel rank, like the serial packing
+      pass it replaces; ``dp_local_ranks * num_proc`` should not oversubscribe
+      the node's CPUs. Caching is disabled so every run re-tokenizes fresh.
+
+    Args:
+        dataset: A map-style dataset exposing ``__len__`` and ``__getitem__``
+            whose items are tokenized dicts (``input_ids``, ``labels`` and,
+            optionally, ``loss_mask``), each a ``list[int]``.
+        num_proc: Number of worker processes used for tokenization. Must be > 1
+            for this helper to be worthwhile; the caller gates on that.
+
+    Returns:
+        A HuggingFace ``Dataset`` of the tokenized rows in original order.
+    """
+    index_dataset = Dataset.from_dict({"__index__": list(range(len(dataset)))})
+    return index_dataset.map(
+        _materialize_row,
+        fn_kwargs={"dataset": dataset},
+        num_proc=num_proc,
+        remove_columns=["__index__"],
+        load_from_cache_file=False,
+        desc="Pre-tokenizing dataset for packing",
+    )
+
+
 # based on https://github.com/pytorch/torchtune/blob/v0.6.1/torchtune/datasets/_packed.py#L17
 
 

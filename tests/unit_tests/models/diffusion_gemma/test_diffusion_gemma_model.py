@@ -16,27 +16,11 @@
 
 These exercise construction, the single-shared-stack two-pass training forward,
 the END-TO-END leakage invariant on the composed forward (design v2 item 2),
-the frozen router, and the state-dict adapter round-trip. They do NOT need the
-transformers 5.8 fork (unlike the parity test), but they DO need torch + the
-``gemma4_moe`` MoE backend, so they only run where those import (the training
-container), not on a stock-transformers login node.
+the frozen router, and the state-dict adapter round-trip against the supported
+Transformers implementation.
 """
 
-import importlib.util
-
-import pytest
 import torch
-
-# The model reuses the fork's leaf layers + config (transformers.models.diffusion_gemma)
-# and the gemma4_moe MoE backend (transformers.models.gemma4); both ship in the 5.8-dev
-# fork wheel, so gate on the fork being importable.
-_FORK_AVAILABLE = importlib.util.find_spec("transformers.models.diffusion_gemma") is not None
-_GEMMA4_AVAILABLE = importlib.util.find_spec("transformers.models.gemma4") is not None
-
-pytestmark = pytest.mark.skipif(
-    not (_FORK_AVAILABLE and _GEMMA4_AVAILABLE),
-    reason="transformers.models.diffusion_gemma (5.8-dev fork) / gemma4 backend not available",
-)
 
 
 def _tiny_model(self_conditioning=True, freeze_router=True):
@@ -61,7 +45,7 @@ def _tiny_model(self_conditioning=True, freeze_router=True):
         top_k_experts=2,
         moe_intermediate_size=16,
     )
-    # self_conditioning/freeze_router are model-construction flags (not strict fork-config
+    # self_conditioning/freeze_router are model-construction flags (not strict HF-config
     # fields), so they are passed to the model, not the config.
     config = DiffusionGemmaConfig(text_config=text_cfg, vision_config=None, canvas_length=4)
     backend = BackendConfig(
@@ -290,7 +274,7 @@ def test_no_leakage_on_composed_forward():
 
 
 def test_state_dict_adapter_round_trip_native():
-    """Native -> HF -> native key/value round-trip (no fork needed)."""
+    """Native -> HF -> native key/value round-trip."""
     model, _ = _tiny_model(freeze_router=False)
     adapter = model.state_dict_adapter
     # The adapter downcasts converted weights to its dtype (the ckpt's bf16 in

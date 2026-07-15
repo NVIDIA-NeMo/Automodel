@@ -138,6 +138,34 @@ Key components:
   `0.8^i`, teaching the drafter to make multi-step predictions — exactly what
   speculative decoding needs.
 
+### Supported Target Architectures
+
+The target is resolved from its HF `config.architectures` string through the
+registry in `components/speculative/eagle/registry.py`. Most dense and MoE
+decoders reuse the config-driven Llama-style draft (a one-line registry entry);
+architectures whose RoPE or attention layout the shared draft cannot represent
+get a thin dedicated draft class.
+
+| Target | Draft |
+|--------|-------|
+| Llama, Phi-3, Qwen3 dense, Qwen3-MoE | shared Llama-style dense draft |
+| gpt-oss (`GptOssForCausalLM`) | dedicated draft reproducing gpt-oss YaRN RoPE |
+| DeepSeek-V3 (`DeepseekV3ForCausalLM`) | dedicated MLA draft |
+| Gemma4 (`Gemma4ForConditionalGeneration`) | thin dedicated draft (see below) |
+
+**Gemma4.** Gemma4 ships as a multimodal `Gemma4ForConditionalGeneration` whose
+text decoder config is nested under `config.text_config`; the draft is built
+from that inner config automatically. Set `target_force_hf: true` so the stock
+HuggingFace text-capable model is loaded (the draft hooks the decoder under
+`model.language_model.layers`). The draft consumes only post-block hidden states,
+so it is the same Llama-style dense draft used elsewhere, with two Gemma quirks
+reconciled: the `hidden_activation` (GeGLU) key and Gemma4's nested
+per-attention-type `rope_parameters`, which is flattened to a standard
+full-rotary Llama RoPE on the global (full-attention) base. The saved checkpoint
+keeps the canonical `architectures: ["LlamaEagle3DraftModel"]` layout, so SGLang
+and vLLM serve it with their existing EAGLE-3 Llama head. See
+`examples/speculative/eagle3/gemma4_e2b_eagle3.yaml`.
+
 ### EAGLE-3.1 Drafter Toggles
 
 The same `train_eagle3` recipe supports the EAGLE-3.1 drafter variant via two

@@ -372,6 +372,105 @@ class TestMakeTulu3MagicoderTextMixDataset:
         assert len(result) == 3
 
 
+class TestMakeTulu3Dataset:
+    """End-to-end checks for ``make_tulu3_dataset``.
+
+    The function loads ``allenai/tulu-3-sft-mixture`` directly from the Hub and
+    delegates row conversion to ``_convert_sharegpt_to_conversation`` — the same
+    helper the meta-JSON path uses — so the data composition matches loading a
+    dumped Tulu-3 JSONL through ``make_meta_dataset``: no turn cap, ``system``
+    turns dropped, and every row kept in split order. ``load_dataset`` is mocked
+    with a real HF ``Dataset`` whose rows carry a ``messages`` field (matching the
+    production schema).
+    """
+
+    def _fake_tulu(self, rows):
+        from datasets import Dataset
+
+        return Dataset.from_list(rows)
+
+    def test_happy_path_text_only(self, monkeypatch):
+        rows = [
+            {
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ]
+            },
+        ]
+        monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: self._fake_tulu(rows))
+
+        result = ds.make_tulu3_dataset()
+
+        assert len(result) == 1
+        sample = result[0]
+        assert list(sample) == ["conversation"]
+        conv = sample["conversation"]
+        assert conv[0] == {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        assert conv[1] == {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}
+        # No image entries anywhere (text-only training).
+        for turn in conv:
+            for block in turn["content"]:
+                assert block["type"] == "text"
+
+    def test_system_turns_dropped_like_meta_path(self, monkeypatch):
+        """``_convert_sharegpt_to_conversation`` only maps user/assistant, so a
+        ``system`` turn is dropped — matching the old meta-JSON behavior."""
+        rows = [
+            {
+                "messages": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ]
+            }
+        ]
+        monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: self._fake_tulu(rows))
+        result = ds.make_tulu3_dataset()
+        assert len(result) == 1
+        roles = [t["role"] for t in result[0]["conversation"]]
+        assert roles == ["user", "assistant"]
+
+    def test_no_turn_cap_long_conversation_kept(self, monkeypatch):
+        """Unlike the tulu-magicoder mix builder, there is no ``max_turns`` cap:
+        long multi-turn conversations are retained in full."""
+        long_msgs = [
+            {"role": "user", "content": f"u{i}"} if i % 2 == 0 else {"role": "assistant", "content": f"a{i}"}
+            for i in range(40)
+        ]
+        rows = [{"messages": long_msgs}]
+        monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: self._fake_tulu(rows))
+        result = ds.make_tulu3_dataset()
+        assert len(result) == 1
+        assert len(result[0]["conversation"]) == 40
+
+    def test_every_row_kept_in_order(self, monkeypatch):
+        """No rows are filtered out; order matches the source split."""
+        rows = [
+            {"messages": [{"role": "user", "content": f"u{i}"}, {"role": "assistant", "content": f"a{i}"}]}
+            for i in range(5)
+        ]
+        monkeypatch.setattr(ds, "load_dataset", lambda *a, **k: self._fake_tulu(rows))
+        result = ds.make_tulu3_dataset()
+        assert len(result) == 5
+        texts = [r["conversation"][0]["content"][0]["text"] for r in result]
+        assert texts == ["u0", "u1", "u2", "u3", "u4"]
+
+    def test_extra_kwargs_ignored(self, monkeypatch):
+        """Recipe-forwarded keys like ``truncate`` are absorbed, not passed to load_dataset."""
+        rows = [{"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]}]
+
+        def _fake_load_dataset(path_or_dataset, split="train"):
+            # Signature intentionally does NOT accept **kwargs: if make_tulu3_dataset
+            # forwarded truncate/split here, this would raise TypeError.
+            assert path_or_dataset == "allenai/tulu-3-sft-mixture"
+            return self._fake_tulu(rows)
+
+        monkeypatch.setattr(ds, "load_dataset", _fake_load_dataset)
+        result = ds.make_tulu3_dataset(truncate=False, split="train")
+        assert len(result) == 1
+
+
 def test_make_unimm_chat_dataset(monkeypatch):
     """End-to-end sanity check for `make_unimm_chat_dataset`."""
     fake_ds = [
