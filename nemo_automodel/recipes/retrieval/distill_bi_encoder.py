@@ -397,6 +397,18 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
         )
         return param_groups
 
+    def _extract_scoring_reps(self, model_output):
+        """Select the pooled student embedding for validation scoring.
+
+        ``RetrieverStudentWithProjection.forward`` returns
+        ``(pooled, projected, intermediate_outputs)``. The pooled embedding is the student's
+        native retrieval representation (and what training's InfoNCE terms score with), so it
+        is what the inherited validation loop should compare against.
+        """
+        if isinstance(model_output, tuple):
+            return model_output[0]
+        return model_output
+
     def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
         uses_hard_negatives = self.loss_weights["nce"] > 0 or self.loss_weights["nce_kd"] > 0
         if not uses_hard_negatives:

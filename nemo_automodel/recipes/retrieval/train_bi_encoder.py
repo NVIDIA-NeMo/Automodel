@@ -592,6 +592,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
             metrics=metrics,
         )
 
+    def _extract_scoring_reps(self, model_output):
+        """Return the embedding tensor used for validation scoring from a forward output.
+
+        The base bi-encoder forward returns an embedding tensor directly. Subclasses whose
+        forward returns a richer structure (e.g. the distillation student, which returns
+        ``(pooled, projected, intermediate_outputs)``) should override this to select the
+        tensor to score with.
+        """
+        return model_output
+
     def _run_validation_epoch(self, val_dataloader):
         """Run validation for one epoch and compute loss, accuracy@1, and MRR."""
         with ScopedRNG(seed=1, ranked=True):
@@ -610,8 +620,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     query, passage = _unpack_qp(batch)
 
                     model = self.model_parts[0]
-                    q_reps = model(query)
-                    p_reps = model(passage)
+                    q_reps = self._extract_scoring_reps(model(query))
+                    p_reps = self._extract_scoring_reps(model(passage))
 
                     if _uses_multi_vector_scoring(model):
                         scores, labels = maxsim_scores_and_labels(

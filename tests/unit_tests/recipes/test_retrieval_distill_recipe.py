@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 
 from nemo_automodel.recipes.retrieval import distill_bi_encoder as mod
 from nemo_automodel.recipes.retrieval.distill_bi_encoder import (
@@ -30,6 +31,7 @@ from nemo_automodel.recipes.retrieval.distill_bi_encoder import (
     _strip_student_prefix,
     _unpack_qpn,
 )
+from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
 
 
 class _DictLikeConfig(SimpleNamespace):
@@ -341,3 +343,65 @@ def test_setup_requires_layer_pairs_when_weight_positive(monkeypatch):
 
     with pytest.raises(ValueError, match="requires non-empty layer_pairs"):
         recipe.setup()
+
+
+# ---------------------------------------------------------------------------
+# validation scoring reps (_extract_scoring_reps)
+# ---------------------------------------------------------------------------
+def test_extract_scoring_reps_base_is_identity():
+    recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
+    reps = torch.randn(2, 4)
+
+    assert recipe._extract_scoring_reps(reps) is reps
+
+
+def test_extract_scoring_reps_distill_unpacks_pooled():
+    recipe = mod.EmbeddingDistillRecipe.__new__(mod.EmbeddingDistillRecipe)
+    pooled = torch.randn(2, 4)
+    projected = torch.randn(2, 8)
+    output = (pooled, projected, {0: torch.randn(2, 3, 4)})
+
+    assert recipe._extract_scoring_reps(output) is pooled
+    # A plain tensor (e.g. if forward is ever simplified) still passes through.
+    plain = torch.randn(2, 4)
+    assert recipe._extract_scoring_reps(plain) is plain
+
+
+class _TupleStudent(nn.Module):
+    """Student whose forward mimics RetrieverStudentWithProjection's 3-tuple output."""
+
+    pooling = "avg"
+    l2_normalize = False
+
+    def __init__(self, hidden=4):
+        super().__init__()
+        self.hidden = hidden
+
+    def forward(self, inputs):
+        ids = inputs["input_ids"].float()
+        n = ids.shape[0]
+        pooled = ids.mean(dim=1, keepdim=True).expand(n, self.hidden).contiguous()
+        projected = pooled.clone()
+        return pooled, projected, {}
+
+
+def test_validation_epoch_runs_with_tuple_student_output():
+    """Regression: inherited validation must handle the student's tuple forward output."""
+    recipe = mod.EmbeddingDistillRecipe.__new__(mod.EmbeddingDistillRecipe)
+    recipe.model_parts = [_TupleStudent(hidden=4)]
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.step_scheduler = SimpleNamespace(step=1, epoch=0)
+    recipe.val_n_passages = 2
+    recipe.temperature = 0.05
+
+    batch = {
+        "q_input_ids": torch.randint(1, 10, (2, 3)),
+        "q_attention_mask": torch.ones(2, 3, dtype=torch.long),
+        "d_input_ids": torch.randint(1, 10, (4, 3)),
+        "d_attention_mask": torch.ones(4, 3, dtype=torch.long),
+    }
+
+    result = recipe._run_validation_epoch([batch])
+
+    assert set(result.metrics) == {"val_loss", "val_acc1", "val_mrr"}
+    assert all(torch.isfinite(torch.tensor(v)) for v in result.metrics.values())
