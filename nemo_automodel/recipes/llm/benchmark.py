@@ -43,6 +43,10 @@ def _infer_vocab_size(model_cfg):
     from transformers import AutoConfig
 
     config_section = model_cfg.config
+    vocab_size = getattr(config_section, "vocab_size", None)
+    if vocab_size is not None:
+        return vocab_size
+
     # Recipes may set trust_remote_code either at the model level (nemo_automodel
     # convention) or nested under `config` -- accept either.
     trust_remote_code = getattr(model_cfg, "trust_remote_code", False) or getattr(
@@ -493,6 +497,16 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 )
             )
 
+            avg_tflops_per_gpu_per_second = self.tflops / (self.dist_env.world_size * avg_iter_time)
+            logger.info(
+                f"Average TFLOPs/GPU/s: {avg_tflops_per_gpu_per_second:.6f}"
+                + (
+                    f" (excluding first {warmup_steps} warmup iterations)"
+                    if steps > warmup_steps
+                    else f" (all {steps} iterations)"
+                )
+            )
+
             mfu = calculate_mfu(self.tflops, self.dist_env.world_size, avg_iter_time, reference_mfu=peak_tflops)
             logger.info(
                 f"Average MFU: {mfu:.6f}%"
@@ -514,6 +528,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                 "training_time_seconds": iter_time,
                 "avg_iter_time_seconds": avg_iter_time,
                 "avg_mfu_percent": mfu,
+                "avg_tflops_per_gpu_per_second": avg_tflops_per_gpu_per_second,
                 "tflops_per_gpu": self.tflops,
                 "peak_tflops": peak_tflops,
                 "world_size": self.dist_env.world_size,
@@ -538,7 +553,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                         ["Training Time (s)", iter_time],
                         ["Avg Iteration Time (s)", avg_iter_time],
                         ["Avg MFU (%)", mfu],
-                        ["TFLOPs/GPU/s", peak_tflops * mfu / 100],
+                        ["TFLOPs/GPU/s", avg_tflops_per_gpu_per_second],
                         ["Peak TFLOPs", peak_tflops],
                         ["World Size", self.dist_env.world_size],
                         ["Global Batch Size", self.cfg.step_scheduler.global_batch_size],
@@ -553,6 +568,7 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     {
                         "summary/avg_iter_time_seconds": avg_iter_time,
                         "summary/avg_mfu_percent": mfu,
+                        "summary/avg_tflops_per_gpu_per_second": avg_tflops_per_gpu_per_second,
                         "summary/training_time_seconds": iter_time,
                         "summary/tflops_per_gpu": self.tflops,
                     }

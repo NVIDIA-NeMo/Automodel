@@ -101,6 +101,7 @@ def mock_config():
         model=SimpleNamespace(
             config=SimpleNamespace(
                 pretrained_model_name_or_path="gpt2",
+                vocab_size=50257,
             ),
         ),
     )
@@ -177,6 +178,7 @@ class TestBenchmarkingRecipeInitialization:
         """Test that vocab_size is inferred from model config."""
         mock_model_config = MagicMock()
         mock_model_config.vocab_size = 50257
+        delattr(mock_config.model.config, "vocab_size")
 
         with patch("nemo_automodel.recipes.llm.benchmark.TrainFinetuneRecipeForNextTokenPrediction.__init__"):
             with patch("transformers.AutoConfig.from_pretrained", return_value=mock_model_config):
@@ -676,7 +678,7 @@ class TestBenchmarkingRecipeJSONOutput:
 
             assert recipe._bench_json_output_path is None
 
-    def test_log_benchmark_summary_creates_json_file(self, mock_recipe, tmp_path):
+    def test_log_benchmark_summary_creates_json_file(self, mock_recipe, tmp_path, caplog):
         """Test that benchmark summary is written to JSON file."""
         json_file = tmp_path / "benchmark_summary.json"
         mock_recipe._bench_json_output_path = str(json_file)
@@ -690,8 +692,11 @@ class TestBenchmarkingRecipeJSONOutput:
             "iteration_warmup": mock_timer,
         }
 
-        with patch("torch.distributed.barrier"):
-            mock_recipe._log_benchmark_summary(steps=30, warmup_steps=10, peak_tflops=989, rank=0)
+        with caplog.at_level("INFO", logger="nemo_automodel.recipes.llm.benchmark"):
+            with patch("torch.distributed.barrier"):
+                mock_recipe._log_benchmark_summary(steps=30, warmup_steps=10, peak_tflops=989, rank=0)
+
+        assert "Average TFLOPs/GPU/s: 250.000000" in caplog.text
 
         # Verify JSON file was created
         assert json_file.exists()
@@ -712,6 +717,7 @@ class TestBenchmarkingRecipeJSONOutput:
         assert summary_data["seq_len"] == 2048
         assert "avg_iter_time_seconds" in summary_data
         assert "avg_mfu_percent" in summary_data
+        assert summary_data["avg_tflops_per_gpu_per_second"] == 250.0
 
     def test_log_benchmark_summary_skips_json_when_none(self, mock_recipe, tmp_path):
         """Test that JSON output is skipped when path is None."""
@@ -807,6 +813,7 @@ class TestBenchmarkingRecipeSummaryData:
         scalar_metrics = scalar_call[0][0]
         assert "summary/avg_iter_time_seconds" in scalar_metrics
         assert "summary/avg_mfu_percent" in scalar_metrics
+        assert scalar_metrics["summary/avg_tflops_per_gpu_per_second"] == 25.0
         assert "summary/training_time_seconds" in scalar_metrics
         assert "summary/tflops_per_gpu" in scalar_metrics
 

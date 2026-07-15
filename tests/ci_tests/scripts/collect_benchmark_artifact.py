@@ -45,6 +45,7 @@ def parse_log(log_path: str) -> dict:
         "training_time_seconds": r"Total iteration time.*?:\s+([\d.]+)\s+seconds",
         "avg_iter_time_seconds": r"Average iteration time:\s+([\d.]+)\s+seconds",
         "avg_mfu_percent": r"Average MFU:\s+([\d.]+)%",
+        "avg_tflops_per_gpu_per_second": r"Average TFLOPs/GPU/s:\s+([\d.]+)",
     }
     for key, pattern in summary_patterns.items():
         m = re.search(pattern, content)
