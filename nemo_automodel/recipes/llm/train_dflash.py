@@ -50,6 +50,7 @@ from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloade
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
@@ -74,10 +75,10 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
 logger = logging.getLogger(__name__)
 
 
-def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
+def _all_reduce_sum(value: torch.Tensor) -> torch.Tensor:
+    """Sum a scalar metric tensor across all distributed ranks in place."""
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
-        value = value / dist.get_world_size()
     return value
 
 
@@ -323,6 +324,15 @@ class TrainDFlashRecipe(BaseRecipe):
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
+        self.wandb_run = None
+        if self.dist_env.is_main and self.cfg.get("wandb", None) is not None:
+            suppress_wandb_log_messages()
+            self.wandb_run = init_wandb_run(
+                self.cfg.wandb.to_dict(),
+                self.cfg.to_dict(),
+                default_name=type(self).__name__.lower() + "_" + str(target_path).rstrip("/").split("/")[-1],
+            )
+
     def _build_target_model(self, recipe_cfg, target_path: str) -> torch.nn.Module:
         """Load the frozen (optionally tensor-parallel) target model.
 
@@ -453,6 +463,30 @@ class TrainDFlashRecipe(BaseRecipe):
 
     def _log_extra_train_metrics(self, epoch_idx: int) -> None:
         """Hook for subclasses to log extra per-step metrics at a log point (no-op here)."""
+
+    def _extra_train_wandb_metrics(self, metrics) -> dict[str, float]:
+        """Return algorithm-specific W&B metrics for one training step."""
+        return {"train/accept_len": float(metrics.accept_len)}
+
+    def _extra_eval_metric_sums(self, metrics) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Return additional validation numerator and denominator pairs.
+
+        The base DFlash metrics are accumulated directly by :meth:`_run_eval`.
+        Subclasses use this hook for extra scalar statistics, with both tensors
+        on the same device as ``metrics.loss`` so they can participate in the
+        same ordered distributed SUM reductions.
+        """
+        return {}
+
+    def _empty_extra_eval_metric_sums(self) -> dict[str, list[torch.Tensor]]:
+        """Create zeroed subclass validation accumulators on the trainer device."""
+        return {}
+
+    def _wandb_log(self, data: dict[str, float], step: int) -> None:
+        """Log scalar metrics to the rank-zero W&B run when configured."""
+        run = getattr(self, "wandb_run", None)
+        if run is not None:
+            run.log(data, step=step)
 
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
@@ -738,9 +772,15 @@ class TrainDFlashRecipe(BaseRecipe):
         if self.val_dataloader is None:
             return None
         self.trainer_module.eval()
-        total_loss = torch.zeros((), device=self.device)
-        total_acc = torch.zeros((), device=self.device)
-        total_batches = torch.zeros((), device=self.device)
+        totals = {
+            "loss_sum": torch.zeros((), device=self.device),
+            "loss_weight": torch.zeros((), device=self.device),
+            "correct_tokens": torch.zeros((), device=self.device),
+            "valid_tokens": torch.zeros((), device=self.device),
+            "accept_len_sum": torch.zeros((), device=self.device),
+            "valid_blocks": torch.zeros((), device=self.device),
+        }
+        extra_totals = self._empty_extra_eval_metric_sums()
         with torch.no_grad():
             for batch in self.val_dataloader:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -758,17 +798,35 @@ class TrainDFlashRecipe(BaseRecipe):
                     # Every sample in this micro-batch is too short to form a block;
                     # skip it without counting, mirroring the training loop.
                     continue
-                total_loss += metrics.loss.detach()
-                total_acc += metrics.accuracy.detach()
-                total_batches += 1
-        total_loss = _all_reduce_mean(total_loss)
-        total_acc = _all_reduce_mean(total_acc)
-        total_batches = _all_reduce_mean(total_batches)
+                loss_weight = metrics.loss_weight.detach()
+                valid_tokens = metrics.valid_tokens.detach()
+                totals["loss_sum"] += metrics.loss.detach() * loss_weight
+                totals["loss_weight"] += loss_weight
+                totals["correct_tokens"] += metrics.correct_tokens.detach()
+                totals["valid_tokens"] += valid_tokens
+                totals["accept_len_sum"] += metrics.accept_len_sum.detach()
+                totals["valid_blocks"] += metrics.valid_blocks.detach()
+                for name, (numerator, denominator) in self._extra_eval_metric_sums(metrics).items():
+                    extra_totals[name][0] += numerator
+                    extra_totals[name][1] += denominator
+        for value in totals.values():
+            _all_reduce_sum(value)
+        for numerator, denominator in extra_totals.values():
+            _all_reduce_sum(numerator)
+            _all_reduce_sum(denominator)
         self.trainer_module.train()
-        return {
-            "val_loss": (total_loss / total_batches.clamp_min(1)).item(),
-            "val_accuracy": (total_acc / total_batches.clamp_min(1)).item(),
+        result = {
+            "val_loss": (totals["loss_sum"] / totals["loss_weight"].clamp_min(1)).item(),
+            "val_accuracy": (totals["correct_tokens"] / totals["valid_tokens"].clamp_min(1)).item(),
+            "val_accept_len": (totals["accept_len_sum"] / totals["valid_blocks"].clamp_min(1)).item(),
         }
+        result.update(
+            {
+                name: (numerator / denominator.clamp_min(1)).item()
+                for name, (numerator, denominator) in extra_totals.items()
+            }
+        )
+        return result
 
     def run_train_validation_loop(self):
         """Run the DFlash training loop."""
@@ -874,6 +932,14 @@ class TrainDFlashRecipe(BaseRecipe):
                                 current_lr,
                             )
                             self._log_extra_train_metrics(epoch_idx)
+                            wandb_data = {
+                                "train/loss": avg_loss,
+                                "train/accuracy": avg_acc,
+                                "train/lr": current_lr,
+                                "train/epoch": epoch_idx,
+                            }
+                            wandb_data.update(self._extra_train_wandb_metrics(metrics))
+                            self._wandb_log(wandb_data, step=self.runtime.global_step)
                             running_loss = 0.0
                             running_acc = 0.0
                             running_micro = 0
@@ -903,8 +969,10 @@ class TrainDFlashRecipe(BaseRecipe):
                         f"skipped_short_micro_batches={self._skipped_micro_batches}"
                     )
                     if eval_metrics is not None:
-                        msg += (
-                            f" val_loss={eval_metrics['val_loss']:.4f} val_accuracy={eval_metrics['val_accuracy']:.4f}"
+                        msg += " " + " ".join(f"{name}={value:.4f}" for name, value in eval_metrics.items())
+                        self._wandb_log(
+                            {name.replace("val_", "val/", 1): value for name, value in eval_metrics.items()},
+                            step=self.runtime.global_step,
                         )
                     logger.info(msg)
 
