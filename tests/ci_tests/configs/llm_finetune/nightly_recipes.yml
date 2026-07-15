@@ -24,8 +24,12 @@ configs:
   - gpt_oss/gpt_oss_20b.yaml
 
   # -- llama --
+  - llama3_1/llama3_1_8b_hellaswag_pp.yaml
   - llama3_2/llama3_2_1b_squad.yaml
   - llama3_2/llama3_2_1b_hellaswag.yaml
+
+  # -- mistral --
+  - mistral/ministral3_3b_squad.yaml
 
   # -- moonlight --
   - moonlight/moonlight_16b_te.yaml
@@ -55,6 +59,9 @@ configs:
 
   # -- llama --
   - llama3_2/llama3_2_1b_hellaswag_peft.yaml
+
+  # -- mistral --
+  - mistral/ministral3_3b_squad_peft.yaml
 
   # -- nemotron --
   - nemotron/nemotron_nano_8b_v1_squad_peft.yaml

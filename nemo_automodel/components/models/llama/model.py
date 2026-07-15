@@ -51,7 +51,6 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.deprecation import warn_deprecated_llama_for_causal_lm
 from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
@@ -421,7 +420,6 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         config: LlamaConfig,
         backend: Optional[BackendConfig] = None,
     ):
-        warn_deprecated_llama_for_causal_lm(config)
         super().__init__(config)
         self.config = config
         self.backend = backend or BackendConfig()

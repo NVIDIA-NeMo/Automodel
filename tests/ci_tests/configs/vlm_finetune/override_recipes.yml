@@ -15,9 +15,7 @@
 # Models deprecated for 26.10 removal — skipped in release (auto-discover) scope.
 exempt_models:
   - gemma3
-  - gemma3n
   - kimi
-  - mistral
   - phi4
   - qwen2_5
 

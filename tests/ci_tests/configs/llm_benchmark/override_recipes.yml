@@ -13,24 +13,13 @@
 # limitations under the License.
 
 # Deprecated for 26.10 — skipped in performance (auto-discover) scope.
+# Note: the mistral benchmark folder only contains Mistral Small 4 (not Ministral).
 exempt_models:
-  - llama3_1
-  - llama3_3
   - mistral
 
 exempt_configs:
   glm_4.5_air_te_deepep:
-    reason: "Deprecated for 26.10 (GLM-4 MoE)"
-  glm_4.7_flash_lora:
-    reason: "Deprecated for 26.10 (GLM-4 MoE)"
-  glm_4.7_flash_te_deepep:
-    reason: "Deprecated for 26.10 (GLM-4 MoE)"
-  glm_4.7_flash_te_deepep_lora:
-    reason: "Deprecated for 26.10 (GLM-4 MoE)"
-  glm47_lora:
-    reason: "Deprecated for 26.10 (GLM-4 MoE)"
-  glm_4.7_te_deepep:
-    reason: "Deprecated for 26.10 (GLM-4 MoE)"
+    reason: "Deprecated for 26.10 (GLM-4.5 MoE)"
   custom_qwen2_5_32b_peft_benchmark:
     reason: "Deprecated for 26.10 (Qwen2.5)"
   custom_qwen2_5_32b_peft_benchmark_2nodes:

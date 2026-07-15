@@ -44,67 +44,8 @@ _DEPRECATED_MODEL_YAMLS: dict[str, tuple[str, ...]] = {
         "examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml",
         "examples/llm_finetune/seed/seed_oss_36B_hellaswag_peft.yaml",
     ),
-    "LlamaForCausalLM": (
-        "examples/llm_benchmark/llama3_1/llama3_1_8b_peft_benchmark.yaml",
-        "examples/llm_benchmark/llama3_3/custom_llama3_1_70b_pretrain_benchmark_8nodes.yaml",
-        "examples/llm_benchmark/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark.yaml",
-        "examples/llm_benchmark/llama3_3/custom_llama3_3_70b_instruct_peft_benchmark_2nodes.yaml",
-        "examples/llm_benchmark/llama3_3/llama3_3_70b_instruct_peft_benchmark.yaml",
-        "examples/llm_benchmark/llama3_3/llama_3_3_70b_instruct_squad_peft_pp.yaml",
-        "examples/llm_finetune/llama3_1/customizer_llama_3_1_8b_full_sft_tp.yaml",
-        "examples/llm_finetune/llama3_1/llama3_1_8b_columnmapped_lora.yaml",
-        "examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_fp8.yaml",
-        "examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp.yaml",
-        "examples/llm_finetune/llama3_1/llama3_1_8b_hellaswag_pp_dynamic_seq_len.yaml",
-        "examples/llm_finetune/llama3_1/llama3_1_8b_instruct_squad_qlora_2node.yaml",
-        "examples/llm_finetune/llama3_1/llama3_1_8b_squad_qlora.yaml",
-        "examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad.yaml",
-        "examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft.yaml",
-        "examples/llm_finetune/llama3_3/llama_3_3_70b_instruct_squad_peft_qlora_spark.yaml",
-        "examples/llm_pretrain/llama3_70b_pretrain.yaml",
-        "examples/speculative/eagle1/llama_eagle1_perfectblend.yaml",
-        "examples/speculative/eagle2/llama_eagle2_perfectblend.yaml",
-        "examples/speculative/eagle3/llama_eagle3_mvp.yaml",
-        "examples/speculative/eagle3/llama_eagle3_mvp_flash_attn.yaml",
-        "examples/speculative/eagle3/llama_eagle3_perfectblend.yaml",
-        "examples/speculative/eagle3/llama_eagle3_remote.yaml",
-        "examples/speculative/eagle3_1/llama_eagle3_1_mvp.yaml",
-        "examples/speculative/eagle3_1/llama_eagle3_1_perfectblend.yaml",
-        "examples/speculative/p-eagle/llama_peagle_mvp.yaml",
-    ),
-    "Glm4MoeForCausalLM": (
-        "examples/llm_benchmark/glm/glm_4.5_air_te_deepep.yaml",
-        "examples/llm_benchmark/glm/glm_4.7_te_deepep.yaml",
-        "examples/llm_benchmark/glm/glm47_lora.yaml",
-        "examples/llm_finetune/glm/glm_4.5_air_te_deepep.yaml",
-        "examples/llm_finetune/glm/glm_4.7_te_deepep.yaml",
-    ),
-    "Glm4MoeLiteForCausalLM": (
-        "examples/llm_benchmark/glm/glm_4.7_flash_lora.yaml",
-        "examples/llm_benchmark/glm/glm_4.7_flash_te_deepep.yaml",
-        "examples/llm_benchmark/glm/glm_4.7_flash_te_deepep_lora.yaml",
-        "examples/llm_finetune/glm/glm_4.7_flash_te_deepep.yaml",
-        "examples/llm_finetune/glm/glm_4.7_flash_te_packed_sequence.yaml",
-    ),
     "KimiVLForConditionalGeneration": ("examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml",),
 }
-
-
-def _llama_config_name_or_path(config: object) -> str:
-    """Return the HF checkpoint id stored on a Llama config, if any."""
-    return str(getattr(config, "_name_or_path", "") or getattr(config, "name_or_path", "") or "")
-
-
-def is_llama_3_2_1b_config(config: object) -> bool:
-    """Return True when *config* refers to a supported Llama 3.2 1B checkpoint."""
-    return "Llama-3.2-1B" in _llama_config_name_or_path(config)
-
-
-def warn_deprecated_llama_for_causal_lm(config: object) -> None:
-    """Emit a deprecation warning for Llama 3.x except supported 3.2-1B checkpoints."""
-    if is_llama_3_2_1b_config(config):
-        return
-    warn_deprecated_model_class("LlamaForCausalLM")
 
 
 def warn_deprecated_model_class(model_cls_name: str) -> None:

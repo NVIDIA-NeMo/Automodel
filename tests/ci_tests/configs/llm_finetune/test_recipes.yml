@@ -20,10 +20,15 @@ configs:
   - falcon/falcon_h1_7b_instruct_squad_peft.yaml
   - falcon/falcon_h1_7b_instruct_hellaswag_peft.yaml
   - falcon/falcon_h1_34b_instruct_squad_peft.yaml
+  - glm/glm_4.7_flash_te_packed_sequence.yaml
   - gpt_oss/gpt_oss_120b.yaml
   - gpt_oss/gpt_oss_20b.yaml
   - gpt_oss/gpt_oss_20b_peft.yaml
   - gpt_oss/gpt_oss_20b_single_gpu_peft.yaml
+  - llama3_2/llama_3_2_3b_instruct_squad.yaml
+  - llama3_2/llama_3_2_3b_instruct_squad_peft.yaml
+  - llama3_3/llama_3_3_70b_instruct_squad.yaml
+  - mistral/ministral3_3b_squad_peft.yaml
   - minicpm/minicpm5_1b_hellaswag_peft.yaml
   - minicpm/minicpm5_1b_squad.yaml
   - minicpm/minicpm5_1b_squad_peft.yaml
