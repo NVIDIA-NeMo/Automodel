@@ -291,6 +291,7 @@ def _make_recipe_with_cfg(cfg):
 
 def test_setup_default_intermediate_loss_inherits_layer_pairs(monkeypatch):
     monkeypatch.setattr(mod.TrainBiEncoderRecipe, "setup", lambda self: None)
+    monkeypatch.setattr(mod.EmbeddingDistillRecipe, "_sync_projection_parameters", lambda self: None)
     cfg = _DictLikeConfig(
         intermediate_loss_weight=0.0,
         layer_pairs=[[1, 2], [3, 4]],
@@ -385,8 +386,9 @@ class _TupleStudent(nn.Module):
         return pooled, projected, {}
 
 
-def test_validation_epoch_runs_with_tuple_student_output():
+def test_validation_epoch_runs_with_tuple_student_output(monkeypatch):
     """Regression: inherited validation must handle the student's tuple forward output."""
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     recipe = mod.EmbeddingDistillRecipe.__new__(mod.EmbeddingDistillRecipe)
     recipe.model_parts = [_TupleStudent(hidden=4)]
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
