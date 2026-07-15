@@ -255,7 +255,7 @@ def test_distill_loss_zero_when_student_matches_teacher(divergence):
 
 
 def test_distill_loss_teacher_gets_no_gradient():
-    s_q, s_d, _, _, s_n, _ = _distill_inputs()
+    s_q, s_d, _, _, s_n, _ = _distill_inputs(requires_grad=True)
     t_q = torch.randn(4, 8, requires_grad=True)
     t_d = torch.randn(4, 8, requires_grad=True)
     t_n = torch.randn(4, 3, 8, requires_grad=True)
