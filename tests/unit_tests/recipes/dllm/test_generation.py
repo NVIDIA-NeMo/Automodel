@@ -63,8 +63,6 @@ def test_llada2_sampler_is_registered_with_native_generation_defaults():
     assert config.steps == 32
     assert config.block_size == 32
     assert config.threshold == 0.5
-    assert config.editing_threshold == 0.0
-    assert config.max_post_steps == 16
 
 
 def test_chat_prompt_encoding_requests_dictionary_output():
@@ -96,8 +94,6 @@ def test_generate_llada2_maps_config_and_decodes_generated_only_tokens():
         block_size=16,
         temperature=0.2,
         threshold=0.7,
-        editing_threshold=0.4,
-        max_post_steps=9,
     )
 
     responses = generate_llada2(model, tokenizer, [[11, 12, 13], [21]], config, mask_id=156895, eos_id=156892)
@@ -115,8 +111,8 @@ def test_generate_llada2_maps_config_and_decodes_generated_only_tokens():
             "gen_length": 64,
             "eos_early_stop": True,
             "threshold": 0.7,
-            "editing_threshold": 0.4,
-            "max_post_steps": 9,
+            "editing_threshold": 0.0,
+            "max_post_steps": 16,
             "eos_id": 156892,
             "mask_id": 156895,
         }

@@ -98,8 +98,6 @@ class SamplerConfig:
     remasking: str = "low_confidence"
     use_kv_cache: bool = False
     threshold: Optional[float] = None
-    editing_threshold: Optional[float] = None
-    max_post_steps: Optional[int] = None
     causal_context: bool = False
     eos_token_id: Optional[int] = None
 
@@ -387,8 +385,6 @@ class LLaDA2Sampler(DLLMSampler):
         remasking="low_confidence",
         use_kv_cache=False,
         threshold=0.5,
-        editing_threshold=0.0,
-        max_post_steps=16,
         causal_context=False,
         eos_token_id=None,
     )
@@ -447,8 +443,9 @@ def generate_llada2(model, tokenizer, inputs, config: SamplerConfig, mask_id: in
             gen_length=config.max_new_tokens,
             eos_early_stop=True,
             threshold=config.threshold,
-            editing_threshold=config.editing_threshold,
-            max_post_steps=config.max_post_steps,
+            # LLaDA2-specific speed-mode settings; keep them out of the shared CLI.
+            editing_threshold=0.0,
+            max_post_steps=16,
             eos_id=eos_id,
             mask_id=mask_id,
         )
@@ -497,8 +494,6 @@ def main():
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--remasking", default=None, choices=["low_confidence", "random"])
     parser.add_argument("--threshold", type=float, default=None)
-    parser.add_argument("--editing_threshold", type=float, default=None)
-    parser.add_argument("--max_post_steps", type=int, default=None)
     parser.add_argument(
         "--no_kv_cache",
         action="store_true",
@@ -532,8 +527,6 @@ def main():
         "temperature",
         "remasking",
         "threshold",
-        "editing_threshold",
-        "max_post_steps",
     ]:
         val = getattr(args, key)
         if val is not None:

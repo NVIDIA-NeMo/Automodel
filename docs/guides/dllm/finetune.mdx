@@ -274,9 +274,7 @@ python examples/dllm_generate/generate.py \
     --steps 32 \
     --max_new_tokens 128 \
     --block_size 32 \
-    --threshold 0.5 \
-    --editing_threshold 0.0 \
-    --max_post_steps 16
+    --threshold 0.5
 ```
 
 ### Generate with Nemotron-Labs-Diffusion
@@ -290,7 +288,7 @@ python examples/dllm_generate/generate.py \
 
 ### Generation Parameters
 
-The sampler selected with `--sampler` supplies these preset values. LLaDA uses the standalone AutoModel sampler. LLaDA2 and Nemotron call their models' built-in `generate()` methods. `--remasking` and `--no_kv_cache` do not affect LLaDA2 generation. LLaDA2-specific `--editing_threshold` and `--max_post_steps` control post-generation refinement.
+The sampler selected with `--sampler` supplies these preset values. LLaDA uses the standalone AutoModel sampler. LLaDA2 and Nemotron call their models' built-in `generate()` methods. `--remasking` and `--no_kv_cache` do not affect LLaDA2 generation.
 
 | Parameter | Description | LLaDA default | LLaDA2 preset | Nemotron preset |
 |-----------|-------------|---------------|----------------|------------------|
@@ -299,6 +297,4 @@ The sampler selected with `--sampler` supplies these preset values. LLaDA uses t
 | `--block_size` | Tokens per denoising block | 128 | 32 | 32 |
 | `--temperature` | Sampling temperature (0 = greedy) | 0.0 | 0.0 | 0.0 |
 | `--threshold` | Confidence threshold for committing tokens | `None` (disabled by default) | 0.5 | 0.9 |
-| `--editing_threshold` | LLaDA2 confidence threshold for revising committed tokens | Not used | 0.0 | Not used |
-| `--max_post_steps` | Maximum LLaDA2 post-generation refinement steps | Not used | 16 | Not used |
 | `--remasking` | Confidence scoring strategy for selecting which positions to unmask | `low_confidence` | `low_confidence` (preset only; unused by built-in generation) | `low_confidence` (preset only; unused by built-in generation) |
