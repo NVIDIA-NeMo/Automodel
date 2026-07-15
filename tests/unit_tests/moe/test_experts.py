@@ -18,6 +18,8 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+import nemo_automodel.components.moe.experts as experts_module
+
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_CUDA = torch.cuda.is_available()
 SKIP_TE_TESTS = not (HAVE_TE and HAVE_CUDA)
@@ -2374,6 +2376,81 @@ class TestGroupedExpertsConvergenceFixes:
             experts_mm.gate_and_up_projs.grad, experts_loop.gate_and_up_projs.grad, rtol=1e-3, atol=1e-3
         )
         torch.testing.assert_close(experts_mm.down_projs.grad, experts_loop.down_projs.grad, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.parametrize("expert_bias", [False, True])
+    @pytest.mark.parametrize("chunk_size", [1, 2])
+    def test_loop_path_expert_chunking_matches_unchunked(
+        self, config, device, monkeypatch, expert_bias, chunk_size
+    ):
+        """Chunked per-expert loop should match the same loop run as one chunk."""
+        torch.manual_seed(31)
+        config.dtype = torch.float32
+        config.expert_bias = expert_bias
+        experts = self._init_experts(config, device=device)
+        if expert_bias:
+            with torch.no_grad():
+                experts.gate_up_proj_bias.normal_(0, 0.01)
+                experts.down_proj_bias.normal_(0, 0.01)
+
+        num_tokens = 7
+        x_base = torch.randn(num_tokens, config.dim, dtype=torch.float32, device=device)
+        weights = torch.rand(num_tokens, config.n_activated_experts, dtype=torch.float32, device=device)
+        indices = torch.tensor(
+            [
+                [0, 0],
+                [0, 1],
+                [0, 0],
+                [0, 2],
+                [0, 0],
+                [0, 3],
+                [0, 0],
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        x_unchunked = x_base.detach().clone().requires_grad_(True)
+        monkeypatch.setattr(experts_module, "_MOE_LOOP_EXPERT_CHUNK_TOKENS", 10_000)
+        unchunked_output = experts(x_unchunked, token_mask, weights, indices)
+        unchunked_output.sum().backward()
+        unchunked_output = unchunked_output.detach().clone()
+        unchunked_x_grad = x_unchunked.grad.detach().clone()
+        unchunked_gate_grad = experts.gate_and_up_projs.grad.detach().clone()
+        unchunked_down_grad = experts.down_projs.grad.detach().clone()
+        if expert_bias:
+            unchunked_gate_bias_grad = experts.gate_up_proj_bias.grad.detach().clone()
+            unchunked_down_bias_grad = experts.down_proj_bias.grad.detach().clone()
+
+        experts.zero_grad(set_to_none=True)
+
+        x_chunked = x_base.detach().clone().requires_grad_(True)
+        monkeypatch.setattr(experts_module, "_MOE_LOOP_EXPERT_CHUNK_TOKENS", chunk_size)
+        chunked_output = experts(x_chunked, token_mask, weights, indices)
+        chunked_output.sum().backward()
+
+        torch.testing.assert_close(chunked_output, unchunked_output, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(x_chunked.grad, unchunked_x_grad, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(
+            experts.gate_and_up_projs.grad,
+            unchunked_gate_grad,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(experts.down_projs.grad, unchunked_down_grad, rtol=1e-5, atol=1e-5)
+        if expert_bias:
+            torch.testing.assert_close(
+                experts.gate_up_proj_bias.grad,
+                unchunked_gate_bias_grad,
+                rtol=1e-5,
+                atol=1e-5,
+            )
+            torch.testing.assert_close(
+                experts.down_proj_bias.grad,
+                unchunked_down_bias_grad,
+                rtol=1e-5,
+                atol=1e-5,
+            )
 
     # --- Test 5: Loop path with bias ---
 

@@ -39,6 +39,8 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
 from nemo_automodel.components.moe.megatron.token_dispatcher import MoEFlexTokenDispatcher, TokenDispatcherConfig
 from nemo_automodel.components.moe.mxfp8 import select_grouped_mm
 
+_MOE_LOOP_EXPERT_CHUNK_TOKENS = 4096
+
 # ── EP variable-length collective helpers ──
 
 
@@ -432,28 +434,32 @@ class GroupedExperts(nn.Module):
             down_proj = down_projs[local_idx]
             expert_down_proj_bias = down_proj_bias[local_idx] if down_proj_bias is not None else None
 
-            idx_b = idx[:, None].expand(-1, x.size(1))
-            x_idx = x.gather(dim=0, index=idx_b)
-
             gate_and_up_proj = gate_and_up_projs[local_idx]
             expert_gate_up_proj_bias = gate_up_proj_bias[local_idx] if gate_up_proj_bias is not None else None
 
-            # Up projection (separate from activation, matching DeepEP pattern)
-            gate_and_up_out = x_idx @ gate_and_up_proj
-            if expert_gate_up_proj_bias is not None:
-                gate_and_up_out = gate_and_up_out + expert_gate_up_proj_bias
+            for start in range(0, int(idx.numel()), _MOE_LOOP_EXPERT_CHUNK_TOKENS):
+                end = min(int(idx.numel()), start + _MOE_LOOP_EXPERT_CHUNK_TOKENS)
+                idx_chunk = idx[start:end]
+                top_chunk = top[start:end]
+                idx_b = idx_chunk[:, None].expand(-1, x.size(1))
+                x_idx = x.gather(dim=0, index=idx_b)
 
-            # Weighted activation (routing weight applied BETWEEN up and down projections)
-            # Uses WeightedSwiGLUFunction with float32 backward precision
-            w = weights[idx, top, None]
-            activated = self.expert_activation_grouped(gate_and_up_out, w)
+                # Up projection (separate from activation, matching DeepEP pattern)
+                gate_and_up_out = x_idx @ gate_and_up_proj
+                if expert_gate_up_proj_bias is not None:
+                    gate_and_up_out = gate_and_up_out + expert_gate_up_proj_bias
 
-            # Down projection
-            expert_out = activated @ down_proj
-            if expert_down_proj_bias is not None:
-                expert_out = expert_out + expert_down_proj_bias * w
+                # Weighted activation (routing weight applied BETWEEN up and down projections)
+                # Uses WeightedSwiGLUFunction with float32 backward precision
+                w = weights[idx_chunk, top_chunk, None]
+                activated = self.expert_activation_grouped(gate_and_up_out, w)
 
-            y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
+                # Down projection
+                expert_out = activated @ down_proj
+                if expert_down_proj_bias is not None:
+                    expert_out = expert_out + expert_down_proj_bias * w
+
+                y.scatter_add_(dim=0, index=idx_b, src=expert_out.float())
 
         # Dummy computation for gradient flow when no tokens routed locally
         if active_local_experts == 0:
