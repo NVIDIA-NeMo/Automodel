@@ -745,6 +745,18 @@ class TestTieWeightsNemoConfigGate:
         assert model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr()
         torch.testing.assert_close(model.lm_head.weight, lm_head_before)
 
+    def test_untied_only_policy_overrides_misleading_tied_config(self):
+        """A fixed untied policy prevents re-tying despite an outer True flag."""
+        from nemo_automodel._transformers.model_init import _tie_weights_nemo
+        from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
+
+        model = self._make_model(tie=True)
+        model.tie_word_embeddings_support = TieSupport.UNTIED_ONLY
+
+        _tie_weights_nemo(model)
+
+        assert model.lm_head.weight is not model.model.embed_tokens.weight
+
     def test_tied_config_reties(self):
         """tie_word_embeddings=True: keep the #1817 re-tie behavior."""
         from nemo_automodel._transformers.model_init import _tie_weights_nemo

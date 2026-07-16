@@ -14,7 +14,7 @@ This guide shows how to train a sequence classification model using the `TrainFi
 Use the example config for GLUE MRPC with RoBERTa-large + LoRA:
 
 ```bash
-python3 examples/llm_seq_cls/seq_cls.py --config examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
+uv run automodel examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
 ```
 
 - Loads `roberta-large` with `num_labels: 2`
@@ -103,8 +103,8 @@ optimizer:
 
 ## Dataset Notes
 
-- For single-sentence datasets (e.g., `yelp_review_full`, `imdb`), use `YelpReviewFull` or `IMDB` from `nemo_automodel.components.datasets.llm.seq_cls`.
-- For GLUE MRPC (sentence-pair classification), use `GLUE_MRPC`, which tokenizes `(sentence1, sentence2)` with padding/truncation.
+- `nemo_automodel.components.datasets.llm.seq_cls` provides `GLUE_MRPC`, the implemented sentence-pair adapter. It tokenizes `(sentence1, sentence2)` with truncation; `default_collater` pads each batch.
+- For other datasets, including single-sentence datasets such as `yelp_review_full` or `imdb`, provide a custom dataset class or factory through `_target_`. Accept a `tokenizer` argument so the recipe can inject the model tokenizer, and return `input_ids`, `attention_mask`, a one-element `labels` list, and the `___PAD_TOKEN_IDS___` mapping used by `default_collater` for each sample. Use `GLUE_MRPC` as the adapter pattern.
 
 ## LoRA (PEFT) Settings
 
@@ -112,9 +112,9 @@ optimizer:
 - `dim` (rank), `alpha`, `dropout`: tune per model/compute budget. Values `dim=8, alpha=16, dropout=0.1` are a good starting point for RoBERTa.
 - The recipe automatically applies the adapters; no additional code changes are required.
 
-## Running with torchrun
+## Running on Multiple GPUs
 
 ```bash
-torchrun --nproc-per-node=2 examples/llm_seq_cls/seq_cls.py --config examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml
+uv run automodel examples/llm_seq_cls/glue/mrpc_roberta_lora.yaml --nproc-per-node 2
 ```
 You can adjust the number of GPUs as necessary using the `--nproc-per-node` knob.

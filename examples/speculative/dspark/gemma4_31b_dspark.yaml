@@ -1,0 +1,84 @@
+# DSpark draft training for a Gemma4-31B target (online target hidden-state capture).
+#
+# Same method and three-term objective as the Gemma4-12B config; the draft is built
+# from the Gemma4-31B target's text sub-config (60 hidden layers, hidden_size 5376,
+# vocab 262144). Relative to the 12B recipe this only changes the target checkpoint,
+# the five feature layers (rescaled across the 60-layer target), and the sequence /
+# anchor budget.
+#
+# Memory: a dense target is otherwise replicated on every rank, and the frozen 31B
+# target is ~62 GiB, so training OOMs at the first backward on 80 GiB GPUs. Setting
+# shard_dense_target below makes TrainDSparkRecipe load the dense target through the
+# standard distributed setup (the same FSDP2 path the MoE / VL targets use), which
+# shards it across the world mesh, drops the resident target to ~9 GiB/rank on 8
+# GPUs, and leaves room for the draft's training activations. The
+# draft's per-anchor projection over the 262144-vocab head is the next-largest term,
+# so seq_length and num_anchors are trimmed from the 12B defaults (4096 / 512) to
+# keep peak memory comfortable; raise them if you have more GPUs / headroom.
+#
+# Data: prompts with responses in the tokenizer's 'messages' chat format. For best
+# draft quality the responses should be REGENERATED with the Gemma4-31B target
+# (teacher-forced training); regenerate first.
+#
+# NOTE: requires a Gemma4 checkpoint and a transformers build with Gemma4 support.
+
+recipe: TrainDSparkRecipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+distributed:
+  strategy: fsdp2
+  defer_fsdp_grad_sync: true
+
+recipe_args:
+  target_model_name_or_path: google/gemma-4-31B-it
+  train_data_path: /path/to/gemma4-31b_messages.jsonl   # regenerate responses with the target first
+  val_data_path: null
+  output_dir: ./outputs/dspark_gemma4_31b
+  seq_length: 2048
+  micro_batch_size: 1
+  grad_accumulation_steps: 8
+  num_workers: 4
+  num_epochs: 10
+
+  shard_dense_target: true               # FSDP2-shard the frozen 31B target so it fits (see header)
+  draft_num_hidden_layers: 5
+  block_size: 7
+  num_anchors: 128
+  mask_token_id: 4                       # reserved Gemma4 token for non-anchor block positions
+  target_layer_ids: [7, 22, 37, 52, 58]  # 5 feature layers across the 60-layer Gemma4-31B target
+  freeze_embeddings: true
+  attention_backend: flex_attention        # draft attention (block mask); requires flex
+  # The Gemma4 target's head_dim (256) exceeds FlashAttention's limit, so run the
+  # target replay / hidden-state capture with sdpa (the draft still uses flex_attention).
+  target_attn_implementation: sdpa
+
+  markov_rank: 256
+  markov_head_type: vanilla
+
+  confidence_head_alpha: 1.0
+  confidence_head_with_markov: true
+
+  ce_loss_alpha: 0.1
+  l1_loss_alpha: 0.9
+  loss_decay_gamma: 4.0
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+
+optimizer:
+  lr: 6.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  warmup_ratio: 0.04
+  min_lr_ratio: 0.1
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/dspark_gemma4_31b/checkpoints
+  model_save_format: safetensors
+  save_consolidated: final

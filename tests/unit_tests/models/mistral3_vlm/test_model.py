@@ -29,7 +29,9 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.nn as nn
+from transformers import Mistral3Config
 
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport, reject_tie_word_embeddings_flip
 from nemo_automodel.components.models.mistral3_vlm.model import (
     Mistral3FP8VLMForConditionalGeneration,
     _rotary_reinit_self_hook,
@@ -249,3 +251,78 @@ class TestRotaryReinitSelfHook:
         # Should not raise.
         _rotary_reinit_self_hook(rot, args=(), kwargs={})
         assert rot._mistral3_fp8_rotary_reinit_done is True
+
+
+# --------------------------------------------------------------------------- #
+# tie_word_embeddings (BOTH: serves tied Ministral-3 + untied Mistral-Medium)  #
+# --------------------------------------------------------------------------- #
+def _tiny_vlm_config(tie_word_embeddings: bool) -> Mistral3Config:
+    """Tiny Mistral3 VLM config (2 text + 2 vision layers) for CPU construction."""
+    return Mistral3Config(
+        text_config=dict(
+            model_type="mistral",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            max_position_embeddings=128,
+            tie_word_embeddings=tie_word_embeddings,
+        ),
+        vision_config=dict(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            image_size=32,
+            patch_size=16,
+            head_dim=8,
+        ),
+        tie_word_embeddings=tie_word_embeddings,
+        image_token_index=1,
+    )
+
+
+class TestTieWordEmbeddings:
+    """One class loads both tied (Ministral-3, lm_head not serialized) and untied
+    (Mistral-Medium-3.5-128B, Devstral-24B) checkpoints, so it declares BOTH and
+    construction must honor the config flag either way — no construction-time
+    rejection. Per-checkpoint enforcement (rejecting a flag flipped away from the
+    checkpoint's value) is the from_pretrained flip guard's job, covered by
+    test_from_pretrained_flip_guard_rejects_tie_mismatch below.
+    """
+
+    def test_declares_both(self):
+        assert Mistral3FP8VLMForConditionalGeneration.tie_word_embeddings_support is TieSupport.BOTH
+
+    def test_tied_config_shares_lm_head_storage(self):
+        model = Mistral3FP8VLMForConditionalGeneration(_tiny_vlm_config(tie_word_embeddings=True))
+        assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
+
+    def test_tie_weights_restores_tied_alias(self):
+        model = Mistral3FP8VLMForConditionalGeneration(_tiny_vlm_config(tie_word_embeddings=True))
+        model.lm_head.weight = nn.Parameter(model.lm_head.weight.detach().clone())
+        assert model.get_input_embeddings().weight is not model.get_output_embeddings().weight
+
+        model.tie_weights()
+
+        assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
+
+    def test_untied_config_has_separate_lm_head(self):
+        model = Mistral3FP8VLMForConditionalGeneration(_tiny_vlm_config(tie_word_embeddings=False))
+        assert model.get_input_embeddings().weight is not model.get_output_embeddings().weight
+
+    def test_from_pretrained_flip_guard_rejects_tie_mismatch(self):
+        # Layer 2: as a BOTH class it relies on the from_pretrained flip guard to enforce
+        # each checkpoint's own tie value. The resolver reads the top-level flag for this
+        # class, so a top-level mismatch must be rejected in either direction.
+        cls_name = "Mistral3FP8VLMForConditionalGeneration"
+        untied = SimpleNamespace(tie_word_embeddings=False)
+        tied = SimpleNamespace(tie_word_embeddings=True)
+        with pytest.raises(NotImplementedError, match="flipping the flag is not supported"):
+            reject_tie_word_embeddings_flip(untied, tied, cls_name)
+        with pytest.raises(NotImplementedError, match="flipping the flag is not supported"):
+            reject_tie_word_embeddings_flip(tied, untied, cls_name)
+        reject_tie_word_embeddings_flip(untied, untied, cls_name)  # matching value -> no raise

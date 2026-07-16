@@ -148,46 +148,61 @@ def build_model(
 
             kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
 
-        # Check if using NeMoAutoModel
-        is_nemo_auto_model = cfg_model.get("_target_", None) in (
-            NeMoAutoModelForImageTextToText.from_config,
-            NeMoAutoModelForImageTextToText.from_pretrained,
-            NeMoAutoModelForMultimodalLM.from_config,
-            NeMoAutoModelForMultimodalLM.from_pretrained,
-            NeMoAutoModelForCausalLM.from_config,
-            NeMoAutoModelForCausalLM.from_pretrained,
-        )
-
-        # The Gemma4 base + drafter composite loads its sub-models via the
-        # NeMoAuto paths internally, so it gets the same infrastructure kwargs.
-        is_joint_composite = _is_gemma4_joint_target(cfg_model.get("_target_", None))
-
-        if is_nemo_auto_model or is_joint_composite:
+        if _is_recipe_target(cfg_model.get("_target_", None)):
             model = cfg_model.instantiate(**kwargs)
         else:
             raise ValueError(
-                f"VLM finetuning requires NeMoAutoModelForImageTextToText. "
+                "VLM finetuning requires a recipe-compatible model target. "
+                "Add the entrypoint to `_accepted_targets()` in this module "
+                "if you're onboarding a new wrapper that absorbs the recipe's "
+                "infrastructure kwargs. "
                 f"Got model target: {cfg_model.get('_target_', None)}"
             )
     return model
 
 
-def _is_gemma4_joint_target(target) -> bool:
-    """Return True if ``target`` is :meth:`Gemma4WithDrafter.from_pretrained`.
+def _accepted_targets() -> set:
+    """Return the set of model ``_target_`` callables this recipe accepts.
 
-    Imported lazily so the optional ``transformers.models.gemma4_assistant``
-    dependency only fires when a joint recipe is actually requested.
+    These are the wrapper-layer entrypoints that know how to absorb the
+    recipe's infrastructure kwargs (``device_mesh``, ``distributed_config``,
+    ``peft_config``, ``freeze_config``, ``pipeline_config``, plus the
+    optional ``moe_config`` / ``fp8_config`` / ``compile_config``). Anything
+    not on this list is rejected with a clear error -- vanilla
+    ``transformers.AutoModelFor*`` does not handle these kwargs and would
+    otherwise fail deep inside HF code.
+
+    New infra-aware composites (e.g. Gemma4WithDrafter) opt in by adding their ``.from_pretrained``
+    (and ``.from_config`` if applicable) here.
+
+    The Gemma4 joint composite is added behind a try/except because it
+    requires the optional ``transformers.models.gemma4_assistant`` module
+    that ships with ``transformers>=5.8.0.dev``.
     """
-    if target is None:
-        return False
+    accepted = {
+        NeMoAutoModelForCausalLM.from_pretrained,
+        NeMoAutoModelForCausalLM.from_config,
+        NeMoAutoModelForImageTextToText.from_pretrained,
+        NeMoAutoModelForImageTextToText.from_config,
+        NeMoAutoModelForMultimodalLM.from_pretrained,
+        NeMoAutoModelForMultimodalLM.from_config,
+    }
     try:
         from nemo_automodel.components.models.gemma4_drafter.composite import (
             Gemma4WithDrafter,
         )
+
+        accepted.add(Gemma4WithDrafter.from_pretrained)
     except ImportError:
+        pass
+    return accepted
+
+
+def _is_recipe_target(target) -> bool:
+    """True if ``target`` is on this recipe's allowlist of model entrypoints."""
+    if target is None:
         return False
-    # Bound classmethods are not identity-stable across accesses; compare via ==.
-    return target == Gemma4WithDrafter.from_pretrained
+    return target in _accepted_targets()
 
 
 def _shift_labels_left(labels: torch.Tensor, k: int) -> torch.Tensor:

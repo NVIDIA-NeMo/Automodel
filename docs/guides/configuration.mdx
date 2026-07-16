@@ -46,13 +46,17 @@ There is also support for resolving callables from:
 - **Dotted paths**: `pkg.module.symbol`
 - **Local file paths**: `/abs/path/to/file.py:symbol`
 
-### Safety and Policy
+### Target Resolution and Code Execution
 
-By default, resolving targets is restricted:
+Target resolution is intentionally permissive and should be treated as code execution:
 
-- Imports are allowed from common safe prefixes (e.g. `nemo_automodel`, `torch`, `transformers`, …).
-- Accessing private or dunder attributes is blocked by default.
-- Loading out-of-tree user code can be enabled with `NEMO_ENABLE_USER_MODULES=1` or by calling `set_enable_user_modules(True)`.
+- A dotted target can import any package discoverable through Python's `sys.path` (or reuse a package already present in `sys.modules`); it is not limited to a safe-prefix allowlist.
+- An existing `file.py:symbol` target loads that file directly without requiring an environment-variable opt-in. Loading either form executes the imported module's top-level code.
+- For `file.py:symbol`, private or dunder symbols (names beginning with `_` or containing `__`) are rejected. For dotted targets, private attribute traversal is rejected by default and can be enabled with `NEMO_ENABLE_USER_MODULES=1` or `set_enable_user_modules(True)`.
+
+<Warning>
+Only load configuration files and `_target_` values from trusted sources. A YAML file that names an importable package or Python file can execute arbitrary Python code during target resolution.
+</Warning>
 
 ## Distributed Section (Strategy-Based)
 
