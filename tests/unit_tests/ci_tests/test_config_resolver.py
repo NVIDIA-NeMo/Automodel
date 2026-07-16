@@ -207,6 +207,7 @@ def test_conditional_layer_passes_non_string_values_through():
 
 
 RESOLVER = str(SCRIPTS_DIR / "config_resolver.py")
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.fixture
@@ -335,6 +336,36 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     assert resolved["ci"]["checkpoint_robustness"]["source_load_kl_threshold"] == 1e-2
     assert resolved["ci"]["checkpoint_robustness"]["source_load_mean_kl_threshold"] == 1e-3
     assert resolved["ci"]["checkpoint_robustness"]["source_load_cosine_threshold"] == 0.999
+
+
+@pytest.mark.parametrize(
+    "recipe_path",
+    [
+        "examples/vlm_finetune/gemma4/gemma4_2b.yaml",
+        "examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml",
+    ],
+)
+def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
+    """VLM robustness opt-ins retain fixture settings and receive checkpoint phase defaults."""
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": Path(recipe_path).stem}
+    _run_resolver(
+        ["--base", str(REPO_ROOT / recipe_path), "--phase", "checkpoint_robustness", "--output", str(out)],
+        env=env,
+    )
+
+    resolved = yaml.load(out.open())
+    robustness = resolved["ci"]["checkpoint_robustness"]
+    assert resolved["checkpoint"]["enabled"] is True
+    assert resolved["checkpoint"]["model_save_format"] == "safetensors"
+    assert resolved["checkpoint"]["save_consolidated"] is True
+    assert robustness["check_source_load_parity"] is True
+    assert robustness["tokenizer_name"] == resolved["model"]["pretrained_model_name_or_path"]
+    if Path(recipe_path).stem == "qwen3_vl_moe_30b_te_deepep":
+        assert robustness["resume_loss_threshold"] == 1e-2
+    assert "check_source_load_parity" not in resolved
+    assert "hf_device_map_auto" not in resolved
+    assert "tokenizer_name" not in resolved
 
 
 def test_end_to_end_dry_run_does_not_write(tmp_path, synthetic_recipe):

@@ -186,6 +186,10 @@ def test_hf_reload_wait_has_separate_timeout(tmp_path, monkeypatch):
         _wait_for_hf_reload_rank0(tmp_path / "done")
 
 
+def test_hf_reload_finish_returns_error_without_distributed_sync():
+    assert _finish_hf_reload_sync(None, "HF parity failed") == "HF parity failed"
+
+
 def test_hf_reload_wait_does_not_start_collective_during_rank0_work(tmp_path):
     mp.spawn(
         _run_hf_reload_sync_rank,

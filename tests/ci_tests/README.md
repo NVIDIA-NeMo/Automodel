@@ -75,6 +75,10 @@ When `checkpoint_robustness` is present, the robustness test runs after the fine
 4. **Cross-TP** (optional) -- Reload with different `tp_size`
 5. **Training resumption** (on by default) -- Baseline + resumed run, verify loss continuity
 
+LLM recipes use the causal-LM harness, while `examples/vlm_finetune/` recipes use the VLM finetune recipe and
+`AutoModelForImageTextToText`. VLM parity currently exercises the language path with text-only `input_ids`; real-image
+multimodal parity is a separate follow-up.
+
 Phase 5 is the most expensive (two additional training passes). Use `no_check_resume: true` to skip it.
 
 Use source-load parity for recipes where the initial HF checkpoint load is itself part of the contract, especially

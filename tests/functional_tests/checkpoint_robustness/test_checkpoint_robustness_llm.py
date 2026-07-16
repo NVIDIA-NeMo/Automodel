@@ -44,6 +44,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 )
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -445,14 +446,20 @@ def _prepare_hf_reload_sync(cfg) -> tuple[Path, Path] | None:
     return sync_dir, done_path
 
 
-def _finish_hf_reload_sync(sync_paths: tuple[Path, Path] | None) -> None:
-    """Release waiting ranks and synchronize after the rank-0-only HF reload."""
+def _finish_hf_reload_sync(
+    sync_paths: tuple[Path, Path] | None,
+    error_message: str | None = None,
+) -> str | None:
+    """Release waiting ranks and propagate a rank-0 HF parity failure."""
     if sync_paths is None:
-        return
+        return error_message
 
     sync_dir, done_path = sync_paths
     if _rank0():
-        done_path.write_text("ok\n")
+        status = "ok\n" if error_message is None else f"error\n{error_message}"
+        done_path.write_text(status)
+    _barrier()
+    status = done_path.read_text()
     _barrier()
     if _rank0():
         done_path.unlink(missing_ok=True)
@@ -460,12 +467,16 @@ def _finish_hf_reload_sync(sync_paths: tuple[Path, Path] | None) -> None:
             sync_dir.rmdir()
         except OSError:
             pass
+    if status.startswith("error\n"):
+        return status.removeprefix("error\n")
+    return None
 
 
 def _prepare_source_load_reference(
     cfg,
     input_ids: list[int],
     *,
+    hf_model_cls: type,
     trust_remote_code: bool,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
@@ -490,6 +501,7 @@ def _prepare_source_load_reference(
         result = _prepare_source_load_reference_rank0(
             cfg,
             input_ids,
+            hf_model_cls=hf_model_cls,
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
@@ -508,14 +520,13 @@ def _prepare_source_load_reference_rank0(
     cfg,
     input_ids: list[int],
     *,
+    hf_model_cls: type,
     trust_remote_code: bool,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
 ) -> tuple[torch.Tensor, bool | None, bool | None]:
     """Rank-0 implementation of vanilla HF source-load reference capture."""
     from contextlib import nullcontext
-
-    from transformers import AutoModelForCausalLM
 
     from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 
@@ -557,10 +568,10 @@ def _prepare_source_load_reference_rank0(
     print(f"\n[Phase 0] Source-load reference: vanilla HF for {original_pretrained_path}")
     with no_meta:
         if "device_map" in hf_kwargs:
-            hf_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+            hf_model = hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
         else:
             hf_model = _fix_meta_rotary_embeddings(
-                AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+                hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
             ).to(device)
     _reinit_rotary_per_module(hf_model, device)
     if trust_remote_code:
@@ -897,8 +908,13 @@ def _release_recipe_memory(recipe) -> None:
         torch.cuda.empty_cache()
 
 
-def test_checkpoint_robustness():
-    """Train -> checkpoint -> reload automodel from consolidated -> reload vanilla HF, compare logits."""
+def run_checkpoint_robustness(*, recipe_cls: type[BaseRecipe], hf_model_cls: type) -> None:
+    """Run checkpoint robustness for one recipe and Hugging Face auto-model class.
+
+    Args:
+        recipe_cls: Recipe class used for training, checkpoint reload, and resume phases.
+        hf_model_cls: Hugging Face auto-model class used for source and consolidated loads.
+    """
     custom_args, config_argv = _extract_custom_args(sys.argv[1:])
     sys.argv = [sys.argv[0]] + config_argv
     # When tensor parallelism is active the forward pass uses row-parallel
@@ -937,6 +953,7 @@ def test_checkpoint_robustness():
         source_load_reference = _prepare_source_load_reference(
             cfg,
             input_ids,
+            hf_model_cls=hf_model_cls,
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
@@ -946,7 +963,7 @@ def test_checkpoint_robustness():
     # Phase 1: Construct the training model, optionally compare it against the
     # raw HF source-load reference, then train and checkpoint.
     torch.cuda.reset_peak_memory_stats()
-    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer = recipe_cls(cfg)
     trainer.setup()
 
     if check_source_load_parity:
@@ -962,6 +979,11 @@ def test_checkpoint_robustness():
         )
         for model_part in trainer.model_parts:
             model_part.train()
+        # A function-local loop variable keeps its last value alive after the
+        # loop. Drop it explicitly so Phase 1's model can be reclaimed before
+        # the fresh Phase 6 baseline model is built.
+        del model_part
+        del trainer_source_logits, source_load_reference
         _barrier()
         if _rank0():
             _cleanup_source_load_sync(cfg)
@@ -1043,7 +1065,7 @@ def test_checkpoint_robustness():
     if not is_peft:
         cfg.model.pretrained_model_name_or_path = str(consolidated_dir)
         cfg.checkpoint.enabled = False
-    restored_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    restored_trainer = recipe_cls(cfg)
     restored_trainer.setup()
 
     restored_logits = _get_logits(restored_trainer.model_parts[0], input_ids, device, trainer=restored_trainer)
@@ -1062,13 +1084,12 @@ def test_checkpoint_robustness():
     del restored_trainer
     hf_reload_sync_paths = _prepare_hf_reload_sync(cfg)
 
+    hf_reload_error = None
     if skip_hf_reload:
         if _rank0():
             print("[Phase 4] Skipped (ci.checkpoint_robustness.skip_hf_reload=true).")
     elif _rank0():
         from contextlib import nullcontext
-
-        from transformers import AutoModelForCausalLM
 
         # Nemotron-Flash's custom ``LlamaRotaryEmbedding.__init__`` does
         # ``torch.arange(...).to(device)`` which blows up under transformers 5.x's
@@ -1125,10 +1146,10 @@ def test_checkpoint_robustness():
 
             with _no_meta:
                 if "device_map" in hf_kwargs:
-                    base_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+                    base_model = hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
                 else:
                     base_model = _fix_meta_rotary_embeddings(
-                        AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+                        hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
                     ).to(device)
             # Re-init non-persistent rotary buffers for ``model_type`` values
             # in ``_MODELS_REQUIRING_BUFFER_REINIT`` (``nemotron-nas``,
@@ -1172,10 +1193,10 @@ def test_checkpoint_robustness():
             _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
             with _no_meta:
                 if "device_map" in hf_kwargs:
-                    hf_model = AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
+                    hf_model = hf_model_cls.from_pretrained(str(consolidated_dir), **hf_kwargs)
                 else:
                     hf_model = _fix_meta_rotary_embeddings(
-                        AutoModelForCausalLM.from_pretrained(str(consolidated_dir), **hf_kwargs)
+                        hf_model_cls.from_pretrained(str(consolidated_dir), **hf_kwargs)
                     ).to(device)
             # Re-init non-persistent rotary buffers for nemotron-nas / gemma3
             # (``_MODELS_REQUIRING_BUFFER_REINIT`` allow-list). See PEFT branch
@@ -1196,12 +1217,14 @@ def test_checkpoint_robustness():
         kl_hf = _kl_divergence_from_logits(reference_logits, hf_logits)
         max_kl_hf = kl_hf.max().item()
         print(f"[Phase 4] HF-loaded max KL: {max_kl_hf:.6e} (threshold: {hf_kl_threshold:.6e})")
-        assert max_kl_hf <= hf_kl_threshold, (
-            f"KL divergence between original and HF-loaded model too large: "
-            f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
-        )
+        if max_kl_hf > hf_kl_threshold:
+            hf_reload_error = (
+                "KL divergence between original and HF-loaded model too large: "
+                f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
+            )
 
-    _finish_hf_reload_sync(hf_reload_sync_paths)
+    hf_reload_error = _finish_hf_reload_sync(hf_reload_sync_paths, hf_reload_error)
+    assert hf_reload_error is None, hf_reload_error
 
     # Phase 5 (optional): Cross-TP — reload consolidated with a different TP size
     if cross_tp_size > 0 and not is_peft:
@@ -1210,7 +1233,7 @@ def test_checkpoint_robustness():
         cfg.checkpoint.enabled = False
         cfg.distributed.tp_size = cross_tp_size
         cfg.distributed.dp_size = None
-        cross_tp_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+        cross_tp_trainer = recipe_cls(cfg)
         cross_tp_trainer.setup()
 
         cross_tp_logits = _get_logits(cross_tp_trainer.model_parts[0], input_ids, device, trainer=cross_tp_trainer)
@@ -1254,7 +1277,7 @@ def test_checkpoint_robustness():
         # Phase 1's checkpoint.  Pin lr_decay_steps to match Phase 1.
         if hasattr(cfg, "lr_scheduler") and cfg.lr_scheduler is not None:
             cfg.lr_scheduler.lr_decay_steps = original_max_steps
-        baseline_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+        baseline_trainer = recipe_cls(cfg)
         baseline_trainer.setup()
         baseline_trainer.run_train_validation_loop()
 
@@ -1275,7 +1298,7 @@ def test_checkpoint_robustness():
         cfg = parse_args_and_load_config()
         cfg.checkpoint.restore_from = str(ckpt_step_dir)
         cfg.step_scheduler.max_steps = resume_max_steps
-        resume_trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+        resume_trainer = recipe_cls(cfg)
         resume_trainer.setup()
         resume_trainer.run_train_validation_loop()
 
@@ -1325,6 +1348,16 @@ def test_checkpoint_robustness():
     from nemo_automodel.components.distributed.init_utils import destroy_global_state
 
     atexit.unregister(destroy_global_state)
+
+
+def test_checkpoint_robustness() -> None:
+    """Run checkpoint robustness with the LLM finetune recipe."""
+    from transformers import AutoModelForCausalLM
+
+    run_checkpoint_robustness(
+        recipe_cls=TrainFinetuneRecipeForNextTokenPrediction,
+        hf_model_cls=AutoModelForCausalLM,
+    )
 
 
 if __name__ == "__main__":
