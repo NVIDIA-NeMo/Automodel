@@ -1417,11 +1417,63 @@ class TestMoE:
             mock_experts.return_value = torch.randn(batch_size * seq_len, moe_config.dim, device=device)
             mock_shared.return_value = torch.randn(batch_size * seq_len, moe_config.dim, device=device)
 
-            # Shared experts run inline on the main stream (no side-stream overlap).
+            # Shared experts overlap the routed-expert dispatch/combine on a side CUDA
+            # stream when the input is on CUDA; on CPU they run inline.
             output = moe(x)
 
             assert output.shape == x.shape
             assert output.device == device
+
+    @pytest.mark.skipif(not HAVE_CUDA, reason="CUDA required for shared-expert side-stream overlap")
+    def test_moe_shared_expert_overlap_matches_inline(self, moe_config, backend_config):
+        """Side-stream shared-expert overlap must match a serial reference in fwd and bwd.
+
+        The routed-expert dispatch/combine comm on the main stream overlaps the
+        shared-expert MLP on a side stream. The fork/join autograd fences must make this
+        numerically identical to serial compute in the forward pass and produce finite,
+        matching input gradients in the backward pass (a missing backward fence or
+        record_stream is the cross-stream race that corrupts gradients).
+        """
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        moe_config.n_shared_experts = 2
+        moe = MoE(moe_config, backend_config).to(device)
+
+        batch_size, seq_len = 2, 8
+        n_tokens = batch_size * seq_len
+        torch.manual_seed(0)
+        gate_w = torch.rand(n_tokens, moe_config.n_activated_experts, device=device)
+        gate_i = torch.randint(0, moe_config.n_routed_experts, (n_tokens, moe_config.n_activated_experts), device=device)
+        routed = torch.randn(n_tokens, moe_config.dim, device=device)
+
+        def run_moe():
+            torch.manual_seed(1234)
+            x = torch.randn(batch_size, seq_len, moe_config.dim, device=device, requires_grad=True)
+            with (
+                patch.object(moe.gate, "forward", return_value=(gate_w, gate_i, None)),
+                patch.object(moe.experts, "forward", return_value=routed.clone()),
+            ):
+                out = moe(x)
+                out.sum().backward()
+            return out.detach().clone(), x.grad.detach().clone()
+
+        def run_reference():
+            torch.manual_seed(1234)
+            x = torch.randn(batch_size, seq_len, moe_config.dim, device=device, requires_grad=True)
+            flat = x.view(-1, moe_config.dim)
+            z = moe.shared_experts(flat)
+            if moe.shared_expert_gate is not None:
+                z = torch.nn.functional.sigmoid(moe.shared_expert_gate(flat)) * z
+            out = (routed + z).view(x.shape)
+            out.sum().backward()
+            return out.detach().clone(), x.grad.detach().clone()
+
+        out_overlap, grad_overlap = run_moe()
+        out_ref, grad_ref = run_reference()
+
+        assert torch.isfinite(out_overlap).all()
+        assert torch.isfinite(grad_overlap).all()
+        torch.testing.assert_close(out_overlap, out_ref, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(grad_overlap, grad_ref, rtol=1e-3, atol=1e-3)
 
     def test_moe_forward_with_padding_mask(self, moe_config, backend_config, device):
         """Test MoE forward pass with padding mask."""
