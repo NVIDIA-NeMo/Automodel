@@ -1,0 +1,5 @@
+{
+  "name": "automodel",
+  "description": "NeMo AutoModel repository skills (build and dependency, CI/CD, linting, testing, model onboarding, recipe development) for Regent agents working on this repo.",
+  "version": "0.1.0"
+}
