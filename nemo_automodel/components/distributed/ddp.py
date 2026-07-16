@@ -34,6 +34,48 @@ from nemo_automodel.components.distributed.parallelizer import (
 logger = logging.getLogger(__name__)
 
 
+class _DDPFusedGradNormState:
+    """Accumulate the norm of DDP-reduced gradient buckets."""
+
+    def __init__(self, process_group, world_size: int, device: torch.device):
+        self.process_group = process_group
+        self.world_size = world_size
+        self.device = device
+        self.norm_sq = torch.zeros((), dtype=torch.float32, device=device)
+        self.events = []
+
+    def reset(self) -> None:
+        self.norm_sq.zero_()
+        self.events.clear()
+
+    def wait(self) -> None:
+        if not self.events:
+            return
+        current_stream = torch.cuda.current_stream(device=self.device)
+        for event in self.events:
+            current_stream.wait_event(event)
+        self.events.clear()
+
+
+def _ddp_fused_grad_norm_hook(state: _DDPFusedGradNormState, bucket):
+    """Average a DDP bucket and accumulate its post-reduction squared norm."""
+    buffer = bucket.buffer()
+    buffer.div_(state.world_size)
+    work = dist.all_reduce(buffer, group=state.process_group, async_op=True)
+
+    def _accumulate_norm(future):
+        reduced = future.value()[0]
+        stream = torch.cuda.current_stream(device=reduced.device)
+        with torch.cuda.stream(stream):
+            state.norm_sq.add_(reduced.float().square().sum())
+            event = torch.cuda.Event()
+            event.record(stream)
+        state.events.append(event)
+        return reduced
+
+    return work.get_future().then(_accumulate_norm)
+
+
 class DDPManager:
     """
     Manager for distributed training using PyTorch's DDP.
@@ -63,6 +105,7 @@ class DDPManager:
         self.static_graph = config.static_graph
         self.bucket_cap_mb = config.bucket_cap_mb
         self.gradient_as_bucket_view = config.gradient_as_bucket_view
+        self.fused_grad_norm = config.fused_grad_norm
 
         # Setup distributed environment
         self._setup_distributed()
@@ -152,4 +195,16 @@ class DDPManager:
         if self.bucket_cap_mb is not None:
             ddp_kwargs["bucket_cap_mb"] = self.bucket_cap_mb
 
-        return DDP(model.to(self.device), **ddp_kwargs)
+        ddp_model = DDP(model.to(self.device), **ddp_kwargs)
+        if self.fused_grad_norm:
+            if self.device.type != "cuda":
+                raise ValueError("distributed.fused_grad_norm requires CUDA DDP")
+            norm_state = _DDPFusedGradNormState(
+                ddp_model.process_group,
+                ddp_model.process_group.size() if ddp_model.process_group is not None else dist.get_world_size(),
+                self.device,
+            )
+            ddp_model.register_comm_hook(norm_state, _ddp_fused_grad_norm_hook)
+            ddp_model._nemo_fused_grad_norm_state = norm_state
+            logger.info("Enabled opt-in fused DDP gradient norm")
+        return ddp_model
