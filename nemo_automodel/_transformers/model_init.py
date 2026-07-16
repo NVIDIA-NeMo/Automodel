@@ -1001,7 +1001,7 @@ def _tie_weights_nemo(model):
     # model is tied. Re-tying an untied model here would alias away the trained
     # ``lm_head.weight`` that ``from_pretrained`` just loaded (see #2941).
     config = getattr(model, "config", None)
-    if config is not None and not checkpoint_utils.get_controlling_tie_word_embeddings(config, type(model).__name__):
+    if config is not None and not checkpoint_utils.is_tied_word_embeddings(model):
         return
 
     def get_module_by_fqn(model, fqn):

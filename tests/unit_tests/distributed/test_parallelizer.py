@@ -759,6 +759,42 @@ class TestGetHfTpShardPlan:
         with pytest.raises(ValueError, match="Unknown parallel style"):
             get_hf_tp_shard_plan(model)
 
+    @staticmethod
+    def _bare_gemma3():
+        """Gemma3 instance with exact class identity but no HF ``__init__``."""
+        model = Gemma3ForConditionalGeneration.__new__(Gemma3ForConditionalGeneration)
+        nn.Module.__init__(model)
+        return model
+
+    def test_gemma3_pre_standardization_tree_uses_language_model_prefix(self):
+        """Old Gemma3 (transformers <= 4.51) hangs the text tower off a top-level
+        ``language_model``; the prefix must follow the registered child module,
+        not a transformers version gate.
+        """
+        model = self._bare_gemma3()
+        language_model = nn.Module()
+        language_model._tp_plan = {"model.layers.0.self_attn.q_proj": "colwise"}
+        model.language_model = language_model
+
+        result = get_hf_tp_shard_plan(model)
+
+        assert isinstance(result["language_model.model.layers.0.self_attn.q_proj"], ColwiseParallel)
+        assert "language_model.embed_tokens" in result
+
+    def test_gemma3_standardized_tree_uses_model_prefix(self):
+        """Standardized Gemma3 (transformers >= 4.52, incl. v5) nests everything
+        under ``model``; the prefix must resolve structurally to ``model``.
+        """
+        model = self._bare_gemma3()
+        inner = nn.Module()
+        inner._tp_plan = {"language_model.layers.0.self_attn.q_proj": "colwise"}
+        model.model = inner
+
+        result = get_hf_tp_shard_plan(model)
+
+        assert isinstance(result["model.language_model.layers.0.self_attn.q_proj"], ColwiseParallel)
+        assert "model.embed_tokens" in result
+
 
 class TestApplyFsdpShardingRecursively:
     """Test class for apply_fsdp2_sharding_recursively utility function."""
@@ -2230,11 +2266,70 @@ class TestExtractModelLayers:
         assert len(result) == 4
         assert all(r is layers[i] for i, r in enumerate(result))
 
-    def test_multi_fqn_flattens_each_modulelist(self):
-        """Qwen2.5-VL entry ``["language_model.layers", "visual.blocks"]``.
+    def _attach_qwen_vl_towers(self, model, lang, vis, *, nested):
+        """Attach Qwen2-VL-style towers for one historical tree shape.
 
-        Both FQNs resolve to ModuleLists; both must be flattened so all decoder
-        and vision blocks appear as individual elements in the final list.
+        ``nested=True`` builds the standardized tree (transformers >= 4.52,
+        incl. v5): ``model.language_model.layers`` + ``model.visual.blocks``.
+        ``nested=False`` builds the pre-standardization tree (<= 4.51):
+        ``model.layers`` + top-level ``visual.blocks``.
+        """
+        visual = nn.Module()
+        visual.blocks = vis
+        if nested:
+            language_model = nn.Module()
+            language_model.layers = lang
+            inner = nn.Module()
+            inner.language_model = language_model
+            inner.visual = visual
+            model.model = inner
+        else:
+            text_model = nn.Module()
+            text_model.layers = lang
+            model.model = text_model
+            model.visual = visual
+
+    @staticmethod
+    def _attach_language_vision_towers(model, lang, vis, *, shape):
+        """Attach Gemma3/Llava-style towers for one historical tree ``shape``.
+
+        ``"pre_standardization"`` (<= 4.51): ``language_model.model.layers`` +
+        ``vision_tower.vision_model.encoder.layers``.
+        ``"standardized_v4"`` (4.52-4.x): ``model.language_model.layers`` +
+        ``model.vision_tower.vision_model.encoder.layers``.
+        ``"v5"`` (>= 5.0): ``model.language_model.layers`` +
+        ``model.vision_tower.encoder.layers`` (flattened tower).
+        """
+        if shape == "pre_standardization":
+            language_model = nn.Module()
+            language_model.model = nn.Module()
+            language_model.model.layers = lang
+            vision_tower = nn.Module()
+            vision_tower.vision_model = nn.Module()
+            vision_tower.vision_model.encoder = nn.Module()
+            vision_tower.vision_model.encoder.layers = vis
+            model.language_model = language_model
+            model.vision_tower = vision_tower
+            return
+        inner = nn.Module()
+        inner.language_model = nn.Module()
+        inner.language_model.layers = lang
+        inner.vision_tower = nn.Module()
+        if shape == "standardized_v4":
+            inner.vision_tower.vision_model = nn.Module()
+            inner.vision_tower.vision_model.encoder = nn.Module()
+            inner.vision_tower.vision_model.encoder.layers = vis
+        else:  # v5: flattened tower, no inner `vision_model`.
+            inner.vision_tower.encoder = nn.Module()
+            inner.vision_tower.encoder.layers = vis
+        model.model = inner
+
+    def test_multi_fqn_flattens_each_modulelist(self):
+        """Qwen2.5-VL pre-standardization tree (``model.layers`` + ``visual.blocks``).
+
+        Both groups resolve to ModuleLists; both must be flattened so all
+        decoder and vision blocks appear as individual elements in the final
+        list.
         """
         from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
             Qwen2_5_VLForConditionalGeneration,
@@ -2243,12 +2338,7 @@ class TestExtractModelLayers:
         model = self._bare_instance(Qwen2_5_VLForConditionalGeneration)
         lang = self._make_layers(5)
         vis = self._make_layers(2)
-        language_model = nn.Module()
-        language_model.layers = lang
-        model.language_model = language_model
-        visual = nn.Module()
-        visual.blocks = vis
-        model.visual = visual
+        self._attach_qwen_vl_towers(model, lang, vis, nested=False)
 
         result = _extract_model_layers(model)
 
@@ -2256,6 +2346,139 @@ class TestExtractModelLayers:
         assert [id(r) for r in result[:5]] == [id(item) for item in lang]
         assert [id(r) for r in result[5:]] == [id(item) for item in vis]
         assert not any(isinstance(r, nn.ModuleList) for r in result)
+
+    @pytest.mark.parametrize("nested", [False, True], ids=["pre_standardization", "standardized"])
+    def test_qwen2_vl_tree_shapes_extract_language_and_vision_groups(self, nested):
+        """Every historical Qwen2-VL tree must resolve structurally, no version gate.
+
+        Pre-standardization (verified transformers 4.51.3): ``model.layers`` +
+        ``visual.blocks``. Standardized (verified 4.57.1/5.8.1/5.12.1):
+        ``model.language_model.layers`` + ``model.visual.blocks``. Version-gated
+        FQNs picked the wrong tree for parts of the 4.x line and silently
+        disabled activation checkpointing.
+        """
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+            Qwen2_5_VLForConditionalGeneration,
+        )
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        for cls in (Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration):
+            model = self._bare_instance(cls)
+            lang = self._make_layers(3)
+            vis = self._make_layers(2)
+            self._attach_qwen_vl_towers(model, lang, vis, nested=nested)
+
+            groups = _extract_model_layer_groups(model)
+
+            assert set(groups) == {"language", "vision"}, cls.__name__
+            assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+            assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    def test_qwen2_vl_deprecation_aliases_do_not_double_count_layers(self):
+        """Standardized 4.x keeps deprecated top-level ``visual``/``language_model``
+        aliases for the nested towers; first-match resolution must count each
+        layer exactly once even when the historical FQN also resolves.
+        """
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        model = self._bare_instance(Qwen2VLForConditionalGeneration)
+        lang = self._make_layers(3)
+        vis = self._make_layers(2)
+        self._attach_qwen_vl_towers(model, lang, vis, nested=True)
+        # Simulate the transformers 4.52-4.x deprecation aliases: the same
+        # towers are reachable at the historical top-level paths too.
+        model.visual = model.model.visual
+        model.language_model = model.model.language_model
+
+        groups = _extract_model_layer_groups(model)
+
+        assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+        assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    @pytest.mark.parametrize("shape", ["pre_standardization", "standardized_v4", "v5"])
+    def test_gemma3_tree_shapes_extract_language_and_vision_groups(self, shape):
+        """Every historical Gemma3 tree must resolve structurally, no version gate.
+
+        Shapes verified by meta-instantiation: ``language_model.model.layers`` +
+        ``vision_tower.vision_model.encoder.layers`` on 4.51.3,
+        ``model.language_model.layers`` +
+        ``model.vision_tower.vision_model.encoder.layers`` on 4.57.1, and
+        ``model.language_model.layers`` + ``model.vision_tower.encoder.layers``
+        on 5.8.1/5.12.1.
+        """
+        model = self._bare_instance(Gemma3ForConditionalGeneration)
+        lang = self._make_layers(3)
+        vis = self._make_layers(2)
+        self._attach_language_vision_towers(model, lang, vis, shape=shape)
+
+        groups = _extract_model_layer_groups(model)
+
+        assert set(groups) == {"language", "vision"}
+        assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+        assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    @pytest.mark.parametrize("shape", ["pre_standardization", "standardized_v4", "v5"])
+    def test_llava_tree_shapes_extract_language_and_vision_groups(self, shape):
+        """Llava-family trees share the Gemma3 lineage (CLIP instead of SigLIP);
+        each historical shape must resolve structurally for every Llava class.
+        """
+        from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+        from transformers.models.llava_next.modeling_llava_next import (
+            LlavaNextForConditionalGeneration,
+        )
+        from transformers.models.llava_next_video.modeling_llava_next_video import (
+            LlavaNextVideoForConditionalGeneration,
+        )
+        from transformers.models.llava_onevision.modeling_llava_onevision import (
+            LlavaOnevisionForConditionalGeneration,
+        )
+
+        for cls in (
+            LlavaForConditionalGeneration,
+            LlavaNextForConditionalGeneration,
+            LlavaNextVideoForConditionalGeneration,
+            LlavaOnevisionForConditionalGeneration,
+        ):
+            model = self._bare_instance(cls)
+            lang = self._make_layers(3)
+            vis = self._make_layers(2)
+            self._attach_language_vision_towers(model, lang, vis, shape=shape)
+
+            groups = _extract_model_layer_groups(model)
+
+            assert set(groups) == {"language", "vision"}, cls.__name__
+            assert [id(m) for m in groups["language"]] == [id(item) for item in lang], cls.__name__
+            assert [id(m) for m in groups["vision"]] == [id(item) for item in vis], cls.__name__
+
+    def test_spec_resolving_no_modules_warns_and_returns_empty(self, caplog):
+        """A mapped model class whose spec FQNs all fail to resolve must warn.
+
+        This is the transformers-version-drift failure mode: extraction used to
+        return ``{}`` silently and activation checkpointing became a no-op.
+        """
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        # A tree that matches no known Qwen2-VL shape: top-level
+        # `language_model.layers` (never a registered module path for this
+        # class; it only ever existed as a deprecation alias).
+        model = self._bare_instance(Qwen2VLForConditionalGeneration)
+        language_model = nn.Module()
+        language_model.layers = self._make_layers(2)
+        model.language_model = language_model
+
+        with caplog.at_level("WARNING", logger=parallelizer.logger.name):
+            groups = _extract_model_layer_groups(model)
+
+        assert groups == {}
+        assert "Qwen2VLForConditionalGeneration" in caplog.text
+        assert "model.language_model.layers" in caplog.text
+        assert "model.visual.blocks" in caplog.text
 
     def test_moduledict_layer_container_flattens(self):
         """PP post-split: ``_reduce_attrs`` returns a ModuleDict.

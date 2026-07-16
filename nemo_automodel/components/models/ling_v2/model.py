@@ -42,7 +42,6 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -50,6 +49,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.gpt_oss.rope_utils import RotaryEmbedding, position_ids_to_freqs_cis
 from nemo_automodel.components.models.ling_v2.config import BailingMoeV2Config
@@ -281,6 +284,8 @@ class BailingMoeV2Model(nn.Module):
 class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Causal-LM head wrapping ``BailingMoeV2Model``."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     # ``e_score_correction_bias`` must stay in fp32 even when the rest of the
     # model is bf16; tiny quantization errors in the bias change routing.
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
@@ -347,7 +352,7 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     ):
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = BailingMoeV2Model(

@@ -223,6 +223,102 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
             )
 
 
+_MULTIMODAL_TOWER_ATTRS = (
+    "visual",
+    "vision_tower",
+    "vision_model",
+    "vit_model",
+    "audio_tower",
+    "audio_model",
+)
+
+
+def _has_trainable_multimodal_tower(model: nn.Module) -> bool:
+    """Return whether the model (or its inner ``.model``) exposes a trainable vision/audio tower.
+
+    Deliberately a cheap duck-typed gate, not a second owner of the tower
+    mapping: it only decides whether importing the heavy, transformers-aware
+    dense parallelizer is worthwhile, while the dense parallelizer's per-model
+    layer-group mapping remains the sole owner of which blocks get wrapped.
+    Requiring a trainable, parameter-bearing tower (rather than mere attribute
+    existence) keeps the import off text-only, frozen-tower, and duck-typed
+    stub-model call paths.
+    """
+    for owner in (model, getattr(model, "model", None)):
+        if owner is None:
+            continue
+        for attr in _MULTIMODAL_TOWER_ATTRS:
+            tower = getattr(owner, attr, None)
+            if tower is None or not hasattr(tower, "parameters"):
+                continue
+            if any(param.requires_grad for param in tower.parameters()):
+                return True
+    return False
+
+
+def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> None:
+    """Checkpoint trainable multimodal (vision/audio) tower blocks on the expert-parallel path.
+
+    ``apply_ac`` iterates only the text/MTP decoder stack
+    (``_iter_transformer_and_mtp_blocks``), and the generic FSDP2 scope
+    handling does not run for expert-parallel configs, so a trainable vision
+    tower would otherwise keep every activation. Reuses the per-model
+    layer-group mapping from the dense parallelizer and applies the same
+    per-submodule wrapping (attention/MLP/norms) as the generic FSDP2/DDP
+    path, with ``sdpa_backend_snapshot_context_fn`` on the attention/MLP
+    wrappers so the backward-time recompute reruns under the forward-time SDPA
+    backend set. Fully frozen vision towers are left untouched, consistent
+    with the generic path's frozen-tower behavior.
+
+    Args:
+        model: Root model owning the tower(s) to checkpoint.
+        scopes: Normalized activation-checkpointing scope tuple. ``("all",)``
+            selects the vision and audio groups (matching the generic path's
+            scope filter); otherwise only the named non-language groups are
+            selected, with ``multimodal`` expanding to vision + audio. Groups
+            the model does not expose are simply absent.
+    """
+    if scopes == ("all",):
+        group_names: tuple[str, ...] = ("vision", "audio")
+    else:
+        group_names = tuple(
+            dict.fromkeys(
+                name
+                for scope in scopes
+                for name in (("vision", "audio") if scope == "multimodal" else (scope,))
+                if name != "language"
+            )
+        )
+    if not group_names or not _has_trainable_multimodal_tower(model):
+        return
+
+    # Lazy imports keep the heavy, transformers-aware dense parallelizer module
+    # off the text-only MoE call path.
+    from nemo_automodel.components.distributed.activation_checkpointing import (
+        apply_submodule_checkpointing,
+        sdpa_backend_snapshot_context_fn,
+    )
+    from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
+
+    layer_groups = get_model_layer_groups(model)
+    tower_layers = [
+        layer
+        for name in group_names
+        for layer in layer_groups.get(name, [])
+        if any(param.requires_grad for param in layer.parameters())
+    ]
+    if not tower_layers:
+        logger.info(
+            "No trainable multimodal tower blocks selected by activation checkpointing scope %s; "
+            "skipping vision-tower activation checkpointing.",
+            scopes,
+        )
+        return
+    # Vision towers have no KV cache, so KV-sharing (a text-decoder concern)
+    # never applies here.
+    apply_submodule_checkpointing(tower_layers, has_kv_sharing=False, context_fn=sdpa_backend_snapshot_context_fn)
+
+
 def apply_ac(
     model: nn.Module,
     ignore_router: bool = True,
@@ -230,6 +326,7 @@ def apply_ac(
     num_experts: int | None = None,
     selective: bool = False,
     activation_checkpointing: bool | str = True,
+    activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
 ):
     """Apply activation checkpointing to the model.
 
@@ -253,13 +350,32 @@ def apply_ac(
             for skipping the expensive expert-dispatch recompute in backward. Note that
             ``"non_moe_no_attn"`` only exempts ``self_attn``; linear attention
             (``linear_attn``, e.g. Qwen3-Next GatedDeltaNet) is still checkpointed.
+        activation_checkpointing_scope: Which layer groups to checkpoint -- the same field
+            and semantics as the generic FSDP2/DDP path. ``"all"`` (the default) checkpoints
+            the text/MoE decoder blocks plus the trainable vision tower; ``"language"`` the
+            decoder blocks only; ``"vision"`` (or ``"multimodal"``) only the trainable
+            tower blocks, skipping decoder checkpointing entirely. The scope decides which
+            groups participate; ``activation_checkpointing`` decides how selected decoder
+            blocks are checkpointed.
+
+    Trainable VLM vision-tower blocks selected by the scope get the same per-submodule
+    wrapping (attention/MLP/norms) as the generic FSDP2/DDP path, with the SDPA backend
+    set snapshotted at checkpoint-forward time and restored during the backward-time
+    recompute; frozen vision towers are left untouched.
     """
+    # Lazy import: keeps the scope normalization single-sourced with the strategy
+    # configs without importing distributed.config on the (torch-stub-friendly)
+    # module import path.
+    from nemo_automodel.components.distributed.config import normalize_activation_checkpointing_scope
+
+    scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
+    checkpoint_decoder = "all" in scopes or "language" in scopes
     selective = selective or _is_selective_ac(activation_checkpointing)
     scoped_mode = _scoped_ac_mode(activation_checkpointing)
 
     # Scoped modes never checkpoint the MoE MLP, so the router-recompute hazard
     # behind the ignore_router warning does not apply to them.
-    if not selective and scoped_mode is None and not ignore_router:
+    if checkpoint_decoder and not selective and scoped_mode is None and not ignore_router:
         logger.warning(
             "Activation checkpointing is enabled with ignore_router_for_ac=False. The MoE "
             "router/dispatch will be recomputed in the backward pass, which can route a "
@@ -270,23 +386,31 @@ def apply_ac(
         )
 
     if selective:
-        # Reuse the dense FSDP2 selective policy so the save-op set (attention,
-        # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
-        from nemo_automodel.components.distributed.activation_checkpointing import (
-            SELECTIVE_AC_WRAPPER_FLAG,
-            make_selective_checkpoint_context_fn,
-        )
+        if checkpoint_decoder:
+            # Reuse the dense FSDP2 selective policy so the save-op set (attention,
+            # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
+            from nemo_automodel.components.distributed.activation_checkpointing import (
+                SELECTIVE_AC_WRAPPER_FLAG,
+                make_selective_checkpoint_context_fn,
+            )
 
-        selective_context_fn = make_selective_checkpoint_context_fn()
-        for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
-            block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, context_fn=selective_context_fn)
-            # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
-            # selective policy visible to the partitioner) instead of unwrapping and
-            # compiling the block inner, which would collapse selective AC into full
-            # recompute. The flag is only read when per-layer torch.compile is
-            # enabled, so it is a no-op for every other mode.
-            setattr(block, SELECTIVE_AC_WRAPPER_FLAG, True)
-            parent_layers.register_module(layer_id, block)
+            selective_context_fn = make_selective_checkpoint_context_fn()
+            for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+                block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, context_fn=selective_context_fn)
+                # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
+                # selective policy visible to the partitioner) instead of unwrapping and
+                # compiling the block inner, which would collapse selective AC into full
+                # recompute. The flag is only read when per-layer torch.compile is
+                # enabled, so it is a no-op for every other mode.
+                setattr(block, SELECTIVE_AC_WRAPPER_FLAG, True)
+                parent_layers.register_module(layer_id, block)
+        _apply_multimodal_tower_ac(model, scopes)
+        return
+
+    if not checkpoint_decoder:
+        # Vision-only (or otherwise non-language) scope: skip decoder checkpointing
+        # entirely, including the hidden_size/num_experts derivation it needs.
+        _apply_multimodal_tower_ac(model, scopes)
         return
 
     # Derive hidden_size and num_experts from model.config if not provided
@@ -395,6 +519,7 @@ def apply_ac(
             skipped_moe_count,
             skipped_self_attn_count,
         )
+        _apply_multimodal_tower_ac(model, scopes)
         return
 
     for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
@@ -410,6 +535,8 @@ def apply_ac(
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
 
         parent_layers.register_module(layer_id, block)
+
+    _apply_multimodal_tower_ac(model, scopes)
 
 
 def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):
@@ -715,6 +842,7 @@ def parallelize_model(
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = True,
+    activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
@@ -746,6 +874,7 @@ def parallelize_model(
             ignore_router=ignore_router_for_ac,
             selective=_is_selective_ac(activation_checkpointing),
             activation_checkpointing=activation_checkpointing,
+            activation_checkpointing_scope=activation_checkpointing_scope,
         )
 
     if ep_shard_axis_names is not None:

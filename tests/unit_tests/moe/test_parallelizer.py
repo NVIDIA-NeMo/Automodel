@@ -1023,6 +1023,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
         ignore_router=True,
         selective=False,
         activation_checkpointing=True,
+        activation_checkpointing_scope="all",
     )
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args
