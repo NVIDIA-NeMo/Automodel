@@ -137,6 +137,27 @@ def chunk_step3_media(
     flat list of optional crop patches in ``patch_pixel_values``. ``num_patches``
     maps samples to the flat patch tensor. Processors may also emit
     ``pixel_values`` itself as a flat patch tensor using the same mapping.
+
+    Args:
+        pixel_values: Either ``[batch, ...]`` (one image tensor per sample) or a
+            row-flattened ``[total_patches, ...]`` tensor whose patches are
+            concatenated along axis 0 in sample order, where
+            ``total_patches == sum(num_patches)``.
+        batch_size: Number of samples in the batch.
+        n_microbatches: Number of PP microbatches to split the batch into.
+        num_patches: Tensor of shape ``[batch]``; entry ``i`` is the patch count
+            for sample ``i``. Defaults to all-zeros when the processor emits no
+            crop patches.
+        patch_pixel_values: Optional row-flattened crop patches of shape
+            ``[total_patches, ...]`` indexed by ``num_patches``.
+        patch_newline_mask: Optional tensor of shape ``[total_patches]`` marking
+            patch-row newline positions, indexed by ``num_patches``.
+
+    Returns:
+        dict[str, list[torch.Tensor]]: Per-microbatch slices keyed by
+        ``pixel_values`` and ``num_patches`` (plus ``patch_pixel_values`` and
+        ``patch_newline_mask`` when provided). ``pixel_values`` is sliced along
+        the patch axis for the flat layout and along the sample axis otherwise.
     """
     if num_patches is None:
         num_patches = torch.zeros(batch_size, dtype=torch.long, device=pixel_values.device)

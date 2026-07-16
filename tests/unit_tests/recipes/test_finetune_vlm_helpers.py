@@ -3069,7 +3069,7 @@ class TestChunkVlmMedia:
         assert "patch_pixel_values" not in chunks
         assert "patch_newline_mask" not in chunks
 
-        with pytest.raises(ValueError, match="one full image tensor per sample"):
+        with pytest.raises(ValueError, match="cannot align pixel_values with num_patches"):
             chunk_step3_media(pixel_values[:2], batch_size=3, n_microbatches=2)
         with pytest.raises(ValueError, match="num_patches must have length"):
             chunk_step3_media(pixel_values, batch_size=3, n_microbatches=2, num_patches=torch.tensor([1, 2]))

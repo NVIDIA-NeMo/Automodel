@@ -238,7 +238,19 @@ class InklingGate(nn.Module):
 
 
 def inkling_swiglu(hidden_states: torch.Tensor, routing_weights: torch.Tensor) -> torch.Tensor:
-    """Apply SwiGLU to Inkling's interleaved ``[gate, up]`` projection layout."""
+    """Apply SwiGLU to Inkling's interleaved ``[gate, up]`` projection layout.
+
+    Args:
+        hidden_states: Tensor of shape ``[..., 2 * intermediate]`` with arbitrary
+            leading dimensions, whose last axis interleaves gate and up channels
+            as ``[g0, u0, g1, u1, ...]`` (``::2`` selects gate, ``1::2`` selects up).
+        routing_weights: Tensor broadcastable to ``[..., intermediate]`` that scales
+            the activated output.
+
+    Returns:
+        torch.Tensor: Activated tensor of shape ``[..., intermediate]`` in
+        ``hidden_states``' dtype.
+    """
     gate = hidden_states[..., ::2]
     up = hidden_states[..., 1::2]
     return (F.silu(gate) * up * routing_weights).to(hidden_states.dtype)
@@ -257,6 +269,17 @@ class InklingDenseMLP(nn.Module):
         self.global_scale = nn.Parameter(torch.ones(1, dtype=model_dtype))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the dense MLP over the fused interleaved gate/up projection.
+
+        Args:
+            hidden_states: Tensor of shape ``[..., hidden]`` with arbitrary leading
+                dimensions.
+
+        Returns:
+            torch.Tensor: Tensor of shape ``[..., hidden]``. ``gate_up_proj`` maps
+            it to ``[..., 2 * intermediate]`` with gate/up channels interleaved as
+            ``[g0, u0, g1, u1, ...]`` (``::2`` gate, ``1::2`` up) before SwiGLU.
+        """
         gate_up = hidden_states @ self.gate_up_proj
         activated = F.silu(gate_up[..., ::2]) * gate_up[..., 1::2]
         return (activated @ self.down_proj) * self.global_scale
