@@ -19,14 +19,13 @@ import pathlib
 import time
 from collections import deque
 from contextlib import nullcontext
+from functools import partial
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 import wandb
-from torch.utils.data import IterableDataset
-from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
-from transformers import PretrainedConfig
+from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -227,65 +226,6 @@ class _BidirectionalMaskCollator:
         )
 
 
-def build_dataloader(
-    cfg_dl,
-    tokenizer,
-    seed,
-    batch_size=None,
-    dp_rank=0,
-    dp_world_size=1,
-    precompute_bidirectional_mask: bool = False,
-    bidirectional_mask_model_config: PretrainedConfig | None = None,
-    bidirectional_mask_dtype: torch.dtype | None = None,
-):
-    """Build a DataLoader for encoder training."""
-    with ScopedRNG(seed=seed, ranked=True):
-        with FirstRankPerNode():
-            dataset = cfg_dl.dataset.instantiate()
-
-        collate_fn = None
-        if hasattr(cfg_dl, "collate_fn") and hasattr(cfg_dl.collate_fn, "_target_"):
-            collate_fn = cfg_dl.collate_fn.instantiate(tokenizer=tokenizer)
-
-        if not isinstance(dataset, IterableDataset):
-            shuffle = cfg_dl.get("shuffle", True)
-            if "shuffle" in cfg_dl:
-                del cfg_dl.shuffle
-
-            dist_sampler_kwargs = {
-                "num_replicas": dp_world_size,
-                "rank": dp_rank,
-                "shuffle": shuffle,
-            }
-            sampler = StatefulDistributedSampler(
-                dataset,
-                seed=seed,
-                drop_last=True,
-                **dist_sampler_kwargs,
-            )
-            dl_kwargs = {"sampler": sampler, "batch_size": batch_size}
-        else:
-            logging.info("Using IterableDataset; skipping sampler.")
-            dl_kwargs = {"dataset": dataset, "batch_size": batch_size}
-
-        dl_kwargs["dataset"] = dataset
-        if precompute_bidirectional_mask:
-            if collate_fn is None:
-                raise ValueError("precompute_bidirectional_mask requires an explicit retrieval collate_fn")
-            if bidirectional_mask_model_config is None:
-                raise ValueError("precompute_bidirectional_mask requires a model config")
-            collate_fn = _BidirectionalMaskCollator(
-                collate_fn,
-                model_config=bidirectional_mask_model_config,
-                mask_dtype=bidirectional_mask_dtype,
-            )
-
-        if collate_fn is not None:
-            dl_kwargs["collate_fn"] = collate_fn
-
-        return cfg_dl.instantiate(**dl_kwargs)
-
-
 class TrainBiEncoderRecipe(BaseRecipe):
     """Recipe for training encoder models with contrastive learning."""
 
@@ -410,9 +350,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         # Might be tokenizer or processor (for VLMs)
         self.tokenizer = self.cfg.tokenizer.instantiate()
-        tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
-        if getattr(tokenizer, "pad_token", None) is None:
-            tokenizer.pad_token = getattr(tokenizer, "eos_token", getattr(self.tokenizer, "eos_token", None))
+        tokenizer = self.tokenizer.tokenizer if isinstance(self.tokenizer, ProcessorMixin) else self.tokenizer
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = self.tokenizer.eos_token
             tokenizer.padding_side = "left"
 
         precompute_bidirectional_mask = _get_bi_encoder_optimization_bool(self.cfg, "precompute_bidirectional_mask")
@@ -422,36 +362,40 @@ class TrainBiEncoderRecipe(BaseRecipe):
         bidirectional_mask_dtype = (
             _get_first_parameter_dtype(self.model_parts[0]) if precompute_bidirectional_mask else None
         )
-        self.dataloader = build_dataloader(
-            self.cfg.dataloader,
-            self.tokenizer,
-            seed=self.cfg.get("seed", 42),
-            batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-            dp_rank=self._get_dp_rank(),
-            dp_world_size=self._get_dp_group_size(),
-            precompute_bidirectional_mask=precompute_bidirectional_mask,
-            bidirectional_mask_model_config=bidirectional_mask_model_config,
-            bidirectional_mask_dtype=bidirectional_mask_dtype,
+        collate_wrapper = (
+            partial(
+                _BidirectionalMaskCollator,
+                model_config=bidirectional_mask_model_config,
+                mask_dtype=bidirectional_mask_dtype,
+            )
+            if precompute_bidirectional_mask
+            else None
         )
-        self.train_n_passages = self.cfg.get("dataloader.dataset.n_passages", 1)
+
+        dataloader_config = self.cfg.dataloader
+        if dataloader_config is None:
+            raise ValueError("Retrieval training requires a top-level dataset config")
+
+        def materialize_loader(config):
+            build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
+            with ScopedRNG(seed=config.seed, ranked=True):
+                return config.build(
+                    tokenizer=self.tokenizer,
+                    dataset_build_context=build_context,
+                    dp_rank=self._get_dp_rank(),
+                    dp_world_size=self._get_dp_group_size(),
+                    collate_wrapper=collate_wrapper,
+                )
+
+        self.dataloader = materialize_loader(dataloader_config)
+        self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
 
         self.val_dataloader = None
-        if "validation_dataloader" in self.cfg:
-            val_batch_size = self.cfg.get(
-                "validation_dataloader.batch_size", self.cfg.get("step_scheduler.local_batch_size", 1)
-            )
-            self.val_dataloader = build_dataloader(
-                self.cfg.validation_dataloader,
-                self.tokenizer,
-                seed=self.cfg.get("seed", 42),
-                batch_size=val_batch_size,
-                dp_rank=self._get_dp_rank(),
-                dp_world_size=self._get_dp_group_size(),
-                precompute_bidirectional_mask=precompute_bidirectional_mask,
-                bidirectional_mask_model_config=bidirectional_mask_model_config,
-                bidirectional_mask_dtype=bidirectional_mask_dtype,
-            )
-            self.val_n_passages = self.cfg.get("validation_dataloader.dataset.n_passages", self.train_n_passages)
+        validation_configs = self.cfg.validation_dataloaders
+        if validation_configs:
+            validation_config = next(iter(validation_configs.values()))
+            self.val_dataloader = materialize_loader(validation_config)
+            self.val_n_passages = getattr(validation_config.dataset_config, "n_passages", self.train_n_passages)
 
         self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
