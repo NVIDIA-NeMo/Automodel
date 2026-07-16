@@ -13,7 +13,6 @@ concurrency:
 
 env:
   TORCH_CU_INDEX: https://download.pytorch.org/whl/cu130
-  # TODO: bump to 26.06-cuda13.3 once nv-grouped-gemm ships a CUDA-13.3-compatible release.
   CUDA_CONTAINER_IMAGE: nvcr.io/nvidia/cuda-dl-base:26.04-cuda13.2-devel-ubuntu24.04
 
 jobs:
