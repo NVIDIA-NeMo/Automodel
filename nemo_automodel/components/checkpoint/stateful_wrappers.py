@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from functools import partial
 from typing import Any, Optional
 
@@ -108,6 +109,75 @@ def _get_peft_state_dict(model: torch.nn.Module) -> dict[str, Any]:
             param = param.full_tensor() if hasattr(param, "full_tensor") else param
             state_dict[name] = param.detach().cpu()
     return state_dict
+
+
+def _gather_peft_state_dict_across_pp(
+    local_state_dict: dict[str, Any],
+    pp_group: "torch.distributed.ProcessGroup",
+) -> dict[str, Any]:
+    """All-gather PEFT adapter tensors across a pipeline-parallel group.
+
+    Pipeline parallelism partitions the model's layers across PP ranks: each
+    rank's local module only contains its own stage's layers. The local
+    collection in :meth:`ModelState.state_dict` gathers PEFT tensors solely from
+    the local model parts, so under ``pp_size > 1`` the per-rank state dict is
+    missing every layer owned by another stage. Saving that directly yields a
+    truncated adapter (only ~1/pp of the layers), which silently degrades a
+    merged model.
+
+    This gathers the per-rank PEFT dicts over ``pp_group`` and merges them by FQN
+    so every rank returns the complete adapter. Keys are globally unique across PP
+    stages (layer indices never overlap between stages), so the union is exact and
+    order-independent; on the rare chance the same key appears on two ranks (e.g.
+    a replicated tied parameter) the lowest-rank value wins deterministically.
+
+    Args:
+        local_state_dict: This rank's PEFT tensors (already CPU, bf16/fp32).
+        pp_group: The pipeline-parallel process group to gather over.
+
+    Returns:
+        The merged PEFT state dict containing every PP stage's adapter tensors.
+    """
+    world = torch.distributed.get_world_size(group=pp_group)
+    if world == 1:
+        return local_state_dict
+
+    gathered: list[dict[str, Any]] = [None] * world
+    torch.distributed.all_gather_object(gathered, local_state_dict, group=pp_group)
+
+    merged: dict[str, Any] = {}
+    # Iterate in rank order so a duplicate key resolves to the lowest rank.
+    for rank_sd in gathered:
+        if not rank_sd:
+            continue
+        for k, v in rank_sd.items():
+            if k not in merged:
+                merged[k] = v
+
+    # Sanity check: the merge must add keys beyond any single rank's local set,
+    # otherwise the gather silently collapsed (e.g. wrong/global group passed in)
+    # and we would write a truncated adapter -- the exact failure this fix exists
+    # to prevent. Log the per-rank vs merged sizes and warn on the degenerate case.
+    local_n = len(local_state_dict)
+    merged_n = len(merged)
+    per_rank = [len(sd) if sd else 0 for sd in gathered]
+    logging.getLogger(__name__).info(
+        "PEFT PP gather: pp_world=%d per_rank_tensors=%s merged_tensors=%d (local=%d)",
+        world,
+        per_rank,
+        merged_n,
+        local_n,
+    )
+    if merged_n <= max(per_rank):
+        logging.getLogger(__name__).warning(
+            "PEFT PP gather produced no more tensors (%d) than the largest single "
+            "rank (%d) despite pp_world=%d. The saved adapter may be INCOMPLETE -- "
+            "verify the pipeline-parallel process group is correct.",
+            merged_n,
+            max(per_rank),
+            world,
+        )
+    return merged
 
 
 def _set_peft_state_dict(model: torch.nn.Module, state_dict: dict[str, Any]) -> None:
@@ -221,6 +291,7 @@ class ModelState:
         is_peft: bool = False,
         is_init_step: bool = False,
         skip_task_head_prefixes: list[str] | None = None,
+        pp_group: "torch.distributed.ProcessGroup | None" = None,
     ):
         """
         Initialize a ModelState instance for distributed checkpointing.
@@ -240,6 +311,12 @@ class ModelState:
                 - ["classifier."] for sequence/token classification
                 - ["qa_outputs."] for question answering
                 - ["score."] for some classification heads
+            pp_group (ProcessGroup | None): Pipeline-parallel process group. When
+                set and ``pp_size > 1``, PEFT adapter weights are all-gathered
+                across this group at save time so the on-disk adapter contains
+                every PP stage's layers (not just the local stage's). Required
+                for correct PEFT saves under pipeline parallelism; ignored for
+                non-PEFT models and no-op when ``pp_size == 1``.
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.uses_tied_lm_head = is_tied_word_embeddings(self.model[0])
@@ -251,6 +328,7 @@ class ModelState:
         self.is_peft = is_peft
         self.is_init_step = is_init_step
         self.skip_task_head_prefixes = skip_task_head_prefixes or []
+        self.pp_group = pp_group
 
     def _refresh_local_tied_lm_head(self) -> None:
         """Refresh tied-head metadata after DCP has normalized module state."""
@@ -269,13 +347,25 @@ class ModelState:
         if self.is_init_step:
             return self._get_base_model_state_dict()
 
-        # For PEFT models with quantized parameters or expert parallelism, bypass
-        # PyTorch DCP's get_model_state_dict() which fails when: (1) traversing
-        # quantized parameter types like Params4bit (QLoRA with BitsAndBytes); or
-        # (2) expert weights are sharded across EP ranks (MoE+EP), causing DCP to
-        # raise KeyError on expert-parallel FQNs. Instead, directly collect
-        # trainable PEFT adapter weights.
-        if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
+        # Decide how to collect the PEFT adapter:
+        #   * Local per-rank collection: directly walk named_parameters and
+        #     full_tensor() the local shards. Needed for (a) BnB-quantized or
+        #     EP-sharded models DCP can't traverse, and (b) PIPELINE PARALLELISM
+        #     -- see below.
+        #   * DCP full_state_dict: consolidates across FSDP to rank 0.
+        #
+        # Under pp_size>1 we MUST use the local path even for a plain (non-EP,
+        # non-quant) PEFT model: DCP's full_state_dict returns the dict only on
+        # global rank 0 and an EMPTY dict on every other rank (PyTorch contract).
+        # That empties PP ranks 1..N-1, so the cross-PP gather below would collect
+        # nothing from them. The local collection keeps each PP rank's own stage
+        # adapters, which the gather then unions into the complete adapter.
+        use_local_peft_collection = self.is_peft and (
+            self.pp_group is not None
+            or any(_has_expert_parallelism(m) for m in self.model)
+            or any(_has_quantized_params(m) for m in self.model)
+        )
+        if use_local_peft_collection:
             model_state_dict = {k: v for sd in map(_get_peft_state_dict, self.model) for k, v in sd.items()}
         else:
             options = None
@@ -290,6 +380,14 @@ class ModelState:
         # TODO: this is a hack and we should find a better way to do this.
         if self.is_peft:
             model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
+
+        # Pipeline parallelism partitions layers across PP ranks, so each rank's
+        # local adapter (collected above) only covers its own stages. Gather the
+        # PEFT tensors across the PP group and union by FQN so every rank ends up
+        # with the complete adapter. No-op when pp_group is None (pp_size==1).
+        # Done after the lora_ filter so only adapter tensors travel.
+        if self.is_peft and self.pp_group is not None:
+            model_state_dict = _gather_peft_state_dict_across_pp(model_state_dict, self.pp_group)
 
         self._refresh_local_tied_lm_head()
         if self.has_local_tied_lm_head:

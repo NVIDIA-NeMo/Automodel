@@ -187,6 +187,7 @@ class CheckpointingConfig:
         pp_rank: int,
         moe_mesh: DeviceMesh | None = None,
         process_group: ProcessGroup | None = None,
+        pp_group: ProcessGroup | None = None,
     ) -> Checkpointer:
         """Build the :class:`Checkpointer` engine for this config.
 
@@ -200,6 +201,9 @@ class CheckpointingConfig:
             pp_rank: Pipeline-parallel rank.
             moe_mesh: Optional device mesh for MoE checkpointing.
             process_group: Process group used for distributed checkpoint collectives.
+            pp_group: Optional pipeline-parallel process group. Threaded to the
+                PEFT save path so adapter weights are gathered across PP stages
+                (required for complete adapters when ``pp_size > 1``).
 
         Returns:
             Configured :class:`Checkpointer`.
@@ -213,6 +217,7 @@ class CheckpointingConfig:
             pp_rank=pp_rank,
             moe_mesh=moe_mesh,
             process_group=process_group,
+            pp_group=pp_group,
         )
 
 
