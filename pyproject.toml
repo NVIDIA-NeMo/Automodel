@@ -86,7 +86,7 @@ dependencies = [
     "tiktoken",
     "torch>=2.6.0",
     "torchdata",
-    "transformers==5.12.1",
+    "transformers==5.14.0.dev0",
     "wandb>=0.28.0",
     "torchao",
     "mlflow",
@@ -271,6 +271,7 @@ override-dependencies = [
 prerelease = "allow"
 
 [tool.uv.sources]
+transformers = { git = "https://github.com/huggingface/transformers.git", rev = "c375c5e8666aee864528aa52e8287b3ba82232bb" }
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "7febc6e25660af0f54d95dd781ecdcd62265ecca" }
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }

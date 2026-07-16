@@ -25,6 +25,7 @@ from torch.distributed.pipelining.schedules import (
 from nemo_automodel.components.distributed.pipelining.functional import (
     _get_hidden_and_vocab_size,
     _precompute_stage_shapes,
+    _set_stage_metas,
     _wrap_stage_forward_to_emit_tensor,
     build_pipeline_schedule,
     calculate_virtual_stages,
@@ -754,6 +755,30 @@ class TestPrecomputeStageShapes:
         import types
 
         return types.SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab_size)
+
+    def test_sets_static_metadata_for_new_pipeline_stage_api(self, monkeypatch):
+        """New PipelineStage stores static metadata in _user_meta."""
+        stage_module = __import__("torch.distributed.pipelining.stage", fromlist=["extract_tensor_metas"])
+
+        def extract_tensor_metas(tensors):
+            return tuple(
+                types.SimpleNamespace(shape=tensor.shape, dtype=tensor.dtype, requires_grad=tensor.requires_grad)
+                for tensor in tensors
+            )
+
+        monkeypatch.setattr(stage_module, "extract_tensor_metas", extract_tensor_metas, raising=False)
+        stage = types.SimpleNamespace(_user_meta=types.SimpleNamespace(inputs=None, outputs=None))
+        inputs = (
+            torch.empty(2, 16, device="meta", dtype=torch.long),
+            torch.empty(2, 16, 64, device="meta", dtype=torch.bfloat16),
+        )
+        outputs = (torch.empty(2, 16, 64, device="meta", dtype=torch.bfloat16),)
+
+        _set_stage_metas(stage, inputs, outputs)
+
+        assert stage._user_meta.inputs[0].requires_grad is False
+        assert stage._user_meta.inputs[1].requires_grad is True
+        assert stage._user_meta.outputs[0].requires_grad is True
 
     def test_first_stage_shapes(self):
         """First stage input should be [mb, seq_len] int64, output [mb, seq_len, hidden]."""

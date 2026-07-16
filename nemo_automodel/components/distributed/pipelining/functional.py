@@ -276,6 +276,34 @@ def _get_hidden_and_vocab_size(model_config) -> tuple[int, int]:
     return hidden_size, vocab_size
 
 
+def _set_stage_metas(
+    stage: PipelineStage,
+    inputs_meta: tuple[torch.Tensor, ...],
+    outputs_meta: tuple[torch.Tensor, ...],
+) -> None:
+    """Set static pipeline metadata across supported PyTorch APIs."""
+    configure_outputs_meta = getattr(stage, "_configure_outputs_meta", None)
+    if callable(configure_outputs_meta):
+        stage.inputs_meta = inputs_meta
+        configure_outputs_meta(outputs_meta)
+        return
+
+    user_meta = getattr(stage, "_user_meta", None)
+    if user_meta is None:
+        raise RuntimeError("Unsupported PipelineStage metadata API")
+
+    from torch.distributed.pipelining.stage import extract_tensor_metas
+
+    def mark_activations(tensors: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            tensor.requires_grad_(True) if tensor.is_floating_point() or tensor.is_complex() else tensor
+            for tensor in tensors
+        )
+
+    user_meta.inputs = extract_tensor_metas(mark_activations(inputs_meta))
+    user_meta.outputs = extract_tensor_metas(mark_activations(outputs_meta))
+
+
 def _precompute_stage_shapes(
     stages: list[PipelineStage],
     model_config,
@@ -289,9 +317,9 @@ def _precompute_stage_shapes(
     stage 0 → send → stage 1 → send → ... → stage N-1.  This is O(N) in the number of
     pipeline stages and becomes a bottleneck for large world sizes.
 
-    This function sets ``inputs_meta`` and ``_outputs_meta`` on each stage *before* the
-    first ``step()`` call, so that ``_shape_inference`` is never invoked and the serial
-    chain is completely eliminated.
+    This function installs static input/output metadata on each stage *before* the first
+    ``step()`` call, so runtime shape inference is never invoked and the serial chain is
+    completely eliminated.
 
     Args:
         stages: The local pipeline stages (already parallelized).
@@ -312,21 +340,21 @@ def _precompute_stage_shapes(
 
         get_stage_metas = _get_optional_hook(stage.submod, "get_pipeline_stage_metas")
         if get_stage_metas is not None:
-            stage.inputs_meta, outputs_meta = get_stage_metas(
+            inputs_meta, outputs_meta = get_stage_metas(
                 is_first=stage.is_first,
                 microbatch_size=microbatch_size,
                 seq_len=seq_len,
                 dtype=model_dtype,
             )
-            stage._configure_outputs_meta(outputs_meta)
+            _set_stage_metas(stage, inputs_meta, outputs_meta)
             continue
 
         # --- inputs_meta ---
         if stage.is_first:
             # First stage receives input_ids: [mb, seq_len] int64
-            stage.inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
         else:
-            stage.inputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
+            inputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
 
         # --- outputs_meta ---
         has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
@@ -337,7 +365,7 @@ def _precompute_stage_shapes(
         else:
             primary_output_meta = torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype)
         outputs_meta = (primary_output_meta,)
-        stage._configure_outputs_meta(outputs_meta)
+        _set_stage_metas(stage, inputs_meta, outputs_meta)
 
     logger.info(
         f"Precomputed pipeline stage shapes (seq_len={seq_len}, microbatch_size={microbatch_size}) — "
@@ -373,10 +401,19 @@ def reset_pp_stage_shapes(
         seq_len: Sequence length of the upcoming batch (e.g. ``input_ids.shape[1]``).
     """
     for stage in stages:
-        # Allow _configure_outputs_meta to be called again (it asserts _outputs_meta is None)
-        stage._outputs_meta = None
-        # Allow _shape_inference to re-run for non-first stages receiving new shapes
-        stage.inputs_meta = None
+        # PyTorch <= 2.10 stores static metadata in these fields.
+        if hasattr(stage, "_outputs_meta"):
+            stage._outputs_meta = None
+        if hasattr(stage, "inputs_meta"):
+            stage.inputs_meta = None
+
+        # PyTorch 2.12 stores runtime metadata separately from user-provided metadata.
+        stage_meta = getattr(stage, "_stage_meta", None)
+        if stage_meta is not None:
+            stage_meta.inputs = None
+            stage_meta.outputs = None
+            stage_meta.input_grads = None
+            stage_meta.output_grads = None
         # Clear pre-allocated recv/send buffers; they will be reallocated by _prepare_forward_infra
         stage.args_recv_info = {}
         stage.grad_recv_info = {}

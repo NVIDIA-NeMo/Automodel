@@ -3106,6 +3106,21 @@ class TestChunkVlmMedia:
         assert model._vlm_patch_newline_mask_chunks is None
         assert model._vlm_chunk_idx is None
 
+    def test_prepare_flat_patches_without_image_grid(self):
+        pixel_values = torch.arange(5 * 2 * 2 * 2 * 3).reshape(5, 2, 2, 2, 3)
+        batch = {
+            "input_ids": torch.ones(2, 4, dtype=torch.long),
+            "pixel_values": pixel_values,
+            "num_patches": torch.tensor([2, 3]),
+        }
+
+        prepared = prepare_vlm_media_for_pp(batch, batch_size=2, n_microbatches=2)
+        media = prepared[VLM_PP_MEDIA_KEY]
+
+        assert torch.equal(media["pixel_values"][0], pixel_values[:2])
+        assert torch.equal(media["pixel_values"][1], pixel_values[2:])
+        assert [chunk.tolist() for chunk in media["num_patches"]] == [[2], [3]]
+
 
 # -----------------------------------------------------------------------------
 # get_rope_index forwarding tests for build_dataloader

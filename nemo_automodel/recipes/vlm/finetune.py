@@ -688,6 +688,9 @@ class FinetuneRecipeForVLM(BaseRecipe):
         else:
             self.model_parts = [model]
             self.pp = None
+        warmup_process_groups = getattr(self.model_parts[0], "warmup_process_groups", None)
+        if warmup_process_groups is not None:
+            warmup_process_groups(self.model_parts, pp_mesh=self.device_mesh["pp"] if self.pp_enabled else None)
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
 
