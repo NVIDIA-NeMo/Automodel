@@ -103,5 +103,6 @@ optimizer:
   weight_decay: 0
 
 ci:
-  time: "00:15:00"
+  # CuTe kernels compile on first use before the configured warmup iterations.
+  time: "01:00:00"
   nodes: 1
