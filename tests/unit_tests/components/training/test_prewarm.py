@@ -15,6 +15,7 @@
 import logging
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -28,6 +29,7 @@ from nemo_automodel.components.training.prewarm import (
     _prewarm_cublas_backward,
     _prewarm_fla_gdn_autotune,
     _prewarm_fla_gdn_cp_kernels,
+    _prewarm_fla_gdn_end_to_end,
     _triton_kernel_accepts,
 )
 
@@ -195,13 +197,18 @@ def test_fla_prewarm_skips_without_gdn_modules():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-def test_fla_prewarm_populates_cache_without_advancing_rng_on_gpu():
-    pytest.importorskip("fla")
+def test_fla_end_to_end_prewarm_preserves_rng_with_stubbed_op(monkeypatch):
     device = torch.device("cuda", torch.cuda.current_device())
-    module = _FakeGDN(num_v_heads=2, head_k_dim=64, head_v_dim=64).to(device, torch.bfloat16)
+    output = torch.ones((1, 2, 2, 4), device=device, requires_grad=True)
+    fake_gdn_op = Mock(return_value=(output, None))
+    monkeypatch.setattr(prewarm, "safe_import_from", lambda *args: (True, fake_gdn_op))
+
     rng_before = torch.cuda.get_rng_state(device)
-    assert _prewarm_fla_gdn_autotune([module], device) is True
+    assert _prewarm_fla_gdn_end_to_end({(2, 4, 4, torch.float32): "gdn"}, device, seq_len=2) is True
     assert torch.equal(torch.cuda.get_rng_state(device), rng_before)
+    fake_gdn_op.assert_called_once()
+    assert output.grad is not None
+    assert torch.equal(output.grad, torch.ones_like(output))
 
 
 def test_triton_kernel_accepts_unwraps_wrappers_and_validates_args():
