@@ -47,12 +47,14 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _ensure_dirs,
     _equally_divide_layers,
     _is_custom_model,
+    _maybe_adapt_state_dict_to_hf,
     _model_has_dtensors,
     _new_gloo_process_group,
     _normalize_dtype_mapping_to_state_dict_keys,
     _reinit_non_persistent_buffers,
     _should_write_consolidated_safetensors,
     _summarize_state_dict_key_diff,
+    _unwrap_model_for_checkpoint_metadata,
     _warn_if_large_inline_consolidation,
     is_cloud_path,
     save_config,
@@ -66,6 +68,7 @@ from nemo_automodel.components.checkpoint.utils import (
     has_local_tied_lm_head,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
@@ -217,6 +220,214 @@ def _count_by_shard(mapping: dict[str, int]) -> dict[int, int]:
     for shard_index in mapping.values():
         counts[shard_index] = counts.get(shard_index, 0) + 1
     return counts
+
+
+def _make_source_checkpointer(tmp_path, model_repo_id="nvidia/source-model"):
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id=model_repo_id,
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+
+def test_original_model_path_uses_configured_repo_exact_cached_revision_and_caches(tmp_path):
+    checkpointer = _make_source_checkpointer(tmp_path)
+    local_model_code = tmp_path / "nemo_model_code"
+    local_model_code.mkdir()
+    exact_snapshot = tmp_path / "cache" / "models--nvidia--source-model" / "snapshots" / "source-commit"
+    exact_snapshot.mkdir(parents=True)
+    inner_model = torch.nn.Module()
+    inner_model.name_or_path = str(local_model_code)
+    inner_model.config = SimpleNamespace(name_or_path="wrong/repo", _commit_hash="source-commit")
+    compiled_model = torch.nn.Module()
+    compiled_model._orig_mod = inner_model
+    distributed_model = torch.nn.Module()
+    distributed_model.module = compiled_model
+    model_state = SimpleNamespace(model=[distributed_model])
+
+    with patch("huggingface_hub.snapshot_download") as mock_download:
+        first = checkpointer._get_original_model_path(model_state)
+        second = checkpointer._get_original_model_path(model_state)
+
+    assert first == str(exact_snapshot)
+    assert second == str(exact_snapshot)
+    mock_download.assert_not_called()
+
+
+def test_original_model_path_missing_exact_revision_falls_back_once(tmp_path, caplog):
+    checkpointer = _make_source_checkpointer(tmp_path)
+    model_state = SimpleNamespace(model=[SimpleNamespace(config=SimpleNamespace(_commit_hash="source-commit"))])
+    caplog.set_level(logging.WARNING)
+
+    with patch("huggingface_hub.snapshot_download") as mock_download:
+        first = checkpointer._get_original_model_path(model_state)
+        second = checkpointer._get_original_model_path(model_state)
+
+    assert first is None
+    assert second is None
+    mock_download.assert_not_called()
+    assert "falling back to generated Hugging Face metadata" in caplog.text
+
+
+def test_original_model_path_without_revision_keeps_cached_lookup(tmp_path):
+    checkpointer = _make_source_checkpointer(tmp_path)
+    cached_snapshot = tmp_path / "cached_snapshot"
+    model_state = SimpleNamespace(model=[SimpleNamespace(config=SimpleNamespace())])
+
+    with patch(
+        "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+        return_value=str(cached_snapshot),
+    ) as mock_cached_lookup:
+        result = checkpointer._get_original_model_path(model_state)
+
+    assert result == str(cached_snapshot)
+    mock_cached_lookup.assert_called_once_with(str(tmp_path / "cache"), "nvidia/source-model")
+
+
+def test_original_model_path_uses_unwrapped_model_name_when_repo_is_not_configured(tmp_path):
+    checkpointer = _make_source_checkpointer(tmp_path, model_repo_id=None)
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    inner_model = torch.nn.Module()
+    inner_model.name_or_path = str(source_dir)
+    inner_model.config = SimpleNamespace()
+    distributed_model = torch.nn.Module()
+    distributed_model.module = inner_model
+    compiled_model = torch.nn.Module()
+    compiled_model._orig_mod = distributed_model
+    model_state = SimpleNamespace(model=[compiled_model])
+
+    assert checkpointer._get_original_model_path(model_state) == str(source_dir)
+
+
+def test_original_model_path_prefers_actual_load_root_for_exact_revision(tmp_path):
+    checkpointer = _make_source_checkpointer(tmp_path)
+    load_root = tmp_path / "load_root"
+    exact_snapshot = load_root / "models--nvidia--source-model" / "snapshots" / "source-commit"
+    exact_snapshot.mkdir(parents=True)
+    checkpointer.config.original_model_root_dir = str(load_root)
+    model_state = SimpleNamespace(model=[SimpleNamespace(config=SimpleNamespace(_commit_hash="source-commit"))])
+
+    assert checkpointer._get_original_model_path(model_state) == str(exact_snapshot)
+
+
+def test_encoder_state_dict_adapter_is_used_through_ddp_and_compile_wrappers():
+    inner_model = torch.nn.Module()
+    inner_model.state_dict_adapter = EncoderStateDictAdapter()
+    compiled_model = torch.nn.Module()
+    compiled_model._orig_mod = inner_model
+    wrapped_model = torch.nn.Module()
+    wrapped_model.module = compiled_model
+    value = torch.ones(2)
+
+    exported = _maybe_adapt_state_dict_to_hf(
+        _unwrap_model_for_checkpoint_metadata(wrapped_model),
+        {"model.layers.0.weight": value},
+    )
+
+    assert set(exported) == {"layers.0.weight"}
+    assert exported["layers.0.weight"] is value
+
+
+def test_unwrap_model_for_checkpoint_metadata_ignores_non_module_wrapper_attributes():
+    model = torch.nn.Module()
+    model.module = object()
+    model._orig_mod = object()
+
+    assert _unwrap_model_for_checkpoint_metadata(model) is model
+
+
+def test_generated_metadata_path_preserves_local_custom_model_code_reference(tmp_path):
+    checkpointer = _make_source_checkpointer(tmp_path)
+    local_model_code = tmp_path / "nemo_model_code"
+    local_model_code.mkdir()
+    model_state = SimpleNamespace(
+        model=[SimpleNamespace(name_or_path=str(local_model_code), config=SimpleNamespace(name_or_path="source/repo"))]
+    )
+
+    assert checkpointer._get_generated_metadata_path(model_state, "/cache/source_snapshot") == str(local_model_code)
+
+    model_state.model[0].name_or_path = "source/repo"
+    assert checkpointer._get_generated_metadata_path(model_state, "/cache/source_snapshot") == (
+        "/cache/source_snapshot"
+    )
+
+
+def test_save_model_generates_sentence_transformer_metadata_from_effective_model(tmp_path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (source_dir / "config.json").write_text('{"architectures": ["SourceModel"], "is_causal": false}')
+    (source_dir / "modules.json").write_text(
+        json.dumps([{"idx": 0, "path": "stale", "type": "sentence_transformers.models.Dense"}])
+    )
+    pooling_dir = source_dir / "1_Pooling"
+    pooling_dir.mkdir()
+    (pooling_dir / "config.json").write_text('{"pooling_mode_mean_tokens": true}')
+    (source_dir / "LICENSE").write_text("license")
+
+    local_model_code = tmp_path / "nemo_model_code"
+    local_model_code.mkdir()
+    (local_model_code / "modeling_custom.py").write_text("class CustomModel: pass")
+
+    checkpointer = _make_source_checkpointer(tmp_path, model_repo_id=str(source_dir))
+    checkpointer._maybe_build_consolidated_index = MagicMock(return_value={"weight": 1, "bias": 1})
+    checkpointer._maybe_build_original_dtype_mapping = MagicMock(return_value=None)
+    checkpointer._get_storage_writer = MagicMock(return_value=MagicMock())
+    checkpointer._do_save = MagicMock(return_value=None)
+
+    class GeneratedConfig:
+        tie_word_embeddings = False
+        hidden_size = 2
+        max_position_embeddings = 32768
+
+        def to_json_string(self, use_diff=False):
+            del use_diff
+            return '{"architectures": ["GeneratedModel"]}'
+
+    model = torch.nn.Linear(2, 2)
+    model.config = GeneratedConfig()
+    model.name_or_path = str(local_model_code)
+    model.pooling = "avg"
+    model.l2_normalize = True
+    model.sentence_transformer_export_config = SimpleNamespace(
+        query_prompt="query: ",
+        document_prompt="passage: ",
+        max_seq_length=8192,
+        similarity_fn_name="cosine",
+        do_lower_case=False,
+        include_prompt=True,
+    )
+    model.get_hf_export_config = lambda: model.config
+    tokenizer = MagicMock()
+    weights_path = tmp_path / "step"
+
+    checkpointer.save_model(model, str(weights_path), tokenizer=tokenizer)
+
+    metadata_dir = weights_path / "model" / ".hf_metadata"
+    assert (metadata_dir / "config.json").read_text() == '{"architectures": ["GeneratedModel"]}'
+    assert json.loads((metadata_dir / "modules.json").read_text()) == [
+        {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+        {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+        {"idx": 2, "name": "2", "path": "2_Normalize", "type": "sentence_transformers.models.Normalize"},
+    ]
+    assert json.loads((metadata_dir / "config_sentence_transformers.json").read_text()) == {
+        "prompts": {"query": "query: ", "document": "passage: "},
+        "default_prompt_name": None,
+        "similarity_fn_name": "cosine",
+    }
+    assert json.loads((metadata_dir / "sentence_bert_config.json").read_text()) == {
+        "max_seq_length": 8192,
+        "do_lower_case": False,
+    }
+    assert (metadata_dir / "LICENSE").read_text() == "license"
+    assert not (metadata_dir / "modeling_custom.py").exists()
+    tokenizer.save_pretrained.assert_called_once_with(str(metadata_dir))
 
 
 def test_extract_file_index_with_status_supports_hf_and_qwen35_patterns():
