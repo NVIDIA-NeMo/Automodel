@@ -86,7 +86,7 @@ dependencies = [
     "tiktoken",
     "torch>=2.6.0",
     "torchdata",
-    "transformers==5.8.1",
+    "transformers==5.12.1",
     "wandb>=0.28.0",
     "torchao",
     "mlflow",
@@ -129,7 +129,7 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
-ffpa = ["ffpa-attn>=0.1.19"]
+ffpa = ["ffpa-attn>=0.1.19", "nvidia-cutlass-dsl>=4.5.1,<4.6"]
 fla = [
     "flash-linear-attention>=0.4.2",
 ]

@@ -103,7 +103,7 @@ recipe_args:
   block_size: 5                       # DeepSeek-V4-Flash-DSpark drafts 5 tokens per block
   num_anchors: 512                    # blocks sampled per sequence per step
   mask_token_id: 128799               # reserved V4 token id for non-anchor block positions (in-vocab; < 129280)
-  target_layer_ids: [40, 41, 42]      # 3 late feature layers of the full 43-layer V4 target
+  target_layer_ids: [39, 40, 41]      # 3 late feature layers of the full 43-layer V4 target; stays within [0, N-2] so the checkpoint is SGLang-servable (the last layer 42 has no SGLang aux capture point)
   freeze_embeddings: true             # draft shares + freezes the target embed_tokens and lm_head
   # The V4 draft attention is fixed to the dense SDPA mask path by the config builder,
   # so attention_backend is not used here (flex_attention is the Qwen3 / Gemma4 path).

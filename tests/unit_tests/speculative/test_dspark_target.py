@@ -20,9 +20,12 @@ and the functional tests -- including the last layer (post-norm) and ``-1``
 (embedding output), the two cases a forward hook gets wrong.
 """
 
+import logging
+
 import torch
 from transformers import AutoModelForCausalLM, Qwen3Config
 
+from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
 from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
 
 VOCAB = 256
@@ -128,3 +131,22 @@ def test_generate_batch_backward_compatible_without_multimodal_kwargs():
     for key in ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"):
         assert key not in received
     assert set(received) == {"input_ids", "attention_mask", "use_cache"}
+
+
+def test_validate_target_layer_ids_warns_on_sglang_unservable_ids(caplog):
+    # -1 (embedding) and the last layer (post-norm) have no standard-SGLang aux
+    # capture point, so validate_target_layer_ids warns (but still accepts them,
+    # since AutoModel's own spec_generate serves them).
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.speculative.dspark.common"):
+        validate_target_layer_ids([-1, 1, NUM_LAYERS - 1], NUM_LAYERS)
+    assert "SGLang" in caplog.text
+    assert str(NUM_LAYERS - 1) in caplog.text
+    # The ids are still returned unchanged (warning, not error).
+    assert validate_target_layer_ids([-1, 1, NUM_LAYERS - 1], NUM_LAYERS) == [-1, 1, NUM_LAYERS - 1]
+
+
+def test_validate_target_layer_ids_no_warn_within_range(caplog):
+    # Ids within [0, N-2] are captured identically by AutoModel and SGLang -> no warning.
+    with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.speculative.dspark.common"):
+        validate_target_layer_ids([0, 1, NUM_LAYERS - 2], NUM_LAYERS)
+    assert "SGLang" not in caplog.text

@@ -12,22 +12,13 @@
 # descending loss (the cp-correctness baseline is the MedPix cp1-vs-cp2 parity recipe;
 # cp1 at 16k is impractical -- which is the whole reason for CP).
 #
-# DATA PREP (one-time, no code changes -- the Tulu-3 pipeline is model-agnostic).
-# make_meta_dataset reads JSON/JSONL (not parquet), so dump Tulu-3 conversations to a
-# JSONL whose rows carry a `messages` field, then point a meta JSON at it. The meta JSON
-# already lives at the dataset.path_or_dataset below; only the .jsonl needs generating:
-#   1. Dump Tulu-3 train to JSONL (drop_long_samples + pretokenize below handle >16k
-#      docs, so an explicit prefilter pass is optional):
-#        python -c "from datasets import load_dataset; \
-#          load_dataset('allenai/tulu-3-sft-mixture', split='train') \
-#            .select_columns(['messages']) \
-#            .to_json('logs/m3_tulu3_seqpack/data/tulu3_train.jsonl', lines=True)"
-#   2. (Optional) Validate label-masking/EOS for M3's chat template:
+# DATA (no data-prep step): make_tulu3_dataset pulls allenai/tulu-3-sft-mixture straight
+# from the HF Hub and converts each row's `messages` into the text-only conversation shape.
+# drop_long_samples + pretokenize below handle >16k docs, so no prefilter pass is needed.
+# Requires HF access for Tulu-3 (set HF_TOKEN; do NOT set HF_HUB_OFFLINE).
+#   (Optional) Validate label-masking/EOS for M3's chat template:
 #        python examples/convergence/tulu3/data/validate_data.py \
 #          --dataset allenai/tulu-3-sft-mixture --model MiniMaxAI/MiniMax-M3 --seq_length 16384
-# The meta JSON (logs/m3_tulu3_seqpack/data/tulu3_train_meta.json) points file_name at
-# tulu3_train.jsonl with columns {messages: messages}. Requires HF access for Tulu-3
-# (set HF_TOKEN; do NOT set HF_HUB_OFFLINE for prep).
 
 recipe: FinetuneRecipeForVLM
 seed: 1234
@@ -116,8 +107,9 @@ loss_fn:
   fp32_upcast: false
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_meta_dataset
-  path_or_dataset: logs/m3_tulu3_seqpack/data/tulu3_train_meta.json
+  # Pull Tulu-3 straight from the HF Hub (no meta-JSON / JSONL data-prep step).
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_dataset
+  path_or_dataset: allenai/tulu-3-sft-mixture
   split: train
   truncate: false
 

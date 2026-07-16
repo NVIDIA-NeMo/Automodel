@@ -92,6 +92,23 @@ class DummyIterableDataset(IterableDataset):  # noqa: D401
         return self
 
 
+class DummyMapDataset(torch.utils.data.Dataset):
+    """Minimal map-style dataset used to exercise recipe-side packing."""
+
+    def __init__(self, split=None):
+        self.split = split
+        self.items = [{"input_ids": [1, 2], "labels": [1, 2]}]
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        return self.items[index]
+
+    def shuffle(self, seed):
+        return self
+
+
 def dl_factory_capture(**kwargs):  # returns a sentinel while exposing passed kwargs via attribute
     dl_factory_capture.captured = kwargs
     return "dl"
@@ -626,6 +643,117 @@ def test_build_dataloader_prepacked_sequence_skips_recipe_packing(monkeypatch):
     assert ds._shuffle_calls == []
 
 
+@pytest.mark.parametrize("supports_thd", [True, False])
+def test_build_dataloader_packing_uses_configured_cp_size(monkeypatch, supports_thd):
+    captured = {}
+
+    def fake_pack_dataset(dataset, **kwargs):
+        captured.update(kwargs)
+        return dataset
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.pack_dataset", fake_pack_dataset)
+    cfg_ds = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset",
+            "split": "train",
+        }
+    )
+    cfg_dl = ConfigNode(
+        {
+            "_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture",
+            "num_workers": 0,
+        }
+    )
+    cfg_model = ConfigNode({})
+    cfg_ps = ConfigNode({"packed_sequence_size": 8, "packing_strategy": "thd"})
+
+    class _PackedModel(nn.Module):
+        def forward(self, input_ids, seq_lens=None):
+            return input_ids
+
+    model = _PackedModel()
+    model.supports_thd = supports_thd
+
+    dl, _ = _build_dataloader(
+        cfg_ds=cfg_ds,
+        cfg_dl=cfg_dl,
+        cfg_model=cfg_model,
+        cfg_ps=cfg_ps,
+        seed=123,
+        local_batch_size=1,
+        global_batch_size=1,
+        max_steps=None,
+        val_check_interval=None,
+        dp_rank=0,
+        dp_world_size=1,
+        pp_enabled=False,
+        cp_size=2,
+        model=model,
+    )
+
+    assert dl == "dl"
+    assert captured["cp_size"] == 2
+
+
+# (num_proc, max_packs, expect_parallel): parallel only when num_proc>1 AND max_packs unset
+# (max_packs relies on the serial pass' lazy early-stop, so it stays serial).
+@pytest.mark.parametrize(
+    "num_proc,max_packs,expect_parallel",
+    [(2, None, True), (1, None, False), (2, 5, False)],
+)
+def test_build_dataloader_parallel_tokenize_gated_on_num_proc(monkeypatch, num_proc, max_packs, expect_parallel):
+    """num_proc>1 pre-tokenizes in parallel and feeds the result to packing; else it does not."""
+    calls = {"tokenize": 0}
+    packed_input = {}
+
+    def fake_tokenize_parallel(dataset, num_proc):
+        calls["tokenize"] += 1
+        calls["num_proc"] = num_proc
+        return "MATERIALIZED"
+
+    def fake_pack_dataset(dataset, **kwargs):
+        packed_input["dataset"] = dataset
+        return dataset
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.tokenize_dataset_parallel", fake_tokenize_parallel)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.pack_dataset", fake_pack_dataset)
+
+    cfg_ds = ConfigNode({"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset", "split": "train"})
+    cfg_dl = ConfigNode({"_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture", "num_workers": 0})
+    cfg_model = ConfigNode({})
+    cfg_ps = ConfigNode(
+        {"packed_sequence_size": 8, "packing_strategy": "thd", "num_proc": num_proc, "max_packs": max_packs}
+    )
+
+    class _PackedModel(nn.Module):
+        def forward(self, input_ids, seq_lens=None):
+            return input_ids
+
+    _build_dataloader(
+        cfg_ds=cfg_ds,
+        cfg_dl=cfg_dl,
+        cfg_model=cfg_model,
+        cfg_ps=cfg_ps,
+        seed=123,
+        local_batch_size=1,
+        global_batch_size=1,
+        max_steps=None,
+        val_check_interval=None,
+        dp_rank=0,
+        dp_world_size=1,
+        pp_enabled=False,
+        cp_size=1,
+        model=_PackedModel(),
+    )
+
+    if expect_parallel:
+        assert calls["tokenize"] == 1 and calls["num_proc"] == num_proc
+        assert packed_input["dataset"] == "MATERIALIZED"
+    else:
+        assert calls["tokenize"] == 0
+        assert packed_input["dataset"].__class__.__name__ == "DummyMapDataset"
+
+
 class _FlagCM(AbstractContextManager):
     """Simple context manager that flips a flag on enter/exit."""
 
@@ -912,6 +1040,44 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
         (parts[0], "PipelineStage_0"),
         (parts[1], "PipelineStage_1"),
     ]
+
+
+class _StageWithLogitsToKeep(nn.Module):
+    def forward(self, input_ids=None, logits_to_keep=0, **kwargs):
+        return None
+
+
+class _StageNoLogitsToKeep(nn.Module):
+    def forward(self, input_ids=None, **kwargs):
+        return None
+
+
+@pytest.mark.parametrize(
+    "has_logits_to_keep, has_marker, pp_enabled, expect_fused",
+    [
+        (True, True, True, True),  # PP generic patched forward -> fused CE kept
+        (False, True, True, False),  # PP, no logits_to_keep -> fall back
+        (True, False, True, False),  # PP, logits_to_keep but no hidden-states marker (MoE/custom) -> fall back
+        (True, False, False, True),  # non-PP: the hidden-states marker gate does not apply -> fused CE kept
+    ],
+)
+def test_maybe_downgrade_loss_fn(has_logits_to_keep, has_marker, pp_enabled, expect_fused):
+    """FusedLinearCrossEntropy survives only when the probed stage module supports
+    logits_to_keep and (under PP) advertises hidden-states emission via
+    _pp_return_hidden_states_supported; otherwise it downgrades to MaskedCrossEntropy."""
+    from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+    from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+    from nemo_automodel.recipes.llm.train_ft import _maybe_downgrade_loss_fn
+
+    probe = (_StageWithLogitsToKeep if has_logits_to_keep else _StageNoLogitsToKeep)()
+    if has_marker:
+        probe._pp_return_hidden_states_supported = True  # set by patch_hf_model_for_pp on the generic forward
+
+    result = _maybe_downgrade_loss_fn(FusedLinearCrossEntropy(), probe, pp_enabled=pp_enabled)
+
+    assert isinstance(result, FusedLinearCrossEntropy) is expect_fused
+    if not expect_fused:
+        assert isinstance(result, MaskedCrossEntropy)
 
 
 def test_run_train_validation_loop_calls_gc_hook_once_per_step():
@@ -2248,10 +2414,15 @@ class TestRunValidationToolCallEval:
         assert out.metrics["tool_call/has_call"] == 0.0
 
 
-def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
-    """Non-PP step: the model-owned CP hook attaches its batch prep, and the
-    ``_cp_full_logits_grad_touch`` flag adds the zero-valued full-logits term so
-    backward still reaches every parameter."""
+@pytest.mark.parametrize(
+    ("cp_size", "uses_thd", "supports_thd"),
+    [
+        (2, False, False),
+        (1, True, True),
+    ],
+)
+def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, supports_thd):
+    """Non-PP training invokes model-owned batch preparation for CP or native THD."""
     from contextlib import nullcontext
 
     cfg = ConfigNode(
@@ -2265,7 +2436,7 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
             "optimizer": {},
             "loss_fn": {},
             "checkpoint": {"best_metric_key": "default"},
-            "distributed": {"cp_size": 2},
+            "distributed": {"cp_size": cp_size},
             "autopipeline": {"pp_microbatch_size": 1},
         }
     )
@@ -2275,27 +2446,26 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_te_dot_product_attention", lambda cfg: False)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: False)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._uses_thd_collater", lambda cfg: uses_thd)
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
 
     class _CPModel(nn.Module):
         def __init__(self):
             super().__init__()
-            # Wide output + large magnitude in fp16 so a naive (low-precision)
-            # logits.sum() overflows to inf; the grad touch must promote to fp32.
-            self.lin = nn.Linear(4, 8192)
+            self.lin = nn.Linear(4, 8)
             self.prepared = False
 
         def prepare_model_inputs_for_cp(self, input_ids, **kwargs):
             self.prepared = True
             self.num_chunks = kwargs.get("num_chunks")
-            return {"_cp_full_logits_grad_touch": True}
+            return {}
 
         def forward(self, **batch):
-            logits = (self.lin(batch["input_ids"].float()) + 50.0).to(torch.float16)
+            logits = self.lin(batch["input_ids"].float())
             return SimpleNamespace(logits=logits)
 
     model = _CPModel()
+    model.supports_thd = supports_thd
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
     object.__setattr__(recipe, "device_mesh", None)
     object.__setattr__(recipe, "pp_enabled", False)
@@ -2312,8 +2482,7 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
     def _fake_calc_loss(loss_fn, *, logits, labels, model, hidden_states, lm_weight, num_label_tokens):
         captured["logits_is_tensor"] = isinstance(logits, torch.Tensor)
         assert lm_weight is None
-        # finite base loss (fp32) so any non-finiteness must come from the grad touch
-        return logits.float().mean()
+        return logits.mean()
 
     monkeypatch.setattr(
         "nemo_automodel.recipes.llm.train_ft.make_cp_batch_and_ctx",
@@ -2330,11 +2499,10 @@ def test_forward_backward_step_dsv4_cp_hook_and_grad_touch(monkeypatch):
         idx=0, batch=batch, loss_buffer=loss_buffer, num_label_tokens=None, num_batches=1, is_train=True
     )
 
-    assert model.prepared is True  # cp_size>1 + hasattr -> hook body ran
+    assert model.prepared is True
+    assert model.num_chunks == 1
     assert captured["logits_is_tensor"]
     assert len(loss_buffer) == 1
-    # the fp32-promoted grad touch must not poison the loss with inf/nan
     assert torch.isfinite(loss_buffer[0]).all()
-    # the grad-touch kept the full logits in the graph, so backward populated grads
     assert model.lin.weight.grad is not None
     assert torch.isfinite(model.lin.weight.grad).all()

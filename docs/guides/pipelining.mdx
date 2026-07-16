@@ -9,11 +9,11 @@ As large language models continue to grow in size, training and fine-tuning them
 
 Pipeline parallelism addresses these challenges by splitting a model's layers across different devices and processing them in a pipelined fashion. Each device processes a different stage of the model, enabling training of models that wouldn't fit on a single device while maintaining high GPU utilization through overlapped computation.
 
-AutoPipeline is NeMo AutoModel's high-level pipeline parallelism interface specifically designed for Hugging Face models, making pipeline parallelism as simple as data parallelism. Built on PyTorch's native `torch.distributed.pipelining`, AutoPipeline provides seamless pipeline parallelism support for any Hugging Face decoder-only causal language model with minimal code changes.
+AutoPipeline is NeMo AutoModel's high-level pipeline parallelism interface for Hugging Face-compatible models. Built on PyTorch's native `torch.distributed.pipelining`, it expects an HF-style model with a `config`, a supported decoder-layer layout, and pipeline-compatible forwards. Recipe-driven pipeline parallelism also requires the selected model implementation to advertise a `_pp_plan` (or use the supported MoE path) and pass the repository's pipeline validation; encoder-decoder models and models with actually tied input/output embedding weights are rejected.
 
-For custom models and more granular control, the functional API in `nemo_automodel.components.distributed.pipelining.functional` provides modular, accessible building blocks that can be used with any PyTorch model architecture.
+The functional module at `nemo_automodel.components.distributed.pipelining.functional` exposes the same HF-specific `pipeline_model()` splitter plus lower-level stage and schedule helpers. Custom PyTorch architectures can reuse helpers such as `stage_ids_this_rank()`, `calculate_virtual_stages()`, and `build_pipeline_schedule()` after their own code constructs valid `PipelineStage` objects; `pipeline_model()` is not a generic `nn.Module` splitter.
 
-This guide walks you through the complete process of using AutoPipeline for Hugging Face models and the functional API for custom models. You'll learn how to configure pipeline stages, integrate with existing training workflows, optimize performance, and combine pipeline parallelism with other parallelization strategies.
+This guide walks you through AutoPipeline for compatible Hugging Face models and the lower-level helpers for manually constructed stages. You'll learn how to configure pipeline stages, integrate with existing training workflows, optimize performance, and combine pipeline parallelism with other parallelization strategies.
 
 **Prerequisites:**
 
@@ -38,11 +38,11 @@ For a complete guide and additional options please consult the AutoModel [Instal
 
 AutoPipeline provides the following capabilities:
 
-- **Universal Hugging Face Support**: Works with any Hugging Face decoder-only causal language model including Llama, Qwen, Mistral, Gemma, and more
+- **Hugging Face-Compatible Model Support**: Works with decoder-only causal language models and explicitly supported VLMs that satisfy the pipeline model contract
 - **PyTorch Native Integration**: Built on PyTorch's `torch.distributed.pipelining` for optimal performance
 - **Flexible Configuration**: Multiple scheduling strategies, configurable microbatch sizes, and automatic or manual layer splitting
 - **Mixed Parallelism Support**: Combine pipeline parallelism with data parallelism, tensor parallelism, and FSDP
-- **Modular Functional API**: For custom models, the functional module provides accessible, low-level building blocks
+- **Modular Functional API**: Lower-level stage and schedule helpers can be reused with manually constructed `PipelineStage` objects
 - **Minimal Opinions**: Easy to extend and integrate with existing training workflows
 
 ## Quick Start with AutoPipeline (Hugging Face Models)
@@ -53,9 +53,9 @@ Here's a minimal example to get started with AutoPipeline using 2 pipeline stage
 import torch
 from torch.distributed.device_mesh import init_device_mesh
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
+from nemo_automodel.components.utils.model_utils import init_empty_weights
 from transformers import AutoModelForCausalLM
-from transformers.integrations.accelerate import init_empty_weights
-from transformers.modeling_utils import no_init_weights
+from transformers.initialization import no_init_weights
 from transformers.utils import ContextManagers
 
 def loss_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -81,7 +81,7 @@ if __name__ == "__main__":
         pp_axis_name="pp",
         pp_schedule="1f1b",
         pp_microbatch_size=1,
-        pp_batch_size=8,  # Total batch size across pipeline
+        pp_batch_size=8,  # Local batch size consumed by the pipeline schedule
         device=torch.cuda.current_device(),
         dtype=torch.bfloat16,
     ).build(model, loss_fn=loss_fn)
@@ -120,9 +120,10 @@ ap = AutoPipeline(
     pp_axis_name="pp",              # Name of pipeline axis (default: "pp")
 
     # Schedule configuration
-    pp_schedule="1f1b",             # Pipeline schedule ("1f1b", "looped_bfs", etc.)
+    pp_schedule="1f1b",             # Pipeline schedule ("1f1b", "LoopedBFS", etc.)
     pp_microbatch_size=1,           # Microbatch size per stage
-    # pp_batch_size is automatically inferred from dataloader.batch_size
+    pp_batch_size=8,                # Local schedule batch, split into microbatches
+    # Recipe flows set this from step_scheduler.local_batch_size
 
     # Stage configuration
     layers_per_stage=None,          # Layers per stage (None for auto)
@@ -278,9 +279,9 @@ Key observations:
 - **Rotary embeddings** are shared across all stages (for position encoding)
 - **Transformer layers** are evenly distributed
 
-## Use the Functional API for Custom Models
+## Use Lower-Level Functional Helpers
 
-While AutoPipeline is specifically designed as a high-level interface for Hugging Face models, the functional API in `nemo_automodel.components.distributed.pipelining.functional` provides more modular and accessible building blocks that can be used with any PyTorch model, including custom architectures. This separation allows for cleaner code organization where AutoPipeline handles Hugging Face-specific optimizations while the functional module remains model-agnostic.
+AutoPipeline and the functional `pipeline_model()` convenience path both use Hugging Face-specific model splitting. For a custom architecture, construct the stage modules and PyTorch `PipelineStage` objects in model-owned code, then reuse the lower-level scheduling helpers. The examples below illustrate those lower-level pieces; they do not make `pipeline_model()` a generic model splitter.
 
 ### Key Functional API Components
 
@@ -306,7 +307,7 @@ from nemo_automodel.components.distributed.pipelining.functional import (
     generate_hf_model_fqn_per_model_part
 )
 
-# Generate balanced module assignments for any model
+# Generate balanced module assignments for an HF-style decoder layout
 module_names = generate_hf_model_fqn_per_model_part(
     num_stages=4,
     num_layers=32,
@@ -347,11 +348,14 @@ schedule = build_pipeline_schedule(
 )
 ```
 
-### Example: Pipeline Parallelism for Custom Models
+### Pseudocode: Pipeline Parallelism for Custom Models
 
-Here's how to use the functional API to implement pipeline parallelism for a custom model:
+The following fence is intentionally non-runnable pseudocode. A real custom model must provide model-owned
+`create_stage_model` splitting, a `dataloader`, pipeline-compatible stage input/output contracts, and process-group
+setup before reusing these scheduling helpers. It is an architectural outline, not a script to run unchanged.
 
 ```python
+# NON-RUNNABLE PSEUDOCODE
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
@@ -420,7 +424,7 @@ def split_custom_model_for_pipeline(model, pp_rank, pp_size, num_stages):
 
     return stages
 
-# Usage
+# Sketch of model-owned orchestration
 def main():
     # Initialize device mesh
     world_mesh = init_device_mesh("cuda", mesh_shape=(4,), mesh_dim_names=("pp",))
@@ -451,7 +455,7 @@ def main():
     # Build pipeline schedule
     schedule = build_pipeline_schedule(
         pipeline_parallel_schedule_csv=None,
-        pipeline_parallel_schedule="interleaved_1f1b",  # Good for multi-stage
+        pipeline_parallel_schedule="interleaved1f1b",  # Multi-stage schedule registered by PyTorch
         microbatch_size=1,
         local_batch_size=8,
         stages=stages,
@@ -470,29 +474,33 @@ def main():
             print(f"Loss: {sum(losses) / len(losses)}")
 ```
 
-### Advanced: Custom Model Splitting Logic
+### Add a Parallelization Callback to HF-Compatible Splitting
 
-For more complex custom models, you can implement your own splitting logic:
+When using the HF-compatible `pipeline_model()` path, a callback can apply additional parallelism to each model part. Its signature must match `ParallelizeFnProtocol`:
 
 ```python
 from nemo_automodel.components.distributed.pipelining.functional import pipeline_model
 
 def custom_parallelize_fn(
     model, world_mesh, moe_mesh, *,
-    pp_enabled, dp_axis_names, **kwargs
+    dp_axis_names,
+    cp_axis_name=None,
+    tp_axis_name=None,
+    ep_axis_name=None,
+    ep_shard_axis_names=None,
 ):
-    """Custom parallelization function for each pipeline stage."""
+    """Custom parallelization function for each local model part."""
     # Apply your custom parallelization logic here
-    # This is called for each pipeline stage
+    # This is called for each local model part
     if dp_axis_names:
         # Apply data parallelism
         pass
     # Add any other parallelization strategies
     pass
 
-# Use pipeline_model for complete pipeline setup
+# Use pipeline_model only with an HF-compatible model.
 schedule, model_parts, has_first, has_last, stages = pipeline_model(
-    model=your_custom_model,
+    model=hf_compatible_model,
     world_mesh=world_mesh,
     moe_mesh=None,
     pp_axis_name="pp",
@@ -505,23 +513,23 @@ schedule, model_parts, has_first, has_last, stages = pipeline_model(
     device=torch.cuda.current_device(),
     loss_fn=loss_fn,
     parallelize_fn=custom_parallelize_fn,
-    module_fqns_per_model_part=None,  # Provide custom module names
-    patch_inner_model=False,  # Custom model: don't apply HF forward patches
-    patch_causal_lm_model=False,  # Custom model: don't apply HF forward patches
+    module_fqns_per_model_part=None,  # Or provide an explicit HF module assignment
+    patch_inner_model=False,  # Use only when the model's inner forward is already stage-friendly
+    patch_causal_lm_model=False,  # Use only when the wrapper already returns stage tensors
 )
 ```
 
-### Tips for Using Functional API with Custom Models
+### Tips for Manually Staged Custom Models
 
-The functional API is designed to be more accessible and modular than AutoPipeline:
+The lower-level helpers can support a custom model after its model-owned splitting code has created the stage modules:
 
 1. **Module Naming**: Ensure your model has consistent module naming that can be mapped to stages
 2. **State Management**: Handle model state (embeddings, buffers) carefully across stages
 3. **Communication**: First and last stages need special handling for inputs/outputs
-4. **Flexibility**: The functional API gives you complete control over how models are split and parallelized
+4. **Splitting Ownership**: Keep custom model splitting in the model implementation; do not pass an arbitrary `nn.Module` to `pipeline_model()`
 5. **Testing**: Start with a small model and verify correct splitting before scaling up
 
-The functional module's modular design makes it easier to integrate pipeline parallelism into existing custom model training workflows without the Hugging Face-specific assumptions that AutoPipeline makes.
+The schedule helpers are reusable, but the repository's automatic splitting path retains Hugging Face-specific assumptions.
 
 ## Mixed Parallelism
 
@@ -530,11 +538,14 @@ AutoPipeline can be combined with other parallelization strategies for optimal p
 ```python
 def parallelize_fn(
     model, world_mesh, moe_mesh, *,
-    pp_enabled, dp_axis_names,
-    cp_axis_name=None, tp_axis_name=None, ep_axis_name=None
+    dp_axis_names,
+    cp_axis_name=None,
+    tp_axis_name=None,
+    ep_axis_name=None,
+    ep_shard_axis_names=None,
 ):
-    """Apply additional parallelization to each pipeline stage."""
-    # Example: Apply FSDP to each stage
+    """Apply additional parallelization to each local model part."""
+    # Example: Apply FSDP to each local model part
     if dp_axis_names:
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         # Wrap model with FSDP (simplified example)
@@ -566,9 +577,10 @@ print(f"Pipeline enabled: {info.enabled}")
 print(f"Has first stage: {info.has_first_stage}")
 print(f"Has last stage: {info.has_last_stage}")
 
-# Access model parts
-model_parts = ap.parts  # List of pipeline stages
-stage_modules = ap.list_stage_modules()  # Module names per stage
+# Access model parts and runtime pipeline stages
+model_parts = ap.parts  # List of local model-part nn.Module objects
+pipeline_stages = info.stages  # List of local PipelineStage objects used by the schedule
+stage_modules = ap.list_stage_modules()  # Module names within each local model part
 ```
 
 ### Analysis
@@ -592,23 +604,37 @@ ap.visualize_current_schedule("pipeline_schedule.png")
 
 ### Gradient Management
 ```python
-# Scale gradients for mixed parallelism
-ap.scale_grads_by_divisor(divisor=8)
+from nemo_automodel.components.distributed.pipelining.functional import scale_grads_by_divisor
+from nemo_automodel.components.training.utils import clip_grad_norm
 
-# Clip gradients across pipeline stages
-grad_norm = ap.clip_grad_norm(max_norm=1.0, norm_type=2.0)
+# Call these after backward on every pipeline rank.
+scale_grads_by_divisor(ap.info.stages, divisor=8)
+
+# Use the PP-aware clipping helper across the local model parts.
+grad_norm = clip_grad_norm(
+    1.0,
+    ap.parts,
+    norm_type=2.0,
+    pp_enabled=True,
+    device_mesh=world_mesh,
+    pp_axis_name="pp",
+)
 ```
 
-## Add Pipeline Parallelism to Existing Configurations
+## Add Pipeline Parallelism to Supported Configurations
 
-You can easily add pipeline parallelism to any existing training configuration through command-line overrides or YAML modifications.
+Pipeline parallelism can be added to an FSDP2 training configuration only when the model satisfies the repository's PP
+contract and the PP, TP, CP, and inferred DP sizes compose to the total worker count. DDP and Megatron FSDP do not
+support PP. For recipe-driven model implementations, use a model with a `_pp_plan` or the explicitly supported MoE path.
 
 ### Command-Line Override Method
 
-Add pipeline parallelism to an existing config using command-line arguments:
+For an FSDP2 config whose model supports PP, use command-line overrides such as:
 
 ```bash
-automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
+    --nproc-per-node 2 \
+    --step_scheduler.local_batch_size 8 \
     --distributed.strategy fsdp2 \
     --distributed.pp_size 2 \
     --distributed.pipeline.pp_schedule 1f1b \
@@ -618,15 +644,18 @@ automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 ```
 
 Key parameters to override:
-- `--distributed.pp_size`: Number of pipeline stages (must match nproc-per-node)
-- `pp_batch_size` is automatically inferred from `--dataloader.batch_size`
-- `--distributed.pipeline.pp_schedule`: Pipeline schedule (1f1b, interleaved_1f1b, etc.)
+- `--distributed.pp_size`: Number of pipeline ranks; PP, TP, CP, and inferred DP sizes must compose to the total worker count
+- `--step_scheduler.local_batch_size`: Runtime batch size used for both the pipeline schedule and dataloader
+- `--distributed.pipeline.pp_schedule`: Pipeline schedule (`1f1b`, `interleaved1f1b`, `LoopedBFS`, etc.)
 
 ### YAML Configuration Method
 
-Add these sections to your existing YAML config:
+Add these sections to a compatible FSDP2 YAML config:
 
 ```yaml
+step_scheduler:
+  local_batch_size: 8  # Also sets the runtime pipeline batch size
+
 distributed:
   strategy: fsdp2
   dp_size: 1
@@ -637,7 +666,6 @@ distributed:
   pipeline:
     pp_schedule: 1f1b
     pp_microbatch_size: 1
-    # pp_batch_size is automatically inferred from dataloader.batch_size
     round_virtual_stages_to_pp_multiple: up
     scale_grads_in_schedule: false
     layers_per_stage: null  # Auto-compute, or specify number
@@ -647,27 +675,30 @@ distributed:
 
 #### Pipeline + Data Parallelism (4 GPUs Total)
 ```bash
-automodel --nproc-per-node=4 your_config.yaml \
+uv run automodel your_config.yaml \
+    --nproc-per-node 4 \
     --distributed.pp_size 2 \
     --distributed.dp_size 2 \
-    --dataloader.batch_size 16
+    --step_scheduler.local_batch_size 16
 ```
 
 #### Pipeline + Tensor Parallelism (4 GPUs Total)
 ```bash
-automodel --nproc-per-node=4 your_config.yaml \
+uv run automodel your_config.yaml \
+    --nproc-per-node 4 \
     --distributed.pp_size 2 \
     --distributed.tp_size 2 \
-    --dataloader.batch_size 8
+    --step_scheduler.local_batch_size 8
 ```
 
 #### Full Hybrid: PP + DP + TP (8 GPUs Total)
 ```bash
-automodel --nproc-per-node=8 your_config.yaml \
+uv run automodel your_config.yaml \
+    --nproc-per-node 8 \
     --distributed.pp_size 2 \
     --distributed.dp_size 2 \
     --distributed.tp_size 2 \
-    --dataloader.batch_size 32
+    --step_scheduler.local_batch_size 32
 ```
 
 ## Integrate with Training Recipes
@@ -676,42 +707,91 @@ AutoPipeline seamlessly integrates with NeMo AutoModel's recipe system. Here's a
 
 ```yaml
 # config.yaml
-distributed:
-  strategy: fsdp2
-  dp_size: 1
-  tp_size: 1
-  cp_size: 1
-  pp_size: 2          # 2-way pipeline parallelism
-  sequence_parallel: false
-  pipeline:
-    pp_schedule: 1f1b
-    pp_microbatch_size: 1
-    # pp_batch_size is automatically inferred from dataloader.batch_size
-    layers_per_stage: null  # Auto-compute layer distribution
-    round_virtual_stages_to_pp_multiple: up
-    scale_grads_in_schedule: false
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 8
+  max_steps: 10
+  ckpt_every_steps: 10
+  val_every_steps: 10
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 1
+
+seed: 1111
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
 
+checkpoint:
+  enabled: false
+
+clip_grad_norm:
+  max_norm: 1.0
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  dp_replicate_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 2          # 2-way pipeline parallelism
+  ep_size: 1
+  sequence_parallel: false
+  pipeline:
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: null  # Auto-compute layer distribution
+    round_virtual_stages_to_pp_multiple: up
+    scale_grads_in_schedule: false
+
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.squad.SQuAD
-  path_or_dataset: squad
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
   split: train
 
+packed_sequence:
+  packed_sequence_size: 0
+
 dataloader:
-  batch_size: 8
-  shuffle: true
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+  limit_dataset_samples: 64
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
 ```
 
 Run training with:
 ```bash
 # Run with 2 GPUs for 2-way pipeline parallelism
-automodel --nproc-per-node=2 config.yaml
+uv run automodel config.yaml --nproc-per-node 2
 ```
 
 ## Troubleshooting
@@ -724,8 +804,8 @@ automodel --nproc-per-node=2 config.yaml
 - Enable gradient checkpointing
 
 **Pipeline bubbles reducing efficiency:**
-- Increase batch size to have more microbatches
-- Try different schedules (e.g., `interleaved_1f1b`)
+- Increase `step_scheduler.local_batch_size` to have more microbatches
+- Try different schedules (e.g., `interleaved1f1b`)
 - Adjust virtual stages configuration
 
 **Uneven stage distribution:**
@@ -735,11 +815,11 @@ automodel --nproc-per-node=2 config.yaml
 
 ## Conclusion
 
-AutoPipeline and the functional API together provide a complete pipeline parallelism solution for both Hugging Face and custom models. AutoPipeline offers a high-level, optimized interface specifically for Hugging Face models, while the functional module provides modular, accessible building blocks for custom architectures.
+AutoPipeline and `pipeline_model()` provide the repository's HF-compatible splitting path, while lower-level functional helpers can be reused after custom code constructs its own pipeline stages.
 
 Key takeaways:
 - Pipeline parallelism enables training of models too large for a single GPU
-- AutoPipeline provides a simple API for Hugging Face models with powerful customization options
-- The functional API offers modular components for implementing pipeline parallelism with any PyTorch model
+- AutoPipeline provides a simple API for Hugging Face-compatible models with powerful customization options
+- Lower-level functional helpers can schedule manually constructed stages for custom models
 - Both can be combined with other parallelization strategies for optimal performance
 - Use built-in monitoring tools to understand and optimize your pipeline

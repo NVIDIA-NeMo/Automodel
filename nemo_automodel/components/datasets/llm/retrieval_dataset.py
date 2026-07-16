@@ -19,6 +19,7 @@ import random
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
 
 from datasets import Dataset, concatenate_datasets, load_dataset
@@ -631,7 +632,9 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
             cur_pos_neg_doc += [negatives[n_id] for n_id in cur_neg_ids]
 
         cur_pos_neg_doc_batch.append(cur_pos_neg_doc)
-        cur_pos_neg_doc_id_batch.append([d["id"] for d in cur_pos_neg_doc])
+        cur_pos_neg_doc_id_batch.append(
+            [d["id"] if isinstance(d, dict) and "id" in d else str(d) for d in cur_pos_neg_doc]
+        )
 
     # Extract text and images from corpus
     cur_pos_neg_text_batch = []
@@ -643,15 +646,23 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         cur_pos_neg_text = []
         cur_pos_neg_image = []
         cur_corpus_id = corpus_ids[idx_doc]
-        if cur_corpus_id not in corpus_dict:
-            raise ValueError(
-                f"Unknown corpus_id '{cur_corpus_id}' in retrieval example. "
-                f"Available corpus ids: {sorted(corpus_dict.keys())}"
-            )
-
         for doc in docs:
-            cur_id = doc["id"]
-            cur_doc = corpus_dict[cur_corpus_id].get_document_by_id(cur_id)
+            if isinstance(doc, dict) and "text" in doc:
+                # Inline-text records (.jsonl/.tsv/.csv) keep document content
+                # directly in pos_doc / neg_doc.
+                cur_doc = {
+                    "text": "" if doc.get("text") is None else str(doc.get("text", "")),
+                    "image": doc.get("image", ""),
+                    "nr_ocr": "" if doc.get("nr_ocr") is None else str(doc.get("nr_ocr", "")),
+                }
+            else:
+                if cur_corpus_id not in corpus_dict:
+                    raise ValueError(
+                        f"Unknown corpus_id '{cur_corpus_id}' in retrieval example. "
+                        f"Available corpus ids: {sorted(corpus_dict.keys())}"
+                    )
+                cur_id = doc["id"] if isinstance(doc, dict) else str(doc)
+                cur_doc = corpus_dict[cur_corpus_id].get_document_by_id(cur_id)
 
             # Extract text
             if cur_doc["text"] != "" and not cur_doc["image"]:
@@ -835,14 +846,36 @@ def make_retrieval_dataset(
         corpus_dict.update(hf_corpus)
 
     if local_entries:
-        local_dataset, local_corpus = load_datasets(local_entries, concatenate=True, seed=seed)
-        datasets_list.append(local_dataset)
-        for cid, cinfo in local_corpus.items():
-            if cid in corpus_dict and corpus_dict[cid].path != cinfo.path:
-                raise ValueError(
-                    f"Duplicate corpus_id '{cid}' with different paths: {corpus_dict[cid].path} vs {cinfo.path}"
-                )
-            corpus_dict[cid] = cinfo
+        corpus_local_entries: list[tuple[Optional[int], str]] = []
+        inline_local_entries: list[tuple[Optional[int], str]] = []
+        for num_samples, local_path in local_entries:
+            suffix = Path(local_path).suffix.lower()
+            if suffix in {".jsonl", ".tsv", ".csv"}:
+                inline_local_entries.append((num_samples, local_path))
+            else:
+                corpus_local_entries.append((num_samples, local_path))
+
+        if corpus_local_entries:
+            local_dataset, local_corpus = load_datasets(corpus_local_entries, concatenate=True, seed=seed)
+            datasets_list.append(local_dataset)
+            for cid, cinfo in local_corpus.items():
+                if cid in corpus_dict and corpus_dict[cid].path != cinfo.path:
+                    raise ValueError(
+                        f"Duplicate corpus_id '{cid}' with different paths: {corpus_dict[cid].path} vs {cinfo.path}"
+                    )
+                corpus_dict[cid] = cinfo
+
+        if inline_local_entries:
+            from nemo_automodel.components.datasets.llm import retrieval_dataset_inline
+
+            inline_rows: list[dict] = []
+            for num_samples, local_path in inline_local_entries:
+                inline_dataset, _ = retrieval_dataset_inline.load_datasets(local_path, concatenate=True)
+                sampled_rows = _sample_data_items(inline_dataset.to_list(), num_samples, local_path, seed)
+                inline_rows.extend(sampled_rows)
+
+            if inline_rows:
+                datasets_list.append(Dataset.from_list(inline_rows))
 
     dataset = concatenate_datasets(datasets_list) if len(datasets_list) > 1 else datasets_list[0]
 

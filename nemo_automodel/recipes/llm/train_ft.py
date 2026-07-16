@@ -38,7 +38,7 @@ import torch
 import torch.nn as nn
 import wandb
 from huggingface_hub import constants as hf_constants
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig
@@ -55,7 +55,7 @@ from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.megatron.sampler import create_megatron_sampler
 from nemo_automodel.components.datasets.llm.megatron_dataset import MegatronPretraining
-from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset
+from nemo_automodel.components.datasets.llm.packed_sequence import pack_dataset, tokenize_dataset_parallel
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -159,6 +159,24 @@ def _get_num_thd_chunks(pp_enabled, cfg):
     if pp_enabled:
         return cfg.get("step_scheduler.local_batch_size", 1) // cfg.get("distributed.pipeline.pp_microbatch_size", 1)
     return 1
+
+
+def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
+    """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
+    if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
+        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+        return MaskedCrossEntropy()
+    if (
+        pp_enabled
+        and isinstance(loss_fn, FusedLinearCrossEntropy)
+        and not getattr(probe_module, "_pp_return_hidden_states_supported", False)
+    ):
+        logger.warning(
+            "FusedLinearCrossEntropy is not supported under pipeline parallelism for this "
+            "model. Using MaskedCrossEntropy instead."
+        )
+        return MaskedCrossEntropy()
+    return loss_fn
 
 
 def build_model(
@@ -422,6 +440,30 @@ def build_dataloader(
             logger.info(f"Packing dataset with size: {packed_sequence_size}, strategy: {packing_strategy}")
             if hasattr(ds, "shuffle"):
                 ds = ds.shuffle(seed)
+
+            # Front-load per-sample tokenization across processes before the
+            # (serial) packing pass. Restricted to lazily-tokenizing map-style
+            # datasets (e.g. ChatDataset): raw HF Dataset/DatasetDict are already
+            # materialized and handled by pack_dataset directly, IterableDataset
+            # cannot be indexed, and max_packs relies on the serial pass' lazy
+            # early-stop, so those all stay on the serial path.
+            num_proc = int(getattr(cfg_ps, "num_proc", 1) or 1)
+            can_pretokenize = (
+                num_proc > 1
+                and isinstance(ds, Dataset)
+                and not isinstance(ds, IterableDataset)
+                and hasattr(ds, "__len__")
+                and getattr(cfg_ps, "max_packs", None) is None
+            )
+            if can_pretokenize:
+                logger.info("Pre-tokenizing dataset with num_proc=%s before packing", num_proc)
+                ds = tokenize_dataset_parallel(ds, num_proc=num_proc)
+            elif num_proc > 1:
+                logger.info(
+                    "num_proc=%s set but skipping parallel pre-tokenization: it requires an indexable "
+                    "map-style dataset and an unset max_packs; falling back to serial packing.",
+                    num_proc,
+                )
 
             if packing_strategy == "neat":
                 from nemo_automodel.components.datasets.llm.neat_packing import neat_pack_dataset
@@ -819,10 +861,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )
 
-        if not _supports_logits_to_keep(model) and not isinstance(self.loss_fn, MaskedCrossEntropy):
-            logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
-            self.loss_fn = MaskedCrossEntropy()
-
         if isinstance(model, AutoPipeline):
             self.model_parts = model.parts
             self.pp = model
@@ -840,6 +878,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 autonvtx.patch(model, name=model.__class__.__name__)
             self.model_parts = [model]
             self.pp = None
+
+        # Loss-function capability check
+        self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
 
         # Extract TE FP8 config from model backend (set after model construction)
         self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
@@ -1022,6 +1063,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if last_stage_model is None:
             raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
 
+        # FusedLinearCrossEntropy consumes hidden states: flag the last stage to emit them
+        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+            last_stage_model._pp_return_hidden_states = True
+
         self.pp.info.schedule._loss_fn = self.cfg.mtp.build(self.loss_fn, last_stage_model)
 
     def _setup_qat(self, cfg, model_parts: list[nn.Module]):
@@ -1171,7 +1216,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # before make_cp_batch_and_ctx shards the batch, instead of the default
             # load-balanced context_parallel path.
             _model_cp = self.model_parts[0] if hasattr(self, "model_parts") else None
-            if cp_size > 1 and _model_cp is not None and hasattr(_model_cp, "prepare_model_inputs_for_cp"):
+            model_owns_thd = _thd_collater and bool(getattr(_model_cp, "supports_thd", False))
+            if (
+                (cp_size > 1 or model_owns_thd)
+                and _model_cp is not None
+                and hasattr(_model_cp, "prepare_model_inputs_for_cp")
+            ):
                 batch.update(
                     _model_cp.prepare_model_inputs_for_cp(input_ids=batch["input_ids"], num_chunks=_num_chunks_value)
                 )
@@ -1291,16 +1341,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         cu_seqlens=batch.get("cu_seqlens"),
                         lm_weight=shared_lm_weight,
                     )
-                # Model-owned CP (e.g. DSV4) can request a zero-valued full-logits
-                # term so every CP rank's backward reaches all parameters even when
-                # its local loss is fully masked (avoids FSDP2 unused-parameter hangs).
-                if is_train and batch.get("_cp_full_logits_grad_touch"):
-                    logits = getattr(out, "logits", out)
-                    if isinstance(logits, torch.Tensor):
-                        # Promote to fp32 before summing: bf16 logits over a large
-                        # vocab (e.g. DSV4's 129280) overflow to inf, and inf * 0.0
-                        # would be nan, poisoning local_loss and the backward pass.
-                        local_loss = local_loss + logits.float().sum() * 0.0
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()

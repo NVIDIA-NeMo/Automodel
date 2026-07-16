@@ -218,22 +218,15 @@ def resume_start_sample(existing_shards: set[int], shard_size: int) -> int:
     return len(existing_shards) * shard_size
 
 
-def dataloader_from_sample(dataloader: DataLoader, start_sample: int) -> DataLoader:
-    """Return an equivalent sequential dataloader beginning at ``start_sample``."""
-    if start_sample <= 0:
-        return dataloader
+def _sequential_subset_loader(dataloader: DataLoader, start: int, end: int) -> DataLoader:
+    """Return a sequential loader over ``dataset[start:end)`` mirroring ``dataloader``.
+
+    Preserves the source loader's worker settings: in particular
+    ``multiprocessing_context`` -- the precompute paths load the target onto CUDA
+    before iterating, so fork-started workers would inherit a live CUDA context and
+    abort (see ``build_eagle3_dataloader``'s forkserver note).
+    """
     dataset = dataloader.dataset
-    batch_size = getattr(dataloader, "batch_size", None) or 1
-    collate_fn = getattr(dataloader, "collate_fn", None)
-    if start_sample >= len(dataset):
-        return DataLoader(
-            Subset(dataset, []),
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,
-            collate_fn=collate_fn,
-            drop_last=False,
-        )
     worker_kwargs: dict[str, Any] = {}
     num_workers = int(getattr(dataloader, "num_workers", 0))
     if num_workers > 0:
@@ -242,15 +235,83 @@ def dataloader_from_sample(dataloader: DataLoader, start_sample: int) -> DataLoa
         if multiprocessing_context is not None:
             worker_kwargs["multiprocessing_context"] = multiprocessing_context
     return DataLoader(
-        Subset(dataset, range(start_sample, len(dataset))),
-        batch_size=batch_size,
+        Subset(dataset, range(start, end)),
+        batch_size=getattr(dataloader, "batch_size", None) or 1,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=bool(getattr(dataloader, "pin_memory", False)),
-        collate_fn=collate_fn,
+        collate_fn=getattr(dataloader, "collate_fn", None),
         drop_last=False,
         **worker_kwargs,
     )
+
+
+def dataloader_from_sample(dataloader: DataLoader, start_sample: int) -> DataLoader:
+    """Return an equivalent sequential dataloader beginning at ``start_sample``."""
+    if start_sample <= 0:
+        return dataloader
+    dataset = dataloader.dataset
+    if start_sample >= len(dataset):
+        return DataLoader(
+            Subset(dataset, []),
+            batch_size=getattr(dataloader, "batch_size", None) or 1,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=getattr(dataloader, "collate_fn", None),
+            drop_last=False,
+        )
+    return _sequential_subset_loader(dataloader, start_sample, len(dataset))
+
+
+class _ShardAccumulator:
+    """Buffer per-batch cache tensors and flush them as fixed-size sequential shards.
+
+    Shard indices count up from ``start_shard_index``; a trailing partial shard is
+    written by :meth:`finalize`. Shared by the single-process and distributed
+    precompute loops so both produce the identical on-disk shard layout.
+    """
+
+    def __init__(
+        self,
+        *,
+        output_dir: str,
+        shard_size: int,
+        start_shard_index: int,
+        write_shard_fn: Callable[[str, int, dict[str, torch.Tensor]], str],
+        logger: logging.Logger,
+    ) -> None:
+        self._output_dir = output_dir
+        self._shard_size = shard_size
+        self._write_shard_fn = write_shard_fn
+        self._logger = logger
+        self._shard_index = start_shard_index
+        self._chunks: list[dict[str, torch.Tensor]] = []
+        self._buffered = 0
+
+    def _flush(self, max_samples: int | None = None) -> None:
+        if self._buffered == 0:
+            return
+        samples_to_write = self._buffered if max_samples is None else min(self._buffered, max_samples)
+        merged = {k: torch.cat([c[k] for c in self._chunks], dim=0) for k in self._chunks[0]}
+        shard = {k: v[:samples_to_write] for k, v in merged.items()}
+        path = self._write_shard_fn(self._output_dir, self._shard_index, shard)
+        self._logger.info("Wrote %s (%d samples)", path, shard["input_ids"].shape[0])
+        remainder = {k: v[samples_to_write:] for k, v in merged.items()}
+        remaining = self._buffered - samples_to_write
+        self._chunks = [remainder] if remaining else []
+        self._buffered = remaining
+        self._shard_index += 1
+
+    def add(self, batch_cache: dict[str, torch.Tensor]) -> None:
+        """Append one computed batch, flushing whole shards as they fill."""
+        self._chunks.append(batch_cache)
+        self._buffered += batch_cache["input_ids"].shape[0]
+        while self._buffered >= self._shard_size:
+            self._flush(self._shard_size)
+
+    def finalize(self) -> None:
+        """Write the trailing partial shard, if any."""
+        self._flush()
 
 
 def write_cache_shards(
@@ -264,29 +325,116 @@ def write_cache_shards(
     logger: logging.Logger,
 ) -> None:
     """Run a precompute loop and write sequential cache shards."""
-    shard_index = start_shard_index
-    chunks: list[dict[str, torch.Tensor]] = []
-    buffered = 0
-
-    def _flush(max_samples: int | None = None) -> None:
-        nonlocal shard_index, chunks, buffered
-        if buffered == 0:
-            return
-        samples_to_write = buffered if max_samples is None else min(buffered, max_samples)
-        merged = {k: torch.cat([c[k] for c in chunks], dim=0) for k in chunks[0]}
-        shard = {k: v[:samples_to_write] for k, v in merged.items()}
-        path = write_shard_fn(output_dir, shard_index, shard)
-        logger.info("Wrote %s (%d samples)", path, shard["input_ids"].shape[0])
-        remainder = {k: v[samples_to_write:] for k, v in merged.items()}
-        remaining = buffered - samples_to_write
-        chunks = [remainder] if remaining else []
-        buffered = remaining
-        shard_index += 1
-
+    accumulator = _ShardAccumulator(
+        output_dir=output_dir,
+        shard_size=shard_size,
+        start_shard_index=start_shard_index,
+        write_shard_fn=write_shard_fn,
+        logger=logger,
+    )
     for batch in dataloader:
-        chunks.append(compute_batch(batch))
-        buffered += batch["input_ids"].shape[0]
-        while buffered >= shard_size:
-            _flush(shard_size)
+        accumulator.add(compute_batch(batch))
+    accumulator.finalize()
 
-    _flush()
+
+def partition_cache_shards(num_samples: int, shard_size: int, world_size: int, rank: int) -> tuple[int, int, int]:
+    """Assign a contiguous, shard-aligned block of samples to ``rank``.
+
+    Splits the ``ceil(num_samples / shard_size)`` shards into contiguous runs across
+    ``world_size`` ranks (the first ``total_shards % world_size`` ranks take one
+    extra shard). Because the split is on whole shards, every shard is owned by
+    exactly one rank, so ranks can write straight into a shared output directory
+    with global shard indices and no cross-rank overlap. Ranks that receive no
+    shards (when ``total_shards < world_size``) get ``num_local_samples == 0``.
+
+    Returns ``(start_shard_index, start_sample, num_local_samples)``.
+    """
+    if world_size < 1:
+        raise ValueError(f"world_size must be >= 1, got {world_size}")
+    if not 0 <= rank < world_size:
+        raise ValueError(f"rank={rank} must be in [0, {world_size}).")
+    total_shards = (num_samples + shard_size - 1) // shard_size
+    base, remainder = divmod(total_shards, world_size)
+    num_local_shards = base + (1 if rank < remainder else 0)
+    start_shard_index = rank * base + min(rank, remainder)
+    start_sample = start_shard_index * shard_size
+    end_sample = min((start_shard_index + num_local_shards) * shard_size, num_samples)
+    num_local_samples = max(0, end_sample - start_sample)
+    return start_shard_index, start_sample, num_local_samples
+
+
+def write_cache_shards_distributed(
+    *,
+    dataloader: DataLoader,
+    output_dir: str,
+    shard_size: int,
+    world_size: int,
+    rank: int,
+    compute_batch: Callable[[dict[str, torch.Tensor]], dict[str, torch.Tensor]],
+    write_shard_fn: Callable[[str, int, dict[str, torch.Tensor]], str],
+    logger: logging.Logger,
+    sync_max_steps: Callable[[int], int] | None = None,
+) -> None:
+    """Distributed precompute loop: each rank writes its contiguous shard block.
+
+    The target model is sharded across all ranks (expert-parallel / FSDP), so every
+    ``compute_batch`` call is a collective that all ranks must enter the same number
+    of times. This rank forwards its own contiguous slice of the dataset (a different
+    slice per rank -- pure data parallelism, which the MoE all-to-all routes tokens
+    for), and pads its step count up to the global maximum with dummy forwards whose
+    output is discarded, keeping the collectives in lockstep.
+
+    Writes are idempotent (atomic replace), so re-running after a partial failure
+    safely recomputes and overwrites rather than resuming. ``sync_max_steps`` reduces
+    the per-rank step count to the global max across ranks (an all-reduce MAX); it
+    defaults to the identity for a single-process run.
+    """
+    dataset = dataloader.dataset
+    collate_fn = getattr(dataloader, "collate_fn", None)
+    batch_size = int(getattr(dataloader, "batch_size", None) or 1)
+    num_samples = len(dataset)
+
+    start_shard_index, start_sample, num_local_samples = partition_cache_shards(
+        num_samples, shard_size, world_size, rank
+    )
+    local_steps = (num_local_samples + batch_size - 1) // batch_size
+    global_steps = local_steps if sync_max_steps is None else sync_max_steps(local_steps)
+
+    logger.info(
+        "Rank %d/%d: samples [%d, %d) -> shards from %d (%d local samples, %d/%d steps)",
+        rank,
+        world_size,
+        start_sample,
+        start_sample + num_local_samples,
+        start_shard_index,
+        num_local_samples,
+        local_steps,
+        global_steps,
+    )
+
+    local_loader = None
+    if num_local_samples > 0:
+        local_loader = _sequential_subset_loader(dataloader, start_sample, start_sample + num_local_samples)
+
+    accumulator = _ShardAccumulator(
+        output_dir=output_dir,
+        shard_size=shard_size,
+        start_shard_index=start_shard_index,
+        write_shard_fn=write_shard_fn,
+        logger=logger,
+    )
+    local_iter = iter(local_loader) if local_loader is not None else iter(())
+    # A single-sample dummy batch (index 0 exists on every rank because the dataset is
+    # identical across ranks) feeds the padding forwards that keep collectives aligned;
+    # its computed output is never written. Built lazily: only ranks that must pad need
+    # it, and an empty dataset (global_steps == 0) has no index 0 to read.
+    dummy_batch = None
+    for _ in range(global_steps):
+        real_batch = next(local_iter, None)
+        if real_batch is None and dummy_batch is None:
+            dummy_batch = collate_fn([dataset[0]]) if collate_fn is not None else dataset[0]
+        batch = real_batch if real_batch is not None else dummy_batch
+        batch_cache = compute_batch(batch)
+        if real_batch is not None:
+            accumulator.add(batch_cache)
+    accumulator.finalize()

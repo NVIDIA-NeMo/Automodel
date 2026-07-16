@@ -55,10 +55,20 @@ class TrainJetSpecRecipe(TrainDFlashRecipe):
 
     def _build_target_wrapper(self, target_layer_ids: list[int]) -> HFDFlashTargetModel:
         """Capture the target's full-vocab logits too -- JetSpec distills against them."""
-        return HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids, capture_logits=True)
+        return HFDFlashTargetModel(
+            self.target_model,
+            target_layer_ids=target_layer_ids,
+            capture_logits=True,
+            cp_mesh=getattr(self, "cp_mesh", None),
+        )
 
     def _build_trainer_module(self, attention_backend: str, recipe_cfg):
         """Build the JetSpec trainer wrapper (causal parallel drafting + forward-KL)."""
+        if (recipe_cfg.get("loss_type", None) or "dflash") != "dflash":
+            raise ValueError(
+                "loss_type is only supported by the DFlash recipe; the JetSpec trainer has its own "
+                "forward-KL objective and would silently ignore it."
+            )
         return JetSpecTrainerModule(
             draft_model=self.draft_model,
             target_lm_head=self.target_model.get_output_embeddings(),
@@ -78,6 +88,9 @@ class TrainJetSpecRecipe(TrainDFlashRecipe):
             hidden_states=target_batch.hidden_states,
             loss_mask=target_batch.loss_mask,
             target_logits=target_batch.logits,
+            position_ids=target_batch.position_ids,
+            seq_lens=target_batch.seq_lens,
+            doc_remaining=target_batch.doc_remaining,
         )
         self._last_jetspec_metrics = metrics
         return metrics

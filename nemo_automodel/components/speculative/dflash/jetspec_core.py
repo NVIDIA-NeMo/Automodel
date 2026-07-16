@@ -47,17 +47,13 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.attention.dflash_mask import (
-    create_dflash_block_mask,
-    create_dflash_sdpa_mask,
-)
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.components.speculative.dflash.core import (
     DFlashTrainerModule,
     NoValidAnchorsError,
     _to_full_tensor,
+    compute_acceptance_stats,
 )
-from nemo_automodel.components.speculative.dflash.domino_core import compute_accept_len
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 # Ignore index marking non-supervised draft positions in the KD labels tensor.
@@ -73,12 +69,26 @@ class JetSpecStepMetrics:
     expected accepted-prefix length per block (a greedy acceptance-length / tau
     proxy), which is the headline quantity for speculative decoding -- far more
     informative than the depth-averaged token accuracy.
+
+    Attributes:
+        loss: Scalar tensor containing the differentiable forward-KL loss.
+        loss_weight: Scalar tensor containing the effective loss denominator.
+        accuracy: Scalar tensor containing greedy draft-to-target agreement.
+        valid_tokens: Scalar tensor containing the supervised-token count.
+        correct_tokens: Scalar tensor containing the greedy-agreement count.
+        accept_len: Scalar tensor containing mean bonus-token-inclusive acceptance length.
+        accept_len_sum: Scalar tensor containing the additive acceptance-length sum.
+        valid_blocks: Scalar tensor containing the number of evaluated draft blocks.
     """
 
     loss: torch.Tensor
+    loss_weight: torch.Tensor
     accuracy: torch.Tensor
     valid_tokens: torch.Tensor
+    correct_tokens: torch.Tensor
     accept_len: torch.Tensor
+    accept_len_sum: torch.Tensor
+    valid_blocks: torch.Tensor
 
 
 class JetSpecTrainerModule(DFlashTrainerModule):
@@ -142,18 +152,34 @@ class JetSpecTrainerModule(DFlashTrainerModule):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_logits: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> JetSpecStepMetrics:
         """Causal parallel block-wise forward with a forward-KL distillation loss.
 
         ``target_logits`` is the frozen target's full-vocab logits ``[B, S, V]``
         (captured by ``HFDFlashTargetModel(capture_logits=True)``); it supplies the
-        teacher distribution for every supervised draft position.
+        teacher distribution for every supervised draft position. Under sequence
+        packing (``position_ids`` / ``seq_lens`` / ``doc_remaining``, see
+        ``DFlashTrainerModule.forward``) the target runs block-causal, so the
+        teacher logits gathered below are document-local, and the anchor sampling
+        keeps every gathered teacher position (up to ``anchor + block_size - 2``)
+        inside the anchor's document.
         """
         bsz, seq_len = input_ids.shape
-        device = input_ids.device
         bs = self.block_size
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(seq_len, loss_mask, device)
+        anchor_positions, block_keep_mask, noise_embedding, full_position_ids, attn_mask, _ = (
+            self._prepare_block_inputs(
+                input_ids,
+                loss_mask,
+                position_ids=position_ids,
+                seq_lens=seq_lens,
+                doc_remaining=doc_remaining,
+                causal=True,
+            )
+        )
         n = anchor_positions.size(1)
         label_indices, target_ids, block_mask = self._build_block_targets(
             input_ids, loss_mask, anchor_positions, block_keep_mask, seq_len
@@ -166,18 +192,6 @@ class JetSpecTrainerModule(DFlashTrainerModule):
             # Anchors exist but none has a supervised continuation (every predicted
             # position is loss-masked); nothing to distill. Skip like a short batch.
             raise NoValidAnchorsError("No supervised draft positions in this batch.")
-
-        noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
-        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-
-        if self.attention_backend == "flex_attention":
-            attn_mask = create_dflash_block_mask(anchor_positions, block_keep_mask, seq_len, bs, device, causal=True)
-        else:
-            attn_mask = create_dflash_sdpa_mask(
-                anchor_positions, block_keep_mask, seq_len, bs, device, dtype=noise_embedding.dtype, causal=True
-            )
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
@@ -205,7 +219,8 @@ class JetSpecTrainerModule(DFlashTrainerModule):
             # when the training data was regenerated by a different model.
             draft_ids = student_logits.argmax(dim=-1)
             target_ids = teacher_logits.argmax(dim=-1)
-            accuracy = ((draft_ids == target_ids) & valid).sum().float() / valid_tokens.clamp_min(1).float()
+            correct_tokens = ((draft_ids == target_ids) & valid).sum()
+            accuracy = correct_tokens.float() / valid_tokens.clamp_min(1).float()
 
             # Expected accepted-prefix length per block (a tau proxy): consecutive
             # draft==target matches from the first drafted depth, +1 for the always
@@ -215,13 +230,15 @@ class JetSpecTrainerModule(DFlashTrainerModule):
             d4 = draft_ids.view(bsz, n, bs - 1)
             t4 = target_ids.view(bsz, n, bs - 1)
             v4 = valid.view(bsz, n, bs - 1)
-            block_accept = compute_accept_len(d4, t4, v4)  # [B, N]
-            valid_block = v4.any(dim=2)
-            accept_len = ((block_accept + 1.0) * valid_block).sum() / valid_block.sum().clamp_min(1).float()
+            accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(d4, t4, v4)
 
         return JetSpecStepMetrics(
             loss=loss,
+            loss_weight=valid_tokens.detach(),
             accuracy=accuracy.detach(),
             valid_tokens=valid_tokens.detach(),
+            correct_tokens=correct_tokens.detach(),
             accept_len=accept_len.detach(),
+            accept_len_sum=accept_len_sum.detach(),
+            valid_blocks=valid_blocks.detach(),
         )

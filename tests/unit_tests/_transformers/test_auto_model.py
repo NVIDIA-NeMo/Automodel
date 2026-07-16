@@ -28,6 +28,7 @@ from nemo_automodel._transformers.auto_model import (
     _consume_config_overrides,
     _get_next_fallback_attn,
     _init_model,
+    _maybe_reject_tie_word_embeddings_flip,
     _patch_attention,
     _patch_remote_code_compat,
     _resolve_distributed_setup,
@@ -2008,3 +2009,67 @@ class TestPatchRemoteCodeCompat:
         # Existing values should be preserved
         assert model.all_tied_weights_keys == ["existing.key"]
         assert model.config.use_cache is True
+
+
+class TestMaybeRejectTieWordEmbeddingsFlip:
+    """Layer 2 from_pretrained flip guard (_maybe_reject_tie_word_embeddings_flip).
+
+    from_pretrained accepts str | os.PathLike sources, so the guard must normalize
+    path-like inputs with os.fspath() and enforce the checkpoint's raw
+    tie_word_embeddings for both — a pathlib.Path local checkpoint must not bypass
+    the check. Non-path sources are skipped and a failed raw-config re-read is
+    conservative (never blocks the load).
+    """
+
+    @staticmethod
+    def _requested_config(tied):
+        return types.SimpleNamespace(tie_word_embeddings=tied, architectures=["DummyForCausalLM"])
+
+    @staticmethod
+    def _patch_raw_config(**kwargs):
+        return patch(
+            "nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained",
+            **kwargs,
+        )
+
+    def test_str_source_flip_rejected(self):
+        raw = types.SimpleNamespace(tie_word_embeddings=True)
+        with self._patch_raw_config(return_value=raw):
+            with pytest.raises(NotImplementedError, match="flipping the flag is not supported"):
+                _maybe_reject_tie_word_embeddings_flip("org/tied-model", self._requested_config(tied=False), {})
+
+    def test_pathlib_path_source_flip_rejected(self):
+        from pathlib import Path
+
+        raw = types.SimpleNamespace(tie_word_embeddings=True)
+        with self._patch_raw_config(return_value=raw):
+            with pytest.raises(NotImplementedError, match="flipping the flag is not supported"):
+                _maybe_reject_tie_word_embeddings_flip(
+                    Path("/ckpts/tied-model"), self._requested_config(tied=False), {}
+                )
+
+    def test_pathlib_path_source_matching_value_passes(self):
+        from pathlib import Path
+
+        raw = types.SimpleNamespace(tie_word_embeddings=True)
+        with self._patch_raw_config(return_value=raw):
+            _maybe_reject_tie_word_embeddings_flip(Path("/ckpts/tied-model"), self._requested_config(tied=True), {})
+
+    def test_pathlib_path_normalized_to_str_for_raw_read(self):
+        from pathlib import Path
+
+        raw = types.SimpleNamespace(tie_word_embeddings=True)
+        with self._patch_raw_config(return_value=raw) as mock_from_pretrained:
+            _maybe_reject_tie_word_embeddings_flip(Path("/ckpts/tied-model"), self._requested_config(tied=True), {})
+        (source,) = mock_from_pretrained.call_args.args
+        assert isinstance(source, str)
+        assert source == str(Path("/ckpts/tied-model"))
+
+    def test_non_path_source_skipped(self):
+        with self._patch_raw_config() as mock_from_pretrained:
+            _maybe_reject_tie_word_embeddings_flip(None, self._requested_config(tied=False), {})
+        mock_from_pretrained.assert_not_called()
+
+    def test_raw_config_read_failure_does_not_block(self):
+        with self._patch_raw_config(side_effect=OSError("offline")):
+            _maybe_reject_tie_word_embeddings_flip("org/unreachable", self._requested_config(tied=False), {})
