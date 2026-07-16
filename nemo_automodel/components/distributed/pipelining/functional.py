@@ -18,6 +18,7 @@ import inspect
 import logging
 import math
 import os
+import time
 import types
 from typing import Callable, Optional, Protocol
 
@@ -373,6 +374,67 @@ def _precompute_stage_shapes(
     )
 
 
+def _warmup_pipeline_stage_neighbors(stage: PipelineStage) -> None:
+    """Initialize the pairwise NCCL communicators used by a pipeline stage."""
+    warmup_tensor = torch.zeros(1, device=stage.device)
+    group_rank = stage.group.rank()
+    group_ranks = torch.distributed.get_process_group_ranks(stage.group)
+    local_world_size = max(torch.cuda.device_count(), 1)
+
+    # Stagger PP replicas by their first node to avoid overloading NCCL communicator bootstrap.
+    time.sleep(2 * (min(group_ranks) // local_world_size))
+
+    edges = {(rank, rank + 1) for rank in range(stage.group_size - 1)}
+    if stage.group_size > 2:
+        edges.add((0, stage.group_size - 1))
+
+    edge_phases: list[list[tuple[int, int]]] = []
+    phase_ranks: list[set[int]] = []
+    for edge in sorted(edges):
+        for phase, ranks in zip(edge_phases, phase_ranks):
+            if ranks.isdisjoint(edge):
+                phase.append(edge)
+                ranks.update(edge)
+                break
+        else:
+            edge_phases.append([edge])
+            phase_ranks.append(set(edge))
+
+    for phase in edge_phases:
+        for reverse in (False, True):
+            for lower_rank, higher_rank in phase:
+                src_rank, dst_rank = (higher_rank, lower_rank) if reverse else (lower_rank, higher_rank)
+                if group_rank == src_rank:
+                    torch.distributed.isend(warmup_tensor, group=stage.group, group_dst=dst_rank).wait()
+                elif group_rank == dst_rank:
+                    torch.distributed.irecv(warmup_tensor, group=stage.group, group_src=src_rank).wait()
+
+    torch.cuda.synchronize(stage.device)
+
+
+def _use_static_pipeline_stage_metadata(schedule: _PipelineSchedule, stages: list[PipelineStage]) -> None:
+    """Select static metadata when every Torch 2.12 pipeline stage supports it."""
+    try:
+        from torch.distributed.pipelining._utils import InferenceMode
+
+        inspect.getattr_static(schedule, "_warmup_p2p")
+        stage_metas = [inspect.getattr_static(stage, "_user_meta") for stage in stages]
+    except (AttributeError, ImportError):
+        return
+
+    has_backward = getattr(schedule, "_has_backward", True)
+    if any(InferenceMode.needs_dynamic(stage_meta, has_backward) for stage_meta in stage_metas):
+        return
+
+    def _warmup_static_stages(self, pipeline_stages, has_backward, p2p_done) -> None:
+        del self, has_backward, p2p_done
+        for stage in pipeline_stages:
+            stage._inference_mode = InferenceMode.STATIC
+
+    schedule._warmup_p2p = types.MethodType(_warmup_static_stages, schedule)
+    logger.info("Using static pipeline metadata with preinitialized neighbor P2P communicators")
+
+
 def reset_pp_stage_shapes(
     schedule: _PipelineSchedule,
     stages: list[PipelineStage],
@@ -408,12 +470,18 @@ def reset_pp_stage_shapes(
             stage.inputs_meta = None
 
         # PyTorch 2.12 stores runtime metadata separately from user-provided metadata.
-        stage_meta = getattr(stage, "_stage_meta", None)
-        if stage_meta is not None:
-            stage_meta.inputs = None
-            stage_meta.outputs = None
-            stage_meta.input_grads = None
-            stage_meta.output_grads = None
+        for stage_meta_name in ("_stage_meta", "_user_meta"):
+            stage_meta = getattr(stage, stage_meta_name, None)
+            if stage_meta is not None:
+                stage_meta.inputs = None
+                stage_meta.outputs = None
+                stage_meta.input_grads = None
+                stage_meta.output_grads = None
+        if hasattr(stage, "_inference_mode"):
+            stage._inference_mode = None
+        for attr_name in ("_fwd_outputs_for_bwd_meta", "_fwd_inputs_for_bwd_meta", "_fwd_kwargs_tensors_for_bwd_meta"):
+            if hasattr(stage, attr_name):
+                setattr(stage, attr_name, None)
         # Clear pre-allocated recv/send buffers; they will be reallocated by _prepare_forward_infra
         stage.args_recv_info = {}
         stage.grad_recv_info = {}
@@ -837,6 +905,9 @@ def pipeline_model(
             model_parts[i] = m
             stages[i].submod = m
 
+    if seq_len is not None:
+        _warmup_pipeline_stage_neighbors(stages[0])
+
     # Precompute stage shapes to bypass serial P2P shape inference.
     # This must happen *after* parallelization so that dtypes are final.
     if seq_len is not None:
@@ -852,6 +923,8 @@ def pipeline_model(
         loss_fn,
         scale_grads=scale_grads,
     )
+    if seq_len is not None:
+        _use_static_pipeline_stage_metadata(pp_schedule, stages)
 
     # Patch FSDP backward for MoE models, or when per-microbatch grad reduce-scatter
     # is requested (mapped from surface-level defer_fsdp_grad_sync=False for memory

@@ -28,8 +28,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Replicate
 from transformers.cache_utils import DynamicCache
 from transformers.masking_utils import (
     create_causal_mask,
@@ -258,38 +256,6 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
             head_dtype = self.lm_head.weight.dtype
             outputs_meta = (torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=head_dtype),)
         return inputs_meta, outputs_meta
-
-    @staticmethod
-    @torch.no_grad()
-    def warmup_process_groups(
-        model_parts: list[nn.Module],
-        *,
-        pp_mesh: DeviceMesh | None = None,
-    ) -> None:
-        """Initialize gradient-norm communicators before peak-memory backward."""
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            return
-
-        process_groups = {}
-        for model_part in model_parts:
-            for parameter in model_part.parameters():
-                if not parameter.requires_grad or not isinstance(parameter, DTensor):
-                    continue
-                for dim_idx, placement in enumerate(parameter.placements):
-                    if not isinstance(placement, Replicate):
-                        group = parameter.device_mesh.get_group(mesh_dim=dim_idx)
-                        process_groups.setdefault(id(group), group)
-
-        if pp_mesh is not None:
-            group = pp_mesh.get_group()
-            process_groups.setdefault(id(group), group)
-
-        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-        value = torch.zeros((), dtype=torch.float32, device=device)
-        for group in process_groups.values():
-            torch.distributed.all_reduce(value, group=group)
-        if process_groups and device.type == "cuda":
-            torch.cuda.synchronize(device)
 
     def forward(
         self,

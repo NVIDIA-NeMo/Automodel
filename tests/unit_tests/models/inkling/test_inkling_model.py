@@ -15,7 +15,6 @@
 """Unit tests for the NeMo AutoModel Inkling MoE VLM implementation."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import torch
 import torch.nn.functional as F
@@ -104,38 +103,6 @@ def test_processor_builder_configures_padding(monkeypatch):
     assert actual is expected
     assert tokenizer.eos_token == "<|content_model_end_sampling|>"
     assert tokenizer.pad_token == tokenizer.eos_token
-
-
-def test_process_group_warmup_uses_sharded_and_pipeline_groups(monkeypatch):
-    import nemo_automodel.components.models.inkling.model as inkling_model
-
-    class FakeDTensor:
-        def __init__(self, mesh, placements):
-            self.device_mesh = mesh
-            self.placements = placements
-            self.requires_grad = True
-
-    shard_group = object()
-    replicated_group = object()
-    pp_group = object()
-    mesh = Mock()
-    mesh.get_group.side_effect = lambda mesh_dim: (replicated_group, shard_group)[mesh_dim]
-    pp_mesh = Mock()
-    pp_mesh.get_group.return_value = pp_group
-    model_part = Mock()
-    model_part.parameters.return_value = [
-        FakeDTensor(mesh, (torch.distributed.tensor.Replicate(), Mock())),
-    ]
-
-    all_reduce = Mock()
-    monkeypatch.setattr(inkling_model, "DTensor", FakeDTensor)
-    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-
-    inkling_model.InklingForConditionalGeneration.warmup_process_groups([model_part], pp_mesh=pp_mesh)
-
-    assert [call.kwargs["group"] for call in all_reduce.call_args_list] == [shard_group, pp_group]
 
 
 def test_inkling_collator_does_not_require_qwen_vl_utils(monkeypatch):
