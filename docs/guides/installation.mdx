@@ -8,10 +8,10 @@ This guide explains how to install NeMo AutoModel for LLM, VLM, and OMNI models 
 | Method                  | Dev Mode | Use Case                                                          | Recommended For             |
 | ----------------------- | ---------|----------------------------------------------------------------- | ---------------------------- |
 | 📦 **PyPI**             | - | Install stable release with minimal setup                         | Most users, production usage |
-| 🐳 **Docker**           | - | Use in isolated GPU environments, e.g., with NeMo container       | Multi-node deployments     |
-| 🐍 **Git Repo**         | ✅ | Use the latest code without cloning or installing extras manually | Power users, testers         |
+| 🐳 **Docker**           | - | Use a preconfigured, isolated CUDA userspace environment          | Multi-node deployments     |
+| 🐍 **Git Repo**         | ✅ | Install the latest base package directly from Git; select extras explicitly | Power users, testers         |
 | 🧪 **Editable Install** | ✅ | Contribute to the codebase or make local modifications            | Contributors, researchers    |
-| 🐳 **Docker + Mount**   | ✅ | Use in isolated GPU environments, e.g., with NeMo container       | Multi-node deployments     |
+| 🐳 **Docker + Mount**   | ✅ | Develop against mounted source with container-provided CUDA dependencies | Multi-node deployments     |
 
 ## Choose Your Installation Method
 
@@ -21,7 +21,7 @@ Pick the installation method that matches your needs and platform.
 
 | Method | Best For | Pros | Cons |
 |--------|----------|------|------|
-| **Docker Container** | Production, multi-node, Debian-based systems | Reproducible environment, pre-configured dependencies, GPU driver isolation | Larger download size, container overhead |
+| **Docker Container** | Production, multi-node, Debian-based systems | Reproducible environment, preconfigured CUDA userspace and dependencies | Requires a compatible host NVIDIA driver; larger download size and container overhead |
 | **virtualenv (PyPI/Git)** | Local development, quick prototyping, macOS | Fast setup, lightweight, direct code access | Manual dependency management, platform-specific issues |
 
 ### When to Use Docker Containers
@@ -30,9 +30,9 @@ Use Docker containers when you need:
 
 - **Multi-node deployments**: Containers ensure consistency across cluster nodes
 - **Production environments**: Reproducible builds with tested dependency versions
-- **GPU driver compatibility**: Isolates CUDA/driver versions from host system
+- **CUDA userspace isolation**: Containers supply CUDA libraries and dependencies, but use the host NVIDIA driver; the driver must support the CUDA runtime in the container
 - **Debian-based systems**: Recommended for Ubuntu, Debian, and derivatives due to dependency complexity
-- **Complex dependencies**: Pre-configured environment with all optimizations (TransformerEngine, DeepEP, etc.)
+- **Complex dependencies**: Preconfigured environment with optimized CUDA packages such as TransformerEngine and DeepEP
 - **Team consistency**: Same environment across development, testing, and production
 
 ### When to Use virtualenv
@@ -43,7 +43,7 @@ Use virtualenv (PyPI, Git, or editable install) when you need:
 - **Quick prototyping**: Minimal setup for experimentation
 - **macOS systems**: Better native support without container overhead
 - **Frequent code changes**: Contributors working on the codebase (use editable install)
-- **Compatible GPU drivers**: System has correct CUDA toolkit and drivers installed
+- **Compatible GPU drivers**: The host driver supports the CUDA runtime selected by PyTorch
 - **Lightweight setup**: Minimal disk space and memory footprint
 
 ### Platform-Specific Recommendations
@@ -61,14 +61,17 @@ docker run --gpus all -it --rm --shm-size=8g nvcr.io/nvidia/nemo-automodel:26.06
 
 **Alternative: virtualenv** (if Docker is not available)
 
-Ensure CUDA 11.8+ and compatible drivers are installed:
+Ensure the host NVIDIA driver supports the CUDA runtime selected by your
+installation. The current source lock selects PyTorch `cu130` wheels on Linux;
+prebuilt wheels do not require a separately installed CUDA toolkit.
 
 ```bash
-# Check CUDA version
+# Check the installed driver and its maximum supported CUDA version.
 nvidia-smi
 
-# Install via PyPI
-pip3 install nemo-automodel
+# Create an environment and install via PyPI.
+uv venv
+uv pip install "nemo-automodel"
 ```
 
 #### Linux (RHEL, CentOS, Fedora)
@@ -86,11 +89,9 @@ Follow the same Docker commands as Debian-based systems above.
 Docker on macOS has GPU limitations. Use native Python installation:
 
 ```bash
-# Using PyPI
-pip3 install nemo-automodel
-
-# Or using uv for reproducible environments
-uv pip install nemo-automodel
+# Create a local environment and install from PyPI.
+uv venv
+uv pip install "nemo-automodel"
 ```
 
 <Note>
@@ -115,7 +116,7 @@ Install directly in WSL2 Ubuntu environment (follow Debian instructions).
 
 **GPU driver compatibility errors**
 - **Problem**: CUDA version mismatch between host and application
-- **Solution**: Use Docker container to isolate driver versions
+- **Solution**: Update the host NVIDIA driver to support the CUDA runtime in the selected wheel or container, or select a runtime compatible with the installed driver. Docker does not replace or isolate the host GPU driver
 
 **Dependency conflicts on Debian/Ubuntu**
 - **Problem**: System packages conflict with Python packages
@@ -133,7 +134,9 @@ Install directly in WSL2 Ubuntu environment (follow Debian instructions).
 
 ### System Requirements
 - **Python**: 3.10 or higher
-- **CUDA**: 11.8 or higher (for GPU support)
+- **GPU runtime**: The current source lock selects PyTorch `cu130` wheels on Linux, while the current container build uses a CUDA 13.2 development image. These are separate installation artifacts, not a blanket CUDA 11.8+ requirement
+- **NVIDIA driver**: For GPU execution, the host driver must support the CUDA runtime shipped by the selected PyTorch wheel or container
+- **CUDA toolkit**: A host toolkit is not required for prebuilt wheels or containers. Install one only when building CUDA extensions from source, and match it to the selected PyTorch or container runtime
 - **Memory**: Minimum 16GB RAM, 32GB+ recommended
 - **Storage**: At least 50GB free space for models and datasets
 
@@ -144,19 +147,27 @@ Install directly in WSL2 Ubuntu environment (follow Debian instructions).
 - **Network**: Stable internet connection for downloading models
 
 ## Installation Options for Non-Developers
-This section explains the easiest installation options for non-developers, including using pip3 via PyPI or leveraging a preconfigured NVIDIA NeMo Docker container. Both methods offer quick access to the latest stable release of NeMo AutoModel with all required dependencies.
+This section explains the easiest installation options for non-developers, including using `uv` with PyPI or leveraging a preconfigured NVIDIA NeMo Docker container. Both methods offer quick access to a stable NeMo AutoModel installation and its base dependency set.
 
 ### Install via PyPI (Recommended)
 
-For most users, the easiest way to get started is using `pip3`.
+For most users, the easiest way to get started is using `uv`:
 
 ```bash
-pip3 install nemo-automodel
+uv venv
+uv pip install "nemo-automodel"
 ```
 <Tip>
 This installs the latest stable release of NeMo AutoModel from PyPI.
 
-To verify the install, run `python -c "import nemo_automodel; print(nemo_automodel.__version__)"`. See [nemo-automodel on PyPI](https://pypi.org/project/nemo-automodel/).
+To verify the install in the environment:
+
+```bash
+uv run --no-project python -c \
+  "import nemo_automodel; print(nemo_automodel.__version__)"
+```
+
+See [nemo-automodel on PyPI](https://pypi.org/project/nemo-automodel/).
 
 </Tip>
 
@@ -192,7 +203,7 @@ docker run --gpus all -it --rm \
 </Info>
 
 <Tip>
-**Models that require CUDA-specific packages (e.g., Nemotron).** Some model families—such as Nemotron Nano and Nemotron Flash—depend on packages like `mamba-ssm` and `causal-conv1d` that must be compiled against a matching CUDA toolkit. Installing these from source on a bare-metal host can be error-prone. The NeMo Automodel Docker container ships with these dependencies pre-built, so **using the container is the recommended approach** for fine-tuning Nemotron and other models with similar requirements.
+**Models that require CUDA-specific packages (e.g., Nemotron).** Some model families—such as Nemotron Nano and Nemotron Flash—depend on packages like `mamba-ssm` and `causal-conv1d`. If these packages are built from source, the build requires a CUDA toolkit that matches the selected PyTorch runtime. The NeMo Automodel Docker container ships with these dependencies pre-built, so **using the container is the recommended approach** for fine-tuning Nemotron and other models with similar requirements.
 
 </Tip>
 
@@ -205,21 +216,21 @@ This section provides installation options for developers, including pulling the
 
 If you want the **latest features** from the `main` branch or want to contribute:
 
-#### Option A – Use `pip` With Git Repo
+#### Use `uv` With Git Repo
 ```bash
-pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git
+# Create the environment before using uv pip in a clean directory.
+uv venv
+
+# Install the base package.
+uv pip install "nemo-automodel @ git+https://github.com/NVIDIA-NeMo/Automodel.git"
+
+# Or request the standard extras bundle in the requirement spec.
+uv pip install "nemo-automodel[all] @ git+https://github.com/NVIDIA-NeMo/Automodel.git"
 ```
 <Note>
-This installs the repo as a standard Python package (not editable).
-
-</Note>
-
-#### Option B – Use `uv` With Git Repo
-```bash
-uv pip install git+https://github.com/NVIDIA-NeMo/Automodel.git
-```
-<Note>
-`uv` handles virtual environment transparently and enables more reproducible installs.
+`uv venv` creates `.venv`; subsequent `uv pip` commands in this directory use
+that environment. The first Git requirement installs only the base dependencies;
+optional extras are installed only when the requirement includes an extras list.
 
 </Note>
 
@@ -230,11 +241,11 @@ To contribute or modify the code:
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
-pip3 install -e .
+uv sync --locked --all-groups --extra all
 ```
 
 <Note>
-This installs AutoModel in editable mode, so changes to the code are immediately reflected in Python.
+`uv sync` installs AutoModel in editable mode, so changes to the code are immediately reflected in Python.
 
 </Note>
 
@@ -270,36 +281,65 @@ The `update_pyproject_pytorch.sh` step is required. Without it, `uv sync` tries 
 
 NeMo AutoModel provides several install extras for different use cases.
 
-### Full Install (default)
+### Base Install (default)
 
-Installs the core library with all LLM training dependencies (PyTorch, CUDA, etc.):
-
-```bash
-pip3 install nemo-automodel
-```
-
-### CLI-Only Install (Login Nodes)
-
-If you only need to **submit jobs** from a login node or CI environment (SLURM,
-SkyPilot, NeMo-Run) and do **not** need to run training locally, use the
-lightweight CLI-only install:
+Installs the base library dependencies, including PyTorch. It does not install
+the optional TransformerEngine, Mamba, and other packages in the `cuda` extra:
 
 ```bash
-pip3 install nemo-automodel[cli]
+uv venv
+uv pip install "nemo-automodel"
 ```
 
-This installs only `pyyaml` -- no PyTorch, no CUDA. The `automodel` and `am`
-CLI commands will be available for SLURM and SkyPilot job submission. If you
-also need the NeMo-Run launcher, install it separately (`pip install nemo-run`).
-If you accidentally try to run a local/interactive job with this install, you
-will get a clear error with instructions to install the full package.
+### Extras Reference
+
+The following table covers every optional profile declared by the package.
+"Included in `[all]`" means the complete profile is pulled in by that bundle.
+
+| Extra | Purpose | Included in `[all]` |
+|-------|---------|---------------------|
+| `cli` | NeMo-Run launcher support | Yes |
+| `cuda` | TransformerEngine, Mamba, causal convolution, grouped GEMM, and TileLang CUDA packages | Yes |
+| `cuda_source` | bitsandbytes | No |
+| `delta-databricks` | Delta Lake and Databricks access | Yes |
+| `diffusion` | Diffusion models | Yes |
+| `diffusion_kernels` | Diffusion plus the `kernels` package | No |
+| `extra` | Perceptron and SentencePiece | Yes |
+| `fa` | FlashAttention | No |
+| `ffpa` | FFPA attention | No |
+| `fla` | Flash Linear Attention | Yes |
+| `media` | Union of `vlm-media` and `diffusion-media` | No |
+| `moe` | `cuda`, `fla`, and DeepEP | No; DeepEP is omitted |
+| `msc` | Multi-Storage Client | No |
+| `s3` | Amazon S3 support | Yes |
+| `vlm` | Core vision-language model packages | Yes |
+| `vlm-media` | VLM media decoding and preprocessing | No |
+| `diffusion-media` | Diffusion media preprocessing and export | No |
+| `all` | Standard bundle described below | Bundle |
+
+### CLI and NeMo-Run Extra (Login Nodes)
+
+If your login node or CI environment needs the AutoModel CLI together with the
+NeMo-Run launcher, install the `cli` extra:
+
+```bash
+uv venv
+uv pip install "nemo-automodel[cli]"
+```
+
+The `cli` extra is additive: it installs the normal `nemo-automodel` base
+dependencies, including PyTorch, and adds `nemo-run`. PyYAML is already a base
+dependency and is also listed in the extra. The `automodel` and `am` entry
+points come from the base package, and no separate NeMo-Run installation step
+is required. This extra is not a reduced or CLI-only package profile.
 
 ### VLM Dependencies
 
 For vision-language model training, add the VLM extras:
 
 ```bash
-pip3 install nemo-automodel[vlm]
+uv venv
+uv pip install "nemo-automodel[vlm]"
 ```
 
 <Note>
@@ -309,7 +349,8 @@ Qwen3-Omni, Mistral VLMs, and Nemotron-Omni — additionally require the
 `vlm-media` extra (see [Media Extras](#media-extras-video--image-decode)):
 
 ```bash
-pip3 install "nemo-automodel[vlm,vlm-media]"
+uv venv
+uv pip install "nemo-automodel[vlm,vlm-media]"
 ```
 
 </Note>
@@ -327,56 +368,77 @@ They are opt-in and split by domain:
 | `media` | both of the above | Convenience union |
 
 ```bash
-pip3 install "nemo-automodel[vlm,vlm-media]"              # VLM + media
-pip3 install "nemo-automodel[diffusion,diffusion-media]"  # diffusion + media
+uv venv
+uv pip install "nemo-automodel[vlm,vlm-media]"              # VLM + media
+uv pip install "nemo-automodel[diffusion,diffusion-media]"  # diffusion + media
 ```
 
 <Warning>
 **`[all]` does not include the media extras**, and they are not installed in
 the Docker container by default — FFmpeg is no longer packaged in the container.
-After `pip3 install nemo-automodel[all]` (or inside the container) add media
-explicitly: `pip3 install nemo-automodel[media]`.
+To install the standard bundle together with media in a fresh environment:
+
+```bash
+uv venv
+uv pip install "nemo-automodel[all,media]"
+```
 
 </Warning>
 
 ### CUDA-Specific Packages
 
-For models requiring TransformerEngine, bitsandbytes, Mamba, or other
-CUDA-compiled packages:
+For models requiring TransformerEngine, Mamba, or the other CUDA-compiled
+packages in the `cuda` extra:
 
 ```bash
-pip3 install nemo-automodel[cuda]
+uv venv
+uv pip install "nemo-automodel[cuda]"
 ```
 
-### All Extras
-
-Install all standard extras (CUDA, VLM, NeMo-Run, diffusion, etc.):
+`bitsandbytes` is provided by the separate `cuda_source` extra:
 
 ```bash
-pip3 install nemo-automodel[all]
+uv venv
+uv pip install "nemo-automodel[cuda_source]"
+```
+
+### Standard Extras Bundle
+
+The standard bundle includes exactly `cli`, `cuda`, `delta-databricks`,
+`diffusion`, `extra`, `fla`, `s3`, and `vlm`:
+
+```bash
+uv venv
+uv pip install "nemo-automodel[all]"
 ```
 
 <Note>
-`[all]` intentionally **excludes the media extras** (FFmpeg-bearing). Add them
-explicitly if you need video/image decode:
-`pip3 install nemo-automodel[all,media]`.
+`[all]` excludes `cuda_source`, `diffusion_kernels`, `fa`, `ffpa`, `moe`,
+`msc`, `vlm-media`, `diffusion-media`, and their `media` union. Add the extras
+you need explicitly. The media example above installs `[all]` and `[media]`
+together.
 
 </Note>
 
 <Tip>
-You can combine extras: `pip3 install nemo-automodel[vlm,cuda]`
+You can combine extras:
+
+```bash
+uv venv
+uv pip install "nemo-automodel[vlm,cuda]"
+```
 
 </Tip>
 
 ## Summary
 | Goal                        | Command or Method                                               |
 | --------------------------- | --------------------------------------------------------------- |
-| Stable install (PyPI)       | `pip3 install nemo-automodel`                                   |
-| CLI-only (login nodes)      | `pip3 install nemo-automodel[cli]`                              |
-| VLM + media (Qwen/Mistral/video) | `pip3 install "nemo-automodel[vlm,vlm-media]"`             |
-| Diffusion + media           | `pip3 install "nemo-automodel[diffusion,diffusion-media]"`      |
-| Latest from GitHub          | `pip3 install git+https://github.com/NVIDIA-NeMo/Automodel.git` |
-| Editable install (dev mode) | `pip install -e .` after cloning                                |
-| Run without installing      | Use `PYTHONPATH=$(pwd)` to run scripts                          |
-| Use in Docker container     | Mount repo and `pip install -e .` inside container              |
-| Fast install (using `uv`)   | `uv pip install ...`                                            |
+| Stable install (PyPI)       | `uv venv`, then `uv pip install "nemo-automodel"`              |
+| Base package + NeMo-Run extra | `uv venv`, then `uv pip install "nemo-automodel[cli]"`     |
+| CUDA packages (TransformerEngine, Mamba, etc.) | `uv venv`, then `uv pip install "nemo-automodel[cuda]"` |
+| bitsandbytes                | `uv venv`, then `uv pip install "nemo-automodel[cuda_source]"` |
+| VLM + media (Qwen/Mistral/video) | `uv venv`, then `uv pip install "nemo-automodel[vlm,vlm-media]"` |
+| Diffusion + media           | `uv venv`, then `uv pip install "nemo-automodel[diffusion,diffusion-media]"` |
+| Latest base package from GitHub | `uv venv`, then `uv pip install "nemo-automodel @ git+https://github.com/NVIDIA-NeMo/Automodel.git"` |
+| Editable install (dev mode) | `uv sync --locked --all-groups --extra all` after cloning      |
+| Use mounted source in Docker | Run `update_pyproject_pytorch.sh`, then `uv sync --locked --all-groups --extra all` |

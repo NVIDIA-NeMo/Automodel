@@ -139,6 +139,38 @@ def _extract_mm_kwargs(batch: dict) -> dict:
     return {k: batch[k] for k in _DSPARK_MM_KEYS if k in batch}
 
 
+def _packing_kwargs(batch: dict) -> dict:
+    """Sequence-packing metadata from a dataloader batch (empty dict when unpacked)."""
+    if "seq_lens" not in batch:
+        return {}
+    return {
+        "position_ids": batch["position_ids"],
+        "seq_lens": batch["seq_lens"],
+        "doc_remaining": batch["doc_remaining"],
+    }
+
+
+def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_size: int) -> None:
+    """Reject sequence-packing configs the DSpark path cannot honor (fail fast at setup).
+
+    Context parallelism shards the sequence and strips the block-causal mask packing
+    relies on, and a FlashAttention target packs documents from per-document
+    ``position_ids`` only at batch size 1.
+    """
+    if cp_size > 1:
+        raise NotImplementedError(
+            "Sequence packing (packed_sequence_size>0) is not supported with context parallelism "
+            "(distributed.cp_size>1) in DSpark; CP shards the sequence and strips the block-causal mask "
+            "packing relies on. Set cp_size=1 or packed_sequence_size=0."
+        )
+    if "flash" in target_attn_impl and micro_batch_size > 1:
+        raise ValueError(
+            "Sequence packing with a FlashAttention target requires micro_batch_size=1 "
+            f"(got {micro_batch_size}); set micro_batch_size=1 or load the target with "
+            "attn_implementation='sdpa'."
+        )
+
+
 class _DraftArgs(dict):
     """Dict with attribute access for the per-architecture draft-config builders."""
 
@@ -350,6 +382,17 @@ def _distributed_section_dict(cfg) -> dict:
     return section.to_dict() if hasattr(section, "to_dict") else dict(section)
 
 
+def _add_accept_rate_per_position(
+    metrics: dict[str, float],
+    accept_num: torch.Tensor,
+    accept_den: torch.Tensor,
+) -> None:
+    """Add measured per-position acceptance rates to a metrics dictionary."""
+    for position, (num, den) in enumerate(zip(accept_num.tolist(), accept_den.tolist())):
+        if den > 0:
+            metrics[f"accept_rate@{position}"] = num / den
+
+
 class TrainDSparkRecipe(BaseRecipe):
     """Recipe for DSpark draft-model training on Qwen3, Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 VL targets."""
 
@@ -450,6 +493,14 @@ class TrainDSparkRecipe(BaseRecipe):
             raise ValueError(
                 f"recipe_args.multimodal=true is only supported for a MiniMax M3 VL target "
                 f"(model_type in {_MINIMAX_M3_MODEL_TYPES}), got model_type={target_model_type!r}."
+            )
+        # Sequence packing is supported on the online LLM (text-only) path only; the
+        # VLM and offline-cache paths do not carry the block-causal packing metadata.
+        self.packed_sequence_size = int(recipe_cfg.get("packed_sequence_size", 0) or 0)
+        if self.packed_sequence_size > 0 and (is_multimodal or self.cached_target_path is not None):
+            raise NotImplementedError(
+                "Sequence packing (packed_sequence_size>0) is only supported on the online text-only "
+                "DSpark path; the VLM and cached-target paths do not carry the packing metadata."
             )
 
         # Context parallelism (long-context memory relief): shard only the frozen
@@ -708,6 +759,12 @@ class TrainDSparkRecipe(BaseRecipe):
                         distributed=self.dist_env.world_size > 1,
                     )
             else:
+                if self.packed_sequence_size > 0:
+                    _validate_packing_gates(
+                        cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
+                        target_attn_impl=getattr(self.target_model.config, "_attn_implementation", None) or "",
+                        micro_batch_size=int(recipe_cfg.micro_batch_size),
+                    )
                 self.train_dataloader = build_eagle3_dataloader(
                     data_path=recipe_cfg.train_data_path,
                     tokenizer=self.tokenizer,
@@ -719,6 +776,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     distributed=self.dist_env.world_size > 1,
                     shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                     mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                    packed_sequence_size=self.packed_sequence_size,
                     dp_mesh=self.dp_mesh,
                 )
                 self.val_dataloader = None
@@ -734,6 +792,7 @@ class TrainDSparkRecipe(BaseRecipe):
                         distributed=self.dist_env.world_size > 1,
                         shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                         mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                        packed_sequence_size=self.packed_sequence_size,
                     )
         else:
             manifest = read_manifest(self.cached_target_path)
@@ -834,6 +893,13 @@ class TrainDSparkRecipe(BaseRecipe):
 
         draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
         self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        if self.packed_sequence_size > 0 and type(self.draft_model).__name__ != "Qwen3DSparkModel":
+            # Only the Qwen3 draft forward threads the packing metadata so far; the
+            # other DSpark drafts would silently let anchors cross document boundaries.
+            raise NotImplementedError(
+                f"Sequence packing (packed_sequence_size>0) is only supported by the Qwen3 DSpark draft, "
+                f"not {type(self.draft_model).__name__}."
+            )
 
         # training only the backbone, fc, Markov head, and confidence head.
         if embed_src is None or head_src is None:
@@ -1211,6 +1277,7 @@ class TrainDSparkRecipe(BaseRecipe):
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             loss_mask=batch["loss_mask"],
+            **_packing_kwargs(batch),
             **_extract_mm_kwargs(batch),
         )
         return self.trainer_module(
@@ -1218,6 +1285,9 @@ class TrainDSparkRecipe(BaseRecipe):
             target_hidden_states=target_batch.target_hidden_states,
             loss_mask=target_batch.loss_mask,
             target_last_hidden_states=target_batch.target_last_hidden_states,
+            position_ids=target_batch.position_ids,
+            seq_lens=target_batch.seq_lens,
+            doc_remaining=target_batch.doc_remaining,
         )
 
     def _maybe_save_step_checkpoint(self, epoch: int) -> bool:
@@ -1410,8 +1480,7 @@ class TrainDSparkRecipe(BaseRecipe):
                             accept_den = pos_den.sum().item()
                             if accept_den > 0:
                                 avg["accept_rate"] = pos_num.sum().item() / accept_den
-                                for k, rate in enumerate((pos_num / pos_den.clamp_min(1.0)).tolist()):
-                                    avg[f"accept_rate@{k}"] = rate
+                                _add_accept_rate_per_position(avg, pos_num, pos_den)
                             if w[5] > 0:
                                 avg["tau"] = w[4] / w[5]
                             if w[9] > 0:

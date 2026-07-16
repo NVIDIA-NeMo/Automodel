@@ -20,16 +20,21 @@ attributes each helper reads are populated -- mirroring the EAGLE recipe tests.
 
 from __future__ import annotations
 
+import pathlib
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.recipes.llm import train_dflash
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.llm.train_domino import TrainDominoRecipe
 
 _VOCAB = 64
 _HIDDEN = 32
@@ -181,6 +186,9 @@ def _eval_self(trainer, num_batches):
                 input_ids=kw["input_ids"],
                 hidden_states=kw["input_ids"],
                 loss_mask=kw["loss_mask"],
+                position_ids=None,
+                seq_lens=None,
+                doc_remaining=None,
             )
         ),
     )
@@ -188,7 +196,64 @@ def _eval_self(trainer, num_batches):
     # training (so subclasses inject their extra inputs); bind the base seam, which
     # forwards (input_ids, hidden_states, loss_mask) to the trainer module.
     obj._run_trainer_step = TrainDFlashRecipe._run_trainer_step.__get__(obj)
+    obj._extra_eval_metric_sums = TrainDFlashRecipe._extra_eval_metric_sums.__get__(obj)
+    obj._empty_extra_eval_metric_sums = TrainDFlashRecipe._empty_extra_eval_metric_sums.__get__(obj)
     return obj
+
+
+def _distributed_domino_eval_worker(rank: int, world_size: int, init_file: str, output_dir: str) -> None:
+    """Run uneven Domino validation on one CPU process.
+
+    Rank 0 contributes no valid batch while rank 1 contributes scalar step
+    statistics. Both ranks must enter the same Gloo collectives and produce the
+    same globally reduced result.
+    """
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        batch = {
+            "input_ids": torch.zeros(1, 4, dtype=torch.long),
+            "attention_mask": torch.ones(1, 4, dtype=torch.long),
+            "loss_mask": torch.ones(1, 4),
+        }
+        recipe = TrainDominoRecipe.__new__(TrainDominoRecipe)
+        recipe.device = torch.device("cpu")
+        recipe.val_dataloader = [batch]
+        recipe.trainer_module = SimpleNamespace(eval=lambda: None, train=lambda: None)
+        recipe.target_wrapper = SimpleNamespace(generate_batch=lambda **kwargs: SimpleNamespace(**kwargs))
+        result = (
+            NoValidAnchorsError("rank has no valid anchors")
+            if rank == 0
+            else SimpleNamespace(
+                loss=torch.tensor(2.0),
+                loss_weight=torch.tensor(4.0),
+                accuracy=torch.tensor(0.8),
+                valid_tokens=torch.tensor(5.0),
+                correct_tokens=torch.tensor(4.0),
+                accept_len_sum=torch.tensor(6.0),
+                valid_blocks=torch.tensor(2.0),
+                final_loss=torch.tensor(1.5),
+                base_loss=torch.tensor(3.0),
+                base_correct_tokens=torch.tensor(2.0),
+                base_accept_len_sum=torch.tensor(4.0),
+            )
+        )
+
+        def _run_step(_target_batch):
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        recipe._run_trainer_step = _run_step
+        metrics = recipe._run_eval()
+        torch.save(metrics, pathlib.Path(output_dir) / f"rank_{rank}.pt")
+    finally:
+        dist.destroy_process_group()
 
 
 def test_run_eval_returns_none_without_val_dataloader():
@@ -199,17 +264,38 @@ def test_run_eval_returns_none_without_val_dataloader():
 def test_run_eval_skips_short_micro_batches():
     trainer = _StubTrainerModule(
         [
-            SimpleNamespace(loss=torch.tensor(1.0), accuracy=torch.tensor(0.5)),
+            SimpleNamespace(
+                loss=torch.tensor(1.0),
+                loss_weight=torch.tensor(2.0),
+                accuracy=torch.tensor(0.5),
+                valid_tokens=torch.tensor(2.0),
+                correct_tokens=torch.tensor(1.0),
+                accept_len_sum=torch.tensor(4.0),
+                valid_blocks=torch.tensor(2.0),
+            ),
             NoValidAnchorsError("all samples too short"),
-            SimpleNamespace(loss=torch.tensor(3.0), accuracy=torch.tensor(1.0)),
+            SimpleNamespace(
+                loss=torch.tensor(3.0),
+                loss_weight=torch.tensor(6.0),
+                accuracy=torch.tensor(1.0),
+                valid_tokens=torch.tensor(6.0),
+                correct_tokens=torch.tensor(6.0),
+                accept_len_sum=torch.tensor(3.0),
+                valid_blocks=torch.tensor(1.0),
+            ),
         ]
     )
     obj = _eval_self(trainer, num_batches=3)
 
     metrics = TrainDFlashRecipe._run_eval(obj)
 
-    # The short batch is skipped without counting: averages are over 2 batches.
-    assert metrics == {"val_loss": 2.0, "val_accuracy": 0.75}
+    # The short batch is skipped. The two valid batches are weighted by their
+    # token/block counts instead of receiving equal batch weight.
+    assert metrics == {
+        "val_loss": 2.5,
+        "val_accuracy": 0.875,
+        "val_accept_len": pytest.approx(7.0 / 3.0),
+    }
     assert trainer.mode_calls == ["eval", "train"]
 
 
@@ -219,8 +305,30 @@ def test_run_eval_all_batches_short_returns_zero_metrics():
 
     metrics = TrainDFlashRecipe._run_eval(obj)
 
-    assert metrics == {"val_loss": 0.0, "val_accuracy": 0.0}
+    assert metrics == {"val_loss": 0.0, "val_accuracy": 0.0, "val_accept_len": 0.0}
     assert trainer.mode_calls == ["eval", "train"]
+
+
+def test_distributed_domino_eval_handles_rank_with_no_valid_batches(tmp_path):
+    init_file = tmp_path / "gloo_init"
+    mp.spawn(
+        _distributed_domino_eval_worker,
+        args=(2, str(init_file), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+
+    expected = {
+        "val_loss": 2.0,
+        "val_accuracy": pytest.approx(0.8),
+        "val_accept_len": 3.0,
+        "val_final_loss": 1.5,
+        "val_base_loss": 3.0,
+        "val_base_accuracy": pytest.approx(0.4),
+        "val_base_accept_len": 2.0,
+    }
+    assert torch.load(tmp_path / "rank_0.pt", weights_only=True) == expected
+    assert torch.load(tmp_path / "rank_1.pt", weights_only=True) == expected
 
 
 def test_all_ranks_have_valid_single_process_passes_local_flag():
@@ -241,6 +349,28 @@ def test_all_ranks_have_valid_ddp_min_reduces_across_ranks(monkeypatch):
     # Every rank valid -> MIN leaves the 1 in place -> all run the backward.
     monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda t, op=None: None)
     assert train_dflash._all_ranks_have_valid(1, is_ddp=True, device="cpu") is True
+
+
+def test_all_reduce_sum_uses_additive_distributed_statistics(monkeypatch):
+    monkeypatch.setattr(train_dflash.dist, "is_available", lambda: True)
+    monkeypatch.setattr(train_dflash.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(train_dflash.dist, "all_reduce", lambda value, op=None: value.add_(2.0))
+
+    value = torch.tensor(3.0)
+    assert train_dflash._all_reduce_sum(value).item() == 5.0
+
+
+def test_wandb_log_forwards_metrics_when_run_exists():
+    calls = []
+    obj = SimpleNamespace(wandb_run=SimpleNamespace(log=lambda data, step: calls.append((data, step))))
+
+    TrainDFlashRecipe._wandb_log(obj, {"val/accuracy": 0.75}, step=9)
+
+    assert calls == [({"val/accuracy": 0.75}, 9)]
+
+
+def test_wandb_log_is_noop_without_run():
+    TrainDFlashRecipe._wandb_log(SimpleNamespace(), {"val/accuracy": 0.75}, step=9)
 
 
 def _load_extra_state_self(mask_token_id=7):

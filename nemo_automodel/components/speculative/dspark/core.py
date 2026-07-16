@@ -85,13 +85,32 @@ class DSparkTrainerModule(nn.Module):
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        doc_remaining: Optional[torch.Tensor] = None,
     ) -> DSparkStepMetrics:
-        """Run the draft on the target supervision and compute the DSpark loss."""
+        """Run the draft on the target supervision and compute the DSpark loss.
+
+        ``position_ids`` / ``seq_lens`` / ``doc_remaining`` (all ``None`` off the
+        packing path) are forwarded to the draft, which keeps each anchor block
+        inside one document (block-causal context, per-document positions, and
+        document-truncated supervision).
+        """
+        # Only the Qwen3 draft accepts the packing kwargs (the other registered
+        # drafts keep the original signature), and packing is gated to the Qwen3
+        # draft at recipe setup. Pass the packing metadata only when packing is
+        # active so the unpacked path stays signature-compatible with every draft.
+        packing_kwargs = (
+            {"position_ids": position_ids, "seq_lens": seq_lens, "doc_remaining": doc_remaining}
+            if seq_lens is not None
+            else {}
+        )
         outputs = self.draft_model(
             input_ids=input_ids,
             target_hidden_states=target_hidden_states,
             loss_mask=loss_mask,
             target_last_hidden_states=target_last_hidden_states,
+            **packing_kwargs,
         )
         loss, terms = compute_dspark_loss(
             outputs=outputs,

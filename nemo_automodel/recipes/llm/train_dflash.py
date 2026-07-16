@@ -50,6 +50,7 @@ from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloade
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
@@ -74,11 +75,43 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
 logger = logging.getLogger(__name__)
 
 
-def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
+def _all_reduce_sum(value: torch.Tensor) -> torch.Tensor:
+    """Sum a scalar metric tensor across all distributed ranks in place."""
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
-        value = value / dist.get_world_size()
     return value
+
+
+def _packing_kwargs(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Sequence-packing metadata from a dataloader batch (empty dict when unpacked)."""
+    if "seq_lens" not in batch:
+        return {}
+    return {
+        "position_ids": batch["position_ids"],
+        "seq_lens": batch["seq_lens"],
+        "doc_remaining": batch["doc_remaining"],
+    }
+
+
+def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_size: int) -> None:
+    """Reject sequence-packing configs the DFlash path cannot honor (fail fast at setup).
+
+    Context parallelism shards the sequence and strips the block-causal mask packing
+    relies on, and a FlashAttention target packs documents from per-document
+    ``position_ids`` only at batch size 1.
+    """
+    if cp_size > 1:
+        raise NotImplementedError(
+            "Sequence packing (packed_sequence_size>0) is not supported with context parallelism "
+            "(distributed.cp_size>1) in DFlash; CP shards the sequence and strips the block-causal mask "
+            "packing relies on. Set cp_size=1 or packed_sequence_size=0."
+        )
+    if "flash" in target_attn_impl and micro_batch_size > 1:
+        raise ValueError(
+            "Sequence packing with a FlashAttention target requires micro_batch_size=1 "
+            f"(got {micro_batch_size}); set micro_batch_size=1 or load the target with "
+            "attn_implementation='sdpa'."
+        )
 
 
 def _all_ranks_have_valid(local_has_valid: int, is_ddp: bool, device) -> bool:
@@ -162,6 +195,16 @@ class TrainDFlashRecipe(BaseRecipe):
         self.block_size = int(recipe_cfg.get("block_size", 16))
         self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_config.vocab_size)
 
+        # ``packed_sequence_size > 0`` enables sequence packing; the DFlash target,
+        # block mask, anchor sampling, and draft RoPE all consume the block-causal
+        # packing metadata (position_ids / seq_lens / doc_remaining) the loader emits.
+        packed_sequence_size = int(recipe_cfg.get("packed_sequence_size", 0) or 0)
+        if packed_sequence_size > 0:
+            _validate_packing_gates(
+                cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
+                target_attn_impl=getattr(self.target_model.config, "_attn_implementation", None) or "",
+                micro_batch_size=int(recipe_cfg.micro_batch_size),
+            )
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
             tokenizer=self.tokenizer,
@@ -173,6 +216,7 @@ class TrainDFlashRecipe(BaseRecipe):
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            packed_sequence_size=packed_sequence_size,
             dp_mesh=self.dp_mesh,
         )
         self.val_dataloader = None
@@ -188,6 +232,7 @@ class TrainDFlashRecipe(BaseRecipe):
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                packed_sequence_size=packed_sequence_size,
                 dp_mesh=self.dp_mesh,
             )
 
@@ -278,6 +323,15 @@ class TrainDFlashRecipe(BaseRecipe):
         self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)) + self._get_dp_rank(), ranked=False)
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
+
+        self.wandb_run = None
+        if self.dist_env.is_main and self.cfg.get("wandb", None) is not None:
+            suppress_wandb_log_messages()
+            self.wandb_run = init_wandb_run(
+                self.cfg.wandb.to_dict(),
+                self.cfg.to_dict(),
+                default_name=type(self).__name__.lower() + "_" + str(target_path).rstrip("/").split("/")[-1],
+            )
 
     def _build_target_model(self, recipe_cfg, target_path: str) -> torch.nn.Module:
         """Load the frozen (optionally tensor-parallel) target model.
@@ -402,10 +456,37 @@ class TrainDFlashRecipe(BaseRecipe):
             input_ids=target_batch.input_ids,
             hidden_states=target_batch.hidden_states,
             loss_mask=target_batch.loss_mask,
+            position_ids=target_batch.position_ids,
+            seq_lens=target_batch.seq_lens,
+            doc_remaining=target_batch.doc_remaining,
         )
 
     def _log_extra_train_metrics(self, epoch_idx: int) -> None:
         """Hook for subclasses to log extra per-step metrics at a log point (no-op here)."""
+
+    def _extra_train_wandb_metrics(self, metrics) -> dict[str, float]:
+        """Return algorithm-specific W&B metrics for one training step."""
+        return {"train/accept_len": float(metrics.accept_len)}
+
+    def _extra_eval_metric_sums(self, metrics) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Return additional validation numerator and denominator pairs.
+
+        The base DFlash metrics are accumulated directly by :meth:`_run_eval`.
+        Subclasses use this hook for extra scalar statistics, with both tensors
+        on the same device as ``metrics.loss`` so they can participate in the
+        same ordered distributed SUM reductions.
+        """
+        return {}
+
+    def _empty_extra_eval_metric_sums(self) -> dict[str, list[torch.Tensor]]:
+        """Create zeroed subclass validation accumulators on the trainer device."""
+        return {}
+
+    def _wandb_log(self, data: dict[str, float], step: int) -> None:
+        """Log scalar metrics to the rank-zero W&B run when configured."""
+        run = getattr(self, "wandb_run", None)
+        if run is not None:
+            run.log(data, step=step)
 
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
@@ -691,9 +772,15 @@ class TrainDFlashRecipe(BaseRecipe):
         if self.val_dataloader is None:
             return None
         self.trainer_module.eval()
-        total_loss = torch.zeros((), device=self.device)
-        total_acc = torch.zeros((), device=self.device)
-        total_batches = torch.zeros((), device=self.device)
+        totals = {
+            "loss_sum": torch.zeros((), device=self.device),
+            "loss_weight": torch.zeros((), device=self.device),
+            "correct_tokens": torch.zeros((), device=self.device),
+            "valid_tokens": torch.zeros((), device=self.device),
+            "accept_len_sum": torch.zeros((), device=self.device),
+            "valid_blocks": torch.zeros((), device=self.device),
+        }
+        extra_totals = self._empty_extra_eval_metric_sums()
         with torch.no_grad():
             for batch in self.val_dataloader:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -701,6 +788,7 @@ class TrainDFlashRecipe(BaseRecipe):
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     loss_mask=batch["loss_mask"],
+                    **_packing_kwargs(batch),
                 )
                 try:
                     # Route through the same seam as training so subclass-specific
@@ -710,17 +798,35 @@ class TrainDFlashRecipe(BaseRecipe):
                     # Every sample in this micro-batch is too short to form a block;
                     # skip it without counting, mirroring the training loop.
                     continue
-                total_loss += metrics.loss.detach()
-                total_acc += metrics.accuracy.detach()
-                total_batches += 1
-        total_loss = _all_reduce_mean(total_loss)
-        total_acc = _all_reduce_mean(total_acc)
-        total_batches = _all_reduce_mean(total_batches)
+                loss_weight = metrics.loss_weight.detach()
+                valid_tokens = metrics.valid_tokens.detach()
+                totals["loss_sum"] += metrics.loss.detach() * loss_weight
+                totals["loss_weight"] += loss_weight
+                totals["correct_tokens"] += metrics.correct_tokens.detach()
+                totals["valid_tokens"] += valid_tokens
+                totals["accept_len_sum"] += metrics.accept_len_sum.detach()
+                totals["valid_blocks"] += metrics.valid_blocks.detach()
+                for name, (numerator, denominator) in self._extra_eval_metric_sums(metrics).items():
+                    extra_totals[name][0] += numerator
+                    extra_totals[name][1] += denominator
+        for value in totals.values():
+            _all_reduce_sum(value)
+        for numerator, denominator in extra_totals.values():
+            _all_reduce_sum(numerator)
+            _all_reduce_sum(denominator)
         self.trainer_module.train()
-        return {
-            "val_loss": (total_loss / total_batches.clamp_min(1)).item(),
-            "val_accuracy": (total_acc / total_batches.clamp_min(1)).item(),
+        result = {
+            "val_loss": (totals["loss_sum"] / totals["loss_weight"].clamp_min(1)).item(),
+            "val_accuracy": (totals["correct_tokens"] / totals["valid_tokens"].clamp_min(1)).item(),
+            "val_accept_len": (totals["accept_len_sum"] / totals["valid_blocks"].clamp_min(1)).item(),
         }
+        result.update(
+            {
+                name: (numerator / denominator.clamp_min(1)).item()
+                for name, (numerator, denominator) in extra_totals.items()
+            }
+        )
+        return result
 
     def run_train_validation_loop(self):
         """Run the DFlash training loop."""
@@ -754,6 +860,7 @@ class TrainDFlashRecipe(BaseRecipe):
                         input_ids=batch["input_ids"],
                         attention_mask=batch["attention_mask"],
                         loss_mask=batch["loss_mask"],
+                        **_packing_kwargs(batch),
                     )
                     sync_grads = should_sync_grads(
                         pending_micro_batches=pending_micro_batches,
@@ -825,6 +932,15 @@ class TrainDFlashRecipe(BaseRecipe):
                                 current_lr,
                             )
                             self._log_extra_train_metrics(epoch_idx)
+                            if getattr(self, "wandb_run", None) is not None:
+                                wandb_data = {
+                                    "train/loss": avg_loss,
+                                    "train/accuracy": avg_acc,
+                                    "train/lr": current_lr,
+                                    "train/epoch": epoch_idx,
+                                }
+                                wandb_data.update(self._extra_train_wandb_metrics(metrics))
+                                self._wandb_log(wandb_data, step=self.runtime.global_step)
                             running_loss = 0.0
                             running_acc = 0.0
                             running_micro = 0
@@ -854,8 +970,10 @@ class TrainDFlashRecipe(BaseRecipe):
                         f"skipped_short_micro_batches={self._skipped_micro_batches}"
                     )
                     if eval_metrics is not None:
-                        msg += (
-                            f" val_loss={eval_metrics['val_loss']:.4f} val_accuracy={eval_metrics['val_accuracy']:.4f}"
+                        msg += " " + " ".join(f"{name}={value:.4f}" for name, value in eval_metrics.items())
+                        self._wandb_log(
+                            {name.replace("val_", "val/", 1): value for name, value in eval_metrics.items()},
+                            step=self.runtime.global_step,
                         )
                     logger.info(msg)
 

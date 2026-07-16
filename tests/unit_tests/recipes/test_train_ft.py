@@ -695,6 +695,65 @@ def test_build_dataloader_packing_uses_configured_cp_size(monkeypatch, supports_
     assert captured["cp_size"] == 2
 
 
+# (num_proc, max_packs, expect_parallel): parallel only when num_proc>1 AND max_packs unset
+# (max_packs relies on the serial pass' lazy early-stop, so it stays serial).
+@pytest.mark.parametrize(
+    "num_proc,max_packs,expect_parallel",
+    [(2, None, True), (1, None, False), (2, 5, False)],
+)
+def test_build_dataloader_parallel_tokenize_gated_on_num_proc(monkeypatch, num_proc, max_packs, expect_parallel):
+    """num_proc>1 pre-tokenizes in parallel and feeds the result to packing; else it does not."""
+    calls = {"tokenize": 0}
+    packed_input = {}
+
+    def fake_tokenize_parallel(dataset, num_proc):
+        calls["tokenize"] += 1
+        calls["num_proc"] = num_proc
+        return "MATERIALIZED"
+
+    def fake_pack_dataset(dataset, **kwargs):
+        packed_input["dataset"] = dataset
+        return dataset
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.tokenize_dataset_parallel", fake_tokenize_parallel)
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.pack_dataset", fake_pack_dataset)
+
+    cfg_ds = ConfigNode({"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset", "split": "train"})
+    cfg_dl = ConfigNode({"_target_": "tests.unit_tests.recipes.test_train_ft.dl_factory_capture", "num_workers": 0})
+    cfg_model = ConfigNode({})
+    cfg_ps = ConfigNode(
+        {"packed_sequence_size": 8, "packing_strategy": "thd", "num_proc": num_proc, "max_packs": max_packs}
+    )
+
+    class _PackedModel(nn.Module):
+        def forward(self, input_ids, seq_lens=None):
+            return input_ids
+
+    _build_dataloader(
+        cfg_ds=cfg_ds,
+        cfg_dl=cfg_dl,
+        cfg_model=cfg_model,
+        cfg_ps=cfg_ps,
+        seed=123,
+        local_batch_size=1,
+        global_batch_size=1,
+        max_steps=None,
+        val_check_interval=None,
+        dp_rank=0,
+        dp_world_size=1,
+        pp_enabled=False,
+        cp_size=1,
+        model=_PackedModel(),
+    )
+
+    if expect_parallel:
+        assert calls["tokenize"] == 1 and calls["num_proc"] == num_proc
+        assert packed_input["dataset"] == "MATERIALIZED"
+    else:
+        assert calls["tokenize"] == 0
+        assert packed_input["dataset"].__class__.__name__ == "DummyMapDataset"
+
+
 class _FlagCM(AbstractContextManager):
     """Simple context manager that flips a flag on enter/exit."""
 
