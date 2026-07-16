@@ -423,7 +423,9 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         unpadded_vocab_size = text_config.unpadded_vocab_size
         if unpadded_vocab_size is not None and unpadded_vocab_size < logits.shape[-1]:
-            logits = logits[..., :unpadded_vocab_size]
+            # ``.contiguous()`` so the last pipeline stage's output matches the meta
+            # tensor's stride (the slice alone leaves a padded-vocab storage stride).
+            logits = logits[..., :unpadded_vocab_size].contiguous()
 
         loss = None
         if labels is not None:
