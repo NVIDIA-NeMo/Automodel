@@ -100,6 +100,16 @@ def test_construct_and_forward_shape():
     assert torch.isfinite(out.logits).all()
 
 
+def test_tie_weights_restores_lm_head_alias():
+    model, _ = _tiny_model()
+    model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.detach().clone())
+    assert model.lm_head.weight is not model.model.embed_tokens.weight
+
+    model.tie_weights()
+
+    assert model.lm_head.weight is model.model.embed_tokens.weight
+
+
 def test_top_forward_enters_backbone_call_for_fsdp_hooks():
     torch.manual_seed(0)
     model, _ = _tiny_model()
