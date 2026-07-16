@@ -607,91 +607,6 @@ def test_apply_ac_custom_policy_respects_hidden_and_expert_dims(monkeypatch):
     assert prefer_recompute_func == P.CheckpointPolicy.PREFER_RECOMPUTE
 
 
-def test_apply_ac_scoped_non_moe_wraps_submodules_and_skips_moe_mlp(monkeypatch):
-    """activation_checkpointing="non_moe" wraps attention/norm/dense-MLP submodules in place
-    and leaves the MoE MLP uncheckpointed; blocks themselves are not re-registered."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-    monkeypatch.setattr(P, "MoE", DummyMoE)
-    wrapper_mock = MagicMock(side_effect=lambda module, **kwargs: ("wrapped", module))
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
-
-    moe = DummyMoE()
-    dense_mlp = object()
-    attn = object()
-    norm = object()
-    moe_block = DummyBlock(mlp=moe)
-    moe_block.self_attn = attn
-    moe_block.input_layernorm = norm
-    dense_block = DummyBlock(mlp=dense_mlp)
-    model = DummyModel([moe_block, dense_block])
-
-    P.apply_ac(
-        model,
-        ignore_router=True,
-        hidden_size=64,
-        num_experts=8,
-        activation_checkpointing="non_moe",
-    )
-
-    # MoE MLP stays uncheckpointed; everything else is wrapped in place.
-    assert moe_block.mlp is moe
-    assert moe_block.self_attn == ("wrapped", attn)
-    assert moe_block.input_layernorm == ("wrapped", norm)
-    assert dense_block.mlp == ("wrapped", dense_mlp)
-    for _, kwargs in wrapper_mock.call_args_list:
-        assert kwargs == {"preserve_rng_state": True}
-    # Scoped mode wraps submodules, not blocks: no block re-registration.
-    assert model.layers.registered == {}
-
-
-def test_apply_ac_scoped_non_moe_no_attn_also_skips_self_attention(monkeypatch):
-    """activation_checkpointing="non_moe_no_attn" additionally leaves self_attn uncheckpointed."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-    monkeypatch.setattr(P, "MoE", DummyMoE)
-    monkeypatch.setattr(
-        P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda module, **kwargs: ("wrapped", module))
-    )
-
-    moe = DummyMoE()
-    attn = object()
-    norm = object()
-    block = DummyBlock(mlp=moe)
-    block.self_attn = attn
-    block.post_attention_layernorm = norm
-    model = DummyModel([block])
-
-    P.apply_ac(
-        model,
-        ignore_router=True,
-        hidden_size=64,
-        num_experts=8,
-        activation_checkpointing="non_moe_no_attn",
-    )
-
-    assert block.self_attn is attn
-    assert block.mlp is moe
-    assert block.post_attention_layernorm == ("wrapped", norm)
-
-
-def test_apply_ac_scoped_mode_does_not_warn_about_router_recompute(monkeypatch):
-    """Scoped modes never checkpoint the MoE MLP, so no router-recompute warning fires."""
-    P = _import_parallelizer_with_stubs(monkeypatch)
-    monkeypatch.setattr(P, "MoE", DummyMoE)
-    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda module, **kwargs: module))
-    logger_mock = MagicMock()
-    monkeypatch.setattr(P, "logger", logger_mock)
-
-    P.apply_ac(
-        DummyModel([DummyBlock()]),
-        ignore_router=False,
-        hidden_size=64,
-        num_experts=8,
-        activation_checkpointing="non_moe",
-    )
-
-    logger_mock.warning.assert_not_called()
-
-
 def _find_call_by_first_arg(mock_obj, target_first_arg):
     for args, kwargs in mock_obj.call_args_list:
         if args and args[0] is target_first_arg:
@@ -1019,11 +934,7 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     apply_ep_mock.assert_called_once()
     # AC enabled
     apply_ac_mock.assert_called_once_with(
-        model,
-        ignore_router=True,
-        selective=False,
-        activation_checkpointing=True,
-        activation_checkpointing_scope="all",
+        model, ignore_router=True, selective=False, activation_checkpointing_scope="all"
     )
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args

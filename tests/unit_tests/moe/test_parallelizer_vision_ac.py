@@ -127,13 +127,6 @@ def _assert_decoder_untouched(language_model: nn.Module) -> None:
     assert all(not isinstance(layer, CheckpointWrapper) for layer in language_model.layers)
 
 
-def _assert_decoder_submodules_wrapped(language_model: nn.Module) -> None:
-    for layer in language_model.layers:
-        assert not isinstance(layer, CheckpointWrapper)
-        assert isinstance(layer.self_attn, CheckpointWrapper)
-        assert isinstance(layer.mlp, CheckpointWrapper)
-
-
 def test_apply_ac_checkpoints_decoder_and_vision_submodules_by_default():
     model = Qwen3VLMoeForConditionalGeneration()
 
@@ -150,20 +143,6 @@ def test_apply_ac_checkpoints_decoder_and_vision_submodules_by_default():
     out.sum().backward()
     qkv_weight = model.model.visual.blocks[0].attn._checkpoint_wrapped_module.qkv.weight
     assert qkv_weight.grad is not None
-
-
-def test_apply_ac_non_moe_mode_still_checkpoints_vision_submodules():
-    model = Qwen3VLMoeForConditionalGeneration()
-
-    moe_parallelizer.apply_ac(
-        model,
-        hidden_size=_DIM,
-        num_experts=2,
-        activation_checkpointing="non_moe",
-    )
-
-    _assert_vision_submodules_wrapped(model.model.visual)
-    _assert_decoder_submodules_wrapped(model.model.language_model)
 
 
 def test_apply_ac_scope_language_skips_vision_tower():

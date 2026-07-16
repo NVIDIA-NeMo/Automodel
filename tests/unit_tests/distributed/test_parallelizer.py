@@ -2088,15 +2088,6 @@ class TestSingleGpuActivationCheckpointing:
             assert isinstance(layer.mlp, CheckpointWrapper)
             assert isinstance(layer.self_attn, CheckpointWrapper)
 
-    @pytest.mark.parametrize("mode", ["non_moe", "non_moe_no_attn", "bogus_mode"])
-    def test_unknown_string_modes_rejected_on_dense_fsdp2_path(self, monkeypatch, mode):
-        """String AC modes other than 'selective' must not be coerced to full per-block AC."""
-        manager = self._make_manager(monkeypatch, mode)
-        model = _make_model_for_ac(num_kv_shared_layers=0)
-
-        with pytest.raises(ValueError, match="dense\\s+FSDP2"):
-            manager.parallelize(model)
-
 
 class TestSelectiveCheckpointSaveOps:
     """Tests for the TorchTitan-style save-op set used by selective AC."""

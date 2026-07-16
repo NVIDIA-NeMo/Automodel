@@ -50,11 +50,6 @@ def _normalize_activation_checkpointing(value: Any) -> bool | str:
 
     ``True`` keeps the existing full checkpointing behavior. ``"selective"``
     enables PyTorch selective activation checkpointing for supported paths.
-    ``"non_moe"`` and ``"non_moe_no_attn"`` enable scoped checkpointing on the
-    MoE parallelizer path: submodules are wrapped individually while the MoE
-    MLP (and, for ``"non_moe_no_attn"``, self-attention) stays uncheckpointed.
-    ``"non_moe_no_attn"`` only exempts ``self_attn``; linear attention
-    (``linear_attn``, e.g. Qwen3-Next GatedDeltaNet) is still checkpointed.
     """
     if value is None:
         return False
@@ -66,12 +61,9 @@ def _normalize_activation_checkpointing(value: Any) -> bool | str:
             return False
         if normalized in {"true", "on", "full", "enabled", "yes"}:
             return True
-        if normalized in {"selective", "non_moe", "non_moe_no_attn"}:
-            return normalized
-    raise ValueError(
-        "distributed.activation_checkpointing must be a boolean or one of "
-        "'full', 'selective', 'non_moe', 'non_moe_no_attn', 'false'."
-    )
+        if normalized == "selective":
+            return "selective"
+    raise ValueError("distributed.activation_checkpointing must be a boolean or one of 'full', 'selective', 'false'.")
 
 
 def parse_distributed_section(cfg_dict: dict) -> dict:
@@ -166,16 +158,6 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     ep_size: int = parallelism.get("ep_size") or 1
     if activation_checkpointing == "selective" and strategy_name not in {"fsdp2", "ddp"}:
         raise ValueError("selective activation checkpointing is supported only for FSDP2 and DDP configs.")
-    if activation_checkpointing in {"non_moe", "non_moe_no_attn"} and ep_size <= 1:
-        # Only the expert-parallel MoE parallelizer (selected when ep_size > 1)
-        # implements the scoped modes; the dense paths would otherwise degrade
-        # to full per-block checkpointing, silently checkpointing the MoE MLP
-        # the user asked to exempt.
-        raise ValueError(
-            f"distributed.activation_checkpointing='{activation_checkpointing}' requires expert parallelism "
-            f"(distributed.ep_size > 1, got ep_size={ep_size}); the scoped modes are implemented only by the "
-            "MoE parallelizer. Use ep_size > 1 or activation_checkpointing: true/'selective'."
-        )
 
     # `distributed.pipeline` and `pp_size` are validated asymmetrically:
     #   * pipeline block with pp_size<=1 -> WARN (inert; block ignored). This is

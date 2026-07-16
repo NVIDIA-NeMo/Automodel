@@ -64,21 +64,6 @@ def _is_selective_ac(activation_checkpointing: object) -> bool:
     )
 
 
-# Scoped AC modes: checkpoint per-submodule instead of per-block, always leaving
-# the MoE MLP (router + expert dispatch) uncheckpointed. "non_moe_no_attn"
-# additionally leaves self-attention uncheckpointed.
-_SCOPED_AC_MODES = frozenset({"non_moe", "non_moe_no_attn"})
-
-
-def _scoped_ac_mode(activation_checkpointing: object) -> str | None:
-    """Return the normalized scoped-AC mode string, or None when not a scoped mode."""
-    if isinstance(activation_checkpointing, str):
-        normalized = activation_checkpointing.lower().replace("-", "_")
-        if normalized in _SCOPED_AC_MODES:
-            return normalized
-    return None
-
-
 def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
     config = getattr(model, "config", None)
     if getattr(config, "model_type", None) == "deepseek_v4":
@@ -325,7 +310,6 @@ def apply_ac(
     hidden_size: int | None = None,
     num_experts: int | None = None,
     selective: bool = False,
-    activation_checkpointing: bool | str = True,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
 ):
     """Apply activation checkpointing to the model.
@@ -342,21 +326,13 @@ def apply_ac(
             (shared with the dense FSDP2 path) to each block. Takes precedence over
             ``ignore_router``; the shared policy already saves expert-parallel communication
             collectives and ``topk``, so it composes with expert parallelism.
-        activation_checkpointing: The normalized AC mode. ``True``/``"selective"`` keep the
-            existing per-block behavior. The scoped modes ``"non_moe"`` and
-            ``"non_moe_no_attn"`` checkpoint per submodule instead of per block: attention
-            (``non_moe`` only), layer norms, and dense MLPs are wrapped while the MoE MLP
-            (router + expert dispatch) is left uncheckpointed, trading its activation memory
-            for skipping the expensive expert-dispatch recompute in backward. Note that
-            ``"non_moe_no_attn"`` only exempts ``self_attn``; linear attention
-            (``linear_attn``, e.g. Qwen3-Next GatedDeltaNet) is still checkpointed.
         activation_checkpointing_scope: Which layer groups to checkpoint -- the same field
             and semantics as the generic FSDP2/DDP path. ``"all"`` (the default) checkpoints
             the text/MoE decoder blocks plus the trainable vision tower; ``"language"`` the
             decoder blocks only; ``"vision"`` (or ``"multimodal"``) only the trainable
-            tower blocks, skipping decoder checkpointing entirely. The scope decides which
-            groups participate; ``activation_checkpointing`` decides how selected decoder
-            blocks are checkpointed.
+            tower blocks, skipping decoder checkpointing entirely. The scope decides WHICH
+            groups participate; the ``selective``/``ignore_router`` mode decides HOW the
+            selected decoder blocks are checkpointed.
 
     Trainable VLM vision-tower blocks selected by the scope get the same per-submodule
     wrapping (attention/MLP/norms) as the generic FSDP2/DDP path, with the SDPA backend
@@ -370,12 +346,7 @@ def apply_ac(
 
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
-    selective = selective or _is_selective_ac(activation_checkpointing)
-    scoped_mode = _scoped_ac_mode(activation_checkpointing)
-
-    # Scoped modes never checkpoint the MoE MLP, so the router-recompute hazard
-    # behind the ignore_router warning does not apply to them.
-    if checkpoint_decoder and not selective and scoped_mode is None and not ignore_router:
+    if checkpoint_decoder and not selective and not ignore_router:
         logger.warning(
             "Activation checkpointing is enabled with ignore_router_for_ac=False. The MoE "
             "router/dispatch will be recomputed in the backward pass, which can route a "
@@ -477,50 +448,6 @@ def apply_ac(
         mtp_repeated = bool(getattr(getattr(mtp_module, "mtp_config", None), "use_repeated_layer", False))
     if mtp_repeated and mtp_block_ids:
         logger.info("Skipping activation checkpointing on %d weight-tied MTP head block(s)", len(mtp_block_ids))
-
-    if scoped_mode is not None:
-        # Checkpoint per submodule instead of per block, leaving the MoE MLP
-        # (and, for "non_moe_no_attn", self-attention) uncheckpointed. Block
-        # forwards dispatch on the wrapped submodules via
-        # unwrap_checkpoint_wrapper, so submodule wrapping is transparent.
-        skip_self_attn = scoped_mode == "non_moe_no_attn"
-        wrapped_count = 0
-        skipped_moe_count = 0
-        skipped_self_attn_count = 0
-        for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
-            if mtp_repeated and id(block) in mtp_block_ids:
-                continue
-
-            for attr in ("self_attn", "linear_attn", "input_layernorm", "post_attention_layernorm"):
-                module = getattr(block, attr, None)
-                if module is None:
-                    continue
-                if attr == "self_attn" and skip_self_attn:
-                    skipped_self_attn_count += 1
-                    continue
-                setattr(block, attr, ptd_checkpoint_wrapper(module, preserve_rng_state=True))
-                wrapped_count += 1
-
-            for attr in ("mlp", "moe"):
-                module = getattr(block, attr, None)
-                if module is None:
-                    continue
-                if isinstance(module, MoE):
-                    skipped_moe_count += 1
-                    continue
-                setattr(block, attr, ptd_checkpoint_wrapper(module, preserve_rng_state=True))
-                wrapped_count += 1
-
-        logger.info(
-            "Scoped activation checkpointing (%s): wrapped %d submodule(s), left %d MoE "
-            "MLP module(s) and %d self-attention module(s) uncheckpointed.",
-            scoped_mode,
-            wrapped_count,
-            skipped_moe_count,
-            skipped_self_attn_count,
-        )
-        _apply_multimodal_tower_ac(model, scopes)
-        return
 
     for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
         if mtp_repeated and id(block) in mtp_block_ids:
@@ -873,7 +800,6 @@ def parallelize_model(
             model,
             ignore_router=ignore_router_for_ac,
             selective=_is_selective_ac(activation_checkpointing),
-            activation_checkpointing=activation_checkpointing,
             activation_checkpointing_scope=activation_checkpointing_scope,
         )
 

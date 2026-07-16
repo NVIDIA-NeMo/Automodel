@@ -182,10 +182,16 @@ class TestConfigurePacking:
         def build_args(attention_mask, cache_position):
             """Build positional args matching the installed _preprocess_mask_arguments signature.
 
-            ``attention_mask`` is a ``[B, S]`` indexed packing mask (or a
-            ``[B, 1, S, S]`` bool mask for the reference call); the remaining
-            parameters are filled by name so the test tracks Transformers
-            signature changes (e.g. the added ``layer_idx``).
+            Args:
+                attention_mask: Tensor of shape [batch, sequence] containing
+                    indexed document IDs, or a boolean tensor of shape [batch,
+                    heads, query_sequence, key_sequence] for the reference call.
+                cache_position: Optional tensor of shape [sequence] containing
+                    absolute token positions.
+
+            Returns:
+                Positional argument list for the installed private Transformers
+                function. Tensor layouts are unchanged.
             """
             values = {
                 "config": config,

@@ -166,13 +166,10 @@ def get_attn_implementation(cfg_model):
 
 
 def _transformers_version() -> str:
-    """Best-effort transformers version string for shim diagnostics."""
-    try:
-        import transformers
+    """Return the installed transformers version for shim diagnostics."""
+    import transformers
 
-        return str(transformers.__version__)
-    except Exception:  # pragma: no cover - transformers is a hard dependency
-        return "unknown"
+    return str(transformers.__version__)
 
 
 def _patch_preprocess_mask_arguments_for_packing() -> None:
@@ -225,11 +222,11 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
                 index 2 is the attention mask and is replaced by the probe mask.
             kwargs: Keyword arguments of the intercepted call; used (and probed)
                 when the attention mask was passed by keyword.
-            inputs_embeds: ``[B, S, H]`` input embeddings tensor used to size the
-                probe mask (batch and query length).
-            attention_mask: ``[B, S]`` indexed packing mask (1-based document
-                index per position, 0 = padding); only its trailing dimension is
-                read, as the probe's KV length.
+            inputs_embeds: Tensor of shape [batch, sequence, hidden] used to size
+                the probe mask.
+            attention_mask: Tensor of shape [batch, sequence] containing a
+                1-based document index per token, with 0 indicating padding. Only
+                its trailing dimension is read as the probe's key/value length.
 
         Returns:
             Length of the tuple returned by the original function, or the
@@ -260,7 +257,7 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
 
         try:
             return len(original_preprocess(*patched_args, **patched_kwargs))
-        except Exception:
+        except (AttributeError, RuntimeError, TypeError, ValueError):
             logger.warning(
                 "Packed-sequence mask shim could not probe the _preprocess_mask_arguments return "
                 "arity (transformers %s); assuming the historical arity of 7. If this transformers "
@@ -271,6 +268,19 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
             return 7
 
     def _patched_preprocess_mask_arguments(*args, **kwargs):
+        """Preserve indexed masks while matching the installed private HF API.
+
+        Args:
+            *args: Positional HF arguments. When present, index 1 is an input
+                tensor of shape [batch, sequence, hidden] and index 2 is an
+                attention mask of shape [batch, sequence].
+            **kwargs: Keyword form of the same HF arguments.
+
+        Returns:
+            Tuple matching the installed Transformers preprocessing result. For
+            indexed FA2/FA3 masks, the first entries are ``True`` and the
+            unchanged mask tensor of shape [batch, sequence].
+        """
         nonlocal preprocess_result_len
         config = kwargs.get("config", args[0] if len(args) > 0 else None)
         inputs_embeds = kwargs.get(

@@ -38,9 +38,6 @@ class TestMaskedCrossEntropyConfig:
         assert cfg.fp32_upcast is True
         assert cfg.ignore_index == -100
         assert cfg.reduction == "sum"
-        assert cfg.chunk_size is None
-        # Opt-in: inplace_grad destroys the logits values in backward.
-        assert cfg.inplace_grad is False
 
     def test_build(self):
         from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
@@ -48,14 +45,6 @@ class TestMaskedCrossEntropyConfig:
         loss = MaskedCrossEntropyConfig(fp32_upcast=False).build()
         assert isinstance(loss, MaskedCrossEntropy)
         assert loss.fp32_upcast is False
-
-    def test_build_chunked(self):
-        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-
-        loss = MaskedCrossEntropyConfig(chunk_size=128, inplace_grad=False).build()
-        assert isinstance(loss, MaskedCrossEntropy)
-        assert loss.chunk_size == 128
-        assert loss.inplace_grad is False
 
 
 class TestFusedLinearCEConfig:
@@ -212,20 +201,6 @@ class TestLossConfigRegistry:
         loss = cfg.build()
         assert isinstance(loss, MaskedCrossEntropy)
         assert loss.fp32_upcast is False
-
-    def test_masked_ce_class_upgraded_with_chunked_kwargs(self):
-        # MaskedCrossEntropyConfig exposes the chunked-path knobs, so a bare
-        # class plus chunk_size/inplace_grad upgrades to the typed config.
-        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-
-        cfg = build_loss_config(MaskedCrossEntropy, chunk_size=256, inplace_grad=False)
-        assert isinstance(cfg, MaskedCrossEntropyConfig)
-        assert cfg.chunk_size == 256
-        assert cfg.inplace_grad is False
-
-        loss = cfg.build()
-        assert isinstance(loss, MaskedCrossEntropy)
-        assert loss.chunk_size == 256
 
     def test_kd_loss_class_upgraded_with_full_kwargs(self):
         # KDLossConfig now exposes the full KDLoss surface (incl. chunk_size).
