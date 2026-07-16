@@ -1354,7 +1354,15 @@ def inkling_collate_fn(
     ``[[patch_count, 1], ...]`` so :func:`chunk_vlm_media` slices the flat ``pixel_values``
     stack along dim 0 correctly. ``n_images_per_sample`` is already added by
     :func:`default_collate_fn`.
+
+    Inkling's tokenizer ships without a pad token; set one to ``<|endoftext|>`` so
+    ``apply_chat_template`` can pad, matching the model's padding behavior.
     """
+    tokenizer = getattr(processor, "tokenizer", processor)
+    if getattr(tokenizer, "pad_token", None) is None:
+        eos = getattr(tokenizer, "eos_token", None) or "<|endoftext|>"
+        tokenizer.pad_token = eos
+
     batch = default_collate_fn(examples, processor, max_length=max_length, drop_overlong=drop_overlong)
     if "pixel_values" not in batch or "n_images_per_sample" not in batch:
         return batch

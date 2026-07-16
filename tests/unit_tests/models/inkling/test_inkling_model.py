@@ -53,13 +53,20 @@ def test_sparse_layers_use_inkling_moe():
 
 
 def test_state_dict_adapter_roundtrip_exact():
+    # ``to_hf`` now emits the raw Thinking-Machines layout (model.llm.*, interleaved
+    # w13_weight, ...); verify the native <-> raw round-trip is bit-exact.
     _, hf, nemo = _build_models()
     adapter = nemo.state_dict_adapter
-    hf_sd = hf.state_dict()
-    roundtrip = adapter.to_hf(adapter.from_hf(hf_sd))
-    assert set(roundtrip.keys()) == set(hf_sd.keys())
-    for k in hf_sd:
-        assert torch.equal(hf_sd[k], roundtrip[k]), f"round-trip mismatch for {k}"
+    native = adapter.from_hf(hf.state_dict())  # HF-module -> native
+    raw = adapter.to_hf(native)  # native -> raw layout
+    assert any(k.startswith("model.llm.") for k in raw)
+    assert any(k.endswith(".mlp.experts.w13_weight") for k in raw)
+    assert any(k.endswith(".mlp.shared_experts.shared_w13_weight") for k in raw)
+    assert any(k.endswith(".mlp.w13_dn.weight") for k in raw)
+    native2 = adapter.from_hf(raw)  # raw -> native (round-trip)
+    assert set(native2.keys()) == set(native.keys())
+    for k in native:
+        assert torch.equal(native[k], native2[k]), f"native round-trip mismatch for {k}"
 
 
 def test_from_hf_load_has_no_missing_or_unexpected_keys():
