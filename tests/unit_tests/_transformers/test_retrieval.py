@@ -175,6 +175,62 @@ def test_extract_submodel_llama_embedding_from_local_vlm_converts_to_supported_b
     assert outputs.last_hidden_state.shape == (2, 8, backbone.config.hidden_size)
 
 
+def test_build_encoder_backbone_forwards_hub_location_kwargs_to_config_and_model(monkeypatch):
+    """Config and weights resolve from the same Hub location and revision."""
+    from nemo_automodel._transformers import retrieval
+
+    config = MagicMock()
+    config.model_type = "qwen3"
+    backbone = MagicMock()
+    auto_config_from_pretrained = MagicMock(return_value=config)
+    auto_model_from_pretrained = MagicMock(return_value=backbone)
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
+    monkeypatch.setattr(retrieval.AutoModel, "from_pretrained", auto_model_from_pretrained)
+
+    result = retrieval.build_encoder_backbone(
+        model_name_or_path="org/model",
+        task="embedding",
+        trust_remote_code=True,
+        revision="revision-a",
+        subfolder="encoder",
+        token="token",
+        cache_dir="/cache",
+        local_files_only=True,
+        torch_dtype=torch.bfloat16,
+    )
+
+    assert result is backbone
+    auto_config_from_pretrained.assert_called_once_with(
+        "org/model",
+        trust_remote_code=True,
+        revision="revision-a",
+        subfolder="encoder",
+        token="token",
+        cache_dir="/cache",
+        local_files_only=True,
+    )
+    auto_model_from_pretrained.assert_called_once_with(
+        "org/model",
+        trust_remote_code=True,
+        revision="revision-a",
+        subfolder="encoder",
+        token="token",
+        cache_dir="/cache",
+        local_files_only=True,
+        torch_dtype=torch.bfloat16,
+    )
+
+
+@pytest.mark.parametrize("task", ["score", "unsupported"])
+def test_direct_ministral_rejects_non_embedding_tasks(tmp_path, task):
+    from nemo_automodel._transformers import retrieval
+
+    model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
+
+    with pytest.raises(ValueError, match=f"Unsupported task '{task}'.*Available tasks: embedding"):
+        retrieval.build_encoder_backbone(model_name_or_path=str(model_dir), task=task, num_labels=1)
+
+
 def test_ministral_embedding_uses_stock_bidirectional_model(tmp_path):
     """Standard Ministral checkpoints use and save the stock non-causal model."""
     from nemo_automodel._transformers import retrieval
