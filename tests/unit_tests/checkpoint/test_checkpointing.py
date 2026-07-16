@@ -54,7 +54,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _reinit_non_persistent_buffers,
     _should_write_consolidated_safetensors,
     _summarize_state_dict_key_diff,
-    _unwrap_model_for_checkpoint_metadata,
     _warn_if_large_inline_consolidation,
     is_cloud_path,
     save_config,
@@ -69,6 +68,7 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+from nemo_automodel.shared.utils import unwrap_model
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
@@ -327,7 +327,7 @@ def test_encoder_state_dict_adapter_is_used_through_ddp_and_compile_wrappers():
     value = torch.ones(2)
 
     exported = _maybe_adapt_state_dict_to_hf(
-        _unwrap_model_for_checkpoint_metadata(wrapped_model),
+        unwrap_model(wrapped_model),
         {"model.layers.0.weight": value},
     )
 
@@ -335,12 +335,12 @@ def test_encoder_state_dict_adapter_is_used_through_ddp_and_compile_wrappers():
     assert exported["layers.0.weight"] is value
 
 
-def test_unwrap_model_for_checkpoint_metadata_ignores_non_module_wrapper_attributes():
+def test_unwrap_model_ignores_non_module_wrapper_attributes():
     model = torch.nn.Module()
     model.module = object()
     model._orig_mod = object()
 
-    assert _unwrap_model_for_checkpoint_metadata(model) is model
+    assert unwrap_model(model) is model
 
 
 def test_generated_metadata_path_preserves_local_custom_model_code_reference(tmp_path):

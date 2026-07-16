@@ -23,7 +23,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
+from huggingface_hub import try_to_load_from_cache
+from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PretrainedConfig, PreTrainedModel
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import logging
 
@@ -56,6 +57,23 @@ class SentenceTransformerExportConfig:
     similarity_fn_name: str | None = None
     do_lower_case: bool | None = None
     include_prompt: bool = True
+
+
+def _resolve_cached_source_model_path(model_name_or_path: str, config, hf_kwargs: dict) -> str | None:
+    """Resolve the already-downloaded source snapshot without network access."""
+    if os.path.isdir(model_name_or_path):
+        return model_name_or_path
+    subfolder = hf_kwargs.get("subfolder")
+    filename = os.path.join(subfolder, "config.json") if subfolder else "config.json"
+    cached_config = try_to_load_from_cache(
+        model_name_or_path,
+        filename,
+        cache_dir=hf_kwargs.get("cache_dir"),
+        revision=getattr(config, "_commit_hash", None) or hf_kwargs.get("revision"),
+    )
+    if isinstance(cached_config, str) and os.path.isfile(cached_config):
+        return os.path.dirname(cached_config)
+    return None
 
 
 def _clone_pretrained_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -399,21 +417,35 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
         return
 
     logger.info(f"Saving encoder model to {save_directory}")
-    model.model.save_pretrained(save_directory)
     export_config = getattr(model, "sentence_transformer_export_config", None)
+    tokenizer = kwargs.get("tokenizer", None)
+    deploy_config = model.get_hf_export_config() if export_config is not None else None
+    original_model_path = getattr(model, "source_model_path", None)
+    if original_model_path is None:
+        model_reference = getattr(model.model, "name_or_path", None) or getattr(
+            model.model.config, "name_or_path", None
+        )
+        original_model_path = str(model_reference) if model_reference and os.path.isdir(str(model_reference)) else None
+    if export_config is not None and tokenizer is not None:
+        from nemo_automodel.components.checkpoint.addons import (
+            _save_generated_sentence_transformer_assets,
+            _validate_sentence_transformer_export,
+        )
+
+        _validate_sentence_transformer_export(model, export_config, tokenizer, original_model_path)
+
+    model.model.save_pretrained(save_directory)
     if export_config is None:
         return
 
-    deploy_config = model.get_hf_export_config()
     deploy_config.save_pretrained(save_directory)
-    tokenizer = kwargs.get("tokenizer", None)
-    if tokenizer is not None:
-        tokenizer.save_pretrained(save_directory)
+    if tokenizer is None:
+        logger.warning(
+            "Sentence Transformers metadata was not exported because direct save_pretrained() received no tokenizer."
+        )
+        return
 
-    model_reference = getattr(model.model, "name_or_path", None) or getattr(model.model.config, "name_or_path", None)
-    original_model_path = str(model_reference) if model_reference and os.path.isdir(str(model_reference)) else None
-    from nemo_automodel.components.checkpoint.addons import _save_generated_sentence_transformer_assets
-
+    tokenizer.save_pretrained(save_directory)
     _save_generated_sentence_transformer_assets(model, export_config, original_model_path, save_directory, tokenizer)
 
 
@@ -510,7 +542,7 @@ class BiEncoderModel(nn.Module):
             model_name_or_path, effective_task, trust_remote_code=trust_remote_code, pooling=pooling, **hf_kwargs
         )
 
-        return cls(
+        encoder = cls(
             model=backbone,
             pooling=pooling,
             l2_normalize=l2_normalize,
@@ -522,6 +554,12 @@ class BiEncoderModel(nn.Module):
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
             detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
         )
+        encoder.source_model_path = _resolve_cached_source_model_path(
+            model_name_or_path,
+            backbone.config,
+            hf_kwargs,
+        )
+        return encoder
 
     def configure_sentence_transformer_prompts(self, query_prompt: str, document_prompt: str) -> None:
         """Set the exact prompts used by training and reject conflicting explicit export settings."""
@@ -539,6 +577,10 @@ class BiEncoderModel(nn.Module):
                     f"the training collator prompt {effective_prompt!r}."
                 )
             setattr(export_config, field_name, effective_prompt)
+
+    def disable_sentence_transformer_export(self) -> None:
+        """Disable standard export when runtime behavior cannot be represented faithfully."""
+        self.sentence_transformer_export_config = None
 
     def get_hf_export_config(self) -> PretrainedConfig:
         """Return a deployable Hugging Face config describing the effective bi-encoder."""

@@ -27,6 +27,7 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
+from nemo_automodel.shared.utils import unwrap_model
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -114,10 +115,29 @@ def _restore_source_tokenizer_serialization_state(original_model_path: str | Non
         _write_json(tokenizer_config_path, tokenizer_config)
 
 
+def _read_source_sentence_transformer_max_seq_length(original_model_path: str | None) -> int | None:
+    """Read the source Sentence Transformers deployment limit when present."""
+    if original_model_path is None:
+        return None
+    config_path = os.path.join(original_model_path, "sentence_bert_config.json")
+    if not os.path.isfile(config_path):
+        return None
+    with open(config_path) as f:
+        source_config = json.load(f)
+    value = source_config.get("max_seq_length")
+    if value is None:
+        return None
+    max_seq_length = int(value)
+    if max_seq_length <= 0:
+        raise ValueError("Source sentence_bert_config.json max_seq_length must be positive.")
+    return max_seq_length
+
+
 def _resolve_sentence_transformer_max_seq_length(
     model_part: nn.Module,
     export_config,
     tokenizer,
+    original_model_path: str | None = None,
 ) -> int:
     """Resolve deployment sequence length without using training-time truncation."""
     if export_config.max_seq_length is not None:
@@ -130,6 +150,15 @@ def _resolve_sentence_transformer_max_seq_length(
             if 0 < model_max_seq_length < 1_000_000_000 and max_seq_length > model_max_seq_length:
                 raise ValueError("sentence_transformer_max_seq_length exceeds the model's max_position_embeddings.")
         return max_seq_length
+
+    source_max_seq_length = _read_source_sentence_transformer_max_seq_length(original_model_path)
+    if source_max_seq_length is not None:
+        model_max_seq_length = getattr(getattr(model_part, "config", None), "max_position_embeddings", None)
+        if model_max_seq_length is not None:
+            model_max_seq_length = int(model_max_seq_length)
+            if 0 < model_max_seq_length < 1_000_000_000 and source_max_seq_length > model_max_seq_length:
+                raise ValueError("Source Sentence Transformers max_seq_length exceeds max_position_embeddings.")
+        return source_max_seq_length
 
     candidates = [
         getattr(tokenizer, "model_max_length", None),
@@ -147,7 +176,12 @@ def _resolve_sentence_transformer_max_seq_length(
     raise ValueError("Unable to determine a finite Sentence Transformers deployment max_seq_length.")
 
 
-def _validate_sentence_transformer_export(model_part: nn.Module, export_config, tokenizer) -> None:
+def _validate_sentence_transformer_export(
+    model_part: nn.Module,
+    export_config,
+    tokenizer,
+    original_model_path: str | None = None,
+) -> None:
     """Validate generated metadata inputs before rank-zero-only checkpoint I/O."""
     pooling = getattr(model_part, "pooling", None)
     if pooling not in _SENTENCE_TRANSFORMER_POOLING_KEYS:
@@ -158,7 +192,10 @@ def _validate_sentence_transformer_export(model_part: nn.Module, export_config, 
     if not isinstance(embedding_dimension, int) or embedding_dimension <= 0:
         raise ValueError("Bi-encoder config must expose a positive hidden_size for Sentence Transformers export.")
 
-    _resolve_sentence_transformer_max_seq_length(model_part, export_config, tokenizer)
+    if tokenizer is None:
+        raise ValueError("A tokenizer is required to export a loadable Sentence Transformers checkpoint.")
+
+    _resolve_sentence_transformer_max_seq_length(model_part, export_config, tokenizer, original_model_path)
 
 
 def _save_generated_sentence_transformer_assets(
@@ -169,7 +206,7 @@ def _save_generated_sentence_transformer_assets(
     tokenizer,
 ) -> None:
     """Generate Sentence Transformers metadata from the effective bi-encoder behavior."""
-    _validate_sentence_transformer_export(model_part, export_config, tokenizer)
+    _validate_sentence_transformer_export(model_part, export_config, tokenizer, original_model_path)
     pooling = getattr(model_part, "pooling", None)
     model_config = getattr(model_part, "config", None)
     embedding_dimension = getattr(model_config, "hidden_size", None)
@@ -218,7 +255,9 @@ def _save_generated_sentence_transformer_assets(
     }
     pooling_config[_SENTENCE_TRANSFORMER_POOLING_KEYS[pooling]] = True
 
-    max_seq_length = _resolve_sentence_transformer_max_seq_length(model_part, export_config, tokenizer)
+    max_seq_length = _resolve_sentence_transformer_max_seq_length(
+        model_part, export_config, tokenizer, original_model_path
+    )
     do_lower_case = bool(export_config.do_lower_case)
 
     os.makedirs(os.path.join(hf_metadata_dir, "1_Pooling"), exist_ok=True)
@@ -336,15 +375,20 @@ class ConsolidatedHFAddon:
         original_model_path = kwargs["original_model_path"]
         generated_metadata_path = kwargs.get("generated_metadata_path", original_model_path)
 
-        export_model = getattr(model_part, "module", model_part)
-        export_model = getattr(export_model, "_orig_mod", export_model)
+        export_model = unwrap_model(model_part)
         sentence_transformer_export_config = getattr(
             export_model,
             "sentence_transformer_export_config",
             None,
         )
         if sentence_transformer_export_config is not None:
-            _validate_sentence_transformer_export(export_model, sentence_transformer_export_config, tokenizer)
+            _validate_sentence_transformer_export(
+                export_model,
+                sentence_transformer_export_config,
+                tokenizer,
+                original_model_path,
+            )
+
         process_group = kwargs.get("process_group")
 
         # Perform save operations on rank 0

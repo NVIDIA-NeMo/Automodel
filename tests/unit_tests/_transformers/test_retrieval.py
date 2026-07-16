@@ -15,6 +15,7 @@
 """Functional tests for retrieval backbone extraction."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -157,6 +158,116 @@ def test_save_encoder_pretrained_forwards_is_final_checkpoint(tmp_path, kwargs, 
         tokenizer=None,
         is_final_checkpoint=expected_is_final,
     )
+
+
+def test_direct_standard_export_without_tokenizer_saves_plain_hf_checkpoint(tmp_path, caplog):
+    from nemo_automodel._transformers import retrieval
+
+    backbone = LlamaBidirectionalModel(
+        LlamaBidirectionalConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+        )
+    )
+    encoder = retrieval.BiEncoderModel(
+        backbone,
+        pooling="avg",
+        l2_normalize=True,
+        query_prompt="query: ",
+    )
+    save_dir = tmp_path / "missing_tokenizer"
+
+    encoder.save_pretrained(save_dir)
+
+    assert (save_dir / "config.json").exists()
+    assert not (save_dir / "modules.json").exists()
+    assert "received no tokenizer" in caplog.text
+
+
+def test_direct_standard_export_validates_before_writing(tmp_path):
+    from nemo_automodel._transformers import retrieval
+
+    backbone = LlamaBidirectionalModel(
+        LlamaBidirectionalConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            max_position_embeddings=32,
+        )
+    )
+    encoder = retrieval.BiEncoderModel(
+        backbone,
+        pooling="avg",
+        l2_normalize=True,
+        sentence_transformer_max_seq_length=64,
+    )
+    save_dir = tmp_path / "invalid_export"
+
+    with pytest.raises(ValueError, match="exceeds the model's max_position_embeddings"):
+        encoder.save_pretrained(save_dir, tokenizer=_tiny_tokenizer())
+
+    assert not save_dir.exists()
+
+
+def test_cached_source_model_path_uses_exact_loaded_revision(tmp_path, monkeypatch):
+    from nemo_automodel._transformers import retrieval
+
+    cached_config = tmp_path / "snapshot" / "encoder" / "config.json"
+    cached_config.parent.mkdir(parents=True)
+    cached_config.write_text("{}")
+    cache_lookup = MagicMock(return_value=str(cached_config))
+    monkeypatch.setattr(retrieval, "try_to_load_from_cache", cache_lookup)
+
+    result = retrieval._resolve_cached_source_model_path(
+        "org/model",
+        SimpleNamespace(_commit_hash="exact-commit"),
+        {"cache_dir": "/cache", "revision": "branch", "subfolder": "encoder"},
+    )
+
+    assert result == str(cached_config.parent)
+    cache_lookup.assert_called_once_with(
+        "org/model",
+        "encoder/config.json",
+        cache_dir="/cache",
+        revision="exact-commit",
+    )
+
+
+def test_direct_standard_export_preserves_cached_source_deployment_limit(tmp_path):
+    from nemo_automodel._transformers import retrieval
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (source_dir / "sentence_bert_config.json").write_text('{"max_seq_length": 16}')
+
+    backbone = LlamaBidirectionalModel(
+        LlamaBidirectionalConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            max_position_embeddings=32,
+        )
+    )
+    encoder = retrieval.BiEncoderModel(
+        backbone,
+        pooling="avg",
+        l2_normalize=True,
+    )
+    encoder.source_model_path = str(source_dir)
+    save_dir = tmp_path / "source_limit"
+    encoder.save_pretrained(save_dir, tokenizer=_tiny_tokenizer())
+
+    assert json.loads((save_dir / "sentence_bert_config.json").read_text())["max_seq_length"] == 16
 
 
 def test_extract_submodel_unsupported_embedding_from_local_vlm(tmp_path):
@@ -525,6 +636,39 @@ def test_ministral_embedding_uses_bidirectional_flash_attention(tmp_path, monkey
     for call in kernel_calls:
         assert call["attention_mask"] is None
         assert call["is_causal"] is False
+
+
+def test_sentence_transformers_loads_generated_ministral_checkpoint(tmp_path):
+    sentence_transformers = pytest.importorskip("sentence_transformers")
+    from nemo_automodel._transformers import retrieval
+
+    model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="embedding",
+        pooling="avg",
+    )
+    encoder = retrieval.BiEncoderModel(
+        backbone,
+        pooling="avg",
+        l2_normalize=True,
+        query_prompt="query: ",
+        document_prompt="passage: ",
+    )
+    tokenizer = _tiny_tokenizer()
+    encoder.eval()
+    with torch.no_grad():
+        expected_query = encoder(tokenizer(["query: hello"], return_tensors="pt"))
+        expected_document = encoder(tokenizer(["passage: hello"], return_tensors="pt"))
+    save_dir = tmp_path / "sentence_transformers_ministral"
+    encoder.save_pretrained(save_dir, tokenizer=tokenizer)
+
+    reloaded = sentence_transformers.SentenceTransformer(str(save_dir), device="cpu")
+    actual_query = reloaded.encode_query(["hello"], convert_to_tensor=True)
+    actual_document = reloaded.encode_document(["hello"], convert_to_tensor=True)
+    assert actual_query.shape == actual_document.shape == (1, 16)
+    torch.testing.assert_close(actual_query, expected_query)
+    torch.testing.assert_close(actual_document, expected_document)
 
 
 def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):

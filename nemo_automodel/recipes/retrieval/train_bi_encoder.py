@@ -42,19 +42,40 @@ from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_con
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
+from nemo_automodel.shared.utils import unwrap_model
 
 logger = logging.getLogger(__name__)
 
 
 def _uses_multi_vector_scoring(model) -> bool:
     """Return whether the model emits token-level embeddings for MaxSim scoring."""
-    model = _unwrap_model_for_attrs(model)
+    model = unwrap_model(model)
     return getattr(model, "pooling", None) in {"colbert", "multi_vector"}
 
 
-def _unwrap_model_for_attrs(model):
-    """Return the underlying model object for configuration-style attribute reads."""
-    return getattr(model, "module", model)
+def _configure_sentence_transformer_export(model, collate_fn) -> None:
+    """Bind the training collator's exact static prompts to bi-encoder export metadata."""
+    model = unwrap_model(model)
+    configure_prompts = getattr(model, "configure_sentence_transformer_prompts", None)
+    if configure_prompts is None:
+        return
+
+    if getattr(collate_fn, "use_dataset_instruction", False):
+        disable_export = getattr(model, "disable_sentence_transformer_export", None)
+        if disable_export is not None:
+            disable_export()
+            logger.warning(
+                "Standard Sentence Transformers export is disabled because per-example dataset instructions "
+                "cannot be represented by static checkpoint prompts."
+            )
+        return
+    else:
+        if not hasattr(collate_fn, "query_prefix") or not hasattr(collate_fn, "passage_prefix"):
+            raise TypeError("Bi-encoder collator must expose query_prefix and passage_prefix for checkpoint export.")
+        query_prompt = f"{collate_fn.query_prefix} " if collate_fn.query_prefix else ""
+        document_prompt = f"{collate_fn.passage_prefix} " if collate_fn.passage_prefix else ""
+
+    configure_prompts(query_prompt=query_prompt, document_prompt=document_prompt)
 
 
 def _get_autocast_ctx(distributed_config):
@@ -421,7 +442,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     passage["run_dummy_vision"] = True
             q_reps = model(query)
             p_reps = model(passage)
-            attr_model = _unwrap_model_for_attrs(model)
+            attr_model = unwrap_model(model)
 
             n_passages = self.train_n_passages
             use_multi_vector_scoring = _uses_multi_vector_scoring(model)
@@ -592,7 +613,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         )
                     else:
                         scores, labels = contrastive_scores_and_labels(q_reps, p_reps, self.val_n_passages)
-                    attr_model = _unwrap_model_for_attrs(model)
+                    attr_model = unwrap_model(model)
                     if attr_model.l2_normalize:
                         scores = scores / self.temperature
                     loss = F.cross_entropy(scores, labels)

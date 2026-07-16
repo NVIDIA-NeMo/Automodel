@@ -79,6 +79,7 @@ from nemo_automodel.components.checkpoint.utils import (
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
+from nemo_automodel.shared.utils import unwrap_model
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -91,20 +92,6 @@ _CONSOLIDATED_SIZE_WARNING_THRESHOLD_BYTES = 50 * 1024**3
 _DEFAULT_HF_CONSOLIDATED_SHARD_SIZE_BYTES = 5 * 1024**3
 
 logger = logging.getLogger(__name__)
-
-
-def _unwrap_model_for_checkpoint_metadata(model: nn.Module) -> nn.Module:
-    """Unwrap DDP and torch.compile containers for checkpoint metadata and adapters."""
-    seen: set[int] = set()
-    while id(model) not in seen:
-        seen.add(id(model))
-        wrapped_model = getattr(model, "module", None)
-        if not isinstance(wrapped_model, nn.Module):
-            wrapped_model = getattr(model, "_orig_mod", None)
-        if not isinstance(wrapped_model, nn.Module) or wrapped_model is model:
-            break
-        model = wrapped_model
-    return model
 
 
 # NOTE [nemotron-singlegpu-lora]: the branches tagged with this marker below exist to make
@@ -561,7 +548,7 @@ class Checkpointer:
 
         # Convert to HF format if using custom model implementations.
         state_dict = _maybe_adapt_state_dict_to_hf(
-            _unwrap_model_for_checkpoint_metadata(model_state.model[0]),
+            unwrap_model(model_state.model[0]),
             state_dict,
             quantization=False,
             device_mesh=self.moe_mesh,
@@ -1421,7 +1408,7 @@ fi
         """
         if not _should_write_hf_metadata(self.config):
             return None
-        model = _unwrap_model_for_checkpoint_metadata(model_state.model[0])
+        model = unwrap_model(model_state.model[0])
         # we first need to find the FQN -> .safetensors mapping
         reference_path = self._get_original_model_path(model_state)
         if reference_path:
@@ -1514,7 +1501,7 @@ fi
         if not reference_path:
             return None
 
-        model = _unwrap_model_for_checkpoint_metadata(model_state.model[0])
+        model = unwrap_model(model_state.model[0])
         dtype_mapping = get_fqn_to_dtype_mapping(reference_path, getattr(model, "_checkpoint_conversion_mapping", None))
         if not dtype_mapping:
             return None
@@ -1616,8 +1603,13 @@ fi
             return self._original_model_path
 
         self._original_model_path_resolved = True
-        model_part = _unwrap_model_for_checkpoint_metadata(model_state.model[0])
+        model_part = unwrap_model(model_state.model[0])
         model_config = getattr(model_part, "config", None)
+        source_model_path = getattr(model_part, "source_model_path", None)
+        if source_model_path and os.path.isdir(str(source_model_path)):
+            self._original_model_path = str(source_model_path)
+            return self._original_model_path
+
         model_repo_id = (
             self.config.model_repo_id
             or getattr(model_part, "name_or_path", None)
@@ -1667,7 +1659,7 @@ fi
         original_model_path: str | None,
     ) -> str | None:
         """Return the existing model/code reference used by the generated-metadata path."""
-        model_part = _unwrap_model_for_checkpoint_metadata(model_state.model[0])
+        model_part = unwrap_model(model_state.model[0])
         model_reference = getattr(model_part, "name_or_path", None) or getattr(
             getattr(model_part, "config", None), "name_or_path", None
         )
