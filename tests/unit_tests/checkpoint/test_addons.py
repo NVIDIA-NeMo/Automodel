@@ -12,18 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from torch import nn
 
 from nemo_automodel.components.checkpoint.addons import (
+    ConsolidatedHFAddon,
     _extract_target_modules,
     _group_barrier,
     _is_group_rank_0,
     _maybe_save_custom_model_code,
     _maybe_strip_quantization_config,
+    _resolve_sentence_transformer_max_seq_length,
+    _save_generated_sentence_transformer_assets,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 
@@ -97,6 +103,343 @@ def test_maybe_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
     some_file.write_text("hello")
     _maybe_save_custom_model_code(str(some_file), str(dst_root))
     assert list(dst_root.rglob("*.py")) == []
+
+
+def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effective_model(tmp_path):
+    source_dir = tmp_path / "source"
+    metadata_dir = tmp_path / "model" / ".hf_metadata"
+    consolidated_dir = tmp_path / "model" / "consolidated"
+    source_files = {
+        ".gitattributes": "git attributes",
+        "1_Pooling/config.json": '{"pooling_mode_mean_tokens": true}',
+        "2_Dense/config.json": '{"in_features": 2048, "out_features": 1024}',
+        "2_Dense/model.safetensors": "stale module weights",
+        "LICENSE": "license",
+        "NOTICE": "notice",
+        "README.md": "model card",
+        "config.json": '{"architectures": ["SourceModel"], "pooling": "avg"}',
+        "config_sentence_transformers.json": (
+            '{"prompts": {"query": "old query: ", "document": "old passage: "}, "similarity_fn_name": "cosine"}'
+        ),
+        "custom_module.py": "class CustomModule: pass",
+        "model.safetensors": "old weights",
+        "modules.json": '[{"idx": 0, "path": "2_Dense", "type": "stale.Dense"}]',
+        "sentence_bert_config.json": '{"max_seq_length": 8192, "do_lower_case": false}',
+    }
+    for relative_path, content in source_files.items():
+        _write(str(source_dir / relative_path), content)
+    metadata_dir.mkdir(parents=True)
+    consolidated_dir.mkdir(parents=True)
+
+    class DeployConfig:
+        hidden_size = 2048
+        max_position_embeddings = 32768
+
+        def to_json_string(self, use_diff=False):
+            del use_diff
+            return '{"architectures": ["DeployableModel"], "pooling": "cls"}'
+
+    model = nn.Module()
+    model.config = DeployConfig()
+    model.pooling = "cls"
+    model.l2_normalize = False
+    model.sentence_transformer_export_config = SimpleNamespace(
+        query_prompt="search: ",
+        document_prompt="index: ",
+        max_seq_length=4096,
+        similarity_fn_name="dot",
+        do_lower_case=True,
+        include_prompt=False,
+    )
+    model.get_hf_export_config = lambda: model.config
+    tokenizer = MagicMock()
+
+    addon = ConsolidatedHFAddon()
+    addon.pre_save(
+        model_state=SimpleNamespace(model=[model]),
+        hf_metadata_dir=str(metadata_dir),
+        tokenizer=tokenizer,
+        fqn_to_file_index_mapping={"w": 1},
+        fqn_to_dtype_mapping={"w": "BF16"},
+        original_model_path=str(source_dir),
+        v4_compatible=True,
+    )
+
+    (consolidated_dir / "model.safetensors").write_text("new weights")
+    (consolidated_dir / "model.safetensors.index.json").write_text('{"weight_map": {"w": "model.safetensors"}}')
+    addon.post_save(
+        consolidated_path=str(consolidated_dir),
+        hf_metadata_path=str(metadata_dir),
+    )
+
+    actual_manifest = {
+        path.relative_to(consolidated_dir).as_posix() for path in consolidated_dir.rglob("*") if path.is_file()
+    }
+    assert actual_manifest == {
+        ".gitattributes",
+        "1_Pooling/config.json",
+        "LICENSE",
+        "NOTICE",
+        "config.json",
+        "config_sentence_transformers.json",
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "modules.json",
+        "sentence_bert_config.json",
+    }
+    assert json.loads((consolidated_dir / "config.json").read_text()) == {
+        "architectures": ["DeployableModel"],
+        "pooling": "cls",
+    }
+    assert not (consolidated_dir / "config.v5.json").exists()
+    assert json.loads((consolidated_dir / "modules.json").read_text()) == [
+        {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+        {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+    ]
+    pooling_config = json.loads((consolidated_dir / "1_Pooling" / "config.json").read_text())
+    assert pooling_config["pooling_mode_cls_token"] is True
+    assert pooling_config["pooling_mode_mean_tokens"] is False
+    assert pooling_config["include_prompt"] is False
+    assert pooling_config["word_embedding_dimension"] == 2048
+    assert json.loads((consolidated_dir / "config_sentence_transformers.json").read_text()) == {
+        "prompts": {"query": "search: ", "document": "index: "},
+        "default_prompt_name": None,
+        "similarity_fn_name": "dot",
+    }
+    assert json.loads((consolidated_dir / "sentence_bert_config.json").read_text()) == {
+        "max_seq_length": 4096,
+        "do_lower_case": True,
+    }
+    assert (consolidated_dir / "model.safetensors").read_text() == "new weights"
+    assert not (consolidated_dir / "2_Dense").exists()
+    assert not (consolidated_dir / "custom_module.py").exists()
+    tokenizer.save_pretrained.assert_called_once_with(str(metadata_dir))
+
+
+def test_generated_sentence_transformer_assets_ignore_stale_source_semantics(tmp_path):
+    source_dir = tmp_path / "source"
+    metadata_dir = tmp_path / "metadata"
+    source_dir.mkdir()
+    metadata_dir.mkdir()
+    (source_dir / "config_sentence_transformers.json").write_text(
+        json.dumps(
+            {
+                "prompts": {"query": "source query: ", "document": "source document: "},
+                "similarity_fn_name": "cosine",
+            }
+        )
+    )
+    (source_dir / "sentence_bert_config.json").write_text(json.dumps({"max_seq_length": 8192, "do_lower_case": False}))
+    model = SimpleNamespace(
+        pooling="avg",
+        l2_normalize=True,
+        config=SimpleNamespace(hidden_size=8, max_position_embeddings=32768),
+    )
+    export_config = SimpleNamespace(
+        query_prompt=None,
+        document_prompt=None,
+        max_seq_length=None,
+        similarity_fn_name=None,
+        do_lower_case=None,
+        include_prompt=True,
+    )
+    tokenizer = SimpleNamespace(model_max_length=512)
+
+    _save_generated_sentence_transformer_assets(
+        model,
+        export_config,
+        str(source_dir),
+        str(metadata_dir),
+        tokenizer,
+    )
+
+    sentence_config = json.loads((metadata_dir / "config_sentence_transformers.json").read_text())
+    assert sentence_config["prompts"] == {"query": "", "document": ""}
+    assert sentence_config["similarity_fn_name"] == "cosine"
+    assert json.loads((metadata_dir / "sentence_bert_config.json").read_text()) == {
+        "max_seq_length": 512,
+        "do_lower_case": False,
+    }
+    assert json.loads((metadata_dir / "modules.json").read_text())[-1] == {
+        "idx": 2,
+        "name": "2",
+        "path": "2_Normalize",
+        "type": "sentence_transformers.models.Normalize",
+    }
+    pooling_config = json.loads((metadata_dir / "1_Pooling" / "config.json").read_text())
+    assert pooling_config["pooling_mode_mean_tokens"] is True
+
+
+def test_inferred_sentence_transformer_max_seq_length_uses_smallest_finite_capability():
+    model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=512))
+    tokenizer = SimpleNamespace(model_max_length=4096)
+
+    assert (
+        _resolve_sentence_transformer_max_seq_length(
+            model,
+            SimpleNamespace(max_seq_length=None),
+            tokenizer,
+        )
+        == 512
+    )
+    assert (
+        _resolve_sentence_transformer_max_seq_length(
+            model,
+            SimpleNamespace(max_seq_length=256),
+            tokenizer,
+        )
+        == 256
+    )
+
+    with pytest.raises(ValueError, match="exceeds the model's max_position_embeddings"):
+        _resolve_sentence_transformer_max_seq_length(
+            model,
+            SimpleNamespace(max_seq_length=1024),
+            tokenizer,
+        )
+
+
+def test_generated_sentence_transformer_assets_remove_training_tokenizer_state(tmp_path):
+    source_dir = tmp_path / "source"
+    metadata_dir = tmp_path / "metadata"
+    source_dir.mkdir()
+    metadata_dir.mkdir()
+    (source_dir / "tokenizer.json").write_text(json.dumps({"truncation": None, "padding": None, "model": {}}))
+    (source_dir / "tokenizer_config.json").write_text(json.dumps({"local_files_only": False, "model_max_length": 512}))
+    (metadata_dir / "tokenizer.json").write_text(
+        json.dumps({"truncation": {"max_length": 32}, "padding": {"length": 32}, "model": {}})
+    )
+    (metadata_dir / "tokenizer_config.json").write_text(
+        json.dumps({"local_files_only": True, "model_max_length": 512, "processor_class": "PixtralProcessor"})
+    )
+    (metadata_dir / "processor_config.json").write_text('{"processor_class": "PixtralProcessor"}')
+    (metadata_dir / "preprocessor_config.json").write_text('{"image_processor_type": "PixtralImageProcessor"}')
+    model = SimpleNamespace(
+        pooling="avg",
+        l2_normalize=True,
+        config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
+    )
+    export_config = SimpleNamespace(
+        query_prompt="query: ",
+        document_prompt="passage: ",
+        max_seq_length=None,
+        similarity_fn_name=None,
+        do_lower_case=None,
+        include_prompt=True,
+    )
+
+    _save_generated_sentence_transformer_assets(
+        model,
+        export_config,
+        str(source_dir),
+        str(metadata_dir),
+        SimpleNamespace(model_max_length=512),
+    )
+
+    tokenizer_json = json.loads((metadata_dir / "tokenizer.json").read_text())
+    tokenizer_config = json.loads((metadata_dir / "tokenizer_config.json").read_text())
+    assert tokenizer_json["truncation"] is None
+    assert tokenizer_json["padding"] is None
+    assert tokenizer_config["local_files_only"] is False
+    assert "processor_class" not in tokenizer_config
+    assert not (metadata_dir / "processor_config.json").exists()
+    assert not (metadata_dir / "preprocessor_config.json").exists()
+
+
+def test_generated_sentence_transformer_assets_reject_unrepresentable_pooling(tmp_path):
+    metadata_dir = tmp_path / "metadata"
+    metadata_dir.mkdir()
+    model = SimpleNamespace(
+        pooling="weighted_avg",
+        l2_normalize=False,
+        config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
+    )
+    export_config = SimpleNamespace(
+        query_prompt="",
+        document_prompt="",
+        max_seq_length=512,
+        similarity_fn_name="dot",
+        do_lower_case=False,
+        include_prompt=True,
+    )
+
+    with pytest.raises(ValueError, match="cannot be represented"):
+        _save_generated_sentence_transformer_assets(
+            model,
+            export_config,
+            original_model_path=None,
+            hf_metadata_dir=str(metadata_dir),
+            tokenizer=None,
+        )
+
+
+def test_consolidated_hf_addon_validates_sentence_transformer_export_on_nonzero_rank(tmp_path):
+    model = nn.Module()
+    model.pooling = "weighted_avg"
+    model.l2_normalize = False
+    model.config = SimpleNamespace(hidden_size=8, max_position_embeddings=512)
+    model.sentence_transformer_export_config = SimpleNamespace(
+        query_prompt="",
+        document_prompt="",
+        max_seq_length=512,
+        similarity_fn_name="dot",
+        do_lower_case=False,
+        include_prompt=True,
+    )
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_rank", return_value=1),
+        patch("torch.distributed.barrier") as mock_barrier,
+        pytest.raises(ValueError, match="cannot be represented"),
+    ):
+        ConsolidatedHFAddon().pre_save(
+            model_state=SimpleNamespace(model=[model]),
+            hf_metadata_dir=str(tmp_path),
+            tokenizer=None,
+            fqn_to_file_index_mapping={"w": 1},
+            fqn_to_dtype_mapping=None,
+            original_model_path=None,
+            v4_compatible=False,
+        )
+
+    mock_barrier.assert_not_called()
+
+
+def test_consolidated_hf_addon_keeps_generated_metadata_path_for_other_models(tmp_path):
+    source_dir = tmp_path / "source"
+    generated_metadata_dir = tmp_path / "generated"
+    metadata_dir = tmp_path / "model" / ".hf_metadata"
+    _write(str(source_dir / "config.json"), '{"architectures": ["SourceModel"]}')
+    _write(str(source_dir / "LICENSE"), "source license")
+    _write(str(generated_metadata_dir / "modeling_custom.py"), "class CustomModel: pass")
+    metadata_dir.mkdir(parents=True)
+
+    class GeneratedConfig:
+        def to_json_string(self, use_diff=False):
+            del use_diff
+            return '{"architectures": ["GeneratedModel"]}'
+
+    model = nn.Module()
+    model.config = GeneratedConfig()
+    tokenizer = MagicMock()
+
+    ConsolidatedHFAddon().pre_save(
+        model_state=SimpleNamespace(model=[model]),
+        hf_metadata_dir=str(metadata_dir),
+        tokenizer=tokenizer,
+        fqn_to_file_index_mapping={"w": 1},
+        fqn_to_dtype_mapping=None,
+        original_model_path=str(source_dir),
+        generated_metadata_path=str(generated_metadata_dir),
+        v4_compatible=False,
+    )
+
+    assert (metadata_dir / "config.json").read_text() == '{"architectures": ["GeneratedModel"]}'
+    assert (metadata_dir / "modeling_custom.py").exists()
+    assert not (metadata_dir / "LICENSE").exists()
+    assert not (metadata_dir / "modules.json").exists()
+    tokenizer.save_pretrained.assert_called_once_with(str(metadata_dir))
 
 
 def test_model_state_keeps_lm_head_when_storage_not_shared():
