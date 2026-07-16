@@ -62,6 +62,21 @@ class _InklingShortConvolutionFP32(nn.Module):
         conv_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        """Apply the causal short convolution with a residual connection.
+
+        Args:
+            hidden_states: Tensor of shape ``[batch, sequence, hidden]``. Internally
+                transposed to ``[batch, hidden, sequence]`` for the depthwise
+                ``conv1d`` and transposed back before the residual add.
+            past_key_values: Optional cache holding the per-layer conv state; updated
+                in place during incremental decoding.
+            conv_mask: Optional boolean padding mask of shape ``[batch, sequence]``
+                that zeroes padded positions before the convolution.
+
+        Returns:
+            torch.Tensor: Tensor of shape ``[batch, sequence, hidden]`` (input plus
+            convolution output).
+        """
         residual = hidden_states
         hidden_states = apply_mask_to_padding_states(hidden_states, conv_mask)
         seq_len = hidden_states.shape[1]
@@ -103,6 +118,17 @@ class InklingShortConvolution(nn.Module):
         conv_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        """Run the short convolution in fp32 and cast the result back.
+
+        Args:
+            hidden_states: Tensor of shape ``[batch, sequence, hidden]``.
+            past_key_values: Optional cache holding the per-layer conv state.
+            conv_mask: Optional boolean padding mask of shape ``[batch, sequence]``.
+
+        Returns:
+            torch.Tensor: Tensor of shape ``[batch, sequence, hidden]`` in the input
+            dtype.
+        """
         input_dtype = hidden_states.dtype
         output = self._fp32_params(
             hidden_states.float(),
