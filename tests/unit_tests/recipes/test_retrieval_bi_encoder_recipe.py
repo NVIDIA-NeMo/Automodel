@@ -22,6 +22,7 @@ from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.recipes.retrieval import train_bi_encoder
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     TrainBiEncoderRecipe,
+    _configure_sentence_transformer_export,
     _get_autocast_ctx,
     _get_model_instantiate_kwargs,
     _unwrap_model_for_attrs,
@@ -65,6 +66,45 @@ def test_retrieval_attrs_accept_unwrapped_model():
 
     assert _unwrap_model_for_attrs(inner) is inner
     assert _uses_multi_vector_scoring(inner) is True
+
+
+def test_configure_sentence_transformer_export_binds_exact_static_collator_prompts():
+    captured = {}
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def configure_sentence_transformer_prompts(self, **kwargs):
+            captured.update(kwargs)
+
+    collator = SimpleNamespace(
+        query_prefix="query:",
+        passage_prefix="passage:",
+        use_dataset_instruction=False,
+    )
+
+    _configure_sentence_transformer_export(_DDPLikeWrapper(_Model()), collator)
+
+    assert captured == {"query_prompt": "query: ", "document_prompt": "passage: "}
+
+
+def test_configure_sentence_transformer_export_uses_empty_static_prompts_for_dataset_instructions():
+    captured = {}
+
+    class _Model:
+        def configure_sentence_transformer_prompts(self, **kwargs):
+            captured.update(kwargs)
+
+    collator = SimpleNamespace(
+        query_prefix="ignored query:",
+        passage_prefix="ignored passage:",
+        use_dataset_instruction=True,
+    )
+
+    _configure_sentence_transformer_export(_Model(), collator)
+
+    assert captured == {"query_prompt": "", "document_prompt": ""}
 
 
 def test_retrieval_autocast_ctx_disabled_by_default(monkeypatch):

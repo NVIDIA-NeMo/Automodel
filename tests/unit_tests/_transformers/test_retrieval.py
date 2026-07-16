@@ -20,15 +20,30 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import torch.nn as nn
-from transformers import AutoModel, Ministral3Config, Mistral3Config
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import (
+    AutoModel,
+    LlamaConfig,
+    Ministral3Config,
+    Mistral3Config,
+    PretrainedConfig,
+    PreTrainedTokenizerFast,
+)
 from transformers.models.ministral3.modeling_ministral3 import (
     Ministral3ForSequenceClassification,
     Ministral3Model,
 )
 
 from nemo_automodel.components.models.llama_bidirectional.model import (
+    LlamaBidirectionalConfig,
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
+)
+from nemo_automodel.components.models.ministral_bidirectional.model import (
+    Ministral3BidirectionalConfig,
+    Ministral3BidirectionalModel,
 )
 
 
@@ -74,6 +89,22 @@ def _save_tiny_vlm(tmp_path, text_model_type: str):
     model.save_pretrained(model_dir)
     language_state_dict = {key: tensor.detach().clone() for key, tensor in model.language_model.state_dict().items()}
     return model_dir, language_state_dict
+
+
+def _tiny_tokenizer() -> PreTrainedTokenizerFast:
+    tokenizer_backend = Tokenizer(
+        WordLevel(
+            {"[UNK]": 0, "[PAD]": 1, "hello": 2, "world": 3},
+            unk_token="[UNK]",
+        )
+    )
+    tokenizer_backend.pre_tokenizer = Whitespace()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer_backend,
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        model_max_length=32,
+    )
 
 
 def _save_tiny_ministral_text_model(tmp_path):
@@ -268,6 +299,131 @@ def test_ministral_embedding_preserves_hf_config_overrides(tmp_path):
     assert backbone.config.output_attentions is True
 
 
+@pytest.mark.parametrize("pooling", ["weighted_avg", "colbert", "multi_vector"])
+def test_bi_encoder_skips_standard_export_for_unrepresentable_pooling(pooling, tmp_path):
+    from nemo_automodel._transformers import retrieval
+
+    backbone = LlamaBidirectionalModel(
+        LlamaBidirectionalConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+        )
+    )
+    encoder = retrieval.BiEncoderModel(
+        backbone,
+        pooling=pooling,
+        l2_normalize=True,
+        query_prompt="query: ",
+    )
+
+    assert encoder.sentence_transformer_export_config is None
+    encoder.configure_sentence_transformer_prompts(query_prompt="query: ", document_prompt="passage: ")
+    save_dir = tmp_path / pooling
+    encoder.save_pretrained(save_dir)
+    assert (save_dir / "config.json").exists()
+    assert not (save_dir / "modules.json").exists()
+
+
+def test_bi_encoder_skips_standard_export_for_multimodal_backbone():
+    from nemo_automodel._transformers import retrieval
+
+    class CompositeBackbone(nn.Module):
+        main_input_name = "pixel_values"
+
+        def __init__(self):
+            super().__init__()
+            self.config = PretrainedConfig()
+            self.config.is_composition = True
+            self.config.llm_config = PretrainedConfig(hidden_size=16)
+            self.config.name_or_path = ""
+
+    encoder = retrieval.BiEncoderModel(
+        CompositeBackbone(),
+        pooling="last",
+        l2_normalize=True,
+        query_prompt="query: ",
+    )
+
+    assert encoder.sentence_transformer_export_config is None
+    encoder.configure_sentence_transformer_prompts(query_prompt="query: ", document_prompt="passage: ")
+
+
+def test_bi_encoder_export_config_uses_deployable_hf_base_classes():
+    from nemo_automodel._transformers import retrieval
+
+    backbone = LlamaBidirectionalModel(
+        LlamaBidirectionalConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            pooling="avg",
+        )
+    )
+    encoder = retrieval.BiEncoderModel(
+        backbone,
+        pooling="cls",
+        l2_normalize=True,
+        query_prompt="query: ",
+    )
+
+    export_config = encoder.get_hf_export_config()
+
+    assert isinstance(export_config, LlamaConfig)
+    assert not isinstance(export_config, LlamaBidirectionalConfig)
+    assert export_config.model_type == "llama"
+    assert export_config.architectures == ["LlamaModel"]
+    assert getattr(export_config, "auto_map", None) is None
+    assert export_config.is_causal is False
+    assert export_config.pooling == "cls"
+    assert encoder.config.model_type == "llama_bidirec"
+
+    with pytest.raises(ValueError, match="does not match the training collator prompt"):
+        encoder.configure_sentence_transformer_prompts(
+            query_prompt="different query: ",
+            document_prompt="passage: ",
+        )
+
+
+def test_bi_encoder_export_config_uses_class_model_type_when_source_type_is_retained():
+    from nemo_automodel._transformers import retrieval
+
+    config = Ministral3BidirectionalConfig.from_dict(
+        {
+            "model_type": "ministral3",
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "pooling": "avg",
+        }
+    )
+    backbone = Ministral3BidirectionalModel(config)
+    encoder = retrieval.BiEncoderModel(backbone, pooling="avg", l2_normalize=True)
+
+    assert encoder.config.model_type == "ministral3"
+    assert type(encoder.config).model_type == "ministral3_bidirec"
+
+    export_config = encoder.get_hf_export_config()
+
+    assert isinstance(export_config, Ministral3Config)
+    assert not isinstance(export_config, Ministral3BidirectionalConfig)
+    assert export_config.model_type == "ministral3"
+    assert export_config.architectures == ["Ministral3Model"]
+    assert getattr(export_config, "auto_map", None) is None
+    assert export_config.is_causal is False
+    assert export_config.pooling == "avg"
+
+
 def test_ministral_embedding_uses_stock_bidirectional_model(tmp_path):
     """Standard Ministral checkpoints use and save the stock non-causal model."""
     from nemo_automodel._transformers import retrieval
@@ -298,16 +454,34 @@ def test_ministral_embedding_uses_stock_bidirectional_model(tmp_path):
         modified_output = backbone(input_ids=modified_input_ids, attention_mask=attention_mask).last_hidden_state
     assert not torch.allclose(original_output[0, 0], modified_output[0, 0])
 
+    encoder = retrieval.BiEncoderModel(backbone, pooling="avg", l2_normalize=True, query_prompt="query: ")
+    export_config = encoder.get_hf_export_config()
+
+    assert type(export_config) is Ministral3Config
+    assert export_config.architectures == ["Ministral3Model"]
+    assert export_config.is_causal is False
+    assert getattr(export_config, "auto_map", None) is None
+
     save_dir = tmp_path / "saved_stock_ministral"
-    backbone.save_pretrained(save_dir)
+    encoder.save_pretrained(save_dir, tokenizer=_tiny_tokenizer())
 
     assert not list(save_dir.glob("*.py"))
     reloaded = AutoModel.from_pretrained(save_dir)
+    assert (save_dir / "tokenizer.json").exists()
+    assert json.loads((save_dir / "modules.json").read_text()) == [
+        {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+        {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+        {"idx": 2, "name": "2", "path": "2_Normalize", "type": "sentence_transformers.models.Normalize"},
+    ]
+    assert json.loads((save_dir / "config_sentence_transformers.json").read_text())["prompts"]["query"] == "query: "
+
     assert type(reloaded) is Ministral3Model
     assert reloaded.config.model_type == "ministral3"
+    assert reloaded.config.architectures == ["Ministral3Model"]
     assert reloaded.config.is_causal is False
     assert getattr(reloaded.config, "auto_map", None) is None
     _assert_state_dict_equal(source_state_dict, reloaded.state_dict())
+    assert reloaded.config.sliding_window == 4
 
 
 def test_ministral_embedding_uses_bidirectional_flash_attention(tmp_path, monkeypatch):
@@ -323,22 +497,34 @@ def test_ministral_embedding_uses_bidirectional_flash_attention(tmp_path, monkey
         pooling="avg",
     )
     assert backbone.config.is_causal is False
+    assert hasattr(backbone.config, "_attn_implementation")
     backbone.config._attn_implementation = "flash_attention_2"
     assert all(layer.self_attn.is_causal is True for layer in backbone.layers)
 
     kernel_calls = []
 
     def record_flash_attention(query, key, value, attention_mask, **kwargs):
-        kernel_calls.append({"is_causal": kwargs.get("is_causal"), "attention_mask": attention_mask})
+        kernel_calls.append(
+            {
+                "is_causal": kwargs.get("is_causal"),
+                "attention_mask": attention_mask,
+            }
+        )
         return torch.zeros_like(query)
 
-    monkeypatch.setattr(flash_attention, "_flash_attention_forward", record_flash_attention)
+    monkeypatch.setattr(
+        flash_attention,
+        "_flash_attention_forward",
+        record_flash_attention,
+    )
 
     input_ids = torch.randint(0, backbone.config.vocab_size, (1, 4))
     backbone(input_ids=input_ids, attention_mask=torch.ones_like(input_ids))
 
     assert len(kernel_calls) == backbone.config.num_hidden_layers
-    assert all(call == {"is_causal": False, "attention_mask": None} for call in kernel_calls)
+    for call in kernel_calls:
+        assert call["attention_mask"] is None
+        assert call["is_causal"] is False
 
 
 def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):

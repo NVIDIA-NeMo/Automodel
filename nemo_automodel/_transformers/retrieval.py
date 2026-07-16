@@ -17,6 +17,7 @@
 import inspect
 import os
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -31,6 +32,39 @@ from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 logger = logging.get_logger(__name__)
+
+
+_STANDARD_SENTENCE_TRANSFORMER_POOLING_TYPES = frozenset({"avg", "cls", "last"})
+
+
+@dataclass
+class SentenceTransformerExportConfig:
+    """Effective Sentence Transformers semantics written with a bi-encoder checkpoint.
+
+    Attributes:
+        query_prompt: Exact prompt prepended to queries, or None when no prompt is configured yet.
+        document_prompt: Exact prompt prepended to documents, or None when no prompt is configured yet.
+        max_seq_length: Deployment sequence limit, or None to use the tokenizer or model capability.
+        similarity_fn_name: Sentence Transformers similarity function, or None to derive it.
+        do_lower_case: Transformer preprocessing flag, or None to default to False.
+        include_prompt: Whether pooling includes prompt tokens.
+    """
+
+    query_prompt: str | None = None
+    document_prompt: str | None = None
+    max_seq_length: int | None = None
+    similarity_fn_name: str | None = None
+    do_lower_case: bool | None = None
+    include_prompt: bool = True
+
+
+def _clone_pretrained_config(config: PretrainedConfig) -> PretrainedConfig:
+    """Clone a config while retaining private source-revision metadata."""
+    cloned_config = config.__class__.from_dict(config.to_dict())
+    commit_hash = getattr(config, "_commit_hash", None)
+    if commit_hash is not None:
+        cloned_config._commit_hash = commit_hash
+    return cloned_config
 
 
 def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedModel:
@@ -316,12 +350,27 @@ def build_encoder_backbone(
     return AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
 
 
+def _supports_standard_sentence_transformer_export(model: nn.Module, pooling: str) -> bool:
+    """Return whether a backbone can be represented by the standard text module stack."""
+    config = getattr(model, "config", None)
+    hidden_size = getattr(config, "hidden_size", None)
+    return (
+        pooling in _STANDARD_SENTENCE_TRANSFORMER_POOLING_TYPES
+        and getattr(model, "main_input_name", "input_ids") == "input_ids"
+        and isinstance(config, PretrainedConfig)
+        and not bool(getattr(config, "is_composition", False))
+        and isinstance(hidden_size, int)
+        and hidden_size > 0
+    )
+
+
 def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> None:
     """Save an encoder model to an output directory.
 
     If ``checkpointer`` is present in *kwargs*, delegates to
     ``Checkpointer.save_model`` for distributed/FSDP-safe saving.
-    Otherwise falls back to the inner ``PreTrainedModel.save_pretrained``.
+    Otherwise saves the inner ``PreTrainedModel`` and generates standard
+    Sentence Transformers metadata when the encoder can be represented by that format.
 
     The inner model is expected to be stored as ``model.model`` (the
     backbone wrapped by the encoder).
@@ -351,6 +400,21 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
 
     logger.info(f"Saving encoder model to {save_directory}")
     model.model.save_pretrained(save_directory)
+    export_config = getattr(model, "sentence_transformer_export_config", None)
+    if export_config is None:
+        return
+
+    deploy_config = model.get_hf_export_config()
+    deploy_config.save_pretrained(save_directory)
+    tokenizer = kwargs.get("tokenizer", None)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(save_directory)
+
+    model_reference = getattr(model.model, "name_or_path", None) or getattr(model.model.config, "name_or_path", None)
+    original_model_path = str(model_reference) if model_reference and os.path.isdir(str(model_reference)) else None
+    from nemo_automodel.components.checkpoint.addons import _save_generated_sentence_transformer_assets
+
+    _save_generated_sentence_transformer_assets(model, export_config, original_model_path, save_directory, tokenizer)
 
 
 # Model types that require a registered custom retrieval backbone for each task.
@@ -394,6 +458,11 @@ class BiEncoderModel(nn.Module):
         model: PreTrainedModel,
         pooling: str = "avg",
         l2_normalize: bool = True,
+        query_prompt: str | None = None,
+        document_prompt: str | None = None,
+        sentence_transformer_max_seq_length: int | None = None,
+        similarity_fn_name: str | None = None,
+        do_lower_case: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
     ):
@@ -401,6 +470,15 @@ class BiEncoderModel(nn.Module):
         _init_encoder_common(self, model)
         self.pooling = pooling
         self.l2_normalize = l2_normalize
+        self.sentence_transformer_export_config: SentenceTransformerExportConfig | None = None
+        if _supports_standard_sentence_transformer_export(model, pooling):
+            self.sentence_transformer_export_config = SentenceTransformerExportConfig(
+                query_prompt=query_prompt,
+                document_prompt=document_prompt,
+                max_seq_length=sentence_transformer_max_seq_length,
+                similarity_fn_name=similarity_fn_name,
+                do_lower_case=do_lower_case,
+            )
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
         self.detach_distributed_inbatch_negatives = detach_distributed_inbatch_negatives
 
@@ -411,6 +489,11 @@ class BiEncoderModel(nn.Module):
         task: str = None,
         pooling: str = "avg",
         l2_normalize: bool = True,
+        query_prompt: str | None = None,
+        document_prompt: str | None = None,
+        sentence_transformer_max_seq_length: int | None = None,
+        similarity_fn_name: str | None = None,
+        do_lower_case: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
         trust_remote_code: bool = False,
@@ -431,9 +514,57 @@ class BiEncoderModel(nn.Module):
             model=backbone,
             pooling=pooling,
             l2_normalize=l2_normalize,
+            query_prompt=query_prompt,
+            document_prompt=document_prompt,
+            sentence_transformer_max_seq_length=sentence_transformer_max_seq_length,
+            similarity_fn_name=similarity_fn_name,
+            do_lower_case=do_lower_case,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
             detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
         )
+
+    def configure_sentence_transformer_prompts(self, query_prompt: str, document_prompt: str) -> None:
+        """Set the exact prompts used by training and reject conflicting explicit export settings."""
+        export_config = self.sentence_transformer_export_config
+        if export_config is None:
+            return
+        for field_name, effective_prompt in (
+            ("query_prompt", query_prompt),
+            ("document_prompt", document_prompt),
+        ):
+            configured_prompt = getattr(export_config, field_name)
+            if configured_prompt is not None and configured_prompt != effective_prompt:
+                raise ValueError(
+                    f"Configured {field_name}={configured_prompt!r} does not match "
+                    f"the training collator prompt {effective_prompt!r}."
+                )
+            setattr(export_config, field_name, effective_prompt)
+
+    def get_hf_export_config(self) -> PretrainedConfig:
+        """Return a deployable Hugging Face config describing the effective bi-encoder."""
+        config_dict = self.config.to_dict()
+        model_type = getattr(type(self.config), "model_type", "")
+        if model_type.endswith("_bidirec"):
+            export_config_class = type(self.config).__mro__[1]
+            if not issubclass(export_config_class, PretrainedConfig):
+                raise TypeError(f"Unable to determine deployable Hugging Face classes for {type(self.model).__name__}.")
+
+            config_dict.pop("model_type", None)
+            config_dict.pop("auto_map", None)
+            export_config = export_config_class.from_dict(config_dict)
+            try:
+                export_model_class = MODEL_MAPPING[type(export_config)]
+            except KeyError as exc:
+                raise TypeError(
+                    f"Unable to determine deployable Hugging Face classes for {type(self.model).__name__}."
+                ) from exc
+            export_config.architectures = [export_model_class.__name__]
+            export_config.is_causal = False
+        else:
+            export_config = self.config.__class__.from_dict(config_dict)
+
+        export_config.pooling = self.pooling
+        return export_config
 
     def save_pretrained(self, save_directory: str, **kwargs):
         save_encoder_pretrained(self, save_directory, **kwargs)

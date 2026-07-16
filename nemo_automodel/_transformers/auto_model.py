@@ -1218,6 +1218,11 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         pretrained_model_name_or_path: str,
         pooling: str = "avg",
         l2_normalize: bool = True,
+        query_prompt: str | None = None,
+        document_prompt: str | None = None,
+        sentence_transformer_max_seq_length: int | None = None,
+        similarity_fn_name: str | None = None,
+        do_lower_case: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
         **kwargs,
@@ -1231,6 +1236,12 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
             pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.).
             l2_normalize: Whether to L2-normalize embeddings.
+            query_prompt: Exact query prompt written to Sentence Transformers metadata.
+            document_prompt: Exact document prompt written to Sentence Transformers metadata.
+            sentence_transformer_max_seq_length: Deployment sequence limit written to Sentence Transformers
+                metadata. This is independent of training-time truncation.
+            similarity_fn_name: Similarity function written to Sentence Transformers metadata.
+            do_lower_case: Sentence Transformers preprocessing flag.
             do_distributed_inbatch_negative: Whether to gather passages across ranks for distributed in-batch
                 negatives during training.
             detach_distributed_inbatch_negatives: Whether to detach remote passage embeddings in distributed
@@ -1244,6 +1255,11 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             pretrained_model_name_or_path,
             pooling=pooling,
             l2_normalize=l2_normalize,
+            query_prompt=query_prompt,
+            document_prompt=document_prompt,
+            sentence_transformer_max_seq_length=sentence_transformer_max_seq_length,
+            similarity_fn_name=similarity_fn_name,
+            do_lower_case=do_lower_case,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
             detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
             **kwargs,

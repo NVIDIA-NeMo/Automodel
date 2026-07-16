@@ -313,6 +313,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 )
 
         self.dataloader = materialize_loader(dataloader_config)
+        _configure_sentence_transformer_export(self.model_parts[0], self.dataloader.collate_fn)
         self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
 
         self.val_dataloader = None
