@@ -92,6 +92,53 @@ class ModelWithStrictFp32Buffer(nn.Module):
         )
 
 
+class _CheckpointWrappedLeaf(nn.Module):
+    """Small wrapper that exposes the same child name as activation checkpointing."""
+
+    def __init__(self, wrapped_module):
+        super().__init__()
+        self._checkpoint_wrapped_module = wrapped_module
+
+
+class ModelWithCheckpointWrappedDirectFp32Buffer(nn.Module):
+    """Model with an fp32 buffer registered directly on a checkpoint-wrapped leaf."""
+
+    _keep_in_fp32_modules = ["attention_sink_bias"]
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4)
+        attention = nn.Module()
+        attention.register_buffer(
+            "attention_sink_bias",
+            torch.tensor([1.001, -2.003, 0.3333, 17.125], dtype=torch.float32),
+        )
+        self.self_attn = _CheckpointWrappedLeaf(attention)
+
+
+class ModelWithCheckpointWrapperAliasFp32Buffer(nn.Module):
+    """Model whose named_buffers emits a forwarded checkpoint-wrapper alias."""
+
+    _keep_in_fp32_modules = ["e_score_correction_bias"]
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4)
+        self.mlp = nn.Module()
+        self.mlp.gate = nn.Module()
+        self.mlp.gate.register_buffer(
+            "e_score_correction_bias",
+            torch.tensor([1.001, -2.003, 0.3333, 17.125], dtype=torch.float32),
+        )
+
+    def named_buffers(self, prefix="", recurse=True, remove_duplicate=True):
+        for name, buffer in super().named_buffers(prefix, recurse, remove_duplicate):
+            if name == "mlp.gate.e_score_correction_bias":
+                yield "mlp._checkpoint_wrapped_module.gate.e_score_correction_bias", buffer
+            else:
+                yield name, buffer
+
+
 class ModelWithBothFp32Attrs(nn.Module):
     """Model with both _keep_in_fp32_modules and _keep_in_fp32_modules_strict."""
 
@@ -286,6 +333,30 @@ class TestCastModelToDtype:
         assert model.router.e_score_correction_bias.dtype == torch.float32
         assert torch.equal(model.router.e_score_correction_bias, original_bias)
         assert not torch.equal(model.router.e_score_correction_bias, original_bias.to(torch.bfloat16).float())
+        assert model.linear.weight.dtype == torch.bfloat16
+
+    def test_checkpoint_wrapper_alias_fp32_buffer_preserves_values(self):
+        model = ModelWithCheckpointWrapperAliasFp32Buffer()
+        original_bias = model.mlp.gate.e_score_correction_bias.clone()
+
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert model.mlp.gate.e_score_correction_bias.dtype == torch.float32
+        assert torch.equal(model.mlp.gate.e_score_correction_bias, original_bias)
+        assert not torch.equal(model.mlp.gate.e_score_correction_bias, original_bias.to(torch.bfloat16).float())
+        assert model.linear.weight.dtype == torch.bfloat16
+
+    def test_checkpoint_wrapped_direct_fp32_buffer_preserves_values(self):
+        model = ModelWithCheckpointWrappedDirectFp32Buffer()
+        wrapped_attention = model.self_attn._checkpoint_wrapped_module
+        original_bias = wrapped_attention.attention_sink_bias.clone()
+
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        assert "attention_sink_bias" not in model.self_attn._buffers
+        assert wrapped_attention.attention_sink_bias.dtype == torch.float32
+        assert torch.equal(wrapped_attention.attention_sink_bias, original_bias)
+        assert not torch.equal(wrapped_attention.attention_sink_bias, original_bias.to(torch.bfloat16).float())
         assert model.linear.weight.dtype == torch.bfloat16
 
     def test_both_fp32_attrs_preserved(self):

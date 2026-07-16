@@ -20,18 +20,11 @@ The config classes are the released ``transformers`` ``DiffusionGemmaConfig`` /
 AM owns only the compute (model/layers/adapter).
 """
 
-from nemo_automodel.shared.import_utils import UnavailableMeta
-
-try:
-    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-        DiffusionGemmaConfig as DiffusionGemmaConfig,
-    )
-    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-        DiffusionGemmaTextConfig as DiffusionGemmaTextConfig,
-    )
-except (ModuleNotFoundError, ImportError):
-    _MSG = "transformers.models.diffusion_gemma is not available."
-    DiffusionGemmaConfig = UnavailableMeta("DiffusionGemmaConfig", (), {"_msg": _MSG})
-    DiffusionGemmaTextConfig = UnavailableMeta("DiffusionGemmaTextConfig", (), {"_msg": _MSG})
+from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
+    DiffusionGemmaConfig as DiffusionGemmaConfig,
+)
+from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
+    DiffusionGemmaTextConfig as DiffusionGemmaTextConfig,
+)
 
 __all__ = ["DiffusionGemmaConfig", "DiffusionGemmaTextConfig"]

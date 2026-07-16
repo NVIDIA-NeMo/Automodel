@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -140,6 +141,9 @@ def test_run_trainer_step_passes_target_logits():
         input_ids=torch.zeros(1, 4, dtype=torch.long),
         hidden_states=torch.zeros(1, 4, 8),
         loss_mask=torch.ones(1, 4),
+        position_ids=None,
+        seq_lens=None,
+        doc_remaining=None,
         logits=torch.randn(1, 4, VOCAB),
     )
     recipe._run_trainer_step(target_batch)
@@ -158,3 +162,11 @@ def test_main_runs_setup_then_loop(monkeypatch):
     monkeypatch.setattr(TrainJetSpecRecipe, "run_train_validation_loop", lambda self: calls.append("loop"))
     train_jetspec.main("cfg.yaml")
     assert calls == ["setup", "loop"]
+
+
+def test_build_trainer_module_rejects_loss_type():
+    """The DFlash loss_type knob must fail loudly here instead of being
+    silently ignored (JetSpec has its own forward-KL objective)."""
+    recipe = _jetspec_recipe()
+    with pytest.raises(ValueError, match="loss_type"):
+        recipe._build_trainer_module("sdpa", {"loss_type": "variable_prefix"})

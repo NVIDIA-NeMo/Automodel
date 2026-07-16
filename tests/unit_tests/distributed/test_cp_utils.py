@@ -111,6 +111,34 @@ def test_make_cp_batch_and_ctx_no_mesh():
         pass  # nothing should happen
 
 
+def test_make_cp_batch_and_ctx_honors_model_batch_fn_at_cp_size_one():
+    """Native packed models still need their batch transform without CP sharding."""
+    device_mesh = _DummyDeviceMesh(cp_size=1, tp_size=1)
+    called = False
+
+    def make_native_batch(cp_mesh, tp_mesh, batch, **kwargs):
+        nonlocal called
+        called = True
+        assert cp_mesh.size() == 1
+        assert tp_mesh.size() == 1
+        assert kwargs["padding_token_id"] == 99
+        batch["native_thd"] = True
+        return contextlib.nullcontext, batch
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": torch.tensor([[1, 2, 3, 4]]),
+        "_cp_make_batch_fn": make_native_batch,
+    }
+
+    ctx_obj, new_batch = _cu.make_cp_batch_and_ctx(device_mesh, batch, use_te=True, padding_token_id=99)
+
+    assert called
+    assert ctx_obj is contextlib.nullcontext
+    assert new_batch is batch
+    assert new_batch["native_thd"] is True
+
+
 def test_make_cp_batch_and_ctx_with_cp(monkeypatch):
     """Verify correct interaction when Context-Parallelism *is* enabled."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # CP enabled (>1)

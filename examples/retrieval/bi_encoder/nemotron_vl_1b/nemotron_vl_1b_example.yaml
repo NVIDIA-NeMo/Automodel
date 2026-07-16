@@ -56,22 +56,22 @@ tokenizer:
   max_input_tiles: 2
 
 
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
+  model_type: bi_encoder
+  data_dir_list:
+    - path: <DATASETS_PATH>/automodel_colpali/training_datasets/colpali_train.json
+      num_samples: 5000
+    - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
+      num_samples: 5000
+  data_type: train
+  n_passages: 5
+  seed: 42
+  do_shuffle: true
+
 dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-    model_type: bi_encoder
-    data_dir_list:
-      - path: <DATASETS_PATH>/automodel_colpali/training_datasets/colpali_train.json 
-        num_samples: 5000
-      - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
-        num_samples: 5000
-    data_type: train
-    n_passages: 5
-    seed: 42
-    do_shuffle: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.make_vision_collator_from_processor_method
+    _target_: nemo_automodel.components.datasets.llm.ProcessorMethodCollator
     collator_fn_name: process_queries_documents_biencoder
   shuffle: true
   num_workers: 4
