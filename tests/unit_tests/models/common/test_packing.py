@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from nemo_automodel.components.models.common.packing import (
@@ -145,20 +145,38 @@ class TestGetAttnImplementation:
 
 
 class TestConfigurePacking:
-    def test_noop_for_sdpa(self):
-        """configure_packing should do nothing for non-FA2 backends."""
-        configure_packing("sdpa")  # should not raise
+    @pytest.mark.parametrize("attn_implementation", ["sdpa", "flash_attention_3"])
+    def test_noop_for_unsupported_backends(self, attn_implementation, monkeypatch):
+        """configure_packing should not install FA2 shims for unsupported backends."""
+        patch_preprocess = MagicMock()
+        monkeypatch.setattr(
+            "nemo_automodel.components.models.common.packing._patch_preprocess_mask_arguments_for_packing",
+            patch_preprocess,
+        )
 
-    def test_patches_flash_attention_utils(self, monkeypatch):
+        configure_packing(attn_implementation)
+
+        patch_preprocess.assert_not_called()
+
+    def test_patches_flash_attention_utils(self):
         """configure_packing should patch _get_unpad_data for flash_attention_2."""
+        import transformers.masking_utils as masking_utils
         import transformers.modeling_flash_attention_utils as fa_utils
 
         original = fa_utils._get_unpad_data
+        original_preprocess = masking_utils._preprocess_mask_arguments
+        original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
         try:
             configure_packing("flash_attention_2")
             assert fa_utils._get_unpad_data is get_unpad_data
         finally:
             fa_utils._get_unpad_data = original
+            masking_utils._preprocess_mask_arguments = original_preprocess
+            if original_flag is None:
+                if hasattr(masking_utils, "_nemo_automodel_packing_preprocess_patched"):
+                    delattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
+            else:
+                masking_utils._nemo_automodel_packing_preprocess_patched = original_flag
 
     def test_patches_preprocess_mask_arguments_for_indexed_mask(self):
         """configure_packing should preserve integer indexed masks for FA2."""
@@ -168,9 +186,8 @@ class TestConfigurePacking:
         original_unpad = fa_utils._get_unpad_data
         pre_test_preprocess = masking_utils._preprocess_mask_arguments
         original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
-        # Earlier tests call configure_packing, which installs the shim on the
-        # module; reload to recover the pristine Transformers function so the
-        # reference call below exercises the real signature.
+        # Reload so the reference call below exercises the pristine installed
+        # Transformers implementation regardless of test order.
         importlib.reload(masking_utils)
         if hasattr(masking_utils, "_nemo_automodel_packing_preprocess_patched"):
             delattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
@@ -216,15 +233,21 @@ class TestConfigurePacking:
         try:
             configure_packing("flash_attention_2")
             mask = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
-            expected_len = len(
-                original_preprocess(*build_args(torch.zeros(1, 1, 5, 5, dtype=torch.bool), torch.arange(5)))
-            )
+            probe_mask = torch.zeros(1, 1, 1, 1, dtype=torch.bool)
+            expected_template = original_preprocess(*build_args(probe_mask, torch.arange(5)))
             for cache_position in (torch.arange(5), None):
                 result = masking_utils._preprocess_mask_arguments(*build_args(mask, cache_position))
-                assert result[0] is True
+                assert result[0] is expected_template[0]
                 assert result[1] is mask
-                assert len(result) == expected_len
-                assert result[2:] == (None,) * (expected_len - 2)
+                assert result[2:] == expected_template[2:]
+
+            binary_mask = torch.tensor([[1, 1, 1, 0, 0]], dtype=torch.long)
+            expected_binary = original_preprocess(*build_args(binary_mask, None))
+            result_binary = masking_utils._preprocess_mask_arguments(*build_args(binary_mask, None))
+            assert result_binary[0] is expected_binary[0]
+            assert result_binary[1].dtype == torch.bool
+            assert torch.equal(result_binary[1], expected_binary[1])
+            assert result_binary[2:] == expected_binary[2:]
         finally:
             fa_utils._get_unpad_data = original_unpad
             masking_utils._preprocess_mask_arguments = pre_test_preprocess
@@ -234,26 +257,70 @@ class TestConfigurePacking:
             else:
                 masking_utils._nemo_automodel_packing_preprocess_patched = original_flag
 
-    def test_warns_when_preprocess_shim_cannot_install(self, monkeypatch, caplog):
-        """A missing _preprocess_mask_arguments must warn (with the transformers version), not silently no-op."""
-        import transformers
+    def test_qwen3_uses_generic_preprocess_shim(self):
+        """Qwen3 should preserve indexed masks without a model-specific module patch."""
+        import transformers.masking_utils as masking_utils
+        import transformers.modeling_flash_attention_utils as fa_utils
+        import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
+
+        original_unpad = fa_utils._get_unpad_data
+        original_preprocess = masking_utils._preprocess_mask_arguments
+        original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
+        original_create_causal_mask = modeling_qwen3.create_causal_mask
+        try:
+            configure_packing("flash_attention_2")
+            mask = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
+            result = modeling_qwen3.create_causal_mask(
+                config=SimpleNamespace(_attn_implementation="flash_attention_2"),
+                inputs_embeds=torch.zeros(1, 5, 8),
+                attention_mask=mask,
+                past_key_values=None,
+                position_ids=torch.arange(5).unsqueeze(0),
+            )
+
+            assert modeling_qwen3.create_causal_mask is original_create_causal_mask
+            assert result is mask
+        finally:
+            fa_utils._get_unpad_data = original_unpad
+            masking_utils._preprocess_mask_arguments = original_preprocess
+            if original_flag is None:
+                if hasattr(masking_utils, "_nemo_automodel_packing_preprocess_patched"):
+                    delattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
+            else:
+                masking_utils._nemo_automodel_packing_preprocess_patched = original_flag
+
+    def test_fails_when_preprocess_shim_cannot_install(self, monkeypatch):
+        """A missing private hook must fail before training can mix packed documents."""
         import transformers.masking_utils as masking_utils
 
         monkeypatch.setattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", False, raising=False)
         monkeypatch.delattr(masking_utils, "_preprocess_mask_arguments", raising=False)
 
-        with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.models.common.packing"):
+        with pytest.raises(RuntimeError, match="Cannot enable FA2 neat packing.*_preprocess_mask_arguments"):
             _patch_preprocess_mask_arguments_for_packing()
 
-        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("mask shim not installed" in msg for msg in warnings)
-        assert any(str(transformers.__version__) in msg for msg in warnings)
+    def test_fails_on_incompatible_preprocess_result(self, monkeypatch):
+        """An incompatible private return contract must fail instead of guessing tuple fields."""
+        import transformers.masking_utils as masking_utils
+
+        def incompatible_preprocess(**kwargs):
+            """Return a non-early-exit result for the 4D contract probe."""
+            return False, kwargs["attention_mask"]
+
+        monkeypatch.setattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", False, raising=False)
+        monkeypatch.setattr(masking_utils, "_preprocess_mask_arguments", incompatible_preprocess)
+
+        with pytest.raises(RuntimeError, match="incompatible _preprocess_mask_arguments early-exit result"):
+            _patch_preprocess_mask_arguments_for_packing()
 
     def test_patches_loaded_model_modules(self):
         """configure_packing should patch create_causal_mask on loaded modules."""
+        import transformers.masking_utils as masking_utils
         import transformers.modeling_flash_attention_utils as fa_utils
 
         original_unpad = fa_utils._get_unpad_data
+        original_preprocess = masking_utils._preprocess_mask_arguments
+        original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
         # Create a fake module with create_causal_mask
         fake_mod = MagicMock()
         fake_mod.create_causal_mask = MagicMock()
@@ -264,4 +331,10 @@ class TestConfigurePacking:
             assert fake_mod.create_causal_mask is _passthrough_create_causal_mask
         finally:
             fa_utils._get_unpad_data = original_unpad
+            masking_utils._preprocess_mask_arguments = original_preprocess
+            if original_flag is None:
+                if hasattr(masking_utils, "_nemo_automodel_packing_preprocess_patched"):
+                    delattr(masking_utils, "_nemo_automodel_packing_preprocess_patched")
+            else:
+                masking_utils._nemo_automodel_packing_preprocess_patched = original_flag
             del sys.modules[fake_mod_name]
