@@ -624,6 +624,14 @@ def apply_fsdp(
     if embed_tokens is not None and not tied_input_output_embeddings:
         fully_shard_default(embed_tokens)
 
+    # Some backbones (e.g. Inkling) apply a pre-decoder embedding norm by calling
+    # ``_model.embed_norm`` directly from the multimodal forward, i.e. outside the
+    # backbone's own forward. Give it its own FSDP unit so the call site unshards
+    # it; otherwise its sharded weight mixes with plain activations.
+    embed_norm = getattr(_model, "embed_norm", None)
+    if embed_norm is not None and isinstance(embed_norm, nn.Module):
+        fully_shard_default(embed_norm)
+
     if lm_head is not None and not tied_input_output_embeddings:
         # Use custom mixed precision policy for lm_head if lm_head_precision is specified
         if lm_head_precision == torch.float32:
