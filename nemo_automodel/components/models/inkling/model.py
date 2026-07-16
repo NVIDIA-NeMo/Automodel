@@ -45,6 +45,10 @@ from transformers.models.inkling.modeling_inkling import InklingTextModel as HFI
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -122,6 +126,8 @@ class InklingTextModel(HFInklingTextModel):
 class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditionalGeneration, MoEFSDPSyncMixin):
     """Inkling VLM with expert-parallel MoE feed-forwards."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     # The adapter covers every checkpoint tensor. Avoid initializing the 975B
     # sharded model immediately before loading it, which can also introduce
     # stage-divergent DTensor collectives under PP.
@@ -170,6 +176,7 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
         backend: BackendConfig | None = None,
         **kwargs,
     ) -> None:
+        reject_unsupported_tie_word_embeddings(type(self), config)
         backend = backend or BackendConfig()
 
         # Propagate the requested top-level dtype to the nested sub-configs so the

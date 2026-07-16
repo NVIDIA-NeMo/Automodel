@@ -16,8 +16,10 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
+from transformers.models.inkling.configuration_inkling import InklingConfig
 from transformers.models.inkling.modeling_inkling import (  # noqa: E402
     InklingForConditionalGeneration as HFInklingForConditionalGeneration,
 )
@@ -28,6 +30,7 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (  # noqa: E402
     default_collate_fn,
 )
 from nemo_automodel.components.models.common import BackendConfig  # noqa: E402
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.inkling.layers import InklingDenseMLP, InklingMoE  # noqa: E402
 from nemo_automodel.components.models.inkling.model import InklingForConditionalGeneration  # noqa: E402
 from nemo_automodel.components.models.inkling.state_dict_adapter import _interleave  # noqa: E402
@@ -57,6 +60,24 @@ def test_sparse_layers_use_inkling_moe():
 
 def test_pretrained_load_skips_redundant_full_model_initialization():
     assert InklingForConditionalGeneration._skip_init_weights_on_load is True
+
+
+def test_inkling_uses_separate_input_and_output_embeddings():
+    cfg = build_tiny_config()
+    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", experts="torch", dispatcher="torch")
+    model = InklingForConditionalGeneration.from_config(cfg, backend=backend)
+
+    assert InklingForConditionalGeneration.tie_word_embeddings_support is TieSupport.UNTIED_ONLY
+    assert model.lm_head.weight is not model.model.language_model.embed_tokens.weight
+
+
+def test_inkling_rejects_tied_word_embeddings():
+    config_dict = build_tiny_config().to_dict()
+    config_dict["tie_word_embeddings"] = True
+    cfg = InklingConfig.from_dict(config_dict)
+
+    with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=True"):
+        InklingForConditionalGeneration.from_config(cfg)
 
 
 def test_pipeline_metadata_uses_unpadded_vocabulary_size():
