@@ -1309,6 +1309,8 @@ fi
             pre_shard_hf_state_dict_keys = (
                 getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
             )
+            if pre_shard_hf_state_dict_keys is None:
+                pre_shard_hf_state_dict_keys = list(state_dict.keys())
             if model_type and requires_tensor_merging(model_type) and not hasattr(model_part, "state_dict_adapter"):
                 # in this case, Transformers performed weight conversion so we will save the converted format in the checkpoint
                 num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1

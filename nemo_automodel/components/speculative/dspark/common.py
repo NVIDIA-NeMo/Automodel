@@ -11,11 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -80,13 +83,49 @@ def validate_target_layer_ids(layer_ids, num_target_layers: int):
         )
         assert previous is None or layer_id > previous, "target_layer_ids must be strictly increasing."
         previous = layer_id
+
+    # The standard SGLang runtime captures aux/context features via
+    # ``set_eagle3_layers_to_capture`` (effectively capturing the input of layer
+    # ``id + 1``), so it cannot produce a feature for ``-1`` (no capture point) or
+    # for the last layer ``end`` (capture point ``num_target_layers`` does not
+    # exist in a ``0..end`` decoder loop, and SGLang exposes the post-norm hidden
+    # only as a separate last-hidden, never as an aux slot). A checkpoint trained
+    # with these ids still serves with AutoModel's own ``spec_generate`` (which
+    # follows the HuggingFace ``output_hidden_states`` convention), but not on the
+    # standard SGLang runtime. Warn rather than fail: the ids are valid for
+    # AutoModel, only unservable on SGLang.
+    sglang_unsupported = sorted({layer_id for layer_id in layer_ids if layer_id == -1 or layer_id == end})
+    if sglang_unsupported:
+        logger.warning(
+            "target_layer_ids %s include %s, which the standard SGLang runtime cannot capture "
+            "(-1 is the embedding and the last layer %d is post-norm; neither has an SGLang aux "
+            "capture point). A drafter trained with these ids serves with AutoModel's spec_generate "
+            "but not on standard SGLang; keep target_layer_ids within [0, %d] for SGLang deployment.",
+            layer_ids,
+            sglang_unsupported,
+            end,
+            end - 1,
+        )
     return layer_ids
+
+
+def context_doc_ids(seq_lens: torch.Tensor, seq_len: int, device: torch.device) -> torch.Tensor:
+    """Per-context-token document id ``[B, S]`` from packed ``seq_lens`` ``[B, max_docs]``.
+
+    Mirrors the ``doc_id`` construction in ``build_block_causal_additive_mask``: a
+    token's id is the number of document boundaries at or before its position, so
+    0-length padding entries never split a real document.
+    """
+    boundaries = seq_lens.to(device).cumsum(dim=1)  # [B, max_docs]
+    positions = torch.arange(seq_len, device=device)
+    return (boundaries.unsqueeze(1) <= positions.view(1, -1, 1)).sum(dim=2)
 
 
 def build_anchor_candidate_mask(
     *,
     seq_len: int,
     loss_mask: torch.Tensor,
+    doc_remaining: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_candidates = max(seq_len - 1, 0)
     if num_candidates == 0:
@@ -94,7 +133,12 @@ def build_anchor_candidate_mask(
 
     anchor_valid = loss_mask[:, :num_candidates] > 0.5
     first_target_valid = loss_mask[:, 1 : num_candidates + 1] > 0.5
-    return anchor_valid & first_target_valid
+    valid = anchor_valid & first_target_valid
+    if doc_remaining is not None:
+        # Packing: the anchor's first target (anchor + 1) must stay in the anchor's
+        # document, i.e. at least one real token follows the anchor in its document.
+        valid = valid & (doc_remaining[:, :num_candidates] >= 1)
+    return valid
 
 
 def sample_anchor_positions(
@@ -103,10 +147,12 @@ def sample_anchor_positions(
     loss_mask: torch.Tensor,
     num_anchors: int,
     device: torch.device,
+    doc_remaining: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     valid = build_anchor_candidate_mask(
         seq_len=seq_len,
         loss_mask=loss_mask,
+        doc_remaining=doc_remaining,
     )
     valid_counts = valid.sum(dim=1)
     bsz = loss_mask.shape[0]
@@ -155,6 +201,8 @@ def build_eval_mask(
     label_indices: torch.Tensor,
     safe_label_indices: torch.Tensor,
     block_keep_mask: torch.Tensor,
+    doc_remaining: Optional[torch.Tensor] = None,
+    anchor_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     target_valid = label_indices < seq_len
     target_loss_mask = torch.gather(
@@ -164,20 +212,39 @@ def build_eval_mask(
     )
     eval_mask = target_valid & (target_loss_mask > 0.5)
     eval_mask = eval_mask & block_keep_mask.unsqueeze(-1)
+    if doc_remaining is not None:
+        # Packing: truncate each block at its anchor's document boundary. The k-th
+        # block slot (0-indexed) predicts token ``anchor + k + 1``, which stays in
+        # the document iff ``k + 1 <= doc_remaining[anchor]``. The trailing cumprod
+        # then drops every slot at or beyond the boundary (a partial in-document
+        # block), matching how the block is truncated at the sequence end.
+        block_size = label_indices.size(-1)
+        step = torch.arange(1, block_size + 1, device=label_indices.device).view(1, 1, -1)
+        anchor_remaining = torch.gather(doc_remaining, 1, anchor_positions).unsqueeze(-1)
+        eval_mask = eval_mask & (step <= anchor_remaining)
     return eval_mask.to(torch.int32).cumprod(dim=-1).bool()
 
 
 def create_position_ids(
     anchor_positions: torch.Tensor,
     block_size: int,
+    context_position_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Position ids for the parallel draft blocks (``base position + offset``).
+
+    Without packing the anchor's position equals its row index, so the block
+    positions are ``anchor + offset``. Under packing ``context_position_ids``
+    ``[B, S]`` holds per-document reset positions, so the block's base position is
+    gathered from it at the anchor to keep the draft's RoPE phase document-local.
+    """
     bsz, num_blocks = anchor_positions.shape
     device = anchor_positions.device
     offsets = torch.arange(block_size, device=device).view(1, 1, -1)
-    return (anchor_positions.unsqueeze(-1) + offsets).view(
-        bsz,
-        num_blocks * block_size,
-    )
+    if context_position_ids is None:
+        base = anchor_positions.unsqueeze(-1)
+    else:
+        base = torch.gather(context_position_ids, 1, anchor_positions).unsqueeze(-1)
+    return (base + offsets).view(bsz, num_blocks * block_size)
 
 
 def create_noise_embed(
@@ -263,6 +330,7 @@ __all__ = [
     "AcceptRatePredictor",
     "extract_context_feature",
     "validate_target_layer_ids",
+    "context_doc_ids",
     "build_anchor_candidate_mask",
     "sample_anchor_positions",
     "build_eval_mask",

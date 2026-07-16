@@ -40,9 +40,10 @@ Built on `transformers` for day-0 model support and OOTB compatibility.
 ## Get Started
 
 ```bash
-uv pip install nemo-automodel
-
-automodel --nproc-per-node=2 llama3_2_1b_squad.yaml
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv sync --locked --all-groups --extra all
+uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml --nproc-per-node 2
 ```
 
 See the [installation guide](/get-started/installation) for Docker, source builds, and multi-node setup.
@@ -81,7 +82,7 @@ Find the right guide for your task: fine-tuning, pretraining, distillation, diff
 | **Fine-tune VLM-MoE**       | You need large-scale vision-language training with sparse MoE efficiency            | Image + text dataset                              | VLM (MoE) | [Fine-tune VLM-MoE](/recipes-e2e-examples/qwen3-5-vl)                |
 | **Fine-tune agentic VLM-MoE** | You need image/video context for agentic developer workflows                       | Image / video + text dataset                      | VLM (MoE) | [Fine-tune Step-3.7-Flash](/recipes-e2e-examples/step-3-7)        |
 | **Fine-tune Audio ASR**     | Adapt Qwen3-Omni for speech recognition on HF audio datasets                        | Audio + transcript dataset                        | Qwen3-Omni | [Fine-tune Qwen3-Omni ASR](/recipes-e2e-examples/qwen3-omni-asr) |
-| **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | <Badge intent="info">Coming Soon</Badge>                                   |
+| **Embedding fine-tune**     | You want to improve text similarity for search, retrieval, or RAG         | Text pairs / retrieval corpus                     | LLM       | [Train a bi-encoder or cross-encoder](/recipes-e2e-examples/retrieval-finetune) |
 | **Fine-tune a large MoE**   | You are adapting a large sparse MoE model (DeepSeek-V3, GLM-5, etc.) to your domain | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune MoE](/recipes-e2e-examples/large-moe-fine-tuning)         |
 | **Fine-tune DeepSeek V4 Flash** | You want to fine-tune the DeepSeek V4 Flash hybrid-attention MoE (SWA / CSA / HCA + hash-routing) | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune DeepSeek V4 Flash](/recipes-e2e-examples/deepseek-v4-flash)   |
 | **Fine-tune Hy3-preview**       | You want to fine-tune Tencent's 295B MoE with sigmoid routing and per-head QK RMSNorm              | Text dataset (e.g., HellaSwag)                    | LLM (MoE) | [Fine-tune Hy3-preview](/recipes-e2e-examples/hy3-preview)                |
@@ -153,7 +154,7 @@ Track experiments and metrics with MLflow and Wandb.
 Components, recipes, and CLI architecture.
 </Card>
 
-<Card title="API Reference" href="/development/api-reference/overview">
+<Card title="API Reference" href="/reference/api-reference">
 Auto-generated Python API documentation.
 </Card>
 

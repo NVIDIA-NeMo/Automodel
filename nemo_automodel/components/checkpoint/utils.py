@@ -26,7 +26,6 @@ from nemo_automodel.shared.tied_weights import (
     ensure_tied_lm_head as ensure_tied_lm_head,
 )
 from nemo_automodel.shared.tied_weights import (
-    get_controlling_tie_word_embeddings,
     get_input_embeddings_weight_and_name,
     get_lm_head_weight_and_name,
     is_tied_word_embeddings,
@@ -112,61 +111,6 @@ def resolve_trust_remote_code(pretrained_model_name_or_path):
         return False
     # pretrained_model_name_or_path can be something like nvidia/NVIDIA-Nemotron-Nano-9B-v2
     return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
-
-
-def reject_unsupported_tied_word_embeddings(config: object, model_class_name: str) -> None:
-    """Reject ``tie_word_embeddings=True`` for models whose HF default is untied.
-
-    Separate-head architectures (HF default: distinct input/output embeddings)
-    don't build a shared ``lm_head``, so honoring ``tie_word_embeddings=True``
-    would silently leave a randomly-initialized head or require materializing a
-    tied weight NeMo does not support. Reject it explicitly with a clear message
-    instead of pretending to support it.
-
-    Uses :func:`get_controlling_tie_word_embeddings`, so composite VLM/omni configs
-    are read from the controlling top-level flag rather than a nested
-    ``text_config``.
-
-    Args:
-        config: The model's config.
-        model_class_name: ``type(self).__name__`` of the constructing model.
-
-    Raises:
-        NotImplementedError: if the controlling ``tie_word_embeddings`` flag is set.
-    """
-    if get_controlling_tie_word_embeddings(config, model_class_name):
-        raise NotImplementedError(
-            f"{model_class_name} has separate input and output embeddings and does not "
-            f"support tie_word_embeddings=True. The Hugging Face default for this "
-            f"architecture is untied; set tie_word_embeddings=False."
-        )
-
-
-def reject_unsupported_untied_word_embeddings(config: object, model_class_name: str) -> None:
-    """Reject ``tie_word_embeddings=False`` for models whose HF default is tied.
-
-    Tied-by-default architectures share ``lm_head`` with the input embedding and
-    ship checkpoints without a separate ``lm_head.weight``. Honoring
-    ``tie_word_embeddings=False`` would require materializing a distinct
-    ``lm_head`` NeMo does not build (and a tied checkpoint has no weights for it),
-    so reject it explicitly instead of running with a randomly-initialized head.
-
-    The mirror of :func:`reject_unsupported_tied_word_embeddings`; both read the
-    controlling flag via :func:`get_controlling_tie_word_embeddings`.
-
-    Args:
-        config: The model's config.
-        model_class_name: ``type(self).__name__`` of the constructing model.
-
-    Raises:
-        NotImplementedError: if the controlling ``tie_word_embeddings`` flag evaluates to ``False``.
-    """
-    if not get_controlling_tie_word_embeddings(config, model_class_name):
-        raise NotImplementedError(
-            f"{model_class_name} ties its input and output embeddings and does not "
-            f"support tie_word_embeddings=False. The Hugging Face default for this "
-            f"architecture is tied; set tie_word_embeddings=True."
-        )
 
 
 def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | None = None) -> list[str]:

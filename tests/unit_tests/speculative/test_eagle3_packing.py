@@ -103,6 +103,19 @@ def test_block_causal_additive_mask():
     assert m[2, 3] == neg  # doc A query cannot see doc B
 
 
+def test_block_causal_additive_mask_rejects_malformed_seq_lens():
+    """Fail loud (not silently misbucket) on non-2D seq_lens or a row that does not sum to T."""
+    cpu = torch.device("cpu")
+    with pytest.raises(ValueError, match="2D"):
+        build_block_causal_additive_mask(
+            torch.tensor([3, 2], dtype=torch.long), seq_length=5, dtype=torch.float32, device=cpu
+        )
+    with pytest.raises(ValueError, match="sum to seq_length"):
+        build_block_causal_additive_mask(
+            torch.tensor([[3, 1]], dtype=torch.long), seq_length=5, dtype=torch.float32, device=cpu
+        )
+
+
 def test_seq_lens_to_cu_seqlens():
     """cu_seqlens is int32, monotonic, row-major, and sums to B*T; max_seqlen is the longest doc."""
     seq_lens = torch.tensor([[3, 2], [4, 1]], dtype=torch.long)  # B=2, T=5
