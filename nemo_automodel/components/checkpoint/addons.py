@@ -43,12 +43,17 @@ class CheckpointAddon(Protocol):
 
 
 class ConsolidatedHFAddon:
-    """
-    Addon that writes consolidated Hugging Face metadata alongside sharded weights.
+    """Write consolidated Hugging Face metadata alongside sharded weights.
 
     On rank 0, this saves `config.json`, `generation_config.json`, and tokenizer
     artifacts into the provided consolidated directory, then synchronizes ranks.
+
+    Args:
+        process_group: Optional process group used to coordinate consolidated export.
     """
+
+    def __init__(self, process_group: torch.distributed.ProcessGroup | None = None) -> None:
+        self.process_group = process_group
 
     def pre_save(self, **kwargs) -> None:
         """
@@ -69,7 +74,7 @@ class ConsolidatedHFAddon:
         original_model_path = kwargs["original_model_path"]
 
         # Perform save operations on rank 0
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank(group=self.process_group) == 0:
             # if the HF model has custom model code, we need to save it as part of the checkpoint
             _maybe_save_custom_model_code(original_model_path, hf_metadata_dir, model_part=model_part)
             # save the config.json file
@@ -122,7 +127,7 @@ class ConsolidatedHFAddon:
                 with open(os.path.join(hf_metadata_dir, FQN_TO_DTYPE_MAPPING_FILENAME), "w") as f:
                     json.dump(fqn_to_dtype_mapping, f, indent=2, sort_keys=True)
         if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+            torch.distributed.barrier(group=self.process_group)
 
     def post_save(self, **kwargs) -> None:
         """
@@ -142,7 +147,7 @@ class ConsolidatedHFAddon:
             # in this case we are just saving the sharded HF safetensors
             return
 
-        if (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0):
+        if (not torch.distributed.is_initialized()) or (torch.distributed.get_rank(group=self.process_group) == 0):
             # Copy each public metadata item into consolidated_path while keeping
             # .hf_metadata intact for the offline consolidation helper.
             for item_name in os.listdir(hf_metadata_path):
@@ -155,7 +160,7 @@ class ConsolidatedHFAddon:
                 else:
                     shutil.copy2(src_path, dst_path)
         if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+            torch.distributed.barrier(group=self.process_group)
 
 
 class PeftAddon:

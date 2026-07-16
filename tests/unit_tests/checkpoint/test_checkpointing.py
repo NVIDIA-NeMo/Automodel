@@ -17,8 +17,9 @@ import json
 import logging
 import os
 from contextlib import ExitStack
+from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -62,6 +63,112 @@ from nemo_automodel.components.checkpoint.utils import (
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
+
+
+class TestConsolidationProcessGroup:
+    """Tests for the process group that isolates inline consolidation from NCCL."""
+
+    @staticmethod
+    def _config(tmp_path, save_consolidated="final", consolidation_timeout_minutes=30):
+        return CheckpointingConfig(
+            checkpoint_dir=str(tmp_path),
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id="test/model",
+            save_consolidated=save_consolidated,
+            consolidation_timeout_minutes=consolidation_timeout_minutes,
+        )
+
+    def test_creates_gloo_group_with_configured_timeout(self, tmp_path):
+        process_group = MagicMock()
+        config = self._config(tmp_path, consolidation_timeout_minutes=45)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.new_group", return_value=process_group) as new_group,
+        ):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+        new_group.assert_called_once_with(backend="gloo", timeout=timedelta(minutes=45))
+        assert checkpointer._consolidation_process_group is process_group
+
+    def test_sharded_only_save_does_not_create_group(self, tmp_path):
+        config = self._config(tmp_path, save_consolidated=False)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.new_group") as new_group,
+        ):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+        new_group.assert_not_called()
+        assert checkpointer._consolidation_process_group is None
+
+    def test_uninitialized_distributed_does_not_create_group(self, tmp_path):
+        config = self._config(tmp_path)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch("torch.distributed.new_group") as new_group,
+        ):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+        new_group.assert_not_called()
+        assert checkpointer._consolidation_process_group is None
+
+    def test_close_destroys_consolidation_group(self, tmp_path):
+        process_group = MagicMock()
+        config = self._config(tmp_path)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.new_group", return_value=process_group),
+        ):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.destroy_process_group") as destroy_process_group,
+        ):
+            checkpointer.close()
+
+        destroy_process_group.assert_called_once_with(process_group)
+        assert checkpointer._consolidation_process_group is None
+
+    def test_save_model_passes_group_to_consolidation(self, tmp_path):
+        process_group = MagicMock()
+        config = self._config(tmp_path)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.new_group", return_value=process_group),
+        ):
+            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+        checkpointer._maybe_build_consolidated_index = MagicMock(return_value={"weight": 1})
+        checkpointer._maybe_build_original_dtype_mapping = MagicMock(return_value=None)
+        checkpointer._get_storage_writer = MagicMock(return_value=MagicMock())
+        checkpointer._do_save = MagicMock(return_value=None)
+        checkpointer._addons = []
+        model = MagicMock()
+        model.state_dict.return_value = {"weight": torch.ones(1)}
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                side_effect=lambda *args, **kwargs: args[1],
+            ),
+            patch(
+                "nemo_automodel.components.checkpoint.checkpointing.consolidate_safetensors_files_on_every_rank"
+            ) as consolidate,
+        ):
+            checkpointer.save_model(model, str(tmp_path / "step_1"), is_final_checkpoint=True)
+
+        assert consolidate.call_args.kwargs["process_group"] is process_group
 
 
 def _make_keys(count: int) -> list[str]:
@@ -1788,6 +1895,30 @@ class TestOfflineConsolidationScriptAndWarnings:
         assert (consolidated_dir / "tokenizer" / "tokenizer.json").exists()
         assert not (consolidated_dir / FQN_TO_FILE_INDEX_MAPPING_FILENAME).exists()
         assert not (consolidated_dir / FQN_TO_DTYPE_MAPPING_FILENAME).exists()
+
+    def test_consolidated_metadata_hooks_use_process_group(self):
+        process_group = MagicMock()
+        model_state = SimpleNamespace(model=[MagicMock()])
+        addon = ConsolidatedHFAddon(process_group=process_group)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=1) as get_rank,
+            patch("torch.distributed.barrier") as barrier,
+        ):
+            addon.pre_save(
+                model_state=model_state,
+                hf_metadata_dir="unused",
+                fqn_to_file_index_mapping={},
+                original_model_path="unused",
+            )
+            addon.post_save(
+                consolidated_path="unused",
+                hf_metadata_path="unused",
+            )
+
+        assert get_rank.call_args_list == [call(group=process_group), call(group=process_group)]
+        assert barrier.call_args_list == [call(group=process_group), call(group=process_group)]
 
     def test_save_consolidated_normalizes_legacy_bools(self, tmp_path):
         assert self._make_checkpointer(tmp_path, save_consolidated=True).config.save_consolidated is (

@@ -119,9 +119,13 @@ class CheckpointingConfig:
     diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
     # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
     best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
+    consolidation_timeout_minutes: int = 30  # Timeout for inline consolidated-export synchronization.
 
     def __post_init__(self):
         """Resolve the cache dir, enforce PEFT constraints, and coerce the save format/mode."""
+        if self.consolidation_timeout_minutes <= 0:
+            raise ValueError("checkpoint.consolidation_timeout_minutes must be greater than 0")
+
         if self.model_cache_dir is None:
             self.model_cache_dir = hf_constants.HF_HUB_CACHE
 

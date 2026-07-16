@@ -18,6 +18,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -410,15 +411,29 @@ class Checkpointer:
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
         self._optim_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
+        self._consolidation_process_group = None
         if self.config.is_async:
             self._model_ctx.stager = DefaultStager()
             self._optim_ctx.stager = DefaultStager()
             self._model_ctx.process_group = torch.distributed.new_group(backend="gloo")
             self._optim_ctx.process_group = torch.distributed.new_group(backend="gloo")
+        elif (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+            and _should_write_hf_metadata(self.config)
+            and self.config.save_consolidated != SaveConsolidatedMode.FALSE
+            and not self.config.single_rank_consolidation
+        ):
+            # Every rank evaluates the same config-owned condition and must create
+            # process groups in the same order.
+            self._consolidation_process_group = torch.distributed.new_group(
+                backend="gloo",
+                timeout=timedelta(minutes=self.config.consolidation_timeout_minutes),
+            )
 
         self._addons = []
         if _should_write_hf_metadata(self.config):
-            self._addons.append(ConsolidatedHFAddon())
+            self._addons.append(ConsolidatedHFAddon(process_group=self._consolidation_process_group))
         if self.config.is_peft:
             self._addons.append(PeftAddon())
         _warn_if_inline_consolidation_enabled(self.config)
@@ -519,6 +534,7 @@ class Checkpointer:
                 use_staging=self.config.staging_dir is not None,
                 staging_dir=self.config.staging_dir,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
+                process_group=self._consolidation_process_group,
             )
             if self.config.diffusers_compatible:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -1105,6 +1121,10 @@ class Checkpointer:
             self._model_ctx.stager.close()
         if self._optim_ctx.stager is not None:
             self._optim_ctx.stager.close()
+        consolidation_process_group = self._consolidation_process_group
+        self._consolidation_process_group = None
+        if consolidation_process_group is not None and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group(consolidation_process_group)
 
     def _do_load(
         self,
