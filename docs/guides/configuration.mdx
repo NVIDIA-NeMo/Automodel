@@ -60,7 +60,7 @@ Only load configuration files and `_target_` values from trusted sources. A YAML
 
 ## Distributed Section (Strategy-Based)
 
-The `distributed:` section is **not** instantiated using `_target_`. Recipes parse it with a fixed schema: use `strategy: fsdp2`, `strategy: ddp`, or `strategy: megatron_fsdp`, plus optional parallelism sizes (`dp_size`, `tp_size`, `pp_size`, etc.) and strategy-specific options. When pipeline parallelism is enabled (`pp_size > 1`), add a `pipeline:` subsection with options such as `pp_schedule`, `pp_microbatch_size`, and `layers_per_stage`. See the [Pipeline Parallelism with AutoPipeline](/development/pipeline-parallelism) guide and recipe example configs for full examples.
+The `distributed:` section is **not** instantiated using `_target_`. Recipes parse it with a fixed schema. Use `strategy: fsdp2`, `strategy: ddp`, or `strategy: megatron_fsdp`. You can also configure parallelism sizes, such as `dp_size`, `tp_size`, and `pp_size`, and strategy-specific options. When pipeline parallelism is enabled (`pp_size > 1`), add a `pipeline:` subsection with options such as `pp_schedule`, `pp_microbatch_size`, and `layers_per_stage`. For examples, see the [Pipeline Parallelism with AutoPipeline](/development/pipeline-parallelism) guide and the recipe configs.
 
 ## Prewarm One-Time CUDA Initialization
 
@@ -80,9 +80,9 @@ All options default to `false`. Enable only the warmup associated with an observ
 - `comm_groups` initializes the process groups used by gradient-norm collectives.
 
 <Info>
-Prewarming is most useful for long-context or otherwise memory-constrained runs. Such a run can have enough steady-state memory and still fail on its first training step: activations and gradients are live while cuBLAS workspaces, Triton autotuning buffers, and NCCL communicators are initialized for the first time. Temporary autotuning allocations are released afterward, and some memory—notably NCCL scratch space—is outside PyTorch's caching allocator, so `torch.cuda.memory_allocated()` does not show the complete transient peak.
+Prewarming is most useful for long-context or otherwise memory-constrained runs. A run can have enough steady-state memory and still fail on its first training step. Activations and gradients are live while cuBLAS workspaces, Triton autotuning buffers, and NCCL communicators are initialized for the first time. Temporary autotuning allocations are released afterward. Some memory, including NCCL scratch space, is outside PyTorch's caching allocator, so `torch.cuda.memory_allocated()` does not show the complete transient peak.
 
-Adding GPUs helps only when it reduces the relevant per-rank tensors enough; each rank still initializes its own resources, and additional parallel dimensions can introduce more communication groups. Shorter contexts can therefore leave enough slack for lazy initialization, while longer contexts may need the same initialization moved into setup. Long-context hybrid-attention MoE workloads are one common case, but enable each prewarm based on the observed first-step failure rather than a model name. Prewarming does not reduce steady-state memory or imply support for a particular context length.
+Adding GPUs helps only when it sufficiently reduces the relevant per-rank tensors. Each rank still initializes its own resources, and additional parallel dimensions can introduce more communication groups. Shorter contexts can leave enough memory for lazy initialization, while longer contexts might require the same initialization during setup. Long-context hybrid-attention MoE workloads are one common case. Enable each prewarm based on the observed first-step failure rather than a model name. Prewarming does not reduce steady-state memory or imply support for a particular context length.
 
 </Info>
 

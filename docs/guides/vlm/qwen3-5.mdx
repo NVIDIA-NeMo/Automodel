@@ -27,14 +27,14 @@ For a full walkthrough of how MedPix-VQA is preprocessed and integrated into NeM
 
 ## Launch Training
 
-We provide a ready-to-use recipe at [`examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml). This recipe is configured to run on 32 x 8 H100 nodes.
+A ready-to-use recipe is available at [`examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml). This recipe is configured for 32 nodes with eight NVIDIA H100 GPUs per node.
 
 <Info>
-Long-context Qwen3.5 runs can require setup-time prewarming even when later training steps fit in memory, because first-use CUDA and communicator allocations overlap with the first backward peak. The short-context MedPix recipe does not enable prewarming by default. If a longer hybrid-attention MoE run fails only on its first step, see [Prewarm One-Time CUDA Initialization](/get-started/configuration#prewarm-one-time-cuda-initialization) and enable only the warmup matching the failure signature. This does not by itself establish support for a particular context length.
+Long-context Qwen3.5 runs can require prewarming during setup even when later training steps fit in memory. This occurs because first-use CUDA and communicator allocations overlap with the first backward-pass memory peak. The short-context MedPix recipe does not enable prewarming by default. If a longer hybrid-attention MoE run fails only during its first step, see [Prewarm One-Time CUDA Initialization](/get-started/configuration#prewarm-one-time-cuda-initialization). Enable only the warmup that matches the failure signature. This behavior alone does not establish support for a specific context length.
 
 </Info>
 
-NeMo Automodel supports several ways to launch training—via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
+NeMo AutoModel supports several methods for launching training, including the AutoModel CLI with Slurm, interactive sessions, and `torchrun`. For details about all launch options, including Slurm batch jobs, multi-node configs, and environment variables, see the [Run on a Cluster](/job-launchers/slurm-cluster) guide.
 
 ### Standalone Slurm Script
 
