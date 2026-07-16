@@ -273,6 +273,17 @@ def _get_hidden_and_vocab_size(model_config) -> tuple[int, int]:
             f"Cannot determine vocab_size from {type(model_config).__name__}. "
             "Expected either model_config.vocab_size or model_config.text_config.vocab_size."
         )
+
+    # Some models (e.g. Inkling) pad the embedding/lm_head to ``vocab_size`` but slice the
+    # emitted logits to a smaller ``unpadded_vocab_size`` in forward. The last pipeline
+    # stage's output shape must match that sliced width.
+    unpadded = getattr(model_config, "unpadded_vocab_size", None)
+    if unpadded is None:
+        text_config = getattr(model_config, "text_config", None)
+        unpadded = getattr(text_config, "unpadded_vocab_size", None) if text_config is not None else None
+    if unpadded is not None and 0 < unpadded < vocab_size:
+        vocab_size = unpadded
+
     return hidden_size, vocab_size
 
 

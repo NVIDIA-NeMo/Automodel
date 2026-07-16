@@ -1328,6 +1328,64 @@ def default_collate_fn(
     return batch
 
 
+def _inkling_image_token_id(processor, default: int = 200054) -> int:
+    """Resolve Inkling's image placeholder token id from the processor."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    image_token = getattr(processor, "image_token", None)
+    if image_token is not None:
+        tid = tokenizer.convert_tokens_to_ids(image_token)
+        if isinstance(tid, int) and tid >= 0:
+            return tid
+    return default
+
+
+def inkling_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+    max_length: Optional[int] = None,
+    drop_overlong: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """Collate for the Inkling VLM: adds ``image_grid_hws`` for pipeline-parallel media chunking.
+
+    Inkling's vision tower emits one feature per image placeholder token, so a sample's
+    image-placeholder-token count equals that sample's total patch count (the leading
+    dimension of ``pixel_values``). The PP media chunker needs a grid key whose per-row
+    product reproduces the per-image patch count; we emit ``image_grid_hws`` as
+    ``[[patch_count, 1], ...]`` so :func:`chunk_vlm_media` slices the flat ``pixel_values``
+    stack along dim 0 correctly. ``n_images_per_sample`` is already added by
+    :func:`default_collate_fn`.
+    """
+    batch = default_collate_fn(examples, processor, max_length=max_length, drop_overlong=drop_overlong)
+    if "pixel_values" not in batch or "n_images_per_sample" not in batch:
+        return batch
+
+    image_token_id = _inkling_image_token_id(processor)
+    per_sample_patches = (batch["input_ids"] == image_token_id).sum(dim=1).tolist()
+    n_images_per_sample = batch["n_images_per_sample"].tolist()
+
+    grid: list[list[int]] = []
+    for count, n_images in zip(per_sample_patches, n_images_per_sample):
+        if n_images <= 0:
+            continue
+        if n_images != 1:
+            raise ValueError(
+                "Inkling PP media chunking currently supports a single image per sample; "
+                f"got n_images_per_sample={n_images}."
+            )
+        grid.append([int(count), 1])
+
+    if grid:
+        total_patches = int(batch["pixel_values"].shape[0])
+        grid_patches = sum(row[0] for row in grid)
+        if grid_patches != total_patches:
+            raise ValueError(
+                "Inkling collate: image placeholder tokens do not match pixel_values patches "
+                f"({grid_patches} vs {total_patches}); likely truncation dropped image tokens."
+            )
+        batch["image_grid_hws"] = torch.tensor(grid, dtype=torch.long)
+    return batch
+
+
 def pad_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
@@ -2009,5 +2067,6 @@ COLLATE_FNS = {
     "NemotronParseProcessor": nemotron_parse_collate_fn,
     "NemotronH_Nano_Omni_Reasoning_V3Processor": nemotron_omni_collate_fn,
     "LlavaOneVisionProcessor": llava_onevision_collate_fn,
+    "InklingProcessor": inkling_collate_fn,
     "default": default_collate_fn,
 }
