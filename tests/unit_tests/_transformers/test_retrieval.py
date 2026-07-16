@@ -219,6 +219,12 @@ def test_direct_standard_export_validates_before_writing(tmp_path):
 def test_cached_source_model_path_uses_exact_loaded_revision(tmp_path, monkeypatch):
     from nemo_automodel._transformers import retrieval
 
+    local_root = tmp_path / "local"
+    (local_root / "encoder").mkdir(parents=True)
+    assert retrieval._resolve_cached_source_model_path(
+        str(local_root), SimpleNamespace(), {"subfolder": "encoder"}
+    ) == str(local_root / "encoder")
+
     cached_config = tmp_path / "snapshot" / "encoder" / "config.json"
     cached_config.parent.mkdir(parents=True)
     cached_config.write_text("{}")

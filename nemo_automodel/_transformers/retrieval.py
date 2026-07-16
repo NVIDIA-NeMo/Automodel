@@ -61,9 +61,10 @@ class SentenceTransformerExportConfig:
 
 def _resolve_cached_source_model_path(model_name_or_path: str, config, hf_kwargs: dict) -> str | None:
     """Resolve the already-downloaded source snapshot without network access."""
-    if os.path.isdir(model_name_or_path):
-        return model_name_or_path
     subfolder = hf_kwargs.get("subfolder")
+    if os.path.isdir(model_name_or_path):
+        source_path = os.path.join(model_name_or_path, subfolder) if subfolder else model_name_or_path
+        return source_path if os.path.isdir(source_path) else None
     filename = os.path.join(subfolder, "config.json") if subfolder else "config.json"
     cached_config = try_to_load_from_cache(
         model_name_or_path,
