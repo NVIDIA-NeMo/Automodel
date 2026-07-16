@@ -28,6 +28,7 @@ the added ``ckpt_every_steps`` (save every N optimizer steps) and
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -44,13 +45,14 @@ RECIPE_CLASSES = [TrainEagle1Recipe, TrainEagle3Recipe]
 # ---------------------------------------------------------------------------
 
 
-def _helper_self(ckpt_every_steps, global_step):
+def _helper_self(ckpt_every_steps, global_step, total_optim_steps=None):
     """A minimal stand-in carrying just the attributes the helper reads."""
     calls = []
     return (
         SimpleNamespace(
             ckpt_every_steps=ckpt_every_steps,
             runtime=SimpleNamespace(global_step=global_step),
+            total_optim_steps=total_optim_steps,
             dist_env=SimpleNamespace(is_main=True),
             checkpoint_config=None,
             save_checkpoint=lambda **kw: calls.append(kw),
@@ -98,6 +100,22 @@ def test_maybe_save_step_checkpoint_missing_attr_is_noop(recipe_cls):
     assert recipe_cls._maybe_save_step_checkpoint(obj, epoch=0) is False
 
 
+@pytest.mark.parametrize("recipe_cls", RECIPE_CLASSES)
+@pytest.mark.parametrize(
+    "total,step,expect_final",
+    [
+        (None, 4, False),  # unknown total (e.g. unsized dataloader) -> never final
+        (6, 4, False),  # mid-run step save
+        (4, 4, True),  # save lands exactly on the last optimizer step
+    ],
+)
+def test_step_checkpoint_final_flag_tracks_total_optim_steps(recipe_cls, total, step, expect_final):
+    """The step save's final flag tracks ``total_optim_steps``."""
+    obj, calls = _helper_self(2, step, total_optim_steps=total)
+    assert recipe_cls._maybe_save_step_checkpoint(obj, epoch=0) is True
+    assert calls[0]["is_final_checkpoint"] is expect_final
+
+
 def _final_self(ckpt_every_steps, save_every_epoch, global_step):
     calls = []
     return (
@@ -133,6 +151,7 @@ def test_final_checkpoint_fires_unless_final_step_already_saved(recipe_cls, ever
     if should_fire:
         assert calls[0]["epoch"] == 3
         assert calls[0]["step"] == gs
+        assert calls[0]["is_final_checkpoint"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +177,7 @@ class _ConstantGradModule(nn.Module):
 
 
 class _FakeTargetWrapper:
-    def generate_batch(self, input_ids, attention_mask, loss_mask):
+    def generate_batch(self, input_ids, attention_mask, loss_mask, **packing_kwargs):
         return SimpleNamespace(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -166,6 +185,9 @@ class _FakeTargetWrapper:
             input_hidden_states=None,
             target_hidden_states=None,
             target_logits=None,
+            position_ids=None,
+            seq_lens=None,
+            doc_remaining=None,
         )
 
 
@@ -204,7 +226,7 @@ def _build_eagle1_recipe(num_batches, grad_accum, num_epochs, ckpt_every_steps, 
     recipe.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(recipe.optimizer, lambda s: 1.0)
 
     saves = []
-    recipe.save_checkpoint = lambda **kw: saves.append((kw["epoch"], kw["step"], kw["val_loss"] is not None))
+    recipe.save_checkpoint = lambda **kw: saves.append((kw["epoch"], kw["step"], kw["is_final_checkpoint"]))
     return recipe, saves
 
 
@@ -234,13 +256,13 @@ def test_save_checkpoint_every_epoch_false_skips_epoch_save():
 
 def test_only_final_checkpoint_when_both_unset():
     # Neither cadence set -> exactly one save, at the end of the whole run,
-    # labeled with num_epochs and the final global_step.
+    # labeled with num_epochs and the final global_step, flagged final.
     recipe, saves = _build_eagle1_recipe(
         num_batches=6, grad_accum=2, num_epochs=2, ckpt_every_steps=None, save_every_epoch=False
     )
     recipe.run_train_validation_loop()
     assert recipe.runtime.global_step == 6
-    assert saves == [(2, 6, False)]
+    assert saves == [(2, 6, True)]
 
 
 def test_step_only_saves_final_when_last_step_off_cadence():
@@ -252,7 +274,8 @@ def test_step_only_saves_final_when_last_step_off_cadence():
     )
     recipe.run_train_validation_loop()
     assert recipe.runtime.global_step == 3
-    assert [(e, s) for (e, s, _) in saves] == [(0, 2), (1, 3)]
+    # only the safety-net save is final; the mid-epoch step save is not
+    assert saves == [(0, 2, False), (1, 3, True)]
 
 
 def test_step_only_no_final_duplicate_when_last_step_on_cadence():
@@ -263,7 +286,8 @@ def test_step_only_no_final_duplicate_when_last_step_on_cadence():
     )
     recipe.run_train_validation_loop()
     assert recipe.runtime.global_step == 3
-    assert [(e, s) for (e, s, _) in saves] == [(0, 3)]
+    # the on-cadence save IS the run's last checkpoint, so it must be final
+    assert saves == [(0, 3, True)]
 
 
 def test_only_epoch_checkpoints_no_final_duplicate():
@@ -274,5 +298,40 @@ def test_only_epoch_checkpoints_no_final_duplicate():
     )
     recipe.run_train_validation_loop()
     assert recipe.runtime.global_step == 6
-    # one save per epoch boundary, labeled epoch+1, never a num_epochs final extra
-    assert [(e, s) for (e, s, _) in saves] == [(1, 3), (2, 6)]
+    # one save per epoch boundary, labeled epoch+1, never a num_epochs final
+    # extra; only the last epoch's save is flagged final
+    assert saves == [(1, 3, False), (2, 6, True)]
+
+
+# ---------------------------------------------------------------------------
+# save_checkpoint forwards is_final_checkpoint to the checkpointer
+# ---------------------------------------------------------------------------
+
+
+def _saving_recipe(recipe_cls, tmp_path):
+    """A recipe stub with just enough state to run the real ``save_checkpoint``."""
+    recipe = recipe_cls.__new__(recipe_cls)
+    recipe.checkpointer = MagicMock()
+    recipe.checkpointer.config = SimpleNamespace(enabled=True, is_async=False)
+    recipe.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    recipe.tokenizer = object()
+    recipe.optimizer = MagicMock()
+    recipe.lr_scheduler = MagicMock()
+    recipe.rng = MagicMock()
+    recipe._module = lambda: SimpleNamespace(draft_model=nn.Linear(2, 2))
+    recipe._save_extra_state = lambda path, epoch: None
+    recipe._update_latest_symlink = lambda path: None
+    recipe.cfg = SimpleNamespace()  # no raw_config -> the config snapshot is skipped
+    return recipe
+
+
+@pytest.mark.parametrize("recipe_cls", RECIPE_CLASSES)
+@pytest.mark.parametrize("is_final", [True, False])
+def test_save_checkpoint_forwards_final_flag_to_checkpointer(recipe_cls, is_final, tmp_path):
+    """Regression: ``save_checkpoint`` used to derive the flag from a
+    ``step_scheduler`` attribute these hand-rolled recipes never set, so the
+    checkpointer never saw ``is_final_checkpoint=True`` and
+    ``save_consolidated: final`` never exported the HF safetensors."""
+    recipe = _saving_recipe(recipe_cls, tmp_path)
+    recipe.save_checkpoint(epoch=1, step=5, is_final_checkpoint=is_final)
+    assert recipe.checkpointer.save_model.call_args.kwargs["is_final_checkpoint"] is is_final

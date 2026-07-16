@@ -38,23 +38,18 @@ description: ""
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
-
-```bash
-pip install "nemo-automodel[diffusion,diffusion-media]"
-```
-
-**2. Clone the repo** to get the example recipes:
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
+uv sync --locked --all-groups --all-extras --extra diffusion-media
 ```
 
-**3. Run the recipe** from inside the repo:
+**2. Run the recipe** from inside the repo:
 
 ```bash
-torchrun --nproc-per-node=8 \
+uv run torchrun --nproc-per-node=8 \
   examples/diffusion/finetune/finetune.py \
   -c examples/diffusion/finetune/flux_t2i_flow.yaml
 ```

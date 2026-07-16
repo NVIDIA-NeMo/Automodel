@@ -35,11 +35,12 @@ from nemo_automodel.components.speculative.serve_vllm import (
 def _build_args(
     draft: str,
     *,
-    method: str = "eagle3",
+    method: str | None = "eagle3",
     num_speculative_tokens: int | None = None,
     print_only: bool = False,
     trust_remote_code: bool = False,
     max_model_len: int | None = None,
+    dflash_causal: bool = False,
     extra: list[str] | None = None,
 ) -> argparse.Namespace:
     return argparse.Namespace(
@@ -56,6 +57,7 @@ def _build_args(
         max_model_len=max_model_len,
         trust_remote_code=trust_remote_code,
         print_only=print_only,
+        dflash_causal=dflash_causal,
         extra=extra or [],
     )
 
@@ -92,6 +94,39 @@ def _write_draft_checkpoint(
     config_path = model_dir / "config.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
     # A tokenizer-ish asset that the export should carry along.
+    (model_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    return config_path
+
+
+def _write_dflash_checkpoint(
+    model_dir: Path,
+    *,
+    architectures: list[str] | None = None,
+    dflash_config: dict | None = None,
+    block_size: int | None = 16,
+) -> Path:
+    """Write a tiny DFlash-family draft checkpoint (unprefixed weights, no embed/lm_head)."""
+    model_dir.mkdir(parents=True, exist_ok=True)
+    tensors = {
+        "fc.weight": torch.zeros(2, 6),
+        "hidden_norm.weight": torch.zeros(2),
+        "layers.0.self_attn.q_proj.weight": torch.zeros(2, 2),
+        "norm.weight": torch.zeros(2),
+    }
+    save_file(tensors, str(model_dir / "model.safetensors"), metadata={"format": "pt"})
+
+    config = {
+        "architectures": architectures or ["Qwen3DFlashDraftModel"],
+        "model_type": "qwen3",
+        "num_target_layers": 36,
+        "dflash_config": dflash_config
+        if dflash_config is not None
+        else {"mask_token_id": 151669, "target_layer_ids": [1, 18, 34]},
+    }
+    if block_size is not None:
+        config["block_size"] = block_size
+    config_path = model_dir / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
     (model_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
     return config_path
 
@@ -350,6 +385,109 @@ def test_parse_args_strips_leading_double_dash():
     """A leading ``--`` separator before extras is stripped."""
     args = serve_vllm._parse_args(["--target", "Qwen/Qwen3-8B", "--draft", "/tmp/d", "--", "--enable-chunked-prefill"])
     assert args.extra == ["--enable-chunked-prefill"]
+
+
+# --------------------------------------------------------------------------- #
+# DFlash-family drafts (DFlash / JetSpec).
+# --------------------------------------------------------------------------- #
+def test_build_argv_dflash_autodetects_method_and_derives_k(tmp_path: Path):
+    """A DFlash draft is auto-detected (method=None), K defaults to block_size - 1,
+    and the config's architectures are rewritten in place to vLLM's DFlashDraftModel."""
+    model_dir = tmp_path / "model"
+    config_path = _write_dflash_checkpoint(model_dir, block_size=16)
+
+    argv = build_vllm_argv(_build_args(str(model_dir), method=None))
+    spec = _speculative_config_from_argv(argv)
+
+    assert spec["method"] == "dflash"
+    assert spec["num_speculative_tokens"] == 15
+    assert "parallel_drafting" not in spec
+    # In-place rewrite (no model.-prefixed weights, so no vllm_export/).
+    assert spec["model"] == str(model_dir)
+    assert not (model_dir / "vllm_export").exists()
+    rewritten = json.loads(config_path.read_text(encoding="utf-8"))
+    assert rewritten["architectures"] == ["DFlashDraftModel"]
+
+
+def test_build_argv_dflash_explicit_method_wins(tmp_path: Path):
+    """An explicit --method is not overridden by draft-config detection."""
+    model_dir = tmp_path / "model"
+    _write_dflash_checkpoint(model_dir, block_size=16)
+
+    spec = _speculative_config_from_argv(build_vllm_argv(_build_args(str(model_dir), method="dflash")))
+    assert spec["method"] == "dflash"
+
+
+def test_build_argv_dflash_without_block_size_raises(tmp_path: Path):
+    """A DFlash draft without block_size and without an explicit K fails clearly."""
+    model_dir = tmp_path / "model"
+    _write_dflash_checkpoint(model_dir, block_size=None)
+
+    with pytest.raises(ValueError, match="block_size"):
+        build_vllm_argv(_build_args(str(model_dir), method=None))
+
+
+def test_resolve_dflash_already_vllm_arch_is_untouched(tmp_path: Path):
+    """A draft already carrying vLLM's DFlashDraftModel arch gets no config rewrite."""
+    model_dir = tmp_path / "model"
+    config_path = _write_dflash_checkpoint(model_dir, architectures=["DFlashDraftModel"])
+    before = config_path.read_text(encoding="utf-8")
+
+    draft_path, config = resolve_draft_artifacts(str(model_dir))
+
+    assert draft_path == str(model_dir)
+    assert config_path.read_text(encoding="utf-8") == before
+    assert serve_vllm._resolve_method(None, config) == "dflash"
+
+
+def test_resolve_dflash_causal_stamps_config(tmp_path: Path):
+    """--dflash-causal stamps dflash_config.causal=true (JetSpec ckpt predating the recipe stamp)."""
+    model_dir = tmp_path / "model"
+    config_path = _write_dflash_checkpoint(model_dir)
+
+    resolve_draft_artifacts(str(model_dir), dflash_causal=True)
+
+    rewritten = json.loads(config_path.read_text(encoding="utf-8"))
+    assert rewritten["dflash_config"]["causal"] is True
+    # Existing dflash_config keys survive the stamp.
+    assert rewritten["dflash_config"]["mask_token_id"] == 151669
+
+
+def test_resolve_dflash_causal_already_stamped_is_untouched(tmp_path: Path):
+    """A JetSpec draft whose recipe already stamped causal=true gets no extra rewrite."""
+    model_dir = tmp_path / "model"
+    config_path = _write_dflash_checkpoint(
+        model_dir,
+        architectures=["DFlashDraftModel"],
+        dflash_config={"mask_token_id": 151669, "target_layer_ids": [1, 18, 34], "causal": True},
+    )
+    before = config_path.read_text(encoding="utf-8")
+
+    resolve_draft_artifacts(str(model_dir), dflash_causal=True)
+
+    assert config_path.read_text(encoding="utf-8") == before
+
+
+def test_resolve_domino_draft_raises(tmp_path: Path):
+    """A Domino draft (GRU correction head) is rejected: vLLM has no runtime for it."""
+    model_dir = tmp_path / "model"
+    _write_dflash_checkpoint(
+        model_dir,
+        dflash_config={"mask_token_id": 151669, "target_layer_ids": [1, 18, 34], "projector_type": "domino"},
+    )
+
+    with pytest.raises(ValueError, match="[Dd]omino"):
+        resolve_draft_artifacts(str(model_dir))
+    # Rejected in --print-only (dry_run) too: a printed command must not imply servability.
+    with pytest.raises(ValueError, match="[Dd]omino"):
+        resolve_draft_artifacts(str(model_dir), dry_run=True)
+
+
+def test_resolve_method_defaults_to_eagle3_for_eagle_and_hub_drafts(tmp_path: Path):
+    """Method inference: eagle3 for an EAGLE draft config and for a pass-through Hub id."""
+    assert serve_vllm._resolve_method(None, {"architectures": ["LlamaEagle3DraftModel"]}) == "eagle3"
+    assert serve_vllm._resolve_method(None, {}) == "eagle3"
+    assert serve_vllm._resolve_method("eagle", {"architectures": ["Qwen3DFlashDraftModel"]}) == "eagle"
 
 
 # --------------------------------------------------------------------------- #

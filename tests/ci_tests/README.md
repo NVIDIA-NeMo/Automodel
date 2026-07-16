@@ -41,13 +41,15 @@ SFT vs PEFT is determined by whether `peft` appears in the recipe filename.
 
 ## Recipe CI Configuration
 
-Each recipe YAML under `examples/` has an optional `ci:` section:
+Each recipe YAML under `examples/` has a `ci:` section. It is required for
+newly added CI recipes, which must declare `recipe_owner`, `time`, and `nodes`
+(enforced by `validate_new_recipe_ci.py`); pre-existing recipes are grandfathered:
 
 ```yaml
 ci:
   recipe_owner: username          # Required. Maintainer's handle
   time: "00:25:00"                # Required. SLURM wall time (HH:MM:SS)
-  nodes: 2                        # Optional. SLURM node count (default: 1)
+  nodes: 2                        # Required for new recipes. SLURM node count (omitted -> defaults to 1)
   node_multiplier: true           # Optional. Dynamic node scaling
   max_steps: 50                   # Optional. Override max training steps for CI
   local_batch_size: 2             # Optional. Override batch size for CI
@@ -56,6 +58,8 @@ ci:
   checkpoint_robustness:          # Optional. Enable robustness testing
     hf_kl_threshold: 1e-3
     tokenizer_name: org/model
+    check_source_load_parity: true  # Optional. Compare raw HF source load vs constructed trainer before training
+    hf_device_map_auto: true      # Optional. Use for large HF reference loads that do not fit on one GPU
     no_check_resume: true         # Skip phase 6 (training resumption)
     # See checkpoint robustness section for all options
 ```
@@ -64,6 +68,7 @@ ci:
 
 When `checkpoint_robustness` is present, the robustness test runs after the finetune under the same SLURM allocation. It trains for 5 steps, saves a checkpoint, then validates through:
 
+0. **Source-load parity** (optional) -- With `check_source_load_parity: true`, capture logits from the raw HF source load, release the HF model, construct the normal trainer model, then compare the constructed pre-training model against those HF logits
 1. **Reference logits** -- Capture logits before teardown
 2. **AutoModel reload** -- Reload from consolidated checkpoint, verify KL = 0
 3. **HF reload** -- Load into vanilla `transformers`/`peft`, verify KL below `hf_kl_threshold`
@@ -71,6 +76,18 @@ When `checkpoint_robustness` is present, the robustness test runs after the fine
 5. **Training resumption** (on by default) -- Baseline + resumed run, verify loss continuity
 
 Phase 5 is the most expensive (two additional training passes). Use `no_check_resume: true` to skip it.
+
+Use source-load parity for recipes where the initial HF checkpoint load is itself part of the contract, especially
+remote-code, force-HF, custom model, or tied/untied `lm_head` paths. The raw HF reference model is loaded only long
+enough to capture logits and is released before the trainer model is constructed.
+
+For large reference models, set `hf_device_map_auto: true` so HF can use `device_map="auto"` instead of placing the
+whole reference load on one rank's GPU. This is intentionally opt-in rather than the default: small models should keep
+the simpler single-device HF load for deterministic behavior, while large models (for example 9B+ or configs that
+already require multi-GPU HF reloads) should enable it to avoid rank-0 OOM. Tune `source_load_kl_threshold` and
+`source_load_mean_kl_threshold` only when backend or dtype differences are expected. The first threshold bounds the
+worst token, while the stricter mean threshold prevents broad drift; Phase 0 also reports p95 KL for diagnosis.
+`source_load_cosine_threshold` remains an independent full-logit check.
 
 `ci.time` must cover both finetune and robustness. Estimated overhead:
 - ~30% with `no_check_resume: true`
@@ -81,7 +98,7 @@ Phase 5 is the most expensive (two additional training passes). Use `no_check_re
 ### Add a New Recipe to Nightly
 
 1. Create recipe YAML under `examples/{test_folder}/{model_family}/`
-2. Add `ci:` section with `recipe_owner` and `time`
+2. Add `ci:` section with `recipe_owner`, `time`, and `nodes` (use `nodes: 1` for single-node)
 3. Add the path to `configs/{test_folder}/nightly_recipes.yml`
 
 ### Enable Checkpoint Robustness

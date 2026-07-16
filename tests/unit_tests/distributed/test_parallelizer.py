@@ -32,7 +32,9 @@ import nemo_automodel.components.distributed.parallelizer as parallelizer
 from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
 from nemo_automodel.components.distributed.parallelizer import (
     _attention_is_head_sharded,
+    _extract_model_layer_groups,
     _extract_model_layers,
+    _filter_layer_groups_for_activation_checkpointing,
     _get_parallel_plan,
     _update_attention_head_counts_for_tp,
     apply_fsdp2_sharding_recursively,
@@ -757,6 +759,42 @@ class TestGetHfTpShardPlan:
         with pytest.raises(ValueError, match="Unknown parallel style"):
             get_hf_tp_shard_plan(model)
 
+    @staticmethod
+    def _bare_gemma3():
+        """Gemma3 instance with exact class identity but no HF ``__init__``."""
+        model = Gemma3ForConditionalGeneration.__new__(Gemma3ForConditionalGeneration)
+        nn.Module.__init__(model)
+        return model
+
+    def test_gemma3_pre_standardization_tree_uses_language_model_prefix(self):
+        """Old Gemma3 (transformers <= 4.51) hangs the text tower off a top-level
+        ``language_model``; the prefix must follow the registered child module,
+        not a transformers version gate.
+        """
+        model = self._bare_gemma3()
+        language_model = nn.Module()
+        language_model._tp_plan = {"model.layers.0.self_attn.q_proj": "colwise"}
+        model.language_model = language_model
+
+        result = get_hf_tp_shard_plan(model)
+
+        assert isinstance(result["language_model.model.layers.0.self_attn.q_proj"], ColwiseParallel)
+        assert "language_model.embed_tokens" in result
+
+    def test_gemma3_standardized_tree_uses_model_prefix(self):
+        """Standardized Gemma3 (transformers >= 4.52, incl. v5) nests everything
+        under ``model``; the prefix must resolve structurally to ``model``.
+        """
+        model = self._bare_gemma3()
+        inner = nn.Module()
+        inner._tp_plan = {"language_model.layers.0.self_attn.q_proj": "colwise"}
+        model.model = inner
+
+        result = get_hf_tp_shard_plan(model)
+
+        assert isinstance(result["model.language_model.layers.0.self_attn.q_proj"], ColwiseParallel)
+        assert "model.embed_tokens" in result
+
 
 class TestApplyFsdpShardingRecursively:
     """Test class for apply_fsdp2_sharding_recursively utility function."""
@@ -1400,7 +1438,7 @@ class TestActivationCheckpointingKVSharing:
             lambda mesh, *a, **kw: MagicMock(),
         )
 
-    def _run_parallelize(self, model, activation_checkpointing=True):
+    def _run_parallelize(self, model, activation_checkpointing=True, activation_checkpointing_scope="all"):
         """Invoke the strategy under test and return the model."""
         from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
@@ -1413,6 +1451,7 @@ class TestActivationCheckpointingKVSharing:
             model=model,
             device_mesh=mesh,
             activation_checkpointing=activation_checkpointing,
+            activation_checkpointing_scope=activation_checkpointing_scope,
         )
 
     # ------------------------------------------------------------------ #
@@ -1452,8 +1491,8 @@ class TestActivationCheckpointingKVSharing:
     def test_no_config_does_not_crash(self, monkeypatch):
         """Model without a config attribute must not raise."""
         monkeypatch.setattr(
-            "nemo_automodel.components.distributed.parallelizer._extract_model_layers",
-            lambda m: [],
+            "nemo_automodel.components.distributed.parallelizer._extract_model_layer_groups",
+            lambda m: {},
         )
         model = nn.Module()
         model.forward = lambda x: x  # type: ignore[attr-defined]
@@ -1500,6 +1539,163 @@ class TestActivationCheckpointingKVSharing:
             for layer in model.model.layers:
                 assert isinstance(layer.input_layernorm, self._Wrapped)
                 assert isinstance(layer.post_attention_layernorm, self._Wrapped)
+
+    def test_vision_style_child_names_are_wrapped(self):
+        """Vision/Ministral-style blocks use ``attention`` and ``feed_forward`` names."""
+
+        class _VisionStyleLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attention = nn.Linear(16, 16)
+                self.feed_forward = nn.Linear(16, 16)
+                self.attention_norm = nn.Linear(16, 16)
+                self.ffn_norm = nn.Linear(16, 16)
+
+            def forward(self, x):
+                return x
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.model.layers = nn.ModuleList([_VisionStyleLayer() for _ in range(2)])
+
+        self._run_parallelize(model)
+
+        for layer in model.model.layers:
+            assert isinstance(layer.attention, self._Wrapped)
+            assert isinstance(layer.feed_forward, self._Wrapped)
+            assert isinstance(layer.attention_norm, self._Wrapped)
+            assert isinstance(layer.ffn_norm, self._Wrapped)
+
+    def test_qwen_clip_style_vision_child_names_are_wrapped(self):
+        """Qwen/SigLIP/CLIP-style vision blocks use ``attn`` or layer/norm pairs."""
+
+        class _QwenStyleLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = nn.Linear(16, 16)
+                self.mlp = nn.Linear(16, 16)
+                self.norm1 = nn.Linear(16, 16)
+                self.norm2 = nn.Linear(16, 16)
+
+            def forward(self, x):
+                return x
+
+        class _ClipStyleLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = nn.Linear(16, 16)
+                self.mlp = nn.Linear(16, 16)
+                self.layer_norm1 = nn.Linear(16, 16)
+                self.layer_norm2 = nn.Linear(16, 16)
+
+            def forward(self, x):
+                return x
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.model.layers = nn.ModuleList([_QwenStyleLayer(), _ClipStyleLayer()])
+
+        self._run_parallelize(model)
+
+        qwen_layer = model.model.layers[0]
+        assert isinstance(qwen_layer.attn, self._Wrapped)
+        assert isinstance(qwen_layer.mlp, self._Wrapped)
+        assert isinstance(qwen_layer.norm1, self._Wrapped)
+        assert isinstance(qwen_layer.norm2, self._Wrapped)
+
+        clip_layer = model.model.layers[1]
+        assert isinstance(clip_layer.self_attn, self._Wrapped)
+        assert isinstance(clip_layer.mlp, self._Wrapped)
+        assert isinstance(clip_layer.layer_norm1, self._Wrapped)
+        assert isinstance(clip_layer.layer_norm2, self._Wrapped)
+
+    def test_activation_checkpointing_scope_language_only(self):
+        """``language`` scope leaves extracted vision layers unwrapped."""
+
+        class LlamaNemotronVLModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = nn.ModuleList([_FakeLayer()])
+                self.vision_model = nn.Module()
+                self.vision_model.vision_model = nn.Module()
+                self.vision_model.vision_model.encoder = nn.Module()
+                self.vision_model.vision_model.encoder.layers = nn.ModuleList([_FakeLayer()])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = LlamaNemotronVLModel()
+                self.config = SimpleNamespace(use_cache=True, text_config=SimpleNamespace(num_kv_shared_layers=0))
+
+            def forward(self, x):
+                return x
+
+        model = BiEncoderModel()
+        self._run_parallelize(model, activation_checkpointing_scope="language")
+
+        language_layer = model.model.language_model.layers[0]
+        vision_layer = model.model.vision_model.vision_model.encoder.layers[0]
+        assert isinstance(language_layer.mlp, self._Wrapped)
+        assert not isinstance(vision_layer.mlp, self._Wrapped)
+
+    def test_activation_checkpointing_scope_all_wraps_custom_vlm_language_and_vision(self):
+        """Default ``all`` scope should not let the retrieval wrapper hide the vision tower."""
+
+        class LlamaNemotronVLModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = nn.ModuleList([_FakeLayer()])
+                self.vision_model = nn.Module()
+                self.vision_model.vision_model = nn.Module()
+                self.vision_model.vision_model.encoder = nn.Module()
+                self.vision_model.vision_model.encoder.layers = nn.ModuleList([_FakeLayer()])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = LlamaNemotronVLModel()
+                self.config = SimpleNamespace(use_cache=True, text_config=SimpleNamespace(num_kv_shared_layers=0))
+
+            def forward(self, x):
+                return x
+
+        model = BiEncoderModel()
+        self._run_parallelize(model)
+
+        language_layer = model.model.language_model.layers[0]
+        vision_layer = model.model.vision_model.vision_model.encoder.layers[0]
+        assert isinstance(language_layer.mlp, self._Wrapped)
+        assert isinstance(vision_layer.mlp, self._Wrapped)
+
+    def test_activation_checkpointing_scope_vision_only(self):
+        """``vision`` scope leaves extracted language layers unwrapped."""
+
+        class LlamaNemotronVLModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = nn.ModuleList([_FakeLayer()])
+                self.vision_model = nn.Module()
+                self.vision_model.vision_model = nn.Module()
+                self.vision_model.vision_model.encoder = nn.Module()
+                self.vision_model.vision_model.encoder.layers = nn.ModuleList([_FakeLayer()])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = LlamaNemotronVLModel()
+                self.config = SimpleNamespace(use_cache=True, text_config=SimpleNamespace(num_kv_shared_layers=0))
+
+            def forward(self, x):
+                return x
+
+        model = BiEncoderModel()
+        self._run_parallelize(model, activation_checkpointing_scope="vision")
+
+        language_layer = model.model.language_model.layers[0]
+        vision_layer = model.model.vision_model.vision_model.encoder.layers[0]
+        assert not isinstance(language_layer.mlp, self._Wrapped)
+        assert isinstance(vision_layer.mlp, self._Wrapped)
 
     def test_no_wrapping_without_activation_checkpointing(self):
         """When activation_checkpointing=False, nothing is wrapped."""
@@ -1685,6 +1881,17 @@ class TestActivationCheckpointingKVSharing:
             gradient_checkpointing_kwargs={"use_reentrant": True}
         )
 
+    def test_hf_native_grad_ckpt_skips_frozen_layers(self, monkeypatch):
+        """Frozen layers force scoped submodule wrapping instead of whole-model HF native GC."""
+        model = self._setup_hf_native_model(monkeypatch, num_kv_shared_layers=0)
+        model.model.layers[0].requires_grad_(False)
+
+        self._run_parallelize(model)
+
+        model.gradient_checkpointing_enable.assert_not_called()
+        assert not isinstance(model.model.layers[0].mlp, self._Wrapped)
+        assert isinstance(model.model.layers[1].mlp, self._Wrapped)
+
 
 class TestSelectiveCheckpointNumerics:
     """Real forward/backward parity for the selective-AC op policy.
@@ -1866,14 +2073,20 @@ class TestSingleGpuActivationCheckpointing:
             assert isinstance(layer.mlp, CheckpointWrapper)
             assert not isinstance(layer.self_attn, CheckpointWrapper)
 
-    def test_full_uses_hf_gradient_checkpointing_on_single_gpu(self, monkeypatch):
-        """Non-selective AC still uses HF gradient_checkpointing_enable on a single GPU."""
+    def test_full_wraps_layers_on_single_gpu_without_hf_native(self, monkeypatch):
+        """Non-selective AC wraps layers on single GPU when the model is not an HF native GC candidate."""
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
         manager = self._make_manager(monkeypatch, True)
         model = _make_model_for_ac(num_kv_shared_layers=0)
         model.gradient_checkpointing_enable = MagicMock()
         manager.parallelize(model)
 
-        model.gradient_checkpointing_enable.assert_called_once()
+        model.gradient_checkpointing_enable.assert_not_called()
+        for layer in model.model.layers:
+            assert not isinstance(layer, CheckpointWrapper)
+            assert isinstance(layer.mlp, CheckpointWrapper)
+            assert isinstance(layer.self_attn, CheckpointWrapper)
 
 
 class TestSelectiveCheckpointSaveOps:
@@ -2044,11 +2257,70 @@ class TestExtractModelLayers:
         assert len(result) == 4
         assert all(r is layers[i] for i, r in enumerate(result))
 
-    def test_multi_fqn_flattens_each_modulelist(self):
-        """Qwen2.5-VL entry ``["language_model.layers", "visual.blocks"]``.
+    def _attach_qwen_vl_towers(self, model, lang, vis, *, nested):
+        """Attach Qwen2-VL-style towers for one historical tree shape.
 
-        Both FQNs resolve to ModuleLists; both must be flattened so all decoder
-        and vision blocks appear as individual elements in the final list.
+        ``nested=True`` builds the standardized tree (transformers >= 4.52,
+        incl. v5): ``model.language_model.layers`` + ``model.visual.blocks``.
+        ``nested=False`` builds the pre-standardization tree (<= 4.51):
+        ``model.layers`` + top-level ``visual.blocks``.
+        """
+        visual = nn.Module()
+        visual.blocks = vis
+        if nested:
+            language_model = nn.Module()
+            language_model.layers = lang
+            inner = nn.Module()
+            inner.language_model = language_model
+            inner.visual = visual
+            model.model = inner
+        else:
+            text_model = nn.Module()
+            text_model.layers = lang
+            model.model = text_model
+            model.visual = visual
+
+    @staticmethod
+    def _attach_language_vision_towers(model, lang, vis, *, shape):
+        """Attach Gemma3/Llava-style towers for one historical tree ``shape``.
+
+        ``"pre_standardization"`` (<= 4.51): ``language_model.model.layers`` +
+        ``vision_tower.vision_model.encoder.layers``.
+        ``"standardized_v4"`` (4.52-4.x): ``model.language_model.layers`` +
+        ``model.vision_tower.vision_model.encoder.layers``.
+        ``"v5"`` (>= 5.0): ``model.language_model.layers`` +
+        ``model.vision_tower.encoder.layers`` (flattened tower).
+        """
+        if shape == "pre_standardization":
+            language_model = nn.Module()
+            language_model.model = nn.Module()
+            language_model.model.layers = lang
+            vision_tower = nn.Module()
+            vision_tower.vision_model = nn.Module()
+            vision_tower.vision_model.encoder = nn.Module()
+            vision_tower.vision_model.encoder.layers = vis
+            model.language_model = language_model
+            model.vision_tower = vision_tower
+            return
+        inner = nn.Module()
+        inner.language_model = nn.Module()
+        inner.language_model.layers = lang
+        inner.vision_tower = nn.Module()
+        if shape == "standardized_v4":
+            inner.vision_tower.vision_model = nn.Module()
+            inner.vision_tower.vision_model.encoder = nn.Module()
+            inner.vision_tower.vision_model.encoder.layers = vis
+        else:  # v5: flattened tower, no inner `vision_model`.
+            inner.vision_tower.encoder = nn.Module()
+            inner.vision_tower.encoder.layers = vis
+        model.model = inner
+
+    def test_multi_fqn_flattens_each_modulelist(self):
+        """Qwen2.5-VL pre-standardization tree (``model.layers`` + ``visual.blocks``).
+
+        Both groups resolve to ModuleLists; both must be flattened so all
+        decoder and vision blocks appear as individual elements in the final
+        list.
         """
         from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
             Qwen2_5_VLForConditionalGeneration,
@@ -2057,12 +2329,7 @@ class TestExtractModelLayers:
         model = self._bare_instance(Qwen2_5_VLForConditionalGeneration)
         lang = self._make_layers(5)
         vis = self._make_layers(2)
-        language_model = nn.Module()
-        language_model.layers = lang
-        model.language_model = language_model
-        visual = nn.Module()
-        visual.blocks = vis
-        model.visual = visual
+        self._attach_qwen_vl_towers(model, lang, vis, nested=False)
 
         result = _extract_model_layers(model)
 
@@ -2070,6 +2337,139 @@ class TestExtractModelLayers:
         assert [id(r) for r in result[:5]] == [id(item) for item in lang]
         assert [id(r) for r in result[5:]] == [id(item) for item in vis]
         assert not any(isinstance(r, nn.ModuleList) for r in result)
+
+    @pytest.mark.parametrize("nested", [False, True], ids=["pre_standardization", "standardized"])
+    def test_qwen2_vl_tree_shapes_extract_language_and_vision_groups(self, nested):
+        """Every historical Qwen2-VL tree must resolve structurally, no version gate.
+
+        Pre-standardization (verified transformers 4.51.3): ``model.layers`` +
+        ``visual.blocks``. Standardized (verified 4.57.1/5.8.1/5.12.1):
+        ``model.language_model.layers`` + ``model.visual.blocks``. Version-gated
+        FQNs picked the wrong tree for parts of the 4.x line and silently
+        disabled activation checkpointing.
+        """
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+            Qwen2_5_VLForConditionalGeneration,
+        )
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        for cls in (Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration):
+            model = self._bare_instance(cls)
+            lang = self._make_layers(3)
+            vis = self._make_layers(2)
+            self._attach_qwen_vl_towers(model, lang, vis, nested=nested)
+
+            groups = _extract_model_layer_groups(model)
+
+            assert set(groups) == {"language", "vision"}, cls.__name__
+            assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+            assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    def test_qwen2_vl_deprecation_aliases_do_not_double_count_layers(self):
+        """Standardized 4.x keeps deprecated top-level ``visual``/``language_model``
+        aliases for the nested towers; first-match resolution must count each
+        layer exactly once even when the historical FQN also resolves.
+        """
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        model = self._bare_instance(Qwen2VLForConditionalGeneration)
+        lang = self._make_layers(3)
+        vis = self._make_layers(2)
+        self._attach_qwen_vl_towers(model, lang, vis, nested=True)
+        # Simulate the transformers 4.52-4.x deprecation aliases: the same
+        # towers are reachable at the historical top-level paths too.
+        model.visual = model.model.visual
+        model.language_model = model.model.language_model
+
+        groups = _extract_model_layer_groups(model)
+
+        assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+        assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    @pytest.mark.parametrize("shape", ["pre_standardization", "standardized_v4", "v5"])
+    def test_gemma3_tree_shapes_extract_language_and_vision_groups(self, shape):
+        """Every historical Gemma3 tree must resolve structurally, no version gate.
+
+        Shapes verified by meta-instantiation: ``language_model.model.layers`` +
+        ``vision_tower.vision_model.encoder.layers`` on 4.51.3,
+        ``model.language_model.layers`` +
+        ``model.vision_tower.vision_model.encoder.layers`` on 4.57.1, and
+        ``model.language_model.layers`` + ``model.vision_tower.encoder.layers``
+        on 5.8.1/5.12.1.
+        """
+        model = self._bare_instance(Gemma3ForConditionalGeneration)
+        lang = self._make_layers(3)
+        vis = self._make_layers(2)
+        self._attach_language_vision_towers(model, lang, vis, shape=shape)
+
+        groups = _extract_model_layer_groups(model)
+
+        assert set(groups) == {"language", "vision"}
+        assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+        assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    @pytest.mark.parametrize("shape", ["pre_standardization", "standardized_v4", "v5"])
+    def test_llava_tree_shapes_extract_language_and_vision_groups(self, shape):
+        """Llava-family trees share the Gemma3 lineage (CLIP instead of SigLIP);
+        each historical shape must resolve structurally for every Llava class.
+        """
+        from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+        from transformers.models.llava_next.modeling_llava_next import (
+            LlavaNextForConditionalGeneration,
+        )
+        from transformers.models.llava_next_video.modeling_llava_next_video import (
+            LlavaNextVideoForConditionalGeneration,
+        )
+        from transformers.models.llava_onevision.modeling_llava_onevision import (
+            LlavaOnevisionForConditionalGeneration,
+        )
+
+        for cls in (
+            LlavaForConditionalGeneration,
+            LlavaNextForConditionalGeneration,
+            LlavaNextVideoForConditionalGeneration,
+            LlavaOnevisionForConditionalGeneration,
+        ):
+            model = self._bare_instance(cls)
+            lang = self._make_layers(3)
+            vis = self._make_layers(2)
+            self._attach_language_vision_towers(model, lang, vis, shape=shape)
+
+            groups = _extract_model_layer_groups(model)
+
+            assert set(groups) == {"language", "vision"}, cls.__name__
+            assert [id(m) for m in groups["language"]] == [id(item) for item in lang], cls.__name__
+            assert [id(m) for m in groups["vision"]] == [id(item) for item in vis], cls.__name__
+
+    def test_spec_resolving_no_modules_warns_and_returns_empty(self, caplog):
+        """A mapped model class whose spec FQNs all fail to resolve must warn.
+
+        This is the transformers-version-drift failure mode: extraction used to
+        return ``{}`` silently and activation checkpointing became a no-op.
+        """
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        # A tree that matches no known Qwen2-VL shape: top-level
+        # `language_model.layers` (never a registered module path for this
+        # class; it only ever existed as a deprecation alias).
+        model = self._bare_instance(Qwen2VLForConditionalGeneration)
+        language_model = nn.Module()
+        language_model.layers = self._make_layers(2)
+        model.language_model = language_model
+
+        with caplog.at_level("WARNING", logger=parallelizer.logger.name):
+            groups = _extract_model_layer_groups(model)
+
+        assert groups == {}
+        assert "Qwen2VLForConditionalGeneration" in caplog.text
+        assert "model.language_model.layers" in caplog.text
+        assert "model.visual.blocks" in caplog.text
 
     def test_moduledict_layer_container_flattens(self):
         """PP post-split: ``_reduce_attrs`` returns a ModuleDict.
@@ -2172,6 +2572,173 @@ class TestExtractModelLayers:
         # 3 text-decoder + 2 vision tower layers, all flattened.
         assert len(result) == 5
         assert not any(isinstance(r, nn.ModuleList) for r in result)
+
+    def test_retrieval_wrapper_unwraps_llama_nemotron_vl_groups(self):
+        """Retrieval wrappers should not fall back to the largest-layer heuristic."""
+
+        class LlamaNemotronVLModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = self._mklayers(4)
+                self.vision_model = nn.Module()
+                self.vision_model.vision_model = nn.Module()
+                self.vision_model.vision_model.encoder = nn.Module()
+                self.vision_model.vision_model.encoder.layers = self._mklayers(2)
+
+            @staticmethod
+            def _mklayers(n):
+                return nn.ModuleList([_FakeLayer() for _ in range(n)])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = LlamaNemotronVLModel()
+
+        model = BiEncoderModel()
+
+        groups = _extract_model_layer_groups(model)
+        result = _extract_model_layers(model)
+
+        assert set(groups) == {"language", "vision"}
+        assert len(groups["language"]) == 4
+        assert len(groups["vision"]) == 2
+        assert result == groups["language"] + groups["vision"]
+
+    def test_retrieval_wrapper_unwraps_ministral_bidirectional_language_layers(self):
+        """The mainline Ministral bidirectional text encoder remains language-only."""
+
+        class Ministral3BidirectionalModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([_FakeLayer() for _ in range(3)])
+
+        class BiEncoderModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Ministral3BidirectionalModel()
+
+        model = BiEncoderModel()
+
+        groups = _extract_model_layer_groups(model)
+        result = _extract_model_layers(model)
+
+        assert set(groups) == {"language"}
+        assert len(groups["language"]) == 3
+        assert result == groups["language"]
+
+    def test_activation_checkpointing_scope_filtering(self):
+        language = [_FakeLayer(), _FakeLayer()]
+        vision = [_FakeLayer()]
+        audio = [_FakeLayer()]
+        vision[0].requires_grad_(False)
+
+        groups = {"language": language, "vision": vision, "audio": audio}
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "language")
+        assert scopes == ("language",)
+        assert selected == language
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "multimodal")
+        assert scopes == ("multimodal",)
+        assert selected == audio
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, ["language", "vision"])
+        assert scopes == ("language", "vision")
+        assert selected == language
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing(groups, "all")
+        assert scopes == ("all",)
+        assert selected == language + audio
+
+    def test_activation_checkpointing_scope_filtering_warns_when_scope_has_only_frozen_layers(self, caplog):
+        vision = [_FakeLayer()]
+        vision[0].requires_grad_(False)
+
+        selected, scopes = _filter_layer_groups_for_activation_checkpointing({"vision": vision}, "vision")
+
+        assert scopes == ("vision",)
+        assert selected == []
+        assert "selected no layers" in caplog.text
+
+    def test_string_keyed_new_vlm_families_extract_language_and_vision_layers(self):
+        """Native VLM families in examples should not fall back to the largest-layer heuristic."""
+
+        def _layers(count):
+            return nn.ModuleList([_FakeLayer() for _ in range(count)])
+
+        def _assert_counts(model, language_count, vision_count):
+            groups = _extract_model_layer_groups(model)
+            result = _extract_model_layers(model)
+            assert set(groups) == {"language", "vision"}
+            assert len(groups["language"]) == language_count
+            assert len(groups["vision"]) == vision_count
+            assert result == groups["language"] + groups["vision"]
+
+        class KimiVLForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(3)
+                self.model.vision_tower = nn.Module()
+                self.model.vision_tower.encoder = nn.Module()
+                self.model.vision_tower.encoder.blocks = _layers(2)
+
+        class KimiK25VLForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(4)
+                self.model.vision_tower = nn.Module()
+                self.model.vision_tower.encoder = nn.Module()
+                self.model.vision_tower.encoder.blocks = _layers(2)
+
+        class MiniMaxM3SparseForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleDict({str(i): _FakeLayer() for i in range(5)})
+                self.vision_tower = nn.Module()
+                self.vision_tower.vision_model = nn.Module()
+                self.vision_tower.vision_model.encoder = nn.Module()
+                self.vision_tower.vision_model.encoder.layers = _layers(2)
+
+        class Qwen3_5MoeForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(6)
+                self.model.visual = nn.Module()
+                self.model.visual.blocks = _layers(3)
+
+        class Qwen3VLMoeForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(8)
+                self.model.visual = nn.Module()
+                self.model.visual.blocks = _layers(3)
+
+        class Step3p7ForConditionalGeneration(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.language_model = nn.Module()
+                self.model.language_model.layers = _layers(7)
+                self.model.vision_model = nn.Module()
+                self.model.vision_model.transformer = nn.Module()
+                self.model.vision_model.transformer.resblocks = _layers(2)
+
+        _assert_counts(KimiVLForConditionalGeneration(), 3, 2)
+        _assert_counts(KimiK25VLForConditionalGeneration(), 4, 2)
+        _assert_counts(MiniMaxM3SparseForConditionalGeneration(), 5, 2)
+        _assert_counts(Qwen3_5MoeForConditionalGeneration(), 6, 3)
+        _assert_counts(Qwen3VLMoeForConditionalGeneration(), 8, 3)
+        _assert_counts(Step3p7ForConditionalGeneration(), 7, 2)
 
     def test_string_keyed_bagel_extracts_language_and_vision_layers(self):
         """BAGEL exposes Qwen decoder layers and SigLIP encoder layers."""

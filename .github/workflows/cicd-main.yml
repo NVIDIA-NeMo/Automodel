@@ -503,6 +503,11 @@ jobs:
           - test-name: L2_HF_DCP
             test-folder: hf_dcp
             timeout: 40
+            # DeepEP expert-parallel subtest (GPT-OSS MXFP4, ep_size=2) hard-requires
+            # NVLink P2P, which on GB200 comes from the IMEX ComputeDomain channel.
+            # Route to the imex-lease runner; every other gb200 test stays on the
+            # plain (non-IMEX) pool. See nemo-ci-gcp-gpu-x2-imex in TF-States.
+            runner: nemo-ci-gcp-gpu-x2-imex
           - test-name: L2_HF_PEFT
             test-folder: hf_peft
             timeout: 30
@@ -533,7 +538,7 @@ jobs:
             test-folder: moe
             timeout: 20
     needs: [pre-flight, cicd-unit-tests, cicd-container-build]
-    runs-on: nemo-ci-gcp-gpu-x2
+    runs-on: ${{ matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
     name: gb200_${{ matrix.test-name }}
     if: |
       (
@@ -556,7 +561,7 @@ jobs:
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry-gb200 }}/automodel:${{ github.sha }}
-          runner: nemo-ci-gcp-gpu-x2
+          runner: ${{ matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
 
   Nemo_CICD_Test:
     needs:
@@ -682,6 +687,8 @@ jobs:
           verbose: true
           flags: ${{ matrix.flag }}
           base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
+          override_pr: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          override_commit: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6

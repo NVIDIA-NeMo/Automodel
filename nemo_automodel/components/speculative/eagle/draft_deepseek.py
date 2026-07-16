@@ -34,9 +34,11 @@ projection layout and the interleaved RoPE are taken from the onboarded DeepSeek
 target (``components/models/deepseek_v3``: the ``MLA`` projection structure and
 ``rope_utils``), not reimplemented.
 
-Scope (v1): EAGLE-3 single fused draft layer, eager attention. P-EAGLE
-parallel-drafting, flash-attention, and sequence packing are intentionally left
-to follow-ups (they are orthogonal to the MLA attention this file adds).
+Scope: EAGLE-3 single fused draft layer, eager attention. Sequence packing is
+supported via the shared ``[B, 1, T, T]`` block-causal mask (see
+``forward``); the MLA attention is eager-only, so packing reuses the eager mask
+path rather than a FlashAttention varlen kernel. P-EAGLE parallel-drafting and
+flash-attention remain follow-ups (orthogonal to the MLA attention this file adds).
 """
 
 from __future__ import annotations
@@ -47,12 +49,27 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig, PreTrainedModel
 
+from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
 from nemo_automodel.components.models.common import initialize_rms_norm_module
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb,
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
+
+
+def _resolve_rope_theta(config: PretrainedConfig) -> float:
+    """Read the RoPE base the way the DeepSeek target does.
+
+    transformers 5.x moved ``rope_theta`` under ``config.rope_parameters`` and
+    dropped the top-level attribute (``DeepseekV3Config(rope_theta=...).rope_theta``
+    raises ``AttributeError``), so a bare ``getattr(config, "rope_theta", 10000.0)``
+    always returns the fallback and the draft's rotary phase silently diverges from
+    any target whose base is not 10000. The top-level read is kept only as a
+    fallback for older configs.
+    """
+    rope_parameters = getattr(config, "rope_parameters", None) or {}
+    return float(rope_parameters.get("rope_theta", getattr(config, "rope_theta", 10000.0)))
 
 
 def _build_causal_mask(attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -121,7 +138,7 @@ class Eagle3DeepseekMLAAttention(nn.Module):
         freqs = precompute_freqs_cis(
             self.qk_rope_head_dim,
             getattr(config, "max_position_embeddings", 4096),
-            getattr(config, "rope_theta", 10000.0),
+            _resolve_rope_theta(config),
             getattr(config, "rope_scaling", None),
         )
         self.register_buffer("rope_freqs", freqs, persistent=False)
@@ -151,7 +168,7 @@ class Eagle3DeepseekMLAAttention(nn.Module):
             fresh = precompute_freqs_cis(
                 self.qk_rope_head_dim,
                 getattr(self.config, "max_position_embeddings", 4096),
-                getattr(self.config, "rope_theta", 10000.0),
+                _resolve_rope_theta(self.config),
                 getattr(self.config, "rope_scaling", None),
             )
             self.rope_freqs = fresh.to(device=rope_freqs.device, dtype=torch.float32)
@@ -396,10 +413,30 @@ class DeepseekV3Eagle3DraftModel(PreTrainedModel):
         cache_hidden: Optional[list[list[torch.Tensor]]] = None,
         seq_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run one EAGLE-3 TTT draft step (eager attention; ``seq_lens`` packing not supported in v1)."""
-        if seq_lens is not None:
-            raise NotImplementedError(
-                "DeepseekV3Eagle3DraftModel does not support sequence packing (seq_lens) yet; use the unpacked path."
+        """Run one EAGLE-3 TTT draft step (eager attention).
+
+        Args (batch ``B``, sequence length ``T``, draft hidden size ``H``):
+            input_ids: ``[B, T]`` long token ids.
+            projected_hidden_states: ``[B, T, H]`` draft-hidden features (``fc`` output).
+            attention_mask: ``[B, T]`` (1 = real, 0 = pad); used on the unpacked path only.
+            position_ids: ``[B, T]`` long, or ``None`` to default to ``arange``.
+                Packing requires per-document positions (reset to ``range(doc_len)``).
+            cache_hidden: EAGLE-3 TTT cache ``[K_list, V_list]`` -- ``[[], []]`` on the
+                first step, the same list on later steps, or ``None`` for a fresh cache.
+            seq_lens: ``[B, max_docs]`` long (0-padded per-document lengths that sum to
+                ``T`` per row) turns on sequence packing -- Block-1 attention becomes
+                document-level block-causal via :func:`build_block_causal_additive_mask`
+                (eager mask path; the MLA attention has no FA2 varlen kernel). The TTT
+                diagonal block is position-wise and stays document-safe; cross-document
+                supervision is masked by the trainer's ``doc_remaining`` gate, not here.
+        """
+        if seq_lens is not None and position_ids is None:
+            # Packing needs per-document position_ids: the arange fallback below
+            # would give every document after the first a global (wrong) RoPE
+            # phase. Fail loud, matching the target-side guard in target.py.
+            raise ValueError(
+                "DeepseekV3Eagle3DraftModel: sequence packing (seq_lens) requires per-document "
+                "position_ids (reset to range(doc_len) within each document), but none were provided."
             )
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long).unsqueeze(0)
@@ -407,7 +444,16 @@ class DeepseekV3Eagle3DraftModel(PreTrainedModel):
         if cache_hidden is None:
             cache_hidden = [[], []]
 
-        causal_mask = _build_causal_mask(attention_mask=attention_mask, dtype=projected_hidden_states.dtype)
+        if seq_lens is not None:
+            # Packed: document structure comes from seq_lens (block-causal mask).
+            causal_mask = build_block_causal_additive_mask(
+                seq_lens,
+                seq_length=input_ids.shape[1],
+                dtype=projected_hidden_states.dtype,
+                device=input_ids.device,
+            )
+        else:
+            causal_mask = _build_causal_mask(attention_mask=attention_mask, dtype=projected_hidden_states.dtype)
         draft_input_embeds = self.embed_input_ids(input_ids)
         hidden_states = self.model.layers[0](
             input_embeds=draft_input_embeds,
