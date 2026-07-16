@@ -277,7 +277,21 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
-    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
+    config_load_kwargs = {
+        key: hf_kwargs[key]
+        for key in (
+            "cache_dir",
+            "code_revision",
+            "force_download",
+            "local_files_only",
+            "proxies",
+            "revision",
+            "subfolder",
+            "token",
+        )
+        if key in hf_kwargs
+    }
+    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **config_load_kwargs)
     model_type = getattr(config, "model_type", "")
 
     if extract_submodel is not None:
@@ -292,6 +306,9 @@ def build_encoder_backbone(
             temperature=temperature,
             source_commit_hash=getattr(config, "_commit_hash", None),
         )
+
+    if model_type.lower() == "ministral3" and task != "embedding":
+        raise ValueError(f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: embedding.")
 
     if model_type.lower() == "ministral3" and task == "embedding":
         config.is_causal = False
