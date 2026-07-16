@@ -42,6 +42,259 @@ def _group_barrier(process_group: "ProcessGroup | None") -> None:
         torch.distributed.barrier(group=process_group)
 
 
+_SENTENCE_TRANSFORMER_POOLING_KEYS = {
+    "avg": "pooling_mode_mean_tokens",
+    "cls": "pooling_mode_cls_token",
+    "last": "pooling_mode_lasttoken",
+}
+_SOURCE_LEGAL_ASSET_PREFIXES = ("license", "notice")
+_TEXT_EXPORT_STALE_PROCESSOR_ASSETS = ("processor_config.json", "preprocessor_config.json")
+
+
+def _write_json(path: str, value) -> None:
+    """Write deterministic, human-readable JSON metadata."""
+    with open(path, "w") as f:
+        json.dump(value, f, indent=2)
+        f.write("\n")
+
+
+def _copy_source_legal_assets(original_model_path: str | None, hf_metadata_dir: str) -> None:
+    """Preserve legal notices without inheriting source model semantics."""
+    if original_model_path is None or not os.path.isdir(original_model_path):
+        return
+
+    for item in os.scandir(original_model_path):
+        normalized_name = item.name.lower()
+        is_legal_asset = normalized_name == ".gitattributes" or normalized_name.startswith(_SOURCE_LEGAL_ASSET_PREFIXES)
+        if item.is_file() and is_legal_asset and not normalized_name.endswith(".md"):
+            shutil.copy2(item.path, os.path.join(hf_metadata_dir, item.name))
+
+
+def _remove_stale_text_processor_assets(hf_metadata_dir: str) -> None:
+    """Remove source multimodal processor metadata from a text-only export."""
+    for asset_name in _TEXT_EXPORT_STALE_PROCESSOR_ASSETS:
+        asset_path = os.path.join(hf_metadata_dir, asset_name)
+        if os.path.isfile(asset_path):
+            os.remove(asset_path)
+
+
+def _restore_source_tokenizer_serialization_state(original_model_path: str | None, hf_metadata_dir: str) -> None:
+    """Remove training-time tokenizer state while retaining tokenizer edits."""
+    tokenizer_json_path = os.path.join(hf_metadata_dir, "tokenizer.json")
+    source_tokenizer_json_path = (
+        os.path.join(original_model_path, "tokenizer.json") if original_model_path is not None else None
+    )
+    if os.path.isfile(tokenizer_json_path):
+        with open(tokenizer_json_path) as f:
+            tokenizer_json = json.load(f)
+        source_tokenizer_json = {}
+        if source_tokenizer_json_path is not None and os.path.isfile(source_tokenizer_json_path):
+            with open(source_tokenizer_json_path) as f:
+                source_tokenizer_json = json.load(f)
+        for key in ("truncation", "padding"):
+            tokenizer_json[key] = source_tokenizer_json.get(key)
+        _write_json(tokenizer_json_path, tokenizer_json)
+
+    tokenizer_config_path = os.path.join(hf_metadata_dir, "tokenizer_config.json")
+    source_tokenizer_config_path = (
+        os.path.join(original_model_path, "tokenizer_config.json") if original_model_path is not None else None
+    )
+    if os.path.isfile(tokenizer_config_path):
+        with open(tokenizer_config_path) as f:
+            tokenizer_config = json.load(f)
+        source_tokenizer_config = {}
+        if source_tokenizer_config_path is not None and os.path.isfile(source_tokenizer_config_path):
+            with open(source_tokenizer_config_path) as f:
+                source_tokenizer_config = json.load(f)
+        if "local_files_only" in source_tokenizer_config:
+            tokenizer_config["local_files_only"] = source_tokenizer_config["local_files_only"]
+        else:
+            tokenizer_config.pop("local_files_only", None)
+        tokenizer_config.pop("processor_class", None)
+        _write_json(tokenizer_config_path, tokenizer_config)
+
+
+def _resolve_sentence_transformer_max_seq_length(
+    model_part: nn.Module,
+    export_config,
+    tokenizer,
+) -> int:
+    """Resolve deployment sequence length without using training-time truncation."""
+    if export_config.max_seq_length is not None:
+        max_seq_length = int(export_config.max_seq_length)
+        if max_seq_length <= 0:
+            raise ValueError("sentence_transformer_max_seq_length must be positive.")
+        model_max_seq_length = getattr(getattr(model_part, "config", None), "max_position_embeddings", None)
+        if model_max_seq_length is not None:
+            model_max_seq_length = int(model_max_seq_length)
+            if 0 < model_max_seq_length < 1_000_000_000 and max_seq_length > model_max_seq_length:
+                raise ValueError("sentence_transformer_max_seq_length exceeds the model's max_position_embeddings.")
+        return max_seq_length
+
+    candidates = [
+        getattr(tokenizer, "model_max_length", None),
+        getattr(getattr(model_part, "config", None), "max_position_embeddings", None),
+    ]
+    finite_candidates = []
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        max_seq_length = int(candidate)
+        if 0 < max_seq_length < 1_000_000_000:
+            finite_candidates.append(max_seq_length)
+    if finite_candidates:
+        return min(finite_candidates)
+    raise ValueError("Unable to determine a finite Sentence Transformers deployment max_seq_length.")
+
+
+def _validate_sentence_transformer_export(model_part: nn.Module, export_config, tokenizer) -> None:
+    """Validate generated metadata inputs before rank-zero-only checkpoint I/O."""
+    pooling = getattr(model_part, "pooling", None)
+    if pooling not in _SENTENCE_TRANSFORMER_POOLING_KEYS:
+        raise ValueError(f"Pooling mode {pooling!r} cannot be represented by standard Sentence Transformers metadata.")
+
+    model_config = getattr(model_part, "config", None)
+    embedding_dimension = getattr(model_config, "hidden_size", None)
+    if not isinstance(embedding_dimension, int) or embedding_dimension <= 0:
+        raise ValueError("Bi-encoder config must expose a positive hidden_size for Sentence Transformers export.")
+
+    _resolve_sentence_transformer_max_seq_length(model_part, export_config, tokenizer)
+
+
+def _save_generated_sentence_transformer_assets(
+    model_part: nn.Module,
+    export_config,
+    original_model_path: str | None,
+    hf_metadata_dir: str,
+    tokenizer,
+) -> None:
+    """Generate Sentence Transformers metadata from the effective bi-encoder behavior."""
+    _validate_sentence_transformer_export(model_part, export_config, tokenizer)
+    pooling = getattr(model_part, "pooling", None)
+    model_config = getattr(model_part, "config", None)
+    embedding_dimension = getattr(model_config, "hidden_size", None)
+
+    query_prompt = export_config.query_prompt or ""
+    document_prompt = export_config.document_prompt or ""
+
+    normalize = bool(getattr(model_part, "l2_normalize", False))
+    similarity_fn_name = export_config.similarity_fn_name
+    if similarity_fn_name is None:
+        similarity_fn_name = "cosine" if normalize else "dot"
+
+    modules = [
+        {
+            "idx": 0,
+            "name": "0",
+            "path": "",
+            "type": "sentence_transformers.models.Transformer",
+        },
+        {
+            "idx": 1,
+            "name": "1",
+            "path": "1_Pooling",
+            "type": "sentence_transformers.models.Pooling",
+        },
+    ]
+    if normalize:
+        modules.append(
+            {
+                "idx": 2,
+                "name": "2",
+                "path": "2_Normalize",
+                "type": "sentence_transformers.models.Normalize",
+            }
+        )
+
+    pooling_config = {
+        "word_embedding_dimension": embedding_dimension,
+        "pooling_mode_cls_token": False,
+        "pooling_mode_max_tokens": False,
+        "pooling_mode_mean_tokens": False,
+        "pooling_mode_mean_sqrt_len_tokens": False,
+        "pooling_mode_weightedmean_tokens": False,
+        "pooling_mode_lasttoken": False,
+        "include_prompt": bool(export_config.include_prompt),
+    }
+    pooling_config[_SENTENCE_TRANSFORMER_POOLING_KEYS[pooling]] = True
+
+    max_seq_length = _resolve_sentence_transformer_max_seq_length(model_part, export_config, tokenizer)
+    do_lower_case = bool(export_config.do_lower_case)
+
+    os.makedirs(os.path.join(hf_metadata_dir, "1_Pooling"), exist_ok=True)
+    _write_json(os.path.join(hf_metadata_dir, "modules.json"), modules)
+    _write_json(
+        os.path.join(hf_metadata_dir, "config_sentence_transformers.json"),
+        {
+            "prompts": {"query": query_prompt, "document": document_prompt},
+            "default_prompt_name": None,
+            "similarity_fn_name": similarity_fn_name,
+        },
+    )
+    _write_json(
+        os.path.join(hf_metadata_dir, "sentence_bert_config.json"),
+        {"max_seq_length": max_seq_length, "do_lower_case": bool(do_lower_case)},
+    )
+    _write_json(os.path.join(hf_metadata_dir, "1_Pooling", "config.json"), pooling_config)
+    _restore_source_tokenizer_serialization_state(original_model_path, hf_metadata_dir)
+    _remove_stale_text_processor_assets(hf_metadata_dir)
+    _copy_source_legal_assets(original_model_path, hf_metadata_dir)
+
+
+def _save_generated_hf_assets(
+    model_part: nn.Module,
+    metadata_reference_path: str | None,
+    hf_metadata_dir: str,
+    tokenizer,
+    v4_compatible: bool,
+    model_config=None,
+    save_custom_model_code: bool = True,
+) -> None:
+    """Run the existing generated Hugging Face metadata export path."""
+    if save_custom_model_code:
+        _maybe_save_custom_model_code(metadata_reference_path, hf_metadata_dir, model_part=model_part)
+
+    config = model_config if model_config is not None else getattr(model_part, "config", None)
+    if config is not None:
+        config_name = "config.json"
+        if v4_compatible and _config_exists(metadata_reference_path, config_name):
+            _save_original_config_json(metadata_reference_path, hf_metadata_dir, config_name)
+            config_name = "config.v5.json"
+
+        _maybe_strip_quantization_config(model_part, config=config)
+        with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
+            if hasattr(config, "to_json_string"):
+                # Use ``use_diff=False`` so the full config (not the
+                # diff against class defaults) is serialized. For
+                # remote-code configs registered via
+                # ``register_for_auto_class`` (e.g. DeciLM /
+                # Llama-Nemotron-Super-49B ``model_type='nemotron-nas'``),
+                # ``to_diff_dict`` sees the class-level ``model_type``
+                # attribute as equal to the class default and drops
+                # it from the serialized JSON. Reloading via
+                # ``AutoConfig.from_pretrained`` on the resulting
+                # consolidated directory then raises
+                # ``Unrecognized model ... Should have a 'model_type'
+                # key``. Writing the full dict guarantees
+                # ``model_type``, ``architectures`` and ``auto_map``
+                # land in the saved config regardless of class defaults.
+                f.write(config.to_json_string(use_diff=False))
+            else:
+                # Diffusers models use FrozenDict for config instead of PretrainedConfig
+                json.dump(dict(config), f, indent=2, default=str)
+
+    if getattr(model_part, "generation_config", None) is not None:
+        config_name = "generation_config.json"
+        if v4_compatible and _config_exists(metadata_reference_path, config_name):
+            _save_original_config_json(metadata_reference_path, hf_metadata_dir, config_name)
+            config_name = "generation_config.v5.json"
+        with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
+            f.write(model_part.generation_config.to_json_string())
+
+    if tokenizer is not None:
+        tokenizer.save_pretrained(hf_metadata_dir)
+
+
 class CheckpointAddon(Protocol):
     """
     Optional hooks that run around backend IO (used for PEFT and consolidated HF metadata).
@@ -56,8 +309,10 @@ class ConsolidatedHFAddon:
     """
     Addon that writes consolidated Hugging Face metadata alongside sharded weights.
 
-    On rank 0, this saves `config.json`, `generation_config.json`, and tokenizer
-    artifacts into the provided consolidated directory, then synchronizes ranks.
+    Bi-encoder checkpoints generate Sentence Transformers metadata from effective
+    runtime semantics while retaining source legal notices.
+    Other models retain the generated config, custom-code, and tokenizer path.
+    Rank 0 writes the artifacts, then synchronizes ranks.
     """
 
     def pre_save(self, **kwargs) -> None:
@@ -69,6 +324,8 @@ class ConsolidatedHFAddon:
             hf_metadata_dir (str): Target directory for HF metadata artifacts.
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
             fqn_to_dtype_mapping (dict[str, str] | None): Original HF safetensors dtype map.
+            original_model_path (str | None): Authoritative source checkpoint snapshot.
+            generated_metadata_path (str | None): Existing model/code reference for generated metadata fallback.
         """
         model_state = kwargs["model_state"]
         hf_metadata_dir = kwargs["hf_metadata_dir"]
@@ -77,54 +334,49 @@ class ConsolidatedHFAddon:
         tokenizer = kwargs.get("tokenizer", None)
         model_part = model_state.model[0]  # ModelState already converts to list if needed
         original_model_path = kwargs["original_model_path"]
+        generated_metadata_path = kwargs.get("generated_metadata_path", original_model_path)
+
+        export_model = getattr(model_part, "module", model_part)
+        export_model = getattr(export_model, "_orig_mod", export_model)
+        sentence_transformer_export_config = getattr(
+            export_model,
+            "sentence_transformer_export_config",
+            None,
+        )
+        if sentence_transformer_export_config is not None:
+            _validate_sentence_transformer_export(export_model, sentence_transformer_export_config, tokenizer)
         process_group = kwargs.get("process_group")
 
         # Perform save operations on rank 0
         if _is_group_rank_0(process_group):
-            # if the HF model has custom model code, we need to save it as part of the checkpoint
-            _maybe_save_custom_model_code(original_model_path, hf_metadata_dir, model_part=model_part)
-            # save the config.json file
-            if hasattr(model_part, "config"):
-                v4_compatible = kwargs.get("v4_compatible", False)
-                config_name = "config.json"
-                if v4_compatible and _config_exists(original_model_path, config_name):
-                    _save_original_config_json(original_model_path, hf_metadata_dir, config_name)
-                    config_name = "config.v5.json"
-
-                _maybe_strip_quantization_config(model_part)
-                with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
-                    if hasattr(model_part.config, "to_json_string"):
-                        # Use ``use_diff=False`` so the full config (not the
-                        # diff against class defaults) is serialized. For
-                        # remote-code configs registered via
-                        # ``register_for_auto_class`` (e.g. DeciLM /
-                        # Llama-Nemotron-Super-49B ``model_type='nemotron-nas'``),
-                        # ``to_diff_dict`` sees the class-level ``model_type``
-                        # attribute as equal to the class default and drops
-                        # it from the serialized JSON. Reloading via
-                        # ``AutoConfig.from_pretrained`` on the resulting
-                        # consolidated directory then raises
-                        # ``Unrecognized model ... Should have a 'model_type'
-                        # key``. Writing the full dict guarantees
-                        # ``model_type``, ``architectures`` and ``auto_map``
-                        # land in the saved config regardless of class defaults.
-                        f.write(model_part.config.to_json_string(use_diff=False))
-                    else:
-                        # Diffusers models use FrozenDict for config instead of PretrainedConfig
-                        json.dump(dict(model_part.config), f, indent=2, default=str)
-
-            # save the generation_config.json file
-            if getattr(model_part, "generation_config", None) is not None:
-                config_name = "generation_config.json"
-                if v4_compatible and _config_exists(original_model_path, config_name):
-                    _save_original_config_json(original_model_path, hf_metadata_dir, config_name)
-                    config_name = "generation_config.v5.json"
-                with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
-                    f.write(model_part.generation_config.to_json_string())
-
-            # save the tokenizer
-            if tokenizer is not None:
-                tokenizer.save_pretrained(hf_metadata_dir)
+            if sentence_transformer_export_config is not None:
+                deploy_config = export_model.get_hf_export_config()
+                _save_generated_hf_assets(
+                    export_model,
+                    generated_metadata_path,
+                    hf_metadata_dir,
+                    tokenizer,
+                    # Bi-encoder metadata always describes the effective trained model;
+                    # copying a source config in v4 mode could restore stale semantics.
+                    v4_compatible=False,
+                    model_config=deploy_config,
+                    save_custom_model_code=bool(getattr(deploy_config, "auto_map", None)),
+                )
+                _save_generated_sentence_transformer_assets(
+                    export_model,
+                    sentence_transformer_export_config,
+                    original_model_path,
+                    hf_metadata_dir,
+                    tokenizer,
+                )
+            else:
+                _save_generated_hf_assets(
+                    model_part,
+                    generated_metadata_path,
+                    hf_metadata_dir,
+                    tokenizer,
+                    v4_compatible=kwargs.get("v4_compatible", False),
+                )
 
             # save the fqn_to_file_index_mapping file
             with open(os.path.join(hf_metadata_dir, FQN_TO_FILE_INDEX_MAPPING_FILENAME), "w") as f:
@@ -191,6 +443,7 @@ class PeftAddon:
         model_state = kwargs["model_state"]
         peft_config = kwargs["peft_config"]
         original_model_path = kwargs["original_model_path"]
+        generated_metadata_path = kwargs.get("generated_metadata_path", original_model_path)
         v4_compatible = kwargs.get("v4_compatible", False)
         process_group = kwargs.get("process_group")
         hf_peft_config = _get_hf_peft_config(peft_config, model_state, v4_compatible=v4_compatible)
@@ -198,7 +451,7 @@ class PeftAddon:
         if _is_group_rank_0(process_group):
             # if the HF model has custom model code, we need to save it as part of the checkpoint
             model_part = model_state.model[0] if model_state is not None else None
-            _maybe_save_custom_model_code(original_model_path, model_path, model_part=model_part)
+            _maybe_save_custom_model_code(generated_metadata_path, model_path, model_part=model_part)
             # save the tokenizer
             if tokenizer is not None:
                 tokenizer.save_pretrained(model_path)
@@ -448,7 +701,7 @@ def _extract_target_modules(
     return sorted(final_target_modules)
 
 
-def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
+def _maybe_strip_quantization_config(model_part: nn.Module, config=None) -> None:
     """Remove ``quantization_config`` from the HF config when no parameters are quantized.
 
     Models loaded from quantized checkpoints (e.g. mxfp4 GPT-OSS) carry a
@@ -458,7 +711,8 @@ def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
     checkpoint is a clean bf16 checkpoint, consistent with e.g.
     ``unsloth/gpt-oss-20b-BF16``.
     """
-    config = getattr(model_part, "config", None)
+    if config is None:
+        config = getattr(model_part, "config", None)
     if config is None or not hasattr(config, "quantization_config"):
         return
 
@@ -469,7 +723,7 @@ def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
     delattr(config, "quantization_config")
 
 
-def _config_exists(original_model_path: str, config_name: str) -> bool:
+def _config_exists(original_model_path: str | None, config_name: str) -> bool:
     if original_model_path is None or not os.path.isdir(original_model_path):
         return False
     src = os.path.join(original_model_path, config_name)
