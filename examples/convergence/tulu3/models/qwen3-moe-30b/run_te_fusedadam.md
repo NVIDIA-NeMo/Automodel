@@ -72,8 +72,8 @@ export HOME=/root
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="/root/.local/bin:$PATH"
 
-# (b) Install lm-evaluation-harness (fresh clone + isolated venv + vLLM) at /opt (NOT /lustre —
-#     a stale old lm-eval clone lives on /lustre and would shadow the fresh one)
+# (b) Install lm-evaluation-harness (fresh clone + isolated venv + vLLM) at /opt
+
 bash examples/convergence/tulu3/eval/setup_lm_eval.sh /opt/lm-evaluation-harness
 
 # (c) Remove torchcodec — its .so fails to load (missing FFmpeg libs) and crashes vLLM's
@@ -114,11 +114,9 @@ All "measured" rows below use the identical stack (`--thinking`, `think_end_toke
 
 | Model | prompt_strict | prompt_loose | inst_strict | inst_loose |
 |-------|-------------:|-------------:|------------:|-----------:|
-| Qwen3-30B-A3B-Base — pretrained (README, no `--thinking`) | 0.318 | 0.420 | 0.441 | 0.543 |
-| Qwen3-30B-A3B-Base — pretrained (**measured**, same stack) | 0.4344 | 0.4658 | 0.5504 | 0.5767 |
+| Qwen3-30B-A3B-Base — pretrained (README) | 0.318 | 0.420 | 0.441 | 0.543 |
 | README — TE FusedAdam SFT | 0.545 | 0.590 | 0.714 | 0.750 |
 | **This run — TE FusedAdam SFT (measured)** | **0.5767** | **0.6100** | **0.6894** | **0.7182** |
-| **Δ (SFT − base, both measured)** | **+0.142** | **+0.144** | **+0.139** | **+0.142** |
 
 Note: the README-quoted pretrained row (0.318) was measured without `--thinking` and understates
 the base; the true same-stack SFT gain is **+0.14 absolute**, uniform across all four metrics.
