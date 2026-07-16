@@ -113,6 +113,7 @@ cuda = [
     "causal-conv1d",
     "mamba-ssm",
     "nv-grouped-gemm",
+    "quack-kernels==0.6.1",
     # This is required to prevent ONNX errors arising from TE
     "onnxscript>=0.5.6",
     "transformer-engine[pytorch]>=2.14.1",
@@ -129,7 +130,7 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
-ffpa = ["ffpa-attn>=0.1.19", "nvidia-cutlass-dsl>=4.5.1,<4.6"]
+ffpa = ["ffpa-attn>=0.2.1", "nvidia-cutlass-dsl==4.6.0"]
 fla = [
     "flash-linear-attention>=0.4.2",
 ]

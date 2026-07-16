@@ -22,8 +22,10 @@ import torch
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-logger = logging.getLogger(__name__)
+from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str
+
+logger = logging.getLogger(__name__)
 
 HAVE_TE = importlib.util.find_spec("transformer_engine") is not None
 HAVE_DEEP_EP = importlib.util.find_spec("deep_ep") is not None
@@ -159,8 +161,8 @@ class BackendConfig:
         attn: Attention backend ("te", "sdpa", "flex", "eager", or "tilelang").
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together.
-        linear: Linear layer backend ("torch" or "te").
-        rms_norm: RMSNorm backend ("torch", "torch_fp32", or "te").
+        linear: Linear layer backend ("torch", "te", or "quack").
+        rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
             "te" uses TE GroupedLinear, "gmm" uses grouped_gemm.ops.gmm,
@@ -194,8 +196,8 @@ class BackendConfig:
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
-    linear: Literal["torch", "te"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
-    rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
+    linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
+    rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
         "torch_mm" if torch.cuda.is_available() else "torch"
@@ -319,10 +321,11 @@ def initialize_rms_norm_module(
     Call reset_parameters() to materialize weights if created on meta device.
 
     Args:
-        rms_norm_impl: Backend implementation ("te", "torch", or "torch_fp32")
+        rms_norm_impl: Backend implementation ("te", "torch", "torch_fp32", or "quack")
             - "te": Transformer Engine fused RMSNorm kernel
             - "torch": PyTorch native nn.RMSNorm (computes in input dtype)
             - "torch_fp32": torch.compiled fp32 RMSNorm for training stability
+            - "quack": QuACK CuTe DSL RMSNorm kernel
         dim: Normalized dimension
         eps: Epsilon for numerical stability
         device: Device to create module on (None uses PyTorch default, typically CPU)
@@ -340,6 +343,15 @@ def initialize_rms_norm_module(
         return nn.RMSNorm(dim, eps=eps, device=device, dtype=dtype)
     elif rms_norm_impl == "torch_fp32":
         return Float32RMSNorm(dim, eps=eps, device=device, dtype=dtype)
+    elif rms_norm_impl == "quack":
+        available, quack_rms_norm = safe_import_from(
+            "quack.rmsnorm",
+            "QuackRMSNorm",
+            msg="rms_norm='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
+        )
+        if not available:
+            raise ImportError("rms_norm='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].")
+        return quack_rms_norm(dim, eps=eps, device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported RMSNorm implementation: {rms_norm_impl}")
 
@@ -358,7 +370,7 @@ def initialize_linear_module(
     Call reset_parameters() to materialize weights if created on meta device.
 
     Args:
-        linear_impl: Backend implementation ("te" or "torch")
+        linear_impl: Backend implementation ("te", "torch", or "quack")
         in_features: Input features
         out_features: Output features
         bias: Whether to use bias
@@ -378,6 +390,15 @@ def initialize_linear_module(
         return TransformerEngineLinear(
             in_features=in_features, out_features=out_features, bias=bias, device=device, params_dtype=dtype
         )
+    elif linear_impl == "quack":
+        available, quack_linear = safe_import_from(
+            "quack.linear",
+            "Linear",
+            msg="linear='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
+        )
+        if not available:
+            raise ImportError("linear='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].")
+        return quack_linear(in_features, out_features, bias=bias, device=device, dtype=dtype)
     else:
         raise ValueError(f"Unsupported Linear implementation: {linear_impl}")
 
