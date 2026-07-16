@@ -310,21 +310,21 @@ class InklingStateDictAdapter(StateDictAdapter):
         """Combine native ``gate_proj`` / ``up_proj`` into one fused raw tensor.
 
         ``fused_dim`` is the axis the gate/up interleave lives on (1 for shared
-        experts, 0 for the dense MLP). When it is a sharded dim (dense case) the
-        combine is done on the gathered full tensor and returned replicated;
-        otherwise it is local-safe.
+        experts, 0 for the dense MLP). The shared/dense gate/up are tiny (n_shared=2,
+        two dense layers) and FSDP-sharded on dim 0, which is *degenerate* when dim 0
+        (size 2) is spread over many ranks -- a local-shard + ``from_local`` rebuild
+        then infers a wrong global shape (e.g. ``[mesh_size, ...]`` instead of the
+        true ``[2, ...]``). The raw checkpoint stores these unsharded, so gather the
+        true full tensor and return it **replicated** on the mesh: DCP then loads the
+        full checkpoint tensor onto every rank correctly, regardless of native
+        sharding.
         """
         if not state_dict_utils.is_dtensor(gate):
             return _interleave(torch.cat([gate, up], dim=fused_dim), dim=fused_dim)
 
-        sharded_dims = {p.dim for p in gate.placements if isinstance(p, Shard)}
-        if fused_dim in sharded_dims:
-            gate_f, up_f = gate.full_tensor(), up.full_tensor()
-            combined = _interleave(torch.cat([gate_f, up_f], dim=fused_dim), dim=fused_dim)
-            return DTensor.from_local(combined, gate.device_mesh, tuple(Replicate() for _ in gate.placements))
-        gate_l, up_l = gate.to_local(), up.to_local()
-        combined = _interleave(torch.cat([gate_l, up_l], dim=fused_dim), dim=fused_dim)
-        return DTensor.from_local(combined, gate.device_mesh, tuple(gate.placements))
+        gate_f, up_f = gate.full_tensor(), up.full_tensor()
+        combined = _interleave(torch.cat([gate_f, up_f], dim=fused_dim), dim=fused_dim)
+        return DTensor.from_local(combined, gate.device_mesh, tuple(Replicate() for _ in gate.placements))
 
     def _transpose_for_hf(self, native_fqn: str, tensor: Any) -> Any:
         """Transpose-only routed ``down_projs`` -> raw ``w2_weight`` (writable strided view).
@@ -455,27 +455,24 @@ class InklingStateDictAdapter(StateDictAdapter):
         return native
 
     def _raw_w13_split(self, value, fused_dim: int):
-        """De-interleave a fused shared/dense ``w13`` tensor and split into gate/up."""
+        """De-interleave a fused shared/dense ``w13`` tensor and split into gate/up.
+
+        Symmetric with :meth:`_combine_gate_up_to_raw`: the ``to_hf`` destination for
+        these tiny tensors is replicated, so gather the full tensor, split, and return
+        the halves **replicated**. ``set_model_state_dict`` then re-shards each to the
+        native (FSDP) placement. Gathering avoids any degenerate local-shard rebuild
+        when dim 0 (size 2) is spread over many ranks.
+        """
         if not state_dict_utils.is_dtensor(value):
             gate, up = _deinterleave(value, dim=fused_dim).chunk(2, dim=fused_dim)
             return gate.contiguous(), up.contiguous()
 
-        sharded_dims = {p.dim for p in value.placements if isinstance(p, Shard)}
-        if fused_dim in sharded_dims:
-            # Split crosses the sharded dim -> gather, split, return replicated so
-            # set_model_state_dict re-shards to the native (FSDP) placement.
-            full = value.full_tensor()
-            gate, up = _deinterleave(full, dim=fused_dim).chunk(2, dim=fused_dim)
-            repl = tuple(Replicate() for _ in value.placements)
-            return (
-                DTensor.from_local(gate.contiguous(), value.device_mesh, repl),
-                DTensor.from_local(up.contiguous(), value.device_mesh, repl),
-            )
-        local = value.to_local()
-        gate, up = _deinterleave(local, dim=fused_dim).chunk(2, dim=fused_dim)
+        full = value.full_tensor()
+        gate, up = _deinterleave(full, dim=fused_dim).chunk(2, dim=fused_dim)
+        repl = tuple(Replicate() for _ in value.placements)
         return (
-            DTensor.from_local(gate.contiguous(), value.device_mesh, tuple(value.placements)),
-            DTensor.from_local(up.contiguous(), value.device_mesh, tuple(value.placements)),
+            DTensor.from_local(gate.contiguous(), value.device_mesh, repl),
+            DTensor.from_local(up.contiguous(), value.device_mesh, repl),
         )
 
     def _from_hf_module(self, hf_state_dict: dict[str, Any], device_mesh: Optional[DeviceMesh]) -> dict[str, Any]:
