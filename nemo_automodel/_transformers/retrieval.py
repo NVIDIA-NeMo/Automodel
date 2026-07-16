@@ -288,6 +288,7 @@ def build_encoder_backbone(
             "revision",
             "subfolder",
             "token",
+            "use_auth_token",
         )
         if key in hf_kwargs
     }

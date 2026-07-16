@@ -192,6 +192,7 @@ def test_build_encoder_backbone_forwards_hub_location_kwargs_to_config_and_model
         task="embedding",
         trust_remote_code=True,
         revision="revision-a",
+        use_auth_token="legacy-token",
         subfolder="encoder",
         token="token",
         cache_dir="/cache",
@@ -208,6 +209,7 @@ def test_build_encoder_backbone_forwards_hub_location_kwargs_to_config_and_model
         token="token",
         cache_dir="/cache",
         local_files_only=True,
+        use_auth_token="legacy-token",
     )
     auto_model_from_pretrained.assert_called_once_with(
         "org/model",
@@ -218,6 +220,7 @@ def test_build_encoder_backbone_forwards_hub_location_kwargs_to_config_and_model
         cache_dir="/cache",
         local_files_only=True,
         torch_dtype=torch.bfloat16,
+        use_auth_token="legacy-token",
     )
 
 
