@@ -58,6 +58,7 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
+  activation_checkpointing: true
   tp_size: 1
   cp_size: 1
   pp_size: 8
@@ -91,7 +92,7 @@ dataloader:
   num_workers: 1
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.inkling_collate_fn
-    max_length: 512
+    max_length: 2048
   drop_last: true
 
 optimizer:
