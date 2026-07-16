@@ -35,6 +35,8 @@ NeMo AutoModel currently supports the following dLLM model families:
 
 ### Supported Models
 
+The following table lists the supported models, their training modes, loss functions, inference methods, and example configurations.
+
 | Model Family | dLLM Mode | Loss | Inference | Example Config |
 |---|---|---|---|---|
 | LLaDA | `mdlm` | MDLM cross-entropy | Standalone full-forward denoising (no KV cache) | [llada_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_sft.yaml) |
@@ -249,9 +251,9 @@ torchrun --nproc-per-node=8 \
 
 ## Run Inference
 
-The generation script ([`generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_generate/generate.py)) supports chat and raw generation. Pick the sampler that matches the trained family with `--sampler {llada,llada2,nemotron}`. Infilling is also available for LLaDA and Nemotron, but is not supported by the LLaDA2 generation path.
+The generation script ([`generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_generate/generate.py)) supports chat and raw generation. Select the sampler that matches the trained family by using the `--sampler {llada,llada2,nemotron}` argument. Infilling is also available for LLaDA and Nemotron, but the LLaDA2 generation path does not support it.
 
-`--checkpoint` accepts any of: a path to a `consolidated/` directory, a step directory (`.../epoch_0_step_499`), or the top-level checkpoint dir (the script will follow `LATEST/model/consolidated/`).
+The `--checkpoint` argument accepts several path types, such as a path to a `consolidated/` directory, a step directory (for example, `.../epoch_0_step_499`), or the top-level checkpoint directory. The script automatically follows the path to `LATEST/model/consolidated/`.
 
 ### Generate with LLaDA
 
@@ -264,7 +266,7 @@ python examples/dllm_generate/generate.py \
 
 ### Generate with LLaDA2
 
-LLaDA2 generation calls the model's built-in block-refinement `generate()` method.
+LLaDA2 generation calls the built-in block-refinement `generate()` method of the model.
 
 ```bash
 python examples/dllm_generate/generate.py \
@@ -288,9 +290,9 @@ python examples/dllm_generate/generate.py \
 
 ### Generation Parameters
 
-The sampler selected with `--sampler` supplies these preset values. LLaDA uses the standalone AutoModel sampler. LLaDA2 and Nemotron call their models' built-in `generate()` methods. `--remasking` and `--no_kv_cache` do not affect LLaDA2 generation.
+The sampler selected with the `--sampler` argument supplies these preset values. LLaDA uses the standalone AutoModel sampler. LLaDA2 and Nemotron call the built-in `generate()` methods of their models. The `--remasking` and `--no_kv_cache` arguments do not affect LLaDA2 generation. The following table lists the default and preset values for the generation parameters.
 
-| Parameter | Description | LLaDA default | LLaDA2 preset | Nemotron preset |
+| Parameter | Description | LLaDA Default | LLaDA2 Preset | Nemotron Preset |
 |-----------|-------------|---------------|----------------|------------------|
 | `--steps` | Number of denoising steps | 128 | 32 | 1024 (preset only; unused by built-in generation) |
 | `--max_new_tokens` | Maximum tokens to generate | 128 | 128 | 1024 |
