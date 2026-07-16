@@ -25,9 +25,9 @@ from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     _configure_sentence_transformer_export,
     _get_autocast_ctx,
     _get_model_instantiate_kwargs,
-    _unwrap_model_for_attrs,
     _uses_multi_vector_scoring,
 )
+from nemo_automodel.shared.utils import unwrap_model
 
 
 class _RetrieverAttrs(torch.nn.Module):
@@ -43,6 +43,12 @@ class _DDPLikeWrapper(torch.nn.Module):
         self.module = module
 
 
+class _CompiledLikeWrapper(torch.nn.Module):
+    def __init__(self, module: torch.nn.Module):
+        super().__init__()
+        self._orig_mod = module
+
+
 class _DictLikeConfig(SimpleNamespace):
     def get(self, key, default=None):
         return getattr(self, key, default)
@@ -52,7 +58,7 @@ def test_retrieval_attrs_unwrap_ddp_like_wrapper():
     inner = _RetrieverAttrs()
     wrapped = _DDPLikeWrapper(inner)
 
-    attr_model = _unwrap_model_for_attrs(wrapped)
+    attr_model = unwrap_model(wrapped)
 
     assert attr_model is inner
     assert attr_model.l2_normalize is True
@@ -64,7 +70,7 @@ def test_retrieval_attrs_unwrap_ddp_like_wrapper():
 def test_retrieval_attrs_accept_unwrapped_model():
     inner = _RetrieverAttrs()
 
-    assert _unwrap_model_for_attrs(inner) is inner
+    assert unwrap_model(inner) is inner
     assert _uses_multi_vector_scoring(inner) is True
 
 
@@ -84,17 +90,21 @@ def test_configure_sentence_transformer_export_binds_exact_static_collator_promp
         use_dataset_instruction=False,
     )
 
-    _configure_sentence_transformer_export(_DDPLikeWrapper(_Model()), collator)
+    wrapped = _CompiledLikeWrapper(_DDPLikeWrapper(_Model()))
+    _configure_sentence_transformer_export(wrapped, collator)
 
     assert captured == {"query_prompt": "query: ", "document_prompt": "passage: "}
 
 
-def test_configure_sentence_transformer_export_uses_empty_static_prompts_for_dataset_instructions():
-    captured = {}
-
+def test_configure_sentence_transformer_export_disables_export_for_dataset_instructions(caplog):
     class _Model:
+        sentence_transformer_export_config = object()
+
         def configure_sentence_transformer_prompts(self, **kwargs):
-            captured.update(kwargs)
+            raise AssertionError(f"static prompts must not be configured: {kwargs}")
+
+        def disable_sentence_transformer_export(self):
+            self.sentence_transformer_export_config = None
 
     collator = SimpleNamespace(
         query_prefix="ignored query:",
@@ -102,9 +112,11 @@ def test_configure_sentence_transformer_export_uses_empty_static_prompts_for_dat
         use_dataset_instruction=True,
     )
 
-    _configure_sentence_transformer_export(_Model(), collator)
+    model = _Model()
+    _configure_sentence_transformer_export(model, collator)
 
-    assert captured == {"query_prompt": "", "document_prompt": ""}
+    assert model.sentence_transformer_export_config is None
+    assert "per-example dataset instructions" in caplog.text
 
 
 def test_retrieval_autocast_ctx_disabled_by_default(monkeypatch):

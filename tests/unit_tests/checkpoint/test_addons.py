@@ -153,10 +153,14 @@ def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effe
     )
     model.get_hf_export_config = lambda: model.config
     tokenizer = MagicMock()
+    ddp_model = nn.Module()
+    ddp_model.module = model
+    compiled_model = nn.Module()
+    compiled_model._orig_mod = ddp_model
 
     addon = ConsolidatedHFAddon()
     addon.pre_save(
-        model_state=SimpleNamespace(model=[model]),
+        model_state=SimpleNamespace(model=[compiled_model]),
         hf_metadata_dir=str(metadata_dir),
         tokenizer=tokenizer,
         fqn_to_file_index_mapping={"w": 1},
@@ -216,7 +220,7 @@ def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effe
     tokenizer.save_pretrained.assert_called_once_with(str(metadata_dir))
 
 
-def test_generated_sentence_transformer_assets_ignore_stale_source_semantics(tmp_path):
+def test_generated_sentence_transformer_assets_regenerate_semantics_and_preserve_source_limit(tmp_path):
     source_dir = tmp_path / "source"
     metadata_dir = tmp_path / "metadata"
     source_dir.mkdir()
@@ -257,7 +261,7 @@ def test_generated_sentence_transformer_assets_ignore_stale_source_semantics(tmp
     assert sentence_config["prompts"] == {"query": "", "document": ""}
     assert sentence_config["similarity_fn_name"] == "cosine"
     assert json.loads((metadata_dir / "sentence_bert_config.json").read_text()) == {
-        "max_seq_length": 512,
+        "max_seq_length": 8192,
         "do_lower_case": False,
     }
     assert json.loads((metadata_dir / "modules.json").read_text())[-1] == {
@@ -369,6 +373,31 @@ def test_generated_sentence_transformer_assets_reject_unrepresentable_pooling(tm
             export_config,
             original_model_path=None,
             hf_metadata_dir=str(metadata_dir),
+            tokenizer=None,
+        )
+
+
+def test_generated_sentence_transformer_assets_require_tokenizer(tmp_path):
+    model = SimpleNamespace(
+        pooling="avg",
+        l2_normalize=True,
+        config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
+    )
+    export_config = SimpleNamespace(
+        query_prompt="",
+        document_prompt="",
+        max_seq_length=512,
+        similarity_fn_name="cosine",
+        do_lower_case=False,
+        include_prompt=True,
+    )
+
+    with pytest.raises(ValueError, match="tokenizer is required"):
+        _save_generated_sentence_transformer_assets(
+            model,
+            export_config,
+            original_model_path=None,
+            hf_metadata_dir=str(tmp_path),
             tokenizer=None,
         )
 
