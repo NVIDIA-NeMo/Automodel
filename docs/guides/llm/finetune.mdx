@@ -801,17 +801,10 @@ optimizer:
 | `rng` | Optional | Controls reproducibility. Source: [`rng.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/training/rng.py). |
 | `step_scheduler` | Yes | `grad_acc_steps` sets how many micro-batches accumulate per gradient step. `ckpt_every_steps` and `val_every_steps` are counted in gradient steps. |
 | `distributed` | Yes | `dp_size: null` means auto-detect from world size. Adjust `tp_size` for tensor parallelism across GPUs. |
-| `prewarm` | Optional | Enable only the targeted setup warmup associated with a first-step out-of-memory error from lazy cuBLAS workspace allocation, FLA gated-delta-net Triton autotuning, or NCCL communicator creation. Prewarms move one-time initialization earlier; they do not reduce steady-state training memory or imply support for a particular context length. Source: [`prewarm.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/training/prewarm.py). |
+| `prewarm` | Optional | Enable only the targeted setup warmup associated with a first-step out-of-memory error. See [Prewarm One-Time CUDA Initialization](/get-started/configuration#prewarm-one-time-cuda-initialization). Source: [`prewarm.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/components/training/prewarm.py). |
 | `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. |
 | `optimizer` | Optional | Defaults are reasonable. Any `torch.optim` class can be substituted via `_target_`. For long fine-tuning, especially full-parameter SFT, see the [mixed-precision training guide](/development/mixed-precision-training) before combining torch AdamW with bf16 resident parameters. |
 | `wandb` | Optional | Uncomment and configure to enable Weights & Biases logging. |
-
-<Info>
-Prewarming is most useful for long-context or otherwise memory-constrained runs. Such a run can have enough steady-state memory and still fail on its first training step: activations and gradients are live while cuBLAS workspaces, Triton autotuning buffers, and NCCL communicators are initialized for the first time. Temporary autotuning allocations are released afterward, and some memory—notably NCCL scratch space—is outside PyTorch's caching allocator, so `torch.cuda.memory_allocated()` does not show the complete transient peak.
-
-Adding GPUs helps only when it reduces the relevant per-rank tensors enough; each rank still initializes its own resources, and additional parallel dimensions can introduce more communication groups. Shorter contexts can therefore leave enough slack for lazy initialization, while longer contexts may need the same initialization moved into setup. Long-context hybrid-attention MoE workloads are one common case, but enable each prewarm based on the observed first-step failure rather than a model name.
-
-</Info>
 
 For the fine-tuning recipe itself, see [`train_ft.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/recipes/llm/train_ft.py). For more example configs, browse [`examples/llm_finetune/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples/llm_finetune).
 

@@ -676,6 +676,16 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
 
+        # Optional setup-time prewarms (cuBLAS workspaces, Triton autotune
+        # caches, NCCL communicators) while the allocator pool is still small,
+        # instead of lazily at step-1 peak memory.
+        if self.cfg.prewarm is not None:
+            self.cfg.prewarm.apply(
+                model_parts=self.model_parts,
+                device=self.dist_env.device,
+                pp_mesh=(self.device_mesh["pp"] if self.pp_enabled and self.device_mesh is not None else None),
+            )
+
         # Extract mRoPE position-id builder from the model so VLM neat packing can
         # produce 3D position_ids per sample. Without this, packed multimodal
         # training silently degrades mRoPE to plain 1D positions.
