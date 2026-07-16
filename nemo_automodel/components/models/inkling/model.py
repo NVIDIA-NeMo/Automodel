@@ -51,15 +51,12 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
     # CausalLM forward and drops them). Mirrors qwen3_vl_moe.
     _pp_keep_self_forward: bool = True
 
-    # Preserve HF's fp32-pinned short-conv modules and additionally pin the router
-    # correction bias: bf16 rounding of either flips numerics / expert selection.
-    _keep_in_fp32_modules_strict = [
-        "attn_sconv",
-        "mlp_sconv",
-        "k_sconv",
-        "v_sconv",
-        "e_score_correction_bias",
-    ]
+    # Keep parameters in a single (model) dtype so FSDP2 sees a uniform dtype per
+    # wrapped group. The short convolutions upcast their compute to fp32 internally
+    # and the router scores/bias are computed in fp32 (gate_precision), so uniform
+    # bf16 storage does not change those numerically-sensitive paths. Overriding
+    # HF's fp32-pinned short-conv list is intentional.
+    _keep_in_fp32_modules_strict = []
 
     @dataclass(frozen=True)
     class ModelCapabilities:

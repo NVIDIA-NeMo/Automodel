@@ -97,8 +97,9 @@ class InklingGate(nn.Module):
         model_dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
         self.weight = nn.Parameter(torch.empty(self.n_total_experts, config.hidden_size, dtype=model_dtype))
         self.global_scale = nn.Parameter(torch.ones(1, dtype=model_dtype))
-        # Kept in fp32: small quantization errors in bf16 flip expert selection.
-        self.e_score_correction_bias = nn.Parameter(torch.empty(self.num_experts, dtype=torch.float32))
+        # Stored in the model dtype (uniform dtype keeps FSDP2 happy); selection math
+        # upcasts to fp32 via ``gate_precision`` in forward.
+        self.e_score_correction_bias = nn.Parameter(torch.empty(self.num_experts, dtype=model_dtype))
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route tokens to experts.
