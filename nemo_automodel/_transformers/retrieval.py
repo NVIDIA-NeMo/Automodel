@@ -22,8 +22,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
-from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
+from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PretrainedConfig, PreTrainedModel
+from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -31,6 +31,15 @@ from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 logger = logging.get_logger(__name__)
+
+
+def _clone_pretrained_config(config: PretrainedConfig) -> PretrainedConfig:
+    """Clone a config while retaining private source-revision metadata."""
+    cloned_config = config.__class__.from_dict(config.to_dict())
+    commit_hash = getattr(config, "_commit_hash", None)
+    if commit_hash is not None:
+        cloned_config._commit_hash = commit_hash
+    return cloned_config
 
 
 def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedModel:
@@ -98,20 +107,29 @@ def _build_backbone_from_extracted_submodel(
     pooling: Optional[str],
     num_labels: Optional[int],
     temperature: Optional[float],
+    source_commit_hash: Optional[str] = None,
 ) -> PreTrainedModel:
     """Build a task-specific retrieval backbone from an extracted text submodel."""
     text_config = extracted_model.config
     model_type = getattr(text_config, "model_type", "")
     task_map = SUPPORTED_BACKBONES.get(model_type.lower())
     has_supported_target = task_map is not None and task in task_map
+    uses_stock_ministral_embedding = model_type.lower() == "ministral3" and task == "embedding"
 
     if task_map is not None and not has_supported_target and task != "score":
         raise ValueError(
             f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: {', '.join(task_map)}."
         )
 
-    if task == "score" and not has_supported_target:
-        config = text_config.__class__.from_dict(text_config.to_dict())
+    if uses_stock_ministral_embedding:
+        config = _clone_pretrained_config(text_config)
+        config.is_causal = False
+        try:
+            backbone_class = MODEL_MAPPING[type(config)]
+        except KeyError as exc:
+            raise ValueError(f"No HuggingFace base model found for '{model_type}'.") from exc
+    elif task == "score" and not has_supported_target:
+        config = _clone_pretrained_config(text_config)
         try:
             backbone_class = MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING[type(config)]
         except KeyError as exc:
@@ -128,14 +146,19 @@ def _build_backbone_from_extracted_submodel(
         config_dict.pop("model_type", None)
         config = config_class(**config_dict)
 
+    if source_commit_hash is None:
+        source_commit_hash = getattr(text_config, "_commit_hash", None)
+    if source_commit_hash is not None:
+        config._commit_hash = source_commit_hash
+
     attn_implementation = getattr(text_config, "_attn_implementation", None)
     if attn_implementation is not None:
         config._attn_implementation = attn_implementation
-    if has_supported_target and pooling is not None:
+    if (has_supported_target or uses_stock_ministral_embedding) and pooling is not None:
         config.pooling = pooling
     if num_labels is not None:
         config.num_labels = num_labels
-    if has_supported_target and temperature is not None:
+    if (has_supported_target or uses_stock_ministral_embedding) and temperature is not None:
         config.temperature = temperature
 
     return _load_from_extracted_state(backbone_class, config, extracted_model)
@@ -223,12 +246,13 @@ def build_encoder_backbone(
     When ``extract_submodel`` is set, loads the parent model with HuggingFace
     Auto classes and extracts the dotted path. For supported extracted text
     backbones, it then builds the registered retrieval class for the requested
-    task (bidirectional base model for ``"embedding"``, sequence-classification
-    wrapper for ``"score"``). For unsupported extracted text backbones, it
-    returns the extracted model for ``"embedding"`` and wraps it with
+    task. Extracted Ministral embedding backbones use the stock HuggingFace model
+    with ``is_causal=False``. For unsupported extracted text backbones, it returns
+    the extracted model for ``"embedding"`` and wraps it with
     ``AutoModelForSequenceClassification`` for ``"score"``.
 
-    Without ``extract_submodel``, model types listed in
+    Without ``extract_submodel``, standard Ministral embedding checkpoints use
+    the stock HuggingFace model with ``is_causal=False``. Model types listed in
     :data:`SUPPORTED_BACKBONES` resolve to custom bidirectional classes from
     :class:`ModelRegistry`; all other model types fall back to HuggingFace Auto
     classes.
@@ -266,6 +290,20 @@ def build_encoder_backbone(
             pooling=pooling,
             num_labels=num_labels,
             temperature=temperature,
+            source_commit_hash=getattr(config, "_commit_hash", None),
+        )
+
+    if model_type.lower() == "ministral3" and task == "embedding":
+        config.is_causal = False
+        if pooling is not None:
+            config.pooling = pooling
+        if temperature is not None:
+            config.temperature = temperature
+        return AutoModel.from_pretrained(
+            model_name_or_path,
+            config=config,
+            trust_remote_code=trust_remote_code,
+            **hf_kwargs,
         )
 
     BidirectionalModelClass = _get_supported_backbone_class(model_type, task)
@@ -328,7 +366,7 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
     model.model.save_pretrained(save_directory)
 
 
-# HuggingFace model_type -> task -> bidirectional architecture class name in ModelRegistry
+# Model types that require a registered custom retrieval backbone for each task.
 _LLAMA_TASKS = {
     "embedding": "LlamaBidirectionalModel",
     "score": "LlamaBidirectionalForSequenceClassification",
@@ -342,7 +380,6 @@ _LLAMA_NEMOTRON_VL_TASKS = {
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
-    "ministral3": _MINISTRAL3_BIDIREC_TASKS,
     "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
     "llama_nemotron_vl": _LLAMA_NEMOTRON_VL_TASKS,
 }

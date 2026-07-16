@@ -1,11 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0.
 """
-Bidirectional Ministral3 model for embedding tasks.
+Custom bidirectional Ministral3 model for explicit and legacy use.
 
 This module provides a modified Ministral3Model that uses bidirectional (non-causal)
 attention, suitable for generating embeddings where each token should attend
-to all other tokens in the sequence.
+to all other tokens in the sequence. Standard ``ministral3`` embedding checkpoints
+use the stock HuggingFace model with ``is_causal=False``; this custom architecture
+remains available for ``ministral3_bidirec`` checkpoints and future task-specific
+extensions.
 """
 
 from dataclasses import dataclass
@@ -37,7 +40,10 @@ class Ministral3BidirectionalModel(Ministral3Model):
     """
     Ministral3Model modified to use bidirectional (non-causal) attention.
 
-    In standard Ministral3, each token can only attend to previous tokens (causal
+    This class is not selected automatically for standard ``ministral3`` embedding
+    checkpoints. It remains registered for explicit and legacy use.
+
+    In causal Ministral3, each token can only attend to previous tokens (causal
     attention). This model removes that restriction, allowing each token to attend
     to all tokens in the sequence, which is useful for embedding tasks.
 
