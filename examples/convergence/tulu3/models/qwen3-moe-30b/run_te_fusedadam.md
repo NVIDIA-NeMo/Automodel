@@ -107,16 +107,13 @@ Why each Qwen-specific flag matters:
 - **`max_model_len=8192`**: the 30B on 1 GPU can't fit KV cache for the default 32768 context.
 - **`until=<|im_end|>`**: explicit stop token for the current vLLM/lm-eval stack.
 
-**Reference IFEval (this run, TE FusedAdam SFT):**
-
-All "measured" rows below use the identical stack (`--thinking`, `think_end_token=</think>`,
-`until=<|im_end|>`, `max_model_len=8192`, tokenizer `Qwen/Qwen3-30B-A3B`, tp=1/dp=1).
+**Reference IFEval — measured.** Identical stack (`until=<|im_end|>`, `max_model_len=8192`,
+tokenizer `Qwen/Qwen3-30B-A3B`, tp=1/dp=1). The **base is evaluated without `--thinking`** (its
+natural mode — an untuned base isn't hurt by the empty-`<think>` prefill: 0% empty responses), and
+the **SFT model with `--thinking`**.
 
 | Model | prompt_strict | prompt_loose | inst_strict | inst_loose |
 |-------|-------------:|-------------:|------------:|-----------:|
-| Qwen3-30B-A3B-Base — pretrained (README) | 0.318 | 0.420 | 0.441 | 0.543 |
-| README — TE FusedAdam SFT | 0.545 | 0.590 | 0.714 | 0.750 |
+| Qwen3-30B-A3B-Base — pretrained (measured) | 0.3179 | 0.4140 | 0.4376 | 0.5360 |
 | **This run — TE FusedAdam SFT (measured)** | **0.5767** | **0.6100** | **0.6894** | **0.7182** |
-
-Note: the README-quoted pretrained row (0.318) was measured without `--thinking` and understates
-the base; the true same-stack SFT gain is **+0.14 absolute**, uniform across all four metrics.
+| **Δ (SFT − base)** | **+0.259** | **+0.196** | **+0.252** | **+0.182** |
