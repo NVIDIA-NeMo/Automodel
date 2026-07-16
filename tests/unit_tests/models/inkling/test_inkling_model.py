@@ -19,7 +19,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from transformers.models.inkling.configuration_inkling import InklingConfig
+
+# The Inkling model ships in transformers >= 5.14; skip the whole module when the
+# installed transformers build predates it (e.g. the pinned release on main).
+pytest.importorskip("transformers.models.inkling", reason="transformers build without the Inkling model")
+
+from transformers.models.inkling.configuration_inkling import InklingConfig  # noqa: E402
 from transformers.models.inkling.modeling_inkling import (  # noqa: E402
     InklingForConditionalGeneration as HFInklingForConditionalGeneration,
 )
@@ -30,7 +35,7 @@ from nemo_automodel.components.datasets.vlm.collate_fns import (  # noqa: E402
     default_collate_fn,
 )
 from nemo_automodel.components.models.common import BackendConfig  # noqa: E402
-from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport  # noqa: E402
 from nemo_automodel.components.models.inkling.layers import InklingDenseMLP, InklingMoE  # noqa: E402
 from nemo_automodel.components.models.inkling.model import InklingForConditionalGeneration  # noqa: E402
 from nemo_automodel.components.models.inkling.state_dict_adapter import _interleave  # noqa: E402
