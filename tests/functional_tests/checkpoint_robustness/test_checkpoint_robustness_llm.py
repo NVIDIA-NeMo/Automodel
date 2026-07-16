@@ -206,13 +206,12 @@ def _get_trust_remote_code_attn_implementation(
         config_kwargs["token"] = token
     config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
 
-    # Nemotron-H's remote-code attention passes an ordinary padding mask through
-    # HF's FlashAttention varlen/unpadding path. That path raises a
-    # vectorized_gather_kernel index-OOB device assert for Nemotron-3 Super.
-    # PyTorch SDPA uses its optimized CUDA dispatcher while avoiding the
-    # incompatible varlen route. Other remote-code models (notably
-    # Nemotron-Flash) still require FA2.
-    return "sdpa" if config.model_type == "nemotron_h" else "flash_attention_2"
+    # Nemotron-H remote-code checkpoints do not share optimized attention backend
+    # support: FlashAttention fails in Nemotron-3 Super's varlen path, while
+    # Nemotron-Nano v2 declares SDPA unsupported. Eager is their common HF
+    # reference path. Other remote-code models (notably Nemotron-Flash) still
+    # require FA2.
+    return "eager" if config.model_type == "nemotron_h" else "flash_attention_2"
 
 
 def _hf_source_load_kwargs(

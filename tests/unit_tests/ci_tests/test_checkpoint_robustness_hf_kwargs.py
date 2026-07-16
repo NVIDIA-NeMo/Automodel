@@ -23,10 +23,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import _finish_hf_reload_sync
-from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import _hf_source_load_kwargs
-from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import _prepare_hf_reload_sync
-from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import _wait_for_hf_reload_rank0
+from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
+    _finish_hf_reload_sync,
+    _hf_source_load_kwargs,
+    _prepare_hf_reload_sync,
+    _wait_for_hf_reload_rank0,
+)
 
 
 def _run_hf_reload_sync_rank(rank, init_path, checkpoint_dir):
@@ -51,7 +53,7 @@ def _run_hf_reload_sync_rank(rank, init_path, checkpoint_dir):
 
 @pytest.mark.parametrize(
     ("model_type", "expected_attn_implementation"),
-    [("nemotron_h", "sdpa"), ("nemotron_flash", "flash_attention_2")],
+    [("nemotron_h", "eager"), ("nemotron_flash", "flash_attention_2")],
 )
 def test_remote_code_attention_implementation(model_type, expected_attn_implementation):
     with patch(
