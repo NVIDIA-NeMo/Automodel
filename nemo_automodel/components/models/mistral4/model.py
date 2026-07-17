@@ -19,7 +19,6 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -28,6 +27,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.deepseek_v3.layers import MLA
 from nemo_automodel.components.models.deepseek_v3.model import Block
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
@@ -305,6 +308,8 @@ class Mistral4Model(nn.Module):
 
 
 class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -348,7 +353,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         # Reject an unsupported tied request on the controlling top-level flag
         # before unwrapping to text_config below.
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         # Extract text_config if this is a multimodal wrapper config
         config = getattr(config, "text_config", config)
         self.config = config
@@ -675,6 +680,10 @@ if _HF_MISTRAL3_AVAILABLE:
         (not HF PreTrainedModel) to avoid FSDP conflicts.
         """
 
+        # Head lives in the Mistral4 text backbone (separate lm_head, no tie
+        # mechanism); the controlling flag is on the nested text_config.
+        tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
         @dataclass(frozen=True)
         class ModelCapabilities:
             """Declared parallelism capabilities for this model class."""
@@ -720,6 +729,9 @@ if _HF_MISTRAL3_AVAILABLE:
             **kwargs,
         ):
             super().__init__()
+            # Read the nested text_config flag: the composite Mistral3Config top-level
+            # defaults to tie=True and does not reflect the untied Mistral4 backbone.
+            reject_unsupported_tie_word_embeddings(type(self), config.text_config)
             backend = backend or BackendConfig()
             num_hidden_layers = kwargs.pop("num_hidden_layers", None)
             if num_hidden_layers is not None:

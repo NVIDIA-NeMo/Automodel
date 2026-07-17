@@ -236,6 +236,14 @@ class BackendConfig:
     cuda_graph_modules: list[Literal["attn", "te_dpa", "moe_router", "moe_preprocess"]] = field(default_factory=list)
 
     def __post_init__(self):
+        # TEMPORARY: force TE fused RoPE off globally. The fused kernel computes cos/sin
+        # in fp32 in-kernel while HF/vLLM rotate with bf16 tables, breaking logprob parity
+        # in some models. See #3027. This is the one chokepoint every BackendConfig passes
+        # through, so it also overrides an explicit rope_fusion=True from a recipe/config.
+        if self.rope_fusion:
+            logger.warning("rope_fusion is temporarily force-disabled globally (see #3027).")
+        self.rope_fusion = False
+
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
         if isinstance(self.te_fp8, dict):
             self.te_fp8 = TEFp8Config(**self.te_fp8)
@@ -717,11 +725,24 @@ def _restore_fp32_tensor_snapshots(
         param.data = snapshot.to(dtype=torch.float32)
 
     for name, snapshot in buffer_snapshots.items():
-        module_name, _, buffer_name = name.rpartition(".")
-        module = model.get_submodule(module_name) if module_name else model
-        if buffer_name not in module._buffers:
-            continue
-        module._buffers[buffer_name] = snapshot.to(dtype=torch.float32)
+        # ActivationWrapper forwards __getattr__ / __setattr__ to the wrapped
+        # module. Try the literal FQN first for buffers registered on the wrapped
+        # leaf, then strip the wrapper alias as a fallback for forwarded names.
+        candidate_names = [name]
+        stripped_name = name.replace("._checkpoint_wrapped_module", "")
+        if stripped_name != name:
+            candidate_names.append(stripped_name)
+
+        for candidate_name in candidate_names:
+            module_name, _, buffer_name = candidate_name.rpartition(".")
+            try:
+                module = model.get_submodule(module_name) if module_name else model
+            except AttributeError:
+                continue
+            if buffer_name not in module._buffers:
+                continue
+            module._buffers[buffer_name] = snapshot.to(dtype=torch.float32)
+            break
 
 
 def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:

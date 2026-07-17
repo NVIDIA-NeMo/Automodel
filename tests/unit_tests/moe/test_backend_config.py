@@ -432,3 +432,25 @@ class TestBackendConfigPartialCudaGraphs:
                 dispatcher="deepep",
                 cuda_graph_modules=["moe_router", "moe_preprocess"],
             )
+
+
+class TestBackendConfigRopeFusionDisabled:
+    """TE fused RoPE is temporarily force-disabled globally in __post_init__ (see #3027)."""
+
+    def test_rope_fusion_default_forced_false(self):
+        """The default resolves to False regardless of TE/CUDA availability."""
+        assert BackendConfig().rope_fusion is False
+
+    def test_rope_fusion_explicit_true_is_overridden(self, caplog):
+        """An explicit rope_fusion=True is forced back to False and warns once."""
+        with caplog.at_level(logging.WARNING):
+            config = BackendConfig(rope_fusion=True)
+        assert config.rope_fusion is False
+        assert "rope_fusion is temporarily force-disabled globally" in caplog.text
+
+    def test_rope_fusion_explicit_false_no_warning(self, caplog):
+        """An explicit rope_fusion=False stays False and logs no override warning."""
+        with caplog.at_level(logging.WARNING):
+            config = BackendConfig(rope_fusion=False)
+        assert config.rope_fusion is False
+        assert "force-disabled" not in caplog.text

@@ -112,6 +112,7 @@ class DistributedSetup:
         activation_checkpointing: ActivationCheckpointingMode = False,
         world_size: int | None = None,
         timeout_minutes: int | None = None,
+        ranks: list[int] | tuple[int, ...] | None = None,
     ) -> "DistributedSetup":
         """Create a resolved distributed setup from sizes and policy configs.
 
@@ -150,6 +151,7 @@ class DistributedSetup:
             parallelism_sizes=parallelism_sizes,
             world_size=world_size,
             timeout_minutes=timeout_minutes,
+            ranks=ranks,
         )
 
         return cls(

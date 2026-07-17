@@ -18,7 +18,8 @@ Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
     [--kl_threshold <float>] [--hf_kl_threshold <float>]
     [--cross_tp_size <int>] [--cross_tp_kl_threshold <float>]
     [--tokenizer_name <str>]
-    [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
+    [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
+    [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
     [--max_vram_gb <float>] [--max_cpu_gb <float>]
 """
 
@@ -27,6 +28,8 @@ from __future__ import annotations
 import gc
 import os
 import sys
+import time
+import traceback
 from pathlib import Path
 
 import datasets
@@ -40,7 +43,9 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _reinit_non_persistent_buffers,
 )
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+from nemo_automodel.shared.utils import dtype_from_str
 
 datasets.disable_caching()
 
@@ -61,9 +66,13 @@ def _extract_custom_args(argv):
         "--max_vram_gb",
         "--max_cpu_gb",
         "--resume_loss_threshold",
+        "--source_load_cosine_threshold",
+        "--source_load_kl_threshold",
+        "--source_load_mean_kl_threshold",
     }
     boolean_keys = {
         "--trust_remote_code",
+        "--check_source_load_parity",
         "--check_fused_qkv_keys",
         "--check_phantom_keys",
         "--check_resume",
@@ -140,6 +149,454 @@ def _kl_divergence_from_logits(reference_logits: torch.Tensor, candidate_logits:
     ref_log_probs = F.log_softmax(reference_logits.float(), dim=-1).reshape(-1, vocab_size)
     cand_log_probs = F.log_softmax(candidate_logits.float(), dim=-1).reshape(-1, vocab_size)
     return F.kl_div(cand_log_probs, ref_log_probs, reduction="none", log_target=True).sum(-1)
+
+
+def _cosine_similarity_from_logits(reference_logits: torch.Tensor, candidate_logits: torch.Tensor) -> float:
+    """Cosine similarity over flattened float32 logits."""
+    return F.cosine_similarity(reference_logits.flatten().float(), candidate_logits.flatten().float(), dim=0).item()
+
+
+def _materialize_config_value(value):
+    """Convert a config value into the object that recipe instantiation would pass as a kwarg."""
+    if isinstance(value, ConfigNode):
+        if hasattr(value, "_target_"):
+            return value.instantiate()
+        return {
+            k: _materialize_config_value(v)
+            for k, v in value.__dict__.items()
+            if k not in ("raise_on_missing_attr", "_raw_config", "_original_strings")
+        }
+    if isinstance(value, list):
+        return [_materialize_config_value(v) for v in value]
+    return value
+
+
+def _model_kwargs_from_config(model_cfg: ConfigNode) -> dict:
+    """Return kwargs from the recipe model config without invoking the model target."""
+    return {
+        k: _materialize_config_value(v)
+        for k, v in model_cfg.__dict__.items()
+        if k not in ("_target_", "raise_on_missing_attr", "_raw_config", "_original_strings")
+    }
+
+
+def _resolve_source_load_dtype(model_kwargs: dict) -> torch.dtype:
+    """Mirror NeMoAuto's practical source-load dtype default for the HF reference model."""
+    torch_dtype = model_kwargs.get("torch_dtype", "auto")
+    if torch_dtype == "auto":
+        return torch.bfloat16
+    if isinstance(torch_dtype, str):
+        return dtype_from_str(torch_dtype)
+    return torch_dtype
+
+
+def _get_trust_remote_code_attn_implementation(
+    pretrained_model_name_or_path: str | Path,
+    *,
+    revision: str | None = None,
+    token: str | bool | None = None,
+) -> str:
+    """Select the vanilla-HF attention implementation for a remote-code model."""
+    from transformers import AutoConfig
+
+    config_kwargs: dict[str, str | bool] = {"trust_remote_code": True}
+    if revision is not None:
+        config_kwargs["revision"] = revision
+    if token is not None:
+        config_kwargs["token"] = token
+    config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
+
+    # Nemotron-H remote-code checkpoints do not share optimized attention backend
+    # support: FlashAttention fails in Nemotron-3 Super's varlen path, while
+    # Nemotron-Nano v2 declares SDPA unsupported. Eager is their common HF
+    # reference path. Other remote-code models (notably Nemotron-Flash) still
+    # require FA2.
+    return "eager" if config.model_type == "nemotron_h" else "flash_attention_2"
+
+
+def _hf_source_load_kwargs(
+    model_kwargs: dict,
+    *,
+    pretrained_model_name_or_path: str | Path,
+    source_dtype: torch.dtype,
+    trust_remote_code: bool,
+    experts_implementation: str | None,
+    device: torch.device,
+    hf_device_map_auto: bool,
+) -> dict:
+    """Build the HF-safe subset of recipe model kwargs for the source-load reference."""
+    hf_allowed_keys = {
+        "attn_implementation",
+        "config",
+        "quantization_config",
+        "revision",
+        "token",
+        "trust_remote_code",
+    }
+    hf_kwargs = {k: v for k, v in model_kwargs.items() if k in hf_allowed_keys}
+    hf_kwargs["torch_dtype"] = source_dtype
+    hf_kwargs["trust_remote_code"] = trust_remote_code or bool(hf_kwargs.get("trust_remote_code", False))
+    if hf_kwargs["trust_remote_code"] and "attn_implementation" not in hf_kwargs:
+        hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(
+            pretrained_model_name_or_path,
+            revision=hf_kwargs.get("revision"),
+            token=hf_kwargs.get("token"),
+        )
+    if experts_implementation and not trust_remote_code:
+        hf_kwargs["experts_implementation"] = experts_implementation
+        hf_kwargs["trust_remote_code"] = False
+    if hf_device_map_auto:
+        hf_kwargs["device_map"] = "auto"
+    if (
+        "device_map" not in hf_kwargs
+        and not hf_kwargs["trust_remote_code"]
+        and hf_kwargs.get("quantization_config") is None
+    ):
+        hf_kwargs["device_map"] = {"": device}
+    return hf_kwargs
+
+
+def _lm_head_embedding_aliased(model) -> bool | None:
+    """Return lm_head/input-embedding aliasing when real local storage is inspectable."""
+    # FSDP2/TP wrappers may expose distinct local storages for logically tied
+    # parameters, so only use this as a real storage check before sharding.
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        return None
+    lm_head = getattr(model, "lm_head", None)
+    get_input_embeddings = getattr(model, "get_input_embeddings", None)
+    if lm_head is None or get_input_embeddings is None:
+        return None
+    embeddings = get_input_embeddings()
+    if embeddings is None or not hasattr(lm_head, "weight") or not hasattr(embeddings, "weight"):
+        return None
+    lm_head_weight = lm_head.weight
+    embedding_weight = embeddings.weight
+    if isinstance(lm_head_weight, DTensor) or isinstance(embedding_weight, DTensor):
+        return None
+    try:
+        lm_head_ptr = lm_head_weight.data_ptr()
+        embedding_ptr = embedding_weight.data_ptr()
+    except RuntimeError:
+        return None
+    if lm_head_ptr == 0 or embedding_ptr == 0:
+        return None
+    return lm_head_ptr == embedding_ptr
+
+
+def _explicit_tie_word_embeddings(config) -> bool | None:
+    """Return an explicit tie_word_embeddings flag from a top-level or text config."""
+    tie_word_embeddings = getattr(config, "tie_word_embeddings", None)
+    if tie_word_embeddings is not None:
+        return bool(tie_word_embeddings)
+    text_config = getattr(config, "text_config", None)
+    tie_word_embeddings = getattr(text_config, "tie_word_embeddings", None)
+    return None if tie_word_embeddings is None else bool(tie_word_embeddings)
+
+
+def _release_model_memory() -> None:
+    """Release standalone model memory between source-load parity phases."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _preinit_global_rank() -> int:
+    """Return the torchrun global rank before torch.distributed is initialized."""
+    if dist.is_initialized():
+        return dist.get_rank()
+    return int(os.environ.get("RANK", "0"))
+
+
+def _preinit_world_size() -> int:
+    """Return the torchrun world size before torch.distributed is initialized."""
+    if dist.is_initialized():
+        return dist.get_world_size()
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _sanitize_sync_id(value: str) -> str:
+    """Return a filesystem-friendly sync identifier."""
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
+
+
+def _source_load_run_id() -> str:
+    """Return a launch-scoped ID shared by ranks for pre-init file sync."""
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    if slurm_job_id:
+        slurm_step_id = os.environ.get("SLURM_STEP_ID", "step")
+        slurm_restart_count = os.environ.get("SLURM_RESTART_COUNT", "0")
+        return _sanitize_sync_id(f"slurm_{slurm_job_id}_{slurm_step_id}_{slurm_restart_count}")
+
+    torch_run_id = os.environ.get("TORCHELASTIC_RUN_ID")
+    if torch_run_id and torch_run_id.lower() not in ("local", "none", "default"):
+        restart_count = os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")
+        return _sanitize_sync_id(f"torchelastic_{torch_run_id}_{restart_count}")
+
+    master_port = os.environ.get("MASTER_PORT", "unknown")
+    world_size = os.environ.get("WORLD_SIZE", "1")
+    # Local fallback is intended for single-node torchrun/debug runs. Multi-node
+    # non-SLURM launches should provide a meaningful TORCHELASTIC_RUN_ID so all
+    # nodes agree on the same marker path.
+    return _sanitize_sync_id(f"local_ppid_{os.getppid()}_port_{master_port}_world_{world_size}")
+
+
+def _source_load_sync_paths(cfg) -> tuple[Path, Path, Path]:
+    """Return sync directory and done/fail paths for pre-init source-load parity."""
+    checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
+    sync_dir = checkpoint_dir.parent / f".source_load_parity_{_source_load_run_id()}"
+    return sync_dir, sync_dir / "done", sync_dir / "fail"
+
+
+def _wait_for_source_load_rank0(done_path: Path, fail_path: Path) -> None:
+    """Wait for rank 0 to finish source-load parity before process-group init."""
+    timeout_s = int(os.environ.get("SOURCE_LOAD_PARITY_TIMEOUT_SECONDS", "1800"))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if done_path.exists():
+            return
+        if fail_path.exists():
+            raise RuntimeError(f"Rank 0 source-load parity failed:\n{fail_path.read_text()}")
+        time.sleep(5)
+    raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 source-load parity")
+
+
+def _cleanup_source_load_sync(cfg) -> None:
+    """Best-effort cleanup of pre-init source-load sync markers."""
+    sync_dir, done_path, fail_path = _source_load_sync_paths(cfg)
+    if not sync_dir.exists():
+        return
+    for path in (done_path, fail_path):
+        path.unlink(missing_ok=True)
+    try:
+        sync_dir.rmdir()
+    except OSError:
+        pass
+
+
+def _hf_reload_sync_paths(cfg) -> tuple[Path, Path]:
+    """Return sync directory and done path for the rank-0-only HF reload."""
+    checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
+    sync_dir = checkpoint_dir.parent / f".hf_reload_{_source_load_run_id()}"
+    return sync_dir, sync_dir / "done"
+
+
+def _wait_for_hf_reload_rank0(done_path: Path) -> None:
+    """Wait without an active collective for rank 0 to finish the vanilla-HF reload."""
+    timeout_s = int(os.environ.get("HF_RELOAD_TIMEOUT_SECONDS", "1800"))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if done_path.exists():
+            return
+        time.sleep(5)
+    raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 vanilla-HF reload")
+
+
+def _prepare_hf_reload_sync(cfg) -> tuple[Path, Path] | None:
+    """Prepare ranks for a long rank-0-only HF reload without starting an NCCL wait."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return None
+
+    sync_dir, done_path = _hf_reload_sync_paths(cfg)
+    if _rank0():
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        done_path.unlink(missing_ok=True)
+    _barrier()  # ensure all ranks released recipe memory and rank 0 reset the marker
+    if not _rank0():
+        _wait_for_hf_reload_rank0(done_path)
+    return sync_dir, done_path
+
+
+def _finish_hf_reload_sync(sync_paths: tuple[Path, Path] | None) -> None:
+    """Release waiting ranks and synchronize after the rank-0-only HF reload."""
+    if sync_paths is None:
+        return
+
+    sync_dir, done_path = sync_paths
+    if _rank0():
+        done_path.write_text("ok\n")
+    _barrier()
+    if _rank0():
+        done_path.unlink(missing_ok=True)
+        try:
+            sync_dir.rmdir()
+        except OSError:
+            pass
+
+
+def _prepare_source_load_reference(
+    cfg,
+    input_ids: list[int],
+    *,
+    trust_remote_code: bool,
+    experts_implementation: str | None,
+    hf_device_map_auto: bool,
+) -> tuple[torch.Tensor, bool | None, bool | None] | None:
+    """Compute raw HF source-load reference logits before trainer construction."""
+    if _preinit_world_size() > 1:
+        sync_dir, done_path, fail_path = _source_load_sync_paths(cfg)
+        if _preinit_global_rank() != 0:
+            _wait_for_source_load_rank0(done_path, fail_path)
+            return None
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        done_path.unlink(missing_ok=True)
+        fail_path.unlink(missing_ok=True)
+    else:
+        done_path = None
+        fail_path = None
+
+    if _preinit_global_rank() != 0:
+        return None
+
+    try:
+        result = _prepare_source_load_reference_rank0(
+            cfg,
+            input_ids,
+            trust_remote_code=trust_remote_code,
+            experts_implementation=experts_implementation,
+            hf_device_map_auto=hf_device_map_auto,
+        )
+    except Exception:
+        if fail_path is not None:
+            fail_path.write_text(traceback.format_exc())
+        raise
+    else:
+        if done_path is not None:
+            done_path.write_text("ok\n")
+        return result
+
+
+def _prepare_source_load_reference_rank0(
+    cfg,
+    input_ids: list[int],
+    *,
+    trust_remote_code: bool,
+    experts_implementation: str | None,
+    hf_device_map_auto: bool,
+) -> tuple[torch.Tensor, bool | None, bool | None]:
+    """Rank-0 implementation of raw HF source-load reference capture."""
+    from contextlib import nullcontext
+
+    from transformers import AutoModelForCausalLM
+
+    from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+
+    apply_cache_compatibility_patches()
+
+    model_kwargs = _model_kwargs_from_config(cfg.model)
+    original_pretrained_path = model_kwargs.get("pretrained_model_name_or_path")
+    assert original_pretrained_path is not None, "source-load parity requires model.pretrained_model_name_or_path"
+    source_dtype = _resolve_source_load_dtype(model_kwargs)
+    trust_remote_code = trust_remote_code or bool(model_kwargs.get("trust_remote_code", False))
+
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    hf_kwargs = _hf_source_load_kwargs(
+        model_kwargs,
+        pretrained_model_name_or_path=original_pretrained_path,
+        source_dtype=source_dtype,
+        trust_remote_code=trust_remote_code,
+        experts_implementation=experts_implementation,
+        device=device,
+        hf_device_map_auto=hf_device_map_auto,
+    )
+
+    try:
+        from nemo_automodel._transformers.model_init import no_hf_meta_device
+
+        no_meta = no_hf_meta_device() if trust_remote_code else nullcontext()
+    except ImportError:
+        no_meta = nullcontext()
+
+    print(f"\n[Phase 0] Source-load reference: raw HF for {original_pretrained_path}")
+    with no_meta:
+        if "device_map" in hf_kwargs:
+            hf_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+        else:
+            hf_model = _fix_meta_rotary_embeddings(
+                AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
+            ).to(device)
+    _reinit_rotary_per_module(hf_model, device)
+    if trust_remote_code:
+        from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
+
+        if should_fix_rotary_embeddings([hf_model]):
+            fix_rotary_embeddings([hf_model])
+
+    hf_logits = _get_logits(hf_model, input_ids, device)
+    hf_aliased = _lm_head_embedding_aliased(hf_model)
+    explicit_tie_word_embeddings = _explicit_tie_word_embeddings(hf_model.config)
+    del hf_model
+    _release_model_memory()
+    return hf_logits, hf_aliased, explicit_tie_word_embeddings
+
+
+def _compare_source_load_parity(
+    source_reference: tuple[torch.Tensor, bool | None, bool | None] | None,
+    candidate_logits: torch.Tensor,
+    candidate_model,
+    *,
+    source_load_kl_threshold: float,
+    source_load_mean_kl_threshold: float,
+    source_load_cosine_threshold: float,
+) -> None:
+    """Compare the raw HF source-load reference against the constructed trainer model."""
+    candidate_aliased = _lm_head_embedding_aliased(candidate_model)
+    failure_message = None
+    if _rank0():
+        try:
+            assert source_reference is not None, "rank 0 source-load reference was not captured"
+            hf_logits, hf_aliased, explicit_tie_word_embeddings = source_reference
+            assert hf_logits.shape == candidate_logits.shape, (
+                f"Source-load parity shape mismatch: HF logits {hf_logits.shape} vs trainer logits "
+                f"{candidate_logits.shape}"
+            )
+            kl_source = _kl_divergence_from_logits(hf_logits, candidate_logits)
+            max_kl_source = kl_source.max().item()
+            mean_kl_source = kl_source.mean().item()
+            p95_kl_source = torch.quantile(kl_source, 0.95).item()
+            cosine_source = _cosine_similarity_from_logits(hf_logits, candidate_logits)
+            print(
+                f"[Phase 0] Source-load vs constructed-trainer max KL: {max_kl_source:.6e} "
+                f"(threshold: {source_load_kl_threshold:.6e}); mean KL: {mean_kl_source:.6e} "
+                f"(threshold: {source_load_mean_kl_threshold:.6e}); p95 KL: {p95_kl_source:.6e}; "
+                f"cosine={cosine_source:.8f} "
+                f"(threshold: {source_load_cosine_threshold:.8f}); "
+                f"hf_aliased={hf_aliased}; trainer_aliased={candidate_aliased}; "
+                f"tie_word_embeddings={explicit_tie_word_embeddings}"
+            )
+
+            assert max_kl_source <= source_load_kl_threshold, (
+                f"KL divergence between original HF source load and constructed trainer model too large: "
+                f"max per-token KL = {max_kl_source:.6e} > threshold {source_load_kl_threshold:.6e}"
+            )
+            assert mean_kl_source <= source_load_mean_kl_threshold, (
+                f"Mean KL divergence between original HF source load and constructed trainer model too large: "
+                f"mean per-token KL = {mean_kl_source:.6e} > threshold {source_load_mean_kl_threshold:.6e}"
+            )
+            assert cosine_source >= source_load_cosine_threshold, (
+                f"Cosine similarity between original HF source load and constructed trainer model too low: "
+                f"cosine = {cosine_source:.8f} < threshold {source_load_cosine_threshold:.8f}"
+            )
+            if hf_aliased is not None and candidate_aliased is not None:
+                assert hf_aliased == candidate_aliased, (
+                    f"Source-load lm_head aliasing mismatch: HF aliased={hf_aliased}, "
+                    f"trainer aliased={candidate_aliased}"
+                )
+            if explicit_tie_word_embeddings is not None and candidate_aliased is not None:
+                assert candidate_aliased == explicit_tie_word_embeddings, (
+                    f"Constructed trainer lm_head aliasing does not match config.tie_word_embeddings="
+                    f"{explicit_tie_word_embeddings}: aliased={candidate_aliased}"
+                )
+        except Exception:
+            failure_message = traceback.format_exc()
+
+    # Avoid leaving non-zero ranks blocked at the next barrier when rank 0 detects
+    # a Phase 0 mismatch.
+    if dist.is_initialized():
+        payload = [failure_message]
+        dist.broadcast_object_list(payload, src=0)
+        failure_message = payload[0]
+    if failure_message is not None:
+        raise AssertionError(failure_message)
 
 
 def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
@@ -419,14 +876,49 @@ def test_checkpoint_robustness():
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
     skip_hf_reload = bool(custom_args.get("skip_hf_reload", False))
+    check_source_load_parity = bool(custom_args.get("check_source_load_parity", False))
+    source_load_kl_threshold = float(custom_args.get("source_load_kl_threshold", "5e-3"))
+    source_load_mean_kl_threshold = float(custom_args.get("source_load_mean_kl_threshold", "1e-3"))
+    source_load_cosine_threshold = float(custom_args.get("source_load_cosine_threshold", "0.9999"))
 
     input_ids = _get_input_ids(tokenizer_name)
-
-    # Phase 1: Train and checkpoint
-    torch.cuda.reset_peak_memory_stats()
     cfg = parse_args_and_load_config()
+
+    source_load_reference = None
+    if check_source_load_parity:
+        source_load_reference = _prepare_source_load_reference(
+            cfg,
+            input_ids,
+            trust_remote_code=trust_remote_code,
+            experts_implementation=experts_implementation,
+            hf_device_map_auto=hf_device_map_auto,
+        )
+        _barrier()
+
+    # Phase 1: Construct the training model, optionally compare it against the
+    # raw HF source-load reference, then train and checkpoint.
+    torch.cuda.reset_peak_memory_stats()
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
+
+    if check_source_load_parity:
+        device = next(trainer.model_parts[0].parameters()).device
+        trainer_source_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+        _compare_source_load_parity(
+            source_load_reference,
+            trainer_source_logits,
+            trainer.model_parts[0],
+            source_load_kl_threshold=source_load_kl_threshold,
+            source_load_mean_kl_threshold=source_load_mean_kl_threshold,
+            source_load_cosine_threshold=source_load_cosine_threshold,
+        )
+        for model_part in trainer.model_parts:
+            model_part.train()
+        _barrier()
+        if _rank0():
+            _cleanup_source_load_sync(cfg)
+        _barrier()
+
     trainer.run_train_validation_loop()
 
     # Memory tracking after training
@@ -524,7 +1016,7 @@ def test_checkpoint_robustness():
     # Phase 4: Load into vanilla HF (rank 0 only)
     _release_recipe_memory(restored_trainer)
     del restored_trainer
-    _barrier()  # ensure all ranks free memory before rank 0 loads HF model
+    hf_reload_sync_paths = _prepare_hf_reload_sync(cfg)
 
     if skip_hf_reload:
         if _rank0():
@@ -548,13 +1040,12 @@ def test_checkpoint_robustness():
             _no_meta = nullcontext()
 
         hf_kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code)
-        # Nemotron-Flash's config ships ``attn_implementation="fused_mha"`` which
-        # transformers 5.x rejects in ``_check_and_adjust_attn_implementation``
-        # (only ``eager`` + registered ALL_ATTENTION_FUNCTIONS keys are accepted).
-        # Force a universally accepted impl; Nemotron-Flash routes
-        # ``flash_attention_2`` through its own fused path internally.
+        # Remote-code models can ship attention names that transformers 5.x
+        # rejects. Select a supported implementation while keeping Nemotron-H
+        # off HF's incompatible FlashAttention varlen path.
         if trust_remote_code and "attn_implementation" not in hf_kwargs:
-            hf_kwargs["attn_implementation"] = "flash_attention_2"
+            config_path = original_pretrained_path if is_peft else consolidated_dir
+            hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(config_path)
         if experts_implementation and not trust_remote_code:
             hf_kwargs["experts_implementation"] = experts_implementation
             hf_kwargs["trust_remote_code"] = False
@@ -654,7 +1145,7 @@ def test_checkpoint_robustness():
             f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
         )
 
-    _barrier()
+    _finish_hf_reload_sync(hf_reload_sync_paths)
 
     # Phase 5 (optional): Cross-TP — reload consolidated with a different TP size
     if cross_tp_size > 0 and not is_peft:

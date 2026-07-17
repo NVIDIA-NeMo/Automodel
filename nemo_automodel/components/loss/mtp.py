@@ -221,9 +221,25 @@ class PipelineCausalLMLoss(nn.Module):
         return None, output
 
     def forward(self, output, labels: torch.Tensor) -> torch.Tensor:
+        """Last-stage pipeline loss (main CE plus optional MTP aux CE).
+
+        B=microbatch, S=seq, H=hidden, V=vocab.
+
+        Args:
+            output: bare hidden states ``[B, S, H]`` (FusedLinearCrossEntropy
+                path), a HF output with logits ``[B, S, V]``, or an MTP tuple
+                ``(logits, *mtp_per_depth_h[, seq_idx])`` with ``seq_idx``
+                ``[B, S]`` int32. A tuple with FusedLinearCrossEntropy raises.
+            labels: target token ids ``[B, S]`` int64.
+
+        Returns:
+            Scalar loss tensor.
+        """
         seq_idx_mb, output = self._extract_seq_idx_tail(output)
 
         if isinstance(output, tuple):
+            if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                raise ValueError("FusedLinearCrossEntropy is not supported with MTP under pipeline parallelism")
             logits = output[0]
             hidden_states = None
             mtp_per_depth_h = None
@@ -235,11 +251,15 @@ class PipelineCausalLMLoss(nn.Module):
                     mtp_per_depth_h = list(output[1:])
             model_scaling_factor = get_mtp_loss_scaling_factor(self.model)
         else:
-            logits = getattr(output, "logits", output)
-            hidden_states = _get_final_hidden_states(output)
             mtp_per_depth_h = getattr(output, "mtp_per_depth_h", None)
             mtp_per_depth_logits = getattr(output, "mtp_per_depth_logits", None)
             model_scaling_factor = getattr(output, "mtp_loss_scaling_factor", get_mtp_loss_scaling_factor(self.model))
+            if isinstance(self.loss_fn, FusedLinearCrossEntropy) and isinstance(output, torch.Tensor):
+                logits = None
+                hidden_states = output
+            else:
+                logits = getattr(output, "logits", output)
+                hidden_states = _get_final_hidden_states(output)
 
         # Gather the LM head at most once and thread it through the main loss and
         # every MTP depth (avoids redundant per-call full_tensor() gathers).
