@@ -34,7 +34,11 @@
 
 set -xeuo pipefail
 
-TRANSFORMERS_OFFLINE=1 CUDA_LAUNCH_BLOCKING=1 coverage run \
+# PyTorch 2.13's Python-native Triton bmm_outer_product override can issue an
+# illegal memory access while backpropagating through the recurrent drafter on
+# pre-Blackwell GPUs. Use the regular aten::bmm kernel for this compatibility
+# smoke test until the upstream native-JIT kernel is fixed.
+TRANSFORMERS_OFFLINE=1 TORCH_DISABLE_NATIVE_JIT=1 coverage run \
 examples/vlm_finetune/finetune.py \
   --config examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_medpix.yaml \
   --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_gemma4_e4b_2l/ \
