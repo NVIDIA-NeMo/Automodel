@@ -92,7 +92,34 @@ def _discover_via_recipe_list(automodel_dir: str, scope: str, test_folder: str) 
     with open(config_path, "r", encoding="utf-8") as f:
         test_configs = yaml.load(f)
     examples_dir = test_configs.get("examples_dir", test_folder)
-    return [Path(f"examples/{examples_dir}/{c}") for c in test_configs["configs"]]
+    return [resolve_recipe_path(config, examples_dir) for config in test_configs["configs"]]
+
+
+def resolve_recipe_path(config: str, examples_dir: str) -> Path:
+    """Resolve a recipe-list entry to a repository-relative examples path.
+
+    Entries are normally relative to ``examples/<test_folder>``. A full
+    ``examples/...`` path lets an existing CI launcher run a recipe whose
+    semantic folder differs from the launcher name, such as LLM pretraining
+    through the shared LLM training launcher.
+
+    Args:
+        config: Recipe-list entry, either relative to ``examples_dir`` or a
+            repository-relative path beginning with ``examples/``.
+        examples_dir: Default subdirectory under ``examples/``.
+
+    Returns:
+        Repository-relative path to the recipe.
+
+    Raises:
+        ValueError: If the entry is absolute or traverses a parent directory.
+    """
+    path = Path(config)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"Recipe path must stay within the repository: {config}")
+    if path.parts and path.parts[0] == "examples":
+        return path
+    return Path("examples") / examples_dir / path
 
 
 def detect_yml_configurations(automodel_dir: str, scope: str, test_folder: str) -> list[Path]:

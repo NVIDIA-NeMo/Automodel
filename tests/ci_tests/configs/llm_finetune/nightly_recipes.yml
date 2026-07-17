@@ -13,6 +13,9 @@
 # limitations under the License.
 
 configs:
+  # LLM pretraining uses the same training recipe/launcher as finetuning.
+  - examples/llm_pretrain/deepseek_v4/deepseek_v4_flash_pretrain.yaml
+
   # ==========================================================================
   # SFT (Supervised Fine-Tuning)
   # ==========================================================================

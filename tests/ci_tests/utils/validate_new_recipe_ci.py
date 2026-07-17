@@ -48,7 +48,7 @@ UTILS_DIR = Path(__file__).resolve().parent
 if str(UTILS_DIR) not in sys.path:
     sys.path.insert(0, str(UTILS_DIR))
 
-from generate_ci_tests import AUTO_DISCOVER_SCOPES  # noqa: E402
+from generate_ci_tests import AUTO_DISCOVER_SCOPES, resolve_recipe_path  # noqa: E402
 
 # ci: keys every newly added CI recipe must declare.
 REQUIRED_CI_FIELDS = ("recipe_owner", "time", "nodes")
@@ -86,7 +86,7 @@ def listed_recipe_paths(automodel_dir: Path) -> set[Path]:
             continue
         examples_dir = data.get("examples_dir", recipe_list.parent.name)
         for config in configs:
-            paths.add(Path("examples") / examples_dir / config)
+            paths.add(resolve_recipe_path(config, examples_dir))
     return paths
 
 

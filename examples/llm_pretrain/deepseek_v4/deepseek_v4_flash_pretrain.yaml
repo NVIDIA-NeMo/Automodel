@@ -1,0 +1,149 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Random-initialized DeepSeek-V4-Flash pretraining. Replace the dataset paths
+# below for a production run. NeMo CI supplies its own dataset through the
+# ci.nightly overrides without changing this user-facing recipe.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+step_scheduler:
+  global_batch_size: 256
+  local_batch_size: 8
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  num_epochs: 1
+  max_steps: 9500
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    num_nextn_predict_layers: 0
+  trust_remote_code: false
+  load_base_model: false
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: torch
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    dispatcher: deepep
+    experts: torch_mm
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/deepseek_v4_flash_pretrain
+  model_save_format: torch_save
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 4
+  ep_size: 32
+  sequence_parallel: false
+  activation_checkpointing: false
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 2
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /path/to/preprocessed_data_text_document
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    trust_remote_code: true
+  seq_length: 1024
+  split: "0.99, 0.01, 0.00"
+  splits_to_build: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: single
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /path/to/preprocessed_data_text_document
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+    trust_remote_code: true
+  seq_length: 1024
+  split: "0.99, 0.01, 0.00"
+  splits_to_build: validation
+  num_val_samples: 256
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: single
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-5
+  lr: 4.2e-4
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 500
+  min_lr: 0.0
+
+ci:
+  recipe_owner: akoumpa
+  nodes: 2
+  time: "00:30:00"
+  cluster_tag: eos
+  env_vars:
+    REQUIRE_FINITE_METRICS: "true"
+  nightly:
+    step_scheduler.global_batch_size: 16
+    step_scheduler.local_batch_size: 2
+    step_scheduler.max_steps: 4
+    model.config.num_hidden_layers: 8
+    distributed.pp_size: 2
+    distributed.ep_size: 8
+    optimizer.lr: 1e-5
+    checkpoint.enabled: false
+    dataset.paths: /home/TestData/automodel/mcore_dataset_fineweb/processed_data_0_text_document
+    validation_dataset.paths: /home/TestData/automodel/mcore_dataset_fineweb/processed_data_0_text_document
