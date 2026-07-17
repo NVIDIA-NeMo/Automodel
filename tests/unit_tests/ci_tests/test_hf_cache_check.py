@@ -14,7 +14,6 @@
 
 """Tests for ``tests/ci_tests/utils/hf_cache_check.py``."""
 
-import json
 import sys
 from pathlib import Path
 
@@ -133,11 +132,10 @@ def test_check_cache_partitions_hits_and_misses(tmp_path):
     # 3B-Instruct is deliberately left un-seeded so it registers as missing.
 
     recipe = _write_recipe(tmp_path, "llm.yaml", LLM_RECIPE)
-    result = hf_cache_check.check_cache(recipe, hf_home)
+    cached, missing = hf_cache_check.check_cache(recipe, hf_home)
 
-    assert result["cached"] == ["meta-llama/Llama-3.2-1B"]
-    assert result["missing"] == ["meta-llama/Llama-3.2-3B-Instruct"]
-    assert result["hf_home"] == str(hf_home)
+    assert cached == ["meta-llama/Llama-3.2-1B"]
+    assert missing == ["meta-llama/Llama-3.2-3B-Instruct"]
 
 
 def test_check_cache_empty_snapshot_dir_counts_as_missing(tmp_path):
@@ -146,49 +144,49 @@ def test_check_cache_empty_snapshot_dir_counts_as_missing(tmp_path):
     _seed_cache(hf_home, "meta-llama/Llama-3.2-3B-Instruct", with_file=False)
 
     recipe = _write_recipe(tmp_path, "llm.yaml", LLM_RECIPE)
-    result = hf_cache_check.check_cache(recipe, hf_home)
+    cached, missing = hf_cache_check.check_cache(recipe, hf_home)
 
-    assert result["cached"] == []
-    assert set(result["missing"]) == {
+    assert cached == []
+    assert set(missing) == {
         "meta-llama/Llama-3.2-1B",
         "meta-llama/Llama-3.2-3B-Instruct",
     }
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI (exit code = decision: 0 = all cached, 1 = miss / error)
 # ---------------------------------------------------------------------------
 
 
-def test_main_writes_json_output(tmp_path, monkeypatch, capsys):
+def test_main_exits_zero_when_all_cached(tmp_path, monkeypatch):
     hf_home = tmp_path / "hf_home"
     _seed_cache(hf_home, "Qwen/Qwen3-VL-4B-Thinking")
     monkeypatch.setenv("HF_HOME", str(hf_home))
-
     recipe = _write_recipe(tmp_path, "vlm.yaml", VLM_RECIPE)
-    output = tmp_path / "out.json"
 
-    monkeypatch.setattr(sys, "argv", ["hf_cache_check.py", "--config", str(recipe), "--output", str(output)])
+    monkeypatch.setattr(sys, "argv", ["hf_cache_check.py", "--config", str(recipe)])
     assert hf_cache_check.main() == 0
 
-    payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload["cached"] == ["Qwen/Qwen3-VL-4B-Thinking"]
-    assert payload["missing"] == []
 
-
-def test_main_without_hf_home_marks_everything_missing(tmp_path, monkeypatch):
-    monkeypatch.delenv("HF_HOME", raising=False)
-
+def test_main_exits_one_when_any_missing(tmp_path, monkeypatch):
+    hf_home = tmp_path / "hf_home"
+    _seed_cache(hf_home, "meta-llama/Llama-3.2-1B")  # only one of two seeded
+    monkeypatch.setenv("HF_HOME", str(hf_home))
     recipe = _write_recipe(tmp_path, "llm.yaml", LLM_RECIPE)
-    output = tmp_path / "out.json"
 
-    monkeypatch.setattr(sys, "argv", ["hf_cache_check.py", "--config", str(recipe), "--output", str(output)])
-    assert hf_cache_check.main() == 0
+    monkeypatch.setattr(sys, "argv", ["hf_cache_check.py", "--config", str(recipe)])
+    assert hf_cache_check.main() == 1
 
-    payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload["cached"] == []
-    assert set(payload["missing"]) == {
-        "meta-llama/Llama-3.2-1B",
-        "meta-llama/Llama-3.2-3B-Instruct",
-    }
-    assert payload["hf_home"] == ""
+
+def test_main_exits_one_when_hf_home_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("HF_HOME", raising=False)
+    recipe = _write_recipe(tmp_path, "llm.yaml", LLM_RECIPE)
+
+    monkeypatch.setattr(sys, "argv", ["hf_cache_check.py", "--config", str(recipe)])
+    assert hf_cache_check.main() == 1
+
+
+def test_main_exits_one_when_recipe_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf_home"))
+    monkeypatch.setattr(sys, "argv", ["hf_cache_check.py", "--config", str(tmp_path / "does_not_exist.yaml")])
+    assert hf_cache_check.main() == 1
