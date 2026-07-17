@@ -185,6 +185,8 @@ class CheckpointingConfig:
         tp_rank: int,
         pp_rank: int,
         moe_mesh: DeviceMesh | None = None,
+        *,
+        model_state_dict_keys: list[str] | None = None,
     ) -> Checkpointer:
         """Build the :class:`Checkpointer` engine for this config.
 
@@ -197,13 +199,26 @@ class CheckpointingConfig:
             tp_rank: Tensor-parallel rank.
             pp_rank: Pipeline-parallel rank.
             moe_mesh: Optional device mesh for MoE checkpointing.
+            model_state_dict_keys: Model state-dict keys captured before any
+                parallelization, for models that do not set
+                ``_pre_shard_hf_state_dict_keys``. Runtime data (the model must
+                be built first), so it is a build argument rather than a config
+                field; takes precedence over the legacy
+                ``model_state_dict_keys`` config field.
 
         Returns:
             Configured :class:`Checkpointer`.
         """
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
-        return Checkpointer(config=self, dp_rank=dp_rank, tp_rank=tp_rank, pp_rank=pp_rank, moe_mesh=moe_mesh)
+        return Checkpointer(
+            config=self,
+            dp_rank=dp_rank,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            moe_mesh=moe_mesh,
+            model_state_dict_keys=model_state_dict_keys,
+        )
 
 
 __all__ = ["CheckpointingConfig", "SaveConsolidatedMode"]

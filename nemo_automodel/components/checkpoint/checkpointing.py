@@ -390,6 +390,8 @@ class Checkpointer:
         tp_rank: int,
         pp_rank: int,
         moe_mesh: Optional[DeviceMesh] = None,
+        *,
+        model_state_dict_keys: Optional[list[str]] = None,
     ) -> None:
         """
         Initialize the checkpointer.
@@ -400,12 +402,19 @@ class Checkpointer:
             tp_rank: Tensor parallel rank for the current process.
             pp_rank: Pipeline parallel rank for the current process.
             moe_mesh: Optional device mesh used for MoE when adapting state dicts.
+            model_state_dict_keys: Model state-dict keys captured before any
+                parallelization, for models that do not set
+                ``_pre_shard_hf_state_dict_keys`` (e.g. diffusion transformers).
+                Runtime data, so it is passed here rather than stored on the
+                config; takes precedence over the legacy
+                ``config.model_state_dict_keys`` field.
         """
         self.config = config
         self.moe_mesh = moe_mesh
         self.dp_rank = dp_rank
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
+        self._model_state_dict_keys = model_state_dict_keys
 
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
@@ -1296,7 +1305,9 @@ fi
             config = getattr(model_part, "config", None)
             model_type = getattr(config, "model_type", None)
             pre_shard_hf_state_dict_keys = (
-                getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
+                getattr(model, "_pre_shard_hf_state_dict_keys", None)
+                or self._model_state_dict_keys
+                or self.config.model_state_dict_keys
             )
             if pre_shard_hf_state_dict_keys is None:
                 pre_shard_hf_state_dict_keys = list(state_dict.keys())
@@ -1320,7 +1331,7 @@ fi
         else:
             pre_shard_hf_state_dict_keys = getattr(model, "_pre_shard_hf_state_dict_keys", None)
             if pre_shard_hf_state_dict_keys is None:
-                pre_shard_hf_state_dict_keys = self.config.model_state_dict_keys
+                pre_shard_hf_state_dict_keys = self._model_state_dict_keys or self.config.model_state_dict_keys
             fallback_keys = pre_shard_hf_state_dict_keys or list(state_dict.keys())
             fqn_to_file_index_mapping = _divide_keys_by_size(
                 fallback_keys,

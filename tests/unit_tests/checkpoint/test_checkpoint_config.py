@@ -195,3 +195,29 @@ def test_async_checkpointing_gate_uses_semantic_versioning(monkeypatch, version,
     cfg = CheckpointingConfig(is_async=True, save_consolidated=False)
 
     assert cfg.is_async is expected
+
+
+class TestBuildModelStateDictKeys:
+    """CheckpointingConfig.build forwards runtime model_state_dict_keys to the Checkpointer."""
+
+    def _build(self, **build_kwargs):
+        cfg = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/ckpt",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="org/model",
+            save_consolidated=False,
+        )
+        return cfg.build(dp_rank=0, tp_rank=0, pp_rank=0, **build_kwargs)
+
+    def test_runtime_keys_take_precedence_over_legacy_config_field(self):
+        checkpointer = self._build(model_state_dict_keys=["transformer.w1", "transformer.w2"])
+
+        assert checkpointer._model_state_dict_keys == ["transformer.w1", "transformer.w2"]
+        assert checkpointer.config.model_state_dict_keys is None
+
+    def test_build_defaults_to_no_runtime_keys(self):
+        checkpointer = self._build()
+
+        assert checkpointer._model_state_dict_keys is None
