@@ -119,4 +119,8 @@ wandb:
 ci:
   recipe_owner: akoumpa
   nodes: 4
-  time: "00:30:00"
+  time: "01:30:00"
+  checkpoint_robustness:
+    check_source_load_parity: true
+    hf_device_map_auto: true
+    tokenizer_name: mistralai/Mistral-Small-4-119B-2603
