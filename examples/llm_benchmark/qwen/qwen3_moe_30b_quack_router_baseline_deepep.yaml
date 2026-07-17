@@ -1,8 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-# Matched baseline for qwen3_moe_30b_quack_fused_deepep.yaml. It keeps the
-# learned router but uses PyTorch top-k and cross-entropy.
+# Matched baseline for qwen3_moe_30b_quack_fused_deepep.yaml. Auxiliary router
+# loss is disabled in both recipes so the QuACK case can fuse normalized
+# softmax and top-k without changing the routing contract.
 recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 
@@ -50,6 +51,8 @@ model:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   trust_remote_code: true
+  moe_overrides:
+    aux_loss_coeff: 0.0
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te

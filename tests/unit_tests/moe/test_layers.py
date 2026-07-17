@@ -546,6 +546,39 @@ class TestGate:
         torch.testing.assert_close(quack_indices, torch_indices)
         assert quack_indices.dtype == torch.int64
 
+    def test_quack_topk_fuses_normalized_aux_free_router(self, moe_config, device):
+        moe_config.score_func = "softmax"
+        moe_config.softmax_before_topk = True
+        moe_config.norm_topk_prob = True
+        moe_config.aux_loss_coeff = 0.0
+        calls = []
+
+        def fake_quack_topk(scores, k, softmax=False):
+            calls.append(softmax)
+            values, indices = torch.topk(scores, k=k, dim=-1)
+            if softmax:
+                values = values.softmax(dim=-1)
+            return values, indices.to(torch.int32)
+
+        with patch(
+            "nemo_automodel.components.moe.layers.safe_import_from",
+            return_value=(True, fake_quack_topk),
+        ):
+            quack_gate = Gate(moe_config, topk_backend="quack").to(device)
+        torch_gate = Gate(moe_config, topk_backend="torch").to(device)
+        with torch.no_grad():
+            quack_gate.weight.normal_(0, 0.02)
+        torch_gate.load_state_dict(quack_gate.state_dict())
+
+        x = torch.randn(16, moe_config.dim, dtype=torch.bfloat16, device=device)
+        token_mask = torch.ones(16, dtype=torch.bool, device=device)
+        quack_weights, quack_indices, _ = quack_gate(x, token_mask, cp_mesh=None)
+        torch_weights, torch_indices, _ = torch_gate(x, token_mask, cp_mesh=None)
+
+        assert calls == [True]
+        torch.testing.assert_close(quack_weights, torch_weights, atol=2e-3, rtol=2e-3)
+        torch.testing.assert_close(quack_indices, torch_indices)
+
     def test_quack_topk_rejects_unsupported_router_mode(self, moe_config):
         moe_config.score_func = "sigmoid"
         with pytest.raises(ValueError, match="softmax_before_topk=True"):

@@ -345,17 +345,37 @@ class Gate(nn.Module):
             bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
 
         scores = F.linear(x_compute, weight, bias=bias)
+        weights_are_normalized = False
 
         if self.score_func == "softmax":
             if self.softmax_before_topk:
-                scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
-                original_scores = scores
+                # When the selected probabilities are normalized again, full
+                # softmax followed by top-k is exactly softmax over the top-k
+                # logits. QuACK can fuse those operations and avoid materializing
+                # the full fp32 probability matrix. Auxiliary-loss and replay
+                # paths still need that matrix, so retain the conventional path.
+                use_fused_quack_topk = (
+                    self._quack_topk is not None
+                    and self.norm_topk_prob
+                    and self.topk > 1
+                    and self.aux_loss_coeff == 0
+                    and not self._track_load_balance
+                    and self.router_replay is None
+                )
+                if use_fused_quack_topk:
+                    weights, indices = self._quack_topk(scores, self.topk, softmax=True)
+                    original_scores = None
+                    weights_are_normalized = True
+                else:
+                    scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+                    original_scores = scores
                 if self._quack_topk is None:
                     weights, indices = torch.topk(scores, k=self.topk, dim=-1)
-                else:
+                elif not use_fused_quack_topk:
                     weights, indices = self._quack_topk(scores, self.topk)
-                    # QuACK emits compact int32 indices; PyTorch indexing and the
-                    # existing dispatchers consume the torch.topk int64 contract.
+                if self._quack_topk is not None:
+                    # QuACK emits compact int32 indices; PyTorch indexing and
+                    # the existing dispatchers consume torch.topk's int64 contract.
                     indices = indices.to(torch.int64)
                 indices = replay_selection(self.router_replay, indices)
                 if self.router_replay is not None:
@@ -452,16 +472,19 @@ class Gate(nn.Module):
             weights = original_scores.gather(1, indices)
 
         if self.norm_topk_prob and self.topk > 1:
-            denom_w = weights.sum(dim=-1, keepdim=True) + 1e-20
-            denom_s = original_scores.sum(dim=-1, keepdim=True) + 1e-20
-            weights = weights / denom_w
-            original_scores = original_scores / denom_s
+            if not weights_are_normalized:
+                denom_w = weights.sum(dim=-1, keepdim=True) + 1e-20
+                weights = weights / denom_w
+            if original_scores is not None:
+                denom_s = original_scores.sum(dim=-1, keepdim=True) + 1e-20
+                original_scores = original_scores / denom_s
 
         weights = weights * self.route_scale
 
         if self.gate_precision is not None:
             weights = weights.to(dtype=original_dtype)
-            original_scores = original_scores.to(dtype=original_dtype)
+            if original_scores is not None:
+                original_scores = original_scores.to(dtype=original_dtype)
 
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0 or self._track_load_balance:
             expert_load = self._compute_expert_load(indices, token_mask)

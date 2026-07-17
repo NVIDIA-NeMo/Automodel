@@ -22,7 +22,6 @@ from nemo_automodel.components.loss.loss import (
     LossConfig,
     LossFromFactoryConfig,
     MaskedCrossEntropyConfig,
-    QuackCrossEntropyConfig,
     TEParallelCEConfig,
     build_loss_config,
     build_loss_module,
@@ -46,14 +45,6 @@ class TestMaskedCrossEntropyConfig:
         loss = MaskedCrossEntropyConfig(fp32_upcast=False).build()
         assert isinstance(loss, MaskedCrossEntropy)
         assert loss.fp32_upcast is False
-
-
-class TestQuackCrossEntropyConfig:
-    def test_defaults(self):
-        cfg = QuackCrossEntropyConfig()
-        assert cfg.fp32_upcast is False
-        assert cfg.ignore_index == -100
-        assert cfg.reduction == "sum"
 
 
 class TestFusedLinearCEConfig:
@@ -188,7 +179,6 @@ class TestLossConfigRegistry:
         from nemo_automodel.components.loss.loss import LOSS_CONFIG_REGISTRY
 
         assert LOSS_CONFIG_REGISTRY["MaskedCrossEntropy"] is MaskedCrossEntropyConfig
-        assert LOSS_CONFIG_REGISTRY["QuackCrossEntropy"] is QuackCrossEntropyConfig
         assert LOSS_CONFIG_REGISTRY["FusedLinearCrossEntropy"] is FusedLinearCEConfig
 
     def test_string_name_resolves_to_typed_config(self):

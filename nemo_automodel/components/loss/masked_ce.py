@@ -81,14 +81,10 @@ class MaskedCrossEntropy(nn.Module):
         if isinstance(labels, DTensor):
             labels = labels.full_tensor()
 
-        loss = self._cross_entropy(logits, labels)
+        loss = F.cross_entropy(logits, labels, reduction=self.reduction)
         if num_label_tokens is not None:
             assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
             if num_label_tokens == 0:
                 return loss * 0.0
             loss = loss / num_label_tokens
         return loss
-
-    def _cross_entropy(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Compute CE after the shared masking, reshaping, and DTensor handling."""
-        return F.cross_entropy(logits, labels, ignore_index=self.ignore_index, reduction=self.reduction)

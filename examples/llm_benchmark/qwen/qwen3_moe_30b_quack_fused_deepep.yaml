@@ -1,8 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-# QuACK linear, RMSNorm, router top-k, and cross-entropy. Compare with
-# qwen3_moe_30b_quack_router_baseline_deepep.yaml under the same image/GPU shape.
+# QuACK linear, RMSNorm, and fused normalized-softmax/top-k routing. Compare
+# with qwen3_moe_30b_quack_router_baseline_deepep.yaml under the same image and
+# GPU shape.
 recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 
@@ -50,6 +51,8 @@ model:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3-30B-A3B
   trust_remote_code: true
+  moe_overrides:
+    aux_loss_coeff: 0.0
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
@@ -67,7 +70,7 @@ checkpoint:
   enabled: false
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.quack_ce.QuackCrossEntropy
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
   fp32_upcast: false
 
 dataset:
