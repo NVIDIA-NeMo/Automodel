@@ -79,8 +79,7 @@ checkpoint:
   dequantize_base_checkpoint: true
 
 loss_fn:
-  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
-  chunk_len: 256
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset

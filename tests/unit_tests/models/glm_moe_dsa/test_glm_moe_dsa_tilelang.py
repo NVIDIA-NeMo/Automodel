@@ -441,6 +441,50 @@ def test_generate_padded_varlen_mask_params_excludes_cp_padding():
     assert ends.dtype == torch.int32
 
 
+def test_tilelang_topk_chunks_rows_without_changing_results(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import indexer as indexer_mod
+
+    logits = torch.randn(7, 11)
+    expected_scores, expected_indices = torch.topk(logits, 4, dim=-1)
+    original_topk = torch.topk
+    call_shapes = []
+
+    def tracked_topk(values, *args, **kwargs):
+        call_shapes.append(tuple(values.shape))
+        return original_topk(values, *args, **kwargs)
+
+    monkeypatch.setattr(indexer_mod, "_TOPK_MAX_ELEMENTS_PER_CALL", 22)
+    monkeypatch.setattr(indexer_mod.torch, "topk", tracked_topk)
+
+    scores, indices = indexer_mod._topk_in_row_chunks(logits, 4)
+
+    assert call_shapes == [(2, 11), (2, 11), (2, 11), (1, 11)]
+    torch.testing.assert_close(scores, expected_scores)
+    torch.testing.assert_close(indices, expected_indices)
+
+
+def test_tilelang_topk_keeps_small_inputs_in_one_call(monkeypatch):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import indexer as indexer_mod
+
+    logits = torch.randn(3, 5)
+    original_topk = torch.topk
+    call_shapes = []
+
+    def tracked_topk(values, *args, **kwargs):
+        call_shapes.append(tuple(values.shape))
+        return original_topk(values, *args, **kwargs)
+
+    monkeypatch.setattr(indexer_mod, "_TOPK_MAX_ELEMENTS_PER_CALL", logits.numel())
+    monkeypatch.setattr(indexer_mod.torch, "topk", tracked_topk)
+
+    scores, indices = indexer_mod._topk_in_row_chunks(logits, 2)
+    expected_scores, expected_indices = original_topk(logits, 2, dim=-1)
+
+    assert call_shapes == [tuple(logits.shape)]
+    torch.testing.assert_close(scores, expected_scores)
+    torch.testing.assert_close(indices, expected_indices)
+
+
 def test_indexer_generates_topk_and_varlen_mask_params(monkeypatch):
     from nemo_automodel.components.models.glm_moe_dsa.kernels import indexer as indexer_mod
 
@@ -456,6 +500,7 @@ def test_indexer_generates_topk_and_varlen_mask_params(monkeypatch):
 
     monkeypatch.setattr(indexer_mod, "indexer_fwd_interface", fake_indexer_fwd)
     monkeypatch.setattr(indexer_mod, "indexer_bwd_interface", fake_indexer_bwd)
+    monkeypatch.setattr(indexer_mod, "_TOPK_MAX_ELEMENTS_PER_CALL", 3)
 
     cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
     starts, ends = indexer_mod.generate_varlen_mask_params(cu_seqlens)
