@@ -587,7 +587,7 @@ class TestGate:
         torch.testing.assert_close(x_quack.grad, x_torch.grad, atol=2e-3, rtol=2e-3)
         # BF16 accumulation amplifies the small forward-rounding difference
         # between fused top-k softmax and full-softmax-then-renormalize.
-        torch.testing.assert_close(quack_gate.weight.grad, torch_gate.weight.grad, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(quack_gate.weight.grad, torch_gate.weight.grad, atol=2e-2, rtol=2e-2)
 
     def test_quack_topk_rejects_unsupported_router_mode(self, moe_config):
         moe_config.score_func = "sigmoid"

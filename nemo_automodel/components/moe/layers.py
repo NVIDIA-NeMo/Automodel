@@ -216,10 +216,11 @@ class _QuackTopKSoftmax(torch.autograd.Function):
     @staticmethod
     def forward(ctx, scores: torch.Tensor, topk_fn, k: int):
         weights, indices = topk_fn(scores, k, softmax=True)
-        # Activation checkpointing recomputes this tensor immediately before
-        # backward. Retain its storage so the dense input gradient can reuse it
-        # instead of allocating another multi-GiB router matrix.
-        ctx.save_for_backward(scores, weights, indices)
+        # Allocate the dense input-gradient buffer during checkpoint
+        # recomputation, before the backward allocator becomes fragmented.
+        # Keeping it separate from scores avoids mutating model activations.
+        dscores = torch.empty_like(scores)
+        ctx.save_for_backward(dscores, weights, indices)
         ctx.mark_non_differentiable(indices)
         ctx.set_materialize_grads(False)
         return weights, indices
@@ -228,14 +229,14 @@ class _QuackTopKSoftmax(torch.autograd.Function):
     def backward(ctx, dweights: torch.Tensor | None, _dindices=None):
         if dweights is None:
             return None, None, None
-        scores, weights, indices = ctx.saved_tensors
+        dscores, weights, indices = ctx.saved_tensors
         weights_f = weights.float()
         dweights_f = dweights.float()
         dot = (dweights_f * weights_f).sum(dim=-1, keepdim=True)
         selected_grads = (weights_f * (dweights_f - dot)).to(dtype=weights.dtype)
-        scores.zero_()
-        scores.scatter_(1, indices.to(torch.int64), selected_grads)
-        return scores, None, None
+        dscores.zero_()
+        dscores.scatter_(1, indices.to(torch.int64), selected_grads)
+        return dscores, None, None
 
 
 class Gate(nn.Module):
