@@ -197,7 +197,13 @@ class LlamaMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._quack_mlp_func is not None:
             if x.is_cuda:
-                return self._quack_mlp_func(x, self.fc1.weight, self.fc2.weight, activation="swiglu")
+                return self._quack_mlp_func(
+                    x,
+                    self.fc1.weight,
+                    self.fc2.weight,
+                    activation="swiglu",
+                    fuse_grad_accum=True,
+                )
             gate_up = self.fc1(x)
             return self.fc2(F.silu(gate_up[..., ::2]) * gate_up[..., 1::2])
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
