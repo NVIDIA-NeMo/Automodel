@@ -299,6 +299,12 @@ def _precompute_stage_shapes(
         microbatch_size: Microbatch size used by the pipeline schedule.
         seq_len: Sequence length of the input data.
     """
+    if stages and not hasattr(stages[0], "_configure_outputs_meta"):
+        logger.info(
+            "PipelineStage no longer exposes _configure_outputs_meta; using PyTorch's dynamic stage metadata inference"
+        )
+        return
+
     hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)
 
     for stage in stages:
@@ -373,10 +379,11 @@ def reset_pp_stage_shapes(
         seq_len: Sequence length of the upcoming batch (e.g. ``input_ids.shape[1]``).
     """
     for stage in stages:
-        # Allow _configure_outputs_meta to be called again (it asserts _outputs_meta is None)
-        stage._outputs_meta = None
-        # Allow _shape_inference to re-run for non-first stages receiving new shapes
-        stage.inputs_meta = None
+        if hasattr(stage, "_configure_outputs_meta"):
+            # Allow _configure_outputs_meta to be called again (it asserts _outputs_meta is None)
+            stage._outputs_meta = None
+            # Allow _shape_inference to re-run for non-first stages receiving new shapes
+            stage.inputs_meta = None
         # Clear pre-allocated recv/send buffers; they will be reallocated by _prepare_forward_infra
         stage.args_recv_info = {}
         stage.grad_recv_info = {}

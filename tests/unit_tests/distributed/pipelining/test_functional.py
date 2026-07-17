@@ -755,6 +755,14 @@ class TestPrecomputeStageShapes:
 
         return types.SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab_size)
 
+    def test_new_pipeline_stage_uses_dynamic_metadata_inference(self):
+        """New PyTorch stages infer metadata without the removed private setter."""
+        stage = types.SimpleNamespace(inputs_meta="unchanged")
+
+        _precompute_stage_shapes([stage], object(), microbatch_size=2, seq_len=16)
+
+        assert stage.inputs_meta == "unchanged"
+
     def test_first_stage_shapes(self):
         """First stage input should be [mb, seq_len] int64, output [mb, seq_len, hidden]."""
         stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
@@ -1077,6 +1085,26 @@ class TestResetPpStageShapes:
         schedule._stages_forward_initialized = initialized
         schedule._stages_backward_initialized = initialized
         return schedule
+
+    def test_new_pipeline_stage_resets_dynamic_metadata_inference(self):
+        """New PyTorch stages clear buffers and let the schedule infer metadata again."""
+        stage = types.SimpleNamespace(
+            args_recv_info={"input": object()},
+            grad_recv_info={"grad": object()},
+            grad_send_info=object(),
+        )
+        schedule = types.SimpleNamespace(
+            _stage_forward_initialized=True,
+            _stage_backward_initialized=True,
+        )
+
+        reset_pp_stage_shapes(schedule, [stage], object(), microbatch_size=2, seq_len=32)
+
+        assert stage.args_recv_info == {}
+        assert stage.grad_recv_info == {}
+        assert stage.grad_send_info is None
+        assert schedule._stage_forward_initialized is False
+        assert schedule._stage_backward_initialized is False
 
     def test_clears_stage_state(self):
         """reset should clear _outputs_meta, inputs_meta, and recv/send buffers."""
