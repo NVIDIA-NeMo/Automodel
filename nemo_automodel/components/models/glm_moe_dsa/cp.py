@@ -93,7 +93,10 @@ def _slice_thd_chunk_for_cp(
         out["max_seqlen"] = chunk["max_seqlen"].to(torch.int32).contiguous()
     if "cu_seqlens_padded" in chunk:
         out["cu_seqlens_padded"] = chunk["cu_seqlens_padded"].to(torch.int32).contiguous()
-    out["padding_mask"] = (out["input_ids"] == padding_token_id).bool().contiguous()
+    if "padding_mask" in chunk:
+        out["padding_mask"] = select_local(chunk["padding_mask"]).bool().contiguous()
+    else:
+        out["padding_mask"] = (out["input_ids"] == padding_token_id).bool().contiguous()
     return out  # type: ignore[return-value]
 
 

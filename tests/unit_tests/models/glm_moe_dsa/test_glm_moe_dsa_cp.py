@@ -198,6 +198,22 @@ def test_slice_thd_chunk_for_cp_preserves_global_metadata_and_padding_mask():
     assert out["_glm_dsa_cp_group"] == "cp-group"
 
 
+def test_slice_thd_chunk_for_cp_preserves_explicit_padding_mask():
+    chunk = _thd_chunk()
+    chunk["padding_mask"] = torch.tensor([False, True, False, False, True, False])
+
+    out = glm_cp._slice_thd_chunk_for_cp(
+        chunk,
+        cp_group="cp-group",
+        cp_size=3,
+        cp_rank=1,
+        padding_token_id=3,
+    )
+
+    assert out["input_ids"].tolist() == [2, 3]
+    assert out["padding_mask"].tolist() == [False, False]
+
+
 def test_slice_thd_chunk_for_cp_omits_identity_query_indices_at_cp1():
     chunk = _thd_chunk()
 
