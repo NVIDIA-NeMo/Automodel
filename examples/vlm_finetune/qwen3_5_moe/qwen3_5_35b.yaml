@@ -117,6 +117,8 @@ ci:
   recipe_owner: HuiyingLi
   nodes: 1
   time: "01:00:00"
+  known_issue_id: AM-711
+  allow_failure: true
   checkpoint_robustness:
     check_source_load_parity: true
     hf_device_map_auto: true

@@ -14,7 +14,29 @@
 
 """VLM entry point for text-only checkpoint robustness and source-load parity."""
 
-from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import run_checkpoint_robustness
+import os
+
+from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
+    _DEFAULT_INPUT_IDS,
+    _DEFAULT_PROMPT,
+    run_checkpoint_robustness,
+)
+
+
+def _get_vlm_input_ids(processor_name: str | None) -> list[int]:
+    """Encode the parity prompt through the same processor family used by VLM data loading."""
+    if processor_name is None:
+        return _DEFAULT_INPUT_IDS
+
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(
+        processor_name,
+        trust_remote_code=True,
+        local_files_only=os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+    )
+    tokenizer = getattr(processor, "tokenizer", processor)
+    return tokenizer.encode(_DEFAULT_PROMPT, add_special_tokens=False)
 
 
 def test_checkpoint_robustness_vlm() -> None:
@@ -26,6 +48,7 @@ def test_checkpoint_robustness_vlm() -> None:
     run_checkpoint_robustness(
         recipe_cls=FinetuneRecipeForVLM,
         hf_model_cls=AutoModelForImageTextToText,
+        input_ids_loader=_get_vlm_input_ids,
     )
 
 

@@ -24,6 +24,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
+    _extract_custom_args,
     _finish_hf_reload_sync,
     _get_input_ids,
     _hf_source_load_kwargs,
@@ -31,6 +32,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _prepare_hf_reload_sync,
     _wait_for_hf_reload_rank0,
 )
+from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm import _get_vlm_input_ids
 
 
 def _run_hf_reload_sync_rank(rank, init_path, checkpoint_dir):
@@ -133,6 +135,33 @@ def test_get_input_ids_respects_hf_offline(monkeypatch, offline, expected_local_
         trust_remote_code=True,
         local_files_only=expected_local_files_only,
     )
+
+
+@pytest.mark.parametrize(("offline", "expected_local_files_only"), [(None, False), ("1", True)])
+def test_get_vlm_input_ids_uses_processor_tokenizer(monkeypatch, offline, expected_local_files_only):
+    if offline is None:
+        monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    else:
+        monkeypatch.setenv("HF_HUB_OFFLINE", offline)
+    tokenizer = SimpleNamespace(encode=lambda *args, **kwargs: [21, 22, 23])
+    processor = SimpleNamespace(tokenizer=tokenizer)
+
+    with patch("transformers.AutoProcessor.from_pretrained", return_value=processor) as from_pretrained:
+        input_ids = _get_vlm_input_ids("mistralai/Ministral-3-3B-Reasoning-2512")
+
+    assert input_ids == [21, 22, 23]
+    from_pretrained.assert_called_once_with(
+        "mistralai/Ministral-3-3B-Reasoning-2512",
+        trust_remote_code=True,
+        local_files_only=expected_local_files_only,
+    )
+
+
+def test_extract_custom_args_accepts_native_hf_source_fp8():
+    custom, remaining = _extract_custom_args(["--native_hf_source_fp8", "--other-arg"])
+
+    assert custom["native_hf_source_fp8"] is True
+    assert remaining == ["--other-arg"]
 
 
 def test_load_hf_fp8_dequantized_config_preserves_checkpoint_quantization_settings(monkeypatch):

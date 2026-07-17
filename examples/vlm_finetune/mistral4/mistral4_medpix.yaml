@@ -123,4 +123,6 @@ ci:
   checkpoint_robustness:
     check_source_load_parity: true
     hf_device_map_auto: true
+    # Preserve HF's scaled FP8 expert module for the source reference.
+    native_hf_source_fp8: true
     tokenizer_name: mistralai/Mistral-Small-4-119B-2603

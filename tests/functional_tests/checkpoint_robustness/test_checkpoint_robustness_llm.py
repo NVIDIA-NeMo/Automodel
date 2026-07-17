@@ -20,6 +20,7 @@ Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
     [--tokenizer_name <str>]
     [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
     [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
+    [--native_hf_source_fp8]
     [--max_vram_gb <float>] [--max_cpu_gb <float>]
 """
 
@@ -30,6 +31,7 @@ import os
 import sys
 import time
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 
 import datasets
@@ -78,6 +80,7 @@ def _extract_custom_args(argv):
         "--check_phantom_keys",
         "--check_resume",
         "--hf_device_map_auto",
+        "--native_hf_source_fp8",
         "--skip_hf_reload",
     }
     custom = {}
@@ -480,6 +483,7 @@ def _prepare_source_load_reference(
     trust_remote_code: bool,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
+    native_hf_source_fp8: bool,
 ) -> tuple[torch.Tensor, bool | None, bool | None] | None:
     """Compute vanilla HF source-load reference logits before trainer construction."""
     if _preinit_world_size() > 1:
@@ -505,6 +509,7 @@ def _prepare_source_load_reference(
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
+            native_hf_source_fp8=native_hf_source_fp8,
         )
     except Exception:
         if fail_path is not None:
@@ -524,6 +529,7 @@ def _prepare_source_load_reference_rank0(
     trust_remote_code: bool,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
+    native_hf_source_fp8: bool,
 ) -> tuple[torch.Tensor, bool | None, bool | None]:
     """Rank-0 implementation of vanilla HF source-load reference capture."""
     from contextlib import nullcontext
@@ -548,7 +554,10 @@ def _prepare_source_load_reference_rank0(
         device=device,
         hf_device_map_auto=hf_device_map_auto,
     )
-    if "config" not in hf_kwargs and hf_kwargs.get("quantization_config") is None:
+    # Dense FP8 checkpoints use the dequantized reference path by default. Some
+    # MoE checkpoints require HF's native FP8 expert module so their 3-D expert
+    # tensors are not sent through ordinary F.linear without their scale grid.
+    if not native_hf_source_fp8 and "config" not in hf_kwargs and hf_kwargs.get("quantization_config") is None:
         fp8_config = _load_hf_fp8_dequantized_config(
             original_pretrained_path,
             trust_remote_code=hf_kwargs["trust_remote_code"],
@@ -908,12 +917,18 @@ def _release_recipe_memory(recipe) -> None:
         torch.cuda.empty_cache()
 
 
-def run_checkpoint_robustness(*, recipe_cls: type[BaseRecipe], hf_model_cls: type) -> None:
+def run_checkpoint_robustness(
+    *,
+    recipe_cls: type[BaseRecipe],
+    hf_model_cls: type,
+    input_ids_loader: Callable[[str | None], list[int]] = _get_input_ids,
+) -> None:
     """Run checkpoint robustness for one recipe and Hugging Face auto-model class.
 
     Args:
         recipe_cls: Recipe class used for training, checkpoint reload, and resume phases.
         hf_model_cls: Hugging Face auto-model class used for source and consolidated loads.
+        input_ids_loader: Domain-specific tokenizer used to encode the parity prompt.
     """
     custom_args, config_argv = _extract_custom_args(sys.argv[1:])
     sys.argv = [sys.argv[0]] + config_argv
@@ -939,13 +954,14 @@ def run_checkpoint_robustness(*, recipe_cls: type[BaseRecipe], hf_model_cls: typ
     check_resume = bool(custom_args.get("check_resume", False))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
+    native_hf_source_fp8 = bool(custom_args.get("native_hf_source_fp8", False))
     skip_hf_reload = bool(custom_args.get("skip_hf_reload", False))
     check_source_load_parity = bool(custom_args.get("check_source_load_parity", False))
     source_load_kl_threshold = float(custom_args.get("source_load_kl_threshold", "5e-3"))
     source_load_mean_kl_threshold = float(custom_args.get("source_load_mean_kl_threshold", "1e-3"))
     source_load_cosine_threshold = float(custom_args.get("source_load_cosine_threshold", "0.9999"))
 
-    input_ids = _get_input_ids(tokenizer_name)
+    input_ids = input_ids_loader(tokenizer_name)
     cfg = parse_args_and_load_config()
 
     source_load_reference = None
@@ -957,6 +973,7 @@ def run_checkpoint_robustness(*, recipe_cls: type[BaseRecipe], hf_model_cls: typ
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
+            native_hf_source_fp8=native_hf_source_fp8,
         )
         _barrier()
 
