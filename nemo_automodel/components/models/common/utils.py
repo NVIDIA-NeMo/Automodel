@@ -190,8 +190,6 @@ class BackendConfig:
         enable_fsdp_optimizations: Whether to enable FSDP2 optimizations.
         gate_precision: Optional dtype override for the gate computation. Accepts
             torch.dtype or string (e.g., "torch.float32", "float32").
-        router_softmax: MoE router softmax backend ("torch" or "quack"). QuACK is
-            currently supported for softmax-before-top-k routing.
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
@@ -223,7 +221,6 @@ class BackendConfig:
     enable_fsdp_optimizations: bool = False
     te_fp8: TEFp8Config | None = None
     gate_precision: str | torch.dtype | None = None
-    router_softmax: Literal["torch", "quack"] = "torch"
     # When True, torch.compile(fullgraph=True) the attention module's forward to fuse its many
     # small ops (projections, RoPE, reshapes, SDPA). Applies to both the DeepSeek-V3 MLA and
     # standard GQA attention (e.g. Qwen3-MoE). The compiled region must contain no TE

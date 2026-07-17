@@ -37,7 +37,6 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
-from nemo_automodel.shared.import_utils import safe_import_from
 
 
 class MLP(nn.Module):
@@ -230,7 +229,6 @@ class Gate(nn.Module):
         self,
         config: MoEConfig,
         gate_precision: torch.dtype | None = None,
-        softmax_backend: str = "torch",
     ):
         """
         Initializes the Gate module.
@@ -253,25 +251,6 @@ class Gate(nn.Module):
         self.aux_loss_coeff = config.aux_loss_coeff
         self.norm_topk_prob = config.norm_topk_prob
         self.gate_precision = gate_precision
-        self.softmax_backend = softmax_backend
-        self._quack_softmax = None
-        if softmax_backend == "quack":
-            if self.score_func != "softmax" or not self.softmax_before_topk:
-                raise ValueError(
-                    "router_softmax='quack' currently requires score_func='softmax' and softmax_before_topk=True."
-                )
-            available, quack_softmax = safe_import_from(
-                "quack.softmax",
-                "softmax",
-                msg="router_softmax='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
-            )
-            if not available:
-                raise ImportError(
-                    "router_softmax='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda]."
-                )
-            self._quack_softmax = quack_softmax
-        elif softmax_backend != "torch":
-            raise ValueError(f"Unsupported router softmax backend: {softmax_backend}")
 
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
@@ -345,19 +324,14 @@ class Gate(nn.Module):
             bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
 
         scores = F.linear(x_compute, weight, bias=bias)
-        weights_are_normalized = False
 
         if self.score_func == "softmax":
             if self.softmax_before_topk:
-                if self._quack_softmax is not None:
-                    scores = self._quack_softmax(scores.float())
-                else:
-                    scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
+                scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
                 original_scores = scores
-                weights, indices = torch.topk(scores, k=self.topk, dim=-1)
+                indices = torch.topk(scores, k=self.topk, dim=-1)[1]
                 indices = replay_selection(self.router_replay, indices)
-                if self.router_replay is not None:
-                    weights = scores.gather(1, indices)
+                weights = scores.gather(1, indices)
             else:
                 values, indices = torch.topk(scores, k=self.topk, dim=-1)
                 replayed = replay_selection(self.router_replay, indices)
@@ -450,19 +424,16 @@ class Gate(nn.Module):
             weights = original_scores.gather(1, indices)
 
         if self.norm_topk_prob and self.topk > 1:
-            if not weights_are_normalized:
-                denom_w = weights.sum(dim=-1, keepdim=True) + 1e-20
-                weights = weights / denom_w
-            if original_scores is not None:
-                denom_s = original_scores.sum(dim=-1, keepdim=True) + 1e-20
-                original_scores = original_scores / denom_s
+            denom_w = weights.sum(dim=-1, keepdim=True) + 1e-20
+            denom_s = original_scores.sum(dim=-1, keepdim=True) + 1e-20
+            weights = weights / denom_w
+            original_scores = original_scores / denom_s
 
         weights = weights * self.route_scale
 
         if self.gate_precision is not None:
             weights = weights.to(dtype=original_dtype)
-            if original_scores is not None:
-                original_scores = original_scores.to(dtype=original_dtype)
+            original_scores = original_scores.to(dtype=original_dtype)
 
         if self.bias_update_factor > 0 or self.aux_loss_coeff > 0 or self._track_load_balance:
             expert_load = self._compute_expert_load(indices, token_mask)
@@ -667,11 +638,7 @@ class MoE(nn.Module):
         if backend.fake_balanced_gate:
             self.gate = FakeBalancedGate(config, noise=backend.fake_gate_noise)
         else:
-            self.gate = Gate(
-                config,
-                gate_precision=backend.gate_precision,
-                softmax_backend=backend.router_softmax,
-            )
+            self.gate = Gate(config, gate_precision=backend.gate_precision)
         if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
             warnings.warn(
                 f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "
