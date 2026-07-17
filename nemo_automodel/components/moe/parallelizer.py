@@ -20,6 +20,9 @@ import logging
 import torch
 import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointImpl,
+)
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
@@ -27,7 +30,6 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy, OffloadPolicy
 from torch.distributed.tensor import Shard, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
-from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
 from nemo_automodel.components.distributed.pipelining.hf_utils import get_text_module
 from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedExpertsTE
@@ -316,22 +318,22 @@ def apply_ac(
 
     Args:
         model: The model to apply activation checkpointing to.
-        ignore_router: If True (the default), saves the MoE router output so the dispatch
-            is not recomputed under activation checkpointing (avoids a CheckpointError from
-            non-deterministic re-routing on recompute). If False, a warning is emitted.
-        hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
-        num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
-            first, then falls back to model.config attributes.
+        ignore_router: Retained for configuration compatibility. Full activation checkpointing
+            uses one native reentrant checkpoint around the whole block, so the router and
+            dispatch are always recomputed together before any inner backward runs.
+        hidden_size: Retained for configuration compatibility with the former router-save policy.
+        num_experts: Retained for configuration compatibility with the former router-save policy.
         selective: If True, applies TorchTitan-style per-op selective activation checkpointing
             (shared with the dense FSDP2 path) to each block. Takes precedence over
             ``ignore_router``; the shared policy already saves expert-parallel communication
-            collectives and ``topk``, so it composes with expert parallelism.
+            collectives and ``topk``. HybridEP is rejected until its rank-symmetric selective
+            recompute ordering is established.
         activation_checkpointing_scope: Which layer groups to checkpoint -- the same field
             and semantics as the generic FSDP2/DDP path. ``"all"`` (the default) checkpoints
             the text/MoE decoder blocks plus the trainable vision tower; ``"language"`` the
             decoder blocks only; ``"vision"`` (or ``"multimodal"``) only the trainable
             tower blocks, skipping decoder checkpointing entirely. The scope decides WHICH
-            groups participate; the ``selective``/``ignore_router`` mode decides HOW the
+            groups participate; the full/selective mode decides HOW the
             selected decoder blocks are checkpointed.
 
     Trainable VLM vision-tower blocks selected by the scope get the same per-submodule
@@ -346,16 +348,6 @@ def apply_ac(
 
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
-    if checkpoint_decoder and not selective and not ignore_router:
-        logger.warning(
-            "Activation checkpointing is enabled with ignore_router_for_ac=False. The MoE "
-            "router/dispatch will be recomputed in the backward pass, which can route a "
-            "different number of tokens per expert than the forward pass and crash with "
-            "torch.utils.checkpoint.CheckpointError ('Recomputed values ... have different "
-            "metadata'). Set ignore_router_for_ac=True (the default) to save the router "
-            "output and keep routing consistent across recompute."
-        )
-
     if selective:
         if checkpoint_decoder:
             # Reuse the dense FSDP2 selective policy so the save-op set (attention,
@@ -365,8 +357,19 @@ def apply_ac(
                 make_selective_checkpoint_context_fn,
             )
 
+            blocks = list(_iter_transformer_and_mtp_blocks(model))
+            for _, _, block in blocks:
+                moe_module = _get_moe_module(block)
+                dispatcher_backend = getattr(getattr(moe_module, "experts", None), "dispatcher_backend", None)
+                if dispatcher_backend == "hybridep":
+                    raise ValueError(
+                        "Selective activation checkpointing with HybridEP is not supported because its "
+                        "rank-symmetric collective ordering has not been established. Use full activation "
+                        "checkpointing, which wraps each MoE block in one native reentrant checkpoint."
+                    )
+
             selective_context_fn = make_selective_checkpoint_context_fn()
-            for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+            for parent_layers, layer_id, block in blocks:
                 block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, context_fn=selective_context_fn)
                 # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
                 # selective policy visible to the partitioner) instead of unwrapping and
@@ -383,53 +386,6 @@ def apply_ac(
         # entirely, including the hidden_size/num_experts derivation it needs.
         _apply_multimodal_tower_ac(model, scopes)
         return
-
-    # Derive hidden_size and num_experts from model.config if not provided
-    if hidden_size is None:
-        cfg = getattr(model, "config", None)
-        # VLM models nest language model config under text_config or llm_config
-        hidden_size = (
-            getattr(getattr(cfg, "text_config", None), "hidden_size", None)
-            or getattr(getattr(cfg, "llm_config", None), "hidden_size", None)
-            or getattr(cfg, "hidden_size", None)
-        )
-        if hidden_size is None:
-            raise ValueError("hidden_size must be provided or model must have config.hidden_size attribute")
-
-    if num_experts is None:
-        _inner = getattr(model, "model", model)
-        if hasattr(_inner, "moe_config") and hasattr(_inner.moe_config, "n_routed_experts"):
-            num_experts = _inner.moe_config.n_routed_experts
-        else:
-            cfg = getattr(model, "config", None)
-            text_cfg = getattr(cfg, "text_config", None) or getattr(cfg, "llm_config", None) or cfg
-            for attr in ["num_experts", "moe_num_experts", "n_routed_experts", "num_local_experts"]:
-                if text_cfg is not None and hasattr(text_cfg, attr):
-                    num_experts = getattr(text_cfg, attr)
-                    break
-            else:
-                raise ValueError("num_experts must be provided or model must have config.num_experts attribute")
-
-    def _is_router_projection(func, args) -> bool:
-        aten = torch.ops.aten
-        mm = getattr(getattr(aten, "mm", None), "default", None)
-        addmm = getattr(getattr(aten, "addmm", None), "default", None)
-        linear = getattr(getattr(aten, "linear", None), "default", None)
-        if func == mm:
-            return len(args) == 2 and args[1].shape == (hidden_size, num_experts)
-        if func == addmm:
-            return len(args) >= 3 and args[2].shape == (hidden_size, num_experts)
-        if func == linear:
-            return len(args) >= 2 and args[1].shape == (num_experts, hidden_size)
-        return False
-
-    def _custom_policy(ctx, func, *args, **kwargs):
-        if _is_router_projection(func, args):
-            return CheckpointPolicy.MUST_SAVE
-        return CheckpointPolicy.PREFER_RECOMPUTE
-
-    def selective_checkpointing_context_fn():
-        return create_selective_checkpoint_contexts(_custom_policy)
 
     # Weight-tied (use_repeated_layer) MTP head blocks must NOT be activation
     # checkpointed: the single physical block is recomputed once per MTP depth in
@@ -452,14 +408,13 @@ def apply_ac(
     for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
         if mtp_repeated and id(block) in mtp_block_ids:
             continue
-        if ignore_router:
-            block = ptd_checkpoint_wrapper(
-                block,
-                preserve_rng_state=True,
-                context_fn=selective_checkpointing_context_fn,
-            )
-        else:
-            block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
+        # Reentrant checkpointing completes the whole block recompute before expert
+        # backward can diverge on rank-local HybridEP routes.
+        block = ptd_checkpoint_wrapper(
+            block,
+            checkpoint_impl=CheckpointImpl.REENTRANT,
+            preserve_rng_state=True,
+        )
 
         parent_layers.register_module(layer_id, block)
 
