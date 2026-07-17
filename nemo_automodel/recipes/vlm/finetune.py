@@ -28,7 +28,6 @@ except ImportError:
 import logging
 import pathlib
 import time
-from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -45,7 +44,7 @@ from nemo_automodel._transformers import (
     NeMoAutoModelForImageTextToText,
     NeMoAutoModelForMultimodalLM,
 )
-from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
@@ -109,33 +108,6 @@ def _get_model_name(cfg_model):
         return cfg_model.config.get("pretrained_model_name_or_path", None)
     else:
         return None
-
-
-def _resolve_get_rope_index(model: nn.Module) -> Callable | None:
-    """Locate a model's mRoPE position-id builder.
-
-    Transformers defines ``get_rope_index`` on the base model rather than on the
-    ``*ForConditionalGeneration`` that ``model_parts`` holds (Qwen2-VL,
-    Qwen2.5-VL, Qwen3-VL and Qwen3-VL-MoE all follow this layout), and DDP or
-    MegatronFSDP add another wrapper on top without proxying attribute reads. A
-    plain ``getattr`` on the top-level module therefore finds nothing, and packed
-    multimodal training silently falls back to 1D positions. Unwrap ``module``
-    first, then check the model itself, then HuggingFace's ``base_model``
-    property, which resolves to ``getattr(model, model.base_model_prefix, model)``.
-
-    Args:
-        model: The (possibly wrapped) model to search. Accepts any module; no
-            tensor inputs.
-
-    Returns:
-        The ``get_rope_index`` callable, or ``None`` when the model does not
-        expose one (i.e. it is not an mRoPE model).
-    """
-    model = getattr(model, "module", model)
-    get_rope_index = getattr(model, "get_rope_index", None)
-    if get_rope_index is not None:
-        return get_rope_index
-    return getattr(getattr(model, "base_model", None), "get_rope_index", None)
 
 
 def build_model(
@@ -566,7 +538,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Extract mRoPE position-id builder from the model so VLM neat packing can
         # produce 3D position_ids per sample. Without this, packed multimodal
         # training silently degrades mRoPE to plain 1D positions.
-        get_rope_index = _resolve_get_rope_index(self.model_parts[0])
+        get_rope_index = resolve_get_rope_index(self.model_parts[0])
         pp_n_microbatches = None
         pp_cp_preembed = (
             self.pp_enabled

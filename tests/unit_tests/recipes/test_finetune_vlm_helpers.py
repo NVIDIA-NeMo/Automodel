@@ -41,7 +41,6 @@ from nemo_automodel.recipes._typed_config import (
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
     _get_model_name,
-    _resolve_get_rope_index,
     build_model,
 )
 
@@ -3259,75 +3258,3 @@ def test_build_dataloader_forwards_inject_fake_images_false():
 
     wrapper_mock = _run_build_dataloader_capturing_wrapper(cfg)
     assert wrapper_mock.call_args.kwargs["inject_fake_images"] is False
-
-
-class _RopeInnerModel(nn.Module):
-    """Stand-in for a transformers base model that owns ``get_rope_index``."""
-
-    def get_rope_index(self, input_ids=None, **kwargs):
-        return None, None
-
-
-class _RopeWrapper(nn.Module):
-    """Mimics the ``*ForConditionalGeneration`` layout of Qwen-VL models.
-
-    ``get_rope_index`` lives on the base model, and ``base_model`` resolves
-    through ``base_model_prefix`` exactly as ``PreTrainedModel`` does.
-    """
-
-    base_model_prefix = "model"
-
-    def __init__(self, inner=None):
-        super().__init__()
-        if inner is not None:
-            self.model = inner
-
-    @property
-    def base_model(self):
-        return getattr(self, self.base_model_prefix, self)
-
-
-def test_resolve_get_rope_index_finds_it_on_the_base_model():
-    """Qwen-VL models expose get_rope_index on the base model, not the wrapper.
-
-    A plain getattr on the top-level module returns None there, which silently
-    degrades packed mRoPE to 1D positions, so the resolver must reach through
-    ``base_model``.
-    """
-    inner = _RopeInnerModel()
-    wrapper = _RopeWrapper(inner)
-
-    assert getattr(wrapper, "get_rope_index", None) is None, "precondition: wrapper itself has none"
-    assert _resolve_get_rope_index(wrapper) == inner.get_rope_index
-
-
-def test_resolve_get_rope_index_reaches_through_a_distributed_wrapper():
-    """DDP and MegatronFSDP wrap the model in ``.module`` and do not proxy attrs.
-
-    model_parts[0] is then the wrapper, so the resolver must unwrap it before
-    looking for the base model.
-    """
-
-    class _DistWrapper(nn.Module):
-        def __init__(self, inner):
-            super().__init__()
-            self.module = inner
-
-    inner = _RopeInnerModel()
-    wrapped = _DistWrapper(_RopeWrapper(inner))
-
-    assert getattr(wrapped, "get_rope_index", None) is None
-    assert getattr(wrapped, "base_model", None) is None
-    assert _resolve_get_rope_index(wrapped) == inner.get_rope_index
-
-
-def test_resolve_get_rope_index_prefers_the_top_level_module():
-    """A model that exposes get_rope_index itself is used directly."""
-    top = _RopeInnerModel()
-    assert _resolve_get_rope_index(top) == top.get_rope_index
-
-
-def test_resolve_get_rope_index_returns_none_for_non_mrope_models():
-    """Models without an mRoPE builder resolve to None (1D positions are correct)."""
-    assert _resolve_get_rope_index(_RopeWrapper()) is None
-    assert _resolve_get_rope_index(nn.Linear(2, 2)) is None
