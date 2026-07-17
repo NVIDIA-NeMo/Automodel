@@ -462,6 +462,7 @@ def apply_model_infrastructure(
         0,
         0,
         getattr(model_wrapper, "moe_mesh", None),
+        process_group=getattr(mesh, "process_group", None),
     )
 
     # Handle checkpointer config updates if checkpointer is provided
@@ -526,9 +527,14 @@ def apply_model_infrastructure(
         checkpoint_already_loaded = True
 
     # hold a list copy of the model state dict keys before any parallelization. To be used during checkpoint saving in safetensors format.
-    pre_shard_hf_state_dict_keys = list(
-        _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=False).keys()
-    )
+    state_dict_adapter = getattr(model, "state_dict_adapter", None)
+    get_hf_state_dict_keys = getattr(state_dict_adapter, "get_hf_state_dict_keys", None)
+    if get_hf_state_dict_keys is not None:
+        pre_shard_hf_state_dict_keys = get_hf_state_dict_keys(model.state_dict())
+    else:
+        pre_shard_hf_state_dict_keys = list(
+            _maybe_adapt_state_dict_to_hf(model, model.state_dict(), quantization=False).keys()
+        )
 
     # Apply freezing before sharding
     freeze_config = _kwargs.get("freeze_config")
@@ -592,6 +598,11 @@ def apply_model_infrastructure(
         model_parts = model.parts if hasattr(model, "parts") else [model]
         lora_a_init = getattr(peft_config, "lora_A_init", None)
         for mp in model_parts:
+            if autopipeline is not None and load_base_model:
+                # PP stages own different modules, so HF random initialization can issue
+                # a different number of DTensor RNG collectives on each stage. Every
+                # parameter is about to be populated from the pretrained checkpoint.
+                mp._skip_init_weights_on_load = True
             checkpointer.initialize_model_weights(mp, init_device, peft_init_method=lora_a_init)
 
     # Load the checkpoint if pretrained weights are needed and weren't already loaded

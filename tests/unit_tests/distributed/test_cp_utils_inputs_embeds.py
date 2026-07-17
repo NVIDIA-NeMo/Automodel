@@ -481,6 +481,33 @@ def test_padding_handles_loss_mask_and_padding_mask(monkeypatch):
         assert buf.shape[1] == expected, f"cp_buffers[{i}] not padded to {expected}: shape={tuple(buf.shape)}"
 
 
+def test_extra_sequence_buffer_is_padded_and_registered(monkeypatch):
+    """Teacher logits ``[B, S, V]`` follow labels through CP padding/sharding."""
+    captured = {}
+
+    def _fake_create_ctx(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", _fake_create_ctx)
+    monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: "ctx")
+
+    device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
+    teacher_logits = torch.randn(1, 6, 5)
+    batch = {
+        "input_ids": torch.arange(6).unsqueeze(0),
+        "labels": torch.arange(6).unsqueeze(0),
+        "teacher_logits": teacher_logits,
+    }
+
+    _cu.make_cp_batch_and_ctx(device_mesh, batch, extra_seq_buffers={"teacher_logits": 1})
+
+    assert captured["cp_seq_dims"] == [1, 1, 1, 1]
+    assert batch["teacher_logits"].shape == (1, 8, 5)
+    torch.testing.assert_close(batch["teacher_logits"][:, :6], teacher_logits)
+    assert torch.count_nonzero(batch["teacher_logits"][:, 6:]) == 0
+
+
 def test_padding_mask_pad_value_is_True_not_False(monkeypatch):
     """Regression: cp-divisor padding extends the seq with positions that are
     semantically padding.  ``padding_mask`` (bool, ``True`` == "this position
