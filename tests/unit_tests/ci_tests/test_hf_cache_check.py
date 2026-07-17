@@ -154,7 +154,8 @@ def test_check_cache_empty_snapshot_dir_counts_as_missing(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# CLI (exit code = decision: 0 = all cached, 1 = miss / error)
+# CLI exit codes:
+#   0 = all cached, 1 = miss (clean), 2 = error (HF_HOME missing / no recipe)
 # ---------------------------------------------------------------------------
 
 
@@ -165,7 +166,7 @@ def test_main_exits_zero_when_all_cached(tmp_path, monkeypatch):
     recipe = _write_recipe(tmp_path, "vlm.yaml", VLM_RECIPE)
 
     monkeypatch.setattr(sys, "argv", ["hf_cache_check.py", "--config", str(recipe)])
-    assert hf_cache_check.main() == 0
+    assert hf_cache_check.main() == hf_cache_check.EXIT_ALL_CACHED
 
 
 def test_main_exits_one_when_any_missing(tmp_path, monkeypatch):
@@ -175,18 +176,24 @@ def test_main_exits_one_when_any_missing(tmp_path, monkeypatch):
     recipe = _write_recipe(tmp_path, "llm.yaml", LLM_RECIPE)
 
     monkeypatch.setattr(sys, "argv", ["hf_cache_check.py", "--config", str(recipe)])
-    assert hf_cache_check.main() == 1
+    assert hf_cache_check.main() == hf_cache_check.EXIT_MISS
 
 
-def test_main_exits_one_when_hf_home_unset(tmp_path, monkeypatch):
+def test_main_exits_two_when_hf_home_unset(tmp_path, monkeypatch):
     monkeypatch.delenv("HF_HOME", raising=False)
     recipe = _write_recipe(tmp_path, "llm.yaml", LLM_RECIPE)
 
     monkeypatch.setattr(sys, "argv", ["hf_cache_check.py", "--config", str(recipe)])
-    assert hf_cache_check.main() == 1
+    assert hf_cache_check.main() == hf_cache_check.EXIT_ERROR
 
 
-def test_main_exits_one_when_recipe_missing(tmp_path, monkeypatch):
+def test_main_exits_two_when_recipe_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf_home"))
     monkeypatch.setattr(sys, "argv", ["hf_cache_check.py", "--config", str(tmp_path / "does_not_exist.yaml")])
-    assert hf_cache_check.main() == 1
+    assert hf_cache_check.main() == hf_cache_check.EXIT_ERROR
+
+
+def test_exit_codes_are_distinct():
+    # Any collision would defeat the shim's tri-state decision.
+    codes = {hf_cache_check.EXIT_ALL_CACHED, hf_cache_check.EXIT_MISS, hf_cache_check.EXIT_ERROR}
+    assert len(codes) == 3

@@ -17,14 +17,15 @@
 in the local Hugging Face Hub cache (``$HF_HOME/hub/``).
 
 Pure inspection — never downloads, never modifies the cache. The exit code
-IS the decision so the caller shell reduces to::
-
-    python3 hf_cache_check.py --config <recipe> || export HF_HUB_OFFLINE=0
+IS the decision:
 
 Exit codes:
     0   every referenced HF repo is present in the local cache
-    1   at least one repo is missing, ``$HF_HOME`` is unset, or the check
-        errored — treat as "cache miss, need online"
+    1   at least one referenced repo is missing (cleanly detected)
+    2   the check could not run to completion (HF_HOME unset, recipe file
+        not found, unexpected exception, ...). The caller should treat this
+        as "unknown" and preserve the pipeline default, not silently flip
+        HF_HUB_OFFLINE.
 """
 
 import argparse
@@ -115,6 +116,11 @@ def check_cache(recipe_path: Path, hf_home: Path) -> tuple[list[str], list[str]]
     return cached, missing
 
 
+EXIT_ALL_CACHED = 0
+EXIT_MISS = 1
+EXIT_ERROR = 2
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, required=True, help="Recipe YAML path")
@@ -122,19 +128,25 @@ def main() -> int:
 
     hf_home = os.environ.get("HF_HOME")
     if not hf_home:
-        print("[hf_cache_check] HF_HOME unset; treating as cache miss", file=sys.stderr)
-        return 1
+        print("[hf_cache_check] ERROR: HF_HOME is not set", file=sys.stderr)
+        return EXIT_ERROR
     if not args.config.is_file():
-        print(f"[hf_cache_check] recipe not found: {args.config}; treating as cache miss", file=sys.stderr)
-        return 1
+        print(f"[hf_cache_check] ERROR: recipe not found: {args.config}", file=sys.stderr)
+        return EXIT_ERROR
 
     cached, missing = check_cache(args.config, Path(hf_home))
     if missing:
         print(f"[hf_cache_check] miss in {hf_home}: {' '.join(missing)}")
-        return 1
+        return EXIT_MISS
     print(f"[hf_cache_check] all {len(cached)} required repos cached in {hf_home}")
-    return 0
+    return EXIT_ALL_CACHED
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - preflight must never leak a traceback as a "miss" signal
+        print(f"[hf_cache_check] ERROR: unexpected exception: {exc!r}", file=sys.stderr)
+        sys.exit(EXIT_ERROR)
