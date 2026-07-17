@@ -276,6 +276,11 @@ def _get_hidden_and_vocab_size(model_config) -> tuple[int, int]:
     return hidden_size, vocab_size
 
 
+def _supports_stage_shape_precomputation(stages: list[PipelineStage]) -> bool:
+    """Return whether every stage exposes PyTorch's analytical metadata hook."""
+    return all(callable(getattr(stage, "_configure_outputs_meta", None)) for stage in stages)
+
+
 def _precompute_stage_shapes(
     stages: list[PipelineStage],
     model_config,
@@ -289,9 +294,11 @@ def _precompute_stage_shapes(
     stage 0 → send → stage 1 → send → ... → stage N-1.  This is O(N) in the number of
     pipeline stages and becomes a bottleneck for large world sizes.
 
-    This function sets ``inputs_meta`` and ``_outputs_meta`` on each stage *before* the
-    first ``step()`` call, so that ``_shape_inference`` is never invoked and the serial
-    chain is completely eliminated.
+    On PyTorch versions that expose the metadata configuration hook, this function sets
+    ``inputs_meta`` and ``_outputs_meta`` on each stage *before* the first ``step()`` call,
+    so that ``_shape_inference`` is never invoked and the serial chain is completely
+    eliminated. Newer PyTorch versions infer metadata dynamically instead; in that case
+    this function leaves the stages untouched.
 
     Args:
         stages: The local pipeline stages (already parallelized).
@@ -299,6 +306,15 @@ def _precompute_stage_shapes(
         microbatch_size: Microbatch size used by the pipeline schedule.
         seq_len: Sequence length of the input data.
     """
+    # PyTorch 2.13 removed PipelineStage._configure_outputs_meta in favor of
+    # dynamic metadata inference. Keep the analytical optimization where the
+    # upstream hook exists and otherwise use the supported inference path.
+    if not _supports_stage_shape_precomputation(stages):
+        logger.info(
+            "Pipeline stages do not expose analytical metadata configuration; using PyTorch dynamic metadata inference"
+        )
+        return
+
     hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)
 
     for stage in stages:
@@ -360,10 +376,9 @@ def reset_pp_stage_shapes(
     buffer sizes on the first ``schedule.step()`` call (``_stages_initialized = True``).
     Subsequent steps with a different seq_len therefore hit a shape-mismatch error.
 
-    This function resets the per-stage infrastructure so that ``_initialize_stages`` re-runs
-    on the next ``step()`` call.  It then calls ``_precompute_stage_shapes`` to set the
-    correct shapes analytically — avoiding the expensive real-valued forward pass that
-    ``_shape_inference`` would otherwise perform.
+    This function resets the per-stage infrastructure so that stage initialization re-runs
+    on the next ``step()`` call. It precomputes the new shapes when supported by the installed
+    PyTorch version; otherwise PyTorch infers metadata from the upcoming real microbatch.
 
     Args:
         schedule: The active pipeline schedule.
@@ -372,17 +387,21 @@ def reset_pp_stage_shapes(
         microbatch_size: Per-microbatch batch size used by the schedule.
         seq_len: Sequence length of the upcoming batch (e.g. ``input_ids.shape[1]``).
     """
+    can_precompute_shapes = _supports_stage_shape_precomputation(stages)
+
     for stage in stages:
-        # Allow _configure_outputs_meta to be called again (it asserts _outputs_meta is None)
-        stage._outputs_meta = None
-        # Allow _shape_inference to re-run for non-first stages receiving new shapes
-        stage.inputs_meta = None
+        if can_precompute_shapes:
+            # Allow _configure_outputs_meta to be called again (it asserts _outputs_meta is None)
+            stage._outputs_meta = None
+            # Allow _shape_inference to re-run for non-first stages receiving new shapes
+            stage.inputs_meta = None
         # Clear pre-allocated recv/send buffers; they will be reallocated by _prepare_forward_infra
         stage.args_recv_info = {}
         stage.grad_recv_info = {}
         stage.grad_send_info = None
 
-    # Analytically set shapes for the new seq_len (no forward pass)
+    # Analytically set shapes when the installed PyTorch version supports it.
+    # Otherwise this is a no-op and the next schedule step infers metadata dynamically.
     _precompute_stage_shapes(stages, model_config, microbatch_size, seq_len, tensor_dtype=tensor_dtype)
 
     # Trigger _initialize_stage(s) on the next step() call.

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import types
 from unittest.mock import MagicMock, Mock, patch
 
@@ -884,6 +885,21 @@ class TestPrecomputeStageShapes:
         out_call = stage._configure_outputs_meta.call_args[0][0]
         assert out_call[0].shape == (2, 16, 64)
 
+    def test_new_pipeline_stage_api_uses_dynamic_metadata_inference(self, caplog):
+        """Stages without the removed metadata hook should be left for dynamic inference."""
+        stage = types.SimpleNamespace(
+            is_first=True,
+            is_last=False,
+            submod=Mock(),
+        )
+
+        caplog.set_level(logging.INFO)
+        _precompute_stage_shapes([stage], self._make_config(), microbatch_size=2, seq_len=16)
+
+        assert not hasattr(stage, "inputs_meta")
+        assert not hasattr(stage, "_outputs_meta")
+        assert "using PyTorch dynamic metadata inference" in caplog.text
+
     @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")
     @patch("nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule")
     def test_pipeline_model_with_seq_len(self, mock_build_schedule, mock_split_stages):
@@ -1118,6 +1134,30 @@ class TestResetPpStageShapes:
         assert stage.args_recv_info == {}
         assert stage.grad_recv_info == {}
         assert stage.grad_send_info is None
+
+    def test_new_pipeline_stage_api_resets_for_dynamic_metadata_inference(self):
+        """New-style stages should reset buffers without recreating removed metadata attributes."""
+        stage = types.SimpleNamespace(
+            is_first=True,
+            is_last=False,
+            submod=Mock(),
+            args_recv_info={"some_key": "some_val"},
+            grad_recv_info={"grad_key": "grad_val"},
+            grad_send_info=Mock(),
+        )
+        schedule = self._make_schedule(initialized=True)
+
+        reset_pp_stage_shapes(schedule, [stage], self._make_config(), microbatch_size=2, seq_len=32)
+
+        assert stage.args_recv_info == {}
+        assert stage.grad_recv_info == {}
+        assert stage.grad_send_info is None
+        assert not hasattr(stage, "inputs_meta")
+        assert not hasattr(stage, "_outputs_meta")
+        assert schedule._stage_forward_initialized is False
+        assert schedule._stage_backward_initialized is False
+        assert schedule._stages_forward_initialized is False
+        assert schedule._stages_backward_initialized is False
 
     def test_multi_stage_reset(self):
         """Reset should work across a full 3-stage pipeline."""
