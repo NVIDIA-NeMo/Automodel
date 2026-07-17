@@ -33,7 +33,6 @@ from typing import Callable, Optional, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import LlamaConfig
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask
@@ -63,7 +62,7 @@ from nemo_automodel.components.models.llama.rope_utils import (
     apply_rotary_pos_emb_fused,
 )
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
-from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator, safe_import_from
+from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
 check_model_inputs = get_check_model_inputs_decorator()
 
@@ -161,51 +160,20 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaMLP(nn.Module):
-    """SwiGLU MLP backed by separate PyTorch projections or a fused QuACK kernel."""
+    """SwiGLU MLP with separate gate_proj and up_proj -- identical to HuggingFace default."""
 
-    def __init__(self, config: LlamaConfig, backend: BackendConfig):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         from transformers.activations import ACT2FN
 
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.mlp_backend = backend.mlp
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._quack_mlp_func = None
-        if backend.mlp == "quack":
-            if config.hidden_act not in ("silu", "swiglu"):
-                raise ValueError("mlp='quack' currently requires a SwiGLU/silu Llama MLP.")
-            if config.mlp_bias:
-                raise ValueError("mlp='quack' currently requires mlp_bias=False.")
-            available, mlp_func = safe_import_from(
-                "quack.mlp",
-                "mlp_func",
-                msg="mlp='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
-            )
-            if not available:
-                raise ImportError("mlp='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].")
-            self._quack_mlp_func = mlp_func
-            self.fc1 = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
-            self.fc2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        elif backend.mlp == "torch":
-            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
-        else:
-            raise ValueError(f"Unsupported Llama MLP backend: {backend.mlp}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._quack_mlp_func is not None:
-            if x.is_cuda:
-                return self._quack_mlp_func(
-                    x,
-                    self.fc1.weight,
-                    self.fc2.weight,
-                    activation="swiglu",
-                    fuse_grad_accum=True,
-                )
-            gate_up = self.fc1(x)
-            return self.fc2(F.silu(gate_up[..., ::2]) * gate_up[..., 1::2])
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -230,7 +198,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
             backend=backend,
         )
 
-        self.mlp = LlamaMLP(config=config, backend=backend)
+        self.mlp = LlamaMLP(config=config)
 
         self.input_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
@@ -467,7 +435,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Create state_dict_adapter
-        self.state_dict_adapter = LlamaStateDictAdapter(config=self.config, mlp_backend=self.backend.mlp)
+        self.state_dict_adapter = LlamaStateDictAdapter(config=self.config)
         # Initialize weights and apply final processing
         self.post_init()
 

@@ -13,17 +13,13 @@
 # limitations under the License.
 
 
-from unittest.mock import patch
-
 import numpy as np
 import pytest
 import torch
-import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, LlamaConfig, set_seed
 
 from nemo_automodel import NeMoAutoModelForCausalLM
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.llama.model import LlamaMLP
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
 
 set_seed(42)
@@ -68,63 +64,6 @@ ROPE_CONFIGS = {
     "default": TINY_DEFAULT_ROPE_CONFIG,
     "llama3": TINY_LLAMA3_ROPE_CONFIG,
 }
-
-
-def test_quack_mlp_state_dict_roundtrip():
-    config = LlamaConfig(**TINY_DEFAULT_ROPE_CONFIG)
-    adapter = LlamaStateDictAdapter(config, mlp_backend="quack")
-    prefix = "model.layers.0.mlp"
-    gate = torch.randn(config.intermediate_size, config.hidden_size)
-    up = torch.randn_like(gate)
-    down = torch.randn(config.hidden_size, config.intermediate_size)
-
-    custom = adapter.from_hf(
-        {
-            f"{prefix}.gate_proj.weight": gate,
-            f"{prefix}.up_proj.weight": up,
-            f"{prefix}.down_proj.weight": down,
-        }
-    )
-
-    torch.testing.assert_close(custom[f"{prefix}.fc1.weight"][::2], gate)
-    torch.testing.assert_close(custom[f"{prefix}.fc1.weight"][1::2], up)
-    torch.testing.assert_close(custom[f"{prefix}.fc2.weight"], down)
-    restored = adapter.to_hf(custom)
-    torch.testing.assert_close(restored[f"{prefix}.gate_proj.weight"], gate)
-    torch.testing.assert_close(restored[f"{prefix}.up_proj.weight"], up)
-    torch.testing.assert_close(restored[f"{prefix}.down_proj.weight"], down)
-
-
-def test_quack_mlp_cpu_fallback_matches_separate_swiglu():
-    config = LlamaConfig(**TINY_DEFAULT_ROPE_CONFIG)
-    gate = torch.randn(config.intermediate_size, config.hidden_size)
-    up = torch.randn_like(gate)
-    down = torch.randn(config.hidden_size, config.intermediate_size)
-
-    with patch(
-        "nemo_automodel.components.models.llama.model.safe_import_from",
-        return_value=(True, object()),
-    ):
-        mlp = LlamaMLP(config, BackendConfig(mlp="quack"))
-    with torch.no_grad():
-        mlp.fc1.weight.copy_(torch.stack((gate, up), dim=1).flatten(0, 1))
-        mlp.fc2.weight.copy_(down)
-
-    x = torch.randn(2, 4, config.hidden_size)
-    expected = F.linear(F.silu(F.linear(x, gate)) * F.linear(x, up), down)
-    torch.testing.assert_close(mlp(x), expected)
-
-
-def test_quack_mlp_reports_missing_dependency():
-    config = LlamaConfig(**TINY_DEFAULT_ROPE_CONFIG)
-    with (
-        patch(
-            "nemo_automodel.components.models.llama.model.safe_import_from",
-            return_value=(False, None),
-        ),
-        pytest.raises(ImportError, match="quack-kernels"),
-    ):
-        LlamaMLP(config, BackendConfig(mlp="quack"))
 
 
 def _create_checkpoint(config_kwargs, tmpdir):
