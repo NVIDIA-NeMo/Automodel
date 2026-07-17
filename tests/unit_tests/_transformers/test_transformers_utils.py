@@ -610,3 +610,104 @@ def test_resolve_get_rope_index_returns_none_for_non_mrope_models():
     """Models without an mRoPE builder resolve to None (1D positions are correct)."""
     assert resolve_get_rope_index(_RopeWrapper()) is None
     assert resolve_get_rope_index(nn.Linear(2, 2)) is None
+
+
+class _OmniLike(nn.Module):
+    """Mimics Qwen3-Omni: the builder is on a submodule the two-step lookup misses.
+
+    The top-level module owns no ``get_rope_index``, and ``base_model_prefix``
+    of ``model`` resolves back to itself because there is no ``model`` child.
+    """
+
+    base_model_prefix = "model"
+
+    def __init__(self, talker=None):
+        super().__init__()
+        self.thinker = _RopeInnerModel()
+        if talker is not None:
+            self.talker = talker
+
+    @property
+    def base_model(self):
+        return getattr(self, self.base_model_prefix, self)
+
+
+def test_resolve_get_rope_index_sweeps_submodules_for_the_omni_layout():
+    """Qwen3-Omni keeps get_rope_index on ``thinker``, past ``self`` and ``base_model``."""
+    omni = _OmniLike()
+
+    assert getattr(omni, "get_rope_index", None) is None, "precondition: top level has none"
+    assert omni.base_model is omni, "precondition: base_model_prefix resolves back to self"
+    assert resolve_get_rope_index(omni) == omni.thinker.get_rope_index
+
+
+def test_resolve_get_rope_index_is_deterministic_across_same_depth_builders():
+    """Qwen3-Omni holds distinct builders on ``thinker`` and ``talker``, both one level down.
+
+    Registration order must decide, not traversal luck: picking the talker's
+    builder would silently produce wrong 3D positions.
+    """
+    talker = _RopeInnerModel()
+    omni = _OmniLike(talker=talker)
+
+    assert omni.talker.get_rope_index != omni.thinker.get_rope_index, "precondition: distinct builders"
+    assert resolve_get_rope_index(omni) == omni.thinker.get_rope_index
+
+
+def test_resolve_get_rope_index_prefers_the_shallowest_submodule():
+    """A shallow builder wins over a deeper one regardless of registration order."""
+
+    class _Deep(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.buried = nn.Sequential(nn.Sequential(_RopeInnerModel()))
+
+    class _Top(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.deep = _Deep()
+            self.shallow = _RopeInnerModel()
+
+    top = _Top()
+    assert resolve_get_rope_index(top) == top.shallow.get_rope_index
+
+
+def test_resolve_get_rope_index_prefers_base_model_over_other_submodules():
+    """``base_model`` stays authoritative; the sweep is only a fallback."""
+
+    class _WithSibling(_RopeWrapper):
+        def __init__(self, inner):
+            super().__init__(inner)
+            self.sibling = _RopeInnerModel()
+
+    inner = _RopeInnerModel()
+    model = _WithSibling(inner)
+
+    assert resolve_get_rope_index(model) == inner.get_rope_index
+
+
+def test_resolve_get_rope_index_terminates_on_a_cyclic_module_graph():
+    """A module graph may cycle; the sweep must not spin on it.
+
+    torch permits registering a module inside its own descendant, and
+    ``named_modules`` guards this with a visited set, so the sweep does too.
+    Without the guard this call never returns.
+    """
+    a = nn.Linear(2, 2)
+    b = nn.Sequential()
+    b.add_module("back", a)
+    a.add_module("fwd", b)
+
+    assert resolve_get_rope_index(a) is None
+
+
+def test_resolve_get_rope_index_finds_a_deeply_buried_builder():
+    """The sweep has no depth limit, so future HF moves stay covered."""
+
+    class _Buried(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = nn.Sequential(nn.Sequential(nn.Sequential(_RopeInnerModel())))
+
+    model = _Buried()
+    assert resolve_get_rope_index(model) is not None

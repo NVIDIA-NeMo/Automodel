@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from collections import deque
 from collections.abc import Callable
 from typing import Any, Optional
 
@@ -26,14 +27,28 @@ logger = logging.getLogger(__name__)
 def resolve_get_rope_index(model: nn.Module) -> Optional[Callable]:
     """Locate a model's mRoPE position-id builder.
 
-    Transformers defines ``get_rope_index`` on the base model rather than on the
-    ``*ForConditionalGeneration`` that ``model_parts`` holds (Qwen2-VL,
-    Qwen2.5-VL, Qwen3-VL and Qwen3-VL-MoE all follow this layout), and DDP or
-    MegatronFSDP add another wrapper on top without proxying attribute reads. A
-    plain ``getattr`` on the top-level module therefore finds nothing, and packed
-    multimodal training silently falls back to 1D positions. Unwrap ``module``
-    first, then check the model itself, then HuggingFace's ``base_model``
-    property, which resolves to ``getattr(model, model.base_model_prefix, model)``.
+    Transformers does not keep ``get_rope_index`` at a fixed depth, and a plain
+    ``getattr`` on the top-level module therefore finds nothing for most
+    layouts, which silently degrades packed multimodal training to 1D positions.
+    Three layouts exist as of transformers 5.8, so the search widens gradually:
+
+    1. The model itself, after unwrapping the ``module`` that DDP and
+       MegatronFSDP add without proxying attribute reads. Qwen2.5-Omni defines
+       ``get_rope_index`` on its top-level ``*ForConditionalGeneration``.
+    2. HuggingFace's ``base_model`` property, which resolves to
+       ``getattr(model, model.base_model_prefix, model)``. Qwen2-VL, Qwen2.5-VL,
+       Qwen3-VL, Qwen3-VL-MoE and GLM-4V put it on that inner ``*Model``.
+    3. Any remaining submodule, breadth-first so the shallowest match wins.
+       Qwen3-Omni reaches neither of the above: it owns no ``get_rope_index``,
+       and its ``base_model_prefix`` of ``model`` resolves back to itself
+       because the builder lives on the ``thinker`` submodule.
+
+    Breadth-first order matters because a model may hold several distinct
+    builders. Qwen3-Omni carries one on ``thinker`` and a different one on
+    ``talker``; both sit one level down, so the traversal must be deterministic
+    rather than depend on how a search happens to recurse. The sweep tracks
+    visited modules like ``nn.Module.named_modules`` does, since a module graph
+    may share a submodule across paths or contain an outright cycle.
 
     Args:
         model: The (possibly wrapped) model to search. Accepts any module; no
@@ -47,7 +62,24 @@ def resolve_get_rope_index(model: nn.Module) -> Optional[Callable]:
     get_rope_index = getattr(model, "get_rope_index", None)
     if get_rope_index is not None:
         return get_rope_index
-    return getattr(getattr(model, "base_model", None), "get_rope_index", None)
+
+    get_rope_index = getattr(getattr(model, "base_model", None), "get_rope_index", None)
+    if get_rope_index is not None:
+        return get_rope_index
+
+    seen = {id(model)}
+    queue = deque(model.named_children())
+    while queue:
+        name, submodule = queue.popleft()
+        if id(submodule) in seen:
+            continue
+        seen.add(id(submodule))
+        get_rope_index = getattr(submodule, "get_rope_index", None)
+        if get_rope_index is not None:
+            logger.debug("Resolved get_rope_index from submodule %r of %s", name, type(model).__name__)
+            return get_rope_index
+        queue.extend((f"{name}.{child_name}", child) for child_name, child in submodule.named_children())
+    return None
 
 
 def _should_load_before_shard(
