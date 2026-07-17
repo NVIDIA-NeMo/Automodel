@@ -210,35 +210,6 @@ class FakeBalancedGate(nn.Module):
         self.apply(partial(_init_weights, buffer_device=buffer_device, init_std=init_std))
 
 
-class _QuackTopKSoftmax(torch.autograd.Function):
-    """Use QuACK's fused forward with an explicit reference-equivalent backward."""
-
-    @staticmethod
-    def forward(ctx, scores: torch.Tensor, topk_fn, k: int):
-        weights, indices = topk_fn(scores, k, softmax=True)
-        # Allocate the dense input-gradient buffer during checkpoint
-        # recomputation, before the backward allocator becomes fragmented.
-        # Keeping it separate from scores avoids mutating model activations.
-        dscores = torch.empty_like(scores)
-        ctx.save_for_backward(dscores, weights, indices)
-        ctx.mark_non_differentiable(indices)
-        ctx.set_materialize_grads(False)
-        return weights, indices
-
-    @staticmethod
-    def backward(ctx, dweights: torch.Tensor | None, _dindices=None):
-        if dweights is None:
-            return None, None, None
-        dscores, weights, indices = ctx.saved_tensors
-        weights_f = weights.float()
-        dweights_f = dweights.float()
-        dot = (dweights_f * weights_f).sum(dim=-1, keepdim=True)
-        selected_grads = (weights_f * (dweights_f - dot)).to(dtype=weights.dtype)
-        dscores.zero_()
-        dscores.scatter_(1, indices.to(torch.int64), selected_grads)
-        return dscores, None, None
-
-
 class Gate(nn.Module):
     """
     Gating mechanism for routing inputs in a mixture-of-experts (MoE) model.
@@ -392,7 +363,11 @@ class Gate(nn.Module):
                     and self.router_replay is None
                 )
                 if use_fused_quack_topk:
-                    weights, indices = _QuackTopKSoftmax.apply(scores, self._quack_topk, self.topk)
+                    # Full softmax followed by normalized top-k is exactly a
+                    # softmax over the selected logits. Keep that tiny softmax
+                    # in fp32 for stable autograd while QuACK selects the logits.
+                    weights, indices = self._quack_topk(scores, self.topk)
+                    weights = weights.float().softmax(dim=-1)
                     original_scores = None
                     weights_are_normalized = True
                 else:
