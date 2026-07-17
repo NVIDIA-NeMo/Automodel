@@ -38,6 +38,8 @@ set -xeuo pipefail
 # illegal memory access while backpropagating through the recurrent drafter on
 # pre-Blackwell GPUs. Use the regular aten::bmm kernel for this compatibility
 # smoke test until the upstream native-JIT kernel is fixed.
+# Upstream issue: https://github.com/pytorch/pytorch/issues/187729
+# Upstream fix: https://github.com/pytorch/pytorch/pull/187733
 TRANSFORMERS_OFFLINE=1 TORCH_DISABLE_NATIVE_JIT=1 coverage run \
 examples/vlm_finetune/finetune.py \
   --config examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_medpix.yaml \
