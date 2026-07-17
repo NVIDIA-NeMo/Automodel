@@ -30,6 +30,14 @@ import config_resolver  # noqa: E402
 yaml = YAML()
 
 
+@pytest.mark.parametrize("phase", ["nightly", "release", "convergence", "checkpoint_robustness"])
+def test_bounded_ci_phase_sets_smaller_warmup(phase):
+    ci_config = config_resolver._load(config_resolver.CI_CONFIG_FILE)
+    defaults = ci_config["phases"][phase]
+
+    assert defaults["lr_scheduler.lr_warmup_steps"] < defaults["step_scheduler.max_steps"]
+
+
 # ---------------------------------------------------------------------------
 # Helper-level tests
 # ---------------------------------------------------------------------------
@@ -217,6 +225,8 @@ def synthetic_recipe(tmp_path: Path) -> Path:
         "step_scheduler:\n"
         "  global_batch_size: 8\n"
         "  max_steps: 1000\n"
+        "lr_scheduler:\n"
+        "  lr_warmup_steps: 100\n"
         "ci:\n"
         "  recipe_owner: tester\n"
         "  nightly:\n"
@@ -247,6 +257,8 @@ def test_end_to_end_phase_defaults_and_ci_section(tmp_path, synthetic_recipe):
     assert resolved["step_scheduler"]["val_every_steps"] == 50
     # Recipe ci.nightly wins over phase default for max_steps (7, not 50)
     assert resolved["step_scheduler"]["max_steps"] == 7
+    # The shortened CI phase also supplies a compatible warmup.
+    assert resolved["lr_scheduler"]["lr_warmup_steps"] == 2
     # Computed override applied
     assert resolved["checkpoint"]["checkpoint_dir"] == f"{tmp_path}/t1/checkpoint"
 
@@ -269,7 +281,18 @@ def test_end_to_end_robustness_ignores_max_steps_env(tmp_path, synthetic_recipe)
 
     resolved = yaml.load(out.open())
     assert resolved["step_scheduler"]["max_steps"] == 5  # robustness phase default holds
+    assert resolved["lr_scheduler"]["lr_warmup_steps"] == 1
     assert resolved["checkpoint"]["checkpoint_dir"] == f"{tmp_path}/t1/robustness_checkpoint"
+
+
+def test_end_to_end_release_uses_nightly_step_and_warmup_defaults(tmp_path, synthetic_recipe):
+    out = tmp_path / "resolved.yaml"
+    env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": "t1"}
+    _run_resolver(["--base", str(synthetic_recipe), "--phase", "release", "--output", str(out)], env=env)
+
+    resolved = yaml.load(out.open())
+    assert resolved["step_scheduler"]["max_steps"] == 50
+    assert resolved["lr_scheduler"]["lr_warmup_steps"] == 2
 
 
 def test_end_to_end_customizer_chat_path_wins(tmp_path):
