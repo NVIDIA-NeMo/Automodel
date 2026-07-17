@@ -144,6 +144,7 @@ ci:
     distributed.pp_size: 2
     distributed.ep_size: 8
     optimizer.lr: 1e-5
+    lr_scheduler.lr_warmup_steps: 0
     checkpoint.enabled: false
     dataset:
       _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
