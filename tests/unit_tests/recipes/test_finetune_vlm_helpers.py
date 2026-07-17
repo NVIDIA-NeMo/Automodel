@@ -3093,6 +3093,69 @@ class TestChunkVlmMedia:
         assert model._vlm_patch_newline_mask_chunks is None
         assert model._vlm_chunk_idx is None
 
+    @pytest.mark.parametrize("schedule_flag", ["_stage_forward_initialized", "_stages_forward_initialized"])
+    def test_stage_media_replays_first_chunk_after_dynamic_metadata_forward(self, schedule_flag):
+        class MediaConsumer(nn.Module):
+            def forward(self):
+                chunk = self._vlm_pixel_values_chunks[self._vlm_chunk_idx]
+                self._vlm_chunk_idx += 1
+                return chunk
+
+        model = MediaConsumer()
+        schedule = SimpleNamespace(**{schedule_flag: False})
+        stage = SimpleNamespace(is_first=True)
+        pp = SimpleNamespace(
+            info=SimpleNamespace(has_first_stage=True, schedule=schedule, stages=[stage]),
+        )
+        first_chunk = torch.tensor([1.0])
+        second_chunk = torch.tensor([2.0])
+        batch = {
+            VLM_PP_MEDIA_KEY: {
+                "pixel_values": [first_chunk, second_chunk],
+                "image_grid_hws": [torch.ones(1), torch.ones(1)],
+            }
+        }
+
+        with stage_vlm_media_for_pp(pp, [model], batch):
+            metadata_output = model()
+            first_microbatch_output = model()
+            second_microbatch_output = model()
+
+            assert torch.equal(metadata_output, first_chunk)
+            assert torch.equal(first_microbatch_output, first_chunk)
+            assert torch.equal(second_microbatch_output, second_chunk)
+            assert model._vlm_chunk_idx == 2
+
+    @pytest.mark.parametrize("analytical_metadata,forward_initialized", [(True, False), (False, True)])
+    def test_stage_media_does_not_replay_without_dynamic_metadata_forward(
+        self, analytical_metadata, forward_initialized
+    ):
+        class MediaConsumer(nn.Module):
+            def forward(self):
+                chunk = self._vlm_pixel_values_chunks[self._vlm_chunk_idx]
+                self._vlm_chunk_idx += 1
+                return chunk
+
+        model = MediaConsumer()
+        schedule = SimpleNamespace(_stage_forward_initialized=forward_initialized)
+        stage = SimpleNamespace(is_first=True)
+        if analytical_metadata:
+            stage._configure_outputs_meta = lambda *_args: None
+        pp = SimpleNamespace(
+            info=SimpleNamespace(has_first_stage=True, schedule=schedule, stages=[stage]),
+        )
+        first_chunk = torch.tensor([1.0])
+        batch = {
+            VLM_PP_MEDIA_KEY: {
+                "pixel_values": [first_chunk],
+                "image_grid_hws": [torch.ones(1)],
+            }
+        }
+
+        with stage_vlm_media_for_pp(pp, [model], batch):
+            assert torch.equal(model(), first_chunk)
+            assert model._vlm_chunk_idx == 1
+
 
 # -----------------------------------------------------------------------------
 # get_rope_index forwarding tests for build_dataloader
