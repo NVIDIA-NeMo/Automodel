@@ -12,22 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Single-node optimized DDP config for Llama Nemotron VL 1B retrieval fine-tuning.
+# Optimized DDP config for Llama Nemotron VL 1B retrieval fine-tuning.
 #
-# Runs the same global_batch_size=64 as the multi-node optimized config on a
-# single 8x80GB node with local_batch_size=8 (8 x 8 = 64, no gradient
-# accumulation). Vision-tower-scoped activation checkpointing makes the larger
-# per-GPU batch fit at roughly ~80GiB peak per GPU, which is memory-tight, so
-# set the allocator option before launch:
+# This topology-neutral default uses local_batch_size=2 and global_batch_size=64.
+# A 4x8 GPU run therefore has no gradient accumulation, while an 8-GPU run
+# accumulates four micro-batches per optimizer step. Use this config with:
 #
 #   export PYTORCH_ALLOC_CONF=expandable_segments:True
-#   torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py \
-#     --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized_ddp_1node.yaml
 #
-# If your data or model variant needs more memory, widen the checkpointing
-# scope (distributed.activation_checkpointing_scope: all) or lower
-# local_batch_size (keep global_batch_size divisible by
-# local_batch_size * num_gpus).
+# The allocator option helps local_batch_size=2 fit on 80GB GPUs by reducing
+# CUDA memory fragmentation. If your data or model variant needs more memory,
+# lower local_batch_size or enable activation checkpointing.
 
 recipe: TrainBiEncoderRecipe
 
@@ -42,7 +37,7 @@ bi_encoder_optimization:
 
 step_scheduler:
   global_batch_size: 64
-  local_batch_size: 8
+  local_batch_size: 2
   ckpt_every_steps: 5000
   val_every_steps: 500
   num_epochs: 1
@@ -82,22 +77,22 @@ tokenizer:
   passage_prefix: "passage:"
   max_input_tiles: 2
 
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
+  model_type: bi_encoder
+  data_dir_list:
+    - path: <DATASETS_PATH>/automodel_colpali/training_datasets/colpali_train.json
+      num_samples: 5000
+    - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
+      num_samples: 5000
+  data_type: train
+  n_passages: 5
+  seed: 42
+  do_shuffle: true
+
 dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-    model_type: bi_encoder
-    data_dir_list:
-      - path: <DATASETS_PATH>/automodel_colpali/training_datasets/colpali_train.json
-        num_samples: 5000
-      - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
-        num_samples: 5000
-    data_type: train
-    n_passages: 5
-    seed: 42
-    do_shuffle: true
   collate_fn:
-    _target_: nemo_automodel.components.datasets.llm.make_vision_collator_from_processor_method
+    _target_: nemo_automodel.components.datasets.llm.ProcessorMethodCollator
     collator_fn_name: process_queries_documents_biencoder
   shuffle: true
   num_workers: 4
@@ -117,7 +112,7 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: ./output/nemotron_vl_1b_optimized_ddp_1node/checkpoints
+  checkpoint_dir: ./output/nemotron_vl_1b_optimized_ddp/checkpoints
   model_save_format: safetensors
   save_consolidated: true
 
@@ -127,11 +122,31 @@ distributed:
   static_graph: true
   bucket_cap_mb: 400
   gradient_as_bucket_view: true
-  activation_checkpointing: true
-  activation_checkpointing_scope: vision
 
 # Uncomment and configure for W&B logging
 # wandb:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
-#   name: nemotron_vl_1b_optimized_ddp_1node
+#   name: nemotron_vl_1b_optimized_ddp
+
+ci:
+  recipe_owner: yuhez
+  time: "02:00:00"
+  nodes: 1
+  nightly:
+    # CI uses the public text corpus; the model still executes a dummy vision
+    # forward for rank symmetry, and checkpoint robustness tests an image input.
+    dataset.data_dir_list:
+      - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
+        num_samples: 5000
+    dataloader.num_workers: 0
+    lr_scheduler.lr_warmup_steps: 2
+  checkpoint_robustness:
+    dataset.data_dir_list:
+      - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
+        num_samples: 5000
+    dataloader.num_workers: 0
+    lr_scheduler.lr_warmup_steps: 1
+    cosine_threshold: 0.999
+    hf_cosine_threshold: 0.999
+    check_hf_reload: true

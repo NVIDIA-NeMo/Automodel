@@ -42,16 +42,14 @@ After running the notebook, open [nemotron_vl_1b_example.yaml](nemotron_vl_1b_ex
 Notice that a second dataset is present in `data_dir_list`, where the positive and negative samples are text passages (from the [MIRACL training set](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1/viewer/MIRACL), which focuses on multilingual text retrieval). You can also set the number of samples per dataset, as shown in the following example.
 
 ```yaml
-dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-    model_type: bi_encoder
-    data_dir_list:
-      - path: /path/to/trainset/colpali_train.json 
-        num_samples: 5000
-      - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
-        num_samples: 5000
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
+  model_type: bi_encoder
+  data_dir_list:
+    - path: /path/to/trainset/colpali_train.json
+      num_samples: 5000
+    - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
+      num_samples: 5000
 ```
 
 Also, if you have a Weights & Biases (W&B) account, you can configure the YAML file to log training metrics during training.
@@ -72,37 +70,30 @@ torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config e
 
 ### Optimized Configuration for Higher Throughput
 
-For higher throughput on the VL bi-encoder path, use the optimized configurations. Compared to the base example above, these configurations enable the following features:
+For higher throughput on the VL bi-encoder path, use [nemotron_vl_1b_optimized_ddp.yaml](nemotron_vl_1b_optimized_ddp.yaml). Compared to the base example above, it enables the following features:
 
 - The optimized custom LLaMA backend with Transformer Engine fused RMSNorm and QKV, and RMSNorm and MLP kernels,
 - Transformer Engine fused SigLIP vision encoder layers with the unused SigLIP pooling head frozen,
 - Bidirectional attention masks precomputed in the data loader (removing per-step host-to-device syncs),
 - Tuned DDP settings (bucket size, static graph, and `gradient_as_bucket_view`).
 
-On the reference workload, this trains the same model about 15% faster per step (~18% more samples per second per GPU) than the tuned DDP baseline, with matching loss curves. All optimizations are opt-in configuration flags (see the `model:` and `bi_encoder_optimization:` sections of the configurations).
+On the reference workload, this trains the same model about 15% faster per step (~18% more samples per second per GPU) than the tuned DDP baseline, with matching loss curves. The optimizations are opt-in flags in the `model:` and `bi_encoder_optimization:` sections, so the base example remains the simplest starting point.
 
-Two ready-to-use configurations are provided. Both train with `global_batch_size=64`, so they are numerically equivalent, but they differ in how the batch is laid out across GPUs:
-
-| Config | Intended setup | `local_batch_size` | Activation ckpt. |
-| --- | --- | ---: | --- |
-| [nemotron_vl_1b_optimized_ddp_lbs2.yaml](nemotron_vl_1b_optimized_ddp_lbs2.yaml) | multi-node, e.g., 4 nodes × 8 GPUs | 2 | off |
-| [nemotron_vl_1b_optimized_ddp_1node.yaml](nemotron_vl_1b_optimized_ddp_1node.yaml) | single 8-GPU node | 8 | vision tower |
-
-On a single node, launch with `torchrun` (both runs have tight memory constraints on 80 GB GPUs, so set the allocator option first):
+The optimized config uses `global_batch_size=64` and `local_batch_size=2`. A 4-node × 8-GPU run therefore has no gradient accumulation. On one 8-GPU node, the same config automatically accumulates four micro-batches per optimizer step. Set the allocator option before launching on 80 GB GPUs:
 
 ```bash
 export PYTORCH_ALLOC_CONF=expandable_segments:True
-torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized_ddp_1node.yaml
+torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized_ddp.yaml
 ```
 
 Note that `torchrun --nproc-per-node` launches a single node. For multi-node runs, submit through your cluster scheduler (e.g., `sbatch` on Slurm), as described in the base example above.
 
 ### Choose a GPU Budget
 
-None of these GPU counts is required. The configurations keep `global_batch_size=64` fixed, and you can reproduce the same training on almost any GPU budget by combining three options:
+The optimized config keeps `global_batch_size=64` fixed, and you can reproduce the same training on different GPU budgets by combining three options:
 
 1. **GPU count**: More GPUs shorten wall-clock time and do not change the result.
-2. **Gradient accumulation**: This happens automatically. Whenever `local_batch_size × GPUs` is smaller than `global_batch_size`, the recipe accumulates over `global / (local × GPUs)` micro-batches per optimizer step. For example, running the `lbs2` configuration unchanged on a single 8-GPU node simply accumulates over four micro-batches (~70 GiB peak, with no other changes needed).
+2. **Gradient accumulation**: This happens automatically. Whenever `local_batch_size × GPUs` is smaller than `global_batch_size`, the recipe accumulates over `global / (local × GPUs)` micro-batches per optimizer step. For example, running the optimized configuration unchanged on a single 8-GPU node accumulates over four micro-batches (~70 GiB peak, with no other changes needed).
 3. **Activation checkpointing**: This trades recompute for memory so a larger `local_batch_size` fits, which avoids accumulation entirely. Enable it under `distributed:` and optionally scope it (`activation_checkpointing_scope: vision` checkpoints only the vision tower). See [Use Gradient (Activation) Checkpointing](https://docs.nvidia.com/nemo/automodel/latest/guides/gradient-checkpointing.html).
 
 Measured reference points on 80GB GPUs (262k-sample VL retrieval workload, no gradient accumulation in any row):
@@ -115,6 +106,19 @@ Measured reference points on 80GB GPUs (262k-sample VL retrieval workload, no gr
 | 4 | 16/64 | full model | ~2.05 | ~61GiB | ~8.9h |
 
 Per-GPU efficiency peaks at the 32-GPU `local_batch_size=2` configuration, and the single-node setups stay close to it (within ~5-7%) even with activation-checkpointing recompute. All three are meaningfully more GPU-hour-efficient than the 64-GPU `local_batch_size=1` run. Using fewer GPUs costs wall-clock time but almost no total GPU-hours.
+
+For maximum throughput on one 8-GPU node, override the optimized config with `local_batch_size=8` and checkpoint only the vision tower:
+
+```yaml
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 8
+
+distributed:
+  strategy: ddp
+  activation_checkpointing: true
+  activation_checkpointing_scope: vision
+```
 
 For example, to run on 4 GPUs, checkpoint the full model and raise `local_batch_size` to 16:
 

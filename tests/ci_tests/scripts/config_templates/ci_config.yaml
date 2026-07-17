@@ -113,14 +113,17 @@ computed:
 # resolved YAML's ci.<phase> block but does not apply them to the top-level.
 fixture_keys:
   checkpoint_robustness:
+    - check_hf_reload
     - check_source_load_parity
     - check_fused_qkv_keys
     - check_phantom_keys
     - check_resume
     - cross_tp_kl_threshold
     - cross_tp_size
+    - cosine_threshold
     - experts_implementation
     - hf_device_map_auto
+    - hf_cosine_threshold
     - hf_kl_threshold
     - kl_threshold
     - no_check_resume

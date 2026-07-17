@@ -16,3 +16,4 @@ examples_dir: retrieval
 
 configs:
   - bi_encoder/llama3_2_1b.yaml
+  - bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized_ddp.yaml

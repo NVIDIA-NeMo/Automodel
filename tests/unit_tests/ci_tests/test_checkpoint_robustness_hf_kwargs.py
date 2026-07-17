@@ -23,10 +23,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import _finish_hf_reload_sync
-from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import _hf_source_load_kwargs
-from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import _prepare_hf_reload_sync
-from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import _wait_for_hf_reload_rank0
+from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_biencoder import (
+    _extract_custom_args as _extract_biencoder_custom_args,
+)
+from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
+    _finish_hf_reload_sync,
+    _hf_source_load_kwargs,
+    _prepare_hf_reload_sync,
+    _wait_for_hf_reload_rank0,
+)
 
 
 def _run_hf_reload_sync_rank(rank, init_path, checkpoint_dir):
@@ -113,3 +118,24 @@ def test_hf_reload_wait_does_not_start_collective_during_rank0_work(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+def test_biencoder_robustness_reads_hf_reload_settings_from_config(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text(
+        "ci:\n"
+        "  checkpoint_robustness:\n"
+        "    check_hf_reload: true\n"
+        "    cosine_threshold: 0.998\n"
+        "    hf_cosine_threshold: 0.997\n"
+        "    dataloader.num_workers: 0\n"
+    )
+
+    custom, remaining = _extract_biencoder_custom_args(["--config", str(config_path)])
+
+    assert custom == {
+        "check_hf_reload": True,
+        "cosine_threshold": "0.998",
+        "hf_cosine_threshold": "0.997",
+    }
+    assert remaining == ["--config", str(config_path), "--dataloader.num_workers", "0"]
