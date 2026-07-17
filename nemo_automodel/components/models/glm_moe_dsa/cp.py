@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Context-parallel helpers for GLM MoE DSA TileLang attention."""
+"""Packed-batch and context-parallel helpers for GLM MoE DSA attention."""
 
 from __future__ import annotations
 
@@ -70,19 +70,25 @@ def _slice_thd_chunk_for_cp(
     padding_token_id: int,
 ) -> dict[str, torch.Tensor]:
     total_tokens = int(chunk["input_ids"].shape[0])
-    query_indices = _contiguous_cp_indices(total_tokens, cp_size, cp_rank, chunk["input_ids"].device)
+    query_indices = (
+        _contiguous_cp_indices(total_tokens, cp_size, cp_rank, chunk["input_ids"].device) if cp_size > 1 else None
+    )
+
+    def select_local(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor if query_indices is None else tensor.index_select(0, query_indices)
 
     out: dict[str, torch.Tensor | int | str | object] = {
-        "input_ids": chunk["input_ids"].index_select(0, query_indices).to(torch.int64).contiguous(),
-        "labels": chunk["labels"].index_select(0, query_indices).to(torch.int64).contiguous(),
-        "position_ids": chunk["position_ids"].index_select(0, query_indices).to(torch.int64).contiguous(),
+        "input_ids": select_local(chunk["input_ids"]).to(torch.int64).contiguous(),
+        "labels": select_local(chunk["labels"]).to(torch.int64).contiguous(),
+        "position_ids": select_local(chunk["position_ids"]).to(torch.int64).contiguous(),
         "cu_seqlens": chunk["cu_seqlens"].to(torch.int32).contiguous(),
         "qkv_format": "thd",
         "cp_size": cp_size,
         "cp_rank": cp_rank,
         "_glm_dsa_cp_group": cp_group,
-        "glm_dsa_cp_query_indices": query_indices.to(torch.int32).contiguous(),
     }
+    if query_indices is not None:
+        out["glm_dsa_cp_query_indices"] = query_indices.to(torch.int32).contiguous()
     if "max_seqlen" in chunk:
         out["max_seqlen"] = chunk["max_seqlen"].to(torch.int32).contiguous()
     if "cu_seqlens_padded" in chunk:
@@ -105,7 +111,7 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
 
     GLM DSA sparse attention gathers K/V activations inside the model. The batch
     side only slices local query tokens and carries the full packed-sequence
-    ``cu_seqlens`` plus per-query global token indices for TileLang's causal
+    ``cu_seqlens`` plus per-query global token indices for the optimized causal
     top-k window.
     """
     del tp_mesh, loss_mask

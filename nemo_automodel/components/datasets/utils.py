@@ -277,7 +277,7 @@ def default_collater(
     return result
 
 
-def packed_sequence_thd_collater(batch):
+def packed_sequence_thd_collater(batch: list[dict] | dict) -> dict:
     """
     Collater for packed sequences in THD (total, hidden, depth) format.
 
@@ -303,7 +303,9 @@ def packed_sequence_thd_collater(batch):
     without requiring the dataset to perform actual sequence packing.
 
     Args:
-        batch (List[dict]): A list of dictionaries, where each dictionary represents one example.
+        batch: A list of example dictionaries, or a pre-batched dictionary whose token tensors
+            have shape ``[batch_size, seq_len]``. The latter supports iterable benchmark datasets
+            used with ``DataLoader(batch_size=None)``.
 
             For pre-packed data, each dictionary should contain:
             - 'input_ids': List[int] - Token IDs for all packed sequences (must be same length across batch)
@@ -347,6 +349,84 @@ def packed_sequence_thd_collater(batch):
         Note: seq_lens and seq_lens_padded are padded with -1000 to handle variable number of
         packed sequences per example. These sentinel values should be filtered out before use.
     """
+    # DataLoader passes a single item directly to collate_fn when batch_size=None. Benchmark
+    # iterable datasets use that mode and already yield [B, S] tensors, so add THD metadata
+    # without trying to stack the dictionary as a list of examples.
+    if isinstance(batch, dict):
+        if not batch:
+            return {}
+
+        input_ids = torch.as_tensor(batch["input_ids"])
+        labels = torch.as_tensor(batch["labels"], device=input_ids.device)
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if labels.ndim == 1:
+            labels = labels.unsqueeze(0)
+        if input_ids.ndim != 2 or labels.shape != input_ids.shape:
+            raise ValueError(
+                "Pre-batched THD input_ids and labels must have matching [batch_size, seq_len] shapes; "
+                f"got input_ids={tuple(input_ids.shape)}, labels={tuple(labels.shape)}."
+            )
+
+        batch_size, seq_len = input_ids.shape
+        position_ids_value = batch.get("position_ids")
+        if position_ids_value is None:
+            position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        else:
+            position_ids = torch.as_tensor(position_ids_value, device=input_ids.device)
+            if position_ids.ndim == 1:
+                position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+            if position_ids.shape != input_ids.shape:
+                raise ValueError(
+                    "Pre-batched THD position_ids must match input_ids shape; "
+                    f"got position_ids={tuple(position_ids.shape)}, input_ids={tuple(input_ids.shape)}."
+                )
+
+        seq_lens_value = batch.get("seq_lens")
+        if seq_lens_value is None:
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is None:
+                actual_seq_lens = torch.full((batch_size,), seq_len, dtype=torch.long, device=input_ids.device)
+            else:
+                attention_mask = torch.as_tensor(attention_mask, device=input_ids.device)
+                if attention_mask.ndim == 1:
+                    attention_mask = attention_mask.unsqueeze(0)
+                if attention_mask.shape != input_ids.shape:
+                    raise ValueError(
+                        "Pre-batched THD attention_mask must match input_ids shape; "
+                        f"got attention_mask={tuple(attention_mask.shape)}, input_ids={tuple(input_ids.shape)}."
+                    )
+                actual_seq_lens = attention_mask.to(torch.long).sum(dim=1)
+            seq_lens = actual_seq_lens.unsqueeze(1)
+        else:
+            seq_lens = torch.as_tensor(seq_lens_value, dtype=torch.long, device=input_ids.device)
+            if seq_lens.ndim == 1:
+                seq_lens = seq_lens.unsqueeze(1) if seq_lens.numel() == batch_size else seq_lens.unsqueeze(0)
+
+        seq_lens_padded_value = batch.get("seq_lens_padded")
+        if seq_lens_padded_value is None:
+            seq_lens_padded = torch.full((batch_size, 1), seq_len, dtype=torch.long, device=input_ids.device)
+        else:
+            seq_lens_padded = torch.as_tensor(seq_lens_padded_value, dtype=torch.long, device=input_ids.device)
+            if seq_lens_padded.ndim == 1:
+                seq_lens_padded = (
+                    seq_lens_padded.unsqueeze(1)
+                    if seq_lens_padded.numel() == batch_size
+                    else seq_lens_padded.unsqueeze(0)
+                )
+
+        result = {
+            "input_ids": input_ids.to(torch.long),
+            "labels": labels.to(torch.long),
+            "position_ids": position_ids.to(torch.long),
+            "seq_lens": seq_lens,
+            "seq_lens_padded": seq_lens_padded,
+            "qkv_format": "thd",
+        }
+        if "mock_data_fingerprint" in batch:
+            result["mock_data_fingerprint"] = str(batch["mock_data_fingerprint"])
+        return result
+
     # Extract and remove padding token metadata if present
     pad_token_ids = None
     if len(batch) > 0 and "___PAD_TOKEN_IDS___" in batch[0]:

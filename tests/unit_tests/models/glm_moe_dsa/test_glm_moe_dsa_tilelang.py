@@ -1149,12 +1149,12 @@ def test_glm_dsa_prepare_model_inputs_for_cp_binds_batch_sharder():
     assert fn.keywords["num_chunks"] == 3
 
 
-def test_glm_dsa_prepare_model_inputs_for_cp_requires_tilelang():
+def test_glm_dsa_prepare_model_inputs_for_cp_requires_packed_backend():
     config = _small_dsa_config()
     backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
     model = GlmMoeDsaForCausalLM(config, backend=backend)
 
-    with pytest.raises(NotImplementedError, match="backend.attn='tilelang'"):
+    with pytest.raises(NotImplementedError, match="backend.attn in"):
         model.prepare_model_inputs_for_cp(input_ids=torch.arange(8).view(1, 8))
 
 

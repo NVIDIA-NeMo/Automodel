@@ -12,37 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Optional GLM-5.2 DSA TileLang kernel dispatch.
+"""Optional GLM-5.2 DSA sparse-kernel dispatch.
 
 The dense torch path in ``layers.py`` (``GlmMoeDsaIndexer`` / ``GlmMoeDsaMLA``)
-is the numerical reference and the default. This module provides the optional
-TileLang-backed sparse path, gated behind ``backend.attn == "tilelang"``:
+is the numerical reference and the default. This module provides optional
+TileLang- and cuDNN-backed sparse paths, selected by ``backend.attn``:
 
 * the fused **lighting indexer** (logits + top-k), and
 * the gather-top-k **sparse MLA** attention (reads only the selected KV; no
   ``[T, T]`` mask is materialized).
 
-The kernels are vendored from THUDM's slime GLM-5.2 plugin under
+The TileLang kernels are vendored from THUDM's slime GLM-5.2 plugin under
 ``nemo_automodel.components.models.glm_moe_dsa.kernels`` (see that package's
-``__init__`` for attribution). They are imported with ``safe_import_from`` so
-environments without ``tilelang`` still import the model and use the torch path.
+``__init__`` for attribution); the cuDNN adapter lives in the same model-owned
+kernel package. Optional entry points are imported with ``safe_import_from`` so
+environments without their dependencies can still import the model and use
+another attention backend.
 
 Mirrors the structure of ``deepseek_v4/optimized_kernels.py``.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 
 from nemo_automodel.components.models.glm_moe_dsa.kernels._tilelang import HAS_TILELANG
 from nemo_automodel.shared.import_utils import safe_import_from
 
-# GLM-5.2 only ever resolves to "torch" or "tilelang" (see ``_dsa_kernel_backend``
-# in ``layers.py``); "auto" is accepted for parity with the V4 dispatcher.
-DsaIndexerBackend = Literal["torch", "tilelang", "auto"]
-DsaSparseAttentionBackend = Literal["torch", "tilelang", "auto"]
+# GLM-5.2 resolves explicit optimized backends in ``_dsa_kernel_backend`` in
+# ``layers.py``; "auto" remains accepted for parity with the V4 dispatcher.
+DsaIndexerBackend = Literal["torch", "tilelang", "cudnn", "auto"]
+DsaSparseAttentionBackend = Literal["torch", "tilelang", "cudnn", "auto"]
 
 _HAS_SLIME_INDEXER, _slime_lighting_indexer = safe_import_from(
     "nemo_automodel.components.models.glm_moe_dsa.kernels.indexer",
@@ -60,6 +62,31 @@ _HAS_SLIME_SPARSE_MLA, _slime_sparse_mla = safe_import_from(
     msg="Vendored slime GLM-5.2 sparse MLA is unavailable. Install tilelang to use backend.attn='tilelang'.",
 )
 
+_CUDNN_DSA_MODULE = "nemo_automodel.components.models.glm_moe_dsa.kernels.cudnn_dsa"
+_HAS_CUDNN_DSA_AVAILABLE, _is_cudnn_dsa_available = safe_import_from(
+    _CUDNN_DSA_MODULE,
+    "is_cudnn_dsa_available",
+    msg="GLM-5.2 cuDNN DSA kernels are unavailable. Install the CUDA optional dependencies to use "
+    "backend.attn='cudnn'.",
+)
+_HAS_CUDNN_INDEXER, _cudnn_indexer_topk = safe_import_from(
+    _CUDNN_DSA_MODULE,
+    "cudnn_indexer_topk",
+    msg="GLM-5.2 cuDNN DSA indexer is unavailable. Install the CUDA optional dependencies to use backend.attn='cudnn'.",
+)
+_HAS_CUDNN_SPARSE_ATTN, _cudnn_sparse_attention = safe_import_from(
+    _CUDNN_DSA_MODULE,
+    "cudnn_sparse_attention",
+    msg="GLM-5.2 cuDNN sparse attention is unavailable. Install the CUDA optional dependencies to use "
+    "backend.attn='cudnn'.",
+)
+_HAS_CUDNN_PACKED_METADATA, _prepare_cudnn_dsa_packed_metadata = safe_import_from(
+    _CUDNN_DSA_MODULE,
+    "prepare_cudnn_dsa_packed_metadata",
+    msg="GLM-5.2 cuDNN packed metadata preparation is unavailable. Install the CUDA optional dependencies to use "
+    "backend.attn='cudnn'.",
+)
+
 
 def is_dsa_kernel_available(name: Literal["indexer", "sparse_attn"]) -> bool:
     """Return whether the optional TileLang kernel package for ``name`` is importable."""
@@ -68,6 +95,105 @@ def is_dsa_kernel_available(name: Literal["indexer", "sparse_attn"]) -> bool:
     if name == "sparse_attn":
         return HAS_TILELANG and _HAS_SLIME_SPARSE_MLA
     raise ValueError(f"Unknown GLM-5.2 DSA kernel name: {name}")
+
+
+def is_cudnn_dsa_available() -> bool:
+    """Return whether all optional cuDNN DSA adapter entry points are available."""
+    return (
+        _HAS_CUDNN_DSA_AVAILABLE
+        and _HAS_CUDNN_INDEXER
+        and _HAS_CUDNN_SPARSE_ATTN
+        and _HAS_CUDNN_PACKED_METADATA
+        and bool(_is_cudnn_dsa_available())
+    )
+
+
+def prepare_cudnn_dsa_packed_metadata(
+    cu_seqlens: torch.Tensor,
+    total_key_tokens: int,
+    max_seqlen: int | torch.Tensor | None = None,
+    *,
+    query_indices: torch.Tensor | None = None,
+    cu_seqlens_padded: torch.Tensor | None = None,
+) -> Any:
+    """Prepare reusable local-query/global-key packed metadata once per stage."""
+    return _prepare_cudnn_dsa_packed_metadata(
+        cu_seqlens,
+        total_key_tokens,
+        max_seqlen,
+        query_indices=query_indices,
+        cu_seqlens_padded=cu_seqlens_padded,
+    )
+
+
+def cudnn_indexer_topk(
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    head_weights: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    index_topk: int,
+    query_indices: torch.Tensor | None = None,
+    cu_seqlens_padded: torch.Tensor | None = None,
+    packed_metadata: Any | None = None,
+) -> torch.Tensor:
+    """Select fixed-width top-k indices with the cuDNN DSA indexer.
+
+    Args:
+        index_q: Contiguous CUDA bfloat16 packed-THD query tensor of shape
+            ``[tokens, index_heads, index_head_dim]``.
+        index_k: Contiguous CUDA bfloat16 packed-THD key tensor of shape
+            ``[tokens, index_head_dim]``.
+        head_weights: Contiguous CUDA FP32 tensor of shape ``[tokens, index_heads]``,
+            scaled by ``index_heads**-0.5 * index_head_dim**-0.5``. The adapter casts
+            it to the kernel dtype without applying any additional scaling.
+        cu_seqlens: CUDA int32 tensor of shape ``[sequences + 1]`` containing
+            cumulative lengths for the compact packed-token layout.
+        index_topk: Fixed number of key indices emitted for every query token.
+        query_indices: Optional CUDA integer tensor of shape ``[tokens]`` containing
+            global query positions. Reserved for context-parallel layouts.
+        cu_seqlens_padded: Optional CUDA int32 tensor of shape ``[sequences + 1]``
+            containing cumulative lengths for a padded packed-token layout.
+        packed_metadata: Optional reusable segmented metadata prepared once for the
+            current packed stage.
+
+    Returns:
+        Contiguous CUDA int32 tensor of shape ``[tokens, 1, index_topk]``. Invalid
+        or causal-masked slots use ``-1``.
+    """
+    return _cudnn_indexer_topk(
+        index_q,
+        index_k,
+        head_weights,
+        cu_seqlens,
+        index_topk,
+        query_indices=query_indices,
+        cu_seqlens_padded=cu_seqlens_padded,
+        packed_metadata=packed_metadata,
+    )
+
+
+def cudnn_sparse_attention(
+    q: torch.Tensor,
+    kv_latent: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    topk_length: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run cuDNN DSA attention on packed latent Q/KV tensors.
+
+    Args:
+        q: Contiguous CUDA bfloat16 packed-query tensor of shape
+            ``[tokens, heads, kv_lora_rank + rope_head_dim]``.
+        kv_latent: Contiguous CUDA bfloat16 packed latent-KV tensor of shape
+            ``[tokens, 1, kv_lora_rank + rope_head_dim]``.
+        topk_indices: Contiguous CUDA int32 tensor of shape ``[tokens, 1, index_topk]``.
+        softmax_scale: MLA attention scale applied to query-key scores.
+        topk_length: Optional int32 valid-prefix lengths of shape ``[tokens]``.
+
+    Returns:
+        CUDA bfloat16 latent-attention tensor of shape ``[tokens, heads, kv_lora_rank]``.
+    """
+    return _cudnn_sparse_attention(q, kv_latent, topk_indices, softmax_scale, topk_length=topk_length)
 
 
 def _all_cuda(*tensors: torch.Tensor) -> bool:
