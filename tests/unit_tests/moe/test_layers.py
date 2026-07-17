@@ -519,20 +519,19 @@ class TestGate:
         assert gate.weight.shape == (moe_config.n_routed_experts, moe_config.dim)
         assert gate.bias is None  # router_bias is False in fixture
 
-    def test_quack_topk_matches_torch_router(self, moe_config, device):
+    def test_quack_softmax_matches_torch_router(self, moe_config, device):
         moe_config.score_func = "softmax"
         moe_config.softmax_before_topk = True
 
-        def fake_quack_topk(scores, k):
-            values, indices = torch.topk(scores, k=k, dim=-1)
-            return values, indices.to(torch.int32)
+        def fake_quack_softmax(scores):
+            return scores.softmax(dim=-1, dtype=torch.float32)
 
         with patch(
             "nemo_automodel.components.moe.layers.safe_import_from",
-            return_value=(True, fake_quack_topk),
+            return_value=(True, fake_quack_softmax),
         ):
-            quack_gate = Gate(moe_config, topk_backend="quack").to(device)
-        torch_gate = Gate(moe_config, topk_backend="torch").to(device)
+            quack_gate = Gate(moe_config, softmax_backend="quack").to(device)
+        torch_gate = Gate(moe_config, softmax_backend="torch").to(device)
         with torch.no_grad():
             quack_gate.weight.normal_(0, 0.02)
         torch_gate.load_state_dict(quack_gate.state_dict())
@@ -546,26 +545,23 @@ class TestGate:
         torch.testing.assert_close(quack_indices, torch_indices)
         assert quack_indices.dtype == torch.int64
 
-    def test_quack_topk_optimizes_normalized_aux_free_router(self, moe_config, device):
+    def test_quack_softmax_preserves_router_gradients(self, moe_config, device):
         moe_config.score_func = "softmax"
         moe_config.softmax_before_topk = True
         moe_config.norm_topk_prob = True
         moe_config.aux_loss_coeff = 0.0
         calls = []
 
-        def fake_quack_topk(scores, k, softmax=False):
-            calls.append(softmax)
-            values, indices = torch.topk(scores, k=k, dim=-1)
-            if softmax:
-                values = values.softmax(dim=-1)
-            return values, indices.to(torch.int32)
+        def fake_quack_softmax(scores):
+            calls.append(scores.shape)
+            return scores.softmax(dim=-1, dtype=torch.float32)
 
         with patch(
             "nemo_automodel.components.moe.layers.safe_import_from",
-            return_value=(True, fake_quack_topk),
+            return_value=(True, fake_quack_softmax),
         ):
-            quack_gate = Gate(moe_config, topk_backend="quack").to(device)
-        torch_gate = Gate(moe_config, topk_backend="torch").to(device)
+            quack_gate = Gate(moe_config, softmax_backend="quack").to(device)
+        torch_gate = Gate(moe_config, softmax_backend="torch").to(device)
         with torch.no_grad():
             quack_gate.weight.normal_(0, 0.02)
         torch_gate.load_state_dict(quack_gate.state_dict())
@@ -577,7 +573,7 @@ class TestGate:
         quack_weights, quack_indices, _ = quack_gate(x_quack, token_mask, cp_mesh=None)
         torch_weights, torch_indices, _ = torch_gate(x_torch, token_mask, cp_mesh=None)
 
-        assert calls == [False]
+        assert calls == [torch.Size([16, moe_config.n_routed_experts])]
         torch.testing.assert_close(quack_weights, torch_weights, atol=2e-3, rtol=2e-3)
         torch.testing.assert_close(quack_indices, torch_indices)
 
@@ -587,10 +583,10 @@ class TestGate:
         torch.testing.assert_close(x_quack.grad, x_torch.grad, atol=2e-3, rtol=2e-3)
         torch.testing.assert_close(quack_gate.weight.grad, torch_gate.weight.grad, atol=2e-3, rtol=2e-3)
 
-    def test_quack_topk_rejects_unsupported_router_mode(self, moe_config):
+    def test_quack_softmax_rejects_unsupported_router_mode(self, moe_config):
         moe_config.score_func = "sigmoid"
         with pytest.raises(ValueError, match="softmax_before_topk=True"):
-            Gate(moe_config, topk_backend="quack")
+            Gate(moe_config, softmax_backend="quack")
 
     def test_gate_init_with_bias(self, moe_config):
         """Test Gate initialization with bias enabled."""

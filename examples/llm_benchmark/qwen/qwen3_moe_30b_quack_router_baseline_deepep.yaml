@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-# Matched baseline for qwen3_moe_30b_quack_selection_deepep.yaml. Auxiliary router
+# Matched baseline for qwen3_moe_30b_quack_softmax_deepep.yaml. Auxiliary router
 # loss is disabled in both recipes so the QuACK case can fuse normalized
 # softmax and top-k without changing the routing contract.
 recipe: BenchmarkingRecipeForNextTokenPrediction
@@ -61,7 +61,7 @@ model:
     rope_fusion: false
     experts: gmm
     dispatcher: deepep
-    router_topk: torch
+    router_softmax: torch
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true

@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-# QuACK linear, RMSNorm, and selection-only top-k routing with selected-logit softmax. Compare
+# QuACK linear, RMSNorm, and router softmax. Compare
 # with qwen3_moe_30b_quack_router_baseline_deepep.yaml under the same image and
 # GPU shape.
 recipe: BenchmarkingRecipeForNextTokenPrediction
@@ -61,7 +61,7 @@ model:
     rope_fusion: false
     experts: gmm
     dispatcher: deepep
-    router_topk: quack
+    router_softmax: quack
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
