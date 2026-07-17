@@ -37,6 +37,7 @@ from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
 from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
+from nemo_automodel.shared.import_utils import safe_import_from
 
 
 class MLP(nn.Module):
@@ -229,6 +230,7 @@ class Gate(nn.Module):
         self,
         config: MoEConfig,
         gate_precision: torch.dtype | None = None,
+        topk_backend: str = "torch",
     ):
         """
         Initializes the Gate module.
@@ -251,6 +253,25 @@ class Gate(nn.Module):
         self.aux_loss_coeff = config.aux_loss_coeff
         self.norm_topk_prob = config.norm_topk_prob
         self.gate_precision = gate_precision
+        self.topk_backend = topk_backend
+        self._quack_topk = None
+        if topk_backend == "quack":
+            if self.score_func != "softmax" or not self.softmax_before_topk:
+                raise ValueError(
+                    "router_topk='quack' currently requires score_func='softmax' and softmax_before_topk=True."
+                )
+            available, quack_topk = safe_import_from(
+                "quack.topk",
+                "topk",
+                msg="router_topk='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
+            )
+            if not available:
+                raise ImportError(
+                    "router_topk='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda]."
+                )
+            self._quack_topk = quack_topk
+        elif topk_backend != "torch":
+            raise ValueError(f"Unsupported router top-k backend: {topk_backend}")
 
         if self.bias_update_factor > 0:
             assert self.train_gate, "Require train_gate to be set to True to apply the bias update"
@@ -329,9 +350,16 @@ class Gate(nn.Module):
             if self.softmax_before_topk:
                 scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
                 original_scores = scores
-                indices = torch.topk(scores, k=self.topk, dim=-1)[1]
+                if self._quack_topk is None:
+                    weights, indices = torch.topk(scores, k=self.topk, dim=-1)
+                else:
+                    weights, indices = self._quack_topk(scores, self.topk)
+                    # QuACK emits compact int32 indices; PyTorch indexing and the
+                    # existing dispatchers consume the torch.topk int64 contract.
+                    indices = indices.to(torch.int64)
                 indices = replay_selection(self.router_replay, indices)
-                weights = scores.gather(1, indices)
+                if self.router_replay is not None:
+                    weights = scores.gather(1, indices)
             else:
                 values, indices = torch.topk(scores, k=self.topk, dim=-1)
                 replayed = replay_selection(self.router_replay, indices)
@@ -638,7 +666,11 @@ class MoE(nn.Module):
         if backend.fake_balanced_gate:
             self.gate = FakeBalancedGate(config, noise=backend.fake_gate_noise)
         else:
-            self.gate = Gate(config, gate_precision=backend.gate_precision)
+            self.gate = Gate(
+                config,
+                gate_precision=backend.gate_precision,
+                topk_backend=backend.router_topk,
+            )
         if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
             warnings.warn(
                 f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "

@@ -84,6 +84,30 @@ class MaskedCrossEntropyConfig(LossConfig):
 
 
 @dataclass
+class QuackCrossEntropyConfig(LossConfig):
+    """``QuackCrossEntropy`` fused CUDA loss.
+
+    Attributes:
+        fp32_upcast: Cast logits to float32 before computing CE.
+        ignore_index: Label value marking padding tokens.
+        reduction: Reduction mode — ``"sum"``, ``"mean"``, or ``"none"``.
+    """
+
+    fp32_upcast: bool = False
+    ignore_index: int = -100
+    reduction: str = "sum"
+
+    def build(self) -> nn.Module:
+        from nemo_automodel.components.loss.quack_ce import QuackCrossEntropy
+
+        return QuackCrossEntropy(
+            fp32_upcast=self.fp32_upcast,
+            ignore_index=self.ignore_index,
+            reduction=self.reduction,
+        )
+
+
+@dataclass
 class FusedLinearCEConfig(LossConfig):
     """``FusedLinearCrossEntropy``.
 
@@ -192,6 +216,7 @@ class LossFromFactoryConfig(LossConfig):
 # Automodel-native path.
 LOSS_CONFIG_REGISTRY: dict[str, type[LossConfig]] = {
     "MaskedCrossEntropy": MaskedCrossEntropyConfig,
+    "QuackCrossEntropy": QuackCrossEntropyConfig,
     "FusedLinearCrossEntropy": FusedLinearCEConfig,
     "TEParallelCrossEntropy": TEParallelCEConfig,
     "KDLoss": KDLossConfig,
@@ -282,6 +307,7 @@ __all__ = [
     "LossConfig",
     "LossFromFactoryConfig",
     "MaskedCrossEntropyConfig",
+    "QuackCrossEntropyConfig",
     "TEParallelCEConfig",
     "build_loss_config",
     "build_loss_module",
