@@ -34,7 +34,7 @@
 
 set -xeuo pipefail
 
-TRANSFORMERS_OFFLINE=1 coverage run \
+TRANSFORMERS_OFFLINE=1 CUDA_LAUNCH_BLOCKING=1 coverage run \
 examples/vlm_finetune/finetune.py \
   --config examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_medpix.yaml \
   --model.pretrained_model_name_or_path $TEST_DATA_DIR/hf_gemma4_e4b_2l/ \
