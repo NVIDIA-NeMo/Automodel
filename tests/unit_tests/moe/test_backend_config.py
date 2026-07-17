@@ -421,8 +421,19 @@ class TestBackendConfigPartialCudaGraphs:
             BackendConfig(attn="te", linear="te", rms_norm="torch", rope_fusion=False, cuda_graph_modules=["attn"])
         with pytest.raises(ValueError, match="requires rms_norm='torch'"):
             BackendConfig(attn="te", linear="torch", rms_norm="te", rope_fusion=False, cuda_graph_modules=["attn"])
-        with pytest.raises(ValueError, match="requires rope_fusion=False"):
-            BackendConfig(attn="te", linear="torch", rms_norm="torch", rope_fusion=True, cuda_graph_modules=["attn"])
+
+    def test_whole_attention_uses_resolved_rope_fusion_value(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            config = BackendConfig(
+                attn="te",
+                linear="torch",
+                rms_norm="torch",
+                rope_fusion=True,
+                cuda_graph_modules=["attn"],
+            )
+
+        assert config.rope_fusion is False
+        assert config.cuda_graph_modules == ["attn"]
 
     def test_preprocess_requires_router_and_hybridep(self):
         with pytest.raises(ValueError, match="requires 'moe_router'"):
