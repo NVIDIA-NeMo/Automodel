@@ -145,5 +145,23 @@ ci:
     distributed.ep_size: 8
     optimizer.lr: 1e-5
     checkpoint.enabled: false
-    dataset.paths: /home/TestData/automodel/mcore_dataset_fineweb/processed_data_0_text_document
-    validation_dataset.paths: /home/TestData/automodel/mcore_dataset_fineweb/processed_data_0_text_document
+    dataset:
+      _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+      vocab_size: 1024
+      seq_len: 1024
+      num_samples: 16
+      batch_size: 2
+    dataloader:
+      _target_: torch.utils.data.DataLoader
+      batch_size: null
+      num_workers: 0
+    validation_dataset:
+      _target_: nemo_automodel.components.datasets.llm.mock_iterable_dataset.MockIterableDataset
+      vocab_size: 1024
+      seq_len: 1024
+      num_samples: 4
+      batch_size: 2
+    validation_dataloader:
+      _target_: torch.utils.data.DataLoader
+      batch_size: null
+      num_workers: 0
