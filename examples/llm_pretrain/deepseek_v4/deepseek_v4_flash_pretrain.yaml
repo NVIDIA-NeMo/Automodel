@@ -133,7 +133,7 @@ ci:
   recipe_owner: akoumpa
   nodes: 2
   time: "00:30:00"
-  cluster_tag: eos
+  cluster_tag: h100
   env_vars:
     REQUIRE_FINITE_METRICS: "true"
   nightly:
