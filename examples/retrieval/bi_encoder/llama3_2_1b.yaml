@@ -150,4 +150,7 @@ ci:
   recipe_owner: oliverholworthy
   time: "01:30:00"
   nodes: 1
+  nightly:
+    # Keep warmup below the 50-step nightly CI limit.
+    lr_scheduler.lr_warmup_steps: 2
   embed_eval: true
