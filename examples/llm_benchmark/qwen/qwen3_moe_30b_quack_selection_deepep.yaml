@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-# QuACK linear, RMSNorm, and top-k routing with selected-logit softmax. Compare
+# QuACK linear, RMSNorm, and selection-only top-k routing with selected-logit softmax. Compare
 # with qwen3_moe_30b_quack_router_baseline_deepep.yaml under the same image and
 # GPU shape.
 recipe: BenchmarkingRecipeForNextTokenPrediction
