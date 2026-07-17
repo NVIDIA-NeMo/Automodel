@@ -229,10 +229,11 @@ jobs:
           REGISTRY_AWS: ${{ env.container-registry }}
           REGISTRY_GCP: ${{ env.container-registry-gb200 }}
           IS_MEMBER: ${{ needs.pre-flight.outputs.is_member }}
+          DISABLE_GB200_TESTS: ${{ vars.DISABLE_GB200_TESTS }}
         run: |
           AWS_ENTRY=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "${RUNNER_PREFIX}" \
             '{"cloud": "aws", "registry": $registry, "runner": $runner}')
-          if [[ "$IS_MEMBER" == "true" ]]; then
+          if [[ "$IS_MEMBER" == "true" && "$DISABLE_GB200_TESTS" != "true" ]]; then
             GCP_ENTRY=$(jq -nc --arg registry "$REGISTRY_GCP" --arg runner "nemo-ci-gcp-gpu-x2" \
               '{"cloud": "gcp", "registry": $registry, "runner": $runner}')
             MATRIX=$(jq -nc --argjson aws "$AWS_ENTRY" --argjson gcp "$GCP_ENTRY" \
@@ -548,6 +549,7 @@ jobs:
       )
       && !cancelled()
       && needs.pre-flight.outputs.is_member == 'true'
+      && vars.DISABLE_GB200_TESTS != 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -591,8 +593,9 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
           IS_MEMBER: ${{ needs.pre-flight.outputs.is_member }}
+          DISABLE_GB200_TESTS: ${{ vars.DISABLE_GB200_TESTS }}
         run: |
-          if [[ "$IS_MEMBER" == "true" ]]; then
+          if [[ "$IS_MEMBER" == "true" && "$DISABLE_GB200_TESTS" != "true" ]]; then
             FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
           else
             FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and (.name | startswith("gb200_") | not))] | length') || echo 0
