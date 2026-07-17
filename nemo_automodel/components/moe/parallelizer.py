@@ -808,10 +808,16 @@ def parallelize_model(
     else:
         ep_shard_mesh = None
 
-    from nemo_automodel.components.distributed.mesh_utils import get_submesh as _get_submesh
+    from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh, get_submesh
 
-    fsdp_enabled = dp_axis_names is not None and _get_submesh(world_mesh, tuple(dp_axis_names)).size() > 1
-    fsdp_mesh = _get_submesh(world_mesh, tuple(dp_axis_names)) if fsdp_enabled else None
+    axis_names = tuple(dp_axis_names or ())
+    # HSDP combines a native replica axis with a flattened shard/CP axis.
+    # Keep their common root mesh so FSDP retains the replica process group.
+    if axis_names == ("dp_replicate", "dp_shard_cp"):
+        fsdp_mesh = get_fsdp_dp_mesh(world_mesh, *axis_names)
+    else:
+        fsdp_mesh = get_submesh(world_mesh, axis_names) if axis_names else None
+    fsdp_enabled = fsdp_mesh is not None and fsdp_mesh.size() > 1
     if fsdp_enabled:
         apply_fsdp(
             model,
