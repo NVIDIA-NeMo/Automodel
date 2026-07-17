@@ -130,6 +130,12 @@ def test_gemma4_dynamic_class_blocks_static_access():
         cls.ModelCapabilities  # noqa: B018  -- attribute access is the test
 
 
+def test_llama_declares_context_parallel_support():
+    """The shipped Llama CP KD example requires the static capability flag."""
+    cls = ModelRegistry.get_model_cls_from_model_arch("LlamaForCausalLM")
+    assert cls.ModelCapabilities().supports_cp is True
+
+
 # ---------------------------------------------------------------------------
 # 3. query_capabilities canonical-type & dispatch behavior
 # ---------------------------------------------------------------------------
