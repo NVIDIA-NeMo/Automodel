@@ -190,9 +190,34 @@ def _resolve_source_load_dtype(model_kwargs: dict) -> torch.dtype:
     return torch_dtype
 
 
+def _get_trust_remote_code_attn_implementation(
+    pretrained_model_name_or_path: str | Path,
+    *,
+    revision: str | None = None,
+    token: str | bool | None = None,
+) -> str:
+    """Select the vanilla-HF attention implementation for a remote-code model."""
+    from transformers import AutoConfig
+
+    config_kwargs: dict[str, str | bool] = {"trust_remote_code": True}
+    if revision is not None:
+        config_kwargs["revision"] = revision
+    if token is not None:
+        config_kwargs["token"] = token
+    config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
+
+    # Nemotron-H remote-code checkpoints do not share optimized attention backend
+    # support: FlashAttention fails in Nemotron-3 Super's varlen path, while
+    # Nemotron-Nano v2 declares SDPA unsupported. Eager is their common HF
+    # reference path. Other remote-code models (notably Nemotron-Flash) still
+    # require FA2.
+    return "eager" if config.model_type == "nemotron_h" else "flash_attention_2"
+
+
 def _hf_source_load_kwargs(
     model_kwargs: dict,
     *,
+    pretrained_model_name_or_path: str | Path,
     source_dtype: torch.dtype,
     trust_remote_code: bool,
     experts_implementation: str | None,
@@ -211,8 +236,12 @@ def _hf_source_load_kwargs(
     hf_kwargs = {k: v for k, v in model_kwargs.items() if k in hf_allowed_keys}
     hf_kwargs["torch_dtype"] = source_dtype
     hf_kwargs["trust_remote_code"] = trust_remote_code or bool(hf_kwargs.get("trust_remote_code", False))
-    if trust_remote_code and "attn_implementation" not in hf_kwargs:
-        hf_kwargs["attn_implementation"] = "flash_attention_2"
+    if hf_kwargs["trust_remote_code"] and "attn_implementation" not in hf_kwargs:
+        hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(
+            pretrained_model_name_or_path,
+            revision=hf_kwargs.get("revision"),
+            token=hf_kwargs.get("token"),
+        )
     if experts_implementation and not trust_remote_code:
         hf_kwargs["experts_implementation"] = experts_implementation
         hf_kwargs["trust_remote_code"] = False
@@ -344,6 +373,56 @@ def _cleanup_source_load_sync(cfg) -> None:
         pass
 
 
+def _hf_reload_sync_paths(cfg) -> tuple[Path, Path]:
+    """Return sync directory and done path for the rank-0-only HF reload."""
+    checkpoint_dir = Path(cfg.checkpoint.checkpoint_dir)
+    sync_dir = checkpoint_dir.parent / f".hf_reload_{_source_load_run_id()}"
+    return sync_dir, sync_dir / "done"
+
+
+def _wait_for_hf_reload_rank0(done_path: Path) -> None:
+    """Wait without an active collective for rank 0 to finish the vanilla-HF reload."""
+    timeout_s = int(os.environ.get("HF_RELOAD_TIMEOUT_SECONDS", "1800"))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if done_path.exists():
+            return
+        time.sleep(5)
+    raise TimeoutError(f"Timed out waiting {timeout_s}s for rank 0 vanilla-HF reload")
+
+
+def _prepare_hf_reload_sync(cfg) -> tuple[Path, Path] | None:
+    """Prepare ranks for a long rank-0-only HF reload without starting an NCCL wait."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return None
+
+    sync_dir, done_path = _hf_reload_sync_paths(cfg)
+    if _rank0():
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        done_path.unlink(missing_ok=True)
+    _barrier()  # ensure all ranks released recipe memory and rank 0 reset the marker
+    if not _rank0():
+        _wait_for_hf_reload_rank0(done_path)
+    return sync_dir, done_path
+
+
+def _finish_hf_reload_sync(sync_paths: tuple[Path, Path] | None) -> None:
+    """Release waiting ranks and synchronize after the rank-0-only HF reload."""
+    if sync_paths is None:
+        return
+
+    sync_dir, done_path = sync_paths
+    if _rank0():
+        done_path.write_text("ok\n")
+    _barrier()
+    if _rank0():
+        done_path.unlink(missing_ok=True)
+        try:
+            sync_dir.rmdir()
+        except OSError:
+            pass
+
+
 def _prepare_source_load_reference(
     cfg,
     input_ids: list[int],
@@ -412,6 +491,7 @@ def _prepare_source_load_reference_rank0(
     device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
     hf_kwargs = _hf_source_load_kwargs(
         model_kwargs,
+        pretrained_model_name_or_path=original_pretrained_path,
         source_dtype=source_dtype,
         trust_remote_code=trust_remote_code,
         experts_implementation=experts_implementation,
@@ -936,7 +1016,7 @@ def test_checkpoint_robustness():
     # Phase 4: Load into vanilla HF (rank 0 only)
     _release_recipe_memory(restored_trainer)
     del restored_trainer
-    _barrier()  # ensure all ranks free memory before rank 0 loads HF model
+    hf_reload_sync_paths = _prepare_hf_reload_sync(cfg)
 
     if skip_hf_reload:
         if _rank0():
@@ -960,13 +1040,12 @@ def test_checkpoint_robustness():
             _no_meta = nullcontext()
 
         hf_kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code)
-        # Nemotron-Flash's config ships ``attn_implementation="fused_mha"`` which
-        # transformers 5.x rejects in ``_check_and_adjust_attn_implementation``
-        # (only ``eager`` + registered ALL_ATTENTION_FUNCTIONS keys are accepted).
-        # Force a universally accepted impl; Nemotron-Flash routes
-        # ``flash_attention_2`` through its own fused path internally.
+        # Remote-code models can ship attention names that transformers 5.x
+        # rejects. Select a supported implementation while keeping Nemotron-H
+        # off HF's incompatible FlashAttention varlen path.
         if trust_remote_code and "attn_implementation" not in hf_kwargs:
-            hf_kwargs["attn_implementation"] = "flash_attention_2"
+            config_path = original_pretrained_path if is_peft else consolidated_dir
+            hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(config_path)
         if experts_implementation and not trust_remote_code:
             hf_kwargs["experts_implementation"] = experts_implementation
             hf_kwargs["trust_remote_code"] = False
@@ -1066,7 +1145,7 @@ def test_checkpoint_robustness():
             f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
         )
 
-    _barrier()
+    _finish_hf_reload_sync(hf_reload_sync_paths)
 
     # Phase 5 (optional): Cross-TP — reload consolidated with a different TP size
     if cross_tp_size > 0 and not is_peft:

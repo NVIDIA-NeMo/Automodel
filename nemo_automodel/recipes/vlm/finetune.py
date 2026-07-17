@@ -37,7 +37,6 @@ import torch.nn as nn
 import wandb
 from torch.utils.data import DataLoader
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from nemo_automodel._transformers import (
@@ -47,9 +46,7 @@ from nemo_automodel._transformers import (
 )
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
-from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS
-from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp, wrap_vlm_collate_for_pp
+from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -148,46 +145,61 @@ def build_model(
 
             kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
 
-        # Check if using NeMoAutoModel
-        is_nemo_auto_model = cfg_model.get("_target_", None) in (
-            NeMoAutoModelForImageTextToText.from_config,
-            NeMoAutoModelForImageTextToText.from_pretrained,
-            NeMoAutoModelForMultimodalLM.from_config,
-            NeMoAutoModelForMultimodalLM.from_pretrained,
-            NeMoAutoModelForCausalLM.from_config,
-            NeMoAutoModelForCausalLM.from_pretrained,
-        )
-
-        # The Gemma4 base + drafter composite loads its sub-models via the
-        # NeMoAuto paths internally, so it gets the same infrastructure kwargs.
-        is_joint_composite = _is_gemma4_joint_target(cfg_model.get("_target_", None))
-
-        if is_nemo_auto_model or is_joint_composite:
+        if _is_recipe_target(cfg_model.get("_target_", None)):
             model = cfg_model.instantiate(**kwargs)
         else:
             raise ValueError(
-                f"VLM finetuning requires NeMoAutoModelForImageTextToText. "
+                "VLM finetuning requires a recipe-compatible model target. "
+                "Add the entrypoint to `_accepted_targets()` in this module "
+                "if you're onboarding a new wrapper that absorbs the recipe's "
+                "infrastructure kwargs. "
                 f"Got model target: {cfg_model.get('_target_', None)}"
             )
     return model
 
 
-def _is_gemma4_joint_target(target) -> bool:
-    """Return True if ``target`` is :meth:`Gemma4WithDrafter.from_pretrained`.
+def _accepted_targets() -> set:
+    """Return the set of model ``_target_`` callables this recipe accepts.
 
-    Imported lazily so the optional ``transformers.models.gemma4_assistant``
-    dependency only fires when a joint recipe is actually requested.
+    These are the wrapper-layer entrypoints that know how to absorb the
+    recipe's infrastructure kwargs (``device_mesh``, ``distributed_config``,
+    ``peft_config``, ``freeze_config``, ``pipeline_config``, plus the
+    optional ``moe_config`` / ``fp8_config`` / ``compile_config``). Anything
+    not on this list is rejected with a clear error -- vanilla
+    ``transformers.AutoModelFor*`` does not handle these kwargs and would
+    otherwise fail deep inside HF code.
+
+    New infra-aware composites (e.g. Gemma4WithDrafter) opt in by adding their ``.from_pretrained``
+    (and ``.from_config`` if applicable) here.
+
+    The Gemma4 joint composite is added behind a try/except because it
+    requires the optional ``transformers.models.gemma4_assistant`` module
+    that ships with ``transformers>=5.8.0.dev``.
     """
-    if target is None:
-        return False
+    accepted = {
+        NeMoAutoModelForCausalLM.from_pretrained,
+        NeMoAutoModelForCausalLM.from_config,
+        NeMoAutoModelForImageTextToText.from_pretrained,
+        NeMoAutoModelForImageTextToText.from_config,
+        NeMoAutoModelForMultimodalLM.from_pretrained,
+        NeMoAutoModelForMultimodalLM.from_config,
+    }
     try:
         from nemo_automodel.components.models.gemma4_drafter.composite import (
             Gemma4WithDrafter,
         )
+
+        accepted.add(Gemma4WithDrafter.from_pretrained)
     except ImportError:
+        pass
+    return accepted
+
+
+def _is_recipe_target(target) -> bool:
+    """True if ``target`` is on this recipe's allowlist of model entrypoints."""
+    if target is None:
         return False
-    # Bound classmethods are not identity-stable across accesses; compare via ==.
-    return target == Gemma4WithDrafter.from_pretrained
+    return target in _accepted_targets()
 
 
 def _shift_labels_left(labels: torch.Tensor, k: int) -> torch.Tensor:
@@ -271,224 +283,50 @@ def build_dataloader(
     Returns:
         The instantiated DataLoader and processor.
     """
-    dist_sampler_kwargs = {
-        "shuffle": cfg_dl.get("shuffle", True),
-    }
+    warnings.warn(
+        "build_dataloader is deprecated; resolve RecipeConfig.vlm_dataloader and call its build() method",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    config = RecipeConfig.resolve_vlm_dataloader(
+        cfg_ds,
+        cfg_dl,
+        processor_node=cfg_processor,
+        packed_sequence_node=cfg_ps,
+    )
+    dp_rank = 0
+    dp_world_size = 1
+    cp_size = 1
     if device_mesh is not None:
         from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 
         dp_mesh = get_flat_mesh(device_mesh, "dp")
-        dist_sampler_kwargs |= {
-            "num_replicas": dp_mesh.size(),
-            "rank": dp_mesh.get_local_rank(),
-        }
+        dp_rank = dp_mesh.get_local_rank()
+        dp_world_size = dp_mesh.size()
+        if "cp" in getattr(device_mesh, "mesh_dim_names", ()):
+            cp_size = device_mesh["cp"].size()
+
+    from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+
+    packing_attn_implementation = config.resolve_packing_attn_implementation(
+        model_attn_implementation=get_attn_implementation(cfg_model),
+        cp_size=cp_size,
+    )
+    if config.packing is not None and config.packing.packing_format != "thd":
+        configure_packing(attn_implementation=packing_attn_implementation)
 
     with ScopedRNG(seed=seed, ranked=True):
-        processor = None
-        processor_kwargs = {}
-
-        with FirstRankPerNode():
-            # Ensure the processor has a _target_ attribute too
-            if (
-                cfg_processor is not None
-                and hasattr(cfg_processor, "instantiate")
-                and hasattr(cfg_processor, "_target_")
-            ):
-                processor = cfg_processor.instantiate()
-            elif cfg_processor is not None:
-                processor_kwargs = cfg_processor.to_dict()
-
-            # If no processor was instantiated, try AutoProcessor
-            if processor is None:
-                try:
-                    processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
-                except Exception as e:
-                    # AutoProcessor.from_pretrained internally loads AutoConfig. Configs
-                    # whose layer_types length differs from num_hidden_layers trip
-                    # validate_layer_type. The processor itself doesn't depend on
-                    # layer_types, so relax the validator and retry once before giving up.
-                    err = str(e)
-                    if "num_hidden_layers" in err and ("layer_types" in err or "layer types" in err):
-                        from nemo_automodel._transformers.v4_patches.layer_types import (
-                            relax_layer_types_validator,
-                        )
-
-                        relax_layer_types_validator()
-                        try:
-                            processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, **processor_kwargs)
-                        except Exception as retry_exc:
-                            processor = None
-                            logging.warning(
-                                f"AutoProcessor not available for {pretrained_model_name_or_path} ({retry_exc}). "
-                            )
-                    else:
-                        # Some models do not provide an AutoProcessor
-                        processor = None
-                        logging.warning(f"AutoProcessor not available for {pretrained_model_name_or_path} ({e}). ")
-
-            chat_template_raw = cfg_ds.__dict__.pop("chat_template", None)
-            # Update chat_template if chat_template is given
-            if chat_template_raw is not None and processor is not None:
-                processor.chat_template = _resolve_chat_template(chat_template_raw)
-                processor.tokenizer.chat_template = processor.chat_template
-
-            _path_or_ds = getattr(cfg_ds, "path_or_dataset", None) or cfg_ds.get("path_or_dataset", None)
-            if _path_or_ds is not None:
-                ds = cfg_ds.instantiate(path_or_dataset=_path_or_ds)
-            else:
-                ds = cfg_ds.instantiate()
-
-        # Resolve packing config: top-level packed_sequence (LLM-style) takes
-        # precedence over legacy dataset.packing (backward compat).
-        if cfg_ps is not None:
-            _ps_enabled = getattr(cfg_ps, "pack_size", 0) > 0
-            packing_cfg = cfg_ps if _ps_enabled else None
-            pretokenize = getattr(cfg_ps, "pretokenize", _ps_enabled)
-            max_length = getattr(cfg_ps, "max_length", None)
-        else:
-            _legacy = cfg_ds.get("packing", None)
-            _ps_enabled = _legacy is not None and _legacy.get("enabled", False)
-            packing_cfg = _legacy if _ps_enabled else None
-            max_length = cfg_ds.get("max_length", None)
-            pretokenize = cfg_ds.get("pretokenize", max_length is not None)
-
-        if pretokenize:
-            from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
-            from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapper
-
-            ds_raw = ds
-            truncate = cfg_ds.get("truncate", max_length is not None)
-
-            post_tokenize_hook = cfg_ps.get("post_tokenize_hook_fn", None) if cfg_ps is not None else None
-
-            ds = PreTokenizedDatasetWrapper(
-                ds_raw,
-                processor,
-                max_length=max_length,
-                truncate=truncate,
-                post_tokenize_hook=post_tokenize_hook,
-                inject_fake_images=cfg_ds.get("inject_fake_images", True),
-            )
-
-            if packing_cfg:
-                from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
-                from nemo_automodel.components.datasets.vlm.neat_packing_vlm import neat_pack_dataset_vlm
-                from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
-
-                ds = neat_pack_dataset_vlm(
-                    ds,
-                    pack_size=packing_cfg.get("pack_size", max_length),
-                    padding_idx=getattr(processor.tokenizer, "pad_token_id", 0) or 0,
-                    drop_long_samples=packing_cfg.get("drop_long_samples", True),
-                    max_packs=packing_cfg.get("max_packs", None),
-                    ds_raw=ds_raw,
-                    packing_ratio=packing_cfg.get("packing_ratio", 1.0),
-                    processor=processor,
-                    balance_media_tokens=packing_cfg.get("balance_media_tokens", True),
-                    get_rope_index=get_rope_index,
-                )
-                _pad_id = getattr(processor.tokenizer, "pad_token_id", 0) or 0
-                _collate_max_length = packing_cfg.get("collate_max_length", None)
-                # ``packing_format`` selects the packed collater. "neat" (default) keeps the
-                # HF flash-attention indexed-mask path below; "thd" emits Transformer Engine
-                # THD (qkv_format=thd, seq_lens) for models that declare supports_thd (e.g.
-                # Qwen3-VL-MoE) and is converted downstream by process_input_for_thd. THD
-                # carries document boundaries in seq_lens, so it needs neither the indexed
-                # attention mask nor configure_packing's HF unpad/mask patches.
-                _packing_format = packing_cfg.get("packing_format", "neat")
-                if _packing_format == "thd":
-                    from nemo_automodel.components.datasets.vlm.collate_fns import (
-                        packed_sequence_thd_vlm_collater,
-                    )
-
-                    logging.info("Configured VLM THD packing (Transformer Engine, qkv_format=thd)")
-                    collate_fn = lambda examples, _pi=_pad_id, _ml=_collate_max_length: (
-                        packed_sequence_thd_vlm_collater(
-                            examples,
-                            padding_idx=_pi,
-                            max_length=_ml,
-                        )
-                    )
-                else:
-                    # The packed collater builds a dense [B, 1, S, S] block-causal mask for
-                    # sdpa/eager but keeps a cheap indexed [B, S] mask for flash_attention_2.
-                    # At long context (e.g. 128k) the dense mask is ~S^2 bytes/sample and
-                    # OOMs the dataloader workers. ``packed_sequence.attn_implementation``
-                    # overrides the mask form: set it to "flash_attention_2" for
-                    # context-parallel runs, where the attention mask is stripped before the
-                    # model anyway (document boundaries are recovered from position_ids), so
-                    # the indexed form is both sufficient and orders of magnitude cheaper.
-                    # Attn computation still uses the model's backend; the attn_implementation
-                    # attribute in packing_cfg only switches the collater mask format. It is
-                    # therefore only safe to diverge from the model backend when cp>1, where the
-                    # mask is stripped before the model. Without CP the collater mask must match
-                    # the model backend, so ignore the override (and warn) and fall back to it.
-                    cp_size = (
-                        device_mesh["cp"].size()
-                        if device_mesh is not None and "cp" in getattr(device_mesh, "mesh_dim_names", ())
-                        else 1
-                    )
-                    _model_attn_impl = get_attn_implementation(cfg_model)
-                    _pack_attn_override = packing_cfg.get("attn_implementation", None)
-                    if _pack_attn_override is not None and cp_size > 1:
-                        _attn_impl = _pack_attn_override
-                    else:
-                        if _pack_attn_override not in (None, _model_attn_impl):
-                            logging.warning(
-                                "Ignoring packed_sequence.attn_implementation=%r at cp_size=1: the packed "
-                                "mask format must match the model attention backend (%r) when the mask is "
-                                "not stripped by context parallelism.",
-                                _pack_attn_override,
-                                _model_attn_impl,
-                            )
-                        _attn_impl = _model_attn_impl
-
-                    configure_packing(attn_implementation=_attn_impl)
-                    logging.info(f"Configured VLM neat packing for attn_implementation={_attn_impl}")
-
-                    collate_fn = lambda examples, _pi=_pad_id, _ml=_collate_max_length, _ai=_attn_impl: (
-                        neat_packed_vlm_collater(
-                            examples,
-                            padding_idx=_pi,
-                            max_length=_ml,
-                            attn_implementation=_ai,
-                        )
-                    )
-            else:
-                collate_cfg = cfg_dl.get("collate_fn", None)
-                if collate_cfg:
-                    collate_fn = lambda examples: collate_cfg.instantiate(examples=examples, processor=processor)
-                else:
-                    collate_fn = lambda examples: pad_collate_fn(examples, processor)
-
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                ds,
-                **dist_sampler_kwargs,
-            )
-        else:
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                ds,
-                **dist_sampler_kwargs,
-            )
-            collate_cfg = cfg_dl.get("collate_fn", None)
-            if collate_cfg:
-                collate_fn = lambda examples: collate_cfg.instantiate(examples=examples, processor=processor)
-            else:
-                processor_type = type(processor).__name__
-                if processor_type not in COLLATE_FNS:
-                    logging.warning(f"You are using {processor_type} with default collate function.")
-                    processor_type = "default"
-                collate_fn = lambda examples: COLLATE_FNS[processor_type](examples, processor)
-
-        if hasattr(ds, "robust_collate"):
-            collate_fn = ds.robust_collate(collate_fn)
-
-        if pp_n_microbatches is not None:
-            collate_fn = wrap_vlm_collate_for_pp(collate_fn, n_microbatches=pp_n_microbatches)
-
-        return cfg_dl.instantiate(
-            dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
-        ), processor
+        result = config.build(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            batch_size=local_batch_size,
+            dataset_build_context=FirstRankPerNode(),
+            get_rope_index=get_rope_index,
+            packing_attn_implementation=packing_attn_implementation,
+            pp_n_microbatches=pp_n_microbatches,
+        )
+    return result.dataloader, result.processor
 
 
 def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
@@ -710,33 +548,45 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.pp_enabled and not pp_cp_preembed:
             pp_n_microbatches = self.pp.pp_batch_size // self.pp.pp_microbatch_size
 
-        self.dataloader, self.processor = build_dataloader(
-            self.cfg.dataset,
-            self.cfg.dataloader,
-            _get_model_name(self.cfg.model),
-            self.cfg.get("processor", None),
-            device_mesh=self.device_mesh,
-            seed=self.cfg.get("seed", 42),
-            local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-            cfg_model=self.cfg.model,
-            cfg_ps=self.cfg.get("packed_sequence", None),
-            get_rope_index=get_rope_index,
-            pp_n_microbatches=pp_n_microbatches,
+        dataloader_config = self.cfg.vlm_dataloader
+        if dataloader_config is None:
+            raise ValueError("VLM training requires a dataset config")
+        from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+
+        packing_attn_implementation = dataloader_config.resolve_packing_attn_implementation(
+            model_attn_implementation=get_attn_implementation(self.cfg.model),
+            cp_size=self.mesh_context.cp_size,
         )
+        if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
+            configure_packing(attn_implementation=packing_attn_implementation)
+        with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
+            dataloader_build = dataloader_config.build(
+                pretrained_model_name_or_path=_get_model_name(self.cfg.model),
+                dp_rank=self._get_dp_rank(),
+                dp_world_size=self._get_dp_group_size(),
+                batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                dataset_build_context=FirstRankPerNode(),
+                get_rope_index=get_rope_index,
+                packing_attn_implementation=packing_attn_implementation,
+                pp_n_microbatches=pp_n_microbatches,
+            )
+        self.dataloader = dataloader_build.dataloader
+        self.processor = dataloader_build.processor
 
         # Build validation dataloader if the config provides it
         self.val_dataloader = None
-        if "validation_dataset" in self.cfg:
-            self.val_dataloader, _ = build_dataloader(
-                self.cfg.validation_dataset,
-                self.cfg.validation_dataloader,
-                _get_model_name(self.cfg.model),
-                self.cfg.get("processor", None),
-                device_mesh=self.device_mesh,
-                seed=self.cfg.get("seed", 42),
-                local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                get_rope_index=get_rope_index,
-            )
+        validation_config = self.cfg.vlm_validation_dataloader
+        if validation_config is not None:
+            with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
+                validation_build = validation_config.build(
+                    pretrained_model_name_or_path=_get_model_name(self.cfg.model),
+                    dp_rank=self._get_dp_rank(),
+                    dp_world_size=self._get_dp_group_size(),
+                    batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
+                    dataset_build_context=FirstRankPerNode(),
+                    get_rope_index=get_rope_index,
+                )
+            self.val_dataloader = validation_build.dataloader
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
         # Scheduler
@@ -938,21 +788,18 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 self.model_parts[0], batch
             )  # pragma: no cover - requires GPU + magi_attention
         elif batch.get("qkv_format", None) == "thd":
-            # THD packed VLM path (packing_format="thd"): convert BSHD -> THD
-            # (flatten token axes, build cu_seqlens from seq_lens) via Transformer
-            # Engine even without context parallelism. process_input_for_thd passes
-            # media tensors (pixel_values / image_grid_thw / ...) through unchanged.
+            # THD packed VLM inputs use TE sequence metadata even without context parallelism.
             if self.mesh_context.cp_size > 1:
                 raise NotImplementedError(
                     "THD packing (packing_format='thd') for VLM currently supports cp_size=1 only; "
                     "context-parallel THD for mRoPE VLMs is not yet implemented."
                 )
-            _pad_id = getattr(getattr(self.processor, "tokenizer", None), "pad_token_id", 0) or 0
+            padding_id = getattr(getattr(self.processor, "tokenizer", None), "pad_token_id", 0) or 0
             train_ctx, batch = make_cp_batch_and_ctx(
                 self.device_mesh,
                 batch,
                 use_te=True,
-                padding_token_id=_pad_id,
+                padding_token_id=padding_id,
             )
         else:
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)

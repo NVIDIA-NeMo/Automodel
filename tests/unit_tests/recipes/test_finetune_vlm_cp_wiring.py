@@ -463,11 +463,24 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
         ),
     )
 
-    def _build_dataloader(*args, **kwargs):
+    def _build_dataloader(**kwargs):
         dataloader_calls.append(kwargs)
-        return "dl", "processor"
+        return SimpleNamespace(dataloader="dl", processor="processor")
 
-    monkeypatch.setattr(vlm_finetune, "build_dataloader", _build_dataloader)
+    loader_config = SimpleNamespace(
+        packing=None,
+        resolve_packing_attn_implementation=lambda **kwargs: None,
+        build=_build_dataloader,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.vlm_dataloader",
+        property(lambda self: loader_config),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.vlm_validation_dataloader",
+        property(lambda self: None),
+    )
+    monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
         "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
         lambda self, *args, **kwargs: SimpleNamespace(step=0, epoch=0, epochs=[]),

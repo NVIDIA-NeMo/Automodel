@@ -96,8 +96,11 @@ def test_forward_returns_finite_loss_and_grads_flow_to_draft():
     assert torch.isfinite(out.loss) and out.loss.item() > 0
     assert 0.0 <= out.accuracy.item() <= 1.0
     assert out.valid_tokens.item() > 0
+    assert out.loss_weight.item() == out.valid_tokens.item()
     # accept_len includes the always-accepted anchor (+1) and is capped at block_size.
     assert 1.0 <= out.accept_len.item() <= BLOCK_SIZE
+    torch.testing.assert_close(out.accuracy, out.correct_tokens / out.valid_tokens)
+    torch.testing.assert_close(out.accept_len, out.accept_len_sum / out.valid_blocks)
     out.loss.backward()
     grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
     assert grad > 0
