@@ -351,10 +351,10 @@ class Gate(nn.Module):
             if self.softmax_before_topk:
                 # When the selected probabilities are normalized again, full
                 # softmax followed by top-k is exactly softmax over the top-k
-                # logits. QuACK can fuse those operations and avoid materializing
+                # logits. QuACK can select directly from logits and avoid materializing
                 # the full fp32 probability matrix. Auxiliary-loss and replay
                 # paths still need that matrix, so retain the conventional path.
-                use_fused_quack_topk = (
+                use_optimized_quack_topk = (
                     self._quack_topk is not None
                     and self.norm_topk_prob
                     and self.topk > 1
@@ -362,12 +362,13 @@ class Gate(nn.Module):
                     and not self._track_load_balance
                     and self.router_replay is None
                 )
-                if use_fused_quack_topk:
+                if use_optimized_quack_topk:
                     # Full softmax followed by normalized top-k is exactly a
-                    # softmax over the selected logits. Keep that tiny softmax
-                    # in fp32 for stable autograd while QuACK selects the logits.
-                    weights, indices = self._quack_topk(scores, self.topk)
-                    weights = weights.float().softmax(dim=-1)
+                    # softmax over the selected logits. QuACK only chooses the
+                    # experts; gather keeps gradients on PyTorch's stable path.
+                    with torch.no_grad():
+                        _, indices = self._quack_topk(scores, self.topk)
+                    weights = scores.gather(1, indices.to(torch.int64)).float().softmax(dim=-1)
                     original_scores = None
                     weights_are_normalized = True
                 else:
@@ -375,7 +376,7 @@ class Gate(nn.Module):
                     original_scores = scores
                 if self._quack_topk is None:
                     weights, indices = torch.topk(scores, k=self.topk, dim=-1)
-                elif not use_fused_quack_topk:
+                elif not use_optimized_quack_topk:
                     weights, indices = self._quack_topk(scores, self.topk)
                 if self._quack_topk is not None:
                     # QuACK emits compact int32 indices; PyTorch indexing and

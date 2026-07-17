@@ -546,7 +546,7 @@ class TestGate:
         torch.testing.assert_close(quack_indices, torch_indices)
         assert quack_indices.dtype == torch.int64
 
-    def test_quack_topk_fuses_normalized_aux_free_router(self, moe_config, device):
+    def test_quack_topk_optimizes_normalized_aux_free_router(self, moe_config, device):
         moe_config.score_func = "softmax"
         moe_config.softmax_before_topk = True
         moe_config.norm_topk_prob = True
