@@ -119,8 +119,6 @@ lr_scheduler:
 ci:
   recipe_owner: akoumpa
   time: "00:15:00"
-  known_issue_id: AM-154
-  allow_failure: true
   checkpoint_robustness:
     check_source_load_parity: true
     # LoRA merge stays within the TP=2-to-HF drift measured by source parity.
