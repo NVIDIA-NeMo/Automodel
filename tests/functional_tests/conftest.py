@@ -148,7 +148,7 @@ _BOOLEAN_OVERRIDES = [
     "check_source_load_parity",
     "check_resume",
     "hf_device_map_auto",
-    "native_hf_source_fp8",
+    "hf_source_post_load_dequantize",
 ]
 
 

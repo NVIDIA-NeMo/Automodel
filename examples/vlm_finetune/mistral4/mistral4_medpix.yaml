@@ -119,10 +119,12 @@ wandb:
 ci:
   recipe_owner: akoumpa
   nodes: 4
-  time: "01:30:00"
+  time: "00:30:00"
   checkpoint_robustness:
     check_source_load_parity: true
     hf_device_map_auto: true
-    # Preserve HF's scaled FP8 expert module for the source reference.
-    native_hf_source_fp8: true
+    # Transformers' load-time dequantization leaves Mistral4 expert weights in
+    # FP8, while native forward requires an optional kernel absent from CI.
+    # Preserve the native layout while loading, then dequantize before forward.
+    hf_source_post_load_dequantize: true
     tokenizer_name: mistralai/Mistral-Small-4-119B-2603

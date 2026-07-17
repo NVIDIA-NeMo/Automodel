@@ -117,7 +117,7 @@ freeze_config:
 ci:
   recipe_owner: HuiyingLi
   nodes: 1
-  time: "00:45:00"
+  time: "00:30:00"
   checkpoint_robustness:
     check_source_load_parity: true
     hf_kl_threshold: 2e-2

@@ -20,7 +20,7 @@ Launch: torchrun --nproc-per-node=<N> -m pytest <this_file> -c <config.yaml>
     [--tokenizer_name <str>]
     [--source_load_kl_threshold <float>] [--source_load_mean_kl_threshold <float>]
     [--check_source_load_parity] [--check_fused_qkv_keys] [--check_phantom_keys] [--check_resume]
-    [--native_hf_source_fp8]
+    [--hf_source_post_load_dequantize]
     [--max_vram_gb <float>] [--max_cpu_gb <float>]
 """
 
@@ -80,7 +80,7 @@ def _extract_custom_args(argv):
         "--check_phantom_keys",
         "--check_resume",
         "--hf_device_map_auto",
-        "--native_hf_source_fp8",
+        "--hf_source_post_load_dequantize",
         "--skip_hf_reload",
     }
     custom = {}
@@ -174,6 +174,64 @@ def _load_hf_fp8_dequantized_config(
     else:
         quantization_config.dequantize = True
     return config
+
+
+def _dequantize_hf_fp8_weights_in_place(model, output_dtype: torch.dtype) -> int:
+    """Dequantize native per-tensor HF FP8 modules without their runtime kernel.
+
+    Some MoE checkpoints cannot use Transformers' load-time ``dequantize=True``
+    conversion, while their native FP8 modules require the optional ``kernels``
+    package at forward time. Load those modules with their native weight/scale
+    layout first, then replace only the FP8 weight parameters with dequantized
+    tensors. ``FP8Linear`` and ``FP8Experts`` both dispatch to their ordinary
+    PyTorch path once a weight uses more than one byte per element. This helper
+    intentionally accepts only the scalar and per-expert scalar scale layouts
+    used by the Mistral4 checkpoint; block-wise layouts should use Transformers'
+    normal load-time conversion.
+    """
+    parameter_pairs = (
+        ("weight", "weight_scale_inv"),
+        ("gate_up_proj", "gate_up_proj_scale_inv"),
+        ("up_proj", "up_proj_scale_inv"),
+        ("down_proj", "down_proj_scale_inv"),
+    )
+    converted = 0
+    for module in model.modules():
+        for weight_name, scale_name in parameter_pairs:
+            weight = getattr(module, weight_name, None)
+            scale = getattr(module, scale_name, None)
+            if not isinstance(weight, torch.Tensor) or not isinstance(scale, torch.Tensor):
+                continue
+            if weight.element_size() > 1:
+                continue
+            scale = scale.squeeze()
+            if scale.numel() == 1:
+                broadcast_scale = scale
+            elif weight.ndim == 3 and scale.ndim == 1 and scale.shape[0] == weight.shape[0]:
+                broadcast_scale = scale.view(-1, 1, 1)
+            else:
+                raise ValueError(
+                    f"Unsupported post-load FP8 scale layout for {type(module).__name__}.{weight_name}: "
+                    f"weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
+                )
+            dequantized = (weight.float() * broadcast_scale.float()).to(output_dtype)
+            setattr(
+                module,
+                weight_name,
+                torch.nn.Parameter(dequantized, requires_grad=bool(getattr(weight, "requires_grad", False))),
+            )
+            converted += 1
+
+    assert converted > 0, "Post-load HF FP8 dequantization requested, but no FP8 weight/scale pairs were found"
+    return converted
+
+
+def _post_load_dequant_max_memory() -> dict[int, int]:
+    """Reserve enough automatic-device-map headroom for FP8-to-BF16 expansion."""
+    return {
+        index: int(torch.cuda.get_device_properties(index).total_memory * 0.35)
+        for index in range(torch.cuda.device_count())
+    }
 
 
 def _rss_gb() -> float:
@@ -483,7 +541,7 @@ def _prepare_source_load_reference(
     trust_remote_code: bool,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
-    native_hf_source_fp8: bool,
+    hf_source_post_load_dequantize: bool,
 ) -> tuple[torch.Tensor, bool | None, bool | None] | None:
     """Compute vanilla HF source-load reference logits before trainer construction."""
     if _preinit_world_size() > 1:
@@ -509,7 +567,7 @@ def _prepare_source_load_reference(
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
-            native_hf_source_fp8=native_hf_source_fp8,
+            hf_source_post_load_dequantize=hf_source_post_load_dequantize,
         )
     except Exception:
         if fail_path is not None:
@@ -529,7 +587,7 @@ def _prepare_source_load_reference_rank0(
     trust_remote_code: bool,
     experts_implementation: str | None,
     hf_device_map_auto: bool,
-    native_hf_source_fp8: bool,
+    hf_source_post_load_dequantize: bool,
 ) -> tuple[torch.Tensor, bool | None, bool | None]:
     """Rank-0 implementation of vanilla HF source-load reference capture."""
     from contextlib import nullcontext
@@ -554,10 +612,19 @@ def _prepare_source_load_reference_rank0(
         device=device,
         hf_device_map_auto=hf_device_map_auto,
     )
-    # Dense FP8 checkpoints use the dequantized reference path by default. Some
-    # MoE checkpoints require HF's native FP8 expert module so their 3-D expert
-    # tensors are not sent through ordinary F.linear without their scale grid.
-    if not native_hf_source_fp8 and "config" not in hf_kwargs and hf_kwargs.get("quantization_config") is None:
+    if hf_source_post_load_dequantize and hf_kwargs.get("device_map") == "auto" and torch.cuda.is_available():
+        # Accelerate sizes the automatic map for the on-disk FP8 tensors. The
+        # post-load BF16 representation needs roughly twice that memory, so cap
+        # each GPU's FP8 placement at 35% and retain headroom for the forward.
+        hf_kwargs["max_memory"] = _post_load_dequant_max_memory()
+    # Dense FP8 checkpoints use Transformers' load-time dequantization by
+    # default. Some MoE checkpoints need to retain their native weight/scale
+    # layout during loading and are dequantized immediately afterwards.
+    if (
+        not hf_source_post_load_dequantize
+        and "config" not in hf_kwargs
+        and hf_kwargs.get("quantization_config") is None
+    ):
         fp8_config = _load_hf_fp8_dequantized_config(
             original_pretrained_path,
             trust_remote_code=hf_kwargs["trust_remote_code"],
@@ -582,6 +649,9 @@ def _prepare_source_load_reference_rank0(
             hf_model = _fix_meta_rotary_embeddings(
                 hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
             ).to(device)
+    if hf_source_post_load_dequantize:
+        converted = _dequantize_hf_fp8_weights_in_place(hf_model, source_dtype)
+        print(f"[Phase 0] Post-load dequantized {converted} HF FP8 weight tensors to {source_dtype}.")
     _reinit_rotary_per_module(hf_model, device)
     if trust_remote_code:
         from nemo_automodel._transformers.v4_patches.rotary import fix_rotary_embeddings, should_fix_rotary_embeddings
@@ -954,7 +1024,7 @@ def run_checkpoint_robustness(
     check_resume = bool(custom_args.get("check_resume", False))
     resume_loss_threshold = float(custom_args.get("resume_loss_threshold", "5e-3"))
     hf_device_map_auto = bool(custom_args.get("hf_device_map_auto", False))
-    native_hf_source_fp8 = bool(custom_args.get("native_hf_source_fp8", False))
+    hf_source_post_load_dequantize = bool(custom_args.get("hf_source_post_load_dequantize", False))
     skip_hf_reload = bool(custom_args.get("skip_hf_reload", False))
     check_source_load_parity = bool(custom_args.get("check_source_load_parity", False))
     source_load_kl_threshold = float(custom_args.get("source_load_kl_threshold", "5e-3"))
@@ -973,7 +1043,7 @@ def run_checkpoint_robustness(
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
             hf_device_map_auto=hf_device_map_auto,
-            native_hf_source_fp8=native_hf_source_fp8,
+            hf_source_post_load_dequantize=hf_source_post_load_dequantize,
         )
         _barrier()
 

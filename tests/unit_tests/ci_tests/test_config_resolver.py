@@ -367,7 +367,7 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
     if "/qwen" in recipe_path or "/mistral4/" in recipe_path:
         assert robustness["hf_device_map_auto"] is True
     if "/mistral4/" in recipe_path:
-        assert robustness["native_hf_source_fp8"] is True
+        assert robustness["hf_source_post_load_dequantize"] is True
     if Path(recipe_path).stem == "qwen3_5_35b":
         assert resolved["ci"]["known_issue_id"] == "AM-711"
         assert resolved["ci"]["allow_failure"] is True
@@ -375,7 +375,7 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["resume_loss_threshold"] == 1e-2
     assert "check_source_load_parity" not in resolved
     assert "hf_device_map_auto" not in resolved
-    assert "native_hf_source_fp8" not in resolved
+    assert "hf_source_post_load_dequantize" not in resolved
     assert "tokenizer_name" not in resolved
 
 

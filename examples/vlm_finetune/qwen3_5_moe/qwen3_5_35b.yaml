@@ -116,7 +116,7 @@ optimizer:
 ci:
   recipe_owner: HuiyingLi
   nodes: 1
-  time: "01:00:00"
+  time: "00:30:00"
   known_issue_id: AM-711
   allow_failure: true
   checkpoint_robustness:

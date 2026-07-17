@@ -24,11 +24,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
+    _dequantize_hf_fp8_weights_in_place,
     _extract_custom_args,
     _finish_hf_reload_sync,
     _get_input_ids,
     _hf_source_load_kwargs,
     _load_hf_fp8_dequantized_config,
+    _post_load_dequant_max_memory,
     _prepare_hf_reload_sync,
     _wait_for_hf_reload_rank0,
 )
@@ -157,11 +159,54 @@ def test_get_vlm_input_ids_uses_processor_tokenizer(monkeypatch, offline, expect
     )
 
 
-def test_extract_custom_args_accepts_native_hf_source_fp8():
-    custom, remaining = _extract_custom_args(["--native_hf_source_fp8", "--other-arg"])
+def test_extract_custom_args_accepts_hf_source_post_load_dequantize():
+    custom, remaining = _extract_custom_args(["--hf_source_post_load_dequantize", "--other-arg"])
 
-    assert custom["native_hf_source_fp8"] is True
+    assert custom["hf_source_post_load_dequantize"] is True
     assert remaining == ["--other-arg"]
+
+
+def test_dequantize_hf_fp8_weights_in_place_handles_linear_and_expert_parameters():
+    class FakeFP8Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.weight_scale_inv = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
+            self.gate_up_proj = torch.nn.Parameter(
+                torch.tensor(
+                    [[[1.0, 2.0], [3.0, 4.0]], [[2.0, 3.0], [4.0, 5.0]]],
+                    dtype=torch.float8_e4m3fn,
+                ),
+                requires_grad=False,
+            )
+            self.gate_up_proj_scale_inv = torch.nn.Parameter(
+                torch.tensor([0.25, 0.5]).view(2, 1, 1),
+                requires_grad=False,
+            )
+
+    model = FakeFP8Module()
+    expected_weight = model.weight.float() * model.weight_scale_inv.float()
+    expected_experts = model.gate_up_proj.float() * model.gate_up_proj_scale_inv.float()
+
+    assert _dequantize_hf_fp8_weights_in_place(model, torch.bfloat16) == 2
+    assert model.weight.dtype == torch.bfloat16
+    assert model.gate_up_proj.dtype == torch.bfloat16
+    torch.testing.assert_close(model.weight.float(), expected_weight, rtol=0, atol=1e-2)
+    torch.testing.assert_close(model.gate_up_proj.float(), expected_experts, rtol=0, atol=1e-2)
+
+
+def test_post_load_dequant_max_memory_reserves_fp8_expansion_headroom():
+    properties = SimpleNamespace(total_memory=80 * 1024**3)
+    with (
+        patch("torch.cuda.device_count", return_value=2),
+        patch("torch.cuda.get_device_properties", return_value=properties),
+    ):
+        max_memory = _post_load_dequant_max_memory()
+
+    assert max_memory == {0: int(properties.total_memory * 0.35), 1: int(properties.total_memory * 0.35)}
 
 
 def test_load_hf_fp8_dequantized_config_preserves_checkpoint_quantization_settings(monkeypatch):
