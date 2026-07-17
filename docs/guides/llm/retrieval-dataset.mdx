@@ -82,15 +82,14 @@ The format uses one JSON object per line:
 
 </Note>
 
-## Prepared Normalized Arrow Bundles for VL Retrieval
+## Normalized Arrow for Large VL Datasets
 
-For full-scale or image-heavy vision-language retrieval, prepare the raw sources on CPU nodes as a portable normalized
-Arrow bundle before starting GPU training. The bundle keeps query rows as document-ID references and stores each
-referenced document or image once in local corpus shards. This avoids spending allocated GPU time rebuilding Hugging
-Face dataset and image-corpus state before training begins.
+For full-scale or image-heavy vision-language retrieval, prepare a normalized Arrow bundle on CPU nodes before starting
+GPU training. The bundle keeps query rows as document-ID references and stores each referenced document or image once
+in local Arrow shards. This moves loading the raw sources and building the corpus shards out of the GPU job.
 
 For typical text-only retrieval, the original `make_retrieval_dataset` factory is usually sufficient. Normalization is
-still available when a text corpus has expensive startup or you need a portable prepared artifact.
+still available when a text corpus has expensive startup or you need a portable dataset.
 
 Configure training with the normalized dataset config:
 
@@ -104,11 +103,9 @@ dataset:
   do_shuffle: true
 ```
 
-Use the
-[retrieval data preparation tools](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/retrieval/README.md) to
-create a bundle locally or with the source-parallel Slurm launcher. The same guide explains source selection, per-source
-sample caps, append and resume workflows, and the shared-cache alternative when you need to keep the raw dataset config
-unchanged.
+Use the [retrieval data preparation tools](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/retrieval/README.md)
+to create a bundle locally or with the source-parallel Slurm launcher. The same guide explains source selection,
+per-source sample caps, append and resume workflows, and the CPU cache-warming script for the original dataset loader.
 
 ## Configure the Dataset and Collator in YAML
 

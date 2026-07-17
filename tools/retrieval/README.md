@@ -6,27 +6,25 @@ This directory contains CPU-side utilities for preparing retrieval training data
 
 For full-scale vision-language retrieval, prepare **normalized Arrow** on CPU nodes before requesting GPUs.
 
-**Do not start a cold full-scale VL training job directly against raw sources.** Loading and materializing an image-heavy
-corpus can substantially delay the first training step. In a multi-GPU job, the GPUs remain allocated during that
-startup, which can waste GPU-hours before optimization begins. Run the CPU Slurm array preparation first, then point the
-training config at its normalized output.
+**Do not start full-scale VL training directly from unprepared raw sources.** Loading a large image corpus and building
+its dataset cache can substantially delay the first training step. In a multi-GPU job, the GPUs remain allocated during
+that startup, which can waste GPU-hours before optimization begins. Run the CPU Slurm array preparation first, then
+point the training config at its normalized output.
 
-- **Original dataset factory:** usually sufficient for text-only retrieval and small smoke tests.
+- **Original dataset factory:** the default for typical text-only retrieval and small smoke tests.
 - **Normalized Arrow:** recommended for full-scale or image-heavy VL retrieval. Prepare a portable dataset bundle once,
   then train with
   `nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig`.
-- **Warm HF cache:** use when you want to keep the original
-  `nemo_automodel.components.datasets.llm.make_retrieval_dataset` path unchanged on the same cluster, but its cold
-  startup is expensive.
+- **Warm HF cache:** use the CPU cache-warming script when the original dataset factory starts slowly and you do not want
+  to change the dataset configuration.
 
-Despite the `vl` in some script names, the preparation tools also support text-only retrieval. Image fields are optional;
-text-only corpus documents are stored with an empty image field. Normalization remains useful for unusually large text
-corpora or when you need a portable prepared artifact, but it is not required for typical text-only training.
+Although some filenames include `vl`, the preparation scripts also accept text-only corpora. Normalization can still
+help with an unusually large text corpus or when you need a portable dataset.
 
 ## Normalized Arrow (Recommended for Full-Scale VL)
 
-Normalized Arrow keeps the original retrieval structure, but moves the expensive corpus materialization into a reusable
-prepared artifact:
+Normalized Arrow keeps the original retrieval structure, but prepares the corpus once and saves it as a reusable Arrow
+bundle:
 
 - Train rows store query text plus positive/negative document IDs.
 - Local corpus shards store each referenced document and optional image once.
@@ -151,13 +149,12 @@ bundle.
 This option keeps the original training dataset unchanged:
 `nemo_automodel.components.datasets.llm.make_retrieval_dataset`.
 
-It moves expensive `datasets.load_dataset(...)` cache construction to CPU nodes, but it does not create a portable
-dataset artifact. Use it only when training will run on the same cluster with the same cache directory and effective
-dataset paths.
+The script populates the Hugging Face cache on CPU nodes so the GPU job can reuse it. It does not create a portable
+dataset.
 
 ```bash
 CONFIG=/path/to/original_retrieval_config.yaml \
-CACHE_DIR=/path/to/shared/hf_cache \
+CACHE_DIR=/path/to/hf_cache \
 PARTITION=cpu_short \
 TIME=02:00:00 \
 CPUS_PER_TASK=32 \
@@ -178,7 +175,7 @@ For local/non-Slurm use:
 ```bash
 uv run python tools/retrieval/warm_retrieval_hf_cache.py \
   --config /path/to/original_retrieval_config.yaml \
-  --cache-dir /path/to/shared/hf_cache \
+  --cache-dir /path/to/hf_cache \
   --touch-samples 128
 ```
 

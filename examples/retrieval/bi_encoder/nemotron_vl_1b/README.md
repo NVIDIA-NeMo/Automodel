@@ -33,11 +33,11 @@ The Nemo Automodel Retrieval recipe expects a train set with a Corpus ID-Based J
 The "corpus" path points to a directory with the corpus in parquet format containing a field with the document id.  
 The "data" contains the list of training samples for contrastive learning, in particular the question, positive samples (pos_doc) and negative samples (neg_doc), which are document ids from the corpus. Positive and negative samples can be document page images or chunks of text (passages). 
 
-**Before a full-scale VL training run, prepare the dataset on CPU nodes.** Starting a cold GPU job against the raw image
-corpus can leave every allocated GPU waiting while that corpus is loaded and materialized. Use the source-parallel Slurm
-launcher in the [retrieval data preparation tools](../../../../tools/retrieval/README.md) to build a normalized Arrow
-bundle first. For text-only retrieval, the original dataset path is usually sufficient; warming the shared Hugging Face
-cache is another option when the raw configuration must remain unchanged on the same cluster.
+**Before a full-scale VL training run, prepare the dataset on CPU nodes.** Starting GPU training directly from a raw
+image corpus can leave every allocated GPU waiting while the corpus is loaded and its dataset cache is built. Use the
+source-parallel Slurm launcher in the [retrieval data preparation tools](../../../../tools/retrieval/README.md) to build
+a normalized Arrow bundle first. For text-only retrieval, the original dataset path is usually sufficient. If its
+initial startup is slow, use the CPU cache-warming script instead.
 
 ### Preparing the vision retrieval train set
 This example includes a notebook that demonstrates how to prepare a vision retrieval training dataset using [ColPali](https://huggingface.co/datasets/vidore/colpali_train_set): [prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb](../prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb). It performs the following steps:

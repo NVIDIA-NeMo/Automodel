@@ -145,22 +145,21 @@ matches the workflow you need:
 | `hf://` AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires an AutoModel-style HF subset with a companion corpus split. |
 | Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record; no document IDs are available for same-document masking. |
 | Corpus ID-based JSON | You need hard-negative mining, reusable corpora, or same-document masking | Records reference document IDs in a local corpus that can be loaded by Hugging Face `datasets`. |
-| Normalized Arrow | You are preparing a full-scale or image-heavy vision-language retrieval dataset | Stores query rows and referenced corpus documents in portable local Arrow shards, avoiding repeated image-corpus loading and materialization in GPU jobs. |
+| Normalized Arrow | You are preparing a full-scale or image-heavy vision-language retrieval dataset | Stores query rows and referenced corpus documents in portable local Arrow shards, avoiding repeated image-corpus loading and preparation in GPU jobs. |
 
 <Warning>
-Do not launch a cold full-scale VL training job directly against raw sources. Loading and materializing an image-heavy
-corpus can substantially delay the first training step while the GPUs are already allocated. Across a multi-GPU job,
-that startup can waste GPU-hours before optimization begins. Run the CPU Slurm array preparation first, then train from
-its normalized Arrow output.
+Do not start full-scale VL training directly from unprepared raw sources. Loading a large image corpus and building its
+dataset cache can substantially delay the first training step while the GPUs are already allocated. Across a multi-GPU
+job, that startup can waste GPU-hours before optimization begins. Run the CPU Slurm array preparation first, then train
+from its normalized Arrow output.
 </Warning>
 
-For typical text-only retrieval, the original `make_retrieval_dataset` path is usually sufficient. Normalized Arrow is
-still available for unusually large text corpora or when you need a portable prepared artifact. If you need to keep the
-original dataset configuration unchanged and train on the same cluster, you can instead warm its shared Hugging Face
-cache on CPU nodes. See the
-[retrieval data preparation tools](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/retrieval/README.md) for the
-normalization command, source-parallel Slurm launcher, cache-warming alternative, and storage tradeoffs. Despite `vl`
-in some tool filenames, both preparation paths also support text-only retrieval.
+For typical text-only retrieval, the original `make_retrieval_dataset` path is usually sufficient. If its initial startup
+is slow, use the CPU cache-warming script in the
+[retrieval data preparation tools](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/retrieval/README.md) without
+changing the dataset configuration. Normalized Arrow remains available for unusually large text corpora or when you
+need a portable dataset. The same guide includes the normalization command, source-parallel Slurm launcher, and storage
+comparison. Both tools support text-only and vision-language retrieval.
 
 The key field requirements differ by raw source:
 
@@ -462,8 +461,9 @@ In pure data parallelism, `data_parallel_size` is the total GPU count. With tens
 `n_passages`. Bi-encoders scale memory with query length plus `local_batch_size * n_passages` passage sequences;
 cross-encoders scale with `local_batch_size * n_passages` combined query-passage sequences.
 
-Current retrieval datasets are map-style datasets loaded in each process, not streaming distributed inputs. Pre-cache
-HF data on each node or use a shared cache, and budget CPU RAM and local disk per rank for corpus-backed datasets.
+Current retrieval datasets are map-style datasets loaded in each process, not streaming distributed inputs. Before a
+multi-node run, either populate the Hugging Face cache on each node or place it on storage available to every node. Also
+budget CPU RAM and local disk per rank for corpus-backed datasets.
 
 ## Add Validation
 
