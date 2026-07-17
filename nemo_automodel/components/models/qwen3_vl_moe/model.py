@@ -381,6 +381,14 @@ class Qwen3VLMoeTextModelBackend(nn.Module):
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         head_dim = cos.shape[-1] // 2
         freqs_cis = torch.cat((cos[..., :head_dim], sin[..., :head_dim]), dim=-1)
+        if attn_kwargs.get("qkv_format") == "thd":
+            # THD q/k/v are token-major [total, heads, dim] with no batch axis, and
+            # the non-fused rope apply broadcasts freqs after an unsqueeze(-2). The
+            # HF-style rotary above emits [1, total, head_dim]; keeping that batch
+            # axis broadcasts q/k up to 4D while v stays 3D, tripping TE attention
+            # ("Keys and values must have the same batch size..."). Drop it so the
+            # per-token mRoPE freqs match the native THD freqs_cis layout.
+            freqs_cis = freqs_cis.squeeze(0)
 
         for layer_id_str, decoder_layer in self.layers.items():
             layer_idx = int(layer_id_str)
