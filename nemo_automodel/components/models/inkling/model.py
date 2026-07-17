@@ -28,20 +28,31 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from transformers.cache_utils import DynamicCache
-from transformers.masking_utils import (
-    create_causal_mask,
-    create_recurrent_attention_mask,
-    create_sliding_window_causal_mask,
-)
-from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.models.inkling.configuration_inkling import InklingConfig
-from transformers.models.inkling.modeling_inkling import (
-    InklingForConditionalGeneration as HFInklingForConditionalGeneration,
-)
-from transformers.models.inkling.modeling_inkling import InklingMLP as HFInklingMLP
-from transformers.models.inkling.modeling_inkling import InklingMoE as HFInklingMoE
-from transformers.models.inkling.modeling_inkling import InklingTextModel as HFInklingTextModel
+
+try:
+    from transformers.cache_utils import DynamicCache
+    from transformers.masking_utils import (
+        create_causal_mask,
+        create_recurrent_attention_mask,
+        create_sliding_window_causal_mask,
+    )
+    from transformers.modeling_outputs import BaseModelOutputWithPast
+    from transformers.models.inkling.configuration_inkling import InklingConfig
+    from transformers.models.inkling.modeling_inkling import (
+        InklingForConditionalGeneration as HFInklingForConditionalGeneration,
+    )
+    from transformers.models.inkling.modeling_inkling import InklingMLP as HFInklingMLP
+    from transformers.models.inkling.modeling_inkling import InklingMoE as HFInklingMoE
+    from transformers.models.inkling.modeling_inkling import InklingTextModel as HFInklingTextModel
+except ImportError as exc:  # transformers < 5.14 ships neither symbol set
+    from nemo_automodel.shared.import_utils import UnavailableError
+
+    raise UnavailableError(
+        "The Inkling model requires a transformers build that provides "
+        "transformers.models.inkling and "
+        "transformers.masking_utils.create_recurrent_attention_mask "
+        "(transformers >= 5.14)."
+    ) from exc
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin

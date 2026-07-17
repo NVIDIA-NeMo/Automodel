@@ -30,11 +30,19 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.models.inkling.modeling_inkling import (
-    apply_mask_to_padding_states,
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
+
+try:
+    from transformers.models.inkling.modeling_inkling import (
+        apply_mask_to_padding_states,
+        causal_conv1d_fn,
+        causal_conv1d_update,
+    )
+except ImportError as exc:  # transformers < 5.14 does not ship the Inkling model
+    from nemo_automodel.shared.import_utils import UnavailableError
+
+    raise UnavailableError(
+        "The Inkling model requires a transformers build that ships transformers.models.inkling (transformers >= 5.14)."
+    ) from exc
 
 from nemo_automodel.components.models.common.utils import BackendConfig
 from nemo_automodel.components.moe.config import MoEConfig
