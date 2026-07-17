@@ -51,8 +51,10 @@ def resolve_get_rope_index(model: nn.Module) -> Optional[Callable]:
     may share a submodule across paths or contain an outright cycle.
 
     Args:
-        model: The (possibly wrapped) model to search. Accepts any module; no
-            tensor inputs.
+        model: The (possibly wrapped) model to search. Accepts any object; no
+            tensor inputs. Objects without the ``nn.Module`` child API, such as
+            the stage wrappers a pipeline-parallel run holds, are searched by
+            attribute only and never swept.
 
     Returns:
         The ``get_rope_index`` callable, or ``None`` when the model does not
@@ -67,8 +69,14 @@ def resolve_get_rope_index(model: nn.Module) -> Optional[Callable]:
     if get_rope_index is not None:
         return get_rope_index
 
+    # Pipeline stages reach this as bare wrappers rather than nn.Modules, so the
+    # sweep is only available when the object actually carries the module API.
+    named_children = getattr(model, "named_children", None)
+    if named_children is None:
+        return None
+
     seen = {id(model)}
-    queue = deque(model.named_children())
+    queue = deque(named_children())
     while queue:
         name, submodule = queue.popleft()
         if id(submodule) in seen:

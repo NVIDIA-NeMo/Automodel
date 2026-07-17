@@ -612,6 +612,32 @@ def test_resolve_get_rope_index_returns_none_for_non_mrope_models():
     assert resolve_get_rope_index(nn.Linear(2, 2)) is None
 
 
+def test_resolve_get_rope_index_tolerates_objects_without_the_module_api():
+    """model_parts[0] is a bare pipeline stage wrapper, not always an nn.Module.
+
+    Sweeping submodules is only possible on the nn.Module API, so an object
+    without it must resolve to None rather than raise AttributeError out of
+    setup().
+    """
+
+    class _BareStage:
+        pass
+
+    assert not hasattr(_BareStage(), "named_children"), "precondition: no module API"
+    assert resolve_get_rope_index(_BareStage()) is None
+
+
+def test_resolve_get_rope_index_finds_the_builder_on_a_bare_wrapper():
+    """The attribute lookups still apply when the object is not an nn.Module."""
+
+    class _BareStageWithBuilder:
+        def get_rope_index(self, input_ids=None, **kwargs):
+            return None, None
+
+    stage = _BareStageWithBuilder()
+    assert resolve_get_rope_index(stage) == stage.get_rope_index
+
+
 class _OmniLike(nn.Module):
     """Mimics Qwen3-Omni: the builder is on a submodule the two-step lookup misses.
 
