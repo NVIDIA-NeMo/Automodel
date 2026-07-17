@@ -308,6 +308,27 @@ def _next_source_index(output_dir: Path, metadata: dict[str, Any]) -> int:
     return max(indices, default=-1) + 1
 
 
+def _source_metadata_from_dir(output_dir: Path, source_idx: int, source_entry: Any) -> dict[str, Any]:
+    source_dir = output_dir / "sources" / f"source-{source_idx:05d}"
+    metadata_path = source_dir / "metadata.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Normalized source metadata not found: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("data_dir_list") != [source_entry]:
+        raise ValueError(
+            f"Normalized source {source_dir} was built from a different source entry. "
+            "Choose a new output directory or rebuild the mismatched source."
+        )
+    return {
+        "source_index": source_idx,
+        "source_name": _source_entry_name(source_entry),
+        "source_key": _source_entry_key(source_entry),
+        "source_entry": source_entry,
+        "path": str(source_dir.relative_to(output_dir)),
+        "num_records": metadata["num_records"],
+    }
+
+
 def _existing_source_keys(metadata: dict[str, Any]) -> set[str]:
     keys = set()
     for source in metadata.get("sources", []):
@@ -737,6 +758,71 @@ def _append_normalized_sources(
         raise
 
 
+def _prepare_normalized_source(
+    data_dir_list: list[Any],
+    output_dir: Path,
+    source_index: int,
+    *,
+    samples_per_shard: int,
+    docs_per_shard: int,
+    seed: int,
+    max_samples: int | None,
+    jpeg_quality: int,
+    resume: bool = False,
+) -> dict[str, Any]:
+    """Write one source bundle under a top-level normalized output directory."""
+    source_entries = _split_data_dir_list(data_dir_list)
+    if source_index < 0 or source_index >= len(source_entries):
+        raise ValueError(f"source_index must satisfy 0 <= source_index < {len(source_entries)}, got {source_index}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "sources").mkdir(exist_ok=True)
+    source_metadata, _ = _prepare_source_bundle(
+        source_entries[source_index],
+        output_dir,
+        source_index,
+        samples_per_shard=samples_per_shard,
+        docs_per_shard=docs_per_shard,
+        seed=seed,
+        max_samples=max_samples,
+        jpeg_quality=jpeg_quality,
+        resume=resume,
+        staged=False,
+    )
+    return source_metadata
+
+
+def _finalize_normalized_sources(
+    data_dir_list: list[Any],
+    output_dir: Path,
+    *,
+    samples_per_shard: int,
+    docs_per_shard: int,
+) -> dict[str, Any]:
+    """Write top-level metadata for source bundles prepared independently."""
+    source_entries = _split_data_dir_list(data_dir_list)
+    source_metadata = [
+        _source_metadata_from_dir(output_dir, source_idx, source_entry)
+        for source_idx, source_entry in enumerate(source_entries)
+    ]
+    metadata = {
+        "format": "nemo_automodel_normalized_vl_retrieval_arrow",
+        "version": 3,
+        "data_dir_list": data_dir_list,
+        "num_records": sum(int(source["num_records"]) for source in source_metadata),
+        "samples_per_shard": samples_per_shard,
+        "docs_per_shard": docs_per_shard,
+        "sources": source_metadata,
+    }
+    _write_json_atomic(output_dir / "metadata.json", metadata)
+    logger.info(
+        "Finalized normalized retrieval bundle with %d source(s), %d total train records at %s",
+        len(source_metadata),
+        metadata["num_records"],
+        output_dir,
+    )
+    return metadata
+
+
 def prepare_normalized_dataset(
     data_dir_list: list[Any],
     output_dir: Path,
@@ -765,11 +851,9 @@ def prepare_normalized_dataset(
 
     source_entries = _split_data_dir_list(data_dir_list)
     _prepare_multi_source_output_dir(output_dir, resume=resume)
-    source_metadata = []
-    total_records = 0
-    for source_idx, source_entry in enumerate(source_entries):
-        source, _ = _prepare_source_bundle(
-            source_entry,
+    for source_idx in range(len(source_entries)):
+        _prepare_normalized_source(
+            data_dir_list,
             output_dir,
             source_idx,
             samples_per_shard=samples_per_shard,
@@ -778,10 +862,7 @@ def prepare_normalized_dataset(
             max_samples=max_samples,
             jpeg_quality=jpeg_quality,
             resume=resume,
-            staged=False,
         )
-        total_records += source["num_records"]
-        source_metadata.append(source)
 
     if max_samples is not None and len(source_entries) > 1:
         logger.warning(
@@ -789,23 +870,12 @@ def prepare_normalized_dataset(
             "Use per-source num_samples in the original config or at training time for source-specific caps."
         )
 
-    metadata = {
-        "format": "nemo_automodel_normalized_vl_retrieval_arrow",
-        "version": 3,
-        "data_dir_list": data_dir_list,
-        "num_records": total_records,
-        "samples_per_shard": samples_per_shard,
-        "docs_per_shard": docs_per_shard,
-        "sources": source_metadata,
-    }
-    _write_json_atomic(output_dir / "metadata.json", metadata)
-    logger.info(
-        "Wrote normalized retrieval bundle with %d source(s), %d total train records to %s",
-        len(source_metadata),
-        total_records,
+    return _finalize_normalized_sources(
+        data_dir_list,
         output_dir,
+        samples_per_shard=samples_per_shard,
+        docs_per_shard=docs_per_shard,
     )
-    return metadata
 
 
 def parse_args() -> argparse.Namespace:
@@ -824,6 +894,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=None, help="Optional global train sample cap")
     parser.add_argument("--jpeg-quality", type=int, default=95, help="JPEG quality for packed corpus images")
     parser.add_argument("--resume", action="store_true", help="Reuse complete shards in an existing output directory")
+    parser.add_argument(
+        "--source-index",
+        type=int,
+        default=None,
+        help="Prepare one data_dir_list source for a Slurm array, then run --finalize-sources.",
+    )
+    parser.add_argument(
+        "--finalize-sources",
+        action="store_true",
+        help="Write top-level metadata from independently prepared source directories.",
+    )
     parser.add_argument(
         "--append",
         action="store_true",
@@ -846,17 +927,42 @@ def main() -> None:
     else:
         data_dir_list = args.data_dir_list
 
-    metadata = prepare_normalized_dataset(
-        data_dir_list=data_dir_list,
-        output_dir=Path(args.output_dir),
-        samples_per_shard=args.samples_per_shard,
-        docs_per_shard=args.docs_per_shard,
-        seed=args.seed,
-        max_samples=args.max_samples,
-        jpeg_quality=args.jpeg_quality,
-        resume=args.resume,
-        append=args.append,
-    )
+    if args.source_index is not None and args.finalize_sources:
+        raise ValueError("Use only one of --source-index or --finalize-sources")
+    if args.append and (args.source_index is not None or args.finalize_sources):
+        raise ValueError("--append cannot be combined with --source-index or --finalize-sources")
+
+    if args.source_index is not None:
+        metadata = _prepare_normalized_source(
+            data_dir_list=data_dir_list,
+            output_dir=Path(args.output_dir),
+            source_index=args.source_index,
+            samples_per_shard=args.samples_per_shard,
+            docs_per_shard=args.docs_per_shard,
+            seed=args.seed,
+            max_samples=args.max_samples,
+            jpeg_quality=args.jpeg_quality,
+            resume=args.resume,
+        )
+    elif args.finalize_sources:
+        metadata = _finalize_normalized_sources(
+            data_dir_list=data_dir_list,
+            output_dir=Path(args.output_dir),
+            samples_per_shard=args.samples_per_shard,
+            docs_per_shard=args.docs_per_shard,
+        )
+    else:
+        metadata = prepare_normalized_dataset(
+            data_dir_list=data_dir_list,
+            output_dir=Path(args.output_dir),
+            samples_per_shard=args.samples_per_shard,
+            docs_per_shard=args.docs_per_shard,
+            seed=args.seed,
+            max_samples=args.max_samples,
+            jpeg_quality=args.jpeg_quality,
+            resume=args.resume,
+            append=args.append,
+        )
     print(json.dumps(metadata, indent=2))
 
 

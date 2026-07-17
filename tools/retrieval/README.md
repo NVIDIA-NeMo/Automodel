@@ -36,17 +36,24 @@ uv run python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
   --resume
 ```
 
-On Slurm CPU nodes:
+On Slurm CPU nodes, use the array launcher for full datasets. Set `NUM_SOURCES` to the number of entries in the
+config's `dataset.data_dir_list`. Each array task prepares one source, then a dependent finalizer writes the top-level
+metadata after every source succeeds:
 
 ```bash
 CONFIG=/path/to/original_retrieval_config.yaml \
 OUT_DIR=/path/to/normalized_vl_retrieval \
+NUM_SOURCES=7 \
 PARTITION=cpu_short \
-TIME=08:00:00 \
+TIME=04:00:00 \
 CPUS_PER_TASK=32 \
+ARRAY_PARALLELISM=7 \
 EXTRA_CONTAINER_MOUNTS=/path/to/source_data:/path/to/source_data \
-tools/retrieval/submit_prepare_normalized_vl_retrieval_data_cpu.sh
+tools/retrieval/submit_prepare_normalized_vl_retrieval_data_cpu_array.sh
 ```
+
+The non-array `submit_prepare_normalized_vl_retrieval_data_cpu.sh` launcher is useful for smoke tests and small source
+lists, but it prepares sources serially.
 
 ### Train
 
@@ -125,8 +132,10 @@ different sources, so do not re-list old sources under a modified path or config
 ### Resume Interrupted Normalized Prep
 
 Use `--resume` when a normalized CPU prep job was interrupted and you want to reuse readable train shards and complete
-corpus directories from the same output directory. Resume is for continuing an interrupted prep run; append mode is for
-adding new source entries to an already prepared bundle.
+corpus directories from the same output directory. For the array launcher, submit the same `NUM_SOURCES` and
+`ARRAY_SPEC`; each task resumes its own `sources/source-*` directory and the finalizer refreshes the top-level metadata.
+Resume is for continuing an interrupted prep run; append mode is for adding new source entries to an already prepared
+bundle.
 
 ## Warm Hugging Face Dataset Cache
 

@@ -16,8 +16,10 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -424,6 +426,126 @@ def test_prepare_normalized_vl_retrieval_data_preserves_source_bundles(tmp_path,
     assert len(questions) == 3
     assert sum(question.startswith("a ") for question in questions) == 1
     assert sum(question.startswith("b ") for question in questions) == 2
+
+
+def test_prepare_normalized_vl_retrieval_data_finalizes_independent_sources(tmp_path, monkeypatch):
+    pytest.importorskip("datasets")
+    pytest.importorskip("datasets.arrow_writer")
+    image_mod = pytest.importorskip("PIL.Image")
+    _patch_normalized_source(monkeypatch, image_mod)
+
+    output_dir = tmp_path / "normalized_array"
+    data_dir_list = [{"path": "source_a.json", "num_samples": None}, {"path": "source_b.json", "num_samples": None}]
+    source_1 = prep_norm._prepare_normalized_source(
+        data_dir_list=data_dir_list,
+        output_dir=output_dir,
+        source_index=1,
+        samples_per_shard=10,
+        docs_per_shard=10,
+        seed=42,
+        max_samples=None,
+        jpeg_quality=90,
+    )
+
+    assert source_1["path"] == "sources/source-00001"
+    assert not (output_dir / "metadata.json").exists()
+    with pytest.raises(FileNotFoundError, match="source-00000"):
+        prep_norm._finalize_normalized_sources(
+            data_dir_list,
+            output_dir,
+            samples_per_shard=10,
+            docs_per_shard=10,
+        )
+
+    source_0 = prep_norm._prepare_normalized_source(
+        data_dir_list=data_dir_list,
+        output_dir=output_dir,
+        source_index=0,
+        samples_per_shard=10,
+        docs_per_shard=10,
+        seed=42,
+        max_samples=None,
+        jpeg_quality=90,
+    )
+    metadata = prep_norm._finalize_normalized_sources(
+        data_dir_list,
+        output_dir,
+        samples_per_shard=10,
+        docs_per_shard=10,
+    )
+
+    assert [source["path"] for source in metadata["sources"]] == [source_0["path"], source_1["path"]]
+    assert metadata["num_records"] == 4
+    dataset = nd.make_normalized_retrieval_dataset(data_dir_list=str(output_dir), n_passages=2)
+    assert len(dataset) == 4
+
+
+def test_normalized_array_launcher_generates_source_and_finalizer_jobs(tmp_path):
+    repo_dir = Path(__file__).resolve().parents[4]
+    launcher = repo_dir / "tools/retrieval/submit_prepare_normalized_vl_retrieval_data_cpu_array.sh"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("dataset:\n  data_dir_list:\n    - source_a.json\n    - source_b.json\n", encoding="utf-8")
+
+    capture_dir = tmp_path / "captured_sbatch"
+    capture_dir.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_sbatch = fake_bin / "sbatch"
+    fake_sbatch.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+capture_dir = Path(os.environ["SBATCH_CAPTURE_DIR"])
+counter_path = capture_dir / "counter"
+index = int(counter_path.read_text(encoding="utf-8")) if counter_path.exists() else 0
+(capture_dir / f"args-{index}.json").write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+(capture_dir / f"script-{index}.sh").write_text(sys.stdin.read(), encoding="utf-8")
+counter_path.write_text(str(index + 1), encoding="utf-8")
+print(1000 + index)
+""",
+        encoding="utf-8",
+    )
+    fake_sbatch.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "SBATCH_CAPTURE_DIR": str(capture_dir),
+            "REPO_DIR": str(repo_dir),
+            "CONFIG": str(config_path),
+            "OUT_DIR": str(tmp_path / "normalized"),
+            "CACHE_DIR": str(tmp_path / "cache"),
+            "HF_CACHE": str(tmp_path / "cache/hf"),
+            "TRITON_CACHE": str(tmp_path / "cache/triton"),
+            "NUM_SOURCES": "2",
+            "ARRAY_PARALLELISM": "1",
+            "RUN_NAME": "normalized-array-test",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(launcher)],
+        cwd=repo_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    source_args = json.loads((capture_dir / "args-0.json").read_text(encoding="utf-8"))
+    source_script = (capture_dir / "script-0.sh").read_text(encoding="utf-8")
+    finalizer_args = json.loads((capture_dir / "args-1.json").read_text(encoding="utf-8"))
+    finalizer_script = (capture_dir / "script-1.sh").read_text(encoding="utf-8")
+    assert "--array=0-1%1" in source_args
+    assert '--source-index "${SLURM_ARRAY_TASK_ID}"' in source_script
+    assert '--container-image="nvcr.io#nvidia/nemo-automodel:26.06.00"' in source_script
+    assert "--dependency=afterok:1000" in finalizer_args
+    assert "--finalize-sources" in finalizer_script
+    assert "Submitted normalized source array job: 1000" in result.stdout
+    assert "Submitted normalized finalizer job: 1001" in result.stdout
 
 
 def test_prepare_normalized_vl_retrieval_data_rejects_resume_with_changed_inputs(tmp_path, monkeypatch):
