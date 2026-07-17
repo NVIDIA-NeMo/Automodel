@@ -21,7 +21,7 @@ handles **FP8 dequantization** during load/save:
   * The checkpoint's language_model Linear weights are stored as per-tensor
     FP8 with a scalar ``weight_scale_inv`` sibling (and an unused
     ``activation_scale`` sibling). The adapter pairs each weight with its
-    scale on load, dequantizes to bf16 (``w_bf16 = w_fp8.to(bf16) * scale``),
+    scale on load, dequantizes through fp32 (``w_bf16 = (w_fp8.float() * scale.float()).bfloat16()``),
     and drops the scale keys. Vision tower + multi_modal_projector + lm_head
     are BF16 on disk and pass through unchanged.
 
@@ -89,7 +89,7 @@ def _dequantize_from_fp8(
     (``transformers.integrations.finegrained_fp8.Fp8Dequantize.convert``,
     finegrained_fp8.py:867-906) is not needed here.
     """
-    return weight_fp8.to(target_dtype) * scale_inv.to(target_dtype)
+    return (weight_fp8.float() * scale_inv.float()).to(target_dtype)
 
 
 def _identity(k: str) -> str:

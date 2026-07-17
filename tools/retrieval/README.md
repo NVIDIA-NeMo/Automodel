@@ -10,11 +10,9 @@ Despite the `vl` in some script names, these tools also support text-only retrie
 corpus documents are stored with an empty image field.
 
 - **Normalized Arrow:** recommended. Prepare a portable dataset bundle once, then train with
-  `nemo_automodel.components.datasets.llm.make_normalized_retrieval_dataset`.
+  `nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig`.
 - **Warm HF cache:** use only when you want to keep the original
   `nemo_automodel.components.datasets.llm.make_retrieval_dataset` path unchanged on the same cluster.
-- **Resolved Arrow:** use for small repro/debug datasets. Prepare fully materialized rows, then train with
-  `nemo_automodel.components.datasets.llm.make_resolved_retrieval_dataset`.
 
 ## Normalized Arrow (Recommended)
 
@@ -32,7 +30,7 @@ training row.
 ### Prepare
 
 ```bash
-python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
+uv run python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
   --config /path/to/original_retrieval_config.yaml \
   --output-dir /path/to/normalized_vl_retrieval \
   --resume
@@ -53,14 +51,13 @@ tools/retrieval/submit_prepare_normalized_vl_retrieval_data_cpu.sh
 ### Train
 
 ```yaml
-dataloader:
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_normalized_retrieval_dataset
-    data_dir_list: /path/to/normalized_vl_retrieval
-    model_type: bi_encoder
-    data_type: train
-    n_passages: 5
-    do_shuffle: true
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig
+  data_dir_list: /path/to/normalized_vl_retrieval
+  model_type: bi_encoder
+  data_type: train
+  n_passages: 5
+  do_shuffle: true
 ```
 
 ### Choose Sources Or Sample Caps
@@ -73,33 +70,31 @@ For normal training, pass the top-level bundle path. If you want to choose speci
 source, pass a list instead:
 
 ```yaml
-dataloader:
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_normalized_retrieval_dataset
-    data_dir_list:
-      - path: /path/to/normalized_vl_retrieval/sources/source-00000
-        num_samples: 10000
-      - path: /path/to/normalized_vl_retrieval/sources/source-00001
-        num_samples: null
-    model_type: bi_encoder
-    data_type: train
-    n_passages: 5
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig
+  data_dir_list:
+    - path: /path/to/normalized_vl_retrieval/sources/source-00000
+      num_samples: 10000
+    - path: /path/to/normalized_vl_retrieval/sources/source-00001
+      num_samples: null
+  model_type: bi_encoder
+  data_type: train
+  n_passages: 5
 ```
 
 The same list form can also combine different normalized bundle roots:
 
 ```yaml
-dataloader:
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_normalized_retrieval_dataset
-    data_dir_list:
-      - path: /path/to/normalized_vl_retrieval_a
-        num_samples: 20000
-      - path: /path/to/normalized_vl_retrieval_b
-        num_samples: null
-    model_type: bi_encoder
-    data_type: train
-    n_passages: 5
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig
+  data_dir_list:
+    - path: /path/to/normalized_vl_retrieval_a
+      num_samples: 20000
+    - path: /path/to/normalized_vl_retrieval_b
+      num_samples: null
+  model_type: bi_encoder
+  data_type: train
+  n_passages: 5
 ```
 
 You can mix top-level bundle roots and individual `sources/source-*` paths in the same list. Avoid overlapping entries,
@@ -163,7 +158,7 @@ different mount alias, symlink, or config path, for example `/lustre/fsw/...` ve
 For local/non-Slurm use:
 
 ```bash
-python tools/retrieval/warm_retrieval_hf_cache.py \
+uv run python tools/retrieval/warm_retrieval_hf_cache.py \
   --config /path/to/original_retrieval_config.yaml \
   --cache-dir /path/to/shared/hf_cache \
   --touch-samples 128
@@ -172,65 +167,6 @@ python tools/retrieval/warm_retrieval_hf_cache.py \
 `--touch-samples` reads transformed examples to validate corpus lookup and image decoding. Decoded images are not
 persisted.
 
-## Resolved Arrow Debug Data
-
-Resolved Arrow writes packed Arrow shards where every training row already contains the selected document text and
-optional image bytes. This avoids corpus lookup during training, but it duplicates payload whenever the same document
-appears in multiple rows.
-
-Use resolved Arrow for:
-
-- small self-contained repro datasets;
-- debugging exact post-transform samples;
-- copying a tiny subset to another cluster.
-
-Do not use it as the default full-dataset format when normalized Arrow is available.
-
-### Prepare
-
-```bash
-CONFIG=/path/to/original_retrieval_config.yaml \
-OUT_DIR=/path/to/resolved_vl_retrieval \
-NUM_BUILD_SHARDS=32 \
-ARRAY_SPEC=0-31 \
-PARTITION=cpu_short \
-TIME=04:00:00 \
-CPUS_PER_TASK=32 \
-EXTRA_CONTAINER_MOUNTS=/path/to/source_data:/path/to/source_data \
-tools/retrieval/submit_prepare_resolved_vl_retrieval_data_cpu_array.sh
-```
-
-### Train
-
-```yaml
-dataloader:
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_resolved_retrieval_dataset
-    data_dir_list: /path/to/resolved_vl_retrieval
-    model_type: bi_encoder
-    data_type: train
-    n_passages: 5
-```
-
-Resolved prep can pack multiple original `data_dir_list` entries into one output directory. Prepare separate output
-directories only if you want to choose prepared sources independently later or apply different per-source sample caps:
-
-```yaml
-dataloader:
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_resolved_retrieval_dataset
-    data_dir_list:
-      - path: /path/to/resolved_vl_retrieval_a
-        num_samples: 10000
-      - path: /path/to/resolved_vl_retrieval_b
-        num_samples: null
-    model_type: bi_encoder
-    data_type: train
-    n_passages: 5
-```
-
-Resolved Arrow is map-style, so normal DataLoader sampler/shuffle behavior applies.
-
 ## Storage Comparison
 
 Measured on the Nemotron VL 1B image-retrieval training set used in debugging, with 262,197 train rows:
@@ -238,7 +174,6 @@ Measured on the Nemotron VL 1B image-retrieval training set used in debugging, w
 | Path | What it stores | Size observed | Recommendation |
 | --- | --- | ---: | --- |
 | Original HF cache | Hugging Face cache fingerprints and materialized source corpora under `HF_DATASETS_CACHE` | `3.7T` in one observed active cache dir; varies by cache history | Fast when warm, but not portable and can grow with each fingerprint/config/path variant |
-| Resolved Arrow | Fully materialized train rows with document/image payload repeated per row | `508G` | Keep only for small self-contained repro/debug datasets |
 | Normalized Arrow | Train refs plus deduplicated local corpus Arrow shards | `176G` | Recommended full-dataset portable format |
 
 The exact HF cache size can vary because Hugging Face Datasets may keep multiple fingerprints, source downloads,
@@ -252,4 +187,4 @@ For new corpus schemas, use the original AutoModel extension point:
 1. Add an `AbstractDataset` implementation with `get_document_by_id()` and `get_all_ids()`.
 2. Register it in `DATASETS`.
 3. Add the source JSON to the original retrieval config.
-4. Run one of the prep paths above.
+4. Prepare a normalized bundle or warm the original Hugging Face cache.

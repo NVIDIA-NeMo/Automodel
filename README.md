@@ -136,9 +136,9 @@ What you can expect:
 
 > TL;DR: SPMD turns “how to parallelize” into a *runtime layout choice*, not a code fork.
 
-## Feature List
+## Feature Roadmap
 
-✅ _Available now ([v0.4.0](https://pypi.org/project/nemo-automodel/0.4.0/) / [26.04 container](nvcr.io/nvidia/nemo-automodel:26.04))_ | 🔜 _Coming next_
+✅ _Available now ([v0.5.0](https://pypi.org/project/nemo-automodel/0.5.0/) / [26.06 container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel/tags?version=26.06.00))_ | 🔜 _Planned for 26.08_
 
 High-throughput scalable training
 - ✅ **PyTorch DTensor-native SPMD training** Same training script can scale from 1 GPU to large multi-node jobs by changing the device mesh/config.
@@ -146,19 +146,21 @@ High-throughput scalable training
 - ✅ **Optimized kernels** - Uses NVIDIA-oriented kernel paths such as Transformer Engine, DeepEP, FlexAttn, TorchSDPA, fused attention, rotary embeddings, Triton, and optional kernel patches.
 - ✅ **MoE acceleration** - Includes MoE routing and DeepEP integration, plus expert-parallel configurations used in DeepSeek, Qwen MoE, GPT-OSS, and Nemotron MoE benchmarks.
 - ✅ **FP8 and mixed precision** - FP8 support with torchao and Transformer Engine.
+- ✅ **MXFP8 MoE training** - Transformer Engine and torchao MXFP8 grouped-expert training on GB200.
 - ✅ **Activation checkpointing** - Trades recomputation for lower activation memory, especially useful with FSDP and memory-efficient losses.
 - ✅ **Memory-efficient loss** - Linear-Cut / fused linear cross entropy avoids materializing full logits for the loss, reducing output-layer memory pressure.
 - ✅ **Sequence packing** - Packs variable-length examples together to reduce padding compute and improve GPU utilization.
 - ✅ **FlashAttention packed-sequence support** - Packed masks can feed variable-length FlashAttention paths using per-document cu_seqlens.
 - ✅ **DCP** - Supports PyTorch DCP and SafeTensors, sharded and consolidated layouts, merge/reshard utilities, and Hugging Face-compatible outputs.
 - ✅ **Async checkpointing** - Can write checkpoints in the background to reduce training stalls caused by I/O.
-- ✅ **Dion optimizer** - Distributed Dion optimizer integration.
+- ✅ **Dion and Muon optimizers** - Distributed optimizer integrations with typed recipe configuration.
 - ✅ **Environment Support** - SLURM, interactive, SkyPilot, and Kubernetes (via SkyPilot) launchers.
 
 SOTA algorithms
 - ✅ **Pre-training** - Support for model pre-training, including DeepSeekV3.
 - ✅ **Learning Algorithms** - SFT (Supervised Fine-Tuning), PEFT (LoRA, QLoRA), and QAT (Quantization-Aware Training).
-- ✅ **Knowledge Distillation** - Support for knowledge distillation with LLMs.**
+- ✅ **Knowledge distillation** - Support for knowledge distillation with LLMs.
+- ✅ **VLM knowledge distillation** - Chunked KD loss and a Qwen3.5-VL teacher-student recipe.
 - ✅ **Speculative decoding training** - Train target-aligned EAGLE-1/2/3, P-EAGLE, DFlash, and DSpark drafters for faster verified generation.
 
 Model Coverage and 🤗 Ecosystem compatibility
@@ -174,11 +176,15 @@ Model Coverage and 🤗 Ecosystem compatibility
 Agentic Development and UX
 - ✅ **Agent-friendly skills** - Curated [`skills/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/skills) for common dev tasks (recipe runs, model onboarding, CI).
 
-- 🔜 **Muon optimizer** - Muon optimizer support.
-- 🔜 **SonicMoE** - Optimized MoE implementation for faster expert computation.
-- 🔜 **FP8 MoE** - FP8 precision training and inference for MoE models.
-- 🔜 **Cudagraph with MoE** - CUDA graph support for MoE layers to reduce kernel launch overhead.
-- 🔜 **VLM Knowledge Distillation** - Extend KD to VLM and omnimodal models.
+Planned for 26.08
+- 🔜 **Unified Engine API and recipes** - Introduce a common engine and consolidate the LLM and VLM recipe paths.
+- 🔜 **Composable component configuration** - Complete the typed config and `.build()` refactor across data and remaining components.
+- 🔜 **Packed long-context training with CP** - Combine THD sequence packing with context parallelism, including DeepSeek V4 coverage.
+- 🔜 **Kernel and runtime upgrades** - Add partial CUDA graphs, evaluate FlashAttention 3/4, and upgrade to DeepEP v2.
+- 🔜 **Multimodal retrieval** - Expand vision-language retrieval datasets and models and improve retriever performance.
+- 🔜 **Convergence and regression testing** - Add automated loss, evaluation, and performance gates to NeMo CI.
+- 🔜 **Transformers 5.12 alignment** - Upgrade the Transformers integration and restore affected model parity coverage.
+- 🔜 **Recipe consistency** - Align diffusion recipes with the shared AutoModel recipe and configuration patterns.
 
 
 ## Getting Started
@@ -192,7 +198,8 @@ uv venv
 # Choose ONE:
 uv sync --frozen  # LLM recipes (default)
 # uv sync --frozen --extra vlm --extra vlm-media  # VLM recipes (Qwen/Mistral/Omni need vlm-media for video/vision; fixes: ImportError: qwen_vl_utils is not installed)
-# uv sync --frozen --extra cuda  # Optional CUDA deps (e.g., Transformer Engine, bitsandbytes)
+# uv sync --frozen --extra cuda  # Optional CUDA deps (e.g., Transformer Engine, Mamba SSM)
+# uv sync --frozen --extra cuda_source  # Optional bitsandbytes dependency
 # uv sync --frozen --extra all  # Most optional deps (includes `vlm` and `cuda`; NOTE: excludes media — add --extra media for video/image decode)
 # uv sync --frozen --all-extras  # Everything (includes `fa`, `moe`, `media`, etc.)
 
@@ -218,7 +225,7 @@ uv run automodel examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag.yaml --npr
 ```
 
 > [!TIP]
-> **Login-node / CI installs:** If you only need to submit jobs (SLURM, k8s, NeMo-Run) and don't need to train locally, install the lightweight CLI package: `pip install nemo-automodel[cli]`
+> **NeMo-Run submission:** The `cli` extra adds NeMo Run to the base package: `uv pip install "nemo-automodel[cli]"`. It is additive; the base package still installs its core training dependencies, including PyTorch.
 
 
 ## LLM Pre-training

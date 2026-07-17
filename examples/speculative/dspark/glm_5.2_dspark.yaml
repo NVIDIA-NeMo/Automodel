@@ -1,0 +1,134 @@
+# DSpark draft training for a GLM-5.2 (GlmMoeDsaForCausalLM) target (online hidden-state capture).
+#
+# Same method and three-term objective as the Qwen3 / Gemma4 / DeepSeek V4 configs. The
+# difference is the target: a full GLM-5.2 model is loaded frozen with the GLM finetune
+# recipe's distributed path (expert-parallel + FSDP2), so the 256 routed experts shard
+# across ranks and the base weights (FP8, when quantized) dequantize on load. The draft is
+# a small dense GLM-MLA stack (DeepSeek-V3-style Q-LoRA, a compressed KV latent, a separate
+# value up-projection, interleaved complex RoPE) and runs the DFlash SDPA mask path
+# (NOT flex_attention). GLM's DSA sparse indexer and MoE belong to the target, not the draft.
+#
+# The reserved mask token id 154856 is the first unused GLM-5.2 vocab slot (the last named
+# special token is 154855 '<|video|>'; vocab_size is 154880), so it never collides with real
+# content. It must match the id the inference runtime fills block slots with.
+#
+# ---------------------------------------------------------------------------
+# HARDWARE: GLM-5.2 is a ~355B-parameter MoE; this needs MULTIPLE nodes, NOT a single box.
+# ---------------------------------------------------------------------------
+# The DSpark target wrapper hooks ONE non-pipelined self.model(...) forward, so pipeline
+# parallelism must be OFF (pp_size=1). Shard the parameter memory with expert parallelism
+# instead: ep_size MUST divide n_routed_experts (256) AND equal world_size (nnodes * 8).
+# Valid ep_size: 8, 16, 32, 64. Larger ep_size shards the experts more (less memory/rank)
+# but does not change the effective data batch (EP is data-parallel-compatible: each rank
+# forwards its own data shard and the MoE all-to-all routes tokens to the expert-owning
+# ranks). The default below is ep_size=64 (8 nodes); drop to 32/16 only if it fits.
+#
+# LAUNCH (8 nodes, ep_size=64). Run the SAME command on every node, varying only
+# --node-rank; node 0 is the rendezvous master. See README_glm_5.2.md.
+#   torchrun --nnodes=8 --node-rank=0 --nproc_per_node=8 \
+#     --master-addr=<NODE0_IP> --master-port=29500 \
+#     -m nemo_automodel.recipes.llm.train_dspark -c examples/speculative/dspark/glm_5.2_dspark.yaml
+#
+# To first sanity-check the whole path on ONE node in minutes, run
+# tests/functional_tests/speculative/run_glm_5.2_smoke.sh. It derives a temporary
+# config from this recipe and shrinks the target to 6 layers so it fits.
+
+recipe: TrainDSparkRecipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+wandb:
+  enable: false            # opt-in: flip to true to log this run (needs W&B credentials)
+  project: glm-5.2-dspark
+  group: perfectblend-direct
+  tags: [dspark, glm-5.2, glm-moe-dsa, hybridep]
+
+distributed:
+  strategy: fsdp2
+  defer_fsdp_grad_sync: true
+  # The draft is data-parallel sharded over the full world; these sizes shape the
+  # frozen GLM-5.2 target's expert-parallel / FSDP mesh only.
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1                 # keep PP off: the DSpark target wrapper hooks a single (non-pipelined) model
+  ep_size: 64                # = world_size (8 nodes x 8). Must divide n_routed_experts (256); 256/64 = 4 experts/rank
+  activation_checkpointing: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+recipe_args:
+  target_model_name_or_path: zai-org/GLM-5.2
+  # Or a local path to a downloaded GLM-5.2 checkpoint:
+  # target_model_name_or_path: /path/to/GLM-5.2
+  train_data_path: /path/to/open-perfectblend-direct-clean   # <-- messages-format SFT data
+  train_split: "train[4096:]"
+  val_data_path: /path/to/open-perfectblend-direct-clean
+  val_split: "train[:4096]"
+  output_dir: ./outputs/dspark_glm_5.2_perfectblend
+  seq_length: 4096
+  micro_batch_size: 1
+  grad_accumulation_steps: 8          # 1 (micro) x 64 (data-parallel ranks) x 8 = 512 effective batch
+  num_workers: 2
+  num_epochs: 10
+  ckpt_every_steps: 500
+  save_checkpoint_every_epoch: true
+  # GLM-5.2 ships a chat template in its tokenizer, so recipe_args.chat_template is not
+  # needed here (the messages-format data renders with the tokenizer's own template).
+
+  # --- draft backbone (parallel, dense GLM MLA) ---
+  draft_num_hidden_layers: 3          # small dense draft on top of the 78-layer GLM-5.2 target
+  block_size: 5                       # tokens drafted per block
+  num_anchors: 512                    # blocks sampled per sequence per step
+  mask_token_id: 154856               # first reserved GLM-5.2 vocab slot for non-anchor block positions (in-vocab; < 154880)
+  target_layer_ids: [75, 76, 77]      # 3 late feature layers of the full 78-layer GLM-5.2 target
+  freeze_embeddings: true             # draft shares + freezes the target embed_tokens and lm_head
+  # The GLM draft attention is fixed to the dense SDPA mask path by the config builder,
+  # so attention_backend is not used here (flex_attention is the Qwen3 / Gemma4 path).
+
+  # --- frozen GLM-5.2 target backend (mirrors the GLM finetune recipe) ---
+  # sdpa: reliable everywhere (the DSA indexer emits an additive float bias that SDPA's
+  # explicit-mask path accepts). Switch to `tilelang` for the fused sparse kernels IF your
+  # TileLang build JIT-compiles the GLM DSA indexer / sparse-MLA kernels.
+  target_attn_backend: sdpa
+  target_dispatcher: hybridep         # MoE token dispatcher for the sharded experts
+  # torch_mm needs no optional package; `gmm` is faster but requires grouped_gemm,
+  # which the current AutoModel image does not ship (NameError: ops is not defined).
+  target_experts: torch_mm            # grouped-expert GEMM backend
+  target_enable_fsdp_optimizations: true
+
+  # --- serial Markov head (semi-autoregressive) ---
+  markov_rank: 256
+  markov_head_type: vanilla           # vanilla | gated | rnn
+
+  # --- confidence head (scheduled verification) ---
+  confidence_head_alpha: 1.0          # > 0 enables the confidence head
+  confidence_head_with_markov: true
+
+  # --- objective: L = ce_alpha * L_ce + l1_alpha * L_tv + conf_alpha * L_conf ---
+  ce_loss_alpha: 0.1
+  l1_loss_alpha: 0.9
+  loss_decay_gamma: 4.0               # block-position loss decay: exp(-(k-1)/gamma)
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+  # mask_reasoning_content: true      # exclude <think>...</think> traces from loss (non-thinking data)
+
+optimizer:
+  lr: 6.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  warmup_ratio: 0.04
+  min_lr_ratio: 0.1
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/dspark_glm_5.2_perfectblend/checkpoints
+  model_save_format: safetensors
+  save_consolidated: final
+  dequantize_base_checkpoint: true    # GLM-5.2 ships FP8 base weights; dequantize on load
+  # restore_from: LATEST

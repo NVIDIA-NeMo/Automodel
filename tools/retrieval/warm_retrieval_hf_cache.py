@@ -21,7 +21,7 @@ when corpus ``datasets.load_dataset(...)`` startup is expensive.
 Example:
 
 ```
-python tools/retrieval/warm_retrieval_hf_cache.py \
+uv run python tools/retrieval/warm_retrieval_hf_cache.py \
   --config examples/retrieval/bi_encoder/nemotron_vl_1b/eagle_llama_1b_gmoreira_8_nodes_image.yaml \
   --cache-dir /path/to/shared/hf_cache \
   --touch-samples 128
@@ -31,7 +31,6 @@ python tools/retrieval/warm_retrieval_hf_cache.py \
 from __future__ import annotations
 
 import argparse
-import importlib.metadata
 import inspect
 import json
 import logging
@@ -40,33 +39,22 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from nemo_automodel.shared.import_utils import safe_import
+
 logger = logging.getLogger(__name__)
 
-_RETRIEVAL_DATASET_TARGET = "nemo_automodel.components.datasets.llm.make_retrieval_dataset"
-
-
-def _patch_missing_torch_distribution_version() -> None:
-    original_version = importlib.metadata.version
-
-    def version(distribution_name: str) -> str:
-        package_version = original_version(distribution_name)
-        if distribution_name == "torch" and package_version is None:
-            import torch
-
-            package_version = torch.__version__
-        return package_version
-
-    importlib.metadata.version = version
-
-
-_patch_missing_torch_distribution_version()
+_RETRIEVAL_DATASET_TARGETS = {
+    None,
+    "nemo_automodel.components.datasets.llm.make_retrieval_dataset",
+    "nemo_automodel.components.datasets.llm.retrieval_dataset.make_retrieval_dataset",
+    "nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig",
+}
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
-    try:
-        import yaml
-    except ImportError as e:
-        raise ImportError("PyYAML is required to load --config. Install pyyaml.") from e
+    has_yaml, yaml = safe_import("yaml")
+    if not has_yaml:
+        raise ImportError("PyYAML is required to load --config. Install pyyaml.")
 
     with path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -77,22 +65,23 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 def _extract_dataset_config(config_path: Path) -> dict[str, Any]:
     cfg = _load_yaml(config_path)
-    try:
-        dataset_cfg = cfg["dataloader"]["dataset"]
-    except (KeyError, TypeError) as e:
-        raise ValueError(f"Config does not contain dataloader.dataset: {config_path}") from e
+    dataset_cfg = cfg.get("dataset")
+    if dataset_cfg is None:
+        dataloader_cfg = cfg.get("dataloader")
+        if isinstance(dataloader_cfg, dict):
+            dataset_cfg = dataloader_cfg.get("dataset")
     if not isinstance(dataset_cfg, dict):
-        raise ValueError(f"Config dataloader.dataset must be a mapping: {config_path}")
+        raise ValueError(f"Config dataset or legacy dataloader.dataset must be a mapping: {config_path}")
 
     target = dataset_cfg.get("_target_")
-    if target not in {None, _RETRIEVAL_DATASET_TARGET}:
+    if target not in _RETRIEVAL_DATASET_TARGETS:
         raise ValueError(
-            "warm_retrieval_hf_cache.py only supports the original retrieval dataset target "
-            f"{_RETRIEVAL_DATASET_TARGET!r}; got {target!r}. Use the original training config, "
-            "not a resolved-dataset override."
+            "warm_retrieval_hf_cache.py only supports the original retrieval dataset config; "
+            f"got target {target!r}. Use the original training config, "
+            "not a prepared-dataset override."
         )
     if "data_dir_list" not in dataset_cfg:
-        raise ValueError(f"Config dataloader.dataset does not contain data_dir_list: {config_path}")
+        raise ValueError(f"Config dataset does not contain data_dir_list: {config_path}")
     return dict(dataset_cfg)
 
 
@@ -110,9 +99,7 @@ def _dataset_kwargs_from_config(
     allowed_keys = set(signature.parameters)
     unknown_keys = sorted(set(kwargs) - allowed_keys)
     if unknown_keys:
-        raise ValueError(
-            f"Config dataloader.dataset contains unsupported field(s) for {dataset_factory.__name__}: {unknown_keys}"
-        )
+        raise ValueError(f"Config dataset contains unsupported field(s) for {dataset_factory.__name__}: {unknown_keys}")
     return kwargs
 
 

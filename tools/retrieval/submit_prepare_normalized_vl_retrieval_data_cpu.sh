@@ -45,7 +45,7 @@ RUN_NAME="${RUN_NAME:-normalized-vl-retrieval}"
 LOG_DIR="${LOG_DIR:-${OUT_DIR}/slurm_logs}"
 EXCLUDE_NODES="${EXCLUDE_NODES:-}"
 
-CONTAINER_IMAGE="${CONTAINER_IMAGE:-nvcr.io#nvidian/nemo-automodel:26.04.rc10}"
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-nvcr.io#nvidia/nemo-automodel:26.06.00}"
 USE_CONTAINER="${USE_CONTAINER:-1}"
 EXTRA_CONTAINER_MOUNTS="${EXTRA_CONTAINER_MOUNTS:-}"
 
@@ -58,9 +58,21 @@ SAMPLES_PER_SHARD="${SAMPLES_PER_SHARD:-10000}"
 DOCS_PER_SHARD="${DOCS_PER_SHARD:-10000}"
 SEED="${SEED:-42}"
 JPEG_QUALITY="${JPEG_QUALITY:-95}"
-RESUME="${RESUME:-1}"
+RESUME="${RESUME:-}"
 APPEND="${APPEND:-0}"
 EXTRA_PREP_ARGS="${EXTRA_PREP_ARGS:-}"
+
+if [[ -z "${RESUME}" ]]; then
+    if [[ "${APPEND}" == "1" ]]; then
+        RESUME=0
+    else
+        RESUME=1
+    fi
+fi
+if [[ "${RESUME}" == "1" && "${APPEND}" == "1" ]]; then
+    echo "RESUME=1 and APPEND=1 are mutually exclusive" >&2
+    exit 2
+fi
 
 if [[ -z "${CONFIG}" || -z "${OUT_DIR}" ]]; then
     cat >&2 <<EOF

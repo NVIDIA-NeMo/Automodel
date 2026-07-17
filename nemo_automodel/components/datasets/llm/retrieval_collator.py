@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import hashlib
-from typing import TYPE_CHECKING, Any, Dict, List, Union
+import warnings
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Union, cast
 
 import torch
 from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase, ProcessorMixin
@@ -304,7 +305,37 @@ class CrossEncoderCollator(DataCollatorWithPadding):
         return batch_dict
 
 
-def make_vision_collator_from_processor_method(tokenizer: ProcessorMixin, collator_fn_name: str):
+class ProcessorMethodCollator:
+    """Expose one method of a multimodal processor as a dataloader collator."""
+
+    def __init__(self, tokenizer: ProcessorMixin, collator_fn_name: str) -> None:
+        """Resolve the processor method once during dataloader construction.
+
+        Args:
+            tokenizer: Runtime multimodal processor.
+            collator_fn_name: Processor method used to collate each batch.
+        """
+        self.collate_fn = cast(
+            Callable[[list[dict[str, object]]], dict[str, object]],
+            getattr(tokenizer, collator_fn_name),
+        )
+
+    def __call__(self, batch: list[dict[str, object]]) -> dict[str, object]:
+        """Collate retrieval examples with the resolved processor method.
+
+        Args:
+            batch: Retrieval examples for one local batch.
+
+        Returns:
+            Processor-produced tensor batch.
+        """
+        return self.collate_fn(batch)
+
+
+def make_vision_collator_from_processor_method(
+    tokenizer: ProcessorMixin,
+    collator_fn_name: str,
+) -> Callable[[list[dict[str, object]]], dict[str, object]]:
     """
     Turns a method of a processor into a collator function.
 
@@ -315,9 +346,9 @@ def make_vision_collator_from_processor_method(tokenizer: ProcessorMixin, collat
     Returns:
         A collator for vision/multimodal retrieval datasets.
     """
-    if not hasattr(tokenizer, collator_fn_name):
-        raise ValueError(f"Processor {type(tokenizer).__name__} has no collator method {collator_fn_name!r}")
-    collator = getattr(tokenizer, collator_fn_name)
-    if not callable(collator):
-        raise ValueError(f"Processor attribute {collator_fn_name!r} on {type(tokenizer).__name__} is not callable")
-    return collator
+    warnings.warn(
+        "make_vision_collator_from_processor_method is deprecated; use ProcessorMethodCollator instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return cast(Callable[[list[dict[str, object]]], dict[str, object]], getattr(tokenizer, collator_fn_name))

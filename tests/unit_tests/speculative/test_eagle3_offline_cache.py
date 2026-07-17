@@ -30,15 +30,17 @@ import pytest
 import torch
 from transformers import LlamaConfig
 
-from nemo_automodel.components.datasets.llm import eagle3_cache as ec
+from nemo_automodel.components.datasets.llm import offline_cache as oc
 from nemo_automodel.components.datasets.llm.eagle3_cache import (
     CACHE_KEYS,
     CachedEagle3Dataset,
     build_cached_eagle3_dataloader,
+    compress_target_probs,
     existing_shard_indices,
     manifest_path,
     read_manifest,
     read_target_embeddings,
+    reconstruct_target_probs,
     write_manifest,
     write_shard,
     write_target_embeddings,
@@ -157,10 +159,11 @@ def test_forward_rejects_both_supervision_sources():
 # ---------------------------------------------------------------------------
 
 
-def test_compute_batch_cache_matches_compute_target_distribution():
+def test_compute_batch_cache_lossless_matches_compute_target_distribution():
     _, ids, mask = _build_module()
     tb = _fake_target_batch()
-    cache = _compute_batch_cache(tb, ids, mask, cache_dtype=torch.float32)
+    # topk=0 (the default) stores the full distribution -- exact, no factorization.
+    cache = _compute_batch_cache(tb, ids, mask, cache_dtype=torch.float32, target_probs_topk=0)
 
     assert set(cache) == set(CACHE_KEYS)
     target_probs, position_mask = _compute_target_distribution(
@@ -173,13 +176,58 @@ def test_compute_batch_cache_matches_compute_target_distribution():
     assert cache["position_mask"].dtype == torch.bool
 
 
+def test_compute_batch_cache_compressed_stores_topk():
+    _, ids, mask = _build_module()
+    tb = _fake_target_batch()
+    # A positive k below the draft vocab switches to the top-k factorization.
+    cache = _compute_batch_cache(tb, ids, mask, cache_dtype=torch.float32, target_probs_topk=4)
+
+    assert "target_probs" not in cache
+    assert cache["target_probs_values"].shape[-1] == 4
+    assert cache["target_probs_indices"].dtype == torch.int32
+    target_probs, _ = _compute_target_distribution(
+        target_logits=tb.logits, selected_token_ids=ids, selected_token_mask=mask, loss_mask=tb.loss_mask
+    )
+    reconstructed = reconstruct_target_probs(cache["target_probs_values"], cache["target_probs_indices"], _DRAFT_VOCAB)
+    # The kept top tokens carry the same argmax as the live distribution.
+    assert (reconstructed.argmax(-1) == target_probs.argmax(-1)).all()
+
+
 def test_compute_batch_cache_downcasts_floats():
     _, ids, mask = _build_module()
     tb = _fake_target_batch()
-    cache = _compute_batch_cache(tb, ids, mask, cache_dtype=torch.bfloat16)
+    cache = _compute_batch_cache(tb, ids, mask, cache_dtype=torch.bfloat16, target_probs_topk=4)
     assert cache["aux_hidden_states"].dtype == torch.bfloat16
-    assert cache["target_probs"].dtype == torch.bfloat16
+    assert cache["target_probs_values"].dtype == torch.bfloat16
+    assert cache["target_probs_indices"].dtype == torch.int32  # indices stay exact
     assert cache["input_ids"].dtype == torch.long  # ids/masks stay exact
+
+
+# ---------------------------------------------------------------------------
+# target_probs top-k compression / reconstruction
+# ---------------------------------------------------------------------------
+
+
+def test_compress_reconstruct_preserves_peaked_mass():
+    torch.manual_seed(0)
+    target_probs = torch.softmax(torch.randn(3, 5, _DRAFT_VOCAB) * 6.0, dim=-1)
+    values, indices = compress_target_probs(target_probs, topk=4)
+
+    assert values.shape[-1] == 4 and indices.dtype == torch.int32
+    # The kept mass is renormalized to a proper distribution.
+    torch.testing.assert_close(values.sum(-1), torch.ones(3, 5))
+    reconstructed = reconstruct_target_probs(values, indices, _DRAFT_VOCAB)
+    # The argmax (the always-supervised top token) is never dropped.
+    assert (reconstructed.argmax(-1) == target_probs.argmax(-1)).all()
+
+
+def test_compress_lossless_when_topk_at_least_vocab():
+    target_probs = torch.softmax(torch.randn(2, 4, _DRAFT_VOCAB), dim=-1)
+    values, indices = compress_target_probs(target_probs, topk=_DRAFT_VOCAB + 10)
+
+    assert values.shape[-1] == _DRAFT_VOCAB  # clamped to the vocab width
+    reconstructed = reconstruct_target_probs(values, indices, _DRAFT_VOCAB)
+    torch.testing.assert_close(reconstructed, target_probs)
 
 
 # ---------------------------------------------------------------------------
@@ -187,15 +235,29 @@ def test_compute_batch_cache_downcasts_floats():
 # ---------------------------------------------------------------------------
 
 
-def _write_tiny_cache(cache_dir, num_samples=3, shard_size=2, seq_len=4):
+def _write_tiny_cache(cache_dir, num_samples=3, shard_size=2, seq_len=4, topk=0):
+    """Write a tiny cache (lossless by default, top-k when ``topk`` compresses).
+
+    Returns ``(disk_samples, expected_target_probs)`` where the expectation is what
+    the reader yields for ``target_probs`` (reconstructed under compression).
+    """
+    target_probs = torch.softmax(torch.randn(num_samples, seq_len, _DRAFT_VOCAB), dim=-1)
     samples = {
         "input_ids": torch.randint(0, _VOCAB, (num_samples, seq_len), dtype=torch.long),
         "attention_mask": torch.ones(num_samples, seq_len, dtype=torch.long),
         "loss_mask": torch.ones(num_samples, seq_len, dtype=torch.long),
         "aux_hidden_states": torch.randn(num_samples, seq_len, _HIDDEN * 3),
-        "target_probs": torch.rand(num_samples, seq_len, _DRAFT_VOCAB),
         "position_mask": torch.ones(num_samples, seq_len, 1, dtype=torch.bool),
     }
+    if 0 < topk < _DRAFT_VOCAB:
+        values, indices = compress_target_probs(target_probs, topk)
+        samples["target_probs_values"] = values
+        samples["target_probs_indices"] = indices
+        expected = reconstruct_target_probs(values, indices, _DRAFT_VOCAB)
+    else:
+        samples["target_probs"] = target_probs
+        expected = target_probs
+
     shard_index = 0
     for start in range(0, num_samples, shard_size):
         chunk = {k: v[start : start + shard_size] for k, v in samples.items()}
@@ -211,25 +273,58 @@ def _write_tiny_cache(cache_dir, num_samples=3, shard_size=2, seq_len=4):
             "dtype": "fp32",
             "num_samples": num_samples,
             "shard_size": shard_size,
+            "target_probs_topk": topk,
             "aux_hidden_dim": _HIDDEN * 3,
             "aux_layer_ids": [1, 2, 3],
             "selected_token_ids": list(range(_DRAFT_VOCAB)),
         },
     )
-    return samples
+    return samples, expected
 
 
-def test_cache_dataset_round_trip(tmp_path):
+def test_cache_dataset_round_trip_lossless(tmp_path):
     cache_dir = str(tmp_path / "cache")
-    samples = _write_tiny_cache(cache_dir, num_samples=3, shard_size=2, seq_len=4)
+    samples, expected_target_probs = _write_tiny_cache(cache_dir, num_samples=3, shard_size=2, seq_len=4)
 
     dataset = CachedEagle3Dataset(cache_dir)
     assert len(dataset) == 3
     item = dataset[2]  # last sample lives in the trailing partial shard
     assert set(item) == set(CACHE_KEYS)
     torch.testing.assert_close(item["aux_hidden_states"], samples["aux_hidden_states"][2])
-    torch.testing.assert_close(item["target_probs"], samples["target_probs"][2])
+    torch.testing.assert_close(item["target_probs"], expected_target_probs[2])
     assert int(item["input_ids"][0]) == int(samples["input_ids"][2][0])
+
+
+def test_cache_dataset_round_trip_compressed(tmp_path):
+    cache_dir = str(tmp_path / "cache")
+    _, expected_target_probs = _write_tiny_cache(cache_dir, num_samples=3, shard_size=2, seq_len=4, topk=4)
+
+    dataset = CachedEagle3Dataset(cache_dir)
+    item = dataset[2]
+    # The reader yields full-width target_probs (reconstructed), not the disk keys.
+    assert set(item) == set(CACHE_KEYS)
+    assert item["target_probs"].shape == (4, _DRAFT_VOCAB)
+    torch.testing.assert_close(item["target_probs"], expected_target_probs[2])
+
+
+def test_write_shard_rejects_ambiguous_target_probs(tmp_path):
+    cache_dir = str(tmp_path / "cache")
+    base = {
+        "input_ids": torch.zeros(1, 4, dtype=torch.long),
+        "attention_mask": torch.ones(1, 4, dtype=torch.long),
+        "loss_mask": torch.ones(1, 4, dtype=torch.long),
+        "aux_hidden_states": torch.zeros(1, 4, _HIDDEN * 3),
+        "position_mask": torch.ones(1, 4, 1, dtype=torch.bool),
+    }
+    # Neither representation present.
+    with pytest.raises(ValueError, match="exactly one target_probs"):
+        write_shard(cache_dir, 0, dict(base))
+    # Both representations present.
+    both = dict(base, target_probs=torch.rand(1, 4, _DRAFT_VOCAB))
+    both["target_probs_values"] = torch.rand(1, 4, 2)
+    both["target_probs_indices"] = torch.zeros(1, 4, 2, dtype=torch.int32)
+    with pytest.raises(ValueError, match="exactly one target_probs"):
+        write_shard(cache_dir, 0, both)
 
 
 def test_cache_dataloader_batches(tmp_path):
@@ -250,7 +345,7 @@ def test_cache_dataset_rejects_missing_shards(tmp_path):
     manifest.pop("format_version", None)
     manifest["num_samples"] = 99
     write_manifest(cache_dir, manifest)
-    with pytest.raises(ValueError, match="shard files"):
+    with pytest.raises(ValueError, match="shard indices"):
         CachedEagle3Dataset(cache_dir)
 
 
@@ -273,7 +368,7 @@ def test_read_target_embeddings_missing_raises(tmp_path):
 
 
 def _args(**overrides):
-    base = dict(batch_size=4, shard_size=256, draft_vocab_size=8192, dtype="bf16")
+    base = dict(batch_size=4, shard_size=256, draft_vocab_size=8192, target_probs_topk=64, dtype="bf16")
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -285,6 +380,7 @@ def _args(**overrides):
         ({"shard_size": 0}, "shard-size"),
         ({"shard_size": 100, "batch_size": 8}, "multiple of"),  # 100 % 8 != 0
         ({"draft_vocab_size": 0}, "draft-vocab-size"),
+        ({"target_probs_topk": -1}, "target-probs-topk"),
         ({"dtype": "int4"}, "dtype"),
     ],
 )
@@ -520,14 +616,22 @@ def test_read_manifest_wrong_format_version_raises(tmp_path):
 
 
 def test_write_shard_missing_fields_raises(tmp_path):
+    # A valid target_probs representation but missing the common fields.
     with pytest.raises(ValueError, match="missing required cache fields"):
-        write_shard(str(tmp_path), 0, {"input_ids": torch.zeros(1, 1, dtype=torch.long)})
+        write_shard(
+            str(tmp_path),
+            0,
+            {
+                "input_ids": torch.zeros(1, 1, dtype=torch.long),
+                "target_probs": torch.rand(1, 1, _DRAFT_VOCAB),
+            },
+        )
 
 
 def test_load_safetensors_missing_raises(monkeypatch):
-    monkeypatch.setattr(ec, "safe_import_from", lambda *a, **k: (False, None))
+    monkeypatch.setattr(oc, "safe_import_from", lambda *a, **k: (False, None))
     with pytest.raises(ImportError, match="safetensors"):
-        ec._load_safetensors()
+        oc.load_safetensors("EAGLE-3")
 
 
 def test_trainer_module_rejects_nonpositive_ttt_steps():

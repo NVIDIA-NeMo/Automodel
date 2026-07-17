@@ -90,3 +90,27 @@ def test_gemma4_draft_forward_shapes():
     assert out.draft_logits.shape == (b, anchors, block, VOCAB)
     assert out.confidence_pred.shape == (b, anchors, block)
     assert torch.isfinite(out.draft_logits).all()
+
+
+def test_gemma4_rope_inv_freq_stays_fp32_after_bf16_cast():
+    """``model.to(bf16)`` must keep the Gemma4 RoPE frequencies in fp32.
+
+    A bf16-rounded frequency buffer dephases with absolute position and erodes
+    draft acceptance, so the draft recomputes fresh fp32 frequencies after the
+    cast. ``Gemma4TextRotaryEmbedding`` has no single ``inv_freq``; it registers
+    one ``<layer_type>_inv_freq`` buffer per layer type, so check all of them.
+    """
+    model = _build_gemma4_draft()  # fp32
+    freq_names = [n for n, _ in model.rotary_emb.named_buffers(recurse=False) if n.endswith("inv_freq")]
+    assert freq_names, "expected at least one *_inv_freq buffer on the Gemma4 rotary embedding"
+    ref = {n: getattr(model.rotary_emb, n).detach().clone().float() for n in freq_names}
+
+    model = model.to(torch.bfloat16)
+    for n in freq_names:
+        inv_freq = getattr(model.rotary_emb, n)
+        # Without the fp32 pin this buffer would be bf16 (its frequencies rounded).
+        assert inv_freq.dtype == torch.float32, n
+        # Recomputed fresh in fp32, not a bf16 round-trip (bf16 rel. error ~1e-2).
+        assert torch.allclose(inv_freq, ref[n], rtol=1e-6, atol=1e-8), n
+    # The pin is rope-only: the rest of the model still casts to bf16.
+    assert next(model.layers[0].parameters()).dtype == torch.bfloat16

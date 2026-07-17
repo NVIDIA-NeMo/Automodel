@@ -42,13 +42,24 @@ recipe_args:
   block_size: 7                       # tokens drafted in parallel per block
   num_anchors: 512                    # blocks sampled per sequence per step
   mask_token_id: 151669               # reserved Qwen3 token id for non-anchor block positions
-  target_layer_ids: [1, 7, 14, 21, 27]  # 5 feature layers spread across the 28-layer 0.6B target
+  target_layer_ids: [1, 7, 14, 21, 26]  # 5 feature layers spread across the 28-layer 0.6B target; 26 stays within [0, N-2] so the checkpoint is SGLang-servable (the last layer 27 has no SGLang aux capture point)
   freeze_embeddings: true             # draft shares + freezes the target embed_tokens and lm_head
   attention_backend: flex_attention   # block mask requires flex_attention (GPU)
 
   # --- serial Markov head (semi-autoregressive) ---
   markov_rank: 256
   markov_head_type: vanilla           # vanilla | gated | rnn
+
+  # OFFLINE path: precompute the target supervision once, then stream it here
+  # without loading/running the target model during draft training:
+  #
+  #   python -m nemo_automodel.components.speculative.precompute_dspark \
+  #     --target-model Qwen/Qwen3-0.6B \
+  #     --input-data /path/to/perfectblend_qwen3-0.6b_regen.jsonl \
+  #     --output-dir /data/dspark_cache/qwen3_0.6b \
+  #     --seq-length 4096 --target-layer-ids 1 7 14 21 27
+  #
+  # cached_target_path: /data/dspark_cache/qwen3_0.6b
 
   # --- confidence head (scheduled verification) ---
   confidence_head_alpha: 1.0          # > 0 enables the confidence head

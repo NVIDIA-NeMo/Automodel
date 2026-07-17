@@ -21,7 +21,7 @@ This format keeps the original retrieval data model:
 - training still resolves ``doc_id -> document`` through the retrieval transform.
 
 It is intended as a portable alternative to the original corpus-id JSON plus
-external Hugging Face corpus paths, not as a resolved-row format.
+external Hugging Face corpus paths.
 """
 
 from __future__ import annotations
@@ -30,9 +30,10 @@ import json
 import logging
 import os
 from copy import deepcopy
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, TypedDict
 
 from nemo_automodel.components.datasets.llm.retrieval_dataset import (
     EXAMPLE_TEMPLATE,
@@ -43,6 +44,17 @@ from nemo_automodel.components.datasets.llm.retrieval_dataset import (
 from nemo_automodel.shared.import_utils import safe_import
 
 _VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
+
+
+class NormalizedDataEntryConfig(TypedDict, total=False):
+    """One normalized retrieval source and its optional sample cap."""
+
+    path: str | Path | os.PathLike[str]
+    num_samples: int | None
+
+
+NormalizedDataEntry = str | Path | os.PathLike[str] | NormalizedDataEntryConfig
+NormalizedDataPath = NormalizedDataEntry | Sequence[NormalizedDataEntry]
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +75,7 @@ def _coerce_bundle_root(data_path: str | Path | os.PathLike[str]) -> Path:
     return path
 
 
-def _parse_data_entries(data_path: str | Path | os.PathLike[str] | Sequence[Any]) -> list[tuple[Path, int | None]]:
+def _parse_data_entries(data_path: NormalizedDataPath) -> list[tuple[Path, int | None]]:
     if isinstance(data_path, (str, Path, os.PathLike)):
         return [(_coerce_bundle_root(data_path), None)]
     if isinstance(data_path, dict):
@@ -166,8 +178,9 @@ class NormalizedArrowCorpusDataset(AbstractDataset):
         self.data = dataset
         self.docid2idx = {str(doc_id): idx for idx, doc_id in enumerate(self.data["id"])}
 
-    def get_document_by_id(self, id):
-        row = self.data[self.docid2idx[str(id)]]
+    def get_document_by_id(self, doc_id: str) -> dict[str, Any]:
+        """Return one normalized corpus document by ID."""
+        row = self.data[self.docid2idx[str(doc_id)]]
         example = deepcopy(EXAMPLE_TEMPLATE)
         example["text"] = "" if row.get("text") is None else str(row.get("text"))
         example["image"] = _decode_image_bytes(row.get("image_jpeg"))
@@ -177,7 +190,8 @@ class NormalizedArrowCorpusDataset(AbstractDataset):
             example["complex_ocr"] = str(row.get("complex_ocr"))
         return example
 
-    def get_all_ids(self):
+    def get_all_ids(self) -> list[str]:
+        """Return all document IDs in sorted order."""
         return sorted(self.docid2idx.keys())
 
 
@@ -223,7 +237,29 @@ def _merge_corpus_dicts(corpus_dicts: Sequence[dict[str, CorpusInfo]]) -> dict[s
                 corpus_info.corpus, NormalizedArrowCorpusDataset
             ):
                 raise TypeError(f"Cannot merge non-normalized corpus dataset for corpus_id={corpus_id!r}")
-            combined_dataset = datasets.concatenate_datasets([existing.corpus.data, corpus_info.corpus.data])
+            if existing.metadata != corpus_info.metadata:
+                raise ValueError(f"Conflicting metadata for normalized corpus_id={corpus_id!r}")
+
+            existing_ids = set(existing.corpus.docid2idx)
+            incoming_ids = set(corpus_info.corpus.docid2idx)
+            conflicting_ids = [
+                doc_id
+                for doc_id in sorted(existing_ids & incoming_ids)
+                if existing.corpus.data[existing.corpus.docid2idx[doc_id]]
+                != corpus_info.corpus.data[corpus_info.corpus.docid2idx[doc_id]]
+            ]
+            if conflicting_ids:
+                raise ValueError(
+                    f"Conflicting document payloads for normalized corpus_id={corpus_id!r}, "
+                    f"document id(s): {conflicting_ids[:5]}"
+                )
+
+            unique_indices = [idx for doc_id, idx in corpus_info.corpus.docid2idx.items() if doc_id not in existing_ids]
+            combined_dataset = existing.corpus.data
+            if unique_indices:
+                combined_dataset = datasets.concatenate_datasets(
+                    [existing.corpus.data, corpus_info.corpus.data.select(unique_indices)]
+                )
             corpus_metadata = dict(existing.metadata)
             merged[corpus_id] = CorpusInfo(
                 corpus_metadata,
@@ -306,7 +342,7 @@ def _build_transform(
 
 
 def make_normalized_retrieval_dataset(
-    data_path: str | Path | os.PathLike[str] | Sequence[Any] | None = None,
+    data_path: NormalizedDataPath | None = None,
     model_type: str = "bi_encoder",
     data_type: str = "train",
     n_passages: int = 5,
@@ -317,9 +353,27 @@ def make_normalized_retrieval_dataset(
     train_data_select_offset: int = 0,
     use_dataset_instruction: bool = False,
     cycle_positive_docs: bool = False,
-    data_dir_list: str | Path | os.PathLike[str] | Sequence[Any] | None = None,
+    data_dir_list: NormalizedDataPath | None = None,
 ) -> Any:
-    """Build a normalized portable retrieval dataset from a local Arrow bundle."""
+    """Build a normalized portable retrieval dataset from local Arrow bundles.
+
+    Args:
+        data_path: Bundle path or source entries. Use either this field or ``data_dir_list``.
+        model_type: Retrieval model type, either ``bi_encoder`` or ``cross_encoder``.
+        data_type: Dataset mode, either ``train`` or ``eval``.
+        n_passages: Number of passages per training query, including the positive passage.
+        eval_negative_size: Number of negative passages per evaluation query.
+        seed: Random seed used for source sampling and optional shuffling.
+        do_shuffle: Whether to shuffle before applying ``max_train_samples``.
+        max_train_samples: Optional cap on the combined training rows.
+        train_data_select_offset: Starting row for the training sample cap.
+        use_dataset_instruction: Whether to attach corpus query and passage instructions.
+        cycle_positive_docs: Whether to cycle through positive documents by epoch.
+        data_dir_list: Legacy alias for ``data_path`` used by existing retrieval configs.
+
+    Returns:
+        A Hugging Face dataset with a lazy retrieval transform attached.
+    """
     if data_path is not None and data_dir_list is not None:
         raise ValueError("Provide only one of data_path or data_dir_list")
     if data_path is None:
@@ -372,3 +426,38 @@ def make_normalized_retrieval_dataset(
         dataset.set_epoch = transform.set_epoch
     logger.info("Created normalized %s dataset with %d examples", data_type, len(dataset))
     return dataset
+
+
+@dataclass
+class NormalizedRetrievalDatasetConfig:
+    """Construction-time configuration for a normalized retrieval Arrow dataset."""
+
+    data_path: NormalizedDataPath | None = None
+    model_type: str = "bi_encoder"
+    data_type: str = "train"
+    n_passages: int = 5
+    eval_negative_size: int | None = None
+    seed: int = 42
+    do_shuffle: bool = False
+    max_train_samples: int | None = None
+    train_data_select_offset: int = 0
+    use_dataset_instruction: bool = False
+    cycle_positive_docs: bool = False
+    data_dir_list: NormalizedDataPath | None = None
+
+    def build(self) -> Any:
+        """Build the normalized retrieval dataset."""
+        return make_normalized_retrieval_dataset(
+            data_path=self.data_path,
+            model_type=self.model_type,
+            data_type=self.data_type,
+            n_passages=self.n_passages,
+            eval_negative_size=self.eval_negative_size,
+            seed=self.seed,
+            do_shuffle=self.do_shuffle,
+            max_train_samples=self.max_train_samples,
+            train_data_select_offset=self.train_data_select_offset,
+            use_dataset_instruction=self.use_dataset_instruction,
+            cycle_positive_docs=self.cycle_positive_docs,
+            data_dir_list=self.data_dir_list,
+        )

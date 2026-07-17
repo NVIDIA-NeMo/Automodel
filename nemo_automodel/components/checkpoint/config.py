@@ -37,14 +37,23 @@ from packaging.version import parse
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 
 if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
 
     from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
+_TORCH_2_7_1 = (2, 7, 1)
+_TORCH_2_9 = (2, 9)
+
+
+def _is_leq_torch_2_7_1() -> bool:
+    """Check if the current torch version is less than or equal to 2.7.1."""
+    return parse(torch.__version__).release <= _TORCH_2_7_1
+
 
 def _is_geq_torch_2_9() -> bool:
     """Check if the current torch version is greater than or equal to 2.9.0."""
-    return parse(torch.__version__).base_version >= "2.9.0"
+    return parse(torch.__version__).release >= _TORCH_2_9
 
 
 class SaveConsolidatedMode(str, Enum):
@@ -103,9 +112,9 @@ class CheckpointingConfig:
         None  # Parameter prefixes to skip when loading base model
     )
     single_rank_consolidation: bool = False  # If True, only rank 0 performs consolidation.
-    # This should be used for remote storage systems that don't support direct-append or non-sequential writes.
-    staging_dir: str | None = None  # Optional directory for staging files during consolidation.
-    # If provided, temp files will be created here instead of system temp. Useful when system temp has limited space.
+    # Optional directory for staging files during consolidation. If provided, temp files will be created here instead
+    # of system temp before copying completed files to the final output directory.
+    staging_dir: str | None = None
     v4_compatible: bool = False  # If True, save the original pretrained config.json (with quantization_config removed)
     # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
     diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
@@ -177,6 +186,7 @@ class CheckpointingConfig:
         tp_rank: int,
         pp_rank: int,
         moe_mesh: DeviceMesh | None = None,
+        process_group: ProcessGroup | None = None,
     ) -> Checkpointer:
         """Build the :class:`Checkpointer` engine for this config.
 
@@ -189,13 +199,21 @@ class CheckpointingConfig:
             tp_rank: Tensor-parallel rank.
             pp_rank: Pipeline-parallel rank.
             moe_mesh: Optional device mesh for MoE checkpointing.
+            process_group: Process group used for distributed checkpoint collectives.
 
         Returns:
             Configured :class:`Checkpointer`.
         """
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
-        return Checkpointer(config=self, dp_rank=dp_rank, tp_rank=tp_rank, pp_rank=pp_rank, moe_mesh=moe_mesh)
+        return Checkpointer(
+            config=self,
+            dp_rank=dp_rank,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            moe_mesh=moe_mesh,
+            process_group=process_group,
+        )
 
 
 __all__ = ["CheckpointingConfig", "SaveConsolidatedMode"]

@@ -27,6 +27,7 @@ Heavy-lifting helpers live in sibling modules:
 import gc
 import inspect
 import logging
+import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -96,6 +97,7 @@ from nemo_automodel._transformers.model_init import (
     no_hf_meta_device,
     resolve_sdpa_method,
 )
+from nemo_automodel.components.models.common.tie_word_embeddings import reject_tie_word_embeddings_flip
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
     from transformers.cache_utils import StaticCache
@@ -252,6 +254,42 @@ def _maybe_dequantize_fp8_for_peft(hf_native_quant_cfg, peft_config, pretrained_
             logger.info("FP8 model with PEFT: setting dequantize=True for compatibility")
             return True
     return False
+
+
+def _maybe_reject_tie_word_embeddings_flip(pretrained_model_name_or_path, hf_config, kwargs):
+    """Reject a from_pretrained request that flips tie_word_embeddings from the checkpoint.
+
+    Re-reads the checkpoint's raw config (no user value-overrides) and compares its
+    controlling tie flag to the requested ``hf_config`` via
+    :func:`reject_tie_word_embeddings_flip`. Conservative by design: path-like sources
+    are normalized with :func:`os.fspath`, non-path sources are skipped, and it silently
+    returns if the raw config cannot be re-read, so it never blocks a load except on a
+    genuine flip.
+
+    Args:
+        pretrained_model_name_or_path: The from_pretrained source (``str`` and
+            ``os.PathLike`` are checked; anything else is skipped).
+        hf_config: The resolved config with user overrides applied (the requested value).
+        kwargs: The from_pretrained kwargs (hub-locating keys are reused for the raw load).
+    """
+    if isinstance(pretrained_model_name_or_path, os.PathLike):
+        pretrained_model_name_or_path = os.fspath(pretrained_model_name_or_path)
+    if not isinstance(pretrained_model_name_or_path, str):
+        # Non-path source (e.g. bytes fspath or preloaded object): nothing to re-read.
+        return
+    hub_kwargs = {k: kwargs[k] for k in _AUTO_CONFIG_HUB_KWARG_KEYS if k in kwargs}
+    try:
+        raw_config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=kwargs.get("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path)),
+            **hub_kwargs,
+        )
+    except Exception:
+        # Cannot re-read the raw config (offline / custom loader); do not block the load.
+        return
+    architectures = getattr(hf_config, "architectures", None) or []
+    model_class_name = architectures[0] if architectures else type(hf_config).__name__
+    reject_tie_word_embeddings_flip(raw_config, hf_config, model_class_name)
 
 
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
@@ -421,6 +459,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             logger.info("attn_implementation='te' requested: using 'sdpa' for model init and will inject TE post-init.")
             attn_implementation = "sdpa"
 
+        # FFPA backend setup (validate + register) lives in ffpa_attention; run it
+        # before _apply_preload_overrides, which would otherwise rewrite ffpa → sdpa/
+        # flash_attention_2 for HF models.
+        if attn_implementation == "ffpa":
+            from nemo_automodel.components.attention.ffpa_attention import setup_ffpa_backend
+
+            setup_ffpa_backend(mesh.cp_size, has_packed_sequence)
+
         if is_hf_model:
             attn_implementation, use_liger_kernel = _apply_preload_overrides(
                 mesh.tp_size,
@@ -476,6 +522,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         model = None  # Ensure 'model' is always bound for the except handler
         is_custom_model = None
+        process_group = getattr(mesh, "process_group", None)
         try:
             with init_ctx:
                 is_custom_model, model = _init_model(
@@ -486,6 +533,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     quantization_config,
                     force_hf,
                     *model_args,
+                    _process_group=process_group,
                     **kwargs,
                 )
         except (NotImplementedError, RuntimeError) as e:
@@ -515,6 +563,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                         quantization_config,
                         force_hf,
                         *model_args,
+                        _process_group=process_group,
                         **kwargs,
                     )
             else:
@@ -701,6 +750,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             else:
                 raise
         is_hf_model = get_is_hf_model(hf_config, force_hf)
+
+        # Layer 2: reject loading a checkpoint with tie_word_embeddings flipped from the
+        # value it was saved with (the class-level TieSupport policy cannot catch this).
+        _maybe_reject_tie_word_embeddings_flip(pretrained_model_name_or_path, hf_config, kwargs)
 
         sdpa_method = resolve_sdpa_method(sdpa_method, mesh.device_mesh, activation_checkpointing)
 
@@ -1042,6 +1095,11 @@ class _NeMoAutoModelForRetrievalBase:
         from nemo_automodel._transformers import retrieval as _enc_mod
 
         encoder_cls = getattr(_enc_mod, cls._ENCODER_CLS_NAME)
+
+        if attn_implementation == "ffpa":
+            from nemo_automodel.components.attention.ffpa_attention import register_ffpa_attention
+
+            register_ffpa_attention()
 
         logger.info(f"Loading {cls.__name__} from {pretrained_model_name_or_path}")
 

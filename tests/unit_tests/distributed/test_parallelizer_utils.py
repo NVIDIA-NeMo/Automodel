@@ -295,6 +295,56 @@ def test_fully_shard_by_dtype_single_dtype(monkeypatch):
     assert sub_calls == []  # no fp32-compute carve-outs declared
 
 
+def test_fully_shard_by_dtype_omits_none_reshard_kwarg(monkeypatch):
+    calls: list[tuple[nn.Module, dict]] = []
+
+    def fake_fully_shard(mod, **kwargs):
+        calls.append((mod, kwargs))
+
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.parallelizer_utils.fully_shard",
+        fake_fully_shard,
+        raising=True,
+    )
+
+    # Single-dtype branch.
+    uniform = ToyModel(
+        a_dtype=torch.bfloat16,
+        b_dtype_l1=torch.bfloat16,
+        b_dtype_l2=torch.bfloat16,
+    )
+    fully_shard_by_dtype(
+        uniform,
+        mesh=object(),
+        mp_policy=_make_mp_policy(),
+        offload_policy=object(),
+        reshard_after_forward=None,
+    )
+    assert len(calls) == 1
+    assert calls[0][0] is uniform
+    assert "reshard_after_forward" not in calls[0][1]
+
+    # Two-dtype branch: both the minority subtree and parent call must omit
+    # the kwarg. Older supported PyTorch releases and some vendor builds
+    # reject an explicit ``None``.
+    calls.clear()
+    mixed = ToyModel(
+        a_dtype=torch.float32,
+        b_dtype_l1=torch.float16,
+        b_dtype_l2=torch.float16,
+    )
+    _tag_hf_compute_dtype(mixed)
+    fully_shard_by_dtype(
+        mixed,
+        mesh=object(),
+        mp_policy=_make_mp_policy(),
+        offload_policy=object(),
+        reshard_after_forward=None,
+    )
+    assert {mod for mod, _ in calls} == {mixed.a, mixed}
+    assert all("reshard_after_forward" not in kwargs for _, kwargs in calls)
+
+
 def test_fully_shard_by_dtype_storage_equals_compute_keeps_storage_dtype(monkeypatch):
     """Uniform storage that matches the requested compute dtype shards as before."""
     fully_calls: list[tuple[nn.Module, MixedPrecisionPolicy]] = []

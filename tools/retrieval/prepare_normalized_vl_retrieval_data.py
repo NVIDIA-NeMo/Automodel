@@ -14,7 +14,7 @@
 
 """Build a portable normalized VL retrieval Arrow bundle.
 
-Unlike resolved retrieval shards, this keeps the corpus-id data model:
+This keeps the corpus-id data model:
 
 - train shards contain query text and positive/negative document ids;
 - corpus shards store each referenced document/image once;
@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.metadata
 import json
 import logging
 import os
@@ -47,23 +46,6 @@ import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-
-
-def _patch_missing_torch_distribution_version() -> None:
-    original_version = importlib.metadata.version
-
-    def version(distribution_name: str) -> str:
-        package_version = original_version(distribution_name)
-        if distribution_name == "torch" and package_version is None:
-            import torch
-
-            package_version = torch.__version__
-        return package_version
-
-    importlib.metadata.version = version
-
-
-_patch_missing_torch_distribution_version()
 
 from nemo_automodel.components.datasets.llm.retrieval_dataset import load_datasets
 from nemo_automodel.shared.import_utils import safe_import
@@ -132,13 +114,16 @@ def _load_dataset_args_from_config(config_path: str) -> tuple[list[Any], int | N
     with Path(config_path).open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    try:
-        dataset_cfg = cfg["dataloader"]["dataset"]
-    except (KeyError, TypeError) as e:
-        raise ValueError(f"Config does not contain dataloader.dataset: {config_path}") from e
+    dataset_cfg = cfg.get("dataset") if isinstance(cfg, dict) else None
+    if dataset_cfg is None and isinstance(cfg, dict):
+        dataloader_cfg = cfg.get("dataloader")
+        if isinstance(dataloader_cfg, dict):
+            dataset_cfg = dataloader_cfg.get("dataset")
+    if not isinstance(dataset_cfg, dict):
+        raise ValueError(f"Config does not contain dataset or legacy dataloader.dataset: {config_path}")
 
     if "data_dir_list" not in dataset_cfg:
-        raise ValueError(f"Config dataloader.dataset does not contain data_dir_list: {config_path}")
+        raise ValueError(f"Config dataset does not contain data_dir_list: {config_path}")
     return dataset_cfg["data_dir_list"], dataset_cfg.get("n_passages")
 
 
@@ -247,6 +232,45 @@ def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
         if temp_path.exists():
             temp_path.unlink()
         raise
+
+
+def _validate_or_write_resume_state(
+    output_dir: Path,
+    data_dir_list: list[Any],
+    *,
+    samples_per_shard: int,
+    docs_per_shard: int,
+    seed: int,
+    max_samples: int | None,
+    jpeg_quality: int,
+    resume: bool,
+) -> None:
+    """Persist the inputs that determine whether existing shards are reusable."""
+    state_path = output_dir / ".resume-state.json"
+    expected_state = {
+        "source_key": _source_entry_key(data_dir_list),
+        "samples_per_shard": samples_per_shard,
+        "docs_per_shard": docs_per_shard,
+        "seed": seed,
+        "max_samples": max_samples,
+        "jpeg_quality": jpeg_quality,
+    }
+    if state_path.is_file():
+        existing_state = json.loads(state_path.read_text(encoding="utf-8"))
+        if existing_state != expected_state:
+            raise ValueError(
+                f"Cannot resume normalized retrieval prep in {output_dir}: the source or prep options changed. "
+                "Use the original inputs or choose a new output directory."
+            )
+        return
+
+    has_existing_shards = any((output_dir / "train").glob("*.arrow")) or any((output_dir / "corpus").glob("**/*.arrow"))
+    if resume and has_existing_shards:
+        raise ValueError(
+            f"Cannot safely resume normalized retrieval prep in {output_dir}: .resume-state.json is missing. "
+            "Choose a new output directory."
+        )
+    _write_json_atomic(state_path, expected_state)
 
 
 def _load_top_level_metadata(output_dir: Path) -> dict[str, Any]:
@@ -363,20 +387,23 @@ def _existing_corpus_metadata_if_complete(
     if not has_datasets:
         raise ImportError("datasets is required to resume normalized retrieval Arrow shards. Install datasets.")
 
+    existing_ids: set[str] = set()
     num_records = 0
     try:
         for path in shard_paths:
-            num_records += len(datasets.Dataset.from_file(str(path)))
+            shard = datasets.Dataset.from_file(str(path))
+            num_records += len(shard)
+            existing_ids.update(str(doc_id) for doc_id in shard["id"])
     except Exception:
         logger.warning("Corpus %s has unreadable existing shards in %s; rewriting", corpus_id, corpus_output_dir)
         return None
 
-    if num_records != len(refs):
+    if num_records != len(existing_ids) or existing_ids != refs:
         logger.warning(
-            "Corpus %s has %d existing docs but %d are expected; rewriting",
+            "Corpus %s existing document IDs do not match the %d expected references; rewriting %d row(s)",
             corpus_id,
-            num_records,
             len(refs),
+            num_records,
         )
         return None
 
@@ -530,6 +557,16 @@ def _prepare_single_normalized_dataset(
 ) -> dict[str, Any]:
     """Write a normalized portable Arrow retrieval bundle."""
     _prepare_output_dir(output_dir, resume=resume)
+    _validate_or_write_resume_state(
+        output_dir,
+        data_dir_list,
+        samples_per_shard=samples_per_shard,
+        docs_per_shard=docs_per_shard,
+        seed=seed,
+        max_samples=max_samples,
+        jpeg_quality=jpeg_quality,
+        resume=resume,
+    )
     dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True, seed=seed)
     existing_train = _collect_refs_from_train_shards(output_dir / "train") if resume else None
     if existing_train is None:
@@ -713,6 +750,8 @@ def prepare_normalized_dataset(
     append: bool = False,
 ) -> dict[str, Any]:
     """Write a normalized portable Arrow retrieval bundle."""
+    if resume and append:
+        raise ValueError("--resume and --append are mutually exclusive")
     if append:
         return _append_normalized_sources(
             data_dir_list,
@@ -775,7 +814,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         default=None,
-        help="AutoModel bi-encoder YAML. Uses dataloader.dataset.data_dir_list.",
+        help="AutoModel bi-encoder YAML. Uses dataset.data_dir_list (or legacy dataloader.dataset).",
     )
     parser.add_argument("--data-dir-list", nargs="+", default=None, help="Corpus-id retrieval JSON files to bundle")
     parser.add_argument("--output-dir", required=True, help="Directory for normalized Arrow train/corpus shards")
