@@ -25,6 +25,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler, SignalLike
 
 if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
     from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ class StepScheduler(Stateful):
         num_epochs: Optional[int] = None,
         max_steps: Optional[int] = None,
         preemption_signal: SignalLike | list[SignalLike] | None = signal.SIGTERM,
+        process_group: ProcessGroup | None = None,
     ):
         """
         Initialize the StepScheduler.
@@ -100,6 +102,7 @@ class StepScheduler(Stateful):
                 preemption checkpoint, each given as a signal number, name (e.g. "SIGTERM"), or
                 ``signal.Signals`` member. When ``None``, no signal handler is installed and preemption
                 checkpointing is disabled. Default: ``signal.SIGTERM``.
+            process_group: Process group whose ranks participate in distributed signal handling.
         """
         if global_batch_size <= 0:
             raise ValueError(f"global_batch_size must be greater than 0, got {global_batch_size}")
@@ -175,11 +178,10 @@ class StepScheduler(Stateful):
             raise ValueError(f"ckpt_every_steps must be greater than 0, got {ckpt_every_steps}")
         self.ckpt_every_steps = ckpt_every_steps
         self.save_checkpoint_every_epoch = save_checkpoint_every_epoch
-
         if preemption_signal is None:
             self.sig_handler = None
         else:
-            self.sig_handler = DistributedSignalHandler(sig=preemption_signal).__enter__()
+            self.sig_handler = DistributedSignalHandler(sig=preemption_signal, group=process_group).__enter__()
         self.sigterm_flag = False
         self._sig_polled_step: Optional[int] = None
 
@@ -387,13 +389,20 @@ class StepSchedulerConfig:
     start_epoch: int = 0
     preemption_signal: int | str | list[int | str] | None = "SIGTERM"
 
-    def build(self, dataloader: DataLoader, dp_group_size: int, local_batch_size: int) -> StepScheduler:
+    def build(
+        self,
+        dataloader: DataLoader,
+        dp_group_size: int,
+        local_batch_size: int,
+        process_group: ProcessGroup | None = None,
+    ) -> StepScheduler:
         """Build the step scheduler.
 
         Args:
             dataloader: The training dataloader.
             dp_group_size: The size of the data parallel group.
             local_batch_size: The size of the local batch.
+            process_group: Process group whose ranks participate in distributed signal handling.
 
         Returns:
             Configured StepScheduler.
@@ -402,4 +411,5 @@ class StepSchedulerConfig:
         kwargs["local_batch_size"] = local_batch_size
         kwargs["dp_size"] = dp_group_size
         kwargs["dataloader"] = dataloader
+        kwargs["process_group"] = process_group
         return StepScheduler(**kwargs)

@@ -104,16 +104,24 @@ class DistributedSignalHandler:
         sig: One or more signals to handle, each given as a signal number,
             name (e.g. "SIGTERM"), or ``signal.Signals`` member. Accepts a
             single value or a sequence. Defaults to signal.SIGTERM.
+        group: Process group whose ranks participate in signal propagation.
+            Defaults to the global process group.
     """
 
-    def __init__(self, sig: SignalLike | Sequence[SignalLike] = signal.SIGTERM) -> None:
+    def __init__(
+        self,
+        sig: SignalLike | Sequence[SignalLike] = signal.SIGTERM,
+        group: torch.distributed.ProcessGroup | None = None,
+    ) -> None:
         """
         Constructor for the DistributedSignalHandler.
 
         Args:
-            sig (SignalLike | Sequence[SignalLike], optional): One or more signals to handle, each
-                given as a signal number, name (e.g. "SIGTERM"), or ``signal.Signals`` member.
-                Defaults to signal.SIGTERM.
+            sig (SignalLike | Sequence[SignalLike], optional): One or more signals to handle,
+                each given as a signal number, name (e.g. "SIGTERM"), or ``signal.Signals``
+                member. Defaults to signal.SIGTERM.
+            group: Process group whose ranks participate in signal propagation.
+                Defaults to the global process group.
         """
         specs = sig if isinstance(sig, (list, tuple)) else [sig]
         sigs = [resolve_signal(s) for s in specs]
@@ -122,6 +130,7 @@ class DistributedSignalHandler:
         if len(set(sigs)) != len(sigs):
             raise ValueError(f"Duplicate signals provided: {[s.name for s in sigs]}")
         self.sigs = sigs
+        self.group = group
         self._signal_received = False
         self.released = False
         self.original_handlers = {}
@@ -133,7 +142,7 @@ class DistributedSignalHandler:
 
     def signals_received(self) -> list[bool]:
         """
-        Check if any rank in the default group received the signal.
+        Check if any rank in the configured group received the signal.
 
         Uses all_gather to collect the signal status from all ranks.
 
@@ -141,7 +150,7 @@ class DistributedSignalHandler:
             A list of booleans, where each element indicates if the
             corresponding rank received the signal.
         """
-        all_received = all_gather_item(self._signal_received, dtype=torch.int32)
+        all_received = all_gather_item(self._signal_received, dtype=torch.int32, group=self.group)
         return all_received
 
     def __enter__(self) -> "DistributedSignalHandler":

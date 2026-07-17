@@ -37,7 +37,6 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
-from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 from nemo_automodel.components.models.glm4_moe.state_dict_adapter import Glm4MoeStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
@@ -278,7 +277,6 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         backend: BackendConfig | None = None,
         **kwargs,
     ):
-        warn_deprecated_model_class("Glm4MoeLiteForCausalLM")
         super().__init__()
         self.config = config
         reject_unsupported_tie_word_embeddings(type(self), config)
