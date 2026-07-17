@@ -162,6 +162,8 @@ class BackendConfig:
             For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
             indexer, and Sinkhorn kernels together.
         linear: Linear layer backend ("torch", "te", or "quack").
+        mlp: Dense gated-MLP backend ("torch" or "quack"). QuACK is currently
+            integrated for Llama SwiGLU MLPs with bias disabled.
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope_fusion: Whether to use fused RoPE (requires TE).
         experts: MoE expert GEMM backend. "torch" uses per-expert loop,
@@ -197,6 +199,7 @@ class BackendConfig:
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
+    mlp: Literal["torch", "quack"] = "torch"
     rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
     rope_fusion: bool = HAVE_TE and torch.cuda.is_available()
     experts: Literal["torch", "te", "gmm", "torch_mm", "torch_mm_mxfp8"] = (
