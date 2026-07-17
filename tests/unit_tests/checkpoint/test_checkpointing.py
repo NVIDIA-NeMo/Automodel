@@ -45,6 +45,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _equally_divide_layers,
     _is_custom_model,
     _model_has_dtensors,
+    _new_gloo_process_group,
     _normalize_dtype_mapping_to_state_dict_keys,
     _reinit_non_persistent_buffers,
     _should_write_consolidated_safetensors,
@@ -62,6 +63,21 @@ from nemo_automodel.components.checkpoint.utils import (
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
+
+
+def test_new_gloo_process_group_preserves_subset_membership():
+    """Async checkpoint groups use only the supplied model-process ranks."""
+    model_group = object()
+    gloo_group = object()
+    with (
+        patch("torch.distributed.get_process_group_ranks", return_value=[2, 3]) as get_ranks,
+        patch("torch.distributed.new_group", return_value=gloo_group) as new_group,
+    ):
+        result = _new_gloo_process_group(model_group)
+
+    assert result is gloo_group
+    get_ranks.assert_called_once_with(model_group)
+    new_group.assert_called_once_with(ranks=[2, 3], backend="gloo", use_local_synchronization=True)
 
 
 def _make_keys(count: int) -> list[str]:
@@ -2386,6 +2402,7 @@ def _make_ckptr(is_peft=False, is_async=False):
     ckptr.config = config
     ckptr._model_ctx = MagicMock(staging_active=False)
     ckptr._optim_ctx = MagicMock(staging_active=False)
+    ckptr.process_group = None
     return ckptr
 
 
@@ -2431,6 +2448,15 @@ class TestEnsureDirs:
         with patch("os.makedirs") as mock_makedirs:
             _ensure_dirs(target)
         mock_makedirs.assert_called_once_with(target, exist_ok=True)
+
+    def test_distributed_barrier_uses_process_group(self, tmp_path):
+        group = object()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.barrier") as barrier,
+        ):
+            _ensure_dirs(str(tmp_path), process_group=group)
+        barrier.assert_called_once_with(group=group)
 
 
 class TestSaveConfig:
@@ -3121,6 +3147,7 @@ class TestSyncAsyncSave:
         ckptr.config = config
         ckptr._model_ctx = MagicMock(staging_active=False)
         ckptr._optim_ctx = MagicMock(staging_active=False)
+        ckptr.process_group = None
         return ckptr
 
     def test_dcp_cloud_sync_calls_dcp_save(self):
@@ -3273,6 +3300,31 @@ class TestSyncAsyncSave:
 
         mock_dcp.save.assert_called_once()
         mock_dcp.async_save.assert_not_called()
+
+    def test_local_sync_passes_model_process_group(self):
+        ckptr = self._make_ckptr(is_async=False)
+        ckptr.process_group = object()
+        sd = {"w": torch.ones(4)}
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp:
+            Checkpointer._do_save(ckptr, sd, "/tmp/step-100/optim")
+
+        assert mock_dcp.save.call_args.kwargs["process_group"] is ckptr.process_group
+
+    def test_peft_sync_barrier_uses_model_process_group(self):
+        ckptr = self._make_ckptr(is_async=False, is_peft=True)
+        ckptr.process_group = object()
+        sd = {"w": torch.ones(4)}
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.barrier") as barrier,
+            patch("nemo_automodel.components.checkpoint.checkpointing._save_safetensors"),
+        ):
+            Checkpointer._do_save(ckptr, sd, "/tmp/step-100/model")
+
+        barrier.assert_called_once_with(group=ckptr.process_group)
 
     def test_local_async_calls_dcp_async_save(self):
         """Local + async: dcp.async_save called, dcp.save NOT called."""
