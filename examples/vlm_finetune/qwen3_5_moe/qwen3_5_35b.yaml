@@ -115,7 +115,12 @@ optimizer:
 
 ci:
   recipe_owner: HuiyingLi
-  time: "00:30:00"
+  nodes: 1
+  time: "01:00:00"
+  checkpoint_robustness:
+    check_source_load_parity: true
+    hf_device_map_auto: true
+    tokenizer_name: Qwen/Qwen3.5-35B-A3B
 
 # Uncomment and configure for W&B logging
 # wandb:

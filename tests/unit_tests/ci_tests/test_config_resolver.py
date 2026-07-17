@@ -343,6 +343,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     [
         "examples/vlm_finetune/gemma4/gemma4_2b.yaml",
         "examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml",
+        "examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml",
     ],
 )
 def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
@@ -361,6 +362,8 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
     assert resolved["checkpoint"]["save_consolidated"] is True
     assert robustness["check_source_load_parity"] is True
     assert robustness["tokenizer_name"] == resolved["model"]["pretrained_model_name_or_path"]
+    if "/qwen" in recipe_path:
+        assert robustness["hf_device_map_auto"] is True
     if Path(recipe_path).stem == "qwen3_vl_moe_30b_te_deepep":
         assert robustness["resume_loss_threshold"] == 1e-2
     assert "check_source_load_parity" not in resolved
