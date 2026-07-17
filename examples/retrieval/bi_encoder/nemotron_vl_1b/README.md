@@ -35,9 +35,10 @@ The "data" contains the list of training samples for contrastive learning, in pa
 
 **Before a full-scale VL training run, prepare the dataset on CPU nodes.** Starting GPU training directly from a raw
 image corpus can leave every allocated GPU waiting while the corpus is loaded and its dataset cache is built. Use the
-source-parallel Slurm launcher in the [retrieval data preparation tools](../../../../tools/retrieval/README.md) to build
-a normalized Arrow bundle first. For text-only retrieval, the original dataset path is usually sufficient. If its
-initial startup is slow, use the CPU cache-warming script instead.
+normalized dataset preparation script in the
+[retrieval data preparation tools](../../../../tools/retrieval/README.md) to build an Arrow bundle on CPU nodes first.
+For text-only retrieval, the original dataset path is usually sufficient. If its initial startup is slow, use the CPU
+cache-warming script instead.
 
 ### Preparing the vision retrieval train set
 This example includes a notebook that demonstrates how to prepare a vision retrieval training dataset using [ColPali](https://huggingface.co/datasets/vidore/colpali_train_set): [prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb](../prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb). It performs the following steps:

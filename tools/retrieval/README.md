@@ -8,8 +8,8 @@ For full-scale vision-language retrieval, prepare **normalized Arrow** on CPU no
 
 **Do not start full-scale VL training directly from unprepared raw sources.** Loading a large image corpus and building
 its dataset cache can substantially delay the first training step. In a multi-GPU job, the GPUs remain allocated during
-that startup, which can waste GPU-hours before optimization begins. Run the CPU Slurm array preparation first, then
-point the training config at its normalized output.
+that startup, which can waste GPU-hours before optimization begins. Run the normalized dataset preparation script on CPU
+nodes first, then point the training config at the generated Arrow dataset.
 
 - **Original dataset factory:** the default for typical text-only retrieval and small smoke tests.
 - **Normalized Arrow:** recommended for full-scale or image-heavy VL retrieval. Prepare a portable dataset bundle once,

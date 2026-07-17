@@ -150,16 +150,16 @@ matches the workflow you need:
 <Warning>
 Do not start full-scale VL training directly from unprepared raw sources. Loading a large image corpus and building its
 dataset cache can substantially delay the first training step while the GPUs are already allocated. Across a multi-GPU
-job, that startup can waste GPU-hours before optimization begins. Run the CPU Slurm array preparation first, then train
-from its normalized Arrow output.
+job, that startup can waste GPU-hours before optimization begins. Run the normalized dataset preparation script on CPU
+nodes first, then train from the generated Arrow dataset.
 </Warning>
 
 For typical text-only retrieval, the original `make_retrieval_dataset` path is usually sufficient. If its initial startup
 is slow, use the CPU cache-warming script in the
 [retrieval data preparation tools](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/retrieval/README.md) without
 changing the dataset configuration. Normalized Arrow remains available for unusually large text corpora or when you
-need a portable dataset. The same guide includes the normalization command, source-parallel Slurm launcher, and storage
-comparison. Both tools support text-only and vision-language retrieval.
+need a portable dataset. The same guide includes local and Slurm preparation commands and a storage comparison. Both
+tools support text-only and vision-language retrieval.
 
 The key field requirements differ by raw source:
 
