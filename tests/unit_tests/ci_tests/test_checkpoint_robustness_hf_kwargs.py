@@ -28,7 +28,9 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_bie
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
     _finish_hf_reload_sync,
+    _get_input_ids,
     _hf_source_load_kwargs,
+    _load_hf_fp8_dequantized_config,
     _prepare_hf_reload_sync,
     _wait_for_hf_reload_rank0,
 )
@@ -56,7 +58,7 @@ def _run_hf_reload_sync_rank(rank, init_path, checkpoint_dir):
 
 @pytest.mark.parametrize(
     ("model_type", "expected_attn_implementation"),
-    [("nemotron_h", "sdpa"), ("nemotron_flash", "flash_attention_2")],
+    [("nemotron_h", "eager"), ("nemotron_flash", "flash_attention_2")],
 )
 def test_remote_code_attention_implementation(model_type, expected_attn_implementation):
     with patch(
@@ -95,6 +97,82 @@ def test_explicit_attention_implementation_is_preserved():
         )
 
     assert hf_kwargs["attn_implementation"] == "eager"
+
+
+@pytest.mark.parametrize(("offline", "expected_local_files_only"), [(None, False), ("1", True)])
+def test_hf_source_load_kwargs_respects_hf_offline(monkeypatch, offline, expected_local_files_only):
+    if offline is None:
+        monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    else:
+        monkeypatch.setenv("HF_HUB_OFFLINE", offline)
+
+    hf_kwargs = _hf_source_load_kwargs(
+        {},
+        pretrained_model_name_or_path="model-path",
+        source_dtype=torch.bfloat16,
+        trust_remote_code=False,
+        experts_implementation=None,
+        device=torch.device("cpu"),
+        hf_device_map_auto=False,
+    )
+
+    assert hf_kwargs["local_files_only"] is expected_local_files_only
+
+
+@pytest.mark.parametrize(("offline", "expected_local_files_only"), [(None, False), ("1", True)])
+def test_get_input_ids_respects_hf_offline(monkeypatch, offline, expected_local_files_only):
+    if offline is None:
+        monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    else:
+        monkeypatch.setenv("HF_HUB_OFFLINE", offline)
+    tokenizer = SimpleNamespace(encode=lambda *args, **kwargs: [11, 12, 13])
+
+    with patch("nemo_automodel.NeMoAutoTokenizer.from_pretrained", return_value=tokenizer) as from_pretrained:
+        input_ids = _get_input_ids("mistralai/Ministral-3-3B-Instruct-2512")
+
+    assert input_ids == [11, 12, 13]
+    from_pretrained.assert_called_once_with(
+        "mistralai/Ministral-3-3B-Instruct-2512",
+        trust_remote_code=True,
+        local_files_only=expected_local_files_only,
+    )
+
+
+def test_load_hf_fp8_dequantized_config_preserves_checkpoint_quantization_settings(monkeypatch):
+    source_config = SimpleNamespace(
+        quantization_config={
+            "quant_method": "fp8",
+            "activation_scheme": "static",
+            "weight_block_size": None,
+            "dequantize": False,
+        }
+    )
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+    with patch("transformers.AutoConfig.from_pretrained", return_value=source_config) as from_pretrained:
+        config = _load_hf_fp8_dequantized_config(
+            "mistralai/Ministral-3-3B-Instruct-2512",
+            trust_remote_code=False,
+        )
+
+    assert config.quantization_config == {
+        "quant_method": "fp8",
+        "activation_scheme": "static",
+        "weight_block_size": None,
+        "dequantize": True,
+    }
+    from_pretrained.assert_called_once_with(
+        "mistralai/Ministral-3-3B-Instruct-2512",
+        trust_remote_code=False,
+        local_files_only=True,
+    )
+
+
+def test_load_hf_fp8_dequantized_config_ignores_non_fp8_checkpoint():
+    source_config = SimpleNamespace(quantization_config={"quant_method": "awq"})
+
+    with patch("transformers.AutoConfig.from_pretrained", return_value=source_config):
+        assert _load_hf_fp8_dequantized_config("model-path", trust_remote_code=False) is None
 
 
 def test_hf_reload_wait_returns_after_rank0_marker(tmp_path):

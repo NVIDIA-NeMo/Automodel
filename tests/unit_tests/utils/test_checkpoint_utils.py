@@ -19,6 +19,19 @@ import torch.nn as nn
 
 import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.models.common.tie_word_embeddings as tie_utils
+from nemo_automodel.shared import tied_weights
+
+
+def test_checkpoint_utils_reexports_shared_tied_weight_helpers():
+    """Checkpoint callers retain their existing imports while shared code owns the helpers."""
+    assert checkpoint_utils.ensure_tied_lm_head is tied_weights.ensure_tied_lm_head
+    assert checkpoint_utils.has_local_tied_lm_head is tied_weights.has_local_tied_lm_head
+
+
+def test_model_tie_policy_reexports_shared_contract():
+    """Model policy and cross-component callers use one tie contract."""
+    assert tie_utils.TieSupport is tied_weights.TieSupport
+    assert tie_utils.get_controlling_tie_word_embeddings is tied_weights.get_controlling_tie_word_embeddings
 
 
 def test_is_tied_word_embeddings_prefers_top_level_value():

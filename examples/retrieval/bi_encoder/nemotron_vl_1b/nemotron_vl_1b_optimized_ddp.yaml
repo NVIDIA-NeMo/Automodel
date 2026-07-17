@@ -119,7 +119,9 @@ checkpoint:
 distributed:
   strategy: ddp
   find_unused_parameters: false
-  static_graph: true
+  # Keep this false when gradient accumulation is active. A no-accumulation
+  # topology may override it to true after verifying the graph is static.
+  static_graph: false
   bucket_cap_mb: 400
   gradient_as_bucket_view: true
 
@@ -141,12 +143,14 @@ ci:
         num_samples: 5000
     dataloader.num_workers: 0
     lr_scheduler.lr_warmup_steps: 2
+    distributed.static_graph: false
   checkpoint_robustness:
     dataset.data_dir_list:
       - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
         num_samples: 5000
     dataloader.num_workers: 0
     lr_scheduler.lr_warmup_steps: 1
+    distributed.static_graph: false
     cosine_threshold: 0.999
     hf_cosine_threshold: 0.999
     check_hf_reload: true

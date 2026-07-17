@@ -523,6 +523,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         model = None  # Ensure 'model' is always bound for the except handler
         is_custom_model = None
+        process_group = getattr(mesh, "process_group", None)
         try:
             with init_ctx:
                 is_custom_model, model = _init_model(
@@ -533,6 +534,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     quantization_config,
                     force_hf,
                     *model_args,
+                    _process_group=process_group,
                     **kwargs,
                 )
         except (NotImplementedError, RuntimeError) as e:
@@ -562,6 +564,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                         quantization_config,
                         force_hf,
                         *model_args,
+                        _process_group=process_group,
                         **kwargs,
                     )
             else:

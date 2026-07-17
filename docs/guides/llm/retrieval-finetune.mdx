@@ -441,6 +441,11 @@ In pure data parallelism, `data_parallel_size` is the total GPU count. With tens
 `world_size / (tp_size * cp_size)`. For example, two 8-GPU nodes with `tp_size: 1` and `cp_size: 1` have
 `data_parallel_size: 16`; with `tp_size: 2`, they have `data_parallel_size: 8`.
 
+For DDP recipes, set `distributed.static_graph: false` whenever
+`gradient_accumulation_steps > 1`. If a nightly or release override reduces the GPU count without changing the global
+and local batch sizes, it must also override `distributed.static_graph: false`. You may enable the static-graph
+optimization only for a no-accumulation topology after verifying that the forward graph does not change between steps.
+
 `local_batch_size` is the number of query groups per rank. For memory pressure, reduce
 `step_scheduler.local_batch_size` first, then sequence lengths (`q_max_len`, `p_max_len`, or `rerank_max_length`), then
 `n_passages`. Bi-encoders scale memory with query length plus `local_batch_size * n_passages` passage sequences;
@@ -846,6 +851,6 @@ versions without calibration.
 - Retrieval dataset guide: [Retrieval Dataset](/datasets/retrieval-dataset)
 - Llama-Embed-Nemotron-8B example:
   [examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml)
-- Llama-Nemotron-Embed-VL-1B multimodal (visual document retrieval) example, including
-  optimized DDP configs for multi-node and single-node training:
+- Llama-Nemotron-Embed-VL-1B multimodal (visual document retrieval) example, including one topology-neutral optimized
+  DDP config and documented batch/checkpointing overrides:
   [examples/retrieval/bi_encoder/nemotron_vl_1b/README.md](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/nemotron_vl_1b/README.md)

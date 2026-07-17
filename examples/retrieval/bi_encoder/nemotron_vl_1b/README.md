@@ -75,7 +75,7 @@ For higher throughput on the VL bi-encoder path, use [nemotron_vl_1b_optimized_d
 - The optimized custom LLaMA backend with Transformer Engine fused RMSNorm and QKV, and RMSNorm and MLP kernels,
 - Transformer Engine fused SigLIP vision encoder layers with the unused SigLIP pooling head frozen,
 - Bidirectional attention masks precomputed in the data loader (removing per-step host-to-device syncs),
-- Tuned DDP settings (bucket size, static graph, and `gradient_as_bucket_view`).
+- Tuned DDP settings (bucket size and `gradient_as_bucket_view`).
 
 On the reference workload, this trains the same model about 15% faster per step (~18% more samples per second per GPU) than the tuned DDP baseline, with matching loss curves. The optimizations are opt-in flags in the `model:` and `bi_encoder_optimization:` sections, so the base example remains the simplest starting point.
 
@@ -85,6 +85,8 @@ The optimized config uses `global_batch_size=64` and `local_batch_size=2`. A 4-n
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized_ddp.yaml
 ```
+
+Keep `distributed.static_graph: false` whenever DDP uses gradient accumulation. The optimized config uses this safe default, and the one-node nightly checkpoint test overrides it explicitly because it accumulates four micro-batches. On a topology with no gradient accumulation, such as 4 nodes × 8 GPUs with this config, you may set `static_graph: true` after verifying that the forward graph is static.
 
 Note that `torchrun --nproc-per-node` launches a single node. For multi-node runs, submit through your cluster scheduler (e.g., `sbatch` on Slurm), as described in the base example above.
 
@@ -116,6 +118,7 @@ step_scheduler:
 
 distributed:
   strategy: ddp
+  static_graph: true
   activation_checkpointing: true
   activation_checkpointing_scope: vision
 ```
