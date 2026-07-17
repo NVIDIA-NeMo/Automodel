@@ -75,6 +75,7 @@ from nemo_automodel.components.training.model_output_utils import get_final_hidd
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
+    get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
@@ -445,6 +446,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     # ------------------ build phase ------------------
+    def _create_distributed_setup(self) -> DistributedSetup:
+        """Create the distributed setup used by this recipe rank."""
+        return create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+
+    def _should_setup_training_components(self) -> bool:
+        """Whether this rank owns the trainable model and its components."""
+        return True
+
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
 
@@ -478,9 +487,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.pipeline_config,
             self.moe_parallel_config,
             self.activation_checkpointing,
-        ) = self._distributed_setup_attributes(
-            create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
-        )
+        ) = self._distributed_setup_attributes(self._create_distributed_setup())
+
+        if not self._should_setup_training_components():
+            return
 
         # MagiAttention (FFA / context-parallel) backend, enabled via
         # model.attn_implementation="magi" (HF) or model.backend.attn="magi" (custom).
@@ -576,6 +586,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
             moe_mesh=self.moe_mesh,
+            process_group=getattr(self.mesh_context, "process_group", None),
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
@@ -661,7 +672,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
         def materialize_loader(config):
-            build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
+            process_group = getattr(self.mesh_context, "process_group", None)
+            build_context = (
+                nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode(group=process_group)
+            )
             with ScopedRNG(seed=config.seed, ranked=True):
                 return config.build(
                     tokenizer=self.tokenizer,
@@ -700,6 +714,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.dataloader,
             self._get_dp_group_size(),
             self.cfg.get("step_scheduler.local_batch_size", 1),
+            process_group=getattr(self, "_training_process_group", None),
         )
         self._setup_garbage_collection(self.step_scheduler)
 
@@ -1174,6 +1189,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             foreach=True,
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
         )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api

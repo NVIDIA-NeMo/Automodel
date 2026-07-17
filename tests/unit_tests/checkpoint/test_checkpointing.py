@@ -46,6 +46,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _equally_divide_layers,
     _is_custom_model,
     _model_has_dtensors,
+    _new_gloo_process_group,
     _normalize_dtype_mapping_to_state_dict_keys,
     _reinit_non_persistent_buffers,
     _should_write_consolidated_safetensors,
@@ -79,18 +80,33 @@ class TestConsolidationProcessGroup:
         )
 
     def test_creates_gloo_group_with_configured_timeout(self, tmp_path):
-        process_group = MagicMock()
+        model_process_group = MagicMock()
+        consolidation_process_group = MagicMock()
         config = self._config(tmp_path, consolidation_timeout_minutes=45)
 
         with (
             patch("torch.distributed.is_initialized", return_value=True),
-            patch("torch.distributed.get_world_size", return_value=2),
-            patch("torch.distributed.new_group", return_value=process_group) as new_group,
+            patch("torch.distributed.get_world_size", return_value=2) as get_world_size,
+            patch("torch.distributed.get_process_group_ranks", return_value=[2, 3]) as get_ranks,
+            patch("torch.distributed.new_group", return_value=consolidation_process_group) as new_group,
         ):
-            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+            checkpointer = Checkpointer(
+                config,
+                dp_rank=0,
+                tp_rank=0,
+                pp_rank=0,
+                process_group=model_process_group,
+            )
 
-        new_group.assert_called_once_with(backend="gloo", timeout=timedelta(minutes=45))
-        assert checkpointer._consolidation_process_group is process_group
+        get_world_size.assert_called_once_with(group=model_process_group)
+        get_ranks.assert_called_once_with(model_process_group)
+        new_group.assert_called_once_with(
+            ranks=[2, 3],
+            backend="gloo",
+            timeout=timedelta(minutes=45),
+            use_local_synchronization=True,
+        )
+        assert checkpointer._consolidation_process_group is consolidation_process_group
 
     def test_sharded_only_save_does_not_create_group(self, tmp_path):
         config = self._config(tmp_path, save_consolidated=False)
@@ -169,6 +185,21 @@ class TestConsolidationProcessGroup:
             checkpointer.save_model(model, str(tmp_path / "step_1"), is_final_checkpoint=True)
 
         assert consolidate.call_args.kwargs["process_group"] is process_group
+
+
+def test_new_gloo_process_group_preserves_subset_membership():
+    """Async checkpoint groups use only the supplied model-process ranks."""
+    model_group = object()
+    gloo_group = object()
+    with (
+        patch("torch.distributed.get_process_group_ranks", return_value=[2, 3]) as get_ranks,
+        patch("torch.distributed.new_group", return_value=gloo_group) as new_group,
+    ):
+        result = _new_gloo_process_group(model_group)
+
+    assert result is gloo_group
+    get_ranks.assert_called_once_with(model_group)
+    new_group.assert_called_once_with(ranks=[2, 3], backend="gloo", use_local_synchronization=True)
 
 
 def _make_keys(count: int) -> list[str]:
@@ -1899,7 +1930,7 @@ class TestOfflineConsolidationScriptAndWarnings:
     def test_consolidated_metadata_hooks_use_process_group(self):
         process_group = MagicMock()
         model_state = SimpleNamespace(model=[MagicMock()])
-        addon = ConsolidatedHFAddon(process_group=process_group)
+        addon = ConsolidatedHFAddon()
 
         with (
             patch("torch.distributed.is_initialized", return_value=True),
@@ -1911,10 +1942,12 @@ class TestOfflineConsolidationScriptAndWarnings:
                 hf_metadata_dir="unused",
                 fqn_to_file_index_mapping={},
                 original_model_path="unused",
+                process_group=process_group,
             )
             addon.post_save(
                 consolidated_path="unused",
                 hf_metadata_path="unused",
+                process_group=process_group,
             )
 
         assert get_rank.call_args_list == [call(group=process_group), call(group=process_group)]
@@ -2517,6 +2550,7 @@ def _make_ckptr(is_peft=False, is_async=False):
     ckptr.config = config
     ckptr._model_ctx = MagicMock(staging_active=False)
     ckptr._optim_ctx = MagicMock(staging_active=False)
+    ckptr.process_group = None
     return ckptr
 
 
@@ -2562,6 +2596,15 @@ class TestEnsureDirs:
         with patch("os.makedirs") as mock_makedirs:
             _ensure_dirs(target)
         mock_makedirs.assert_called_once_with(target, exist_ok=True)
+
+    def test_distributed_barrier_uses_process_group(self, tmp_path):
+        group = object()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.barrier") as barrier,
+        ):
+            _ensure_dirs(str(tmp_path), process_group=group)
+        barrier.assert_called_once_with(group=group)
 
 
 class TestSaveConfig:
@@ -3252,6 +3295,7 @@ class TestSyncAsyncSave:
         ckptr.config = config
         ckptr._model_ctx = MagicMock(staging_active=False)
         ckptr._optim_ctx = MagicMock(staging_active=False)
+        ckptr.process_group = None
         return ckptr
 
     def test_dcp_cloud_sync_calls_dcp_save(self):
@@ -3404,6 +3448,31 @@ class TestSyncAsyncSave:
 
         mock_dcp.save.assert_called_once()
         mock_dcp.async_save.assert_not_called()
+
+    def test_local_sync_passes_model_process_group(self):
+        ckptr = self._make_ckptr(is_async=False)
+        ckptr.process_group = object()
+        sd = {"w": torch.ones(4)}
+
+        with patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp:
+            Checkpointer._do_save(ckptr, sd, "/tmp/step-100/optim")
+
+        assert mock_dcp.save.call_args.kwargs["process_group"] is ckptr.process_group
+
+    def test_peft_sync_barrier_uses_model_process_group(self):
+        ckptr = self._make_ckptr(is_async=False, is_peft=True)
+        ckptr.process_group = object()
+        sd = {"w": torch.ones(4)}
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.barrier") as barrier,
+            patch("nemo_automodel.components.checkpoint.checkpointing._save_safetensors"),
+        ):
+            Checkpointer._do_save(ckptr, sd, "/tmp/step-100/model")
+
+        barrier.assert_called_once_with(group=ckptr.process_group)
 
     def test_local_async_calls_dcp_async_save(self):
         """Local + async: dcp.async_save called, dcp.save NOT called."""

@@ -69,6 +69,7 @@ from nemo_automodel.components.training.model_output_utils import get_final_hidd
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
+    get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
@@ -398,6 +399,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     # ------------------ build phase ------------------
+    def _create_distributed_setup(self) -> DistributedSetup:
+        """Create the distributed setup used by this recipe rank."""
+        return create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+
+    def _should_setup_training_components(self) -> bool:
+        """Whether this rank owns the trainable model and its components."""
+        return True
+
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
 
@@ -428,9 +437,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.pipeline_config,
             self.moe_parallel_config,
             self.activation_checkpointing,
-        ) = self._distributed_setup_attributes(
-            create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
-        )
+        ) = self._distributed_setup_attributes(self._create_distributed_setup())
+
+        if not self._should_setup_training_components():
+            return
 
         # MagiAttention (FFA) backend for the language backbone; the vision tower
         # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
@@ -496,6 +506,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
             moe_mesh=self.moe_mesh,
+            process_group=getattr(self.mesh_context, "process_group", None),
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
@@ -559,13 +570,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         if dataloader_config.packing is not None:
             configure_packing(attn_implementation=packing_attn_implementation)
+        process_group = getattr(self.mesh_context, "process_group", None)
+        dataset_build_context = FirstRankPerNode(group=process_group)
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             dataloader_build = dataloader_config.build(
                 pretrained_model_name_or_path=_get_model_name(self.cfg.model),
                 dp_rank=self._get_dp_rank(),
                 dp_world_size=self._get_dp_group_size(),
                 batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                dataset_build_context=FirstRankPerNode(),
+                dataset_build_context=dataset_build_context,
                 get_rope_index=get_rope_index,
                 packing_attn_implementation=packing_attn_implementation,
                 pp_n_microbatches=pp_n_microbatches,
@@ -577,13 +590,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.val_dataloader = None
         validation_config = self.cfg.vlm_validation_dataloader
         if validation_config is not None:
+            validation_build_context = FirstRankPerNode(group=process_group)
             with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
                 validation_build = validation_config.build(
                     pretrained_model_name_or_path=_get_model_name(self.cfg.model),
                     dp_rank=self._get_dp_rank(),
                     dp_world_size=self._get_dp_group_size(),
                     batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                    dataset_build_context=FirstRankPerNode(),
+                    dataset_build_context=validation_build_context,
                     get_rope_index=get_rope_index,
                 )
             self.val_dataloader = validation_build.dataloader
@@ -594,6 +608,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.dataloader,
             self._get_dp_group_size(),
             self.cfg.get("step_scheduler.local_batch_size", 1),
+            process_group=getattr(self, "_training_process_group", None),
         )
         self._setup_garbage_collection(self.step_scheduler)
 
@@ -976,6 +991,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             foreach=True,
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
         )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api

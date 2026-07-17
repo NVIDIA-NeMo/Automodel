@@ -30,6 +30,16 @@ from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateD
 
 if TYPE_CHECKING:
     from peft import PeftConfig
+    from torch.distributed import ProcessGroup
+
+
+def _is_group_rank_0(process_group: "ProcessGroup | None") -> bool:
+    return not torch.distributed.is_initialized() or torch.distributed.get_rank(group=process_group) == 0
+
+
+def _group_barrier(process_group: "ProcessGroup | None") -> None:
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier(group=process_group)
 
 
 class CheckpointAddon(Protocol):
@@ -43,17 +53,12 @@ class CheckpointAddon(Protocol):
 
 
 class ConsolidatedHFAddon:
-    """Write consolidated Hugging Face metadata alongside sharded weights.
+    """
+    Addon that writes consolidated Hugging Face metadata alongside sharded weights.
 
     On rank 0, this saves `config.json`, `generation_config.json`, and tokenizer
     artifacts into the provided consolidated directory, then synchronizes ranks.
-
-    Args:
-        process_group: Optional process group used to coordinate consolidated export.
     """
-
-    def __init__(self, process_group: torch.distributed.ProcessGroup | None = None) -> None:
-        self.process_group = process_group
 
     def pre_save(self, **kwargs) -> None:
         """
@@ -72,9 +77,10 @@ class ConsolidatedHFAddon:
         tokenizer = kwargs.get("tokenizer", None)
         model_part = model_state.model[0]  # ModelState already converts to list if needed
         original_model_path = kwargs["original_model_path"]
+        process_group = kwargs.get("process_group")
 
         # Perform save operations on rank 0
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank(group=self.process_group) == 0:
+        if _is_group_rank_0(process_group):
             # if the HF model has custom model code, we need to save it as part of the checkpoint
             _maybe_save_custom_model_code(original_model_path, hf_metadata_dir, model_part=model_part)
             # save the config.json file
@@ -126,8 +132,7 @@ class ConsolidatedHFAddon:
             if fqn_to_dtype_mapping:
                 with open(os.path.join(hf_metadata_dir, FQN_TO_DTYPE_MAPPING_FILENAME), "w") as f:
                     json.dump(fqn_to_dtype_mapping, f, indent=2, sort_keys=True)
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier(group=self.process_group)
+        _group_barrier(process_group)
 
     def post_save(self, **kwargs) -> None:
         """
@@ -143,11 +148,12 @@ class ConsolidatedHFAddon:
         """
         consolidated_path = kwargs["consolidated_path"]
         hf_metadata_path = kwargs["hf_metadata_path"]
+        process_group = kwargs.get("process_group")
         if not consolidated_path:
             # in this case we are just saving the sharded HF safetensors
             return
 
-        if (not torch.distributed.is_initialized()) or (torch.distributed.get_rank(group=self.process_group) == 0):
+        if _is_group_rank_0(process_group):
             # Copy each public metadata item into consolidated_path while keeping
             # .hf_metadata intact for the offline consolidation helper.
             for item_name in os.listdir(hf_metadata_path):
@@ -159,8 +165,7 @@ class ConsolidatedHFAddon:
                     shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
                 else:
                     shutil.copy2(src_path, dst_path)
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier(group=self.process_group)
+        _group_barrier(process_group)
 
 
 class PeftAddon:
@@ -187,9 +192,10 @@ class PeftAddon:
         peft_config = kwargs["peft_config"]
         original_model_path = kwargs["original_model_path"]
         v4_compatible = kwargs.get("v4_compatible", False)
+        process_group = kwargs.get("process_group")
         hf_peft_config = _get_hf_peft_config(peft_config, model_state, v4_compatible=v4_compatible)
         automodel_peft_metadata = _get_automodel_peft_metadata(peft_config)
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        if _is_group_rank_0(process_group):
             # if the HF model has custom model code, we need to save it as part of the checkpoint
             model_part = model_state.model[0] if model_state is not None else None
             _maybe_save_custom_model_code(original_model_path, model_path, model_part=model_part)
@@ -202,8 +208,7 @@ class PeftAddon:
             # save the full PEFT config for inference loading inside Automodel.
             with open(os.path.join(model_path, "automodel_peft_config.json"), "w") as f:
                 json.dump(automodel_peft_metadata, f, indent=2, sort_keys=True)
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        _group_barrier(process_group)
 
     def post_save(self, **kwargs) -> None:
         pass

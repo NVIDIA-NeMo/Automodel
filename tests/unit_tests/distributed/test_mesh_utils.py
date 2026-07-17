@@ -148,7 +148,9 @@ def test_fsdp2_forwards_nccl_timeout_to_moe_mesh(monkeypatch):
         device_mesh,
         ep_shard_size=4,
         ep_size=2,
+        pp_size=1,
         timeout_minutes=30,
+        ranks=None,
     )
 
 
