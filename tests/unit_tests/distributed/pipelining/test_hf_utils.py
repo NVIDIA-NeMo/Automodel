@@ -554,7 +554,7 @@ class TestValidateHfModelForPipelineSupport:
 
         model = MockModel()
 
-        with pytest.raises(ValueError, match="tie_word_embeddings=True is not supported"):
+        with pytest.raises(ValueError, match="Pipeline parallelism does not support tie_word_embeddings=True"):
             validate_hf_model_for_pipeline_support(model)
 
     def test_validate_encoder_decoder_model(self):

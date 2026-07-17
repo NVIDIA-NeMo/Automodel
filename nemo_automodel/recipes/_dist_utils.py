@@ -284,6 +284,7 @@ def create_distributed_setup_from_config(
     world_size: Optional[int] = None,
     *,
     timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
     strategy: str | None = None,
     dp_size: int | None = None,
     dp_replicate_size: int | None = None,
@@ -314,6 +315,7 @@ def create_distributed_setup_from_config(
         timeout_minutes: Optional timeout for process groups created by
             ``DeviceMesh`` axes. If omitted and ``cfg`` is a top-level recipe
             config, ``dist_env.timeout_minutes`` is used.
+        ranks: Optional ordered global ranks used by this setup's device mesh.
         strategy: Distributed strategy name (``fsdp2``, ``megatron_fsdp``,
             ``megatron-fsdp``, ``mfsdp``, or ``ddp``).
         dp_size: Data-parallel size. If ``None``, inferred by mesh creation.
@@ -364,6 +366,7 @@ def create_distributed_setup_from_config(
         activation_checkpointing=parsed["activation_checkpointing"],
         world_size=world_size,
         timeout_minutes=mesh_timeout_minutes,
+        ranks=ranks,
     )
 
 

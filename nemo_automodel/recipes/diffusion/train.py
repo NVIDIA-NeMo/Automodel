@@ -754,15 +754,16 @@ class TrainDiffusionRecipe(BaseRecipe):
             model_state_dict_keys=list(self.model.state_dict().keys()),
         )
 
-        dataloader_cfg = self.cfg.get("data.dataloader")
-        if not hasattr(dataloader_cfg, "instantiate"):
-            raise RuntimeError("data.dataloader must be a config node with instantiate()")
-
-        self.dataloader, self.sampler = dataloader_cfg.instantiate(
+        dataloader_config = self.cfg.diffusion_dataloader
+        if dataloader_config is None:
+            raise ValueError("Diffusion training requires a data.dataloader config")
+        dataloader_build = dataloader_config.build(
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             batch_size=self.cfg.get("step_scheduler.local_batch_size"),
         )
+        self.dataloader = dataloader_build.dataloader
+        self.sampler = dataloader_build.sampler
 
         if len(self.dataloader) == 0:
             raise RuntimeError("Training dataloader is empty; cannot proceed with training")

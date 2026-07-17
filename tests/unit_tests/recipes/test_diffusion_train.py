@@ -21,6 +21,7 @@ import torch
 import yaml
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.diffusion.collate_fns import TextToImageDataloaderConfig
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, OptimizerFromFactoryConfig
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.diffusion.train import (
@@ -304,3 +305,41 @@ def test_example_diffusion_yamls_coerce_through_typed_configs(yaml_path):
     if optimizer_target.startswith("torch."):
         # non-torch targets (e.g. TransformerEngine FusedAdam) need optional deps
         assert cfg.optimizer is not None
+
+
+def test_recipe_config_resolves_diffusion_builder_target_to_typed_config():
+    config = RecipeConfig(
+        ConfigNode(
+            {
+                "data": {
+                    "dataloader": {
+                        "_target_": (
+                            "nemo_automodel.components.datasets.diffusion."
+                            "build_text_to_image_multiresolution_dataloader"
+                        ),
+                        "cache_dir": "/tmp/cache",
+                        "base_resolution": [512, 512],
+                        "num_workers": 0,
+                    }
+                }
+            }
+        )
+    ).diffusion_dataloader
+
+    assert isinstance(config, TextToImageDataloaderConfig)
+    assert config.cache_dir == "/tmp/cache"
+    assert config.base_resolution == (512, 512)
+    assert config.num_workers == 0
+
+
+def test_recipe_config_rejects_unknown_diffusion_dataloader_field():
+    raw = ConfigNode(
+        {
+            "_target_": "nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader",
+            "cache_dir": "/tmp/cache",
+            "num_workerz": 2,
+        }
+    )
+
+    with pytest.raises(TypeError, match="num_workerz"):
+        RecipeConfig.resolve_diffusion_dataloader(raw)

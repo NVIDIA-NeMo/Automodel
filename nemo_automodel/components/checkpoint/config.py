@@ -37,6 +37,7 @@ from packaging.version import parse
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 
 if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
 
     from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
@@ -185,6 +186,7 @@ class CheckpointingConfig:
         tp_rank: int,
         pp_rank: int,
         moe_mesh: DeviceMesh | None = None,
+        process_group: ProcessGroup | None = None,
         *,
         model_state_dict_keys: list[str] | None = None,
     ) -> Checkpointer:
@@ -199,6 +201,7 @@ class CheckpointingConfig:
             tp_rank: Tensor-parallel rank.
             pp_rank: Pipeline-parallel rank.
             moe_mesh: Optional device mesh for MoE checkpointing.
+            process_group: Process group used for distributed checkpoint collectives.
             model_state_dict_keys: Model state-dict keys captured before any
                 parallelization, for models that do not set
                 ``_pre_shard_hf_state_dict_keys``. Runtime data (the model must
@@ -217,6 +220,7 @@ class CheckpointingConfig:
             tp_rank=tp_rank,
             pp_rank=pp_rank,
             moe_mesh=moe_mesh,
+            process_group=process_group,
             model_state_dict_keys=model_state_dict_keys,
         )
 

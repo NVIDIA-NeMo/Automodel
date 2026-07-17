@@ -24,6 +24,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
 
 if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
     from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ class StepScheduler(Stateful):
         start_epoch: int = 0,
         num_epochs: Optional[int] = None,
         max_steps: Optional[int] = None,
+        process_group: ProcessGroup | None = None,
     ):
         """
         Initialize the StepScheduler.
@@ -94,6 +96,7 @@ class StepScheduler(Stateful):
             start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
             num_epochs (Optional[int]): Total number of epochs. Default: None or calculated from max_steps if num_epochs is None or 10 if max_steps and num_epochs are both None.
             max_steps (Optional[int]): Maximum number of steps to run. If None, calculated from num_epochs.
+            process_group: Process group whose ranks participate in distributed signal handling.
         """
         if global_batch_size <= 0:
             raise ValueError(f"global_batch_size must be greater than 0, got {global_batch_size}")
@@ -170,7 +173,7 @@ class StepScheduler(Stateful):
         self.ckpt_every_steps = ckpt_every_steps
         self.save_checkpoint_every_epoch = save_checkpoint_every_epoch
 
-        self.sig_handler = DistributedSignalHandler().__enter__()
+        self.sig_handler = DistributedSignalHandler(group=process_group).__enter__()
         self.sigterm_flag = False
 
     def __iter__(self):
@@ -366,13 +369,20 @@ class StepSchedulerConfig:
     start_step: int = 0
     start_epoch: int = 0
 
-    def build(self, dataloader: DataLoader, dp_group_size: int, local_batch_size: int) -> StepScheduler:
+    def build(
+        self,
+        dataloader: DataLoader,
+        dp_group_size: int,
+        local_batch_size: int,
+        process_group: ProcessGroup | None = None,
+    ) -> StepScheduler:
         """Build the step scheduler.
 
         Args:
             dataloader: The training dataloader.
             dp_group_size: The size of the data parallel group.
             local_batch_size: The size of the local batch.
+            process_group: Process group whose ranks participate in distributed signal handling.
 
         Returns:
             Configured StepScheduler.
@@ -381,4 +391,5 @@ class StepSchedulerConfig:
         kwargs["local_batch_size"] = local_batch_size
         kwargs["dp_size"] = dp_group_size
         kwargs["dataloader"] = dataloader
+        kwargs["process_group"] = process_group
         return StepScheduler(**kwargs)
