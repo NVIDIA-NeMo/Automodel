@@ -304,6 +304,28 @@ def prepare_for_final_backward(model_parts: list[torch.nn.Module], pp_enabled: b
             mp.prepare_for_final_backward(pp_enabled=pp_enabled)
 
 
+def get_expert_tp_replication_factor(
+    model_parts: list[torch.nn.Module],
+    device_mesh: DeviceMesh | None,
+) -> int:
+    """Return the TP token-replication factor for custom-MoE expert gradients.
+
+    The custom-MoE tensor-parallel path keeps the token path (attention,
+    router) replicated across TP ranks, so every TP rank feeds the same tokens
+    into the expert-parallel all-gather and each expert gradient is accumulated
+    ``tp_size`` times. ``scale_grads_and_clip_grad_norm`` divides expert
+    gradients by this factor to restore the correct scale.
+    """
+    if device_mesh is None or "tp" not in (device_mesh.mesh_dim_names or ()):
+        return 1
+    tp_size = device_mesh["tp"].size()
+    if tp_size <= 1:
+        return 1
+    if any(getattr(part, "_nemo_moe_tp_requires_replica_sync", False) for part in model_parts):
+        return int(tp_size)
+    return 1
+
+
 @torch.no_grad()
 def scale_grads_and_clip_grad_norm(
     max_grad_norm: float | None,
@@ -318,12 +340,14 @@ def scale_grads_and_clip_grad_norm(
     foreach: bool = True,
     num_label_tokens: int | None = None,
     dp_group_size: int | None = None,
+    expert_tp_replication_factor: int = 1,
     use_torch_clip_grad_norm: bool = False,
 ):
     """Scale gradients for PP/EP in a single pass, then clip.
 
     - PP scaling: divide all local grads by (num_label_tokens / dp_group_size).
-    - EP scaling: for parameters on the expert axis, divide grads by (dp_group_size / ep_shard_size).
+    - EP scaling: for parameters on the expert axis, divide grads by
+      ``(dp_group_size / ep_shard_size) * expert_tp_replication_factor``.
     - Finally, perform grad clipping with PP/EP-aware reductions.
     """
 
@@ -334,11 +358,17 @@ def scale_grads_and_clip_grad_norm(
             candidate = num_label_tokens / dp_group_size
             pp_divisor = float(candidate) if candidate != 0 else None
 
+    if not isinstance(expert_tp_replication_factor, int) or isinstance(expert_tp_replication_factor, bool):
+        raise TypeError("expert_tp_replication_factor must be an integer")
+    if expert_tp_replication_factor < 1:
+        raise ValueError("expert_tp_replication_factor must be >= 1")
+
     ep_ratio: float | None = None
     if moe_mesh is not None and dp_group_size is not None:
         ep_shard_size = moe_mesh["ep_shard"].size() if "ep_shard" in moe_mesh.mesh_dim_names else 1
         if ep_shard_size > 0:
             ep_ratio = float(dp_group_size) / float(ep_shard_size)
+            ep_ratio *= float(expert_tp_replication_factor)
 
     # Single pass over parameters to apply both scalings where applicable
     if pp_divisor is not None or ep_ratio is not None:
@@ -349,7 +379,8 @@ def scale_grads_and_clip_grad_norm(
                 if pp_divisor is not None:
                     p.grad.div_(pp_divisor)
                 if ep_ratio is not None:
-                    # Scale expert gradients by EP ratio.
+                    # Scale expert gradients by the FSDP/EP ratio and by any
+                    # identical TP token replicas that were gathered inside EP.
                     # DTensor experts: check device mesh for EP sharding axis
                     # Non-DTensor experts (e.g., DeepEP): check param name
                     is_ep_sharded_dtensor = (
