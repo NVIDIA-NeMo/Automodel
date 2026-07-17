@@ -16,9 +16,9 @@ The dataset factory `nemo_automodel.components.datasets.llm.make_retrieval_datas
 - `doc_image`: list of images (or empty strings), aligned with `doc_text`
 - `query_instruction` / `passage_instruction`: optional, used when `use_dataset_instruction: true` and the corpus provides instructions through metadata
 
-## Supported Input Formats
+## Supported Raw Input Formats
 
-NeMo AutoModel supports **two** input schemas:
+The `make_retrieval_dataset` factory supports **two** raw input schemas:
 
 ### Corpus ID-Based JSON (Merlin/NeMo-Retriever Style)
 
@@ -81,6 +81,30 @@ The format uses one JSON object per line:
 - `use_dataset_instruction: true` has no effect for pure inline records (instructions come from corpus metadata).
 
 </Note>
+
+## Prepared Normalized Arrow Bundles
+
+For larger text or vision-language retrieval datasets, you can prepare the raw sources once as a portable normalized
+Arrow bundle. The bundle keeps query rows as document-ID references and stores each referenced document or image once
+in local corpus shards. This avoids rebuilding Hugging Face dataset and corpus state in each GPU training job.
+
+Configure training with the normalized dataset config:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig
+  data_dir_list: /path/to/normalized_vl_retrieval
+  model_type: bi_encoder
+  data_type: train
+  n_passages: 5
+  do_shuffle: true
+```
+
+Use the
+[retrieval data preparation tools](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/retrieval/README.md) to
+create a bundle locally or with the source-parallel Slurm launcher. The same guide explains source selection, per-source
+sample caps, append and resume workflows, and the shared-cache alternative when you need to keep the raw dataset config
+unchanged.
 
 ## Configure the Dataset and Collator in YAML
 

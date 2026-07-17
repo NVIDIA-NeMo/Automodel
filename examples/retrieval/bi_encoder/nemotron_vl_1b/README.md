@@ -33,8 +33,12 @@ The Nemo Automodel Retrieval recipe expects a train set with a Corpus ID-Based J
 The "corpus" path points to a directory with the corpus in parquet format containing a field with the document id.  
 The "data" contains the list of training samples for contrastive learning, in particular the question, positive samples (pos_doc) and negative samples (neg_doc), which are document ids from the corpus. Positive and negative samples can be document page images or chunks of text (passages). 
 
+For full-scale training, see the [retrieval data preparation tools](../../../../tools/retrieval/README.md). They can
+prepare the raw sources once as a portable normalized Arrow bundle using a source-parallel Slurm launcher, or warm the
+shared Hugging Face cache when you need to keep the original dataset configuration unchanged.
+
 ### Preparing the vision retrieval train set
-This example includes a notebook that demonstrates how to prepare a vision retrieval training dataset using [ColPali](https://huggingface.co/datasets/vidore/colpali_train_set): [prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb]([prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb]). It performs the following steps:
+This example includes a notebook that demonstrates how to prepare a vision retrieval training dataset using [ColPali](https://huggingface.co/datasets/vidore/colpali_train_set): [prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb](../prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb). It performs the following steps:
 1. Downloads a [train set](https://huggingface.co/datasets/Tevatron/colpali) that includes mined hard-negatives (for faster contrastive learning) and the corresponding [corpus](https://huggingface.co/datasets/Tevatron/colpali-corpus)
 2. Converts and saves that data into the Corpus ID-Based JSON schema expected for training biencoder models with Nemo Automodel.
 
@@ -69,4 +73,3 @@ Here is an example on how to fine-tune the [nvidia/llama-nemotron-embed-vl-1b-v2
 ```bash
 torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml
 ```
-

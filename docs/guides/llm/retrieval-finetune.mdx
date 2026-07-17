@@ -145,8 +145,16 @@ matches the workflow you need:
 | `hf://` AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires an AutoModel-style HF subset with a companion corpus split. |
 | Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record; no document IDs are available for same-document masking. |
 | Corpus ID-based JSON | You need hard-negative mining, reusable corpora, or same-document masking | Records reference document IDs in a local corpus that can be loaded by Hugging Face `datasets`. |
+| Normalized Arrow | You want to prepare a large text or vision-language retrieval dataset once and reuse it across training jobs | Stores query rows and referenced corpus documents in portable local Arrow shards, avoiding repeated source loading and corpus materialization in GPU jobs. |
 
-The key field requirements differ by source:
+For full-scale training, normalized Arrow is the recommended prepared-data path. If you need to keep the original
+`make_retrieval_dataset` configuration unchanged and train on the same cluster, you can instead warm its shared Hugging
+Face cache on CPU nodes. See the
+[retrieval data preparation tools](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/retrieval/README.md) for the
+normalization command, source-parallel Slurm launcher, cache-warming alternative, and storage tradeoffs. Despite `vl`
+in some tool filenames, both preparation paths also support text-only retrieval.
+
+The key field requirements differ by raw source:
 
 | Source | Required query field | Required document fields |
 |--------|----------------------|--------------------------|
