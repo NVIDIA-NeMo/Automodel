@@ -571,13 +571,23 @@ class TestGate:
         torch_gate.load_state_dict(quack_gate.state_dict())
 
         x = torch.randn(16, moe_config.dim, dtype=torch.bfloat16, device=device)
+        x_quack = x.detach().clone().requires_grad_(True)
+        x_torch = x.detach().clone().requires_grad_(True)
         token_mask = torch.ones(16, dtype=torch.bool, device=device)
-        quack_weights, quack_indices, _ = quack_gate(x, token_mask, cp_mesh=None)
-        torch_weights, torch_indices, _ = torch_gate(x, token_mask, cp_mesh=None)
+        quack_weights, quack_indices, _ = quack_gate(x_quack, token_mask, cp_mesh=None)
+        torch_weights, torch_indices, _ = torch_gate(x_torch, token_mask, cp_mesh=None)
 
         assert calls == [True]
         torch.testing.assert_close(quack_weights, torch_weights, atol=2e-3, rtol=2e-3)
         torch.testing.assert_close(quack_indices, torch_indices)
+
+        dweights = torch.randn_like(quack_weights)
+        quack_weights.backward(dweights)
+        torch_weights.backward(dweights)
+        torch.testing.assert_close(x_quack.grad, x_torch.grad, atol=2e-3, rtol=2e-3)
+        # BF16 accumulation amplifies the small forward-rounding difference
+        # between fused top-k softmax and full-softmax-then-renormalize.
+        torch.testing.assert_close(quack_gate.weight.grad, torch_gate.weight.grad, atol=1e-2, rtol=1e-2)
 
     def test_quack_topk_rejects_unsupported_router_mode(self, moe_config):
         moe_config.score_func = "sigmoid"
