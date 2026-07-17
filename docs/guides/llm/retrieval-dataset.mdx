@@ -82,11 +82,15 @@ The format uses one JSON object per line:
 
 </Note>
 
-## Prepared Normalized Arrow Bundles
+## Prepared Normalized Arrow Bundles for VL Retrieval
 
-For larger text or vision-language retrieval datasets, you can prepare the raw sources once as a portable normalized
-Arrow bundle. The bundle keeps query rows as document-ID references and stores each referenced document or image once
-in local corpus shards. This avoids rebuilding Hugging Face dataset and corpus state in each GPU training job.
+For full-scale or image-heavy vision-language retrieval, prepare the raw sources on CPU nodes as a portable normalized
+Arrow bundle before starting GPU training. The bundle keeps query rows as document-ID references and stores each
+referenced document or image once in local corpus shards. This avoids spending allocated GPU time rebuilding Hugging
+Face dataset and image-corpus state before training begins.
+
+For typical text-only retrieval, the original `make_retrieval_dataset` factory is usually sufficient. Normalization is
+still available when a text corpus has expensive startup or you need a portable prepared artifact.
 
 Configure training with the normalized dataset config:
 

@@ -4,17 +4,26 @@ This directory contains CPU-side utilities for preparing retrieval training data
 
 ## Which Option Should I Use?
 
-Use **normalized Arrow** for most large retrieval runs.
+For full-scale vision-language retrieval, prepare **normalized Arrow** on CPU nodes before requesting GPUs.
 
-Despite the `vl` in some script names, these tools also support text-only retrieval. Image fields are optional; text-only
-corpus documents are stored with an empty image field.
+**Do not start a cold full-scale VL training job directly against raw sources.** Loading and materializing an image-heavy
+corpus can substantially delay the first training step. In a multi-GPU job, the GPUs remain allocated during that
+startup, which can waste GPU-hours before optimization begins. Run the CPU Slurm array preparation first, then point the
+training config at its normalized output.
 
-- **Normalized Arrow:** recommended. Prepare a portable dataset bundle once, then train with
+- **Original dataset factory:** usually sufficient for text-only retrieval and small smoke tests.
+- **Normalized Arrow:** recommended for full-scale or image-heavy VL retrieval. Prepare a portable dataset bundle once,
+  then train with
   `nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig`.
-- **Warm HF cache:** use only when you want to keep the original
-  `nemo_automodel.components.datasets.llm.make_retrieval_dataset` path unchanged on the same cluster.
+- **Warm HF cache:** use when you want to keep the original
+  `nemo_automodel.components.datasets.llm.make_retrieval_dataset` path unchanged on the same cluster, but its cold
+  startup is expensive.
 
-## Normalized Arrow (Recommended)
+Despite the `vl` in some script names, the preparation tools also support text-only retrieval. Image fields are optional;
+text-only corpus documents are stored with an empty image field. Normalization remains useful for unusually large text
+corpora or when you need a portable prepared artifact, but it is not required for typical text-only training.
+
+## Normalized Arrow (Recommended for Full-Scale VL)
 
 Normalized Arrow keeps the original retrieval structure, but moves the expensive corpus materialization into a reusable
 prepared artifact:
@@ -24,8 +33,8 @@ prepared artifact:
 - Training still resolves `doc_id -> document`, but it reads from local Arrow instead of rebuilding Hugging Face cache
   state in the GPU job.
 
-This is the recommended full-dataset format because it is portable and avoids duplicating image payload in every
-training row.
+This is the recommended format for full-scale VL datasets because it is portable and avoids duplicating image payload
+in every training row.
 
 ### Prepare
 
@@ -36,9 +45,9 @@ uv run python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
   --resume
 ```
 
-On Slurm CPU nodes, use the array launcher for full datasets. Set `NUM_SOURCES` to the number of entries in the
-config's `dataset.data_dir_list`. Each array task prepares one source, then a dependent finalizer writes the top-level
-metadata after every source succeeds:
+On Slurm CPU nodes, use the array launcher for full-scale VL datasets before submitting the GPU training job. Set
+`NUM_SOURCES` to the number of entries in the config's `dataset.data_dir_list`. Each array task prepares one source,
+then a dependent finalizer writes the top-level metadata after every source succeeds:
 
 ```bash
 CONFIG=/path/to/original_retrieval_config.yaml \
