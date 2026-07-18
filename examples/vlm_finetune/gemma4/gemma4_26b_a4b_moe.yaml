@@ -116,4 +116,11 @@ freeze_config:
 
 ci:
   recipe_owner: athitten
-  time: "00:20:00"
+  nodes: 1
+  time: "00:45:00"
+  checkpoint_robustness:
+    check_source_load_parity: true
+    check_resume: true
+    hf_kl_threshold: 2e-2
+    hf_device_map_auto: true
+    tokenizer_name: google/gemma-4-26B-A4B-it
