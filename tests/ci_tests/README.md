@@ -68,7 +68,7 @@ ci:
 
 When `checkpoint_robustness` is present, the robustness test runs after the finetune under the same SLURM allocation. It trains for 5 steps, saves a checkpoint, then validates through:
 
-0. **Source-load parity** (optional) -- With `check_source_load_parity: true`, capture logits from the raw HF source load, release the HF model, construct a parity-only trainer model, compare the constructed pre-training model against those HF logits, then release it so training starts from a fresh trainer
+0. **Source-load parity** (optional) -- With `check_source_load_parity: true`, capture logits from the raw HF source load before distributed initialization, release the HF model, run the checkpoint lifecycle with a pristine trainer, then construct a parity-only trainer last and compare its pre-training logits against the saved HF logits
 1. **Reference logits** -- Capture logits before teardown
 2. **AutoModel reload** -- Reload from consolidated checkpoint, verify KL = 0
 3. **HF reload** -- Load into vanilla `transformers`/`peft`, verify KL below `hf_kl_threshold`
