@@ -119,6 +119,9 @@ ci:
   nodes: 1
   time: "00:45:00"
   checkpoint_robustness:
+    # Match the validated per-rank image batch; the shared robustness default
+    # of 2 exceeds this 26B MoE recipe's memory envelope.
+    step_scheduler.local_batch_size: 1
     check_source_load_parity: true
     check_resume: true
     hf_kl_threshold: 2e-2
