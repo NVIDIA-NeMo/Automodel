@@ -39,8 +39,7 @@ in every training row.
 ```bash
 uv run python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
   --config /path/to/original_retrieval_config.yaml \
-  --output-dir /path/to/normalized_vl_retrieval \
-  --resume
+  --output-dir /path/to/normalized_vl_retrieval
 ```
 
 On Slurm CPU nodes, use the array launcher for full-scale VL datasets before submitting the GPU training job. Set
@@ -136,16 +135,26 @@ Append mode skips exact duplicate source entries already present in metadata. It
 directory and updates top-level metadata only after all new sources finish. It does not deduplicate documents across
 different sources, so do not re-list old sources under a modified path or config entry.
 
-### Resume Interrupted Normalized Prep
+### Resume an Interrupted Preparation Run
 
-Use `--resume` when a normalized CPU prep job was interrupted. The tool reuses train data only when its completion
-record and row count match, and it reuses corpus directories only when they contain every referenced document. It also
-verifies that the loaded query and corpus data have not changed. If the source changed or its content cannot be verified,
-resume stops and asks you to use a new output directory.
+If the local preparation command stops before it finishes, run the same command again with `--resume`:
 
-For the array launcher, submit the same `NUM_SOURCES` and `ARRAY_SPEC`; each task resumes its own
-`sources/source-*` directory and the finalizer refreshes the top-level metadata. Resume is for continuing an interrupted
-prep run; append mode is for adding new source entries to an already prepared bundle.
+```bash
+uv run python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
+  --config /path/to/original_retrieval_config.yaml \
+  --output-dir /path/to/normalized_vl_retrieval \
+  --resume
+```
+
+The tool keeps work that finished successfully and rebuilds incomplete output. Use the same input data, config, output
+directory, and preparation settings as the original run. If the input data changed, or the tool cannot confirm that it is
+unchanged, start again with a new output directory.
+
+For Slurm array preparation, submit the same launcher command again. Resume is enabled by default, so no extra option is
+needed. Keep `CONFIG`, `OUT_DIR`, `NUM_SOURCES`, and the other preparation settings unchanged.
+
+Use resume only to continue an interrupted run. To add new sources to a finished bundle, use
+[append mode](#add-more-normalized-data).
 
 ## Warm Hugging Face Dataset Cache
 
