@@ -64,6 +64,12 @@ model:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: Qwen/Qwen3.5-35B-A3B
   trust_remote_code: true
+  # Disable Multi-Token-Prediction (MTP) for this throughput benchmark. Qwen3.5-MoE MTP
+  # support (added in #2417) builds and runs an extra MTP transformer sublayer every
+  # training step whenever the HF config's num_nextn_predict_layers > 0 (Qwen3.5-35B-A3B
+  # ships it enabled), which added ~8% step time vs the 26.04 baseline (AM-685). The
+  # benchmark measures base-model throughput, so keep MTP off (matches 26.04 behavior).
+  num_nextn_predict_layers: 0
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: te
