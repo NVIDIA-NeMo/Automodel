@@ -350,7 +350,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         from functools import partial  # noqa: PLC0415
 
         from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
-            CPSharder,
+            ContextParallelismSharder,
             contiguous_local_indices,
         )
 
@@ -359,7 +359,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         # Two-step construction so shard_batch records its shard facts (the
         # pre-flatten row shape / stream length) on the sharder it belongs to.
-        cp_sharder = CPSharder(
+        cp_sharder = ContextParallelismSharder(
             shard_batch=None,
             # Contiguous over the packed THD token axis: rank r keeps
             # tokens [r * T/cp, (r + 1) * T/cp).

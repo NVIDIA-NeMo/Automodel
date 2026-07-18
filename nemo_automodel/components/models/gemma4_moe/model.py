@@ -80,7 +80,7 @@ except (ModuleNotFoundError, ImportError, AttributeError):
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.distributed.cp_sharder import (
-    CPSharder,
+    ContextParallelismSharder,
     contiguous_local_indices,
 )
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
@@ -999,7 +999,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     def _cp_shard_batch(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0, record_on=None):
         """Gemma4-owned CP batch sharder that also self-installs the ring.
 
-        Exposed as ``CPSharder.shard_batch`` by
+        Exposed as ``ContextParallelismSharder.shard_batch`` by
         ``prepare_model_inputs_for_cp``. The CP dispatch calls it
         with the CP submesh, which is the one place Gemma4 receives ``cp_mesh`` on a
         model-owned path -- so install the ring here (idempotent) before sharding,
@@ -1427,7 +1427,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         inputs_embeds = self.model.get_input_embeddings()(llm_input_ids)
         # Two-step construction so shard_batch records its shard facts
         # (original/padded lengths) on the sharder it belongs to.
-        cp_sharder = CPSharder(
+        cp_sharder = ContextParallelismSharder(
             shard_batch=None,
             local_token_global_indices=contiguous_local_indices,
         )

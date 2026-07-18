@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the CPSharder contract in components/distributed/cp_sharder.py.
+"""Unit tests for the ContextParallelismSharder contract in components/distributed/cp_sharder.py.
 
 Collectives are not exercised here (CPU CI): the tests cover the pure layout
 math — local index generation, index-based token-tensor shard, gathered-shard
-reordering — and the CPSharder default/override resolution.
+reordering — and the ContextParallelismSharder default/override resolution.
 """
 
 from __future__ import annotations
@@ -129,10 +129,10 @@ def test_gather_token_tensor_identity_without_cp():
 
 
 # ---------------------------------------------------------------------------
-# CPSharder default/override resolution
+# ContextParallelismSharder default/override resolution
 # ---------------------------------------------------------------------------
 def test_sharder_default_shard_token_tensor_uses_indices():
-    sharder = cs.CPSharder(
+    sharder = cs.ContextParallelismSharder(
         shard_batch=lambda *a, **k: (contextlib.nullcontext, {}),
         local_token_global_indices=cs.contiguous_local_indices,
     )
@@ -144,7 +144,7 @@ def test_sharder_default_shard_token_tensor_uses_indices():
 def test_shard_batch_contiguous_records_shard_facts():
     """record_on captures original/padded lengths so the token verbs accept
     caller-coordinate tensors and reject mismatched ones."""
-    sharder = cs.CPSharder(
+    sharder = cs.ContextParallelismSharder(
         shard_batch=None,
         local_token_global_indices=cs.contiguous_local_indices,
     )
@@ -173,7 +173,7 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
     columns and dropped input pad slots come back as fill."""
     # input row: [a, b, PAD] -> rebuilt row: [a, b, X, X] (doc re-padded to 4)
     positions = torch.tensor([[0, 1, -1]])
-    sharder = cs.CPSharder(
+    sharder = cs.ContextParallelismSharder(
         shard_batch=None,
         local_token_global_indices=cs.contiguous_local_indices,
         original_seq_len=None,
@@ -195,7 +195,7 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
 
 
 def test_gather_trim_raises_without_captured_facts():
-    sharder = cs.CPSharder(
+    sharder = cs.ContextParallelismSharder(
         shard_batch=None,
         local_token_global_indices=cs.contiguous_local_indices,
     )
@@ -217,7 +217,7 @@ def test_sharder_token_verbs_unavailable_for_data_dependent_layouts():
     # THD/magi layouts depend on batch content (cu_seqlens / dispatch solver),
     # so their framework sharders carry no index map and the token-tensor verbs
     # must fail loudly rather than shard the wrong slice.
-    sharder = cs.CPSharder(
+    sharder = cs.ContextParallelismSharder(
         shard_batch=lambda *a, **k: (contextlib.nullcontext, {}),
         local_token_global_indices=None,
     )

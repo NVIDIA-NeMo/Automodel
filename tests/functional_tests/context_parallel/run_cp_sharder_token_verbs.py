@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-rank functional test for the CPSharder token verbs (L1, 2+ GPUs).
+"""Multi-rank functional test for the ContextParallelismSharder token verbs (L1, 2+ GPUs).
 
 The single-process unit suite can only exercise the identity early-returns of
 ``gather_token_tensor``; this driver runs the real collectives:

@@ -14,7 +14,7 @@
 
 """Context-parallel batch-sharding contract.
 
-Every CP backend is a :class:`CPSharder`. A model that owns its CP batch
+Every CP backend is a :class:`ContextParallelismSharder`. A model that owns its CP batch
 sharding and attention transport returns one from
 ``prepare_model_inputs_for_cp`` under the ``"cp_sharder"`` batch key; the
 framework constructs its own for the remaining backends (torch
@@ -225,7 +225,7 @@ def gather_token_tensor_by_indices(
 
 
 @dataclass
-class CPSharder:
+class ContextParallelismSharder:
     """CP backend description: how a batch is sharded and where local tokens live.
 
     Attributes:
@@ -266,7 +266,7 @@ class CPSharder:
     def _indices(self, cp_mesh, padded_seq_len: int, device) -> torch.Tensor:
         if self.local_token_global_indices is None:
             raise NotImplementedError(
-                "This CPSharder has a data-dependent token layout; its index map is "
+                "This ContextParallelismSharder has a data-dependent token layout; its index map is "
                 "captured during shard_batch — token-tensor shard/gather are unavailable before the first shard."
             )
         return self.local_token_global_indices(cp_mesh, padded_seq_len, device)
@@ -314,7 +314,7 @@ class CPSharder:
                 tensor = _pad_tensor_seq_dim_(tensor, seq_dim, self.padded_seq_len - length, fill)
             else:
                 raise ValueError(
-                    f"This CPSharder sharded a batch of padded_seq_len={self.padded_seq_len} "
+                    f"This ContextParallelismSharder sharded a batch of padded_seq_len={self.padded_seq_len} "
                     f"(original_seq_len={self.original_seq_len}), got a tensor of length {length} on dim {seq_dim}. "
                     "Pass the original-length tensor with an explicit `fill`, or pre-pad it yourself."
                 )
@@ -360,7 +360,7 @@ class CPSharder:
         if self.original_seq_len is not None:
             return full.narrow(seq_dim, 0, self.original_seq_len)
         raise NotImplementedError(
-            "This CPSharder captured no original-coordinate facts; "
+            "This ContextParallelismSharder captured no original-coordinate facts; "
             "gather with trim=False and restore the layout with the batch metadata "
             "(padding_mask / cu_seqlens)."
         )
@@ -465,7 +465,7 @@ def shard_batch_contiguous(
     pad_multiple: int = 1,
     extra_seq_keys: dict[str, int] | None = None,
     extra_pad_values: dict[str, Any] | None = None,
-    record_on: "CPSharder | None" = None,
+    record_on: "ContextParallelismSharder | None" = None,
 ):
     """Prepare and contiguously shard a batch for model-owned CP.
 
@@ -486,7 +486,7 @@ def shard_batch_contiguous(
         extra_seq_keys: Model-specific per-token batch keys to pad and shard,
             mapped to their sequence dim (e.g. Gemma4 vision group ids).
         extra_pad_values: Pad sentinels for ``extra_seq_keys`` (default 0).
-        record_on: Optional CPSharder receiving the shard facts
+        record_on: Optional ContextParallelismSharder receiving the shard facts
             (``original_seq_len`` / ``padded_seq_len``) for its token verbs;
             the owning model passes the sharder it constructed.
 
@@ -621,7 +621,7 @@ def shard_batch_load_balanced(
 ):
     """Shard a batch with torch ``context_parallel`` round-robin load balancing.
 
-    ``CPSharder.shard_batch`` implementation for the default framework-owned CP
+    ``ContextParallelismSharder.shard_batch`` implementation for the default framework-owned CP
     path (layout ``"round_robin"``, indices from
     :func:`round_robin_local_indices`). Assumes an active CP mesh (size > 1).
     ``padding_token_id`` is accepted per the contract but unused: CP-pad slots

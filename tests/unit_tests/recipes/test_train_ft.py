@@ -2391,12 +2391,12 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
             self.prepared = True
             self.num_chunks = kwargs.get("num_chunks")
             from nemo_automodel.components.distributed.cp_sharder import (
-                CPSharder,
+                ContextParallelismSharder,
                 contiguous_local_indices,
             )
 
             return {
-                "cp_sharder": CPSharder(
+                "cp_sharder": ContextParallelismSharder(
                     shard_batch=lambda cp_mesh, tp_mesh, batch, **k: (nullcontext, batch),
                     local_token_global_indices=contiguous_local_indices,
                 )

@@ -30,13 +30,13 @@ import torch
 
 # Import module under test
 from nemo_automodel.components.distributed import cp_utils as _cu
-from nemo_automodel.components.distributed.cp_sharder import CPSharder, contiguous_local_indices
+from nemo_automodel.components.distributed.cp_sharder import ContextParallelismSharder, contiguous_local_indices
 
 
-# CPSharder used by the model-owned dispatch tests below (passed as an explicit
+# ContextParallelismSharder used by the model-owned dispatch tests below (passed as an explicit
 # _make_cp_batch_and_ctx parameter; the batch itself stays pure tensors).
 def _contiguous_sharder():
-    return CPSharder(
+    return ContextParallelismSharder(
         shard_batch=_cm.make_contiguous_shard_cp_batch_and_ctx,
         local_token_global_indices=contiguous_local_indices,
     )
@@ -154,7 +154,7 @@ def test_make_cp_batch_and_ctx_honors_model_sharder_at_cp_size_one():
         "input_ids": torch.tensor([[1, 2, 3, 4]]),
         "labels": torch.tensor([[1, 2, 3, 4]]),
     }
-    sharder = CPSharder(
+    sharder = ContextParallelismSharder(
         shard_batch=make_native_batch,
         local_token_global_indices=contiguous_local_indices,
     )
@@ -667,7 +667,7 @@ def test_magi_dispatches_at_the_te_rung():
 
 
 def test_te_dispatches_through_a_framework_sharder(monkeypatch):
-    """use_te resolves to a framework-built THD CPSharder whose shard_batch
+    """use_te resolves to a framework-built THD ContextParallelismSharder whose shard_batch
     wraps make_cp_batch_for_te, threading the recipe-static args through."""
     seen = {}
 

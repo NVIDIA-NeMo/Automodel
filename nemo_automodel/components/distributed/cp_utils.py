@@ -19,7 +19,7 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.cp_sharder import (
-    CPSharder,
+    ContextParallelismSharder,
     captured_token_indices,
     identity_local_indices,
     round_robin_local_indices,
@@ -247,7 +247,7 @@ def prepare_cp_forward(
     """Single CP dispatch for a training/eval forward: hook -> sharder -> (ctx, batch).
 
     Collapses the per-recipe CP branching into one call: the model hook may
-    return a CPSharder, ``_make_cp_batch_and_ctx`` resolves it against the
+    return a ContextParallelismSharder, ``_make_cp_batch_and_ctx`` resolves it against the
     framework-owned sharders (magi / TE / generic torch ``context_parallel``)
     and calls ``shard_batch``. When CP is active and the model exposes
     ``prepare_model_inputs_for_cp``, the hook is invoked uniformly through
@@ -277,7 +277,7 @@ def prepare_cp_forward(
             batch on the generic torch path (rejected on the TE THD path;
             ignored by backends that own their transport).
     Returns:
-        ``(ctx_factory, batch, sharder)`` — the resolved :class:`CPSharder`
+        ``(ctx_factory, batch, sharder)`` — the resolved :class:`ContextParallelismSharder`
         (the identity sharder when no CP prep applies), whose token
         verbs keep per-token tensors aligned with the sharded inputs.
     """
@@ -326,7 +326,7 @@ def prepare_cp_forward(
 
 def _resolve_cp_sharder(
     cp_mesh,
-    model_sharder: Optional[CPSharder],
+    model_sharder: Optional[ContextParallelismSharder],
     *,
     magi,
     use_te: bool,
@@ -334,8 +334,8 @@ def _resolve_cp_sharder(
     seq_lens_padding_value: int,
     model,
     extra_seq_buffers: Optional[dict[str, int]] = None,
-) -> CPSharder:
-    """Resolve the CPSharder for this forward: model-owned > magi > TE > generic > none.
+) -> ContextParallelismSharder:
+    """Resolve the ContextParallelismSharder for this forward: model-owned > magi > TE > generic > none.
 
     Always returns a sharder: when no CP prep applies, an identity sharder,
     so callers hold working token verbs at every cp_size and
@@ -350,7 +350,7 @@ def _resolve_cp_sharder(
     """
     cp_active = cp_mesh is not None and cp_mesh.size() > 1
 
-    # A model that owns its CP attention returns a CPSharder from its CP
+    # A model that owns its CP attention returns a ContextParallelismSharder from its CP
     # input-prep hook. Honor it instead of any framework-owned path so the
     # implementation stays with the model.
     if model_sharder is not None:
@@ -390,7 +390,7 @@ def _resolve_cp_sharder(
                         magi_sharder.original_seq_len = row_shape[1]
             return contextlib.nullcontext, prepped
 
-        magi_sharder = CPSharder(shard_batch=_shard_batch_magi, local_token_global_indices=None)
+        magi_sharder = ContextParallelismSharder(shard_batch=_shard_batch_magi, local_token_global_indices=None)
         return magi_sharder
 
     if use_te:
@@ -418,7 +418,7 @@ def _resolve_cp_sharder(
                     te_sharder.padded_seq_len = row_shape[0] * row_shape[1]
             return contextlib.nullcontext, prepped
 
-        te_sharder = CPSharder(shard_batch=_shard_batch_te, local_token_global_indices=None)
+        te_sharder = ContextParallelismSharder(shard_batch=_shard_batch_te, local_token_global_indices=None)
         return te_sharder
 
     if cp_active:
@@ -444,7 +444,7 @@ def _resolve_cp_sharder(
                 rr_sharder.padded_seq_len = original + (-original % (2 * cp_mesh.size()))
             return ctx, prepped
 
-        rr_sharder = CPSharder(
+        rr_sharder = ContextParallelismSharder(
             shard_batch=_shard_batch_round_robin,
             local_token_global_indices=round_robin_local_indices,
         )
@@ -459,7 +459,7 @@ def _resolve_cp_sharder(
             none_sharder.original_seq_len = none_sharder.padded_seq_len = primary.shape[1]
         return contextlib.nullcontext, batch
 
-    none_sharder = CPSharder(
+    none_sharder = ContextParallelismSharder(
         shard_batch=_shard_batch_none,
         local_token_global_indices=identity_local_indices,
     )
@@ -503,13 +503,13 @@ def _make_cp_batch_and_ctx(
     seq_lens_padding_value: int = -1000,
     magi=None,
     model=None,
-    cp_sharder: Optional[CPSharder] = None,
+    cp_sharder: Optional[ContextParallelismSharder] = None,
     extra_seq_buffers: Optional[dict[str, int]] = None,
 ):
     """
-    Resolve a CPSharder and shard the batch; a no-op when no CP prep applies.
+    Resolve a ContextParallelismSharder and shard the batch; a no-op when no CP prep applies.
 
-    Every CP backend is a :class:`CPSharder`. A model that owns its CP
+    Every CP backend is a :class:`ContextParallelismSharder`. A model that owns its CP
     attention returns one from its ``prepare_model_inputs_for_cp`` hook
     (threaded here as ``cp_sharder`` — an explicit parameter, never a batch
     key, so the batch stays pure tensors); the framework constructs one for
@@ -524,7 +524,7 @@ def _make_cp_batch_and_ctx(
         batch (Dict[str, torch.Tensor]): The input batch containing (string, torch.Tensor)
 
     Returns:
-        tuple (contextmanager, dict[str, torch.Tensor], CPSharder): The forward
+        tuple (contextmanager, dict[str, torch.Tensor], ContextParallelismSharder): The forward
         context factory (nullcontext when the backend owns its transport or CP
         is inactive), the prepared/sharded batch, and the resolved sharder —
         callers use its token verbs (``shard_token_tensor`` /
@@ -592,7 +592,7 @@ def make_cp_batch_for_te(
         return_local_indices (bool): Also return this rank's local-token global
             index map (the ``thd_get_partitioned_indices`` partition; an
             identity arange when CP is inactive; None in chunked mode, where
-            each chunk is its own token space). Used by the THD CPSharder's
+            each chunk is its own token space). Used by the THD ContextParallelismSharder's
             token verbs.
 
     Returns:
@@ -709,7 +709,7 @@ def _shard_thd_chunk_for_te(
 
     # The partition is the same for every token-aligned key; it is also this
     # rank's local-token global index map, returned so the caller can install
-    # it on the THD sharder (CPSharder token verbs).
+    # it on the THD sharder (ContextParallelismSharder token verbs).
     local_indices = tex.thd_get_partitioned_indices(
         filtered_cu_seqlens_padded, batch["input_ids"].size(0), cp_size, cp_rank
     )

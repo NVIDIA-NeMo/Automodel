@@ -842,7 +842,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ) -> dict[str, Any]:
         """Model-owned context-parallel batch prep (Miles-style contiguous shard).
 
-        Returns a ``CPSharder`` (under the ``"cp_sharder"`` batch key) so
+        Returns a ``ContextParallelismSharder`` (under the ``"cp_sharder"`` batch key) so
         the CP dispatch delegates CP sharding back to this
         model, with the config-derived per-rank shard multiple bound. DSV4
         embeds internally, so (unlike VLM models) this does not pre-embed --
@@ -851,13 +851,13 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         from functools import partial  # noqa: PLC0415
 
         from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
-            CPSharder,
+            ContextParallelismSharder,
             contiguous_local_indices,
         )
 
         # Two-step construction so shard_batch records its shard facts
         # (lengths; the packed repad position map) on the sharder it belongs to.
-        cp_sharder = CPSharder(
+        cp_sharder = ContextParallelismSharder(
             shard_batch=None,
             local_token_global_indices=contiguous_local_indices,
         )

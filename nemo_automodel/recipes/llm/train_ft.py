@@ -979,7 +979,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream.
         _use_te_value = _thd_collater
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
-        # Single CP dispatch: magi / model-owned (CPSharder) / TE-THD / generic
+        # Single CP dispatch: magi / model-owned (ContextParallelismSharder) / TE-THD / generic
         # torch context_parallel.
         train_ctx, batch, _ = prepare_cp_forward(
             self.model_parts[0] if hasattr(self, "model_parts") else None,
