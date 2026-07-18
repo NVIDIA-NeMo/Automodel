@@ -21,6 +21,7 @@ import contextlib
 import torch
 import torch.distributed as dist
 
+from nemo_automodel.components.distributed.cp_sharder import ShardFacts
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
 
 
@@ -100,7 +101,6 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
     padding_token_id: int = 0,
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
-    record_on=None,
 ):
     """Convert packed GLM DSA batches to THD and keep a contiguous query shard per CP rank.
 
@@ -113,11 +113,14 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
 
     # The BSHD->THD flatten is a pure reshape: the pre-flatten rows are the
     # caller's coordinate system and the stream length is rows x cols. Chunked
-    # streams (num_chunks > 1) are per-chunk token spaces and capture nothing.
+    # streams (num_chunks > 1) are per-chunk token spaces and report no facts.
+    facts = None
     input_ids = batch.get("input_ids")
-    if record_on is not None and num_chunks <= 1 and input_ids is not None and input_ids.dim() >= 2:
-        record_on.input_row_shape = tuple(input_ids.shape[:2])
-        record_on.padded_seq_len = input_ids.shape[0] * input_ids.shape[1]
+    if num_chunks <= 1 and input_ids is not None and input_ids.dim() >= 2:
+        facts = ShardFacts(
+            padded_seq_len=input_ids.shape[0] * input_ids.shape[1],
+            input_row_shape=tuple(input_ids.shape[:2]),
+        )
 
     thd_batch = split_batch_into_thd_chunks(
         batch,
@@ -130,13 +133,14 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
     cp_rank = dist.get_rank(group=cp_group) if dist.is_available() and dist.is_initialized() else 0
 
     if num_chunks <= 1:
-        return contextlib.nullcontext, _slice_thd_chunk_for_cp(
+        sliced = _slice_thd_chunk_for_cp(
             thd_batch,
             cp_group=cp_group,
             cp_size=cp_size,
             cp_rank=cp_rank,
             padding_token_id=padding_token_id,
         )
+        return contextlib.nullcontext, sliced, facts
 
     chunks = []
     for idx in range(num_chunks):
@@ -157,4 +161,4 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
             stacked[key] = torch.stack([chunk[key] for chunk in chunks])  # type: ignore[list-item]
         else:
             stacked[key] = value
-    return contextlib.nullcontext, stacked
+    return contextlib.nullcontext, stacked, facts

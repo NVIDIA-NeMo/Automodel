@@ -20,7 +20,6 @@ MoE parallelizer.
 """
 
 from collections.abc import MutableMapping
-from functools import partial
 from typing import Any, Iterator, Optional, Union
 
 import torch
@@ -996,7 +995,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             if callable(module_setup):
                 module_setup(cp_mesh)
 
-    def _cp_shard_batch(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0, record_on=None):
+    def _cp_shard_batch(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
         """Gemma4-owned CP batch sharder that also self-installs the ring.
 
         Exposed as ``ContextParallelismSharder.shard_batch`` by
@@ -1014,7 +1013,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             padding_token_id=padding_token_id,
             extra_seq_keys={"_gemma4_vision_group_ids": 1},
             extra_pad_values={"_gemma4_vision_group_ids": -1},
-            record_on=record_on,
         )
 
     def __init__(
@@ -1425,13 +1423,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         special_image_mask = self._get_special_image_mask(input_ids, mm_token_type_ids)
         llm_input_ids = input_ids.masked_fill(special_image_mask, self._get_text_pad_token_id())
         inputs_embeds = self.model.get_input_embeddings()(llm_input_ids)
-        # Two-step construction so shard_batch records its shard facts
-        # (original/padded lengths) on the sharder it belongs to.
         cp_sharder = ContextParallelismSharder(
-            shard_batch=None,
+            shard_batch=self._cp_shard_batch,
             local_token_global_indices=contiguous_local_indices,
         )
-        cp_sharder.shard_batch = partial(self._cp_shard_batch, record_on=cp_sharder)
         prepared_inputs: dict[str, Any] = {
             "inputs_embeds": inputs_embeds,
             "mm_token_type_ids": mm_token_type_ids

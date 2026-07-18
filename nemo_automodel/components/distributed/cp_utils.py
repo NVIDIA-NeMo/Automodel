@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+from functools import partial
 from typing import List, Optional, Set
 
 import torch
@@ -20,9 +21,10 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.cp_sharder import (
     ContextParallelismSharder,
-    captured_token_indices,
+    ShardFacts,
     identity_local_indices,
     round_robin_local_indices,
+    shard_batch_identity,
     shard_batch_load_balanced,
 )
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
@@ -375,23 +377,28 @@ def _resolve_cp_sharder(
                 model=model,
                 return_local_indices=True,
             )
+            facts = None
             if local_indices is not None:
-                magi_sharder.local_token_global_indices = captured_token_indices(local_indices)
                 padded = local_indices.numel() * max(getattr(magi, "cp_size", 1) or 1, 1)
-                magi_sharder.padded_seq_len = padded
+                original, in_rows = None, None
                 if row_shape is not None:
                     if padded == row_shape[0] * row_shape[1]:
                         # Flatten moved no tokens and dispatch added no pad: the
                         # pre-flatten rows are the caller's coordinate system.
-                        magi_sharder.input_row_shape = row_shape
+                        in_rows = row_shape
                     elif row_shape[0] == 1 and padded >= row_shape[1]:
                         # Single-sequence HF path: dispatch pads at the tail of
                         # the global order, so trim restores the original length.
-                        magi_sharder.original_seq_len = row_shape[1]
-            return contextlib.nullcontext, prepped
+                        original = row_shape[1]
+                facts = ShardFacts(
+                    local_token_global_indices=local_indices,
+                    original_seq_len=original,
+                    padded_seq_len=padded,
+                    input_row_shape=in_rows,
+                )
+            return contextlib.nullcontext, prepped, facts
 
-        magi_sharder = ContextParallelismSharder(shard_batch=_shard_batch_magi, local_token_global_indices=None)
-        return magi_sharder
+        return ContextParallelismSharder(shard_batch=_shard_batch_magi, local_token_global_indices=None)
 
     if use_te:
         # The THD partition is data-dependent (cu_seqlens), so shard_batch
@@ -411,59 +418,29 @@ def _resolve_cp_sharder(
                 seq_lens_padding_value=seq_lens_padding_value,
                 return_local_indices=True,
             )
+            facts = None
             if local_indices is not None:
-                te_sharder.local_token_global_indices = captured_token_indices(local_indices)
-                if row_shape is not None:
-                    te_sharder.input_row_shape = row_shape
-                    te_sharder.padded_seq_len = row_shape[0] * row_shape[1]
-            return contextlib.nullcontext, prepped
+                facts = ShardFacts(
+                    local_token_global_indices=local_indices,
+                    padded_seq_len=row_shape[0] * row_shape[1] if row_shape is not None else None,
+                    input_row_shape=row_shape,
+                )
+            return contextlib.nullcontext, prepped, facts
 
-        te_sharder = ContextParallelismSharder(shard_batch=_shard_batch_te, local_token_global_indices=None)
-        return te_sharder
+        return ContextParallelismSharder(shard_batch=_shard_batch_te, local_token_global_indices=None)
 
     if cp_active:
-        # torch context_parallel pads inside shard_batch but slices at
-        # ctx-enter, so the primary length right after the call IS the padded
-        # global length.
-        def _shard_batch_round_robin(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
-            primary = batch.get("inputs_embeds", batch.get("input_ids"))
-            original = primary.shape[1] if primary is not None else None
-            ctx, prepped = shard_batch_load_balanced(
-                cp_mesh,
-                tp_mesh,
-                batch,
-                loss_mask=loss_mask,
-                padding_token_id=padding_token_id,
-                extra_seq_buffers=extra_seq_buffers,
-            )
-            rr_sharder.original_seq_len = original
-            # The pad is deterministic (round up to 2*cp); computed closed-form
-            # because a grad-bearing primary is already local after the call
-            # (sharded out of place), so its shape no longer shows the pad.
-            if original is not None:
-                rr_sharder.padded_seq_len = original + (-original % (2 * cp_mesh.size()))
-            return ctx, prepped
-
-        rr_sharder = ContextParallelismSharder(
-            shard_batch=_shard_batch_round_robin,
+        return ContextParallelismSharder(
+            shard_batch=partial(shard_batch_load_balanced, extra_seq_buffers=extra_seq_buffers),
             local_token_global_indices=round_robin_local_indices,
         )
-        return rr_sharder
 
     # No CP prep applies: the identity sharder, so callers hold working token
-    # verbs at every cp_size. Lengths are captured for trim/fill symmetry with
-    # the sharding layouts (original == padded: nothing was padded).
-    def _shard_batch_none(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
-        primary = batch.get("inputs_embeds", batch.get("input_ids"))
-        if primary is not None and primary.dim() >= 2:
-            none_sharder.original_seq_len = none_sharder.padded_seq_len = primary.shape[1]
-        return contextlib.nullcontext, batch
-
-    none_sharder = ContextParallelismSharder(
-        shard_batch=_shard_batch_none,
+    # verbs at every cp_size.
+    return ContextParallelismSharder(
+        shard_batch=shard_batch_identity,
         local_token_global_indices=identity_local_indices,
     )
-    return none_sharder
 
 
 def unshard_context_parallel_tensor(
@@ -548,7 +525,11 @@ def _make_cp_batch_and_ctx(
         model=model,
         extra_seq_buffers=extra_seq_buffers,
     )
-    ctx, batch = sharder.shard_batch(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
+    ctx, batch, facts = sharder.shard_batch(
+        cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id
+    )
+    if facts is not None:
+        sharder.install_shard_facts(facts)
     return ctx, batch, sharder
 
 

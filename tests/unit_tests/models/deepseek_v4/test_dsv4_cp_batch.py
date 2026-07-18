@@ -153,7 +153,7 @@ def test_contiguous_shard_basic_input_ids():
         "input_ids": torch.arange(seq).view(1, seq),
         "labels": torch.arange(seq).view(1, seq),
     }
-    ctx, out = _shard(batch, cp_size=2, local_rank=1)
+    ctx, out, _ = _shard(batch, cp_size=2, local_rank=1)
     # context manager factory is the nullcontext class (instantiated by the caller)
     assert ctx is contextlib.nullcontext
     # divisor = cp_size * max(pad_multiple or 2, 2) = 4; seq=8 already divisible -> no pad.
@@ -169,7 +169,7 @@ def test_contiguous_shard_basic_input_ids():
 
 def test_contiguous_shard_rank0_slice():
     batch = {"input_ids": torch.arange(8).view(1, 8), "labels": torch.arange(8).view(1, 8)}
-    _, out = _shard(batch, cp_size=2, local_rank=0)
+    _, out, _ = _shard(batch, cp_size=2, local_rank=0)
     torch.testing.assert_close(out["input_ids"], torch.arange(0, 4).view(1, 4))
 
 
@@ -183,7 +183,7 @@ def test_cp_size_one_native_thd_preserves_packed_batch_without_padding():
     }
     expected = {key: value.clone() for key, value in batch.items()}
 
-    ctx, out = _shard(batch, cp_size=1, local_rank=0, pad_multiple=8, padding_token_id=99)
+    ctx, out, _ = _shard(batch, cp_size=1, local_rank=0, pad_multiple=8, padding_token_id=99)
 
     assert ctx is contextlib.nullcontext
     assert out["qkv_format"] == "thd"
@@ -197,22 +197,22 @@ def test_cp_size_one_native_thd_preserves_packed_batch_without_padding():
 def test_contiguous_shard_pads_to_divisor():
     # seq=5, cp_size=2, pad_multiple=2 -> divisor=2*max(2,2)=4 -> pad to 8.
     batch = {"input_ids": torch.arange(5).view(1, 5), "labels": torch.arange(5).view(1, 5)}
-    _, out = _shard(batch, cp_size=2, local_rank=0, pad_multiple=2)
+    _, out, _ = _shard(batch, cp_size=2, local_rank=0, pad_multiple=2)
     assert out["input_ids"].shape == (1, 4)  # padded global 8 // cp_size 2
     # labels pad uses ignore_index -100
     batch2 = {"input_ids": torch.arange(5).view(1, 5), "labels": torch.arange(5).view(1, 5)}
-    _, out2 = _shard(batch2, cp_size=2, local_rank=1, pad_multiple=2)
+    _, out2, _ = _shard(batch2, cp_size=2, local_rank=1, pad_multiple=2)
     assert (out2["labels"] == -100).any()
 
 
 def test_contiguous_shard_pad_multiple_controls_shard_size():
     # pad_multiple=4 -> divisor=cp_size*max(4,2)=8; seq=8 already divisible.
     batch = {"input_ids": torch.arange(8).view(1, 8), "labels": torch.arange(8).view(1, 8)}
-    _, out = _shard(batch, cp_size=2, local_rank=0, pad_multiple=4)
+    _, out, _ = _shard(batch, cp_size=2, local_rank=0, pad_multiple=4)
     assert out["input_ids"].shape == (1, 4)
     # seq=8, pad_multiple=8 -> divisor=16 -> pad to 16, local=8.
     batch2 = {"input_ids": torch.arange(8).view(1, 8), "labels": torch.arange(8).view(1, 8)}
-    _, out2 = _shard(batch2, cp_size=2, local_rank=0, pad_multiple=8)
+    _, out2, _ = _shard(batch2, cp_size=2, local_rank=0, pad_multiple=8)
     assert out2["input_ids"].shape == (1, 8)
 
 
@@ -225,7 +225,7 @@ def test_contiguous_shard_attention_mask_2d_to_padding_mask():
         "labels": torch.arange(seq).view(1, seq),
         "attention_mask": attn,
     }
-    _, out = _shard(batch, cp_size=2, local_rank=1)
+    _, out, _ = _shard(batch, cp_size=2, local_rank=1)
     assert "attention_mask" not in out  # consumed
     # rank 1 owns [4:8]; padding_mask True == pad on the last two positions.
     torch.testing.assert_close(out["padding_mask"], torch.tensor([[False, False, True, True]]))
@@ -241,7 +241,7 @@ def test_contiguous_shard_attention_mask_4d_to_padding_mask():
         "labels": torch.arange(seq).view(1, seq),
         "attention_mask": attn,
     }
-    _, out = _shard(batch, cp_size=2, local_rank=1)
+    _, out, _ = _shard(batch, cp_size=2, local_rank=1)
     torch.testing.assert_close(out["padding_mask"], torch.tensor([[True, True]]))
 
 
@@ -255,7 +255,7 @@ def test_contiguous_shard_attention_mask_4d_bool():
         "labels": torch.arange(seq).view(1, seq),
         "attention_mask": attn,
     }
-    _, out = _shard(batch, cp_size=2, local_rank=1)
+    _, out, _ = _shard(batch, cp_size=2, local_rank=1)
     torch.testing.assert_close(out["padding_mask"], torch.tensor([[False, True]]))
 
 
@@ -265,7 +265,7 @@ def test_contiguous_shard_inputs_embeds_path():
         "inputs_embeds": torch.randn(1, seq, hidden),
         "labels": torch.arange(seq).view(1, seq),
     }
-    _, out = _shard(batch, cp_size=2, local_rank=0)
+    _, out, _ = _shard(batch, cp_size=2, local_rank=0)
     assert "inputs_embeds" in out and out["inputs_embeds"].shape == (1, 4, hidden)
     assert "input_ids" not in out
 
@@ -274,7 +274,7 @@ def test_contiguous_shard_loss_mask_becomes_labels_when_labels_absent():
     seq = 8
     batch = {"input_ids": torch.arange(seq).view(1, seq)}
     loss_mask = torch.ones(1, seq)
-    _, out = _shard(batch, cp_size=2, local_rank=0, loss_mask=loss_mask)
+    _, out, _ = _shard(batch, cp_size=2, local_rank=0, loss_mask=loss_mask)
     # loss_mask was promoted to labels then sharded.
     assert out["labels"].shape == (1, 4)
 
@@ -283,7 +283,7 @@ def test_contiguous_shard_loss_mask_kept_alongside_labels():
     seq = 8
     batch = {"input_ids": torch.arange(seq).view(1, seq), "labels": torch.arange(seq).view(1, seq)}
     loss_mask = torch.ones(1, seq)
-    _, out = _shard(batch, cp_size=2, local_rank=1, loss_mask=loss_mask)
+    _, out, _ = _shard(batch, cp_size=2, local_rank=1, loss_mask=loss_mask)
     assert out["loss_mask"].shape == (1, 4)
 
 
@@ -291,7 +291,7 @@ def test_contiguous_shard_position_ids_3d():
     seq = 8
     pos = torch.arange(seq).view(1, 1, seq).expand(1, 3, seq).contiguous()
     batch = {"input_ids": torch.arange(seq).view(1, seq), "labels": torch.arange(seq).view(1, seq), "position_ids": pos}
-    _, out = _shard(batch, cp_size=2, local_rank=1)
+    _, out, _ = _shard(batch, cp_size=2, local_rank=1)
     assert out["position_ids"].shape == (1, 3, 4)
     torch.testing.assert_close(out["position_ids"][0, 0], torch.arange(4, 8))
 
@@ -313,14 +313,14 @@ def test_contiguous_shard_packed_sequence_pads_each_doc_before_cp_slice():
         "seq_lens_padded": torch.tensor([[3, 5]]),
     }
 
-    _, rank0 = _shard(
+    _, rank0, _ = _shard(
         {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()},
         cp_size=2,
         local_rank=0,
         pad_multiple=4,
         padding_token_id=99,
     )
-    _, rank1 = _shard(
+    _, rank1, _ = _shard(
         {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()},
         cp_size=2,
         local_rank=1,
@@ -438,7 +438,7 @@ def test_contiguous_shard_syncs_packed_length_for_hybridep(monkeypatch):
         "seq_lens_padded": torch.tensor([[3, 5]]),
     }
 
-    _, out = _shard(
+    _, out, _ = _shard(
         batch,
         cp_size=2,
         local_rank=0,
@@ -459,7 +459,7 @@ def test_contiguous_shard_syncs_packed_length_for_hybridep(monkeypatch):
         "seq_lens": torch.tensor([[3, 2]]),
         "seq_lens_padded": torch.tensor([[3, 5]]),
     }
-    _, out = _shard(
+    _, out, _ = _shard(
         batch,
         cp_size=2,
         local_rank=1,
@@ -517,7 +517,7 @@ def test_prepare_model_inputs_for_cp_returns_sharder():
 
     # the bound fn shards a batch end-to-end with a real (fake-mesh) divisor.
     batch = {"input_ids": torch.arange(256).view(1, 256), "labels": torch.arange(256).view(1, 256)}
-    _, out = fn(_FakeMesh(2, 0), None, batch)
+    _, out, _ = fn(_FakeMesh(2, 0), None, batch)
     assert out["input_ids"].shape == (1, 128)
 
 

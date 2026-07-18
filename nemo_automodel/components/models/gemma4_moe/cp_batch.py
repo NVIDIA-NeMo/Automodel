@@ -85,7 +85,6 @@ def make_contiguous_shard_cp_batch_and_ctx(
     padding_token_id: int = 0,
     extra_seq_keys: dict[str, int] | None = None,
     extra_pad_values: dict[str, Any] | None = None,
-    record_on=None,
 ):
     """Prepare and contiguously shard a batch for Gemma4's ring CP.
 
@@ -109,5 +108,4 @@ def make_contiguous_shard_cp_batch_and_ctx(
         padding_token_id=padding_token_id,
         extra_seq_keys={**_GEMMA4_SEQ_KEYS, **(extra_seq_keys or {})},
         extra_pad_values={**_GEMMA4_PAD_VALUES, **(extra_pad_values or {})},
-        record_on=record_on,
     )

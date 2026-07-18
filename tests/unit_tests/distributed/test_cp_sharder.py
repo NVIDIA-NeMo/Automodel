@@ -133,7 +133,7 @@ def test_gather_token_tensor_identity_without_cp():
 # ---------------------------------------------------------------------------
 def test_sharder_default_shard_token_tensor_uses_indices():
     sharder = cs.ContextParallelismSharder(
-        shard_batch=lambda *a, **k: (contextlib.nullcontext, {}),
+        shard_batch=lambda *a, **k: (contextlib.nullcontext, {}, None),
         local_token_global_indices=cs.contiguous_local_indices,
     )
     full = torch.randn(1, 8)
@@ -142,15 +142,16 @@ def test_sharder_default_shard_token_tensor_uses_indices():
 
 
 def test_shard_batch_contiguous_records_shard_facts():
-    """record_on captures original/padded lengths so the token verbs accept
-    caller-coordinate tensors and reject mismatched ones."""
+    """shard_batch reports original/padded lengths as ShardFacts; once installed,
+    the token verbs accept caller-coordinate tensors and reject mismatched ones."""
     sharder = cs.ContextParallelismSharder(
         shard_batch=None,
         local_token_global_indices=cs.contiguous_local_indices,
     )
     mesh = _FakeMesh(2, 0)
     batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
-    cs.shard_batch_contiguous(mesh, None, batch, record_on=sharder)  # pads 6 -> 8
+    _, _, facts = cs.shard_batch_contiguous(mesh, None, batch)  # pads 6 -> 8
+    sharder.install_shard_facts(facts)
 
     assert (sharder.original_seq_len, sharder.padded_seq_len) == (6, 8)
     # down: unpadded tensor auto-pads with the explicit fill, rank 0 owns [0:4]
@@ -218,7 +219,7 @@ def test_sharder_token_verbs_unavailable_for_data_dependent_layouts():
     # so their framework sharders carry no index map and the token-tensor verbs
     # must fail loudly rather than shard the wrong slice.
     sharder = cs.ContextParallelismSharder(
-        shard_batch=lambda *a, **k: (contextlib.nullcontext, {}),
+        shard_batch=lambda *a, **k: (contextlib.nullcontext, {}, None),
         local_token_global_indices=None,
     )
     with pytest.raises(NotImplementedError, match="data-dependent"):
@@ -236,7 +237,7 @@ def test_shard_batch_contiguous_respects_pad_multiple():
         "input_ids": torch.arange(seq).view(1, seq),
         "labels": torch.arange(seq).view(1, seq),
     }
-    ctx, out = cs.shard_batch_contiguous(
+    ctx, out, _ = cs.shard_batch_contiguous(
         _FakeMesh(2, 1),
         None,
         batch,
@@ -258,7 +259,7 @@ def test_shard_batch_contiguous_extra_seq_keys():
         "labels": torch.arange(seq).view(1, seq),
         "vision_ids": torch.arange(seq).view(1, seq),
     }
-    _, out = cs.shard_batch_contiguous(
+    _, out, _ = cs.shard_batch_contiguous(
         _FakeMesh(2, 0),
         None,
         batch,

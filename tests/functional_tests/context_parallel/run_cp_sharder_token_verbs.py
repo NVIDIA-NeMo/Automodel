@@ -57,7 +57,8 @@ def main() -> None:
         "input_ids": torch.arange(seq_len, device=device).unsqueeze(0),
         "labels": torch.arange(seq_len, device=device).unsqueeze(0),
     }
-    sharder.shard_batch(cp_mesh, None, batch)
+    _, _, facts = sharder.shard_batch(cp_mesh, None, batch)
+    sharder.install_shard_facts(facts)
     padded = sharder.padded_seq_len
     assert sharder.original_seq_len == seq_len, sharder.original_seq_len
     assert padded == seq_len + (-seq_len) % (2 * world), padded

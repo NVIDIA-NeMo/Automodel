@@ -430,7 +430,6 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     padding_token_id: int = 0,
     pad_multiple: int | None = None,
     sync_packed_length: bool = False,
-    record_on=None,
 ):
     """Contiguously shard a batch for DeepSeek V4 Miles-style context parallelism.
 
@@ -449,6 +448,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     import contextlib
 
     from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
+        ShardFacts,
         convert_attention_mask_to_padding_mask,
         shard_batch_contiguous,
     )
@@ -462,7 +462,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
             batch["labels"] = loss_mask
         elif loss_mask is not None:
             batch["loss_mask"] = loss_mask
-        return contextlib.nullcontext, batch
+        return contextlib.nullcontext, batch, None
 
     local_multiple = max(int(pad_multiple or 2), 2)
 
@@ -486,7 +486,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
             loss_mask=loss_mask,
         )
 
-    ctx, batch = shard_batch_contiguous(
+    ctx, batch, facts = shard_batch_contiguous(
         cp_mesh,
         tp_mesh,
         batch,
@@ -495,14 +495,15 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
         pad_multiple=local_multiple,
         extra_seq_keys={"packed_seq_ids": 1} if packed else None,
         extra_pad_values={"packed_seq_ids": 0} if packed else None,
-        record_on=record_on,
     )
-    if packed and record_on is not None:
+    if packed:
         # The repad rebuilt the rows, so no single original length exists; the
         # caller's coordinates are restored through the position map instead.
-        record_on.original_seq_len = None
-        record_on.input_token_stream_positions = input_positions
+        facts = ShardFacts(
+            padded_seq_len=facts.padded_seq_len,
+            input_token_stream_positions=input_positions,
+        )
     # Hand the CP process group to the model forward (read from attn_kwargs) so
     # DSV4 attention all-gathers K/V across CP ranks. Not a tensor -> not sharded.
     batch["_dsv4_cp_group"] = cp_mesh.get_group()
-    return ctx, batch
+    return ctx, batch, facts

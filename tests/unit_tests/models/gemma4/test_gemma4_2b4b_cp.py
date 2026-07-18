@@ -139,7 +139,7 @@ def test_get_capabilities_plain_dense_unchanged():
 # ---------------------------------------------------------------------------
 def _shard_batch(batch, cp_size, cp_rank, seq_len):
     mesh = _FakeCPMesh(cp_size, cp_rank)
-    _ctx_fn, sharded = make_contiguous_shard_cp_batch_and_ctx(
+    _ctx_fn, sharded, _ = make_contiguous_shard_cp_batch_and_ctx(
         mesh,
         None,
         batch,
@@ -248,10 +248,8 @@ def test_prepare_model_inputs_threads_real_per_layer_inputs():
     tc = cfg.text_config
     assert pli.shape == (1, ids.shape[1], tc.num_hidden_layers, tc.hidden_size_per_layer_input)
     # and the model-owned batch-sharding callable is attached for cp_utils.
-    # shard_batch is the model's bound sharding callable, wrapped so it
-    # records its shard facts on the sharder it belongs to.
-    assert prepared["cp_sharder"].shard_batch.func == model._cp_shard_batch
-    assert prepared["cp_sharder"].shard_batch.keywords["record_on"] is prepared["cp_sharder"]
+    # shard_batch is the model's bound sharding callable.
+    assert prepared["cp_sharder"].shard_batch == model._cp_shard_batch
 
 
 def test_prepare_per_layer_inputs_masks_image_tokens():

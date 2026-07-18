@@ -32,10 +32,11 @@ default token-tensor shard/gather are synthesized from it, so a sharder only
 overrides them when it has a cheaper communication pattern. Layouts that are a
 pure function of ``(cp_mesh, padded_seq_len)`` (contiguous, round-robin)
 provide it at construction; data-dependent layouts (THD ``cu_seqlens``
-partitioning, magi's dispatch solver) start as None and install the index map
-computed during ``shard_batch`` via :func:`captured_token_indices` — the
-framework builds those sharders per resolution, so a capture never leaks
-across steps. Before the first ``shard_batch`` their token verbs raise.
+partitioning, magi's dispatch solver) start as None and report the partition
+they computed as :class:`ShardFacts`, which the dispatch installs on the
+sharder — sharders are built per resolution/hook call, so installed facts
+never leak across steps. Before the first ``shard_batch`` their token verbs
+raise.
 The sharder carries no backend tag: nothing may branch on which backend
 produced it.
 
@@ -97,6 +98,20 @@ def identity_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | 
     return torch.arange(padded_seq_len, device=device, dtype=torch.long)
 
 
+def shard_batch_identity(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id: int = 0):
+    """``shard_batch`` of the identity sharder: a no-op with length facts.
+
+    Returned by the dispatch when no CP prep applies, so callers hold working
+    token verbs at every cp_size (nothing was padded: original == padded).
+    """
+    del cp_mesh, tp_mesh, loss_mask, padding_token_id
+    primary = batch.get("inputs_embeds", batch.get("input_ids"))
+    facts = None
+    if primary is not None and primary.dim() >= 2:
+        facts = ShardFacts(original_seq_len=primary.shape[1], padded_seq_len=primary.shape[1])
+    return contextlib.nullcontext, batch, facts
+
+
 def round_robin_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
     """Global positions owned by this rank under torch ``context_parallel`` load balancing.
 
@@ -131,8 +146,8 @@ def captured_token_indices(local_indices: torch.Tensor) -> Callable[..., torch.T
     For data-dependent layouts the index map is a byproduct of the sharding
     itself (TE's ``thd_get_partitioned_indices`` result, magi's
     ``get_position_ids``) rather than a function of ``(cp_mesh,
-    padded_seq_len)``. The framework sharders install this wrapper on
-    ``local_token_global_indices`` after sharding; it validates the requested
+    padded_seq_len)``. ``install_shard_facts`` wraps the reported partition
+    with this on ``local_token_global_indices``; it validates the requested
     length against the captured partition so a mismatched tensor cannot be
     silently mis-sharded.
 
@@ -224,44 +239,73 @@ def gather_token_tensor_by_indices(
     return _reorder_gathered_token_tensor(parts, index_parts, seq_dim=seq_dim)
 
 
+@dataclass(frozen=True)
+class ShardFacts:
+    """What a ``shard_batch`` learned about the layout it just applied.
+
+    Returned as the third element of ``shard_batch`` and installed on the
+    sharder by the dispatch (the single installation point), so the token verbs
+    can accept and return tensors in the CALLER's coordinates: pad is an
+    internal detail of the CP layout.
+
+    Attributes:
+        local_token_global_indices: The partition actually computed, for
+            data-dependent layouts (TE's ``thd_get_partitioned_indices``
+            result, magi's ``get_position_ids``); None for layouts whose index
+            map is a closed-form function already on the sharder.
+        original_seq_len: Pre-pad sequence length; None when the layout has no
+            single original length (packed streams).
+        padded_seq_len: Post-pad global sequence length; the token verbs
+            validate tensor lengths against it.
+        input_row_shape: For flat-stream (THD) layouts, the ``[B, S]`` shape of
+            the pre-flatten input rows (the flatten moves no tokens).
+        input_token_stream_positions: For layouts that reposition tokens (DSV4
+            packed repad), the per-row map from input position to padded output
+            column (-1 = an input pad slot whose token was dropped).
+    """
+
+    local_token_global_indices: torch.Tensor | None = None
+    original_seq_len: int | None = None
+    padded_seq_len: int | None = None
+    input_row_shape: tuple[int, ...] | None = None
+    input_token_stream_positions: torch.Tensor | None = None
+
+
 @dataclass
 class ContextParallelismSharder:
     """CP backend description: how a batch is sharded and where local tokens live.
 
     Attributes:
         shard_batch: ``(cp_mesh, tp_mesh, batch, *, loss_mask=None,
-            padding_token_id=0) -> (ctx_factory, batch)``. Pads and shards the
-            batch and installs any backend-owned attention transport; returns
-            the forward context factory and the sharded batch.
+            padding_token_id=0) -> (ctx_factory, batch, ShardFacts | None)``.
+            Pads and shards the batch, installs any backend-owned attention
+            transport, and reports the layout facts it computed; the dispatch
+            installs them on this sharder for the token verbs (which raise
+            before the first shard on data-dependent layouts).
         local_token_global_indices: ``(cp_mesh, padded_seq_len, device) ->
-            LongTensor`` with the global position of each local token. Layouts
-            that depend on batch content (THD ``cu_seqlens`` partitioning,
-            magi's dispatch solver) construct with None and install the
-            partition computed during ``shard_batch`` (see
-            :func:`captured_token_indices`); their token verbs raise until the
-            first shard.
-        original_seq_len: Pre-pad sequence length captured at shard time; None
-            when the layout has no single original length (packed streams).
-        padded_seq_len: Post-pad global sequence length captured at shard time;
-            the token verbs validate tensor lengths against it.
-        input_row_shape: For flat-stream (THD) layouts, the ``[B, S]`` shape of
-            the pre-flatten input rows; the verbs translate between row and
-            stream coordinates with it (the flatten moves no tokens).
-        input_token_stream_positions: For layouts that reposition tokens (DSV4
-            packed repad), the per-row map from input position to padded output
-            column (-1 = an input pad slot whose token was dropped).
+            LongTensor`` with the global position of each local token —
+            closed-form at construction, or installed from the returned
+            :class:`ShardFacts` for data-dependent layouts.
     """
 
-    shard_batch: Callable[..., tuple[Callable, dict[str, Any]]]
+    shard_batch: Callable[..., tuple[Callable, dict[str, Any], "ShardFacts | None"]]
     local_token_global_indices: Callable[..., torch.Tensor] | None
-    # Facts captured while shard_batch runs (framework sharders are built per
-    # resolution, model sharders per hook call, so captures never leak across
-    # steps). They let the token verbs accept/return tensors in the CALLER's
-    # coordinates: pad is an internal detail of the CP layout.
-    original_seq_len: int | None = None  # pre-pad length along seq_dim; None when no single value exists (packed)
-    padded_seq_len: int | None = None  # post-pad global length; validation anchor for the token verbs
-    input_row_shape: tuple[int, ...] | None = None  # [B, S] of pre-flatten rows for flat-stream (THD) layouts
-    input_token_stream_positions: torch.Tensor | None = None  # [B, S_in] -> padded column; -1 = dropped input pad
+    # Shard-time facts, installed from the ShardFacts a shard_batch returns
+    # (framework sharders are built per resolution, model sharders per hook
+    # call, so installed facts never leak across steps).
+    original_seq_len: int | None = None
+    padded_seq_len: int | None = None
+    input_row_shape: tuple[int, ...] | None = None
+    input_token_stream_positions: torch.Tensor | None = None
+
+    def install_shard_facts(self, facts: "ShardFacts") -> None:
+        """Adopt the facts a ``shard_batch`` returned (called by the dispatch)."""
+        if facts.local_token_global_indices is not None:
+            self.local_token_global_indices = captured_token_indices(facts.local_token_global_indices)
+        self.original_seq_len = facts.original_seq_len
+        self.padded_seq_len = facts.padded_seq_len
+        self.input_row_shape = facts.input_row_shape
+        self.input_token_stream_positions = facts.input_token_stream_positions
 
     def _indices(self, cp_mesh, padded_seq_len: int, device) -> torch.Tensor:
         if self.local_token_global_indices is None:
@@ -465,7 +509,6 @@ def shard_batch_contiguous(
     pad_multiple: int = 1,
     extra_seq_keys: dict[str, int] | None = None,
     extra_pad_values: dict[str, Any] | None = None,
-    record_on: "ContextParallelismSharder | None" = None,
 ):
     """Prepare and contiguously shard a batch for model-owned CP.
 
@@ -486,13 +529,10 @@ def shard_batch_contiguous(
         extra_seq_keys: Model-specific per-token batch keys to pad and shard,
             mapped to their sequence dim (e.g. Gemma4 vision group ids).
         extra_pad_values: Pad sentinels for ``extra_seq_keys`` (default 0).
-        record_on: Optional ContextParallelismSharder receiving the shard facts
-            (``original_seq_len`` / ``padded_seq_len``) for its token verbs;
-            the owning model passes the sharder it constructed.
 
     Returns:
-        ``(contextlib.nullcontext, batch)`` — transport lives in the model's
-        own attention, so no CP context manager is needed.
+        ``(contextlib.nullcontext, batch, ShardFacts)`` — transport lives in
+        the model's own attention, so no CP context manager is needed.
     """
     primary_key, seq_len, labels, position_ids, pos_seq_dim, loss_mask = _prepare_contiguous_cp_batch(batch, loss_mask)
     ctx, batch = _make_contiguous_shard_cp_batch(
@@ -509,10 +549,8 @@ def shard_batch_contiguous(
         extra_seq_keys=extra_seq_keys,
         extra_pad_values=extra_pad_values,
     )
-    if record_on is not None:
-        record_on.original_seq_len = seq_len
-        record_on.padded_seq_len = batch[primary_key].shape[1] * cp_mesh.size()
-    return ctx, batch
+    facts = ShardFacts(original_seq_len=seq_len, padded_seq_len=batch[primary_key].shape[1] * cp_mesh.size())
+    return ctx, batch, facts
 
 
 def _make_contiguous_shard_cp_batch(
@@ -629,8 +667,8 @@ def shard_batch_load_balanced(
     carry -100 labels.
 
     Returns:
-        ``(ctx_factory, batch)`` where entering ``ctx_factory()`` installs the
-        SDPA-kernel + ``context_parallel`` context for the forward.
+        ``(ctx_factory, batch, ShardFacts)`` where entering ``ctx_factory()``
+        installs the SDPA-kernel + ``context_parallel`` context for the forward.
     """
     # Call-time import: the torch-CP transport machinery stays in cp_utils
     # (NeMo-RL imports it from there), and cp_utils imports this module.
@@ -778,4 +816,5 @@ def shard_batch_load_balanced(
     # TODO(@akoumparouli): surface these in the future.
     enable_loss_parallel: bool = False
     enable_compiled_autograd: bool = False
-    return get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch
+    facts = ShardFacts(original_seq_len=seq_len, padded_seq_len=seq_len + (-seq_len) % cp_divisor)
+    return get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch, facts
