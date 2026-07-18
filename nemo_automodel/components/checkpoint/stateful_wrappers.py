@@ -221,6 +221,7 @@ class ModelState:
         is_peft: bool = False,
         is_init_step: bool = False,
         skip_task_head_prefixes: list[str] | None = None,
+        cpu_offload: bool = False,
     ):
         """
         Initialize a ModelState instance for distributed checkpointing.
@@ -240,6 +241,7 @@ class ModelState:
                 - ["classifier."] for sequence/token classification
                 - ["qa_outputs."] for question answering
                 - ["score."] for some classification heads
+            cpu_offload: Whether DCP should move sharded tensors to CPU before saving.
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.uses_tied_lm_head = is_tied_word_embeddings(self.model[0])
@@ -251,6 +253,7 @@ class ModelState:
         self.is_peft = is_peft
         self.is_init_step = is_init_step
         self.skip_task_head_prefixes = skip_task_head_prefixes or []
+        self.cpu_offload = cpu_offload
 
     def _refresh_local_tied_lm_head(self) -> None:
         """Refresh tied-head metadata after DCP has normalized module state."""
@@ -264,7 +267,7 @@ class ModelState:
         Get the model's state dictionary.
 
         Returns:
-            dict: Dictionary containing the model's state dict with CPU offloading enabled.
+            Dictionary containing the model state dict, optionally offloaded to CPU.
         """
         if self.is_init_step:
             return self._get_base_model_state_dict()
@@ -278,7 +281,7 @@ class ModelState:
         if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
             model_state_dict = {k: v for sd in map(_get_peft_state_dict, self.model) for k, v in sd.items()}
         else:
-            options = None
+            options = StateDictOptions(cpu_offload=True) if self.cpu_offload else None
             if self.is_peft:
                 options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=True)
 
@@ -416,6 +419,7 @@ class OptimizerState:
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[Any] = None,
         is_peft: bool = False,
+        cpu_offload: bool = False,
     ):
         """
         Initialize an OptimizerState instance.
@@ -434,18 +438,20 @@ class OptimizerState:
             scheduler (Optional[Any], optional): Learning-rate scheduler to track
                 alongside the optimizer. Pass ``None`` if no scheduler is used.
             is_peft (bool): Whether the model uses PEFT adapters (e.g. LoRA/QLoRA).
+            cpu_offload: Whether DCP should move sharded tensors to CPU before saving.
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.optimizer = [optimizer] if isinstance(optimizer, torch.optim.Optimizer) else optimizer
         self.scheduler = [scheduler] if isinstance(scheduler, torch.optim.lr_scheduler.LRScheduler) else scheduler
         self.is_peft = is_peft
+        self.cpu_offload = cpu_offload
 
     def state_dict(self) -> dict[str, Any]:
         """
         Get the optimizer and scheduler state dictionaries.
 
         Returns:
-            dict: Dictionary containing the optimizer and scheduler state dicts with CPU offloading enabled.
+            Dictionary containing the optimizer and scheduler state dicts, optionally offloaded to CPU.
         """
         # For PEFT models with quantized parameters or expert parallelism, bypass
         # PyTorch DCP's get_optimizer_state_dict() which fails because DCP cannot
@@ -460,7 +466,7 @@ class OptimizerState:
             # to FSDP.SHARDED_STATE_DICT
             func = partial(
                 get_optimizer_state_dict,
-                options=StateDictOptions(flatten_optimizer_state_dict=True),
+                options=StateDictOptions(flatten_optimizer_state_dict=True, cpu_offload=self.cpu_offload),
             )
             optimizer_state_dict = {k: v for sd in map(func, self.model, self.optimizer) for k, v in sd.items()}
 

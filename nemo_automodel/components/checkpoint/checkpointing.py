@@ -479,7 +479,7 @@ class Checkpointer:
             should_write_consolidated and not self.config.is_async and not self.config.single_rank_consolidation
         )
 
-        model_state = ModelState(model, self.config.is_peft)
+        model_state = ModelState(model, self.config.is_peft, cpu_offload=self.config.cpu_offload)
         state_dict = model_state.state_dict()
 
         # Convert to HF format if using custom model implementations.
@@ -564,7 +564,9 @@ class Checkpointer:
         """
         optimizer_path = os.path.join(weights_path, "optim")
         _ensure_dirs(optimizer_path, process_group=self.process_group)
-        optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
+        optimizer_state = OptimizerState(
+            model, optimizer, scheduler, is_peft=self.config.is_peft, cpu_offload=self.config.cpu_offload
+        )
         state_dict = optimizer_state.state_dict()
         self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
 
@@ -580,7 +582,9 @@ class Checkpointer:
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to populate.
         """
-        optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
+        optimizer_state = OptimizerState(
+            model, optimizer, scheduler, is_peft=self.config.is_peft, cpu_offload=self.config.cpu_offload
+        )
         state_dict = optimizer_state.state_dict()
         self._do_load(state_dict, os.path.join(weights_path, "optim"))
         optimizer_state.load_state_dict(state_dict)
@@ -621,6 +625,7 @@ class Checkpointer:
             is_peft=self.config.is_peft,
             is_init_step=is_init_step,
             skip_task_head_prefixes=getattr(self.config, "skip_task_head_prefixes_for_base_model", None),
+            cpu_offload=self.config.cpu_offload,
         )
 
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
