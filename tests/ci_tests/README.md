@@ -8,6 +8,7 @@ Configuration, scripts, and utilities for AutoModel's CI recipe validation pipel
 ci_tests/
   configs/{test_folder}/
     nightly_recipes.yml         # Recipes included in nightly scope
+    release_recipes.yml         # Explicit release list for non-auto-discovered folders
     convergence_recipes.yml     # Recipes included in convergence scope (2x time)
     override_recipes.yml        # Exemptions, known issues
   scripts/
@@ -26,7 +27,8 @@ ci_tests/
 **Scopes:**
 - **nightly** -- Recipes listed in `nightly_recipes.yml`
 - **convergence** -- Recipes in `convergence_recipes.yml`, time automatically doubled
-- **release** -- All recipe YAMLs found under `examples/{test_folder}/`
+- **release** -- All recipe YAMLs in auto-discovered folders, or recipes listed
+  in `release_recipes.yml` for explicitly managed folders such as `llm_pretrain`
 
 **Stage assignment** is based on recipe type and configuration:
 

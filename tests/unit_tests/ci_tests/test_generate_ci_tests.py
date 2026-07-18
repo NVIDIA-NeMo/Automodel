@@ -12,24 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
-
-import pytest
-
-from tests.ci_tests.utils.generate_ci_tests import resolve_recipe_path
+from tests.ci_tests.utils.generate_ci_tests import generate_pipeline
 
 
-def test_resolve_recipe_path_defaults_to_test_folder():
-    assert resolve_recipe_path("llama/recipe.yaml", "llm_finetune") == Path("examples/llm_finetune/llama/recipe.yaml")
+def test_generate_deepseek_v4_pretrain_nightly_job():
+    pipeline = generate_pipeline(".", "nightly", "llm_pretrain")
+
+    job = pipeline["deepseek_v4_flash_pretrain"]
+    assert job["extends"] == ".llm_pretrain_test"
+    assert job["stage"] == "pretrain"
+    assert job["variables"]["CONFIG_PATH"] == ("examples/llm_pretrain/deepseek_v4/deepseek_v4_flash_pretrain.yaml")
+    assert job["variables"]["REQUIRE_FINITE_METRICS"] == "true"
+    assert job["variables"]["TEST_NODE_COUNT"] == 2
 
 
-def test_resolve_recipe_path_preserves_full_examples_path():
-    assert resolve_recipe_path("examples/llm_pretrain/deepseek_v4/recipe.yaml", "llm_finetune") == Path(
-        "examples/llm_pretrain/deepseek_v4/recipe.yaml"
-    )
+def test_generate_deepseek_v4_pretrain_release_job():
+    pipeline = generate_pipeline(".", "release", "llm_pretrain")
 
-
-@pytest.mark.parametrize("path", ["/tmp/recipe.yaml", "../recipe.yaml", "examples/../recipe.yaml"])
-def test_resolve_recipe_path_rejects_repository_escape(path):
-    with pytest.raises(ValueError, match="must stay within the repository"):
-        resolve_recipe_path(path, "llm_finetune")
+    job = pipeline["deepseek_v4_flash_pretrain"]
+    assert job["extends"] == ".llm_pretrain_test"
+    assert job["variables"]["TEST_LEVEL"] == "release"

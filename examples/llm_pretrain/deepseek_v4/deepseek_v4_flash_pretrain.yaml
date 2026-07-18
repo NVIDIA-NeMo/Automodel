@@ -14,7 +14,7 @@
 
 # Random-initialized DeepSeek-V4-Flash pretraining. Replace the dataset paths
 # below for a production run. NeMo CI supplies its own dataset through the
-# ci.nightly overrides without changing this user-facing recipe.
+# ci.nightly/ci.release overrides without changing this user-facing recipe.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -136,7 +136,7 @@ ci:
   cluster_tag: h100
   env_vars:
     REQUIRE_FINITE_METRICS: "true"
-  nightly:
+  nightly: &ci_smoke
     step_scheduler.global_batch_size: 16
     step_scheduler.local_batch_size: 2
     step_scheduler.max_steps: 4
@@ -166,3 +166,4 @@ ci:
       _target_: torch.utils.data.DataLoader
       batch_size: null
       num_workers: 0
+  release: *ci_smoke
