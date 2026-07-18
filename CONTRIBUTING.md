@@ -44,7 +44,7 @@ uv sync --locked --extra all --all-groups
 
 ### 2. Developing with uv sync/pip install
 
-Uv sync and pip install are both supported in Automodel. Uv sync is the recommened path.
+Uv sync and pip install are both supported in Automodel. Uv sync is the recommended path.
 
 From the local Automodel directory run the following command:
 
