@@ -18,6 +18,7 @@ import inspect
 import logging
 import math
 import os
+import time
 import types
 from typing import Callable, Optional, Protocol
 
@@ -276,6 +277,34 @@ def _get_hidden_and_vocab_size(model_config) -> tuple[int, int]:
     return hidden_size, vocab_size
 
 
+def _set_stage_metas(
+    stage: PipelineStage,
+    inputs_meta: tuple[torch.Tensor, ...],
+    outputs_meta: tuple[torch.Tensor, ...],
+) -> None:
+    """Set static pipeline metadata across supported PyTorch APIs."""
+    configure_outputs_meta = getattr(stage, "_configure_outputs_meta", None)
+    if callable(configure_outputs_meta):
+        stage.inputs_meta = inputs_meta
+        configure_outputs_meta(outputs_meta)
+        return
+
+    user_meta = getattr(stage, "_user_meta", None)
+    if user_meta is None:
+        raise RuntimeError("Unsupported PipelineStage metadata API")
+
+    from torch.distributed.pipelining.stage import extract_tensor_metas
+
+    def mark_activations(tensors: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            tensor.requires_grad_(True) if tensor.is_floating_point() or tensor.is_complex() else tensor
+            for tensor in tensors
+        )
+
+    user_meta.inputs = extract_tensor_metas(mark_activations(inputs_meta))
+    user_meta.outputs = extract_tensor_metas(mark_activations(outputs_meta))
+
+
 def _precompute_stage_shapes(
     stages: list[PipelineStage],
     model_config,
@@ -289,9 +318,9 @@ def _precompute_stage_shapes(
     stage 0 → send → stage 1 → send → ... → stage N-1.  This is O(N) in the number of
     pipeline stages and becomes a bottleneck for large world sizes.
 
-    This function sets ``inputs_meta`` and ``_outputs_meta`` on each stage *before* the
-    first ``step()`` call, so that ``_shape_inference`` is never invoked and the serial
-    chain is completely eliminated.
+    This function installs static input/output metadata on each stage *before* the first
+    ``step()`` call, so runtime shape inference is never invoked and the serial chain is
+    completely eliminated.
 
     Args:
         stages: The local pipeline stages (already parallelized).
@@ -312,21 +341,21 @@ def _precompute_stage_shapes(
 
         get_stage_metas = _get_optional_hook(stage.submod, "get_pipeline_stage_metas")
         if get_stage_metas is not None:
-            stage.inputs_meta, outputs_meta = get_stage_metas(
+            inputs_meta, outputs_meta = get_stage_metas(
                 is_first=stage.is_first,
                 microbatch_size=microbatch_size,
                 seq_len=seq_len,
                 dtype=model_dtype,
             )
-            stage._configure_outputs_meta(outputs_meta)
+            _set_stage_metas(stage, inputs_meta, outputs_meta)
             continue
 
         # --- inputs_meta ---
         if stage.is_first:
             # First stage receives input_ids: [mb, seq_len] int64
-            stage.inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
+            inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
         else:
-            stage.inputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
+            inputs_meta = (torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype),)
 
         # --- outputs_meta ---
         has_lm_head = hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
@@ -337,12 +366,73 @@ def _precompute_stage_shapes(
         else:
             primary_output_meta = torch.empty(microbatch_size, seq_len, hidden_size, device="meta", dtype=model_dtype)
         outputs_meta = (primary_output_meta,)
-        stage._configure_outputs_meta(outputs_meta)
+        _set_stage_metas(stage, inputs_meta, outputs_meta)
 
     logger.info(
         f"Precomputed pipeline stage shapes (seq_len={seq_len}, microbatch_size={microbatch_size}) — "
         f"serial shape inference bypassed"
     )
+
+
+def _warmup_pipeline_stage_neighbors(stage: PipelineStage) -> None:
+    """Initialize the pairwise NCCL communicators used by a pipeline stage."""
+    warmup_tensor = torch.zeros(1, device=stage.device)
+    group_rank = stage.group.rank()
+    group_ranks = torch.distributed.get_process_group_ranks(stage.group)
+    local_world_size = max(torch.cuda.device_count(), 1)
+
+    # Stagger PP replicas by their first node to avoid overloading NCCL communicator bootstrap.
+    time.sleep(2 * (min(group_ranks) // local_world_size))
+
+    edges = {(rank, rank + 1) for rank in range(stage.group_size - 1)}
+    if stage.group_size > 2:
+        edges.add((0, stage.group_size - 1))
+
+    edge_phases: list[list[tuple[int, int]]] = []
+    phase_ranks: list[set[int]] = []
+    for edge in sorted(edges):
+        for phase, ranks in zip(edge_phases, phase_ranks):
+            if ranks.isdisjoint(edge):
+                phase.append(edge)
+                ranks.update(edge)
+                break
+        else:
+            edge_phases.append([edge])
+            phase_ranks.append(set(edge))
+
+    for phase in edge_phases:
+        for reverse in (False, True):
+            for lower_rank, higher_rank in phase:
+                src_rank, dst_rank = (higher_rank, lower_rank) if reverse else (lower_rank, higher_rank)
+                if group_rank == src_rank:
+                    torch.distributed.isend(warmup_tensor, group=stage.group, group_dst=dst_rank).wait()
+                elif group_rank == dst_rank:
+                    torch.distributed.irecv(warmup_tensor, group=stage.group, group_src=src_rank).wait()
+
+    torch.cuda.synchronize(stage.device)
+
+
+def _use_static_pipeline_stage_metadata(schedule: _PipelineSchedule, stages: list[PipelineStage]) -> None:
+    """Select static metadata when every Torch 2.12 pipeline stage supports it."""
+    try:
+        from torch.distributed.pipelining._utils import InferenceMode
+
+        inspect.getattr_static(schedule, "_warmup_p2p")
+        stage_metas = [inspect.getattr_static(stage, "_user_meta") for stage in stages]
+    except (AttributeError, ImportError):
+        return
+
+    has_backward = getattr(schedule, "_has_backward", True)
+    if any(InferenceMode.needs_dynamic(stage_meta, has_backward) for stage_meta in stage_metas):
+        return
+
+    def _warmup_static_stages(self, pipeline_stages, has_backward, p2p_done) -> None:
+        del self, has_backward, p2p_done
+        for stage in pipeline_stages:
+            stage._inference_mode = InferenceMode.STATIC
+
+    schedule._warmup_p2p = types.MethodType(_warmup_static_stages, schedule)
+    logger.info("Using static pipeline metadata with preinitialized neighbor P2P communicators")
 
 
 def reset_pp_stage_shapes(
@@ -373,10 +463,25 @@ def reset_pp_stage_shapes(
         seq_len: Sequence length of the upcoming batch (e.g. ``input_ids.shape[1]``).
     """
     for stage in stages:
-        # Allow _configure_outputs_meta to be called again (it asserts _outputs_meta is None)
-        stage._outputs_meta = None
-        # Allow _shape_inference to re-run for non-first stages receiving new shapes
-        stage.inputs_meta = None
+        # PyTorch <= 2.10 stores static metadata in these fields.
+        if hasattr(stage, "_outputs_meta"):
+            stage._outputs_meta = None
+        if hasattr(stage, "inputs_meta"):
+            stage.inputs_meta = None
+
+        # PyTorch 2.12 stores runtime metadata separately from user-provided metadata.
+        for stage_meta_name in ("_stage_meta", "_user_meta"):
+            stage_meta = getattr(stage, stage_meta_name, None)
+            if stage_meta is not None:
+                stage_meta.inputs = None
+                stage_meta.outputs = None
+                stage_meta.input_grads = None
+                stage_meta.output_grads = None
+        if hasattr(stage, "_inference_mode"):
+            stage._inference_mode = None
+        for attr_name in ("_fwd_outputs_for_bwd_meta", "_fwd_inputs_for_bwd_meta", "_fwd_kwargs_tensors_for_bwd_meta"):
+            if hasattr(stage, attr_name):
+                setattr(stage, attr_name, None)
         # Clear pre-allocated recv/send buffers; they will be reallocated by _prepare_forward_infra
         stage.args_recv_info = {}
         stage.grad_recv_info = {}
@@ -800,6 +905,9 @@ def pipeline_model(
             model_parts[i] = m
             stages[i].submod = m
 
+    if seq_len is not None:
+        _warmup_pipeline_stage_neighbors(stages[0])
+
     # Precompute stage shapes to bypass serial P2P shape inference.
     # This must happen *after* parallelization so that dtypes are final.
     if seq_len is not None:
@@ -815,6 +923,8 @@ def pipeline_model(
         loss_fn,
         scale_grads=scale_grads,
     )
+    if seq_len is not None:
+        _use_static_pipeline_stage_metadata(pp_schedule, stages)
 
     # Patch FSDP backward for MoE models, or when per-microbatch grad reduce-scatter
     # is requested (mapped from surface-level defer_fsdp_grad_sync=False for memory

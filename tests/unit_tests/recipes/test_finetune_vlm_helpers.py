@@ -2794,20 +2794,43 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_pp_rank", lambda self: 0)
 
 
-def _minimal_vlm_cfg(cp_size: int, rope_fusion: bool):
-    return ConfigNode(
-        {
-            "model": {"backend": {"rope_fusion": rope_fusion}},
-            "dataloader": {},
-            "dataset": {"path_or_dataset": "dummy"},
-            "validation_dataloader": {},
-            "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
-            "optimizer": {},
-            "loss_fn": {},
-            "checkpoint": {"best_metric_key": "default"},
-            "distributed": {"cp_size": cp_size},
-        }
-    )
+def _minimal_vlm_cfg(cp_size: int, rope_fusion: bool, prewarm: dict[str, bool] | None = None) -> ConfigNode:
+    cfg = {
+        "model": {"backend": {"rope_fusion": rope_fusion}},
+        "dataloader": {},
+        "dataset": {"path_or_dataset": "dummy"},
+        "validation_dataloader": {},
+        "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
+        "optimizer": {},
+        "loss_fn": {},
+        "checkpoint": {"best_metric_key": "default"},
+        "distributed": {"cp_size": cp_size},
+    }
+    if prewarm is not None:
+        cfg["prewarm"] = prewarm
+    return ConfigNode(cfg)
+
+
+def test_vlm_setup_applies_prewarm_config(monkeypatch):
+    """VLM setup should apply the typed prewarm config to its parallelized model parts."""
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False, prewarm={"comm_groups": True})
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    calls = []
+
+    def _record_apply(self, *, model_parts, device, pp_mesh=None):
+        calls.append((self, model_parts, device, pp_mesh))
+
+    monkeypatch.setattr("nemo_automodel.components.training.prewarm.PrewarmConfig.apply", _record_apply)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert len(calls) == 1
+    prewarm, model_parts, device, pp_mesh = calls[0]
+    assert prewarm.comm_groups is True
+    assert model_parts == trainer.model_parts
+    assert device == torch.device("cpu")
+    assert pp_mesh is None
 
 
 def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
@@ -3056,7 +3079,7 @@ class TestChunkVlmMedia:
         assert "patch_pixel_values" not in chunks
         assert "patch_newline_mask" not in chunks
 
-        with pytest.raises(ValueError, match="one full image tensor per sample"):
+        with pytest.raises(ValueError, match="cannot align pixel_values with num_patches"):
             chunk_step3_media(pixel_values[:2], batch_size=3, n_microbatches=2)
         with pytest.raises(ValueError, match="num_patches must have length"):
             chunk_step3_media(pixel_values, batch_size=3, n_microbatches=2, num_patches=torch.tensor([1, 2]))
@@ -3092,6 +3115,21 @@ class TestChunkVlmMedia:
         assert model._vlm_num_patches_chunks is None
         assert model._vlm_patch_newline_mask_chunks is None
         assert model._vlm_chunk_idx is None
+
+    def test_prepare_flat_patches_without_image_grid(self):
+        pixel_values = torch.arange(5 * 2 * 2 * 2 * 3).reshape(5, 2, 2, 2, 3)
+        batch = {
+            "input_ids": torch.ones(2, 4, dtype=torch.long),
+            "pixel_values": pixel_values,
+            "num_patches": torch.tensor([2, 3]),
+        }
+
+        prepared = prepare_vlm_media_for_pp(batch, batch_size=2, n_microbatches=2)
+        media = prepared[VLM_PP_MEDIA_KEY]
+
+        assert torch.equal(media["pixel_values"][0], pixel_values[:2])
+        assert torch.equal(media["pixel_values"][1], pixel_values[2:])
+        assert [chunk.tolist() for chunk in media["num_patches"]] == [[2], [3]]
 
 
 # -----------------------------------------------------------------------------

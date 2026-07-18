@@ -128,10 +128,48 @@ def _get_input_ids(tokenizer_name: str | None) -> list[int]:
     """Return input IDs for the test prompt, using dynamic tokenization if tokenizer_name is set."""
     if tokenizer_name is None:
         return _DEFAULT_INPUT_IDS
-    from transformers import AutoTokenizer
+    from nemo_automodel import NeMoAutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    tokenizer = NeMoAutoTokenizer.from_pretrained(
+        tokenizer_name,
+        trust_remote_code=True,
+        local_files_only=os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+    )
     return tokenizer.encode(_DEFAULT_PROMPT, add_special_tokens=False)
+
+
+def _load_hf_fp8_dequantized_config(
+    pretrained_model_name_or_path: str | Path,
+    *,
+    trust_remote_code: bool,
+    revision: str | None = None,
+    token: str | bool | None = None,
+):
+    """Return an HF config that dequantizes a fine-grained FP8 checkpoint, if applicable."""
+    from transformers import AutoConfig
+
+    config_kwargs: dict[str, str | bool] = {
+        "trust_remote_code": trust_remote_code,
+        "local_files_only": os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+    }
+    if revision is not None:
+        config_kwargs["revision"] = revision
+    if token is not None:
+        config_kwargs["token"] = token
+    config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
+    quantization_config = getattr(config, "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        quant_method = quantization_config.get("quant_method")
+    else:
+        quant_method = getattr(quantization_config, "quant_method", None)
+    if getattr(quant_method, "value", quant_method) != "fp8":
+        return None
+
+    if isinstance(quantization_config, dict):
+        config.quantization_config = {**quantization_config, "dequantize": True}
+    else:
+        quantization_config.dequantize = True
+    return config
 
 
 def _rss_gb() -> float:
@@ -206,13 +244,12 @@ def _get_trust_remote_code_attn_implementation(
         config_kwargs["token"] = token
     config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
 
-    # Nemotron-H's remote-code attention passes an ordinary padding mask through
-    # HF's FlashAttention varlen/unpadding path. That path raises a
-    # vectorized_gather_kernel index-OOB device assert for Nemotron-3 Super.
-    # PyTorch SDPA uses its optimized CUDA dispatcher while avoiding the
-    # incompatible varlen route. Other remote-code models (notably
-    # Nemotron-Flash) still require FA2.
-    return "sdpa" if config.model_type == "nemotron_h" else "flash_attention_2"
+    # Nemotron-H remote-code checkpoints do not share optimized attention backend
+    # support: FlashAttention fails in Nemotron-3 Super's varlen path, while
+    # Nemotron-Nano v2 declares SDPA unsupported. Eager is their common HF
+    # reference path. Other remote-code models (notably Nemotron-Flash) still
+    # require FA2.
+    return "eager" if config.model_type == "nemotron_h" else "flash_attention_2"
 
 
 def _hf_source_load_kwargs(
@@ -237,6 +274,7 @@ def _hf_source_load_kwargs(
     hf_kwargs = {k: v for k, v in model_kwargs.items() if k in hf_allowed_keys}
     hf_kwargs["torch_dtype"] = source_dtype
     hf_kwargs["trust_remote_code"] = trust_remote_code or bool(hf_kwargs.get("trust_remote_code", False))
+    hf_kwargs["local_files_only"] = os.environ.get("HF_HUB_OFFLINE", "0") == "1"
     if hf_kwargs["trust_remote_code"] and "attn_implementation" not in hf_kwargs:
         hf_kwargs["attn_implementation"] = _get_trust_remote_code_attn_implementation(
             pretrained_model_name_or_path,
@@ -432,7 +470,7 @@ def _prepare_source_load_reference(
     experts_implementation: str | None,
     hf_device_map_auto: bool,
 ) -> tuple[torch.Tensor, bool | None, bool | None] | None:
-    """Compute raw HF source-load reference logits before trainer construction."""
+    """Compute vanilla HF source-load reference logits before trainer construction."""
     if _preinit_world_size() > 1:
         sync_dir, done_path, fail_path = _source_load_sync_paths(cfg)
         if _preinit_global_rank() != 0:
@@ -474,7 +512,7 @@ def _prepare_source_load_reference_rank0(
     experts_implementation: str | None,
     hf_device_map_auto: bool,
 ) -> tuple[torch.Tensor, bool | None, bool | None]:
-    """Rank-0 implementation of raw HF source-load reference capture."""
+    """Rank-0 implementation of vanilla HF source-load reference capture."""
     from contextlib import nullcontext
 
     from transformers import AutoModelForCausalLM
@@ -499,6 +537,15 @@ def _prepare_source_load_reference_rank0(
         device=device,
         hf_device_map_auto=hf_device_map_auto,
     )
+    if "config" not in hf_kwargs and hf_kwargs.get("quantization_config") is None:
+        fp8_config = _load_hf_fp8_dequantized_config(
+            original_pretrained_path,
+            trust_remote_code=hf_kwargs["trust_remote_code"],
+            revision=hf_kwargs.get("revision"),
+            token=hf_kwargs.get("token"),
+        )
+        if fp8_config is not None:
+            hf_kwargs["config"] = fp8_config
 
     try:
         from nemo_automodel._transformers.model_init import no_hf_meta_device
@@ -507,7 +554,7 @@ def _prepare_source_load_reference_rank0(
     except ImportError:
         no_meta = nullcontext()
 
-    print(f"\n[Phase 0] Source-load reference: raw HF for {original_pretrained_path}")
+    print(f"\n[Phase 0] Source-load reference: vanilla HF for {original_pretrained_path}")
     with no_meta:
         if "device_map" in hf_kwargs:
             hf_model = AutoModelForCausalLM.from_pretrained(original_pretrained_path, **hf_kwargs)
@@ -539,7 +586,7 @@ def _compare_source_load_parity(
     source_load_mean_kl_threshold: float,
     source_load_cosine_threshold: float,
 ) -> None:
-    """Compare the raw HF source-load reference against the constructed trainer model."""
+    """Compare the vanilla HF source-load reference against the constructed trainer model."""
     candidate_aliased = _lm_head_embedding_aliased(candidate_model)
     failure_message = None
     if _rank0():
@@ -945,13 +992,9 @@ def test_checkpoint_robustness():
 
     is_peft = hasattr(cfg, "peft")
     original_pretrained_path = cfg.model.pretrained_model_name_or_path
-    # Some FP8-quantized checkpoints (e.g. ministral3) require dequantize=True
-    # at load time to avoid a Triton-only FP8 matmul kernel dispatch in the
-    # vanilla HF forward pass (Phase 4).  Materialise the yaml quantization
-    # sub-tree into an HF config object here so Phase 4 can forward it
-    # to `from_pretrained` — passing the raw ConfigNode directly would
-    # trip transformers' internal deepcopy (triggers ConfigNode.__getattr__
-    # on `__setstate__`, which then fails recursively).
+    # Materialize an explicit YAML quantization subtree for the vanilla HF
+    # reload. Passing ConfigNode directly would recurse in HF's deepcopy.
+    # Source FP8 configs without an override are detected and dequantized below.
     _raw_qc = getattr(cfg.model, "quantization_config", None)
     if _raw_qc is not None and hasattr(_raw_qc, "instantiate"):
         try:
@@ -1040,7 +1083,11 @@ def test_checkpoint_robustness():
         except ImportError:
             _no_meta = nullcontext()
 
-        hf_kwargs = dict(torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code)
+        hf_kwargs = dict(
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=trust_remote_code,
+            local_files_only=os.environ.get("HF_HUB_OFFLINE", "0") == "1",
+        )
         # Remote-code models can ship attention names that transformers 5.x
         # rejects. Select a supported implementation while keeping Nemotron-H
         # off HF's incompatible FlashAttention varlen path.
@@ -1054,6 +1101,14 @@ def test_checkpoint_robustness():
             hf_kwargs["device_map"] = "auto"
         if original_quantization_config is not None:
             hf_kwargs["quantization_config"] = original_quantization_config
+        else:
+            config_path = original_pretrained_path if is_peft else consolidated_dir
+            fp8_config = _load_hf_fp8_dequantized_config(
+                config_path,
+                trust_remote_code=trust_remote_code,
+            )
+            if fp8_config is not None:
+                hf_kwargs["config"] = fp8_config
         # Load the reference model straight onto the target GPU. Materialising a
         # 14B checkpoint on CPU and then ``.to(device)`` costs ~50-225s, and that
         # rank-0-only stall trips the NCCL watchdog while the other ranks idle at

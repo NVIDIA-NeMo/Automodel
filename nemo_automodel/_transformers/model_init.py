@@ -357,7 +357,7 @@ def get_is_hf_model(config, force_hf):
     return _resolve_custom_model_cls_for_config(config) is None
 
 
-def _download_model_weights(hf_config, pretrained_model_name_or_path):
+def _download_model_weights(hf_config, pretrained_model_name_or_path, process_group=None):
     if not os.path.isdir(pretrained_model_name_or_path):
         if os.environ.get("HF_HUB_OFFLINE", "0") == "1":
             logger.info(
@@ -375,12 +375,12 @@ def _download_model_weights(hf_config, pretrained_model_name_or_path):
             )
         # Import via module reference (vs bound name) so unit tests can patch
         # `nemo_automodel.components.distributed.utils.FirstRankPerNode`.
-        with dist_utils.FirstRankPerNode():
+        with dist_utils.FirstRankPerNode(group=process_group):
             snapshot_download(pretrained_model_name_or_path)
 
 
-def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs):
-    """Fully populate HF's dynamic-module (custom code) cache on global rank 0 first.
+def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs, process_group=None):
+    """Fully populate HF's dynamic-module cache on the model-local rank 0 first.
 
     ``get_cached_module_file`` copies a custom-code file plus its *direct* relative
     imports, but ``get_class_in_module`` later validates the *transitive* closure. A
@@ -408,7 +408,7 @@ def _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwa
             if isinstance(ref, str) and "." in ref:
                 module_files.add(ref.rsplit(".", 1)[0] + ".py")
     src_py = glob.glob(os.path.join(src_dir, "*.py"))
-    with dist_utils.FirstRankPerNode():
+    with dist_utils.FirstRankPerNode(group=process_group):
         for module_file in module_files:
             try:
                 cached = get_cached_module_file(src_dir, module_file)
@@ -806,6 +806,7 @@ def __init_model(
     # Default ``True`` keeps existing behavior for every recipe that doesn't set
     # it. Pop here so the flag never reaches HF's ``from_pretrained``.
     restore_loaded_dtype = kwargs.pop("_restore_loaded_dtype", True)
+    process_group = kwargs.pop("_process_group", None)
     torch_dtype = dtype_from_str(torch_dtype) if torch_dtype != "auto" else torch_dtype
     is_pretrained_init = isinstance(pretrained_model_name_or_path_or_config, str)  # The caller is .from_pretrained
     hf_config = (
@@ -919,7 +920,7 @@ def __init_model(
         else:
             # Download model weights on local rank 0; skip for from_config or local paths
             if pretrained_model_name_or_path:
-                _download_model_weights(hf_config, pretrained_model_name_or_path)
+                _download_model_weights(hf_config, pretrained_model_name_or_path, process_group=process_group)
             logger.info(f"Using custom model implementation for {architectures[0]}")
             kwargs.pop("trust_remote_code", None)
             # Treat config-related kwargs as config overrides (HF behavior) and
@@ -938,7 +939,7 @@ def __init_model(
     # 3. fallback to HF model class wrapped with mixin
     model = None
     # Serialize HF custom-code cache population across ranks to avoid a partial-copy race.
-    _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs)
+    _prepopulate_remote_code_cache(hf_config, pretrained_model_name_or_path, kwargs, process_group=process_group)
     if quantization_config is not None:
         kwargs["quantization_config"] = quantization_config
         _setup_bnb_loading_kwargs(kwargs)
