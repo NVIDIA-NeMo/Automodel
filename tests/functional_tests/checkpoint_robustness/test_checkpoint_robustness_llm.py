@@ -1053,22 +1053,6 @@ def run_checkpoint_robustness(
     input_ids = input_ids_loader(tokenizer_name)
     cfg = parse_args_and_load_config()
 
-    # Capture the raw HF result before distributed initialization, but keep
-    # only its CPU logits. The constructed-source comparison runs after the
-    # checkpoint lifecycle so its wrapper state cannot affect training.
-    source_load_reference = None
-    if check_source_load_parity:
-        source_load_reference = _prepare_source_load_reference(
-            cfg,
-            input_ids,
-            hf_model_cls=hf_model_cls,
-            trust_remote_code=trust_remote_code,
-            experts_implementation=experts_implementation,
-            hf_device_map_auto=hf_device_map_auto,
-            hf_source_post_load_dequantize=hf_source_post_load_dequantize,
-        )
-        _barrier()
-
     # Phase 1: Construct a pristine model, then train and checkpoint.
     torch.cuda.reset_peak_memory_stats()
     trainer = recipe_cls(cfg)
@@ -1424,14 +1408,24 @@ def run_checkpoint_robustness(
         del resume_trainer
         _barrier()
 
-    # Complete Phase 0 last. Large FSDP/EP models can retain wrapper-owned
-    # allocations after a no-grad probe even when the recipe's public model and
-    # optimizer references are cleared. Isolating this diagnostic after the
+    # Complete Phase 0 last. Large device-mapped HF references and FSDP/EP
+    # candidates can retain wrapper-owned allocations even after their public
+    # model references are cleared. Isolating the entire diagnostic after the
     # checkpoint lifecycle makes that state irrelevant to training, save,
     # reload, and resume while preserving a blocking source-parity result.
     source_load_failure = None
     if check_source_load_parity:
         cfg = parse_args_and_load_config()
+        source_load_reference = _prepare_source_load_reference(
+            cfg,
+            input_ids,
+            hf_model_cls=hf_model_cls,
+            trust_remote_code=trust_remote_code,
+            experts_implementation=experts_implementation,
+            hf_device_map_auto=hf_device_map_auto,
+            hf_source_post_load_dequantize=hf_source_post_load_dequantize,
+        )
+        _barrier()
         source_load_trainer = recipe_cls(cfg)
         source_load_trainer.setup()
         device = next(source_load_trainer.model_parts[0].parameters()).device
