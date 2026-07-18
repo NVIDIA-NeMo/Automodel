@@ -989,6 +989,46 @@ class TestPrecomputeStageShapes:
         assert mock_stage.inputs_meta is None
 
 
+class TestPipelineStageWarmupCpu:
+    """CPU coverage for the warm-up helpers that does not require the torch>=2.12
+    ``InferenceMode`` pipelining internals (which are absent in older builds)."""
+
+    def test_set_stage_metas_unsupported_api_raises(self):
+        """A stage exposing neither metadata API surfaces a clear error."""
+        meta = (torch.empty(2, 4, device="meta"),)
+        with pytest.raises(RuntimeError, match="Unsupported PipelineStage metadata API"):
+            _set_stage_metas(types.SimpleNamespace(), meta, meta)
+
+    def test_use_static_metadata_is_noop_without_warmup_p2p(self):
+        """Without a ``_warmup_p2p`` hook the helper leaves the schedule untouched."""
+        schedule = types.SimpleNamespace()
+        _use_static_pipeline_stage_metadata(schedule, [types.SimpleNamespace(_user_meta=object())])
+        assert not hasattr(schedule, "_warmup_p2p")
+
+    @pytest.mark.parametrize("group_rank", [0, 1])
+    @patch("nemo_automodel.components.distributed.pipelining.functional.time.sleep")
+    @patch("torch.cuda.device_count", return_value=8)
+    @patch("torch.distributed.get_process_group_ranks", return_value=[8, 72, 136, 200])
+    @patch("torch.cuda.synchronize")
+    @patch("torch.distributed.irecv")
+    @patch("torch.distributed.isend")
+    def test_warmup_pipeline_stage_neighbors_issues_staggered_p2p(
+        self, isend, irecv, synchronize, _get_ranks, _device_count, sleep, group_rank
+    ):
+        """Neighbor warm-up staggers by node and issues send/recv over the stage group."""
+        stage = types.SimpleNamespace(device=torch.device("cpu"), group=Mock(), group_size=4)
+        stage.group.rank.return_value = group_rank
+
+        _warmup_pipeline_stage_neighbors(stage)
+
+        # min(group_ranks)=8, local_world_size=device_count()=8 -> sleep(2 * (8 // 8)).
+        sleep.assert_called_once_with(2)
+        synchronize.assert_called_once_with(stage.device)
+        assert isend.call_count + irecv.call_count > 0
+        for mock_call in list(isend.call_args_list) + list(irecv.call_args_list):
+            assert mock_call.kwargs["group"] is stage.group
+
+
 @pytest.mark.skipif(
     not hasattr(importlib.import_module("torch.distributed.pipelining._utils"), "InferenceMode"),
     reason="requires the torch>=2.12 pipelining InferenceMode internals",

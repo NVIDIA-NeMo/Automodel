@@ -3188,3 +3188,31 @@ def test_gemma4_inject_thinking_prefix_accepts_processor_or_tokenizer(collate_mo
     out_proc = collate_mod.gemma4_inject_thinking_prefix(batch_a, _Processor())
     out_tok = collate_mod.gemma4_inject_thinking_prefix(batch_b, _GemmaTokenizerStub())
     assert torch.equal(out_proc["input_ids"], out_tok["input_ids"])
+
+
+def test_build_labels_from_template_uses_inkling_markers():
+    """InklingProcessor routes labelling through the message/content markers."""
+    import nemo_automodel.components.datasets.vlm.collate_fns as collate_mod
+
+    marker_ids = {
+        "<|message_model|>": 10,
+        "<|content_text|>": 11,
+        "<|content_model_end_sampling|>": 12,
+    }
+
+    class _InklingTokenizer:
+        unk_token_id = 0
+
+        def convert_tokens_to_ids(self, token):
+            return marker_ids[token]
+
+    class InklingProcessor:
+        def __init__(self):
+            self.tokenizer = _InklingTokenizer()
+
+    # marker [10, 11] opens the assistant turn; 12 closes it (inclusive).
+    input_ids = torch.tensor([[1, 10, 11, 5, 6, 12, 0]], dtype=torch.long)
+    labels = collate_mod.build_labels_from_template(input_ids, [CONVERSATION], InklingProcessor())
+
+    assert labels.shape == input_ids.shape
+    assert labels[0].tolist() == [-100, -100, -100, 5, 6, 12, -100]
