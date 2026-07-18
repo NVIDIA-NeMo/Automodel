@@ -432,48 +432,6 @@ def convert_attention_mask_to_padding_mask(batch: dict) -> None:
             batch["padding_mask"] = attention_mask.bool().logical_not()
 
 
-def _prepare_contiguous_cp_batch(batch, loss_mask):
-    """Pre-shard prep for the model-owned contiguous CP path.
-
-    Converts ``attention_mask`` to a ``padding_mask`` (preserving padding
-    semantics for modules such as MoE), selects the primary sequence tensor,
-    injects/normalizes ``position_ids``, and resolves ``labels`` (falling back
-    to ``loss_mask``).
-    """
-    convert_attention_mask_to_padding_mask(batch)
-
-    has_inputs_embeds = "inputs_embeds" in batch
-    has_input_ids = "input_ids" in batch
-    assert has_inputs_embeds ^ has_input_ids, (
-        "the CP dispatch requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
-    )
-    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
-    primary_seq_tensor = batch[primary_key]
-    seq_len = primary_seq_tensor.shape[1]
-
-    batch_size = primary_seq_tensor.shape[0]
-    if "position_ids" not in batch:
-        batch["position_ids"] = (
-            torch.arange(0, seq_len, device=primary_seq_tensor.device).unsqueeze(0).expand(batch_size, -1).contiguous()
-        )
-    elif "position_ids" in batch:
-        position_ids = batch["position_ids"]
-        if position_ids.ndim == 2 and position_ids.shape[0] == 1 and batch_size > 1:
-            batch["position_ids"] = position_ids.expand(batch_size, -1).contiguous()
-
-    position_ids = batch["position_ids"]
-    pos_seq_dim = 2 if position_ids.ndim == 3 else 1
-
-    labels = batch.get("labels")
-    if labels is None and loss_mask is not None:
-        labels = loss_mask
-        loss_mask = None
-    if labels is None:
-        raise KeyError("Context parallelism requires `labels` in the batch, or labels passed as `loss_mask`.")
-
-    return primary_key, seq_len, labels, position_ids, pos_seq_dim, loss_mask
-
-
 def shard_batch_contiguous(
     cp_mesh,
     tp_mesh,
@@ -487,9 +445,9 @@ def shard_batch_contiguous(
 ):
     """Prepare and contiguously shard a batch for model-owned CP.
 
-    Runs the shared pre-shard prep, pads the sequence to
-    ``cp_size * max(pad_multiple, 2)``, then keeps one contiguous sequence
-    slice per CP rank.
+    Normalizes the batch (mask conversion, position_ids, labels), pads the
+    sequence to ``cp_size * max(pad_multiple, 2)``, then keeps one contiguous
+    sequence slice per CP rank.
 
     Args:
         cp_mesh: The context-parallel device (sub)mesh.
@@ -509,40 +467,39 @@ def shard_batch_contiguous(
         ``(contextlib.nullcontext, batch, ShardLayout)`` — transport lives in
         the model's own attention, so no CP context manager is needed.
     """
-    primary_key, seq_len, labels, position_ids, pos_seq_dim, loss_mask = _prepare_contiguous_cp_batch(batch, loss_mask)
-    ctx, batch = _make_contiguous_shard_cp_batch(
-        cp_mesh,
-        batch,
-        primary_key=primary_key,
-        seq_len=seq_len,
-        labels=labels,
-        position_ids=position_ids,
-        pos_seq_dim=pos_seq_dim,
-        loss_mask=loss_mask,
-        padding_token_id=padding_token_id,
-        pad_multiple=pad_multiple,
-        extra_seq_keys=extra_seq_keys,
-        extra_pad_values=extra_pad_values,
+    # --- normalize: mask -> padding_mask, primary tensor, position_ids, labels
+    convert_attention_mask_to_padding_mask(batch)
+
+    has_inputs_embeds = "inputs_embeds" in batch
+    has_input_ids = "input_ids" in batch
+    assert has_inputs_embeds ^ has_input_ids, (
+        "the CP dispatch requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
     )
-    facts = ShardLayout(original_seq_len=seq_len, padded_seq_len=batch[primary_key].shape[1] * cp_mesh.size())
-    return ctx, batch, facts
+    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
+    primary_seq_tensor = batch[primary_key]
+    seq_len = primary_seq_tensor.shape[1]
 
+    batch_size = primary_seq_tensor.shape[0]
+    if "position_ids" not in batch:
+        batch["position_ids"] = (
+            torch.arange(0, seq_len, device=primary_seq_tensor.device).unsqueeze(0).expand(batch_size, -1).contiguous()
+        )
+    else:
+        position_ids = batch["position_ids"]
+        if position_ids.ndim == 2 and position_ids.shape[0] == 1 and batch_size > 1:
+            batch["position_ids"] = position_ids.expand(batch_size, -1).contiguous()
 
-def _make_contiguous_shard_cp_batch(
-    cp_mesh,
-    batch,
-    *,
-    primary_key,
-    seq_len,
-    labels,
-    position_ids,
-    pos_seq_dim,
-    loss_mask,
-    padding_token_id,
-    pad_multiple: int = 1,
-    extra_seq_keys: dict[str, int] | None = None,
-    extra_pad_values: dict[str, Any] | None = None,
-):
+    position_ids = batch["position_ids"]
+    pos_seq_dim = 2 if position_ids.ndim == 3 else 1
+
+    labels = batch.get("labels")
+    if labels is None and loss_mask is not None:
+        labels = loss_mask
+        loss_mask = None
+    if labels is None:
+        raise KeyError("Context parallelism requires `labels` in the batch, or labels passed as `loss_mask`.")
+
+    # --- pad to the CP divisor
     cp_size = cp_mesh.size()
     # Batch-resident sequence tensors, each sharded on seq dim 1 with its own pad
     # sentinel. ``position_ids``/``labels``/``loss_mask`` are sharded too but handled
@@ -557,11 +514,9 @@ def _make_contiguous_shard_cp_batch(
     known_sequence_keys = set(seq_pad_values) | {"labels", "position_ids", "loss_mask"}
 
     # Extra per-token metadata (e.g. Gemma4 vision group ids) is sharded like the
-    # known sequence tensors, using model-provided seq dims / pad values. The
-    # legacy batch-key spelling (`_cp_metadata_*`) is still honored for direct
-    # callers; explicit arguments win on key collisions.
-    metadata_seq_dims = {**batch.pop("_cp_metadata_seq_dims", {}), **(extra_seq_keys or {})}
-    metadata_pad_values = {**batch.pop("_cp_metadata_pad_values", {}), **(extra_pad_values or {})}
+    # known sequence tensors, using model-provided seq dims / pad values.
+    metadata_seq_dims = extra_seq_keys or {}
+    metadata_pad_values = extra_pad_values or {}
     extra_metadata_keys = [key for key in metadata_seq_dims if key in batch and key not in known_sequence_keys]
 
     divisor = cp_size * max(int(pad_multiple or 1), 2)
@@ -583,15 +538,17 @@ def _make_contiguous_shard_cp_batch(
                 metadata_pad_values.get(key, 0),
             )
 
-    # Contiguous sequence slicing. Every CP rank in the same CP group starts from
-    # the same full batch, then keeps one contiguous sequence shard.
+    # --- contiguous sequence slicing. Every CP rank in the same CP group starts
+    # from the same full batch, then keeps one contiguous sequence shard.
     batch["labels"] = labels
     cp_rank = _cp_rank(cp_mesh)
 
-    seq_len = batch[primary_key].shape[1]
-    if seq_len % cp_size != 0:
-        raise ValueError(f"CP sequence length must be divisible by cp_size after padding, got {seq_len=} {cp_size=}")
-    local_seq_len = seq_len // cp_size
+    padded_seq_len = batch[primary_key].shape[1]
+    if padded_seq_len % cp_size != 0:
+        raise ValueError(
+            f"CP sequence length must be divisible by cp_size after padding, got {padded_seq_len=} {cp_size=}"
+        )
+    local_seq_len = padded_seq_len // cp_size
     seq_start = cp_rank * local_seq_len
     seq_end = seq_start + local_seq_len
 
@@ -611,7 +568,8 @@ def _make_contiguous_shard_cp_batch(
     if loss_mask is not None:
         batch["loss_mask"] = loss_mask[:, seq_start:seq_end].contiguous()
 
-    return contextlib.nullcontext, batch
+    layout = ShardLayout(original_seq_len=seq_len, padded_seq_len=padded_seq_len)
+    return contextlib.nullcontext, batch, layout
 
 
 # ---------------------------------------------------------------------------

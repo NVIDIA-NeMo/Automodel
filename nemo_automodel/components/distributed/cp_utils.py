@@ -30,17 +30,6 @@ from nemo_automodel.components.distributed.cp_sharder import (
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
 
 
-def _build_position_ids(batch, device):
-    """Add position_ids to the batch only if they are missing."""
-    # TODO(@boxiangw): Refractor. Needed for SP support
-    # If 'position_ids' does not exist in batch already then override it.
-    # In case of Packed sequence contains 'position_ids' and we don't want to override it.
-    if "position_ids" not in batch:
-        seq_len = batch["input_ids"].shape[1]
-        batch["position_ids"] = torch.arange(seq_len, device=device).unsqueeze(0)
-    return batch
-
-
 # based on https://github.com/pytorch/torchtitan/blob/0b44d4c437c424b6bf719661c0eb4283dc4068bc/torchtitan/distributed/utils.py#L180  # pylint: disable=C0301
 def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool, cp_context=None):
     """
@@ -377,7 +366,7 @@ def _resolve_cp_sharder(
                 model=model,
                 return_local_indices=True,
             )
-            facts = None
+            layout = None
             if local_indices is not None:
                 padded = local_indices.numel() * max(getattr(magi, "cp_size", 1) or 1, 1)
                 original, in_rows = None, None
@@ -390,13 +379,13 @@ def _resolve_cp_sharder(
                         # Single-sequence HF path: dispatch pads at the tail of
                         # the global order, so trim restores the original length.
                         original = row_shape[1]
-                facts = ShardLayout(
+                layout = ShardLayout(
                     local_token_global_indices=local_indices,
                     original_seq_len=original,
                     padded_seq_len=padded,
                     input_row_shape=in_rows,
                 )
-            return contextlib.nullcontext, prepped, facts
+            return contextlib.nullcontext, prepped, layout
 
         return ContextParallelismSharder(shard_batch=_shard_batch_magi, local_token_global_indices=None)
 
@@ -418,14 +407,14 @@ def _resolve_cp_sharder(
                 seq_lens_padding_value=seq_lens_padding_value,
                 return_local_indices=True,
             )
-            facts = None
+            layout = None
             if local_indices is not None:
-                facts = ShardLayout(
+                layout = ShardLayout(
                     local_token_global_indices=local_indices,
                     padded_seq_len=row_shape[0] * row_shape[1] if row_shape is not None else None,
                     input_row_shape=row_shape,
                 )
-            return contextlib.nullcontext, prepped, facts
+            return contextlib.nullcontext, prepped, layout
 
         return ContextParallelismSharder(shard_batch=_shard_batch_te, local_token_global_indices=None)
 
@@ -525,10 +514,10 @@ def _make_cp_batch_and_ctx(
         model=model,
         extra_seq_buffers=extra_seq_buffers,
     )
-    ctx, batch, facts = sharder.shard_batch(
+    ctx, batch, layout = sharder.shard_batch(
         cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id
     )
-    sharder.shard_layout = facts
+    sharder.shard_layout = layout
     return ctx, batch, sharder
 
 

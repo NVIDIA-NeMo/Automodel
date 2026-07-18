@@ -86,33 +86,6 @@ class _DummyDeviceMesh(dict):
         self.mesh_dim_names = ["cp", "tp"]
 
 
-def test_build_position_ids_adds_missing():
-    """If ``position_ids`` is absent it should be generated correctly."""
-    batch: dict[str, Any] = {"input_ids": torch.arange(6).view(1, -1)}
-    device = torch.device("cpu")
-
-    returned = _cu._build_position_ids(batch, device)
-
-    # Same object returned & mutated in-place
-    assert returned is batch
-
-    assert "position_ids" in batch, "position_ids key should be added"
-    expected = torch.arange(batch["input_ids"].shape[1], device=device).unsqueeze(0)
-    assert torch.equal(batch["position_ids"], expected), "Generated position_ids incorrect"
-
-
-def test_build_position_ids_does_not_override_existing():
-    """Existing ``position_ids`` must be left untouched."""
-    original_pos = torch.tensor([[5, 4, 3]])
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3]]),
-        "position_ids": original_pos.clone(),
-    }
-
-    _cu._build_position_ids(batch, torch.device("cpu"))
-    assert torch.equal(batch["position_ids"], original_pos), "position_ids should not be modified"
-
-
 def test_make_cp_batch_and_ctx_no_mesh():
     """When *no* device mesh is provided the call should be a no-op."""
     input_ids = torch.tensor([[1, 2, 3]])
@@ -721,8 +694,8 @@ def test_te_sharder_captures_partition_indices_at_shard_time(monkeypatch):
     with pytest.raises(NotImplementedError, match="before the first shard"):
         sharder.shard_token_tensor(cp2, full, seq_dim=0)
 
-    _, _, facts = sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([1, 2, 3, 4])})
-    sharder.shard_layout = facts
+    _, _, layout = sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([1, 2, 3, 4])})
+    sharder.shard_layout = layout
     assert torch.equal(sharder.shard_token_tensor(cp2, full, seq_dim=0), torch.tensor([0.0, 3.0]))
     with pytest.raises(ValueError, match="does not match"):
         sharder.shard_token_tensor(cp2, torch.arange(6.0), seq_dim=0)
@@ -757,8 +730,8 @@ def test_magi_sharder_captures_hf_dispatch_facts():
         seq_lens_padding_value=-1000,
         model=None,
     )
-    _, _, facts = sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([[1, 2, 3]])})
-    sharder.shard_layout = facts
+    _, _, layout = sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([[1, 2, 3]])})
+    sharder.shard_layout = layout
     assert (sharder.shard_layout.original_seq_len, sharder.shard_layout.padded_seq_len) == (3, 4)
     # down: original-length tensor auto-pads then follows the dispatch permutation
     local = sharder.shard_token_tensor(cp2, torch.tensor([[10.0, 20.0, 30.0]]), fill=0.0)
@@ -778,8 +751,8 @@ def test_magi_sharder_captures_packed_row_shape():
         seq_lens_padding_value=-1000,
         model=None,
     )
-    _, _, facts = sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([[1, 2], [3, 4]])})
-    sharder.shard_layout = facts
+    _, _, layout = sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([[1, 2], [3, 4]])})
+    sharder.shard_layout = layout
     assert sharder.shard_layout.input_row_shape == (2, 2)
     assert sharder.shard_layout.padded_seq_len == 4
     rows = torch.tensor([[10.0, 20.0], [30.0, 40.0]])
@@ -849,8 +822,8 @@ def test_te_sharder_captures_row_shape(monkeypatch):
     sharder = _cu._resolve_cp_sharder(
         cp1, None, magi=None, use_te=True, num_chunks=1, seq_lens_padding_value=-1000, model=None
     )
-    _, _, facts = sharder.shard_batch(cp1, None, {"input_ids": torch.arange(4).view(2, 2)})
-    sharder.shard_layout = facts
+    _, _, layout = sharder.shard_batch(cp1, None, {"input_ids": torch.arange(4).view(2, 2)})
+    sharder.shard_layout = layout
     assert sharder.shard_layout.input_row_shape == (2, 2)
     assert sharder.shard_layout.padded_seq_len == 4
 

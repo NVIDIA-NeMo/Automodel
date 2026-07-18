@@ -113,11 +113,11 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
 
     # The BSHD->THD flatten is a pure reshape: the pre-flatten rows are the
     # caller's coordinate system and the stream length is rows x cols. Chunked
-    # streams (num_chunks > 1) are per-chunk token spaces and report no facts.
-    facts = None
+    # streams (num_chunks > 1) are per-chunk token spaces and report no layout.
+    layout = None
     input_ids = batch.get("input_ids")
     if num_chunks <= 1 and input_ids is not None and input_ids.dim() >= 2:
-        facts = ShardLayout(
+        layout = ShardLayout(
             padded_seq_len=input_ids.shape[0] * input_ids.shape[1],
             input_row_shape=tuple(input_ids.shape[:2]),
         )
@@ -140,7 +140,7 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
             cp_rank=cp_rank,
             padding_token_id=padding_token_id,
         )
-        return contextlib.nullcontext, sliced, facts
+        return contextlib.nullcontext, sliced, layout
 
     chunks = []
     for idx in range(num_chunks):
@@ -161,4 +161,4 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
             stacked[key] = torch.stack([chunk[key] for chunk in chunks])  # type: ignore[list-item]
         else:
             stacked[key] = value
-    return contextlib.nullcontext, stacked, facts
+    return contextlib.nullcontext, stacked, layout

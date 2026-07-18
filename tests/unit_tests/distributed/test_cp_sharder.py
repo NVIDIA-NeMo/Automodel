@@ -150,8 +150,8 @@ def test_shard_batch_contiguous_records_shard_layout():
     )
     mesh = _FakeMesh(2, 0)
     batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
-    _, _, facts = cs.shard_batch_contiguous(mesh, None, batch)  # pads 6 -> 8
-    sharder.shard_layout = facts
+    _, _, layout = cs.shard_batch_contiguous(mesh, None, batch)  # pads 6 -> 8
+    sharder.shard_layout = layout
 
     assert (sharder.shard_layout.original_seq_len, sharder.shard_layout.padded_seq_len) == (6, 8)
     # down: unpadded tensor auto-pads with the explicit fill, rank 0 owns [0:4]
@@ -161,7 +161,7 @@ def test_shard_batch_contiguous_records_shard_layout():
     # wrong length raises even though it divides cp_size
     with pytest.raises(ValueError, match="padded_seq_len=8"):
         sharder.shard_token_tensor(mesh, torch.zeros(1, 4))
-    # up: trim validates the gathered length against the captured facts (no
+    # up: trim validates the gathered length against the captured layout (no
     # collective runs in this single-process test, so the gather stays local
     # and the guard must fire rather than mis-trim)
     with pytest.raises(ValueError, match="reported padded_seq_len 8"):

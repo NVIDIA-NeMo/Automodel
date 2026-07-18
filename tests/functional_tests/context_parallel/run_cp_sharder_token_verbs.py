@@ -51,14 +51,14 @@ def main() -> None:
     )
 
     # Shard a batch whose length needs CP padding (6 -> 8 at cp=2) so the
-    # captured facts (original=6, padded=8) drive fill/trim below.
+    # captured layout (original=6, padded=8) drive fill/trim below.
     seq_len = 3 * world
     batch = {
         "input_ids": torch.arange(seq_len, device=device).unsqueeze(0),
         "labels": torch.arange(seq_len, device=device).unsqueeze(0),
     }
-    _, _, facts = sharder.shard_batch(cp_mesh, None, batch)
-    sharder.shard_layout = facts
+    _, _, layout = sharder.shard_batch(cp_mesh, None, batch)
+    sharder.shard_layout = layout
     padded = sharder.shard_layout.padded_seq_len
     assert sharder.shard_layout.original_seq_len == seq_len, sharder.shard_layout.original_seq_len
     assert padded == seq_len + (-seq_len) % (2 * world), padded

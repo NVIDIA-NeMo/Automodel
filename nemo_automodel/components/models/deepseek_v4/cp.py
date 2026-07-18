@@ -486,7 +486,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
             loss_mask=loss_mask,
         )
 
-    ctx, batch, facts = shard_batch_contiguous(
+    ctx, batch, layout = shard_batch_contiguous(
         cp_mesh,
         tp_mesh,
         batch,
@@ -499,11 +499,11 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     if packed:
         # The repad rebuilt the rows, so no single original length exists; the
         # caller's coordinates are restored through the position map instead.
-        facts = ShardLayout(
-            padded_seq_len=facts.padded_seq_len,
+        layout = ShardLayout(
+            padded_seq_len=layout.padded_seq_len,
             input_token_stream_positions=input_positions,
         )
     # Hand the CP process group to the model forward (read from attn_kwargs) so
     # DSV4 attention all-gathers K/V across CP ranks. Not a tensor -> not sharded.
     batch["_dsv4_cp_group"] = cp_mesh.get_group()
-    return ctx, batch, facts
+    return ctx, batch, layout

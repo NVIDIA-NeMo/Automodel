@@ -141,66 +141,58 @@ def test_pad_position_ids_extends_monotonically():
 
 
 # ---------------------------------------------------------------------------
-# _prepare_contiguous_cp_batch branches (model-owned CP prep)
+# shard_batch_contiguous branches (model-owned CP prep + pad + slice)
 # ---------------------------------------------------------------------------
-def test_prepare_contiguous_cp_batch_builds_padding_mask_from_4d_mask():
+def test_shard_batch_contiguous_builds_padding_mask_from_4d_mask():
     mask = torch.ones(1, 1, 4, 4, dtype=torch.bool)
     batch = {
         "input_ids": torch.zeros(1, 4, dtype=torch.long),
         "labels": torch.zeros(1, 4, dtype=torch.long),
         "attention_mask": mask,
     }
-    cm._prepare_contiguous_cp_batch(batch, None)
-    assert "padding_mask" in batch and batch["padding_mask"].shape == (1, 4)
+    cm.shard_batch_contiguous(_FakeMesh(size=2, rank=0), None, batch)
+    assert "attention_mask" not in batch
+    assert "padding_mask" in batch and batch["padding_mask"].shape == (1, 2)
 
 
-def test_prepare_contiguous_cp_batch_labels_from_loss_mask():
+def test_shard_batch_contiguous_labels_from_loss_mask():
     batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
-    loss_mask = torch.ones(1, 4, dtype=torch.long)
-    # returns (primary_key, seq_len, labels, position_ids, pos_seq_dim, loss_mask)
-    res = cm._prepare_contiguous_cp_batch(batch, loss_mask)
-    labels = res[2]
-    assert torch.equal(labels, loss_mask)
+    loss_mask = torch.arange(4).unsqueeze(0)
+    _, out, _ = cm.shard_batch_contiguous(_FakeMesh(size=2, rank=1), None, batch, loss_mask=loss_mask)
+    # promoted to labels (rank 1 slice) and NOT also carried as loss_mask
+    assert torch.equal(out["labels"], torch.tensor([[2, 3]]))
+    assert "loss_mask" not in out
 
 
-def test_prepare_contiguous_cp_batch_raises_without_labels():
+def test_shard_batch_contiguous_raises_without_labels():
     batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
     with pytest.raises(KeyError, match="labels"):
-        cm._prepare_contiguous_cp_batch(batch, None)
+        cm.shard_batch_contiguous(_FakeMesh(size=2, rank=0), None, batch)
 
 
-# ---------------------------------------------------------------------------
-# _make_contiguous_shard_cp_batch: pad branches for every sequence key + extra
-# metadata, plus the contiguous slice.
-# ---------------------------------------------------------------------------
-def test_make_contiguous_shard_pads_and_slices_all_keys():
+def test_shard_batch_contiguous_pads_and_slices_all_keys():
     cp_size = 2
     seq = 6  # pad_len = (-6) % 4 = 2 -> padded to 8, local 4
     d = 8
     batch = {
         "inputs_embeds": torch.randn(1, seq, d),
+        "labels": torch.zeros(1, seq, dtype=torch.long),
+        "position_ids": torch.arange(seq).unsqueeze(0),
         "mm_token_type_ids": torch.zeros(1, seq, dtype=torch.long),
         "per_layer_inputs": torch.randn(1, seq, d),
         "padding_mask": torch.zeros(1, seq, dtype=torch.bool),
         "vision_extra": torch.zeros(1, seq, dtype=torch.long),
-        # model-specific per-token keys ride the generic metadata mechanism
-        "_cp_metadata_seq_dims": {"vision_extra": 1, "mm_token_type_ids": 1, "per_layer_inputs": 1},
-        "_cp_metadata_pad_values": {"vision_extra": 0, "mm_token_type_ids": 0, "per_layer_inputs": 0},
     }
-    labels = torch.zeros(1, seq, dtype=torch.long)
-    position_ids = torch.arange(seq).unsqueeze(0)
     loss_mask = torch.ones(1, seq, dtype=torch.long)
 
-    _ctx, out = cm._make_contiguous_shard_cp_batch(
+    _ctx, out, layout = cm.shard_batch_contiguous(
         _FakeMesh(size=cp_size, rank=0),
+        None,
         batch,
-        primary_key="inputs_embeds",
-        seq_len=seq,
-        labels=labels,
-        position_ids=position_ids,
-        pos_seq_dim=1,
         loss_mask=loss_mask,
-        padding_token_id=0,
+        # model-specific per-token keys arrive as explicit arguments
+        extra_seq_keys={"vision_extra": 1, "mm_token_type_ids": 1, "per_layer_inputs": 1},
+        extra_pad_values={"vision_extra": 0, "mm_token_type_ids": 0, "per_layer_inputs": 0},
     )
     # rank 0 keeps the first local_seq_len=4 positions
     assert out["inputs_embeds"].shape == (1, 4, d)
@@ -209,50 +201,33 @@ def test_make_contiguous_shard_pads_and_slices_all_keys():
     assert out["padding_mask"].shape == (1, 4)
     assert out["vision_extra"].shape == (1, 4)
     assert out["loss_mask"].shape == (1, 4)
+    assert (layout.original_seq_len, layout.padded_seq_len) == (6, 8)
 
 
-def test_make_contiguous_shard_uses_dist_rank_when_initialized():
-    batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
-    labels = torch.zeros(1, 4, dtype=torch.long)
-    position_ids = torch.arange(4).unsqueeze(0)
+def test_shard_batch_contiguous_uses_dist_rank_when_initialized():
+    batch = {
+        "input_ids": torch.zeros(1, 4, dtype=torch.long),
+        "labels": torch.zeros(1, 4, dtype=torch.long),
+    }
     with (
         mock.patch("torch.distributed.is_available", return_value=True),
         mock.patch("torch.distributed.is_initialized", return_value=True),
         mock.patch("torch.distributed.get_rank", return_value=0),
     ):
-        _ctx, out = cm._make_contiguous_shard_cp_batch(
-            _FakeMesh(size=2, rank=0),
-            batch,
-            primary_key="input_ids",
-            seq_len=4,
-            labels=labels,
-            position_ids=position_ids,
-            pos_seq_dim=1,
-            loss_mask=None,
-            padding_token_id=0,
-        )
+        _ctx, out, _ = cm.shard_batch_contiguous(_FakeMesh(size=2, rank=0), None, batch)
     assert out["input_ids"].shape == (1, 2)
 
 
-def test_make_contiguous_shard_raises_when_not_divisible(monkeypatch):
+def test_shard_batch_contiguous_raises_when_not_divisible(monkeypatch):
     # Force padding to be a no-op so the post-pad divisibility check trips.
     monkeypatch.setattr(cm, "_pad_tensor_seq_dim_", lambda t, *a, **k: t)
     monkeypatch.setattr(cm, "_pad_position_ids_seq_dim_", lambda p, *a, **k: p)
-    batch = {"input_ids": torch.zeros(1, 6, dtype=torch.long)}
-    labels = torch.zeros(1, 6, dtype=torch.long)
-    position_ids = torch.arange(6).unsqueeze(0)
+    batch = {
+        "input_ids": torch.zeros(1, 6, dtype=torch.long),
+        "labels": torch.zeros(1, 6, dtype=torch.long),
+    }
     with pytest.raises(ValueError, match="divisible by cp_size"):
-        cm._make_contiguous_shard_cp_batch(
-            _FakeMesh(size=4, rank=0),
-            batch,
-            primary_key="input_ids",
-            seq_len=6,
-            labels=labels,
-            position_ids=position_ids,
-            pos_seq_dim=1,
-            loss_mask=None,
-            padding_token_id=0,
-        )
+        cm.shard_batch_contiguous(_FakeMesh(size=4, rank=0), None, batch)
 
 
 # ---------------------------------------------------------------------------
