@@ -681,8 +681,22 @@ def _compare_source_load_parity(
     source_load_kl_threshold: float,
     source_load_mean_kl_threshold: float,
     source_load_cosine_threshold: float,
-) -> None:
-    """Compare the vanilla HF source-load reference against the constructed trainer model."""
+) -> str | None:
+    """Compare the vanilla HF source-load reference against the constructed trainer model.
+
+    Args:
+        source_reference: Rank-0 tuple containing logits of shape [batch, sequence, vocab], the HF input/output
+            embedding alias state, and the explicit tie-word-embeddings setting. Other ranks pass ``None``.
+        candidate_logits: Constructed trainer logits of shape [batch, sequence, vocab].
+        candidate_model: Constructed trainer model used to inspect input/output embedding aliasing.
+        source_load_kl_threshold: Maximum allowed per-token KL divergence.
+        source_load_mean_kl_threshold: Maximum allowed mean per-token KL divergence.
+        source_load_cosine_threshold: Minimum allowed cosine similarity over flattened logits.
+
+    Returns:
+        Synchronized failure traceback when source-load parity fails, otherwise ``None``. The caller may defer this
+        failure until independent checkpoint reload and resume phases have completed.
+    """
     candidate_aliased = _lm_head_embedding_aliased(candidate_model)
     failure_message = None
     if _rank0():
@@ -733,14 +747,16 @@ def _compare_source_load_parity(
         except Exception:
             failure_message = traceback.format_exc()
 
-    # Avoid leaving non-zero ranks blocked at the next barrier when rank 0 detects
-    # a Phase 0 mismatch.
+    # Keep every rank on the same control-flow path when rank 0 detects a Phase 0
+    # mismatch. The caller records the failure and continues with the independent
+    # checkpoint reload and resume phases.
     if dist.is_initialized():
         payload = [failure_message]
         dist.broadcast_object_list(payload, src=0)
         failure_message = payload[0]
-    if failure_message is not None:
-        raise AssertionError(failure_message)
+    if failure_message is not None and _rank0():
+        print("[Phase 0] Source-load parity failed; deferring failure until later checkpoint phases complete.")
+    return failure_message
 
 
 def _get_logits_pp(trainer, input_ids, device) -> torch.Tensor:
@@ -1036,6 +1052,7 @@ def run_checkpoint_robustness(
     source_load_kl_threshold = float(custom_args.get("source_load_kl_threshold", "5e-3"))
     source_load_mean_kl_threshold = float(custom_args.get("source_load_mean_kl_threshold", "1e-3"))
     source_load_cosine_threshold = float(custom_args.get("source_load_cosine_threshold", "0.9999"))
+    deferred_failures: list[str] = []
 
     input_ids = input_ids_loader(tokenizer_name)
     cfg = parse_args_and_load_config()
@@ -1062,7 +1079,7 @@ def run_checkpoint_robustness(
     if check_source_load_parity:
         device = next(trainer.model_parts[0].parameters()).device
         trainer_source_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
-        _compare_source_load_parity(
+        source_load_failure = _compare_source_load_parity(
             source_load_reference,
             trainer_source_logits,
             trainer.model_parts[0],
@@ -1070,6 +1087,8 @@ def run_checkpoint_robustness(
             source_load_mean_kl_threshold=source_load_mean_kl_threshold,
             source_load_cosine_threshold=source_load_cosine_threshold,
         )
+        if source_load_failure is not None:
+            deferred_failures.append(f"Phase 0 source-load parity:\n{source_load_failure}")
         for model_part in trainer.model_parts:
             model_part.train()
         # A function-local loop variable keeps its last value alive after the
@@ -1441,6 +1460,11 @@ def run_checkpoint_robustness(
     from nemo_automodel.components.distributed.init_utils import destroy_global_state
 
     atexit.unregister(destroy_global_state)
+
+    if deferred_failures:
+        raise AssertionError(
+            "Checkpoint robustness completed with deferred failures:\n\n" + "\n\n".join(deferred_failures)
+        )
 
 
 def test_checkpoint_robustness() -> None:

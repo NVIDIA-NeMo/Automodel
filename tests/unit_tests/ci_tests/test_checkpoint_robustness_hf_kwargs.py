@@ -24,6 +24,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
+    _compare_source_load_parity,
     _dequantize_hf_fp8_weights_in_place,
     _extract_custom_args,
     _finish_hf_reload_sync,
@@ -164,6 +165,38 @@ def test_extract_custom_args_accepts_hf_source_post_load_dequantize():
 
     assert custom["hf_source_post_load_dequantize"] is True
     assert remaining == ["--other-arg"]
+
+
+def test_source_load_parity_failure_is_returned_for_later_reporting():
+    reference_logits = torch.tensor([[[2.0, -2.0], [1.0, -1.0]]])
+    candidate_logits = -reference_logits
+
+    failure = _compare_source_load_parity(
+        (reference_logits, None, None),
+        candidate_logits,
+        SimpleNamespace(),
+        source_load_kl_threshold=0.0,
+        source_load_mean_kl_threshold=0.0,
+        source_load_cosine_threshold=1.0,
+    )
+
+    assert failure is not None
+    assert "KL divergence between original HF source load and constructed trainer model too large" in failure
+
+
+def test_source_load_parity_success_returns_no_deferred_failure():
+    logits = torch.tensor([[[2.0, -2.0], [1.0, -1.0]]])
+
+    failure = _compare_source_load_parity(
+        (logits, None, None),
+        logits.clone(),
+        SimpleNamespace(),
+        source_load_kl_threshold=0.0,
+        source_load_mean_kl_threshold=0.0,
+        source_load_cosine_threshold=1.0,
+    )
+
+    assert failure is None
 
 
 def test_dequantize_hf_fp8_weights_in_place_handles_linear_and_expert_parameters():
