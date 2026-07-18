@@ -98,6 +98,7 @@ dataset:
   padding: do_not_pad  # dataset stays unpadded; the collater pads to the fixed 2048
   # SFT supervises only assistant tokens, but the stock Qwen3 template can't produce that loss mask
   # (it rewrites earlier turns); this override adds {% generation %} blocks so the tokenizer emits it.
+  # Needed for multi-turn chat datasets like Tulu-3.
   chat_template: examples/llm_finetune/qwen/qwen3_tulu3_chat_template.jinja
 
 packed_sequence:
