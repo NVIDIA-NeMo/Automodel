@@ -142,12 +142,14 @@ ci:
       - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
         num_samples: 5000
     dataloader.num_workers: 0
+    tokenizer.p_max_length: 1536
     distributed.static_graph: false
   checkpoint_robustness:
     dataset.data_dir_list:
       - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
         num_samples: 5000
     dataloader.num_workers: 0
+    tokenizer.p_max_length: 1536
     distributed.static_graph: false
     cosine_threshold: 0.999
     hf_cosine_threshold: 0.999
