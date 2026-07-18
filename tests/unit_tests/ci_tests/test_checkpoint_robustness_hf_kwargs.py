@@ -170,6 +170,7 @@ def test_dequantize_hf_fp8_weights_in_place_handles_linear_and_expert_parameters
     class FakeFP8Module(torch.nn.Module):
         def __init__(self):
             super().__init__()
+            self.experts_implementation = "grouped_mm"
             self.weight = torch.nn.Parameter(
                 torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float8_e4m3fn),
                 requires_grad=False,
@@ -187,6 +188,9 @@ def test_dequantize_hf_fp8_weights_in_place_handles_linear_and_expert_parameters
                 requires_grad=False,
             )
 
+        def set_experts_implementation(self, experts_implementation: str) -> None:
+            self.experts_implementation = experts_implementation
+
     model = FakeFP8Module()
     expected_weight = model.weight.float() * model.weight_scale_inv.float()
     expected_experts = model.gate_up_proj.float() * model.gate_up_proj_scale_inv.float()
@@ -194,8 +198,63 @@ def test_dequantize_hf_fp8_weights_in_place_handles_linear_and_expert_parameters
     assert _dequantize_hf_fp8_weights_in_place(model, torch.bfloat16) == 2
     assert model.weight.dtype == torch.bfloat16
     assert model.gate_up_proj.dtype == torch.bfloat16
+    assert model.experts_implementation == "eager"
     torch.testing.assert_close(model.weight.float(), expected_weight, rtol=0, atol=1e-2)
     torch.testing.assert_close(model.gate_up_proj.float(), expected_experts, rtol=0, atol=1e-2)
+
+
+def test_dequantize_hf_fp8_weights_in_place_restores_eager_expert_forward():
+    from transformers import Mistral4Config
+    from transformers.integrations.finegrained_fp8 import ALL_FP8_EXPERTS_FUNCTIONS, FP8Experts
+    from transformers.integrations.moe import use_experts_implementation
+
+    class TestFP8Experts(FP8Experts):
+        pass
+
+    wrapped_experts_class = use_experts_implementation(
+        experts_class=TestFP8Experts,
+        experts_interface=ALL_FP8_EXPERTS_FUNCTIONS,
+    )
+    config = Mistral4Config(
+        hidden_size=4,
+        moe_intermediate_size=3,
+        n_routed_experts=2,
+        num_experts_per_tok=1,
+    )
+    config._experts_implementation_internal = "grouped_mm"
+
+    class FakeFP8Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = wrapped_experts_class(config=config, activation_scheme="static")
+            with torch.no_grad():
+                self.experts.gate_up_proj.fill_(0.25)
+                self.experts.down_proj.fill_(0.25)
+            self.experts.gate_up_proj_scale_inv = torch.nn.Parameter(
+                torch.ones(config.n_routed_experts, 1, 1),
+                requires_grad=False,
+            )
+            self.experts.down_proj_scale_inv = torch.nn.Parameter(
+                torch.ones(config.n_routed_experts, 1, 1),
+                requires_grad=False,
+            )
+
+        def set_experts_implementation(self, experts_implementation: str) -> None:
+            config._experts_implementation_internal = experts_implementation
+
+    model = FakeFP8Model()
+    hidden_states = torch.ones(2, config.hidden_size, dtype=torch.bfloat16)
+    top_k_index = torch.tensor([[0], [1]])
+    top_k_weights = torch.ones(2, 1, dtype=torch.bfloat16)
+
+    with pytest.raises(NotImplementedError, match="activation_scheme='static'"):
+        model.experts(hidden_states, top_k_index, top_k_weights)
+
+    assert _dequantize_hf_fp8_weights_in_place(model, torch.bfloat16) == 2
+    assert config._experts_implementation == "eager"
+    output = model.experts(hidden_states, top_k_index, top_k_weights)
+    assert output.shape == hidden_states.shape
+    assert torch.isfinite(output).all()
 
 
 def test_post_load_dequant_max_memory_reserves_fp8_expansion_headroom():

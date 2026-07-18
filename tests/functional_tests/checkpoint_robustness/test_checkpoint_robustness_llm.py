@@ -183,11 +183,13 @@ def _dequantize_hf_fp8_weights_in_place(model, output_dtype: torch.dtype) -> int
     conversion, while their native FP8 modules require the optional ``kernels``
     package at forward time. Load those modules with their native weight/scale
     layout first, then replace only the FP8 weight parameters with dequantized
-    tensors. ``FP8Linear`` and ``FP8Experts`` both dispatch to their ordinary
-    PyTorch path once a weight uses more than one byte per element. This helper
-    intentionally accepts only the scalar and per-expert scalar scale layouts
-    used by the Mistral4 checkpoint; block-wise layouts should use Transformers'
-    normal load-time conversion.
+    tensors. ``FP8Linear`` dispatches to its ordinary PyTorch path once a weight
+    uses more than one byte per element. ``FP8Experts`` also needs its configured
+    experts implementation reset to ``eager`` because its wrapper selects the
+    grouped FP8 kernel independently of the weight dtype. This helper intentionally
+    accepts only the scalar and per-expert scalar scale layouts used by the
+    Mistral4 checkpoint; block-wise layouts should use Transformers' normal
+    load-time conversion.
     """
     parameter_pairs = (
         ("weight", "weight_scale_inv"),
@@ -196,6 +198,7 @@ def _dequantize_hf_fp8_weights_in_place(model, output_dtype: torch.dtype) -> int
         ("down_proj", "down_proj_scale_inv"),
     )
     converted = 0
+    converted_expert_weights = False
     for module in model.modules():
         for weight_name, scale_name in parameter_pairs:
             weight = getattr(module, weight_name, None)
@@ -221,8 +224,11 @@ def _dequantize_hf_fp8_weights_in_place(model, output_dtype: torch.dtype) -> int
                 torch.nn.Parameter(dequantized, requires_grad=bool(getattr(weight, "requires_grad", False))),
             )
             converted += 1
+            converted_expert_weights |= weight.ndim == 3
 
     assert converted > 0, "Post-load HF FP8 dequantization requested, but no FP8 weight/scale pairs were found"
+    if converted_expert_weights:
+        model.set_experts_implementation("eager")
     return converted
 
 
