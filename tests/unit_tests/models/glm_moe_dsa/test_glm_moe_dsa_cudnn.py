@@ -23,7 +23,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm_moe_dsa import layers as layer_mod
 from nemo_automodel.components.models.glm_moe_dsa.kernels import cudnn_dsa
 from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaIndexer, GlmMoeDsaMLA
-from nemo_automodel.components.models.glm_moe_dsa.model import GlmMoeDsaForCausalLM
+from nemo_automodel.components.models.glm_moe_dsa.model import GlmMoeDsaForCausalLM, GlmMoeDsaModel
 
 TOKENS = 5
 INDEX_HEADS = 64
@@ -195,6 +195,37 @@ class _FakeCpIndexerDsa:
         return {"indices": torch.tensor([[2, 0], [3, 1]], dtype=torch.int32)}
 
 
+class _FakePaddedCpIndexerDsa:
+    """Check that invalid query rows are ranked safely and masked afterward."""
+
+    def indexer_forward_wrapper(
+        self,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+        head_weights: torch.Tensor,
+        **kwargs: object,
+    ) -> dict[str, torch.Tensor]:
+        assert index_q.shape == (8, INDEX_HEADS, INDEX_DIM)
+        assert index_k.shape == (10, 1, INDEX_DIM)
+        assert head_weights.shape == (8, INDEX_HEADS)
+        torch.testing.assert_close(kwargs["cu_seqlens_q"], torch.tensor([0, 2, 7, 8], dtype=torch.int32))
+        torch.testing.assert_close(kwargs["cu_seqlens_k"], torch.tensor([0, 4, 9, 10], dtype=torch.int32))
+        assert kwargs["max_seqlen_q"] == 5
+        assert kwargs["max_seqlen_k"] == 5
+        return {"scores": torch.zeros(8, 5, dtype=torch.float32)}
+
+    def indexer_top_k_wrapper(
+        self,
+        scores: torch.Tensor,
+        causal_lengths: torch.Tensor,
+        **kwargs: object,
+    ) -> dict[str, torch.Tensor]:
+        assert scores.shape == (8, 5)
+        torch.testing.assert_close(causal_lengths, torch.tensor([3, 1, 1, 2, 3, 4, 1, 1], dtype=torch.int32))
+        assert kwargs == {"top_k": 2, "next_n": 1, "return_val": False}
+        return {"indices": torch.tensor([[0, 1]] * 8, dtype=torch.int32)}
+
+
 class _FakeFlashMla:
     """Assert FlashMLA forward arguments and return a head-distinct value tensor."""
 
@@ -321,6 +352,90 @@ class _FakeSparseDsa:
         return {"dq": torch.full_like(q, 3), "dkv": torch.full_like(kv, 5)}
 
 
+class _FakeZeroLengthFlashMla:
+    """Return visible invalid-row values so the adapter's output masking is tested."""
+
+    def __init__(self, expected_lengths: torch.Tensor) -> None:
+        self.expected_lengths = expected_lengths
+        self.output: torch.Tensor | None = None
+        self.lse: torch.Tensor | None = None
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        kv_latent: torch.Tensor,
+        indices: torch.Tensor,
+        softmax_scale: float,
+        *,
+        d_v: int,
+        attn_sink: torch.Tensor,
+        topk_length: torch.Tensor,
+        indexer_topk: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert q.shape == (SPARSE_TOKENS, 64, QK_DIM)
+        assert kv_latent.shape == (SPARSE_TOKENS, 1, QK_DIM)
+        assert indices.shape == (SPARSE_TOKENS, 1, 512)
+        assert softmax_scale == 0.125
+        assert d_v == VALUE_DIM
+        assert torch.isneginf(attn_sink).all()
+        torch.testing.assert_close(topk_length, self.expected_lengths)
+        assert indexer_topk == 0
+
+        self.output = torch.full((SPARSE_TOKENS, 64, VALUE_DIM), 7, dtype=torch.bfloat16)
+        self.lse = torch.ones(SPARSE_TOKENS, 64, dtype=torch.float32)
+        return self.output, torch.zeros_like(self.lse), self.lse
+
+
+class _FakeCompactedSparseDsa:
+    """Validate direct valid-row compaction and the all-empty dummy row."""
+
+    def __init__(self, *, valid_rows: int, dkv_value: int) -> None:
+        self.valid_rows = valid_rows
+        self.dkv_value = dkv_value
+        self.called = False
+
+    def sparse_attention_backward_wrapper(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        out: torch.Tensor,
+        d_out: torch.Tensor,
+        lse: torch.Tensor,
+        attn_sink: torch.Tensor,
+        indices: torch.Tensor,
+        *,
+        softmax_scale: float,
+        topk_length: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        call_rows = max(self.valid_rows, 1)
+        assert q.shape == (call_rows, 64, QK_DIM)
+        assert kv.shape == (SPARSE_TOKENS, QK_DIM)
+        assert out.shape == (call_rows, 64, VALUE_DIM)
+        assert d_out.shape == (call_rows, 64, VALUE_DIM)
+        assert lse.shape == (call_rows, 64)
+        assert indices.shape == (call_rows, 512)
+        assert torch.isneginf(attn_sink).all()
+        assert softmax_scale == 0.125
+
+        if self.valid_rows:
+            torch.testing.assert_close(q[:, :SPARSE_HEADS], torch.ones_like(q[:, :SPARSE_HEADS]))
+            torch.testing.assert_close(out[:, :SPARSE_HEADS], torch.full_like(out[:, :SPARSE_HEADS], 7))
+            torch.testing.assert_close(d_out[:, :SPARSE_HEADS], torch.ones_like(d_out[:, :SPARSE_HEADS]))
+            torch.testing.assert_close(lse[:, :SPARSE_HEADS], torch.ones_like(lse[:, :SPARSE_HEADS]))
+            torch.testing.assert_close(topk_length, torch.full((self.valid_rows,), 2, dtype=torch.int32))
+            dq = torch.full_like(q, 3)
+        else:
+            torch.testing.assert_close(q[0], torch.zeros_like(q[0]))
+            torch.testing.assert_close(out[0], torch.zeros_like(out[0]))
+            torch.testing.assert_close(d_out[0], torch.zeros_like(d_out[0]))
+            torch.testing.assert_close(lse[0], torch.zeros_like(lse[0]))
+            torch.testing.assert_close(indices[0], torch.zeros_like(indices[0]))
+            assert topk_length[0].item() == 1
+            dq = torch.full_like(q, 9)
+        self.called = True
+        return {"dq": dq, "dkv": torch.full_like(kv, self.dkv_value)}
+
+
 @pytest.mark.parametrize(
     ("has_cudnn", "has_flash_mla", "expected"),
     [(False, False, False), (True, False, False), (False, True, False), (True, True, True)],
@@ -400,10 +515,33 @@ def test_cudnn_metadata_segments_cp_queries_and_padded_documents() -> None:
     torch.testing.assert_close(metadata.segment_cu_k, torch.tensor([0, 4, 9, 10], dtype=torch.int32))
     torch.testing.assert_close(metadata.key_source_indices, torch.arange(10))
     torch.testing.assert_close(metadata.starts, torch.tensor([0, 0, 4, 4, 4, 4, 4, 9], dtype=torch.int32))
-    torch.testing.assert_close(metadata.causal_lengths, torch.tensor([3, 3, 1, 2, 3, 4, 4, 1], dtype=torch.int32))
+    torch.testing.assert_close(metadata.causal_lengths, torch.tensor([3, 0, 1, 2, 3, 4, 0, 1], dtype=torch.int32))
+    torch.testing.assert_close(
+        metadata.query_valid,
+        torch.tensor([True, False, True, True, True, True, False, True]),
+    )
+    torch.testing.assert_close(metadata.valid_row_indices, torch.tensor([0, 2, 3, 4, 5, 7]))
+    assert metadata.all_rows_nonempty is False
     assert metadata.max_seqlen_q == 5
     assert metadata.max_seqlen_k == 5
     assert metadata.total_key_tokens == 12
+
+
+def test_cudnn_metadata_uses_padding_mask_after_thd_absorption() -> None:
+    """The runtime padding mask recovers real rows after trailing padding was absorbed."""
+    metadata = cudnn_dsa.prepare_cudnn_dsa_packed_metadata(
+        torch.tensor([0, 3, 8], dtype=torch.int32),
+        total_key_tokens=8,
+        padding_mask=torch.tensor([False, False, False, False, False, True, True, True]),
+    )
+
+    torch.testing.assert_close(metadata.causal_lengths, torch.tensor([1, 2, 3, 1, 2, 0, 0, 0], dtype=torch.int32))
+    torch.testing.assert_close(
+        metadata.query_valid,
+        torch.tensor([True, True, True, True, True, False, False, False]),
+    )
+    torch.testing.assert_close(metadata.valid_row_indices, torch.arange(5))
+    assert metadata.all_rows_nonempty is False
 
 
 def test_cudnn_indexer_maps_cp_segment_indices_to_global_keys(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -427,6 +565,32 @@ def test_cudnn_indexer_maps_cp_segment_indices_to_global_keys(monkeypatch: pytes
     torch.testing.assert_close(
         actual,
         torch.tensor([[[4, 6]], [[5, 7]]], dtype=torch.int32),
+    )
+
+
+def test_cudnn_indexer_masks_padded_cp_query_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ranker sees positive lengths while padded query rows remain fully invalid."""
+    monkeypatch.setattr(cudnn_dsa, "_HAS_CUDNN_DSA", True)
+    monkeypatch.setattr(cudnn_dsa, "_HAS_FLASH_MLA", True)
+    monkeypatch.setattr(cudnn_dsa, "_CUDNN_DSA", _FakePaddedCpIndexerDsa())
+    monkeypatch.setattr(cudnn_dsa, "_require_cuda_tensors", _accept_cpu_tensors)
+
+    actual = cudnn_dsa.cudnn_indexer_topk(
+        torch.ones(8, INDEX_HEADS, INDEX_DIM, dtype=torch.bfloat16),
+        torch.ones(12, INDEX_DIM, dtype=torch.bfloat16),
+        torch.ones(8, INDEX_HEADS),
+        torch.tensor([0, 3, 7, 9], dtype=torch.int32),
+        index_topk=2,
+        query_indices=torch.arange(2, 10, dtype=torch.int32),
+        cu_seqlens_padded=torch.tensor([0, 4, 9, 12], dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(
+        actual,
+        torch.tensor(
+            [[[0, 1]], [[-1, -1]], [[4, -1]], [[4, 5]], [[4, 5]], [[4, 5]], [[-1, -1]], [[9, -1]]],
+            dtype=torch.int32,
+        ),
     )
 
 
@@ -461,7 +625,13 @@ def test_cudnn_sparse_attention_dispatches_padded_forward_and_exact_backward(
     kv_latent = torch.ones(SPARSE_TOKENS, 1, QK_DIM, dtype=torch.bfloat16, requires_grad=True)
     topk_indices = torch.tensor([[[0, -1, -1]], [[0, 1, -1]]], dtype=torch.int32)
 
-    actual = cudnn_dsa.cudnn_sparse_attention(q, kv_latent, topk_indices, softmax_scale=0.125)
+    actual = cudnn_dsa.cudnn_sparse_attention(
+        q,
+        kv_latent,
+        topk_indices,
+        softmax_scale=0.125,
+        all_rows_nonempty=True,
+    )
 
     assert actual.shape == (SPARSE_TOKENS, SPARSE_HEADS, VALUE_DIM)
     assert actual.dtype == torch.bfloat16
@@ -475,6 +645,79 @@ def test_cudnn_sparse_attention_dispatches_padded_forward_and_exact_backward(
     torch.testing.assert_close(q.grad, torch.full_like(q, 3))
     torch.testing.assert_close(kv_latent.grad, torch.full_like(kv_latent, 5))
     assert fake_flash_mla.called
+    assert fake_dsa.called
+
+
+@pytest.mark.parametrize("cache_valid_rows", [False, True])
+def test_cudnn_sparse_attention_compacts_zero_length_rows(
+    monkeypatch: pytest.MonkeyPatch, cache_valid_rows: bool
+) -> None:
+    """Backward excludes padded queries and scatters valid query gradients back."""
+    topk_length = torch.tensor([0, 2], dtype=torch.int32)
+    fake_flash_mla = _FakeZeroLengthFlashMla(topk_length)
+    fake_dsa = _FakeCompactedSparseDsa(valid_rows=1, dkv_value=5)
+    monkeypatch.setattr(cudnn_dsa, "_HAS_CUDNN_DSA", True)
+    monkeypatch.setattr(cudnn_dsa, "_HAS_FLASH_MLA", True)
+    monkeypatch.setattr(cudnn_dsa, "_CUDNN_DSA", fake_dsa)
+    monkeypatch.setattr(cudnn_dsa, "_FLASH_MLA_SPARSE_FWD", fake_flash_mla)
+    monkeypatch.setattr(cudnn_dsa, "_require_cuda_tensors", _accept_cpu_tensors)
+
+    q = torch.ones(SPARSE_TOKENS, SPARSE_HEADS, QK_DIM, dtype=torch.bfloat16, requires_grad=True)
+    kv_latent = torch.ones(SPARSE_TOKENS, 1, QK_DIM, dtype=torch.bfloat16, requires_grad=True)
+    topk_indices = torch.tensor([[[-1, -1, -1]], [[0, 1, -1]]], dtype=torch.int32)
+    actual = cudnn_dsa.cudnn_sparse_attention(
+        q,
+        kv_latent,
+        topk_indices,
+        softmax_scale=0.125,
+        topk_length=topk_length,
+        all_rows_nonempty=False,
+        valid_row_indices=torch.tensor([1]) if cache_valid_rows else None,
+    )
+
+    torch.testing.assert_close(actual[0], torch.zeros_like(actual[0]))
+    torch.testing.assert_close(actual[1], torch.full_like(actual[1], 7))
+    actual.sum().backward()
+
+    assert q.grad is not None
+    assert kv_latent.grad is not None
+    torch.testing.assert_close(q.grad[0], torch.zeros_like(q.grad[0]))
+    torch.testing.assert_close(q.grad[1], torch.full_like(q.grad[1], 3))
+    torch.testing.assert_close(kv_latent.grad, torch.full_like(kv_latent, 5))
+    assert fake_dsa.called
+
+
+def test_cudnn_sparse_attention_all_empty_rows_use_only_dummy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CP rank containing only padding still produces shape-stable zero gradients."""
+    topk_length = torch.zeros(SPARSE_TOKENS, dtype=torch.int32)
+    fake_flash_mla = _FakeZeroLengthFlashMla(topk_length)
+    fake_dsa = _FakeCompactedSparseDsa(valid_rows=0, dkv_value=0)
+    monkeypatch.setattr(cudnn_dsa, "_HAS_CUDNN_DSA", True)
+    monkeypatch.setattr(cudnn_dsa, "_HAS_FLASH_MLA", True)
+    monkeypatch.setattr(cudnn_dsa, "_CUDNN_DSA", fake_dsa)
+    monkeypatch.setattr(cudnn_dsa, "_FLASH_MLA_SPARSE_FWD", fake_flash_mla)
+    monkeypatch.setattr(cudnn_dsa, "_require_cuda_tensors", _accept_cpu_tensors)
+
+    q = torch.ones(SPARSE_TOKENS, SPARSE_HEADS, QK_DIM, dtype=torch.bfloat16, requires_grad=True)
+    kv_latent = torch.ones(SPARSE_TOKENS, 1, QK_DIM, dtype=torch.bfloat16, requires_grad=True)
+    topk_indices = torch.full((SPARSE_TOKENS, 1, 3), -1, dtype=torch.int32)
+    actual = cudnn_dsa.cudnn_sparse_attention(
+        q,
+        kv_latent,
+        topk_indices,
+        softmax_scale=0.125,
+        topk_length=topk_length,
+        all_rows_nonempty=False,
+        valid_row_indices=torch.empty(0, dtype=torch.int64),
+    )
+
+    torch.testing.assert_close(actual, torch.zeros_like(actual))
+    actual.sum().backward()
+
+    assert q.grad is not None
+    assert kv_latent.grad is not None
+    torch.testing.assert_close(q.grad, torch.zeros_like(q.grad))
+    torch.testing.assert_close(kv_latent.grad, torch.zeros_like(kv_latent.grad))
     assert fake_dsa.called
 
 
@@ -618,7 +861,7 @@ def test_cudnn_mla_layer_projects_latent_values_with_model_weight(monkeypatch: p
     backend = BackendConfig(attn="cudnn", linear="torch", rms_norm="torch", rope_fusion=False)
     mla = GlmMoeDsaMLA(config, backend, skip_topk=True)
     mla.o_proj = torch.nn.Identity()
-    captured: dict[str, torch.Tensor | float | None] = {}
+    captured: dict[str, torch.Tensor | float | bool | None] = {}
     latent = torch.ones(4, config.num_attention_heads, config.kv_lora_rank, dtype=torch.bfloat16)
 
     def fake_sparse(
@@ -627,6 +870,8 @@ def test_cudnn_mla_layer_projects_latent_values_with_model_weight(monkeypatch: p
         topk_indices: torch.Tensor,
         softmax_scale: float,
         topk_length: torch.Tensor | None = None,
+        all_rows_nonempty: bool = False,
+        valid_row_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         captured.update(
             q=q,
@@ -634,6 +879,8 @@ def test_cudnn_mla_layer_projects_latent_values_with_model_weight(monkeypatch: p
             topk_indices=topk_indices,
             softmax_scale=softmax_scale,
             topk_length=topk_length,
+            all_rows_nonempty=all_rows_nonempty,
+            valid_row_indices=valid_row_indices,
         )
         return latent
 
@@ -641,12 +888,15 @@ def test_cudnn_mla_layer_projects_latent_values_with_model_weight(monkeypatch: p
     monkeypatch.setattr(layer_mod, "cudnn_sparse_attention", fake_sparse)
     x = torch.randn(4, config.hidden_size, dtype=torch.bfloat16)
     topk = torch.zeros(4, 1, config.index_topk, dtype=torch.int32)
-    topk_length = torch.arange(1, 5, dtype=torch.int32)
+    topk_length = torch.tensor([1, 0, 3, 4], dtype=torch.int32)
+    valid_row_indices = torch.tensor([0, 2, 3])
     actual = mla(
         x,
         _freqs(4, config.qk_rope_head_dim),
         prev_topk_indices=topk,
         _cudnn_dsa_topk_length=topk_length,
+        _cudnn_dsa_all_rows_nonempty=False,
+        _cudnn_dsa_valid_row_indices=valid_row_indices,
     )
 
     weight = mla.kv_b_proj.weight.view(
@@ -662,6 +912,8 @@ def test_cudnn_mla_layer_projects_latent_values_with_model_weight(monkeypatch: p
     assert captured["topk_indices"] is topk
     assert captured["softmax_scale"] == mla.softmax_scale
     assert captured["topk_length"] is topk_length
+    assert captured["all_rows_nonempty"] is False
+    assert captured["valid_row_indices"] is valid_row_indices
 
 
 def test_cudnn_mla_layer_gathers_cp_kv(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -684,8 +936,10 @@ def test_cudnn_mla_layer_gathers_cp_kv(monkeypatch: pytest.MonkeyPatch) -> None:
         topk_indices: torch.Tensor,
         softmax_scale: float,
         topk_length: torch.Tensor | None = None,
+        all_rows_nonempty: bool = False,
+        valid_row_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del softmax_scale, topk_length
+        del softmax_scale, topk_length, all_rows_nonempty, valid_row_indices
         captured.update(q=q, kv_latent=kv_latent, topk_indices=topk_indices)
         return torch.ones(q.shape[0], config.num_attention_heads, config.kv_lora_rank, dtype=torch.bfloat16)
 
@@ -705,6 +959,45 @@ def test_cudnn_mla_layer_gathers_cp_kv(monkeypatch: pytest.MonkeyPatch) -> None:
     assert gathered == [(4, config.kv_lora_rank), (4, config.qk_rope_head_dim)]
     assert captured["kv_latent"].shape == (8, 1, config.kv_lora_rank + config.qk_rope_head_dim)
     assert captured["topk_indices"] is topk
+
+
+def test_cudnn_model_threads_padding_aware_attention_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The model prepares zero attention lengths from its local THD padding mask."""
+    config = _small_dsa_config()
+    backend = BackendConfig(attn="cudnn", linear="torch", rms_norm="torch", rope_fusion=False)
+    model = GlmMoeDsaModel(config, backend=backend)
+    model.norm = torch.nn.Identity()
+    captured: dict[str, object] = {}
+
+    def fake_forward(
+        x: torch.Tensor,
+        *,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        prev_topk_indices: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del freqs_cis, attention_mask, padding_mask, prev_topk_indices
+        captured.update(kwargs)
+        return x, torch.zeros(x.shape[0], 1, config.index_topk, dtype=torch.int32)
+
+    monkeypatch.setattr(model.layers["0"], "forward", fake_forward)
+    padding_mask = torch.tensor([False, False, False, False, False, True, True, True])
+    model(
+        torch.arange(8),
+        position_ids=torch.tensor([0, 1, 2, 0, 1, 2, 3, 4]),
+        padding_mask=padding_mask,
+        qkv_format="thd",
+        cu_seqlens=torch.tensor([0, 3, 8], dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(
+        captured["_cudnn_dsa_topk_length"],
+        torch.tensor([1, 2, 3, 1, 2, 0, 0, 0], dtype=torch.int32),
+    )
+    torch.testing.assert_close(captured["_cudnn_dsa_valid_row_indices"], torch.arange(5))
+    assert captured["_cudnn_dsa_all_rows_nonempty"] is False
 
 
 def test_cudnn_model_requires_packing_and_fixed_pipeline_topk() -> None:
@@ -828,6 +1121,7 @@ def test_cudnn_dsa_gpu_forward_backward_parity() -> None:
         indices,
         softmax_scale,
         topk_length=topk_length,
+        all_rows_nonempty=True,
     )
     (actual.float() * output_grad.float()).sum().backward()
 
@@ -894,6 +1188,7 @@ def test_cudnn_dsa_gpu_cp_forward_backward_parity() -> None:
         indices,
         softmax_scale,
         topk_length=topk_length,
+        all_rows_nonempty=True,
     )
     (actual.float() * output_grad.float()).sum().backward()
 
@@ -907,3 +1202,71 @@ def test_cudnn_dsa_gpu_cp_forward_backward_parity() -> None:
     assert _cosine(kv_actual.grad, kv_expected.grad) > 0.99
     assert _relative_rmse(q_actual.grad, q_expected.grad) < 0.15
     assert _relative_rmse(kv_actual.grad, kv_expected.grad) < 0.15
+
+
+@requires_cudnn_dsa_gpu
+def test_cudnn_dsa_gpu_zero_length_rows_match_explicit_compaction() -> None:
+    """Cached padded-row compaction and the all-empty dummy are exact on Hopper."""
+    torch.manual_seed(456)
+    device = torch.device("cuda")
+    tokens, keys, heads, topk = 4, 8, 64, 4
+    softmax_scale = QK_DIM**-0.5
+    q_seed = torch.randn(tokens, heads, QK_DIM, device=device, dtype=torch.bfloat16).mul_(0.25)
+    kv_seed = torch.randn(keys, 1, QK_DIM, device=device, dtype=torch.bfloat16).mul_(0.25)
+    output_grad = torch.randn(tokens, heads, VALUE_DIM, device=device, dtype=torch.bfloat16)
+    lengths = torch.tensor([1, 0, 2, 3], dtype=torch.int32, device=device)
+    indices = torch.tensor(
+        [[[0, -1, -1, -1]], [[-1, -1, -1, -1]], [[0, 2, -1, -1]], [[0, 1, 3, -1]]],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    q_actual = q_seed.detach().clone().requires_grad_(True)
+    kv_actual = kv_seed.detach().clone().requires_grad_(True)
+    valid_rows = torch.tensor([0, 2, 3], device=device)
+    actual = cudnn_dsa.cudnn_sparse_attention(
+        q_actual,
+        kv_actual,
+        indices,
+        softmax_scale,
+        topk_length=lengths,
+        all_rows_nonempty=False,
+        valid_row_indices=valid_rows,
+    )
+    (actual.float() * output_grad.float()).sum().backward()
+
+    q_compact = q_seed.index_select(0, valid_rows).detach().clone().requires_grad_(True)
+    kv_compact = kv_seed.detach().clone().requires_grad_(True)
+    compact = cudnn_dsa.cudnn_sparse_attention(
+        q_compact,
+        kv_compact,
+        indices.index_select(0, valid_rows),
+        softmax_scale,
+        topk_length=lengths.index_select(0, valid_rows).contiguous(),
+        all_rows_nonempty=True,
+    )
+    (compact.float() * output_grad.index_select(0, valid_rows).float()).sum().backward()
+
+    torch.testing.assert_close(actual.index_select(0, valid_rows), compact, rtol=0, atol=0)
+    torch.testing.assert_close(q_actual.grad.index_select(0, valid_rows), q_compact.grad, rtol=0, atol=0)
+    torch.testing.assert_close(kv_actual.grad, kv_compact.grad, rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], torch.zeros_like(actual[1]), rtol=0, atol=0)
+    torch.testing.assert_close(q_actual.grad[1], torch.zeros_like(q_actual.grad[1]), rtol=0, atol=0)
+
+    q_empty = q_seed[:2].detach().clone().requires_grad_(True)
+    kv_empty = kv_seed.detach().clone().requires_grad_(True)
+    empty = cudnn_dsa.cudnn_sparse_attention(
+        q_empty,
+        kv_empty,
+        torch.full((2, 1, topk), -1, dtype=torch.int32, device=device),
+        softmax_scale,
+        topk_length=torch.zeros(2, dtype=torch.int32, device=device),
+        all_rows_nonempty=False,
+        valid_row_indices=torch.empty(0, dtype=torch.int64, device=device),
+    )
+    empty.sum().backward()
+
+    assert torch.isfinite(empty).all()
+    torch.testing.assert_close(empty, torch.zeros_like(empty), rtol=0, atol=0)
+    torch.testing.assert_close(q_empty.grad, torch.zeros_like(q_empty.grad), rtol=0, atol=0)
+    torch.testing.assert_close(kv_empty.grad, torch.zeros_like(kv_empty.grad), rtol=0, atol=0)

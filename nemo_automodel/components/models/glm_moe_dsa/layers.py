@@ -758,6 +758,8 @@ class GlmMoeDsaMLA(nn.Module):
                     topk_indices,
                     self.softmax_scale,
                     topk_length=attn_kwargs.get("_cudnn_dsa_topk_length"),
+                    all_rows_nonempty=bool(attn_kwargs.get("_cudnn_dsa_all_rows_nonempty", False)),
+                    valid_row_indices=attn_kwargs.get("_cudnn_dsa_valid_row_indices"),
                 )
                 attn_out = torch.einsum("thc,hdc->thd", latent_out, w_vc.to(latent_out.dtype))
             x = self.o_proj(attn_out.flatten(1))

@@ -115,6 +115,7 @@ def prepare_cudnn_dsa_packed_metadata(
     *,
     query_indices: torch.Tensor | None = None,
     cu_seqlens_padded: torch.Tensor | None = None,
+    padding_mask: torch.Tensor | None = None,
 ) -> Any:
     """Prepare reusable local-query/global-key packed metadata once per stage."""
     return _prepare_cudnn_dsa_packed_metadata(
@@ -123,6 +124,7 @@ def prepare_cudnn_dsa_packed_metadata(
         max_seqlen,
         query_indices=query_indices,
         cu_seqlens_padded=cu_seqlens_padded,
+        padding_mask=padding_mask,
     )
 
 
@@ -178,6 +180,8 @@ def cudnn_sparse_attention(
     topk_indices: torch.Tensor,
     softmax_scale: float,
     topk_length: torch.Tensor | None = None,
+    all_rows_nonempty: bool = False,
+    valid_row_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run cuDNN DSA attention on packed latent Q/KV tensors.
 
@@ -189,11 +193,21 @@ def cudnn_sparse_attention(
         topk_indices: Contiguous CUDA int32 tensor of shape ``[tokens, 1, index_topk]``.
         softmax_scale: MLA attention scale applied to query-key scores.
         topk_length: Optional int32 valid-prefix lengths of shape ``[tokens]``.
+        all_rows_nonempty: Whether every query has a positive valid-prefix length.
+        valid_row_indices: Optional cached int64 indices of nonempty query rows.
 
     Returns:
         CUDA bfloat16 latent-attention tensor of shape ``[tokens, heads, kv_lora_rank]``.
     """
-    return _cudnn_sparse_attention(q, kv_latent, topk_indices, softmax_scale, topk_length=topk_length)
+    return _cudnn_sparse_attention(
+        q,
+        kv_latent,
+        topk_indices,
+        softmax_scale,
+        topk_length=topk_length,
+        all_rows_nonempty=all_rows_nonempty,
+        valid_row_indices=valid_row_indices,
+    )
 
 
 def _all_cuda(*tensors: torch.Tensor) -> bool:

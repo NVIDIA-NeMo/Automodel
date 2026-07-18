@@ -238,15 +238,17 @@ class GlmMoeDsaModel(nn.Module):
                 query_indices = query_indices.flatten().to(device=h.device, dtype=torch.int32).contiguous()
             cu_seqlens_padded = attn_kwargs.get("cu_seqlens_padded")
             if cu_seqlens_padded is not None:
-                cu_seqlens_padded = (
-                    cu_seqlens_padded.flatten().to(device=h.device, dtype=torch.int32).contiguous()
-                )
+                cu_seqlens_padded = cu_seqlens_padded.flatten().to(device=h.device, dtype=torch.int32).contiguous()
+            cudnn_padding_mask = None
+            if padding_mask is not None:
+                cudnn_padding_mask = padding_mask.flatten().to(device=h.device, dtype=torch.bool).contiguous()
             cp_size = int(attn_kwargs.get("cp_size", 1))
             packed_metadata = prepare_cudnn_dsa_packed_metadata(
                 cu_seqlens,
                 h.shape[0] * cp_size,
                 query_indices=query_indices,
                 cu_seqlens_padded=cu_seqlens_padded,
+                padding_mask=cudnn_padding_mask,
             )
             attn_kwargs = dict(attn_kwargs)
             attn_kwargs["cu_seqlens"] = cu_seqlens
@@ -255,9 +257,11 @@ class GlmMoeDsaModel(nn.Module):
             if cu_seqlens_padded is not None:
                 attn_kwargs["cu_seqlens_padded"] = cu_seqlens_padded
             attn_kwargs["_cudnn_dsa_packed_metadata"] = packed_metadata
-            attn_kwargs["_cudnn_dsa_topk_length"] = (
-                packed_metadata.causal_lengths.clamp_max(int(self.config.index_topk)).contiguous()
-            )
+            attn_kwargs["_cudnn_dsa_topk_length"] = packed_metadata.causal_lengths.clamp_max(
+                int(self.config.index_topk)
+            ).contiguous()
+            attn_kwargs["_cudnn_dsa_all_rows_nonempty"] = packed_metadata.all_rows_nonempty
+            attn_kwargs["_cudnn_dsa_valid_row_indices"] = packed_metadata.valid_row_indices
 
         # IndexShare: thread the most recent "full" layer's top-k selection forward so the
         # following "shared" layers can reuse it. Seeded from `prev_topk_indices` (carried from

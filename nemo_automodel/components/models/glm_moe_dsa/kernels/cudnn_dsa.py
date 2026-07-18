@@ -46,18 +46,22 @@ _TOPK_SCRATCH_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
 _TOPK_SCRATCH_INT32_FACTOR = 2
 _TOPK_ROW_ALIGNMENT = 512
 
+
 @dataclass(frozen=True)
 class CudnnDsaPackedMetadata:
     """Reusable THD metadata for local-query/global-key cuDNN DSA."""
 
     starts: torch.Tensor
     causal_lengths: torch.Tensor
+    query_valid: torch.Tensor
+    valid_row_indices: torch.Tensor | None
     segment_cu_q: torch.Tensor
     segment_cu_k: torch.Tensor
     key_source_indices: torch.Tensor | None
     max_seqlen_q: int
     max_seqlen_k: int
     total_key_tokens: int
+    all_rows_nonempty: bool
 
 
 def is_cudnn_dsa_available() -> bool:
@@ -101,6 +105,7 @@ def prepare_cudnn_dsa_packed_metadata(
     *,
     query_indices: torch.Tensor | None = None,
     cu_seqlens_padded: torch.Tensor | None = None,
+    padding_mask: torch.Tensor | None = None,
 ) -> CudnnDsaPackedMetadata:
     """Build segmented THD metadata for local queries and gathered global keys.
 
@@ -113,6 +118,9 @@ def prepare_cudnn_dsa_packed_metadata(
             query rows. When absent, queries cover all global key tokens (CP=1).
         cu_seqlens_padded: Optional cumulative padded layout boundaries. When absent,
             the real boundaries in ``cu_seqlens`` are also the storage boundaries.
+        padding_mask: Optional local boolean padding mask ``[T_q]``. This remains
+            authoritative when THD preprocessing has absorbed trailing pack padding
+            into ``cu_seqlens``.
 
     Returns:
         Cached global starts and real causal lengths per query, positive-length cuDNN
@@ -154,6 +162,15 @@ def prepare_cudnn_dsa_packed_metadata(
             raise ValueError("query_indices and cu_seqlens must be contiguous on the same device.")
         global_queries = query_indices.to(torch.int64)
 
+    if padding_mask is not None:
+        if padding_mask.shape != global_queries.shape or padding_mask.dtype != torch.bool:
+            raise ValueError(
+                "padding_mask must be a boolean tensor with one entry per local query; "
+                f"got shape={tuple(padding_mask.shape)}, dtype={padding_mask.dtype}."
+            )
+        if padding_mask.device != cu_seqlens.device or not padding_mask.is_contiguous():
+            raise ValueError("padding_mask and cu_seqlens must be contiguous on the same device.")
+
     # AutoModel CP keeps one contiguous interval of global padded-token rows per rank.
     # Filter non-intersecting documents, then pair each local Q segment with that
     # document's K prefix. The unequal Q/K lengths give cuDNN the required bottom-right
@@ -166,6 +183,11 @@ def prepare_cudnn_dsa_packed_metadata(
     segment_document_starts = layout_cu.to(torch.int64).index_select(0, segment_documents)
     key_counts = segment_query_starts + query_counts - segment_document_starts
     segment_cu_k64 = torch.nn.functional.pad(key_counts.cumsum(0), (1, 0))
+    starts64 = layout_cu.to(torch.int64).index_select(0, safe_document_ids)
+    real_ends = starts64 + real_lengths.index_select(0, safe_document_ids)
+    query_valid = global_queries < real_ends
+    if padding_mask is not None:
+        query_valid = query_valid & ~padding_mask
 
     query_deltas = global_queries[1:] - global_queries[:-1]
     if query_deltas.numel() == 0:
@@ -203,6 +225,7 @@ def prepare_cudnn_dsa_packed_metadata(
             key_counts.max(),
             key_counts.sum(),
             provided_max,
+            query_valid.to(torch.int64).min(),
         )
     ).tolist()
     (
@@ -225,6 +248,7 @@ def prepare_cudnn_dsa_packed_metadata(
         max_key_count,
         segment_key_tokens,
         provided_max_value,
+        min_query_valid,
     ) = (int(value) for value in summary)
     if real_first != 0 or min_real <= 0:
         raise ValueError("cu_seqlens must start at zero and be strictly increasing.")
@@ -245,14 +269,14 @@ def prepare_cudnn_dsa_packed_metadata(
         raise ValueError("cuDNN DSA requires every filtered Q/K segment to have positive length.")
     if provided_max_value != actual_max_seqlen:
         raise ValueError(
-            f"max_seqlen must equal the largest real packed length ({actual_max_seqlen}), "
-            f"got {provided_max_value}."
+            f"max_seqlen must equal the largest real packed length ({actual_max_seqlen}), got {provided_max_value}."
         )
 
-    starts64 = layout_cu.to(torch.int64).index_select(0, safe_document_ids)
-    real_ends = starts64 + real_lengths.index_select(0, safe_document_ids)
     causal_lengths64 = torch.minimum(global_queries + 1, real_ends) - starts64
-    causal_lengths64.clamp_(min=1)
+    causal_lengths64 = torch.where(query_valid, causal_lengths64, 0)
+    valid_row_indices = None
+    if not min_query_valid:
+        valid_row_indices = torch.nonzero(query_valid, as_tuple=False).flatten().contiguous()
 
     full_identity_query = (
         global_queries.numel() == total_key_tokens and query_first == 0 and query_last == total_key_tokens - 1
@@ -268,12 +292,15 @@ def prepare_cudnn_dsa_packed_metadata(
     return CudnnDsaPackedMetadata(
         starts=starts64.to(torch.int32).contiguous(),
         causal_lengths=causal_lengths64.to(torch.int32).contiguous(),
+        query_valid=query_valid.contiguous(),
+        valid_row_indices=valid_row_indices,
         segment_cu_q=segment_cu_q64.to(torch.int32).contiguous(),
         segment_cu_k=segment_cu_k64.to(torch.int32).contiguous(),
         key_source_indices=key_source_indices.contiguous() if key_source_indices is not None else None,
         max_seqlen_q=max_query_count,
         max_seqlen_k=max_key_count,
         total_key_tokens=total_key_tokens,
+        all_rows_nonempty=bool(min_query_valid),
     )
 
 
@@ -296,6 +323,28 @@ def _unpack_packed_metadata(
             )
         if not tensor.is_contiguous():
             raise ValueError(f"packed {name} must be contiguous.")
+    query_valid = packed_metadata.query_valid
+    if (
+        query_valid.shape != expected_shape
+        or query_valid.dtype != torch.bool
+        or query_valid.device != device
+        or not query_valid.is_contiguous()
+    ):
+        raise ValueError(f"packed query_valid must be contiguous bool {expected_shape} on {device}.")
+    if not isinstance(packed_metadata.all_rows_nonempty, bool):
+        raise TypeError("packed all_rows_nonempty must be a Python bool.")
+    valid_row_indices = packed_metadata.valid_row_indices
+    if packed_metadata.all_rows_nonempty:
+        if valid_row_indices is not None:
+            raise ValueError("packed valid_row_indices must be None when every query row is nonempty.")
+    elif (
+        valid_row_indices is None
+        or valid_row_indices.ndim != 1
+        or valid_row_indices.dtype != torch.int64
+        or valid_row_indices.device != device
+        or not valid_row_indices.is_contiguous()
+    ):
+        raise ValueError("packed valid_row_indices must be contiguous int64 [valid_queries] on the query device.")
     for name, tensor in (
         ("segment_cu_q", packed_metadata.segment_cu_q),
         ("segment_cu_k", packed_metadata.segment_cu_k),
@@ -307,9 +356,7 @@ def _unpack_packed_metadata(
     if packed_metadata.segment_cu_q.shape != packed_metadata.segment_cu_k.shape:
         raise ValueError("packed segment_cu_q and segment_cu_k must have the same shape.")
     if packed_metadata.total_key_tokens != total_key_tokens:
-        raise ValueError(
-            f"packed total_key_tokens must be {total_key_tokens}, got {packed_metadata.total_key_tokens}."
-        )
+        raise ValueError(f"packed total_key_tokens must be {total_key_tokens}, got {packed_metadata.total_key_tokens}.")
     if packed_metadata.max_seqlen_q <= 0 or packed_metadata.max_seqlen_k <= 0:
         raise ValueError("packed maximum Q/K sequence lengths must be positive Python integers.")
     source = packed_metadata.key_source_indices
@@ -454,11 +501,14 @@ def cudnn_indexer_topk(
     if actual_topk == packed_metadata.max_seqlen_k:
         local_indices = torch.arange(actual_topk, dtype=torch.int32, device=index_q.device).expand(index_q.shape[0], -1)
     else:
-        local_indices = _topk_wrapper_chunked(
-            scores.contiguous(), packed_metadata.causal_lengths, actual_topk
-        ).to(torch.int32)
+        ranker_lengths = packed_metadata.causal_lengths.clamp_min(1)
+        local_indices = _topk_wrapper_chunked(scores.contiguous(), ranker_lengths, actual_topk).to(torch.int32)
 
-    valid = (local_indices >= 0) & (local_indices < packed_metadata.causal_lengths.unsqueeze(-1))
+    valid = (
+        packed_metadata.query_valid.unsqueeze(-1)
+        & (local_indices >= 0)
+        & (local_indices < packed_metadata.causal_lengths.unsqueeze(-1))
+    )
     global_indices = torch.where(valid, local_indices + packed_metadata.starts.unsqueeze(-1), -1)
     if actual_topk < index_topk:
         global_indices = torch.nn.functional.pad(global_indices, (0, index_topk - actual_topk), value=-1)
@@ -507,6 +557,8 @@ class _CudnnSparseAttention(torch.autograd.Function):
         softmax_scale: float,
         padded_heads: int,
         topk_length: torch.Tensor | None,
+        all_rows_nonempty: bool,
+        valid_row_indices: torch.Tensor | None,
     ) -> torch.Tensor:
         """Produce latent values ``[T_q, H, 512]`` from Q/KV and ``[T_q, 1, K]`` indices."""
         kv = kv_latent.squeeze(1).contiguous()
@@ -534,27 +586,66 @@ class _CudnnSparseAttention(torch.autograd.Function):
         )
         out = out_kernel[:, : q.shape[1]].contiguous()
         lse = lse_kernel[:, : q.shape[1]].contiguous()
-        ctx.save_for_backward(q, kv, out, lse, attn_sink, indices.clamp_min(0), topk_length)
+        if not all_rows_nonempty:
+            out.masked_fill_(topk_length.eq(0).view(-1, 1, 1), 0)
+        cached_valid_rows = (
+            valid_row_indices if valid_row_indices is not None else torch.empty(0, dtype=torch.int64, device=q.device)
+        )
+        ctx.save_for_backward(q, kv, out, lse, attn_sink, indices.clamp_min(0), topk_length, cached_valid_rows)
         ctx.softmax_scale = softmax_scale
         ctx.padded_heads = padded_heads
+        ctx.all_rows_nonempty = all_rows_nonempty
+        ctx.has_cached_valid_rows = valid_row_indices is not None
         return out
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         """Map output gradients ``[T_q, H, 512]`` to Q and latent KV layouts."""
-        q, kv, out, lse, attn_sink, indices, topk_length = ctx.saved_tensors
-        q_kernel, sink_kernel = _pad_attention_heads(q, attn_sink, ctx.padded_heads)
+        q, kv, out, lse, attn_sink, indices, topk_length, cached_valid_rows = ctx.saved_tensors
+        valid_row_indices = None
+        if not ctx.all_rows_nonempty:
+            valid_row_indices = (
+                cached_valid_rows
+                if ctx.has_cached_valid_rows
+                else torch.nonzero(topk_length > 0, as_tuple=False).flatten()
+            )
+
+        q_input = q
+        out_input = out
+        grad_input = grad_output
+        lse_input = lse
+        indices_kernel = indices
+        topk_length_kernel = topk_length
+        used_dummy = False
+        if valid_row_indices is not None:
+            if valid_row_indices.numel() == 0:
+                used_dummy = True
+                q_input = torch.zeros_like(q[:1])
+                out_input = torch.zeros_like(out[:1])
+                grad_input = torch.zeros_like(grad_output[:1])
+                lse_input = torch.zeros_like(lse[:1])
+                indices_kernel = torch.zeros_like(indices[:1])
+                topk_length_kernel = torch.ones_like(topk_length[:1])
+            else:
+                q_input = q.index_select(0, valid_row_indices)
+                out_input = out.index_select(0, valid_row_indices)
+                grad_input = grad_output.index_select(0, valid_row_indices)
+                lse_input = lse.index_select(0, valid_row_indices)
+                indices_kernel = indices.index_select(0, valid_row_indices)
+                topk_length_kernel = topk_length.index_select(0, valid_row_indices)
+
+        q_kernel, sink_kernel = _pad_attention_heads(q_input, attn_sink, ctx.padded_heads)
         if ctx.padded_heads == q.shape[1]:
-            out_kernel = out
-            grad_kernel = grad_output.contiguous()
-            lse_kernel = lse
+            out_kernel = out_input
+            grad_kernel = grad_input.contiguous()
+            lse_kernel = lse_input
         else:
-            out_kernel = out.new_zeros((out.shape[0], ctx.padded_heads, out.shape[2]))
-            out_kernel[:, : out.shape[1]] = out
-            grad_kernel = grad_output.new_zeros((grad_output.shape[0], ctx.padded_heads, grad_output.shape[2]))
-            grad_kernel[:, : grad_output.shape[1]] = grad_output
-            lse_kernel = lse.new_zeros((lse.shape[0], ctx.padded_heads))
-            lse_kernel[:, : lse.shape[1]] = lse
+            out_kernel = out_input.new_zeros((out_input.shape[0], ctx.padded_heads, out_input.shape[2]))
+            out_kernel[:, : out_input.shape[1]] = out_input
+            grad_kernel = grad_input.new_zeros((grad_input.shape[0], ctx.padded_heads, grad_input.shape[2]))
+            grad_kernel[:, : grad_input.shape[1]] = grad_input
+            lse_kernel = lse_input.new_zeros((lse_input.shape[0], ctx.padded_heads))
+            lse_kernel[:, : lse_input.shape[1]] = lse_input
 
         result = _CUDNN_DSA.sparse_attention_backward_wrapper(
             q_kernel.contiguous(),
@@ -563,13 +654,18 @@ class _CudnnSparseAttention(torch.autograd.Function):
             grad_kernel.contiguous(),
             lse_kernel.contiguous(),
             sink_kernel,
-            indices,
+            indices_kernel,
             softmax_scale=ctx.softmax_scale,
-            topk_length=topk_length,
+            topk_length=topk_length_kernel,
         )
-        grad_q = result["dq"][:, : q.shape[1]].contiguous()
+        if valid_row_indices is None:
+            grad_q = result["dq"][:, : q.shape[1]].contiguous()
+        else:
+            grad_q_valid = result["dq"][:0, : q.shape[1]] if used_dummy else result["dq"][:, : q.shape[1]]
+            grad_q = torch.zeros_like(q)
+            grad_q.index_copy_(0, valid_row_indices, grad_q_valid)
         grad_kv = result["dkv"].unsqueeze(1).contiguous()
-        return grad_q, grad_kv, None, None, None, None
+        return grad_q, grad_kv, None, None, None, None, None, None
 
 
 def cudnn_sparse_attention(
@@ -578,6 +674,8 @@ def cudnn_sparse_attention(
     topk_indices: torch.Tensor,
     softmax_scale: float,
     topk_length: torch.Tensor | None = None,
+    all_rows_nonempty: bool = False,
+    valid_row_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run split GLM-5.2 sparse MLA with FlashMLA forward and cuDNN backward.
 
@@ -592,6 +690,12 @@ def cudnn_sparse_attention(
         topk_length: Optional int32 valid-prefix lengths ``[T_q]`` prepared once
             from packed causal metadata. When supplied, ``topk_indices`` must already
             contain the indexer's canonical compact, ascending prefix.
+        all_rows_nonempty: Whether every query has a positive valid-prefix length.
+            The model supplies this cached metadata flag to keep unpadded inputs on
+            the allocation-free backward path.
+        valid_row_indices: Optional cached int64 row indices whose valid-prefix length
+            is positive. The model supplies these once per stage for padded inputs so
+            every attention layer can compact without rescanning CUDA metadata.
 
     Returns:
         Latent sparse-attention output, CUDA BF16 ``[T_q, H, 512]``. The caller
@@ -621,6 +725,10 @@ def cudnn_sparse_attention(
         raise TypeError("softmax_scale must be a finite Python float.")
     if float(softmax_scale) <= 0.0:
         raise ValueError(f"softmax_scale must be positive, got {softmax_scale}.")
+    if not isinstance(all_rows_nonempty, bool):
+        raise TypeError(f"all_rows_nonempty must be a bool, got {type(all_rows_nonempty).__name__}.")
+    if all_rows_nonempty and valid_row_indices is not None:
+        raise ValueError("valid_row_indices must be None when all_rows_nonempty is true.")
     if topk_length is not None:
         if topk_length.shape != (q.shape[0],) or topk_length.dtype != torch.int32 or topk_length.device != q.device:
             raise ValueError(
@@ -630,6 +738,18 @@ def cudnn_sparse_attention(
             )
         if not topk_length.is_contiguous():
             raise ValueError("topk_length must be contiguous.")
+    if valid_row_indices is not None:
+        if topk_length is None:
+            raise ValueError("valid_row_indices requires precomputed topk_length metadata.")
+        if (
+            valid_row_indices.ndim != 1
+            or valid_row_indices.dtype != torch.int64
+            or valid_row_indices.device != q.device
+            or not valid_row_indices.is_contiguous()
+        ):
+            raise ValueError("valid_row_indices must be a contiguous int64 tensor on the query device.")
+        if valid_row_indices.numel() > q.shape[0]:
+            raise ValueError("valid_row_indices cannot contain more entries than query rows.")
 
     padded_heads = _padded_head_count(q.shape[1], major)
     return _CudnnSparseAttention.apply(
@@ -639,6 +759,8 @@ def cudnn_sparse_attention(
         float(softmax_scale),
         padded_heads,
         topk_length,
+        all_rows_nonempty,
+        valid_row_indices,
     )
 
 
