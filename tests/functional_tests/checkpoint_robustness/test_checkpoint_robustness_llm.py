@@ -694,7 +694,8 @@ def _compare_source_load_parity(
         source_load_cosine_threshold: Minimum allowed cosine similarity over flattened logits.
 
     Returns:
-        Synchronized failure traceback when source-load parity fails, otherwise ``None``.
+        Synchronized failure traceback when source-load parity fails, otherwise ``None``. The caller may defer this
+        failure until independent checkpoint reload and resume phases have completed.
     """
     candidate_aliased = _lm_head_embedding_aliased(candidate_model)
     failure_message = None
@@ -747,13 +748,14 @@ def _compare_source_load_parity(
             failure_message = traceback.format_exc()
 
     # Keep every rank on the same control-flow path when rank 0 detects a Phase 0
-    # mismatch.
+    # mismatch. The caller records the failure and continues with the independent
+    # checkpoint reload and resume phases.
     if dist.is_initialized():
         payload = [failure_message]
         dist.broadcast_object_list(payload, src=0)
         failure_message = payload[0]
     if failure_message is not None and _rank0():
-        print("[Phase 0] Source-load parity failed.")
+        print("[Phase 0] Source-load parity failed; deferring failure until later checkpoint phases complete.")
     return failure_message
 
 
@@ -1050,13 +1052,61 @@ def run_checkpoint_robustness(
     source_load_kl_threshold = float(custom_args.get("source_load_kl_threshold", "5e-3"))
     source_load_mean_kl_threshold = float(custom_args.get("source_load_mean_kl_threshold", "1e-3"))
     source_load_cosine_threshold = float(custom_args.get("source_load_cosine_threshold", "0.9999"))
+    deferred_failures: list[str] = []
+
     input_ids = input_ids_loader(tokenizer_name)
     cfg = parse_args_and_load_config()
 
-    # Phase 1: Construct a pristine model, then train and checkpoint.
+    source_load_reference = None
+    if check_source_load_parity:
+        source_load_reference = _prepare_source_load_reference(
+            cfg,
+            input_ids,
+            hf_model_cls=hf_model_cls,
+            trust_remote_code=trust_remote_code,
+            experts_implementation=experts_implementation,
+            hf_device_map_auto=hf_device_map_auto,
+            hf_source_post_load_dequantize=hf_source_post_load_dequantize,
+        )
+        _barrier()
+
+    # Phase 1: Construct the model, optionally compare it against the raw HF
+    # source-load reference, then train and checkpoint.
     torch.cuda.reset_peak_memory_stats()
     trainer = recipe_cls(cfg)
     trainer.setup()
+
+    if check_source_load_parity:
+        device = next(trainer.model_parts[0].parameters()).device
+        trainer_source_logits = _get_logits(trainer.model_parts[0], input_ids, device, trainer=trainer)
+        source_load_failure = _compare_source_load_parity(
+            source_load_reference,
+            trainer_source_logits,
+            trainer.model_parts[0],
+            source_load_kl_threshold=source_load_kl_threshold,
+            source_load_mean_kl_threshold=source_load_mean_kl_threshold,
+            source_load_cosine_threshold=source_load_cosine_threshold,
+        )
+        if source_load_failure is not None:
+            deferred_failures.append(f"Phase 0 source-load parity:\n{source_load_failure}")
+        del trainer_source_logits, source_load_reference
+        _barrier()
+        if _rank0():
+            _cleanup_source_load_sync(cfg)
+        _barrier()
+
+        # Do not train with a model that has already run a no-grad parity
+        # forward. FSDP2 and non-reentrant activation-checkpoint wrappers keep
+        # forward bookkeeping that is expected to match the first backward;
+        # reusing the probed model can make that bookkeeping nondeterministic.
+        # A fresh recipe is also the clearest separation between the optional
+        # diagnostic and the checkpoint lifecycle under test.
+        _release_recipe_memory(trainer)
+        del trainer
+        _barrier()
+        cfg = parse_args_and_load_config()
+        trainer = recipe_cls(cfg)
+        trainer.setup()
 
     trainer.run_train_validation_loop()
 
@@ -1408,46 +1458,6 @@ def run_checkpoint_robustness(
         del resume_trainer
         _barrier()
 
-    # Complete Phase 0 last. Large device-mapped HF references and FSDP/EP
-    # candidates can retain wrapper-owned allocations even after their public
-    # model references are cleared. Isolating the entire diagnostic after the
-    # checkpoint lifecycle makes that state irrelevant to training, save,
-    # reload, and resume while preserving a blocking source-parity result.
-    source_load_failure = None
-    if check_source_load_parity:
-        cfg = parse_args_and_load_config()
-        source_load_reference = _prepare_source_load_reference(
-            cfg,
-            input_ids,
-            hf_model_cls=hf_model_cls,
-            trust_remote_code=trust_remote_code,
-            experts_implementation=experts_implementation,
-            hf_device_map_auto=hf_device_map_auto,
-            hf_source_post_load_dequantize=hf_source_post_load_dequantize,
-        )
-        _barrier()
-        source_load_trainer = recipe_cls(cfg)
-        source_load_trainer.setup()
-        device = next(source_load_trainer.model_parts[0].parameters()).device
-        trainer_source_logits = _get_logits(
-            source_load_trainer.model_parts[0], input_ids, device, trainer=source_load_trainer
-        )
-        source_load_failure = _compare_source_load_parity(
-            source_load_reference,
-            trainer_source_logits,
-            source_load_trainer.model_parts[0],
-            source_load_kl_threshold=source_load_kl_threshold,
-            source_load_mean_kl_threshold=source_load_mean_kl_threshold,
-            source_load_cosine_threshold=source_load_cosine_threshold,
-        )
-        del trainer_source_logits, source_load_reference
-        _release_recipe_memory(source_load_trainer)
-        del source_load_trainer
-        _barrier()
-        if _rank0():
-            _cleanup_source_load_sync(cfg)
-        _barrier()
-
     # Skip the atexit-registered destroy_process_group() call. MoE models with expert
     # parallelism create NCCL sub-groups (DeepEP) that leave pending collective state,
     # causing destroy_process_group() to hang and SIGABRT. Since the process is about to
@@ -1458,8 +1468,10 @@ def run_checkpoint_robustness(
 
     atexit.unregister(destroy_global_state)
 
-    if source_load_failure is not None:
-        raise AssertionError("Checkpoint robustness source-load parity failed:\n\n" + source_load_failure)
+    if deferred_failures:
+        raise AssertionError(
+            "Checkpoint robustness completed with deferred failures:\n\n" + "\n\n".join(deferred_failures)
+        )
 
 
 def test_checkpoint_robustness() -> None:
