@@ -21,7 +21,7 @@ import contextlib
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.distributed.cp_sharder import ShardFacts
+from nemo_automodel.components.distributed.cp_sharder import ShardLayout
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
 
 
@@ -117,7 +117,7 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
     facts = None
     input_ids = batch.get("input_ids")
     if num_chunks <= 1 and input_ids is not None and input_ids.dim() >= 2:
-        facts = ShardFacts(
+        facts = ShardLayout(
             padded_seq_len=input_ids.shape[0] * input_ids.shape[1],
             input_row_shape=tuple(input_ids.shape[:2]),
         )

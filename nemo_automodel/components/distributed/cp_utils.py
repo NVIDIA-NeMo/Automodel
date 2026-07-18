@@ -21,7 +21,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.cp_sharder import (
     ContextParallelismSharder,
-    ShardFacts,
+    ShardLayout,
     identity_local_indices,
     round_robin_local_indices,
     shard_batch_identity,
@@ -390,7 +390,7 @@ def _resolve_cp_sharder(
                         # Single-sequence HF path: dispatch pads at the tail of
                         # the global order, so trim restores the original length.
                         original = row_shape[1]
-                facts = ShardFacts(
+                facts = ShardLayout(
                     local_token_global_indices=local_indices,
                     original_seq_len=original,
                     padded_seq_len=padded,
@@ -420,7 +420,7 @@ def _resolve_cp_sharder(
             )
             facts = None
             if local_indices is not None:
-                facts = ShardFacts(
+                facts = ShardLayout(
                     local_token_global_indices=local_indices,
                     padded_seq_len=row_shape[0] * row_shape[1] if row_shape is not None else None,
                     input_row_shape=row_shape,
@@ -528,8 +528,7 @@ def _make_cp_batch_and_ctx(
     ctx, batch, facts = sharder.shard_batch(
         cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id
     )
-    if facts is not None:
-        sharder.install_shard_facts(facts)
+    sharder.shard_layout = facts
     return ctx, batch, sharder
 
 

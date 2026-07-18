@@ -58,9 +58,9 @@ def main() -> None:
         "labels": torch.arange(seq_len, device=device).unsqueeze(0),
     }
     _, _, facts = sharder.shard_batch(cp_mesh, None, batch)
-    sharder.install_shard_facts(facts)
-    padded = sharder.padded_seq_len
-    assert sharder.original_seq_len == seq_len, sharder.original_seq_len
+    sharder.shard_layout = facts
+    padded = sharder.shard_layout.padded_seq_len
+    assert sharder.shard_layout.original_seq_len == seq_len, sharder.shard_layout.original_seq_len
     assert padded == seq_len + (-seq_len) % (2 * world), padded
 
     # --- down: caller-coordinate tensor rides the same layout -------------

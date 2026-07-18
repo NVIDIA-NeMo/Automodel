@@ -722,7 +722,7 @@ def test_te_sharder_captures_partition_indices_at_shard_time(monkeypatch):
         sharder.shard_token_tensor(cp2, full, seq_dim=0)
 
     _, _, facts = sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([1, 2, 3, 4])})
-    sharder.install_shard_facts(facts)
+    sharder.shard_layout = facts
     assert torch.equal(sharder.shard_token_tensor(cp2, full, seq_dim=0), torch.tensor([0.0, 3.0]))
     with pytest.raises(ValueError, match="does not match"):
         sharder.shard_token_tensor(cp2, torch.arange(6.0), seq_dim=0)
@@ -758,8 +758,8 @@ def test_magi_sharder_captures_hf_dispatch_facts():
         model=None,
     )
     _, _, facts = sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([[1, 2, 3]])})
-    sharder.install_shard_facts(facts)
-    assert (sharder.original_seq_len, sharder.padded_seq_len) == (3, 4)
+    sharder.shard_layout = facts
+    assert (sharder.shard_layout.original_seq_len, sharder.shard_layout.padded_seq_len) == (3, 4)
     # down: original-length tensor auto-pads then follows the dispatch permutation
     local = sharder.shard_token_tensor(cp2, torch.tensor([[10.0, 20.0, 30.0]]), fill=0.0)
     assert torch.equal(local, torch.tensor([[10.0, 30.0]]))
@@ -779,9 +779,9 @@ def test_magi_sharder_captures_packed_row_shape():
         model=None,
     )
     _, _, facts = sharder.shard_batch(cp2, None, {"input_ids": torch.tensor([[1, 2], [3, 4]])})
-    sharder.install_shard_facts(facts)
-    assert sharder.input_row_shape == (2, 2)
-    assert sharder.padded_seq_len == 4
+    sharder.shard_layout = facts
+    assert sharder.shard_layout.input_row_shape == (2, 2)
+    assert sharder.shard_layout.padded_seq_len == 4
     rows = torch.tensor([[10.0, 20.0], [30.0, 40.0]])
     assert torch.equal(sharder.shard_token_tensor(cp2, rows), torch.tensor([10.0, 40.0]))
 
@@ -810,7 +810,7 @@ def test_round_robin_sharder_captures_lengths_and_pads_token_tensors(monkeypatch
     batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
     _, _, sharder = _cu._make_cp_batch_and_ctx(device_mesh, batch)  # pads 6 -> 8 (2*cp)
 
-    assert (sharder.original_seq_len, sharder.padded_seq_len) == (6, 8)
+    assert (sharder.shard_layout.original_seq_len, sharder.shard_layout.padded_seq_len) == (6, 8)
     # down: unpadded [1, 6] advantages ride with an explicit fill
     local = sharder.shard_token_tensor(device_mesh["cp"], torch.arange(6.0).unsqueeze(0), fill=0.0)
     # rank 0 under 2*cp=4 chunks of len 2: chunks 0 and 3 -> positions [0,1,6,7]
@@ -829,7 +829,7 @@ def test_none_sharder_captures_lengths_for_trim():
     device_mesh = _DummyDeviceMesh(cp_size=1, tp_size=1)
     batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
     _, _, sharder = _cu._make_cp_batch_and_ctx(device_mesh, batch)
-    assert (sharder.original_seq_len, sharder.padded_seq_len) == (6, 6)
+    assert (sharder.shard_layout.original_seq_len, sharder.shard_layout.padded_seq_len) == (6, 6)
     t = torch.randn(1, 6)
     assert torch.equal(sharder.gather_token_tensor(device_mesh["cp"], t, trim=True), t)
 
@@ -850,9 +850,9 @@ def test_te_sharder_captures_row_shape(monkeypatch):
         cp1, None, magi=None, use_te=True, num_chunks=1, seq_lens_padding_value=-1000, model=None
     )
     _, _, facts = sharder.shard_batch(cp1, None, {"input_ids": torch.arange(4).view(2, 2)})
-    sharder.install_shard_facts(facts)
-    assert sharder.input_row_shape == (2, 2)
-    assert sharder.padded_seq_len == 4
+    sharder.shard_layout = facts
+    assert sharder.shard_layout.input_row_shape == (2, 2)
+    assert sharder.shard_layout.padded_seq_len == 4
 
     # down: row-coordinate [2, 2] flattens to the stream before sharding
     rows = torch.tensor([[1.0, 2.0], [3.0, 4.0]])

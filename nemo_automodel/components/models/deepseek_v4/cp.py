@@ -448,7 +448,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     import contextlib
 
     from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
-        ShardFacts,
+        ShardLayout,
         convert_attention_mask_to_padding_mask,
         shard_batch_contiguous,
     )
@@ -499,7 +499,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     if packed:
         # The repad rebuilt the rows, so no single original length exists; the
         # caller's coordinates are restored through the position map instead.
-        facts = ShardFacts(
+        facts = ShardLayout(
             padded_seq_len=facts.padded_seq_len,
             input_token_stream_positions=input_positions,
         )

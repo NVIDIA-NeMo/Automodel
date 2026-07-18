@@ -141,8 +141,8 @@ def test_sharder_default_shard_token_tensor_uses_indices():
     torch.testing.assert_close(local, full[:, 4:])
 
 
-def test_shard_batch_contiguous_records_shard_facts():
-    """shard_batch reports original/padded lengths as ShardFacts; once installed,
+def test_shard_batch_contiguous_records_shard_layout():
+    """shard_batch reports original/padded lengths as ShardLayout; once installed,
     the token verbs accept caller-coordinate tensors and reject mismatched ones."""
     sharder = cs.ContextParallelismSharder(
         shard_batch=None,
@@ -151,9 +151,9 @@ def test_shard_batch_contiguous_records_shard_facts():
     mesh = _FakeMesh(2, 0)
     batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
     _, _, facts = cs.shard_batch_contiguous(mesh, None, batch)  # pads 6 -> 8
-    sharder.install_shard_facts(facts)
+    sharder.shard_layout = facts
 
-    assert (sharder.original_seq_len, sharder.padded_seq_len) == (6, 8)
+    assert (sharder.shard_layout.original_seq_len, sharder.shard_layout.padded_seq_len) == (6, 8)
     # down: unpadded tensor auto-pads with the explicit fill, rank 0 owns [0:4]
     local = sharder.shard_token_tensor(mesh, torch.arange(6.0).unsqueeze(0), fill=-1.0)
     assert torch.equal(local, torch.tensor([[0.0, 1.0, 2.0, 3.0]]))
@@ -164,7 +164,7 @@ def test_shard_batch_contiguous_records_shard_facts():
     # up: trim validates the gathered length against the captured facts (no
     # collective runs in this single-process test, so the gather stays local
     # and the guard must fire rather than mis-trim)
-    with pytest.raises(ValueError, match="captured padded_seq_len 8"):
+    with pytest.raises(ValueError, match="reported padded_seq_len 8"):
         sharder.gather_token_tensor(mesh, torch.zeros(1, 4), trim=True)
 
 
@@ -177,9 +177,7 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
     sharder = cs.ContextParallelismSharder(
         shard_batch=None,
         local_token_global_indices=cs.contiguous_local_indices,
-        original_seq_len=None,
-        padded_seq_len=4,
-        input_token_stream_positions=positions,
+        shard_layout=cs.ShardLayout(padded_seq_len=4, input_token_stream_positions=positions),
     )
     mesh = _FakeMesh(2, 0)  # rank 0 owns columns [0:2]
     local = sharder.shard_token_tensor(mesh, torch.tensor([[10.0, 20.0, 99.0]]), fill=0.0)
@@ -200,18 +198,22 @@ def test_gather_trim_raises_without_captured_facts():
         shard_batch=None,
         local_token_global_indices=cs.contiguous_local_indices,
     )
-    with pytest.raises(NotImplementedError, match="captured no original-coordinate facts"):
+    with pytest.raises(NotImplementedError, match="no shard layout to trim to"):
         sharder.gather_token_tensor(_FakeMesh(1), torch.zeros(1, 4), trim=True)
 
 
-def test_captured_token_indices_validates_stream_length():
-    # Captured maps flatten + cast to long, and reject a padded_seq_len that
-    # does not match the partition they were captured from.
-    fn = cs.captured_token_indices(torch.tensor([[1, 0]], dtype=torch.int32))
-    assert torch.equal(fn(_FakeMesh(2, 0), 4), torch.tensor([1, 0]))
-    assert torch.equal(fn(None, 2), torch.tensor([1, 0]))  # no mesh -> cp_size 1
+def test_reported_indices_validate_stream_length():
+    # Reported index maps flatten + cast to long, and reject a padded_seq_len
+    # that does not match the partition the shard reported.
+    sharder = cs.ContextParallelismSharder(
+        shard_batch=lambda *a, **k: (contextlib.nullcontext, {}, None),
+        local_token_global_indices=None,
+        shard_layout=cs.ShardLayout(local_token_global_indices=torch.tensor([[1, 0]], dtype=torch.int32)),
+    )
+    assert torch.equal(sharder._indices(_FakeMesh(2, 0), 4, None), torch.tensor([1, 0]))
+    assert torch.equal(sharder._indices(None, 2, None), torch.tensor([1, 0]))  # no mesh -> cp_size 1
     with pytest.raises(ValueError, match="does not match"):
-        fn(_FakeMesh(2, 0), 6)
+        sharder._indices(_FakeMesh(2, 0), 6, None)
 
 
 def test_sharder_token_verbs_unavailable_for_data_dependent_layouts():
