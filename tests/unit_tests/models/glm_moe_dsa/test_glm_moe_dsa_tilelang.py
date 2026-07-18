@@ -834,6 +834,40 @@ def test_indexer_topk_matches_dense():
     assert mean_overlap > 0.97, f"indexer top-k set overlap too low: {mean_overlap:.4f}"
 
 
+@requires_kernels
+def test_indexer_topk_short_sequence_below_index_topk():
+    """When the packed sequence has fewer keys than index_topk, the indexer must not
+
+    crash on torch.topk ("selected index k out of range"); it should select the
+    available keys and pad back to the fixed index_topk width with the -1 sentinel so
+    the sparse-MLA kernel still gets a width that is a multiple of block_I (64).
+    """
+    torch.manual_seed(0)
+    dev = "cuda"
+    short_t = TOPK // 2  # e.g. 32 < TOPK (64): triggers the short-sequence path
+    assert short_t < TOPK
+    scale = IDX_DIM**-0.5
+    index_q = torch.randn(short_t, IDX_HEADS, IDX_DIM, device=dev, dtype=torch.bfloat16)
+    index_k = torch.randn(short_t, IDX_DIM, device=dev, dtype=torch.bfloat16)
+    weights_proj = torch.randn(short_t, IDX_HEADS, device=dev, dtype=torch.float32)
+
+    head_weights = (weights_proj * (IDX_HEADS**-0.5) * scale).contiguous()
+    cu_seqlens = torch.tensor([0, short_t], device=dev, dtype=torch.int32)
+    topk_tl = ok.tilelang_indexer_topk(index_q.contiguous(), index_k.contiguous(), head_weights, cu_seqlens, TOPK)
+
+    # Width stays at the fixed index_topk (multiple of block_I) even though only short_t keys exist.
+    assert topk_tl.shape == (short_t, 1, TOPK)
+    assert TOPK % 64 == 0
+    tilelang_topk = topk_tl.squeeze(1)
+    # Every selected (non-sentinel) index must be a valid causal key position (< short_t).
+    valid = tilelang_topk[tilelang_topk != -1]
+    assert int(valid.min()) >= 0 and int(valid.max()) < short_t
+    # Each query keeps at most (its causal window) real keys; the rest are -1 padding.
+    for t in range(short_t):
+        n_real = int((tilelang_topk[t] != -1).sum())
+        assert n_real <= t + 1
+
+
 def _causal_topk_indices(num_tokens, topk, device):
     idx = torch.full((num_tokens, topk), -1, device=device, dtype=torch.int32)
     for t in range(num_tokens):

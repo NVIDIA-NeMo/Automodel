@@ -34,6 +34,8 @@ from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedE
 from nemo_automodel.components.moe.layers import (
     MoE,
 )
+from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
+from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -132,6 +134,65 @@ def _module_weights_are_tied(left: nn.Module | None, right: nn.Module | None) ->
     return left_weight is not None and left_weight is right_weight
 
 
+def _resolve_moe_tp_plan(
+    model: nn.Module,
+    *,
+    sequence_parallel: bool,
+    tp_shard_plan: dict[str, ParallelStyle] | str | None,
+    tp_size: int,
+) -> dict[str, ParallelStyle]:
+    """Resolve a fail-closed TP plan for a custom MoE model.
+
+    The generic dense parallelizer has broad fallback plans. Those fallbacks
+    can accidentally match ``*.experts`` on custom MoE architectures, so the
+    MoE path only accepts an explicit plan or an architecture registration and
+    always validates routed-expert ownership before applying it.
+    """
+    if sequence_parallel:
+        raise ValueError(
+            "sequence_parallel=True is not supported by the custom MoE TP path yet; "
+            "use sequence_parallel=False so replicated router/attention activations remain correct."
+        )
+    if tp_size <= 1:
+        return {}
+
+    if tp_shard_plan is not None:
+        # Reuse the standard parser for explicit dictionaries, named plans and
+        # import paths, then apply the stricter MoE ownership validation below.
+        from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
+
+        plan = _get_parallel_plan(
+            model,
+            sequence_parallel=False,
+            tp_shard_plan=tp_shard_plan,
+            tp_size=tp_size,
+        )
+    else:
+        from nemo_automodel.components.distributed.optimized_tp_plans import (
+            PARALLELIZE_FUNCTIONS,
+            _get_class_qualname,
+        )
+
+        model_cls = type(model)
+        plan_factory = PARALLELIZE_FUNCTIONS.get(_get_class_qualname(model_cls))
+        if plan_factory is None:
+            plan_factory = PARALLELIZE_FUNCTIONS.get(model_cls.__name__)
+        if plan_factory is None:
+            raise ValueError(
+                f"No safe tensor-parallel plan is registered for custom MoE model "
+                f"'{model_cls.__name__}' at tp_size={tp_size}. Register a non-expert plan in "
+                "PARALLELIZE_FUNCTIONS or pass tp_shard_plan explicitly; routed experts must remain EP-owned."
+            )
+        try:
+            plan = plan_factory(model, False)
+        except Exception as exc:
+            raise ValueError(
+                f"The registered tensor-parallel plan for custom MoE model '{model_cls.__name__}' failed: {exc}"
+            ) from exc
+
+    return _validate_moe_tp_plan(plan, model=model)
+
+
 class ExpertParallel(ParallelStyle):
     """
     ExpertParallel class is used to shard the MoE parameters on the EP mesh.
@@ -208,12 +269,109 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
             )
 
 
+_MULTIMODAL_TOWER_ATTRS = (
+    "visual",
+    "vision_tower",
+    "vision_model",
+    "vit_model",
+    "audio_tower",
+    "audio_model",
+)
+
+
+def _has_trainable_multimodal_tower(model: nn.Module) -> bool:
+    """Return whether the model (or its inner ``.model``) exposes a trainable vision/audio tower.
+
+    Deliberately a cheap duck-typed gate, not a second owner of the tower
+    mapping: it only decides whether importing the heavy, transformers-aware
+    dense parallelizer is worthwhile, while the dense parallelizer's per-model
+    layer-group mapping remains the sole owner of which blocks get wrapped.
+    Requiring a trainable, parameter-bearing tower (rather than mere attribute
+    existence) keeps the import off text-only, frozen-tower, and duck-typed
+    stub-model call paths.
+    """
+    for owner in (model, getattr(model, "model", None)):
+        if owner is None:
+            continue
+        for attr in _MULTIMODAL_TOWER_ATTRS:
+            tower = getattr(owner, attr, None)
+            if tower is None or not hasattr(tower, "parameters"):
+                continue
+            if any(param.requires_grad for param in tower.parameters()):
+                return True
+    return False
+
+
+def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> None:
+    """Checkpoint trainable multimodal (vision/audio) tower blocks on the expert-parallel path.
+
+    ``apply_ac`` iterates only the text/MTP decoder stack
+    (``_iter_transformer_and_mtp_blocks``), and the generic FSDP2 scope
+    handling does not run for expert-parallel configs, so a trainable vision
+    tower would otherwise keep every activation. Reuses the per-model
+    layer-group mapping from the dense parallelizer and applies the same
+    per-submodule wrapping (attention/MLP/norms) as the generic FSDP2/DDP
+    path, with ``sdpa_backend_snapshot_context_fn`` on the attention/MLP
+    wrappers so the backward-time recompute reruns under the forward-time SDPA
+    backend set. Fully frozen vision towers are left untouched, consistent
+    with the generic path's frozen-tower behavior.
+
+    Args:
+        model: Root model owning the tower(s) to checkpoint.
+        scopes: Normalized activation-checkpointing scope tuple. ``("all",)``
+            selects the vision and audio groups (matching the generic path's
+            scope filter); otherwise only the named non-language groups are
+            selected, with ``multimodal`` expanding to vision + audio. Groups
+            the model does not expose are simply absent.
+    """
+    if scopes == ("all",):
+        group_names: tuple[str, ...] = ("vision", "audio")
+    else:
+        group_names = tuple(
+            dict.fromkeys(
+                name
+                for scope in scopes
+                for name in (("vision", "audio") if scope == "multimodal" else (scope,))
+                if name != "language"
+            )
+        )
+    if not group_names or not _has_trainable_multimodal_tower(model):
+        return
+
+    # Lazy imports keep the heavy, transformers-aware dense parallelizer module
+    # off the text-only MoE call path.
+    from nemo_automodel.components.distributed.activation_checkpointing import (
+        apply_submodule_checkpointing,
+        sdpa_backend_snapshot_context_fn,
+    )
+    from nemo_automodel.components.distributed.parallelizer import get_model_layer_groups
+
+    layer_groups = get_model_layer_groups(model)
+    tower_layers = [
+        layer
+        for name in group_names
+        for layer in layer_groups.get(name, [])
+        if any(param.requires_grad for param in layer.parameters())
+    ]
+    if not tower_layers:
+        logger.info(
+            "No trainable multimodal tower blocks selected by activation checkpointing scope %s; "
+            "skipping vision-tower activation checkpointing.",
+            scopes,
+        )
+        return
+    # Vision towers have no KV cache, so KV-sharing (a text-decoder concern)
+    # never applies here.
+    apply_submodule_checkpointing(tower_layers, has_kv_sharing=False, context_fn=sdpa_backend_snapshot_context_fn)
+
+
 def apply_ac(
     model: nn.Module,
     ignore_router: bool = True,
     hidden_size: int | None = None,
     num_experts: int | None = None,
     selective: bool = False,
+    activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
 ):
     """Apply activation checkpointing to the model.
 
@@ -229,8 +387,27 @@ def apply_ac(
             (shared with the dense FSDP2 path) to each block. Takes precedence over
             ``ignore_router``; the shared policy already saves expert-parallel communication
             collectives and ``topk``, so it composes with expert parallelism.
+        activation_checkpointing_scope: Which layer groups to checkpoint -- the same field
+            and semantics as the generic FSDP2/DDP path. ``"all"`` (the default) checkpoints
+            the text/MoE decoder blocks plus the trainable vision tower; ``"language"`` the
+            decoder blocks only; ``"vision"`` (or ``"multimodal"``) only the trainable
+            tower blocks, skipping decoder checkpointing entirely. The scope decides WHICH
+            groups participate; the ``selective``/``ignore_router`` mode decides HOW the
+            selected decoder blocks are checkpointed.
+
+    Trainable VLM vision-tower blocks selected by the scope get the same per-submodule
+    wrapping (attention/MLP/norms) as the generic FSDP2/DDP path, with the SDPA backend
+    set snapshotted at checkpoint-forward time and restored during the backward-time
+    recompute; frozen vision towers are left untouched.
     """
-    if not selective and not ignore_router:
+    # Lazy import: keeps the scope normalization single-sourced with the strategy
+    # configs without importing distributed.config on the (torch-stub-friendly)
+    # module import path.
+    from nemo_automodel.components.distributed.config import normalize_activation_checkpointing_scope
+
+    scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
+    checkpoint_decoder = "all" in scopes or "language" in scopes
+    if checkpoint_decoder and not selective and not ignore_router:
         logger.warning(
             "Activation checkpointing is enabled with ignore_router_for_ac=False. The MoE "
             "router/dispatch will be recomputed in the backward pass, which can route a "
@@ -241,23 +418,31 @@ def apply_ac(
         )
 
     if selective:
-        # Reuse the dense FSDP2 selective policy so the save-op set (attention,
-        # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
-        from nemo_automodel.components.distributed.activation_checkpointing import (
-            SELECTIVE_AC_WRAPPER_FLAG,
-            make_selective_checkpoint_context_fn,
-        )
+        if checkpoint_decoder:
+            # Reuse the dense FSDP2 selective policy so the save-op set (attention,
+            # matmuls, comm collectives, topk, D2H copies) stays single-sourced.
+            from nemo_automodel.components.distributed.activation_checkpointing import (
+                SELECTIVE_AC_WRAPPER_FLAG,
+                make_selective_checkpoint_context_fn,
+            )
 
-        selective_context_fn = make_selective_checkpoint_context_fn()
-        for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
-            block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, context_fn=selective_context_fn)
-            # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
-            # selective policy visible to the partitioner) instead of unwrapping and
-            # compiling the block inner, which would collapse selective AC into full
-            # recompute. The flag is only read when per-layer torch.compile is
-            # enabled, so it is a no-op for every other mode.
-            setattr(block, SELECTIVE_AC_WRAPPER_FLAG, True)
-            parent_layers.register_module(layer_id, block)
+            selective_context_fn = make_selective_checkpoint_context_fn()
+            for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
+                block = ptd_checkpoint_wrapper(block, preserve_rng_state=True, context_fn=selective_context_fn)
+                # Tag so _apply_per_layer_compile compiles the wrapper OUTER (keeping the
+                # selective policy visible to the partitioner) instead of unwrapping and
+                # compiling the block inner, which would collapse selective AC into full
+                # recompute. The flag is only read when per-layer torch.compile is
+                # enabled, so it is a no-op for every other mode.
+                setattr(block, SELECTIVE_AC_WRAPPER_FLAG, True)
+                parent_layers.register_module(layer_id, block)
+        _apply_multimodal_tower_ac(model, scopes)
+        return
+
+    if not checkpoint_decoder:
+        # Vision-only (or otherwise non-language) scope: skip decoder checkpointing
+        # entirely, including the hidden_size/num_experts derivation it needs.
+        _apply_multimodal_tower_ac(model, scopes)
         return
 
     # Derive hidden_size and num_experts from model.config if not provided
@@ -338,6 +523,8 @@ def apply_ac(
             block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
 
         parent_layers.register_module(layer_id, block)
+
+    _apply_multimodal_tower_ac(model, scopes)
 
 
 def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):
@@ -452,6 +639,7 @@ def apply_fsdp(
                 shard_placement_fn=_moe_shard_placement,
                 reshard_after_forward=experts_reshard_after_forward,
                 mp_policy=mp_policy,
+                offload_policy=offload_policy,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters
@@ -542,9 +730,10 @@ def apply_fsdp(
         )
     else:
         if tied_embeddings_cross_fsdp_roots and not wrap_outer_model:
-            logger.warning(
+            raise ValueError(
                 "lm_head.weight is tied to embed_tokens.weight across the outer model boundary, but "
-                "wrap_outer_model=False prevents preserving the tie in one FSDP root."
+                "wrap_outer_model=False cannot preserve that parameter in one FSDP root. "
+                "Use wrap_outer_model=True or untie the embeddings explicitly."
             )
         fully_shard_default(_model)
 
@@ -643,16 +832,58 @@ def parallelize_model(
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = True,
+    activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
+    offload_policy: OffloadPolicy | None = None,
+    tp_shard_plan: dict[str, ParallelStyle] | str | None = None,
+    sequence_parallel: bool = False,
+    enable_async_tensor_parallel: bool = False,
 ):
-    """Apply context, expert, activation-checkpointing, and FSDP parallelism."""
+    """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism."""
 
-    assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
-        "Tensor parallelism not supported for custom MoE models"
-    )
+    tp_enabled = tp_axis_name is not None and world_mesh[tp_axis_name].size() > 1
+    if tp_enabled:
+        if enable_async_tensor_parallel:
+            raise ValueError(
+                "enable_async_tensor_parallel=True is not supported by the custom MoE TP path; "
+                "it requires sequence parallelism, which is intentionally disabled for replicated router/attention paths."
+            )
+        tp_mesh = world_mesh[tp_axis_name]
+        model_parallel_plan = _resolve_moe_tp_plan(
+            model,
+            sequence_parallel=sequence_parallel,
+            tp_shard_plan=tp_shard_plan,
+            tp_size=tp_mesh.size(),
+        )
+        # Every custom-MoE TP plan keeps the token path (attention, router)
+        # replicated across TP ranks, so each expert gradient accumulates
+        # tp_size identical contributions through the EP all-gather.
+        # get_expert_tp_replication_factor reads this marker to remove that
+        # factor in scale_grads_and_clip_grad_norm.
+        model._nemo_moe_tp_requires_replica_sync = True
+        # The replicated paths have no gradient synchronization of their own;
+        # they stay identical across TP ranks only when every rank starts from
+        # the same complete pretrained checkpoint. This marker makes
+        # apply_model_infrastructure and checkpoint loading fail closed on
+        # random/from-config initialization or partial checkpoints. It applies
+        # equally to registered and explicit custom-MoE plans.
+        model._nemo_moe_tp_requires_pretrained_weights = True
+        # PEFT is applied before distributed sharding. Translate each style so
+        # LoRA-wrapped shared-expert/lm-head modules keep the same TP semantics.
+        from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+
+        model_parallel_plan = {path: translate_to_lora(style) for path, style in model_parallel_plan.items()}
+        logger.info(
+            "Applying safe custom-MoE tensor parallelism (tp_size=%d) to %d non-expert module patterns: %s",
+            tp_mesh.size(),
+            len(model_parallel_plan),
+            ", ".join(sorted(model_parallel_plan)),
+        )
+        parallelize_module(model, tp_mesh, model_parallel_plan)
+        ensure_tied_lm_head(model)
 
     cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
     if cp_enabled:
@@ -673,6 +904,7 @@ def parallelize_model(
             model,
             ignore_router=ignore_router_for_ac,
             selective=_is_selective_ac(activation_checkpointing),
+            activation_checkpointing_scope=activation_checkpointing_scope,
         )
 
     if ep_shard_axis_names is not None:
@@ -692,6 +924,7 @@ def parallelize_model(
             ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
             ep_shard_mesh=ep_shard_mesh,
             mp_policy=mp_policy,
+            offload_policy=offload_policy,
             reshard_after_forward=reshard_after_forward,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,

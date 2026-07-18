@@ -43,7 +43,7 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import wandb
@@ -58,6 +58,7 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.training.rng import ScopedRNG
+from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
 from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     count_tail_padding,
@@ -67,6 +68,13 @@ from nemo_automodel.components.training.utils import (
     scale_grads_and_clip_grad_norm,
 )
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+from nemo_automodel.recipes.kd_utils import (
+    RUN_TEACHER,
+    STOP_TEACHER,
+    KDMeshBridge,
+    create_kd_distributed_setups,
+    materialize_teacher_logits,
+)
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM, build_model, calculate_loss
 
 logger = logging.getLogger(__name__)
@@ -183,6 +191,31 @@ def _validate_cp_pre_embed_teacher_compatibility(inputs_embeds: torch.Tensor, te
 class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
     """Fine-tune a student VLM via knowledge distillation from a teacher VLM."""
 
+    def _create_distributed_setup(self) -> DistributedSetup:
+        self.kd_distributed_setups = create_kd_distributed_setups(self.cfg, world_size=self.dist_env.world_size)
+        self.separate_meshes = self.kd_distributed_setups.separate
+        if not self.separate_meshes:
+            self.kd_mesh_bridge = None
+            return self.kd_distributed_setups.student
+        self.kd_mesh_bridge = KDMeshBridge(self.kd_distributed_setups, device=self.dist_env.device)
+        self._training_process_group = self.kd_mesh_bridge.student_group
+        if self.kd_mesh_bridge.is_student:
+            setup = self.kd_distributed_setups.student
+            setup.mesh_context.process_group = self.kd_mesh_bridge.student_group
+        else:
+            setup = self.kd_distributed_setups.teacher
+            setup.mesh_context.process_group = self.kd_mesh_bridge.teacher_group
+        return setup
+
+    def _should_setup_training_components(self) -> bool:
+        return not getattr(self, "separate_meshes", False) or self.kd_mesh_bridge.is_student
+
+    def _setup_kd_state(self) -> None:
+        self.kd_loss_fn = _build_kd_loss_fn(self.cfg.get("kd_loss_fn", None))
+        self.kd_ratio = float(self.cfg.get("kd_ratio", 0.5))
+        self._kd_loss_buffer = []
+        self._ce_loss_buffer = []
+
     def setup(self):
         """Build student & teacher, dataloaders, optimizers, etc."""
         _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
@@ -193,6 +226,23 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             raise NotImplementedError("Pipeline parallelism is not supported for VLM knowledge distillation yet.")
 
         self._offload_teacher_model = self.cfg.get("offload_teacher_model", False)
+        if getattr(self, "separate_meshes", False):
+            if self._offload_teacher_model:
+                raise ValueError("offload_teacher_model is not supported with separate_meshes=true")
+            self._setup_kd_state()
+            if self.kd_mesh_bridge.is_teacher:
+                self.teacher_model = _build_teacher_model(
+                    cfg_teacher=self.cfg.get("teacher_model", None),
+                    cfg_freeze=self.cfg.get("teacher_freeze_config", None),
+                    seed=self.cfg.get("seed", 42),
+                    distributed_setup=self.distributed_setup,
+                    device=self.dist_env.device,
+                )
+            else:
+                self.teacher_model = None
+            self.kd_mesh_bridge.synchronize()
+            return
+
         teacher_device = self.dist_env.device if not self._offload_teacher_model else "cpu"
 
         self.teacher_model = _build_teacher_model(
@@ -205,14 +255,75 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
 
         logger.info("Teacher Model: " + str(self.teacher_model))
 
-        self.kd_loss_fn = _build_kd_loss_fn(self.cfg.get("kd_loss_fn", None))
-        self.kd_ratio: float = float(self.cfg.get("kd_ratio", 0.5))
+        self._setup_kd_state()
         logger.info("KD Loss config: " + str(self.cfg.get("kd_loss_fn", None)))
         temperature = getattr(self.kd_loss_fn, "temperature", "N/A")
         logger.info(f"Knowledge-distillation enabled: ratio={self.kd_ratio}, T={temperature}")
 
-        self._kd_loss_buffer: list[torch.Tensor] = []
-        self._ce_loss_buffer: list[torch.Tensor] = []
+    def _get_separate_teacher_logits(self, batch: dict[str, Any]) -> torch.Tensor:
+        """Request teacher logits for one student VLM batch.
+
+        Args:
+            batch: Mapping containing ``input_ids`` and ``labels`` as tensors of
+                shape ``[batch, sequence]``. Multimodal tensor leaves may have
+                arbitrary rank and axis order and are transported unchanged.
+
+        Returns:
+            Replicated tensor of shape ``[batch, sequence, vocab]`` containing
+            full teacher logits.
+        """
+        self.kd_mesh_bridge.broadcast_command(RUN_TEACHER)
+        teacher_logits = None
+        for wave in range(self.kd_mesh_bridge.num_waves):
+            self.kd_mesh_bridge.send_batch(wave, batch)
+            received = self.kd_mesh_bridge.send_logits(wave, None)
+            if received is not None:
+                teacher_logits = received
+        if teacher_logits is None:
+            raise RuntimeError("Student rank did not receive teacher logits from the separate KD mesh")
+        return teacher_logits
+
+    @torch.no_grad()
+    def _teacher_forward_separate(self, batch: dict[str, Any]) -> torch.Tensor:
+        """Run one teacher VLM batch and materialize full logits.
+
+        Args:
+            batch: Mapping containing ``input_ids`` and ``labels`` as tensors of
+                shape ``[batch, sequence]``. Multimodal tensor leaves may have
+                arbitrary rank and axis order; their model processor owns those
+                layouts.
+
+        Returns:
+            Detached tensor of shape ``[batch, sequence, vocab]`` containing
+            full teacher logits with CP padding removed.
+        """
+        batch = self.kd_mesh_bridge.move_to_device(batch)
+        sequence_length = batch["labels"].shape[1]
+        model = self.teacher_model
+        # Single CP dispatch: invokes the teacher's pre-embed hook (when CP is
+        # active and the model has one) and shards the batch.
+        train_ctx, batch, _ = prepare_cp_forward(model, self.device_mesh, batch)
+        batch.pop("labels")
+        with train_ctx(), torch.no_grad():
+            teacher_batch = filter_forward_kwargs(model, batch)
+            output = model(**teacher_batch)
+            logits = getattr(output, "logits", output).detach()
+        return materialize_teacher_logits(
+            logits,
+            device_mesh=self.device_mesh,
+            sequence_length=sequence_length,
+        )
+
+    def _run_teacher_worker(self) -> None:
+        """Serve teacher forwards until the student mesh broadcasts stop."""
+        with DistributedSignalHandler(group=self.kd_mesh_bridge.teacher_group):
+            while self.kd_mesh_bridge.broadcast_command() == RUN_TEACHER:
+                for wave in range(self.kd_mesh_bridge.num_waves):
+                    batch = self.kd_mesh_bridge.send_batch(wave, None)
+                    if batch is None:
+                        raise RuntimeError("Teacher rank did not receive a batch from the student mesh")
+                    logits = self._teacher_forward_separate(batch)
+                    self.kd_mesh_bridge.send_logits(wave, logits)
 
     def _forward_backward_step(
         self,
@@ -224,7 +335,25 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         num_batches,
         is_train: bool = True,
     ):
-        """Override the forward backward step to include knowledge distillation loss."""
+        """Run one student VLM microbatch with KD.
+
+        Args:
+            idx: Zero-based accumulation microbatch index.
+            batch: Mapping containing text tensors of shape
+                ``[batch, sequence]``. Multimodal tensor leaves may have
+                arbitrary rank and axis order.
+            loss_buffer: Output list receiving one detached scalar tensor.
+            num_label_tokens: Valid-label count across the optimizer step.
+            num_batches: Number of accumulation microbatches in the step.
+            is_train: Whether to run backward.
+
+        Teacher and student logits have global shape
+        ``[batch, sequence, vocab]`` and may use local TP/CP layouts inside the
+        step.
+        """
+        separate_teacher_logits = (
+            self._get_separate_teacher_logits(batch) if getattr(self, "separate_meshes", False) else None
+        )
         batch = {
             k: (
                 {dk: dv.to(self.dist_env.device, non_blocking=True) if dv is not None else None for dk, dv in v.items()}
@@ -233,16 +362,23 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             )
             for k, v in batch.items()
         }
+        if separate_teacher_logits is not None:
+            batch["teacher_logits"] = separate_teacher_logits
 
+        # Separate-mesh teacher logits ride the batch through CP sharding.
         train_ctx, batch, _ = prepare_cp_forward(
             self.model_parts[0],
             self.device_mesh,
             batch,
             invoke_pre_embed=not self.pp_enabled,
+            extra_seq_buffers={"teacher_logits": 1} if separate_teacher_logits is not None else None,
         )
+        separate_teacher_logits = batch.pop("teacher_logits", None)
         # Hidden-size compatibility with the teacher: checked on the (possibly
-        # sharded) student embeds — sequence sharding never changes the hidden dim.
-        if batch.get("inputs_embeds") is not None:
+        # sharded) student embeds — sequence sharding never changes the hidden
+        # dim. With separate meshes the teacher runs on its own ranks; skip the
+        # local check.
+        if batch.get("inputs_embeds") is not None and not getattr(self, "separate_meshes", False):
             _validate_cp_pre_embed_teacher_compatibility(batch["inputs_embeds"], self.teacher_model)
         labels = batch.pop("labels")
 
@@ -258,14 +394,17 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         )
         with sync_ctx, train_ctx():
             # Teacher forward (no grad) — free intermediates immediately.
-            with (
-                ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
-                torch.no_grad(),
-            ):
-                teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
-                teacher_out = self.teacher_model(**teacher_batch)
-                teacher_logits = getattr(teacher_out, "logits", teacher_out).detach().clone()
-                del teacher_out, teacher_batch
+            if separate_teacher_logits is None:
+                with (
+                    ScopedModuleOffloading(self.teacher_model, enabled=self._offload_teacher_model),
+                    torch.no_grad(),
+                ):
+                    teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
+                    teacher_out = self.teacher_model(**teacher_batch)
+                    teacher_logits = getattr(teacher_out, "logits", teacher_out).detach().clone()
+                    del teacher_out, teacher_batch
+            else:
+                teacher_logits = separate_teacher_logits
 
             # Student forward.
             student_batch = filter_forward_kwargs(model, batch)
@@ -277,6 +416,8 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             del student_batch
 
             student_logits = getattr(student_out, "logits", student_out)
+            if separate_teacher_logits is not None:
+                teacher_logits = self.kd_mesh_bridge.match_student_vocab_shard(student_logits, teacher_logits)
             hidden_states = (
                 student_out.hidden_states[-1] if getattr(student_out, "hidden_states", None) is not None else None
             )
@@ -415,6 +556,18 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                 "temperature": getattr(self.kd_loss_fn, "temperature", float("nan")),
             },
         )
+
+    def run_train_validation_loop(self):
+        """Run the student loop or serve teacher forwards on a separate mesh."""
+        if getattr(self, "separate_meshes", False) and self.kd_mesh_bridge.is_teacher:
+            self._run_teacher_worker()
+            return
+        if getattr(self, "separate_meshes", False):
+            try:
+                return super().run_train_validation_loop()
+            finally:
+                self.kd_mesh_bridge.broadcast_command(STOP_TEACHER)
+        return super().run_train_validation_loop()
 
     @torch.no_grad()
     def _run_validation_epoch(self, val_dataloader):

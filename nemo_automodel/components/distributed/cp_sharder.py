@@ -611,7 +611,15 @@ def _make_contiguous_shard_cp_batch(
 # ---------------------------------------------------------------------------
 
 
-def shard_batch_load_balanced(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id: int = 0):
+def shard_batch_load_balanced(
+    cp_mesh,
+    tp_mesh,
+    batch,
+    *,
+    loss_mask=None,
+    padding_token_id: int = 0,
+    extra_seq_buffers: dict[str, int] | None = None,
+):
     """Shard a batch with torch ``context_parallel`` round-robin load balancing.
 
     ``CPSharder.shard_batch`` implementation for the default framework-owned CP
@@ -628,6 +636,7 @@ def shard_batch_load_balanced(cp_mesh, tp_mesh, batch, *, loss_mask=None, paddin
     # Call-time import: the torch-CP transport machinery stays in cp_utils
     # (NeMo-RL imports it from there), and cp_utils imports this module.
     from nemo_automodel.components.distributed.cp_utils import (  # noqa: PLC0415
+        _shard_grad_buffer_for_cp,
         create_context_parallel_ctx,
         get_train_context,
     )
@@ -697,6 +706,17 @@ def shard_batch_load_balanced(cp_mesh, tp_mesh, batch, *, loss_mask=None, paddin
         cp_seq_dims.append(1)
         cp_no_restore_buffers.add(padding_mask)
 
+    # Caller-registered sequence-aligned tensors (e.g. KD teacher logits
+    # [B, S, V]) ride the same padding/sharding as the batch tensors.
+    for key, extra_seq_dim in (extra_seq_buffers or {}).items():
+        if key not in batch:
+            raise KeyError(f"Extra CP sequence buffer {key!r} is missing from the batch")
+        buffer = batch[key]
+        batch_buffer_keys[len(cp_buffers)] = key
+        cp_buffers.append(buffer)
+        cp_seq_dims.append(extra_seq_dim)
+        cp_no_restore_buffers.add(buffer)
+
     # Pad sequence length to be divisible by 2 * cp_size (required by
     # context_parallel load balancing). The inputs_embeds path can hit
     # arbitrary seq lengths from the VLM collator, so we pad here rather
@@ -735,6 +755,19 @@ def shard_batch_load_balanced(cp_mesh, tp_mesh, batch, *, loss_mask=None, paddin
         # downstream consumer reading from the dict sees the padded shape.
         for idx, key in batch_buffer_keys.items():
             batch[key] = cp_buffers[idx]
+
+    # PyTorch's legacy context_parallel buffers API shards in place with
+    # ``resize_``/``copy_``. ``resize_`` rejects tensors that require gradients,
+    # and detaching inputs_embeds here would silently stop gradients to trainable
+    # embeddings and multimodal towers. Apply the same default head-tail shard
+    # out of place so autograd remains connected, then let context_parallel
+    # mutate only the integer/mask buffers.
+    primary_seq_tensor = cp_buffers[0]
+    if primary_seq_tensor.requires_grad:
+        batch[primary_key] = _shard_grad_buffer_for_cp(primary_seq_tensor, cp_seq_dims[0], cp_mesh)
+        cp_no_restore_buffers.remove(primary_seq_tensor)
+        cp_buffers = cp_buffers[1:]
+        cp_seq_dims = cp_seq_dims[1:]
 
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,
