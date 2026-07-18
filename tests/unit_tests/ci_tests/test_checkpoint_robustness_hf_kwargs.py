@@ -33,6 +33,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _load_hf_fp8_dequantized_config,
     _post_load_dequant_max_memory,
     _prepare_hf_reload_sync,
+    _record_deferred_failure,
     _wait_for_hf_reload_rank0,
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm import _get_vlm_input_ids
@@ -354,6 +355,15 @@ def test_hf_reload_wait_has_separate_timeout(tmp_path, monkeypatch):
 
 def test_hf_reload_finish_returns_error_without_distributed_sync():
     assert _finish_hf_reload_sync(None, "HF parity failed") == "HF parity failed"
+
+
+def test_record_deferred_failure_preserves_all_comparison_failures():
+    failures = []
+
+    _record_deferred_failure(failures, "Phase 3 AutoModel reload parity", None)
+    _record_deferred_failure(failures, "Phase 4 HF reload parity", "HF parity failed")
+
+    assert failures == ["Phase 4 HF reload parity:\nHF parity failed"]
 
 
 def test_hf_reload_wait_does_not_start_collective_during_rank0_work(tmp_path):

@@ -539,6 +539,19 @@ def _finish_hf_reload_sync(
     return None
 
 
+def _record_deferred_failure(
+    deferred_failures: list[str],
+    phase: str,
+    failure_message: str | None,
+) -> None:
+    """Record a numerical comparison failure without blocking independent phases."""
+    if failure_message is None:
+        return
+    deferred_failures.append(f"{phase}:\n{failure_message}")
+    if _rank0():
+        print(f"[{phase}] Comparison failed; deferring failure until later checkpoint phases complete.")
+
+
 def _prepare_source_load_reference(
     cfg,
     input_ids: list[int],
@@ -754,8 +767,6 @@ def _compare_source_load_parity(
         payload = [failure_message]
         dist.broadcast_object_list(payload, src=0)
         failure_message = payload[0]
-    if failure_message is not None and _rank0():
-        print("[Phase 0] Source-load parity failed; deferring failure until later checkpoint phases complete.")
     return failure_message
 
 
@@ -1087,8 +1098,7 @@ def run_checkpoint_robustness(
             source_load_mean_kl_threshold=source_load_mean_kl_threshold,
             source_load_cosine_threshold=source_load_cosine_threshold,
         )
-        if source_load_failure is not None:
-            deferred_failures.append(f"Phase 0 source-load parity:\n{source_load_failure}")
+        _record_deferred_failure(deferred_failures, "Phase 0 source-load parity", source_load_failure)
         del trainer_source_logits, source_load_reference
         _barrier()
         if _rank0():
@@ -1193,10 +1203,13 @@ def run_checkpoint_robustness(
     max_kl_restored = kl_restored.max().item()
     if _rank0():
         print(f"\n[Phase 3] Automodel-from-consolidated max KL: {max_kl_restored:.6e} (threshold: {kl_threshold:.6e})")
-    assert max_kl_restored <= kl_threshold, (
-        f"KL divergence between original and automodel-from-consolidated too large: "
-        f"max per-token KL = {max_kl_restored:.6e} > threshold {kl_threshold:.6e}"
-    )
+    automodel_reload_error = None
+    if max_kl_restored > kl_threshold:
+        automodel_reload_error = (
+            "KL divergence between original and automodel-from-consolidated too large: "
+            f"max per-token KL = {max_kl_restored:.6e} > threshold {kl_threshold:.6e}"
+        )
+    _record_deferred_failure(deferred_failures, "Phase 3 AutoModel reload parity", automodel_reload_error)
 
     # Phase 4: Load into vanilla HF (rank 0 only)
     _release_recipe_memory(restored_trainer)
@@ -1343,7 +1356,7 @@ def run_checkpoint_robustness(
             )
 
     hf_reload_error = _finish_hf_reload_sync(hf_reload_sync_paths, hf_reload_error)
-    assert hf_reload_error is None, hf_reload_error
+    _record_deferred_failure(deferred_failures, "Phase 4 HF reload parity", hf_reload_error)
 
     # Phase 5 (optional): Cross-TP — reload consolidated with a different TP size
     if cross_tp_size > 0 and not is_peft:
@@ -1364,10 +1377,13 @@ def run_checkpoint_robustness(
                 f"[Phase 5] Cross-TP (tp_size={cross_tp_size}) max KL: "
                 f"{max_kl_cross_tp:.6e} (threshold: {cross_tp_kl_threshold:.6e})"
             )
-        assert max_kl_cross_tp <= cross_tp_kl_threshold, (
-            f"KL divergence between original and cross-TP model too large: "
-            f"max per-token KL = {max_kl_cross_tp:.6e} > threshold {cross_tp_kl_threshold:.6e}"
-        )
+        cross_tp_error = None
+        if max_kl_cross_tp > cross_tp_kl_threshold:
+            cross_tp_error = (
+                "KL divergence between original and cross-TP model too large: "
+                f"max per-token KL = {max_kl_cross_tp:.6e} > threshold {cross_tp_kl_threshold:.6e}"
+            )
+        _record_deferred_failure(deferred_failures, "Phase 5 cross-TP reload parity", cross_tp_error)
 
         _release_recipe_memory(cross_tp_trainer)
         del cross_tp_trainer
