@@ -106,6 +106,7 @@ class CheckpointingConfig:
         None  # copy of the model state dict keys before any parallelization. Kept for BW compatibility.
     )
     is_async: bool = False
+    wait_for_staging: bool = False
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
     skip_task_head_prefixes_for_base_model: list[str] | None = (

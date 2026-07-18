@@ -446,6 +446,8 @@ class BaseRecipe:
             if hasattr(opt, "synchronize_for_checkpoint"):
                 opt.synchronize_for_checkpoint()
         self.checkpointer.save_optimizer(optimizer, model, path, scheduler)
+        if self.checkpointer.config.wait_for_staging:
+            self.checkpointer.maybe_wait_for_staging()
         save_config(config.raw_config, path)
         if is_dist_initialized:
             _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))

@@ -60,6 +60,7 @@ def _patch_checkpoint_ops(monkeypatch):
             self.moe_mesh = moe_mesh
             self.distributed_saves = []
             self.distributed_loads = []
+            self.staging_waits = 0
 
         def save_model(
             self,
@@ -103,6 +104,10 @@ def _patch_checkpoint_ops(monkeypatch):
         def async_wait(self):
             """No-op for tests to satisfy BaseRecipe interface."""
             return
+
+        def maybe_wait_for_staging(self):
+            """Record calls that wait for asynchronous checkpoint staging."""
+            self.staging_waits += 1
 
         def save_on_dp_ranks(self, state, state_name, path):
             """Save stateful object (e.g., dataloader, rng)."""
@@ -337,6 +342,17 @@ def test_distributed_stateful_routes_through_distributed_checkpointing(tmp_path)
     assert torch.allclose(recipe_inst.distributed_state.foo, saved_foo)
     assert recipe_inst.checkpointer.distributed_saves == [("distributed_state", ckpt_dir)]
     assert recipe_inst.checkpointer.distributed_loads == [("distributed_state", ckpt_dir)]
+
+
+@pytest.mark.parametrize("wait_for_staging", [False, True])
+def test_save_checkpoint_optionally_waits_for_async_staging(tmp_path, wait_for_staging):
+    """The staging wait is opt-in so default async checkpoint behavior is unchanged."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    recipe_inst.checkpointer.config.wait_for_staging = wait_for_staging
+
+    recipe_inst.save_checkpoint(epoch=0, step=0, train_loss=1.0)
+
+    assert recipe_inst.checkpointer.staging_waits == int(wait_for_staging)
 
 
 def test_untrack_state_removes_state_from_checkpoint_tracking(tmp_path):
