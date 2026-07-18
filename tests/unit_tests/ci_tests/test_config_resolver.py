@@ -364,6 +364,9 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
     assert resolved["checkpoint"]["save_consolidated"] is True
     assert robustness["check_source_load_parity"] is True
     assert robustness["tokenizer_name"] == resolved["model"]["pretrained_model_name_or_path"]
+    pp_size = resolved["distributed"].get("pp_size", 1)
+    pp_microbatch_size = resolved["distributed"].get("pipeline", {}).get("pp_microbatch_size", 1)
+    assert resolved["step_scheduler"]["local_batch_size"] // pp_microbatch_size >= pp_size
     if "/qwen" in recipe_path or "/mistral4/" in recipe_path:
         assert robustness["hf_device_map_auto"] is True
     if "/mistral4/" in recipe_path:
