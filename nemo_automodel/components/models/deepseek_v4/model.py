@@ -843,7 +843,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """Model-owned context-parallel batch prep (Miles-style contiguous shard).
 
         Returns a ``CPSharder`` (under the ``"cp_sharder"`` batch key) so
-        ``cp_utils.make_cp_batch_and_ctx`` delegates CP sharding back to this
+        the CP dispatch delegates CP sharding back to this
         model, with the config-derived per-rank shard multiple bound. DSV4
         embeds internally, so (unlike VLM models) this does not pre-embed --
         it leaves ``input_ids`` for the sharding callable.
@@ -860,7 +860,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         cp_sharder = CPSharder(
             shard_batch=None,
             local_token_global_indices=contiguous_local_indices,
-            layout="contiguous",
         )
         cp_sharder.shard_batch = partial(
             make_dsv4_contiguous_shard_cp_batch_and_ctx,

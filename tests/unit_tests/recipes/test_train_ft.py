@@ -1277,9 +1277,9 @@ def test_forward_backward_step_pp_uses_eval_for_validation(monkeypatch):
     pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
 
-    # Mock make_cp_batch_and_ctx to return a no-op context manager
+    # Mock _make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
@@ -1311,9 +1311,9 @@ def test_forward_backward_step_pp_uses_step_for_training(monkeypatch):
     pp_info = MockPPInfo(has_first_stage=True, has_last_stage=True)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
 
-    # Mock make_cp_batch_and_ctx to return a no-op context manager
+    # Mock _make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
@@ -1345,9 +1345,9 @@ def test_forward_backward_step_pp_non_first_stage_uses_eval_for_validation(monke
     pp_info = MockPPInfo(has_first_stage=False, has_last_stage=True)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
 
-    # Mock make_cp_batch_and_ctx to return a no-op context manager
+    # Mock _make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
@@ -1381,9 +1381,9 @@ def test_forward_backward_step_pp_non_first_stage_uses_step_for_training(monkeyp
     pp_info = MockPPInfo(has_first_stage=False, has_last_stage=True)
     recipe = _create_minimal_recipe_for_pp_test(monkeypatch, pp_info)
 
-    # Mock make_cp_batch_and_ctx to return a no-op context manager
+    # Mock _make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
@@ -1443,9 +1443,9 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
 
     monkeypatch.setattr(recipe, "_dp_allreduce", mock_dp_allreduce)
 
-    # Mock make_cp_batch_and_ctx
+    # Mock _make_cp_batch_and_ctx
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
@@ -1505,7 +1505,7 @@ def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch)
     monkeypatch.setattr(recipe, "_dp_allreduce", mock_dp_allreduce)
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
@@ -2412,8 +2412,26 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
 
     model = _CPModel()
     model.supports_thd = supports_thd
+
+    # The hook gate reads the CP size from the mesh (the runtime truth), not
+    # from the config: fake a mesh whose "cp" dim matches the parametrization.
+    class _FakeSubMesh:
+        def __init__(self, size):
+            self._size = size
+
+        def size(self):
+            return self._size
+
+        def get_group(self):
+            return None
+
+        def get_local_rank(self):
+            return 0
+
+    fake_mesh = {"cp": _FakeSubMesh(cp_size)}
+    fake_mesh = type("_FakeDeviceMesh", (dict,), {"mesh_dim_names": ("cp",)})(fake_mesh)
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
-    object.__setattr__(recipe, "device_mesh", None)
+    object.__setattr__(recipe, "device_mesh", fake_mesh)
     object.__setattr__(recipe, "pp_enabled", False)
     object.__setattr__(recipe, "magi", SimpleNamespace(enabled=False))
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
@@ -2431,7 +2449,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
         return logits.mean()
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils.make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *a, **k: (nullcontext, batch, None),
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_loss", _fake_calc_loss)

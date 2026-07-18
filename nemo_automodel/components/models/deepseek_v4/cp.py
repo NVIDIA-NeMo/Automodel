@@ -222,7 +222,7 @@ def build_dsv4_cp_causal_padding_mask(
 # ---------------------------------------------------------------------------
 # Model-owned CP batch sharding (Miles-style contiguous query shard).
 #
-# ``cp_utils.make_cp_batch_and_ctx`` delegates manual all-gather CP to the model
+# The CP dispatch (``cp_utils.prepare_cp_forward``) delegates manual all-gather CP to the model
 # via the ``CPSharder`` returned by ``prepare_model_inputs_for_cp``. DSV4's
 # sharder pads + contiguously shards the sequence per CP rank (via the shared
 # contiguous implementation in ``components/distributed/cp_sharder.py``) and
@@ -435,7 +435,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     """Contiguously shard a batch for DeepSeek V4 Miles-style context parallelism.
 
     Exposed as ``CPSharder.shard_batch`` (via ``functools.partial`` to bind
-    ``pad_multiple``) and invoked by ``cp_utils.make_cp_batch_and_ctx``. HybridEP can
+    ``pad_multiple``) and invoked by the CP dispatch. HybridEP can
     first max-reduce packed lengths so every rank contributes a uniform token count.
     Each CP rank then keeps one ``seq_start:seq_end`` slice; DSV4 attention all-gathers
     K/V across CP ranks during forward. Returns ``(nullcontext, batch)``.

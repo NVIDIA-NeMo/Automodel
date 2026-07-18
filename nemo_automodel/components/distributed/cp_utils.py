@@ -218,11 +218,17 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             target.register_forward_hook(_post_hook, always_call=True)
 
 
+def _get_submesh(device_mesh, dim: str):
+    """The named submesh, or None when the mesh or dimension is absent."""
+    if device_mesh is None or dim not in getattr(device_mesh, "mesh_dim_names", ()):
+        return None
+    return device_mesh[dim]
+
+
 def _mesh_dim_size(device_mesh, dim: str) -> int:
     """Size of a named submesh, 0 when the mesh or dimension is absent."""
-    if device_mesh is None or dim not in getattr(device_mesh, "mesh_dim_names", ()):
-        return 0
-    return device_mesh[dim].size()
+    submesh = _get_submesh(device_mesh, dim)
+    return submesh.size() if submesh is not None else 0
 
 
 def prepare_cp_forward(
@@ -235,14 +241,13 @@ def prepare_cp_forward(
     padding_token_id: int = 0,
     num_chunks: int = 1,
     loss_mask=None,
-    cp_size: Optional[int] = None,
     invoke_pre_embed: bool = True,
     extra_seq_buffers: Optional[dict[str, int]] = None,
 ):
     """Single CP dispatch for a training/eval forward: hook -> sharder -> (ctx, batch).
 
     Collapses the per-recipe CP branching into one call: the model hook may
-    return a CPSharder, ``make_cp_batch_and_ctx`` resolves it against the
+    return a CPSharder, ``_make_cp_batch_and_ctx`` resolves it against the
     framework-owned sharders (magi / TE / generic torch ``context_parallel``)
     and calls ``shard_batch``. When CP is active and the model exposes
     ``prepare_model_inputs_for_cp``, the hook is invoked uniformly through
@@ -253,7 +258,7 @@ def prepare_cp_forward(
         model: The (first) model part, or None (e.g. no-model contexts).
         device_mesh: The full device mesh (``cp``/``tp`` submeshes are read).
         batch: The full-sequence batch; mutated and sharded in place.
-        magi: Optional recipe MagiState, threaded to ``make_cp_batch_and_ctx``
+        magi: Optional recipe MagiState, threaded to ``_make_cp_batch_and_ctx``
             where it occupies the same dispatch rung as the TE path. Its
             recipe domain is bound at ``setup_magi``; for llm-domain magi the
             model hook is skipped (mirrors the recipes' historical branching),
@@ -264,8 +269,6 @@ def prepare_cp_forward(
         padding_token_id: Pad sentinel for ``input_ids``.
         num_chunks: THD chunk count, forwarded to the hook and TE sharding.
         loss_mask: Optional per-token mask forwarded to the batch sharding.
-        cp_size: Override for the hook gate (e.g. the config-declared CP size);
-            derived from the ``cp`` submesh when None.
         invoke_pre_embed: Invoke the model hook when CP is active or the model
             owns native THD preparation. Recipes pass False for PP stages
             without embeddings and for KD paths that never wired model-owned CP.
@@ -275,14 +278,14 @@ def prepare_cp_forward(
             ignored by backends that own their transport).
     Returns:
         ``(ctx_factory, batch, sharder)`` — the resolved :class:`CPSharder`
-        (the ``layout="none"`` identity when no CP prep applies), whose token
+        (the identity sharder when no CP prep applies), whose token
         verbs keep per-token tensors aligned with the sharded inputs.
     """
 
     magi_enabled = magi is not None and getattr(magi, "enabled", False)
     cp_sharder = None
     has_hook = model is not None and hasattr(model, "prepare_model_inputs_for_cp")
-    effective_cp_size = cp_size if cp_size is not None else _mesh_dim_size(device_mesh, "cp")
+    effective_cp_size = _mesh_dim_size(device_mesh, "cp")
 
     # llm-domain magi replaces the whole batch prep (no model has both a CP
     # hook and magi); vlm-domain magi composes with the vision pre-embed.
@@ -307,7 +310,7 @@ def prepare_cp_forward(
             else:
                 batch[key] = value
 
-    return make_cp_batch_and_ctx(
+    return _make_cp_batch_and_ctx(
         device_mesh,
         batch,
         loss_mask,
@@ -334,8 +337,8 @@ def _resolve_cp_sharder(
 ) -> CPSharder:
     """Resolve the CPSharder for this forward: model-owned > magi > TE > generic > none.
 
-    Always returns a sharder: when no CP prep applies, the ``layout="none"``
-    identity sharder, so callers hold working token verbs at every cp_size and
+    Always returns a sharder: when no CP prep applies, an identity sharder,
+    so callers hold working token verbs at every cp_size and
     need no branches. The generic torch ``context_parallel`` path only shards
     at cp_size > 1; model-owned, magi, and TE sharders may also run at
     cp_size <= 1 for native THD packing conversion / mask-spec activation. The
@@ -387,7 +390,7 @@ def _resolve_cp_sharder(
                         magi_sharder.original_seq_len = row_shape[1]
             return contextlib.nullcontext, prepped
 
-        magi_sharder = CPSharder(shard_batch=_shard_batch_magi, local_token_global_indices=None, layout="magi")
+        magi_sharder = CPSharder(shard_batch=_shard_batch_magi, local_token_global_indices=None)
         return magi_sharder
 
     if use_te:
@@ -415,7 +418,7 @@ def _resolve_cp_sharder(
                     te_sharder.padded_seq_len = row_shape[0] * row_shape[1]
             return contextlib.nullcontext, prepped
 
-        te_sharder = CPSharder(shard_batch=_shard_batch_te, local_token_global_indices=None, layout="thd")
+        te_sharder = CPSharder(shard_batch=_shard_batch_te, local_token_global_indices=None)
         return te_sharder
 
     if cp_active:
@@ -444,7 +447,6 @@ def _resolve_cp_sharder(
         rr_sharder = CPSharder(
             shard_batch=_shard_batch_round_robin,
             local_token_global_indices=round_robin_local_indices,
-            layout="round_robin",
         )
         return rr_sharder
 
@@ -460,7 +462,6 @@ def _resolve_cp_sharder(
     none_sharder = CPSharder(
         shard_batch=_shard_batch_none,
         local_token_global_indices=identity_local_indices,
-        layout="none",
     )
     return none_sharder
 
@@ -492,7 +493,7 @@ def unshard_context_parallel_tensor(
     return unsharded
 
 
-def make_cp_batch_and_ctx(
+def _make_cp_batch_and_ctx(
     device_mesh,
     batch,
     loss_mask=None,
@@ -530,11 +531,6 @@ def make_cp_batch_and_ctx(
         ``gather_token_tensor``) to keep per-token tensors aligned with the
         sharded inputs.
     """
-
-    def _get_submesh(device_mesh, name):
-        if name in getattr(device_mesh, "mesh_dim_names", {}):
-            return device_mesh[name]
-        return None
 
     cp_mesh = _get_submesh(device_mesh, "cp")
     tp_mesh = _get_submesh(device_mesh, "tp")

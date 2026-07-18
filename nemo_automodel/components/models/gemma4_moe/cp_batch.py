@@ -25,7 +25,7 @@ manual CP attention mask builder needs, and the Gemma4 per-token batch keys
 (``mm_token_type_ids``, ``per_layer_inputs``) that must be padded and sharded
 alongside the sequence. Gemma4's ``prepare_model_inputs_for_cp`` exposes it
 through the ``CPSharder`` it returns under the ``"cp_sharder"`` batch key,
-which ``cp_utils.make_cp_batch_and_ctx`` invokes in place of the default
+which the CP dispatch invokes in place of the default
 load-balanced ``context_parallel`` path.
 """
 
@@ -90,7 +90,7 @@ def make_contiguous_shard_cp_batch_and_ctx(
     """Prepare and contiguously shard a batch for Gemma4's ring CP.
 
     Exposed as ``CPSharder.shard_batch`` by Gemma4's ``_cp_shard_batch``;
-    ``cp_utils.make_cp_batch_and_ctx`` invokes it. Synthesizes the
+    the CP dispatch invokes it. Synthesizes the
     ``_packed_seq_ids`` boundary map, then delegates to the shared contiguous
     sharder with Gemma4's per-token keys, keeping one contiguous sequence
     slice per CP rank (no collective; the transport lives in Gemma4's own

@@ -1000,7 +1000,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         """Gemma4-owned CP batch sharder that also self-installs the ring.
 
         Exposed as ``CPSharder.shard_batch`` by
-        ``prepare_model_inputs_for_cp``. ``cp_utils.make_cp_batch_and_ctx`` calls it
+        ``prepare_model_inputs_for_cp``. The CP dispatch calls it
         with the CP submesh, which is the one place Gemma4 receives ``cp_mesh`` on a
         model-owned path -- so install the ring here (idempotent) before sharding,
         rather than depending on the framework to call ``setup_cp_attention``.
@@ -1430,7 +1430,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         cp_sharder = CPSharder(
             shard_batch=None,
             local_token_global_indices=contiguous_local_indices,
-            layout="contiguous",
         )
         cp_sharder.shard_batch = partial(self._cp_shard_batch, record_on=cp_sharder)
         prepared_inputs: dict[str, Any] = {

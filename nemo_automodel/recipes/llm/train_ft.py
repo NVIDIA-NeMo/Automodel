@@ -979,7 +979,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream.
         _use_te_value = _thd_collater
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
-        cp_size = getattr(getattr(self, "dist_setup", None), "cp_size", self.cfg.get("distributed.cp_size", 1))
         # Single CP dispatch: magi / model-owned (CPSharder) / TE-THD / generic
         # torch context_parallel.
         train_ctx, batch, _ = prepare_cp_forward(
@@ -990,7 +989,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             use_te=_use_te_value,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_num_chunks_value,
-            cp_size=cp_size,
         )
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()

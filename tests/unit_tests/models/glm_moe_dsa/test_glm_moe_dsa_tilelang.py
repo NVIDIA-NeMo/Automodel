@@ -1144,7 +1144,9 @@ def test_glm_dsa_prepare_model_inputs_for_cp_binds_batch_sharder():
     prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.arange(8).view(1, 8)}, num_chunks=3)
 
     sharder = prepared["cp_sharder"]
-    assert sharder.layout == "packed_thd"
+    from nemo_automodel.components.distributed.cp_sharder import contiguous_local_indices
+
+    assert sharder.local_token_global_indices is contiguous_local_indices
     fn = sharder.shard_batch
     assert fn.func is cp_mod.make_glm_dsa_packed_cp_batch_and_ctx
     assert fn.keywords["num_chunks"] == 3

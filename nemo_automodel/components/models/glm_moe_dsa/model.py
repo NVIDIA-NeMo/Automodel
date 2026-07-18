@@ -364,7 +364,6 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             # Contiguous over the packed THD token axis: rank r keeps
             # tokens [r * T/cp, (r + 1) * T/cp).
             local_token_global_indices=contiguous_local_indices,
-            layout="packed_thd",
         )
         cp_sharder.shard_batch = partial(
             make_glm_dsa_packed_cp_batch_and_ctx,

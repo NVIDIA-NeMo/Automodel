@@ -979,7 +979,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
 
         The VLM->LM multimodal scatter and mRoPE ``get_rope_index`` must run on the
         *full* (unsharded) sequence; context-parallel sharding then happens on the
-        returned ``inputs_embeds`` / ``position_ids`` via ``make_cp_batch_and_ctx``.
+        returned ``inputs_embeds`` / ``position_ids`` via the CP dispatch.
 
         Removes the raw input keys it consumed from ``batch``; the dispatcher merges
         the returned entries on top.

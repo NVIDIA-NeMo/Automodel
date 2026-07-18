@@ -506,7 +506,9 @@ def test_prepare_model_inputs_for_cp_returns_sharder():
     prepared = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, {"input_ids": torch.arange(8).view(1, 8)})
 
     sharder = prepared["cp_sharder"]
-    assert sharder.layout == "contiguous"
+    from nemo_automodel.components.distributed.cp_sharder import contiguous_local_indices
+
+    assert sharder.local_token_global_indices is contiguous_local_indices
     fn = sharder.shard_batch
     # the partial binds the config-derived per-rank multiple (lcm(8,128) == 128)
     assert fn.keywords["pad_multiple"] == 128

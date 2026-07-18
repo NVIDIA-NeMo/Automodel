@@ -19,7 +19,7 @@ sharding and attention transport returns one from
 ``prepare_model_inputs_for_cp`` under the ``"cp_sharder"`` batch key; the
 framework constructs its own for the remaining backends (torch
 ``context_parallel`` round-robin, TE/THD, MagiAttention) so
-``cp_utils.make_cp_batch_and_ctx`` reduces to resolving a sharder and calling
+the CP dispatch (``cp_utils.prepare_cp_forward``) reduces to resolving a sharder and calling
 ``shard_batch``. This replaces the retired private batch keys
 (``_cp_make_batch_fn``, ``_cp_metadata_seq_dims``, ``_cp_metadata_pad_values``,
 ``_cp_full_logits_grad_touch``).
@@ -36,7 +36,8 @@ partitioning, magi's dispatch solver) start as None and install the index map
 computed during ``shard_batch`` via :func:`captured_token_indices` — the
 framework builds those sharders per resolution, so a capture never leaks
 across steps. Before the first ``shard_batch`` their token verbs raise.
-``layout`` is a diagnostic string; no framework code may branch on it.
+The sharder carries no backend tag: nothing may branch on which backend
+produced it.
 
 This module also hosts the framework's ``shard_batch`` implementations: the
 shared contiguous-shard batch prep used by models whose CP ranks own contiguous
@@ -89,7 +90,7 @@ def contiguous_local_indices(cp_mesh, padded_seq_len: int, device: torch.device 
 def identity_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
     """Global positions owned by this rank when CP is inactive: all of them.
 
-    Index map of the ``layout="none"`` sharder, so consumers run the same
+    Index map of the identity sharder, so consumers run the same
     token-verb code path at cp_size <= 1 (shard/gather become identities).
     """
     del cp_mesh
@@ -239,7 +240,6 @@ class CPSharder:
             partition computed during ``shard_batch`` (see
             :func:`captured_token_indices`); their token verbs raise until the
             first shard.
-        layout: Diagnostic label; never branched on by framework code.
         original_seq_len: Pre-pad sequence length captured at shard time; None
             when the layout has no single original length (packed streams).
         padded_seq_len: Post-pad global sequence length captured at shard time;
@@ -254,7 +254,6 @@ class CPSharder:
 
     shard_batch: Callable[..., tuple[Callable, dict[str, Any]]]
     local_token_global_indices: Callable[..., torch.Tensor] | None
-    layout: str = "custom"
     # Facts captured while shard_batch runs (framework sharders are built per
     # resolution, model sharders per hook call, so captures never leak across
     # steps). They let the token verbs accept/return tensors in the CALLER's
@@ -267,7 +266,7 @@ class CPSharder:
     def _indices(self, cp_mesh, padded_seq_len: int, device) -> torch.Tensor:
         if self.local_token_global_indices is None:
             raise NotImplementedError(
-                f"CPSharder(layout={self.layout!r}) has a data-dependent token layout; its index map is "
+                "This CPSharder has a data-dependent token layout; its index map is "
                 "captured during shard_batch — token-tensor shard/gather are unavailable before the first shard."
             )
         return self.local_token_global_indices(cp_mesh, padded_seq_len, device)
@@ -315,7 +314,7 @@ class CPSharder:
                 tensor = _pad_tensor_seq_dim_(tensor, seq_dim, self.padded_seq_len - length, fill)
             else:
                 raise ValueError(
-                    f"CPSharder(layout={self.layout!r}) sharded a batch of padded_seq_len={self.padded_seq_len} "
+                    f"This CPSharder sharded a batch of padded_seq_len={self.padded_seq_len} "
                     f"(original_seq_len={self.original_seq_len}), got a tensor of length {length} on dim {seq_dim}. "
                     "Pass the original-length tensor with an explicit `fill`, or pre-pad it yourself."
                 )
@@ -361,7 +360,7 @@ class CPSharder:
         if self.original_seq_len is not None:
             return full.narrow(seq_dim, 0, self.original_seq_len)
         raise NotImplementedError(
-            f"CPSharder(layout={self.layout!r}) captured no original-coordinate facts; "
+            "This CPSharder captured no original-coordinate facts; "
             "gather with trim=False and restore the layout with the batch metadata "
             "(padding_mask / cu_seqlens)."
         )
@@ -427,7 +426,7 @@ def _prepare_contiguous_cp_batch(batch, loss_mask):
     has_inputs_embeds = "inputs_embeds" in batch
     has_input_ids = "input_ids" in batch
     assert has_inputs_embeds ^ has_input_ids, (
-        "make_cp_batch_and_ctx requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
+        "the CP dispatch requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
     )
     primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
     primary_seq_tensor = batch[primary_key]
@@ -653,7 +652,7 @@ def shard_batch_load_balanced(
     has_inputs_embeds = "inputs_embeds" in batch
     has_input_ids = "input_ids" in batch
     assert has_inputs_embeds ^ has_input_ids, (
-        "make_cp_batch_and_ctx requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
+        "the CP dispatch requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
     )
     if has_inputs_embeds:
         primary_seq_tensor = batch["inputs_embeds"]

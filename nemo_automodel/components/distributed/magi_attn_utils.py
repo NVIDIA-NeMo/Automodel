@@ -50,7 +50,7 @@ from typing import Any, Optional
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx, make_cp_batch_for_te
+from nemo_automodel.components.distributed.cp_utils import _make_cp_batch_and_ctx, make_cp_batch_for_te
 
 logger = logging.getLogger(__name__)
 
@@ -795,7 +795,7 @@ class MagiState:
             # cu_seqlens -> the magi attn_func builds the per-document mask.
             # position_ids here are per-document RoPE positions, not stream
             # indices, so no index map is exposed.
-            _, batch, _ = make_cp_batch_and_ctx(
+            _, batch, _ = _make_cp_batch_and_ctx(
                 device_mesh, batch, use_te=True, padding_token_id=pad_id, num_chunks=num_chunks
             )
         return nullcontext, batch, local_indices
@@ -824,7 +824,7 @@ class MagiState:
     ):
         """Backend-owned per-step batch prep, shaped like ``make_cp_batch_for_te``.
 
-        Called by ``cp_utils.make_cp_batch_and_ctx`` at the same dispatch rung
+        Called by the CP dispatch at the same rung
         as the TE path: magi manages its own CP transport, so the context is
         implicitly ``nullcontext`` and only the prepped batch is returned.
         Everything recipe-static (domain, cp group, device mesh, HF-vs-custom)

@@ -135,7 +135,6 @@ def test_sharder_default_shard_token_tensor_uses_indices():
     sharder = cs.CPSharder(
         shard_batch=lambda *a, **k: (contextlib.nullcontext, {}),
         local_token_global_indices=cs.contiguous_local_indices,
-        layout="contiguous",
     )
     full = torch.randn(1, 8)
     local = sharder.shard_token_tensor(_FakeMesh(2, 1), full, seq_dim=1)
@@ -148,7 +147,6 @@ def test_shard_batch_contiguous_records_shard_facts():
     sharder = cs.CPSharder(
         shard_batch=None,
         local_token_global_indices=cs.contiguous_local_indices,
-        layout="contiguous",
     )
     mesh = _FakeMesh(2, 0)
     batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
@@ -178,7 +176,6 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
     sharder = cs.CPSharder(
         shard_batch=None,
         local_token_global_indices=cs.contiguous_local_indices,
-        layout="contiguous",
         original_seq_len=None,
         padded_seq_len=4,
         input_token_stream_positions=positions,
@@ -201,7 +198,6 @@ def test_gather_trim_raises_without_captured_facts():
     sharder = cs.CPSharder(
         shard_batch=None,
         local_token_global_indices=cs.contiguous_local_indices,
-        layout="contiguous",
     )
     with pytest.raises(NotImplementedError, match="captured no original-coordinate facts"):
         sharder.gather_token_tensor(_FakeMesh(1), torch.zeros(1, 4), trim=True)
@@ -224,9 +220,8 @@ def test_sharder_token_verbs_unavailable_for_data_dependent_layouts():
     sharder = cs.CPSharder(
         shard_batch=lambda *a, **k: (contextlib.nullcontext, {}),
         local_token_global_indices=None,
-        layout="thd",
     )
-    with pytest.raises(NotImplementedError, match="thd"):
+    with pytest.raises(NotImplementedError, match="data-dependent"):
         sharder.shard_token_tensor(_FakeMesh(2, 0), torch.randn(1, 8))
     with pytest.raises(NotImplementedError, match="data-dependent"):
         sharder.gather_token_tensor(_FakeMesh(2, 0), torch.randn(1, 4))
