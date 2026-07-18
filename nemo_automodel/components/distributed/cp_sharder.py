@@ -381,7 +381,7 @@ class ContextParallelismSharder:
         )
 
 
-# Uniform "no facts yet" placeholder so the verbs read one code path.
+# Uniform "no layout yet" placeholder so the verbs read one code path.
 _NO_SHARD_LAYOUT = ShardLayout()
 
 
