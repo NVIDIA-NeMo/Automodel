@@ -1070,8 +1070,8 @@ def run_checkpoint_robustness(
         )
         _barrier()
 
-    # Phase 1: Construct the training model, optionally compare it against the
-    # raw HF source-load reference, then train and checkpoint.
+    # Phase 1: Construct the model, optionally compare it against the raw HF
+    # source-load reference, then train and checkpoint.
     torch.cuda.reset_peak_memory_stats()
     trainer = recipe_cls(cfg)
     trainer.setup()
@@ -1089,17 +1089,24 @@ def run_checkpoint_robustness(
         )
         if source_load_failure is not None:
             deferred_failures.append(f"Phase 0 source-load parity:\n{source_load_failure}")
-        for model_part in trainer.model_parts:
-            model_part.train()
-        # A function-local loop variable keeps its last value alive after the
-        # loop. Drop it explicitly so Phase 1's model can be reclaimed before
-        # the fresh Phase 6 baseline model is built.
-        del model_part
         del trainer_source_logits, source_load_reference
         _barrier()
         if _rank0():
             _cleanup_source_load_sync(cfg)
         _barrier()
+
+        # Do not train with a model that has already run a no-grad parity
+        # forward. FSDP2 and non-reentrant activation-checkpoint wrappers keep
+        # forward bookkeeping that is expected to match the first backward;
+        # reusing the probed model can make that bookkeeping nondeterministic.
+        # A fresh recipe is also the clearest separation between the optional
+        # diagnostic and the checkpoint lifecycle under test.
+        _release_recipe_memory(trainer)
+        del trainer
+        _barrier()
+        cfg = parse_args_and_load_config()
+        trainer = recipe_cls(cfg)
+        trainer.setup()
 
     trainer.run_train_validation_loop()
 
