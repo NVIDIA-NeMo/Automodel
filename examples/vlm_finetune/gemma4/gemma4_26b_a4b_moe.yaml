@@ -117,7 +117,9 @@ freeze_config:
 ci:
   recipe_owner: athitten
   nodes: 1
-  time: "00:45:00"
+  # Full diagnostic includes two source loads, consolidated reloads, and a
+  # baseline/resume pair in addition to the normal 26B MoE finetune.
+  time: "01:15:00"
   checkpoint_robustness:
     # Match the validated per-rank image batch; the shared robustness default
     # of 2 exceeds this 26B MoE recipe's memory envelope.
