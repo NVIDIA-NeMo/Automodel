@@ -266,6 +266,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.step3p5.model", "Step3p5ForCausalLM"),
         ),
         (
+            "InklingForConditionalGeneration",
+            ("nemo_automodel.components.models.inkling.model", "InklingForConditionalGeneration"),
+        ),
+        (
             "Step3p7ForConditionalGeneration",
             ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
         ),
