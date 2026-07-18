@@ -24,7 +24,5 @@ exempt_configs:
     reason: "Deprecated for 26.10 (Qwen2.5)"
   custom_qwen2_5_32b_peft_benchmark_2nodes:
     reason: "Deprecated for 26.10 (Qwen2.5)"
-  qwen2_5_7b_peft_benchmark:
-    reason: "Deprecated for 26.10 (Qwen2.5)"
 
 known_issue:
