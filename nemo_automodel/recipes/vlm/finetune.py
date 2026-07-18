@@ -44,7 +44,7 @@ from nemo_automodel._transformers import (
     NeMoAutoModelForImageTextToText,
     NeMoAutoModelForMultimodalLM,
 )
-from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
@@ -559,7 +559,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Extract mRoPE position-id builder from the model so VLM neat packing can
         # produce 3D position_ids per sample. Without this, packed multimodal
         # training silently degrades mRoPE to plain 1D positions.
-        get_rope_index = getattr(self.model_parts[0], "get_rope_index", None)
+        get_rope_index = resolve_get_rope_index(self.model_parts[0])
         pp_n_microbatches = None
         pp_cp_preembed = (
             self.pp_enabled
