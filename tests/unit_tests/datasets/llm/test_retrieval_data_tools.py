@@ -64,10 +64,29 @@ class _DummyRetrievalDataset:
         return self.examples[idx]
 
 
+class _FingerprintDataset(list):
+    def __init__(self, rows, *, fingerprint=None, fail_after=None):
+        super().__init__(rows)
+        self._fingerprint = fingerprint or json.dumps(rows, sort_keys=True)
+        self.fail_after = fail_after
+
+    def __iter__(self):
+        for idx in range(len(self)):
+            if self.fail_after is not None and idx == self.fail_after:
+                raise RuntimeError("interrupted source iteration")
+            yield self[idx]
+
+
 class _FakeCorpusInfo:
-    def __init__(self, docs):
-        self.metadata = {"corpus_id": "test", "query_instruction": "query:", "passage_instruction": "passage:"}
+    def __init__(self, docs, *, corpus_id="test", fingerprint=None):
+        self.metadata = {
+            "corpus_id": corpus_id,
+            "query_instruction": "query:",
+            "passage_instruction": "passage:",
+        }
         self.docs = docs
+        corpus_fingerprint = fingerprint or f"{corpus_id}:{','.join(sorted(docs))}"
+        self.corpus = types.SimpleNamespace(data=types.SimpleNamespace(_fingerprint=corpus_fingerprint))
 
     def get_document_by_id(self, doc_id):
         return self.docs[doc_id]
@@ -124,22 +143,24 @@ def _patch_normalized_source(monkeypatch, image_mod, *, fail_on=None):
             raise RuntimeError(f"failed source: {source_path}")
         source_name = "a" if "source_a" in str(source_path) else "b"
         return (
-            [
-                {
-                    "question_id": f"{source_name}-q0",
-                    "question": f"{source_name} Q0",
-                    "corpus_id": "test",
-                    "pos_doc": [{"id": f"{source_name}-p0"}],
-                    "neg_doc": [{"id": f"{source_name}-n0"}],
-                },
-                {
-                    "question_id": f"{source_name}-q1",
-                    "question": f"{source_name} Q1",
-                    "corpus_id": "test",
-                    "pos_doc": [{"id": f"{source_name}-p1"}],
-                    "neg_doc": [{"id": f"{source_name}-n1"}],
-                },
-            ],
+            _FingerprintDataset(
+                [
+                    {
+                        "question_id": f"{source_name}-q0",
+                        "question": f"{source_name} Q0",
+                        "corpus_id": "test",
+                        "pos_doc": [{"id": f"{source_name}-p0"}],
+                        "neg_doc": [{"id": f"{source_name}-n0"}],
+                    },
+                    {
+                        "question_id": f"{source_name}-q1",
+                        "question": f"{source_name} Q1",
+                        "corpus_id": "test",
+                        "pos_doc": [{"id": f"{source_name}-p1"}],
+                        "neg_doc": [{"id": f"{source_name}-n1"}],
+                    },
+                ]
+            ),
             {
                 "test": _FakeCorpusInfo(
                     {
@@ -218,6 +239,52 @@ def test_normalized_resume_rejects_equal_count_with_wrong_document_ids(tmp_path,
         {"expected-a", "expected-b"},
     )
     assert metadata is None
+
+
+def test_normalized_corpus_paths_are_contained_and_collision_safe(tmp_path):
+    pytest.importorskip("datasets")
+    pytest.importorskip("datasets.arrow_writer")
+
+    output_dir = tmp_path / "normalized"
+    (output_dir / "corpus").mkdir(parents=True)
+    sentinel = output_dir / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    corpus_ids = [".", "..", "a/b", "a__b"]
+    refs_by_corpus = {corpus_id: {f"{corpus_id}-doc"} for corpus_id in corpus_ids}
+    corpus_dict = {
+        corpus_id: _FakeCorpusInfo(
+            {f"{corpus_id}-doc": {"text": corpus_id, "image": ""}},
+            corpus_id=corpus_id,
+        )
+        for corpus_id in corpus_ids
+    }
+
+    metadata = prep_norm._write_corpus_shards(
+        corpus_dict,
+        refs_by_corpus,
+        output_dir,
+        docs_per_shard=10,
+        jpeg_quality=90,
+    )
+    corpus_dirs = {Path(corpus["shards"][0]).parts[1] for corpus in metadata}
+    assert len(corpus_dirs) == len(corpus_ids)
+    assert prep_norm._safe_corpus_dir_name("a/b") != prep_norm._safe_corpus_dir_name("a__b")
+    assert all(name not in {".", ".."} for name in corpus_dirs)
+
+    for corpus in metadata:
+        for shard in corpus["shards"]:
+            (output_dir / shard).unlink()
+    prep_norm._write_corpus_shards(
+        corpus_dict,
+        refs_by_corpus,
+        output_dir,
+        docs_per_shard=10,
+        jpeg_quality=90,
+        resume=True,
+    )
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert (output_dir / "corpus").is_dir()
 
 
 def test_warm_retrieval_hf_cache_builds_original_dataset_from_config(tmp_path):
@@ -300,22 +367,24 @@ def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_p
         prep_norm,
         "load_datasets",
         lambda data_dir_list, concatenate, seed: (
-            [
-                {
-                    "question_id": "q0",
-                    "question": "Q",
-                    "corpus_id": "test",
-                    "pos_doc": [{"id": "p"}],
-                    "neg_doc": [{"id": "n"}],
-                },
-                {
-                    "question_id": "q1",
-                    "question": "Q again",
-                    "corpus_id": "test",
-                    "pos_doc": [{"id": "p"}],
-                    "neg_doc": [{"id": "n2"}],
-                },
-            ],
+            _FingerprintDataset(
+                [
+                    {
+                        "question_id": "q0",
+                        "question": "Q",
+                        "corpus_id": "test",
+                        "pos_doc": [{"id": "p"}],
+                        "neg_doc": [{"id": "n"}],
+                    },
+                    {
+                        "question_id": "q1",
+                        "question": "Q again",
+                        "corpus_id": "test",
+                        "pos_doc": [{"id": "p"}],
+                        "neg_doc": [{"id": "n2"}],
+                    },
+                ]
+            ),
             {
                 "test": _FakeCorpusInfo(
                     {
@@ -387,6 +456,160 @@ def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_p
     assert resumed_metadata["num_records"] == 2
     resumed_source_metadata = json.loads((source_dir / "metadata.json").read_text(encoding="utf-8"))
     assert resumed_source_metadata["corpora"][0]["num_docs"] == 3
+
+
+def test_normalized_resume_rewrites_partial_train_shards(tmp_path, monkeypatch):
+    pytest.importorskip("datasets")
+    pytest.importorskip("datasets.arrow_writer")
+
+    rows = [
+        {
+            "question_id": "q0",
+            "question": "Q0",
+            "corpus_id": "test",
+            "pos_doc": [{"id": "p0"}],
+            "neg_doc": [{"id": "n0"}],
+        },
+        {
+            "question_id": "q1",
+            "question": "Q1",
+            "corpus_id": "test",
+            "pos_doc": [{"id": "p1"}],
+            "neg_doc": [{"id": "n1"}],
+        },
+    ]
+    docs = {
+        "p0": {"text": "positive 0", "image": ""},
+        "n0": {"text": "negative 0", "image": ""},
+        "p1": {"text": "positive 1", "image": ""},
+        "n1": {"text": "negative 1", "image": ""},
+    }
+    load_count = 0
+
+    def load_source(data_dir_list, concatenate, seed):
+        nonlocal load_count
+        load_count += 1
+        fail_after = 1 if load_count == 1 else None
+        return (
+            _FingerprintDataset(rows, fingerprint="query-v1", fail_after=fail_after),
+            {"test": _FakeCorpusInfo(docs, fingerprint="corpus-v1")},
+        )
+
+    monkeypatch.setattr(prep_norm, "load_datasets", load_source)
+    output_dir = tmp_path / "normalized_partial"
+    prep_kwargs = {
+        "data_dir_list": ["source.json"],
+        "output_dir": output_dir,
+        "samples_per_shard": 10,
+        "docs_per_shard": 10,
+        "seed": 42,
+        "max_samples": None,
+        "jpeg_quality": 90,
+    }
+
+    with pytest.raises(RuntimeError, match="interrupted source iteration"):
+        prep_norm.prepare_normalized_dataset(**prep_kwargs)
+
+    train_dir = output_dir / "sources" / "source-00000" / "train"
+    assert list(train_dir.glob("train-*.arrow"))
+    assert not (train_dir / prep_norm._TRAIN_COMPLETION_FILENAME).exists()
+
+    metadata = prep_norm.prepare_normalized_dataset(**prep_kwargs, resume=True)
+    assert metadata["num_records"] == 2
+    assert (train_dir / prep_norm._TRAIN_COMPLETION_FILENAME).is_file()
+    dataset = nd.make_normalized_retrieval_dataset(data_dir_list=str(output_dir), n_passages=2)
+    assert len(dataset) == 2
+
+    completion_path = train_dir / prep_norm._TRAIN_COMPLETION_FILENAME
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion["num_records"] = 1
+    completion_path.write_text(json.dumps(completion), encoding="utf-8")
+    rewritten_metadata = prep_norm.prepare_normalized_dataset(**prep_kwargs, resume=True)
+    assert rewritten_metadata["num_records"] == 2
+    rewritten_completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    assert rewritten_completion["num_records"] == 2
+
+
+@pytest.mark.parametrize("changed_part", ["query", "corpus"])
+def test_normalized_resume_rejects_changed_source_contents(tmp_path, monkeypatch, changed_part):
+    pytest.importorskip("datasets")
+    pytest.importorskip("datasets.arrow_writer")
+
+    revisions = {"query": "v1", "corpus": "v1"}
+    rows = [
+        {
+            "question_id": "q0",
+            "question": "Q0",
+            "corpus_id": "test",
+            "pos_doc": [{"id": "p0"}],
+            "neg_doc": [{"id": "n0"}],
+        }
+    ]
+    docs = {
+        "p0": {"text": "positive", "image": ""},
+        "n0": {"text": "negative", "image": ""},
+    }
+
+    def load_source(data_dir_list, concatenate, seed):
+        return (
+            _FingerprintDataset(rows, fingerprint=f"query-{revisions['query']}"),
+            {"test": _FakeCorpusInfo(docs, fingerprint=f"corpus-{revisions['corpus']}")},
+        )
+
+    monkeypatch.setattr(prep_norm, "load_datasets", load_source)
+    output_dir = tmp_path / f"normalized_changed_{changed_part}"
+    prep_kwargs = {
+        "data_dir_list": ["source.json"],
+        "output_dir": output_dir,
+        "samples_per_shard": 10,
+        "docs_per_shard": 10,
+        "seed": 42,
+        "max_samples": None,
+        "jpeg_quality": 90,
+    }
+    prep_norm.prepare_normalized_dataset(**prep_kwargs)
+
+    revisions[changed_part] = "v2"
+    with pytest.raises(ValueError, match="source or prep options changed"):
+        prep_norm.prepare_normalized_dataset(**prep_kwargs, resume=True)
+
+
+def test_normalized_resume_rejects_unverifiable_source_contents(tmp_path, monkeypatch):
+    pytest.importorskip("datasets")
+    pytest.importorskip("datasets.arrow_writer")
+
+    rows = [
+        {
+            "question_id": "q0",
+            "question": "Q0",
+            "corpus_id": "test",
+            "pos_doc": [{"id": "p0"}],
+            "neg_doc": [{"id": "n0"}],
+        }
+    ]
+    docs = {
+        "p0": {"text": "positive", "image": ""},
+        "n0": {"text": "negative", "image": ""},
+    }
+    monkeypatch.setattr(
+        prep_norm,
+        "load_datasets",
+        lambda data_dir_list, concatenate, seed: (rows, {"test": _FakeCorpusInfo(docs)}),
+    )
+    output_dir = tmp_path / "normalized_unverifiable"
+    prep_kwargs = {
+        "data_dir_list": ["source.json"],
+        "output_dir": output_dir,
+        "samples_per_shard": 10,
+        "docs_per_shard": 10,
+        "seed": 42,
+        "max_samples": None,
+        "jpeg_quality": 90,
+    }
+    prep_norm.prepare_normalized_dataset(**prep_kwargs)
+
+    with pytest.raises(ValueError, match="does not provide verifiable content fingerprints"):
+        prep_norm.prepare_normalized_dataset(**prep_kwargs, resume=True)
 
 
 def test_prepare_normalized_vl_retrieval_data_preserves_source_bundles(tmp_path, monkeypatch):

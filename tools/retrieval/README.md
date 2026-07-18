@@ -138,11 +138,14 @@ different sources, so do not re-list old sources under a modified path or config
 
 ### Resume Interrupted Normalized Prep
 
-Use `--resume` when a normalized CPU prep job was interrupted and you want to reuse readable train shards and complete
-corpus directories from the same output directory. For the array launcher, submit the same `NUM_SOURCES` and
-`ARRAY_SPEC`; each task resumes its own `sources/source-*` directory and the finalizer refreshes the top-level metadata.
-Resume is for continuing an interrupted prep run; append mode is for adding new source entries to an already prepared
-bundle.
+Use `--resume` when a normalized CPU prep job was interrupted. The tool reuses train data only when its completion
+record and row count match, and it reuses corpus directories only when they contain every referenced document. It also
+verifies that the loaded query and corpus data have not changed. If the source changed or its content cannot be verified,
+resume stops and asks you to use a new output directory.
+
+For the array launcher, submit the same `NUM_SOURCES` and `ARRAY_SPEC`; each task resumes its own
+`sources/source-*` directory and the finalizer refreshes the top-level metadata. Resume is for continuing an interrupted
+prep run; append mode is for adding new source entries to an already prepared bundle.
 
 ## Warm Hugging Face Dataset Cache
 

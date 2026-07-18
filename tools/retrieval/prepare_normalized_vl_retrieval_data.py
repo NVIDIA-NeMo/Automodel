@@ -52,6 +52,8 @@ from nemo_automodel.shared.import_utils import safe_import
 
 logger = logging.getLogger(__name__)
 
+_TRAIN_COMPLETION_FILENAME = ".complete.json"
+
 
 class ArrowShardWriter:
     """Write fixed-size Arrow shards with Hugging Face's ArrowWriter."""
@@ -223,6 +225,43 @@ def _source_entry_name(source_entry: Any) -> str:
     return name or "source"
 
 
+def _loaded_dataset_fingerprint(dataset: Any) -> str | None:
+    fingerprint = getattr(dataset, "_fingerprint", None)
+    return fingerprint if isinstance(fingerprint, str) and fingerprint else None
+
+
+def _loaded_source_fingerprint(dataset: Any, corpus_dict: dict[str, Any]) -> str | None:
+    """Fingerprint the loaded query and corpus datasets used by one source."""
+    query_fingerprint = _loaded_dataset_fingerprint(dataset)
+    if query_fingerprint is None:
+        return None
+
+    corpus_fingerprints = []
+    for corpus_id in sorted(corpus_dict):
+        corpus_info = corpus_dict[corpus_id]
+        corpus = getattr(corpus_info, "corpus", None)
+        corpus_dataset = getattr(corpus, "_data", None)
+        if corpus_dataset is None:
+            corpus_dataset = getattr(corpus, "data", None)
+        corpus_fingerprint = _loaded_dataset_fingerprint(corpus_dataset)
+        if corpus_fingerprint is None:
+            return None
+        corpus_fingerprints.append(
+            {
+                "corpus_id": corpus_id,
+                "metadata": corpus_info.metadata,
+                "fingerprint": corpus_fingerprint,
+            }
+        )
+
+    payload = json.dumps(
+        {"query": query_fingerprint, "corpora": corpus_fingerprints},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
     temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
     try:
@@ -237,6 +276,7 @@ def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
 def _validate_or_write_resume_state(
     output_dir: Path,
     data_dir_list: list[Any],
+    source_fingerprint: str | None,
     *,
     samples_per_shard: int,
     docs_per_shard: int,
@@ -249,17 +289,24 @@ def _validate_or_write_resume_state(
     state_path = output_dir / ".resume-state.json"
     expected_state = {
         "source_key": _source_entry_key(data_dir_list),
+        "source_fingerprint": source_fingerprint,
         "samples_per_shard": samples_per_shard,
         "docs_per_shard": docs_per_shard,
         "seed": seed,
         "max_samples": max_samples,
         "jpeg_quality": jpeg_quality,
     }
+    if resume and state_path.is_file() and source_fingerprint is None:
+        raise ValueError(
+            f"Cannot safely resume normalized retrieval prep in {output_dir}: "
+            "the loaded source does not provide verifiable content fingerprints. Choose a new output directory."
+        )
     if state_path.is_file():
         existing_state = json.loads(state_path.read_text(encoding="utf-8"))
         if existing_state != expected_state:
             raise ValueError(
-                f"Cannot resume normalized retrieval prep in {output_dir}: the source or prep options changed. "
+                f"Cannot resume normalized retrieval prep in {output_dir}: "
+                "the source or prep options changed, including the loaded source contents. "
                 "Use the original inputs or choose a new output directory."
             )
         return
@@ -342,7 +389,17 @@ def _existing_source_keys(metadata: dict[str, Any]) -> set[str]:
 
 
 def _safe_corpus_dir_name(corpus_id: str) -> str:
-    return corpus_id.replace("/", "__")
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", corpus_id).strip("._-") or "corpus"
+    digest = hashlib.sha256(corpus_id.encode("utf-8")).hexdigest()[:16]
+    return f"{slug[:48]}-{digest}"
+
+
+def _corpus_output_dir(output_dir: Path, corpus_id: str) -> Path:
+    corpus_root = (output_dir / "corpus").resolve()
+    corpus_output_dir = (corpus_root / _safe_corpus_dir_name(corpus_id)).resolve()
+    if corpus_output_dir.parent != corpus_root:
+        raise ValueError(f"Corpus output path escapes the normalized corpus directory: {corpus_output_dir}")
+    return corpus_output_dir
 
 
 def _arrow_shard_paths(path: Path, filename_prefix: str) -> list[Path]:
@@ -359,8 +416,29 @@ def _parse_doc_refs(value: Any) -> list[dict[str, str]]:
 
 def _collect_refs_from_train_shards(train_dir: Path) -> tuple[list[str], int, dict[str, set[str]]] | None:
     """Read existing train shards from a previous interrupted run."""
+    completion_path = train_dir / _TRAIN_COMPLETION_FILENAME
+    if not completion_path.is_file():
+        if _arrow_shard_paths(train_dir, "train"):
+            logger.warning("Existing train shards in %s have no completion manifest; rewriting them", train_dir)
+        return None
+
+    try:
+        completion = json.loads(completion_path.read_text(encoding="utf-8"))
+        expected_paths = completion["shards"]
+        expected_num_records = completion["num_records"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        logger.warning("Train completion manifest is invalid in %s; rewriting train shards", train_dir, exc_info=True)
+        return None
+    if not isinstance(expected_paths, list) or not all(isinstance(path, str) for path in expected_paths):
+        logger.warning("Train completion manifest has invalid shard paths in %s; rewriting train shards", train_dir)
+        return None
+    if not isinstance(expected_num_records, int) or expected_num_records < 0:
+        logger.warning("Train completion manifest has an invalid record count in %s; rewriting train shards", train_dir)
+        return None
+
     train_paths = _arrow_shard_paths(train_dir, "train")
-    if not train_paths:
+    if [path.name for path in train_paths] != expected_paths:
+        logger.warning("Train shards do not match the completion manifest in %s; rewriting them", train_dir)
         return None
 
     has_datasets, datasets = safe_import("datasets")
@@ -387,6 +465,15 @@ def _collect_refs_from_train_shards(train_dir: Path) -> tuple[list[str], int, di
             num_records += len(shard)
     except Exception:
         logger.warning("Could not read existing train shards in %s; rewriting train shards", train_dir, exc_info=True)
+        return None
+
+    if num_records != expected_num_records:
+        logger.warning(
+            "Train shards contain %d records but the completion manifest expects %d in %s; rewriting them",
+            num_records,
+            expected_num_records,
+            train_dir,
+        )
         return None
 
     logger.info("Reusing %d existing normalized train records from %s", num_records, train_dir)
@@ -486,6 +573,10 @@ def _write_train_shards(
             )
     finally:
         writer.close()
+    _write_json_atomic(
+        output_dir / "train" / _TRAIN_COMPLETION_FILENAME,
+        {"version": 1, "shards": writer.shard_paths, "num_records": writer.num_records},
+    )
     logger.info("Wrote %d normalized train records using seed %d", writer.num_records, seed)
     return [f"train/{path}" for path in writer.shard_paths], writer.num_records, refs_by_corpus
 
@@ -518,7 +609,7 @@ def _write_corpus_shards(
             raise ValueError(f"Unknown corpus_id {corpus_id!r}; available corpora: {sorted(corpus_dict)}")
         corpus_info = corpus_dict[corpus_id]
         corpus_dir_name = _safe_corpus_dir_name(corpus_id)
-        corpus_output_dir = output_dir / "corpus" / corpus_dir_name
+        corpus_output_dir = _corpus_output_dir(output_dir, corpus_id)
         if resume and corpus_output_dir.exists():
             existing_metadata = _existing_corpus_metadata_if_complete(
                 corpus_id,
@@ -578,9 +669,11 @@ def _prepare_single_normalized_dataset(
 ) -> dict[str, Any]:
     """Write a normalized portable Arrow retrieval bundle."""
     _prepare_output_dir(output_dir, resume=resume)
+    dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True, seed=seed)
     _validate_or_write_resume_state(
         output_dir,
         data_dir_list,
+        _loaded_source_fingerprint(dataset, corpus_dict),
         samples_per_shard=samples_per_shard,
         docs_per_shard=docs_per_shard,
         seed=seed,
@@ -588,7 +681,6 @@ def _prepare_single_normalized_dataset(
         jpeg_quality=jpeg_quality,
         resume=resume,
     )
-    dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True, seed=seed)
     existing_train = _collect_refs_from_train_shards(output_dir / "train") if resume else None
     if existing_train is None:
         if resume and (output_dir / "train").exists():
@@ -893,7 +985,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Seed used for source sampling, if configured")
     parser.add_argument("--max-samples", type=int, default=None, help="Optional global train sample cap")
     parser.add_argument("--jpeg-quality", type=int, default=95, help="JPEG quality for packed corpus images")
-    parser.add_argument("--resume", action="store_true", help="Reuse complete shards in an existing output directory")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse verified completed output from an interrupted preparation run",
+    )
     parser.add_argument(
         "--source-index",
         type=int,
