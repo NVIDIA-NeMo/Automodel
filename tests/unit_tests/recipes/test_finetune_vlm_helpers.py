@@ -3079,7 +3079,7 @@ class TestChunkVlmMedia:
         assert "patch_pixel_values" not in chunks
         assert "patch_newline_mask" not in chunks
 
-        with pytest.raises(ValueError, match="one full image tensor per sample"):
+        with pytest.raises(ValueError, match="cannot align pixel_values with num_patches"):
             chunk_step3_media(pixel_values[:2], batch_size=3, n_microbatches=2)
         with pytest.raises(ValueError, match="num_patches must have length"):
             chunk_step3_media(pixel_values, batch_size=3, n_microbatches=2, num_patches=torch.tensor([1, 2]))
@@ -3178,6 +3178,21 @@ class TestChunkVlmMedia:
         with stage_vlm_media_for_pp(pp, [model], batch):
             assert torch.equal(model(), first_chunk)
             assert model._vlm_chunk_idx == 1
+
+    def test_prepare_flat_patches_without_image_grid(self):
+        pixel_values = torch.arange(5 * 2 * 2 * 2 * 3).reshape(5, 2, 2, 2, 3)
+        batch = {
+            "input_ids": torch.ones(2, 4, dtype=torch.long),
+            "pixel_values": pixel_values,
+            "num_patches": torch.tensor([2, 3]),
+        }
+
+        prepared = prepare_vlm_media_for_pp(batch, batch_size=2, n_microbatches=2)
+        media = prepared[VLM_PP_MEDIA_KEY]
+
+        assert torch.equal(media["pixel_values"][0], pixel_values[:2])
+        assert torch.equal(media["pixel_values"][1], pixel_values[2:])
+        assert [chunk.tolist() for chunk in media["num_patches"]] == [[2], [3]]
 
 
 # -----------------------------------------------------------------------------
