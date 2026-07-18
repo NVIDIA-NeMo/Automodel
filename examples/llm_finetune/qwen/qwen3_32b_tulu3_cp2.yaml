@@ -54,7 +54,7 @@ step_scheduler:
   local_batch_size: 2  # doubled vs cp1 because CP halves dp_size (8 -> 4)
   ckpt_every_steps: 1000
   val_every_steps: 100  # will run every x number of gradient steps
-  max_steps: 500
+  max_steps: 100
 
 dist_env:
   backend: nccl
@@ -100,10 +100,22 @@ dataset:
   seq_length: 2048
   truncation: true  # cap the ~0.4% of samples longer than 2048; the rest are unchanged
   padding: do_not_pad  # dataset stays unpadded; the collater pads to the fixed 2048
-  # {% generation %} blocks let the tokenizer emit the assistant loss mask directly;
-  # the stock Qwen3 template rewrites earlier turns and can't build the mask by prefix.
+  # SFT supervises only assistant tokens, but the stock Qwen3 template can't produce that loss mask
+  # (it rewrites earlier turns); this override adds {% generation %} blocks so the tokenizer emits it.
   chat_template: examples/llm_finetune/qwen/qwen3_tulu3_chat_template.jinja
 
+# Packing stays off: Qwen3-32B (dense) has no custom NeMo model class, so it loads
+# directly as the stock HF Qwen3ForCausalLM. With CP>1 the only usable attention is
+# SDPA: CP is implemented by intercepting F.scaled_dot_product_attention (torch's
+# context_parallel ring / all-gather), and HF's flash_attention_2 bypasses SDPA and
+# calls the flash-attn kernels directly, so the CP all-gather never fires (each rank
+# would attend only to its local shard). But packing + CP>1 over SDPA is not supported
+# (rejected in _apply_preload_overrides: "Packed sequence is only supported with CP
+# size 1"), because SDPA has no cu_seqlens/varlen interface and CP over varlen-packed
+# sequences isn't implemented. Supporting packing under CP for Qwen3-32B would require
+# a custom NeMo model class with a cu_seqlens-aware backend (TE or magi) that owns its
+# packed-CP routing (as the qwen3_moe TE/magi recipes do). We don't have that here, so
+# we get long (>=1k) sequences via a fixed seq_length + padding instead of packing.
 packed_sequence:
   packed_sequence_size: 0
 

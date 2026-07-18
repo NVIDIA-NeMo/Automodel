@@ -50,7 +50,7 @@ step_scheduler:
   local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: 100  # will run every x number of gradient steps
-  max_steps: 500
+  max_steps: 100
 
 dist_env:
   backend: nccl
@@ -96,8 +96,8 @@ dataset:
   seq_length: 2048
   truncation: true  # cap the ~0.4% of samples longer than 2048; the rest are unchanged
   padding: do_not_pad  # dataset stays unpadded; the collater pads to the fixed 2048
-  # {% generation %} blocks let the tokenizer emit the assistant loss mask directly;
-  # the stock Qwen3 template rewrites earlier turns and can't build the mask by prefix.
+  # SFT supervises only assistant tokens, but the stock Qwen3 template can't produce that loss mask
+  # (it rewrites earlier turns); this override adds {% generation %} blocks so the tokenizer emits it.
   chat_template: examples/llm_finetune/qwen/qwen3_tulu3_chat_template.jinja
 
 packed_sequence:
