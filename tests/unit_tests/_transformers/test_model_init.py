@@ -26,6 +26,7 @@ from nemo_automodel._transformers.model_init import (
     _has_safetensors,
     _init_model,
     _load_config_with_layer_types_fix,
+    _prepopulate_remote_code_cache,
     _propagate_torch_dtype_to_subconfigs,
     _resolve_model_dir,
     _setup_bnb_loading_kwargs,
@@ -192,6 +193,34 @@ class TestBackendDictCoercion:
         captured = self._run_init_model(mock_resolve_cls)
 
         assert "backend" not in captured
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_process_group_is_forwarded_only_to_weight_download(self, mock_resolve_cls, mock_download):
+        process_group = object()
+
+        captured = self._run_init_model(mock_resolve_cls, _process_group=process_group)
+
+        assert "_process_group" not in captured
+        assert mock_download.call_args.args[1] == "fake/model"
+        assert mock_download.call_args.kwargs == {"process_group": process_group}
+
+
+def test_remote_code_cache_serialization_uses_model_process_group(tmp_path):
+    model_dir = tmp_path / "remote_model"
+    model_dir.mkdir()
+    (model_dir / "modeling_remote.py").write_text("class RemoteModel: pass\n")
+    config = MagicMock(auto_map={"AutoModel": "modeling_remote.RemoteModel"})
+    process_group = object()
+
+    with (
+        patch("nemo_automodel._transformers.model_init.dist_utils.FirstRankPerNode") as first_rank,
+        patch("transformers.dynamic_module_utils.get_cached_module_file", return_value="remote/modeling_remote.py"),
+    ):
+        first_rank.return_value.__enter__.return_value = True
+        _prepopulate_remote_code_cache(config, str(model_dir), {}, process_group=process_group)
+
+    first_rank.assert_called_once_with(group=process_group)
 
 
 class TestGetHfConfigNestedKwargs:

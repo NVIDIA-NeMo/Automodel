@@ -41,7 +41,6 @@ from nemo_automodel.recipes._typed_config import (
 from nemo_automodel.recipes.vlm.finetune import (
     FinetuneRecipeForVLM,
     _get_model_name,
-    _resolve_get_rope_index,
     build_model,
 )
 
@@ -2861,20 +2860,43 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_pp_rank", lambda self: 0)
 
 
-def _minimal_vlm_cfg(cp_size: int, rope_fusion: bool):
-    return ConfigNode(
-        {
-            "model": {"backend": {"rope_fusion": rope_fusion}},
-            "dataloader": {},
-            "dataset": {"path_or_dataset": "dummy"},
-            "validation_dataloader": {},
-            "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
-            "optimizer": {},
-            "loss_fn": {},
-            "checkpoint": {"best_metric_key": "default"},
-            "distributed": {"cp_size": cp_size},
-        }
-    )
+def _minimal_vlm_cfg(cp_size: int, rope_fusion: bool, prewarm: dict[str, bool] | None = None) -> ConfigNode:
+    cfg = {
+        "model": {"backend": {"rope_fusion": rope_fusion}},
+        "dataloader": {},
+        "dataset": {"path_or_dataset": "dummy"},
+        "validation_dataloader": {},
+        "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
+        "optimizer": {},
+        "loss_fn": {},
+        "checkpoint": {"best_metric_key": "default"},
+        "distributed": {"cp_size": cp_size},
+    }
+    if prewarm is not None:
+        cfg["prewarm"] = prewarm
+    return ConfigNode(cfg)
+
+
+def test_vlm_setup_applies_prewarm_config(monkeypatch):
+    """VLM setup should apply the typed prewarm config to its parallelized model parts."""
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False, prewarm={"comm_groups": True})
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    calls = []
+
+    def _record_apply(self, *, model_parts, device, pp_mesh=None):
+        calls.append((self, model_parts, device, pp_mesh))
+
+    monkeypatch.setattr("nemo_automodel.components.training.prewarm.PrewarmConfig.apply", _record_apply)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert len(calls) == 1
+    prewarm, model_parts, device, pp_mesh = calls[0]
+    assert prewarm.comm_groups is True
+    assert model_parts == trainer.model_parts
+    assert device == torch.device("cpu")
+    assert pp_mesh is None
 
 
 def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
@@ -3123,7 +3145,7 @@ class TestChunkVlmMedia:
         assert "patch_pixel_values" not in chunks
         assert "patch_newline_mask" not in chunks
 
-        with pytest.raises(ValueError, match="one full image tensor per sample"):
+        with pytest.raises(ValueError, match="cannot align pixel_values with num_patches"):
             chunk_step3_media(pixel_values[:2], batch_size=3, n_microbatches=2)
         with pytest.raises(ValueError, match="num_patches must have length"):
             chunk_step3_media(pixel_values, batch_size=3, n_microbatches=2, num_patches=torch.tensor([1, 2]))
@@ -3159,6 +3181,21 @@ class TestChunkVlmMedia:
         assert model._vlm_num_patches_chunks is None
         assert model._vlm_patch_newline_mask_chunks is None
         assert model._vlm_chunk_idx is None
+
+    def test_prepare_flat_patches_without_image_grid(self):
+        pixel_values = torch.arange(5 * 2 * 2 * 2 * 3).reshape(5, 2, 2, 2, 3)
+        batch = {
+            "input_ids": torch.ones(2, 4, dtype=torch.long),
+            "pixel_values": pixel_values,
+            "num_patches": torch.tensor([2, 3]),
+        }
+
+        prepared = prepare_vlm_media_for_pp(batch, batch_size=2, n_microbatches=2)
+        media = prepared[VLM_PP_MEDIA_KEY]
+
+        assert torch.equal(media["pixel_values"][0], pixel_values[:2])
+        assert torch.equal(media["pixel_values"][1], pixel_values[2:])
+        assert [chunk.tolist() for chunk in media["num_patches"]] == [[2], [3]]
 
 
 # -----------------------------------------------------------------------------
@@ -3325,75 +3362,3 @@ def test_build_dataloader_forwards_inject_fake_images_false():
 
     wrapper_mock = _run_build_dataloader_capturing_wrapper(cfg)
     assert wrapper_mock.call_args.kwargs["inject_fake_images"] is False
-
-
-class _RopeInnerModel(nn.Module):
-    """Stand-in for a transformers base model that owns ``get_rope_index``."""
-
-    def get_rope_index(self, input_ids=None, **kwargs):
-        return None, None
-
-
-class _RopeWrapper(nn.Module):
-    """Mimics the ``*ForConditionalGeneration`` layout of Qwen-VL models.
-
-    ``get_rope_index`` lives on the base model, and ``base_model`` resolves
-    through ``base_model_prefix`` exactly as ``PreTrainedModel`` does.
-    """
-
-    base_model_prefix = "model"
-
-    def __init__(self, inner=None):
-        super().__init__()
-        if inner is not None:
-            self.model = inner
-
-    @property
-    def base_model(self):
-        return getattr(self, self.base_model_prefix, self)
-
-
-def test_resolve_get_rope_index_finds_it_on_the_base_model():
-    """Qwen-VL models expose get_rope_index on the base model, not the wrapper.
-
-    A plain getattr on the top-level module returns None there, which silently
-    degrades packed mRoPE to 1D positions, so the resolver must reach through
-    ``base_model``.
-    """
-    inner = _RopeInnerModel()
-    wrapper = _RopeWrapper(inner)
-
-    assert getattr(wrapper, "get_rope_index", None) is None, "precondition: wrapper itself has none"
-    assert _resolve_get_rope_index(wrapper) == inner.get_rope_index
-
-
-def test_resolve_get_rope_index_reaches_through_a_distributed_wrapper():
-    """DDP and MegatronFSDP wrap the model in ``.module`` and do not proxy attrs.
-
-    model_parts[0] is then the wrapper, so the resolver must unwrap it before
-    looking for the base model.
-    """
-
-    class _DistWrapper(nn.Module):
-        def __init__(self, inner):
-            super().__init__()
-            self.module = inner
-
-    inner = _RopeInnerModel()
-    wrapped = _DistWrapper(_RopeWrapper(inner))
-
-    assert getattr(wrapped, "get_rope_index", None) is None
-    assert getattr(wrapped, "base_model", None) is None
-    assert _resolve_get_rope_index(wrapped) == inner.get_rope_index
-
-
-def test_resolve_get_rope_index_prefers_the_top_level_module():
-    """A model that exposes get_rope_index itself is used directly."""
-    top = _RopeInnerModel()
-    assert _resolve_get_rope_index(top) == top.get_rope_index
-
-
-def test_resolve_get_rope_index_returns_none_for_non_mrope_models():
-    """Models without an mRoPE builder resolve to None (1D positions are correct)."""
-    assert _resolve_get_rope_index(_RopeWrapper()) is None
-    assert _resolve_get_rope_index(nn.Linear(2, 2)) is None

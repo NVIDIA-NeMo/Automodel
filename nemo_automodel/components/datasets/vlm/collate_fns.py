@@ -424,6 +424,18 @@ def build_labels_from_template(
     processor_type = type(processor).__name__
     tokenizer = getattr(processor, "tokenizer", processor)
 
+    # Inkling closes an assistant message before emitting a separate sampling
+    # terminator. Label through the first sampling terminator, which also keeps
+    # subsequent padding (using the same token id) masked.
+    if processor_type == "InklingProcessor":
+        marker_tokens = ("<|message_model|>", "<|content_text|>")
+        assistant_marker = [tokenizer.convert_tokens_to_ids(token) for token in marker_tokens]
+        stop_id = tokenizer.convert_tokens_to_ids("<|content_model_end_sampling|>")
+        if all(token_id is not None and token_id != tokenizer.unk_token_id for token_id in assistant_marker) and (
+            stop_id is not None and stop_id != tokenizer.unk_token_id
+        ):
+            return _build_labels_from_markers(input_ids_batch, assistant_marker, stop_id)
+
     # ------------------------------------------------------------------
     # Fast path: Qwen-family processors with <|im_start|>/<|im_end|>.
     # ------------------------------------------------------------------
@@ -1256,7 +1268,7 @@ def default_collate_fn(
             (e.g. Gemma4 thinking-channel injection) to transform the
             tokenized batch and the prefix tokens without duplicating the rest of the pipeline.
     """
-    if not HAVE_QWEN_VL_UTILS:
+    if not HAVE_QWEN_VL_UTILS and type(processor).__name__ != "InklingProcessor":
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
 
     conversations = _ensure_rgb([example["conversation"] for example in examples])
@@ -1325,6 +1337,10 @@ def default_collate_fn(
     if any(c > 0 for c in video_counts):
         batch["n_videos_per_sample"] = torch.tensor(video_counts, dtype=torch.long)
 
+    pixel_values = batch.get("pixel_values")
+    image_token_id = getattr(processor, "image_token_id", None)
+    if image_token_id is not None and pixel_values is not None and pixel_values.dim() == 5:
+        batch["num_patches"] = (batch["input_ids"] == image_token_id).sum(dim=-1)
     return batch
 
 

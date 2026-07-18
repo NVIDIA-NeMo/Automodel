@@ -131,18 +131,34 @@ def chunk_step3_media(
     patch_pixel_values: torch.Tensor | None = None,
     patch_newline_mask: torch.Tensor | None = None,
 ) -> dict[str, list[torch.Tensor]]:
-    """Chunk Step3-style image tensors for PP microbatches.
+    """Chunk image tensors with per-sample patch counts for PP microbatches.
 
     Step3 processors emit one full image per sample in ``pixel_values`` and a
     flat list of optional crop patches in ``patch_pixel_values``. ``num_patches``
-    maps samples to the flat patch tensor.
-    """
-    if pixel_values.shape[0] != batch_size:
-        raise ValueError(
-            "Step3 VLM PP chunking expects one full image tensor per sample: "
-            f"pixel_values.shape={tuple(pixel_values.shape)}, batch_size={batch_size}."
-        )
+    maps samples to the flat patch tensor. Processors may also emit
+    ``pixel_values`` itself as a flat patch tensor using the same mapping.
 
+    Args:
+        pixel_values: Either ``[batch, ...]`` (one image tensor per sample) or a
+            row-flattened ``[total_patches, ...]`` tensor whose patches are
+            concatenated along axis 0 in sample order, where
+            ``total_patches == sum(num_patches)``.
+        batch_size: Number of samples in the batch.
+        n_microbatches: Number of PP microbatches to split the batch into.
+        num_patches: Tensor of shape ``[batch]``; entry ``i`` is the patch count
+            for sample ``i``. Defaults to all-zeros when the processor emits no
+            crop patches.
+        patch_pixel_values: Optional row-flattened crop patches of shape
+            ``[total_patches, ...]`` indexed by ``num_patches``.
+        patch_newline_mask: Optional tensor of shape ``[total_patches]`` marking
+            patch-row newline positions, indexed by ``num_patches``.
+
+    Returns:
+        dict[str, list[torch.Tensor]]: Per-microbatch slices keyed by
+        ``pixel_values`` and ``num_patches`` (plus ``patch_pixel_values`` and
+        ``patch_newline_mask`` when provided). ``pixel_values`` is sliced along
+        the patch axis for the flat layout and along the sample axis otherwise.
+    """
     if num_patches is None:
         num_patches = torch.zeros(batch_size, dtype=torch.long, device=pixel_values.device)
     else:
@@ -151,6 +167,13 @@ def chunk_step3_media(
             raise ValueError(
                 f"num_patches must have length batch_size={batch_size}, got shape={tuple(num_patches.shape)}."
             )
+
+    flat_pixel_values = pixel_values.shape[0] != batch_size
+    if flat_pixel_values and int(num_patches.sum().item()) != pixel_values.shape[0]:
+        raise ValueError(
+            "VLM PP chunking cannot align pixel_values with num_patches: "
+            f"pixel_values.shape={tuple(pixel_values.shape)}, sum(num_patches)={int(num_patches.sum().item())}."
+        )
 
     samples_per_mb = -(-batch_size // n_microbatches)
     cumsum_patches = torch.cumsum(num_patches.cpu(), dim=0)
@@ -167,11 +190,11 @@ def chunk_step3_media(
     for mb_idx in range(n_microbatches):
         sample_start = mb_idx * samples_per_mb
         sample_end = min(sample_start + samples_per_mb, batch_size)
-        result["pixel_values"].append(pixel_values[sample_start:sample_end])
-        result["num_patches"].append(num_patches[sample_start:sample_end])
-
         patch_start = 0 if sample_start == 0 else int(cumsum_patches[sample_start - 1].item())
         patch_end = int(cumsum_patches[sample_end - 1].item()) if sample_end > 0 else patch_start
+        pixel_start, pixel_end = (patch_start, patch_end) if flat_pixel_values else (sample_start, sample_end)
+        result["pixel_values"].append(pixel_values[pixel_start:pixel_end])
+        result["num_patches"].append(num_patches[sample_start:sample_end])
         if patch_pixel_values is not None:
             result["patch_pixel_values"].append(patch_pixel_values[patch_start:patch_end])
         if patch_newline_mask is not None:

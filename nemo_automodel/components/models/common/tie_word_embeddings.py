@@ -14,62 +14,7 @@
 
 """Model-owned policy for input and output embedding ties."""
 
-from enum import Enum
-
-
-class TieSupport(Enum):
-    """Which ``tie_word_embeddings`` settings a model class supports.
-
-    Declared as the ``tie_word_embeddings_support`` class attribute on every
-    registered model class and consulted by
-    :func:`reject_unsupported_tie_word_embeddings` at construction time to reject
-    a config whose tying the architecture cannot honor.
-    """
-
-    #: Both tied and untied heads are supported: the class ties in ``__init__`` /
-    #: ``tie_weights()`` when requested and otherwise runs a separate ``lm_head``.
-    BOTH = "both"
-    #: Only ``tie_word_embeddings=True`` is supported: the architecture ties its
-    #: input and output embeddings and ships checkpoints without a distinct
-    #: ``lm_head.weight``.
-    TIED_ONLY = "tied_only"
-    #: Only ``tie_word_embeddings=False`` is supported: the architecture has
-    #: separate input and output embeddings and never builds a shared ``lm_head``.
-    UNTIED_ONLY = "untied_only"
-
-
-def get_controlling_tie_word_embeddings(config: object) -> bool:
-    """Resolve the ``tie_word_embeddings`` flag that actually controls lm_head tying.
-
-    HF ties ``lm_head`` based on the *top-level* config flag, not a nested
-    ``text_config`` (verified by construction for Gemma4 and Mistral3 under
-    transformers 5.8.1: the top-level flag decides tying regardless of the nested
-    value). So prefer the top-level flag, and only fall back to ``text_config``
-    for configs that don't expose a top-level ``tie_word_embeddings``.
-
-    Full Omni wrapper configs do not expose ``tie_word_embeddings`` at the top
-    level; the controlling flag lives on ``config.thinker_config``. Therefore,
-    after checking the top-level flag, fall back to ``thinker_config`` and then
-    ``text_config``.
-
-    Args:
-        config: The model's config (or anything exposing ``tie_word_embeddings``
-            and optionally ``thinker_config`` or ``get_text_config``).
-
-    Returns:
-        The controlling ``tie_word_embeddings`` value.
-    """
-    # General rule: the top-level config wins when it exposes the flag.
-    if hasattr(config, "tie_word_embeddings"):
-        return bool(config.tie_word_embeddings)
-
-    thinker_config = getattr(config, "thinker_config", None)
-    if thinker_config is not None:
-        return bool(getattr(thinker_config, "tie_word_embeddings", False))
-
-    # Final fallback for text-only configs without a top-level tie flag.
-    text_config = getattr(config, "get_text_config", lambda: None)()
-    return bool(getattr(text_config, "tie_word_embeddings", False))
+from nemo_automodel.shared.tied_weights import TieSupport, get_controlling_tie_word_embeddings
 
 
 def reject_unsupported_tie_word_embeddings(model_cls: type, config: object) -> None:

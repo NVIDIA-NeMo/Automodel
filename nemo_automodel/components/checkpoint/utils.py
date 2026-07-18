@@ -22,7 +22,17 @@ import torch
 import torch.nn as nn
 from transformers.modeling_utils import _get_resolved_checkpoint_files, load_state_dict
 
-from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport, get_controlling_tie_word_embeddings
+from nemo_automodel.shared.tied_weights import (
+    ensure_tied_lm_head as ensure_tied_lm_head,
+)
+from nemo_automodel.shared.tied_weights import (
+    get_input_embeddings_weight_and_name,
+    get_lm_head_weight_and_name,
+    is_tied_word_embeddings,
+)
+from nemo_automodel.shared.tied_weights import (
+    has_local_tied_lm_head as has_local_tied_lm_head,
+)
 
 
 def get_rank_safe() -> int:
@@ -103,89 +113,6 @@ def resolve_trust_remote_code(pretrained_model_name_or_path):
     return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
 
 
-def is_tied_word_embeddings(model: nn.Module) -> bool:
-    """Check whether the model's word embeddings are tied.
-
-    A one-direction :class:`TieSupport` policy is authoritative. Only ``BOTH``
-    models and undeclared Hugging Face models need their config flag resolved.
-
-    Args:
-        model (nn.Module): The model to check.
-
-    Returns:
-        bool: True if the model's word embeddings are tied, False otherwise.
-    """
-    support = getattr(model, "tie_word_embeddings_support", None)
-    # Composite VLM configs can expose an outer tie flag that does not describe
-    # the text head (for example Mistral4). No current BOTH VLM has that exception:
-    # they all honor the outer flag, so a model-owned resolver is not needed yet.
-    if support is TieSupport.TIED_ONLY:
-        return True
-    if support is TieSupport.UNTIED_ONLY:
-        return False
-
-    config = getattr(model, "config", None)
-    if config is None:
-        return False
-    return get_controlling_tie_word_embeddings(config)
-
-
-def _normalize_param_name(name: str) -> str:
-    """Strip wrapper-specific prefixes from a parameter name."""
-    return name.replace("_orig_mod.", "")
-
-
-def get_lm_head_weight_and_name(model: nn.Module) -> tuple[torch.Tensor | None, str | None]:
-    """Return the first ``lm_head.weight`` parameter found on a model.
-
-    Args:
-        model: Model to inspect.
-
-    Returns:
-        Tuple of the parameter tensor and its normalized FQN, or ``(None, None)``
-        when the model has no LM head weight.
-    """
-    for name, param in model.named_parameters(remove_duplicate=False):
-        normalized_name = _normalize_param_name(name)
-        if "lm_head" in normalized_name and normalized_name.endswith(".weight"):
-            return param, normalized_name
-    return None, None
-
-
-def get_input_embeddings_weight_and_name(model: nn.Module) -> tuple[torch.Tensor | None, str | None]:
-    """Return the input embedding weight and normalized name if present.
-
-    Args:
-        model: Model to inspect.
-
-    Returns:
-        Tuple of the embedding weight tensor and its normalized FQN, or
-        ``(None, None)`` when the current model partition does not own the input
-        embedding.
-    """
-    get_input_embeddings = getattr(model, "get_input_embeddings", None)
-    if callable(get_input_embeddings):
-        try:
-            input_embeddings = get_input_embeddings()
-        except Exception:
-            input_embeddings = None
-        if input_embeddings is not None and hasattr(input_embeddings, "weight"):
-            for name, param in model.named_parameters(remove_duplicate=False):
-                if param is input_embeddings.weight:
-                    return param, _normalize_param_name(name)
-
-    candidate_suffixes = (
-        "embed_tokens.weight",
-        "language_model.embed_tokens.weight",
-        "model.language_model.embed_tokens.weight",
-    )
-    for name, param in model.named_parameters(remove_duplicate=False):
-        normalized_name = _normalize_param_name(name)
-        if normalized_name.endswith(candidate_suffixes):
-            return param, normalized_name
-    return None, None
-
-
 def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | None = None) -> list[str]:
     """Return candidate checkpoint keys that can source a tied LM head.
 
@@ -238,141 +165,6 @@ def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | No
         seen_source_names.add(source_name)
         deduped_source_names.append(source_name)
     return deduped_source_names
-
-
-def has_local_tied_lm_head(model: nn.Module) -> bool:
-    """Return whether the current model partition has an actual tied LM head.
-
-    This is stricter than ``is_tied_word_embeddings()``: pipeline stages often
-    keep the config flag set to ``True`` even when ``lm_head`` and
-    ``embed_tokens`` live on different partitions. Some custom models can also
-    declare tied embeddings in config without actually aliasing the parameters.
-    In that case omitting ``lm_head.weight`` from a checkpoint loses trained
-    state, so only treat it as safely tied when the local tensors share storage.
-
-    Args:
-        model: Model or pipeline stage to inspect.
-
-    Returns:
-        ``True`` when the model is configured with tied word embeddings, both
-        the local ``lm_head`` and the input embedding live on this partition,
-        and the two tensors share local storage. ``False`` when the config
-        isn't tied, the local partition is missing one of the two (typical for
-        PP non-last / non-first stages), or the tensors are separate despite
-        matching shapes.
-    """
-    if not is_tied_word_embeddings(model):
-        return False
-    lm_head_weight, _ = get_lm_head_weight_and_name(model)
-    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
-    if lm_head_weight is None or input_embeddings_weight is None:
-        return False
-    # Even when ``config.tie_word_embeddings`` is ``True``, refuse to treat
-    # the two as locally tied if their shapes disagree. This handles
-    # speculative-decoding draft models that intentionally keep a
-    # full-vocab ``embed_tokens`` but a shrunk-vocab ``lm_head`` (e.g.
-    # EAGLE-3 with ``draft_vocab_size < target_vocab_size``). Without this
-    # check the save path would drop ``lm_head.weight`` from the state
-    # dict and the load path would resurrect it from ``embed_tokens``,
-    # producing a strict-load shape mismatch on resume.
-    if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
-        return False
-    return _same_tensor_storage(lm_head_weight, input_embeddings_weight)
-
-
-def _get_module_by_normalized_name(model: nn.Module, normalized_module_name: str) -> nn.Module | None:
-    """Return a module by FQN after applying wrapper-prefix normalization."""
-    if normalized_module_name == "":
-        return model
-    for name, module in model.named_modules():
-        if _normalize_param_name(name) == normalized_module_name:
-            return module
-    return None
-
-
-def ensure_tied_lm_head(model: nn.Module) -> bool:
-    """Ensure a local tied LM head actually aliases the input embedding.
-
-    Hugging Face ``tie_weights()`` is the first choice because model classes can
-    have custom tying rules. The direct assignment fallback handles wrapped
-    models whose generic ``tie_weights()`` no longer reaches the local
-    ``lm_head``/embedding pair after sharding.
-
-    Args:
-        model: Model or pipeline stage to inspect and update.
-
-    Returns:
-        ``True`` if the local ``lm_head`` and input embedding are tied after the
-        call, otherwise ``False``.
-    """
-    if not is_tied_word_embeddings(model):
-        return False
-    if has_local_tied_lm_head(model):
-        return True
-
-    lm_head_weight, lm_head_param_name = get_lm_head_weight_and_name(model)
-    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
-    if lm_head_weight is not None and input_embeddings_weight is not None:
-        if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
-            return False
-
-    tie_weights = getattr(model, "tie_weights", None)
-    if callable(tie_weights):
-        try:
-            tie_weights()
-        except AttributeError:
-            pass
-        if has_local_tied_lm_head(model):
-            return True
-
-    lm_head_weight, lm_head_param_name = get_lm_head_weight_and_name(model)
-    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
-    if lm_head_weight is None or lm_head_param_name is None or input_embeddings_weight is None:
-        return False
-    if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
-        return False
-
-    lm_head_module_name = lm_head_param_name.rsplit(".", 1)[0]
-    lm_head_module = _get_module_by_normalized_name(model, lm_head_module_name)
-    if lm_head_module is None or not hasattr(lm_head_module, "weight"):
-        return False
-
-    try:
-        lm_head_module.weight = input_embeddings_weight
-    except (AttributeError, TypeError, RuntimeError):
-        return False
-
-    return has_local_tied_lm_head(model)
-
-
-def _same_tensor_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
-    """Return whether two tensors are aliases of the same local storage."""
-    if left is right:
-        return True
-
-    def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
-        to_local = getattr(tensor, "to_local", None)
-        if callable(to_local):
-            try:
-                return to_local()
-            except RuntimeError:
-                return tensor
-        return tensor
-
-    left_local = _local_tensor(left)
-    right_local = _local_tensor(right)
-    if left_local is right_local:
-        return True
-    if left_local.device.type == "meta" or right_local.device.type == "meta":
-        return False
-
-    try:
-        return (
-            left_local.untyped_storage().data_ptr() == right_local.untyped_storage().data_ptr()
-            and left_local.storage_offset() == right_local.storage_offset()
-        )
-    except RuntimeError:
-        return False
 
 
 def materialize_missing_tied_lm_head(

@@ -28,7 +28,6 @@ except ImportError:
 import logging
 import pathlib
 import time
-from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -45,7 +44,7 @@ from nemo_automodel._transformers import (
     NeMoAutoModelForImageTextToText,
     NeMoAutoModelForMultimodalLM,
 )
-from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
@@ -70,6 +69,7 @@ from nemo_automodel.components.training.model_output_utils import get_final_hidd
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
+    get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
@@ -109,33 +109,6 @@ def _get_model_name(cfg_model):
         return cfg_model.config.get("pretrained_model_name_or_path", None)
     else:
         return None
-
-
-def _resolve_get_rope_index(model: nn.Module) -> Callable | None:
-    """Locate a model's mRoPE position-id builder.
-
-    Transformers defines ``get_rope_index`` on the base model rather than on the
-    ``*ForConditionalGeneration`` that ``model_parts`` holds (Qwen2-VL,
-    Qwen2.5-VL, Qwen3-VL and Qwen3-VL-MoE all follow this layout), and DDP or
-    MegatronFSDP add another wrapper on top without proxying attribute reads. A
-    plain ``getattr`` on the top-level module therefore finds nothing, and packed
-    multimodal training silently falls back to 1D positions. Unwrap ``module``
-    first, then check the model itself, then HuggingFace's ``base_model``
-    property, which resolves to ``getattr(model, model.base_model_prefix, model)``.
-
-    Args:
-        model: The (possibly wrapped) model to search. Accepts any module; no
-            tensor inputs.
-
-    Returns:
-        The ``get_rope_index`` callable, or ``None`` when the model does not
-        expose one (i.e. it is not an mRoPE model).
-    """
-    model = getattr(model, "module", model)
-    get_rope_index = getattr(model, "get_rope_index", None)
-    if get_rope_index is not None:
-        return get_rope_index
-    return getattr(getattr(model, "base_model", None), "get_rope_index", None)
 
 
 def build_model(
@@ -426,6 +399,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     # ------------------ build phase ------------------
+    def _create_distributed_setup(self) -> DistributedSetup:
+        """Create the distributed setup used by this recipe rank."""
+        return create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+
+    def _should_setup_training_components(self) -> bool:
+        """Whether this rank owns the trainable model and its components."""
+        return True
+
     def setup(self):
         """Builds all components needed for training/validation/logging/checkpointing/etc.
 
@@ -456,9 +437,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.pipeline_config,
             self.moe_parallel_config,
             self.activation_checkpointing,
-        ) = self._distributed_setup_attributes(
-            create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
-        )
+        ) = self._distributed_setup_attributes(self._create_distributed_setup())
+
+        if not self._should_setup_training_components():
+            return
 
         # MagiAttention (FFA) backend for the language backbone; the vision tower
         # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
@@ -524,6 +506,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
             moe_mesh=self.moe_mesh,
+            process_group=getattr(self.mesh_context, "process_group", None),
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
@@ -563,10 +546,20 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
 
+        # Optional setup-time prewarms (cuBLAS workspaces, Triton autotune
+        # caches, NCCL communicators) while the allocator pool is still small,
+        # instead of lazily at step-1 peak memory.
+        if self.cfg.prewarm is not None:
+            self.cfg.prewarm.apply(
+                model_parts=self.model_parts,
+                device=self.dist_env.device,
+                pp_mesh=(self.device_mesh["pp"] if self.pp_enabled and self.device_mesh is not None else None),
+            )
+
         # Extract mRoPE position-id builder from the model so VLM neat packing can
         # produce 3D position_ids per sample. Without this, packed multimodal
         # training silently degrades mRoPE to plain 1D positions.
-        get_rope_index = _resolve_get_rope_index(self.model_parts[0])
+        get_rope_index = resolve_get_rope_index(self.model_parts[0])
         pp_n_microbatches = None
         pp_cp_preembed = (
             self.pp_enabled
@@ -587,13 +580,15 @@ class FinetuneRecipeForVLM(BaseRecipe):
         )
         if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
             configure_packing(attn_implementation=packing_attn_implementation)
+        process_group = getattr(self.mesh_context, "process_group", None)
+        dataset_build_context = FirstRankPerNode(group=process_group)
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             dataloader_build = dataloader_config.build(
                 pretrained_model_name_or_path=_get_model_name(self.cfg.model),
                 dp_rank=self._get_dp_rank(),
                 dp_world_size=self._get_dp_group_size(),
                 batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                dataset_build_context=FirstRankPerNode(),
+                dataset_build_context=dataset_build_context,
                 get_rope_index=get_rope_index,
                 packing_attn_implementation=packing_attn_implementation,
                 pp_n_microbatches=pp_n_microbatches,
@@ -605,13 +600,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.val_dataloader = None
         validation_config = self.cfg.vlm_validation_dataloader
         if validation_config is not None:
+            validation_build_context = FirstRankPerNode(group=process_group)
             with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
                 validation_build = validation_config.build(
                     pretrained_model_name_or_path=_get_model_name(self.cfg.model),
                     dp_rank=self._get_dp_rank(),
                     dp_world_size=self._get_dp_group_size(),
                     batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-                    dataset_build_context=FirstRankPerNode(),
+                    dataset_build_context=validation_build_context,
                     get_rope_index=get_rope_index,
                 )
             self.val_dataloader = validation_build.dataloader
@@ -622,6 +618,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.dataloader,
             self._get_dp_group_size(),
             self.cfg.get("step_scheduler.local_batch_size", 1),
+            process_group=getattr(self, "_training_process_group", None),
         )
         self._setup_garbage_collection(self.step_scheduler)
 
@@ -1018,6 +1015,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             foreach=True,
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
         )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
