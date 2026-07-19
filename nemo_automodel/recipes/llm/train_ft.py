@@ -73,6 +73,7 @@ from nemo_automodel.components.training.model_output_utils import get_final_hidd
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
+    get_expert_tp_replication_factor,
     prepare_after_first_microbatch,
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
@@ -529,6 +530,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
+
+        # Optional setup-time prewarms (cuBLAS workspaces, Triton autotune
+        # caches, NCCL communicators) while the allocator pool is still small,
+        # instead of lazily at step-1 peak memory.
+        if self.cfg.prewarm is not None:
+            self.cfg.prewarm.apply(
+                model_parts=self.model_parts,
+                device=self.dist_env.device,
+                pp_mesh=(self.device_mesh["pp"] if self.pp_enabled and self.device_mesh is not None else None),
+            )
 
         _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
         if self.mesh_context.cp_size > 1 and _packed_seq_size > 0:
@@ -1054,6 +1065,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             foreach=True,
             num_label_tokens=num_label_tokens,
             dp_group_size=self._get_dp_group_size(include_cp=True),
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
         )
 
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
