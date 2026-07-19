@@ -313,7 +313,7 @@ def build_dataloader(
         model_attn_implementation=get_attn_implementation(cfg_model),
         cp_size=cp_size,
     )
-    if config.packing is not None:
+    if config.packing is not None and config.packing.packing_format != "thd":
         configure_packing(attn_implementation=packing_attn_implementation)
 
     with ScopedRNG(seed=seed, ranked=True):
@@ -578,7 +578,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             model_attn_implementation=get_attn_implementation(self.cfg.model),
             cp_size=self.mesh_context.cp_size,
         )
-        if dataloader_config.packing is not None:
+        if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
             configure_packing(attn_implementation=packing_attn_implementation)
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
@@ -801,11 +801,23 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k in VLM_INPUT_KEYS:
                 if k != "input_ids":
                     batch.pop(k, None)
+        # THD packed VLM inputs (qkv_format='thd' from the packing collator) use TE
+        # sequence metadata even without context parallelism (#3052); CP over THD for
+        # mRoPE VLMs is not implemented.
+        _use_te_vlm = batch.get("qkv_format", None) == "thd"
+        if _use_te_vlm and self.mesh_context.cp_size > 1:
+            raise NotImplementedError(
+                "THD packing (packing_format='thd') for VLM currently supports cp_size=1 only; "
+                "context-parallel THD for mRoPE VLMs is not yet implemented."
+            )
+        _padding_id = getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
         train_ctx, batch, _ = prepare_cp_forward(
             self.model_parts[0],
             self.device_mesh,
             batch,
             magi=self.magi,
+            use_te=_use_te_vlm,
+            padding_token_id=_padding_id,
             invoke_pre_embed=_pre_embed_here,
         )
         labels = batch.pop("labels")
