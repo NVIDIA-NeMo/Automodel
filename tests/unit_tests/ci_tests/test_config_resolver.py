@@ -342,6 +342,7 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     "recipe_path",
     [
         "examples/vlm_finetune/gemma4/gemma4_2b.yaml",
+        "examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml",
         "examples/vlm_finetune/mistral/ministral3_3b_medpix.yaml",
         "examples/vlm_finetune/mistral4/mistral4_medpix.yaml",
         "examples/vlm_finetune/qwen3/qwen3_vl_moe_30b_te_deepep.yaml",
@@ -371,11 +372,10 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
         assert robustness["hf_device_map_auto"] is True
     if "/mistral4/" in recipe_path:
         assert robustness["hf_source_post_load_dequantize"] is True
-    if Path(recipe_path).stem == "qwen3_5_35b":
-        assert resolved["ci"]["known_issue_id"] == "AM-711"
-        assert resolved["ci"]["allow_failure"] is True
     if Path(recipe_path).stem == "qwen3_vl_moe_30b_te_deepep":
         assert robustness["resume_loss_threshold"] == 1e-2
+    assert "known_issue_id" not in resolved["ci"]
+    assert "allow_failure" not in resolved["ci"]
     assert "check_source_load_parity" not in resolved
     assert "hf_device_map_auto" not in resolved
     assert "hf_source_post_load_dequantize" not in resolved
