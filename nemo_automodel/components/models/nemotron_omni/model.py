@@ -40,6 +40,7 @@ from nemo_automodel.components.distributed.cp_sharder import (
     shard_batch_aux_only,
     shard_sequence_for_cp,
 )
+from nemo_automodel.components.distributed.cp_utils import cp_dispatcher_suspended
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -901,7 +902,10 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             input_ids_flat = input_ids.reshape(B * N)
             selected = input_ids_flat == self.img_context_token_id
 
-            vit_embeds = self.extract_feature_dynamic(pixel_values, imgs_sizes)
+            # Vision/audio encoders are not CP-sharded; suspend the ring dispatcher
+            # so their non-causal attention is not intercepted by the CP ring SDPA.
+            with cp_dispatcher_suspended(self.cp_mesh):
+                vit_embeds = self.extract_feature_dynamic(pixel_values, imgs_sizes)
             vit_embeds = vit_embeds.reshape(-1, C)
 
             if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
@@ -934,7 +938,8 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             selected = input_ids_flat == self.img_context_token_id
 
             vit_batch_size = pixel_values.shape[0]
-            vit_embeds = self.extract_feature(pixel_values)
+            with cp_dispatcher_suspended(self.cp_mesh):
+                vit_embeds = self.extract_feature(pixel_values)
 
             if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
                 logger.info(
@@ -967,7 +972,8 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             B_v, N_v, C_v = inputs_embeds.shape
             inputs_embeds = inputs_embeds.reshape(B_v * N_v, C_v)
             video_selected = input_ids.reshape(B_v * N_v) == self.img_context_token_id
-            video_embeds = self.extract_video_feature(pixel_values_videos)
+            with cp_dispatcher_suspended(self.cp_mesh):
+                video_embeds = self.extract_video_feature(pixel_values_videos)
             inputs_embeds[video_selected] = inputs_embeds[video_selected] * 0.0 + video_embeds.reshape(-1, C_v)
             inputs_embeds = inputs_embeds.reshape(B_v, N_v, C_v)
 
@@ -994,7 +1000,8 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                     sound_attention_mask = sound_attention_mask.to(device=inputs_embeds.device)
 
                 # Extract and project sound features
-                sound_embeds = self.extract_sound_feature(sound_features, sound_attention_mask)
+                with cp_dispatcher_suspended(self.cp_mesh):
+                    sound_embeds = self.extract_sound_feature(sound_features, sound_attention_mask)
                 sound_embeds_flat = sound_embeds.reshape(-1, C_s)
 
                 if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:

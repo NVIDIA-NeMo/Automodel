@@ -959,29 +959,40 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         """
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        if pixel_values is not None:
-            if hasattr(self.model.visual, "rotary_pos_emb"):
-                self.model.visual.rotary_pos_emb.to(pixel_values.device)
-            image_outputs = self.model.get_image_features(pixel_values, image_grid_thw, return_dict=True)
-            image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.model.get_placeholder_mask(
-                input_ids,
-                inputs_embeds=inputs_embeds,
-                image_features=image_embeds,
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        # The HF visual tower's bidirectional attention is not CP-sharded; when this
+        # splice runs in-forward under an active CP ring context it must suspend the
+        # ring dispatcher, or torch's load-balanced ring SDPA all-gathers the vision
+        # Q/K/V and rejects the non-causal attention. No-op when CP is inactive.
+        from nemo_automodel.components.distributed.cp_utils import cp_dispatcher_suspended  # noqa: PLC0415
 
-        if pixel_values_videos is not None:
-            if hasattr(self.model.visual, "rotary_pos_emb"):
-                self.model.visual.rotary_pos_emb.to(pixel_values_videos.device)
-            video_outputs = self.model.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
-            video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.model.get_placeholder_mask(
-                input_ids,
-                inputs_embeds=inputs_embeds,
-                video_features=video_embeds,
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+        with cp_dispatcher_suspended(self.cp_mesh):
+            if pixel_values is not None:
+                if hasattr(self.model.visual, "rotary_pos_emb"):
+                    self.model.visual.rotary_pos_emb.to(pixel_values.device)
+                image_outputs = self.model.get_image_features(pixel_values, image_grid_thw, return_dict=True)
+                image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
+                image_mask, _ = self.model.get_placeholder_mask(
+                    input_ids,
+                    inputs_embeds=inputs_embeds,
+                    image_features=image_embeds,
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+            if pixel_values_videos is not None:
+                if hasattr(self.model.visual, "rotary_pos_emb"):
+                    self.model.visual.rotary_pos_emb.to(pixel_values_videos.device)
+                video_outputs = self.model.get_video_features(pixel_values_videos, video_grid_thw, return_dict=True)
+                video_embeds = torch.cat(video_outputs.pooler_output, dim=0).to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
+                _, video_mask = self.model.get_placeholder_mask(
+                    input_ids,
+                    inputs_embeds=inputs_embeds,
+                    video_features=video_embeds,
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         return inputs_embeds
 
