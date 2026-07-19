@@ -26,6 +26,12 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.distributed.cp_sharder import (
+    ContextParallelismSharder,
+    round_robin_local_indices,
+    shard_batch_aux_only,
+    shard_sequence_for_cp,
+)
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -395,6 +401,10 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     # (MXFP8 -> bf16), so skip HF random init on load. This also avoids the
     # stage-divergent DTensor collectives in initialize_weights() under sharding/PP.
     _skip_init_weights_on_load = True
+    # CP submesh, installed by the MoE parallelizer's apply_cp when context
+    # parallelism is active; None (default) means the forward embeds and shards
+    # nothing for CP. See prepare_model_inputs_for_cp / forward.
+    cp_mesh = None
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -529,13 +539,26 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
         """Per-stage input/output meta tensors for the PP schedule's shape inference.
 
-        First stage consumes token ids ``[mb, seq]``; later stages consume hidden
-        states ``[mb, seq, hidden]``. The final stage (owning ``lm_head``) emits
-        logits ``[mb, seq, vocab]``; earlier stages emit hidden states.
+        First stage consumes the FULL token ids ``[mb, seq]``; later stages
+        consume hidden states. The final stage (owning ``lm_head``) emits logits;
+        earlier stages emit hidden states.
+
+        Under context parallelism the first stage embeds the full sequence and
+        shards it to this rank's round-robin chunk pair inside forward
+        (see :func:`shard_sequence_for_cp`), so every stage output and every
+        later-stage input carries the LOCAL (padded-to-``2*cp`` then ``//cp``)
+        sequence length while the first stage's input stays full-length. At
+        ``cp_size == 1`` the lengths coincide and the layout is symmetric.
         """
         text_config = self.config.text_config
         hidden_size = text_config.hidden_size
         vocab_size = text_config.vocab_size
+
+        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+        local_seq_len = seq_len
+        if cp_size > 1:
+            padded_seq_len = seq_len + (-seq_len) % (2 * cp_size)
+            local_seq_len = padded_seq_len // cp_size
 
         def meta(*shape: int) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=dtype)
@@ -545,16 +568,16 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         if is_first:
             inputs_meta = (torch.empty(microbatch_size, seq_len, device="meta", dtype=torch.long),)
         else:
-            inputs_meta = (meta(microbatch_size, seq_len, hidden_size),)
+            inputs_meta = (meta(microbatch_size, local_seq_len, hidden_size),)
 
         if self.lm_head is not None:
             # Logits follow lm_head's own param dtype, which may diverge from the
             # model dtype if lm_head is ever kept in fp32 (_keep_in_fp32_modules);
             # deriving it here keeps the schedule's output buffer correctly sized.
             head_dtype = getattr(getattr(self.lm_head, "weight", None), "dtype", dtype)
-            outputs_meta = (torch.empty(microbatch_size, seq_len, vocab_size, device="meta", dtype=head_dtype),)
+            outputs_meta = (torch.empty(microbatch_size, local_seq_len, vocab_size, device="meta", dtype=head_dtype),)
         else:
-            outputs_meta = (meta(microbatch_size, seq_len, hidden_size),)
+            outputs_meta = (meta(microbatch_size, local_seq_len, hidden_size),)
         return inputs_meta, outputs_meta
 
     @staticmethod
@@ -615,53 +638,31 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         *,
         num_chunks: int = 1,
     ) -> dict[str, Any]:
-        """Merge vision features into token embeddings BEFORE context-parallel sequence
-        sharding.
+        """Return a sharder-only CP backend; embed + splice + shard happen in forward.
 
-        The VLM recipe calls ``model(_pre_embed_only=True, **mm_kwargs)`` when
-        ``cp_size > 1`` so the ``input_ids == image_token_index`` splice runs on the full,
-        un-sharded sequence; the returned ``inputs_embeds`` is then sequence-sharded by the
-        recipe. Mirrors ``step3p7``/``kimi_k25_vl``. Defining this method is also the opt-in
-        signal the recipe checks (``hasattr(model, "prepare_model_inputs_for_cp")``).
-
-        Removes the raw input keys it consumed from ``batch``; the dispatcher merges
-        the returned entries on top.
+        Context-parallel embedding, vision splice, and sequence sharding now run
+        inside ``forward`` per microbatch (Megatron-style): the returned
+        :class:`ContextParallelismSharder` round-robin-shards only the no-grad
+        aux streams (labels/position_ids/loss_mask/padding_mask) via
+        :func:`shard_batch_aux_only` and leaves ``input_ids`` and the multimodal
+        inputs full-length for the forward. The forward then embeds+splices the
+        full sequence and calls :func:`shard_sequence_for_cp` on the result, so
+        the embeddings and vision tower are trainable under CP and the PP×CP
+        shared pre-embed graph no longer exists. Nothing is consumed here.
+        Defining this method is the opt-in signal the recipe checks
+        (``hasattr(model, "prepare_model_inputs_for_cp")``).
 
         Args:
-            batch: The batch dict (with ``input_ids`` and optional multimodal
-                keys).
-            num_chunks: Number of chunks for load-balanced CP sharding.
+            batch: The full-sequence batch; left intact (nothing consumed).
+            num_chunks: Accepted for hook-signature parity; unused (round-robin CP).
         """
-        input_ids = batch.get("input_ids")
-        if input_ids is None:
-            raise ValueError("MiniMax M3 VL CP pre-embedding requires input_ids.")
-        pixel_values = batch.get("pixel_values")
-        image_grid_thw = batch.get("image_grid_thw")
-        pixel_values_videos = batch.get("pixel_values_videos")
-        video_grid_thw = batch.get("video_grid_thw")
-        inputs_embeds = self._embed_and_splice(
-            input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-        )
-        # Consumed into inputs_embeds; returned as None so the dispatcher
-        # removes them from the batch (the hook may receive a copy of the
-        # batch dict when FSDP2 casts forward kwargs, so in-place pops are
-        # not reliable; the return channel is).
-        consumed = {
-            key: None
-            for key in ("input_ids", "pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw")
+        del batch, num_chunks
+        return {
+            "cp_sharder": ContextParallelismSharder(
+                shard_batch=shard_batch_aux_only,
+                local_token_global_indices=round_robin_local_indices,
+            )
         }
-        # Detach: this recipe family trains with the embeddings/vision tower frozen, so
-        # no gradient is lost. It is also required under pipeline parallelism: the whole
-        # batch is pre-embedded once, then the PP schedule splits it into microbatches
-        # whose backwards each traverse the SAME pre-embed graph — the second microbatch
-        # dies with "Trying to backward through the graph a second time"
-        # (cp2/pp4 E2E, nemo-ci job 367479592). Vision training under CP+PP would need
-        # per-microbatch pre-embedding, not just removing this detach.
-        return {**consumed, "inputs_embeds": inputs_embeds.detach()}
 
     def forward(
         self,
@@ -726,6 +727,17 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             if consumed:
                 self._vlm_chunk_idx = chunk_idx + 1
 
+        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+
+        # Media reaching a PP stage under CP would need grid_thw-aware per-sample
+        # microbatch chunking composed with the CP sequence shard; unsupported.
+        # Text-only CP×PP is the supported combined topology.
+        if is_pp_stage and cp_size > 1 and (pixel_values is not None or pixel_values_videos is not None):
+            raise NotImplementedError(
+                "MiniMax M3 VL does not support image/video microbatch chunking under combined "
+                "pipeline + context parallelism; use a text-only batch for cp>1 and pp>1."
+            )
+
         # Pipeline stages after the first receive the previous stage's hidden
         # states in the input_ids slot (a float tensor); route them straight to
         # the text model (no embedding / vision splicing on non-first stages).
@@ -741,6 +753,13 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
             )
+            # Per-microbatch CP: keep this rank's round-robin chunk pair of the
+            # freshly embedded full sequence. The aux streams and the ring-SDPA
+            # context were sharded to the same layout by shard_batch_aux_only, and
+            # the shard is differentiable so gradients reach the embeddings and
+            # vision tower.
+            if cp_size > 1:
+                inputs_embeds, _, _ = shard_sequence_for_cp(self.cp_mesh, inputs_embeds, seq_dim=1)
 
         hidden = self.model(
             None,

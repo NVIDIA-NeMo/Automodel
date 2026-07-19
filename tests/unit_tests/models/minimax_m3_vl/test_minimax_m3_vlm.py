@@ -158,35 +158,71 @@ def test_vlm_splices_vision_features_via_reference(vlm_model):
     assert torch.allclose(mine, ref, atol=1e-4), (mine - ref).abs().max().item()
 
 
-def test_prepare_model_inputs_for_cp(vlm_model):
-    """CP pre-embed path (Phase 1): ``model(_pre_embed_only=True, ...)`` returns spliced
-    ``inputs_embeds`` identical to the inline embed+splice, and feeding it back through the
-    model reproduces the direct multimodal logits. This is what lets the recipe splice
-    vision into embeddings BEFORE context-parallel sequence sharding."""
+class _FakeCPMesh:
+    """Minimal CP submesh stand-in (no real process group) for the shard path."""
+
+    def __init__(self, size: int, rank: int):
+        self._size, self._rank = size, rank
+
+    def size(self) -> int:
+        return self._size
+
+    def get_local_rank(self) -> int:
+        return self._rank
+
+    def get_group(self):
+        return None
+
+
+def test_prepare_model_inputs_for_cp_is_sharder_only(vlm_model):
+    """The CP hook is sharder-only: it consumes nothing and returns a
+    ContextParallelismSharder whose shard_batch is the aux-only round-robin shard.
+    Embedding + vision splice + sequence shard now run inside forward, so the raw
+    batch (input_ids, pixel_values) is left intact for the forward to consume."""
+    from nemo_automodel.components.distributed.cp_sharder import (
+        ContextParallelismSharder,
+        round_robin_local_indices,
+        shard_batch_aux_only,
+    )
+
     assert hasattr(vlm_model, "prepare_model_inputs_for_cp")
     pixel_values, grid_thw, n_tokens = _make_image_inputs(vlm_model)
     ids = torch.randint(2, 99, (1, 16))
     ids[0, 5 : 5 + n_tokens] = IMAGE_TOKEN_INDEX
-    hidden = vlm_model.config.text_config.hidden_size
+    cp_batch = {"input_ids": ids, "pixel_values": pixel_values, "image_grid_thw": grid_thw}
+    prepared = vlm_model(_pre_embed_only=True, _cp_batch=cp_batch)
+
+    assert set(prepared) == {"cp_sharder"}
+    sharder = prepared["cp_sharder"]
+    assert isinstance(sharder, ContextParallelismSharder)
+    assert sharder.shard_batch is shard_batch_aux_only
+    assert sharder.local_token_global_indices is round_robin_local_indices
+    # nothing consumed: the raw streams stay for the forward
+    assert cp_batch["input_ids"] is ids and cp_batch["pixel_values"] is pixel_values
+
+
+def test_forward_shards_sequence_in_forward_under_cp(vlm_model):
+    """With a CP mesh installed, forward embeds the full sequence then keeps this
+    rank's round-robin chunk pair, so the text model runs on (and the logits span)
+    the local shard length ``padded / cp_size`` instead of the full sequence."""
+    vocab = vlm_model.config.text_config.vocab_size
+    ids = torch.randint(2, 99, (1, 16))  # already a multiple of 2*cp -> no pad
+    try:
+        vlm_model.cp_mesh = _FakeCPMesh(2, 0)
+        with torch.no_grad():
+            logits = vlm_model(ids)
+    finally:
+        vlm_model.cp_mesh = None
+    assert logits.shape == (1, 8, vocab) and torch.isfinite(logits).all()
+
+
+def test_forward_no_shard_without_cp_mesh(vlm_model):
+    """Default (no CP mesh) forward keeps the full sequence length."""
+    vocab = vlm_model.config.text_config.vocab_size
+    ids = torch.randint(2, 99, (1, 16))
     with torch.no_grad():
-        # The dispatcher hands the whole batch dict through the _cp_batch kwarg;
-        # consumed raw inputs come back as None markers.
-        cp_batch = {"input_ids": ids, "pixel_values": pixel_values, "image_grid_thw": grid_thw}
-        prepared = vlm_model(_pre_embed_only=True, _cp_batch=cp_batch)
-        assert prepared["input_ids"] is None
-        assert prepared["pixel_values"] is None
-        assert prepared["image_grid_thw"] is None
-        assert isinstance(prepared, dict) and {k for k, v in prepared.items() if v is not None} == {"inputs_embeds"}
-        embeds = prepared["inputs_embeds"]
-        assert embeds.shape == (1, 16, hidden) and torch.isfinite(embeds).all()
-        # (a) equals the reference embed + vision splice
-        ref_embeds = vlm_model.model.embed_tokens(ids).clone()
-        ref_embeds[ids == IMAGE_TOKEN_INDEX] = _ref_vision(vlm_model, pixel_values, grid_thw).to(ref_embeds.dtype)
-        assert torch.allclose(embeds.float(), ref_embeds.float(), atol=1e-4)
-        # (b) feeding the pre-embedded inputs back == the direct multimodal forward
-        via_preembed = vlm_model(inputs_embeds=embeds).float()
-        direct = vlm_model(ids, pixel_values=pixel_values, image_grid_thw=grid_thw).float()
-    assert torch.allclose(via_preembed, direct, atol=1e-4), (via_preembed - direct).abs().max().item()
+        logits = vlm_model(ids)
+    assert logits.shape == (1, 16, vocab)
 
 
 def test_vlm_adapter_roundtrip_and_naming(vlm_model):
