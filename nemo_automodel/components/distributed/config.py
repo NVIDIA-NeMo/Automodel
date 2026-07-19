@@ -305,8 +305,10 @@ class MegatronFSDPConfig:
     support pp_size, dp_replicate_size, or ep_size.
 
     Attributes:
-        megatron_fsdp_unit_modules (Optional[List[str]]): List of unit modules to be
-            wrapped with MegatronFSDP.
+        megatron_fsdp_unit_modules (list[str] | None): Class paths of the submodules to wrap
+            as individual MegatronFSDP units. When ``None`` (the default), the wrap classes
+            are auto-derived from the model's ``_no_split_modules`` so the real instantiated
+            block classes are used regardless of backend (HF or NeMo-custom).
         zero_dp_strategy (int): Data parallel sharding strategy.
         init_fsdp_with_meta_device (bool): Initialize MegatronFSDP with meta device if True.
         grad_reduce_in_fp32 (bool): Reduce gradients in fp32 if True.
@@ -335,9 +337,7 @@ class MegatronFSDPConfig:
             MLP layers to save memory.
     """
 
-    megatron_fsdp_unit_modules: List[str] = field(
-        default_factory=lambda: ["transformers.models.llama.modeling_llama.LlamaDecoderLayer"]
-    )
+    megatron_fsdp_unit_modules: list[str] | None = None
     zero_dp_strategy: int = 3
     init_fsdp_with_meta_device: bool = False
     grad_reduce_in_fp32: bool = False

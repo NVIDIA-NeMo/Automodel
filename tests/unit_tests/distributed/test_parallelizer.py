@@ -516,6 +516,7 @@ class TestMegatronFSDPStrategyParallelize:
             model=model,
             device_mesh=mesh,
             optimizer=optimizer,
+            megatron_fsdp_unit_modules=["dummy.MockLayer"],
         )
 
         # Verify megatron_fsdp_fully_shard was called with default mesh names
@@ -527,6 +528,49 @@ class TestMegatronFSDPStrategyParallelize:
             tp_group=tp_mesh.get_group(),
             dp_group=dp_mesh.get_group(),
         )
+
+    def test_explicit_unit_modules_take_precedence_over_derivation(
+        self, mock_device_mesh_megatron_fsdp, mock_megatron_fsdp_env, monkeypatch
+    ):
+        """When the config specifies unit modules, they are imported and derivation is skipped."""
+        mesh, _dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_megatron_fsdp
+        tp_mesh.size.return_value = 1
+        cp_mesh.size.return_value = 1
+
+        derive_spy = MagicMock(side_effect=AssertionError("derivation must not run when unit modules are explicit"))
+        monkeypatch.setattr(parallelizer, "_derive_megatron_fsdp_unit_modules", derive_spy, raising=True)
+
+        megatron_fsdp_strategy_parallelize(
+            model=MockModel(),
+            device_mesh=mesh,
+            optimizer=MagicMock(),
+            megatron_fsdp_unit_modules=["dummy.MockLayer"],
+        )
+
+        mock_megatron_fsdp_env["import_classes"].assert_called_once_with(["dummy.MockLayer"])
+        derive_spy.assert_not_called()
+
+    def test_unit_modules_are_derived_when_not_specified(
+        self, mock_device_mesh_megatron_fsdp, mock_megatron_fsdp_env, monkeypatch
+    ):
+        """When no unit modules are configured, they are derived and forwarded to fully_shard."""
+        mesh, _dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_megatron_fsdp
+        tp_mesh.size.return_value = 1
+        cp_mesh.size.return_value = 1
+
+        derive_spy = MagicMock(return_value=[nn.Linear])
+        monkeypatch.setattr(parallelizer, "_derive_megatron_fsdp_unit_modules", derive_spy, raising=True)
+
+        megatron_fsdp_strategy_parallelize(
+            model=MockModel(),
+            device_mesh=mesh,
+            optimizer=MagicMock(),
+        )
+
+        derive_spy.assert_called_once()
+        mock_megatron_fsdp_env["import_classes"].assert_not_called()
+        call_kwargs = mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.call_args[1]
+        assert call_kwargs["fsdp_unit_modules"] == [nn.Linear]
 
     def test_megatron_fsdp_with_custom_mesh_names(self, mock_megatron_fsdp_env):
         """Test Megatron FSDP with custom mesh names."""
@@ -562,6 +606,7 @@ class TestMegatronFSDPStrategyParallelize:
             optimizer=optimizer,
             dp_shard_dim="my_dp",
             tp_dim="my_tp",
+            megatron_fsdp_unit_modules=["dummy.MockLayer"],
         )
 
         # Verify megatron_fsdp_fully_shard was called with custom mesh names
@@ -608,6 +653,7 @@ class TestMegatronFSDPStrategyParallelize:
             optimizer=optimizer,
             dp_shard_dim="dp_cp",
             tp_dim="tp_mesh",
+            megatron_fsdp_unit_modules=["dummy.MockLayer"],
         )
 
         # Verify megatron_fsdp_fully_shard was called with dp_cp_mesh_name set correctly
@@ -883,6 +929,7 @@ class TestMegatronFSDPStrategyParallelize:
             model=MockModel(),
             device_mesh=mesh,
             optimizer=optimizer,
+            megatron_fsdp_unit_modules=["dummy.MockLayer"],
             grad_reduce_in_fp32=True,
             preserve_fp32_weights=False,
             check_for_nan_in_grad=True,

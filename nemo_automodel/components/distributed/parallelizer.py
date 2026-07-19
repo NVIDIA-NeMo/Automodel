@@ -2316,6 +2316,60 @@ def _megatron_fsdp_compat_kwargs(
     }
 
 
+def _derive_megatron_fsdp_unit_modules(model: nn.Module) -> list[type[nn.Module]]:
+    """Derive the MegatronFSDP wrap classes from a model's ``_no_split_modules``.
+
+    Used when a config does not specify ``megatron_fsdp_unit_modules``. HF
+    ``PreTrainedModel`` and the NeMo custom models both define ``_no_split_modules``
+    as a list of block class *names* (for example ``["LlamaDecoderLayer"]``).
+    Walking ``model.modules()`` and matching ``type(module).__name__`` against those
+    names resolves the actual instantiated classes, so the result is correct for
+    both the HF backend and the NeMo-custom backend (which use distinct classes that
+    share the same name). For VLM/MoE models whose top-level ``_no_split_modules``
+    lists several block classes (for example vision and language towers), every
+    matching class found anywhere in the module tree is collected.
+
+    Args:
+        model: The (already TP-parallelized) model to be wrapped by MegatronFSDP.
+
+    Returns:
+        The de-duplicated list of submodule classes to wrap as MegatronFSDP units,
+        in module-traversal order.
+
+    Raises:
+        ValueError: If the model does not expose a non-empty ``_no_split_modules``,
+            or if none of those names match an instantiated submodule. Raised with
+            an actionable message instead of letting MegatronFSDP later fail with
+            ``ZeroDivisionError`` (``total_fsdp_module=0``) when zero modules are wrapped.
+    """
+    no_split_modules = getattr(model, "_no_split_modules", None)
+    if not no_split_modules:
+        raise ValueError(
+            "distributed.megatron_fsdp_unit_modules was not provided and the model does not define a "
+            "non-empty '_no_split_modules' to derive them from. Set distributed.megatron_fsdp_unit_modules "
+            "explicitly to the transformer block class path(s) to wrap as MegatronFSDP units."
+        )
+    no_split_names = set(no_split_modules)
+    derived: list[type[nn.Module]] = []
+    seen: set[type[nn.Module]] = set()
+    for submodule in model.modules():
+        cls = type(submodule)
+        if cls.__name__ in no_split_names and cls not in seen:
+            seen.add(cls)
+            derived.append(cls)
+    if not derived:
+        raise ValueError(
+            "distributed.megatron_fsdp_unit_modules was not provided and none of the model's "
+            f"_no_split_modules {sorted(no_split_names)} matched an instantiated submodule; cannot derive "
+            "MegatronFSDP unit modules. Set distributed.megatron_fsdp_unit_modules explicitly."
+        )
+    logger.info(
+        "Auto-derived MegatronFSDP unit modules from _no_split_modules: %s",
+        [cls.__name__ for cls in derived],
+    )
+    return derived
+
+
 def megatron_fsdp_strategy_parallelize(
     model,
     device_mesh: DeviceMesh,
@@ -2346,9 +2400,10 @@ def megatron_fsdp_strategy_parallelize(
         model: The model to be parallelized.
         device_mesh (DeviceMesh): The device mesh describing the physical devices
             used for distributed training.
-        megatron_fsdp_unit_modules (Optional[List[str]]): Names of sub-modules that should
-            become individual MegatronFSDP units. If None, the full model is wrapped as
-            a single unit.
+        megatron_fsdp_unit_modules (Optional[List[str]]): Class paths of the sub-modules that
+            should become individual MegatronFSDP units. When None or empty, the wrap classes
+            are auto-derived from the model's ``_no_split_modules`` (see
+            :func:`_derive_megatron_fsdp_unit_modules`).
         tp_shard_plan (Optional[Dict[str, Union[RowwiseParallel, ColwiseParallel, SequenceParallel]]]):
             A tensor-parallel sharding plan.
             Keys are module names; values specify the parallel style to apply
@@ -2435,9 +2490,6 @@ def megatron_fsdp_strategy_parallelize(
     if tp_mesh.size() > 1:
         parallelize_module(model, tp_mesh, tp_shard_plan)
 
-    # Import MegatronFSDP unit modules specified by the user.
-    megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)
-
     # MegatronFSDP requires a sharded DP dimension to create its param/grad buffers.
     # In practice, configurations like world_size=2,tp=2 -> dp=1 frequently hit
     # DTensor metadata assertions inside megatron_fsdp. In that case, we still
@@ -2457,6 +2509,17 @@ def megatron_fsdp_strategy_parallelize(
                 # Best-effort fallback (e.g., if current_device isn't set).
                 model = model.to("cuda")
         return model, optimizer
+
+    # Resolve the MegatronFSDP unit (wrap) modules (only needed on the wrapping path).
+    # When the config specifies them, import the class paths as-is. Otherwise derive
+    # them from the model's `_no_split_modules` so the real instantiated block classes
+    # are wrapped regardless of backend (HF or NeMo-custom); a mismatched hard-coded
+    # class path would otherwise wrap zero modules and MegatronFSDP would raise a
+    # ZeroDivisionError (total_fsdp_module=0).
+    if megatron_fsdp_unit_modules:
+        megatron_fsdp_unit_modules = import_classes_from_paths(megatron_fsdp_unit_modules)
+    else:
+        megatron_fsdp_unit_modules = _derive_megatron_fsdp_unit_modules(model)
 
     # Wrap model with MegatronFSDP.
     # When an optimizer is provided, use the combined fully_shard which handles
