@@ -811,6 +811,19 @@ class FinetuneRecipeForVLM(BaseRecipe):
         labels = batch.pop("labels")
 
         if self.pp_enabled:
+            _embeds = batch.get("inputs_embeds")
+            if isinstance(_embeds, torch.Tensor) and _embeds.requires_grad:
+                # The whole batch is pre-embedded once; the PP schedule splits it into
+                # microbatches whose backwards each traverse that shared pre-embed graph,
+                # and the second one fails with "Trying to backward through the graph a
+                # second time". Fail here with the actionable cause instead.
+                raise ValueError(
+                    "Pipeline parallelism received grad-carrying inputs_embeds from the CP "
+                    "pre-embed hook. The shared pre-embed autograd graph cannot be backwarded "
+                    "once per PP microbatch - the model's prepare_model_inputs_for_cp must "
+                    "return inputs_embeds.detach() (embeddings/vision cannot train through "
+                    "the PP schedule; see minimax_m3_vl)."
+                )
             if not is_train:
                 logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
                 return
