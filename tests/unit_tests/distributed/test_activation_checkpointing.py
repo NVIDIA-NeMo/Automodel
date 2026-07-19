@@ -300,3 +300,46 @@ def test_detect_kv_sharing_leaves_cache_enabled_for_kv_shared_models():
     assert has_kv_sharing is True
     assert model.config.use_cache is True
     assert model.config.text_config.use_cache is True
+
+
+def _sac_context_factory():
+    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+
+    def policy(ctx, func, *args, **kwargs):
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    return lambda: create_selective_checkpoint_contexts(policy)
+
+
+def test_sac_replay_tolerates_recompute_only_record_function():
+    """A profiler range entered only during backward recompute must not desync SAC replay.
+
+    torch 2.13's FSDP2 runs its hooks under ``record_function``; with an FSDP
+    boundary inside a SAC region the range ops fire a different number of times
+    in the recompute than in the forward, which shifts SAC's per-op replay
+    index and raises ``... encountered during backward but not found in
+    storage``. ``ensure_profiler_ops_sac_ignored`` keeps profiler ops out of
+    the replay accounting.
+    """
+    if not hasattr(torch.utils.checkpoint, "SAC_IGNORED_OPS"):
+        pytest.skip("torch build without SAC_IGNORED_OPS")
+
+    ac.ensure_profiler_ops_sac_ignored()
+    assert torch.ops.profiler._record_function_enter_new.default in torch.utils.checkpoint.SAC_IGNORED_OPS
+
+    linear = nn.Linear(4, 4)
+    calls = {"n": 0}
+
+    def fn(x):
+        calls["n"] += 1
+        if calls["n"] > 1:  # backward-time recompute takes a different hook path
+            with torch.autograd.profiler.record_function("recompute-only-range"):
+                return linear(x)
+        return linear(x)
+
+    x = torch.randn(2, 4, requires_grad=True)
+    out = torch.utils.checkpoint.checkpoint(fn, x, use_reentrant=False, context_fn=_sac_context_factory())
+    out.sum().backward()
+
+    assert calls["n"] == 2
+    assert x.grad is not None
