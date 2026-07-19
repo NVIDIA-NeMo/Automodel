@@ -13,16 +13,39 @@
 # limitations under the License.
 
 import os
+from unittest.mock import patch
 
 import torch
 from torch import nn
 
 from nemo_automodel.components.checkpoint.addons import (
     _extract_target_modules,
+    _group_barrier,
+    _is_group_rank_0,
     _maybe_save_custom_model_code,
     _maybe_strip_quantization_config,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
+
+
+def test_group_barrier_uses_model_process_group():
+    group = object()
+    with (
+        patch("nemo_automodel.components.checkpoint.addons.torch.distributed.is_initialized", return_value=True),
+        patch("nemo_automodel.components.checkpoint.addons.torch.distributed.barrier") as barrier,
+    ):
+        _group_barrier(group)
+    barrier.assert_called_once_with(group=group)
+
+
+def test_group_rank_zero_is_relative_to_model_process_group():
+    group = object()
+    with (
+        patch("nemo_automodel.components.checkpoint.addons.torch.distributed.is_initialized", return_value=True),
+        patch("nemo_automodel.components.checkpoint.addons.torch.distributed.get_rank", return_value=0) as get_rank,
+    ):
+        assert _is_group_rank_0(group)
+    get_rank.assert_called_once_with(group=group)
 
 
 def _write(path: str, content: str) -> None:
@@ -131,6 +154,24 @@ def test_model_state_drops_lm_head_when_storage_shared():
     state_dict = state.state_dict()
     assert "lm_head.weight" not in state_dict  # dropped because storage is shared
     assert "model.embed_tokens.weight" in state_dict
+
+
+def test_peft_model_state_can_skip_default_group_broadcast():
+    """Subset-mesh ranks already load PEFT state and must not broadcast globally."""
+
+    class _DummyConfig:
+        tie_word_embeddings = False
+
+    model = nn.Linear(2, 2)
+    model.config = _DummyConfig()
+    state = ModelState(model, is_peft=True)
+
+    with patch("nemo_automodel.components.checkpoint.stateful_wrappers.set_model_state_dict") as set_state:
+        state.load_state_dict({}, strict=False, broadcast_from_rank0=False)
+
+    options = set_state.call_args.kwargs["options"]
+    assert options.full_state_dict is True
+    assert options.broadcast_from_rank0 is False
 
 
 # _extract_target_modules tests

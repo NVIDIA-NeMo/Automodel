@@ -51,6 +51,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
@@ -393,6 +397,7 @@ class LlamaModel(LlamaPreTrainedModel):
 class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
     """Llama model with causal language modeling head."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -402,7 +407,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = True
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = False
 
@@ -420,6 +425,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         config: LlamaConfig,
         backend: Optional[BackendConfig] = None,
     ):
+        reject_unsupported_tie_word_embeddings(type(self), config)
         warn_deprecated_model_class("LlamaForCausalLM")
         super().__init__(config)
         self.config = config

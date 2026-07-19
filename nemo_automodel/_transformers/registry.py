@@ -266,6 +266,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.step3p5.model", "Step3p5ForCausalLM"),
         ),
         (
+            "InklingForConditionalGeneration",
+            ("nemo_automodel.components.models.inkling.model", "InklingForConditionalGeneration"),
+        ),
+        (
             "Step3p7ForConditionalGeneration",
             ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
         ),
@@ -282,6 +286,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
+    "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),

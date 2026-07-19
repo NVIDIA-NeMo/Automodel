@@ -99,33 +99,39 @@ def test_env_layer_skips_when_var_unset(monkeypatch):
 def test_computed_layer_substitutes_env(monkeypatch):
     monkeypatch.setenv("PIPELINE_DIR", "/p")
     monkeypatch.setenv("TEST_NAME", "t1")
-    entries = [{
-        "target": "checkpoint.checkpoint_dir",
-        "format": "{PIPELINE_DIR}/{TEST_NAME}/checkpoint",
-        "phases": ["nightly"],
-    }]
+    entries = [
+        {
+            "target": "checkpoint.checkpoint_dir",
+            "format": "{PIPELINE_DIR}/{TEST_NAME}/checkpoint",
+            "phases": ["nightly"],
+        }
+    ]
     assert config_resolver._resolve_computed_layer(entries, "nightly") == {
         "checkpoint.checkpoint_dir": "/p/t1/checkpoint",
     }
 
 
 def test_computed_layer_substitutes_date(monkeypatch):
-    entries = [{
-        "target": "wandb.project",
-        "format": "test-{date:%Y%m%d}",
-        "phases": ["convergence"],
-    }]
+    entries = [
+        {
+            "target": "wandb.project",
+            "format": "test-{date:%Y%m%d}",
+            "phases": ["convergence"],
+        }
+    ]
     result = config_resolver._resolve_computed_layer(entries, "convergence")
     today = datetime.now().strftime("%Y%m%d")
     assert result == {"wandb.project": f"test-{today}"}
 
 
 def test_computed_layer_phase_filter():
-    entries = [{
-        "target": "wandb.name",
-        "format": "x",
-        "phases": ["convergence"],
-    }]
+    entries = [
+        {
+            "target": "wandb.name",
+            "format": "x",
+            "phases": ["convergence"],
+        }
+    ]
     assert config_resolver._resolve_computed_layer(entries, "nightly") == {}
 
 
@@ -222,7 +228,9 @@ def synthetic_recipe(tmp_path: Path) -> Path:
 def _run_resolver(args: list[str], env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, RESOLVER, *args],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
         env={**({} if env is None else env), "PATH": "/usr/bin:/bin"},
     )
 
@@ -274,7 +282,10 @@ def test_end_to_end_customizer_chat_path_wins(tmp_path):
 
     resolved = yaml.load(out.open())
     assert resolved["dataset"]["path_or_dataset_id"] == "/mnt/nci/datasets/customizer/sample-datasets/chat/train.jsonl"
-    assert resolved["validation_dataset"]["path_or_dataset_id"] == "/mnt/nci/datasets/customizer/sample-datasets/chat/validation.jsonl"
+    assert (
+        resolved["validation_dataset"]["path_or_dataset_id"]
+        == "/mnt/nci/datasets/customizer/sample-datasets/chat/validation.jsonl"
+    )
 
 
 def test_end_to_end_robustness_peft_disables_triton(tmp_path):
@@ -296,7 +307,11 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
         "step_scheduler: {global_batch_size: 8}\n"
         "ci:\n"
         "  checkpoint_robustness:\n"
+        "    check_source_load_parity: true             # fixture arg, must NOT become top-level\n"
         "    hf_kl_threshold: 5e-3                       # fixture arg, must NOT become top-level\n"
+        "    source_load_kl_threshold: 1e-2              # fixture arg, must NOT become top-level\n"
+        "    source_load_mean_kl_threshold: 1e-3         # fixture arg, must NOT become top-level\n"
+        "    source_load_cosine_threshold: 0.999         # fixture arg, must NOT become top-level\n"
         "    tokenizer_name: nvidia/Test                 # fixture arg, must NOT become top-level\n"
         "    dataset.limit_dataset_samples: 500          # dotted -> applied as override\n"
     )
@@ -310,8 +325,16 @@ def test_end_to_end_fixture_keys_not_applied_as_overrides(tmp_path):
     # Fixture args stay under ci.checkpoint_robustness for the consumer (pytest) to read,
     # and do NOT pollute the top level.
     assert "hf_kl_threshold" not in resolved
+    assert "check_source_load_parity" not in resolved
+    assert "source_load_kl_threshold" not in resolved
+    assert "source_load_mean_kl_threshold" not in resolved
+    assert "source_load_cosine_threshold" not in resolved
     assert "tokenizer_name" not in resolved
     assert resolved["ci"]["checkpoint_robustness"]["hf_kl_threshold"] == 5e-3
+    assert resolved["ci"]["checkpoint_robustness"]["check_source_load_parity"] is True
+    assert resolved["ci"]["checkpoint_robustness"]["source_load_kl_threshold"] == 1e-2
+    assert resolved["ci"]["checkpoint_robustness"]["source_load_mean_kl_threshold"] == 1e-3
+    assert resolved["ci"]["checkpoint_robustness"]["source_load_cosine_threshold"] == 0.999
 
 
 def test_end_to_end_dry_run_does_not_write(tmp_path, synthetic_recipe):

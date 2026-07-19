@@ -254,7 +254,7 @@ def _build_minified_model(kind: ModelKind):
             head_dim=16,
             max_position_embeddings=128,
             use_cache=False,
-            tie_word_embeddings=True,
+            tie_word_embeddings=False,
             rope_parameters={
                 "type": "yarn",
                 "rope_theta": 1000000.0,
