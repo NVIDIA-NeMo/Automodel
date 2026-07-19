@@ -867,7 +867,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         *mtp_embed_inputs: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
