@@ -297,19 +297,35 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
 }
 
+# model_types whose custom model implementation reads fields that only our
+# config class provides. When a transformers release starts shipping its own
+# config for one of these model_types (same model_type string, often the same
+# class name), the skip-if-built-in registration below would silently hand the
+# native config to our custom model and break its field protocol at init
+# (transformers 5.12 added minimax_m3_vl whose vision config drops rope_theta
+# -> ``'MiniMaxM3VLVisionConfig' object has no attribute 'rope_theta'``).
+# These entries override the built-in registration instead. Entries NOT listed
+# here keep the built-in config when one exists (mistral4's custom model was
+# written against the native config and runs green with it).
+_CUSTOM_CONFIG_OVERRIDES_BUILTIN = {
+    "minimax_m3_vl",
+}
+
 
 def _register_custom_configs() -> None:
     from transformers import AutoConfig
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
     for model_type, (module_path, cls_name) in _CUSTOM_CONFIG_REGISTRATIONS.items():
-        if model_type not in CONFIG_MAPPING:
-            try:
-                mod = importlib.import_module(module_path)
-                cfg_cls = getattr(mod, cls_name)
-                AutoConfig.register(model_type, cfg_cls)
-            except Exception:
-                logger.debug("Failed to register config for model_type=%s", model_type, exc_info=True)
+        is_builtin = model_type in CONFIG_MAPPING
+        if is_builtin and model_type not in _CUSTOM_CONFIG_OVERRIDES_BUILTIN:
+            continue
+        try:
+            mod = importlib.import_module(module_path)
+            cfg_cls = getattr(mod, cls_name)
+            AutoConfig.register(model_type, cfg_cls, exist_ok=is_builtin)
+        except Exception:
+            logger.debug("Failed to register config for model_type=%s", model_type, exc_info=True)
 
 
 _register_custom_configs()
