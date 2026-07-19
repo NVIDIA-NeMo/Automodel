@@ -407,6 +407,18 @@ class _FakePPModel:
 
 
 class _StageWithCPPrepare:
+    # Recipe-level CP pre-embedder (e.g. gemma4): the hook emits inputs_embeds
+    # before the schedule, so raw media never rides schedule.step -> no staging.
+    def prepare_model_inputs_for_cp(self):
+        return {}
+
+
+class _StageWithCPPreembedInForward:
+    # Sunk VLM (minimax/qwen3_5/qwen3_5_moe/step3p7): embeds + shards per
+    # microbatch inside forward and pulls media from the PP side channel, so
+    # media MUST still be staged for PP under CP.
+    cp_preembed_in_forward = True
+
     def prepare_model_inputs_for_cp(self):
         return {}
 
@@ -536,8 +548,15 @@ def _minimal_pp_setup_cfg():
 @pytest.mark.parametrize(
     ("cp_size", "stage0", "expected_pp_n_microbatches"),
     [
+        # Recipe-level CP pre-embedder under CP: media consumed pre-schedule -> no staging.
         (2, _StageWithCPPrepare(), None),
+        # Same model without CP: staging always needed under PP.
         (1, _StageWithCPPrepare(), 2),
+        # Sunk VLM under CP: pulls media from the PP side channel per microbatch,
+        # so media MUST be staged (regression guard for the 156-vs-160 vision
+        # RoPE mismatch when raw media was left for torch pipelining to row-chunk).
+        (2, _StageWithCPPreembedInForward(), 2),
+        # No CP hook at all: standard PP staging.
         (2, _StageWithoutCPPrepare(), 2),
     ],
 )

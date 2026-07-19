@@ -392,6 +392,13 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias"]
     _pp_keep_self_forward: bool = True
     mtp_outputs_are_logits = True
+    # CP pre-embed is sunk into forward (per-microbatch embed + vision splice +
+    # shard_sequence_for_cp), and the forward pulls media from the PP side
+    # channel, so the VLM recipe must still stage media for PP under CP rather
+    # than treating this as a recipe-level pre-embedder (which would leave raw
+    # pixel_values/image_grid_thw in the batch for torch pipelining to row-chunk
+    # independently, desyncing the vision RoPE positions).
+    cp_preembed_in_forward: bool = True
     # Opt into context parallelism on the SDPA attention backend (M3's block-sparse DSA
     # bias is an explicit additive mask that only SDPA accepts, not TE). Dense layers use
     # the standard CP path (mask-strip hook + is_causal); sparse layers require the

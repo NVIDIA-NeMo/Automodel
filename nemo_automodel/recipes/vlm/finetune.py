@@ -561,12 +561,21 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # training silently degrades mRoPE to plain 1D positions.
         get_rope_index = resolve_get_rope_index(self.model_parts[0])
         pp_n_microbatches = None
-        pp_cp_preembed = (
+        # Recipe-level CP pre-embedders (e.g. gemma4) consume media and emit
+        # inputs_embeds before the PP schedule, so raw media never rides
+        # schedule.step and needs no per-microbatch staging. Sunk VLMs instead
+        # embed + shard per microbatch inside forward and pull media from the PP
+        # side channel (cp_preembed_in_forward=True), so they DO need media
+        # staged for PP even under CP -- otherwise torch pipelining row-chunks
+        # pixel_values and image_grid_thw independently and the vision RoPE
+        # positions desync (156-vs-160 patch mismatch).
+        recipe_level_cp_preembed = (
             self.pp_enabled
             and self.mesh_context.cp_size > 1
             and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp")
+            and not getattr(self.model_parts[0], "cp_preembed_in_forward", False)
         )
-        if self.pp_enabled and not pp_cp_preembed:
+        if self.pp_enabled and not recipe_level_cp_preembed:
             pp_n_microbatches = self.pp.pp_batch_size // self.pp.pp_microbatch_size
 
         dataloader_config = self.cfg.vlm_dataloader
