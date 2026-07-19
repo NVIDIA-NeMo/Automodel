@@ -20,6 +20,7 @@ the sglang reference before the vision tower / VLM wrapper (Stage 3) embeds the
 text model as ``language_model``.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -191,6 +192,18 @@ class MiniMaxM3TextModel(nn.Module):
             position_ids = torch.arange(0, h.shape[1], device=h.device).unsqueeze(0).expand(h.shape[0], -1)
 
         freqs_cis = self.make_freqs_cis(position_ids, **attn_kwargs)
+
+        if os.environ.get("NEMO_CP_DEBUG"):
+            import torch.distributed as _d
+
+            _r = _d.get_rank() if _d.is_initialized() else 0
+            _cp = self.cp_mesh.size() if getattr(self, "cp_mesh", None) is not None else 1
+            print(
+                f"[NEMO_CP_DEBUG rank{_r}] CausalLM.forward: h={tuple(h.shape)} "
+                f"freqs={tuple(freqs_cis.shape)} position_ids={tuple(position_ids.shape)} "
+                f"inputs_embeds_given={inputs_embeds is not None} cp_size={_cp} nlayers={len(self.layers)}",
+                flush=True,
+            )
 
         for layer in self.layers.values():
             h = layer(
@@ -757,6 +770,19 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             inputs_embeds = input_ids
             input_ids = None
 
+        _cpdbg = os.environ.get("NEMO_CP_DEBUG")
+        if _cpdbg:
+            import torch.distributed as _d
+
+            _r = _d.get_rank() if _d.is_initialized() else 0
+            _iid = tuple(input_ids.shape) if input_ids is not None else None
+            _ie = tuple(inputs_embeds.shape) if inputs_embeds is not None else None
+            print(
+                f"[NEMO_CP_DEBUG rank{_r}] CondGen.forward ENTER: is_pp_stage={is_pp_stage} "
+                f"input_ids={_iid} inputs_embeds={_ie} cp_size={cp_size}",
+                flush=True,
+            )
+
         if inputs_embeds is None:
             inputs_embeds = self._embed_and_splice(
                 input_ids,
@@ -765,6 +791,11 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
             )
+            if _cpdbg:
+                print(
+                    f"[NEMO_CP_DEBUG rank{_r}] CondGen.forward post-embed inputs_embeds={tuple(inputs_embeds.shape)}",
+                    flush=True,
+                )
             # Per-microbatch CP: keep this rank's round-robin chunk pair of the
             # freshly embedded full sequence. The aux streams and the ring-SDPA
             # context were sharded to the same layout by shard_batch_aux_only, and
@@ -772,6 +803,11 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             # vision tower.
             if cp_size > 1:
                 inputs_embeds, _, _ = shard_sequence_for_cp(self.cp_mesh, inputs_embeds, seq_dim=1)
+                if _cpdbg:
+                    print(
+                        f"[NEMO_CP_DEBUG rank{_r}] CondGen.forward post-shard inputs_embeds={tuple(inputs_embeds.shape)}",
+                        flush=True,
+                    )
 
         hidden = self.model(
             None,
