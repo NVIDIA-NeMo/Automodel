@@ -289,28 +289,58 @@ def test_from_pretrained_uses_step3p7_config(monkeypatch):
 
 
 def test_prepare_model_inputs_for_cp_and_pre_embed_only_error():
+    from nemo_automodel.components.distributed.cp_sharder import (
+        ContextParallelismSharder,
+        round_robin_local_indices,
+        shard_batch_aux_only,
+    )
+
     wrapper, _ = _wrapper_with_fake_inner()
     input_ids = torch.tensor([[1, 31, 2]])
-    image_embeds = torch.randn(1, 8)
 
-    batch = {"input_ids": input_ids, "image_embeds": image_embeds}
-    result = wrapper.prepare_model_inputs_for_cp(batch)
-    assert {k for k, v in result.items() if v is not None} == {"inputs_embeds"}
-    assert result["inputs_embeds"].shape == (1, 3, 8)
-    # Consumed raw inputs come back as None markers for the dispatcher to remove.
-    assert result["input_ids"] is None
-    assert result["image_embeds"] is None
+    # sharder-only hook: no inputs_embeds (the forward embeds), input_ids kept.
+    result = wrapper.prepare_model_inputs_for_cp({"input_ids": input_ids, "image_embeds": torch.randn(1, 8)})
+    assert "inputs_embeds" not in result
+    assert set(result) == {"cp_sharder"}
+    sharder = result["cp_sharder"]
+    assert isinstance(sharder, ContextParallelismSharder)
+    assert sharder.shard_batch is shard_batch_aux_only
+    assert sharder.local_token_global_indices is round_robin_local_indices
 
     # The dispatcher hands the whole batch dict through the _cp_batch kwarg.
-    assert wrapper(_pre_embed_only=True, _cp_batch={"input_ids": input_ids, "image_embeds": image_embeds})[
-        "inputs_embeds"
-    ].shape == (
-        1,
-        3,
-        8,
-    )
+    out = wrapper(_pre_embed_only=True, _cp_batch={"input_ids": input_ids, "image_embeds": torch.randn(1, 8)})
+    assert set(out) == {"cp_sharder"}
     with pytest.raises(ValueError, match="CP pre-embedding requires input_ids"):
         wrapper(_pre_embed_only=True, _cp_batch={})
+
+
+def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():
+    """Under CP the first stage input stays full-length token ids while every
+    stage output (and the propagated MTP hidden states) is the local shard;
+    cp_size==1 keeps the pre-CP symmetric shapes."""
+
+    class _FakeCPMesh:
+        def __init__(self, size):
+            self._size = size
+
+        def size(self):
+            return self._size
+
+    wrapper, _ = _wrapper_with_fake_inner()
+    hidden = wrapper.config.text_config.hidden_size
+    mtp_depth = int(getattr(wrapper.mtp_config, "num_layers", 0) or 0)
+
+    # cp_size == 1: symmetric (regression against the pre-CP behavior).
+    ins, outs = wrapper.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=6, dtype=torch.float32)
+    assert ins[0].shape == (1, 6, hidden)
+    assert len(ins) == 1 + mtp_depth
+
+    # cp_size == 2: first-stage input full (6) ids, hidden states local (pad 6->8, //2 = 4).
+    wrapper.cp_mesh = _FakeCPMesh(2)
+    ins, outs = wrapper.get_pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=6, dtype=torch.float32)
+    assert ins[0].shape == (1, 6) and ins[0].dtype == torch.long
+    assert outs[0].shape[1] == 4  # local sequence length on every output
+    assert all(o.shape[1] == 4 for o in outs)
 
 
 def test_forward_consumes_pp_vlm_chunks_and_drops_mismatched_masks(monkeypatch):
