@@ -829,7 +829,7 @@ def test_force_hf_true_disables_meta_init(monkeypatch):
 # -----------------
 # NVTX flag tests
 # -----------------
-def _minimal_cfg_with_nvtx(nvtx_value: bool):
+def _minimal_cfg_with_nvtx(nvtx_value: bool, optimizer_target: str | None = None):
     """Helper to build a minimal ConfigNode for nvtx tests."""
     return ConfigNode(
         {
@@ -839,7 +839,7 @@ def _minimal_cfg_with_nvtx(nvtx_value: bool):
             "dataset": {},
             "validation_dataloader": {},
             "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
-            "optimizer": {},
+            "optimizer": {"_target_": optimizer_target} if optimizer_target is not None else {},
             "loss_fn": {},
             "checkpoint": {"best_metric_key": "default"},
             "distributed": {"cp_size": 1},
@@ -1036,13 +1036,16 @@ def test_nvtx_false_skips_patching(monkeypatch):
 
 
 def test_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch):
-    cfg = _minimal_cfg_with_nvtx(nvtx_value=False)
+    cfg = _minimal_cfg_with_nvtx(nvtx_value=False, optimizer_target="torch.optim.AdamW")
 
     _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
+    optimizer_config = build_optimizer_config("torch.optim.AdamW", {"lr": 0.01})
+    assert not hasattr(optimizer_config, "_target_")
+    monkeypatch.setattr(optimizer_config, "build", lambda *a, **k: [dummy_opt])
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
-        property(lambda self: SimpleNamespace(_target_="torch.optim.AdamW", build=lambda *a, **k: [dummy_opt])),
+        property(lambda self: optimizer_config),
     )
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)

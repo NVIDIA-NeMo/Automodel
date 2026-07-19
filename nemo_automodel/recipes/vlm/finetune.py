@@ -517,7 +517,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         resolve_storage_dtype(
             self.cfg.model,
-            self.cfg.optimizer,
+            self.cfg.get("optimizer"),
             is_peft=self.peft_config is not None,
             context="vlm",
             logger=logger,
