@@ -594,7 +594,14 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         grid_thw,
         token_index: int,
     ) -> torch.Tensor:
-        features = self.vision_tower(pixel_values, self._to_grid_list(grid_thw))
+        # The vision tower's bidirectional patch attention is not CP-sharded; when
+        # this embed+splice runs in-forward under an active CP ring context it must
+        # suspend the ring dispatcher, or torch's load-balanced ring SDPA rejects
+        # the non-causal attention. No-op when CP is inactive.
+        from nemo_automodel.components.distributed.cp_utils import cp_dispatcher_suspended  # noqa: PLC0415
+
+        with cp_dispatcher_suspended(self.cp_mesh):
+            features = self.vision_tower(pixel_values, self._to_grid_list(grid_thw))
         mask = input_ids == token_index
         expected = int(mask.sum().item())
         if features.shape[0] != expected:
@@ -729,14 +736,12 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
 
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
 
-        # Media reaching a PP stage under CP would need grid_thw-aware per-sample
-        # microbatch chunking composed with the CP sequence shard; unsupported.
-        # Text-only CP×PP is the supported combined topology.
-        if is_pp_stage and cp_size > 1 and (pixel_values is not None or pixel_values_videos is not None):
-            raise NotImplementedError(
-                "MiniMax M3 VL does not support image/video microbatch chunking under combined "
-                "pipeline + context parallelism; use a text-only batch for cp>1 and pp>1."
-            )
+        # Media under CP×PP rides the same per-microbatch side channel as cp1×PP:
+        # stage_vlm_media_for_pp stashed grid-aware pixel chunks (pulled just above),
+        # and the embed + vision splice below runs on this microbatch's FULL sequence
+        # before shard_sequence_for_cp shards it. So the CP shard composes with the
+        # media staging without changing the stage metas (the first-stage input is
+        # still input_ids [mb, S]; media never enters the stage tensor stream).
 
         # Pipeline stages after the first receive the previous stage's hidden
         # states in the input_ids slot (a float tensor); route them straight to

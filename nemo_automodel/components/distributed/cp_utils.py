@@ -30,6 +30,41 @@ from nemo_automodel.components.distributed.cp_sharder import (
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
 
 
+@contextlib.contextmanager
+def cp_dispatcher_suspended(cp_mesh):
+    """Temporarily suspend torch's ``context_parallel`` ring-SDPA monkeypatch.
+
+    A model that embeds and sequence-shards its own primary stream in ``forward``
+    (Megatron-style per-microbatch CP) runs any auxiliary non-CP attention -- a
+    VLM vision tower over image patches -- inside the ring-SDPA
+    ``context_parallel`` context while CP is active. That attention is
+    bidirectional and unsharded, so torch's load-balanced ring SDPA all-gathers
+    its Q/K/V and rejects it with "Load balancing requires ``is_causal=True``".
+    The legacy buffer-API ``context_parallel`` installs the ring by monkeypatching
+    ``F.scaled_dot_product_attention``; this restores the original SDPA for the
+    wrapped vision forward, then re-installs the ring for the sharded text decoder.
+
+    Args:
+        cp_mesh: The context-parallel submesh. A no-op when None or size <= 1, so
+            callers pass the same mesh they shard with; re-enabling needs it.
+    """
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        yield
+        return
+    # torch-internal: the legacy context_parallel enables its SDPA monkeypatch via
+    # these _impl toggles with the attention seq dim (2 for [B, heads, seq, dim]).
+    from torch.distributed.tensor.experimental._context_parallel._attention import (  # noqa: PLC0415
+        _disable_context_parallel_dispatcher_impl,
+        _enable_context_parallel_dispatcher_impl,
+    )
+
+    _disable_context_parallel_dispatcher_impl()
+    try:
+        yield
+    finally:
+        _enable_context_parallel_dispatcher_impl(seq_dim=2, mesh=cp_mesh)
+
+
 # based on https://github.com/pytorch/torchtitan/blob/0b44d4c437c424b6bf719661c0eb4283dc4068bc/torchtitan/distributed/utils.py#L180  # pylint: disable=C0301
 def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool, cp_context=None):
     """
