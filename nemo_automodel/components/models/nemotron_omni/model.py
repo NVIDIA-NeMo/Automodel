@@ -34,6 +34,12 @@ from transformers import AutoConfig, AutoModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.cp_sharder import (
+    ContextParallelismSharder,
+    round_robin_local_indices,
+    shard_batch_aux_only,
+    shard_sequence_for_cp,
+)
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -245,6 +251,9 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
     """
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    # CP submesh, installed by the MoE parallelizer's apply_cp when context
+    # parallelism is active; None means the forward embeds and shards nothing for CP.
+    cp_mesh = None
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -770,105 +779,29 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         *,
         num_chunks: int = 1,
     ) -> dict[str, Any]:
-        """Merge image/video/audio features into text embeddings BEFORE CP sharding.
+        """Return a sharder-only CP backend; embed + splice + shard happen in forward.
 
-        Under CP > 1 the sequence is sharded; multimodal scatter must run on the
-        full un-sharded sequence so each rank ends up with embeddings that match
-        its local slice of input_ids. Returns a dict so future per-layer inputs
-        can ride alongside ``inputs_embeds``.
-
-        Removes the raw input keys it consumed from ``batch``; the dispatcher merges
-        the returned entries on top.
+        Embedding and the image/video/audio multimodal scatter now run inside
+        ``forward`` per microbatch (the existing ``inputs_embeds is None`` block),
+        which then round-robin shards the result with
+        :func:`shard_sequence_for_cp`. The returned
+        :class:`ContextParallelismSharder` round-robin-shards only the no-grad aux
+        streams (labels/position_ids/loss_mask/padding_mask) and leaves
+        ``input_ids`` and the media inputs full-length for the forward. NemotronOmni
+        uses plain 1-D positions, so no ``position_ids`` are computed here.
 
         Args:
-            batch: The batch dict (with ``input_ids`` and optional multimodal
-                keys).
-            num_chunks: Number of chunks for load-balanced CP sharding.
+            batch: The full-sequence batch (with ``input_ids`` ``[batch,
+                sequence]``); left intact.
+            num_chunks: Accepted for hook-signature parity; unused (round-robin CP).
         """
-        input_ids = batch.get("input_ids")
-        pixel_values = batch.get("pixel_values")
-        image_flags = batch.get("image_flags")
-        imgs_sizes = batch.get("imgs_sizes")
-        pixel_values_videos = batch.get("pixel_values_videos")
-        sound_features = batch.get("sound_features")
-        sound_attention_mask = batch.get("sound_attention_mask")
-        inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
-
-        if pixel_values is not None and imgs_sizes is not None:
-            B, N, C = inputs_embeds.shape
-            inputs_embeds = inputs_embeds.reshape(B * N, C)
-            selected = input_ids.reshape(B * N) == self.img_context_token_id
-            vit_embeds = self.extract_feature_dynamic(pixel_values, imgs_sizes).reshape(-1, C)
-            try:
-                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds
-            except Exception:
-                n_token = int(selected.sum().item())
-                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds[:n_token]
-            inputs_embeds = inputs_embeds.reshape(B, N, C)
-        elif pixel_values is not None and image_flags is not None:
-            image_flags_squeezed = image_flags.squeeze(-1)
-            B, N, C = inputs_embeds.shape
-            inputs_embeds = inputs_embeds.reshape(B * N, C)
-            selected = input_ids.reshape(B * N) == self.img_context_token_id
-            vit_embeds = self.extract_feature(pixel_values)[image_flags_squeezed == 1]
-            try:
-                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds.reshape(-1, C)
-            except Exception:
-                vit_embeds = vit_embeds.reshape(-1, C)
-                n_token = selected.sum()
-                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds[:n_token]
-            inputs_embeds = inputs_embeds.reshape(B, N, C)
-
-        if pixel_values_videos is not None:
-            assert pixel_values is None, "pixel_values and pixel_values_videos are mutually exclusive"
-            B_v, N_v, C_v = inputs_embeds.shape
-            inputs_embeds = inputs_embeds.reshape(B_v * N_v, C_v)
-            video_selected = input_ids.reshape(B_v * N_v) == self.img_context_token_id
-            video_embeds = self.extract_video_feature(pixel_values_videos)
-            inputs_embeds[video_selected] = inputs_embeds[video_selected] * 0.0 + video_embeds.reshape(-1, C_v)
-            inputs_embeds = inputs_embeds.reshape(B_v, N_v, C_v)
-
-        has_sound = (
-            sound_features is not None and self.sound_encoder is not None and self.sound_context_token_id is not None
-        )
-        if has_sound:
-            B_s, N_s, C_s = inputs_embeds.shape
-            inputs_embeds = inputs_embeds.reshape(B_s * N_s, C_s)
-            sound_selected = input_ids.reshape(B_s * N_s) == self.sound_context_token_id
-            num_sound_tokens = sound_selected.sum().item()
-            if num_sound_tokens > 0:
-                sound_features = sound_features.to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
-                if sound_attention_mask is not None:
-                    sound_attention_mask = sound_attention_mask.to(device=inputs_embeds.device)
-                sound_embeds_flat = self.extract_sound_feature(sound_features, sound_attention_mask).reshape(-1, C_s)
-                try:
-                    inputs_embeds[sound_selected] = inputs_embeds[sound_selected] * 0.0 + sound_embeds_flat.to(
-                        inputs_embeds.dtype
-                    )
-                except Exception:
-                    inputs_embeds[sound_selected] = inputs_embeds[sound_selected] * 0.0 + sound_embeds_flat[
-                        :num_sound_tokens
-                    ].to(inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.reshape(B_s, N_s, C_s)
-
-        # Consumed into inputs_embeds; returned as None so the dispatcher
-        # removes them from the batch (the hook may receive a copy of the
-        # batch dict when FSDP2 casts forward kwargs, so in-place pops are
-        # not reliable; the return channel is).
-        consumed = {
-            key: None
-            for key in (
-                "input_ids",
-                "pixel_values",
-                "image_flags",
-                "imgs_sizes",
-                "pixel_values_videos",
-                "sound_features",
-                "sound_attention_mask",
+        del batch, num_chunks
+        return {
+            "cp_sharder": ContextParallelismSharder(
+                shard_batch=shard_batch_aux_only,
+                local_token_global_indices=round_robin_local_indices,
             )
         }
-
-        return {**consumed, "inputs_embeds": inputs_embeds}
 
     def forward(
         self,
@@ -1088,6 +1021,16 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
                 del sound_embeds, sound_embeds_flat
 
             inputs_embeds = inputs_embeds.reshape(B_s, N_s, C_s)
+
+        # Context-parallel: keep this rank's round-robin chunk pair of the freshly
+        # embedded + spliced full sequence, so the LM runs on the local shard and
+        # sees exactly what the old dispatch-level pre-embed produced (inputs_embeds
+        # sharded). The aux streams were sharded to the same layout by
+        # shard_batch_aux_only. Skipped when inputs_embeds was supplied pre-sharded.
+        # Differentiable: gradients reach the embeddings and multimodal encoders.
+        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+        if cp_size > 1 and not _embeds_pre_built:
+            inputs_embeds, _, _ = shard_sequence_for_cp(self.cp_mesh, inputs_embeds, seq_dim=1)
 
         # Forward through the LLM. ``logits_to_keep`` gates the lm_head projection
         # (0 -> all positions; N -> last N) and ``output_hidden_states`` makes the
