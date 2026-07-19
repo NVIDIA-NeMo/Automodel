@@ -798,13 +798,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # Single CP dispatch (magi / model-owned / generic). The pre-embed hook is
         # routed through __call__ so FSDP2 forward pre-hooks fire and unshard the
         # vision tower's weights before the embed/scatter.
-        _pre_embed_here = not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False)
+        _is_first_or_no_pp = not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False)
+        # Sunk models expose a sharder-only CP hook (no compute, nothing consumed).
+        # Invoke it on EVERY pp stage so the aux-only sharder is installed there
+        # too and input_ids stays FULL-length on non-first stages. Otherwise those
+        # stages fall through to the generic round-robin sharder, which shards
+        # input_ids to the local length; the recipe then feeds that already-local
+        # length to update_seq_len and the CP-aware get_pipeline_stage_metas ÷cp a
+        # second time -> non-first recv buffers become S/cp² and the inter-stage
+        # P2P truncates the hidden (text-decoder RoPE size mismatch). Recipe-level
+        # pre-embedders (gemma4) must still embed only on the first stage.
+        _model_sunk = getattr(self.model_parts[0], "cp_preembed_in_forward", False)
+        _pre_embed_here = _is_first_or_no_pp or _model_sunk
         _cp_active = (
             self.device_mesh is not None
             and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
             and self.device_mesh["cp"].size() > 1
         )
-        if _cp_active and not _pre_embed_here and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp"):
+        if _cp_active and not _is_first_or_no_pp and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp"):
             # PP stages without embeddings never pre-embed; drop the raw
             # multimodal inputs so stage forwards see only text inputs.
             for k in VLM_INPUT_KEYS:

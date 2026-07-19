@@ -398,6 +398,100 @@ def test_forward_backward_step_pp_cp_first_stage_uses_inputs_embeds(monkeypatch)
     assert torch.equal(loss_buffer[0], torch.tensor(1.25))
 
 
+class _SunkSpyVLM:
+    """Sunk VLM: sharder-only CP hook (embeds/shards in forward, consumes nothing)."""
+
+    cp_preembed_in_forward = True
+
+    def __init__(self):
+        self.calls = []
+
+    def prepare_model_inputs_for_cp(self, **kwargs):
+        return {}
+
+    def __call__(self, *, _pre_embed_only=False, **kwargs):
+        record = {"_pre_embed_only": _pre_embed_only, **kwargs}
+        if isinstance(record.get("_cp_batch"), dict):
+            record["_cp_batch"] = dict(record["_cp_batch"])
+        self.calls.append(record)
+        if _pre_embed_only:
+            # Sharder-only: nothing consumed, no inputs_embeds — input_ids stays full.
+            return {}
+        raise AssertionError("recipe must use _pre_embed_only=True for the CP prepare step")
+
+
+def _run_nonfirst_stage_fbstep(monkeypatch, model):
+    """Drive _forward_backward_step for a non-first (has_first_stage=False) PP+CP stage."""
+    labels = torch.arange(12, dtype=torch.long).reshape(2, 6)
+    schedule = _ScheduleSpy()
+    seq_lens = []
+    recipe = object.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.device_mesh = _FakeCPMesh()
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    recipe.model_parts = [model]
+    recipe.pp_enabled = True
+    recipe.pp = SimpleNamespace(
+        pp_microbatch_size=2,
+        info=SimpleNamespace(
+            has_first_stage=False,
+            has_last_stage=True,
+            stages=[SimpleNamespace(is_first=False, inputs_meta=None)],
+            schedule=schedule,
+        ),
+        update_seq_len=seq_lens.append,
+    )
+    batch = {
+        "input_ids": torch.ones(2, 6, dtype=torch.long),
+        "pixel_values": torch.zeros(2, 3, 4, 4),
+        "labels": labels,
+    }
+    seen_cp_batch = {}
+
+    def _make_cp_batch_and_ctx(device_mesh, cp_batch, *args, **kwargs):
+        seen_cp_batch.update(cp_batch)
+        return nullcontext, cp_batch, None
+
+    monkeypatch.setattr(cp_utils_mod, "_make_cp_batch_and_ctx", _make_cp_batch_and_ctx)
+    monkeypatch.setattr(vlm_finetune, "stage_vlm_media_for_pp", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_maybe_set_pp_first_stage_embed_input_meta", lambda self, mi: None)
+
+    FinetuneRecipeForVLM._forward_backward_step(
+        recipe, 0, batch, loss_buffer=[], num_label_tokens=labels.numel(), num_batches=1
+    )
+    return seen_cp_batch, seq_lens
+
+
+def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keeps_input_ids_full(monkeypatch):
+    """Regression: a sunk model must invoke its sharder-only hook on NON-first PP
+    stages under cp>1, so input_ids stays full-length and update_seq_len (which
+    drives the CP-aware stage metas) sees the FULL seq_len — not the local length
+    the generic sharder would produce, which would ÷cp a second time and truncate
+    the inter-stage hidden (the text-decoder RoPE size mismatch)."""
+    model = _SunkSpyVLM()
+    seen_cp_batch, seq_lens = _run_nonfirst_stage_fbstep(monkeypatch, model)
+
+    # Hook invoked on the non-first stage (this is the fix).
+    assert len(model.calls) == 1
+    assert model.calls[0]["_pre_embed_only"] is True
+    # Sharder-only hook consumes nothing: input_ids stays full-length (seq=6).
+    assert "input_ids" in seen_cp_batch
+    assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
+    # All pp ranks feed the FULL seq_len to update_seq_len.
+    assert seq_lens == [6]
+
+
+def test_forward_backward_step_pp_cp_recipe_level_preembedder_skips_hook_on_nonfirst_stage(monkeypatch):
+    """Control: a recipe-level pre-embedder (no cp_preembed_in_forward) must NOT
+    invoke its hook on non-first stages (it only embeds on the first stage); media
+    is dropped and the generic sharder path handles those stages as before."""
+    model = _SpyVLM()  # no cp_preembed_in_forward flag
+    seen_cp_batch, _ = _run_nonfirst_stage_fbstep(monkeypatch, model)
+
+    assert model.calls == []  # hook NOT invoked on the non-first stage
+    assert "pixel_values" not in seen_cp_batch  # media dropped
+
+
 class _FakePPModel:
     def __init__(self, stage0):
         self.parts = [stage0]
