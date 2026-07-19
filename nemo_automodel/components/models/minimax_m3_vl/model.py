@@ -654,7 +654,14 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             key: None
             for key in ("input_ids", "pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw")
         }
-        return {**consumed, "inputs_embeds": inputs_embeds}
+        # Detach: this recipe family trains with the embeddings/vision tower frozen, so
+        # no gradient is lost. It is also required under pipeline parallelism: the whole
+        # batch is pre-embedded once, then the PP schedule splits it into microbatches
+        # whose backwards each traverse the SAME pre-embed graph — the second microbatch
+        # dies with "Trying to backward through the graph a second time"
+        # (cp2/pp4 E2E, nemo-ci job 367479592). Vision training under CP+PP would need
+        # per-microbatch pre-embedding, not just removing this detach.
+        return {**consumed, "inputs_embeds": inputs_embeds.detach()}
 
     def forward(
         self,
