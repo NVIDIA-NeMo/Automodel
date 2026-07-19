@@ -581,6 +581,111 @@ def shard_batch_contiguous(
 # ---------------------------------------------------------------------------
 
 
+# Per-buffer pad sentinels for the round-robin CP shard: each tensor's "ignore"
+# value is semantic, not dtype-derived. ``labels``/``padding_mask``/
+# ``attention_mask`` are all int/bool but have different ignore conventions.
+# Falling through to 0 for ``padding_mask`` (== False == "real token") would tell
+# the MoE router to route the cp-pad slots to experts -- silently wasting
+# capacity and skewing load-balance loss. Everything else (input_ids,
+# position_ids, ...) falls through to 0.
+_ROUND_ROBIN_PAD_FILL = {
+    "labels": -100,  # CE ignore_index
+    "padding_mask": True,  # bool: True == "this position is pad, ignore"
+    "attention_mask": False,  # HF: 0 == "this position is pad, ignore"
+}
+
+
+def _normalize_cp_primary_and_positions(batch) -> tuple[str, torch.Tensor, int, int, torch.Tensor, int]:
+    """Resolve the primary stream and normalize ``position_ids`` for a CP shard.
+
+    Pops nothing; determines whether the batch carries ``inputs_embeds``
+    (``[batch, sequence, hidden]``) or ``input_ids`` (``[batch, sequence]``),
+    injects a 1-D ``position_ids`` arange when absent, and expands a shared
+    ``[1, sequence]`` position row to the batch size.
+
+    Args:
+        batch: The full-sequence batch; ``position_ids`` is added/expanded in place.
+
+    Returns:
+        ``(primary_key, primary_seq_tensor, seq_len, batch_size, position_ids,
+        pos_seq_dim)`` where ``pos_seq_dim`` is 2 for mRoPE ``[3, batch,
+        sequence]`` position ids and 1 otherwise.
+    """
+    has_inputs_embeds = "inputs_embeds" in batch
+    has_input_ids = "input_ids" in batch
+    assert has_inputs_embeds ^ has_input_ids, (
+        "the CP dispatch requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
+    )
+    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
+    primary_seq_tensor = batch[primary_key]
+    seq_len = primary_seq_tensor.shape[1]
+    batch_size = primary_seq_tensor.shape[0]
+
+    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
+    if "position_ids" not in batch:
+        batch["position_ids"] = (
+            torch.arange(0, seq_len, device=primary_seq_tensor.device).unsqueeze(0).expand(batch_size, -1).contiguous()
+        )
+    else:
+        position_ids = batch["position_ids"]
+        if position_ids.ndim == 2 and position_ids.shape[0] == 1 and batch_size > 1:
+            batch["position_ids"] = position_ids.expand(batch_size, -1).contiguous()
+
+    position_ids = batch["position_ids"]
+    # mRoPE: [3, B, S] → shard on dim 2; standard: [B, S] → shard on dim 1
+    pos_seq_dim = 2 if position_ids.ndim == 3 else 1
+    return primary_key, primary_seq_tensor, seq_len, batch_size, position_ids, pos_seq_dim
+
+
+def _pad_cp_buffers_to_divisor(
+    cp_buffers, cp_seq_dims, cp_no_restore_buffers, batch_buffer_keys, seq_len, cp_divisor, batch
+):
+    """Right-pad every CP buffer on its sequence dim to ``cp_divisor`` in place.
+
+    Pads sequence length to be divisible by ``2 * cp_size`` (required by
+    ``context_parallel`` load balancing); the inputs_embeds path can hit
+    arbitrary seq lengths from the VLM collator, so padding happens here rather
+    than relying on dataset-side padding. Each padded, batch-sourced buffer is
+    mirrored back into ``batch`` so downstream dict readers see the padded shape.
+
+    Args:
+        cp_buffers: Sequence-aligned tensors, each ``[..., sequence, ...]``,
+            padded and replaced in place.
+        cp_seq_dims: Per-buffer sequence axis.
+        cp_no_restore_buffers: Set of buffers the CP context must not restore;
+            rebuilt to reference the padded tensors.
+        batch_buffer_keys: Map from buffer index to its batch key (buffers not
+            sourced from the batch are omitted).
+        seq_len: The pre-pad sequence length.
+        cp_divisor: ``2 * cp_size``.
+        batch: The batch dict; padded batch-sourced buffers are mirrored back.
+
+    Returns:
+        ``(cp_buffers, cp_no_restore_buffers)`` referencing the padded tensors.
+    """
+    if seq_len % cp_divisor == 0:
+        return cp_buffers, cp_no_restore_buffers
+    pad_len = cp_divisor - (seq_len % cp_divisor)
+    new_no_restore = set()
+    for i, (buf, dim) in enumerate(zip(cp_buffers, cp_seq_dims)):
+        pad_shape = list(buf.shape)
+        pad_shape[dim] = pad_len
+        if buf.dtype.is_floating_point:
+            pad_val = torch.zeros(pad_shape, dtype=buf.dtype, device=buf.device)
+        else:
+            fill_val = _ROUND_ROBIN_PAD_FILL.get(batch_buffer_keys.get(i), 0)
+            pad_val = torch.full(pad_shape, fill_val, dtype=buf.dtype, device=buf.device)
+        old_buf = buf
+        cp_buffers[i] = torch.cat([buf, pad_val], dim=dim)
+        if old_buf in cp_no_restore_buffers:
+            new_no_restore.add(cp_buffers[i])
+    # Mirror every batch-sourced cp_buffer back into ``batch`` so any downstream
+    # consumer reading from the dict sees the padded shape.
+    for idx, key in batch_buffer_keys.items():
+        batch[key] = cp_buffers[idx]
+    return cp_buffers, new_no_restore
+
+
 def shard_batch_load_balanced(
     cp_mesh,
     tp_mesh,
@@ -620,33 +725,9 @@ def shard_batch_load_balanced(
 
     # Determine the primary sequence tensor: inputs_embeds (VLM with CP, where
     # multimodal token replacement happened pre-shard) or input_ids (standard LLM).
-    has_inputs_embeds = "inputs_embeds" in batch
-    has_input_ids = "input_ids" in batch
-    assert has_inputs_embeds ^ has_input_ids, (
-        "the CP dispatch requires exactly one of 'inputs_embeds' or 'input_ids' in batch"
+    primary_key, primary_seq_tensor, seq_len, batch_size, position_ids, pos_seq_dim = (
+        _normalize_cp_primary_and_positions(batch)
     )
-    if has_inputs_embeds:
-        primary_seq_tensor = batch["inputs_embeds"]
-    else:
-        primary_seq_tensor = batch["input_ids"]
-    seq_len = primary_seq_tensor.shape[1]
-
-    # Skip 1D injection if position_ids already in batch (e.g. mRoPE pre-computed)
-    batch_size = primary_seq_tensor.shape[0]
-    if "position_ids" not in batch:
-        batch["position_ids"] = (
-            torch.arange(0, seq_len, device=primary_seq_tensor.device).unsqueeze(0).expand(batch_size, -1).contiguous()
-        )
-    else:
-        position_ids = batch["position_ids"]
-        if position_ids.ndim == 2 and position_ids.shape[0] == 1 and batch_size > 1:
-            batch["position_ids"] = position_ids.expand(batch_size, -1).contiguous()
-
-    position_ids = batch["position_ids"]
-
-    # Determine correct seq dim for CP sharding
-    # mRoPE: [3, B, S] → shard on dim 2; standard: [B, S] → shard on dim 1
-    pos_seq_dim = 2 if position_ids.ndim == 3 else 1
 
     labels = batch["labels"]
 
@@ -655,7 +736,6 @@ def shard_batch_load_balanced(
     # below can pick the semantically-correct fill sentinel and mirror the
     # padded tensor back into ``batch``.  ``loss_mask`` is passed as an arg
     # (not in batch) so it has no key.
-    primary_key = "inputs_embeds" if has_inputs_embeds else "input_ids"
     cp_buffers = [primary_seq_tensor, labels, position_ids]
     # inputs_embeds is [B, S, H] → seq_dim=1; input_ids is [B, S] → seq_dim=1
     cp_seq_dims = [1, 1, pos_seq_dim]
@@ -687,44 +767,10 @@ def shard_batch_load_balanced(
         cp_seq_dims.append(extra_seq_dim)
         cp_no_restore_buffers.add(buffer)
 
-    # Pad sequence length to be divisible by 2 * cp_size (required by
-    # context_parallel load balancing). The inputs_embeds path can hit
-    # arbitrary seq lengths from the VLM collator, so we pad here rather
-    # than relying on dataset-side padding.
-    #
-    # Per-buffer pad sentinels: each tensor's "ignore" value is semantic, not
-    # dtype-derived.  ``labels``/``padding_mask``/``attention_mask`` are all
-    # int/bool but have different ignore conventions.  Falling through to 0
-    # for ``padding_mask`` (== False == "real token") would tell the MoE
-    # router to route the cp-pad slots to experts -- silently wasting capacity
-    # and skewing load-balance loss.
-    PAD_FILL = {
-        "labels": -100,  # CE ignore_index
-        "padding_mask": True,  # bool: True == "this position is pad, ignore"
-        "attention_mask": False,  # HF: 0 == "this position is pad, ignore"
-        # everything else (input_ids, position_ids, ...) -> 0
-    }
     cp_divisor = cp_mesh.size() * 2
-    if seq_len % cp_divisor != 0:
-        pad_len = cp_divisor - (seq_len % cp_divisor)
-        new_no_restore = set()
-        for i, (buf, dim) in enumerate(zip(cp_buffers, cp_seq_dims)):
-            pad_shape = list(buf.shape)
-            pad_shape[dim] = pad_len
-            if buf.dtype.is_floating_point:
-                pad_val = torch.zeros(pad_shape, dtype=buf.dtype, device=buf.device)
-            else:
-                fill_val = PAD_FILL.get(batch_buffer_keys.get(i), 0)
-                pad_val = torch.full(pad_shape, fill_val, dtype=buf.dtype, device=buf.device)
-            old_buf = buf
-            cp_buffers[i] = torch.cat([buf, pad_val], dim=dim)
-            if old_buf in cp_no_restore_buffers:
-                new_no_restore.add(cp_buffers[i])
-        cp_no_restore_buffers = new_no_restore
-        # Mirror every batch-sourced cp_buffer back into ``batch`` so any
-        # downstream consumer reading from the dict sees the padded shape.
-        for idx, key in batch_buffer_keys.items():
-            batch[key] = cp_buffers[idx]
+    cp_buffers, cp_no_restore_buffers = _pad_cp_buffers_to_divisor(
+        cp_buffers, cp_seq_dims, cp_no_restore_buffers, batch_buffer_keys, seq_len, cp_divisor, batch
+    )
 
     # PyTorch's legacy context_parallel buffers API shards in place with
     # ``resize_``/``copy_``. ``resize_`` rejects tensors that require gradients,
@@ -751,3 +797,145 @@ def shard_batch_load_balanced(
     enable_compiled_autograd: bool = False
     facts = ShardLayout(original_seq_len=seq_len, padded_seq_len=seq_len + (-seq_len) % cp_divisor)
     return get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch, facts
+
+
+def shard_batch_aux_only(
+    cp_mesh,
+    tp_mesh,
+    batch,
+    *,
+    loss_mask=None,
+    padding_token_id: int = 0,
+    extra_seq_buffers: dict[str, int] | None = None,
+):
+    """Round-robin CP shard of the no-grad AUXILIARY streams only.
+
+    The framework-owned peer of :func:`shard_batch_load_balanced` for models that
+    embed and sequence-shard their primary stream (``input_ids`` /
+    ``inputs_embeds`` and any ``pixel_*`` keys) inside their own forward
+    (Megatron-style per-microbatch CP). Pads and round-robin-shards
+    ``labels``/``position_ids``/``loss_mask``/``padding_mask`` (and any
+    ``extra_seq_buffers``) exactly like the load-balanced path, installs the same
+    ring-SDPA ``context_parallel`` context, and leaves the primary stream
+    full-length in the batch for the model to embed and shard via
+    :func:`shard_sequence_for_cp`.
+
+    Because the primary stream never enters the ``context_parallel`` buffer list,
+    the grad-carrying-buffer constraint (``resize_`` rejects tensors requiring
+    grad) does not apply: the model shards its embeddings with a differentiable
+    ``index_select`` and gradients route to the embeddings / vision tower.
+
+    Args:
+        cp_mesh: The context-parallel device (sub)mesh (size > 1).
+        tp_mesh: The tensor-parallel device (sub)mesh (or None); unused here.
+        batch: The full-sequence batch; aux tensors are padded/mirrored in place
+            and the primary stream (``input_ids``/``inputs_embeds``) is left
+            full-length. ``labels`` is required.
+        loss_mask: Optional per-token loss mask ``[batch, sequence]``, sharded
+            alongside the batch.
+        padding_token_id: Accepted per the contract but unused (the primary
+            stream is not sharded here).
+        extra_seq_buffers: Additional batch keys mapped to their sequence axis,
+            padded and sharded alongside the aux tensors.
+
+    Returns:
+        ``(ctx_factory, batch, ShardLayout)`` where entering ``ctx_factory()``
+        installs the SDPA-kernel + ``context_parallel`` context for the forward.
+        The layout's ``padded_seq_len`` is what the model must pad its primary
+        stream to before sharding.
+    """
+    from nemo_automodel.components.distributed.cp_utils import (  # noqa: PLC0415
+        create_context_parallel_ctx,
+        get_train_context,
+    )
+
+    batch.pop("attention_mask", None)
+
+    _, _, seq_len, _, position_ids, pos_seq_dim = _normalize_cp_primary_and_positions(batch)
+
+    labels = batch["labels"]
+
+    # The primary stream is deliberately excluded: the model embeds and shards
+    # it inside its forward. Only the no-grad aux streams enter the CP buffers.
+    cp_buffers = [labels, position_ids]
+    cp_seq_dims = [1, pos_seq_dim]
+    cp_no_restore_buffers = {labels}
+    batch_buffer_keys: dict[int, str] = {0: "labels", 1: "position_ids"}
+
+    if loss_mask is not None:
+        cp_buffers.append(loss_mask)
+        cp_seq_dims.append(1)
+        cp_no_restore_buffers.add(loss_mask)
+
+    if "padding_mask" in batch:
+        padding_mask = batch["padding_mask"]
+        batch_buffer_keys[len(cp_buffers)] = "padding_mask"
+        cp_buffers.append(padding_mask)
+        cp_seq_dims.append(1)
+        cp_no_restore_buffers.add(padding_mask)
+
+    for key, extra_seq_dim in (extra_seq_buffers or {}).items():
+        if key not in batch:
+            raise KeyError(f"Extra CP sequence buffer {key!r} is missing from the batch")
+        buffer = batch[key]
+        batch_buffer_keys[len(cp_buffers)] = key
+        cp_buffers.append(buffer)
+        cp_seq_dims.append(extra_seq_dim)
+        cp_no_restore_buffers.add(buffer)
+
+    cp_divisor = cp_mesh.size() * 2
+    cp_buffers, cp_no_restore_buffers = _pad_cp_buffers_to_divisor(
+        cp_buffers, cp_seq_dims, cp_no_restore_buffers, batch_buffer_keys, seq_len, cp_divisor, batch
+    )
+
+    cp_ctx = create_context_parallel_ctx(
+        cp_mesh=cp_mesh,
+        cp_buffers=cp_buffers,
+        cp_seq_dims=cp_seq_dims,
+        cp_no_restore_buffers=cp_no_restore_buffers,
+        cp_rotate_method="allgather",  # TODO: expose through cfg
+    )
+    facts = ShardLayout(original_seq_len=seq_len, padded_seq_len=seq_len + (-seq_len) % cp_divisor)
+    return get_train_context(False, False, cp_ctx), batch, facts
+
+
+def shard_sequence_for_cp(
+    cp_mesh, tensor: torch.Tensor, *, seq_dim: int = 1, pad_value: float | int = 0
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Pad and round-robin shard a full-length sequence tensor inside a model forward.
+
+    The in-forward peer of :func:`shard_batch_load_balanced`: a model that leaves
+    its primary stream full-length (see :func:`shard_batch_aux_only`) calls this
+    on its embedded, spliced hidden states to keep this CP rank's head-tail chunk
+    pair, matching the layout the ring-SDPA context and the aux streams were
+    sharded to. Differentiable (``index_select``), so gradients route to the
+    embeddings / vision tower.
+
+    Args:
+        cp_mesh: The context-parallel device (sub)mesh; None or size <= 1 makes
+            this an identity (no pad, arange indices).
+        tensor: Full-length sequence tensor, e.g. ``inputs_embeds`` of shape
+            ``[batch, sequence, hidden]``; the axis given by ``seq_dim`` is padded
+            to ``2 * cp_size`` and sharded.
+        seq_dim: The sequence axis of ``tensor``.
+        pad_value: Fill for the CP-padding slots appended on ``seq_dim`` (0 for
+            embeddings, matching the zero-padding the load-balanced path applies
+            to floating buffers).
+
+    Returns:
+        ``(local, local_indices, padded_seq_len)``: this rank's shard laid out
+        head-chunk-then-tail-chunk (``[..., padded_sequence / cp_size, ...]`` on
+        ``seq_dim``), its global token positions, and the padded global sequence
+        length.
+    """
+    seq_len = tensor.shape[seq_dim]
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        return tensor, torch.arange(seq_len, device=tensor.device, dtype=torch.long), seq_len
+    cp_divisor = 2 * cp_mesh.size()
+    pad_len = (-seq_len) % cp_divisor
+    if pad_len:
+        tensor = _pad_tensor_seq_dim_(tensor, seq_dim, pad_len, pad_value)
+    padded_seq_len = tensor.shape[seq_dim]
+    local_indices = round_robin_local_indices(cp_mesh, padded_seq_len, device=tensor.device)
+    local = shard_token_tensor_by_indices(tensor, local_indices, seq_dim=seq_dim)
+    return local, local_indices, padded_seq_len

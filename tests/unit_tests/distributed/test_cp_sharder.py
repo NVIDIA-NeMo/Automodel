@@ -254,6 +254,116 @@ def test_shard_batch_contiguous_respects_pad_multiple():
     assert "_packed_seq_ids" not in out
 
 
+# ---------------------------------------------------------------------------
+# shard_sequence_for_cp (in-forward round-robin shard, differentiable)
+# ---------------------------------------------------------------------------
+def test_shard_sequence_for_cp_roundtrips_across_ranks():
+    """Sharding all ranks and reassembling reproduces the full padded sequence;
+    the appended CP-pad slots are zero (pad_value=0)."""
+    cp_size, seq = 2, 6  # divisor 2*cp = 4 -> pad to 8
+    full = torch.randn(1, seq, 4)
+    parts, idxs = [], []
+    for rank in range(cp_size):
+        local, idx, padded_len = cs.shard_sequence_for_cp(_FakeMesh(cp_size, rank), full.clone(), pad_value=0.0)
+        assert padded_len == 8
+        assert local.shape == (1, 4, 4)  # 8 / cp_size
+        parts.append(local)
+        idxs.append(idx)
+    rebuilt = cs._reorder_gathered_token_tensor(parts, idxs, seq_dim=1)
+    torch.testing.assert_close(rebuilt[:, :seq], full)
+    torch.testing.assert_close(rebuilt[:, seq:], torch.zeros(1, 2, 4))
+
+
+def test_shard_sequence_for_cp_matches_round_robin_layout():
+    """The kept positions are exactly this rank's round_robin_local_indices."""
+    full = torch.arange(8).view(1, 8, 1).float()
+    for rank in (0, 1):
+        local, idx, _ = cs.shard_sequence_for_cp(_FakeMesh(2, rank), full.clone())
+        expected_idx = cs.round_robin_local_indices(_FakeMesh(2, rank), 8)
+        assert torch.equal(idx, expected_idx)
+        torch.testing.assert_close(local, full.index_select(1, expected_idx))
+
+
+def test_shard_sequence_for_cp_is_differentiable():
+    """Gradient reaches exactly the input positions this rank owns."""
+    full = torch.randn(1, 8, 3, requires_grad=True)
+    local, idx, _ = cs.shard_sequence_for_cp(_FakeMesh(2, 0), full)
+    local.sum().backward()
+    touched = (full.grad.abs().sum(dim=(0, 2)) > 0).nonzero().flatten()
+    assert torch.equal(touched, idx.sort().values)
+
+
+def test_shard_sequence_for_cp_identity_without_cp():
+    full = torch.randn(1, 5, 2)
+    local, idx, padded_len = cs.shard_sequence_for_cp(_FakeMesh(1), full)
+    assert local is full and padded_len == 5
+    assert torch.equal(idx, torch.arange(5))
+
+
+# ---------------------------------------------------------------------------
+# shard_batch_aux_only vs shard_batch_load_balanced (parity on the aux streams)
+# ---------------------------------------------------------------------------
+def test_shard_batch_aux_only_matches_load_balanced(monkeypatch):
+    """The aux-only shard pads labels/position_ids/loss_mask identically to the
+    load-balanced shard but leaves the primary stream full-length and out of the
+    CP buffer list."""
+    from nemo_automodel.components.distributed import cp_utils
+
+    captured: dict = {}
+
+    def _fake_ctx(cp_mesh, cp_buffers, cp_seq_dims, cp_no_restore_buffers, cp_rotate_method=None):
+        captured["buffers"] = list(cp_buffers)
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(cp_utils, "create_context_parallel_ctx", _fake_ctx)
+    monkeypatch.setattr(cp_utils, "get_train_context", lambda *a, **k: contextlib.nullcontext)
+
+    cp_size, seq = 2, 6  # -> pad to 8
+    mesh = _FakeMesh(cp_size, 0)
+
+    def make_batch():
+        return {
+            "input_ids": torch.arange(seq).view(1, seq),
+            "labels": torch.arange(100, 100 + seq).view(1, seq),
+        }
+
+    batch_lb = make_batch()
+    cs.shard_batch_load_balanced(mesh, None, batch_lb, loss_mask=torch.ones(1, seq))
+    buffers_lb = captured["buffers"]
+
+    batch_aux = make_batch()
+    orig_input_ids = batch_aux["input_ids"].clone()
+    cs.shard_batch_aux_only(mesh, None, batch_aux, loss_mask=torch.ones(1, seq))
+    buffers_aux = captured["buffers"]
+
+    # aux tensors padded identically (labels -> -100 tail, position_ids -> 0 tail)
+    torch.testing.assert_close(batch_lb["labels"], batch_aux["labels"])
+    torch.testing.assert_close(batch_lb["position_ids"], batch_aux["position_ids"])
+    assert batch_aux["labels"].shape == (1, 8)
+    assert batch_aux["labels"][0, -1].item() == -100
+    # loss_mask is the last buffer in both lists; padded to 8 the same way
+    torch.testing.assert_close(buffers_lb[-1], buffers_aux[-1])
+    assert buffers_aux[-1].shape == (1, 8)
+    # primary stays full-length + untouched in aux-only; load-balanced pads it
+    torch.testing.assert_close(batch_aux["input_ids"], orig_input_ids)
+    assert batch_lb["input_ids"].shape == (1, 8)
+    # aux-only excludes the primary from the CP buffer list (one fewer buffer)
+    assert len(buffers_aux) == len(buffers_lb) - 1
+    assert all(buf.shape[1] == 8 for buf in buffers_aux)
+
+
+def test_shard_batch_aux_only_reports_padded_layout(monkeypatch):
+    """The returned ShardLayout carries the primary stream's target padded length."""
+    from nemo_automodel.components.distributed import cp_utils
+
+    monkeypatch.setattr(cp_utils, "create_context_parallel_ctx", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(cp_utils, "get_train_context", lambda *a, **k: contextlib.nullcontext)
+
+    batch = {"input_ids": torch.arange(6).view(1, 6), "labels": torch.arange(6).view(1, 6)}
+    _, _, layout = cs.shard_batch_aux_only(_FakeMesh(2, 0), None, batch)
+    assert (layout.original_seq_len, layout.padded_seq_len) == (6, 8)
+
+
 def test_shard_batch_contiguous_extra_seq_keys():
     seq = 8
     batch = {
