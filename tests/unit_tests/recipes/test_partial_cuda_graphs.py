@@ -728,18 +728,19 @@ def test_rejects_full_moe_with_activation_checkpointing():
         partial_graphs.PartialCudaGraphManager.from_model_parts([model], activation_checkpointing=True)
 
 
-@pytest.mark.parametrize(
-    ("model_parts", "pipeline_parallel"),
-    [
-        ([_Model()], True),
-        ([_Model(), _Model()], False),
-    ],
-)
-def test_rejects_pipeline_stages_and_virtual_chunks(model_parts, pipeline_parallel):
-    with pytest.raises(RuntimeError, match="pipeline stages and virtual pipeline chunks"):
+def test_rejects_pipeline_parallel_until_validated():
+    with pytest.raises(RuntimeError, match="do not support pipeline parallelism yet"):
         partial_graphs.PartialCudaGraphManager.from_model_parts(
-            model_parts,
-            pipeline_parallel=pipeline_parallel,
+            [_Model()],
+            pipeline_parallel=True,
+        )
+
+
+def test_rejects_virtual_pipeline_chunks_until_validated():
+    with pytest.raises(RuntimeError, match="require one local model part"):
+        partial_graphs.PartialCudaGraphManager.from_model_parts(
+            [_Model(), _Model()],
+            pipeline_parallel=False,
         )
 
 

@@ -1001,10 +1001,21 @@ class PartialCudaGraphManager:
         ]
         if not enabled_parts:
             return None
-        if pipeline_parallel or len(model_parts) != 1:
+        # Pipeline schedules can run multiple microbatches through the same local
+        # stage before the earlier microbatch has completed backward. The current
+        # partial graph contract owns one static input/output surface per target,
+        # and #2943 additionally shares graph-private pools across layers in a
+        # scope. That combination has not been validated against PP or virtual PP
+        # chunk interleaving, so reject it before any target installs graph hooks.
+        if pipeline_parallel:
             raise RuntimeError(
-                "Partial CUDA graphs require one non-pipeline model root; pipeline stages and virtual "
-                "pipeline chunks can overwrite static graph buffers with in-flight microbatches"
+                "Partial CUDA graphs do not support pipeline parallelism yet; PP schedules can interleave "
+                "microbatches and overwrite static CUDA graph buffers before backward consumes them"
+            )
+        if len(model_parts) != 1:
+            raise RuntimeError(
+                "Partial CUDA graphs require one local model part; virtual pipeline chunks can interleave "
+                "microbatches and overwrite static CUDA graph buffers before backward consumes them"
             )
         if activation_checkpointing:
             if any("attn" in part.backend.cuda_graph_modules for part in enabled_parts):
