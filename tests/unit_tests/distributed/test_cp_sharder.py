@@ -385,10 +385,10 @@ def test_shard_batch_contiguous_extra_seq_keys():
 
 
 # ---------------------------------------------------------------------------
-# shard_batch_aux_only_contiguous + slice_sequence_for_cp_contiguous
+# shard_batch_contiguous(shard_primary=False) + slice_sequence_for_cp_contiguous
 # (Megatron-style contiguous CP: aux streams sliced by the sharder, the primary
 # embedded and sliced inside the model forward). The contract is bit-exact
-# slice-equivalence with today's shard_batch_contiguous.
+# slice-equivalence with the primary-inclusive shard (shard_primary=True).
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("cp_size,rank", [(2, 0), (2, 1), (4, 3)])
 def test_aux_only_contiguous_slice_equivalence_with_shard_batch_contiguous(cp_size, rank):
@@ -416,8 +416,8 @@ def test_aux_only_contiguous_slice_equivalence_with_shard_batch_contiguous(cp_si
     # Aux-only: primary stays full; the model slices it in forward.
     aux = make_batch()
     full_embeds = aux["inputs_embeds"]
-    _, aux_out, aux_layout = cs.shard_batch_aux_only_contiguous(
-        mesh, None, aux, extra_seq_keys={"vision_ids": 1}, extra_pad_values={"vision_ids": -1}
+    _, aux_out, aux_layout = cs.shard_batch_contiguous(
+        mesh, None, aux, extra_seq_keys={"vision_ids": 1}, extra_pad_values={"vision_ids": -1}, shard_primary=False
     )
     # Primary is left full-length + untouched by the aux-only sharder.
     assert aux_out["inputs_embeds"] is full_embeds
@@ -439,10 +439,10 @@ def test_aux_only_contiguous_slice_equivalence_with_shard_batch_contiguous(cp_si
     torch.testing.assert_close(local_idx, cs.contiguous_local_indices(mesh, padded_len))
 
 
-def test_shard_batch_aux_only_contiguous_keeps_input_ids_full(monkeypatch):
+def test_shard_batch_contiguous_aux_only_keeps_input_ids_full(monkeypatch):
     """With ``input_ids`` as the primary (the real Gemma4 case) the aux-only
-    contiguous shard leaves it full-length while slicing the aux streams, so the
-    model embeds and slices it per microbatch in forward."""
+    contiguous shard (``shard_primary=False``) leaves it full-length while slicing
+    the aux streams, so the model embeds and slices it per microbatch in forward."""
     seq = 6  # -> pad to 8
     mesh = _FakeMesh(2, 1)
     batch = {
@@ -450,7 +450,7 @@ def test_shard_batch_aux_only_contiguous_keeps_input_ids_full(monkeypatch):
         "labels": torch.arange(seq).view(1, seq),
     }
     orig_input_ids = batch["input_ids"].clone()
-    _, out, layout = cs.shard_batch_aux_only_contiguous(mesh, None, batch)
+    _, out, layout = cs.shard_batch_contiguous(mesh, None, batch, shard_primary=False)
     torch.testing.assert_close(out["input_ids"], orig_input_ids)  # full + untouched
     assert out["labels"].shape == (1, 4)  # rank 1 owns [4:8]
     assert out["labels"][0, -1].item() == -100  # pad tail is the ignore index

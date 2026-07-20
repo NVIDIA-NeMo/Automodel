@@ -37,7 +37,7 @@ import torch
 
 from nemo_automodel.components.distributed.cp_sharder import (
     convert_attention_mask_to_padding_mask,
-    shard_batch_aux_only_contiguous,
+    shard_batch_contiguous,
 )
 
 
@@ -98,7 +98,7 @@ def make_contiguous_aux_only_shard_cp_batch_and_ctx(
     convert_attention_mask_to_padding_mask(batch)
     primary = batch["inputs_embeds"] if "inputs_embeds" in batch else batch["input_ids"]
     _synthesize_single_document_seq_ids(batch, primary.shape[1])
-    return shard_batch_aux_only_contiguous(
+    return shard_batch_contiguous(
         cp_mesh,
         tp_mesh,
         batch,
@@ -106,4 +106,5 @@ def make_contiguous_aux_only_shard_cp_batch_and_ctx(
         padding_token_id=padding_token_id,
         extra_seq_keys={"_packed_seq_ids": 1, **(extra_seq_keys or {})},
         extra_pad_values={"_packed_seq_ids": 0, **(extra_pad_values or {})},
+        shard_primary=False,
     )

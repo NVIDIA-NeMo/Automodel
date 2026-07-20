@@ -16,8 +16,8 @@
 
 Exercises the sunk contiguous-CP path end to end for the E-series-shaped dense
 Gemma4: ``prepare_cp_forward`` invokes the sharder-only
-``prepare_model_inputs_for_cp`` hook (``shard_batch_aux_only_contiguous`` shards
-labels/position_ids and the synthesized ``_packed_seq_ids``; the model records
+``prepare_model_inputs_for_cp`` hook (``shard_batch_contiguous(shard_primary=False)``
+shards labels/position_ids and the synthesized ``_packed_seq_ids``; the model records
 ``cp_mesh`` and installs its p2p flex ring), and
 ``Gemma4ForConditionalGeneration.forward`` embeds the full sequence, builds
 ``per_layer_inputs`` + the vision-bidirectional ring metadata, then contiguously
