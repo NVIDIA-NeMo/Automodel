@@ -823,8 +823,6 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        *,
-        _pre_embed_only: bool = False,
         **kwargs,
     ) -> Union[dict, Tuple, CausalLMOutputWithPast]:
         """Forward pass for training.
@@ -864,13 +862,6 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         if output_hidden_states is None:
             llm_config = getattr(getattr(self, "config", None), "llm_config", None)
             output_hidden_states = getattr(llm_config, "output_hidden_states", False)
-
-        # CP path: caller wants the multimodal scatter to run inside __call__
-        # so FSDP2's forward pre-hook all-gathers the vision tower's sharded
-        # weights, but does NOT want the LM forward to run. Returns a dict with
-        # at least ``inputs_embeds``.
-        if _pre_embed_only:
-            return self.prepare_model_inputs_for_cp(kwargs.pop("_cp_batch"), num_chunks=kwargs.pop("num_chunks", 1))
 
         # Caller pre-supplied inputs_embeds (CP path: prepare_model_inputs_for_cp
         # ran the multimodal scatter on the un-sharded sequence before

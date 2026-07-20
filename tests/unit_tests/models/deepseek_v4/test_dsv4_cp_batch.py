@@ -17,8 +17,7 @@
 Covers the model-owned CP path that runs without a real process group:
 ``make_dsv4_contiguous_shard_cp_batch_and_ctx`` (the ``ContextParallelismSharder.shard_batch``
 callable), the scalar group helpers, ``dsv4_cp_local_seq_multiple``, and the
-``DeepseekV4ForCausalLM`` CP-prep hook (``prepare_model_inputs_for_cp`` and the
-``_pre_embed_only`` forward branch).
+sharder-only ``DeepseekV4ForCausalLM`` CP-prep hook (``prepare_model_inputs_for_cp``).
 """
 
 from __future__ import annotations
@@ -521,19 +520,12 @@ def test_prepare_model_inputs_for_cp_returns_sharder():
     assert out["input_ids"].shape == (1, 128)
 
 
-def test_forward_pre_embed_only_branch_delegates_to_prepare():
-    # forward()'s first statement short-circuits to prepare_model_inputs_for_cp
-    # before any model compute, so a fake self exercises it without a build.
+def test_prepare_model_inputs_for_cp_binds_shard_multiple():
+    # The sharder-only CP hook binds the config-derived per-rank shard multiple;
+    # a fake self exercises it without a model build (it touches no weights).
     cfg = SimpleNamespace(compress_ratios=[4])
     fake_self = SimpleNamespace(config=cfg, backend=SimpleNamespace(dispatcher="deepep"))
-    fake_self.prepare_model_inputs_for_cp = lambda batch, **kwargs: DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(
-        fake_self, batch, **kwargs
-    )
-    # The dispatcher hands the whole batch dict through the _cp_batch kwarg;
-    # forward's positional input_ids is unused by the interception.
-    out = DeepseekV4ForCausalLM.forward(
-        fake_self, None, _pre_embed_only=True, _cp_batch={"input_ids": torch.arange(8).view(1, 8)}
-    )
+    out = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, {"input_ids": torch.arange(8).view(1, 8)})
     assert out["cp_sharder"].shard_batch.keywords["pad_multiple"] == 8
     assert out["cp_sharder"].shard_batch.keywords["sync_packed_length"] is False
 

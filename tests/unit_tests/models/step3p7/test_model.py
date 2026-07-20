@@ -288,7 +288,7 @@ def test_from_pretrained_uses_step3p7_config(monkeypatch):
     step3p7_model.Step3p7Config.from_pretrained.assert_called_once_with("/tmp/model")
 
 
-def test_prepare_model_inputs_for_cp_and_pre_embed_only_error():
+def test_prepare_model_inputs_for_cp_is_sharder_only():
     from nemo_automodel.components.distributed.cp_sharder import (
         ContextParallelismSharder,
         round_robin_local_indices,
@@ -306,12 +306,6 @@ def test_prepare_model_inputs_for_cp_and_pre_embed_only_error():
     assert isinstance(sharder, ContextParallelismSharder)
     assert sharder.shard_batch is shard_batch_aux_only
     assert sharder.local_token_global_indices is round_robin_local_indices
-
-    # The dispatcher hands the whole batch dict through the _cp_batch kwarg.
-    out = wrapper(_pre_embed_only=True, _cp_batch={"input_ids": input_ids, "image_embeds": torch.randn(1, 8)})
-    assert set(out) == {"cp_sharder"}
-    with pytest.raises(ValueError, match="CP pre-embedding requires input_ids"):
-        wrapper(_pre_embed_only=True, _cp_batch={})
 
 
 def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():

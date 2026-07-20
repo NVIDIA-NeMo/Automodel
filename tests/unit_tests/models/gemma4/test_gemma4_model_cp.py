@@ -230,17 +230,6 @@ def test_prepare_model_inputs_requires_input_ids():
         model.prepare_model_inputs_for_cp({"input_ids": None})
 
 
-def test_forward_pre_embed_only_routes_to_prepare(monkeypatch):
-    cfg = _cfg()
-    cfg.image_token_id = 42
-    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
-    sentinel = {"inputs_embeds": torch.zeros(1)}
-    monkeypatch.setattr(model, "prepare_model_inputs_for_cp", lambda *a, **kw: sentinel)
-    # The dispatcher hands the whole batch dict through the _cp_batch kwarg.
-    out = model(_pre_embed_only=True, _cp_batch={"input_ids": torch.tensor([[1, 2, 3]])})
-    assert out is sentinel
-
-
 # ---------------------------------------------------------------------------
 # forward: MoE CP embeds + splices pixels in-forward (sunk pre-embed)
 # ---------------------------------------------------------------------------

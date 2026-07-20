@@ -268,40 +268,6 @@ class TestEmbedAndSpliceForCP:
         assert torch.allclose(emb[0, 2], torch.full((4,), 7.0))  # text token untouched
 
 
-class TestForwardPreEmbedDispatch:
-    def test_pre_embed_only_dispatches_to_prepare(self):
-        model = _build_model()
-        sentinel = {"inputs_embeds": torch.zeros(1, 4, 4)}
-
-        captured = {}
-
-        def _fake_prepare(batch, *, num_chunks=1, **kwargs):
-            captured["input_ids"] = batch.get("input_ids")
-            captured["pixel_values"] = batch.get("pixel_values")
-            # non-named forward params (e.g. image_grid_hws) ride in the batch dict now
-            captured["kwargs"] = {k: v for k, v in batch.items() if k not in ("input_ids", "pixel_values")}
-            return sentinel
-
-        model.prepare_model_inputs_for_cp = _fake_prepare
-
-        input_ids = torch.tensor([[5, 6, 7, 8]])
-        pixel_values = torch.randn(4, 8)
-        # The dispatcher hands the whole batch dict through the _cp_batch kwarg.
-        out = model.forward(
-            _pre_embed_only=True,
-            _cp_batch={
-                "input_ids": input_ids,
-                "pixel_values": pixel_values,
-                "image_grid_hws": torch.tensor([[2, 2]]),
-            },
-        )
-
-        assert out is sentinel
-        assert torch.equal(captured["input_ids"], input_ids)
-        assert captured["pixel_values"] is pixel_values
-        assert "image_grid_hws" in captured["kwargs"]
-
-
 class TestQwen3_5ModelForward:
     def _build_inner_model(self):
         model = Qwen3_5Model.__new__(Qwen3_5Model)

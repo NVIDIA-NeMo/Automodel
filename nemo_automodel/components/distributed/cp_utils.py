@@ -276,9 +276,9 @@ def prepare_cp_forward(
     return a ContextParallelismSharder, ``_make_cp_batch_and_ctx`` resolves it against the
     framework-owned sharders (magi / TE / generic torch ``context_parallel``)
     and calls ``shard_batch``. When CP is active and the model exposes
-    ``prepare_model_inputs_for_cp``, the hook is invoked uniformly through
-    ``model.__call__(_pre_embed_only=True, ...)`` so FSDP2 pre-forward hooks
-    unshard e.g. vision towers during the pre-embed.
+    ``prepare_model_inputs_for_cp``, that sharder-only hook is invoked directly as
+    a plain method (it constructs a sharder and touches no weights; embed / vision
+    splice / sequence shard run in the model's own forward per microbatch).
 
     Args:
         model: The (first) model part, or None (e.g. no-model contexts).
@@ -318,23 +318,14 @@ def prepare_cp_forward(
     magi_replaces_hook = magi_enabled and getattr(magi, "domain", "llm") == "llm"
     model_owns_thd = use_te and bool(getattr(model, "supports_thd", False))
     if (effective_cp_size > 1 or model_owns_thd) and has_hook and not magi_replaces_hook and invoke_pre_embed:
-        # The whole batch rides through __call__ as an opaque kwarg; the model
-        # reads the keys it needs and removes the raw inputs it consumed (its
-        # returned entries are merged on top). Sharder-only hooks (DSV4/GLM)
-        # consume nothing; their batch — including ``input_ids`` — stays intact.
-        prepared = model(_pre_embed_only=True, _cp_batch=batch, num_chunks=num_chunks)
-        cp_sharder = prepared.pop("cp_sharder", None)
-        # Merge the hook's return: a None value marks a raw input the hook
-        # consumed (e.g. into inputs_embeds) — remove it so it cannot reach
-        # the sharded forward. The return channel is used (not in-place pops)
-        # because FSDP2's forward-kwargs cast can hand the hook a copy of the
-        # batch dict. The sharder itself is passed onward as an explicit
-        # parameter, never through the batch.
-        for key, value in prepared.items():
-            if value is None:
-                batch.pop(key, None)
-            else:
-                batch[key] = value
+        # Every CP hook is sharder-only: it constructs a ContextParallelismSharder
+        # and consumes nothing (embed / vision splice / sequence shard happen in
+        # the model's own forward, per microbatch). It touches no model weights, so
+        # it is a plain method call — no ``__call__`` routing and no FSDP2 unshard.
+        # The batch — including ``input_ids`` and any multimodal inputs — stays
+        # intact for the forward.
+        prepared = model.prepare_model_inputs_for_cp(batch, num_chunks=num_chunks)
+        cp_sharder = prepared.get("cp_sharder")
 
     return _make_cp_batch_and_ctx(
         device_mesh,

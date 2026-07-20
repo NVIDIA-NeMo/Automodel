@@ -12,16 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Signature contract for the ``model(_pre_embed_only=True, ...)`` CP pre-embed call.
+"""Signature contract for the sharder-only ``prepare_model_inputs_for_cp`` CP hook.
 
-``prepare_cp_forward`` invokes hook-aware models through ``__call__`` with only
-keyword arguments (``_pre_embed_only=True, _cp_batch=batch, num_chunks=n``) so
-FSDP2 pre-forward hooks run. Any required positional parameter on ``forward``
-breaks that call at signature-binding time, before the model's
-``_pre_embed_only`` branch can run (DeepseekV4 crashed this way under pp4/cp8:
-``TypeError: forward() missing 1 required positional argument: 'input_ids'``).
-Every model that answers the pre-embed protocol must therefore accept a
-kwargs-only ``forward`` call.
+``prepare_cp_forward`` invokes each hook-aware model directly as
+``model.prepare_model_inputs_for_cp(batch, num_chunks=n)`` (a plain method: the
+sharder-only hook touches no weights, so no ``__call__`` / FSDP2 unshard routing).
+Every model that answers the CP protocol must therefore expose that method with a
+signature that binds ``(instance, batch, num_chunks=n)``.
 """
 
 import inspect
@@ -41,17 +38,17 @@ PRE_EMBED_MODELS = [
 
 
 @pytest.mark.parametrize("module_path,class_name", PRE_EMBED_MODELS)
-def test_forward_binds_pre_embed_kwargs_only_call(module_path, class_name):
+def test_prepare_model_inputs_for_cp_binds_dispatch_call(module_path, class_name):
     module = pytest.importorskip(module_path)
-    forward = getattr(module, class_name).forward
-    signature = inspect.signature(forward)
+    cls = getattr(module, class_name)
+    hook = getattr(cls, "prepare_model_inputs_for_cp", None)
+    assert hook is not None, f"{class_name} must expose prepare_model_inputs_for_cp for the CP dispatch"
+    signature = inspect.signature(hook)
     try:
-        signature.bind(object(), _pre_embed_only=True, _cp_batch={}, num_chunks=1)
+        signature.bind(object(), {}, num_chunks=1)
     except TypeError as err:
         pytest.fail(
-            f"{class_name}.forward cannot be called kwargs-only as "
-            f"model(_pre_embed_only=True, _cp_batch=batch, num_chunks=n): {err}. "
-            "Give every positional parameter a default (input_ids=None) so the "
-            "CP pre-embed dispatch in prepare_cp_forward can reach the "
-            "_pre_embed_only branch."
+            f"{class_name}.prepare_model_inputs_for_cp cannot be called as "
+            f"model.prepare_model_inputs_for_cp(batch, num_chunks=n): {err}. "
+            "The CP dispatch in prepare_cp_forward calls it exactly that way."
         )

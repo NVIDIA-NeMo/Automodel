@@ -1188,9 +1188,6 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         padding_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> Qwen3_5CausalLMOutputWithPast:
-        if kwargs.pop("_pre_embed_only", False):
-            return self.prepare_model_inputs_for_cp(kwargs.pop("_cp_batch"), num_chunks=kwargs.pop("num_chunks", 1))
-
         effective_use_cache = False if use_cache is None and self.training else use_cache
         kwargs = dict(kwargs)
         if effective_use_cache is not None:

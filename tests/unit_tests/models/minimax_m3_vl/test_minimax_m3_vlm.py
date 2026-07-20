@@ -190,7 +190,7 @@ def test_prepare_model_inputs_for_cp_is_sharder_only(vlm_model):
     ids = torch.randint(2, 99, (1, 16))
     ids[0, 5 : 5 + n_tokens] = IMAGE_TOKEN_INDEX
     cp_batch = {"input_ids": ids, "pixel_values": pixel_values, "image_grid_thw": grid_thw}
-    prepared = vlm_model(_pre_embed_only=True, _cp_batch=cp_batch)
+    prepared = vlm_model.prepare_model_inputs_for_cp(cp_batch)
 
     assert set(prepared) == {"cp_sharder"}
     sharder = prepared["cp_sharder"]

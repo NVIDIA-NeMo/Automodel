@@ -18,11 +18,11 @@ These reproduce the ``_forward_backward_step``-style and
 ``_run_validation_epoch``-style batch handling without instantiating the
 full recipe — exercising the code shape that gets shipped:
 
-  - Iterate the umbrella ``VLM_INPUT_KEYS`` to filter the batch
-  - Call model via ``__call__`` with ``_pre_embed_only=True`` (so FSDP2
-    forward pre-hooks fire)
-  - Pop *all* umbrella keys from batch after prepare step
-  - Update batch with the prepared dict (which carries ``inputs_embeds``)
+  - Invoke the sharder-only ``prepare_model_inputs_for_cp`` directly through
+    ``prepare_cp_forward`` (a plain method call; nothing consumed, so input_ids
+    and multimodal inputs stay in the batch for the model's own forward)
+  - PP gating: sunk models (``cp_preembed_in_forward``) invoke the hook on every
+    stage and keep media; non-sunk hook models drop media on non-first stages
   - Validation: count labels after _make_cp_batch_and_ctx and inside train_ctx
   - Validation: position_ids ``.to(self.dist_env.device)`` (not model.device)
 """
@@ -38,239 +38,30 @@ import torch
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed import cp_utils as cp_utils_mod
-from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 # -----------------------------------------------------------------------------
-# Helpers reproducing the recipe's CP-prepare block (train + val flavors).
-# -----------------------------------------------------------------------------
-
-
-def _train_cp_prepare(_model, batch, *, pp_enabled=False, has_first_stage=True):
-    """Replicates the train-side CP prepare block in
-    ``recipes/vlm/finetune.py::_forward_backward_step`` (lines 960-967)."""
-    if not hasattr(_model, "prepare_model_inputs_for_cp"):
-        return batch
-    if not pp_enabled or has_first_stage:
-        prepared = _model(_pre_embed_only=True, _cp_batch=batch, num_chunks=1)
-        # dispatcher contract: None values mark consumed keys -> removed
-        for k, v in prepared.items():
-            if v is None:
-                batch.pop(k, None)
-            else:
-                batch[k] = v
-    else:
-        for k in VLM_INPUT_KEYS:
-            if k != "input_ids":
-                batch.pop(k, None)
-    return batch
-
-
-# -----------------------------------------------------------------------------
-# Spy model: records what it was called with and returns a controllable dict.
+# Spy model: a VLM with a CP hook but NOT sunk (no cp_preembed_in_forward). The
+# recipe drives CP prep through ``prepare_cp_forward`` -> the sharder-only
+# ``prepare_model_inputs_for_cp`` (a plain method call; nothing consumed), so the
+# spy records hook invocations there and exercises the recipe's first-stage-only
+# gate for non-sunk models.
 # -----------------------------------------------------------------------------
 
 
 class _SpyVLM:
     def __init__(self, prepared=None):
         self.calls = []
-        self.prepared = prepared or {"inputs_embeds": torch.zeros(1, 4, 8)}
+        # Sharder-only by default (nothing consumed); ``prepared`` lets a test
+        # override the returned dict (only ``cp_sharder`` is honored downstream).
+        self._prepared = prepared
 
-    def prepare_model_inputs_for_cp(self, **kwargs):
-        # Existence required so recipe's hasattr() check fires; never called by
-        # the recipe (the recipe routes through __call__).
-        return self.prepared
+    def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
+        self.calls.append({"batch": dict(batch), "num_chunks": num_chunks})
+        return self._prepared if self._prepared is not None else {}
 
-    def __call__(self, *, _pre_embed_only=False, **kwargs):
-        record = {"_pre_embed_only": _pre_embed_only, **kwargs}
-        if isinstance(record.get("_cp_batch"), dict):
-            # snapshot: the dispatcher mutates the live batch after this call
-            record["_cp_batch"] = dict(record["_cp_batch"])
-        self.calls.append(record)
-        if _pre_embed_only:
-            # Mirror the production contract: consumed raw inputs are returned
-            # as None markers so the dispatcher removes them from the batch.
-            # This spy "consumes" every input key it received except loss/mask
-            # bookkeeping (a real model lists exactly what it embedded).
-            cp_batch = kwargs.get("_cp_batch") or {}
-            consumed = {k: None for k in cp_batch if k not in ("labels", "attention_mask", "position_ids")}
-            return {**consumed, **self.prepared}
-        raise AssertionError("recipe must use _pre_embed_only=True for the CP prepare step")
-
-
-# -----------------------------------------------------------------------------
-# train-side wiring
-# -----------------------------------------------------------------------------
-
-
-def test_train_cp_prepare_routes_through_call_with_pre_embed_only_flag():
-    """The recipe must invoke model(...) — NOT the bound prepare_model_inputs_for_cp —
-    so FSDP2's forward pre-hook fires."""
-    inputs_embeds = torch.randn(1, 4, 8)
-    model = _SpyVLM(prepared={"inputs_embeds": inputs_embeds})
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4]]),
-        "pixel_values": torch.zeros(1, 3, 4, 4),
-        "labels": torch.tensor([[1, 2, 3, 4]]),
-    }
-    out_batch = _train_cp_prepare(model, batch)
-
-    assert len(model.calls) == 1
-    assert model.calls[0]["_pre_embed_only"] is True
-    # the whole batch rides through the opaque _cp_batch kwarg
-    assert "input_ids" in model.calls[0]["_cp_batch"]
-    assert "pixel_values" in model.calls[0]["_cp_batch"]
-    # The returned batch contains inputs_embeds (not input_ids)
-    assert "inputs_embeds" in out_batch
-    assert torch.equal(out_batch["inputs_embeds"], inputs_embeds)
-    assert "input_ids" not in out_batch
-
-
-def test_train_cp_prepare_pops_all_vlm_input_keys_from_batch():
-    """Keys the model declares consumed (returned as None) must be removed
-    after the prepare step. Other keys (labels, attention_mask, etc.) remain."""
-    model = _SpyVLM(prepared={"inputs_embeds": torch.zeros(1, 4, 8)})
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4]]),
-        "pixel_values": torch.zeros(1, 3, 4, 4),
-        "image_flags": torch.tensor([[1]]),
-        "labels": torch.tensor([[1, 2, 3, 4]]),
-        "attention_mask": torch.ones(1, 4),
-    }
-    out_batch = _train_cp_prepare(model, batch)
-
-    # Multimodal keys gone
-    assert "input_ids" not in out_batch
-    assert "pixel_values" not in out_batch
-    assert "image_flags" not in out_batch
-    # Non-multimodal keys preserved
-    assert "labels" in out_batch
-    assert "attention_mask" in out_batch
-
-
-def test_train_cp_prepare_passes_the_whole_batch_opaquely():
-    """The hook receives the batch dict itself (no framework-side key filter):
-    the model — not a central registry — decides which keys it reads."""
-    model = _SpyVLM()
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4]]),
-        # No pixel_values; no sound_features; etc.
-        "labels": torch.tensor([[1, 2, 3, 4]]),
-    }
-    _train_cp_prepare(model, batch)
-
-    cp_batch = model.calls[0]["_cp_batch"]
-    assert set(cp_batch) == {"input_ids", "labels"}
-
-
-def test_train_cp_prepare_skipped_when_model_has_no_prepare_model_inputs_for_cp():
-    """If the model lacks the method, the prepare step is skipped — batch stays
-    intact for the standard LLM/SDPA path."""
-
-    class _NoPrepareLLM:
-        def __call__(self, **kw):
-            raise AssertionError("should not be called when model lacks prepare_model_inputs_for_cp")
-
-    model = _NoPrepareLLM()
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4]]),
-        "labels": torch.tensor([[1, 2, 3, 4]]),
-    }
-    out = _train_cp_prepare(model, batch)
-    assert "input_ids" in out  # untouched
-    assert "inputs_embeds" not in out
-
-
-def test_train_cp_prepare_allows_grad_through_pre_embed():
-    """Pre-embed must keep grad enabled for trainable multimodal towers."""
-
-    class _GradSensitive:
-        def __init__(self):
-            self.weight = torch.nn.Parameter(torch.tensor(1.0))
-
-        def prepare_model_inputs_for_cp(self, **kw):
-            return {"inputs_embeds": torch.zeros(1, 4, 8)}
-
-        def __call__(self, **kw):
-            assert torch.is_grad_enabled(), "prepare step must keep gradients enabled"
-            return {"inputs_embeds": self.weight * torch.ones(1, 4, 8)}
-
-    model = _GradSensitive()
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4]]),
-        "labels": torch.tensor([[1, 2, 3, 4]]),
-    }
-    with torch.enable_grad():
-        out = _train_cp_prepare(model, batch)
-
-    assert out["inputs_embeds"].requires_grad
-
-
-def test_train_cp_prepare_keeps_only_model_returned_cp_metadata():
-    """The recipe should not preserve VLM metadata itself after pre-embed.
-
-    Model-specific CP metadata, such as Gemma4 ``mm_token_type_ids``, must be
-    returned from the model's pre-embed call when later attention needs it.
-    """
-    mm_token_type_ids = torch.tensor([[1, 1, 0, 0]])
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4]]),
-        "mm_token_type_ids": mm_token_type_ids,
-        "labels": torch.tensor([[1, 2, 3, 4]]),
-    }
-    out = _train_cp_prepare(_SpyVLM(prepared={"inputs_embeds": torch.zeros(1, 4, 8)}), dict(batch))
-    assert "mm_token_type_ids" not in out
-
-    prepared = {"inputs_embeds": torch.zeros(1, 4, 8), "mm_token_type_ids": mm_token_type_ids}
-    out = _train_cp_prepare(_SpyVLM(prepared=prepared), dict(batch))
-    assert torch.equal(out["mm_token_type_ids"], mm_token_type_ids)
-
-
-def test_train_cp_prepare_pp_first_stage_preembeds_inputs():
-    """When CP and PP are both enabled, only the first stage should materialize
-    multimodal inputs before sequence sharding."""
-    inputs_embeds = torch.randn(1, 4, 8)
-    model = _SpyVLM(prepared={"inputs_embeds": inputs_embeds})
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4]]),
-        "pixel_values": torch.zeros(1, 3, 4, 4),
-        "patch_pixel_values": torch.zeros(1, 2, 3, 4, 4),
-        "num_patches": torch.tensor([2]),
-        "labels": torch.tensor([[1, 2, 3, 4]]),
-    }
-
-    out_batch = _train_cp_prepare(model, batch, pp_enabled=True, has_first_stage=True)
-
-    assert len(model.calls) == 1
-    assert model.calls[0]["_pre_embed_only"] is True
-    assert "patch_pixel_values" in model.calls[0]["_cp_batch"]
-    assert "num_patches" in model.calls[0]["_cp_batch"]
-    assert "inputs_embeds" in out_batch
-    assert "input_ids" not in out_batch
-    assert "pixel_values" not in out_batch
-
-
-def test_train_cp_prepare_pp_later_stage_drops_media_without_preembedding():
-    """Later PP stages should not run the media encoder, but should remove
-    unneeded media tensors before CP batch processing."""
-    model = _SpyVLM()
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4]]),
-        "pixel_values": torch.zeros(1, 3, 4, 4),
-        "patch_pixel_values": torch.zeros(1, 2, 3, 4, 4),
-        "num_patches": torch.tensor([2]),
-        "labels": torch.tensor([[1, 2, 3, 4]]),
-    }
-
-    out_batch = _train_cp_prepare(model, batch, pp_enabled=True, has_first_stage=False)
-
-    assert model.calls == []
-    assert "input_ids" in out_batch
-    assert "inputs_embeds" not in out_batch
-    assert "pixel_values" not in out_batch
-    assert "patch_pixel_values" not in out_batch
-    assert "num_patches" not in out_batch
-    assert "labels" in out_batch
+    def __call__(self, **kwargs):
+        raise AssertionError("CP prepare must call prepare_model_inputs_for_cp directly, not __call__")
 
 
 def _make_recipe_with_pp_stages(*, pp_enabled=True, has_first_stage=True, pp_microbatch_size=2):
@@ -336,10 +127,13 @@ class _ScheduleSpy:
             losses.append(torch.tensor(1.25))
 
 
-def test_forward_backward_step_pp_cp_first_stage_uses_inputs_embeds(monkeypatch):
-    inputs_embeds = torch.randn(2, 6, 8)
+def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monkeypatch):
+    """Sunk model on the FIRST PP stage under CP: the sharder-only hook is invoked
+    (consumes nothing), so input_ids stays full-length, update_seq_len sees the
+    full seq_len, and the full-length input_ids is fed to the pipeline schedule
+    (the model embeds + shards inside its own forward)."""
     labels = torch.arange(12, dtype=torch.long).reshape(2, 6)
-    model = _SpyVLM(prepared={"inputs_embeds": inputs_embeds})
+    model = _SunkSpyVLM()
     schedule = _ScheduleSpy()
     seq_lens = []
     first_stage = SimpleNamespace(is_first=True, inputs_meta=None)
@@ -372,6 +166,7 @@ def test_forward_backward_step_pp_cp_first_stage_uses_inputs_embeds(monkeypatch)
 
     monkeypatch.setattr(cp_utils_mod, "_make_cp_batch_and_ctx", _make_cp_batch_and_ctx)
     monkeypatch.setattr(vlm_finetune, "stage_vlm_media_for_pp", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(FinetuneRecipeForVLM, "_maybe_set_pp_first_stage_embed_input_meta", lambda self, mi: None)
 
     loss_buffer = []
     FinetuneRecipeForVLM._forward_backward_step(
@@ -384,17 +179,14 @@ def test_forward_backward_step_pp_cp_first_stage_uses_inputs_embeds(monkeypatch)
     )
 
     assert len(model.calls) == 1
-    assert model.calls[0]["_pre_embed_only"] is True
-    assert "inputs_embeds" in seen_cp_batch
-    assert "input_ids" not in seen_cp_batch
-    assert "pixel_values" not in seen_cp_batch
-    assert seq_lens == [inputs_embeds.shape[1]]
+    # Sharder-only: input_ids stays full, no inputs_embeds injected.
+    assert "input_ids" in seen_cp_batch
+    assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
+    assert "inputs_embeds" not in seen_cp_batch
+    assert seq_lens == [6]
     assert len(schedule.calls) == 1
-    assert schedule.calls[0]["model_input"] is inputs_embeds
+    assert tuple(schedule.calls[0]["model_input"].shape) == (2, 6)
     assert torch.equal(schedule.calls[0]["target"], labels)
-    assert schedule.calls[0]["batch"] == {}
-    assert tuple(first_stage.inputs_meta[0].shape) == (2, 6, 8)
-    assert first_stage.inputs_meta[0].dtype == inputs_embeds.dtype
     assert torch.equal(loss_buffer[0], torch.tensor(1.25))
 
 
@@ -406,18 +198,13 @@ class _SunkSpyVLM:
     def __init__(self):
         self.calls = []
 
-    def prepare_model_inputs_for_cp(self, **kwargs):
+    def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
+        # Sharder-only: nothing consumed, no inputs_embeds — input_ids stays full.
+        self.calls.append({"batch": dict(batch), "num_chunks": num_chunks})
         return {}
 
-    def __call__(self, *, _pre_embed_only=False, **kwargs):
-        record = {"_pre_embed_only": _pre_embed_only, **kwargs}
-        if isinstance(record.get("_cp_batch"), dict):
-            record["_cp_batch"] = dict(record["_cp_batch"])
-        self.calls.append(record)
-        if _pre_embed_only:
-            # Sharder-only: nothing consumed, no inputs_embeds — input_ids stays full.
-            return {}
-        raise AssertionError("recipe must use _pre_embed_only=True for the CP prepare step")
+    def __call__(self, **kwargs):
+        raise AssertionError("CP prepare must call prepare_model_inputs_for_cp directly, not __call__")
 
 
 def _run_nonfirst_stage_fbstep(monkeypatch, model):
@@ -473,7 +260,6 @@ def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keep
 
     # Hook invoked on the non-first stage (this is the fix).
     assert len(model.calls) == 1
-    assert model.calls[0]["_pre_embed_only"] is True
     # Sharder-only hook consumes nothing: input_ids stays full-length (seq=6).
     assert "input_ids" in seen_cp_batch
     assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
@@ -501,8 +287,9 @@ class _FakePPModel:
 
 
 class _StageWithCPPrepare:
-    # Recipe-level CP pre-embedder (e.g. gemma4): the hook emits inputs_embeds
-    # before the schedule, so raw media never rides schedule.step -> no staging.
+    # Hook model WITHOUT cp_preembed_in_forward: the recipe's non-sunk gate treats
+    # it as a recipe-level pre-embedder (media never rides schedule.step -> no
+    # staging). No real model is non-sunk now, but the gate is still exercised.
     def prepare_model_inputs_for_cp(self):
         return {}
 
@@ -785,7 +572,7 @@ def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
 
 def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
     """With CP active and a model exposing prepare_model_inputs_for_cp, the
-    validation loop must run the model's _pre_embed_only pass before sharding.
+    validation loop must invoke the model's sharder-only CP hook before sharding.
     Guards finetune.py:_run_validation_epoch CP pre-embed branch."""
     from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
@@ -800,13 +587,11 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
         def eval(self):
             return self
 
-        def prepare_model_inputs_for_cp(self, **kwargs):  # marker presence matters
-            return {"inputs_embeds": torch.zeros(1, 4, 8)}
+        def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):  # sharder-only hook
+            pre_embed_calls.append(set(batch))
+            return {}
 
-        def forward(self, _pre_embed_only=False, **batch):
-            if _pre_embed_only:
-                pre_embed_calls.append(set(batch))
-                return self.prepare_model_inputs_for_cp(**batch)
+        def forward(self, **batch):
             return SimpleNamespace(logits=torch.zeros(1, 4, 8), hidden_states=None)
 
     class _DM(dict):
@@ -831,5 +616,5 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
 
     result = recipe._run_validation_epoch([batch])
 
-    assert pre_embed_calls, "the _pre_embed_only pass must run when CP is active"
+    assert pre_embed_calls, "the CP hook (prepare_model_inputs_for_cp) must run when CP is active"
     assert result.metrics["val_loss"] == pytest.approx(2.0)

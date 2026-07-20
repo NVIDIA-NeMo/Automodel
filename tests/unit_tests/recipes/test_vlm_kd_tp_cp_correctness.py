@@ -56,17 +56,12 @@ class _StudentVLM(nn.Module):
     def get_input_embeddings(self):
         return self.embedding
 
-    def prepare_model_inputs_for_cp(self, batch, **kwargs):
-        # Production contract: consumed raw inputs are returned as None so the
-        # dispatcher removes them (the hook may receive a copy of the batch).
-        return {"inputs_embeds": self.embedding(batch["input_ids"]), "input_ids": None, "pixel_values": None}
+    def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
+        # Sharder-only CP hook: consumes nothing (the forward embeds + shards).
+        self.pre_embed_calls.append(dict(batch))
+        return {}
 
-    def forward(self, _pre_embed_only: bool = False, input_ids=None, inputs_embeds=None, **kwargs):
-        if _pre_embed_only:
-            cp_batch = kwargs.pop("_cp_batch")
-            self.pre_embed_calls.append(dict(cp_batch))
-            return self.prepare_model_inputs_for_cp(cp_batch)
-
+    def forward(self, input_ids=None, inputs_embeds=None, **kwargs):
         self.forward_calls.append({"input_ids": input_ids, "inputs_embeds": inputs_embeds, **kwargs})
         if inputs_embeds is None:
             inputs_embeds = self.embedding(input_ids)
@@ -164,7 +159,7 @@ def test_vlm_kd_uses_tp_kd_loss_path(monkeypatch, trivial_pg):
     assert torch.isfinite(loss_buffer[0])
 
 
-def test_vlm_kd_cp_prepare_feeds_student_inputs_embeds_to_cp_and_teacher(monkeypatch):
+def test_vlm_kd_cp_prepare_shards_input_ids_and_teacher_embeds_them(monkeypatch):
     make_cp_calls = []
 
     def fake_make_cp_batch_and_ctx(device_mesh, batch, *args, **kwargs):
@@ -192,44 +187,28 @@ def test_vlm_kd_cp_prepare_feeds_student_inputs_embeds_to_cp_and_teacher(monkeyp
         is_train=False,
     )
 
+    # Sunk student: the sharder-only hook consumes nothing, so input_ids (not
+    # inputs_embeds) flows to CP; the teacher embeds those input_ids itself.
     assert len(student.pre_embed_calls) == 1
     assert len(make_cp_calls) == 1
     cp_batch = make_cp_calls[0][1]
-    assert "inputs_embeds" in cp_batch
-    assert "input_ids" not in cp_batch
-    assert "pixel_values" not in cp_batch
+    assert "input_ids" in cp_batch
+    assert "inputs_embeds" not in cp_batch
     assert "labels" in cp_batch
-    assert teacher.forward_calls[0]["inputs_embeds"] is cp_batch["inputs_embeds"]
-    assert teacher.forward_calls[0]["input_ids"] is None
+    assert teacher.forward_calls[0]["input_ids"] is not None
+    assert teacher.forward_calls[0]["inputs_embeds"] is None
     assert torch.isfinite(loss_buffer[0])
 
 
-def test_vlm_kd_cp_rejects_teacher_student_hidden_size_mismatch(monkeypatch):
-    # The teacher-compat check runs on the (sharded) student embeds right after
-    # prepare_cp_forward — sequence sharding never changes the hidden dim, so
-    # sharding is allowed to proceed; only the mismatch error must fire.
-    from contextlib import nullcontext
-
-    monkeypatch.setattr(cp_utils_mod, "_make_cp_batch_and_ctx", lambda device_mesh, batch, *a, **k: (nullcontext, batch, None))
-
-    student = _StudentVLM(hidden_size=8)
+def test_validate_cp_pre_embed_raises_on_teacher_student_hidden_size_mismatch():
+    # The teacher-compat guard raises when the student embeds' hidden size differs
+    # from the teacher's input-embedding dim (exercised directly: the recipe now
+    # runs sunk students that embed in-forward, so this validation is invoked as a
+    # standalone helper rather than off a hook-returned inputs_embeds).
+    student_embeds = torch.zeros(1, 4, 8)
     teacher = _TeacherVLM(hidden_size=12)
-    recipe = _make_recipe(
-        student=student,
-        teacher=teacher,
-        kd_loss_fn=KDLoss(),
-        device_mesh=_DeviceMesh(cp_size=2),
-    )
-
     with pytest.raises(ValueError, match="teacher and student input embedding hidden sizes must match"):
-        recipe._forward_backward_step(
-            0,
-            _batch(),
-            loss_buffer=[],
-            num_label_tokens=3,
-            num_batches=1,
-            is_train=False,
-        )
+        vlm_kd._validate_cp_pre_embed_teacher_compatibility(student_embeds, teacher)
 
 
 class _WeightOnlyEmbedding(nn.Module):

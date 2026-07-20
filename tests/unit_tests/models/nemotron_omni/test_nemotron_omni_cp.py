@@ -17,9 +17,9 @@
 Covers:
   - ``prepare_model_inputs_for_cp`` returns a dict containing ``inputs_embeds``
     with the expected shape and image/video/sound token positions filled.
-  - ``forward(_pre_embed_only=True)`` delegates to ``prepare_model_inputs_for_cp``
-    without entering the LLM body (so FSDP2 forward pre-hooks fire on
-    ``__call__`` while the LLM forward is skipped).
+  - ``prepare_model_inputs_for_cp`` is a sharder-only hook: it returns the CP
+    sharder without entering the LLM body (embed / vision splice / shard happen
+    in the model's own forward).
   - ``forward(inputs_embeds=...)`` skips the multimodal scatter block.
 
 The model is constructed via ``object.__new__`` + minimal stub submodules so we
@@ -30,7 +30,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 import torch.nn as nn
 
@@ -240,53 +239,30 @@ def test_forward_cp_shards_embedded_sequence():
 
 
 # -----------------------------------------------------------------------------
-# forward(_pre_embed_only=True)
+# prepare_model_inputs_for_cp (sharder-only hook)
 # -----------------------------------------------------------------------------
 
 
-def test_forward_pre_embed_only_returns_dict_from_prepare_model_inputs_for_cp(monkeypatch):
-    """forward(_pre_embed_only=True) must early-return prepare_model_inputs_for_cp's dict
-    WITHOUT entering the LLM forward."""
+def test_prepare_model_inputs_for_cp_is_sharder_only_and_skips_lm(monkeypatch):
+    """The sharder-only CP hook returns just the CP sharder and never touches the
+    LLM body (embed / vision splice / shard happen in the model's own forward)."""
     model = _make_omni_stub()
 
-    # Sentinel: if the LLM body is invoked, language_model.__call__ would be hit.
-    # We assert it is NOT by mocking it to raise.
     def _llm_must_not_run(*args, **kwargs):
-        raise AssertionError("language_model should NOT be called under _pre_embed_only=True")
+        raise AssertionError("language_model should NOT be called by the CP hook")
 
-    model.language_model.forward = _llm_must_not_run  # would also catch __call__
+    model.language_model.forward = _llm_must_not_run
 
-    # The dispatcher hands the whole batch dict through the _cp_batch kwarg.
-    out = model.forward(
-        _pre_embed_only=True,
-        _cp_batch={
+    out = model.prepare_model_inputs_for_cp(
+        {
             "input_ids": torch.tensor([[1, IMG_TOKEN_ID, 3]]),
             "pixel_values": torch.zeros(1, 3, 4, 4),
             "image_flags": torch.tensor([[1]]),
-        },
+        }
     )
     # Sharder-only hook: returns the CP sharder, does not embed or call the LM.
     assert isinstance(out, dict)
     assert set(out) == {"cp_sharder"}
-
-
-def test_forward_pre_embed_only_default_false_does_not_short_circuit(monkeypatch):
-    """Default ``_pre_embed_only=False`` must NOT take the early-return path."""
-    model = _make_omni_stub()
-
-    # Prove the early branch isn't triggered by patching prepare_model_inputs_for_cp
-    # to a sentinel and asserting it's NOT what gets returned. (The full forward
-    # would hit the LLM, which we mock to raise — so we expect AssertionError.)
-    def _llm_raises(*args, **kwargs):
-        raise AssertionError("LM was reached past the multimodal block")
-
-    model.language_model.forward = _llm_raises
-
-    with pytest.raises(AssertionError, match="LM was reached"):
-        model.forward(
-            input_ids=torch.tensor([[1, 2, 3]]),
-            # _pre_embed_only defaults to False
-        )
 
 
 def test_forward_inputs_embeds_skips_multimodal_scatter_block():

@@ -2403,10 +2403,6 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
             }
 
         def forward(self, **batch):
-            if batch.pop("_pre_embed_only", False):
-                return self.prepare_model_inputs_for_cp(
-                    batch.pop("_cp_batch"), num_chunks=batch.pop("num_chunks", None)
-                )
             logits = self.lin(batch["input_ids"].float())
             return SimpleNamespace(logits=logits)
 

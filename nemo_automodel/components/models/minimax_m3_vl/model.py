@@ -707,12 +707,6 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        # CP pre-embed: the recipe calls model(_pre_embed_only=True, **mm_kwargs) when
-        # cp_size>1 to splice vision into inputs_embeds before the batch is sequence-
-        # sharded. Return early with {"inputs_embeds": ...}; no PP/MTP/decoder work here.
-        if kwargs.pop("_pre_embed_only", False):
-            return self.prepare_model_inputs_for_cp(kwargs.pop("_cp_batch"), num_chunks=kwargs.pop("num_chunks", 1))
-
         is_pp_stage = self._is_pipeline_parallel_stage()
 
         # Authoritative MTP-under-PP guard: keyed on the config (which survives the

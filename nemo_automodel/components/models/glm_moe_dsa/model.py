@@ -464,13 +464,6 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             output_hidden_states: When set (single-process), carry final hidden states on the output.
             **attn_kwargs: Additional arguments forwarded to the base model.
         """
-        # Model-owned context-parallel input prep. The recipe routes the batch
-        # through ``__call__(_pre_embed_only=True)`` before CP sharding so the model
-        # can attach its own ``cp_sharder`` (see ``prepare_model_inputs_for_cp``).
-        if attn_kwargs.pop("_pre_embed_only", False):
-            return self.prepare_model_inputs_for_cp(
-                attn_kwargs.pop("_cp_batch"), num_chunks=attn_kwargs.pop("num_chunks", 1)
-            )
 
         output_hidden_states = (
             output_hidden_states
