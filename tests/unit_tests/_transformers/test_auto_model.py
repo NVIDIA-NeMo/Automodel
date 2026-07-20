@@ -23,6 +23,7 @@ import torch
 from nemo_automodel._transformers.auto_model import (
     _MAX_BUILD_RETRIES,
     NeMoAutoModelForCausalLM,
+    NeMoAutoModelBiEncoder,
     _alias_remote_auto_map_for_target,
     _BaseNeMoAutoModelClass,
     _consume_config_overrides,
@@ -120,6 +121,45 @@ class TestResolveMeshContext:
         assert isinstance(setup.mesh_context, MeshContext)
         assert setup.strategy_config is None
         assert setup.activation_checkpointing is False
+
+
+def test_retrieval_te_attention_survives_liger_retry():
+    """A retrieval retry must preserve the requested TE attention injection."""
+    first_model = MagicMock()
+    retried_model = MagicMock()
+    final_model = MagicMock()
+    setup = DistributedSetup(mesh_context=MeshContext())
+
+    with (
+        patch(
+            "nemo_automodel._transformers.retrieval.BiEncoderModel.build",
+            side_effect=[first_model, retried_model],
+        ) as mock_build,
+        patch(
+            "nemo_automodel._transformers.auto_model.instantiate_infrastructure",
+            return_value=(None, None, None, None),
+        ),
+        patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", side_effect=RuntimeError("failed")),
+        patch(
+            "nemo_automodel._transformers.auto_model.apply_model_infrastructure",
+            return_value=final_model,
+        ) as mock_apply_infrastructure,
+        patch("torch.cuda.current_device", return_value=0),
+    ):
+        result = NeMoAutoModelBiEncoder.from_pretrained(
+            "local-model",
+            attn_implementation="te",
+            use_liger_kernel=True,
+            use_sdpa_patching=False,
+            distributed_setup=setup,
+        )
+
+    assert result is final_model
+    assert mock_build.call_count == 2
+    assert [call.kwargs["attn_implementation"] for call in mock_build.call_args_list] == ["sdpa", "sdpa"]
+    mock_apply_infrastructure.assert_called_once()
+    assert mock_apply_infrastructure.call_args.kwargs["model"] is retried_model
+    assert mock_apply_infrastructure.call_args.kwargs["inject_te_attention"] is True
 
 
 class TestFromPretrainedDeviceMesh:

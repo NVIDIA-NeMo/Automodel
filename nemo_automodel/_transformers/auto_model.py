@@ -1096,6 +1096,7 @@ class _NeMoAutoModelForRetrievalBase:
         from nemo_automodel._transformers import retrieval as _enc_mod
 
         encoder_cls = getattr(_enc_mod, cls._ENCODER_CLS_NAME)
+        requested_attn_implementation = attn_implementation
 
         # Retrieval encoders bypass the general model builder, so handle the
         # NeMo ``te`` extension here as well: load through SDPA, then inject
@@ -1118,7 +1119,7 @@ class _NeMoAutoModelForRetrievalBase:
         def _retry(**override):
             return cls.from_pretrained(
                 pretrained_model_name_or_path,
-                attn_implementation=attn_implementation,
+                attn_implementation=requested_attn_implementation,
                 use_liger_kernel=override.get("use_liger_kernel", use_liger_kernel),
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,

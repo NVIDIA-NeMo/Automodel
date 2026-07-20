@@ -415,6 +415,10 @@ class BiEncoderModel(nn.Module):
         effective_task = cls._TASK if cls._TASK is not None else task
         if effective_task is None:
             raise ValueError("task must be specified when calling build()")
+        if use_te_fused_mlp and not use_custom_llama_backend:
+            raise ValueError("use_te_fused_mlp requires use_custom_llama_backend=True")
+        if use_te_fused_qkv and not use_custom_llama_backend:
+            raise ValueError("use_te_fused_qkv requires use_custom_llama_backend=True")
 
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
         freeze_config = hf_kwargs.pop("freeze_config", None)

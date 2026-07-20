@@ -77,6 +77,19 @@ def test_biencoder_build_applies_optimized_vl_flags(monkeypatch):
     assert calls == ["custom", "mlp", "qkv", "siglip", "pooling_head"]
 
 
+@pytest.mark.parametrize("flag", ["use_te_fused_mlp", "use_te_fused_qkv"])
+def test_biencoder_build_rejects_custom_llama_fusions_without_custom_backend(monkeypatch, flag):
+    from nemo_automodel._transformers import retrieval
+
+    build_backbone = MagicMock()
+    monkeypatch.setattr(retrieval, "build_encoder_backbone", build_backbone)
+
+    with pytest.raises(ValueError, match=rf"{flag} requires use_custom_llama_backend=True"):
+        retrieval.BiEncoderModel.build("local-vl-model", task="embedding", **{flag: True})
+
+    build_backbone.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("flag_kwargs", "failing_helper", "bad_return", "error_match"),
     [
