@@ -18,7 +18,6 @@ import pytest
 import torch
 
 import nemo_automodel.components.moe.paged_stash as paged_stash
-from nemo_automodel.components.moe.paged_stash_ops import HAVE_TRITON
 
 
 class _SaveForBackward(torch.autograd.Function):
@@ -31,18 +30,6 @@ class _SaveForBackward(torch.autograd.Function):
     def backward(ctx, grad_output):
         (tensor,) = ctx.saved_tensors
         return grad_output + tensor * 0
-
-
-class _SegmentedSquare(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, tensor):
-        ctx.save_for_backward(tensor)
-        return tensor.square()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (tensor,) = ctx.saved_tensors
-        return 2 * tensor * grad_output
 
 
 def _record_group(manager, tensor, live_mask, *, name="test"):
@@ -235,33 +222,4 @@ def test_group_rejects_frozen_expert_input():
     assert manager._group_tensors == {}
     with pytest.raises(RuntimeError, match="recording was invalid"):
         manager.prepare()
-    manager.close()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA and Triton are required")
-def test_cuda_stash_restores_sparse_live_rows_and_zeros_padding():
-    manager = paged_stash.PagedStashManager()
-    manager.configure(enabled=True, page_size=2, buffer_size_factor=1.5)
-
-    warmup = torch.randn(8, 4, device="cuda", requires_grad=True)
-    warmup_mask = torch.tensor([True, False, True, True, False, True, False, True], device="cuda")
-    warmup_output = _record_group(manager, warmup, warmup_mask, name="warmup")
-    warmup_output.sum().backward()
-    manager.prepare()
-
-    tensor = torch.randn(8, 4, device="cuda", requires_grad=True)
-    live_mask = torch.tensor([True, False, True, False, False, True, False, False], device="cuda")
-    group = manager.group(name="active", max_num_tokens=8, live_token_mask=live_mask)
-    tensor_for_compute = group.start(tensor)
-    with group:
-        output = _SegmentedSquare.apply(group.mark_activation(tensor_for_compute))
-    output = group.commit(output)
-    output.sum().backward()
-
-    expected = torch.zeros_like(tensor)
-    expected[live_mask] = 2 * tensor.detach()[live_mask]
-    torch.testing.assert_close(tensor.grad, expected)
-    assert manager.check_overflow() is not None
-    assert manager.check_overflow().item() == 0
-    manager.finish_iteration()
     manager.close()

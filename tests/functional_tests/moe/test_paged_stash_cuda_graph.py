@@ -26,8 +26,63 @@ from torch import nn
 import nemo_automodel.components.moe.paged_stash as paged_stash
 from nemo_automodel.components.moe.paged_stash import PagedStashManager
 from nemo_automodel.components.moe.paged_stash_ops import HAVE_TRITON
+from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes.llm.partial_cuda_graphs import PartialCudaGraphManager, _PartialGraphEntry
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
+
+
+class _GatedActivation(torch.autograd.Function):
+    """Tiny gated activation that saves the complete marked pre-activation surface."""
+
+    @staticmethod
+    def forward(ctx, gate_up_output: torch.Tensor) -> torch.Tensor:
+        """Apply SwiGLU while saving the complete marked activation.
+
+        Args:
+            ctx: Autograd context for the gated activation.
+            gate_up_output: Contiguous pre-activation with shape ``[tokens, 2 * hidden]``.
+
+        Returns:
+            Activated tensor with shape ``[tokens, hidden]``.
+        """
+        ctx.save_for_backward(gate_up_output)
+        gate, up = gate_up_output.chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate) * up
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
+        """Differentiate the gated activation.
+
+        Args:
+            ctx: Autograd context populated by :meth:`forward`.
+            grad_output: Activation gradient with shape ``[tokens, hidden]``.
+
+        Returns:
+            Pre-activation gradient with shape ``[tokens, 2 * hidden]``.
+        """
+        (gate_up_output,) = ctx.saved_tensors
+        gate, up = gate_up_output.chunk(2, dim=-1)
+        sigmoid = torch.sigmoid(gate)
+        silu = gate * sigmoid
+        gate_gradient = grad_output * up * sigmoid * (1 + gate * (1 - sigmoid))
+        up_gradient = grad_output * silu
+        return (torch.cat((gate_gradient, up_gradient), dim=-1),)
+
+
+class _SegmentedSquare(torch.autograd.Function):
+    """Simple saved-tensor consumer used to verify sparse row restoration."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
+        """Save and square a tensor with shape ``[tokens, hidden]``."""
+        ctx.save_for_backward(tensor)
+        return tensor.square()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
+        """Return the elementwise gradient with shape ``[tokens, hidden]``."""
+        (tensor,) = ctx.saved_tensors
+        return (2 * tensor * grad_output,)
 
 
 class _GraphableTEExperts(nn.Module):
@@ -36,10 +91,18 @@ class _GraphableTEExperts(nn.Module):
     def __init__(self, stash_manager: PagedStashManager, grouped_linear: type[nn.Module]) -> None:
         super().__init__()
         self.__dict__["stash_manager"] = stash_manager
-        self.grouped_linear = grouped_linear(
+        self.gate_up_linear = grouped_linear(
             num_gemms=2,
             in_features=4,
             out_features=8,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            device="cuda",
+        )
+        self.down_linear = grouped_linear(
+            num_gemms=2,
+            in_features=4,
+            out_features=4,
             bias=False,
             params_dtype=torch.bfloat16,
             device="cuda",
@@ -61,7 +124,7 @@ class _GraphableTEExperts(nn.Module):
             expert_indices: Expert ids with shape ``[6, 1]``; this guard uses expert zero for every live row.
 
         Returns:
-            Grouped expert output with shape ``[6, 8]``.
+            Grouped expert output with shape ``[6, 4]``.
         """
         weighted_states = hidden_states * routing_weights.to(dtype=hidden_states.dtype)
         live_token_mask = token_mask & routing_weights[:, 0].ne(0) & expert_indices[:, 0].eq(0)
@@ -72,12 +135,26 @@ class _GraphableTEExperts(nn.Module):
         )
         weighted_states = group.start(weighted_states)
         with group:
-            output = self.grouped_linear(group.mark_activation(weighted_states), [3, 3])
+            gate_up_output = self.gate_up_linear(weighted_states, [3, 3])
+            gate_up_output = group.mark_activation(gate_up_output)
+            activated = _GatedActivation.apply(gate_up_output)
+            activated = group.mark_activation(activated)
+            output = self.down_linear(activated, [3, 3])
+        del gate_up_output, activated
         return group.commit(output)
 
 
 def _inputs(live_token_mask: torch.Tensor, *, seed: int) -> tuple[torch.Tensor, ...]:
-    """Create one fixed-shape expert call whose padding rows carry zero routing weight."""
+    """Create one fixed-shape expert call whose padding rows carry zero routing weight.
+
+    Args:
+        live_token_mask: Boolean CUDA tensor with shape ``[6]``.
+        seed: Seed for the local CUDA generator that creates inputs.
+
+    Returns:
+        Hidden states ``[6, 4]``, the unchanged token mask ``[6]``, differentiable routing weights ``[6, 1]``,
+        and integer expert indices ``[6, 1]``.
+    """
     generator = torch.Generator(device="cuda").manual_seed(seed)
     hidden_states = torch.randn(6, 4, generator=generator, device="cuda", dtype=torch.bfloat16)
     routing_weights = torch.rand(6, 1, generator=generator, device="cuda", dtype=torch.float32)
@@ -88,6 +165,38 @@ def _inputs(live_token_mask: torch.Tensor, *, seed: int) -> tuple[torch.Tensor, 
         routing_weights.requires_grad_(),
         torch.zeros(6, 1, device="cuda", dtype=torch.int64),
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA and Triton are required")
+def test_active_stash_restores_sparse_rows_and_zeros_padding():
+    """Validate Triton page copy/pop semantics before composing them with TE graphs."""
+    manager = PagedStashManager()
+    manager.configure(enabled=True, page_size=2, buffer_size_factor=1.5)
+
+    warmup = torch.randn(8, 4, device="cuda", requires_grad=True)
+    warmup_mask = torch.tensor([True, False, True, True, False, True, False, True], device="cuda")
+    warmup_group = manager.group(name="warmup", max_num_tokens=8, live_token_mask=warmup_mask)
+    warmup_for_compute = warmup_group.start(warmup)
+    with warmup_group:
+        warmup_output = _SegmentedSquare.apply(warmup_group.mark_activation(warmup_for_compute))
+    warmup_group.commit(warmup_output).sum().backward()
+    manager.prepare()
+
+    tensor = torch.randn(8, 4, device="cuda", requires_grad=True)
+    live_mask = torch.tensor([True, False, True, False, False, True, False, False], device="cuda")
+    group = manager.group(name="active", max_num_tokens=8, live_token_mask=live_mask)
+    tensor_for_compute = group.start(tensor)
+    with group:
+        output = _SegmentedSquare.apply(group.mark_activation(tensor_for_compute))
+    group.commit(output).sum().backward()
+
+    expected = torch.zeros_like(tensor)
+    expected[live_mask] = 2 * tensor.detach()[live_mask]
+    torch.testing.assert_close(tensor.grad, expected)
+    assert manager.check_overflow() is not None
+    assert manager.check_overflow().item() == 0
+    manager.finish_iteration()
+    manager.close()
 
 
 def _asymmetric_overflow_worker(rank: int, world_size: int, init_method: str) -> None:
@@ -112,27 +221,39 @@ def _asymmetric_overflow_worker(rank: int, world_size: int, init_method: str) ->
     recipe._partial_cuda_graph_paged_stash_enabled = True
     recipe._partial_cuda_graph_paged_stash_reruns = 0
     recipe.optimizer = [SimpleNamespace(zero_grad=lambda: events.append("zero-grad"))]
-    recipe.rng = SimpleNamespace(load_state_dict=lambda state: events.append(("restore-rng", state)))
-    recipe._run_forward_backward_batches = lambda _batches, num_label_tokens: (
-        events.append(("rerun", num_label_tokens)) or [torch.tensor(2.0, device="cuda")]
-    )
+    stateful_rng = StatefulRNG(seed=1234 + rank)
+    rng_state = stateful_rng.state_dict()
+    expected_cuda_draw = torch.rand(3, device="cuda")
+    torch.rand(3, device="cuda")
+
+    def restore_rng(state) -> None:
+        events.append(("restore-rng", state))
+        stateful_rng.load_state_dict(state)
+
+    actual_cuda_draws = []
+
+    def rerun(_batches, num_label_tokens):
+        events.append(("rerun", num_label_tokens))
+        actual_cuda_draws.append(torch.rand(3, device="cuda"))
+        return [torch.tensor(2.0, device="cuda")]
+
+    recipe.rng = SimpleNamespace(load_state_dict=restore_rng)
+    recipe._run_forward_backward_batches = rerun
 
     try:
         result = recipe._rerun_after_paged_stash_overflow(
             ["same-batch"],
             num_label_tokens=7,
             loss_buffer=[torch.tensor(1.0, device="cuda")],
-            rng_state="pre-attempt-state",
+            rng_state=rng_state,
         )
         assert result[0].item() == 2.0
         assert recipe._partial_cuda_graph_paged_stash_reruns == 1
-        assert events == [
-            "graph-close",
-            "stash-close",
-            "zero-grad",
-            ("restore-rng", "pre-attempt-state"),
-            ("rerun", 7),
-        ]
+        assert events[:3] == ["graph-close", "stash-close", "zero-grad"]
+        assert events[3][0] == "restore-rng"
+        assert events[3][1] is rng_state
+        assert events[4] == ("rerun", 7)
+        torch.testing.assert_close(actual_cuda_draws[0], expected_cuda_draw)
     finally:
         torch.distributed.destroy_process_group()
 
@@ -195,6 +316,7 @@ def test_te_grouped_linear_paged_stash_matches_eager_across_graph_replays():
         replay_masks = (
             torch.tensor([True, False, True, True, False, True], device="cuda"),
             torch.tensor([False, True, True, False, True, True], device="cuda"),
+            torch.tensor([True, True, False, True, True, False], device="cuda"),
         )
         for replay_index, live_token_mask in enumerate(replay_masks):
             eager_inputs = _inputs(live_token_mask, seed=456 + replay_index)
@@ -212,9 +334,7 @@ def test_te_grouped_linear_paged_stash_matches_eager_across_graph_replays():
             eager_parameter_gradients = {
                 name: parameter.grad.detach().clone() for name, parameter in target.named_parameters()
             }
-            parameters_before_step = {
-                name: parameter.detach().clone() for name, parameter in target.named_parameters()
-            }
+            parameters_before_step = {name: parameter.detach().clone() for name, parameter in target.named_parameters()}
             optimizer.zero_grad(set_to_none=True)
 
             graph_inputs = tuple(value.detach().clone().requires_grad_(value.requires_grad) for value in eager_inputs)
