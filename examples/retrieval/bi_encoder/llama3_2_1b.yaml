@@ -152,8 +152,9 @@ ci:
   nodes: 1
   embed_eval: true
   # The downstream golden-metric evaluation consumes this full-epoch checkpoint.
-  nightly:
+  nightly: &full_epoch_ci
     step_scheduler.max_steps: null
     step_scheduler.ckpt_every_steps: 2000
     step_scheduler.val_every_steps: 500
     lr_scheduler.lr_warmup_steps: 100
+  release: *full_epoch_ci
