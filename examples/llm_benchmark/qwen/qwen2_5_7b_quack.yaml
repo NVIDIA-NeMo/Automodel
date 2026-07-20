@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-# QuACK Linear and RMSNorm; compare with qwen2_5_7b_quack_baseline.yaml.
+# QuACK RMSNorm and fused RoPE; compare with qwen2_5_7b_quack_baseline.yaml.
 recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 
@@ -44,9 +44,9 @@ model:
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
-    linear: quack
+    linear: torch
     rms_norm: quack
-    rope: torch
+    rope: quack
     rope_fusion: false
     experts: torch
     dispatcher: torch

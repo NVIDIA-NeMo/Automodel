@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-# Matched torch Linear and RMSNorm baseline for qwen2_5_7b_quack.yaml.
+# Matched torch RMSNorm and RoPE baseline for qwen2_5_7b_quack.yaml.
 recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 
