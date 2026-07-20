@@ -629,12 +629,10 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         if self.backend.attn == "te" and attention_mask is not None:
             attention_mask = None
 
-        # Context-parallel: embed + vision splice on the full sequence, then keep
-        # this rank's round-robin chunk pair, so the backbone runs on the local
-        # shard and everything downstream (MTP source embeds built from
-        # inputs_embeds, decoder, lm_head) sees exactly what the old dispatch-level
-        # pre-embed produced. The aux streams were sharded to the same layout by
-        # shard_batch_aux_only. Differentiable: gradients reach embeddings/vision.
+        # Context-parallel: embed + vision-splice the full sequence, then keep this
+        # rank's round-robin chunk pair (aux streams aligned by shard_batch_aux_only).
+        # Downstream (MTP source embeds, decoder, lm_head) sees what the old
+        # dispatch-level pre-embed produced, and stays differentiable.
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
         if (
             cp_size > 1

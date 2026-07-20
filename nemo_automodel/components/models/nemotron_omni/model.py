@@ -1021,11 +1021,9 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             inputs_embeds = inputs_embeds.reshape(B_s, N_s, C_s)
 
         # Context-parallel: keep this rank's round-robin chunk pair of the freshly
-        # embedded + spliced full sequence, so the LM runs on the local shard and
-        # sees exactly what the old dispatch-level pre-embed produced (inputs_embeds
-        # sharded). The aux streams were sharded to the same layout by
-        # shard_batch_aux_only. Skipped when inputs_embeds was supplied pre-sharded.
-        # Differentiable: gradients reach the embeddings and multimodal encoders.
+        # embedded + spliced full sequence (aux streams aligned by
+        # shard_batch_aux_only), so the LM shard matches the old dispatch-level
+        # pre-embed and stays differentiable. Skipped when inputs_embeds is pre-sharded.
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
         if cp_size > 1 and not _embeds_pre_built:
             inputs_embeds, _, _ = shard_sequence_for_cp(self.cp_mesh, inputs_embeds, seq_dim=1)

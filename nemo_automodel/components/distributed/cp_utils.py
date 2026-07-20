@@ -319,11 +319,9 @@ def prepare_cp_forward(
     model_owns_thd = use_te and bool(getattr(model, "supports_thd", False))
     if (effective_cp_size > 1 or model_owns_thd) and has_hook and not magi_replaces_hook and invoke_pre_embed:
         # Every CP hook is sharder-only: it constructs a ContextParallelismSharder
-        # and consumes nothing (embed / vision splice / sequence shard happen in
-        # the model's own forward, per microbatch). It touches no model weights, so
-        # it is a plain method call — no ``__call__`` routing and no FSDP2 unshard.
-        # The batch — including ``input_ids`` and any multimodal inputs — stays
-        # intact for the forward.
+        # and consumes nothing (embed / vision splice / sequence shard happen in the
+        # model's own forward). It touches no weights — a plain method call, no
+        # ``__call__`` routing or FSDP2 unshard — and leaves the batch intact.
         prepared = model.prepare_model_inputs_for_cp(batch, num_chunks=num_chunks)
         cp_sharder = prepared.get("cp_sharder")
 

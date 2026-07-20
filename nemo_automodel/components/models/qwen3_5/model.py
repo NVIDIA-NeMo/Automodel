@@ -1219,12 +1219,10 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         is_first_stage = getattr(language_model, "embed_tokens", None) is not None
         is_last_stage = getattr(self, "lm_head", None) is not None
 
-        # Context-parallel: embed + vision splice on the full sequence, then keep
-        # this rank's round-robin chunk pair, so the text backbone runs on the
-        # local shard and feeds self.model exactly what the old dispatch-level
-        # pre-embed did (inputs_embeds sharded, input_ids None). The aux streams
-        # and mRoPE position_ids were sharded to the same layout by
-        # shard_batch_aux_only. Differentiable: gradients reach embeddings/vision.
+        # Context-parallel: embed + vision-splice the full sequence, then keep this
+        # rank's round-robin chunk pair (aux streams + mRoPE aligned by
+        # shard_batch_aux_only). The local shard matches the old dispatch-level
+        # pre-embed and stays differentiable (gradients reach embeddings/vision).
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
         if (
             cp_size > 1

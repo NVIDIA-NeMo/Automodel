@@ -787,28 +787,22 @@ class FinetuneRecipeForVLM(BaseRecipe):
         batch = {k: _move_to_device(v, self.dist_env.device) for k, v in batch.items()}
 
         # Single CP dispatch (magi / model-owned / generic). The pre-embed hook is
-        # routed through __call__ so FSDP2 forward pre-hooks fire and unshard the
-        # vision tower's weights before the embed/scatter.
+        # a plain method call (prepare_model_inputs_for_cp): sharder-only, it
+        # touches no weights and consumes nothing. Invoke it on EVERY pp stage so
+        # its aux-only sharder keeps input_ids full-length everywhere; otherwise
+        # non-first stages hit the generic round-robin sharder, feed an
+        # already-local seq_len to update_seq_len, and get_pipeline_stage_metas
+        # ÷cp a second time -> the inter-stage hidden truncates to S/cp²
+        # (text-decoder RoPE size mismatch).
         _is_first_or_no_pp = not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False)
-        # The CP hook is invoked on EVERY pp stage. Every PP-capable VLM is sunk:
-        # its sharder-only hook consumes nothing but must
-        # install the aux-only sharder on non-first stages too so input_ids stays
-        # FULL-length there. Otherwise those stages fall through to the generic
-        # round-robin sharder, which shards input_ids to the local length; the
-        # recipe then feeds that already-local length to update_seq_len and the
-        # CP-aware get_pipeline_stage_metas ÷cp a second time -> non-first recv
-        # buffers become S/cp² and the inter-stage P2P truncates the hidden
-        # (text-decoder RoPE size mismatch). Recipe-level pre-embedders (gemma4)
-        # run without PP, so unconditional invocation coincides with first-stage
-        # embedding for them.
         _cp_active = (
             self.device_mesh is not None
             and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
             and self.device_mesh["cp"].size() > 1
         )
         if _cp_active and not _is_first_or_no_pp and hasattr(self.model_parts[0], "prepare_model_inputs_for_cp"):
-            # PP stages without embeddings never pre-embed; drop the raw
-            # multimodal inputs so stage forwards see only text inputs.
+            # Non-first PP stages don't embed; drop raw multimodal inputs so their
+            # forwards see only text.
             for k in VLM_INPUT_KEYS:
                 if k != "input_ids":
                     batch.pop(k, None)

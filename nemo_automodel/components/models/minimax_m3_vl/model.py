@@ -647,15 +647,12 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     ) -> dict[str, Any]:
         """Return a sharder-only CP backend; embed + splice + shard happen in forward.
 
-        Context-parallel embedding, vision splice, and sequence sharding now run
-        inside ``forward`` per microbatch (Megatron-style): the returned
-        :class:`ContextParallelismSharder` round-robin-shards only the no-grad
-        aux streams (labels/position_ids/loss_mask/padding_mask) via
-        :func:`shard_batch_aux_only` and leaves ``input_ids`` and the multimodal
-        inputs full-length for the forward. The forward then embeds+splices the
-        full sequence and calls :func:`shard_sequence_for_cp` on the result, so
-        the embeddings and vision tower are trainable under CP and the PP×CP
-        shared pre-embed graph no longer exists. Nothing is consumed here.
+        The returned :class:`ContextParallelismSharder` round-robin-shards only the
+        no-grad aux streams (labels/position_ids/loss_mask/padding_mask) via
+        :func:`shard_batch_aux_only`, leaving ``input_ids`` and the multimodal inputs
+        full-length; the forward then embeds + splices and calls
+        :func:`shard_sequence_for_cp` per microbatch, so embeddings and vision stay
+        trainable under CP. Nothing is consumed here.
         Defining this method is the opt-in signal the recipe checks
         (``hasattr(model, "prepare_model_inputs_for_cp")``).
 
@@ -753,10 +750,8 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
                 video_grid_thw=video_grid_thw,
             )
             # Per-microbatch CP: keep this rank's round-robin chunk pair of the
-            # freshly embedded full sequence. The aux streams and the ring-SDPA
-            # context were sharded to the same layout by shard_batch_aux_only, and
-            # the shard is differentiable so gradients reach the embeddings and
-            # vision tower.
+            # freshly embedded full sequence (aux streams + ring-SDPA context aligned
+            # by shard_batch_aux_only). Differentiable: gradients reach embeddings/vision.
             if cp_size > 1:
                 inputs_embeds, _, _ = shard_sequence_for_cp(self.cp_mesh, inputs_embeds, seq_dim=1)
 
