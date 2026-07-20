@@ -74,7 +74,6 @@ __all__ = [
 logger = logging.getLogger(__name__)
 _LOGGED_ONCE = False
 _LOGGED_SMALL_FALLBACK = False
-_LOGGED_CUDA_GRID_HOST_SYNC = False
 _LOGGED_COST_ALPHAS: set[tuple[str, int, str]] = set()
 
 
@@ -212,9 +211,9 @@ def _grid_for_visual(grid_thw: torch.Tensor, pixel_values: torch.Tensor) -> torc
 def _grid_list_for_planning(grid_thw: torch.Tensor) -> tuple[list[list[int]], torch.Tensor]:
     """Return host-side grid metadata for Python partitioning.
 
-    ``grid_thw`` should normally arrive on CPU because the recipe keeps VLM metadata off
-    device. Keep this helper defensive: if a caller has already moved it to CUDA, do a
-    single explicit host copy and log it, instead of hiding the sync behind ``tolist()``.
+    The generic VLM recipe moves batch tensors, including grid metadata, to the model
+    device. Make the required host copy explicit instead of hiding the synchronization
+    behind ``tolist()``. Callers that already keep the grid on CPU avoid the copy.
 
     Args:
         grid_thw: [N, 3] tensor, one (t, h, w) row per media entry (N = entries).
@@ -223,17 +222,8 @@ def _grid_list_for_planning(grid_thw: torch.Tensor) -> tuple[list[list[int]], to
         Tuple of ``grid_thw.tolist()`` (a list of ``[t, h, w]`` ints) and the CPU long
         tensor it was read from.
     """
-    global _LOGGED_CUDA_GRID_HOST_SYNC
     grid_host = grid_thw
     if grid_host.device.type != "cpu":
-        if not _LOGGED_CUDA_GRID_HOST_SYNC:
-            _LOGGED_CUDA_GRID_HOST_SYNC = True
-            logger.warning(
-                "vision grid metadata arrived on %s; copying to CPU for "
-                "CP vision-shard planning. This should be rare; VLM grid metadata is "
-                "expected to stay on CPU.",
-                grid_host.device,
-            )
         # Blocking D2H copy: `.tolist()` below reads host memory immediately.
         grid_host = grid_host.to("cpu")
     if grid_host.dtype != torch.long:
