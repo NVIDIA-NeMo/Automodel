@@ -409,6 +409,7 @@ class RecipeConfig:
                 "balance_media_tokens",
                 "collate_max_length",
                 "attn_implementation",
+                "packing_format",
                 "enabled",
                 "pretokenize",
                 "max_length",
@@ -425,6 +426,7 @@ class RecipeConfig:
                 balance_media_tokens=packing_node.get("balance_media_tokens", True),
                 collate_max_length=packing_node.get("collate_max_length", None),
                 attn_implementation=packing_node.get("attn_implementation", None),
+                packing_format=packing_node.get("packing_format", "neat"),
             )
 
         loader_kwargs = _as_dict(dataloader_node)
