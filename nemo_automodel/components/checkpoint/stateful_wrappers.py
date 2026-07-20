@@ -154,13 +154,17 @@ def _gather_peft_state_dict_across_pp(
             if k not in merged:
                 merged[k] = v
 
-    # Sanity check: the merge must add keys beyond any single rank's local set,
-    # otherwise the gather silently collapsed (e.g. wrong/global group passed in)
-    # and we would write a truncated adapter -- the exact failure this fix exists
-    # to prevent. Log the per-rank vs merged sizes and warn on the degenerate case.
+    # Sanity check: when two or more ranks contribute adapter tensors, the merge
+    # must add keys beyond any single rank's set; otherwise the gather silently
+    # collapsed (e.g. a wrong/global group was passed in) and we would write a
+    # truncated adapter -- the exact failure this fix exists to prevent. Skip the
+    # check when only one rank is non-empty: a valid PP layout can place all
+    # trainable adapters on a single stage (per_rank=[N, 0, ...]), where
+    # merged_n == max(per_rank) is correct, not a collapse.
     local_n = len(local_state_dict)
     merged_n = len(merged)
     per_rank = [len(sd) if sd else 0 for sd in gathered]
+    non_empty_ranks = sum(1 for n in per_rank if n > 0)
     logging.getLogger(__name__).info(
         "PEFT PP gather: pp_world=%d per_rank_tensors=%s merged_tensors=%d (local=%d)",
         world,
@@ -168,13 +172,14 @@ def _gather_peft_state_dict_across_pp(
         merged_n,
         local_n,
     )
-    if merged_n <= max(per_rank):
+    if non_empty_ranks > 1 and merged_n <= max(per_rank):
         logging.getLogger(__name__).warning(
             "PEFT PP gather produced no more tensors (%d) than the largest single "
-            "rank (%d) despite pp_world=%d. The saved adapter may be INCOMPLETE -- "
-            "verify the pipeline-parallel process group is correct.",
+            "rank (%d) despite %d non-empty ranks (pp_world=%d). The saved adapter "
+            "may be INCOMPLETE -- verify the pipeline-parallel process group is correct.",
             merged_n,
             max(per_rank),
+            non_empty_ranks,
             world,
         )
     return merged

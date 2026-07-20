@@ -163,6 +163,24 @@ class TestGatherPeftStateDictAcrossPP:
         assert len(merged) == 1
         assert any("may be INCOMPLETE" in rec.message for rec in caplog.records)
 
+    def test_single_nonempty_rank_does_not_warn(self, monkeypatch, caplog):
+        """A valid PP layout can place all trainable adapters on one stage, with
+        every other stage contributing an empty dict (per_rank=[N, 0, ...]).
+        Then merged_n == max(per_rank) is correct, not a collapse, so the
+        INCOMPLETE warning must NOT fire."""
+        rank0 = {
+            "base_model.model.model.layers.0.self_attn.wq_a.lora_A.weight": _t(0),
+            "base_model.model.model.layers.1.self_attn.wq_a.lora_A.weight": _t(1),
+        }
+        payloads = [rank0, {}, {}]  # only rank 0 holds adapters
+        _install_fake_distributed(monkeypatch, payloads)
+
+        with caplog.at_level(logging.WARNING):
+            merged = _gather_peft_state_dict_across_pp(rank0, _FakePPGroup(payloads))
+
+        assert len(merged) == 2
+        assert not any("may be INCOMPLETE" in rec.message for rec in caplog.records)
+
     def test_healthy_gather_does_not_warn(self, monkeypatch, caplog):
         rank0 = {"base_model.model.model.layers.0.self_attn.wq_a.lora_A.weight": _t(0)}
         rank1 = {"base_model.model.model.layers.1.self_attn.wq_a.lora_A.weight": _t(1)}
