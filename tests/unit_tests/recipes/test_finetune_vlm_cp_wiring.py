@@ -21,8 +21,9 @@ full recipe — exercising the code shape that gets shipped:
   - Invoke the sharder-only ``prepare_model_inputs_for_cp`` directly through
     ``prepare_cp_forward`` (a plain method call; nothing consumed, so input_ids
     and multimodal inputs stay in the batch for the model's own forward)
-  - PP gating: sunk models (``cp_preembed_in_forward``) invoke the hook on every
-    stage and keep media; non-sunk hook models drop media on non-first stages
+  - PP gating: the sharder-only hook is invoked on every stage (all PP-capable
+    VLMs are sunk via ``cp_preembed_in_forward``); media is dropped on non-first
+    stages so those stage forwards see only text inputs
   - Validation: count labels after _make_cp_batch_and_ctx and inside train_ctx
   - Validation: position_ids ``.to(self.dist_env.device)`` (not model.device)
 """
@@ -39,29 +40,6 @@ import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed import cp_utils as cp_utils_mod
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
-
-# -----------------------------------------------------------------------------
-# Spy model: a VLM with a CP hook but NOT sunk (no cp_preembed_in_forward). The
-# recipe drives CP prep through ``prepare_cp_forward`` -> the sharder-only
-# ``prepare_model_inputs_for_cp`` (a plain method call; nothing consumed), so the
-# spy records hook invocations there and exercises the recipe's first-stage-only
-# gate for non-sunk models.
-# -----------------------------------------------------------------------------
-
-
-class _SpyVLM:
-    def __init__(self, prepared=None):
-        self.calls = []
-        # Sharder-only by default (nothing consumed); ``prepared`` lets a test
-        # override the returned dict (only ``cp_sharder`` is honored downstream).
-        self._prepared = prepared
-
-    def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
-        self.calls.append({"batch": dict(batch), "num_chunks": num_chunks})
-        return self._prepared if self._prepared is not None else {}
-
-    def __call__(self, **kwargs):
-        raise AssertionError("CP prepare must call prepare_model_inputs_for_cp directly, not __call__")
 
 
 def _make_recipe_with_pp_stages(*, pp_enabled=True, has_first_stage=True, pp_microbatch_size=2):
@@ -265,17 +243,6 @@ def test_forward_backward_step_pp_cp_sunk_model_nonfirst_stage_invokes_hook_keep
     assert tuple(seen_cp_batch["input_ids"].shape) == (2, 6)
     # All pp ranks feed the FULL seq_len to update_seq_len.
     assert seq_lens == [6]
-
-
-def test_forward_backward_step_pp_cp_recipe_level_preembedder_skips_hook_on_nonfirst_stage(monkeypatch):
-    """Control: a recipe-level pre-embedder (no cp_preembed_in_forward) must NOT
-    invoke its hook on non-first stages (it only embeds on the first stage); media
-    is dropped and the generic sharder path handles those stages as before."""
-    model = _SpyVLM()  # no cp_preembed_in_forward flag
-    seen_cp_batch, _ = _run_nonfirst_stage_fbstep(monkeypatch, model)
-
-    assert model.calls == []  # hook NOT invoked on the non-first stage
-    assert "pixel_values" not in seen_cp_batch  # media dropped
 
 
 class _FakePPModel:

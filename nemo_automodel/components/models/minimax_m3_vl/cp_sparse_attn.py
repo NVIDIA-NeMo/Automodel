@@ -31,7 +31,6 @@ on CPU without a process group.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
@@ -283,17 +282,6 @@ class MiniMaxM3CPSparseAttention(MiniMaxM3Attention):
         cp_group = self._cp_mesh.get_group()
         cp_size = self._cp_mesh.size()
         cp_rank = dist.get_rank(cp_group)
-
-        if os.environ.get("NEMO_CP_DEBUG"):
-            _fseq = freqs_cis.shape[1] if freqs_cis.dim() >= 3 else freqs_cis.shape[0]
-            _mismatch = x.shape[1] != _fseq
-            if cp_rank == 0 or _mismatch:
-                print(
-                    f"[NEMO_CP_DEBUG rank{dist.get_rank()}] _cp_forward ENTER: x={tuple(x.shape)} "
-                    f"freqs={tuple(freqs_cis.shape)} t_local={t_local} cp_size={cp_size} "
-                    f"{'*** X/FREQS MISMATCH (hidden double-sharded) ***' if _mismatch else ''}",
-                    flush=True,
-                )
 
         # Structural global token-slot indices for the causal-CP load-balanced layout.
         # Used (instead of position_ids values) for both global reordering and causal

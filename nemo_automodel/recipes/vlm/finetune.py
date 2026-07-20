@@ -799,17 +799,17 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # routed through __call__ so FSDP2 forward pre-hooks fire and unshard the
         # vision tower's weights before the embed/scatter.
         _is_first_or_no_pp = not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False)
-        # Sunk models expose a sharder-only CP hook (no compute, nothing consumed).
-        # Invoke it on EVERY pp stage so the aux-only sharder is installed there
-        # too and input_ids stays FULL-length on non-first stages. Otherwise those
-        # stages fall through to the generic round-robin sharder, which shards
-        # input_ids to the local length; the recipe then feeds that already-local
-        # length to update_seq_len and the CP-aware get_pipeline_stage_metas ÷cp a
-        # second time -> non-first recv buffers become S/cp² and the inter-stage
-        # P2P truncates the hidden (text-decoder RoPE size mismatch). Recipe-level
-        # pre-embedders (gemma4) must still embed only on the first stage.
-        _model_sunk = getattr(self.model_parts[0], "cp_preembed_in_forward", False)
-        _pre_embed_here = _is_first_or_no_pp or _model_sunk
+        # The CP hook is invoked on EVERY pp stage. Every PP-capable VLM is sunk
+        # (cp_preembed_in_forward): its sharder-only hook consumes nothing but must
+        # install the aux-only sharder on non-first stages too so input_ids stays
+        # FULL-length there. Otherwise those stages fall through to the generic
+        # round-robin sharder, which shards input_ids to the local length; the
+        # recipe then feeds that already-local length to update_seq_len and the
+        # CP-aware get_pipeline_stage_metas ÷cp a second time -> non-first recv
+        # buffers become S/cp² and the inter-stage P2P truncates the hidden
+        # (text-decoder RoPE size mismatch). Recipe-level pre-embedders (gemma4)
+        # run without PP, so unconditional invocation coincides with first-stage
+        # embedding for them.
         _cp_active = (
             self.device_mesh is not None
             and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
@@ -838,7 +838,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             magi=self.magi,
             use_te=_use_te_vlm,
             padding_token_id=_padding_id,
-            invoke_pre_embed=_pre_embed_here,
+            invoke_pre_embed=True,
         )
         labels = batch.pop("labels")
 
@@ -945,42 +945,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
-                    # TEMP debug (REVERT before merge): dump every trainable param's
-                    # post-backward grad once, on rank 0, at the first backward, to
-                    # localize the 26b bit-exactness regression to a specific param.
-                    # NEMO_GRAD_DUMP=stdout -> one grep-able line per param in the job
-                    # log (eos-friendly: diff two CI traces with logs/cmp_grads.py);
-                    # NEMO_GRAD_DUMP=<path> -> torch.save a {name: grad} .pt.
-                    # full_tensor() runs on ALL ranks (a collective) before the
-                    # rank-0-only print/save, so it must not be rank-gated.
-                    import os as _os
-
-                    _gd = _os.environ.get("NEMO_GRAD_DUMP")
-                    if _gd and not getattr(self, "_nemo_grad_dumped", False):
-                        self._nemo_grad_dumped = True
-                        import torch.distributed as _dist
-
-                        _is_r0 = not _dist.is_initialized() or _dist.get_rank() == 0
-                        _stdout = _gd == "stdout"
-                        _dump = {}
-                        _n_dumped = 0
-                        for _n, _p in model.named_parameters():
-                            if _p.grad is None:
-                                continue
-                            _g = _p.grad
-                            _g = _g.full_tensor() if hasattr(_g, "full_tensor") else _g
-                            _g = _g.detach()
-                            _n_dumped += 1
-                            if _stdout:
-                                if _is_r0:
-                                    _sum = _g.double().sum().item()
-                                    _norm = _g.float().norm().item()
-                                    print(f"[GRAD_DUMP] {_n} sum={_sum!r} norm={_norm!r}", flush=True)
-                            else:
-                                _dump[_n] = _g.float().cpu()
-                        if _is_r0 and not _stdout:
-                            torch.save(_dump, _gd)
-                            print(f"[NEMO_GRAD_DUMP] wrote {_n_dumped} param grads -> {_gd}", flush=True)
 
     def _configure_pipeline_loss_fn(self):
         if self.pp is None or not self.pp.info.has_last_stage:
