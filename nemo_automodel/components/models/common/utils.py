@@ -277,7 +277,7 @@ class BackendConfig:
             )
 
 
-@torch.compile(fullgraph=True, dynamic=True)
+@torch.compile(dynamic=True)
 def _float32_rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards."""
     input_dtype = x.dtype

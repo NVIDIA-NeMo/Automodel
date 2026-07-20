@@ -665,3 +665,42 @@ class TestTrailingPadAbsorption:
         assert result["max_seqlen"].shape == (2,)
         assert int(result["max_seqlen"][0].item()) == 128
         assert int(result["max_seqlen"][1].item()) == 576
+
+
+def test_process_input_for_thd_mrope_3d_shape():
+    """3D mRoPE position_ids [n_rope, batch, seq] flatten to [n_rope, 1, batch*seq]."""
+    import torch
+
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+
+    B, S = 2, 4
+    pos = torch.arange(S).view(1, 1, S).expand(3, B, S).contiguous()
+    batch = {
+        "input_ids": torch.arange(B * S).view(B, S),
+        "labels": torch.arange(B * S).view(B, S),
+        "position_ids": pos,
+        "seq_lens": torch.tensor([[4], [4]]),
+        "seq_lens_padded": torch.tensor([[4], [4]]),
+    }
+    out = process_input_for_thd(batch)
+    assert tuple(out["position_ids"].shape) == (3, 1, B * S)
+    assert tuple(out["input_ids"].shape) == (B * S,)
+    assert out["position_ids"][0, 0].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
+
+
+def test_process_input_for_thd_2d_position_ids_unchanged():
+    """2D position_ids keep the original [total_tokens] flatten."""
+    import torch
+
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+
+    B, S = 2, 4
+    batch = {
+        "input_ids": torch.arange(B * S).view(B, S),
+        "labels": torch.arange(B * S).view(B, S),
+        "position_ids": torch.arange(S).view(1, S).expand(B, S).contiguous(),
+        "seq_lens": torch.tensor([[4], [4]]),
+        "seq_lens_padded": torch.tensor([[4], [4]]),
+    }
+    out = process_input_for_thd(batch)
+    assert tuple(out["position_ids"].shape) == (B * S,)

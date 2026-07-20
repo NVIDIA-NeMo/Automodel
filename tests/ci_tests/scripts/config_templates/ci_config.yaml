@@ -129,6 +129,7 @@ fixture_keys:
     - hf_cosine_threshold
     - hf_kl_threshold
     - kl_threshold
+    - hf_source_post_load_dequantize
     - no_check_resume
     - resume_loss_threshold
     - skip_hf_reload
