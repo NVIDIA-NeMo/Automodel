@@ -29,8 +29,8 @@ from unittest import mock
 import pytest
 import torch
 
+from nemo_automodel.components.distributed.cp_sharder import shard_batch_contiguous
 from nemo_automodel.components.models.common import BackendConfig
-from nemo_automodel.components.models.gemma4_moe.cp_batch import make_contiguous_shard_cp_batch_and_ctx
 from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4Config,
     Gemma4ForConditionalGeneration,
@@ -139,12 +139,16 @@ def test_get_capabilities_plain_dense_unchanged():
 # ---------------------------------------------------------------------------
 def _shard_batch(batch, cp_size, cp_rank, seq_len):
     mesh = _FakeCPMesh(cp_size, cp_rank)
-    _ctx_fn, sharded, _ = make_contiguous_shard_cp_batch_and_ctx(
+    # Exercise the public contiguous shard directly on the 4D per_layer_inputs key
+    # (the production entry the model wraps), the same slice the sunk forward applies.
+    _ctx_fn, sharded, _ = shard_batch_contiguous(
         mesh,
         None,
         batch,
         loss_mask=None,
         padding_token_id=0,
+        extra_seq_keys={"per_layer_inputs": 1},
+        extra_pad_values={"per_layer_inputs": 0},
     )
     return sharded
 

@@ -23,26 +23,33 @@ contract of the helper utilities.
 from __future__ import annotations
 
 import contextlib
-from typing import Any
+from functools import partial
 
 import pytest
 import torch
 
 # Import module under test
 from nemo_automodel.components.distributed import cp_utils as _cu
-from nemo_automodel.components.distributed.cp_sharder import ContextParallelismSharder, contiguous_local_indices
+from nemo_automodel.components.distributed.cp_sharder import (
+    ContextParallelismSharder,
+    contiguous_local_indices,
+    shard_batch_contiguous,
+)
+from nemo_automodel.components.models.gemma4_moe import cp_batch as _cm
 
 
 # ContextParallelismSharder used by the model-owned dispatch tests below (passed as an explicit
-# _make_cp_batch_and_ctx parameter; the batch itself stays pure tensors).
+# _make_cp_batch_and_ctx parameter; the batch itself stays pure tensors). Exercises the public
+# contiguous shard (the production entry DSV4/Gemma4 wrap) on the model-provided per-token keys.
 def _contiguous_sharder():
     return ContextParallelismSharder(
-        shard_batch=_cm.make_contiguous_shard_cp_batch_and_ctx,
+        shard_batch=partial(
+            shard_batch_contiguous,
+            extra_seq_keys={"per_layer_inputs": 1, "_packed_seq_ids": 1, "mm_token_type_ids": 1},
+            extra_pad_values={"per_layer_inputs": 0, "_packed_seq_ids": 0, "mm_token_type_ids": 0},
+        ),
         local_token_global_indices=contiguous_local_indices,
     )
-
-
-from nemo_automodel.components.models.gemma4_moe import cp_batch as _cm
 
 
 @pytest.fixture(autouse=True)
