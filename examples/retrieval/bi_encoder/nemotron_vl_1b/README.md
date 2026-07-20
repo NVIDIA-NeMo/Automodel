@@ -68,17 +68,19 @@ Here is an example of how to fine-tune the [nvidia/llama-nemotron-embed-vl-1b-v2
 torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml
 ```
 
-### Use the Higher-Throughput Configuration
+### Use the Optimized Configuration
 
-For higher throughput, use [nemotron_vl_1b_optimized.yaml](nemotron_vl_1b_optimized.yaml). It trains the same model and
-uses the same data format as the base example, with these performance options enabled:
+For better training performance, use [nemotron_vl_1b_optimized.yaml](nemotron_vl_1b_optimized.yaml). It trains the
+same model and uses the same data format as the base example, while enabling:
 
-- A custom Llama backend with Transformer Engine fused QKV and MLP projections.
-- Transformer Engine SigLIP encoder layers, with the unused SigLIP pooling head disabled.
+- An optimized Llama backend with Transformer Engine fused QKV and MLP projections.
+- Optimized Transformer Engine SigLIP encoder layers, with the unused SigLIP pooling head disabled.
 - Bidirectional attention masks prepared by the data loader instead of during every training step.
-- DDP reducer settings tuned for this workload.
 
-On the reference workload, this trains the same model about 15% faster per step (~18% more samples per second per GPU) than the tuned DDP baseline, with matching loss curves. The optimizations are opt-in flags in the `model:` and `bi_encoder_optimization:` sections, so the base example remains the simplest starting point.
+On the reference workload, the optimized configuration reduced step time by about 15% and increased per-GPU
+throughput by about 18% compared with `nemotron_vl_1b_example.yaml`, while producing comparable loss values. The
+optimization flags are in the `model:` and `bi_encoder_optimization:` sections, so you can use the base example when
+you prefer the simplest configuration.
 
 The configuration uses `global_batch_size: 64` and `local_batch_size: 2`. On one 8-GPU node, this means four gradient
 accumulation steps per optimizer step, so the file sets `distributed.static_graph: false`. Set the allocator option

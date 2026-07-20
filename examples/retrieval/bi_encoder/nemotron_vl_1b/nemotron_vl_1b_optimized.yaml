@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Higher-throughput configuration for Llama Nemotron VL 1B retrieval fine-tuning.
+# Optimized configuration for Llama Nemotron VL 1B retrieval fine-tuning.
 #
 # The default global batch size is 64 and the local batch size is 2. On one
 # 8-GPU node, this uses four gradient accumulation steps, so static_graph must
@@ -63,12 +63,12 @@ model:
   do_distributed_inbatch_negative: true
   detach_distributed_inbatch_negatives: false
 
-  # Higher-throughput language model backend.
+  # Optimized language model backend.
   use_custom_llama_backend: true
   use_te_fused_mlp: true
   use_te_fused_qkv: true
 
-  # Higher-throughput vision encoder.
+  # Optimized vision encoder.
   use_te_fused_siglip_layer: true
   disable_unused_siglip_pooling_head: true
 
