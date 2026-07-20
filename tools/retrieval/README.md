@@ -66,11 +66,10 @@ lists, but it prepares sources serially.
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig
-  data_dir_list: /path/to/normalized_vl_retrieval
+  data_path: /path/to/normalized_vl_retrieval
   model_type: bi_encoder
   data_type: train
   n_passages: 5
-  do_shuffle: true
 ```
 
 ### Choose Sources Or Sample Caps
@@ -79,8 +78,9 @@ A normalized bundle stores each original `data_dir_list` entry as a separate num
 `sources/source-00000`, `sources/source-00001`, and so on. The top-level metadata records the readable `source_name`,
 stable `source_key`, original `source_entry`, and source path.
 
-For normal training, pass the top-level bundle path. If you want to choose specific prepared sources or cap samples per
-source, pass a list instead:
+For normal training with one bundle, pass its top-level path as `data_path`, as shown above. If you want to choose
+specific prepared sources, cap samples per source, or combine bundles, use `data_dir_list` instead. Do not set both
+fields.
 
 ```yaml
 dataset:
@@ -95,7 +95,7 @@ dataset:
   n_passages: 5
 ```
 
-The same list form can also combine different normalized bundle roots:
+The same `data_dir_list` form can also combine different normalized bundle roots:
 
 ```yaml
 dataset:
@@ -119,7 +119,7 @@ for example listing both `/path/to/normalized_vl_retrieval` and
 There are two supported workflows.
 
 The simplest workflow is to prepare the new source into a separate normalized bundle, then list both bundle roots in
-training `data_dir_list`. This avoids modifying the existing bundle.
+the training `data_dir_list`. This avoids modifying the existing bundle.
 
 If you want one shared bundle path, use append mode. Run prep with a config that contains only the new source(s), the
 same `OUT_DIR`, and `APPEND=1`:

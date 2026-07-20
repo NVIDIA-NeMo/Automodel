@@ -33,33 +33,74 @@ The Nemo Automodel Retrieval recipe expects a train set with a Corpus ID-Based J
 The "corpus" path points to a directory with the corpus in parquet format containing a field with the document id.  
 The "data" contains the list of training samples for contrastive learning, in particular the question, positive samples (pos_doc) and negative samples (neg_doc), which are document ids from the corpus. Positive and negative samples can be document page images or chunks of text (passages). 
 
-**Before a full-scale VL training run, prepare the dataset on CPU nodes.** Starting GPU training directly from a raw
-image corpus can leave every allocated GPU waiting while the corpus is loaded and its dataset cache is built. Use the
-normalized dataset preparation script in the
-[retrieval data preparation tools](../../../../tools/retrieval/README.md) to build an Arrow bundle on CPU nodes first.
-For text-only retrieval, the original dataset path is usually sufficient. If its initial startup is slow, use the CPU
-cache-warming script instead.
+### Prepare the ColPali source data
 
-### Preparing the vision retrieval train set
-This example includes a notebook that demonstrates how to prepare a vision retrieval training dataset using [ColPali](https://huggingface.co/datasets/vidore/colpali_train_set): [prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb](../prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb). It performs the following steps:
-1. Downloads a [train set](https://huggingface.co/datasets/Tevatron/colpali) that includes mined hard-negatives (for faster contrastive learning) and the corresponding [corpus](https://huggingface.co/datasets/Tevatron/colpali-corpus)
-2. Converts and saves that data into the Corpus ID-Based JSON schema expected for training biencoder models with Nemo Automodel.
+Run
+[prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb](../prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb)
+to prepare the ColPali example. The notebook:
 
-After running the notebook, open [nemotron_vl_1b_example.yaml](nemotron_vl_1b_example.yaml) and modify inside `data_dir_list` the path of ColPali dataset (`colpali_train.json`) with the one you set when running the notebook above, as in below example. 
-Notice that in this example there is a second dataset in `data_dir_list`, where the positive/negative samples are text passages (from [MIRACL train set](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1/viewer/MIRACL), focused on multi-lingual text retrieval). You can also set the number of samples per dataset as in the following example.
+1. Downloads a [train set](https://huggingface.co/datasets/Tevatron/colpali) with mined hard negatives and its
+   [corpus](https://huggingface.co/datasets/Tevatron/colpali-corpus).
+2. Writes the corpus as local Parquet shards and writes `colpali_train.json` in AutoModel's corpus ID-based schema.
+
+These files are the source data for both loading paths below. The notebook does not create normalized Arrow; that is a
+separate CPU preparation step for full-scale training.
+
+After the notebook finishes, open [nemotron_vl_1b_example.yaml](nemotron_vl_1b_example.yaml) and replace the ColPali
+path in `dataset.data_dir_list` with the generated `colpali_train.json` path. The example also includes the
+[MIRACL train set](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1/viewer/MIRACL) for multilingual
+text retrieval. Use `num_samples` to control how many examples to load from each source.
+
+### Choose how training loads the prepared data
+
+#### Full-scale VL training: normalize on CPU first
+
+For a full-scale VL run, use the updated example config as the input to the normalized dataset preparation script:
+
+```bash
+uv run python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
+  --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml \
+  --output-dir /path/to/normalized_vl_retrieval
+```
+
+This command reads every source in the original `dataset.data_dir_list`, including the files produced by the notebook,
+and writes one portable Arrow bundle. For large datasets on a Slurm cluster, use the CPU array launcher described in the
+[retrieval data preparation tools](../../../../tools/retrieval/README.md).
+
+Then replace the dataset section in the training config with the normalized loader:
 
 ```yaml
-dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-    model_type: bi_encoder
-    data_dir_list:
-      - path: /path/to/trainset/colpali_train.json 
-        num_samples: 5000
-      - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
-        num_samples: 5000
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig
+  data_path: /path/to/normalized_vl_retrieval
+  model_type: bi_encoder
+  data_type: train
+  n_passages: 5
 ```
+
+Starting GPU training directly from a large image corpus can leave every allocated GPU waiting while the corpus is
+loaded and its dataset cache is built. Normalizing on CPU moves that work before the GPU allocation.
+
+#### Small runs: load the source data directly
+
+For a smoke test or a small dataset, skip normalization and keep the original dataset config. It reads the notebook's
+JSON and corpus files directly:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
+  model_type: bi_encoder
+  data_dir_list:
+    - path: /path/to/trainset/colpali_train.json
+      num_samples: 5000
+    - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
+      num_samples: 5000
+  data_type: train
+  n_passages: 5
+```
+
+The direct path is usually sufficient for text-only retrieval. If its initial startup is slow, the retrieval data tools
+also provide a CPU cache-warming script that keeps this dataset configuration unchanged.
 
 Also, if you have a Weights & Biases (W&B) account, you can configure the YAML file to log training metrics during training.
 ```

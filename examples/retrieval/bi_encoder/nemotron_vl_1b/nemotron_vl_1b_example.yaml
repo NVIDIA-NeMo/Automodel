@@ -67,7 +67,6 @@ dataset:
   data_type: train
   n_passages: 5
   seed: 42
-  do_shuffle: true
 
 dataloader:
   collate_fn:

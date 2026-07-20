@@ -3,22 +3,35 @@ title: "Retrieval Dataset (Embedding Fine-Tuning)"
 description: ""
 position: 3
 ---
-NeMo AutoModel supports **retrieval model fine-tuning** using a retrieval-style dataset: each training example is a **query** paired with **one positive** document and **one or more negative** documents.
+NeMo AutoModel supports **retrieval model fine-tuning** using a retrieval-style dataset: each training example is a
+**query** paired with **one positive** document and **one or more negative** documents.
 
-The retrieval recipes use this dataset with the `BiEncoderCollator`. Example implementations are in `examples/retrieval/bi_encoder/` and `examples/retrieval/cross_encoder/`.
+Choose the dataset config based on where your data is in the preparation flow:
 
-## What the Bi-Encoder Consumes
+| Data | Dataset config | Best for |
+| --- | --- | --- |
+| Source retrieval data | `RetrievalDatasetConfig` | Typical text retrieval and smaller experiments |
+| A prepared normalized Arrow bundle | `NormalizedRetrievalDatasetConfig` | Full-scale or image-heavy VL retrieval |
 
-The dataset factory `nemo_automodel.components.datasets.llm.make_retrieval_dataset` returns a Hugging Face `datasets.Dataset`. At runtime, it transforms each raw record into the training-time schema:
+Both configs produce the same training-time records.
+
+The retrieval recipes pass the resulting records to the configured bi-encoder or cross-encoder collator. Example
+implementations are in `examples/retrieval/bi_encoder/` and `examples/retrieval/cross_encoder/`.
+
+## Training-Time Record Format
+
+Both dataset configs return a Hugging Face `datasets.Dataset`. At runtime, they transform each stored record into the
+training-time schema:
 
 - `question`: query string
 - `doc_text`: list of document texts in the order `[positive, negative_1, negative_2, ...]`
 - `doc_image`: list of images (or empty strings), aligned with `doc_text`
 - `query_instruction` / `passage_instruction`: optional, used when `use_dataset_instruction: true` and the corpus provides instructions through metadata
 
-## Supported Raw Input Formats
+## Raw Input Formats
 
-The `make_retrieval_dataset` factory supports **two** raw input schemas:
+Use `RetrievalDatasetConfig` for data that has not been normalized. It supports two local file layouts. Compatible
+`hf://` sources use the same corpus ID-based logical schema as the first layout.
 
 ### Corpus ID-Based JSON (Merlin/NeMo-Retriever Style)
 
@@ -45,7 +58,9 @@ This is the format used by NeMo retriever pipelines where documents live in a se
 
 #### Corpus Requirements
 
-Each corpus directory must contain a `merlin_metadata.json` file.
+Each corpus directory must be loadable by Hugging Face Datasets and contain a `merlin_metadata.json` file. The
+`corpus_id` in that file must match the `corpus_id` used by the training records. With the default `TextQADataset`, the
+corpus must have a `train` split with `id` and `text` columns.
 
 Minimal example:
 
@@ -84,44 +99,50 @@ The format uses one JSON object per line:
 
 ## Normalized Arrow for Large VL Datasets
 
-For full-scale or image-heavy vision-language retrieval, prepare a normalized Arrow bundle on CPU nodes before starting
-GPU training. The bundle keeps query rows as document-ID references and stores each referenced document or image once
-in local Arrow shards. This moves loading the raw sources and building the corpus shards out of the GPU job.
+A normalized Arrow bundle keeps query rows as document-ID references and stores each referenced document or image once
+in local Arrow shards.
 
-For typical text-only retrieval, the original `make_retrieval_dataset` factory is usually sufficient. Normalization is
-still available when a text corpus has expensive startup or you need a portable dataset.
+Normalized Arrow is a prepared output format and uses `NormalizedRetrievalDatasetConfig` rather than the raw-data
+config.
+
+For typical text-only retrieval, `RetrievalDatasetConfig` is usually sufficient. Normalization is still available when
+a text corpus has expensive startup or you need a portable dataset.
+
+For full-scale or image-heavy vision-language retrieval, run the CPU normalization tool before requesting GPUs. It
+reads the raw sources in `dataset.data_dir_list` and writes a normalized bundle. Then point `data_path` at that bundle.
+This keeps raw-source loading, image decoding, and corpus preparation out of GPU training startup.
 
 Configure training with the normalized dataset config:
 
 ```yaml
 dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig
-  data_dir_list: /path/to/normalized_vl_retrieval
+  data_path: /path/to/normalized_vl_retrieval
   model_type: bi_encoder
   data_type: train
   n_passages: 5
-  do_shuffle: true
 ```
 
 Use the [retrieval data preparation tools](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/retrieval/README.md)
 to prepare the bundle on CPU nodes. The same guide explains local and Slurm commands, source selection, per-source
 sample caps, append and resume workflows, and the CPU cache-warming script for the original dataset loader.
 
-## Configure the Dataset and Collator in YAML
+## Complete Raw-Data Example
 
-Use the dataset factory plus the bi-encoder collator:
+This example pairs the raw dataset config with the bi-encoder collator. To train from normalized Arrow instead, replace
+the `dataset` block with the normalized example above.
 
 ```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
+  data_dir_list:
+    - /abs/path/to/train.jsonl   # or train.json (corpus ID-based format)
+  data_type: train
+  n_passages: 5                 # 1 positive + 4 negatives
+  use_dataset_instruction: false
+
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  dataset:
-    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
-    data_dir_list:
-      - /abs/path/to/train.jsonl   # or train.json (corpus-id format)
-    data_type: train
-    n_passages: 5                 # 1 positive + 4 negatives
-    do_shuffle: true
-    use_dataset_instruction: false
   collate_fn:
     _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
     q_max_len: 512
