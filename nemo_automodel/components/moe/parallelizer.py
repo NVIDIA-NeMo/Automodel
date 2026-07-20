@@ -377,9 +377,9 @@ def apply_ac(
 
     Args:
         model: The model to apply activation checkpointing to.
-        ignore_router: If True (the default), saves the MoE router output so the dispatch
-            is not recomputed under activation checkpointing (avoids a CheckpointError from
-            non-deterministic re-routing on recompute). If False, a warning is emitted.
+        ignore_router: If True (the default), saves the MoE router projection and top-k
+            outputs so recompute preserves expert assignments (avoids a CheckpointError from
+            non-deterministic re-routing changing dispatch shapes). If False, a warning is emitted.
         hidden_size: Hidden dimension size. If None, derived from model.config.hidden_size.
         num_experts: Number of routed experts. If None, derived from moe_config.n_routed_experts
             first, then falls back to model.config attributes.
@@ -414,7 +414,7 @@ def apply_ac(
             "different number of tokens per expert than the forward pass and crash with "
             "torch.utils.checkpoint.CheckpointError ('Recomputed values ... have different "
             "metadata'). Set ignore_router_for_ac=True (the default) to save the router "
-            "output and keep routing consistent across recompute."
+            "projection and top-k outputs and keep routing consistent across recompute."
         )
 
     if selective:
@@ -484,8 +484,10 @@ def apply_ac(
             return len(args) >= 2 and args[1].shape == (num_experts, hidden_size)
         return False
 
+    router_topk = getattr(getattr(torch.ops.aten, "topk", None), "default", None)
+
     def _custom_policy(ctx, func, *args, **kwargs):
-        if _is_router_projection(func, args):
+        if (router_topk is not None and func == router_topk) or _is_router_projection(func, args):
             return CheckpointPolicy.MUST_SAVE
         return CheckpointPolicy.PREFER_RECOMPUTE
 
