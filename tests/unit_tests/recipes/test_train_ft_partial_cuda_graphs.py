@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from torch import nn
 
 import nemo_automodel.recipes.llm.partial_cuda_graphs as partial_graphs
@@ -169,3 +171,33 @@ def test_training_loop_closes_graphs_when_a_step_raises():
 
     assert events == ["close"]
     assert recipe.partial_cuda_graph_manager is None
+
+
+def test_validation_disables_partial_graphs_as_one_eager_region():
+    events = []
+
+    @contextmanager
+    def eager_execution():
+        events.append("enter-eager")
+        try:
+            yield
+        finally:
+            events.append("exit-eager")
+
+    recipe = _bare_recipe()
+    recipe.partial_cuda_graph_manager = SimpleNamespace(eager_execution=eager_execution)
+    recipe.model_parts = [nn.Identity()]
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"), is_main=True)
+    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 1.0e-3}])]
+    recipe.step_scheduler = SimpleNamespace(step=1, epoch=0)
+    recipe.pp_enabled = False
+    recipe._forward_backward_step = lambda _index, _batch, *, loss_buffer, **_kwargs: loss_buffer.append(
+        torch.tensor(2.0)
+    )
+    recipe._dp_allreduce = lambda value, **_kwargs: value
+    batch = {"labels": torch.tensor([[1, 2, -100]])}
+
+    metrics = recipe._run_validation_epoch([batch])
+
+    assert events == ["enter-eager", "exit-eager"]
+    assert metrics.metrics["val_loss"] == 1.0

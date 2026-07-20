@@ -23,6 +23,7 @@ from __future__ import annotations
 import enum
 import logging
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -483,6 +484,7 @@ class _PartialGraphEntry:
         self.captured_call: _CapturedCall | None = None
         self._captured_call_variants: list[_CapturedCall] = []
         self._adapters: tuple[nn.Module, ...] = ()
+        self._replay_forward: Callable[..., Any] | None = None
 
         # Runtime statistics.
         self.capture_count = 0
@@ -553,6 +555,7 @@ class _PartialGraphEntry:
             del reset
 
         self._adapters = ()
+        self._replay_forward = None
         self.captured_call = None
         self._captured_call_variants.clear()
         self._captured_training = None
@@ -681,7 +684,24 @@ class _PartialGraphEntry:
                 self._logged_fallback = True
             return self.original_forward(*args, **kwargs)
 
-        self.target.forward = dispatch
+        self._replay_forward = dispatch
+        self.target.forward = self._replay_forward
+
+    def suspend_replay(self) -> None:
+        """Route this entry through its original eager forward without destroying graphs."""
+        if self._closed:
+            raise RuntimeError(f"Partial CUDA graph entry {self.name!r} is closed")
+        if self._adapters:
+            self.target.forward = self.original_forward
+
+    def resume_replay(self) -> None:
+        """Restore graph dispatch after a manager-wide eager region."""
+        if self._closed:
+            raise RuntimeError(f"Partial CUDA graph entry {self.name!r} is closed")
+        if self._adapters:
+            if self._replay_forward is None:
+                raise RuntimeError(f"Partial CUDA graph entry {self.name!r} has no replay forward")
+            self.target.forward = self._replay_forward
 
 
 def _canonicalize_bf16_fused_attention(
@@ -986,6 +1006,7 @@ class PartialCudaGraphManager:
         self.entries = entries
         self._captured = False
         self._closed = False
+        self._eager_execution_depth = 0
 
     @classmethod
     def from_model_parts(
@@ -1078,6 +1099,30 @@ class PartialCudaGraphManager:
             raise RuntimeError("Partial CUDA graph manager is closed")
         for entry in self.entries:
             entry.start_recording()
+
+    @contextmanager
+    def eager_execution(self) -> Iterator[None]:
+        """Temporarily disable every graph entry as one pooled execution unit.
+
+        Pooled entries cannot fall back independently because doing so would
+        violate the shared private-pool execution order. Validation changes
+        module training mode and runs forward without backward, so the entire
+        manager must execute eagerly for that region.
+        """
+        if self._closed:
+            raise RuntimeError("Partial CUDA graph manager is closed")
+        outermost = self._eager_execution_depth == 0
+        if outermost:
+            for entry in self.entries:
+                entry.suspend_replay()
+        self._eager_execution_depth += 1
+        try:
+            yield
+        finally:
+            self._eager_execution_depth -= 1
+            if outermost and not self._closed:
+                for entry in self.entries:
+                    entry.resume_replay()
 
     def capture(self) -> None:
         """Batch-capture all observed targets in real forward order."""
