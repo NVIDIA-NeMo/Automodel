@@ -26,10 +26,10 @@ tokenizer:
   pretrained_model_name_or_path: Qwen/Qwen2.5-7B-Instruct
 
 model:
-  # Set linear and rms_norm to "te" to enable Transformer Engine.
+  # Transformer Engine is enabled for BAGEL's language-model Linear and RMSNorm layers.
   backend:
-    linear: torch
-    rms_norm: torch_fp32
+    linear: te
+    rms_norm: te
   init_mode: hf_backbones
   stage: 2
   llm_path: Qwen/Qwen2.5-7B-Instruct
