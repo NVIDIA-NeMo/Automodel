@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from unittest.mock import Mock
 
 import pytest
@@ -213,6 +214,24 @@ def test_clip_grad_norm_actually_clips():
     # Verify the actual gradients are clipped
     clipped_norm = torch.sqrt(model.weight.grad.pow(2).sum() + model.bias.grad.pow(2).sum()).item()
     assert abs(clipped_norm - max_norm) < 1e-3
+
+
+def test_clip_grad_norm_large_finite_gradients_do_not_overflow():
+    """Finite rare-token embedding gradients can exceed fp32 squared-norm range."""
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.tensor([[6.0e31, 4.0]], dtype=model.weight.dtype)
+
+    max_norm = 0.3
+    grad_norm = clip_grad_norm(
+        max_grad_norm=max_norm,
+        model_parts=[model],
+        pp_enabled=False,
+    )
+
+    assert math.isfinite(grad_norm)
+    assert grad_norm > 1.0e31
+    assert torch.isfinite(model.weight.grad).all()
+    assert torch.linalg.vector_norm(model.weight.grad.double(), ord=2).item() <= max_norm + 1.0e-6
 
 
 def test_clip_grad_norm_with_inf_norm():

@@ -32,6 +32,21 @@ from nemo_automodel.components.models.common.utils import set_is_first_microbatc
 _TE_EXPERT_PARAM_PATTERN = re.compile(r"(^|\.)mlp\.experts\.(gate_up_linear|down_linear)\.(weight|bias)\d+")
 
 
+def _combine_norms(norms: list[torch.Tensor], norm_type: float, target_device: torch.device) -> torch.Tensor:
+    if len(norms) == 0:
+        return torch.tensor(0.0, dtype=torch.float64, device=target_device)
+
+    norm_stack = torch.stack([n.to(device=target_device, dtype=torch.float64) for n in norms])
+    if math.isinf(norm_type):
+        return norm_stack.max()
+
+    max_norm = norm_stack.abs().max()
+    if max_norm == 0 or not torch.isfinite(max_norm):
+        return max_norm
+
+    return max_norm * norm_stack.div(max_norm).pow(norm_type).sum().pow(1.0 / norm_type)
+
+
 @torch.no_grad()
 def count_tail_padding(labels, ignore_label=-100):
     """Counts the total number of padding token in the tail of labels
@@ -70,13 +85,6 @@ def _clip_grad_norm_impl(
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
 ) -> torch.Tensor:
-    # Determine target device for all tensor operations
-    # Use current CUDA device if available, otherwise use CPU
-    if torch.cuda.is_available():
-        target_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    else:
-        target_device = torch.device("cpu")
-
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     else:
@@ -103,6 +111,21 @@ def _clip_grad_norm_impl(
             sharding_groups[key] = []
         sharding_groups[key].append(p)
 
+    target_device = None
+    for group_params in sharding_groups.values():
+        for p in group_params:
+            g = p.grad
+            if g is None:
+                continue
+            if isinstance(g, DTensor):
+                g = g.to_local()
+            target_device = g.device
+            break
+        if target_device is not None:
+            break
+    if target_device is None:
+        target_device = torch.device("cpu")
+
     # Compute norm for each sharding group using a scalar-first reduction:
     # sum(|g_local|^p) locally → single-scalar allreduce per Shard mesh dim.
     # Going through torch.nn.utils.get_total_norm on DTensor grads would stack
@@ -119,49 +142,71 @@ def _clip_grad_norm_impl(
         # those per-grad (each full_tensor() is a same-shape collective, safe).
         has_partial = is_dtensor and any(isinstance(pl, Partial) for pl in first.placements)
 
-        local_val = torch.zeros((), dtype=torch.float32, device=target_device)
+        local_max = torch.zeros((), dtype=torch.float64, device=target_device)
         for p in group_params:
             g = p.grad
             if isinstance(g, DTensor):
                 g = g.full_tensor() if has_partial else g.to_local()
-            g = g.detach().float()
-            if is_inf:
-                local_val = torch.maximum(local_val, g.abs().max())
-            else:
-                local_val = local_val + g.abs().pow(norm_type).sum()
+            g_abs_max = g.detach().abs().max().to(device=target_device, dtype=torch.float64)
+            local_max = torch.maximum(local_max, g_abs_max)
 
         if is_dtensor and not has_partial:
             mesh = first.device_mesh
-            op = torch.distributed.ReduceOp.MAX if is_inf else torch.distributed.ReduceOp.SUM
             for dim_idx, pl in enumerate(first.placements):
                 if isinstance(pl, Replicate):
                     continue
-                torch.distributed.all_reduce(local_val, op=op, group=mesh.get_group(mesh_dim=dim_idx))
+                torch.distributed.all_reduce(
+                    local_max, op=torch.distributed.ReduceOp.MAX, group=mesh.get_group(mesh_dim=dim_idx)
+                )
 
-        group_norms.append(local_val if is_inf else local_val.pow(1.0 / norm_type))
+        if is_inf or local_max == 0 or not torch.isfinite(local_max):
+            group_norms.append(local_max)
+            continue
+
+        local_val = torch.zeros((), dtype=torch.float64, device=target_device)
+        for p in group_params:
+            g = p.grad
+            if isinstance(g, DTensor):
+                g = g.full_tensor() if has_partial else g.to_local()
+            g = g.detach().abs().div(local_max)
+            if norm_type == 2.0:
+                local_val = local_val + g.square().sum(dtype=torch.float64)
+            else:
+                local_val = local_val + g.pow(norm_type).sum(dtype=torch.float64)
+
+        if is_dtensor and not has_partial:
+            mesh = first.device_mesh
+            for dim_idx, pl in enumerate(first.placements):
+                if isinstance(pl, Replicate):
+                    continue
+                torch.distributed.all_reduce(
+                    local_val, op=torch.distributed.ReduceOp.SUM, group=mesh.get_group(mesh_dim=dim_idx)
+                )
+
+        group_norms.append(local_max * local_val.pow(1.0 / norm_type))
 
     # Combine norms across groups (all rank-identical scalars, no comm)
-    if len(group_norms) == 0:
-        total_norm = torch.tensor(0.0, device=target_device)
-    elif len(group_norms) == 1:
-        total_norm = group_norms[0]
-    elif is_inf:
-        total_norm = torch.stack(group_norms).max()
-    else:
-        total_norm = torch.zeros((), dtype=torch.float32, device=target_device)
-        for gn in group_norms:
-            total_norm = total_norm + gn.pow(norm_type)
-        total_norm = total_norm.pow(1.0 / norm_type)
+    total_norm = _combine_norms(group_norms, norm_type, target_device)
 
-    total_norm = total_norm.float().to(target_device)
     # Reduce across pipeline parallel mesh if provided
     if pp_mesh is not None:
         if math.isinf(norm_type):
             torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.MAX, group=pp_mesh.get_group())
         else:
-            total_norm = total_norm**norm_type
-            torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=pp_mesh.get_group())
-            total_norm = total_norm ** (1.0 / norm_type)
+            pp_max_norm = total_norm.abs().clone()
+            torch.distributed.all_reduce(pp_max_norm, op=torch.distributed.ReduceOp.MAX, group=pp_mesh.get_group())
+            if pp_max_norm == 0 or not torch.isfinite(pp_max_norm):
+                total_norm = pp_max_norm
+            else:
+                total_norm = total_norm.div(pp_max_norm).pow(norm_type)
+                torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=pp_mesh.get_group())
+                total_norm = pp_max_norm * total_norm.pow(1.0 / norm_type)
+
+    if error_if_nonfinite and torch.logical_or(total_norm.isnan(), total_norm.isinf()):
+        raise RuntimeError(
+            f"The total norm of order {norm_type} for gradients from `parameters` is non-finite, "
+            "so it cannot be clipped."
+        )
 
     # Clip gradients for each sharding group separately
     # This is necessary because clip_grads_with_norm_ doesn't support mixing tensors from different device meshes
