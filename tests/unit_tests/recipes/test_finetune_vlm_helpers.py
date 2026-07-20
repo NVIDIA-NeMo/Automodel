@@ -458,6 +458,72 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     assert recipe.optimizer[0].zero_grad_called
 
 
+@pytest.mark.cuda(False)
+def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.mesh_context = SimpleNamespace(cp_size=1)
+    recipe.processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=7))
+    recipe.model_parts = [_TensorModel()]
+    recipe.pp_enabled = False
+    recipe.magi = SimpleNamespace(enabled=False)
+    recipe.distributed_config = None
+    recipe.loss_fn = object()
+    recipe.step_scheduler = SimpleNamespace(is_remote_logging_step=False)
+    recipe._get_dp_group_size = lambda include_cp=True: 1
+    captured = {}
+
+    def make_thd_batch(device_mesh, batch, **kwargs):
+        captured.update(kwargs)
+        return nullcontext, batch
+
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx", make_thd_batch)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.get_sync_ctx", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.calculate_loss",
+        lambda *args, **kwargs: torch.tensor(1.0, requires_grad=True),
+    )
+
+    recipe._forward_backward_step(
+        idx=0,
+        batch={
+            "input_ids": torch.tensor([[1, 2]]),
+            "labels": torch.tensor([[2, -100]]),
+            "qkv_format": "thd",
+        },
+        loss_buffer=[],
+        num_label_tokens=1,
+        num_batches=1,
+    )
+
+    assert captured == {"use_te": True, "padding_token_id": 7}
+
+
+@pytest.mark.cuda(False)
+def test_forward_backward_step_rejects_thd_with_context_parallelism():
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.mesh_context = SimpleNamespace(cp_size=2)
+    recipe.model_parts = [_TensorModel()]
+    recipe.pp_enabled = False
+    recipe.magi = SimpleNamespace(enabled=False)
+
+    with pytest.raises(NotImplementedError, match="currently supports cp_size=1 only"):
+        recipe._forward_backward_step(
+            idx=0,
+            batch={
+                "input_ids": torch.tensor([[1, 2]]),
+                "labels": torch.tensor([[2, -100]]),
+                "qkv_format": "thd",
+            },
+            loss_buffer=[],
+            num_label_tokens=1,
+            num_batches=1,
+        )
+
+
 def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
     """Shared setup for _run_train_optim_step tests with pp_enabled=True."""
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
