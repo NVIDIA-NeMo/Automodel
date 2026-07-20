@@ -945,6 +945,42 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+                    # TEMP debug (REVERT before merge): dump every trainable param's
+                    # post-backward grad once, on rank 0, at the first backward, to
+                    # localize the 26b bit-exactness regression to a specific param.
+                    # NEMO_GRAD_DUMP=stdout -> one grep-able line per param in the job
+                    # log (eos-friendly: diff two CI traces with logs/cmp_grads.py);
+                    # NEMO_GRAD_DUMP=<path> -> torch.save a {name: grad} .pt.
+                    # full_tensor() runs on ALL ranks (a collective) before the
+                    # rank-0-only print/save, so it must not be rank-gated.
+                    import os as _os
+
+                    _gd = _os.environ.get("NEMO_GRAD_DUMP")
+                    if _gd and not getattr(self, "_nemo_grad_dumped", False):
+                        self._nemo_grad_dumped = True
+                        import torch.distributed as _dist
+
+                        _is_r0 = not _dist.is_initialized() or _dist.get_rank() == 0
+                        _stdout = _gd == "stdout"
+                        _dump = {}
+                        _n_dumped = 0
+                        for _n, _p in model.named_parameters():
+                            if _p.grad is None:
+                                continue
+                            _g = _p.grad
+                            _g = _g.full_tensor() if hasattr(_g, "full_tensor") else _g
+                            _g = _g.detach()
+                            _n_dumped += 1
+                            if _stdout:
+                                if _is_r0:
+                                    _sum = _g.double().sum().item()
+                                    _norm = _g.float().norm().item()
+                                    print(f"[GRAD_DUMP] {_n} sum={_sum!r} norm={_norm!r}", flush=True)
+                            else:
+                                _dump[_n] = _g.float().cpu()
+                        if _is_r0 and not _stdout:
+                            torch.save(_dump, _gd)
+                            print(f"[NEMO_GRAD_DUMP] wrote {_n_dumped} param grads -> {_gd}", flush=True)
 
     def _configure_pipeline_loss_fn(self):
         if self.pp is None or not self.pp.info.has_last_stage:
