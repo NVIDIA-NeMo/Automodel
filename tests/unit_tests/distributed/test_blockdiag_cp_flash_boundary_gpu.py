@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -161,6 +161,7 @@ def _run_case(name: str, first_q: int, first_k: int, tails: list[int], device: t
             max_k=max(k_lengths),
             local_query_len=LOCAL_LEN,
             scale=HEAD_DIM**-0.5,
+            dropout_p=0.0,
             meta={
                 "first_q": first_q,
                 "first_k": first_k,

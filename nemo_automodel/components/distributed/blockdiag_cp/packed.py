@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -77,7 +77,7 @@ def _packed_varlen_sdpa(
         value: Values ``[B, Hkv, S, D]``.
         attn_mask: Forwarded to stock SDPA on pass-through; ignored on the
             varlen path (masking is rebuilt from ``doc_ids``).
-        dropout_p: Dropout probability (pass-through / dense fallback only).
+        dropout_p: Dropout probability.
         is_causal: Forwarded on pass-through; the varlen path is always
             per-document causal.
         scale: Softmax scale (``None`` -> ``D**-0.5``).
@@ -124,6 +124,7 @@ def _packed_varlen_sdpa(
         0,
         scale,
         packed_state["backend"],
+        dropout_p=dropout_p,
         meta=packed_state.get("varlen_meta"),
     )
     if out is None:  # backend unavailable / unsupported -> safe fallback
@@ -200,6 +201,9 @@ def enable_cp1_packed_varlen(doc_ids: torch.Tensor, backend: str) -> None:
             over the full packed sequence.
         backend: Varlen kernel backend, ``"flash"`` or ``"te"``.
     """
+    if doc_ids.dim() == 1:
+        doc_ids = doc_ids.unsqueeze(0)
+
     # Segmentation depends only on the packed document ids, not on the layer's
     # Q/K/V tensors. Compute it once per outer forward so every attention
     # layer (and activation-checkpoint recompute) reuses the same CUDA

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -212,6 +212,35 @@ def test_blockdiag_sdpa_noop_without_state():
     out = bd_runtime.cp_blockdiag_sdpa(Q, Q, Q, is_causal=True)
     ref = bd_runtime._ORIGINAL_SDPA(Q, Q, Q, is_causal=True)
     assert torch.allclose(out, ref, atol=1e-6)
+
+
+def test_blockdiag_sdpa_forwards_dropout_to_varlen(monkeypatch):
+    """The CP wrapper preserves the caller's dropout probability on the varlen path."""
+    forwarded_dropout = []
+
+    def fake_varlen(query, key, value, doc_ids, row_offset, scale, backend, *, dropout_p=0.0, meta=None):
+        """Return ``query`` ``[B, Hq, L, D]`` while recording the routed dropout probability."""
+        forwarded_dropout.append(dropout_p)
+        return query
+
+    monkeypatch.setattr(bd_exchange, "_AllGatherSeqDiff", _IdentityGather)
+    monkeypatch.setattr(bd_kernels, "_cp_blockdiag_varlen", fake_varlen)
+    state = {
+        "group": None,
+        "doc_ids": torch.tensor([[1, 1, 2, 2]], dtype=torch.long),
+        "row_offset": 0,
+        "attn_backend": "flash",
+        "kv_exchange": "allgather",
+        "varlen_meta": {"n_real": 4},
+    }
+    token = bd_state._CP_BLOCKDIAG_STATE.set(state)
+    try:
+        qkv = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+        assert bd_runtime.cp_blockdiag_sdpa(qkv, qkv, qkv, dropout_p=0.25) is qkv
+    finally:
+        bd_state._CP_BLOCKDIAG_STATE.reset(token)
+
+    assert forwarded_dropout == [0.25]
 
 
 def test_blockdiag_batch_synthesizes_and_shards_padding_mask(monkeypatch):
@@ -480,16 +509,37 @@ def test_select_kv_exchange_path_downgrades_name_reasons():
     )
     assert path == "allgather" and "varlen_meta" in reason
 
+    state = {"attn_backend": "te", "kv_exchange": "halo", "varlen_meta": {"n_real": 1}}
+    path, _, reason = bd_runtime._select_kv_exchange_path(
+        state,
+        None,
+        torch.ones(1, 8, dtype=torch.long),
+        4,
+        torch.device("cpu"),
+        0,
+        dropout_p=0.1,
+    )
+    assert path == "allgather" and "dropout" in reason
+
 
 def test_flash_long_prefix_guard_peels_only_boundary_segment(monkeypatch):
     calls = []
 
     def fake_fixed(q, k, v, **kwargs):
-        calls.append(("fixed", q.shape[1], k.shape[1], kwargs["causal"]))
+        calls.append(("fixed", q.shape[1], k.shape[1], kwargs["causal"], kwargs["dropout_p"]))
         return q + 1
 
     def fake_varlen(q, k, v, **kwargs):
-        calls.append(("varlen", q.shape[0], k.shape[0], kwargs["max_seqlen_q"], kwargs["max_seqlen_k"]))
+        calls.append(
+            (
+                "varlen",
+                q.shape[0],
+                k.shape[0],
+                kwargs["max_seqlen_q"],
+                kwargs["max_seqlen_k"],
+                kwargs["dropout_p"],
+            )
+        )
         return q + 2
 
     flash_attn = types.ModuleType("flash_attn")
@@ -512,10 +562,11 @@ def test_flash_long_prefix_guard_peels_only_boundary_segment(monkeypatch):
         max_k=7,
         local_query_len=4,
         scale=0.5,
+        dropout_p=0.25,
         meta={"first_q": 2, "first_k": 7, "max_tail": 4},
     )
 
-    assert calls == [("fixed", 2, 7, True), ("varlen", 4, 4, 4, 4)]
+    assert calls == [("fixed", 2, 7, True, 0.25), ("varlen", 4, 4, 4, 4, 0.25)]
     assert torch.equal(out[:2], torch.ones_like(out[:2]))
     assert torch.equal(out[2:], torch.full_like(out[2:], 2))
 
@@ -524,7 +575,7 @@ def test_flash_long_prefix_guard_keeps_normal_single_varlen_call(monkeypatch):
     calls = []
 
     def fake_varlen(q, k, v, **kwargs):
-        calls.append((q.shape[0], k.shape[0]))
+        calls.append((q.shape[0], k.shape[0], kwargs["dropout_p"]))
         return q
 
     flash_attn = types.ModuleType("flash_attn")
@@ -544,10 +595,11 @@ def test_flash_long_prefix_guard_keeps_normal_single_varlen_call(monkeypatch):
         max_k=4,
         local_query_len=4,
         scale=None,
+        dropout_p=0.125,
         meta={},
     )
 
-    assert calls == [(6, 6)]
+    assert calls == [(6, 6, 0.125)]
     assert out is q
 
 
@@ -556,14 +608,26 @@ def test_cp1_packed_precomputes_varlen_metadata_once_per_forward(monkeypatch):
     doc_ids = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
     meta = {"n_real": 4, "sentinel": object()}
     precompute_calls = []
-    forwarded_meta = []
+    forwarded = []
 
     def fake_precompute(got_doc_ids, row_offset, local_len, device):
         precompute_calls.append((got_doc_ids, row_offset, local_len, device))
         return meta
 
-    def fake_varlen(query, key, value, doc_ids_arg, row_offset, scale, backend, *, meta=None):
-        forwarded_meta.append(meta)
+    def fake_varlen(
+        query,
+        key,
+        value,
+        doc_ids_arg,
+        row_offset,
+        scale,
+        backend,
+        *,
+        dropout_p=0.0,
+        meta=None,
+    ):
+        """Return ``query`` ``[B, Hq, S, D]`` while recording per-forward kernel options."""
+        forwarded.append((meta, dropout_p))
         return query
 
     monkeypatch.setattr(bd_packed.kernels, "precompute_blockdiag_varlen_meta", fake_precompute)
@@ -572,8 +636,8 @@ def test_cp1_packed_precomputes_varlen_metadata_once_per_forward(monkeypatch):
     bd_packed.enable_cp1_packed_varlen(doc_ids, "flash")
     try:
         qkv = torch.randn(1, 2, 5, 4)
-        assert bd_packed._packed_varlen_sdpa(qkv, qkv, qkv) is qkv
-        assert bd_packed._packed_varlen_sdpa(qkv, qkv, qkv) is qkv
+        assert bd_packed._packed_varlen_sdpa(qkv, qkv, qkv, dropout_p=0.2) is qkv
+        assert bd_packed._packed_varlen_sdpa(qkv, qkv, qkv, dropout_p=0.2) is qkv
     finally:
         bd_packed.disable_cp1_packed_varlen()
 
@@ -583,7 +647,26 @@ def test_cp1_packed_precomputes_varlen_metadata_once_per_forward(monkeypatch):
     assert row_offset == 0
     assert local_len == doc_ids.shape[-1]
     assert device == doc_ids.device
-    assert forwarded_meta == [meta, meta]
+    assert forwarded == [(meta, 0.2), (meta, 0.2)]
+
+
+def test_cp1_packed_1d_doc_ids_use_block_diagonal_attention():
+    """A documented ``[S]`` doc-id vector must not fall through to ordinary causal SDPA."""
+    torch.manual_seed(7)
+    doc_ids = torch.tensor([1, 1, 2, 2], dtype=torch.long)
+    qkv = torch.randn(1, 2, 4, 8)
+    allow = bd_kernels._cp_blockdiag_mask(doc_ids, 0, 4, 4, 1)
+    ref = bd_runtime._ORIGINAL_SDPA(qkv, qkv, qkv, attn_mask=allow)
+    ordinary = bd_runtime._ORIGINAL_SDPA(qkv, qkv, qkv, is_causal=True)
+
+    bd_packed.enable_cp1_packed_varlen(doc_ids, "flash")
+    try:
+        got = bd_packed._packed_varlen_sdpa(qkv, qkv, qkv, is_causal=True)
+    finally:
+        bd_packed.disable_cp1_packed_varlen()
+
+    torch.testing.assert_close(got, ref)
+    assert not torch.allclose(got, ordinary)
 
 
 def test_cp1_packed_passes_through_non_matching_shapes():
@@ -615,7 +698,19 @@ def test_cp1_packed_hooks_scope_patch_and_cover_ac_recompute(monkeypatch):
     varlen_calls = []
     patched_at_forward_entry = []
 
-    def fake_varlen(query, key, value, doc_ids_arg, row_offset, scale, backend, *, meta=None):
+    def fake_varlen(
+        query,
+        key,
+        value,
+        doc_ids_arg,
+        row_offset,
+        scale,
+        backend,
+        *,
+        dropout_p=0.0,
+        meta=None,
+    ):
+        """Return doubled ``query`` ``[B, Hq, S, D]`` for hook/recompute observability."""
         varlen_calls.append(backend)
         return query * 2.0
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ from nemo_automodel.components.distributed.blockdiag_cp import (
     disable_cp1_packed_varlen,
     enable_cp1_packed_varlen,
 )
+from nemo_automodel.components.distributed.blockdiag_cp import packed as bd_packed
 from nemo_automodel.components.distributed.blockdiag_cp.kernels import (
     _cp_blockdiag_mask,
     _cp_blockdiag_varlen,
@@ -130,6 +131,59 @@ def test_varlen_blockdiag_parity(backend, name, seg_lens, pad, S, cp, Hq, Hkv, D
         rr = real.nonzero().flatten()
         d = (ref[0, :, rr, :].float() - got[0, :, rr, :].float()).abs().max().item()
         assert d < atol, f"[{backend}] {name} r{r} off{off}: max|diff|={d:.4f} >= {atol}"
+
+
+@requires_cuda
+def test_flash_varlen_dropout_is_applied_and_backward_is_finite():
+    """Nonzero Flash dropout changes varlen attention and preserves finite Q/K/V gradients."""
+    _backend_or_skip("flash")
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.manual_seed(23)
+    doc_ids = torch.ones(1, 64, dtype=torch.long, device=device)
+    query = torch.randn(1, 4, 64, 64, device=device, dtype=dtype, requires_grad=True)
+    key = torch.randn(1, 4, 64, 64, device=device, dtype=dtype, requires_grad=True)
+    value = torch.randn(1, 4, 64, 64, device=device, dtype=dtype, requires_grad=True)
+
+    without_dropout = _cp_blockdiag_varlen(query, key, value, doc_ids, 0, backend="flash")
+    torch.manual_seed(29)
+    with_dropout = _cp_blockdiag_varlen(query, key, value, doc_ids, 0, backend="flash", dropout_p=0.25)
+
+    assert without_dropout is not None and with_dropout is not None
+    assert not torch.equal(without_dropout, with_dropout)
+    with_dropout.float().square().mean().backward()
+    for tensor in (query, key, value):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+
+
+@requires_cuda
+def test_te_varlen_dropout_uses_dense_block_diagonal_fallback():
+    """TE THD dropout falls back before launch and exactly matches masked dense SDPA."""
+    _backend_or_skip("te")
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.manual_seed(41)
+    doc_ids = _make_doc_ids([20, 12], 0, 32, device)
+    query = torch.randn(1, 4, 32, 64, device=device, dtype=dtype, requires_grad=True)
+    key = torch.randn(1, 4, 32, 64, device=device, dtype=dtype, requires_grad=True)
+    value = torch.randn(1, 4, 32, 64, device=device, dtype=dtype, requires_grad=True)
+    allow = _cp_blockdiag_mask(doc_ids, 0, 32, 32, 1)
+
+    enable_cp1_packed_varlen(doc_ids, "te")
+    try:
+        torch.manual_seed(43)
+        got = bd_packed._packed_varlen_sdpa(query, key, value, dropout_p=0.25)
+    finally:
+        disable_cp1_packed_varlen()
+    torch.manual_seed(43)
+    ref = _ORIGINAL_SDPA(query, key, value, attn_mask=allow, dropout_p=0.25)
+
+    torch.testing.assert_close(got, ref)
+    got.float().square().mean().backward()
+    for tensor in (query, key, value):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
 
 
 @requires_cuda

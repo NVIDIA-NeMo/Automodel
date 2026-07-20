@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,6 +34,7 @@ _CP_FLASH_WARNED = False
 _CP_FLASH_ENGAGED = False
 _CP_VARLEN_SHAPE_LOGGED = False
 _CP_FLASH_LONG_SEGMENT_WARNED = False
+_CP_TE_DROPOUT_WARNED = False
 _TE_DPA_CACHE = {}
 
 
@@ -249,6 +250,7 @@ def _flash_varlen_with_long_prefix_guard(
     max_k: int,
     local_query_len: int,
     scale,
+    dropout_p: float,
     meta: dict,
 ):
     """Run FlashAttention without an asymmetric-prefix varlen launch.
@@ -274,6 +276,7 @@ def _flash_varlen_with_long_prefix_guard(
         max_k: Maximum per-document key segment length.
         local_query_len: This rank's local sequence length (for diagnostics).
         scale: Softmax scale (``None`` -> kernel default ``D**-0.5``).
+        dropout_p: Attention dropout probability.
         meta: Per-step metadata carrying ``first_q``/``first_k``/``max_tail``.
 
     Returns:
@@ -301,6 +304,7 @@ def _flash_varlen_with_long_prefix_guard(
             cu_seqlens_k=cu_k,
             max_seqlen_q=max_q,
             max_seqlen_k=max_k,
+            dropout_p=dropout_p,
             softmax_scale=scale,
             causal=True,
             deterministic=_CP_FLASH_DETERMINISTIC,
@@ -321,6 +325,7 @@ def _flash_varlen_with_long_prefix_guard(
         q_packed[:first_q].unsqueeze(0),
         k_packed[:first_k].unsqueeze(0),
         v_packed[:first_k].unsqueeze(0),
+        dropout_p=dropout_p,
         softmax_scale=scale,
         causal=True,
         deterministic=_CP_FLASH_DETERMINISTIC,
@@ -342,6 +347,7 @@ def _flash_varlen_with_long_prefix_guard(
         cu_seqlens_k=tail_cu_k,
         max_seqlen_q=tail_max,
         max_seqlen_k=tail_max,
+        dropout_p=dropout_p,
         softmax_scale=scale,
         causal=True,
         deterministic=_CP_FLASH_DETERMINISTIC,
@@ -499,7 +505,18 @@ def precompute_blockdiag_varlen_meta(doc_ids: torch.Tensor, row_offset: int, loc
     return seg if seg is not None else {"n_real": 0}
 
 
-def _cp_blockdiag_varlen(query, key_full, value_full, doc_ids, row_offset, scale=None, backend="flash", meta=None):
+def _cp_blockdiag_varlen(
+    query,
+    key_full,
+    value_full,
+    doc_ids,
+    row_offset,
+    scale=None,
+    backend="flash",
+    *,
+    dropout_p=0.0,
+    meta=None,
+):
     """Block-diagonal CP attention via varlen (flash or TE) -- no dense ``[B,1,L,S]`` mask.
 
     Equivalent to ``_cp_blockdiag_mask`` + SDPA for real (non-padding) query rows.
@@ -524,14 +541,16 @@ def _cp_blockdiag_varlen(query, key_full, value_full, doc_ids, row_offset, scale
         scale: Softmax scale (``None`` -> kernel default ``D**-0.5``).
         backend: ``"flash"`` (flash_attn_varlen_func) or ``"te"``
             (TransformerEngine DotProductAttention thd).
+        dropout_p: Attention dropout probability.
         meta: Optional per-step segmentation from
             :func:`precompute_blockdiag_varlen_meta`; rebuilt inline when absent.
 
     Returns:
         Attention output ``[B, Hq, L, D]``, or ``None`` to signal "fall back to
-        the dense path" (kernel import failed, or a non-half dtype).
+        the dense path" when the requested varlen kernel path is unavailable or
+        unsupported for the supplied inputs.
     """
-    global _CP_FLASH_WARNED
+    global _CP_FLASH_WARNED, _CP_TE_DROPOUT_WARNED
     if query.dtype not in (torch.float16, torch.bfloat16):
         if not _CP_FLASH_WARNED:
             logger.warning(
@@ -539,6 +558,15 @@ def _cp_blockdiag_varlen(query, key_full, value_full, doc_ids, row_offset, scale
                 query.dtype,
             )
             _CP_FLASH_WARNED = True
+        return None
+    if backend == "te" and dropout_p > 0.0:
+        if not _CP_TE_DROPOUT_WARNED:
+            logger.warning(
+                "TransformerEngine THD varlen attention does not support dropout_p=%s; "
+                "reporting the unavailable varlen path so the caller preserves dropout via dense SDPA",
+                dropout_p,
+            )
+            _CP_TE_DROPOUT_WARNED = True
         return None
     if backend == "flash" and not HAS_FLASH_VARLEN:
         if not _CP_FLASH_WARNED:
@@ -628,7 +656,14 @@ def _cp_blockdiag_varlen(query, key_full, value_full, doc_ids, row_offset, scale
             v_packed = value_full[b, :, s_first:real_end, :].transpose(0, 1).contiguous()
 
             if backend == "te":
-                dpa = _te_varlen_dpa(Hq, Hkv, D, scale if scale is not None else D**-0.5, dev, query.dtype)
+                dpa = _te_varlen_dpa(
+                    Hq,
+                    Hkv,
+                    D,
+                    scale if scale is not None else D**-0.5,
+                    dev,
+                    query.dtype,
+                )
                 o = dpa(
                     q_packed,
                     k_packed,
@@ -650,6 +685,7 @@ def _cp_blockdiag_varlen(query, key_full, value_full, doc_ids, row_offset, scale
                     max_k=max_k,
                     local_query_len=L,
                     scale=scale,
+                    dropout_p=dropout_p,
                     meta=seg,
                 )  # [n_real, Hq, D]
             out[b, :, :n_real, :] = o.transpose(0, 1)

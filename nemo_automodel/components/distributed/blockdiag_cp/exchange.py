@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -154,7 +154,7 @@ class _LeftHaloExchange(torch.autograd.Function):
         return grad_x, None, None, None, None
 
 
-def _blockdiag_halo_attention(query, key, value, doc_ids, group, plan, gm, row_offset, scale, backend):
+def _blockdiag_halo_attention(query, key, value, doc_ids, group, plan, gm, row_offset, scale, backend, dropout_p):
     """Needed-only block-diagonal CP attention via the left-halo exchange.
 
     Each rank attends its local queries against ``[boundary-doc halo from rank-1] +
@@ -174,6 +174,7 @@ def _blockdiag_halo_attention(query, key, value, doc_ids, group, plan, gm, row_o
         row_offset: Global position of this rank's first local query row.
         scale: Softmax scale (``None`` -> kernel default).
         backend: Varlen kernel backend, ``"flash"`` or ``"te"``.
+        dropout_p: Attention dropout probability.
 
     Returns:
         Attention output ``[B, Hq, L, D]``, or ``None`` when the kernel is
@@ -233,6 +234,7 @@ def _blockdiag_halo_attention(query, key, value, doc_ids, group, plan, gm, row_o
         row_offset,
         scale,
         backend=backend,
+        dropout_p=dropout_p,
         meta=local_meta,
     )
 
@@ -332,7 +334,7 @@ class _NeededKVExchange(torch.autograd.Function):
         return grad_x.permute(1, 2, 0, 3).contiguous(), None, None, None, None
 
 
-def _blockdiag_a2a_attention(query, key, value, doc_ids, group, plan, gm, row_offset, scale, backend):
+def _blockdiag_a2a_attention(query, key, value, doc_ids, group, plan, gm, row_offset, scale, backend, dropout_p):
     """Needed-only block-diagonal CP attention via the general all-to-all-v exchange.
 
     Handles documents spanning >2 ranks (single long doc / unpacked long context)
@@ -351,6 +353,7 @@ def _blockdiag_a2a_attention(query, key, value, doc_ids, group, plan, gm, row_of
         row_offset: Global position of this rank's first local query row.
         scale: Softmax scale (``None`` -> kernel default).
         backend: Varlen kernel backend, ``"flash"`` or ``"te"``.
+        dropout_p: Attention dropout probability.
 
     Returns:
         Attention output ``[B, Hq, L, D]``, or ``None`` when the kernel is
@@ -397,5 +400,6 @@ def _blockdiag_a2a_attention(query, key, value, doc_ids, group, plan, gm, row_of
         row_offset,
         scale,
         backend=backend,
+        dropout_p=dropout_p,
         meta=local_meta,
     )

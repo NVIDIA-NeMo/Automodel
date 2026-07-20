@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -129,20 +129,18 @@ def _needed_only_kernel_succeeded_on_all_ranks(out, group, device, *, diagnostic
             status = torch.tensor(int(succeeded), dtype=torch.int32, device=device)
         except Exception as exc:
             # CUDA launches are asynchronous: a bad attention kernel commonly
-            # surfaces here rather than at its Python call. Use a plain stderr
-            # print because rank-filtered logging may suppress nonzero ranks.
-            import sys
-
+            # surfaces here rather than at its Python call. Include the global
+            # rank and kernel metadata so the originating rank stays visible.
             try:
                 global_rank = torch.distributed.get_rank()
             except Exception:
                 global_rank = -1
-            print(
-                "CP_NEEDED_ONLY_ASYNC_ERROR "
-                f"global_rank={global_rank} device={device} "
-                f"error={exc!r} diagnostic={diagnostic!r}",
-                file=sys.stderr,
-                flush=True,
+            logger.exception(
+                "CP_NEEDED_ONLY_ASYNC_ERROR global_rank=%d device=%s error=%r diagnostic=%r",
+                global_rank,
+                device,
+                exc,
+                diagnostic,
             )
             raise
         torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MIN, group=group)
@@ -159,6 +157,7 @@ def _select_kv_exchange_path(
     offset,
     *,
     query_dtype: torch.dtype | None = None,
+    dropout_p: float = 0.0,
 ):
     """Decide this step's KV-exchange path and WHY.
 
@@ -173,6 +172,7 @@ def _select_kv_exchange_path(
         device: Device for plan tensors and the preflight all-reduce.
         offset: Global position of this rank's first local query row.
         query_dtype: Query dtype for the kernel preflight (skip when ``None``).
+        dropout_p: Attention dropout probability.
 
     Returns:
         ``(path, plan, reason)`` where ``path`` is ``"halo"``/``"a2a"``/``"allgather"``,
@@ -184,6 +184,8 @@ def _select_kv_exchange_path(
         return "allgather", None, f"mode={kv_exchange}"
     if attn_backend not in ("flash", "te"):
         return "allgather", None, f"needed-only requires flash/te kernel, got {attn_backend}"
+    if attn_backend == "te" and dropout_p > 0.0:
+        return "allgather", None, "TE THD varlen dropout requires the dense fallback"
     if state.get("varlen_meta") is None:
         return "allgather", None, "no varlen_meta (dense / non-varlen step)"
     if _cp_group_spans_nodes(group):
@@ -241,7 +243,7 @@ def cp_blockdiag_sdpa(
         key: This rank's LOCAL key shard ``[B, Hkv, L, D]``.
         value: This rank's LOCAL value shard ``[B, Hkv, L, D]``.
         attn_mask: Ignored on the CP path (forwarded to stock SDPA otherwise).
-        dropout_p: Dropout probability (dense fallback path only).
+        dropout_p: Dropout probability.
         is_causal: Ignored on the CP path (forwarded to stock SDPA otherwise).
         scale: Softmax scale (``None`` -> ``D**-0.5``).
         enable_gqa: Grouped-query attention flag as passed by HF's sdpa path.
@@ -286,6 +288,7 @@ def cp_blockdiag_sdpa(
         query.device,
         offset,
         query_dtype=query.dtype,
+        dropout_p=dropout_p,
     )
     global _KV_EXCHANGE_PATH_LOGGED
     if not _KV_EXCHANGE_PATH_LOGGED:
@@ -303,11 +306,31 @@ def cp_blockdiag_sdpa(
     if path in ("halo", "a2a"):
         if path == "halo":
             out = exchange._blockdiag_halo_attention(
-                query, key, value, doc_ids, group, plan, gm, offset, scale, attn_backend
+                query,
+                key,
+                value,
+                doc_ids,
+                group,
+                plan,
+                gm,
+                offset,
+                scale,
+                attn_backend,
+                dropout_p,
             )
         else:
             out = exchange._blockdiag_a2a_attention(
-                query, key, value, doc_ids, group, plan, gm, offset, scale, attn_backend
+                query,
+                key,
+                value,
+                doc_ids,
+                group,
+                plan,
+                gm,
+                offset,
+                scale,
+                attn_backend,
+                dropout_p,
             )
         if _needed_only_kernel_succeeded_on_all_ranks(
             out,
@@ -343,6 +366,7 @@ def cp_blockdiag_sdpa(
             offset,
             scale,
             backend=attn_backend,
+            dropout_p=dropout_p,
             meta=step_state.get("varlen_meta"),
         )
         if out is not None:
