@@ -44,7 +44,7 @@ from nemo_automodel._transformers import (
     NeMoAutoModelForImageTextToText,
     NeMoAutoModelForMultimodalLM,
 )
-from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
@@ -313,7 +313,7 @@ def build_dataloader(
         model_attn_implementation=get_attn_implementation(cfg_model),
         cp_size=cp_size,
     )
-    if config.packing is not None:
+    if config.packing is not None and config.packing.packing_format != "thd":
         configure_packing(attn_implementation=packing_attn_implementation)
 
     with ScopedRNG(seed=seed, ranked=True):
@@ -546,10 +546,20 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if self.pp_enabled:
             self._configure_pipeline_loss_fn()
 
+        # Optional setup-time prewarms (cuBLAS workspaces, Triton autotune
+        # caches, NCCL communicators) while the allocator pool is still small,
+        # instead of lazily at step-1 peak memory.
+        if self.cfg.prewarm is not None:
+            self.cfg.prewarm.apply(
+                model_parts=self.model_parts,
+                device=self.dist_env.device,
+                pp_mesh=(self.device_mesh["pp"] if self.pp_enabled and self.device_mesh is not None else None),
+            )
+
         # Extract mRoPE position-id builder from the model so VLM neat packing can
         # produce 3D position_ids per sample. Without this, packed multimodal
         # training silently degrades mRoPE to plain 1D positions.
-        get_rope_index = getattr(self.model_parts[0], "get_rope_index", None)
+        get_rope_index = resolve_get_rope_index(self.model_parts[0])
         pp_n_microbatches = None
         pp_cp_preembed = (
             self.pp_enabled
@@ -568,7 +578,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             model_attn_implementation=get_attn_implementation(self.cfg.model),
             cp_size=self.mesh_context.cp_size,
         )
-        if dataloader_config.packing is not None:
+        if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
             configure_packing(attn_implementation=packing_attn_implementation)
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
@@ -802,6 +812,20 @@ class FinetuneRecipeForVLM(BaseRecipe):
             train_ctx, batch = self.magi.prepare_vlm_batch(
                 self.model_parts[0], batch
             )  # pragma: no cover - requires GPU + magi_attention
+        elif batch.get("qkv_format", None) == "thd":
+            # THD packed VLM inputs use TE sequence metadata even without context parallelism.
+            if self.mesh_context.cp_size > 1:
+                raise NotImplementedError(
+                    "THD packing (packing_format='thd') for VLM currently supports cp_size=1 only; "
+                    "context-parallel THD for mRoPE VLMs is not yet implemented."
+                )
+            padding_id = getattr(getattr(self.processor, "tokenizer", None), "pad_token_id", 0) or 0
+            train_ctx, batch = make_cp_batch_and_ctx(
+                self.device_mesh,
+                batch,
+                use_te=True,
+                padding_token_id=padding_id,
+            )
         else:
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")

@@ -281,16 +281,18 @@ class Mistral3FP8VLMForConditionalGeneration(_HFMistral3ForConditionalGeneration
 
     @classmethod
     def supports_config(cls, config: PretrainedConfig) -> bool:
-        """Claim FP8-native Mistral3 VLM configs.
+        """Claim FP8-native and dequantized Mistral3 VLM configs.
 
         Matches ``Mistral3Config`` (outer VLM) with a ministral3 text backbone
-        and ``quantization_config.quant_method == 'fp8'``.
+        and either no quantization config or ``quantization_config.quant_method
+        == 'fp8'``. Consolidated checkpoints are saved in BF16 without the
+        source FP8 metadata and still require this class's rotary-buffer reinit.
         """
         text_config = getattr(config, "text_config", None)
         if text_config is None or getattr(text_config, "model_type", None) != "ministral3":
             return False
         qc = getattr(config, "quantization_config", None)
         if qc is None:
-            return False
+            return True
         method = qc.get("quant_method") if isinstance(qc, dict) else getattr(qc, "quant_method", None)
         return method == "fp8"
