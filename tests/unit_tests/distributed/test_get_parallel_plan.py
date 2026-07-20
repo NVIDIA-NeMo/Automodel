@@ -79,6 +79,19 @@ def test_custom_dict_plan(monkeypatch):
     assert result is plan  # identity check
 
 
+def test_custom_moe_explicit_plan_is_validated_even_when_ep_is_one(monkeypatch):
+    _set_global_model_cls(monkeypatch, _DummyModel)
+    monkeypatch.setattr(parallelizer, "_uses_custom_moe_modules", lambda model: True)
+
+    with pytest.raises(ValueError, match="EP-owned"):
+        _get_parallel_plan(
+            _DummyModel(),
+            sequence_parallel=False,
+            tp_shard_plan={"model.layers.*.mlp.experts": object()},
+            tp_size=2,
+        )
+
+
 # 2. Custom plan via *import path*
 def test_custom_plan_imports_dict(monkeypatch):
     plan = {"baz": "qux"}

@@ -199,12 +199,12 @@ def _is_rank_0() -> bool:
     return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
 
 
-def _dist_barrier() -> None:
+def _dist_barrier(group=None) -> None:
     """Barrier if torch.distributed is initialized.
     TODO(@akoumpa): deprecate in favor of deviemesh api
     """
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=group)
 
 
 class BaseRecipe:
@@ -319,7 +319,7 @@ class BaseRecipe:
             # clear and remember the last completed path
             setattr(self, "_last_pending_checkpoint_dir", None)
             if is_dist_initialized:
-                torch.distributed.barrier()
+                _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
         # If a previous async checkpoint just finished, also update the "best" symlink now (if pending)
         prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
@@ -328,7 +328,7 @@ class BaseRecipe:
                 self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
             setattr(self, "_last_pending_best_checkpoint_info", None)
             if is_dist_initialized:
-                torch.distributed.barrier()
+                _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
         path = self.checkpointer.config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
@@ -364,7 +364,7 @@ class BaseRecipe:
                     logger.warning("Failed to write checkpoint loss metadata to %s", f.name, exc_info=True)
 
         if is_dist_initialized:
-            torch.distributed.barrier()
+            _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
         model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
         step_scheduler = getattr(self, "step_scheduler", None)
@@ -448,7 +448,7 @@ class BaseRecipe:
         self.checkpointer.save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
         if is_dist_initialized:
-            torch.distributed.barrier()
+            _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
         # Update latest symlink according to sync/async behavior
         if getattr(self.checkpointer.config, "is_async", False):
@@ -464,7 +464,7 @@ class BaseRecipe:
                 if best_val_metric is not None:
                     self._update_best_symlink(path, float(best_val_metric))
             if is_dist_initialized:
-                torch.distributed.barrier()
+                _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
         # Release NCCL workspace and DCP gather scratch back to the allocator.
         # Without this, the next training step's backward sees a fragmented
@@ -538,14 +538,14 @@ class BaseRecipe:
                 self._update_latest_symlink(prev_pending)
             setattr(self, "_last_pending_checkpoint_dir", None)
             if is_dist_initialized:
-                torch.distributed.barrier()
+                _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
         prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
         if prev_best_pending is not None:
             if is_rank_0 and prev_best_pending.get("val") is not None:
                 self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
             setattr(self, "_last_pending_best_checkpoint_info", None)
             if is_dist_initialized:
-                torch.distributed.barrier()
+                _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
     def _validate_checkpoint_dir_exists(self, ckpt_dir: str, restore_from: str, is_rank_0: bool) -> None:
         """Validate resolved checkpoint directory exists; raise FileNotFoundError with a helpful message."""
@@ -563,7 +563,7 @@ class BaseRecipe:
             error_msg = f"Checkpoint directory does not exist: {ckpt_dir}"
 
         # Ensure all ranks fail together (before raising)
-        _dist_barrier()
+        _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
         raise FileNotFoundError(error_msg)
 
     def _load_checkpoint_tracked_state(self, ckpt_dir: str):
@@ -879,6 +879,18 @@ class BaseRecipe:
         if not self.device_mesh or "pp" not in self.device_mesh.mesh_dim_names or self.device_mesh["pp"].size() == 1:
             return 0
         return self.device_mesh.get_local_rank("pp")
+
+    def _get_pp_group(self):
+        """Return the pipeline-parallel process group, or None when pp is disabled.
+
+        Threaded to the checkpointer so PEFT adapters are gathered across PP
+        stages at save time; without it the on-disk adapter only contains the
+        local stage's layers (see ``_gather_peft_state_dict_across_pp``).
+        """
+        dm = self.device_mesh
+        if dm is None or "pp" not in dm.mesh_dim_names or dm["pp"].size() == 1:
+            return None
+        return dm["pp"].get_group()
 
     def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)
