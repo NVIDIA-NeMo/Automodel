@@ -28,7 +28,7 @@ except ImportError:
 import logging
 import pathlib
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Optional
 
 import mlflow
@@ -50,6 +50,7 @@ from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
+from nemo_automodel.components.distributed.cp_vision_shard import reset_cp_vision_group, set_cp_vision_group
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
@@ -772,6 +773,24 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     ),
                 )
 
+    @contextmanager
+    def _cp_vision_sharding_context(self):
+        """Publish the CP-only group while a VLM forward may run its vision tower."""
+        cp_active = (
+            self.device_mesh is not None
+            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
+            and self.device_mesh["cp"].size() > 1
+        )
+        if not cp_active:
+            yield
+            return
+
+        token = set_cp_vision_group(self.device_mesh["cp"].get_group())
+        try:
+            yield
+        finally:
+            reset_cp_vision_group(token)
+
     def _forward_backward_step(
         self,
         idx,
@@ -829,7 +848,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
                 return
 
-            with train_ctx():
+            with self._cp_vision_sharding_context(), train_ctx():
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
                     masked_labels = labels.clone()
@@ -865,7 +884,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with sync_ctx, train_ctx():
+            with sync_ctx, self._cp_vision_sharding_context(), train_ctx():
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
@@ -1116,7 +1135,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 )
                 train_ctx, batch = cp_sharder.shard(batch)
                 labels = batch.pop("labels")
-                with train_ctx():
+                with self._cp_vision_sharding_context(), train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                         out = self.model_parts[0](logits_to_keep=1, **batch)
