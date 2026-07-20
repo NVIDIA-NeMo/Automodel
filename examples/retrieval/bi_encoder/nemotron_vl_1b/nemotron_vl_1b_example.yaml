@@ -112,5 +112,5 @@ wandb:
 
 ci:
   recipe_owner: yuhez
-  time: "02:00:00"
+  time: "00:30:00"
   nodes: 1
