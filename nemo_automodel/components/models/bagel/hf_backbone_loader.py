@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict
 import torch
 
 if TYPE_CHECKING:
-    from nemo_automodel.components.models.bagel.backend import BagelBackendConfig
+    from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
 
 logger = logging.getLogger(__name__)
 

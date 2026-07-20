@@ -50,7 +50,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 from nemo_automodel.components.attention.flex_attention import FlexAttention
-from nemo_automodel.components.models.bagel.backend import BagelBackendConfig
+from nemo_automodel.components.models.bagel.configuration import BagelBackendConfig
 from nemo_automodel.components.models.common import (
     initialize_linear_module,
     initialize_rms_norm_module,
@@ -114,7 +114,16 @@ def _initialize_linear(
 
 
 def _index_put_matching_dtype(destination: torch.Tensor, index: torch.Tensor, source: torch.Tensor) -> None:
-    """Assign a packed slice and surface unexpected backend dtype changes once."""
+    """Assign selected packed-token rows and surface backend dtype changes once.
+
+    Args:
+        destination: Packed tensor of shape ``[tokens, ...]``. This tensor is
+            mutated in place.
+        index: One-dimensional integer tensor of shape ``[selected_tokens]``
+            selecting rows along the packed-token axis.
+        source: Tensor of shape ``[selected_tokens, ...]`` whose trailing
+            dimensions match ``destination``.
+    """
     if destination.is_floating_point() and source.is_floating_point() and destination.dtype != source.dtype:
         dtype_pair = (source.dtype, destination.dtype)
         if dtype_pair not in _WARNED_INDEX_PUT_DTYPE_CASTS:
@@ -180,7 +189,19 @@ def _apply_qk_norm(
     backend: BagelBackendConfig,
     eps: float,
 ) -> torch.Tensor:
-    """Keep BAGEL's explicit FP32 inference QK-norm contract with TE enabled."""
+    """Apply Q/K RMSNorm over each attention head's final dimension.
+
+    Args:
+        norm: RMSNorm module to apply.
+        hidden_states: Tensor of shape ``[tokens, heads, head_dim]``. RMSNorm
+            is computed over the final ``head_dim`` axis.
+        backend: Resolved BAGEL backend configuration.
+        eps: Epsilon used by the explicit FP32 Transformer Engine path.
+
+    Returns:
+        Tensor of shape ``[tokens, heads, head_dim]`` with the same layout as
+        ``hidden_states``.
+    """
     weight = getattr(norm, "weight", None)
     if backend.rms_norm == "te" and hidden_states.dtype == torch.float32 and weight is not None:
         variance = hidden_states.pow(2).mean(-1, keepdim=True)

@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from transformers import Qwen2Config
 
-from nemo_automodel.components.models.bagel.backend import resolve_bagel_backend
+from nemo_automodel.components.models.bagel.configuration import resolve_bagel_backend
 from nemo_automodel.components.models.bagel.modeling_qwen2_packed import (
     Qwen2ForCausalLM,
     _apply_qk_norm,

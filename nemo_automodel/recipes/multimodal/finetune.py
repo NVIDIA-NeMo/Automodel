@@ -50,7 +50,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger  # noqa: E402
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages  # noqa: E402
-from nemo_automodel.components.models.bagel.backend import resolve_bagel_backend  # noqa: E402
+from nemo_automodel.components.models.bagel.configuration import resolve_bagel_backend  # noqa: E402
 from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa: E402
     build_bagel_from_hf_backbones,
     initialize_bagel_non_backbone_weights,

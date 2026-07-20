@@ -38,8 +38,11 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
 from nemo_automodel.components.models.bagel.attention_masks import create_sparse_mask
-from nemo_automodel.components.models.bagel.backend import BagelBackendConfig, resolve_bagel_backend
-from nemo_automodel.components.models.bagel.configuration import BagelConfig
+from nemo_automodel.components.models.bagel.configuration import (
+    BagelBackendConfig,
+    BagelConfig,
+    resolve_bagel_backend,
+)
 from nemo_automodel.components.models.bagel.connector import BagelMultiModalProjector
 from nemo_automodel.components.models.bagel.embeddings import BagelGridPositionEmbedding, BagelTimestepEmbedding
 from nemo_automodel.components.models.bagel.modeling_qwen2_packed import Qwen2ForCausalLM
