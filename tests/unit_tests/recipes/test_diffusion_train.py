@@ -287,6 +287,13 @@ def test_lr_scheduler_config_rejects_fractional_warmup():
 )
 def test_example_diffusion_yamls_coerce_through_typed_configs(yaml_path):
     raw = yaml.safe_load(yaml_path.read_text())
+    optimizer_target = raw["optimizer"].get("_target_")
+    assert optimizer_target is not None, "diffusion example YAMLs must declare optimizer._target_"
+    if not optimizer_target.startswith("torch."):
+        # ConfigNode resolves targets eagerly. Keep this schema sweep CPU-compatible
+        # when an example uses an optional optimizer such as Transformer Engine.
+        raw["optimizer"]["_target_"] = "torch.optim.AdamW"
+
     cfg = RecipeConfig(ConfigNode(raw))
 
     _reject_removed_diffusion_keys(cfg)
@@ -300,11 +307,7 @@ def test_example_diffusion_yamls_coerce_through_typed_configs(yaml_path):
     if "checkpoint" in raw:
         assert cfg.checkpoint.model_repo_id == raw["model"]["pretrained_model_name_or_path"]
 
-    optimizer_target = raw["optimizer"].get("_target_")
-    assert optimizer_target is not None, "diffusion example YAMLs must declare optimizer._target_"
-    if optimizer_target.startswith("torch."):
-        # non-torch targets (e.g. TransformerEngine FusedAdam) need optional deps
-        assert cfg.optimizer is not None
+    assert cfg.optimizer is not None
 
 
 def test_recipe_config_resolves_diffusion_builder_target_to_typed_config():
