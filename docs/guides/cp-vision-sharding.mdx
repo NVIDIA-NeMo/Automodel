@@ -71,7 +71,7 @@ embed_multimodal:
 | **Differentiable all-gather** | Per-rank `[max_tokens, H]` blocks are padded to the global max, all-gathered (forward all-gather + concat; backward **reduce-scatter SUM**), then sliced back to true token counts. |
 | **Gradient parity** | Every rank reassembles the full embeds, then keeps only its sequence shard. A frame computed by rank `c` lands in shard-owner rank `s`; reduce-scatter-SUM routes `s`'s gradient back to `c` (summing the straddling case). The total vision-parameter gradient is numerically equivalent (`allclose`) to the replicated baseline's. |
 | **FSDP / no deadlock** | The distribute / pad / replicate choice is a pure function of `(num_frame_units, world, enabled)` and thus identical on all ranks; every rank makes exactly one `visual` call and the same number of vision-shard collectives. Fewer frame units than ranks **pads with minimal dummy frames** (one unit per rank) so no rank is starved; the dummy embeddings are sliced off before the loss and contribute exactly zero gradient. The all-gather inside `maybe_distribute_visual` is the synchronization boundary — do **not** add an extra post-visual CP barrier. |
-| **Small workloads** | Batches whose visual token count is below `NEMO_CP_SHARD_VISION_MIN_TOKENS` (default `2048`) use the replicated path: they have little memory pressure but would still pay the all-gather synchronization cost. |
+| **Small workloads** | Batches whose visual token count is below `cp_vision_sharding.min_tokens` (default `2048`) use the replicated path: they have little memory pressure but would still pay the all-gather synchronization cost. |
 
 `maybe_distribute_visual` also all-gathers an optional `deepstack_features` list
 (Qwen3-VL-style towers); `last_hidden_state` is intentionally left as the local shard since
@@ -80,7 +80,7 @@ embed_multimodal:
 ### Sharding scope: frozen vs. trainable vision tower
 
 The caller **declares** the scope of the process group it publishes via
-`set_cp_vision_group(group, spans_only_cp=...)`, and the declaration is **enforced**:
+`set_cp_vision_group(group, config=..., spans_only_cp=...)`, and the declaration is **enforced**:
 `maybe_distribute_visual` raises a `ValueError` — on every rank, before any collective —
 when the vision tower has trainable parameters but the published group was not declared
 CP-only (`spans_only_cp=False`).
@@ -106,13 +106,28 @@ The built-in dense Qwen3.5 caller publishes its CP group. Custom integrations ma
 wider CP × TP group for a frozen tower by declaring `spans_only_cp=False` (see
 [sharding scope](#sharding-scope-frozen-vs-trainable-vision-tower)):
 
+```yaml
+cp_vision_sharding:
+  enabled: true
+  min_tokens: 2048
+  # cost_alpha: null  # null infers 3 * vision_hidden_size
+```
+
+The policy is disabled by default, so existing CP recipes retain replicated vision behavior.
+Enable it explicitly in the recipe. For an A/B baseline, use the recorded CLI override
+`--cp_vision_sharding.enabled false` rather than an environment variable.
+
+Programmatic callers pass the same typed policy while publishing the runtime-only process
+group:
+
 ```python
 from nemo_automodel.components.distributed import cp_vision_shard
 
+config = cp_vision_shard.CpVisionShardingConfig(enabled=True)
 # Trainable vision tower: publish the CP-only group (spans_only_cp defaults to True).
-token = cp_vision_shard.set_cp_vision_group(cp_group)
+token = cp_vision_shard.set_cp_vision_group(cp_group, config=config)
 # Frozen vision tower only: a wider CP x TP group may be published instead --
-# token = cp_vision_shard.set_cp_vision_group(cp_tp_group, spans_only_cp=False)
+# token = cp_vision_shard.set_cp_vision_group(cp_tp_group, config=config, spans_only_cp=False)
 try:
     # pre-embed forward; embed_multimodal routes self.visual(...) through
     # cp_vision_shard.maybe_distribute_visual(self.visual, pixel_values, grid_thw)
@@ -121,13 +136,13 @@ finally:
     cp_vision_shard.reset_cp_vision_group(token)
 ```
 
-Environment toggles:
+Configuration fields:
 
-| Variable | Default | Effect |
+| Field | Default | Effect |
 |---|---|---|
-| `NEMO_CP_SHARD_VISION` | `1` | `0` forces the replicated ViT path (exact pre-sharding behavior; use as the A/B baseline). |
-| `NEMO_CP_SHARD_VISION_MIN_TOKENS` | `2048` | Visual-token threshold below which the replicated path is used. |
-| `NEMO_CP_SHARD_VISION_COST_ALPHA` | `auto` | Linear term `alpha` in the `p*(p+alpha)` partition cost. `auto` (or unset) discovers `3 * vision_hidden_size` from the model; a non-negative integer is an exact override (`0` restores the legacy pure-quadratic `p**2` partition). Partition-only knob — forward/gradients are identical for any cuts. |
+| `cp_vision_sharding.enabled` | `false` | Enables CP vision sharding. `false` preserves the replicated ViT path. |
+| `cp_vision_sharding.min_tokens` | `2048` | Visual-token threshold below which the replicated path is used. |
+| `cp_vision_sharding.cost_alpha` | `null` | Linear term `alpha` in the `p*(p+alpha)` partition cost. `null` discovers `3 * vision_hidden_size` from the model; a non-negative integer is an exact override (`0` restores the legacy pure-quadratic `p**2` partition). Partition-only knob — forward/gradients are identical for any cuts. |
 
 ## Validation
 

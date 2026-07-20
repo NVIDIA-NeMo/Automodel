@@ -147,7 +147,8 @@ def _sharded_forward_backward(
     from nemo_automodel.components.distributed import cp_vision_shard as vs
 
     visual.zero_grad(set_to_none=True)
-    token = vs.set_cp_vision_group(dist.group.WORLD)
+    config = vs.CpVisionShardingConfig(enabled=True, min_tokens=0)
+    token = vs.set_cp_vision_group(dist.group.WORLD, config=config)
     try:
         out = vs.maybe_distribute_visual(visual, pixel, grid)
     finally:
@@ -167,8 +168,6 @@ def _parity_worker(rank: int, world_size: int, port: int) -> None:
     try:
         _init_gloo(rank, world_size, port)
         torch.set_num_threads(1)
-        os.environ["NEMO_CP_SHARD_VISION_MIN_TOKENS"] = "0"
-
         torch.manual_seed(0)  # identical weights on every rank, like the FSDP all-gather
         visual = _GlooVisual(n_deepstack=2)
         grid = torch.tensor([[1, 2, 2], [2, 2, 4], [1, 4, 4], [2, 2, 2], [1, 2, 4]], dtype=torch.long)
@@ -201,8 +200,6 @@ def _pad_path_worker(rank: int, world_size: int, port: int) -> None:
     try:
         _init_gloo(rank, world_size, port)
         torch.set_num_threads(1)
-        os.environ["NEMO_CP_SHARD_VISION_MIN_TOKENS"] = "0"
-
         torch.manual_seed(0)
         visual = _GlooVisual()
         grid = torch.tensor([[1, 4, 4]], dtype=torch.long)  # 1 frame unit < 2 ranks -> pad path
@@ -265,7 +262,6 @@ def _divergent_count_worker(rank: int, world_size: int, port: int) -> None:
     try:
         _init_gloo(rank, world_size, port, timeout=timedelta(seconds=60))
         torch.set_num_threads(1)
-        os.environ["NEMO_CP_SHARD_VISION_MIN_TOKENS"] = "0"
         from nemo_automodel.components.distributed import cp_vision_shard as vs
 
         torch.manual_seed(0)
@@ -275,7 +271,8 @@ def _divergent_count_worker(rank: int, world_size: int, port: int) -> None:
         gen = torch.Generator().manual_seed(7)
         pixel = torch.randn(int(grid.prod(dim=-1).sum()), 8, generator=gen)
 
-        token = vs.set_cp_vision_group(dist.group.WORLD)
+        config = vs.CpVisionShardingConfig(enabled=True, min_tokens=0)
+        token = vs.set_cp_vision_group(dist.group.WORLD, config=config)
         try:
             # EVERY rank must raise (consensus), not only the diverging one.
             with pytest.raises(ValueError, match="cp_vision_shard"):
@@ -306,8 +303,6 @@ def _real_tower_worker(rank: int, world_size: int, port: int) -> None:
     try:
         _init_gloo(rank, world_size, port, timeout=timedelta(seconds=120))
         torch.set_num_threads(1)
-        os.environ["NEMO_CP_SHARD_VISION_MIN_TOKENS"] = "0"
-
         from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
@@ -334,7 +329,8 @@ def _real_tower_worker(rank: int, world_size: int, port: int) -> None:
 
         with torch.no_grad():
             rep = tower(pixel, grid_thw=grid, return_dict=True)
-            token = vs.set_cp_vision_group(dist.group.WORLD)
+            config = vs.CpVisionShardingConfig(enabled=True, min_tokens=0)
+            token = vs.set_cp_vision_group(dist.group.WORLD, config=config)
             try:
                 out = vs.maybe_distribute_visual(tower, pixel, grid)
             finally:

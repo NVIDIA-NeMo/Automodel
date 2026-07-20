@@ -29,6 +29,7 @@ from nemo_automodel.components.datasets.vlm.pp_media import (
     prepare_vlm_media_for_pp,
     stage_vlm_media_for_pp,
 )
+from nemo_automodel.components.distributed.cp_vision_shard import CpVisionShardingConfig
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_optimizer_config
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
@@ -1560,6 +1561,7 @@ def _create_pp_recipe(model=None):
     recipe.__dict__["pp_enabled"] = True
     recipe.__dict__["loss_fn"] = MagicMock()
     recipe.__dict__["distributed_config"] = None
+    recipe.__dict__["cp_vision_sharding"] = CpVisionShardingConfig(enabled=True)
     recipe.__dict__["model_parts"] = [model]
     recipe.__dict__["_get_dp_group_size"] = lambda include_cp=True: 1
     return recipe
@@ -2207,6 +2209,7 @@ def _create_non_pp_recipe(model, device="cpu"):
     recipe.__dict__["moe_mesh"] = None
     recipe.__dict__["pp_enabled"] = False
     recipe.__dict__["distributed_config"] = None
+    recipe.__dict__["cp_vision_sharding"] = CpVisionShardingConfig(enabled=True)
     recipe.__dict__["model_parts"] = [model]
     recipe.__dict__["_get_dp_group_size"] = lambda include_cp=True: 1
     # ``is_remote_logging_step`` is read by ``_forward_backward_step`` to

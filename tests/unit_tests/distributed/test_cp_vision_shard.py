@@ -90,6 +90,10 @@ def _pixels(grid, in_dim=8, seed=0):
     return torch.randn(total_patches, in_dim, generator=g)
 
 
+def _policy(*, enabled=True, min_tokens=0, cost_alpha=None):
+    return vs.CpVisionShardingConfig(enabled=enabled, min_tokens=min_tokens, cost_alpha=cost_alpha)
+
+
 # entries with varied sizes; every patch count (t*h*w) is a multiple of sms_sq=4.
 _ENTRIES = [(1, 2, 2), (1, 4, 4), (1, 2, 4), (1, 6, 4), (1, 2, 2), (1, 4, 6)]
 
@@ -211,31 +215,25 @@ def test_partition_cut_lands_exactly_on_cumulative_sum():
         (SimpleNamespace(patch_generator=SimpleNamespace(embed_dim=768)), 768, 2304),
     ],
 )
-def test_auto_cost_alpha_discovers_supported_vision_widths(monkeypatch, source, expected_hidden, expected_alpha):
-    monkeypatch.delenv("NEMO_CP_SHARD_VISION_COST_ALPHA", raising=False)
-
+def test_auto_cost_alpha_discovers_supported_vision_widths(source, expected_hidden, expected_alpha):
     assert vs._infer_vision_hidden_size(source) == expected_hidden
     assert vs._vision_cost_alpha(source) == expected_alpha
 
 
-def test_cost_alpha_override_and_unknown_model_fallback(monkeypatch):
+def test_cost_alpha_override_and_unknown_model_fallback():
     qwen_visual = SimpleNamespace(config=SimpleNamespace(hidden_size=1152))
 
-    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "777")
-    assert vs._vision_cost_alpha(qwen_visual) == 777
-    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "0")
-    assert vs._vision_cost_alpha(qwen_visual) == 0
-
-    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "auto")
+    assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha=777)) == 777
+    assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha=0)) == 0
     assert vs._vision_cost_alpha(qwen_visual) == 3456
     assert vs._vision_cost_alpha(SimpleNamespace()) == 0
 
-    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "not-a-number")
-    assert vs._vision_cost_alpha(qwen_visual) == 3456
+    with pytest.raises(ValueError, match="cost_alpha"):
+        vs.CpVisionShardingConfig(cost_alpha=-1)
 
 
-def test_partition_cost_alpha_flattens_mixed_frame_sizes(monkeypatch):
-    """NEMO_CP_SHARD_VISION_COST_ALPHA adds the linear per-patch term to the cost.
+def test_partition_cost_alpha_flattens_mixed_frame_sizes():
+    """Configured cost_alpha adds the linear per-patch term to the cost.
 
     A pack mixing a few BIG image frames with many small video frames is the pathological
     case for the pure ``p**2`` model: one big frame "costs" as much as thousands of small
@@ -246,12 +244,10 @@ def test_partition_cost_alpha_flattens_mixed_frame_sizes(monkeypatch):
     world = 8
     patches = torch.tensor([1024] * 4 + [112] * 400, dtype=torch.long)  # 4 big + 400 small
 
-    monkeypatch.delenv("NEMO_CP_SHARD_VISION_COST_ALPHA", raising=False)
     cuts0 = vs._contiguous_balanced_bounds(patches, world)
     per0 = [cuts0[r + 1] - cuts0[r] for r in range(world)]
 
-    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "3456")
-    cuts_a = vs._contiguous_balanced_bounds(patches, world)
+    cuts_a = vs._contiguous_balanced_bounds(patches, world, config=_policy(cost_alpha=3456))
     per_a = [cuts_a[r + 1] - cuts_a[r] for r in range(world)]
 
     # default (unset) keeps the original pure-quadratic partition: heavily skewed
@@ -264,23 +260,17 @@ def test_partition_cost_alpha_flattens_mixed_frame_sizes(monkeypatch):
     for cuts in (cuts0, cuts_a):
         assert cuts[0] == 0 and cuts[-1] == len(patches) and len(cuts) == world + 1
 
-    # invalid env value falls back to alpha=0 (identical to default partition)
-    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "not-a-number")
-    assert vs._contiguous_balanced_bounds(patches, world) == cuts0
 
-
-def test_partition_uses_model_aware_alpha_by_default(monkeypatch):
+def test_partition_uses_model_aware_alpha_by_default():
     patches = torch.tensor([1024] * 4 + [112] * 400, dtype=torch.long)
     qwen_visual = SimpleNamespace(config=SimpleNamespace(hidden_size=1152))
 
-    monkeypatch.delenv("NEMO_CP_SHARD_VISION_COST_ALPHA", raising=False)
     auto = vs._contiguous_balanced_bounds(
         patches,
         8,
         cost_alpha_source=qwen_visual,
     )
-    monkeypatch.setenv("NEMO_CP_SHARD_VISION_COST_ALPHA", "3456")
-    explicit = vs._contiguous_balanced_bounds(patches, 8)
+    explicit = vs._contiguous_balanced_bounds(patches, 8, config=_policy(cost_alpha=3456))
 
     assert auto == explicit
 
@@ -450,8 +440,6 @@ def _simulate_maybe_distribute(visual, pixel, grid, world, rank, monkeypatch, *,
     ``test_pad_backward_through_real_code_matches_replicate``."""
     import torch.distributed as dist
 
-    monkeypatch.setenv("NEMO_CP_SHARD_VISION_MIN_TOKENS", "0")
-
     sms = visual.spatial_merge_size
     sms_sq = sms**2
     # frame-level units (mirror maybe_distribute_visual): expand (t,h,w) -> t x (h*w patches)
@@ -516,7 +504,11 @@ def _simulate_maybe_distribute(visual, pixel, grid, world, rank, monkeypatch, *,
 
         monkeypatch.setattr(dist, "reduce_scatter", fake_reduce_scatter)
 
-    tok = vs.set_cp_vision_group(object(), spans_only_cp=spans_only_cp)  # any non-None group activates the path
+    tok = vs.set_cp_vision_group(
+        object(),
+        config=_policy(),
+        spans_only_cp=spans_only_cp,
+    )  # any non-None group activates the path
     try:
         return vs.maybe_distribute_visual(visual, pixel, grid)
     finally:
@@ -623,7 +615,7 @@ def test_maybe_distribute_falls_back_when_media_inputs_are_none(monkeypatch, pix
     pixel = None if pixel_is_none else _pixels(_grid(_ENTRIES))
     grid = None if grid_is_none else _grid(_ENTRIES)
     visual = _RecorderVisual()
-    tok = vs.set_cp_vision_group(object())
+    tok = vs.set_cp_vision_group(object(), config=_policy())
     try:
         out = vs.maybe_distribute_visual(visual, pixel, grid)
     finally:
@@ -653,7 +645,7 @@ def test_trainable_tower_rejects_group_not_declared_cp_only(monkeypatch):
     pixel = _pixels(grid)
     visual = _StubVisual()
     assert any(p.requires_grad for p in visual.parameters())
-    tok = vs.set_cp_vision_group(object(), spans_only_cp=False)
+    tok = vs.set_cp_vision_group(object(), config=_policy(), spans_only_cp=False)
     try:
         with pytest.raises(ValueError, match="spans_only_cp"):
             vs.maybe_distribute_visual(visual, pixel, grid)
@@ -677,15 +669,14 @@ def test_frozen_tower_shards_over_group_not_declared_cp_only(monkeypatch):
     assert torch.allclose(out.pooler_output, rep, atol=1e-6)
 
 
-def test_maybe_distribute_disabled_by_env(monkeypatch):
-    monkeypatch.setenv("NEMO_CP_SHARD_VISION", "0")
+def test_maybe_distribute_disabled_by_config(monkeypatch):
     import torch.distributed as dist
 
     monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
     grid = _grid(_ENTRIES)
     pixel = _pixels(grid)
     visual = _StubVisual()
-    tok = vs.set_cp_vision_group(object())
+    tok = vs.set_cp_vision_group(object(), config=_policy(enabled=False))
     try:
         out = vs.maybe_distribute_visual(visual, pixel, grid)
     finally:
@@ -694,7 +685,6 @@ def test_maybe_distribute_disabled_by_env(monkeypatch):
 
 
 def test_maybe_distribute_falls_back_below_min_tokens(monkeypatch):
-    monkeypatch.setenv("NEMO_CP_SHARD_VISION_MIN_TOKENS", "999")
     import torch.distributed as dist
 
     monkeypatch.setattr(dist, "get_world_size", lambda group=None: 4)
@@ -707,7 +697,7 @@ def test_maybe_distribute_falls_back_below_min_tokens(monkeypatch):
     grid = _grid([(1, 2, 2)])
     pixel = _pixels(grid)
     visual = _StubVisual()
-    tok = vs.set_cp_vision_group(object())
+    tok = vs.set_cp_vision_group(object(), config=_policy(min_tokens=999))
     try:
         out = vs.maybe_distribute_visual(visual, pixel, grid)
     finally:

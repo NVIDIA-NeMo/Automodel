@@ -15,17 +15,17 @@
 # Dense Qwen3.5-4B VLM with context parallelism (cp_size=2) on a single node
 # (8 GPUs: cp=2, dp=4), demonstrating context-parallel vision-tower sharding.
 #
-# Vision-tower sharding activates automatically here: with cp_size=2 the recipe
-# publishes the CP group around the pre-embed forward, and
+# Vision-tower sharding is explicitly enabled below: with cp_size=2 the recipe
+# publishes the configured policy and CP group around the pre-embed forward, and
 # Qwen3_5ForConditionalGeneration.prepare_model_inputs_for_cp routes the vision
 # tower through cp_vision_shard.maybe_distribute_visual, so each CP rank runs the
 # ViT on ~1/cp_size of the frames instead of the full set redundantly.
 #
 # A/B (same topology, same global batch -> numerically identical loss):
-#   sharded  : NEMO_CP_SHARD_VISION_MIN_TOKENS=0 automodel examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml --nproc-per-node 8
-#   baseline : NEMO_CP_SHARD_VISION=0 automodel examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml --nproc-per-node 8
-# The sharded command sets the threshold to zero so even this small demo batch exercises the
-# distributed path. NEMO_CP_SHARD_VISION=0 forces the replicated ViT baseline.
+#   sharded  : automodel examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml --nproc-per-node 8
+#   baseline : automodel examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml --nproc-per-node 8 --cp_vision_sharding.enabled false
+# The config sets min_tokens=0 so even this small demo batch exercises the distributed path.
+# The baseline CLI override is captured in the resolved recipe configuration.
 
 recipe: FinetuneRecipeForVLM
 
@@ -76,6 +76,10 @@ distributed:
   ep_size: 1
   sequence_parallel: false
   activation_checkpointing: true
+
+cp_vision_sharding:
+  enabled: true
+  min_tokens: 0
 
 freeze_config:
   # Frozen ViT is the common speedup case (also the recipe default). The

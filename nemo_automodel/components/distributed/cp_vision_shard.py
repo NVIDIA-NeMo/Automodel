@@ -38,7 +38,7 @@ on every rank, then immediately sequence-sharded by the existing CP sharder.
 
 Sharding-group scope (deliberate, machine-checked design constraint): the caller
 declares the scope of the process group it publishes via
-``set_cp_vision_group(group, spans_only_cp=...)``.  With a FROZEN vision tower,
+``set_cp_vision_group(group, config=..., spans_only_cp=...)``. With a FROZEN vision tower,
 frames may be sharded across the full CP x TP rank set (``spans_only_cp=False``):
 the forward is numerically equivalent (``allclose``; per-frame independence,
 replicated weights) and
@@ -56,7 +56,6 @@ declared CP-only.  Under pure TP (``cp_size == 1``) the published group has size
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -65,6 +64,7 @@ import torch
 import torch.distributed as dist
 
 __all__ = [
+    "CpVisionShardingConfig",
     "cp_vision_sharding_active",
     "maybe_distribute_visual",
     "reset_cp_vision_group",
@@ -79,6 +79,36 @@ _LOGGED_COST_ALPHAS: set[tuple[str, int, str]] = set()
 
 
 @dataclass(frozen=True)
+class CpVisionShardingConfig:
+    """Declarative policy for sharding VLM vision work across CP ranks.
+
+    Args:
+        enabled: Enable vision sharding when a multi-rank CP group is published. Disabled
+            by default so existing CP recipes retain their replicated vision behavior.
+        min_tokens: Minimum number of merged visual tokens required to use the sharded
+            path. Smaller workloads stay replicated to avoid collective overhead.
+        cost_alpha: Optional non-negative linear term in the partition cost
+            ``p * (p + cost_alpha)``. ``None`` infers ``3 * vision_hidden_size`` and
+            falls back to ``0`` when the width is unavailable.
+    """
+
+    enabled: bool = False
+    min_tokens: int = 2048
+    cost_alpha: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the serialized policy fields."""
+        if not isinstance(self.enabled, bool):
+            raise TypeError("cp_vision_sharding.enabled must be a boolean")
+        if isinstance(self.min_tokens, bool) or not isinstance(self.min_tokens, int) or self.min_tokens < 0:
+            raise ValueError("cp_vision_sharding.min_tokens must be a non-negative integer")
+        if self.cost_alpha is not None and (
+            isinstance(self.cost_alpha, bool) or not isinstance(self.cost_alpha, int) or self.cost_alpha < 0
+        ):
+            raise ValueError("cp_vision_sharding.cost_alpha must be null or a non-negative integer")
+
+
+@dataclass(frozen=True)
 class _GroupScope:
     """The published sharding group plus the caller's declaration of its scope.
 
@@ -87,6 +117,7 @@ class _GroupScope:
     """
 
     group: dist.ProcessGroup
+    config: CpVisionShardingConfig
     spans_only_cp: bool
 
 
@@ -209,12 +240,18 @@ def _grid_list_for_planning(grid_thw: torch.Tensor) -> tuple[list[list[int]], to
     return grid_host.tolist(), grid_host
 
 
-def set_cp_vision_group(group: dist.ProcessGroup | None, *, spans_only_cp: bool = True) -> CpVisionGroupToken:
+def set_cp_vision_group(
+    group: dist.ProcessGroup | None,
+    *,
+    config: CpVisionShardingConfig,
+    spans_only_cp: bool = True,
+) -> CpVisionGroupToken:
     """Install the sharding process group for the next pre-embed forward.
 
     Args:
         group: Process group to shard vision frames across, or ``None`` to disable
             sharding for the call.
+        config: Declarative sharding policy resolved from the recipe configuration.
         spans_only_cp: Declaration of the group's scope.  ``True`` (default) states
             that ``group`` spans context-parallel ranks only -- always
             gradient-correct.  Pass ``False`` only for a group that also spans
@@ -227,7 +264,7 @@ def set_cp_vision_group(group: dist.ProcessGroup | None, *, spans_only_cp: bool 
     Returns:
         A token to pass to :func:`reset_cp_vision_group`.
     """
-    scope = None if group is None else _GroupScope(group=group, spans_only_cp=spans_only_cp)
+    scope = None if group is None else _GroupScope(group=group, config=config, spans_only_cp=spans_only_cp)
     return _CP_VISION_GROUP.set(scope)
 
 
@@ -236,26 +273,15 @@ def reset_cp_vision_group(token: CpVisionGroupToken) -> None:
     _CP_VISION_GROUP.reset(token)
 
 
-def _shard_vision_enabled() -> bool:
-    """Feature toggle.  ``NEMO_CP_SHARD_VISION=0`` forces the replicate path (exact
-    pre-sharding behaviour), used as the A/B baseline.  Default: enabled."""
-    return os.environ.get("NEMO_CP_SHARD_VISION", "1").lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-
 def cp_vision_sharding_active() -> bool:
     """Return whether the current pre-embed call has an active CP shard group.
 
-    This intentionally shares :func:`maybe_distribute_visual`'s feature toggle.
+    This intentionally shares :func:`maybe_distribute_visual`'s typed policy.
     Model-specific pre-embed implementations can use it to leave their ordinary
     (replicated / CP-off) multimodal forward completely untouched.
     """
     scope = _CP_VISION_GROUP.get()
-    if scope is None or not _shard_vision_enabled():
+    if scope is None or not scope.config.enabled:
         return False
     return dist.get_world_size(scope.group) > 1
 
@@ -278,24 +304,8 @@ def _check_group_scope_for_trainable(visual: torch.nn.Module, scope: _GroupScope
             "set). The vision tower is replicated across TP ranks, so gathering frames over "
             "that group would accumulate the vision gradient tp-fold in the all-gather's "
             "reduce-scatter(SUM) backward. Publish the CP-only group "
-            "(set_cp_vision_group(cp_group)) or freeze the vision tower."
+            "(set_cp_vision_group(cp_group, config=...)) or freeze the vision tower."
         )
-
-
-def _min_shard_tokens() -> int:
-    """Minimum gathered visual-token count before vision sharding is worthwhile.
-
-    Very small mixed image/video batches have little memory pressure but still pay
-    NCCL/all-gather synchronization costs.  Keeping them on the replicated path
-    avoids paying that collective overhead where sharding saves little, while
-    preserving sharding for large vision batches.
-    """
-    value = os.environ.get("NEMO_CP_SHARD_VISION_MIN_TOKENS", "2048")
-    try:
-        return max(0, int(value))
-    except ValueError:
-        logger.warning("invalid NEMO_CP_SHARD_VISION_MIN_TOKENS=%r; using 2048", value)
-        return 2048
 
 
 def _config_value(source: object, name: str) -> object | None:
@@ -376,36 +386,28 @@ def _infer_vision_hidden_size(source: object | None) -> int | None:
     return _walk(source, 0)
 
 
-def _vision_cost_alpha(source: object | None = None) -> int:
+def _vision_cost_alpha(
+    source: object | None = None,
+    config: CpVisionShardingConfig | None = None,
+) -> int:
     """Resolve the linear term in the vision partition cost ``p*(p+alpha)``.
 
-    A non-negative integer in ``NEMO_CP_SHARD_VISION_COST_ALPHA`` is an exact
-    override (``0`` selects the legacy pure-quadratic model).  With the variable
-    unset or set to ``auto``, use ``3 * vision_hidden_size``: the three Q/K/V
-    projections are a portable proxy for linear per-patch ViT work.  Unknown
-    architectures safely retain the legacy ``alpha=0`` behavior.
+    A configured non-negative integer is an exact override (``0`` selects the legacy
+    pure-quadratic model). With ``cost_alpha=None``, use ``3 * vision_hidden_size``:
+    the three Q/K/V projections are a portable proxy for linear per-patch ViT work.
+    Unknown architectures safely retain the legacy ``alpha=0`` behavior.
 
     Args:
         source: Object to infer the vision width from when in ``auto`` mode.
+        config: Optional typed sharding policy containing an exact override.
 
     Returns:
         The resolved non-negative ``alpha``.
     """
-    raw = os.environ.get("NEMO_CP_SHARD_VISION_COST_ALPHA")
     mode = "auto"
-    alpha: int | None = None
-    if raw is not None and raw.strip() and raw.strip().lower() != "auto":
-        try:
-            parsed = int(raw)
-            if parsed < 0:
-                raise ValueError
-            alpha = parsed
-            mode = "override"
-        except ValueError:
-            logger.warning(
-                "invalid NEMO_CP_SHARD_VISION_COST_ALPHA=%r; using auto",
-                raw,
-            )
+    alpha = config.cost_alpha if config is not None else None
+    if alpha is not None:
+        mode = "configured"
 
     hidden_size = _infer_vision_hidden_size(source)
     if alpha is None:
@@ -419,8 +421,8 @@ def _vision_cost_alpha(source: object | None = None) -> int:
             _LOGGED_COST_ALPHAS.add(log_key)
             if mode == "auto":
                 detail = f"auto: 3 x vision hidden_size {hidden_size}"
-            elif mode == "override":
-                detail = "environment override"
+            elif mode == "configured":
+                detail = "configured override"
             else:
                 detail = "vision width unavailable; legacy fallback"
             logger.info(
@@ -437,6 +439,7 @@ def _contiguous_balanced_bounds(
     world: int,
     *,
     cost_alpha_source: object | None = None,
+    config: CpVisionShardingConfig | None = None,
 ) -> list[int] | None:
     """Partition ``len(patches)`` entries into ``world`` CONTIGUOUS groups balanced by
     approximate vision-attention cost, with >=1 entry per group.
@@ -454,9 +457,9 @@ def _contiguous_balanced_bounds(
     every rank, so all ranks compute the same partition (and thus the same per-rank token
     counts they need to unpack the all-gather).
 
-    Cost model: ``p*(p + alpha)``.  An explicit ``NEMO_CP_SHARD_VISION_COST_ALPHA``
-    integer wins; otherwise ``alpha`` is inferred as ``3 * vision_hidden_size`` from
-    ``cost_alpha_source``.  The quadratic term is per-frame attention; ``alpha*p`` adds
+    Cost model: ``p*(p + alpha)``. A configured ``cost_alpha`` wins; otherwise
+    ``alpha`` is inferred as ``3 * vision_hidden_size`` from ``cost_alpha_source``.
+    The quadratic term is per-frame attention; ``alpha*p`` adds
     the LINEAR per-patch work (qkv/MLP projections) that the pure quadratic ignores --
     without it, packs mixing big image frames with many small video frames heap the small
     frames onto few ranks (attention-cost-"balanced" but frame-count- and wall-clock-
@@ -473,7 +476,7 @@ def _contiguous_balanced_bounds(
     # host sync + Python bisect is both cheap and device-agnostic.
     import bisect
 
-    alpha = _vision_cost_alpha(cost_alpha_source)
+    alpha = _vision_cost_alpha(cost_alpha_source, config)
     costs = [int(x) * (int(x) + alpha) for x in patches.tolist()]
     if any(value <= 0 for value in costs):
         raise ValueError("partition costs must be positive")
@@ -608,7 +611,7 @@ def maybe_distribute_visual(
         return visual(pixel_values, grid_thw=grid_thw, return_dict=True)
 
     scope = _CP_VISION_GROUP.get()
-    if scope is None or not _shard_vision_enabled():
+    if scope is None or not scope.config.enabled:
         return visual(
             pixel_values,
             grid_thw=_grid_for_visual(visual, grid_thw, pixel_values),
@@ -645,14 +648,14 @@ def maybe_distribute_visual(
             f_hw.append((int(h), int(w)))
     n_units = len(f_patches)
     n_real_tokens = sum(p // sms_sq for p in f_patches)
-    min_shard_tokens = _min_shard_tokens()
+    min_shard_tokens = scope.config.min_tokens
     if n_real_tokens < min_shard_tokens:
         global _LOGGED_SMALL_FALLBACK
         if not _LOGGED_SMALL_FALLBACK:
             _LOGGED_SMALL_FALLBACK = True
             logger.info(
                 "vision tower using replicated path for small visual workload "
-                "(tokens=%d < NEMO_CP_SHARD_VISION_MIN_TOKENS=%d)",
+                "(tokens=%d < cp_vision_sharding.min_tokens=%d)",
                 n_real_tokens,
                 min_shard_tokens,
             )
@@ -691,6 +694,7 @@ def maybe_distribute_visual(
             torch.tensor(f_patches, dtype=torch.long),
             world,
             cost_alpha_source=visual,
+            config=scope.config,
         )
         if cuts is None:  # n_units == 0 (no frames) -> replicate (keeps collectives uniform)
             return visual(

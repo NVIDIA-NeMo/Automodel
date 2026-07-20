@@ -38,6 +38,9 @@ import torch
 
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed.cp_vision_shard import CpVisionShardingConfig
+from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
@@ -109,34 +112,57 @@ class _FakeCPMesh:
         return SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group")
 
 
-def test_run_cp_pre_embed_resets_published_group_after_failure(monkeypatch):
+def test_recipe_config_resolves_cp_vision_sharding_policy():
+    cfg = RecipeConfig(
+        ConfigNode(
+            {
+                "cp_vision_sharding": {
+                    "enabled": True,
+                    "min_tokens": 17,
+                    "cost_alpha": 0,
+                }
+            }
+        )
+    )
+
+    assert cfg.cp_vision_sharding == CpVisionShardingConfig(enabled=True, min_tokens=17, cost_alpha=0)
+
+
+def test_recipe_config_disables_cp_vision_sharding_by_default():
+    assert RecipeConfig(ConfigNode({})).cp_vision_sharding == CpVisionShardingConfig()
+
+
+def test_cp_vision_sharding_context_resets_published_group_after_failure(monkeypatch):
     """The recipe must restore vision-shard state when the model forward raises."""
     recipe = object.__new__(FinetuneRecipeForVLM)
     group = object()
     token = object()
-    recipe.device_mesh = {"cp": SimpleNamespace(get_group=lambda: group)}
+    policy = CpVisionShardingConfig(enabled=True)
+
+    class _Mesh(dict):
+        mesh_dim_names = ("cp",)
+
+    recipe.device_mesh = _Mesh(cp=SimpleNamespace(size=lambda: 2, get_group=lambda: group))
+    recipe.cp_vision_sharding = policy
     events = []
 
-    def _set(actual_group):
-        events.append(("set", actual_group))
+    def _set(actual_group, *, config):
+        events.append(("set", actual_group, config))
         return token
 
     def _reset(actual_token):
         events.append(("reset", actual_token))
 
-    def _model(**kwargs):
-        events.append(("model", kwargs))
-        raise RuntimeError("pre-embed failed")
-
     monkeypatch.setattr(vlm_finetune, "set_cp_vision_group", _set)
     monkeypatch.setattr(vlm_finetune, "reset_cp_vision_group", _reset)
 
-    with pytest.raises(RuntimeError, match="pre-embed failed"):
-        recipe._run_cp_pre_embed(_model, {"input_ids": torch.ones(1, 2, dtype=torch.long)})
+    with pytest.raises(RuntimeError, match="forward failed"):
+        with recipe._cp_vision_sharding_context():
+            events.append(("forward",))
+            raise RuntimeError("forward failed")
 
-    assert events[0] == ("set", group)
-    assert events[1][0] == "model"
-    assert events[1][1]["_pre_embed_only"] is True
+    assert events[0] == ("set", group, policy)
+    assert events[1] == ("forward",)
     assert events[2] == ("reset", token)
 
 
@@ -163,6 +189,7 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     recipe = object.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.device_mesh = _FakeCPMesh()
+    recipe.cp_vision_sharding = CpVisionShardingConfig(enabled=True)
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.model_parts = [model]
     recipe.pp_enabled = True
@@ -625,6 +652,7 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
     recipe.model_parts = [_Model()]
     recipe.loss_fn = object()
     recipe.device_mesh = _DM(cp=SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group"))
+    recipe.cp_vision_sharding = CpVisionShardingConfig(enabled=True)
     recipe.pp_enabled = False
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)

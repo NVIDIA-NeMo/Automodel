@@ -21,8 +21,8 @@ recipe body only ever sees typed component configs and calls
 
 Known sections are exposed as cached, typed attributes that own a ``build()`` or
 ``apply()``: ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
-``embedding_row_repair`` map to component config dataclasses; the ``optimizer``
-and ``loss_fn`` blocks resolve to a component
+``embedding_row_repair``/``cp_vision_sharding`` map to component config
+dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
 ``build_optimizer_config`` / ``build_loss_config`` (which own a ``build()``),
@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.datasets.loader import DataloaderConfig
     from nemo_automodel.components.datasets.multimodal.loader import BagelDataloaderConfig
     from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig, VlmProcessorConfig
+    from nemo_automodel.components.distributed.cp_vision_shard import CpVisionShardingConfig
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
@@ -131,8 +132,8 @@ class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
     ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
-    ``loss_fn`` and ``checkpoint`` are exposed as typed objects that own a
-    ``.build(...)`` (``optimizer`` is an
+    ``loss_fn``, ``checkpoint``, and ``cp_vision_sharding`` are exposed as typed objects
+    (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
     ``checkpoint`` a
     :class:`~nemo_automodel.components.checkpoint.config.CheckpointingConfig`);
@@ -614,6 +615,14 @@ class RecipeConfig:
 
         node = self._raw.get("embedding_row_repair", None)
         return EmbeddingRowRepairConfig(**_section_kwargs(node)) if node else None
+
+    @cached_property
+    def cp_vision_sharding(self) -> "CpVisionShardingConfig":
+        """Resolve the VLM CP vision-sharding policy from its top-level YAML block."""
+        from nemo_automodel.components.distributed.cp_vision_shard import CpVisionShardingConfig
+
+        node = self._raw.get("cp_vision_sharding", None)
+        return CpVisionShardingConfig(**_section_kwargs(node)) if node else CpVisionShardingConfig()
 
     @cached_property
     def checkpoint(self) -> "CheckpointingConfig":
