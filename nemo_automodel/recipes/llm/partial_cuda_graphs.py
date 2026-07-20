@@ -30,6 +30,8 @@ import torch
 from torch import nn
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
+from nemo_automodel.shared.import_utils import safe_import_from, safe_import_te
+
 logger = logging.getLogger(__name__)
 
 _Canonicalizer = Callable[[tuple[Any, ...], dict[str, Any]], tuple[tuple[Any, ...], dict[str, Any]]]
@@ -37,14 +39,32 @@ _Canonicalizer = Callable[[tuple[Any, ...], dict[str, Any]], tuple[tuple[Any, ..
 
 def _get_make_graphed_callables() -> Callable[..., Any]:
     """Load Transformer Engine's graph helper only when the feature is enabled."""
-    from transformer_engine.pytorch.graph import make_graphed_callables
+    has_te, _transformer_engine = safe_import_te()
+    if not has_te:
+        raise RuntimeError("Partial CUDA graphs require a working Transformer Engine PyTorch installation")
+    has_graph_helper, make_graphed_callables = safe_import_from(
+        "transformer_engine.pytorch.graph",
+        "make_graphed_callables",
+    )
+    if not has_graph_helper:
+        raise RuntimeError("Transformer Engine does not provide make_graphed_callables()")
 
     return make_graphed_callables
 
 
 def _tensor_metadata(tensor: torch.Tensor) -> tuple[Any, ...]:
-    """Return metadata that must stay invariant across graph replays."""
+    """Return metadata that must stay invariant across graph replays.
+
+    Args:
+        tensor: Tensor of arbitrary shape whose type, layout, shape, strides,
+            dtype, device, and autograd requirement define the replay contract.
+
+    Returns:
+        Tuple containing the tensor subclass and replay-critical metadata. The
+        returned value does not retain or alias ``tensor`` storage.
+    """
     return (
+        type(tensor),
         tuple(tensor.shape),
         tensor.dtype,
         tensor.device,
@@ -62,6 +82,8 @@ def _named_buffer_storage(target: nn.Module) -> tuple[tuple[Any, ...], ...]:
             data_ptr = buffer.data_ptr()
         except (RuntimeError, TypeError) as error:
             raise RuntimeError(f"whole-attention buffer {name!r} has no stable local storage") from error
+        if buffer.numel() > 0 and data_ptr == 0:
+            raise RuntimeError(f"whole-attention buffer {name!r} has no stable local storage")
         signatures.append((name, id(buffer), data_ptr, _tensor_metadata(buffer)))
     return tuple(signatures)
 
@@ -69,12 +91,17 @@ def _named_buffer_storage(target: nn.Module) -> tuple[tuple[Any, ...], ...]:
 def _require_local_parameter_storage(name: str, parameter: nn.Parameter) -> None:
     """Reject sharded or otherwise unmaterialized parameters before graph capture."""
     try:
-        parameter.data_ptr()
+        data_ptr = parameter.data_ptr()
     except (RuntimeError, TypeError) as error:
         raise RuntimeError(
             "Whole-attention CUDA graph capture requires materialized parameters with stable local storage; "
             f"{name!r} is not materialized. Nested FSDP attention ownership is not supported."
         ) from error
+    if parameter.numel() > 0 and data_ptr == 0:
+        raise RuntimeError(
+            "Whole-attention CUDA graph capture requires materialized parameters with stable local storage; "
+            f"{name!r} is not materialized. Nested FSDP attention ownership is not supported."
+        )
 
 
 def _alias_pattern(tensors: Sequence[torch.Tensor]) -> tuple[int, ...]:
@@ -942,37 +969,56 @@ class PartialCudaGraphManager:
                 f"missing samples for {missing_entries}"
             )
 
-        for entry in self.entries:
-            graphed_adapters = []
-            try:
-                entry.prepare_for_capture()
-                for captured_call in entry.captured_calls():
-                    adapter = entry.build_adapter(captured_call)
-                    graph_kwargs = {
-                        # TE runs callable-local forward/backward warmups, separate from training-loop warmup steps.
-                        "num_warmup_iters": 3,
-                        # This disables TE FP8/FP4 quantization, not CUDA graph capture.
-                        "enabled": (False,),
-                    }
-                    if entry.retain_graph_in_backward:
-                        graph_kwargs["retain_graph_in_backward"] = True
+        staged_entries: list[tuple[_PartialGraphEntry, tuple[nn.Module, ...]]] = []
+        uninstalled_adapters: list[nn.Module] = []
+        try:
+            for entry in self.entries:
+                graphed_adapters = []
+                try:
+                    entry.prepare_for_capture()
+                    for captured_call in entry.captured_calls():
+                        adapter = entry.build_adapter(captured_call)
+                        graph_kwargs = {
+                            # TE runs callable-local forward/backward warmups, separate from training-loop warmup steps.
+                            "num_warmup_iters": 3,
+                            # This disables TE FP8/FP4 quantization, not CUDA graph capture.
+                            "enabled": (False,),
+                        }
+                        if entry.retain_graph_in_backward:
+                            graph_kwargs["retain_graph_in_backward"] = True
+                        try:
+                            result = _get_make_graphed_callables()(
+                                modules=(adapter,),
+                                sample_args=(entry.capture_inputs(adapter, captured_call),),
+                                **graph_kwargs,
+                            )
+                        except Exception as error:
+                            raise RuntimeError(f"Partial CUDA graph capture failed for {entry.name}") from error
+                        if not isinstance(result, tuple):
+                            result = (result,)
+                        uninstalled_adapters.extend(result)
+                        if len(result) != 1 or not isinstance(result[0], nn.Module):
+                            raise RuntimeError(
+                                "Transformer Engine must return one nn.Module graph for partial target "
+                                f"{entry.name!r}; got {result!r}"
+                            )
+                        graphed_adapters.append(result[0])
+                finally:
+                    entry.finish_capture()
+                staged_entries.append((entry, tuple(graphed_adapters)))
+        except Exception:
+            # Installation starts only after every target succeeds, so resetting
+            # the staged adapters restores a fully eager model on any failure.
+            for graphed_adapter in uninstalled_adapters:
+                reset = getattr(graphed_adapter, "reset", None)
+                if callable(reset):
                     try:
-                        result = _get_make_graphed_callables()(
-                            modules=(adapter,),
-                            sample_args=(entry.capture_inputs(adapter, captured_call),),
-                            **graph_kwargs,
-                        )
-                    except Exception as error:
-                        raise RuntimeError(f"Partial CUDA graph capture failed for {entry.name}") from error
-                    if not isinstance(result, tuple):
-                        result = (result,)
-                    if len(result) != 1:
-                        raise RuntimeError(
-                            f"Transformer Engine returned {len(result)} graphs for partial target {entry.name!r}"
-                        )
-                    graphed_adapters.append(result[0])
-            finally:
-                entry.finish_capture()
+                        reset()
+                    except Exception:
+                        logger.exception("Failed to reset an uninstalled partial CUDA graph after capture failure")
+            raise
+
+        for entry, graphed_adapters in staged_entries:
             entry.install(graphed_adapters)
 
         self._captured = True
