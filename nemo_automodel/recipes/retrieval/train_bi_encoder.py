@@ -71,6 +71,9 @@ def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
         "distributed_setup": distributed_setup,
         "peft_config": peft_config,
     }
+    freeze_config = cfg.get("freeze_config", None)
+    if freeze_config is not None:
+        kwargs["freeze_config"] = freeze_config.to_dict()
     if cfg.get("compile", None) is not None:
         kwargs["compile_config"] = build_compile_config(cfg.compile)
     return kwargs

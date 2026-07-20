@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 import torch
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.recipes.retrieval import train_bi_encoder
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
@@ -107,6 +108,20 @@ def test_retrieval_model_instantiate_kwargs_include_compile_config():
     assert kwargs["compile_config"].enabled is True
     assert kwargs["compile_config"].mode == "reduce-overhead"
     assert kwargs["compile_config"].dynamic is False
+
+
+def test_retrieval_model_instantiate_kwargs_include_freeze_config():
+    distributed_setup = object()
+    peft_config = object()
+    freeze_config = {
+        "freeze_vision_tower": True,
+        "freeze_language_model": True,
+    }
+    cfg = _DictLikeConfig(freeze_config=ConfigNode(freeze_config))
+
+    kwargs = _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config)
+
+    assert kwargs["freeze_config"] == freeze_config
 
 
 class _FakeCheckpointer:

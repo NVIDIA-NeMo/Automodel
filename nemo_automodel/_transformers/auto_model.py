@@ -1060,6 +1060,7 @@ class _NeMoAutoModelForRetrievalBase:
         device_mesh: Optional["DeviceMesh"] = None,
         compile_config: Optional["CompileConfig"] = None,
         peft_config: Optional[dict] = None,
+        freeze_config: dict[str, bool] | None = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Load an encoder model with infrastructure (FSDP, PEFT, kernel patching, etc.).
@@ -1083,6 +1084,8 @@ class _NeMoAutoModelForRetrievalBase:
                 in a topology-only ``DistributedSetup`` internally.
             compile_config: Configuration for torch.compile.
             peft_config: PEFT/LoRA configuration dictionary.
+            freeze_config: Parameter-freezing policy applied after pretrained
+                weights are loaded and before distributed sharding.
             **kwargs: Additional arguments passed to the encoder's ``build()`` method.
 
         Returns:
@@ -1115,6 +1118,7 @@ class _NeMoAutoModelForRetrievalBase:
                 device_mesh=device_mesh,
                 compile_config=compile_config,
                 peft_config=peft_config,
+                freeze_config=freeze_config,
                 **kwargs,
             )
 
@@ -1189,6 +1193,7 @@ class _NeMoAutoModelForRetrievalBase:
             compile_config=compile_config,
             load_base_model=False,  # encoder_cls.build already loads weights
             cache_dir=build_kwargs.get("cache_dir", hf_constants.HF_HUB_CACHE),
+            freeze_config=freeze_config,
         )
 
         return model
