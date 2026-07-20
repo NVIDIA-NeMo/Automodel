@@ -536,7 +536,11 @@ def _shard_batch_contiguous_impl(
     batch["labels"] = labels
     cp_rank = _cp_rank(cp_mesh)
 
-    padded_seq_len = seq_len + pad_len
+    # The primary-inclusive shard just padded the primary, so its actual length is
+    # authoritative and keeps the divisibility guard meaningful; the aux-only shard
+    # leaves the primary full-length, so use the intended padded length the model
+    # will pad its own primary to.
+    padded_seq_len = batch[primary_key].shape[1] if shard_primary else seq_len + pad_len
     if padded_seq_len % cp_size != 0:
         raise ValueError(
             f"CP sequence length must be divisible by cp_size after padding, got {padded_seq_len=} {cp_size=}"
