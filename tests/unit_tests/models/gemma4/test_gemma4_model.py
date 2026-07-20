@@ -684,7 +684,10 @@ class TestGemma4ForConditionalGeneration:
             torch.arange(seq, device=device),
         )
 
-    def test_prepare_model_inputs_for_cp_merges_image_features(self, gemma4_config, backend_config, device):
+    def test_cp_sunk_prepare_inputs_merges_image_features(self, gemma4_config, backend_config, device):
+        # Sunk CP: the forward (not the hook) embeds + splices vision per microbatch.
+        # cp_mesh is None here, so the contiguous slice is the identity and the full
+        # spliced sequence is returned -- the splice math is unchanged.
         gemma4_config.image_token_id = 42
         model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend_config)
         model = model.to(device).to(torch.bfloat16)
@@ -700,7 +703,12 @@ class TestGemma4ForConditionalGeneration:
             "get_image_features",
             return_value=MagicMock(pooler_output=image_features),
         ):
-            prepared = model.prepare_model_inputs_for_cp({"input_ids": input_ids, "pixel_values": pixel_values})
+            prepared = model._cp_sunk_prepare_inputs(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_position_ids=None,
+                mm_token_type_ids=None,
+            )
 
         torch.testing.assert_close(prepared["inputs_embeds"][:, 0, :], base_embeds[:, 0, :])
         torch.testing.assert_close(prepared["inputs_embeds"][:, 1, :], image_features)

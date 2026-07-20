@@ -35,6 +35,7 @@ import torch
 
 from nemo_automodel.components.distributed.cp_sharder import (
     convert_attention_mask_to_padding_mask,
+    shard_batch_aux_only_contiguous,
     shard_batch_contiguous,
 )
 
@@ -108,4 +109,49 @@ def make_contiguous_shard_cp_batch_and_ctx(
         padding_token_id=padding_token_id,
         extra_seq_keys={**_GEMMA4_SEQ_KEYS, **(extra_seq_keys or {})},
         extra_pad_values={**_GEMMA4_PAD_VALUES, **(extra_pad_values or {})},
+    )
+
+
+def make_contiguous_aux_only_shard_cp_batch_and_ctx(
+    cp_mesh,
+    tp_mesh,
+    batch,
+    *,
+    loss_mask=None,
+    padding_token_id: int = 0,
+    extra_seq_keys: dict[str, int] | None = None,
+    extra_pad_values: dict[str, Any] | None = None,
+):
+    """Aux-only contiguous CP shard for Gemma4's sunk (in-forward) pre-embed.
+
+    The sunk peer of :func:`make_contiguous_shard_cp_batch_and_ctx`: exposed as
+    ``ContextParallelismSharder.shard_batch`` by Gemma4's sharder-only
+    ``prepare_model_inputs_for_cp``. It shards only the no-grad auxiliary streams
+    (``labels`` / ``position_ids`` / ``loss_mask`` / ``padding_mask`` plus the
+    synthesized ``_packed_seq_ids`` document map) and leaves ``input_ids`` /
+    ``pixel_values`` / ``mm_token_type_ids`` FULL-length in the batch. The model
+    forward then embeds, splices vision, builds ``per_layer_inputs`` and the
+    ``_gemma4_vision_group_ids`` / ``mm_token_type_ids`` ring metadata on the full
+    sequence and contiguously slices them per microbatch (see
+    ``slice_sequence_for_cp_contiguous``), so the embeddings and vision tower are
+    trainable under CP and the PP×CP shared pre-embed graph no longer exists.
+
+    ``_packed_seq_ids`` is synthesized full (from the full ``padding_mask``) and
+    sharded here rather than in the forward: its pad-region zeros depend on the
+    global pad tail, which the forward — holding only this rank's slice — cannot
+    reconstruct. Every other flex-ring mask input the forward owns is a pure
+    per-token or cumsum-over-full-then-slice quantity, so it slices to the same
+    contiguous layout this sharder applies.
+    """
+    convert_attention_mask_to_padding_mask(batch)
+    primary = batch["inputs_embeds"] if "inputs_embeds" in batch else batch["input_ids"]
+    _synthesize_single_document_seq_ids(batch, primary.shape[1])
+    return shard_batch_aux_only_contiguous(
+        cp_mesh,
+        tp_mesh,
+        batch,
+        loss_mask=loss_mask,
+        padding_token_id=padding_token_id,
+        extra_seq_keys={"_packed_seq_ids": 1, **(extra_seq_keys or {})},
+        extra_pad_values={"_packed_seq_ids": 0, **(extra_pad_values or {})},
     )
