@@ -30,6 +30,7 @@ checkpoint:
     model_save_format: safetensors # Format for saving (torch_save or safetensors)
     save_consolidated: final # Recommended: export consolidated HF weights only for the final checkpoint.
                              # Other modes: false (sharded only) or every/true (export every checkpoint).
+    consolidation_timeout_minutes: 30 # Timeout for inline consolidated-export synchronization.
     ...
 ```
 > **Note:** `save_consolidated` accepts:
@@ -38,6 +39,8 @@ checkpoint:
 > - `every` (or legacy `true`): export consolidated HF weights during every checkpoint save. Use this only when every checkpoint must be immediately loadable by HF tools.
 >
 > AutoModel writes a `model/consolidate.sh` helper next to safetensors model shards. Use this helper to create a Hugging Face-compatible `model/consolidated/` directory after training for `save_consolidated: false` checkpoints, or for earlier checkpoints when using `save_consolidated: final`. Creating consolidated Hugging Face weights requires `model_save_format: safetensors`.
+
+Inline consolidated export synchronizes ranks through a dedicated Gloo process group. `consolidation_timeout_minutes` controls that synchronization independently of `dist_env.timeout_minutes`, which continues to control training collectives. The default is 30 minutes.
 
 <Note>
 The optimizer states are _always_ saved in DCP (`.distcp` extension) format.
