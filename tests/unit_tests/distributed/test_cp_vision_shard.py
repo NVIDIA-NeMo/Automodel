@@ -136,6 +136,55 @@ def test_partition_none_when_fewer_entries_than_ranks():
 
 
 @pytest.mark.parametrize(
+    ("n_frames", "world", "expected_cuts"),
+    [
+        (4, 2, [0, 2, 4]),  # 4 equal-cost frames / world 2 -> even [2, 2] (not [1, 3])
+        (6, 3, [0, 2, 4, 6]),  # 6 equal-cost frames / world 3 -> even [2, 2, 2]
+        (8, 4, [0, 2, 4, 6, 8]),  # 8 equal-cost frames / world 4 -> even [2, 2, 2, 2]
+    ],
+)
+def test_partition_equal_cost_frames_split_evenly(n_frames, world, expected_cuts):
+    """Equal-cost frames must split evenly.  Every cut lands exactly on a cumulative-cost
+    boundary, the case where ``bisect_left`` undershot by one (e.g. [1, 3] for 4 frames /
+    world 2); ``bisect_right`` places the cut past the exact boundary for an even split."""
+    patches = torch.full((n_frames,), 3, dtype=torch.long)  # identical per-frame cost
+    cuts = vs._contiguous_balanced_bounds(patches, world)
+    assert cuts == expected_cuts
+    loads = [cuts[r + 1] - cuts[r] for r in range(world)]
+    assert max(loads) - min(loads) == 0  # perfectly even
+
+
+def test_partition_uneven_cost_exact_boundary_splits_evenly():
+    """Packed mixed-frame case: UNEVEN per-frame costs whose ideal split lands exactly on a
+    cumulative-cost boundary.  ``bisect_left`` would undershoot (skewed load), ``bisect_right``
+    places the whole boundary frame on the lower rank for a balanced split.
+
+    patches=[3, 4, 5] -> costs (alpha=0, p*p)=[9, 16, 25], total=50, r=1 target=25 == cum[1].
+    Even split is loads [9+16, 25] = [25, 25]; the off-by-one bug gave [9, 41].
+    """
+    patches = torch.tensor([3, 4, 5], dtype=torch.long)
+    cuts = vs._contiguous_balanced_bounds(patches, 2)
+    assert cuts == [0, 2, 3]
+    costs = patches * patches
+    loads = [int(costs[cuts[r] : cuts[r + 1]].sum()) for r in range(2)]
+    assert loads == [25, 25]  # perfectly balanced, not [9, 41]
+
+
+def test_partition_cut_lands_exactly_on_cumulative_sum():
+    """Boundary case: a target that coincides with a cumulative sum must put the whole frame
+    that closes that sum on the LOWER rank (``bisect_right``), not split before it."""
+    # costs = [1, 1, 2] (alpha=0 -> p*p on patches [1, 1, sqrt2]-ish); use explicit patches so
+    # cum = [1, 2, 4], total = 4, world 2 -> target = 2 lands exactly on cum[1].
+    patches = torch.tensor([1, 1, 2], dtype=torch.long)  # costs [1, 1, 4], cum [1, 2, 6]
+    # target for r=1 = total(6)*1/2 = 3; cum = [1, 2, 6]; bisect_right(cum, 3) = 2 -> cut at 2.
+    cuts = vs._contiguous_balanced_bounds(patches, 2)
+    assert cuts == [0, 2, 3]
+    # exact-boundary variant: patches [1, 1, 1, 1] -> cum [1, 2, 3, 4], target 2 == cum[1].
+    even = vs._contiguous_balanced_bounds(torch.tensor([1, 1, 1, 1], dtype=torch.long), 2)
+    assert even == [0, 2, 4]  # cut placed PAST the exact boundary -> [2, 2]
+
+
+@pytest.mark.parametrize(
     ("source", "expected_hidden", "expected_alpha"),
     [
         # Qwen3-VL / Qwen3.5 visual modules expose visual.config.hidden_size.

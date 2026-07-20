@@ -484,7 +484,11 @@ def _contiguous_balanced_bounds(
     cuts = [0]
     for r in range(1, world):
         target = total * r / world
-        j = bisect.bisect_left(cum, target)  # first index whose cumulative sum reaches target
+        # ``bisect_right`` returns the first index whose cumulative sum EXCEEDS ``target``.
+        # ``bisect_left`` would stop one short on an exact cumulative-cost boundary (e.g. 4
+        # equal-cost frames at world=2 would split [1, 3] instead of [2, 2]), so use
+        # ``bisect_right`` to place the cut past the frame that lands exactly on the target.
+        j = bisect.bisect_right(cum, target)
         lo = cuts[-1] + 1  # leave >=1 entry for the rank we just closed
         hi = n - (world - r)  # leave >=1 entry for each of ranks r..world-1
         j = max(lo, min(j, hi))
