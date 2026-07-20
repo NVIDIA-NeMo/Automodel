@@ -77,6 +77,16 @@ class _PagedStashBuffer:
         dtype: torch.dtype,
         overflow: torch.Tensor,
     ) -> None:
+        """Allocate one fixed-shape circular page buffer.
+
+        Args:
+            num_tokens: Minimum number of token rows the buffer must hold.
+            hidden_size: Number of storage elements in each token row.
+            page_size: Number of token rows allocated per page.
+            device: CUDA device that owns the page buffer.
+            dtype: Bit-preserving storage dtype for each token element.
+            overflow: Device scalar with shape ``[1]`` shared by every buffer.
+        """
         if num_tokens <= 0:
             raise ValueError(f"Paged stash buffer capacity must be positive, got {num_tokens}")
         self.hidden_size = hidden_size
@@ -123,6 +133,18 @@ class _PagedTensor:
         hidden_size: int,
         page_size: int,
     ) -> None:
+        """Describe one fixed-shape activation whose live rows will be paged.
+
+        Args:
+            tensor: Contiguous saved activation with shape ``[max_num_tokens, ...]``.
+            num_tokens_tensor: Device scalar with shape ``[1]`` containing the number of live rows.
+            live_token_mask: Boolean device tensor with shape ``[max_num_tokens]``.
+            live_token_offsets: Inclusive-prefix offsets with shape ``[max_num_tokens]``; values at live rows
+                identify their packed row indices.
+            max_num_tokens: Static first dimension of ``tensor``.
+            hidden_size: Flattened number of storage elements per token row.
+            page_size: Number of token rows allocated per page.
+        """
         if not tensor.is_contiguous():
             raise RuntimeError("Paged stash only supports contiguous TE grouped saved tensors")
         self._tensor: torch.Tensor | None = tensor
@@ -141,7 +163,12 @@ class _PagedTensor:
         self._new_tail = torch.empty(1, dtype=torch.int64, device=tensor.device)
 
     def offload(self, buffer: _PagedStashBuffer) -> None:
-        """Pack live rows and release the original activation reference."""
+        """Pack live rows and release the original activation reference.
+
+        Args:
+            buffer: Circular page storage with shape ``[num_pages * page_size, hidden_size]``. The copy mutates its
+                free-list head, page storage, and shared overflow scalar on the current CUDA stream.
+        """
         if self._tensor is None:
             raise RuntimeError("Paged tensor was stashed more than once")
         storage_dtype = _storage_dtype(self.dtype)
@@ -174,7 +201,12 @@ class _PagedTensor:
         self._original_tensor = None
 
     def reload(self, buffer: _PagedStashBuffer) -> None:
-        """Allocate the original fixed shape and restore its live rows."""
+        """Allocate the original fixed shape and restore its live rows.
+
+        Args:
+            buffer: Circular page storage used by :meth:`offload`. The pop mutates its free-list tail and restores
+                a tensor with ``original_shape``; rows excluded by ``live_token_mask`` remain zero.
+        """
         if self._tensor is not None:
             raise RuntimeError("Paged tensor was restored more than once")
         # Padded rows participate in the fixed-capacity GroupedLinear backward.
@@ -217,12 +249,17 @@ class _PagedTensor:
 
 @dataclass
 class _GroupState:
+    """Python capture-time state for one fixed-capacity expert call.
+
+    ``live_token_mask`` has shape ``[max_num_tokens]``. Activation surfaces alias
+    tensors whose first dimension is ``max_num_tokens`` and remain valid only for
+    the lifetime of this forward/backward group.
+    """
+
     group_id: int
     name: str
     max_num_tokens: int
-    num_tokens_tensor: torch.Tensor
     live_token_mask: torch.Tensor
-    live_token_offsets: torch.Tensor
     activation_surfaces: list[_ActivationSurface]
     observed_saved_metadata: list[tuple[Any, ...]]
 
@@ -241,7 +278,15 @@ class _ActivationSurface:
     live_token_mask: torch.Tensor
 
     def match(self, tensor: torch.Tensor) -> tuple[int, torch.Tensor] | None:
-        """Return row count and mask for a contained row-aligned alias."""
+        """Match a saved tensor against a registered row-aligned storage alias.
+
+        Args:
+            tensor: Candidate contiguous saved tensor with shape ``[rows, ...]``.
+
+        Returns:
+            The candidate row count and its boolean live-row mask with shape ``[rows]``, or ``None`` when the
+            tensor is not a contained row-aligned alias of this surface.
+        """
         if tensor.device != self.device or tensor.dtype != self.dtype:
             return None
         if (
@@ -275,6 +320,17 @@ class _PagedStashBoundary(torch.autograd.Function):
         manager: PagedStashManager,
         group_id: int,
     ) -> torch.Tensor:
+        """Stash saved activations after returning the unchanged expert output.
+
+        Args:
+            ctx: Autograd context for the expert invocation.
+            output: Expert output with shape ``[tokens, hidden]``.
+            manager: Manager that owns the group's fixed page buffers.
+            group_id: Process-local expert invocation identifier.
+
+        Returns:
+            ``output`` unchanged and with the same shape and strides.
+        """
         ctx.manager = manager
         ctx.group_id = group_id
         manager._stash_group(group_id)
@@ -282,6 +338,15 @@ class _PagedStashBoundary(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        """Restore saved activations before propagating the expert-output gradient.
+
+        Args:
+            ctx: Autograd context populated by :meth:`forward`.
+            grad_output: Output gradient with shape ``[tokens, hidden]``.
+
+        Returns:
+            The unchanged output gradient followed by ``None`` for non-tensor inputs.
+        """
         ctx.manager._reload_group(ctx.group_id)
         return grad_output, None, None
 
@@ -296,6 +361,17 @@ class _PagedStashPreBoundary(torch.autograd.Function):
         manager: PagedStashManager,
         group_id: int,
     ) -> torch.Tensor:
+        """Attach a post-expert-backward cleanup boundary to an input activation.
+
+        Args:
+            ctx: Autograd context for the expert invocation.
+            input_: Fixed-capacity expert input with shape ``[tokens, hidden]``.
+            manager: Manager that owns the group's restored tensors.
+            group_id: Process-local expert invocation identifier.
+
+        Returns:
+            ``input_`` unchanged and with the same shape and strides.
+        """
         ctx.manager = manager
         ctx.group_id = group_id
         ctx.active = manager.is_active
@@ -303,6 +379,15 @@ class _PagedStashPreBoundary(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_input: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        """Release restored tensors after propagating the expert-input gradient.
+
+        Args:
+            ctx: Autograd context populated by :meth:`forward`.
+            grad_input: Input gradient with shape ``[tokens, hidden]``.
+
+        Returns:
+            The unchanged input gradient followed by ``None`` for non-tensor inputs.
+        """
         if ctx.active:
             ctx.manager._finish_group_backward(ctx.group_id)
         return grad_input, None, None
@@ -319,7 +404,14 @@ class _PagedStashGroup:
         self._started = False
 
     def start(self, input_: torch.Tensor) -> torch.Tensor:
-        """Attach the boundary that releases reload storage after expert backward."""
+        """Attach the boundary that releases reload storage after expert backward.
+
+        Args:
+            input_: Fixed-capacity expert input with shape ``[max_num_tokens, hidden]``.
+
+        Returns:
+            An autograd alias of ``input_`` with the same shape and strides.
+        """
         if self.state is None:
             return input_
         if self._started:
@@ -335,7 +427,14 @@ class _PagedStashGroup:
         )
 
     def mark_activation(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Mark one exact GroupedLinear activation input as pageable."""
+        """Mark one exact GroupedLinear activation input as pageable.
+
+        Args:
+            tensor: Contiguous activation with shape ``[max_num_tokens, ...]`` and fixed first dimension.
+
+        Returns:
+            ``tensor`` unchanged and with the same shape and strides.
+        """
         if self.state is None:
             return tensor
         if not tensor.is_contiguous() or tensor.dim() < 2 or tensor.shape[0] != self.state.max_num_tokens:
@@ -378,7 +477,14 @@ class _PagedStashGroup:
         return False
 
     def commit(self, output: torch.Tensor) -> torch.Tensor:
-        """Close the forward group and attach its pre-backward restore boundary."""
+        """Close the forward group and attach its pre-backward restore boundary.
+
+        Args:
+            output: Expert output with shape ``[max_num_tokens, hidden]``.
+
+        Returns:
+            An autograd alias of ``output`` with the same shape and strides.
+        """
         if not self._exited:
             raise RuntimeError("Paged stash group must exit its context before commit()")
         if self.state is None:
@@ -430,13 +536,22 @@ class PagedStashManager:
 
         Repeated identical enable calls are harmless because every TE expert
         layer observes the same process-local manager.
+
+        Args:
+            enabled: Whether to record and then page explicitly registered activations.
+            page_size: Positive number of token rows per page.
+            buffer_size_factor: Finite allocation headroom relative to recorded peak usage. Values below ``1.0``
+                cannot hold the warmup workload and are rejected.
         """
         if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
             raise ValueError(f"page_size must be positive, got {page_size}")
-        if isinstance(buffer_size_factor, bool) or not isinstance(buffer_size_factor, (int, float)):
-            raise ValueError(f"buffer_size_factor must be a positive number, got {buffer_size_factor}")
-        if buffer_size_factor <= 0:
-            raise ValueError(f"buffer_size_factor must be positive, got {buffer_size_factor}")
+        if (
+            isinstance(buffer_size_factor, bool)
+            or not isinstance(buffer_size_factor, (int, float))
+            or not math.isfinite(float(buffer_size_factor))
+            or buffer_size_factor < 1.0
+        ):
+            raise ValueError(f"buffer_size_factor must be finite and at least 1.0, got {buffer_size_factor}")
         if self._current_group is not None or self._group_tensors:
             raise RuntimeError("Cannot reconfigure paged stash while groups are live")
         if not enabled:
@@ -466,7 +581,17 @@ class PagedStashManager:
         max_num_tokens: int,
         live_token_mask: torch.Tensor,
     ) -> _PagedStashGroup:
-        """Create one saved-tensor scope around a grouped expert invocation."""
+        """Create one saved-tensor scope around a grouped expert invocation.
+
+        Args:
+            name: Stable diagnostic name for the expert invocation.
+            max_num_tokens: Fixed first dimension of every marked activation.
+            live_token_mask: Boolean CUDA tensor with shape ``[max_num_tokens]``. True rows are paged; false
+                padding rows are restored as zeros.
+
+        Returns:
+            A non-nestable context that records or pages marked TE saved tensors.
+        """
         if not self.is_enabled or self._disable_depth or not torch.is_grad_enabled():
             return _PagedStashGroup(self, None)
         if self._current_group is not None:
@@ -481,14 +606,11 @@ class PagedStashManager:
             raise ValueError(
                 f"live_token_mask has {live_token_mask.numel()} rows, expected max_num_tokens={max_num_tokens}"
             )
-        live_token_offsets = live_token_mask.to(torch.int64).cumsum(dim=0).sub(1)
         state = _GroupState(
             group_id=self._next_group_id,
             name=name,
             max_num_tokens=max_num_tokens,
-            num_tokens_tensor=live_token_mask.sum().reshape(1),
             live_token_mask=live_token_mask,
-            live_token_offsets=live_token_offsets,
             activation_surfaces=[],
             observed_saved_metadata=[],
         )
@@ -499,6 +621,15 @@ class PagedStashManager:
         return _PagedStashGroup(self, state)
 
     def _pack_saved_tensor(self, tensor: torch.Tensor) -> Any:
+        """Replace a registered saved activation with recording metadata or a paged handle.
+
+        Args:
+            tensor: Tensor saved by autograd, generally with shape ``[rows, row_width]``.
+
+        Returns:
+            The unchanged tensor when it is not registered, recording metadata during warmup, or a paged handle
+            whose live rows are copied to fixed storage during active execution.
+        """
         group = self._current_group
         if group is None:
             raise RuntimeError("Paged stash pack hook ran outside a group")
@@ -566,6 +697,14 @@ class PagedStashManager:
         return paged_tensor
 
     def _unpack_saved_tensor(self, saved: Any) -> torch.Tensor:
+        """Resolve a saved-tensor hook payload for backward.
+
+        Args:
+            saved: Original tensor, warmup recording metadata, or active paged-tensor handle.
+
+        Returns:
+            The saved activation with its original fixed shape and padded rows restored as zeros when paged.
+        """
         if isinstance(saved, _RecordedTensor):
             if not saved.released:
                 current = self._recorded_current_tokens[saved.key] - saved.charged_tokens
@@ -579,6 +718,15 @@ class PagedStashManager:
         return saved
 
     def _commit_group(self, group_id: int, output: torch.Tensor) -> torch.Tensor:
+        """Validate one completed expert group and attach its stash boundary.
+
+        Args:
+            group_id: Process-local expert invocation identifier.
+            output: Expert output with shape ``[max_num_tokens, hidden]``.
+
+        Returns:
+            ``output`` unchanged during recording, or an autograd alias that stashes before backward when active.
+        """
         if self._current_group is None or self._current_group.group_id != group_id:
             raise RuntimeError(f"Paged stash group {group_id} committed out of order")
         group_state = self._current_group
@@ -705,7 +853,11 @@ class PagedStashManager:
             )
 
     def check_overflow(self) -> torch.Tensor | None:
-        """Return the device-resident overflow flag without synchronizing the host."""
+        """Return the device-resident overflow flag without synchronizing the host.
+
+        Returns:
+            An integer CUDA tensor with shape ``[1]``, or ``None`` before fixed buffers have been prepared.
+        """
         return self._overflow
 
     def reset_after_overflow(self) -> None:

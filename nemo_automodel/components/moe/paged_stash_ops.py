@@ -14,19 +14,23 @@
 
 """Triton kernels for graph-safe, device-counted MoE activation stashing."""
 
-from unittest.mock import MagicMock
+from typing import Any
 
 from nemo_automodel.shared.import_utils import null_decorator, safe_import
 
-_missing_triton = MagicMock()
-_missing_triton.jit = null_decorator
-HAVE_TRITON, triton = safe_import("triton", alt=_missing_triton)
-_, tl = safe_import("triton.language", alt=MagicMock())
+_has_triton, triton = safe_import("triton")
+_has_tl, tl = safe_import("triton.language")
+HAVE_TRITON = _has_triton and _has_tl
+
+# Keep this optional module importable on CPU-only installations. Active paged
+# stash checks HAVE_TRITON before it can launch either undecorated function.
+_triton_jit = triton.jit if HAVE_TRITON else null_decorator
+_triton_constexpr = tl.constexpr if HAVE_TRITON else Any
 
 GLOBAL_BLOCK_SIZE = 1024
 
 
-@triton.jit
+@_triton_jit
 def paged_stash_copy_kernel(
     src_ptr,
     dst_ptr,
@@ -40,12 +44,32 @@ def paged_stash_copy_kernel(
     page_record_ptr,
     overflow_ptr,
     new_free_list_head_ptr,
-    PAGE_SIZE: tl.constexpr,
-    HIDDEN_SIZE: tl.constexpr,
-    MAX_NUM_TOKENS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    PAGE_SIZE: _triton_constexpr,
+    HIDDEN_SIZE: _triton_constexpr,
+    MAX_NUM_TOKENS: _triton_constexpr,
+    BLOCK_SIZE: _triton_constexpr,
 ):
-    """Copy a runtime number of rows into pages without a device-to-host sync."""
+    """Copy a runtime number of live rows into pages without a host sync.
+
+    Args:
+        src_ptr: Contiguous source with shape ``[MAX_NUM_TOKENS, HIDDEN_SIZE]``.
+        dst_ptr: Page storage with shape ``[capacity * PAGE_SIZE, HIDDEN_SIZE]``; live rows are written in packed
+            order.
+        num_tokens_ptr: Integer device scalar with shape ``[1]``.
+        live_token_mask_ptr: Boolean live-row mask with shape ``[MAX_NUM_TOKENS]``.
+        live_token_offsets_ptr: Packed row offsets with shape ``[MAX_NUM_TOKENS]``; only live-row values are read.
+        free_list_ptr: Circular array of physical page ids with shape ``[capacity]``.
+        free_list_head_ptr: Integer device scalar with shape ``[1]``; advanced by the allocated page count.
+        free_list_tail_ptr: Integer device scalar with shape ``[1]`` containing the current release position.
+        free_list_capacity_ptr: Integer device scalar with shape ``[1]``.
+        page_record_ptr: Output page ids with shape ``[ceil(MAX_NUM_TOKENS / PAGE_SIZE)]``.
+        overflow_ptr: Shared integer device scalar with shape ``[1]``; set on invalid counts or insufficient pages.
+        new_free_list_head_ptr: Integer output scalar with shape ``[1]`` copied into the persistent head by caller.
+        PAGE_SIZE: Compile-time number of rows per page.
+        HIDDEN_SIZE: Compile-time flattened elements per row.
+        MAX_NUM_TOKENS: Compile-time physical source-row count.
+        BLOCK_SIZE: Compile-time number of elements copied per inner block.
+    """
     program_id = tl.program_id(axis=0)
     num_programs = tl.num_programs(axis=0)
 
@@ -90,7 +114,7 @@ def paged_stash_copy_kernel(
         tl.store(new_free_list_head_ptr, head + required_pages)
 
 
-@triton.jit
+@_triton_jit
 def paged_stash_pop_kernel(
     src_ptr,
     dst_ptr,
@@ -103,12 +127,31 @@ def paged_stash_pop_kernel(
     free_list_tail_ptr,
     free_list_capacity_ptr,
     new_free_list_tail_ptr,
-    PAGE_SIZE: tl.constexpr,
-    HIDDEN_SIZE: tl.constexpr,
-    MAX_NUM_TOKENS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    PAGE_SIZE: _triton_constexpr,
+    HIDDEN_SIZE: _triton_constexpr,
+    MAX_NUM_TOKENS: _triton_constexpr,
+    BLOCK_SIZE: _triton_constexpr,
 ):
-    """Restore runtime-counted rows and recycle their pages on the GPU."""
+    """Restore runtime-counted rows and recycle their pages on the GPU.
+
+    Args:
+        src_ptr: Page storage with shape ``[capacity * PAGE_SIZE, HIDDEN_SIZE]``.
+        dst_ptr: Zero-initialized destination with shape ``[MAX_NUM_TOKENS, HIDDEN_SIZE]``; live rows are restored
+            to their original physical positions.
+        num_tokens_ptr: Integer device scalar with shape ``[1]``.
+        live_token_mask_ptr: Boolean live-row mask with shape ``[MAX_NUM_TOKENS]``.
+        live_token_offsets_ptr: Packed row offsets with shape ``[MAX_NUM_TOKENS]``; only live-row values are read.
+        page_record_ptr: Physical page ids with shape ``[ceil(MAX_NUM_TOKENS / PAGE_SIZE)]``.
+        overflow_ptr: Shared integer device scalar with shape ``[1]``; set on invalid counts.
+        free_list_ptr: Circular array of physical page ids with shape ``[capacity]``; released ids are appended.
+        free_list_tail_ptr: Integer device scalar with shape ``[1]`` containing the current release position.
+        free_list_capacity_ptr: Integer device scalar with shape ``[1]``.
+        new_free_list_tail_ptr: Integer output scalar with shape ``[1]`` copied into the persistent tail by caller.
+        PAGE_SIZE: Compile-time number of rows per page.
+        HIDDEN_SIZE: Compile-time flattened elements per row.
+        MAX_NUM_TOKENS: Compile-time physical destination-row count.
+        BLOCK_SIZE: Compile-time number of elements copied per inner block.
+    """
     program_id = tl.program_id(axis=0)
     num_programs = tl.num_programs(axis=0)
 

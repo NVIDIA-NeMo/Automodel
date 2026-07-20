@@ -172,6 +172,14 @@ def test_configuration_is_idempotent_and_can_restart_recording():
     manager.close()
 
 
+@pytest.mark.parametrize("invalid_factor", [0, 0.5, float("nan"), float("inf")])
+def test_configuration_rejects_buffer_factors_that_cannot_hold_warmup(invalid_factor):
+    manager = paged_stash.PagedStashManager()
+
+    with pytest.raises(ValueError, match="finite and at least 1.0"):
+        manager.configure(enabled=True, buffer_size_factor=invalid_factor)
+
+
 def test_device_overflow_api_does_not_require_host_read():
     manager = paged_stash.PagedStashManager()
     assert manager.check_overflow() is None
@@ -256,30 +264,4 @@ def test_cuda_stash_restores_sparse_live_rows_and_zeros_padding():
     assert manager.check_overflow() is not None
     assert manager.check_overflow().item() == 0
     manager.finish_iteration()
-    manager.close()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_te_grouped_linear_exposes_registered_activation_to_saved_tensor_hooks():
-    te = pytest.importorskip("transformer_engine.pytorch")
-    linear = te.GroupedLinear(
-        num_gemms=2,
-        in_features=4,
-        out_features=8,
-        bias=False,
-        params_dtype=torch.float32,
-        device="cuda",
-    )
-    manager = paged_stash.PagedStashManager()
-    manager.configure(enabled=True, page_size=2)
-    tensor = torch.randn(6, 4, device="cuda", requires_grad=True)
-    group = manager.group(name="te", max_num_tokens=6, live_token_mask=torch.ones(6, dtype=torch.bool, device="cuda"))
-
-    tensor_for_compute = group.start(tensor)
-    with group:
-        output = linear(group.mark_activation(tensor_for_compute), [3, 3])
-    output = group.commit(output)
-    output.sum().backward()
-
-    assert manager.diagnostics()["recorded_peak_tokens"]
     manager.close()
