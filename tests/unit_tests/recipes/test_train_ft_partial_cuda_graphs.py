@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
 
 import nemo_automodel.components.moe.paged_stash as paged_stash
 import nemo_automodel.recipes.llm.partial_cuda_graphs as partial_graphs
+from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 
@@ -91,6 +94,7 @@ def test_paged_stash_is_prepared_before_partial_capture(monkeypatch):
     events = []
     stash = SimpleNamespace(
         prepare=lambda: events.append("prepare"),
+        check_overflow=lambda: torch.zeros(1, dtype=torch.int64),
         finish_iteration=lambda: events.append("finish"),
         diagnostics=lambda: {},
     )
@@ -103,6 +107,40 @@ def test_paged_stash_is_prepared_before_partial_capture(monkeypatch):
     recipe._capture_partial_cuda_graphs_after_eager_step()
 
     assert events == ["prepare", "capture", "finish"]
+
+
+def test_capture_overflow_is_reduced_before_all_ranks_close_graphs(monkeypatch):
+    events = []
+    stash = SimpleNamespace(
+        prepare=lambda: events.append("prepare"),
+        check_overflow=lambda: torch.zeros(1, dtype=torch.int64),
+        finish_iteration=lambda: events.append("finish"),
+        diagnostics=lambda: {},
+        close=lambda: events.append("stash-close"),
+    )
+
+    def all_reduce(overflow_ranks, *, op):
+        assert op is torch.distributed.ReduceOp.SUM
+        events.append("all-reduce")
+        overflow_ranks.fill_(2)
+
+    monkeypatch.setattr(paged_stash, "get_paged_stash_manager", lambda: stash)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    recipe = _bare_recipe()
+    recipe.partial_cuda_graph_manager = SimpleNamespace(
+        capture=lambda: events.append("capture"),
+        close=lambda: events.append("graph-close"),
+    )
+    recipe._partial_cuda_graph_capture_pending = True
+    recipe._partial_cuda_graph_paged_stash_enabled = True
+
+    with pytest.raises(RuntimeError, match="capture on 2 ranks"):
+        recipe._capture_partial_cuda_graphs_after_eager_step()
+
+    assert events == ["prepare", "capture", "all-reduce", "graph-close", "stash-close"]
+    assert recipe.partial_cuda_graph_manager is None
+    assert recipe._partial_cuda_graph_paged_stash_enabled is False
 
 
 def test_paged_stash_overflow_closes_graph_discards_gradients_and_reruns(monkeypatch):
@@ -120,6 +158,7 @@ def test_paged_stash_overflow_closes_graph_discards_gradients_and_reruns(monkeyp
     recipe._partial_cuda_graph_paged_stash_enabled = True
     recipe._partial_cuda_graph_paged_stash_reruns = 0
     recipe.optimizer = [SimpleNamespace(zero_grad=lambda: events.append("zero-grad"))]
+    recipe.rng = SimpleNamespace(load_state_dict=lambda state: events.append(("restore-rng", state)))
     recipe._run_forward_backward_batches = lambda batches, num_label_tokens: (
         events.append(("rerun", batches, num_label_tokens)) or [torch.tensor(2.0)]
     )
@@ -128,12 +167,74 @@ def test_paged_stash_overflow_closes_graph_discards_gradients_and_reruns(monkeyp
         ["same-batch"],
         num_label_tokens=7,
         loss_buffer=[torch.tensor(1.0)],
+        rng_state="pre-attempt-state",
     )
 
-    assert events == ["graph-close", "stash-close", "zero-grad", ("rerun", ["same-batch"], 7)]
+    assert events == [
+        "graph-close",
+        "stash-close",
+        "zero-grad",
+        ("restore-rng", "pre-attempt-state"),
+        ("rerun", ["same-batch"], 7),
+    ]
     assert result[0].item() == 2.0
     assert recipe._partial_cuda_graph_paged_stash_reruns == 1
     assert recipe.partial_cuda_graph_manager is None
+
+
+def test_active_paged_stash_snapshots_recipe_rng(monkeypatch):
+    state = object()
+    monkeypatch.setattr(
+        paged_stash,
+        "get_paged_stash_manager",
+        lambda: SimpleNamespace(is_active=True),
+    )
+    recipe = _bare_recipe()
+    recipe._partial_cuda_graph_paged_stash_enabled = True
+    recipe.rng = SimpleNamespace(state_dict=lambda: state)
+
+    assert recipe._snapshot_paged_stash_rng_state() is state
+
+
+def test_overflow_retry_reproduces_python_numpy_and_torch_rng(monkeypatch):
+    events = []
+    stash = SimpleNamespace(
+        is_active=True,
+        check_overflow=lambda: torch.ones(1, dtype=torch.int64),
+        close=lambda: None,
+    )
+    monkeypatch.setattr(paged_stash, "get_paged_stash_manager", lambda: stash)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    recipe = _bare_recipe()
+    recipe.partial_cuda_graph_manager = SimpleNamespace(close=lambda: None)
+    recipe._partial_cuda_graph_capture_pending = False
+    recipe._partial_cuda_graph_paged_stash_enabled = True
+    recipe._partial_cuda_graph_paged_stash_reruns = 0
+    recipe.optimizer = [SimpleNamespace(zero_grad=lambda: None)]
+    recipe.rng = StatefulRNG(seed=1234)
+
+    rng_state = recipe._snapshot_paged_stash_rng_state()
+    expected_draws = (random.random(), np.random.rand(), torch.rand(3))
+    random.random()
+    np.random.rand()
+    torch.rand(3)
+
+    def rerun(_batches, *, num_label_tokens):
+        assert num_label_tokens == 7
+        events.append((random.random(), np.random.rand(), torch.rand(3)))
+        return [torch.tensor(2.0)]
+
+    recipe._run_forward_backward_batches = rerun
+    recipe._rerun_after_paged_stash_overflow(
+        ["same-batch"],
+        num_label_tokens=7,
+        loss_buffer=[torch.tensor(1.0)],
+        rng_state=rng_state,
+    )
+
+    assert events[0][0] == expected_draws[0]
+    assert events[0][1] == expected_draws[1]
+    torch.testing.assert_close(events[0][2], expected_draws[2])
 
 
 def test_training_loop_captures_after_first_complete_step_and_closes():

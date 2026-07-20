@@ -550,15 +550,16 @@ class TestBackendConfigPartialCudaGraphs:
                 cuda_graph_moe_paged_stash=True,
                 cuda_graph_moe_paged_stash_page_size=0,
             )
-        with pytest.raises(ValueError, match="buffer_size_factor must be positive"):
-            BackendConfig(
-                experts="te",
-                dispatcher="torch",
-                cuda_graph_modules=["moe"],
-                cuda_graph_moe_capacity_factor=1.25,
-                cuda_graph_moe_paged_stash=True,
-                cuda_graph_moe_paged_stash_buffer_size_factor=0,
-            )
+        for invalid_factor in (0, 0.5, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="buffer_size_factor must be finite and at least 1.0"):
+                BackendConfig(
+                    experts="te",
+                    dispatcher="torch",
+                    cuda_graph_modules=["moe"],
+                    cuda_graph_moe_capacity_factor=1.25,
+                    cuda_graph_moe_paged_stash=True,
+                    cuda_graph_moe_paged_stash_buffer_size_factor=invalid_factor,
+                )
 
         config = BackendConfig(
             experts="te",

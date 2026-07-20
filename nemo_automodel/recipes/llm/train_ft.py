@@ -72,7 +72,7 @@ from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
+from nemo_automodel.components.training.rng import RNGState, ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import (
     count_tail_padding,
     get_expert_tp_replication_factor,
@@ -827,6 +827,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logger.info("Partial MoE paged stash prepared: %s", stash_manager.diagnostics())
         self.partial_cuda_graph_manager.capture()
         if getattr(self, "_partial_cuda_graph_paged_stash_enabled", False):
+            overflow_ranks = self._paged_stash_overflow_rank_count(stash_manager)
+            if overflow_ranks:
+                self._close_partial_cuda_graphs()
+                raise RuntimeError(
+                    "MoE paged stash capacity overflowed during CUDA graph capture on "
+                    f"{overflow_ranks} ranks; partial CUDA graphs were disabled"
+                )
             stash_manager.finish_iteration()
         self._partial_cuda_graph_capture_pending = False
 
@@ -1208,7 +1215,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         return tensor
 
     def _run_forward_backward_batches(self, batches, *, num_label_tokens: int | None) -> list[torch.Tensor]:
-        """Run one complete gradient-accumulation forward/backward schedule."""
+        """Run one complete gradient-accumulation forward/backward schedule.
+
+        Args:
+            batches: Sequence of microbatches consumed in order by the training schedule.
+            num_label_tokens: Global number of non-ignored labels, or ``None`` when the caller normalizes later.
+
+        Returns:
+            Detached scalar loss tensors, one for each schedule output that reports a loss.
+        """
         loss_buffer: list[torch.Tensor] = []
         num_batches = len(batches)
         prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
@@ -1226,14 +1241,59 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 prepare_after_first_microbatch()
         return loss_buffer
 
+    def _snapshot_paged_stash_rng_state(self) -> RNGState | None:
+        """Snapshot all recipe-owned RNG streams before an attempt that may be retried.
+
+        Returns:
+            Python, NumPy, PyTorch, and CUDA RNG state when paged stash is active, or ``None`` when no retry can
+            occur.
+        """
+        if not getattr(self, "_partial_cuda_graph_paged_stash_enabled", False):
+            return None
+
+        from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+        if not get_paged_stash_manager().is_active:
+            return None
+        return self.rng.state_dict()
+
+    def _paged_stash_overflow_rank_count(self, stash_manager) -> int:
+        """Collectively count ranks whose device-resident paged-stash flag is set.
+
+        Args:
+            stash_manager: Active process-local paged-stash manager.
+
+        Returns:
+            Number of overflowing ranks. The only device-to-host synchronization occurs after every rank has
+            entered the collective.
+        """
+        overflow = stash_manager.check_overflow()
+        if overflow is None:
+            raise RuntimeError("Active partial MoE paged stash has no overflow flag")
+        overflow_ranks = overflow.reshape(-1)[0].ne(0).to(dtype=torch.int32)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(overflow_ranks, op=torch.distributed.ReduceOp.SUM)
+        return int(overflow_ranks.item())
+
     def _rerun_after_paged_stash_overflow(
         self,
         batches,
         *,
         num_label_tokens: int | None,
         loss_buffer: list[torch.Tensor],
+        rng_state: RNGState | None,
     ) -> list[torch.Tensor]:
-        """Globally discard an overflowing graph attempt and rerun the whole step eagerly."""
+        """Globally discard an overflowing graph attempt and rerun the whole step eagerly.
+
+        Args:
+            batches: The exact microbatches consumed by the failed attempt.
+            num_label_tokens: Global number of non-ignored labels, or ``None`` when normalized later.
+            loss_buffer: Detached losses from the failed attempt.
+            rng_state: RNG snapshot taken immediately before the failed attempt.
+
+        Returns:
+            ``loss_buffer`` when no rank overflowed, otherwise losses from a full eager retry of the same batches.
+        """
         if not getattr(self, "_partial_cuda_graph_paged_stash_enabled", False):
             return loss_buffer
 
@@ -1242,20 +1302,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         stash_manager = get_paged_stash_manager()
         if not stash_manager.is_active:
             return loss_buffer
-        overflow = stash_manager.check_overflow()
-        if overflow is None:
-            raise RuntimeError("Active partial MoE paged stash has no overflow flag")
-        overflow_ranks = overflow.reshape(-1)[0].ne(0).to(dtype=torch.int32)
-        if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(overflow_ranks, op=torch.distributed.ReduceOp.SUM)
-        if int(overflow_ranks.item()) == 0:
+        overflow_ranks = self._paged_stash_overflow_rank_count(stash_manager)
+        if overflow_ranks == 0:
             stash_manager.finish_iteration()
             return loss_buffer
+        if rng_state is None:
+            raise RuntimeError("Paged-stash overflow retry is missing the pre-attempt RNG state")
 
         logger.warning(
             "Discarding partial CUDA graph gradients and rerunning the whole step eagerly after paged-stash "
             "overflow on %d ranks",
-            int(overflow_ranks.item()),
+            overflow_ranks,
         )
         self._partial_cuda_graph_paged_stash_reruns += 1
 
@@ -1264,6 +1321,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._close_partial_cuda_graphs()
         for optimizer in self.optimizer:
             optimizer.zero_grad()
+        self.rng.load_state_dict(rng_state)
         return self._run_forward_backward_batches(batches, num_label_tokens=num_label_tokens)
 
     def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
@@ -1306,11 +1364,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         )
         num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
 
+        paged_stash_rng_state = self._snapshot_paged_stash_rng_state()
         loss_buffer = self._run_forward_backward_batches(batches, num_label_tokens=num_label_tokens)
         loss_buffer = self._rerun_after_paged_stash_overflow(
             batches,
             num_label_tokens=num_label_tokens,
             loss_buffer=loss_buffer,
+            rng_state=paged_stash_rng_state,
         )
 
         grad_norm = scale_grads_and_clip_grad_norm(

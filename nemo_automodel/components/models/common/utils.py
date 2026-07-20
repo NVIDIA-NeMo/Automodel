@@ -311,8 +311,13 @@ class BackendConfig:
             ):
                 raise ValueError("cuda_graph_moe_paged_stash_page_size must be a positive integer")
             factor = self.cuda_graph_moe_paged_stash_buffer_size_factor
-            if isinstance(factor, bool) or not isinstance(factor, (int, float)) or factor <= 0:
-                raise ValueError("cuda_graph_moe_paged_stash_buffer_size_factor must be positive")
+            if (
+                isinstance(factor, bool)
+                or not isinstance(factor, (int, float))
+                or not math.isfinite(float(factor))
+                or factor < 1.0
+            ):
+                raise ValueError("cuda_graph_moe_paged_stash_buffer_size_factor must be finite and at least 1.0")
 
         # enable_deepep was removed. It is no longer honored; warn (once, on rank 0) if a stale
         # config still sets it so the user migrates to explicit dispatcher/experts. The field is
