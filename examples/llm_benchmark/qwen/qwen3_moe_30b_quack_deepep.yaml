@@ -103,6 +103,7 @@ optimizer:
   weight_decay: 0
 
 ci:
+  recipe_owner: akoumpa
   # CuTe kernels compile on first use before the configured warmup iterations.
   time: "01:00:00"
   nodes: 1
