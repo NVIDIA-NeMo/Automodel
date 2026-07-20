@@ -113,6 +113,13 @@ class _PagedStashBuffer:
 
 @dataclass
 class _RecordedTensor:
+    """Warmup saved tensor and its page-rounded live allocation.
+
+    ``tensor`` is a contiguous activation with shape ``[rows, row_width]``.
+    ``key`` is ``(dtype, row_width)`` and ``charged_tokens`` is rounded to the
+    configured page size until autograd unpacks the tensor.
+    """
+
     tensor: torch.Tensor
     key: tuple[torch.dtype, int]
     charged_tokens: int
@@ -266,7 +273,12 @@ class _GroupState:
 
 @dataclass(frozen=True)
 class _ActivationSurface:
-    """One explicitly registered contiguous activation storage range."""
+    """One explicitly registered contiguous activation storage range.
+
+    The range represents ``num_rows`` contiguous rows of width ``row_width``.
+    ``live_token_mask`` is a boolean tensor with shape ``[num_rows]`` on the
+    same device and selects rows that must be preserved for backward.
+    """
 
     device: torch.device
     dtype: torch.dtype
