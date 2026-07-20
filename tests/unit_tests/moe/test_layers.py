@@ -1309,6 +1309,7 @@ class TestMoE:
         backend = BackendConfig(
             experts="te",
             dispatcher="torch",
+            cuda_graph_modules=["moe"],
             cuda_graph_moe_capacity_factor=1.0,
         )
         fixed_te_experts = torch.nn.Identity()
@@ -1317,6 +1318,24 @@ class TestMoE:
             return_value=fixed_te_experts,
         ) as grouped_experts_te:
             with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
+                moe = MoE(moe_config, backend)
+
+        assert moe.experts is fixed_te_experts
+        grouped_experts_te.assert_called_once()
+
+    def test_ep1_hybridep_moe_graph_keeps_local_te_experts(self, moe_config):
+        backend = BackendConfig(
+            experts="te",
+            dispatcher="hybridep",
+            cuda_graph_modules=["moe"],
+            cuda_graph_moe_capacity_factor=1.0,
+        )
+        fixed_te_experts = torch.nn.Identity()
+        with patch(
+            "nemo_automodel.components.moe.layers.GroupedExpertsTE",
+            return_value=fixed_te_experts,
+        ) as grouped_experts_te:
+            with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=1):
                 moe = MoE(moe_config, backend)
 
         assert moe.experts is fixed_te_experts

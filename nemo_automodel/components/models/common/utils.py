@@ -14,6 +14,7 @@
 
 import importlib.util
 import logging
+import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -200,7 +201,9 @@ class BackendConfig:
             are mutually exclusive. ``moe`` captures dispatch, local TE experts, and
             combine after eager routing, and requires ``cuda_graph_moe_capacity_factor``.
         cuda_graph_moe_capacity_factor: Drop-and-pad capacity relative to the average
-            number of routed tokens per expert. Required by the ``moe`` graph scope.
+            number of routed tokens per expert. Required by, and only valid with,
+            the ``moe`` graph scope. Capacity limiting may drop routed expert
+            assignments when an expert is overloaded.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -257,9 +260,28 @@ class BackendConfig:
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
 
-        if self.cuda_graph_moe_capacity_factor is not None and self.cuda_graph_moe_capacity_factor <= 0:
-            raise ValueError("cuda_graph_moe_capacity_factor must be positive")
-        if "moe" in self.cuda_graph_modules:
+        if not isinstance(self.cuda_graph_modules, list):
+            raise TypeError("cuda_graph_modules must be a list")
+        if not all(isinstance(module, str) for module in self.cuda_graph_modules):
+            raise TypeError("cuda_graph_modules entries must be strings")
+        supported_cuda_graph_modules = {"attn", "te_dpa", "moe", "moe_router", "moe_preprocess"}
+        unknown_cuda_graph_modules = set(self.cuda_graph_modules) - supported_cuda_graph_modules
+        if unknown_cuda_graph_modules:
+            raise ValueError(
+                "Unsupported cuda_graph_modules: "
+                f"{sorted(unknown_cuda_graph_modules)}; supported modules are "
+                f"{sorted(supported_cuda_graph_modules)}"
+            )
+        if len(self.cuda_graph_modules) != len(set(self.cuda_graph_modules)):
+            raise ValueError("cuda_graph_modules must not contain duplicates")
+
+        moe_cuda_graph_enabled = "moe" in self.cuda_graph_modules
+        if self.cuda_graph_moe_capacity_factor is not None:
+            if not math.isfinite(self.cuda_graph_moe_capacity_factor) or self.cuda_graph_moe_capacity_factor <= 0:
+                raise ValueError("cuda_graph_moe_capacity_factor must be positive and finite")
+            if not moe_cuda_graph_enabled:
+                raise ValueError("cuda_graph_moe_capacity_factor requires 'moe' in cuda_graph_modules")
+        if moe_cuda_graph_enabled:
             if self.cuda_graph_moe_capacity_factor is None:
                 raise ValueError("cuda_graph_modules='moe' requires cuda_graph_moe_capacity_factor")
             if self.experts != "te":
@@ -285,9 +307,7 @@ class BackendConfig:
             self.enable_deepep = None
 
         # Backward compatibility
-        local_fixed_te_moe = (
-            self.experts == "te" and self.dispatcher == "torch" and self.cuda_graph_moe_capacity_factor is not None
-        )
+        local_fixed_te_moe = self.experts == "te" and self.dispatcher == "torch" and moe_cuda_graph_enabled
         if (
             self.experts in ("te", "gmm")
             and self.dispatcher not in ("deepep", "hybridep", "uccl_ep")
@@ -304,20 +324,6 @@ class BackendConfig:
             self.dispatcher = "torch"
             self.experts = "torch_mm"
 
-        if not isinstance(self.cuda_graph_modules, list):
-            raise TypeError("cuda_graph_modules must be a list")
-        if not all(isinstance(module, str) for module in self.cuda_graph_modules):
-            raise TypeError("cuda_graph_modules entries must be strings")
-        supported_cuda_graph_modules = {"attn", "te_dpa", "moe", "moe_router", "moe_preprocess"}
-        unknown_cuda_graph_modules = set(self.cuda_graph_modules) - supported_cuda_graph_modules
-        if unknown_cuda_graph_modules:
-            raise ValueError(
-                "Unsupported cuda_graph_modules: "
-                f"{sorted(unknown_cuda_graph_modules)}; supported modules are "
-                f"{sorted(supported_cuda_graph_modules)}"
-            )
-        if len(self.cuda_graph_modules) != len(set(self.cuda_graph_modules)):
-            raise ValueError("cuda_graph_modules must not contain duplicates")
         attention_graph_modules = {"attn", "te_dpa"}.intersection(self.cuda_graph_modules)
         if len(attention_graph_modules) > 1:
             raise ValueError("cuda_graph_modules cannot contain both 'attn' and 'te_dpa'")

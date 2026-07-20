@@ -805,6 +805,11 @@ def _build_moe_execution_entry(
     """Build one fixed-capacity post-router MoE graph entry."""
     from torch.distributed.fsdp import FSDPModule
 
+    if isinstance(target, FSDPModule):
+        raise RuntimeError(
+            "Full MoE CUDA graphs do not support nested FSDP expert sharding (ep_shard > 1); "
+            "the expert parameters must be owned by the transformer block"
+        )
     capture_owner = block.capture_owner if isinstance(block.capture_owner, FSDPModule) else None
     return _PartialGraphEntry(
         name=f"{block.name}.moe",

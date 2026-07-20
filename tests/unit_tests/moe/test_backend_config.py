@@ -150,6 +150,14 @@ class TestBackendConfigExpertsDispatcherValidation:
         with pytest.raises(ValueError, match="requires cuda_graph_moe_capacity_factor"):
             BackendConfig(experts="te", dispatcher="torch", cuda_graph_modules=["moe"])
 
+    def test_capacity_factor_requires_full_moe_graph(self):
+        with pytest.raises(ValueError, match="requires 'moe' in cuda_graph_modules"):
+            BackendConfig(
+                experts="te",
+                dispatcher="torch",
+                cuda_graph_moe_capacity_factor=1.0,
+            )
+
     def test_full_moe_graph_requires_te_experts(self):
         with pytest.raises(ValueError, match="requires experts='te'"):
             BackendConfig(
@@ -175,6 +183,16 @@ class TestBackendConfigExpertsDispatcherValidation:
                 dispatcher="torch",
                 cuda_graph_modules=["moe"],
                 cuda_graph_moe_capacity_factor=0.0,
+            )
+
+    @pytest.mark.parametrize("capacity_factor", [float("nan"), float("inf"), -float("inf")])
+    def test_full_moe_graph_capacity_must_be_finite(self, capacity_factor):
+        with pytest.raises(ValueError, match="positive and finite"):
+            BackendConfig(
+                experts="te",
+                dispatcher="torch",
+                cuda_graph_modules=["moe"],
+                cuda_graph_moe_capacity_factor=capacity_factor,
             )
 
 

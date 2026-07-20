@@ -135,6 +135,13 @@ class TestHybridEPFixedCapacity:
             torch.tensor([[1.0, 1.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
         )
 
+    def test_metadata_capacity_change_fails_closed(self):
+        processor = _HybridEPMetadataProcessor(num_experts=3, permute_fusion=False)
+        processor.set_expert_capacity(2)
+
+        with pytest.raises(RuntimeError, match="fail-closed"):
+            processor.set_expert_capacity(3)
+
     def test_manager_keeps_static_receive_shape_through_dispatch_and_combine(self):
         group = Mock()
         group.size.return_value = 2
@@ -172,3 +179,19 @@ class TestHybridEPFixedCapacity:
         assert combine_calls[0]["num_permuted_tokens"] == 8
         assert manager.num_permuted_tokens == 8
         torch.testing.assert_close(manager.tokens_per_expert, torch.tensor([4, 4]))
+
+    def test_manager_capacity_change_fails_closed(self):
+        group = Mock()
+        group.size.return_value = 2
+
+        with patch("nemo_automodel.components.moe.megatron.token_dispatcher.hybrid_ep_dispatch", lambda *a, **kw: None):
+            manager = _HybridEPManager(
+                group=group,
+                num_local_experts=2,
+                num_experts=4,
+                router_topk=2,
+            )
+            manager.set_expert_capacity(2)
+
+        with pytest.raises(RuntimeError, match="fail-closed"):
+            manager.set_expert_capacity(3)

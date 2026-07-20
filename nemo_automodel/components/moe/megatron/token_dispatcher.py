@@ -336,12 +336,25 @@ class _HybridEPMetadataProcessor(nn.Module):
         if self.expert_capacity is not None and self.expert_capacity != expert_capacity:
             raise RuntimeError(
                 "HybridEP expert capacity changed after initialization: "
-                f"expected {self.expert_capacity}, got {expert_capacity}"
+                f"expected {self.expert_capacity}, got {expert_capacity}. "
+                "Fixed-capacity MoE CUDA graphs are fail-closed on dynamic token-count changes."
             )
         self.expert_capacity = expert_capacity
 
     def forward(self, token_indices: torch.Tensor, token_probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convert compact top-k indices and probabilities to multihot tensors."""
+        """Convert compact top-k metadata to dense HybridEP routing tensors.
+
+        Args:
+            token_indices: Tensor of shape [tokens, top_k] containing global expert ids, with
+                negative values indicating masked or dropped assignments.
+            token_probs: Tensor of shape [tokens, top_k] containing routing probabilities.
+
+        Returns:
+            Tuple containing:
+                - routing_map: Boolean tensor of shape [tokens, num_experts].
+                - multihot_probs: Tensor of shape [tokens, num_experts] retaining gradients
+                  to selected routing probabilities.
+        """
         if self.permute_fusion:
             routing_map, multihot_probs = fused_indices_to_multihot(token_indices, token_probs, self.num_experts)
         else:
@@ -437,7 +450,8 @@ class _HybridEPManager(_DispatchManager):
         if self.expert_capacity is not None and self.expert_capacity != expert_capacity:
             raise RuntimeError(
                 "HybridEP expert capacity changed after initialization: "
-                f"expected {self.expert_capacity}, got {expert_capacity}"
+                f"expected {self.expert_capacity}, got {expert_capacity}. "
+                "Fixed-capacity MoE CUDA graphs are fail-closed on dynamic token-count changes."
             )
         self.expert_capacity = expert_capacity
         ep_size = self.group.size()

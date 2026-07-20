@@ -224,6 +224,24 @@ def test_full_moe_scope_uses_the_fsdp_block_as_capture_owner(monkeypatch):
     assert entry.capture_owner is owner
 
 
+def test_full_moe_scope_rejects_nested_fsdp_expert_owner(monkeypatch):
+    class _FakeFSDPModule(nn.Module):
+        pass
+
+    monkeypatch.setattr(torch.distributed.fsdp, "FSDPModule", _FakeFSDPModule)
+    target = _FakeFSDPModule()
+    block = partial_graphs._DiscoveredBlock(
+        name="model.layers.0",
+        module=nn.Module(),
+        capture_owner=_FakeFSDPModule(),
+        moe=nn.Module(),
+        is_mtp=False,
+    )
+
+    with pytest.raises(RuntimeError, match="nested FSDP expert sharding"):
+        partial_graphs._build_moe_execution_entry(block, target, False)
+
+
 def test_explicit_parameter_adapter_matches_eager_forward_and_backward():
     torch.manual_seed(123)
     eager_target = _Attention()
