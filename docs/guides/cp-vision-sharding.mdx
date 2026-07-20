@@ -112,7 +112,7 @@ publish a wider CP × TP group for a frozen tower by declaring `spans_only_cp=Fa
 cp_vision_sharding:
   enabled: true
   min_tokens: 2048
-  # cost_alpha: null  # null infers 3 * vision_hidden_size
+  cost_alpha: auto  # infers 3 * vision_hidden_size
 ```
 
 The policy is disabled by default, so existing CP recipes retain replicated vision behavior.
@@ -149,7 +149,7 @@ Configuration fields:
 |---|---|---|
 | `cp_vision_sharding.enabled` | `false` | Enables CP vision sharding. `false` preserves the replicated ViT path. |
 | `cp_vision_sharding.min_tokens` | `2048` | Visual-token threshold below which the replicated path is used. |
-| `cp_vision_sharding.cost_alpha` | `null` | Linear term `alpha` in the `p*(p+alpha)` partition cost. `null` discovers `3 * vision_hidden_size` from the model; a non-negative integer is an exact override (`0` restores the legacy pure-quadratic `p**2` partition). Partition-only knob — forward/gradients are identical for any cuts. |
+| `cp_vision_sharding.cost_alpha` | `auto` | Linear term `alpha` in the `p*(p+alpha)` partition cost. `auto` discovers `3 * vision_hidden_size` from the model; `null` remains a backward-compatible alias. A non-negative integer is an exact override (`0` restores the legacy pure-quadratic `p**2` partition). Partition-only knob — forward/gradients are identical for any cuts. |
 
 ## Validation
 

@@ -90,7 +90,7 @@ def _pixels(grid, in_dim=8, seed=0):
     return torch.randn(total_patches, in_dim, generator=g)
 
 
-def _policy(*, enabled=True, min_tokens=0, cost_alpha=None):
+def _policy(*, enabled=True, min_tokens=0, cost_alpha="auto"):
     return vs.CpVisionShardingConfig(enabled=enabled, min_tokens=min_tokens, cost_alpha=cost_alpha)
 
 
@@ -223,13 +223,17 @@ def test_auto_cost_alpha_discovers_supported_vision_widths(source, expected_hidd
 def test_cost_alpha_override_and_unknown_model_fallback():
     qwen_visual = SimpleNamespace(config=SimpleNamespace(hidden_size=1152))
 
+    assert vs.CpVisionShardingConfig().cost_alpha == "auto"
+    assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha="auto")) == 3456
+    assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha=None)) == 3456
     assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha=777)) == 777
     assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha=0)) == 0
     assert vs._vision_cost_alpha(qwen_visual) == 3456
     assert vs._vision_cost_alpha(SimpleNamespace()) == 0
 
-    with pytest.raises(ValueError, match="cost_alpha"):
-        vs.CpVisionShardingConfig(cost_alpha=-1)
+    for invalid_alpha in (-1, True, "AUTO", "not-auto"):
+        with pytest.raises(ValueError, match="cost_alpha"):
+            vs.CpVisionShardingConfig(cost_alpha=invalid_alpha)
 
 
 def test_partition_cost_alpha_flattens_mixed_frame_sizes():

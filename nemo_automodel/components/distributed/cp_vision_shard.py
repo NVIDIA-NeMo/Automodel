@@ -58,7 +58,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -87,14 +87,15 @@ class CpVisionShardingConfig:
             by default so existing CP recipes retain their replicated vision behavior.
         min_tokens: Minimum number of merged visual tokens required to use the sharded
             path. Smaller workloads stay replicated to avoid collective overhead.
-        cost_alpha: Optional non-negative linear term in the partition cost
-            ``p * (p + cost_alpha)``. ``None`` infers ``3 * vision_hidden_size`` and
-            falls back to ``0`` when the width is unavailable.
+        cost_alpha: Non-negative linear term in the partition cost
+            ``p * (p + cost_alpha)``. ``"auto"`` infers ``3 * vision_hidden_size``
+            and falls back to ``0`` when the width is unavailable. ``None`` remains
+            accepted as a backward-compatible alias for ``"auto"``.
     """
 
     enabled: bool = False
     min_tokens: int = 2048
-    cost_alpha: int | None = None
+    cost_alpha: int | Literal["auto"] | None = "auto"
 
     def __post_init__(self) -> None:
         """Validate the serialized policy fields."""
@@ -102,10 +103,10 @@ class CpVisionShardingConfig:
             raise TypeError("cp_vision_sharding.enabled must be a boolean")
         if isinstance(self.min_tokens, bool) or not isinstance(self.min_tokens, int) or self.min_tokens < 0:
             raise ValueError("cp_vision_sharding.min_tokens must be a non-negative integer")
-        if self.cost_alpha is not None and (
+        if self.cost_alpha not in (None, "auto") and (
             isinstance(self.cost_alpha, bool) or not isinstance(self.cost_alpha, int) or self.cost_alpha < 0
         ):
-            raise ValueError("cp_vision_sharding.cost_alpha must be null or a non-negative integer")
+            raise ValueError('cp_vision_sharding.cost_alpha must be "auto", null, or a non-negative integer')
 
 
 @dataclass(frozen=True)
@@ -393,9 +394,10 @@ def _vision_cost_alpha(
     """Resolve the linear term in the vision partition cost ``p*(p+alpha)``.
 
     A configured non-negative integer is an exact override (``0`` selects the legacy
-    pure-quadratic model). With ``cost_alpha=None``, use ``3 * vision_hidden_size``:
-    the three Q/K/V projections are a portable proxy for linear per-patch ViT work.
-    Unknown architectures safely retain the legacy ``alpha=0`` behavior.
+    pure-quadratic model). With ``cost_alpha="auto"`` or the backward-compatible
+    ``None`` alias, use ``3 * vision_hidden_size``: the three Q/K/V projections are a
+    portable proxy for linear per-patch ViT work. Unknown architectures safely retain
+    the legacy ``alpha=0`` behavior.
 
     Args:
         source: Object to infer the vision width from when in ``auto`` mode.
@@ -405,7 +407,8 @@ def _vision_cost_alpha(
         The resolved non-negative ``alpha``.
     """
     mode = "auto"
-    alpha = config.cost_alpha if config is not None else None
+    configured_alpha = config.cost_alpha if config is not None else "auto"
+    alpha = configured_alpha if isinstance(configured_alpha, int) else None
     if alpha is not None:
         mode = "configured"
 

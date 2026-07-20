@@ -129,7 +129,16 @@ def test_recipe_config_resolves_cp_vision_sharding_policy():
 
 
 def test_recipe_config_disables_cp_vision_sharding_by_default():
-    assert RecipeConfig(ConfigNode({})).cp_vision_sharding == CpVisionShardingConfig()
+    policy = RecipeConfig(ConfigNode({})).cp_vision_sharding
+
+    assert policy == CpVisionShardingConfig()
+    assert policy.cost_alpha == "auto"
+
+
+def test_recipe_config_accepts_explicit_auto_cost_alpha():
+    cfg = RecipeConfig(ConfigNode({"cp_vision_sharding": {"cost_alpha": "auto"}}))
+
+    assert cfg.cp_vision_sharding.cost_alpha == "auto"
 
 
 def test_cp_vision_sharding_context_resets_published_group_after_failure(monkeypatch):
