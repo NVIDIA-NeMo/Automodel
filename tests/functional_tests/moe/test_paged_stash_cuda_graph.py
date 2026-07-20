@@ -14,13 +14,20 @@
 
 """CUDA parity guard for paged TE expert activations under real graph replay."""
 
+import os
+import tempfile
+from types import SimpleNamespace
+
 import pytest
 import torch
+import torch.multiprocessing as mp
 from torch import nn
 
+import nemo_automodel.components.moe.paged_stash as paged_stash
 from nemo_automodel.components.moe.paged_stash import PagedStashManager
 from nemo_automodel.components.moe.paged_stash_ops import HAVE_TRITON
 from nemo_automodel.recipes.llm.partial_cuda_graphs import PartialCudaGraphManager, _PartialGraphEntry
+from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
 
 
 class _GraphableTEExperts(nn.Module):
@@ -83,6 +90,70 @@ def _inputs(live_token_mask: torch.Tensor, *, seed: int) -> tuple[torch.Tensor, 
     )
 
 
+def _asymmetric_overflow_worker(rank: int, world_size: int, init_method: str) -> None:
+    """Verify a single-rank overflow makes every rank discard and retry."""
+    torch.cuda.set_device(rank)
+    torch.distributed.init_process_group(
+        backend="nccl",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+    )
+    events = []
+    stash_manager = SimpleNamespace(
+        is_active=True,
+        check_overflow=lambda: torch.tensor([rank == 0], dtype=torch.int64, device="cuda"),
+        close=lambda: events.append("stash-close"),
+    )
+    paged_stash._PAGED_STASH_MANAGER = stash_manager
+    recipe = TrainFinetuneRecipeForNextTokenPrediction.__new__(TrainFinetuneRecipeForNextTokenPrediction)
+    recipe.partial_cuda_graph_manager = SimpleNamespace(close=lambda: events.append("graph-close"))
+    recipe._partial_cuda_graph_capture_pending = False
+    recipe._partial_cuda_graph_paged_stash_enabled = True
+    recipe._partial_cuda_graph_paged_stash_reruns = 0
+    recipe.optimizer = [SimpleNamespace(zero_grad=lambda: events.append("zero-grad"))]
+    recipe.rng = SimpleNamespace(load_state_dict=lambda state: events.append(("restore-rng", state)))
+    recipe._run_forward_backward_batches = lambda _batches, num_label_tokens: (
+        events.append(("rerun", num_label_tokens)) or [torch.tensor(2.0, device="cuda")]
+    )
+
+    try:
+        result = recipe._rerun_after_paged_stash_overflow(
+            ["same-batch"],
+            num_label_tokens=7,
+            loss_buffer=[torch.tensor(1.0, device="cuda")],
+            rng_state="pre-attempt-state",
+        )
+        assert result[0].item() == 2.0
+        assert recipe._partial_cuda_graph_paged_stash_reruns == 1
+        assert events == [
+            "graph-close",
+            "stash-close",
+            "zero-grad",
+            ("restore-rng", "pre-attempt-state"),
+            ("rerun", 7),
+        ]
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two CUDA devices are required")
+def test_asymmetric_overflow_retries_on_every_rank():
+    """Exercise the real NCCL overflow reduction with only rank zero set."""
+    with tempfile.NamedTemporaryFile(delete=False) as rendezvous:
+        rendezvous_path = rendezvous.name
+    try:
+        mp.spawn(
+            _asymmetric_overflow_worker,
+            args=(2, f"file://{rendezvous_path}"),
+            nprocs=2,
+            join=True,
+        )
+    finally:
+        if os.path.exists(rendezvous_path):
+            os.unlink(rendezvous_path)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA and Triton are required")
 def test_te_grouped_linear_paged_stash_matches_eager_across_graph_replays():
     """Compare BF16 graph output/gradients/update with eager and force page reuse."""
@@ -111,6 +182,9 @@ def test_te_grouped_linear_paged_stash_matches_eager_across_graph_replays():
         warmup_output.sum().backward()
         assert stash_manager.diagnostics()["recorded_peak_tokens"]
         optimizer.zero_grad(set_to_none=True)
+        # The manager owns detached sample clones. Drop the eager autograd graph
+        # so its default-stream AccumulateGrad nodes cannot leak into TE capture.
+        del warmup_output, warmup_inputs
 
         stash_manager.prepare()
         graph_manager.capture()
