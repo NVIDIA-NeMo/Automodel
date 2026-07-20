@@ -382,3 +382,103 @@ def test_shard_batch_contiguous_extra_seq_keys():
     torch.testing.assert_close(out["vision_ids"], torch.arange(4).view(1, 4))
     # model-specific keys (e.g. _packed_seq_ids) are the owning model's business
     assert "_packed_seq_ids" not in out
+
+
+# ---------------------------------------------------------------------------
+# shard_batch_aux_only_contiguous + slice_sequence_for_cp_contiguous
+# (Megatron-style contiguous CP: aux streams sliced by the sharder, the primary
+# embedded and sliced inside the model forward). The contract is bit-exact
+# slice-equivalence with today's shard_batch_contiguous.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("cp_size,rank", [(2, 0), (2, 1), (4, 3)])
+def test_aux_only_contiguous_slice_equivalence_with_shard_batch_contiguous(cp_size, rank):
+    """Aux-only contiguous shard + in-forward slice_sequence_for_cp_contiguous
+    reproduces shard_batch_contiguous exactly: same primary slice, same aux
+    slices, same padding. The primary rides an ``inputs_embeds`` float tensor so
+    the primary slice is compared value-for-value."""
+    seq, hidden = 6, 3  # divisor = cp_size * 2 -> pad 6 -> 8 (cp=2) / 8 (cp=4? -> 8)
+    mesh = _FakeMesh(cp_size, rank)
+
+    def make_batch():
+        return {
+            "inputs_embeds": torch.arange(seq * hidden, dtype=torch.float32).view(1, seq, hidden),
+            "labels": torch.arange(100, 100 + seq).view(1, seq),
+            "position_ids": torch.arange(seq).view(1, seq),
+            "vision_ids": torch.arange(seq).view(1, seq),
+        }
+
+    # Reference: shard everything at the dispatch level.
+    ref = make_batch()
+    _, ref_out, ref_layout = cs.shard_batch_contiguous(
+        mesh, None, ref, extra_seq_keys={"vision_ids": 1}, extra_pad_values={"vision_ids": -1}
+    )
+
+    # Aux-only: primary stays full; the model slices it in forward.
+    aux = make_batch()
+    full_embeds = aux["inputs_embeds"]
+    _, aux_out, aux_layout = cs.shard_batch_aux_only_contiguous(
+        mesh, None, aux, extra_seq_keys={"vision_ids": 1}, extra_pad_values={"vision_ids": -1}
+    )
+    # Primary is left full-length + untouched by the aux-only sharder.
+    assert aux_out["inputs_embeds"] is full_embeds
+    assert aux_out["inputs_embeds"].shape == (1, seq, hidden)
+    local_primary, local_idx, padded_len = cs.slice_sequence_for_cp_contiguous(
+        mesh, aux_out["inputs_embeds"], seq_dim=1
+    )
+
+    # Same padded layout, same primary slice, same aux slices.
+    assert (aux_layout.original_seq_len, aux_layout.padded_seq_len) == (
+        ref_layout.original_seq_len,
+        ref_layout.padded_seq_len,
+    )
+    assert padded_len == ref_layout.padded_seq_len
+    torch.testing.assert_close(local_primary, ref_out["inputs_embeds"])
+    torch.testing.assert_close(aux_out["labels"], ref_out["labels"])
+    torch.testing.assert_close(aux_out["position_ids"], ref_out["position_ids"])
+    torch.testing.assert_close(aux_out["vision_ids"], ref_out["vision_ids"])
+    torch.testing.assert_close(local_idx, cs.contiguous_local_indices(mesh, padded_len))
+
+
+def test_shard_batch_aux_only_contiguous_keeps_input_ids_full(monkeypatch):
+    """With ``input_ids`` as the primary (the real Gemma4 case) the aux-only
+    contiguous shard leaves it full-length while slicing the aux streams, so the
+    model embeds and slices it per microbatch in forward."""
+    seq = 6  # -> pad to 8
+    mesh = _FakeMesh(2, 1)
+    batch = {
+        "input_ids": torch.arange(seq).view(1, seq),
+        "labels": torch.arange(seq).view(1, seq),
+    }
+    orig_input_ids = batch["input_ids"].clone()
+    _, out, layout = cs.shard_batch_aux_only_contiguous(mesh, None, batch)
+    torch.testing.assert_close(out["input_ids"], orig_input_ids)  # full + untouched
+    assert out["labels"].shape == (1, 4)  # rank 1 owns [4:8]
+    assert out["labels"][0, -1].item() == -100  # pad tail is the ignore index
+    assert (layout.original_seq_len, layout.padded_seq_len) == (6, 8)
+
+
+def test_slice_sequence_for_cp_contiguous_is_differentiable():
+    """Gradient reaches exactly this rank's contiguous positions of the primary."""
+    full = torch.randn(1, 8, 3, requires_grad=True)
+    local, idx, _ = cs.slice_sequence_for_cp_contiguous(_FakeMesh(2, 1), full)
+    local.sum().backward()
+    touched = (full.grad.abs().sum(dim=(0, 2)) > 0).nonzero().flatten()
+    assert torch.equal(touched, idx.sort().values)
+    assert torch.equal(idx, torch.arange(4, 8))  # rank 1 owns the second half
+
+
+def test_slice_sequence_for_cp_contiguous_identity_without_cp():
+    full = torch.randn(1, 5, 2)
+    local, idx, padded_len = cs.slice_sequence_for_cp_contiguous(_FakeMesh(1), full)
+    assert local is full and padded_len == 5
+    assert torch.equal(idx, torch.arange(5))
+
+
+def test_slice_sequence_for_cp_contiguous_respects_pad_multiple():
+    """The divisor is cp_size * max(pad_multiple, 2): a 4D per-layer-inputs tensor
+    (seq axis 1) pads and slices on the same layout as the 3D embeds."""
+    full = torch.arange(6 * 2 * 3, dtype=torch.float32).view(1, 6, 2, 3)  # [B, S, L, H]
+    local, idx, padded_len = cs.slice_sequence_for_cp_contiguous(_FakeMesh(2, 0), full, pad_multiple=4)
+    assert padded_len == 8  # cp_size(2) * max(4, 2) = 8
+    assert local.shape == (1, 4, 2, 3)
+    torch.testing.assert_close(idx, torch.arange(4))

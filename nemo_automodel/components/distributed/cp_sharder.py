@@ -432,7 +432,7 @@ def convert_attention_mask_to_padding_mask(batch: dict) -> None:
             batch["padding_mask"] = attention_mask.bool().logical_not()
 
 
-def shard_batch_contiguous(
+def _shard_batch_contiguous_impl(
     cp_mesh,
     tp_mesh,
     batch,
@@ -442,30 +442,20 @@ def shard_batch_contiguous(
     pad_multiple: int = 1,
     extra_seq_keys: dict[str, int] | None = None,
     extra_pad_values: dict[str, Any] | None = None,
+    shard_primary: bool = True,
 ):
-    """Prepare and contiguously shard a batch for model-owned CP.
+    """Shared contiguous-CP shard for :func:`shard_batch_contiguous` and
+    :func:`shard_batch_aux_only_contiguous`.
 
     Normalizes the batch (mask conversion, position_ids, labels), pads the
     sequence to ``cp_size * max(pad_multiple, 2)``, then keeps one contiguous
-    sequence slice per CP rank.
-
-    Args:
-        cp_mesh: The context-parallel device (sub)mesh.
-        tp_mesh: The tensor-parallel device (sub)mesh (or None).
-        batch: The full-sequence batch; mutated and sharded in place.
-        loss_mask: Optional per-token loss mask; used as labels when the batch
-            has none, otherwise sharded alongside the batch.
-        padding_token_id: Pad sentinel for ``input_ids``.
-        pad_multiple: Required per-CP-rank shard length multiple (e.g. DSV4's
-            compress-ratio LCM). The effective divisor is
-            ``cp_size * max(pad_multiple, 2)``.
-        extra_seq_keys: Model-specific per-token batch keys to pad and shard,
-            mapped to their sequence dim (e.g. Gemma4 vision group ids).
-        extra_pad_values: Pad sentinels for ``extra_seq_keys`` (default 0).
-
-    Returns:
-        ``(contextlib.nullcontext, batch, ShardLayout)`` — transport lives in
-        the model's own attention, so no CP context manager is needed.
+    ``seq_start:seq_end`` slice per CP rank. ``shard_primary`` is the only
+    behavioral switch: when True the primary stream (``input_ids`` /
+    ``inputs_embeds``) is padded and sliced with the aux streams (dispatch-level
+    shard); when False it is left FULL-length for a model that embeds and slices
+    it inside its own forward (per-microbatch CP; see
+    :func:`slice_sequence_for_cp_contiguous`). The padded layout is identical
+    either way, so the two paths stay bit-for-bit slice-equivalent.
     """
     # --- normalize: mask -> padding_mask, primary tensor, position_ids, labels
     convert_attention_mask_to_padding_mask(batch)
@@ -505,12 +495,12 @@ def shard_batch_contiguous(
     # sentinel. ``position_ids``/``labels``/``loss_mask`` are sharded too but handled
     # separately below (special pad logic, or carried as locals rather than in the
     # batch dict during padding). This single table drives padding, slicing, and the
-    # known-key set so a new field is declared in one place.
-    seq_pad_values = {
-        "input_ids": padding_token_id,
-        "inputs_embeds": 0,
-        "padding_mask": True,
-    }
+    # known-key set so a new field is declared in one place. The primary stream is
+    # excluded on the aux-only path (``shard_primary=False``): the model embeds and
+    # slices it in forward, so it must stay full-length here.
+    seq_pad_values = {"padding_mask": True}
+    if shard_primary:
+        seq_pad_values = {"input_ids": padding_token_id, "inputs_embeds": 0, "padding_mask": True}
     known_sequence_keys = set(seq_pad_values) | {"labels", "position_ids", "loss_mask"}
 
     # Extra per-token metadata (e.g. Gemma4 vision group ids) is sharded like the
@@ -539,11 +529,14 @@ def shard_batch_contiguous(
             )
 
     # --- contiguous sequence slicing. Every CP rank in the same CP group starts
-    # from the same full batch, then keeps one contiguous sequence shard.
+    # from the same full batch, then keeps one contiguous sequence shard. The
+    # padded length equals the primary's post-pad length whether or not the
+    # primary itself was padded here, so the aux-only slice matches the primary
+    # slice the model computes with :func:`slice_sequence_for_cp_contiguous`.
     batch["labels"] = labels
     cp_rank = _cp_rank(cp_mesh)
 
-    padded_seq_len = batch[primary_key].shape[1]
+    padded_seq_len = seq_len + pad_len
     if padded_seq_len % cp_size != 0:
         raise ValueError(
             f"CP sequence length must be divisible by cp_size after padding, got {padded_seq_len=} {cp_size=}"
@@ -570,6 +563,98 @@ def shard_batch_contiguous(
 
     layout = ShardLayout(original_seq_len=seq_len, padded_seq_len=padded_seq_len)
     return contextlib.nullcontext, batch, layout
+
+
+def shard_batch_contiguous(
+    cp_mesh,
+    tp_mesh,
+    batch,
+    *,
+    loss_mask=None,
+    padding_token_id: int = 0,
+    pad_multiple: int = 1,
+    extra_seq_keys: dict[str, int] | None = None,
+    extra_pad_values: dict[str, Any] | None = None,
+):
+    """Prepare and contiguously shard a batch for model-owned CP.
+
+    Normalizes the batch (mask conversion, position_ids, labels), pads the
+    sequence to ``cp_size * max(pad_multiple, 2)``, then keeps one contiguous
+    sequence slice per CP rank (primary stream included).
+
+    Args:
+        cp_mesh: The context-parallel device (sub)mesh.
+        tp_mesh: The tensor-parallel device (sub)mesh (or None).
+        batch: The full-sequence batch; mutated and sharded in place.
+        loss_mask: Optional per-token loss mask; used as labels when the batch
+            has none, otherwise sharded alongside the batch.
+        padding_token_id: Pad sentinel for ``input_ids``.
+        pad_multiple: Required per-CP-rank shard length multiple (e.g. DSV4's
+            compress-ratio LCM). The effective divisor is
+            ``cp_size * max(pad_multiple, 2)``.
+        extra_seq_keys: Model-specific per-token batch keys to pad and shard,
+            mapped to their sequence dim (e.g. Gemma4 vision group ids).
+        extra_pad_values: Pad sentinels for ``extra_seq_keys`` (default 0).
+
+    Returns:
+        ``(contextlib.nullcontext, batch, ShardLayout)`` — transport lives in
+        the model's own attention, so no CP context manager is needed.
+    """
+    return _shard_batch_contiguous_impl(
+        cp_mesh,
+        tp_mesh,
+        batch,
+        loss_mask=loss_mask,
+        padding_token_id=padding_token_id,
+        pad_multiple=pad_multiple,
+        extra_seq_keys=extra_seq_keys,
+        extra_pad_values=extra_pad_values,
+        shard_primary=True,
+    )
+
+
+def shard_batch_aux_only_contiguous(
+    cp_mesh,
+    tp_mesh,
+    batch,
+    *,
+    loss_mask=None,
+    padding_token_id: int = 0,
+    pad_multiple: int = 1,
+    extra_seq_keys: dict[str, int] | None = None,
+    extra_pad_values: dict[str, Any] | None = None,
+):
+    """Contiguously shard only the no-grad AUXILIARY streams (contiguous peer of
+    :func:`shard_batch_aux_only`).
+
+    The contiguous-CP counterpart for models that embed and contiguously slice
+    their primary stream inside their own forward (Megatron-style per-microbatch
+    CP; see :func:`slice_sequence_for_cp_contiguous`). Pads the sequence to
+    ``cp_size * max(pad_multiple, 2)`` and keeps this rank's contiguous
+    ``seq_start:seq_end`` slice of ``labels`` / ``position_ids`` / ``loss_mask`` /
+    ``padding_mask`` and every ``extra_seq_keys`` stream (e.g. Gemma4's
+    ``mm_token_type_ids`` / ``_gemma4_vision_group_ids`` / ``_packed_seq_ids``),
+    with the same per-stream pad sentinels and slice math as
+    :func:`shard_batch_contiguous`. The primary stream (``input_ids`` /
+    ``inputs_embeds``) and the pixel streams are left FULL-length in the batch for
+    the model to embed, splice and slice; no collective and no CP context (the
+    transport lives in the model's own ring attention).
+
+    Returns:
+        ``(contextlib.nullcontext, batch, ShardLayout)``. ``padded_seq_len`` is the
+        length the model must pad its primary stream to before slicing.
+    """
+    return _shard_batch_contiguous_impl(
+        cp_mesh,
+        tp_mesh,
+        batch,
+        loss_mask=loss_mask,
+        padding_token_id=padding_token_id,
+        pad_multiple=pad_multiple,
+        extra_seq_keys=extra_seq_keys,
+        extra_pad_values=extra_pad_values,
+        shard_primary=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -937,5 +1022,49 @@ def shard_sequence_for_cp(
         tensor = _pad_tensor_seq_dim_(tensor, seq_dim, pad_len, pad_value)
     padded_seq_len = tensor.shape[seq_dim]
     local_indices = round_robin_local_indices(cp_mesh, padded_seq_len, device=tensor.device)
+    local = shard_token_tensor_by_indices(tensor, local_indices, seq_dim=seq_dim)
+    return local, local_indices, padded_seq_len
+
+
+def slice_sequence_for_cp_contiguous(
+    cp_mesh, tensor: torch.Tensor, *, seq_dim: int = 1, pad_value: float | int = 0, pad_multiple: int = 1
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Pad and contiguously shard a full-length sequence tensor inside a model forward.
+
+    The contiguous peer of :func:`shard_sequence_for_cp`: a model that keeps one
+    contiguous ``seq_start:seq_end`` slice per CP rank (model-owned p2p ring, e.g.
+    Gemma4) and leaves its primary stream full-length (see
+    :func:`shard_batch_aux_only_contiguous`) calls this on its embedded, spliced
+    hidden states (and its 4-D ``per_layer_inputs``) to keep this rank's
+    contiguous shard. It pads the sequence axis to ``cp_size * max(pad_multiple, 2)``
+    — Gemma4's ``pad_multiple`` divisor, NOT the round-robin ``2 * cp_size`` — so
+    the slice aligns with the aux streams the contiguous aux-only sharder sliced.
+    Differentiable (``index_select``), so gradients route to the embeddings /
+    vision tower.
+
+    Args:
+        cp_mesh: The context-parallel (sub)mesh; None or size <= 1 is an identity.
+        tensor: Full-length sequence tensor, e.g. ``inputs_embeds`` ``[B, S, H]``
+            or ``per_layer_inputs`` ``[B, S, L, H]`` (seq axis 1).
+        seq_dim: The sequence axis of ``tensor``.
+        pad_value: Fill for the CP-padding slots appended on ``seq_dim``.
+        pad_multiple: Per-CP-rank shard length multiple (the effective divisor is
+            ``cp_size * max(pad_multiple, 2)``), matching
+            :func:`shard_batch_aux_only_contiguous` / :func:`shard_batch_contiguous`.
+
+    Returns:
+        ``(local, local_indices, padded_seq_len)``: this rank's contiguous shard
+        (``[..., padded_sequence / cp_size, ...]`` on ``seq_dim``), its global
+        token positions, and the padded global sequence length.
+    """
+    seq_len = tensor.shape[seq_dim]
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        return tensor, torch.arange(seq_len, device=tensor.device, dtype=torch.long), seq_len
+    cp_divisor = cp_mesh.size() * max(int(pad_multiple or 1), 2)
+    pad_len = (-seq_len) % cp_divisor
+    if pad_len:
+        tensor = _pad_tensor_seq_dim_(tensor, seq_dim, pad_len, pad_value)
+    padded_seq_len = tensor.shape[seq_dim]
+    local_indices = contiguous_local_indices(cp_mesh, padded_seq_len, device=tensor.device)
     local = shard_token_tensor_by_indices(tensor, local_indices, seq_dim=seq_dim)
     return local, local_indices, padded_seq_len
