@@ -99,6 +99,9 @@ validation_dataset:
   image_size: [896, 896]
   max_length: 2048
   seed: 43
+  # Validation is unpacked and uses gemma4_prefix_collate_fn on raw conversations,
+  # so disable pre-tokenization here (training packs via packed_sequence above).
+  pretokenize: false
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader

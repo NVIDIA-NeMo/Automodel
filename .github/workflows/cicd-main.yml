@@ -371,16 +371,42 @@ jobs:
   cicd-unit-tests:
     strategy:
       fail-fast: false
-      max-parallel: 5
+      max-parallel: 6
       matrix:
         include:
           - test-name: L0_Unit_Tests_CPU
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: true
-          - test-name: L0_Unit_Tests_GPU
+          - test-name: L0_Unit_Tests_GPU_1_of_5
             runner: ${{ needs.pre-flight.outputs.runner_prefix }}
             cpu-only: false
             timeout: 30
+            shard-id: 0
+            num-shards: 5
+          - test-name: L0_Unit_Tests_GPU_2_of_5
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            cpu-only: false
+            timeout: 30
+            shard-id: 1
+            num-shards: 5
+          - test-name: L0_Unit_Tests_GPU_3_of_5
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            cpu-only: false
+            timeout: 30
+            shard-id: 2
+            num-shards: 5
+          - test-name: L0_Unit_Tests_GPU_4_of_5
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            cpu-only: false
+            timeout: 30
+            shard-id: 3
+            num-shards: 5
+          - test-name: L0_Unit_Tests_GPU_5_of_5
+            runner: ${{ needs.pre-flight.outputs.runner_prefix }}
+            cpu-only: false
+            timeout: 30
+            shard-id: 4
+            num-shards: 5
     needs: [pre-flight, cicd-wait-in-queue, cicd-container-build]
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.test-name }}
@@ -400,6 +426,8 @@ jobs:
           timeout: ${{ matrix.timeout || 10 }}
           is-unit-test: "true"
           cpu-only: ${{ matrix.cpu-only || false }}
+          shard-id: ${{ matrix.shard-id }}
+          num-shards: ${{ matrix.num-shards }}
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry }}/${{ vars.CI_CONTAINER_NAME || 'automodel' }}:${{ github.sha }}
@@ -503,6 +531,11 @@ jobs:
           - test-name: L2_HF_DCP
             test-folder: hf_dcp
             timeout: 40
+            # DeepEP expert-parallel subtest (GPT-OSS MXFP4, ep_size=2) hard-requires
+            # NVLink P2P, which on GB200 comes from the IMEX ComputeDomain channel.
+            # Route to the imex-lease runner; every other gb200 test stays on the
+            # plain (non-IMEX) pool. See nemo-ci-gcp-gpu-x2-imex in TF-States.
+            runner: nemo-ci-gcp-gpu-x2-imex
           - test-name: L2_HF_PEFT
             test-folder: hf_peft
             timeout: 30
@@ -533,7 +566,7 @@ jobs:
             test-folder: moe
             timeout: 20
     needs: [pre-flight, cicd-unit-tests, cicd-container-build]
-    runs-on: nemo-ci-gcp-gpu-x2
+    runs-on: ${{ matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
     name: gb200_${{ matrix.test-name }}
     if: |
       (
@@ -556,7 +589,7 @@ jobs:
           PAT: ${{ secrets.PAT }}
           test-data-path: ${{ needs.pre-flight.outputs.test_data_path }}
           container-image: ${{ env.container-registry-gb200 }}/automodel:${{ github.sha }}
-          runner: nemo-ci-gcp-gpu-x2
+          runner: ${{ matrix.runner || 'nemo-ci-gcp-gpu-x2' }}
 
   Nemo_CICD_Test:
     needs:
@@ -682,6 +715,8 @@ jobs:
           verbose: true
           flags: ${{ matrix.flag }}
           base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
+          override_pr: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          override_commit: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6

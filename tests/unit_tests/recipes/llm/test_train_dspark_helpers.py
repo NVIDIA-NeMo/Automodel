@@ -48,16 +48,21 @@ from transformers import Qwen3Config
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest, write_shard, write_target_weights
+from nemo_automodel.recipes.llm._dspark_target_build import (
+    build_deepseek_v4_backend,
+    gather_full_weight_module,
+    repair_glm_5_2_qk_rope_head_dim,
+    resolve_reduced_target_layers,
+)
 from nemo_automodel.recipes.llm.train_dspark import (
     TrainDSparkRecipe,
+    _add_accept_rate_per_position,
     _apply_draft_activation_checkpointing,
     _apply_target_chat_template,
     _build_dspark_optimizer,
     _extract_mm_kwargs,
     _init_dspark_wandb,
-    _repair_glm_5_2_qk_rope_head_dim,
     _resolve_dspark_optimizer_spec,
-    _resolve_reduced_target_layers,
     _resolve_wandb_kwargs,
     _resolve_warmup_steps,
     _validate_cached_dspark_manifest,
@@ -67,6 +72,18 @@ JINJA = (
     "{{ bos_token }}{% for m in messages %}{% if m['role'] == 'assistant' %}"
     "{% generation %}{{ m['content'] }}{% endgeneration %}{% endif %}{% endfor %}"
 )
+
+
+def test_accept_rate_per_position_omits_unmeasured_positions():
+    metrics = {}
+
+    _add_accept_rate_per_position(
+        metrics,
+        accept_num=torch.tensor([3.0, 1.0, 0.0]),
+        accept_den=torch.tensor([4.0, 2.0, 0.0]),
+    )
+
+    assert metrics == {"accept_rate@0": 0.75, "accept_rate@1": 0.5}
 
 
 def _tok(chat_template=None):
@@ -151,25 +168,25 @@ def test_chat_template_non_string_is_coerced(tmp_path):
 
 
 def test_reduced_layers_none_passes_through():
-    assert _resolve_reduced_target_layers(43, None) is None
+    assert resolve_reduced_target_layers(43, None) is None
 
 
 def test_reduced_layers_valid():
-    assert _resolve_reduced_target_layers(43, 4) == 4
+    assert resolve_reduced_target_layers(43, 4) == 4
 
 
 def test_reduced_layers_string_coerced():
-    assert _resolve_reduced_target_layers(43, "4") == 4
+    assert resolve_reduced_target_layers(43, "4") == 4
 
 
 def test_reduced_layers_full_depth_allowed():
-    assert _resolve_reduced_target_layers(43, 43) == 43
+    assert resolve_reduced_target_layers(43, 43) == 43
 
 
 @pytest.mark.parametrize("bad", [0, -1, 44, 100])
 def test_reduced_layers_out_of_range_raises(bad):
     with pytest.raises(ValueError, match="target_num_hidden_layers"):
-        _resolve_reduced_target_layers(43, bad)
+        resolve_reduced_target_layers(43, bad)
 
 
 # ---------------------------------------------------------------------------
@@ -429,19 +446,19 @@ def test_optimizer_spec_real_config_node_without_target_defaults_to_adamw():
 
 def test_repair_glm_qk_rope_restores_clobbered_value():
     cfg = SimpleNamespace(qk_rope_head_dim=192)
-    _repair_glm_5_2_qk_rope_head_dim(cfg, {"qk_rope_head_dim": 64, "head_dim": 192})
+    repair_glm_5_2_qk_rope_head_dim(cfg, {"qk_rope_head_dim": 64, "head_dim": 192})
     assert cfg.qk_rope_head_dim == 64
 
 
 def test_repair_glm_qk_rope_noop_when_already_matching():
     cfg = SimpleNamespace(qk_rope_head_dim=64)
-    _repair_glm_5_2_qk_rope_head_dim(cfg, {"qk_rope_head_dim": 64})
+    repair_glm_5_2_qk_rope_head_dim(cfg, {"qk_rope_head_dim": 64})
     assert cfg.qk_rope_head_dim == 64
 
 
 def test_repair_glm_qk_rope_noop_when_raw_config_omits_field():
     cfg = SimpleNamespace(qk_rope_head_dim=192)
-    _repair_glm_5_2_qk_rope_head_dim(cfg, {"head_dim": 192})
+    repair_glm_5_2_qk_rope_head_dim(cfg, {"head_dim": 192})
     assert cfg.qk_rope_head_dim == 192
 
 
@@ -484,7 +501,7 @@ def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeyp
     ``from_config`` with ``load_base_model=True``."""
     import json
 
-    import nemo_automodel.recipes.llm.train_dspark as td
+    import nemo_automodel.recipes.llm._dspark_target_build as tb
 
     (tmp_path / "config.json").write_text(json.dumps(_TINY_GLM_CONFIG))
 
@@ -495,19 +512,22 @@ def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeyp
         captured.update(kwargs)
         return "target-model"
 
-    monkeypatch.setattr(td, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
-    monkeypatch.setattr(td, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
-
-    recipe = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
-    recipe.cfg = SimpleNamespace()
-    recipe.device = SimpleNamespace(type="cuda")
-    recipe.compute_dtype = torch.bfloat16
-    recipe.dist_env = SimpleNamespace(world_size=8)
+    monkeypatch.setattr(tb, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
+    monkeypatch.setattr(tb, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
 
     recipe_cfg = _opt_cfg(target_num_hidden_layers=2)
-    target_config, target_model = recipe._build_glm_5_2_target(str(tmp_path), recipe_cfg, False)
+    target_config, target_model, distributed_setup = tb.build_glm_5_2_target(
+        cfg=SimpleNamespace(),
+        world_size=8,
+        device=SimpleNamespace(type="cuda"),
+        compute_dtype=torch.bfloat16,
+        target_path=str(tmp_path),
+        recipe_cfg=recipe_cfg,
+        trust_remote_code=False,
+    )
 
     assert target_model == "target-model"
+    assert distributed_setup == "distributed-setup"
     assert captured["config"] is target_config
     # The reduction survives (from_pretrained would have re-read the 8-layer config).
     assert target_config.num_hidden_layers == 2
@@ -519,10 +539,93 @@ def test_build_glm_5_2_target_forwards_reduced_repaired_config(tmp_path, monkeyp
 
 
 def test_build_glm_5_2_target_requires_cuda(tmp_path):
-    recipe = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
-    recipe.device = SimpleNamespace(type="cpu")
+    from nemo_automodel.recipes.llm._dspark_target_build import build_glm_5_2_target
+
     with pytest.raises(RuntimeError, match="requires CUDA"):
-        recipe._build_glm_5_2_target(str(tmp_path), _opt_cfg(), False)
+        build_glm_5_2_target(
+            cfg=SimpleNamespace(),
+            world_size=1,
+            device=SimpleNamespace(type="cpu"),
+            compute_dtype=torch.float32,
+            target_path=str(tmp_path),
+            recipe_cfg=_opt_cfg(),
+            trust_remote_code=False,
+        )
+
+
+def test_build_deepseek_v4_target_forwards_reduced_config(monkeypatch):
+    """The V4 build must hand the (reduced) config to ``from_config`` with the sharded
+    distributed_setup and ``load_base_model=True`` (the full 43-layer target OOMs on
+    one node, so ``target_num_hidden_layers`` must survive to ``from_config``)."""
+    import nemo_automodel.recipes.llm._dspark_target_build as tb
+
+    captured = {}
+
+    def _fake_from_config(config=None, **kwargs):
+        captured["config"] = config
+        captured.update(kwargs)
+        return "target-model"
+
+    monkeypatch.setattr(
+        tb.DeepseekV4Config, "from_pretrained", staticmethod(lambda *a, **k: SimpleNamespace(num_hidden_layers=43))
+    )
+    monkeypatch.setattr(tb, "NeMoAutoModelForCausalLM", SimpleNamespace(from_config=_fake_from_config))
+    monkeypatch.setattr(tb, "create_distributed_setup_from_config", lambda cfg, world_size: "distributed-setup")
+
+    target_config, target_model, distributed_setup = tb.build_deepseek_v4_target(
+        cfg=SimpleNamespace(),
+        world_size=8,
+        device=SimpleNamespace(type="cuda"),
+        compute_dtype=torch.bfloat16,
+        target_path="v4",
+        recipe_cfg=_opt_cfg(target_num_hidden_layers=4),
+        trust_remote_code=False,
+    )
+
+    assert target_model == "target-model"
+    assert distributed_setup == "distributed-setup"
+    assert target_config.num_hidden_layers == 4
+    assert captured["config"] is target_config
+    assert captured["load_base_model"] is True
+    assert captured["distributed_setup"] == "distributed-setup"
+    assert captured["torch_dtype"] == torch.bfloat16
+
+
+def test_build_deepseek_v4_target_requires_cuda():
+    from nemo_automodel.recipes.llm._dspark_target_build import build_deepseek_v4_target
+
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        build_deepseek_v4_target(
+            cfg=SimpleNamespace(),
+            world_size=1,
+            device=SimpleNamespace(type="cpu"),
+            compute_dtype=torch.float32,
+            target_path="v4",
+            recipe_cfg=_opt_cfg(),
+            trust_remote_code=False,
+        )
+
+
+def test_build_deepseek_v4_backend_defaults():
+    backend = build_deepseek_v4_backend(_opt_cfg())
+    assert backend.attn == "tilelang"
+    assert backend.experts == "torch_mm"
+    assert backend.dispatcher == "hybridep"
+    assert backend.enable_hf_state_dict_adapter is True
+
+
+def test_gather_full_weight_module_passthrough_and_full_tensor():
+    plain = torch.nn.Linear(2, 2)
+    assert gather_full_weight_module(plain) is plain  # plain .weight -> unchanged
+
+    gathered = torch.zeros(3)
+    dtensor_like = SimpleNamespace(weight=SimpleNamespace(full_tensor=lambda: gathered))
+    out = gather_full_weight_module(dtensor_like)
+    assert out is not dtensor_like
+    assert out.weight is gathered
+
+    no_weight = SimpleNamespace(weight=None)
+    assert gather_full_weight_module(no_weight) is no_weight
 
 
 # ---------------------------------------------------------------------------
@@ -718,3 +821,67 @@ def test_recipe_cached_path_does_not_load_target_model(monkeypatch, tmp_path):
     assert len(recipe.train_dataloader.dataset) == 1
     torch.testing.assert_close(recipe.draft_model.embed_tokens.weight.detach().cpu(), embed.weight.detach())
     torch.testing.assert_close(recipe.draft_model.lm_head.weight.detach().cpu(), head.weight.detach())
+
+
+# ---------------------------------------------------------------------------
+# _should_shard_dense_target: opt-in gate for loading a frozen dense target
+# FSDP2-sharded via the standard distributed setup.
+# ---------------------------------------------------------------------------
+
+
+def _make_shard_recipe(cfg=None, world_size=8):
+    recipe = TrainDSparkRecipe({"distributed": {"strategy": "fsdp2"}} if cfg is None else cfg)
+    recipe.dist_env = SimpleNamespace(world_size=world_size, is_main=True)
+    return recipe
+
+
+def test_should_shard_dense_target_off_by_default():
+    # Existing configs (no shard_dense_target) keep the target replicated.
+    recipe = _make_shard_recipe()
+    assert recipe._should_shard_dense_target({}) is False
+
+
+def test_should_shard_dense_target_true_on_fsdp2_multi_rank():
+    recipe = _make_shard_recipe()
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True
+
+
+def test_should_shard_dense_target_default_strategy_is_fsdp2():
+    # With no distributed: block at all the default is fsdp2, so the flag takes effect
+    # (regression: the missing block must not raise).
+    recipe = _make_shard_recipe(cfg={})
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True
+
+
+def test_should_shard_dense_target_strategy_is_case_folded():
+    # parse_distributed_section case-folds the strategy, so 'FSDP2' is the same topology.
+    recipe = _make_shard_recipe(cfg={"distributed": {"strategy": "FSDP2"}})
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True
+
+
+def test_should_shard_dense_target_ignored_on_single_rank():
+    recipe = _make_shard_recipe(world_size=1)
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is False
+
+
+def test_should_shard_dense_target_ignored_on_ddp():
+    recipe = _make_shard_recipe(cfg={"distributed": {"strategy": "ddp"}})
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is False
+
+
+@pytest.mark.parametrize("axis", ["tp_size", "pp_size", "cp_size", "ep_size", "dp_replicate_size"])
+def test_should_shard_dense_target_rejects_non_pure_dp_axes(axis):
+    # Only a pure FSDP2 data-parallel topology is supported: pp_size>1 builds an
+    # AutoPipeline the target wrapper cannot run, tp/cp/ep are untested here, and
+    # HSDP replication (dp_replicate_size>1) re-replicates the target.
+    recipe = _make_shard_recipe(cfg={"distributed": {"strategy": "fsdp2", axis: 2}})
+    with pytest.raises(ValueError, match=axis):
+        recipe._should_shard_dense_target({"shard_dense_target": True})
+
+
+def test_should_shard_dense_target_allows_explicit_unit_or_null_axes():
+    # Explicit 1s or YAML nulls on the model-parallel axes are the supported topology.
+    recipe = _make_shard_recipe(
+        cfg={"distributed": {"strategy": "fsdp2", "tp_size": 1, "pp_size": None, "cp_size": 1, "ep_size": None}}
+    )
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True

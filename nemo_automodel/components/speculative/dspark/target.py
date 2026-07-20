@@ -23,24 +23,33 @@ forward hooks, mirroring the DFlash target wrapper.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
 from nemo_automodel.components.speculative.dspark.common import validate_target_layer_ids
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 
 
 @dataclass
 class DSparkTargetBatch:
-    """Target-model features needed by the DSpark trainer."""
+    """Target-model features needed by the DSpark trainer.
+
+    ``position_ids`` / ``seq_lens`` / ``doc_remaining`` are ``None`` off the
+    packing path and carry the (unshifted) packing metadata to the trainer on it.
+    """
 
     target_hidden_states: torch.Tensor  # [B, S, len(target_layer_ids) * H]
     target_last_hidden_states: torch.Tensor  # [B, S, H]
     input_ids: torch.Tensor
     loss_mask: torch.Tensor
+    position_ids: Optional[torch.Tensor] = None
+    seq_lens: Optional[torch.Tensor] = None
+    doc_remaining: Optional[torch.Tensor] = None
 
 
 class HFDSparkTargetModel:
@@ -51,13 +60,28 @@ class HFDSparkTargetModel:
     norm captures the post-norm last hidden state.
     """
 
-    def __init__(self, model: nn.Module, target_layer_ids: Sequence[int]):
+    def __init__(self, model: nn.Module, target_layer_ids: Sequence[int], cp_mesh=None):
         self.model = model.eval()
         self._num_layers = len(self._get_transformer_layers())
         # ``-1`` (the embedding output) is accepted, matching
         # ``common.extract_context_feature`` and the draft ``fc`` sizing in the
         # config builders.
         self.target_layer_ids = validate_target_layer_ids(list(target_layer_ids), self._num_layers)
+        # Context parallelism shards this frozen forward along the sequence dim;
+        # generate_batch gathers the captured hidden states back to the full
+        # sequence so the draft's anchor/block masks stay CP-unaware. cp_mesh is the
+        # "cp" submesh (or None).
+        self.cp_mesh = cp_mesh
+        self._cp_size = cp_mesh.size() if cp_mesh is not None else 1
+        if self._cp_size > 1:
+            from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+            from nemo_automodel.components.speculative.target_cp import attach_cp_kv_gather_hooks
+
+            # Strip the 4D mask (self_attn then calls SDPA on the local shard), and
+            # all-gather K/V so each rank attends its local Q against the full sequence
+            # -- torch's ring dispatch does not fire for a plain HF forward.
+            attach_context_parallel_hooks(self.model)
+            attach_cp_kv_gather_hooks(self.model, cp_mesh)
 
     def _inner_model(self) -> nn.Module:
         """Return the base transformer module that owns ``layers`` and ``norm``.
@@ -129,6 +153,9 @@ class HFDSparkTargetModel:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        doc_remaining: Optional[torch.Tensor] = None,
         **mm_kwargs: torch.Tensor,
     ) -> DSparkTargetBatch:
         """Run the target model once and capture the DSpark context + last hidden state.
@@ -168,19 +195,84 @@ class HFDSparkTargetModel:
         # last-layer feature (post-norm), matching the HF offset-1 convention.
         handles.append(self._get_final_norm().register_forward_hook(_make_hook("norm")))
 
+        target_attention_mask = attention_mask
+        extra_kwargs: dict[str, torch.Tensor] = {}
+        if seq_lens is not None:
+            # Packing: run the frozen target block-causal (SDPA/eager consume the
+            # [B, 1, S, S] additive mask; FlashAttention infers boundaries from the
+            # per-document position_ids at batch size 1) so the captured context
+            # hidden states do not leak across document boundaries.
+            if position_ids is None:
+                raise ValueError("DSpark sequence packing requires per-document position_ids, but none were provided.")
+            # ``filter_forward_kwargs`` drops kwargs the target forward does not
+            # declare. If it would drop ``position_ids``, the target falls back to
+            # default arange positions (wrong per-document RoPE) and, on the FA path,
+            # loses the only document-boundary signal. Fail loud instead.
+            if "position_ids" not in inspect.signature(self.model.forward).parameters:
+                raise ValueError(
+                    "DSpark sequence packing requires the target model's forward to accept a "
+                    "`position_ids` argument for per-document positions, but it does not."
+                )
+            extra_kwargs["position_ids"] = position_ids
+            attn_impl = getattr(self.model.config, "_attn_implementation", None) or ""
+            if "flash" in attn_impl:
+                if input_ids.shape[0] != 1:
+                    raise ValueError(
+                        "DSpark sequence packing with a FlashAttention target only supports "
+                        f"micro_batch_size=1 (got {input_ids.shape[0]}); set micro_batch_size=1 or load "
+                        "the target with attn_implementation='sdpa'."
+                    )
+                target_attention_mask = None
+            else:
+                param_dtype = next(self.model.parameters()).dtype
+                target_attention_mask = build_block_causal_additive_mask(
+                    seq_lens, seq_length=input_ids.shape[1], dtype=param_dtype, device=input_ids.device
+                )
+
         forward_kwargs = filter_forward_kwargs(
             self.model,
-            dict(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, **mm_kwargs),
+            dict(
+                input_ids=input_ids,
+                attention_mask=target_attention_mask,
+                use_cache=False,
+                **extra_kwargs,
+                **mm_kwargs,
+            ),
         )
+        if self._cp_size > 1:
+            # Shard the sequence, run the target as ring attention, then gather every
+            # captured hidden state back to the full sequence.
+            from nemo_automodel.components.speculative.target_cp import run_target_cp_forward_and_gather
 
-        try:
-            self.model(**forward_kwargs)
-        finally:
-            for handle in handles:
-                handle.remove()
+            keys: list = []
 
-        if "norm" not in captured:
-            raise RuntimeError("DSpark target capture did not record the final-norm output.")
+            def _collect(_outputs):
+                if "norm" not in captured:
+                    raise RuntimeError("DSpark target capture did not record the final-norm output.")
+                keys.extend(captured.keys())
+                return [captured[k] for k in keys]
+
+            try:
+                _outputs, gathered = run_target_cp_forward_and_gather(
+                    self.cp_mesh,
+                    self.model,
+                    input_ids,
+                    dict(use_cache=False, **mm_kwargs),
+                    _collect,
+                    filter_kwargs=True,
+                )
+            finally:
+                for handle in handles:
+                    handle.remove()
+            captured = dict(zip(keys, gathered))
+        else:
+            try:
+                self.model(**forward_kwargs)
+            finally:
+                for handle in handles:
+                    handle.remove()
+            if "norm" not in captured:
+                raise RuntimeError("DSpark target capture did not record the final-norm output.")
 
         def _feature(layer_id: int) -> torch.Tensor:
             if layer_id == -1:
@@ -197,6 +289,9 @@ class HFDSparkTargetModel:
             target_last_hidden_states=captured["norm"],
             input_ids=input_ids,
             loss_mask=loss_mask,
+            position_ids=position_ids,
+            seq_lens=seq_lens,
+            doc_remaining=doc_remaining,
         )
 
 

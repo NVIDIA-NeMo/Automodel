@@ -51,6 +51,10 @@ from nemo_automodel.components.models.bagel.state_dict_adapter import (
     load_bagel_checkpoint_state_dict,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +219,9 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
     """
 
     config_class = BagelConfig
+    # BAGEL's served checkpoints are untied; the tie flag lives on the nested
+    # text_config (aliased as llm_config), and the inner Qwen2 LM owns the head.
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     backend_config_resolver = staticmethod(resolve_bagel_backend)
 
     @dataclass(frozen=True)
@@ -228,6 +235,10 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
 
     def __init__(self, config: BagelConfig, backend: Optional[BagelBackendConfig] = None) -> None:
         super().__init__()
+        # Also covers the build_bagel_from_hf_backbones registry-bypass path, which
+        # constructs this class directly. Reads the nested text_config tie flag via
+        # the resolver's get_text_config fallback (BagelConfig has no top-level flag).
+        reject_unsupported_tie_word_embeddings(type(self), config)
         _prepare_config_for_stage(config)
         self.config = config
         self.backend = resolve_bagel_backend(backend)

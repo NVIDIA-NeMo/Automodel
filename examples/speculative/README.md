@@ -128,6 +128,58 @@ full target vocab, the "t2d" direction). The mapping is built and cached by
 or point `recipe_args.selected_token_ids_path` at a precomputed map. `t2d` is
 unset when the draft vocab is uncompressed.
 
+### FP8 draft training
+
+All spec-decode recipes (EAGLE-1/2, EAGLE-3 / P-EAGLE, DFlash / Domino /
+JetSpec, DSpark) accept the same top-level `fp8:` block as the SFT recipes (see
+`components/quantization/fp8.py`). When enabled, the draft's `nn.Linear` layers
+are swapped to torchao `Float8Linear` before the DDP / FSDP2 wrap, so the
+draft's forward and backward GEMMs run in fp8. Requires SM89+ (H100 or newer);
+`emulate: true` runs the fp8 numerics on older GPUs for testing. The frozen
+target model is never converted (it already supports fp8-quantized checkpoints
+via dequant-on-load in the DSpark V4 / GLM path). Linears with a weight dim not
+divisible by 16 are skipped automatically; use `filter_fqns` to exclude more
+(e.g. `["lm_head"]`). On DSpark's FSDP2 path, `enable_fsdp_float8_all_gather`
+plus `precompute_float8_dynamic_scale_for_fsdp` additionally amortize the
+per-step scale computation, mirroring the SFT recipes. See
+`eagle3/qwen3_eagle3_fp8.yaml`.
+
+**Pair `fp8:` with `compile:`.** The recipes also accept the SFT recipes'
+top-level `compile:` block (`CompileConfig`); the draft is compiled in place
+(`nn.Module.compile()`, so checkpoint keys are unchanged) after the fp8 swap.
+This matters for fp8 throughput: Float8Linear's per-GEMM cast/scale ops are
+memory-bound and only pay off once inductor fuses them into the GEMM
+prologue. In eager mode fp8 draft training is typically SLOWER than bf16
+(measured 0.76x on an H100 EAGLE-3 run); compiled, the same A/B measured
+fp8 at 1.03x over bf16 with byte-equivalent convergence. Expect the fp8
+gain to scale with draft GEMM size: a single 4096-wide EAGLE-3 layer sits
+near the float8 break-even point, while wider or deeper drafts (DSpark on
+V4/GLM-scale targets) benefit more. `compile:` also works without `fp8:`
+as a plain draft speedup (measured ~1.34x over the eager bf16 baseline in
+the same run).
+
+### LoRA draft adaptation (EAGLE-3 only)
+
+The EAGLE-3 recipe accepts the SFT recipes' `peft:` block (`PeftConfig`). The
+base draft is frozen and only `lora_A`/`lora_B` adapters train; checkpoints are
+adapter-only (`adapter_model.safetensors` via the standard PEFT checkpoint
+path). This is for adapting an existing draft to a new domain or dataset:
+point `recipe_args.draft_weights_path` at the consolidated safetensors export
+of a trained draft to warm-start the base weights (adapters over a randomly
+initialized draft are pointless; `draft_weights_path` also works without
+`peft:` for full-FT continued training). With a compressed draft vocab the
+base run's token mapping must be reused via `selected_token_ids_path` (the
+frozen `lm_head` rows are tied to it); a differing mapping fails fast at
+load. The FINAL checkpoint of a LoRA run additionally exports the merged
+draft to `model/consolidated` (serve-ready, same layout as full-FT runs), so
+no external merge step is needed. Not supported with `parallel_drafting`
+(P-EAGLE trains `mask_hidden` and the embeddings, which the LoRA freeze would
+lock), with `freeze_embeddings: false` (same freeze conflict), with `fp8:`,
+or in the DFlash-family / DSpark / EAGLE-1/2 recipes (rejected explicitly;
+their drafts carry trainable non-LoRA heads that the freeze would silently
+lock, and only EAGLE-3 implements the warm start). See
+`eagle3/qwen3_eagle3_lora.yaml`.
+
 ## Target backends
 
 The frozen target produces the supervision signal (aux hidden states plus the
@@ -157,6 +209,25 @@ Offline cache is produced by `precompute_eagle3.py`
 (`python -m nemo_automodel.components.speculative.precompute_eagle3 --target-model ... --input-data ... --output-dir ...`),
 then consumed via `cached_target_path`. DSpark also supports a text-only offline cache via `precompute_dspark.py`
 for HF-loadable single-process text targets.
+
+For DSpark targets too large to fit on one node (DeepSeek-V4-Flash, GLM-5.2), a
+**distributed** precompute (`precompute_dspark_dist.py`) loads the target frozen
+through the same expert-parallel + FSDP2 path as online training and writes the
+identical cache. It is config-driven and launched with `torchrun` like multi-node
+training; each rank forwards its own contiguous slice of the dataset and writes its
+own global-indexed shards straight into the shared `cache_output_dir` (no merge step):
+
+```bash
+torchrun --nnodes=4 --node-rank=0 --nproc_per_node=8 \
+  --master-addr=<NODE0_IP> --master-port=29500 \
+  -m nemo_automodel.recipes.llm.precompute_dspark_dist \
+  -c examples/speculative/dspark/deepseek_v4_flash_dspark_precompute.yaml
+```
+
+Then set the matching training config's `recipe_args.cached_target_path` to that
+`cache_output_dir` to train the draft with no live target. See
+`dspark/deepseek_v4_flash_dspark_precompute.yaml` and
+`dspark/glm_5.2_dspark_precompute.yaml`.
 
 EAGLE drafters learn best when the assistant turns in the training data are
 produced by the **same model** that will serve as the inference target. Most
@@ -300,6 +371,43 @@ cover exactly the benchmark's own requests:
 python -m nemo_automodel.components.speculative.bench_vllm --server http://localhost:8000 --model Qwen/Qwen3-8B --input-data <prompts-dataset> --baseline-server http://localhost:8001
 ```
 
+### Multi-dataset sweep
+
+`bench_sglang.py`/`bench_vllm.py` measure one dataset per invocation, but the
+same draft's acceptance rate can vary sharply by task -- conversational data
+tends to accept far more tokens than math or code, whose token distributions
+diverge from the training mix. `bench_sweep.py` drives either engine through
+several datasets in one pass and reports a per-dataset table plus a
+completed-weighted aggregate, instead of invoking the single-dataset scripts
+once per dataset and collating the numbers by hand:
+
+```bash
+python -m nemo_automodel.components.speculative.bench_sweep --engine sglang --server http://localhost:30000 --model meta-llama/Llama-3.1-8B-Instruct
+```
+
+The default suite is the four benchmarks the EAGLE / EAGLE-2 papers report
+acceptance/speedup on -- MT-Bench (first turn), HumanEval (code), GSM8K
+(math), and Alpaca (single-turn instruction-following). None of these ship a
+chat-messages column, so each is read via `--prompt-column` (a raw text field
+wrapped into a fresh single-turn user message) rather than
+`--messages-column`; both flags are also available on `bench_sglang.py` /
+`bench_vllm.py` directly for a single custom dataset. Pass `--engine vllm` to
+sweep a vLLM server instead, `--baseline-server` for the speedup column,
+`--datasets <name...>` to run a subset, and `--datasets-config <path.yaml>` to
+swap in an entirely custom dataset list (see
+`bench_sweep/spec_bench_datasets.yaml`, which mirrors the built-in default and
+doubles as a template). One dataset failing to load or benchmark is reported
+as an error row and excluded from the aggregate rather than aborting the sweep.
+
+**`--engine sglang` caveat with more than one dataset:** SGLang's
+`avg_spec_accept_length` is a server-cumulative running average with no
+reset/delta API, so sweeping several datasets against one live SGLang server
+means every dataset after the first reports a blend with prior datasets'
+traffic, not an independent number (a warning is logged when this applies).
+Restart the server between datasets for independent numbers, or use
+`--engine vllm`, which diffs its Prometheus counters per dataset and has no
+such caveat.
+
 ## Inference-engine compatibility
 
 | Draft | SGLang | vLLM |
@@ -330,7 +438,24 @@ blocks) instead.
 | `distributed` | Optional; only for MoE / large targets. `strategy: fsdp2`, `tp_size`, `pp_size`, `cp_size`, `ep_size`, `activation_checkpointing`, `sequence_parallel`. Absent means DDP. |
 | `optimizer` | `lr`, `betas`, `weight_decay`, optional `warmup_ratio` (0.05), `min_lr_ratio` (0.1). |
 | `checkpoint` | `enabled`, `checkpoint_dir`, `model_save_format: safetensors`, `save_consolidated`, optional `restore_from` (`LATEST` / subdir / path). |
+| `fp8` | Optional; torchao FP8 draft training, same surface as the SFT recipes. See "FP8 draft training". |
+| `compile` | Optional; in-place torch.compile of the draft (`CompileConfig`). Strongly recommended with `fp8`. |
+| `peft` | Optional, EAGLE-3 only; LoRA draft adaptation (`PeftConfig`). See "LoRA draft adaptation". |
 | `wandb` | Optional; `project`, `entity`, `name`. |
+
+### DFlash-family validation metrics
+
+When `recipe_args.val_data_path` is set, DFlash, Domino, and JetSpec report
+globally reduced `val_loss`, token-weighted `val_accuracy`, and block-weighted
+`val_accept_len`. Domino also reports final-head and base-head loss, base
+accuracy, and base acceptance length. The reductions sum raw token and block
+statistics across ranks before division, so uneven valid-token counts do not
+bias the result.
+
+Adding a top-level `wandb:` block uploads these values as `val/loss`,
+`val/accuracy`, `val/accept_len`, and the corresponding Domino base-head keys.
+Training logs include `train/loss`, `train/accuracy`, `train/accept_len`, and
+the method-specific Domino diagnostics.
 
 ### `recipe_args` common to all methods
 
@@ -352,8 +477,9 @@ checkpoint cadence: `ckpt_every_steps`, `save_checkpoint_every_epoch`.
 | `aux_layer_ids` | EAGLE-3 | Override the default low/mid/high recipe `[1, n//2-1, n-4]`. |
 | `draft_attn_implementation` | EAGLE-3 | `eager` (default) or `flash_attention_2`. |
 | `fc_norm`, `norm_output` | EAGLE-3.1 | Both default false; either alone is a valid intermediate config. |
+| `draft_weights_path` | EAGLE-3 | Warm-start the draft from a consolidated safetensors export (file or directory); required for meaningful LoRA adaptation. |
 | `target_model_backend`, `remote_urls`, `target_prefetch_depth`, `remote_timeout`, `remote_max_retries` | EAGLE-3 remote | See Target backends. |
-| `cached_target_path` | EAGLE-3 / DSpark offline | Path to a cache produced by `precompute_eagle3.py` or `precompute_dspark.py`. |
+| `cached_target_path` | EAGLE-3 / DSpark offline | Path to a cache produced by `precompute_eagle3.py`, `precompute_dspark.py`, or (large sharded targets) `precompute_dspark_dist.py`. |
 | `parallel_drafting`, `num_depths`, `num_draft_layers`, `down_sample_ratio`, `down_sample_ratio_min`, `mask_token_id`, `sequence_partitions` | P-EAGLE | `mask_token_id` is required (no default). `sequence_partitions > 1` splits each sequence by dependency lineage to bound long-context memory. |
 | `block_size`, `num_anchors`, `loss_decay_gamma`, `mask_token_id`, `target_layer_ids`, `attention_backend` | DFlash (LLM recipe) | Block drafting knobs. |
 | `emb_dim`, `gru_hidden_dim`, `pure_draft_prefix_len`, `shift_label` | Domino | Correction-head knobs on top of the DFlash set. |
@@ -369,6 +495,7 @@ examples/speculative/
   eagle1/    eagle2/    eagle3/    eagle3_1/    p-eagle/
   dflash/                     # DFlash + Domino (qwen3_domino.yaml) configs
   jetspec/   dspark/
+  bench_sweep/                # --datasets-config example for bench_sweep.py
   README.md                   # this file (includes the dataset regeneration guide)
 examples/dllm_sft/            # DFlash DLLM SFT configs (standard SFT schema)
 ```
@@ -391,6 +518,7 @@ nemo_automodel/components/speculative/
   bench_common.py          # shared chat-completions workload machinery
   bench_sglang.py          # acceptance-length / speedup benchmark (SGLang)
   bench_vllm.py            # acceptance-length / speedup benchmark (vLLM)
+  bench_sweep.py           # multi-dataset acceptance-length sweep (either engine)
 nemo_automodel/recipes/llm/
   train_eagle1.py  train_eagle2.py  train_eagle3.py  peagle_recipe.py
   train_dflash.py  train_domino.py  train_jetspec.py  train_dspark.py
