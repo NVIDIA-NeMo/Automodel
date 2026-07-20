@@ -187,7 +187,6 @@ class TestBackendConfigExpertsDispatcherValidation:
                 cuda_graph=CudaGraphConfig(modules=["moe"], moe_capacity_factor=capacity_factor),
             )
 
-
 class TestBackendConfigFakeGateNoise:
     """Test BackendConfig fake_gate_noise field."""
 

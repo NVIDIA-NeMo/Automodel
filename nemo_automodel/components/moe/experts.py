@@ -164,23 +164,32 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
     (bias * permuted_probs) which native bias support wouldn't handle.
 
     Args:
-        value: Output from grouped GEMM, shape [total_tokens, features].
-        bias: Per-expert bias, shape [num_experts, features].
-        tokens_per_expert: Token counts per expert.
-        permuted_probs: If provided, bias is weighted by routing probs (for down projection).
+        value: Tensor of shape [total_tokens, features] containing grouped GEMM output,
+            with tokens laid out contiguously by expert.
+        bias: Tensor or sequence of tensors with one entry per expert, each of shape [features].
+        tokens_per_expert: Tensor or sequence with shape [num_experts] containing the number
+            of contiguous tokens assigned to each expert. Passing a CUDA tensor requires a
+            device-to-host conversion; graph-captured fixed-capacity paths should pass a
+            Python sequence instead.
+        permuted_probs: Optional tensor of shape [total_tokens, 1] or [total_tokens, features].
+            If provided, the bias is weighted by routing probabilities for down projection.
+
+    Returns:
+        Tensor of shape [total_tokens, features] with per-expert bias applied.
     """
     if bias is None:
         return value
     shape = value.shape
+    split_sizes = tokens_per_expert.tolist() if isinstance(tokens_per_expert, torch.Tensor) else list(tokens_per_expert)
     if permuted_probs is not None:
         output = (
             torch.cat(
                 [
                     t + b * p
                     for t, b, p in zip(
-                        torch.split(value.view(-1, shape[-1]), tokens_per_expert.tolist()),
+                        torch.split(value.view(-1, shape[-1]), split_sizes),
                         bias,
-                        torch.split(permuted_probs, tokens_per_expert.tolist()),
+                        torch.split(permuted_probs, split_sizes),
                     )
                 ]
             )
@@ -195,9 +204,7 @@ def _apply_bias(value, bias, tokens_per_expert, permuted_probs=None):
                     for t, b in zip(
                         torch.split(
                             value.view(-1, shape[-1]),
-                            tokens_per_expert.tolist()
-                            if isinstance(tokens_per_expert, torch.Tensor)
-                            else tokens_per_expert,
+                            split_sizes,
                         ),
                         bias,
                     )
@@ -1016,6 +1023,7 @@ class GroupedExpertsTE(nn.Module):
         self.dispatcher_num_sms = dispatcher_num_sms
         self.dispatcher_share_token_dispatcher = dispatcher_share_token_dispatcher
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
+        self.cuda_graph_moe_enabled = backend is not None and "moe" in backend.cuda_graph.modules
         self.cuda_graph_moe_capacity_factor = backend.cuda_graph.moe_capacity_factor if backend is not None else None
 
         # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
@@ -1368,8 +1376,25 @@ class GroupedExpertsTE(nn.Module):
         token_mask: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
+        capacity: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convert top-k routing to a dense map while retaining routing gradients."""
+        """Convert local top-k routing to dense drop-and-pad metadata.
+
+        Downstream drop-and-pad keeps at most the fixed capacity for each expert.
+        Overflow routed assignments are dropped rather than losslessly padded.
+
+        Args:
+            token_mask: Tensor of shape [tokens] indicating valid source tokens.
+            weights: Tensor of shape [tokens, top_k] containing routing probabilities.
+            indices: Tensor of shape [tokens, top_k] containing global expert ids.
+            capacity: Maximum number of routed assignments retained per expert.
+
+        Returns:
+            Tuple containing:
+                - routing_map: Boolean tensor of shape [tokens, num_experts].
+                - routing_probs: Tensor of shape [tokens, num_experts] retaining gradients
+                  to selected routing probabilities.
+        """
         num_tokens = indices.size(0)
         valid = token_mask.unsqueeze(-1) & (indices >= 0) & (indices < self.config.n_routed_experts)
         safe_indices = indices.clamp(min=0, max=self.config.n_routed_experts - 1)
@@ -1385,6 +1410,18 @@ class GroupedExpertsTE(nn.Module):
             dtype=torch.float32,
             device=weights.device,
         ).scatter_add(1, safe_indices, weights.float() * valid)
+        # Match Megatron's probability-based capacity policy and the HybridEP
+        # path: retain the highest-probability assignments for every expert,
+        # rather than whichever token indices happen to sort first.
+        capacity_indices = torch.topk(
+            routing_probs.masked_fill(~routing_map, -torch.inf),
+            k=capacity,
+            dim=0,
+            sorted=False,
+        ).indices
+        capacity_map = torch.zeros_like(routing_map).scatter(0, capacity_indices, True)
+        routing_map = routing_map & capacity_map
+        routing_probs = routing_probs * routing_map
         return routing_map, routing_probs
 
     def _forward_local_cuda_graph_moe(
@@ -1394,7 +1431,20 @@ class GroupedExpertsTE(nn.Module):
         weights: torch.Tensor,
         indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Run local dispatch, fixed-capacity TE experts, and combine at EP=1."""
+        """Run local fixed-capacity dispatch, TE experts, and combine at EP=1.
+
+        Capacity limiting may drop routed expert assignments when an expert receives
+        more than the configured fixed-capacity slots.
+
+        Args:
+            x: Tensor of shape [tokens, hidden] containing local source tokens.
+            token_mask: Tensor of shape [tokens] indicating valid source tokens.
+            weights: Tensor of shape [tokens, top_k] containing routing probabilities.
+            indices: Tensor of shape [tokens, top_k] containing global expert ids.
+
+        Returns:
+            Tensor of shape [tokens, hidden] containing the combined local MoE output.
+        """
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
         if FP8GlobalStateManager.is_fp8_enabled():
@@ -1403,7 +1453,7 @@ class GroupedExpertsTE(nn.Module):
             raise RuntimeError("Local MoE CUDA graph dispatch requires EP=1")
 
         capacity = self._cuda_graph_source_expert_capacity(x.size(0))
-        routing_map, routing_probs = self._local_drop_and_pad_metadata(token_mask, weights, indices)
+        routing_map, routing_probs = self._local_drop_and_pad_metadata(token_mask, weights, indices, capacity)
         num_permuted_tokens = capacity * self.num_local_experts
         permuted_hidden, permuted_probs, sorted_indices = permute(
             x,
@@ -1435,7 +1485,22 @@ class GroupedExpertsTE(nn.Module):
         weights: torch.Tensor,
         indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Run fixed-capacity HybridEP dispatch, local TE experts, and combine."""
+        """Run fixed-capacity HybridEP dispatch, local TE experts, and combine.
+
+        Capacity limiting may drop routed expert assignments when an expert receives
+        more than the configured fixed-capacity slots. HybridEP capacity is fixed after the first graph-captured shape. A later
+        token-count change is fail-closed instead of falling back to dynamic eager
+        dispatch because replay requires the static receive shape to stay unchanged.
+
+        Args:
+            x: Tensor of shape [tokens, hidden] containing local source tokens.
+            token_mask: Tensor of shape [tokens] indicating valid source tokens.
+            weights: Tensor of shape [tokens, top_k] containing routing probabilities.
+            indices: Tensor of shape [tokens, top_k] containing global expert ids.
+
+        Returns:
+            Tensor of shape [tokens, hidden] containing the combined MoE output.
+        """
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
         if FP8GlobalStateManager.is_fp8_enabled():
@@ -1468,7 +1533,19 @@ class GroupedExpertsTE(nn.Module):
         *,
         tokens_per_local_expert: int,
     ) -> torch.Tensor:
-        """Execute TE GroupedLinear with an identical static split for each local expert."""
+        """Execute TE GroupedLinear with an identical static split per local expert.
+
+        Args:
+            hidden_states: Tensor of shape [num_local_experts * capacity, hidden]
+                containing tokens grouped contiguously by local expert.
+            permuted_probs: Tensor of shape [num_local_experts * capacity] containing
+                routing probabilities in the same grouped order as ``hidden_states``.
+            tokens_per_local_expert: Static number of rows assigned to every local expert.
+
+        Returns:
+            Tensor of shape [num_local_experts * capacity, hidden] containing expert outputs
+            in grouped local-expert order.
+        """
         permuted_probs = permuted_probs.unsqueeze(-1)
         splits = [tokens_per_local_expert] * self.num_local_experts
         output1 = self.gate_up_linear(hidden_states, splits)
@@ -1477,13 +1554,15 @@ class GroupedExpertsTE(nn.Module):
         if self.expert_bias:
             down_bias = self._get_stacked_bias(self.down_linear)
             if down_bias is not None:
-                split_tensor = torch.full(
-                    (self.num_local_experts,),
-                    tokens_per_local_expert,
-                    dtype=torch.int64,
-                    device=output2.device,
+                output_dtype = output2.dtype
+                output_shape = output2.shape
+                output2_by_expert = output2.reshape(self.num_local_experts, tokens_per_local_expert, output_shape[-1])
+                probs_by_expert = permuted_probs.reshape(self.num_local_experts, tokens_per_local_expert, 1)
+                output2 = (
+                    (output2_by_expert + down_bias[:, None, :] * (probs_by_expert - 1.0))
+                    .reshape(output_shape)
+                    .to(output_dtype)
                 )
-                output2 = _apply_bias(output2, down_bias, split_tensor, permuted_probs - 1.0)
         return output2
 
     def forward(
@@ -1497,20 +1576,20 @@ class GroupedExpertsTE(nn.Module):
         Forward pass using TE's GroupedLinear with native FP8 support.
 
         Args:
-            x: [num_tokens, model_dim] input tensor
-            token_mask: [num_tokens] boolean mask for valid tokens
-            weights: [num_tokens, num_activated_experts] routing weights
-            indices: [num_tokens, num_activated_experts] expert indices
+            x: Tensor of shape [tokens, hidden] containing local source tokens.
+            token_mask: Tensor of shape [tokens] indicating valid source tokens.
+            weights: Tensor of shape [tokens, top_k] containing routing probabilities.
+            indices: Tensor of shape [tokens, top_k] containing global expert ids.
 
         Returns:
-            [num_tokens, model_dim] output tensor
+            Tensor of shape [tokens, hidden] containing the combined MoE output.
         """
         assert not isinstance(x, DTensor), "Input should not be a DTensor"
         assert self.config.n_routed_experts % self.ep_size == 0, (
             f"Number of experts must be divisible by ep_size (ep_size={self.ep_size})"
         )
 
-        if self.cuda_graph_moe_capacity_factor is not None:
+        if self.cuda_graph_moe_enabled:
             if self.ep_size == 1:
                 return self._forward_local_cuda_graph_moe(x, token_mask, weights, indices)
             return self._forward_hybridep_cuda_graph_moe(x, token_mask, weights, indices)
