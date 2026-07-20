@@ -1459,3 +1459,135 @@ def test_remap_buffers_round_trip_through_state_dict():
 
     assert torch.equal(dst.d2t, src.d2t)
     assert torch.equal(dst.t2d, src.t2d)
+
+
+def _lk_trainer(draft, lk_loss_type, ttt_steps=2, **kwargs):
+    config = draft.config
+    selected_token_ids = torch.arange(config.draft_vocab_size, dtype=torch.long)
+    selected_token_mask = torch.zeros(config.vocab_size, dtype=torch.bool)
+    selected_token_mask[selected_token_ids] = True
+    return Eagle3TrainerModule(
+        draft,
+        selected_token_ids=selected_token_ids,
+        selected_token_mask=selected_token_mask,
+        ttt_steps=ttt_steps,
+        lk_loss_type=lk_loss_type,
+        **kwargs,
+    )
+
+
+def test_lk_loss_rejects_unknown_type_and_negative_knobs():
+    draft = _build_tiny_draft_model()
+    with pytest.raises(ValueError, match="lk_loss_type"):
+        _lk_trainer(draft, "bogus")
+    with pytest.raises(ValueError, match="lk_kl_scale"):
+        _lk_trainer(draft, "lambda", lk_kl_scale=-0.5)
+    # A scale above 1 would make kl_weight exceed 1 early in training and
+    # sign-flip the (1 - kl_weight) acceptance coefficient.
+    with pytest.raises(ValueError, match="lk_kl_scale"):
+        _lk_trainer(draft, "lambda", lk_kl_scale=1.5)
+    with pytest.raises(ValueError, match="lk_kl_decay"):
+        _lk_trainer(draft, "lambda", lk_kl_decay=-1.0)
+
+
+@pytest.mark.parametrize("lk_loss_type", ["alpha", "lambda"])
+def test_lk_trainer_runs_ttt_and_backprops(lk_loss_type):
+    torch.manual_seed(0)
+    draft = _build_tiny_draft_model()
+    config = draft.config
+    trainer = _lk_trainer(draft, lk_loss_type, ttt_steps=3)
+
+    batch_size, seq_len = 2, 8
+    metrics = trainer(
+        input_ids=torch.randint(0, config.draft_vocab_size, (batch_size, seq_len)),
+        attention_mask=torch.ones(batch_size, seq_len, dtype=torch.long),
+        loss_mask=torch.ones(batch_size, seq_len, dtype=torch.long),
+        aux_hidden_states=torch.randn(batch_size, seq_len, config.hidden_size * 3),
+        target_logits=torch.randn(batch_size, seq_len, config.vocab_size),
+    )
+    assert metrics.loss.dim() == 0
+    assert torch.isfinite(metrics.loss)
+    metrics.loss.backward()
+    has_grad = any(
+        p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum().item() > 0
+        for p in draft.parameters()
+        if p.requires_grad
+    )
+    assert has_grad
+
+
+def test_lk_alpha_step_loss_matches_reference():
+    """alpha = -masked-mean(log sum_v min(p_target, p_draft))."""
+    torch.manual_seed(1)
+    draft = _build_tiny_draft_model()
+    trainer = _lk_trainer(draft, "alpha")
+
+    logits = torch.randn(1, 4, draft.config.draft_vocab_size)
+    target_probs = torch.softmax(torch.randn(1, 4, draft.config.draft_vocab_size), dim=-1)
+    position_mask = torch.tensor([[[True], [True], [False], [True]]])
+
+    loss = trainer._lk_step_loss(logits, target_probs, position_mask)
+
+    accept = torch.minimum(target_probs, torch.softmax(logits.float(), dim=-1)).sum(-1)
+    mask = position_mask.squeeze(-1).float()
+    expected = -(accept.log() * mask).sum() / mask.sum()
+    torch.testing.assert_close(loss, expected)
+
+
+def test_lk_alpha_perfect_draft_has_zero_loss():
+    """A draft matching the target exactly has acceptance 1 -> -log(1) = 0."""
+    draft = _build_tiny_draft_model()
+    trainer = _lk_trainer(draft, "alpha")
+    logits = torch.randn(1, 3, draft.config.draft_vocab_size)
+    target_probs = torch.softmax(logits.float(), dim=-1)
+    position_mask = torch.ones(1, 3, 1, dtype=torch.bool)
+    loss = trainer._lk_step_loss(logits, target_probs, position_mask)
+    torch.testing.assert_close(loss, torch.zeros(()), atol=1e-6, rtol=0)
+
+
+def test_lk_lambda_step_loss_matches_reference():
+    """lambda = kl_weight * soft_ce + (1 - kl_weight) * (1 - acceptance), with
+    kl_weight = kl_scale * exp(-kl_decay * acceptance.detach())."""
+    torch.manual_seed(2)
+    draft = _build_tiny_draft_model()
+    trainer = _lk_trainer(draft, "lambda", lk_kl_scale=0.7, lk_kl_decay=2.0)
+
+    logits = torch.randn(1, 4, draft.config.draft_vocab_size)
+    target_probs = torch.softmax(torch.randn(1, 4, draft.config.draft_vocab_size), dim=-1)
+    position_mask = torch.tensor([[[True], [False], [True], [True]]])
+
+    loss = trainer._lk_step_loss(logits, target_probs, position_mask)
+
+    accept = torch.minimum(target_probs, torch.softmax(logits.float(), dim=-1)).sum(-1)
+    mask = position_mask.squeeze(-1).float()
+    acceptance = (accept * mask).sum() / mask.sum()
+    soft_ce = masked_soft_cross_entropy(logits=logits, target_probs=target_probs, position_mask=position_mask)
+    kl_weight = 0.7 * torch.exp(-2.0 * acceptance)
+    expected = kl_weight * soft_ce + (1.0 - kl_weight) * (1.0 - acceptance)
+    torch.testing.assert_close(loss, expected)
+
+
+def test_lk_lambda_zero_decay_full_scale_reduces_to_soft_ce_plus_zero_weighting():
+    """kl_scale=1, kl_decay=0 -> kl_weight == 1 -> the lambda loss IS the
+    soft-CE step loss (the acceptance term gets weight 0)."""
+    torch.manual_seed(3)
+    draft = _build_tiny_draft_model()
+    trainer = _lk_trainer(draft, "lambda", lk_kl_scale=1.0, lk_kl_decay=0.0)
+    logits = torch.randn(1, 5, draft.config.draft_vocab_size)
+    target_probs = torch.softmax(torch.randn(1, 5, draft.config.draft_vocab_size), dim=-1)
+    position_mask = torch.ones(1, 5, 1, dtype=torch.bool)
+    loss = trainer._lk_step_loss(logits, target_probs, position_mask)
+    expected = masked_soft_cross_entropy(logits=logits, target_probs=target_probs, position_mask=position_mask)
+    torch.testing.assert_close(loss, expected)
+
+
+def test_lk_lambda_zero_supervision_step_is_zero():
+    """A step with no supervised positions must contribute 0 like the soft-CE
+    path, not the gradient-free constant (1 - lk_kl_scale)."""
+    draft = _build_tiny_draft_model()
+    trainer = _lk_trainer(draft, "lambda", lk_kl_scale=0.3)
+    logits = torch.randn(1, 4, draft.config.draft_vocab_size)
+    target_probs = torch.softmax(torch.randn(1, 4, draft.config.draft_vocab_size), dim=-1)
+    position_mask = torch.zeros(1, 4, 1, dtype=torch.bool)
+    loss = trainer._lk_step_loss(logits, target_probs, position_mask)
+    torch.testing.assert_close(loss, torch.zeros(()))

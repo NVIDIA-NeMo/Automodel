@@ -37,14 +37,23 @@ from packaging.version import parse
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
 
 if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
 
     from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
+_TORCH_2_7_1 = (2, 7, 1)
+_TORCH_2_9 = (2, 9)
+
+
+def _is_leq_torch_2_7_1() -> bool:
+    """Check if the current torch version is less than or equal to 2.7.1."""
+    return parse(torch.__version__).release <= _TORCH_2_7_1
+
 
 def _is_geq_torch_2_9() -> bool:
     """Check if the current torch version is greater than or equal to 2.9.0."""
-    return parse(torch.__version__).base_version >= "2.9.0"
+    return parse(torch.__version__).release >= _TORCH_2_9
 
 
 class SaveConsolidatedMode(str, Enum):
@@ -177,6 +186,7 @@ class CheckpointingConfig:
         tp_rank: int,
         pp_rank: int,
         moe_mesh: DeviceMesh | None = None,
+        process_group: ProcessGroup | None = None,
     ) -> Checkpointer:
         """Build the :class:`Checkpointer` engine for this config.
 
@@ -189,13 +199,21 @@ class CheckpointingConfig:
             tp_rank: Tensor-parallel rank.
             pp_rank: Pipeline-parallel rank.
             moe_mesh: Optional device mesh for MoE checkpointing.
+            process_group: Process group used for distributed checkpoint collectives.
 
         Returns:
             Configured :class:`Checkpointer`.
         """
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
-        return Checkpointer(config=self, dp_rank=dp_rank, tp_rank=tp_rank, pp_rank=pp_rank, moe_mesh=moe_mesh)
+        return Checkpointer(
+            config=self,
+            dp_rank=dp_rank,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            moe_mesh=moe_mesh,
+            process_group=process_group,
+        )
 
 
 __all__ = ["CheckpointingConfig", "SaveConsolidatedMode"]

@@ -22,6 +22,7 @@ from nemo_automodel.components.training.utils import (
     ScopedModuleOffloading,
     clip_grad_norm,
     count_tail_padding,
+    get_expert_tp_replication_factor,
     move_to_device,
     scale_grads_and_clip_grad_norm,
 )
@@ -403,6 +404,66 @@ class TestScaleGradsAndClipGradNorm:
         # Non-expert params (gate) should NOT be scaled
         assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 2.0)
         assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 1.0)
+
+    def test_ep_scaling_removes_replicated_tp_token_factor_from_experts_only(self):
+        """TP-replicated MoE inputs add a TP factor only to expert gradients."""
+        model = _MoEModule()
+        expert_param = model.mlp["experts"].gate_up_linear.weight0
+        model.gate.weight.grad = torch.ones_like(model.gate.weight) * 8.0
+        expert_param.grad = torch.ones_like(expert_param) * 8.0
+
+        moe_mesh = Mock()
+        moe_mesh.mesh_dim_names = ["ep_shard"]
+        moe_mesh.__getitem__ = Mock(return_value=Mock(size=Mock(return_value=2)))
+
+        scale_grads_and_clip_grad_norm(
+            max_grad_norm=None,
+            model_parts=[model],
+            moe_mesh=moe_mesh,
+            dp_group_size=4,
+            expert_tp_replication_factor=2,
+        )
+
+        # Base EP divisor = 4/2 = 2; replicated TP tokens add another 2.
+        assert torch.allclose(expert_param.grad, torch.ones_like(expert_param) * 2.0)
+        # Router/dense replicas stay identical across TP ranks via the
+        # fail-closed identical-pretrained-weights invariant (no separate
+        # sync) and must never receive the expert-only divisor.
+        assert torch.allclose(model.gate.weight.grad, torch.ones_like(model.gate.weight) * 8.0)
+
+    @pytest.mark.parametrize(
+        "factor,exc",
+        [(0, ValueError), (-1, ValueError), (True, TypeError), (1.5, TypeError)],
+    )
+    def test_ep_tp_replication_factor_is_strictly_validated(self, factor, exc):
+        with pytest.raises(exc, match="expert_tp_replication_factor"):
+            scale_grads_and_clip_grad_norm(
+                max_grad_norm=None,
+                model_parts=[_MoEModule()],
+                expert_tp_replication_factor=factor,
+            )
+
+    def test_get_expert_tp_replication_factor_requires_moe_tp_marker_and_tp_axis(self):
+        """The factor is tp_size only when the custom-MoE TP path marked the model."""
+        marked = _MoEModule()
+        marked._nemo_moe_tp_requires_replica_sync = True
+        unmarked = _MoEModule()
+
+        tp_mesh = Mock()
+        tp_mesh.mesh_dim_names = ("dp", "tp")
+        tp_mesh.__getitem__ = Mock(return_value=Mock(size=Mock(return_value=2)))
+        no_tp_mesh = Mock()
+        no_tp_mesh.mesh_dim_names = ("dp",)
+
+        assert get_expert_tp_replication_factor([marked], tp_mesh) == 2
+        assert get_expert_tp_replication_factor([unmarked], tp_mesh) == 1
+        assert get_expert_tp_replication_factor([marked], no_tp_mesh) == 1
+        assert get_expert_tp_replication_factor([marked], None) == 1
+
+        tp1_mesh = Mock()
+        tp1_mesh.mesh_dim_names = ("dp", "tp")
+        tp1_mesh.__getitem__ = Mock(return_value=Mock(size=Mock(return_value=1)))
+        assert get_expert_tp_replication_factor([marked], tp1_mesh) == 1
 
     def test_no_ep_scaling_without_moe_mesh(self):
         """Test that no EP scaling occurs when moe_mesh is None."""

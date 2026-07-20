@@ -53,9 +53,16 @@ class _FakeTrainerModule(nn.Module):
 
 
 class _FakeTargetWrapper:
-    def generate_batch(self, input_ids, attention_mask, loss_mask):
+    def generate_batch(self, input_ids, attention_mask, loss_mask, **packing_kwargs):
         bs, sl = input_ids.shape
-        return SimpleNamespace(input_ids=input_ids, hidden_states=torch.randn(bs, sl, 16), loss_mask=loss_mask)
+        return SimpleNamespace(
+            input_ids=input_ids,
+            hidden_states=torch.randn(bs, sl, 16),
+            loss_mask=loss_mask,
+            position_ids=None,
+            seq_lens=None,
+            doc_remaining=None,
+        )
 
 
 def _batch():
