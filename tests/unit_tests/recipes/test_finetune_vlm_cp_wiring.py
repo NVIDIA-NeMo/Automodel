@@ -253,14 +253,6 @@ class _FakePPModel:
         self.info = SimpleNamespace(has_last_stage=False, stages=[], schedule=None)
 
 
-class _StageWithCPPrepare:
-    # Hook model WITHOUT cp_preembed_in_forward: the recipe's non-sunk gate treats
-    # it as a recipe-level pre-embedder (media never rides schedule.step -> no
-    # staging). No real model is non-sunk now, but the gate is still exercised.
-    def prepare_model_inputs_for_cp(self):
-        return {}
-
-
 class _StageWithCPPreembedInForward:
     # Sunk VLM (minimax/qwen3_5/qwen3_5_moe/step3p7): embeds + shards per
     # microbatch inside forward and pulls media from the PP side channel, so
@@ -396,24 +388,26 @@ def _minimal_pp_setup_cfg():
 @pytest.mark.parametrize(
     ("cp_size", "stage0", "expected_pp_n_microbatches"),
     [
-        # Recipe-level CP pre-embedder under CP: media consumed pre-schedule -> no staging.
-        (2, _StageWithCPPrepare(), None),
-        # Same model without CP: staging always needed under PP.
-        (1, _StageWithCPPrepare(), 2),
         # Sunk VLM under CP: pulls media from the PP side channel per microbatch,
         # so media MUST be staged (regression guard for the 156-vs-160 vision
         # RoPE mismatch when raw media was left for torch pipelining to row-chunk).
         (2, _StageWithCPPreembedInForward(), 2),
+        # Sunk VLM without CP: PP still stages media.
+        (1, _StageWithCPPreembedInForward(), 2),
         # No CP hook at all: standard PP staging.
         (2, _StageWithoutCPPrepare(), 2),
     ],
 )
-def test_setup_skips_pp_media_prechunk_when_cp_preembeds_vlm_inputs(
+def test_setup_always_stages_pp_media_under_pp(
     monkeypatch,
     cp_size,
     stage0,
     expected_pp_n_microbatches,
 ):
+    """Under PP, media is always staged per microbatch (pp_n_microbatches set) — CP
+    and the model's pre-embed flavor no longer skip it. Every PP-capable VLM is sunk
+    and pulls media from the PP side channel; leaving raw media on schedule.step
+    desyncs the vision RoPE (156-vs-160)."""
     dataloader_calls = []
     _patch_pp_setup_minimals(monkeypatch, cp_size=cp_size, stage0=stage0, dataloader_calls=dataloader_calls)
     trainer = FinetuneRecipeForVLM(_minimal_pp_setup_cfg())
