@@ -105,6 +105,17 @@ class TestCheckpointingConfig:
         assert cfg.v4_compatible is False
         assert cfg.diffusers_compatible is False
         assert cfg.best_metric_key == "default"
+        assert cfg.consolidation_timeout_minutes == 30
+
+    def test_consolidation_timeout_override(self):
+        cfg = CheckpointingConfig(consolidation_timeout_minutes=45)
+
+        assert cfg.consolidation_timeout_minutes == 45
+
+    @pytest.mark.parametrize("timeout_minutes", [0, -1])
+    def test_consolidation_timeout_must_be_positive(self, timeout_minutes):
+        with pytest.raises(ValueError, match="consolidation_timeout_minutes must be greater than 0"):
+            CheckpointingConfig(consolidation_timeout_minutes=timeout_minutes)
 
     def test_importable_from_checkpointing(self):
         """Verify backward compat: import from checkpointing.py still works."""

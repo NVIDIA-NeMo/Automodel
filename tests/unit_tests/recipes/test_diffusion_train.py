@@ -205,6 +205,7 @@ def test_recipe_config_checkpoint_fills_diffusion_model_fields():
                     "checkpoint_dir": "/tmp/ckpts",
                     "model_save_format": "safetensors",
                     "save_consolidated": False,
+                    "consolidation_timeout_minutes": 45,
                     "diffusers_compatible": True,
                     "restore_from": "/tmp/ckpts/step-5",
                 },
@@ -218,6 +219,7 @@ def test_recipe_config_checkpoint_fills_diffusion_model_fields():
     assert str(checkpoint.model_cache_dir) == "/tmp/hf-cache"
     assert checkpoint.is_peft is True
     assert checkpoint.diffusers_compatible is True
+    assert checkpoint.consolidation_timeout_minutes == 45
     # restore_from is consumed at load time, never a config field
     assert not hasattr(checkpoint, "restore_from")
 
