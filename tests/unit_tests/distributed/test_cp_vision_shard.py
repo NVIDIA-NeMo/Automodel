@@ -21,9 +21,9 @@ independent and
 
     visual(all_entries) == concat_r visual(entries_owned_by_rank_r)    (entry order)
 
-holds exactly for both the forward embeddings AND the vision-parameter gradients.  These
-tests prove that on CPU with the CP ranks simulated in-process and the collectives mocked
--- no GPU / no distributed init.
+holds up to numerical precision (``allclose``) for both the forward embeddings AND the
+vision-parameter gradients.  These tests prove that on CPU with the CP ranks simulated
+in-process and the collectives mocked -- no GPU / no distributed init.
 """
 
 from types import SimpleNamespace

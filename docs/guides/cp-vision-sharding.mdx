@@ -18,8 +18,8 @@ and holds **O(all-images)** vision activations on each rank.
 `nemo_automodel.components.distributed.cp_vision_shard` removes this redundancy by
 partitioning the visual input across the CP group at **frame granularity**, running the
 vision tower on each rank's slice only, and all-gathering the per-frame embeddings back in
-order. The downstream scatter into `inputs_embeds` and the sequence shard are byte-for-byte
-unchanged.
+order. The downstream scatter into `inputs_embeds` and the sequence shard consume
+numerically equivalent (`allclose`) embeds through the unchanged code path.
 
 ## Design
 
@@ -39,7 +39,7 @@ So, with all CP ranks holding identical FSDP-all-gathered vision weights:
 visual((t,h,w)) == visual(t × (1,h,w))    and    visual(all_frames) == concat_r visual(frames_of_rank_r)
 ```
 
-hold **exactly**. Every `(t,h,w)` entry is expanded into `t` per-frame units, the *frames*
+hold up to **numerical precision** (`allclose`). Every `(t,h,w)` entry is expanded into `t` per-frame units, the *frames*
 are partitioned contiguously across the CP group, each rank runs `visual` on its slice, and a
 differentiable all-gather reassembles the embeddings in the original order. Sharding at frame
 granularity (rather than whole-entry) lets a **single large video** — or a pack with fewer
@@ -69,7 +69,7 @@ embed_multimodal:
 |---|---|
 | **Load balance** | Contiguous partition of per-frame units balanced by `p*(p+alpha)`, where `p` is the per-frame attention sequence size (`(h*w)`), ≥1 frame per rank. The quadratic term captures per-frame attention; `alpha*p` adds a model-scaled proxy for the linear per-patch work (qkv/MLP projections) that pure `p**2` ignores, so packs mixing big image frames with many small video frames no longer heap the small frames onto a few ranks. By default `alpha = 3 * vision_hidden_size` is discovered from the model (Qwen `visual.config.hidden_size`, nested `vision_config`, Nemotron `vit_hidden_size`, and RADIO `embed_dim`, without class-name checks); unknown towers fall back to `alpha=0` (legacy pure-quadratic). Contiguous so the gathered blocks concatenate back in original frame order with no reshuffle. Deterministic, so every rank computes the same cuts. |
 | **Differentiable all-gather** | Per-rank `[max_tokens, H]` blocks are padded to the global max, all-gathered (forward all-gather + concat; backward **reduce-scatter SUM**), then sliced back to true token counts. |
-| **Gradient parity** | Every rank reassembles the full embeds, then keeps only its sequence shard. A frame computed by rank `c` lands in shard-owner rank `s`; reduce-scatter-SUM routes `s`'s gradient back to `c` (summing the straddling case). The total vision-parameter gradient equals the replicated baseline's. |
+| **Gradient parity** | Every rank reassembles the full embeds, then keeps only its sequence shard. A frame computed by rank `c` lands in shard-owner rank `s`; reduce-scatter-SUM routes `s`'s gradient back to `c` (summing the straddling case). The total vision-parameter gradient is numerically equivalent (`allclose`) to the replicated baseline's. |
 | **FSDP / no deadlock** | The distribute / pad / replicate choice is a pure function of `(num_frame_units, world, enabled)` and thus identical on all ranks; every rank makes exactly one `visual` call and the same number of vision-shard collectives. Fewer frame units than ranks **pads with minimal dummy frames** (one unit per rank) so no rank is starved; the dummy embeddings are sliced off before the loss and contribute exactly zero gradient. The all-gather inside `maybe_distribute_visual` is the synchronization boundary — do **not** add an extra post-visual CP barrier. |
 | **Small workloads** | Batches whose visual token count is below `NEMO_CP_SHARD_VISION_MIN_TOKENS` (default `2048`) use the replicated path: they have little memory pressure but would still pay the all-gather synchronization cost. |
 
@@ -87,7 +87,7 @@ CP-only (`spans_only_cp=False`).
 
 | Vision tower | Sharding group | Why |
 |---|---|---|
-| **Frozen** | Full **CP × TP** rank set (`spans_only_cp=False`) | Frame independence + replicated weights make the forward bit-identical for *any* rank group with identical weights, and `requires_grad=False` means no backward ever runs through the gather — zero gradient risk. |
+| **Frozen** | Full **CP × TP** rank set (`spans_only_cp=False`) | Frame independence + replicated weights make the forward numerically equivalent (`allclose`) for *any* rank group with identical weights, and `requires_grad=False` means no backward ever runs through the gather — zero gradient risk. |
 | **Trainable** | **CP group only** (`spans_only_cp=True`, the default) | The vision tower is replicated (not tensor-parallel) across TP ranks. Gathering frames across CP × TP would make the all-gather's reduce-scatter(SUM) backward accumulate the vision gradient **tp-fold**: each TP-replicated sequence shard backprops into the single rank that computed the frame. TP ranks therefore redundantly compute the ViT — and `maybe_distribute_visual` **raises** if a trainable tower is published with `spans_only_cp=False`. |
 | **Pure TP** (`cp_size == 1`) | Not enabled | With no CP there is no CP group to publish: either no group is set, or the published group has size 1 — `maybe_distribute_visual` falls back to the replicated path whenever the group size is ≤ 1. |
 

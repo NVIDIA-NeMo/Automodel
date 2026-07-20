@@ -25,11 +25,12 @@ are therefore INDEPENDENT units, and
 
     visual(all_entries) == concat_r visual(entries_owned_by_rank_r)    (entry order)
 
-holds exactly (all CP ranks already hold identical vision weights after the FSDP2
-all-gather -- the replicated design relies on that too).  So we partition the
-entries across the CP group, run ``self.visual`` on each rank's slice, and
-all-gather the per-entry embeddings back to the full set.  The downstream scatter
-into ``inputs_embeds`` and the sequence shard are byte-for-byte unchanged.
+holds up to numerical precision (``allclose``; all CP ranks already hold identical
+vision weights after the FSDP2 all-gather -- the replicated design relies on that
+too).  So we partition the entries across the CP group, run ``self.visual`` on each
+rank's slice, and all-gather the per-entry embeddings back to the full set.  The
+downstream scatter into ``inputs_embeds`` and the sequence shard consume numerically
+equivalent embeds through the unchanged code path.
 
 Memory/compute: vision forward + activations drop ~cp_size x; the final gathered
 embeds (small vs the ViT's internal patch activations) are reconstructed in full
@@ -39,7 +40,8 @@ Sharding-group scope (deliberate, machine-checked design constraint): the caller
 declares the scope of the process group it publishes via
 ``set_cp_vision_group(group, spans_only_cp=...)``.  With a FROZEN vision tower,
 frames may be sharded across the full CP x TP rank set (``spans_only_cp=False``):
-the forward is bit-identical (per-frame independence, replicated weights) and
+the forward is numerically equivalent (``allclose``; per-frame independence,
+replicated weights) and
 ``requires_grad=False`` means no backward ever runs through the gather.  With a
 TRAINABLE vision tower, only a CP-only group (``spans_only_cp=True``, the default)
 is valid: the vision tower is replicated (not tensor-parallel) across TP ranks,
@@ -555,7 +557,7 @@ def maybe_distribute_visual(
         entry order (H = vision output hidden size); each entry of ``deepstack_features``
         (when present) is gathered to the same shape.  ``last_hidden_state`` is left as
         the local shard (unused downstream).  Forward and vision-parameter gradients are
-        exactly equal to the replicated call's.
+        numerically equivalent (``allclose``) to the replicated call's.
 
     Raises:
         ValueError: When the vision tower has trainable parameters but the published
@@ -591,7 +593,7 @@ def maybe_distribute_visual(
     # Expand each (t, h, w) entry into t per-FRAME units.  Qwen3-VL-style vision towers have NO
     # cross-frame coupling -- attention is per-frame (cu_seqlens repeats h*w over t), and both
     # the rotary and the learned position embeddings are spatial-only, repeated identically per
-    # frame -- so visual((t,h,w)) == visual(t x (1,h,w)) exactly.  Sharding at frame granularity
+    # frame -- so visual((t,h,w)) == visual(t x (1,h,w)) up to numerical precision.  Sharding at frame granularity
     # lets a single large video (or a pack with fewer videos than ranks) split across ranks;
     # images (t == 1) are simply one unit each, so their behaviour is unchanged.
     grid_list, grid_host = _grid_list_for_planning(grid_thw)
@@ -626,8 +628,8 @@ def maybe_distribute_visual(
     # (each rank redundantly runs all `n_units` frames), PAD with dummy frames up to
     # `world` so every rank runs exactly ONE frame.  The dummy embeddings are gathered
     # then sliced off below (never reach masked_scatter / the loss), so they contribute
-    # zero gradient and the result is byte-identical to the replicate path -- but per-rank
-    # ViT work drops from `n_units` frames to 1.  (`n_units == 0` -> no frame to copy ->
+    # zero gradient and the result is numerically equivalent (`allclose`) to the replicate
+    # path -- but per-rank ViT work drops from `n_units` frames to 1.  (`n_units == 0` -> no frame to copy ->
     # keep the replicate path.)
     n_pad = 0
     if 0 < n_units < world:
@@ -694,7 +696,7 @@ def maybe_distribute_visual(
     # Build this rank's grid by coalescing consecutive frame units from the SAME original entry
     # into a (count, h, w) row (visual treats it as `count` independent frames).  Frames of one
     # video that land on this rank collapse to one row; distinct entries (incl. every image)
-    # stay separate, so the t==1 image path is byte-identical to the entry-level version.
+    # stay separate, so the t==1 image path is numerically equivalent to the entry-level version.
     local_rows: list[list[int]] = []  # [count, h, w, entry_idx]
     for i in range(cuts[rank], cuts[rank + 1]):
         h, w = f_hw[i]
