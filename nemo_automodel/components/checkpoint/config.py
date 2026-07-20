@@ -187,6 +187,7 @@ class CheckpointingConfig:
         pp_rank: int,
         moe_mesh: DeviceMesh | None = None,
         process_group: ProcessGroup | None = None,
+        pp_group: ProcessGroup | None = None,
         *,
         model_state_dict_keys: list[str] | None = None,
     ) -> Checkpointer:
@@ -202,6 +203,9 @@ class CheckpointingConfig:
             pp_rank: Pipeline-parallel rank.
             moe_mesh: Optional device mesh for MoE checkpointing.
             process_group: Process group used for distributed checkpoint collectives.
+            pp_group: Optional pipeline-parallel process group. Threaded to the
+                PEFT save path so adapter weights are gathered across PP stages
+                (required for complete adapters when ``pp_size > 1``).
             model_state_dict_keys: Model state-dict keys captured before any
                 parallelization, for models that do not set
                 ``_pre_shard_hf_state_dict_keys``. Runtime data (the model must
@@ -221,6 +225,7 @@ class CheckpointingConfig:
             pp_rank=pp_rank,
             moe_mesh=moe_mesh,
             process_group=process_group,
+            pp_group=pp_group,
             model_state_dict_keys=model_state_dict_keys,
         )
 

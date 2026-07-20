@@ -217,6 +217,14 @@ class TestBuildModelStateDictKeys:
         assert checkpointer._model_state_dict_keys == ["transformer.w1", "transformer.w2"]
         assert checkpointer.config.model_state_dict_keys is None
 
+    def test_build_forwards_pp_group_and_runtime_keys(self):
+        pp_group = object()
+
+        checkpointer = self._build(pp_group=pp_group, model_state_dict_keys=["transformer.w1"])
+
+        assert checkpointer.pp_group is pp_group
+        assert checkpointer._model_state_dict_keys == ["transformer.w1"]
+
     def test_build_defaults_to_no_runtime_keys(self):
         checkpointer = self._build()
 

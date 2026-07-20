@@ -404,8 +404,9 @@ class Checkpointer:
         pp_rank: int,
         moe_mesh: Optional[DeviceMesh] = None,
         process_group: torch.distributed.ProcessGroup | None = None,
+        pp_group: Optional["torch.distributed.ProcessGroup"] = None,
         *,
-        model_state_dict_keys: Optional[list[str]] = None,
+        model_state_dict_keys: list[str] | None = None,
     ) -> None:
         """
         Initialize the checkpointer.
@@ -417,6 +418,9 @@ class Checkpointer:
             pp_rank: Pipeline parallel rank for the current process.
             moe_mesh: Optional device mesh used for MoE when adapting state dicts.
             process_group: Process group used for distributed checkpoint collectives.
+            pp_group: Optional pipeline-parallel process group. Passed to
+                ``ModelState`` so PEFT adapters are gathered across PP stages at
+                save time (complete adapter under ``pp_size > 1``).
             model_state_dict_keys: Model state-dict keys captured before any
                 parallelization, for models that do not set
                 ``_pre_shard_hf_state_dict_keys`` (e.g. diffusion transformers).
@@ -426,6 +430,7 @@ class Checkpointer:
         """
         self.config = config
         self.moe_mesh = moe_mesh
+        self.pp_group = pp_group
         self.dp_rank = dp_rank
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
@@ -488,7 +493,7 @@ class Checkpointer:
             should_write_consolidated and not self.config.is_async and not self.config.single_rank_consolidation
         )
 
-        model_state = ModelState(model, self.config.is_peft)
+        model_state = ModelState(model, self.config.is_peft, pp_group=self.pp_group)
         state_dict = model_state.state_dict()
 
         # Convert to HF format if using custom model implementations.
