@@ -275,6 +275,91 @@ def test_parameter_owner_is_resharded_when_capture_fails(monkeypatch):
     manager.close()
 
 
+def test_capture_failure_resets_staged_graphs_and_keeps_all_targets_eager(monkeypatch):
+    reset_adapters = []
+    capture_count = 0
+
+    def make_graphed_callables(modules, sample_args, **kwargs):
+        nonlocal capture_count
+        del sample_args, kwargs
+        capture_count += 1
+        if capture_count == 2:
+            raise RuntimeError("second target failed")
+        adapter = modules[0]
+        adapter.reset = lambda: reset_adapters.append(adapter)
+        return (adapter,)
+
+    monkeypatch.setattr(partial_graphs, "_get_make_graphed_callables", lambda: make_graphed_callables)
+    targets = (nn.Identity(), nn.Identity())
+    original_forwards = tuple(target.forward for target in targets)
+    manager = partial_graphs.PartialCudaGraphManager(
+        [
+            partial_graphs._PartialGraphEntry(name=f"target.{index}", target=target)
+            for index, target in enumerate(targets)
+        ]
+    )
+    manager.start_recording()
+    for target in targets:
+        target(torch.ones(2, 3))
+
+    with pytest.raises(RuntimeError, match="Partial CUDA graph capture failed"):
+        manager.capture()
+
+    assert len(reset_adapters) == 1
+    assert tuple(target.forward for target in targets) == original_forwards
+    assert manager.stats() == {"captured": 0, "replayed": 0, "fallback": 0}
+    manager.close()
+
+
+def test_second_input_variant_failure_resets_first_graph(monkeypatch):
+    reset_adapters = []
+    capture_count = 0
+
+    def make_graphed_callables(modules, sample_args, **kwargs):
+        nonlocal capture_count
+        del sample_args, kwargs
+        capture_count += 1
+        if capture_count == 2:
+            raise RuntimeError("second variant failed")
+        adapter = modules[0]
+        adapter.reset = lambda: reset_adapters.append(adapter)
+        return (adapter,)
+
+    monkeypatch.setattr(partial_graphs, "_get_make_graphed_callables", lambda: make_graphed_callables)
+    target = nn.Identity()
+    original_forward = target.forward
+    entry = partial_graphs._PartialGraphEntry(name="attention", target=target, capture_input_variants=2)
+    manager = partial_graphs.PartialCudaGraphManager([entry])
+    manager.start_recording()
+    target(torch.ones(2, requires_grad=False))
+    target(torch.ones(2, requires_grad=True))
+
+    with pytest.raises(RuntimeError, match="Partial CUDA graph capture failed"):
+        manager.capture()
+
+    assert len(reset_adapters) == 1
+    assert target.forward == original_forward
+    manager.close()
+
+
+def test_rejects_nonempty_parameter_and_buffer_without_storage():
+    parameter = nn.Parameter(torch.empty(2, device="meta"))
+    with pytest.raises(RuntimeError, match="stable local storage"):
+        partial_graphs._require_local_parameter_storage("weight", parameter)
+
+    target = nn.Module()
+    target.register_buffer("cache", torch.empty(2, device="meta"))
+    with pytest.raises(RuntimeError, match="stable local storage"):
+        partial_graphs._named_buffer_storage(target)
+
+
+def test_graph_helper_fails_with_actionable_error_when_te_is_unavailable(monkeypatch):
+    monkeypatch.setattr(partial_graphs, "safe_import_te", lambda: (False, object()))
+
+    with pytest.raises(RuntimeError, match="require a working Transformer Engine"):
+        partial_graphs._get_make_graphed_callables()
+
+
 def test_capture_replays_matching_input_and_falls_back_on_metadata_change(monkeypatch):
     captured_kwargs = _install_fake_graph(monkeypatch)
     target = nn.Identity()
