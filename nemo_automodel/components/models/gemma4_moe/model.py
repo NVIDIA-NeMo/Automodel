@@ -882,13 +882,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     # nn.Module.to rounds floating buffers; cast_model_to_dtype restores keep-fp32
     # modules afterwards (see llama/rope_utils.py).
     _keep_in_fp32_modules = ["rotary_emb"]
-    # CP pre-embed is sunk into forward: the model embeds, splices vision, builds
-    # per_layer_inputs and slices this rank's contiguous shard per microbatch
-    # (Megatron-style), so the CP hook is sharder-only. The VLM recipe reads this
-    # flag to invoke the (no-compute) hook on every PP stage and to keep media in
-    # the batch rather than treating this as a recipe-level pre-embedder. See
-    # prepare_model_inputs_for_cp / forward / _cp_sunk_prepare_inputs.
-    cp_preembed_in_forward: bool = True
     # CP submesh, recorded by _cp_shard_batch_aux_only the first time the dispatch
     # hands the model the CP submesh; None means the forward embeds/shards nothing
     # for CP.

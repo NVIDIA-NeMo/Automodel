@@ -22,8 +22,8 @@ full recipe — exercising the code shape that gets shipped:
     ``prepare_cp_forward`` (a plain method call; nothing consumed, so input_ids
     and multimodal inputs stay in the batch for the model's own forward)
   - PP gating: the sharder-only hook is invoked on every stage (all PP-capable
-    VLMs are sunk via ``cp_preembed_in_forward``); media is dropped on non-first
-    stages so those stage forwards see only text inputs
+    VLMs are sunk — they embed + shard in their own forward); media is dropped on
+    non-first stages so those stage forwards see only text inputs
   - Validation: count labels after _make_cp_batch_and_ctx and inside train_ctx
   - Validation: position_ids ``.to(self.dist_env.device)`` (not model.device)
 """
@@ -171,8 +171,6 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
 class _SunkSpyVLM:
     """Sunk VLM: sharder-only CP hook (embeds/shards in forward, consumes nothing)."""
 
-    cp_preembed_in_forward = True
-
     def __init__(self):
         self.calls = []
 
@@ -257,8 +255,6 @@ class _StageWithCPPreembedInForward:
     # Sunk VLM (minimax/qwen3_5/qwen3_5_moe/step3p7): embeds + shards per
     # microbatch inside forward and pulls media from the PP side channel, so
     # media MUST still be staged for PP under CP.
-    cp_preembed_in_forward = True
-
     def prepare_model_inputs_for_cp(self):
         return {}
 

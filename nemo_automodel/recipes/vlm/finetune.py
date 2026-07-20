@@ -790,8 +790,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         # routed through __call__ so FSDP2 forward pre-hooks fire and unshard the
         # vision tower's weights before the embed/scatter.
         _is_first_or_no_pp = not self.pp_enabled or getattr(self.pp.info, "has_first_stage", False)
-        # The CP hook is invoked on EVERY pp stage. Every PP-capable VLM is sunk
-        # (cp_preembed_in_forward): its sharder-only hook consumes nothing but must
+        # The CP hook is invoked on EVERY pp stage. Every PP-capable VLM is sunk:
+        # its sharder-only hook consumes nothing but must
         # install the aux-only sharder on non-first stages too so input_ids stays
         # FULL-length there. Otherwise those stages fall through to the generic
         # round-robin sharder, which shards input_ids to the local length; the

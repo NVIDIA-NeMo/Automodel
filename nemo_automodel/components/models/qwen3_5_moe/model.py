@@ -707,12 +707,6 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
     # forward() pulls per-microbatch pixel_values from _vlm_pixel_values_chunks;
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
-    # CP pre-embed is sunk into forward and the forward pulls media from the PP
-    # side channel, so the VLM recipe must still stage media for PP under CP
-    # rather than treating this as a recipe-level pre-embedder (which would leave
-    # raw pixel_values/image_grid_thw for torch pipelining to row-chunk
-    # independently, desyncing the vision RoPE positions).
-    cp_preembed_in_forward: bool = True
     # CP submesh, installed by Qwen3_5ParallelizationStrategy when context
     # parallelism is active; None means the forward embeds and shards nothing for CP.
     cp_mesh = None
