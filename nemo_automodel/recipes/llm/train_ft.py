@@ -70,7 +70,6 @@ from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
 from nemo_automodel.components.loss.mtp import calculate_mtp_loss
 from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
-from nemo_automodel.components.optim.precision_warnings import resolve_storage_dtype
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -594,14 +593,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if self.mesh_context.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
             logging.info("Disabling rope_fusion because cp_size=%d > 1", self.mesh_context.cp_size)
             self.cfg.model.backend.rope_fusion = False
-
-        resolve_storage_dtype(
-            self.cfg.model,
-            self.cfg.get("optimizer"),
-            is_peft=self.peft_config is not None,
-            context="llm",
-            logger=logger,
-        )
 
         model = build_model(
             self.cfg.model,

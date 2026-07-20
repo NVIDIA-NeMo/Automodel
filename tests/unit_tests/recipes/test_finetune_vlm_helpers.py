@@ -2860,12 +2860,11 @@ def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
     assert cfg.model.backend.rope_fusion is True
 
 
-def test_vlm_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch):
+def test_vlm_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
     cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True, optimizer_target="torch.optim.AdamW")
     _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
     optimizer_config = build_optimizer_config("torch.optim.AdamW", {"lr": 0.01})
-    assert not hasattr(optimizer_config, "_target_")
     monkeypatch.setattr(optimizer_config, "build", lambda *a, **k: [dummy_opt])
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
@@ -2875,7 +2874,7 @@ def test_vlm_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch):
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
 
-    assert cfg.model.torch_dtype == "float32"
+    assert not hasattr(cfg.model, "torch_dtype")
 
 
 def test_vlm_rope_fusion_stays_false_when_already_disabled(monkeypatch):

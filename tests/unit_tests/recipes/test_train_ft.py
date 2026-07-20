@@ -1035,13 +1035,12 @@ def test_nvtx_false_skips_patching(monkeypatch):
     assert patch_calls == []
 
 
-def test_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch):
+def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
     cfg = _minimal_cfg_with_nvtx(nvtx_value=False, optimizer_target="torch.optim.AdamW")
 
     _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
     optimizer_config = build_optimizer_config("torch.optim.AdamW", {"lr": 0.01})
-    assert not hasattr(optimizer_config, "_target_")
     monkeypatch.setattr(optimizer_config, "build", lambda *a, **k: [dummy_opt])
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
@@ -1051,7 +1050,7 @@ def test_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch):
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
 
-    assert cfg.model.torch_dtype == "float32"
+    assert not hasattr(cfg.model, "torch_dtype")
 
 
 def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
