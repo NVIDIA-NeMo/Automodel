@@ -157,6 +157,11 @@ srun "\${srun_args[@]}" bash -lc 'set -euo pipefail
     export PYTHONPATH="\$(pwd):\${PYTHONPATH:-}"
     export TOKENIZERS_PARALLELISM=false
     export OMP_NUM_THREADS=1
+    export HF_HOME="${CACHE_DIR}"
+    export HF_DATASETS_CACHE="${CACHE_DIR}"
+    export HF_HUB_CACHE="${CACHE_DIR}"
+    export HUGGINGFACE_HUB_CACHE="${CACHE_DIR}"
+    export TRANSFORMERS_CACHE="${CACHE_DIR}"
     python --version
     python tools/retrieval/warm_retrieval_hf_cache.py \
         --config "${CONFIG}" \

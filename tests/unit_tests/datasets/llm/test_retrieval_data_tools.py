@@ -293,6 +293,7 @@ def test_warm_retrieval_hf_cache_builds_original_dataset_from_config(tmp_path):
     cache_dir = tmp_path / "hf_cache"
     report_path = tmp_path / "report.json"
     captured_kwargs = {}
+    captured_cache_env = {}
     old_env = {name: os.environ.get(name) for name in warm._configure_hf_cache(None)}
 
     def dataset_factory(
@@ -304,6 +305,18 @@ def test_warm_retrieval_hf_cache_builds_original_dataset_from_config(tmp_path):
         do_shuffle=False,
         max_train_samples=None,
     ):
+        captured_cache_env.update(
+            {
+                name: os.environ.get(name)
+                for name in (
+                    "HF_HOME",
+                    "HF_DATASETS_CACHE",
+                    "HF_HUB_CACHE",
+                    "HUGGINGFACE_HUB_CACHE",
+                    "TRANSFORMERS_CACHE",
+                )
+            }
+        )
         captured_kwargs.update(
             {
                 "data_dir_list": data_dir_list,
@@ -337,6 +350,8 @@ def test_warm_retrieval_hf_cache_builds_original_dataset_from_config(tmp_path):
     assert captured_kwargs["n_passages"] == 2
     assert captured_kwargs["seed"] == 123
     assert captured_kwargs["max_train_samples"] == 1
+    assert set(captured_cache_env.values()) == {str(cache_dir)}
+    assert report["cache_env"] == captured_cache_env
     assert report["dataset_length"] == 2
     assert report["touched_documents"] == 4
     assert report["touched_images"] == 2
@@ -355,6 +370,85 @@ def test_warm_retrieval_hf_cache_rejects_normalized_dataset_config(tmp_path):
             str(config_path),
             dataset_factory=lambda data_dir_list: _DummyRetrievalDataset(),
         )
+
+
+def test_warm_cache_module_defers_nemo_and_hf_imports():
+    repo_dir = Path(__file__).resolve().parents[4]
+    probe = """
+import json
+import sys
+
+from tools.retrieval import warm_retrieval_hf_cache
+
+module_names = ("nemo_automodel", "datasets", "huggingface_hub", "transformers")
+print(json.dumps({name: name in sys.modules for name in module_names}))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+    assert json.loads(result.stdout) == {
+        "nemo_automodel": False,
+        "datasets": False,
+        "huggingface_hub": False,
+        "transformers": False,
+    }
+
+
+def test_warm_cache_launcher_exports_cache_before_python(tmp_path):
+    repo_dir = Path(__file__).resolve().parents[4]
+    launcher = repo_dir / "tools/retrieval/submit_warm_retrieval_hf_cache_cpu.sh"
+    config_path = tmp_path / "config.yaml"
+    _write_warm_cache_config(config_path, "nemo_automodel.components.datasets.llm.make_retrieval_dataset")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_sbatch = fake_bin / "sbatch"
+    fake_sbatch.write_text(
+        '#!/usr/bin/env bash\ncat > "${SBATCH_CAPTURE_PATH}"\necho 1000\n',
+        encoding="utf-8",
+    )
+    fake_sbatch.chmod(0o755)
+
+    cache_dir = tmp_path / "hf_cache"
+    capture_path = tmp_path / "job.sh"
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "SBATCH_CAPTURE_PATH": str(capture_path),
+            "REPO_DIR": str(repo_dir),
+            "CONFIG": str(config_path),
+            "CACHE_DIR": str(cache_dir),
+            "RUN_NAME": "warm-cache-test",
+        }
+    )
+    subprocess.run(
+        ["bash", str(launcher)],
+        cwd=repo_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    job_script = capture_path.read_text(encoding="utf-8")
+    python_index = job_script.index("python --version")
+    for env_name in (
+        "HF_HOME",
+        "HF_DATASETS_CACHE",
+        "HF_HUB_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "TRANSFORMERS_CACHE",
+    ):
+        export_line = f'export {env_name}="{cache_dir}"'
+        assert export_line in job_script
+        assert job_script.index(export_line) < python_index
 
 
 def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_path, monkeypatch):

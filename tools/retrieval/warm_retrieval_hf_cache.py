@@ -39,9 +39,15 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from nemo_automodel.shared.import_utils import safe_import
-
 logger = logging.getLogger(__name__)
+
+_HF_CACHE_ENV_VARS = (
+    "HF_HOME",
+    "HF_DATASETS_CACHE",
+    "HF_HUB_CACHE",
+    "HUGGINGFACE_HUB_CACHE",
+    "TRANSFORMERS_CACHE",
+)
 
 _RETRIEVAL_DATASET_TARGETS = {
     None,
@@ -52,6 +58,9 @@ _RETRIEVAL_DATASET_TARGETS = {
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
+    # Keep module import stdlib-only until _configure_hf_cache() has run.
+    from nemo_automodel.shared.import_utils import safe_import
+
     has_yaml, yaml = safe_import("yaml")
     if not has_yaml:
         raise ImportError("PyYAML is required to load --config. Install pyyaml.")
@@ -105,23 +114,13 @@ def _dataset_kwargs_from_config(
 
 def _configure_hf_cache(cache_dir: str | None) -> dict[str, str | None]:
     if cache_dir is None:
-        return {
-            "HF_HOME": os.environ.get("HF_HOME"),
-            "HF_DATASETS_CACHE": os.environ.get("HF_DATASETS_CACHE"),
-            "HUGGINGFACE_HUB_CACHE": os.environ.get("HUGGINGFACE_HUB_CACHE"),
-            "TRANSFORMERS_CACHE": os.environ.get("TRANSFORMERS_CACHE"),
-        }
+        return {env_name: os.environ.get(env_name) for env_name in _HF_CACHE_ENV_VARS}
 
     cache_path = str(Path(cache_dir).expanduser())
     Path(cache_path).mkdir(parents=True, exist_ok=True)
-    for env_name in ("HF_HOME", "HF_DATASETS_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"):
+    for env_name in _HF_CACHE_ENV_VARS:
         os.environ[env_name] = cache_path
-    return {
-        "HF_HOME": cache_path,
-        "HF_DATASETS_CACHE": cache_path,
-        "HUGGINGFACE_HUB_CACHE": cache_path,
-        "TRANSFORMERS_CACHE": cache_path,
-    }
+    return {env_name: cache_path for env_name in _HF_CACHE_ENV_VARS}
 
 
 def _touch_example(example: dict[str, Any]) -> dict[str, int]:
@@ -223,8 +222,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache-dir",
         default=None,
-        help="Shared Hugging Face cache directory. Sets HF_HOME, HF_DATASETS_CACHE, HUGGINGFACE_HUB_CACHE, and "
-        "TRANSFORMERS_CACHE before dataset construction.",
+        help="Shared Hugging Face cache directory. Sets HF_HOME, HF_DATASETS_CACHE, HF_HUB_CACHE, "
+        "HUGGINGFACE_HUB_CACHE, and TRANSFORMERS_CACHE before importing the dataset loader.",
     )
     parser.add_argument(
         "--touch-samples",

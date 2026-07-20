@@ -176,7 +176,7 @@ tools/retrieval/submit_warm_retrieval_hf_cache_cpu.sh
 ```
 
 The same `CACHE_DIR` should be mounted into GPU training and exported as `HF_HOME`, `HF_DATASETS_CACHE`,
-`HUGGINGFACE_HUB_CACHE`, and `TRANSFORMERS_CACHE`.
+`HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, and `TRANSFORMERS_CACHE`.
 
 HF cache reuse is exact-key based. A warm cache is reused only when the later training run uses the same cache directory
 and the same effective dataset fingerprint. The fingerprint can change if the same source data is referenced through a
