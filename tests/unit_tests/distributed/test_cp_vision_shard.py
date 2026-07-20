@@ -581,21 +581,19 @@ def test_maybe_distribute_falls_back_without_group():
     assert torch.allclose(out.pooler_output, visual(pixel, grid).pooler_output, atol=1e-6)
 
 
-def test_grid_for_visual_follows_attention_implementation():
-    """CPU-metadata attention impls (non-flash) keep grid_thw on CPU untouched; flash
-    impls get the grid on pixel_values' device."""
+def test_grid_for_visual_follows_vision_execution_device():
+    """Grid metadata follows pixel values even for SDPA vision towers.
+
+    Current Qwen3.5 uses the grid to construct indices for a device-resident position
+    embedding, so attention backend alone cannot make a CPU grid safe.
+    """
     grid = _grid([(1, 2, 2)])
     pixel = _pixels(grid)
 
-    sdpa_visual = _StubVisual()
-    sdpa_visual.config = SimpleNamespace(_attn_implementation="sdpa")
-    assert vs._vision_grid_cpu_ok(sdpa_visual)
-    assert vs._grid_for_visual(sdpa_visual, grid, pixel) is grid
+    assert vs._grid_for_visual(grid, pixel) is grid
 
-    flash_visual = _StubVisual()
-    flash_visual.config = SimpleNamespace(_attn_implementation="flash_attention_2")
-    assert not vs._vision_grid_cpu_ok(flash_visual)
-    assert vs._grid_for_visual(flash_visual, grid, pixel).device == pixel.device
+    meta_pixel = torch.empty(pixel.shape, device="meta")
+    assert vs._grid_for_visual(grid, meta_pixel).device.type == "meta"
 
 
 @pytest.mark.parametrize(

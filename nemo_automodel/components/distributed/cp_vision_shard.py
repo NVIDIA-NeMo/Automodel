@@ -185,25 +185,23 @@ class _AllGatherSeqDiff(torch.autograd.Function):
         return local, None, None
 
 
-def _vision_grid_cpu_ok(visual: torch.nn.Module) -> bool:
-    """Return True when HF vision attention can consume CPU grid metadata."""
-    impl = str(getattr(getattr(visual, "config", None), "_attn_implementation", "") or "").lower()
-    return bool(impl) and not impl.startswith("flash")
-
-
-def _grid_for_visual(visual: torch.nn.Module, grid_thw: torch.Tensor, pixel_values: torch.Tensor) -> torch.Tensor:
+def _grid_for_visual(grid_thw: torch.Tensor, pixel_values: torch.Tensor) -> torch.Tensor:
     """Move ``grid_thw`` ([N, 3] long, rows of (t, h, w)) to the device ``visual`` expects.
 
-    CPU when the attention implementation consumes host metadata, else ``pixel_values``'s
-    device.  ``pixel_values`` is only read for its device.
+    Vision forwards may use the grid both as host-readable shape metadata and as indices
+    into device-resident position embeddings. Keep it on ``pixel_values``'s device; callers
+    that need Python values can synchronize through ``tolist()``, while a CPU grid cannot
+    index a CUDA embedding table. Attention backend alone does not determine every grid
+    consumer's device requirement.
+
+    Args:
+        grid_thw: Tensor of shape [entries, 3] containing ``(time, height, width)`` rows.
+        pixel_values: Tensor of shape [patches, patch_dim] whose device owns vision execution.
+
+    Returns:
+        Tensor of shape [entries, 3] on ``pixel_values``'s device. The input is returned
+        without copying when it is already on that device.
     """
-    if _vision_grid_cpu_ok(visual):
-        if grid_thw.device.type == "cpu":
-            return grid_thw
-        # Blocking D2H copy: downstream metadata construction reads the host
-        # tensor (`.tolist()`) with no stream sync, so a non-blocking copy
-        # can expose uninitialized host memory.
-        return grid_thw.to("cpu")
     if grid_thw.device == pixel_values.device:
         return grid_thw
     return grid_thw.to(pixel_values.device, non_blocking=True)
@@ -617,7 +615,7 @@ def maybe_distribute_visual(
     if scope is None or not scope.config.enabled:
         return visual(
             pixel_values,
-            grid_thw=_grid_for_visual(visual, grid_thw, pixel_values),
+            grid_thw=_grid_for_visual(grid_thw, pixel_values),
             return_dict=True,
         )
 
@@ -626,7 +624,7 @@ def maybe_distribute_visual(
     if world <= 1:
         return visual(
             pixel_values,
-            grid_thw=_grid_for_visual(visual, grid_thw, pixel_values),
+            grid_thw=_grid_for_visual(grid_thw, pixel_values),
             return_dict=True,
         )
 
@@ -664,7 +662,7 @@ def maybe_distribute_visual(
             )
         return visual(
             pixel_values,
-            grid_thw=_grid_for_visual(visual, grid_thw, pixel_values),
+            grid_thw=_grid_for_visual(grid_thw, pixel_values),
             return_dict=True,
         )
 
@@ -702,7 +700,7 @@ def maybe_distribute_visual(
         if cuts is None:  # n_units == 0 (no frames) -> replicate (keeps collectives uniform)
             return visual(
                 pixel_values,
-                grid_thw=_grid_for_visual(visual, grid_thw, pixel_values),
+                grid_thw=_grid_for_visual(grid_thw, pixel_values),
                 return_dict=True,
             )
 
@@ -749,11 +747,10 @@ def maybe_distribute_visual(
             local_rows[-1][0] += 1
         else:
             local_rows.append([1, h, w, f_entry[i]])
-    local_grid_device = torch.device("cpu") if _vision_grid_cpu_ok(visual) else pixel_values.device
     local_grid = torch.tensor(
         [[c, h, w] for c, h, w, _ in local_rows],
         dtype=grid_host.dtype,
-        device=local_grid_device,
+        device=pixel_values.device,
     )
 
     local_out = visual(local_pixel, grid_thw=local_grid, return_dict=True)
