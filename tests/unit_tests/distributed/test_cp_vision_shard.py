@@ -505,6 +505,9 @@ def _simulate_maybe_distribute(visual, pixel, grid, world, rank, monkeypatch, *,
     monkeypatch.setattr(dist, "get_world_size", lambda group=None: world)
     monkeypatch.setattr(dist, "get_rank", lambda group=None: rank)
     monkeypatch.setattr(dist, "all_gather", fake_all_gather)
+    # The token-count consensus all-reduce is a no-op with a single in-process rank: the
+    # stub always produces the planned token count, so the flag stays 0 and no rank raises.
+    monkeypatch.setattr(dist, "all_reduce", lambda tensor, op=None, group=None: None)
     if grad:
         # _AllGatherSeqDiff.backward does reduce_scatter(local, chunks, SUM): hand rank
         # `rank` its own chunk (no other process contributes in this in-process sim).

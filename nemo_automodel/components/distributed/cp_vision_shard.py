@@ -526,6 +526,41 @@ def _all_gather_var_tokens(
     return torch.cat(blocks, dim=0)
 
 
+def _raise_if_any_rank_failed(
+    local_ok: bool,
+    group: dist.ProcessGroup,
+    device: torch.device,
+    local_detail: str,
+) -> None:
+    """Reach group consensus before raising so a per-rank validation failure aborts on EVERY
+    rank instead of deadlocking peers on the next collective.
+
+    A per-rank ``raise`` placed BEFORE a collective hangs the group: the failing rank raises
+    while its peers block forever in ``all_gather``.  Instead, each rank contributes ``0``
+    (ok) or ``1`` (failed) and an all-reduce(MAX) over ``group`` makes the outcome identical
+    everywhere.  When any rank failed, the offending rank(s) raise their own ``local_detail``
+    and the rest raise a group-level message, so all ranks raise and none is left blocking.
+
+    Args:
+        local_ok: Whether THIS rank's local validation passed.
+        group: The sharding process group shared by every rank.
+        device: Device for the 1-element flag tensor (the compute device, so the all-reduce
+            matches the active backend, e.g. CUDA under NCCL).
+        local_detail: Actionable message raised by a rank that itself failed.
+    """
+    flag = torch.tensor([0 if local_ok else 1], dtype=torch.int64, device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
+    if int(flag.item()) == 0:
+        return
+    if not local_ok:
+        raise ValueError(local_detail)
+    raise ValueError(
+        "cp_vision_shard: another rank in the sharding group produced a visual output that did "
+        "not match its planned token count, so the collective was aborted on every rank to "
+        "avoid a hang. Check the diverging rank's log for the mismatch detail."
+    )
+
+
 def maybe_distribute_visual(
     visual: torch.nn.Module,
     pixel_values: torch.Tensor | None,
@@ -562,7 +597,10 @@ def maybe_distribute_visual(
     Raises:
         ValueError: When the vision tower has trainable parameters but the published
             group was declared ``spans_only_cp=False`` (see :func:`set_cp_vision_group`),
-            or when a rank's local visual output does not match its planned token count.
+            or when any rank's local visual output does not match its planned token count.
+            The token-count mismatch is reduced across the sharding group before raising, so
+            a single diverging rank makes EVERY rank raise (rather than deadlocking peers on
+            the gather).
     """
     if grid_thw is None or pixel_values is None:
         # No media inputs: nothing to shard and no grid to place; keep the exact
@@ -714,13 +752,19 @@ def maybe_distribute_visual(
     local_out = visual(local_pixel, grid_thw=local_grid, return_dict=True)
 
     # Validate the planned per-rank token count before the collective: a mismatch would
-    # otherwise silently mis-slice every rank's block out of the gathered tensor.
+    # otherwise silently mis-slice every rank's block out of the gathered tensor.  Route the
+    # check through a group consensus (all-reduce of a boolean flag) so a single diverging
+    # rank makes EVERY rank raise -- a bare per-rank ``raise`` here would hang the group,
+    # since the failing rank would raise while peers block in the all-gather below.
     expected_local_tokens = token_counts[rank]
-    if local_out.pooler_output.shape[0] != expected_local_tokens:
-        raise ValueError(
-            f"cp_vision_shard: rank {rank} produced {local_out.pooler_output.shape[0]} visual "
-            f"tokens for its frame slice, expected {expected_local_tokens}."
-        )
+    actual_local_tokens = local_out.pooler_output.shape[0]
+    _raise_if_any_rank_failed(
+        actual_local_tokens == expected_local_tokens,
+        group,
+        local_out.pooler_output.device,
+        f"cp_vision_shard: rank {rank} produced {actual_local_tokens} visual tokens for its "
+        f"frame slice, expected {expected_local_tokens}.",
+    )
 
     # Gather all per-rank blocks (real + any dummy) in rank order, then slice to the real
     # token count: dummy frames live on the last `n_pad` ranks, so their tokens are the
@@ -733,12 +777,20 @@ def maybe_distribute_visual(
     ]
     deepstack = getattr(local_out, "deepstack_features", None)
     if deepstack is not None:
-        for k, d in enumerate(deepstack):
-            if d.shape[0] != expected_local_tokens:
-                raise ValueError(
-                    f"cp_vision_shard: rank {rank} deepstack feature {k} has {d.shape[0]} visual "
-                    f"tokens, expected {expected_local_tokens}."
-                )
+        # Same consensus contract as the pooler check above: a per-rank ``raise`` before the
+        # deepstack all-gathers would deadlock, so agree across the group first.
+        bad_k = next((k for k, d in enumerate(deepstack) if d.shape[0] != expected_local_tokens), None)
+        _raise_if_any_rank_failed(
+            bad_k is None,
+            group,
+            local_out.pooler_output.device,
+            ""
+            if bad_k is None
+            else (
+                f"cp_vision_shard: rank {rank} deepstack feature {bad_k} has "
+                f"{deepstack[bad_k].shape[0]} visual tokens, expected {expected_local_tokens}."
+            ),
+        )
         local_out.deepstack_features = [
             _all_gather_var_tokens(d, group, world, token_counts)[:n_real_tokens] for d in deepstack
         ]

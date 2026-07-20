@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import socket
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -55,12 +56,13 @@ def _free_port() -> int:
     return port
 
 
-def _init_gloo(rank: int, world_size: int, port: int) -> None:
+def _init_gloo(rank: int, world_size: int, port: int, timeout: timedelta | None = None) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    kwargs = {"timeout": timeout} if timeout is not None else {}
+    dist.init_process_group("gloo", rank=rank, world_size=world_size, **kwargs)
 
 
 class _GlooVisual(torch.nn.Module):
@@ -228,9 +230,68 @@ def _pad_path_worker(rank: int, world_size: int, port: int) -> None:
             dist.destroy_process_group()
 
 
+class _DivergentVisual(_GlooVisual):
+    """Vision stub that, on the diverging rank only, drops one output token so its per-rank
+    ``pooler_output`` fails the planned-token-count check.
+
+    ``forward`` follows the ``_GlooVisual`` contract (``pixel_values`` [total_patch_rows,
+    in_dim] -> ``pooler_output`` [total_patch_rows / sms**2, hidden]); on the diverging rank
+    the returned ``pooler_output`` is shortened by one row.  Used to prove that the
+    token-count consensus makes EVERY rank raise instead of deadlocking a peer in all_gather.
+    """
+
+    def __init__(self, *, divergent: bool, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._divergent = divergent
+
+    def forward(self, pixel_values, grid_thw=None, return_dict=True):
+        out = super().forward(pixel_values, grid_thw=grid_thw, return_dict=return_dict)
+        if self._divergent:
+            out.pooler_output = out.pooler_output[:-1]  # one token short -> per-rank count mismatch
+        return out
+
+
+def _divergent_count_worker(rank: int, world_size: int, port: int) -> None:
+    """One rank's visual output diverges from its planned token count; ALL ranks must raise.
+
+    A bare per-rank ``raise`` before the all_gather would hang the non-diverging rank; the
+    group consensus (all-reduce of a boolean flag) must make every rank raise a ``ValueError``
+    instead.  A short init timeout bounds the collective so a regression fails fast rather
+    than hanging CI.
+    """
+    try:
+        _init_gloo(rank, world_size, port, timeout=timedelta(seconds=60))
+        torch.set_num_threads(1)
+        os.environ["NEMO_CP_SHARD_VISION_MIN_TOKENS"] = "0"
+        from nemo_automodel.components.distributed import cp_vision_shard as vs
+
+        torch.manual_seed(0)
+        # >= world frame units -> balanced path (not the pad path); only the last rank diverges.
+        visual = _DivergentVisual(divergent=(rank == world_size - 1))
+        grid = torch.tensor([[1, 4, 4], [1, 4, 4]], dtype=torch.long)  # 2 frame units, 4 tokens each
+        gen = torch.Generator().manual_seed(7)
+        pixel = torch.randn(int(grid.prod(dim=-1).sum()), 8, generator=gen)
+
+        token = vs.set_cp_vision_group(dist.group.WORLD)
+        try:
+            # EVERY rank must raise (consensus), not only the diverging one.
+            with pytest.raises(ValueError, match="cp_vision_shard"):
+                vs.maybe_distribute_visual(visual, pixel, grid)
+        finally:
+            vs.reset_cp_vision_group(token)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
 def test_cp_vision_shard_two_rank_gloo_forward_backward_parity():
     mp.spawn(_parity_worker, args=(2, _free_port()), nprocs=2, join=True)
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
+def test_cp_vision_shard_two_rank_gloo_divergent_count_all_ranks_raise():
+    mp.spawn(_divergent_count_worker, args=(2, _free_port()), nprocs=2, join=True)
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
