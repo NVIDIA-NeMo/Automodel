@@ -100,13 +100,15 @@ class CpVisionShardingConfig:
     def __post_init__(self) -> None:
         """Validate the serialized policy fields."""
         if not isinstance(self.enabled, bool):
-            raise TypeError("cp_vision_sharding.enabled must be a boolean")
+            raise TypeError("distributed.cp_vision_sharding.enabled must be a boolean")
         if isinstance(self.min_tokens, bool) or not isinstance(self.min_tokens, int) or self.min_tokens < 0:
-            raise ValueError("cp_vision_sharding.min_tokens must be a non-negative integer")
+            raise ValueError("distributed.cp_vision_sharding.min_tokens must be a non-negative integer")
         if self.cost_alpha not in (None, "auto") and (
             isinstance(self.cost_alpha, bool) or not isinstance(self.cost_alpha, int) or self.cost_alpha < 0
         ):
-            raise ValueError('cp_vision_sharding.cost_alpha must be "auto", null, or a non-negative integer')
+            raise ValueError(
+                'distributed.cp_vision_sharding.cost_alpha must be "auto", null, or a non-negative integer'
+            )
 
 
 @dataclass(frozen=True)
@@ -656,7 +658,7 @@ def maybe_distribute_visual(
             _LOGGED_SMALL_FALLBACK = True
             logger.info(
                 "vision tower using replicated path for small visual workload "
-                "(tokens=%d < cp_vision_sharding.min_tokens=%d)",
+                "(tokens=%d < distributed.cp_vision_sharding.min_tokens=%d)",
                 n_real_tokens,
                 min_shard_tokens,
             )

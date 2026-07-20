@@ -71,7 +71,7 @@ embed_multimodal:
 | **Differentiable all-gather** | Per-rank `[max_tokens, H]` blocks are padded to the global max, all-gathered (forward all-gather + concat; backward **reduce-scatter SUM**), then sliced back to true token counts. |
 | **Gradient parity** | Every rank reassembles the full embeds, then keeps only its sequence shard. A frame computed by rank `c` lands in shard-owner rank `s`; reduce-scatter-SUM routes `s`'s gradient back to `c` (summing the straddling case). The total vision-parameter gradient is numerically equivalent (`allclose`) to the replicated baseline's. |
 | **FSDP / no deadlock** | The distribute / pad / replicate choice is a pure function of `(num_frame_units, world, enabled)` and thus identical on all ranks; every rank makes exactly one `visual` call and the same number of vision-shard collectives. Fewer frame units than ranks **pads with minimal dummy frames** (one unit per rank) so no rank is starved; the dummy embeddings are sliced off before the loss and contribute exactly zero gradient. The all-gather inside `maybe_distribute_visual` is the synchronization boundary — do **not** add an extra post-visual CP barrier. |
-| **Small workloads** | Batches whose visual token count is below `cp_vision_sharding.min_tokens` (default `2048`) use the replicated path: they have little memory pressure but would still pay the all-gather synchronization cost. |
+| **Small workloads** | Batches whose visual token count is below `distributed.cp_vision_sharding.min_tokens` (default `2048`) use the replicated path: they have little memory pressure but would still pay the all-gather synchronization cost. |
 
 `maybe_distribute_visual` also all-gathers an optional `deepstack_features` list
 (Qwen3-VL-style towers); `last_hidden_state` is intentionally left as the local shard since
@@ -109,18 +109,20 @@ publish a wider CP × TP group for a frozen tower by declaring `spans_only_cp=Fa
 [sharding scope](#sharding-scope-frozen-vs-trainable-vision-tower)):
 
 ```yaml
-cp_vision_sharding:
-  enabled: true
-  min_tokens: 2048
-  cost_alpha: auto  # infers 3 * vision_hidden_size
+distributed:
+  cp_size: 2
+  cp_vision_sharding:
+    enabled: true
+    min_tokens: 2048
+    cost_alpha: auto  # infers 3 * vision_hidden_size
 ```
 
 The policy is disabled by default, so existing CP recipes retain replicated vision behavior.
 Enable it explicitly in the recipe. For an A/B baseline, use the recorded CLI override
-`--cp_vision_sharding.enabled false` rather than an environment variable.
+`--distributed.cp_vision_sharding.enabled false` rather than an environment variable.
 
 Runnable CP2 examples are available for
-[dense Qwen3-VL](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_4b_cp2_vision_shard.yaml)
+[dense Qwen3-VL](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_shard.yaml)
 and
 [dense Qwen3.5](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml).
 
@@ -147,9 +149,9 @@ Configuration fields:
 
 | Field | Default | Effect |
 |---|---|---|
-| `cp_vision_sharding.enabled` | `false` | Enables CP vision sharding. `false` preserves the replicated ViT path. |
-| `cp_vision_sharding.min_tokens` | `2048` | Visual-token threshold below which the replicated path is used. |
-| `cp_vision_sharding.cost_alpha` | `auto` | Linear term `alpha` in the `p*(p+alpha)` partition cost. `auto` discovers `3 * vision_hidden_size` from the model; `null` remains a backward-compatible alias. A non-negative integer is an exact override (`0` restores the legacy pure-quadratic `p**2` partition). Partition-only knob — forward/gradients are identical for any cuts. |
+| `distributed.cp_vision_sharding.enabled` | `false` | Enables CP vision sharding. `false` preserves the replicated ViT path. |
+| `distributed.cp_vision_sharding.min_tokens` | `2048` | Visual-token threshold below which the replicated path is used. |
+| `distributed.cp_vision_sharding.cost_alpha` | `auto` | Linear term `alpha` in the `p*(p+alpha)` partition cost. `auto` discovers `3 * vision_hidden_size` from the model; `null` remains a backward-compatible alias. A non-negative integer is an exact override (`0` restores the legacy pure-quadratic `p**2` partition). Partition-only knob — forward/gradients are identical for any cuts. |
 
 ## Validation
 

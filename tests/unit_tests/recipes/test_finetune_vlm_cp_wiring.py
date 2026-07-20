@@ -116,10 +116,12 @@ def test_recipe_config_resolves_cp_vision_sharding_policy():
     cfg = RecipeConfig(
         ConfigNode(
             {
-                "cp_vision_sharding": {
-                    "enabled": True,
-                    "min_tokens": 17,
-                    "cost_alpha": 0,
+                "distributed": {
+                    "cp_vision_sharding": {
+                        "enabled": True,
+                        "min_tokens": 17,
+                        "cost_alpha": 0,
+                    }
                 }
             }
         )
@@ -136,7 +138,7 @@ def test_recipe_config_disables_cp_vision_sharding_by_default():
 
 
 def test_recipe_config_accepts_explicit_auto_cost_alpha():
-    cfg = RecipeConfig(ConfigNode({"cp_vision_sharding": {"cost_alpha": "auto"}}))
+    cfg = RecipeConfig(ConfigNode({"distributed": {"cp_vision_sharding": {"cost_alpha": "auto"}}}))
 
     assert cfg.cp_vision_sharding.cost_alpha == "auto"
 

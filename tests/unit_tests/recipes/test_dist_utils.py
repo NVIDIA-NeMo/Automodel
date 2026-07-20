@@ -138,6 +138,14 @@ class TestParsing:
         assert result["strategy_config"].sequence_parallel is True
         assert result["strategy_config"].defer_fsdp_grad_sync is False
 
+    def test_cp_vision_sharding_is_not_forwarded_to_strategy(self):
+        cfg = {"strategy": "fsdp2", "cp_vision_sharding": {"enabled": True, "min_tokens": 0}}
+
+        result = parse_distributed_section(cfg)
+
+        assert isinstance(result["strategy_config"], FSDP2Config)
+        assert cfg["cp_vision_sharding"] == {"enabled": True, "min_tokens": 0}
+
     def test_config_dict_not_mutated(self):
         original = {"strategy": "fsdp2", "tp_size": 2, "activation_checkpointing": True}
         copy = original.copy()

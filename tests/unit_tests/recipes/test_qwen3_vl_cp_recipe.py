@@ -23,7 +23,7 @@ from nemo_automodel.components.distributed.cp_vision_shard import CpVisionShardi
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-CONFIG_PATH = REPO_ROOT / "examples/vlm_finetune/qwen3/qwen3_vl_4b_cp2_vision_shard.yaml"
+CONFIG_PATH = REPO_ROOT / "examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_shard.yaml"
 
 
 def test_qwen3_vl_cp2_example_enables_typed_vision_sharding() -> None:
@@ -31,6 +31,6 @@ def test_qwen3_vl_cp2_example_enables_typed_vision_sharding() -> None:
     raw_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     config = RecipeConfig(ConfigNode(raw_config))
 
-    assert raw_config["model"]["pretrained_model_name_or_path"] == "Qwen/Qwen3-VL-4B-Thinking"
+    assert raw_config["model"]["pretrained_model_name_or_path"] == "Qwen/Qwen3-VL-8B-Instruct"
     assert raw_config["distributed"]["cp_size"] == 2
     assert config.cp_vision_sharding == CpVisionShardingConfig(enabled=True, min_tokens=0)

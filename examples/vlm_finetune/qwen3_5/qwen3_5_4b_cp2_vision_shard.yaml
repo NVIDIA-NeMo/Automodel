@@ -23,7 +23,7 @@
 #
 # A/B (same topology, same global batch -> numerically identical loss):
 #   sharded  : automodel examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml --nproc-per-node 8
-#   baseline : automodel examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml --nproc-per-node 8 --cp_vision_sharding.enabled false
+#   baseline : automodel examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml --nproc-per-node 8 --distributed.cp_vision_sharding.enabled false
 # The config sets min_tokens=0 so even this small demo batch exercises the distributed path.
 # The baseline CLI override is captured in the resolved recipe configuration.
 
@@ -76,10 +76,9 @@ distributed:
   ep_size: 1
   sequence_parallel: false
   activation_checkpointing: true
-
-cp_vision_sharding:
-  enabled: true
-  min_tokens: 0
+  cp_vision_sharding:
+    enabled: true
+    min_tokens: 0
 
 freeze_config:
   # Frozen ViT is the common speedup case (also the recipe default). The

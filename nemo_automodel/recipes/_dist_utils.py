@@ -101,6 +101,9 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     # -- sub-configs --------------------------------------------------------
     pipeline_dict: Optional[dict] = cfg.pop("pipeline", None)
     moe_dict: Optional[dict] = cfg.pop("moe", None)
+    # VLM recipes consume this typed policy through RecipeConfig. It lives under
+    # ``distributed`` for YAML/CLI cohesion but is not a strategy-constructor field.
+    cfg.pop("cp_vision_sharding", None)
     activation_checkpointing = _normalize_activation_checkpointing(cfg.pop("activation_checkpointing", False))
 
     # Strip Hydra / OmegaConf meta keys (e.g. ``_target_``, ``_recursive_``,

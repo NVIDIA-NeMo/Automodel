@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Dense Qwen3-VL-4B with context parallelism and DeepStack-aware vision sharding.
+# Dense Qwen3-VL-8B with context parallelism and DeepStack-aware vision sharding.
 #
 # A/B on 8 GPUs (cp=2, dp=4):
-#   sharded  : automodel examples/vlm_finetune/qwen3/qwen3_vl_4b_cp2_vision_shard.yaml --nproc-per-node 8
-#   baseline : automodel examples/vlm_finetune/qwen3/qwen3_vl_4b_cp2_vision_shard.yaml --nproc-per-node 8 --cp_vision_sharding.enabled false
+#   sharded  : automodel examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_shard.yaml --nproc-per-node 8
+#   baseline : automodel examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_shard.yaml --nproc-per-node 8 --distributed.cp_vision_sharding.enabled false
 
 recipe: FinetuneRecipeForVLM
 
@@ -41,13 +41,13 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3-VL-4B-Thinking
+  pretrained_model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
   attn_implementation: sdpa
   torch_dtype: bfloat16
 
 processor:
   _target_: transformers.AutoProcessor.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen3-VL-4B-Thinking
+  pretrained_model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
   min_pixels: 200704
   max_pixels: 1003520
 
@@ -63,10 +63,9 @@ distributed:
   ep_size: 1
   sequence_parallel: false
   activation_checkpointing: true
-
-cp_vision_sharding:
-  enabled: true
-  min_tokens: 0
+  cp_vision_sharding:
+    enabled: true
+    min_tokens: 0
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
