@@ -222,7 +222,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
 
         resolve_storage_dtype(
-            self.cfg.model,
+            self.cfg.get("model"),
             self.cfg.get("optimizer"),
             is_peft=self.cfg.get("peft", None) is not None,
             context="vlm-kd",
