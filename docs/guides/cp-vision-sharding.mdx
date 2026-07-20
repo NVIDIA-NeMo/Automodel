@@ -25,7 +25,7 @@ numerically equivalent (`allclose`) embeds through the unchanged code path.
 
 ### Key property: vision frames are independent
 
-Qwen3-VL-style vision towers have **zero cross-frame coupling**:
+Qwen3.5/Qwen3-VL-style vision towers have **zero cross-frame coupling**:
 
 - attention is **per-frame** — `cu_seqlens` is built from `grid_thw` so each frame's `h*w`
   patches attend only within that frame;
@@ -85,7 +85,7 @@ The caller **declares** the scope of the process group it publishes via
 when the vision tower has trainable parameters but the published group was not declared
 CP-only (`spans_only_cp=False`).
 
-| Vision tower | Sharding group | Why |
+| Vision tower | Helper-supported sharding group | Why |
 |---|---|---|
 | **Frozen** | Full **CP × TP** rank set (`spans_only_cp=False`) | Frame independence + replicated weights make the forward numerically equivalent (`allclose`) for *any* rank group with identical weights, and `requires_grad=False` means no backward ever runs through the gather — zero gradient risk. |
 | **Trainable** | **CP group only** (`spans_only_cp=True`, the default) | The vision tower is replicated (not tensor-parallel) across TP ranks. Gathering frames across CP × TP would make the all-gather's reduce-scatter(SUM) backward accumulate the vision gradient **tp-fold**: each TP-replicated sequence shard backprops into the single rank that computed the frame. TP ranks therefore redundantly compute the ViT — and `maybe_distribute_visual` **raises** if a trainable tower is published with `spans_only_cp=False`. |
@@ -95,12 +95,16 @@ Extending the trainable case to CP × TP would require gathering over CP × TP w
 gradients over CP only (or scaling by `1/tp`), plus a gradient-parity test — until then the
 CP-only group is correct by construction.
 
+The built-in dense Qwen3.5 integration currently publishes the **CP-only group for both
+frozen and trainable towers**. A wider frozen-tower group is supported by the helper, but a
+caller must publish that group explicitly; the recipe does not derive or publish CP × TP.
+
 ## Usage
 
-The helper activates when a process group is published around the VLM pre-embed forward —
-the CP group for a trainable vision tower, or the flattened CP × TP group (declared with
-`spans_only_cp=False`) for a frozen one
-(see [sharding scope](#sharding-scope-frozen-vs-trainable-vision-tower)):
+The helper activates when a process group is published around the VLM pre-embed forward.
+The built-in dense Qwen3.5 caller publishes its CP group. Custom integrations may publish a
+wider CP × TP group for a frozen tower by declaring `spans_only_cp=False` (see
+[sharding scope](#sharding-scope-frozen-vs-trainable-vision-tower)):
 
 ```python
 from nemo_automodel.components.distributed import cp_vision_shard
@@ -127,7 +131,7 @@ Environment toggles:
 
 ## Validation
 
-- **Unit tests** (`tests/unit_tests/distributed/test_cp_vision_shard.py`, CPU-only, 49 tests):
+- **Unit tests** (`tests/unit_tests/distributed/test_cp_vision_shard.py`, CPU-only):
   `visual(full) == concat_r visual(slice_r)` for **forward and vision-parameter gradient** at
   world sizes 2–4; partition balance/coverage/order; variable-token all-gather forward +
   backward; end-to-end `maybe_distribute_visual` (including deepstack, video entries, and a
@@ -135,18 +139,21 @@ Environment toggles:
   media inputs); the trainable-tower sharding-scope guard; and the pad path end-to-end
   through the production code, asserting `sum_r grad_r == replicate grad` and that every
   padded (dummy) rank contributes exactly zero gradient.
+- **Qwen3.5 composition tests**
+  (`tests/unit_tests/distributed/test_cp_vision_shard_qwen3_5.py`, CPU-only): the real,
+  small `Qwen3_5VisionModel` produces the same pooled output for a replicated forward and
+  concatenated contiguous frame slices, including the single-video frame-split case.
 - **Real-collective tests** (`tests/unit_tests/distributed/test_cp_vision_shard_gloo.py`,
   2-rank gloo on CPU): `maybe_distribute_visual` forward + backward through the actual
   `all_gather` / `reduce_scatter(SUM)` collectives — each rank backprops its sequence shard
   and the group-summed vision-parameter gradients must equal the single-process replicated
   reference, for both the balanced-partition path (with deepstack) and the dummy-pad path
-  (padded rank receives exactly zero gradient).
+  (padded rank receives exactly zero gradient). A real Qwen3.5 tower test additionally
+  validates forward parity through the production collective path.
 - **Internal validation runs** (Qwen3.5-class VLM): with `cp_size=2`, loss parity with the
   replicated baseline (step-0 loss bit-identical, later steps within bf16 noise), lower peak
   memory, and **about +19% tokens/sec per GPU**; validated with both a frozen and a trained
-  vision tower. Frozen-tower runs additionally validated sharding across the full CP × TP
-  rank set: step-0 loss identical to the replicated baseline and **~1.5–2× faster steps** on
-  many-frame video packs.
+  vision tower using the CP-only group.
 
 Because the memory saving depends on activation checkpointing (a checkpointed vision tower
 retains only block-boundary activations), the primary win is **compute**: activation
@@ -155,11 +162,10 @@ checkpointing runs the vision forward twice and sharding divides both by ~`cp_si
 ## Limitations
 
 <Note>
-**Trainable vision towers shard within the CP group only.** This is the deliberate
-gradient-correctness constraint described in
-[sharding scope](#sharding-scope-frozen-vs-trainable-vision-tower): with an unfrozen tower,
-TP ranks redundantly compute the ViT, so the full CP × TP speedup is available only when the
-vision tower is frozen (`freeze_config.freeze_vision_tower: true`, the recipe default).
+**The built-in dense Qwen3.5 caller shards within the CP group only**, whether the tower is
+frozen or trainable. This is always gradient-correct. The lower-level helper permits a wider
+CP × TP group only for a frozen tower, but the current recipe does not publish that wider
+group.
 </Note>
 
 - **Memory saving is modest under activation checkpointing.** Retained vision activations
@@ -168,6 +174,7 @@ vision tower is frozen (`freeze_config.freeze_vision_tower: true`, the recipe de
 - **Gathered embeds are full on every rank.** The final per-frame embeddings (small compared
   to the ViT's internal activations) are reconstructed in full before the existing sequence
   shard; sharding them too is a separate, more invasive effort.
-- **Model wiring required.** The helper is model-agnostic, but each VLM family's
+- **Model wiring required outside dense Qwen3.5.** The helper is model-agnostic, but each
+  additional VLM family's
   `embed_multimodal` must route its `visual(...)` call through `maybe_distribute_visual`
   (and the recipe must publish the CP group around the pre-embed forward) to benefit.

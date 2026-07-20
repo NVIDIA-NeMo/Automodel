@@ -106,7 +106,38 @@ class _FakeCPMesh:
 
     def __getitem__(self, key):
         assert key == "cp"
-        return SimpleNamespace(size=lambda: 2)
+        return SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group")
+
+
+def test_run_cp_pre_embed_resets_published_group_after_failure(monkeypatch):
+    """The recipe must restore vision-shard state when the model forward raises."""
+    recipe = object.__new__(FinetuneRecipeForVLM)
+    group = object()
+    token = object()
+    recipe.device_mesh = {"cp": SimpleNamespace(get_group=lambda: group)}
+    events = []
+
+    def _set(actual_group):
+        events.append(("set", actual_group))
+        return token
+
+    def _reset(actual_token):
+        events.append(("reset", actual_token))
+
+    def _model(**kwargs):
+        events.append(("model", kwargs))
+        raise RuntimeError("pre-embed failed")
+
+    monkeypatch.setattr(vlm_finetune, "set_cp_vision_group", _set)
+    monkeypatch.setattr(vlm_finetune, "reset_cp_vision_group", _reset)
+
+    with pytest.raises(RuntimeError, match="pre-embed failed"):
+        recipe._run_cp_pre_embed(_model, {"input_ids": torch.ones(1, 2, dtype=torch.long)})
+
+    assert events[0] == ("set", group)
+    assert events[1][0] == "model"
+    assert events[1][1]["_pre_embed_only"] is True
+    assert events[2] == ("reset", token)
 
 
 class _ScheduleSpy:
@@ -593,7 +624,7 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.model_parts = [_Model()]
     recipe.loss_fn = object()
-    recipe.device_mesh = _DM(cp=SimpleNamespace(size=lambda: 2))
+    recipe.device_mesh = _DM(cp=SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group"))
     recipe.pp_enabled = False
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)

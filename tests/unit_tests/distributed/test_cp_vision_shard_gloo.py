@@ -42,7 +42,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-_HAS_QWEN3VL = importlib.util.find_spec("transformers.models.qwen3_vl") is not None
+_HAS_QWEN3_5 = importlib.util.find_spec("transformers.models.qwen3_5") is not None
 
 # Run only on the GPU job. Each test mp.spawns two gloo worker processes that re-import
 # the full package (several seconds per test on the CPU unit-test job); the sharding they
@@ -298,21 +298,22 @@ def test_cp_vision_shard_two_rank_gloo_divergent_count_all_ranks_raise():
 
 
 def _real_tower_worker(rank: int, world_size: int, port: int) -> None:
-    """Drive maybe_distribute_visual on the REAL (tiny) Qwen3-VL vision tower through real
-    2-rank gloo collectives; assert forward parity (pooler + deepstack) with the replicated
-    full forward. This is the exact tower the dense Qwen3.5 VLM CP pre-embed shards.
+    """Run the real Qwen3.5 vision tower through two-rank gloo sharding.
+
+    Assert pooled-output parity with the replicated full forward. This is the exact tower
+    used by the dense Qwen3.5 VLM CP pre-embed.
     """
     try:
         _init_gloo(rank, world_size, port, timeout=timedelta(seconds=120))
         torch.set_num_threads(1)
         os.environ["NEMO_CP_SHARD_VISION_MIN_TOKENS"] = "0"
 
-        from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
-        from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+        from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
         from nemo_automodel.components.distributed import cp_vision_shard as vs
 
-        cfg = Qwen3VLVisionConfig(
+        cfg = Qwen3_5VisionConfig(
             hidden_size=32,
             intermediate_size=64,
             num_heads=4,
@@ -323,10 +324,9 @@ def _real_tower_worker(rank: int, world_size: int, port: int) -> None:
             spatial_merge_size=2,
             in_channels=3,
             num_position_embeddings=64,
-            deepstack_visual_indexes=[0, 1],
         )
         torch.manual_seed(0)  # identical weights on every rank (mirrors the FSDP all-gather)
-        tower = Qwen3VLVisionModel(cfg).eval().to(torch.float32)
+        tower = Qwen3_5VisionModel(cfg).eval().to(torch.float32)
         feat = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size
         grid = torch.tensor([[1, 4, 4], [1, 2, 2], [1, 4, 2], [1, 2, 4]], dtype=torch.long)
         gen = torch.Generator().manual_seed(7)
@@ -341,17 +341,14 @@ def _real_tower_worker(rank: int, world_size: int, port: int) -> None:
                 vs.reset_cp_vision_group(token)
 
         torch.testing.assert_close(out.pooler_output, rep.pooler_output, atol=1e-5, rtol=1e-5)
-        assert len(out.deepstack_features) == len(rep.deepstack_features)
-        for got, exp in zip(out.deepstack_features, rep.deepstack_features):
-            torch.testing.assert_close(got, exp, atol=1e-5, rtol=1e-5)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-@pytest.mark.skipif(not _HAS_QWEN3VL, reason="transformers Qwen3-VL vision tower is not available")
-def test_cp_vision_shard_two_rank_gloo_real_qwen3vl_tower_forward_parity():
+@pytest.mark.skipif(not _HAS_QWEN3_5, reason="transformers Qwen3.5 vision tower is not available")
+def test_cp_vision_shard_two_rank_gloo_real_qwen3_5_tower_forward_parity():
     mp.spawn(_real_tower_worker, args=(2, _free_port()), nprocs=2, join=True)
 
 

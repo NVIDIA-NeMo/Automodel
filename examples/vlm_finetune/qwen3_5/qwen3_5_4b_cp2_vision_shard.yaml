@@ -22,10 +22,10 @@
 # ViT on ~1/cp_size of the frames instead of the full set redundantly.
 #
 # A/B (same topology, same global batch -> numerically identical loss):
-#   sharded  : automodel finetune -c examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml --nproc-per-node 8
-#   baseline : NEMO_CP_SHARD_VISION=0 automodel finetune -c examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml --nproc-per-node 8
-# NEMO_CP_SHARD_VISION=0 forces the replicated ViT path; the sharded run has the
-# same loss curve but a lower per-step vision-tower cost on many-frame batches.
+#   sharded  : NEMO_CP_SHARD_VISION_MIN_TOKENS=0 automodel examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml --nproc-per-node 8
+#   baseline : NEMO_CP_SHARD_VISION=0 automodel examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml --nproc-per-node 8
+# The sharded command sets the threshold to zero so even this small demo batch exercises the
+# distributed path. NEMO_CP_SHARD_VISION=0 forces the replicated ViT baseline.
 
 recipe: FinetuneRecipeForVLM
 

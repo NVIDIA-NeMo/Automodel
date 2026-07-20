@@ -2219,9 +2219,13 @@ def _create_non_pp_recipe(model, device="cpu"):
 class _DummyCPSubMesh:
     def __init__(self, size: int):
         self._size = size
+        self._group = object()
 
     def size(self) -> int:
         return self._size
+
+    def get_group(self):
+        return self._group
 
 
 class _DummyCPDeviceMesh(dict):

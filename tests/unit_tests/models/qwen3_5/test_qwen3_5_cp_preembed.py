@@ -23,6 +23,7 @@ import torch.nn as nn
 
 pytest.importorskip("transformers.models.qwen3_5")
 
+import nemo_automodel.components.models.qwen3_5.model as qwen3_5_model_module
 from nemo_automodel.components.models.qwen3_5.model import (
     HFQwen3_5Model,
     Qwen3_5ForConditionalGeneration,
@@ -266,6 +267,35 @@ class TestEmbedAndSpliceForCP:
         )
         assert torch.allclose(emb[0, 1], torch.full((4,), 3.0))  # video token overwritten
         assert torch.allclose(emb[0, 2], torch.full((4,), 7.0))  # text token untouched
+
+    @pytest.mark.parametrize("is_video", [False, True])
+    def test_active_vision_shard_routes_exact_visual_tower(self, monkeypatch, is_video):
+        """Active CP sharding must bypass the replicated HF feature helpers."""
+        model = _build_model()
+        visual = types.SimpleNamespace(dtype=torch.bfloat16)
+        model.model.visual = visual
+        model.model.get_image_features = lambda *args, **kwargs: pytest.fail("replicated image path used")
+        model.model.get_video_features = lambda *args, **kwargs: pytest.fail("replicated video path used")
+
+        pixel_values = torch.randn(8, 12, dtype=torch.float32)
+        grid_thw = torch.tensor([[1, 2, 4]], dtype=torch.long)
+        expected = torch.randn(2, 4)
+        captured = {}
+
+        def _fake_distribute(visual_arg, pixel_arg, grid_arg):
+            captured.update(visual=visual_arg, pixel=pixel_arg, grid=grid_arg)
+            return types.SimpleNamespace(pooler_output=expected)
+
+        monkeypatch.setattr(qwen3_5_model_module, "cp_vision_sharding_active", lambda: True)
+        monkeypatch.setattr(qwen3_5_model_module, "maybe_distribute_visual", _fake_distribute)
+
+        actual = model._encode_vision_for_cp(pixel_values, grid_thw, is_video=is_video)
+
+        assert actual is expected
+        assert captured["visual"] is visual
+        assert captured["grid"] is grid_thw
+        assert captured["pixel"].dtype == visual.dtype
+        torch.testing.assert_close(captured["pixel"].float(), pixel_values, atol=5e-3, rtol=5e-3)
 
 
 class TestQwen3_5ModelForward:
