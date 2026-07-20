@@ -631,6 +631,32 @@ def test_pooled_entry_fails_closed_instead_of_skipping_replay(monkeypatch):
     manager.close()
 
 
+def test_manager_wide_eager_execution_supports_eval_then_resumes_training_replay(monkeypatch):
+    _install_fake_graph(monkeypatch)
+    targets = (nn.Identity(), nn.Identity())
+    entries = [
+        partial_graphs._PartialGraphEntry(name=f"attention.{index}", target=target, pool_group="attn")
+        for index, target in enumerate(targets)
+    ]
+    manager = partial_graphs.PartialCudaGraphManager(entries)
+    manager.start_recording()
+    for target in targets:
+        target(torch.ones(2, 3))
+    manager.capture()
+
+    with manager.eager_execution():
+        for target in targets:
+            target.eval()
+            torch.testing.assert_close(target(torch.ones(2, 3)), torch.ones(2, 3))
+
+    for target in targets:
+        target.train()
+        torch.testing.assert_close(target(torch.ones(2, 3)), torch.ones(2, 3))
+
+    assert manager.stats() == {"captured": 2, "replayed": 2, "fallback": 0}
+    manager.close()
+
+
 def test_cuda_memory_state_splits_normal_and_private_pools(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 700)

@@ -1314,7 +1314,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             val_name: Name of the validation dataset.
             val_dataloader: DataLoader for the validation dataset.
         """
-        with ScopedRNG(seed=1, ranked=True):
+        graph_context = (
+            self.partial_cuda_graph_manager.eager_execution()
+            if self.partial_cuda_graph_manager is not None
+            else nullcontext()
+        )
+        with graph_context, ScopedRNG(seed=1, ranked=True):
             for mp in self.model_parts:
                 mp.eval()
 
