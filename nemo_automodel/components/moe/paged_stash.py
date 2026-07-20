@@ -115,9 +115,10 @@ class _PagedStashBuffer:
 class _RecordedTensor:
     """Warmup saved tensor and its page-rounded live allocation.
 
-    ``tensor`` is a contiguous activation with shape ``[rows, row_width]``.
-    ``key`` is ``(dtype, row_width)`` and ``charged_tokens`` is rounded to the
-    configured page size until autograd unpacks the tensor.
+    ``tensor`` is a contiguous activation with shape ``[rows, ...]`` whose
+    trailing dimensions flatten to ``row_width``. ``key`` is
+    ``(dtype, row_width)`` and ``charged_tokens`` is rounded to the configured
+    page size until autograd unpacks the tensor.
     """
 
     tensor: torch.Tensor

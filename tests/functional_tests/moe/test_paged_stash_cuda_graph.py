@@ -301,10 +301,13 @@ def test_te_grouped_linear_paged_stash_matches_eager_across_graph_replays():
         warmup_inputs = _inputs(warmup_mask, seed=123)
         warmup_output = target(*warmup_inputs)
         warmup_output.sum().backward()
-        assert stash_manager.diagnostics()["recorded_peak_tokens"]
+        assert set(stash_manager.diagnostics()["recorded_peak_tokens"]) == {
+            (torch.bfloat16, 4),
+            (torch.bfloat16, 8),
+        }
         optimizer.zero_grad(set_to_none=True)
-        # The manager owns detached sample clones. Drop the eager autograd graph
-        # so its default-stream AccumulateGrad nodes cannot leak into TE capture.
+        # The manager owns detached sample clones after recording, so these local
+        # warmup references are no longer needed.
         del warmup_output, warmup_inputs
 
         stash_manager.prepare()
@@ -355,6 +358,7 @@ def test_te_grouped_linear_paged_stash_matches_eager_across_graph_replays():
                     expected = parameters_before_step[name] - 0.01 * eager_parameter_gradients[name]
                     torch.testing.assert_close(parameter, expected)
             optimizer.zero_grad(set_to_none=True)
+        assert graph_manager.stats() == {"captured": 1, "replayed": 3, "fallback": 0}
     finally:
         graph_manager.close()
         stash_manager.close()
