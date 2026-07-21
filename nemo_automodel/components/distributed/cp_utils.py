@@ -324,6 +324,7 @@ def prepare_cp_forward(
         # ``__call__`` routing or FSDP2 unshard — and leaves the batch intact.
         prepared = model.prepare_model_inputs_for_cp(batch, num_chunks=num_chunks)
         cp_sharder = prepared.get("cp_sharder")
+        batch.update({key: value for key, value in prepared.items() if key != "cp_sharder"})
 
     return _make_cp_batch_and_ctx(
         device_mesh,

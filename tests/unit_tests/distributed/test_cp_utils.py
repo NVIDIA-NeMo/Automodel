@@ -33,6 +33,8 @@ from nemo_automodel.components.distributed import cp_utils as _cu
 from nemo_automodel.components.distributed.cp_sharder import (
     ContextParallelismSharder,
     contiguous_local_indices,
+    round_robin_local_indices,
+    shard_batch_aux_only,
     shard_batch_contiguous,
 )
 from nemo_automodel.components.models.gemma4_moe import cp_batch as _cm
@@ -679,6 +681,60 @@ def test_te_dispatches_through_a_framework_sharder(monkeypatch):
     seen.clear()
     _, batch2, _ = _cu._make_cp_batch_and_ctx(None, {"input_ids": torch.tensor([[1, 2]])}, use_te=True)
     assert batch2 == {"thd": True} and seen["cp_mesh"] is None
+
+
+def test_prepare_cp_forward_merges_model_hook_batch_updates(monkeypatch):
+    """Model-owned hooks may return batch metadata in addition to the sharder."""
+
+    cp_context_kwargs = {}
+
+    def fake_create_context_parallel_ctx(**kwargs):
+        cp_context_kwargs.update(kwargs)
+        return "cp_ctx"
+
+    monkeypatch.setattr(_cu, "create_context_parallel_ctx", fake_create_context_parallel_ctx)
+    monkeypatch.setattr(_cu, "get_train_context", lambda *a, **kw: contextlib.nullcontext)
+
+    position_ids = torch.arange(3 * 1 * 4).view(3, 1, 4)
+    image_grid_thw = torch.tensor([[1, 2, 2]])
+
+    class _Model:
+        def prepare_model_inputs_for_cp(self, batch, *, num_chunks):
+            assert num_chunks == 3
+            assert batch["mm_token_type_ids"].shape == (1, 4)
+            return {
+                "cp_sharder": ContextParallelismSharder(
+                    shard_batch=shard_batch_aux_only,
+                    local_token_global_indices=round_robin_local_indices,
+                ),
+                "position_ids": position_ids,
+                "mm_token_type_ids": None,
+                "image_grid_thw": image_grid_thw,
+                "image_grid_hws": None,
+            }
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": torch.tensor([[10, 20, 30, 40]]),
+        "mm_token_type_ids": torch.ones(1, 4, dtype=torch.long),
+        "image_grid_hws": torch.tensor([[2, 2]]),
+    }
+
+    ctx, out, sharder = _cu.prepare_cp_forward(_Model(), _DummyDeviceMesh(cp_size=2, tp_size=1), batch, num_chunks=3)
+
+    assert ctx is contextlib.nullcontext
+    assert out is batch
+    assert "cp_sharder" not in out
+    assert torch.equal(out["input_ids"], torch.tensor([[1, 2, 3, 4]]))
+    assert torch.equal(out["labels"], torch.tensor([[10, 20, 30, 40]]))
+    assert out["position_ids"] is position_ids
+    assert out["mm_token_type_ids"] is None
+    assert out["image_grid_thw"] is image_grid_thw
+    assert out["image_grid_hws"] is None
+    assert cp_context_kwargs["cp_buffers"][1] is position_ids
+    assert cp_context_kwargs["cp_seq_dims"] == [1, 2]
+    assert sharder.shard_layout.original_seq_len == 4
+    assert sharder.shard_layout.padded_seq_len == 4
 
 
 def test_te_sharder_captures_partition_indices_at_shard_time(monkeypatch):
