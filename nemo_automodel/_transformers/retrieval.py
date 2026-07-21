@@ -81,6 +81,8 @@ class SentenceTransformerWrapperOptions:
 
     pooling: str
     l2_normalize: bool
+    query_prompt: str | None = None
+    document_prompt: str | None = None
 
 
 def _load_sentence_transformer_json(
@@ -130,6 +132,18 @@ def _load_sentence_transformer_wrapper_options(
     if not isinstance(modules, list):
         raise ValueError("Sentence Transformers modules.json must contain a list of modules.")
 
+    transformer_type = "sentence_transformers.models.Transformer"
+    pooling_type = "sentence_transformers.models.Pooling"
+    normalize_type = "sentence_transformers.models.Normalize"
+    module_types = [module.get("type") if isinstance(module, dict) else None for module in modules]
+    if module_types not in ([transformer_type, pooling_type], [transformer_type, pooling_type, normalize_type]):
+        raise ValueError(
+            "Sentence Transformers metadata must use the exact supported module stack: "
+            "Transformer, Pooling, and optional Normalize."
+        )
+    if modules[0].get("path") != "":
+        raise ValueError("Sentence Transformers Transformer metadata must reference the checkpoint root.")
+
     sentence_bert_config = _load_sentence_transformer_json(
         model_name_or_path,
         "sentence_bert_config.json",
@@ -141,15 +155,7 @@ def _load_sentence_transformer_wrapper_options(
             "the NeMo inference path does not lowercase text."
         )
 
-    pooling_modules = [
-        module
-        for module in modules
-        if isinstance(module, dict) and module.get("type") == "sentence_transformers.models.Pooling"
-    ]
-    if len(pooling_modules) != 1:
-        raise ValueError("Sentence Transformers metadata must contain exactly one standard Pooling module.")
-
-    pooling_path = pooling_modules[0].get("path")
+    pooling_path = modules[1].get("path")
     if not isinstance(pooling_path, str) or not pooling_path:
         raise ValueError("Sentence Transformers Pooling metadata must reference a module path.")
     pooling_config = _load_sentence_transformer_json(
@@ -159,6 +165,11 @@ def _load_sentence_transformer_wrapper_options(
     )
     if not isinstance(pooling_config, dict):
         raise ValueError("Sentence Transformers Pooling config.json is missing or invalid.")
+    if pooling_config.get("include_prompt", True) is False:
+        raise ValueError(
+            "Sentence Transformers checkpoints with include_prompt=False are unsupported because "
+            "the NeMo pooling path includes prompt tokens."
+        )
 
     active_pooling_keys = {
         key for key, value in pooling_config.items() if key.startswith("pooling_mode_") and bool(value)
@@ -173,11 +184,32 @@ def _load_sentence_transformer_wrapper_options(
             "Sentence Transformers pooling metadata cannot be represented by a single NeMo avg, cls, or last mode."
         )
 
-    l2_normalize = any(
-        isinstance(module, dict) and module.get("type") == "sentence_transformers.models.Normalize"
-        for module in modules
+    sentence_transformer_config = _load_sentence_transformer_json(
+        model_name_or_path,
+        "config_sentence_transformers.json",
+        hf_kwargs,
     )
-    return SentenceTransformerWrapperOptions(pooling=matching_pooling[0], l2_normalize=l2_normalize)
+    query_prompt = None
+    document_prompt = None
+    if sentence_transformer_config is not None:
+        if not isinstance(sentence_transformer_config, dict):
+            raise ValueError("Sentence Transformers config_sentence_transformers.json is invalid.")
+        prompts = sentence_transformer_config.get("prompts", {})
+        if not isinstance(prompts, dict):
+            raise ValueError("Sentence Transformers prompts metadata must contain a mapping.")
+        query_prompt = prompts.get("query")
+        document_prompt = prompts.get("document")
+        if query_prompt is not None and not isinstance(query_prompt, str):
+            raise ValueError("Sentence Transformers query prompt must be a string.")
+        if document_prompt is not None and not isinstance(document_prompt, str):
+            raise ValueError("Sentence Transformers document prompt must be a string.")
+
+    return SentenceTransformerWrapperOptions(
+        pooling=matching_pooling[0],
+        l2_normalize=len(modules) == 3,
+        query_prompt=query_prompt,
+        document_prompt=document_prompt,
+    )
 
 
 def _resolve_bi_encoder_options(
@@ -479,21 +511,7 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
-    config_load_kwargs = {
-        key: hf_kwargs[key]
-        for key in (
-            "cache_dir",
-            "code_revision",
-            "force_download",
-            "local_files_only",
-            "proxies",
-            "revision",
-            "subfolder",
-            "token",
-            "use_auth_token",
-        )
-        if key in hf_kwargs
-    }
+    config_load_kwargs = dict(hf_kwargs)
     config = loaded_config
     if config is None:
         config = AutoConfig.from_pretrained(
@@ -742,6 +760,11 @@ class BiEncoderModel(nn.Module):
         if commit_hash is not None:
             metadata_kwargs["revision"] = commit_hash
         saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, metadata_kwargs)
+        if saved_options is not None:
+            if query_prompt is None:
+                query_prompt = saved_options.query_prompt
+            if document_prompt is None:
+                document_prompt = saved_options.document_prompt
         pooling, l2_normalize = _resolve_bi_encoder_options(
             config,
             saved_options,

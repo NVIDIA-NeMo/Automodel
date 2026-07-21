@@ -756,12 +756,89 @@ def test_nemo_bi_encoder_explicit_options_override_sentence_transformer_metadata
     assert reloaded.l2_normalize is True
 
 
+def test_nemo_bi_encoder_saved_prompts_round_trip_through_reexport(tmp_path):
+    from nemo_automodel._transformers import retrieval
+
+    model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="embedding",
+        pooling="avg",
+    )
+    encoder = retrieval.BiEncoderModel(
+        backbone,
+        pooling="avg",
+        l2_normalize=True,
+        query_prompt="query: ",
+        document_prompt="passage: ",
+    )
+    tokenizer = _tiny_tokenizer()
+    first_export = tmp_path / "first_export"
+    encoder.save_pretrained(first_export, tokenizer=tokenizer)
+
+    reloaded = retrieval.BiEncoderModel.build(str(first_export))
+    assert reloaded.sentence_transformer_export_config.query_prompt == "query: "
+    assert reloaded.sentence_transformer_export_config.document_prompt == "passage: "
+
+    second_export = tmp_path / "second_export"
+    reloaded.save_pretrained(second_export, tokenizer=tokenizer)
+    metadata = json.loads((second_export / "config_sentence_transformers.json").read_text())
+    assert metadata["prompts"] == {"query": "query: ", "document": "passage: "}
+
+    explicit = retrieval.BiEncoderModel.build(
+        str(first_export),
+        query_prompt="search: ",
+        document_prompt="index: ",
+    )
+    assert explicit.sentence_transformer_export_config.query_prompt == "search: "
+    assert explicit.sentence_transformer_export_config.document_prompt == "index: "
+
+
 def test_nemo_bi_encoder_uses_defaults_without_sentence_transformer_metadata():
     from nemo_automodel._transformers import retrieval
 
     config = PretrainedConfig()
 
     assert retrieval._resolve_bi_encoder_options(config, None, None, None) == ("avg", True)
+
+
+def test_sentence_transformer_source_with_unsupported_module_is_rejected(tmp_path):
+    from nemo_automodel._transformers import retrieval
+
+    (tmp_path / "1_Pooling").mkdir()
+    (tmp_path / "modules.json").write_text(
+        json.dumps(
+            [
+                {"idx": 0, "path": "", "type": "sentence_transformers.models.Transformer"},
+                {"idx": 1, "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+                {"idx": 2, "path": "2_Dense", "type": "sentence_transformers.models.Dense"},
+            ]
+        )
+    )
+    (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps({"pooling_mode_mean_tokens": True}))
+
+    with pytest.raises(ValueError, match="exact supported module stack"):
+        retrieval._load_sentence_transformer_wrapper_options(str(tmp_path), {})
+
+
+def test_sentence_transformer_source_excluding_prompts_is_rejected(tmp_path):
+    from nemo_automodel._transformers import retrieval
+
+    (tmp_path / "1_Pooling").mkdir()
+    (tmp_path / "modules.json").write_text(
+        json.dumps(
+            [
+                {"idx": 0, "path": "", "type": "sentence_transformers.models.Transformer"},
+                {"idx": 1, "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+            ]
+        )
+    )
+    (tmp_path / "1_Pooling" / "config.json").write_text(
+        json.dumps({"pooling_mode_mean_tokens": True, "include_prompt": False})
+    )
+
+    with pytest.raises(ValueError, match="include_prompt=False"):
+        retrieval._load_sentence_transformer_wrapper_options(str(tmp_path), {})
 
 
 def test_sentence_transformer_source_lowercasing_is_rejected(tmp_path):

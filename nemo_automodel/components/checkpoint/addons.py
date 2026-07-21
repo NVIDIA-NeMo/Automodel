@@ -215,6 +215,8 @@ def _validate_sentence_transformer_export(
             f"similarity_fn_name={similarity_fn_name!r} does not match l2_normalize={normalize}; "
             f"expected {expected_similarity!r}."
         )
+    if not export_config.include_prompt:
+        raise ValueError("include_prompt=False is unsupported because the NeMo training pipeline pools prompt tokens.")
     if export_config.do_lower_case:
         raise ValueError(
             "do_lower_case=True is unsupported because the NeMo training pipeline does not lowercase text."
@@ -418,10 +420,8 @@ class ConsolidatedHFAddon:
                 original_model_path,
             )
 
-        process_group = kwargs.get("process_group")
-
         # Perform save operations on rank 0
-        if _is_group_rank_0(process_group):
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             if sentence_transformer_export_config is not None:
                 deploy_config = export_model.get_hf_export_config()
                 _save_generated_hf_assets(

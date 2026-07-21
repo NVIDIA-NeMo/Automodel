@@ -47,6 +47,10 @@ entity EncoderCheckpoint {
     l2_normalize: Boolean?
     similarity: SimilarityFunction?
     do_lower_case: Boolean?
+    module_stack_representable: Boolean
+    query_prompt: String?
+    document_prompt: String?
+    include_prompt: Boolean?
     embedding_observations: Set<EmbeddingObservation>
     -- Top-level LICENSE*/NOTICE* assets from the repository and model roots;
     -- a model-root asset replaces a same-named repository-root asset.
@@ -57,12 +61,17 @@ entity EncoderLoadRequest {
     checkpoint: EncoderCheckpoint
     explicit_pooling: PoolingMode?
     explicit_l2_normalize: Boolean?
+    explicit_query_prompt: String?
+    explicit_document_prompt: String?
 }
 
 entity LoadedEncoder {
     source: EncoderCheckpoint
     pooling: PoolingMode
     l2_normalize: Boolean
+    query_prompt: String
+    document_prompt: String
+    include_prompt: Boolean
     embedding_observations: Set<EmbeddingObservation>
 }
 
@@ -79,6 +88,9 @@ entity SentenceTransformerExport {
     l2_normalize: Boolean
     similarity: SimilarityFunction
     do_lower_case: Boolean
+    query_prompt: String
+    document_prompt: String
+    include_prompt: Boolean
     embedding_observations: Set<EmbeddingObservation>
     legal_assets: Set<LegalAsset>
 }
@@ -89,7 +101,9 @@ entity SentenceTransformerExport {
 
 rule ResolveLoadedEncoderBehavior {
     when: request: EncoderLoadRequest.created
+    requires: request.checkpoint.module_stack_representable
     requires: request.checkpoint.do_lower_case != true
+    requires: request.checkpoint.include_prompt != false
     ensures: LoadedEncoder.created(
         source: request.checkpoint,
         pooling:
@@ -100,6 +114,15 @@ rule ResolveLoadedEncoderBehavior {
             if request.explicit_l2_normalize != null: request.explicit_l2_normalize
             else if request.checkpoint.l2_normalize != null: request.checkpoint.l2_normalize
             else: true,
+        query_prompt:
+            if request.explicit_query_prompt != null: request.explicit_query_prompt
+            else if request.checkpoint.query_prompt != null: request.checkpoint.query_prompt
+            else: "",
+        document_prompt:
+            if request.explicit_document_prompt != null: request.explicit_document_prompt
+            else if request.checkpoint.document_prompt != null: request.checkpoint.document_prompt
+            else: "",
+        include_prompt: true,
         embedding_observations: request.checkpoint.embedding_observations
     )
 }
@@ -120,6 +143,9 @@ rule ExportCompatibleEncoder {
             if request.encoder.l2_normalize: cosine
             else: dot,
         do_lower_case: false,
+        query_prompt: request.encoder.query_prompt,
+        document_prompt: request.encoder.document_prompt,
+        include_prompt: true,
         embedding_observations: request.encoder.embedding_observations,
         legal_assets: request.encoder.source.legal_assets
     )
@@ -133,6 +159,9 @@ invariant ExportPreservesEmbeddingBehavior {
     for export in SentenceTransformerExports:
         export.pooling = export.source.pooling
         and export.l2_normalize = export.source.l2_normalize
+        and export.query_prompt = export.source.query_prompt
+        and export.document_prompt = export.source.document_prompt
+        and export.include_prompt = export.source.include_prompt
         and export.embedding_observations = export.source.embedding_observations
 }
 

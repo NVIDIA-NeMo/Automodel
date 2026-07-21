@@ -59,6 +59,8 @@ def _configure_sentence_transformer_export(model, collate_fn) -> None:
     configure_prompts = getattr(model, "configure_sentence_transformer_prompts", None)
     if configure_prompts is None:
         return
+    if hasattr(model, "sentence_transformer_export_config") and model.sentence_transformer_export_config is None:
+        return
 
     if getattr(collate_fn, "use_dataset_instruction", False):
         disable_export = getattr(model, "disable_sentence_transformer_export", None)
