@@ -79,6 +79,17 @@ class EmbeddingRowRepairConfig:
 
 @dataclass(frozen=True)
 class _WeightView:
+    """Local tensor view and DTensor metadata for an embedding matrix.
+
+    Attributes:
+        local: Tensor of shape [local_vocab, local_hidden].
+        global_shape: Global embedding matrix shape [vocab, hidden].
+        local_shape: Rank-local embedding matrix shape [local_vocab, local_hidden].
+        global_offset: Global [vocab, hidden] offset of the rank-local shard.
+        mesh: DTensor device mesh when the weight is distributed.
+        placements: DTensor placements for the [vocab, hidden] axes.
+    """
+
     local: torch.Tensor
     global_shape: tuple[int, ...]
     local_shape: tuple[int, ...]
@@ -88,6 +99,17 @@ class _WeightView:
 
 
 def _weight_view(weight: torch.Tensor, name: str) -> _WeightView:
+    """Create a local view for a regular tensor or DTensor embedding matrix.
+
+    Args:
+        weight: Embedding matrix of shape [vocab, hidden]. For DTensor inputs, the global shape is
+            [vocab, hidden] and each placement must replicate or shard axis 0 (vocab) or axis 1 (hidden).
+        name: Parameter name used in validation errors.
+
+    Returns:
+        View whose ``local`` tensor has shape [local_vocab, local_hidden] and whose shape and offset metadata
+        use the global [vocab, hidden] axis order.
+    """
     if weight.ndim != 2:
         raise ValueError(f"{name} must be a 2-D embedding matrix, got shape={tuple(weight.shape)}")
     if not weight.is_floating_point():
@@ -131,6 +153,16 @@ def _weight_view(weight: torch.Tensor, name: str) -> _WeightView:
 
 
 def _full_row_squared_norms(view: _WeightView) -> torch.Tensor:
+    """Compute complete row squared norms for the local vocabulary shard.
+
+    Args:
+        view: Embedding matrix view with global shape [vocab, hidden] and local tensor shape
+            [local_vocab, local_hidden].
+
+    Returns:
+        Tensor of shape [local_vocab] containing each local vocabulary row's squared L2 norm over the full
+        hidden axis. When the hidden axis is sharded, values are summed across that DTensor shard group.
+    """
     local = view.local.detach().to(torch.float32)
     row_squared_norms = local.square().sum(dim=1, dtype=torch.float64)
     if view.mesh is None:
@@ -146,11 +178,22 @@ def _full_row_squared_norms(view: _WeightView) -> torch.Tensor:
 
 
 def _global_ids(view: _WeightView, local_mask: torch.Tensor) -> list[int]:
+    """Map local vocabulary-row selections to global token IDs.
+
+    Args:
+        view: Embedding matrix view with global shape [vocab, hidden] and local tensor shape
+            [local_vocab, local_hidden].
+        local_mask: Boolean tensor of shape [local_vocab] selecting rows from ``view.local``.
+
+    Returns:
+        Global vocabulary row IDs selected by ``local_mask``.
+    """
     local_ids = torch.nonzero(local_mask, as_tuple=False).flatten().cpu().tolist()
     return [view.global_offset[0] + int(local_id) for local_id in local_ids]
 
 
 def _gather_unique_ids(local_ids: list[int]) -> tuple[int, ...]:
+    """Gather sorted global vocabulary row IDs across all ranks."""
     if not dist.is_initialized():
         return tuple(sorted(set(local_ids)))
 
@@ -160,6 +203,14 @@ def _gather_unique_ids(local_ids: list[int]) -> tuple[int, ...]:
 
 
 def _global_min(value: torch.Tensor) -> float:
+    """Compute the global minimum of a scalar tensor.
+
+    Args:
+        value: Scalar tensor of shape [] containing this rank's local minimum.
+
+    Returns:
+        Minimum scalar value across all distributed ranks.
+    """
     value = value.detach().to(dtype=torch.float64).clone()
     if dist.is_initialized():
         dist.all_reduce(value, op=dist.ReduceOp.MIN)
@@ -167,6 +218,16 @@ def _global_min(value: torch.Tensor) -> float:
 
 
 def _healthy_rms_norm(row_squared_norms: torch.Tensor, healthy_mask: torch.Tensor) -> float:
+    """Compute the RMS norm of healthy input-embedding rows.
+
+    Args:
+        row_squared_norms: Tensor of shape [local_vocab] containing each local vocabulary row's squared L2
+            norm over the full hidden axis.
+        healthy_mask: Boolean tensor of shape [local_vocab] selecting healthy rows from ``row_squared_norms``.
+
+    Returns:
+        RMS L2 norm over all healthy global vocabulary rows.
+    """
     stats = torch.stack(
         (
             row_squared_norms[healthy_mask].sum(dtype=torch.float64),
@@ -181,6 +242,14 @@ def _healthy_rms_norm(row_squared_norms: torch.Tensor, healthy_mask: torch.Tenso
 
 
 def _check_matching_layout(input_view: _WeightView, output_view: _WeightView) -> None:
+    """Validate that input and output embedding shards can be repaired rowwise.
+
+    Args:
+        input_view: Input embedding matrix view with global shape [vocab, hidden] and local tensor shape
+            [local_vocab, local_hidden].
+        output_view: Output embedding matrix view with global shape [vocab, hidden] and local tensor shape
+            [local_vocab, local_hidden].
+    """
     if input_view.global_shape != output_view.global_shape:
         raise ValueError(
             "Input and output embedding shapes must match for row repair, got "
@@ -204,7 +273,8 @@ def repair_input_embedding_rows(
     """Detect and repair near-zero input-embedding rows.
 
     Args:
-        model: Loaded and optionally DTensor-sharded causal language model.
+        model: Loaded and optionally DTensor-sharded causal language model whose input and output embedding
+            weights have shape [vocab, hidden].
         min_norm: Inclusive L2-norm threshold identifying a damaged row.
         max_rows: Safety bound; abort instead of mutating a broadly damaged checkpoint.
 

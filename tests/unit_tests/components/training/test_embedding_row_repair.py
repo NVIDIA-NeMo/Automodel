@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from datetime import timedelta
 
 import pytest
 import torch
@@ -27,20 +28,19 @@ from nemo_automodel.recipes._typed_config import RecipeConfig
 
 
 class _TinyLM(torch.nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.embed_tokens = torch.nn.Embedding(6, 4)
         self.lm_head = torch.nn.Linear(4, 6, bias=False)
 
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> torch.nn.Embedding:
         return self.embed_tokens
 
-    def get_output_embeddings(self):
+    def get_output_embeddings(self) -> torch.nn.Linear:
         return self.lm_head
 
 
-@pytest.fixture
-def damaged_model():
+def _make_damaged_model() -> _TinyLM:
     model = _TinyLM()
     with torch.no_grad():
         model.embed_tokens.weight.copy_(
@@ -68,6 +68,11 @@ def damaged_model():
             )
         )
     return model
+
+
+@pytest.fixture
+def damaged_model():
+    return _make_damaged_model()
 
 
 def test_repair_identifies_rows_and_restores_healthy_scale(damaged_model, caplog):
@@ -169,6 +174,63 @@ def test_repair_supports_single_rank_sharded_dtensors(damaged_model, single_rank
     assert report.repaired_row_ids == (1, 3)
     repaired_norms = torch.linalg.vector_norm(damaged_model.embed_tokens.weight.full_tensor()[[1, 3]], dim=1)
     assert torch.all(repaired_norms > 1.0e-4)
+
+
+def _run_two_rank_sharded_dtensor_repair(rank: int, world_size: int, init_file: str, shard_dim: int) -> None:
+    """Exercise embedding repair with real two-rank DTensor collectives."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        mesh = init_device_mesh("cpu", (world_size,))
+        model = _make_damaged_model()
+        before = model.embed_tokens.weight.detach().clone()
+        source = model.lm_head.weight.detach().clone()
+        expected_target = torch.tensor([1.0, 2.0, 3.0, 4.0]).square().mean().sqrt()
+
+        model.embed_tokens.weight = torch.nn.Parameter(
+            distribute_tensor(model.embed_tokens.weight.detach(), mesh, [Shard(shard_dim)])
+        )
+        model.lm_head.weight = torch.nn.Parameter(
+            distribute_tensor(model.lm_head.weight.detach(), mesh, [Shard(shard_dim)])
+        )
+
+        report = repair_input_embedding_rows(model, min_norm=1.0e-4)
+
+        assert report.repaired_row_ids == (1, 3)
+        assert report.min_norm_before == 0.0
+        assert report.target_norm == pytest.approx(expected_target.item())
+
+        repaired_full = model.embed_tokens.weight.full_tensor()
+        torch.testing.assert_close(repaired_full[[0, 2, 4, 5]], before[[0, 2, 4, 5]])
+        repaired_rows = repaired_full[[1, 3]]
+        repaired_norms = torch.linalg.vector_norm(repaired_rows, dim=1)
+        torch.testing.assert_close(repaired_norms, expected_target.expand_as(repaired_norms))
+        torch.testing.assert_close(
+            torch.nn.functional.normalize(repaired_rows, dim=1),
+            torch.nn.functional.normalize(source[[1, 3]], dim=1),
+        )
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("shard_dim", [0, 1])
+def test_repair_supports_two_rank_sharded_dtensors(tmp_path, shard_dim):
+    """Two-rank CPU DTensor repair matches the unsharded row IDs and target norm."""
+    torch.multiprocessing.spawn(
+        _run_two_rank_sharded_dtensor_repair,
+        args=(2, str(tmp_path / f"repair_pg_shard_{shard_dim}"), shard_dim),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.fixture
