@@ -410,7 +410,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         self.rng = StatefulRNG(seed=self.global_seed, ranked=True)
 
         # -- wandb --------------------------------------------------------
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
             run = self._build_wandb()
             logging.info("Running run at %s", run.url)
