@@ -354,6 +354,48 @@ def test_generated_sentence_transformer_assets_remove_training_tokenizer_state(t
     assert not (metadata_dir / "preprocessor_config.json").exists()
 
 
+def test_generated_sentence_transformer_assets_preserve_repository_and_model_root_legal_assets(tmp_path):
+    repository_root = tmp_path / "repository"
+    model_root = repository_root / "encoder"
+    metadata_dir = tmp_path / "metadata"
+    (repository_root / "legal").mkdir(parents=True)
+    model_root.mkdir()
+    metadata_dir.mkdir()
+    (repository_root / "LICENSE.md").write_text("repository license")
+    (repository_root / "NOTICE.md").write_text("repository notice")
+    (repository_root / "COPYING").write_text("copying")
+    (repository_root / "legal" / "LICENSE.txt").write_text("nested license")
+    (model_root / "LICENSE.md").write_text("model license")
+
+    model = SimpleNamespace(
+        pooling="avg",
+        l2_normalize=True,
+        source_repository_path=str(repository_root),
+        config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
+    )
+    export_config = SimpleNamespace(
+        query_prompt="",
+        document_prompt="",
+        max_seq_length=512,
+        similarity_fn_name="cosine",
+        do_lower_case=False,
+        include_prompt=True,
+    )
+
+    _save_generated_sentence_transformer_assets(
+        model,
+        export_config,
+        str(model_root),
+        str(metadata_dir),
+        SimpleNamespace(model_max_length=512),
+    )
+
+    assert (metadata_dir / "LICENSE.md").read_text() == "model license"
+    assert (metadata_dir / "NOTICE.md").read_text() == "repository notice"
+    assert not (metadata_dir / "COPYING").exists()
+    assert not (metadata_dir / "LICENSE.txt").exists()
+
+
 def test_generated_sentence_transformer_assets_reject_unrepresentable_pooling(tmp_path):
     metadata_dir = tmp_path / "metadata"
     metadata_dir.mkdir()
