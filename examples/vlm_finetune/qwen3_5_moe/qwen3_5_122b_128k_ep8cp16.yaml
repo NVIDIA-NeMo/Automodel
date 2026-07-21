@@ -34,6 +34,8 @@ step_scheduler:
   save_checkpoint_every_epoch: false
   num_epochs: 10
   gc_every_steps: 20
+  # Keep the published scaling example bounded. Longer validation runs can
+  # override this through --step_scheduler.max_steps.
   max_steps: 10
 
 dist_env:
@@ -137,7 +139,7 @@ optimizer:
   master_weights: true
   master_weight_dtype: torch.float32
   store_param_remainders: true
-  exp_avg_dtype: torch.bfloat16
+  exp_avg_dtype: torch.float32
   exp_avg_sq_dtype: torch.float32
 
 lr_scheduler:
