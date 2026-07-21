@@ -182,7 +182,17 @@ class KimiLinearStateDictAdapter(MoESplitExpertsStateDictMixin, StateDictAdapter
         return self._from_hf_w_merged_experts(generic_state_dict, device_mesh)
 
     def _split_experts_weights(self, weight: torch.Tensor, n_experts: int) -> list[torch.Tensor]:
-        """Split grouped experts, tolerating DTensors whose mesh dim is not named ``ep``."""
+        """Split grouped experts, tolerating DTensors whose mesh dim is not named ``ep``.
+
+        Args:
+            weight: Grouped routed-expert tensor of shape [experts, ...]. May be a plain tensor or a DTensor
+                sharded or replicated over the expert axis; for Shard(0), the local shard covers this rank's
+                expert slice.
+            n_experts: Global number of routed experts.
+
+        Returns:
+            List of per-expert tensors of shape [...] for the experts local to this rank.
+        """
         from torch.distributed._tensor.placement_types import Replicate, Shard
 
         from nemo_automodel.components.moe.state_dict_utils import get_submesh, is_dtensor
