@@ -67,7 +67,7 @@ def _copy_source_legal_assets(original_model_path: str | None, hf_metadata_dir: 
     for item in os.scandir(original_model_path):
         normalized_name = item.name.lower()
         is_legal_asset = normalized_name == ".gitattributes" or normalized_name.startswith(_SOURCE_LEGAL_ASSET_PREFIXES)
-        if item.is_file() and is_legal_asset and not normalized_name.endswith(".md"):
+        if item.is_file() and is_legal_asset:
             shutil.copy2(item.path, os.path.join(hf_metadata_dir, item.name))
 
 
@@ -195,6 +195,19 @@ def _validate_sentence_transformer_export(
     if tokenizer is None:
         raise ValueError("A tokenizer is required to export a loadable Sentence Transformers checkpoint.")
 
+    normalize = bool(getattr(model_part, "l2_normalize", False))
+    expected_similarity = "cosine" if normalize else "dot"
+    similarity_fn_name = export_config.similarity_fn_name
+    if similarity_fn_name is not None and similarity_fn_name != expected_similarity:
+        raise ValueError(
+            f"similarity_fn_name={similarity_fn_name!r} does not match l2_normalize={normalize}; "
+            f"expected {expected_similarity!r}."
+        )
+    if export_config.do_lower_case:
+        raise ValueError(
+            "do_lower_case=True is unsupported because the NeMo training pipeline does not lowercase text."
+        )
+
     _resolve_sentence_transformer_max_seq_length(model_part, export_config, tokenizer, original_model_path)
 
 
@@ -258,7 +271,7 @@ def _save_generated_sentence_transformer_assets(
     max_seq_length = _resolve_sentence_transformer_max_seq_length(
         model_part, export_config, tokenizer, original_model_path
     )
-    do_lower_case = bool(export_config.do_lower_case)
+    do_lower_case = False
 
     os.makedirs(os.path.join(hf_metadata_dir, "1_Pooling"), exist_ok=True)
     _write_json(os.path.join(hf_metadata_dir, "modules.json"), modules)

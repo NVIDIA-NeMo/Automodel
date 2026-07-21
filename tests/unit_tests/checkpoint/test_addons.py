@@ -115,7 +115,9 @@ def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effe
         "2_Dense/config.json": '{"in_features": 2048, "out_features": 1024}',
         "2_Dense/model.safetensors": "stale module weights",
         "LICENSE": "license",
+        "LICENSE.md": "markdown license",
         "NOTICE": "notice",
+        "NOTICE.md": "markdown notice",
         "README.md": "model card",
         "config.json": '{"architectures": ["SourceModel"], "pooling": "avg"}',
         "config_sentence_transformers.json": (
@@ -148,7 +150,7 @@ def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effe
         document_prompt="index: ",
         max_seq_length=4096,
         similarity_fn_name="dot",
-        do_lower_case=True,
+        do_lower_case=False,
         include_prompt=False,
     )
     model.get_hf_export_config = lambda: model.config
@@ -183,7 +185,9 @@ def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effe
         ".gitattributes",
         "1_Pooling/config.json",
         "LICENSE",
+        "LICENSE.md",
         "NOTICE",
+        "NOTICE.md",
         "config.json",
         "config_sentence_transformers.json",
         "model.safetensors",
@@ -212,7 +216,7 @@ def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effe
     }
     assert json.loads((consolidated_dir / "sentence_bert_config.json").read_text()) == {
         "max_seq_length": 4096,
-        "do_lower_case": True,
+        "do_lower_case": False,
     }
     assert (consolidated_dir / "model.safetensors").read_text() == "new weights"
     assert not (consolidated_dir / "2_Dense").exists()
@@ -374,6 +378,64 @@ def test_generated_sentence_transformer_assets_reject_unrepresentable_pooling(tm
             original_model_path=None,
             hf_metadata_dir=str(metadata_dir),
             tokenizer=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("l2_normalize", "similarity_fn_name"),
+    [(False, "cosine"), (True, "dot")],
+)
+def test_generated_sentence_transformer_assets_reject_similarity_that_contradicts_normalization(
+    tmp_path,
+    l2_normalize,
+    similarity_fn_name,
+):
+    model = SimpleNamespace(
+        pooling="avg",
+        l2_normalize=l2_normalize,
+        config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
+    )
+    export_config = SimpleNamespace(
+        query_prompt="",
+        document_prompt="",
+        max_seq_length=512,
+        similarity_fn_name=similarity_fn_name,
+        do_lower_case=False,
+        include_prompt=True,
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        _save_generated_sentence_transformer_assets(
+            model,
+            export_config,
+            original_model_path=None,
+            hf_metadata_dir=str(tmp_path),
+            tokenizer=SimpleNamespace(model_max_length=512),
+        )
+
+
+def test_generated_sentence_transformer_assets_reject_lowercasing_not_used_by_training(tmp_path):
+    model = SimpleNamespace(
+        pooling="avg",
+        l2_normalize=True,
+        config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
+    )
+    export_config = SimpleNamespace(
+        query_prompt="",
+        document_prompt="",
+        max_seq_length=512,
+        similarity_fn_name="cosine",
+        do_lower_case=True,
+        include_prompt=True,
+    )
+
+    with pytest.raises(ValueError, match="do_lower_case=True"):
+        _save_generated_sentence_transformer_assets(
+            model,
+            export_config,
+            original_model_path=None,
+            hf_metadata_dir=str(tmp_path),
+            tokenizer=SimpleNamespace(model_max_length=512),
         )
 
 
