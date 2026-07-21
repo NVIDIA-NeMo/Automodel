@@ -24,10 +24,6 @@ step_scheduler:
   num_epochs: 8
   max_steps: 100
 
-ci:
-  nodes: 32
-  time: "00:30:00"
-
 distributed:
   strategy: fsdp2
   tp_size: 1
@@ -114,3 +110,7 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
+
+ci:
+  nodes: 32
+  time: "00:30:00"
