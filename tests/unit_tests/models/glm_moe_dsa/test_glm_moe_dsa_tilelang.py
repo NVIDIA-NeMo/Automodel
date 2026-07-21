@@ -1148,7 +1148,7 @@ def test_glm_dsa_prepare_model_inputs_for_cp_binds_batch_sharder():
 
     assert sharder.local_token_global_indices is contiguous_local_indices
     fn = sharder.shard_batch
-    assert fn.func is cp_mod.make_glm_dsa_packed_cp_batch_and_ctx
+    assert fn.func is cp_mod.shard_glm_dsa_packed_cp_batch
     assert fn.keywords["num_chunks"] == 3
 
 
