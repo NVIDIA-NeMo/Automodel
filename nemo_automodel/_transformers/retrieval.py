@@ -106,11 +106,14 @@ def _load_sentence_transformer_json(
                 subfolder=subfolder,
                 **download_kwargs,
             )
-        except (EntryNotFoundError, LocalEntryNotFoundError):
+        except EntryNotFoundError:
             return None
+        except LocalEntryNotFoundError as exc:
+            raise RuntimeError(
+                f"Could not establish whether Sentence Transformers metadata {filename} exists locally."
+            ) from exc
         except Exception as exc:
-            logger.warning("Unable to load Sentence Transformers metadata %s: %s", filename, exc)
-            return None
+            raise RuntimeError(f"Unable to load Sentence Transformers metadata {filename}.") from exc
 
     with open(asset_path) as f:
         return json.load(f)
@@ -126,6 +129,17 @@ def _load_sentence_transformer_wrapper_options(
         return None
     if not isinstance(modules, list):
         raise ValueError("Sentence Transformers modules.json must contain a list of modules.")
+
+    sentence_bert_config = _load_sentence_transformer_json(
+        model_name_or_path,
+        "sentence_bert_config.json",
+        hf_kwargs,
+    )
+    if isinstance(sentence_bert_config, dict) and sentence_bert_config.get("do_lower_case"):
+        raise ValueError(
+            "Sentence Transformers checkpoints with do_lower_case=True are unsupported because "
+            "the NeMo inference path does not lowercase text."
+        )
 
     pooling_modules = [
         module
@@ -567,6 +581,8 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
     logger.info(f"Saving encoder model to {save_directory}")
     export_config = getattr(model, "sentence_transformer_export_config", None)
     tokenizer = kwargs.get("tokenizer", None)
+    if export_config is not None and tokenizer is None:
+        raise ValueError("A tokenizer is required to export a loadable Sentence Transformers checkpoint.")
     deploy_config = model.get_hf_export_config() if export_config is not None else None
     original_model_path = getattr(model, "source_model_path", None)
     if original_model_path is None:
@@ -574,7 +590,7 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
             model.model.config, "name_or_path", None
         )
         original_model_path = str(model_reference) if model_reference and os.path.isdir(str(model_reference)) else None
-    if export_config is not None and tokenizer is not None:
+    if export_config is not None:
         from nemo_automodel.components.checkpoint.addons import (
             _save_generated_sentence_transformer_assets,
             _validate_sentence_transformer_export,
@@ -587,12 +603,6 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
         return
 
     deploy_config.save_pretrained(save_directory)
-    if tokenizer is None:
-        logger.warning(
-            "Sentence Transformers metadata was not exported because direct save_pretrained() received no tokenizer."
-        )
-        return
-
     tokenizer.save_pretrained(save_directory)
     _save_generated_sentence_transformer_assets(model, export_config, original_model_path, save_directory, tokenizer)
 

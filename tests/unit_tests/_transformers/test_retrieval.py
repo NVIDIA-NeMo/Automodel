@@ -160,7 +160,7 @@ def test_save_encoder_pretrained_forwards_is_final_checkpoint(tmp_path, kwargs, 
     )
 
 
-def test_direct_standard_export_without_tokenizer_saves_plain_hf_checkpoint(tmp_path, caplog):
+def test_direct_standard_export_without_tokenizer_rejects_before_writing(tmp_path):
     from nemo_automodel._transformers import retrieval
 
     backbone = LlamaBidirectionalModel(
@@ -176,16 +176,15 @@ def test_direct_standard_export_without_tokenizer_saves_plain_hf_checkpoint(tmp_
     encoder = retrieval.BiEncoderModel(
         backbone,
         pooling="avg",
-        l2_normalize=True,
+        l2_normalize=False,
         query_prompt="query: ",
     )
     save_dir = tmp_path / "missing_tokenizer"
 
-    encoder.save_pretrained(save_dir)
+    with pytest.raises(ValueError, match="tokenizer is required"):
+        encoder.save_pretrained(save_dir)
 
-    assert (save_dir / "config.json").exists()
-    assert not (save_dir / "modules.json").exists()
-    assert "received no tokenizer" in caplog.text
+    assert not save_dir.exists()
 
 
 def test_direct_standard_export_validates_before_writing(tmp_path):
@@ -648,18 +647,22 @@ def test_ministral_embedding_uses_bidirectional_flash_attention(tmp_path, monkey
     ("pooling", "l2_normalize"),
     [
         ("avg", True),
-        ("cls", True),
-        ("last", True),
         ("avg", False),
+        ("cls", True),
+        ("cls", False),
+        ("last", True),
+        ("last", False),
     ],
 )
 def test_sentence_transformers_and_nemo_round_trip_generated_ministral_checkpoint(
     tmp_path,
+    monkeypatch,
     pooling,
     l2_normalize,
 ):
     from sentence_transformers import SentenceTransformer
 
+    from nemo_automodel._transformers import auto_model as auto_model_module
     from nemo_automodel._transformers import retrieval
 
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
@@ -676,25 +679,48 @@ def test_sentence_transformers_and_nemo_round_trip_generated_ministral_checkpoin
         document_prompt="passage: ",
     )
     tokenizer = _tiny_tokenizer()
+    raw_texts = ["hello", "hello world"]
+    query_texts = [f"query: {text}" for text in raw_texts]
+    document_texts = [f"passage: {text}" for text in raw_texts]
     encoder.eval()
     with torch.no_grad():
-        expected_query = encoder(tokenizer(["query: hello"], return_tensors="pt"))
-        expected_document = encoder(tokenizer(["passage: hello"], return_tensors="pt"))
+        expected_query = encoder(tokenizer(query_texts, padding=True, return_tensors="pt"))
+        expected_document = encoder(tokenizer(document_texts, padding=True, return_tensors="pt"))
     save_dir = tmp_path / f"sentence_transformers_ministral_{pooling}_{l2_normalize}"
     encoder.save_pretrained(save_dir, tokenizer=tokenizer)
 
     sentence_transformer = SentenceTransformer(str(save_dir), device="cpu")
-    actual_query = sentence_transformer.encode_query(["hello"], convert_to_tensor=True)
-    actual_document = sentence_transformer.encode_document(["hello"], convert_to_tensor=True)
-    nemo_reloaded = retrieval.BiEncoderModel.build(str(save_dir))
+    actual_query = sentence_transformer.encode_query(raw_texts, convert_to_tensor=True)
+    actual_document = sentence_transformer.encode_document(raw_texts, convert_to_tensor=True)
+
+    setup = SimpleNamespace(
+        mesh_context=None,
+        strategy_config=None,
+        moe_parallel_config=None,
+        activation_checkpointing=None,
+    )
+    monkeypatch.setattr(auto_model_module, "_resolve_distributed_setup", lambda **_: setup)
+    monkeypatch.setattr(
+        auto_model_module,
+        "instantiate_infrastructure",
+        lambda **_: (None, None, None, None),
+    )
+    monkeypatch.setattr(auto_model_module.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(auto_model_module, "apply_model_infrastructure", lambda model, **_: model)
+    nemo_reloaded = auto_model_module.NeMoAutoModelBiEncoder.from_pretrained(
+        str(save_dir),
+        attn_implementation="eager",
+        use_liger_kernel=False,
+        use_sdpa_patching=False,
+    )
     nemo_reloaded.eval()
     with torch.no_grad():
-        nemo_query = nemo_reloaded(tokenizer(["query: hello"], return_tensors="pt"))
-        nemo_document = nemo_reloaded(tokenizer(["passage: hello"], return_tensors="pt"))
+        nemo_query = nemo_reloaded(tokenizer(query_texts, padding=True, return_tensors="pt"))
+        nemo_document = nemo_reloaded(tokenizer(document_texts, padding=True, return_tensors="pt"))
 
     assert nemo_reloaded.pooling == pooling
     assert nemo_reloaded.l2_normalize is l2_normalize
-    assert actual_query.shape == actual_document.shape == nemo_query.shape == nemo_document.shape == (1, 16)
+    assert actual_query.shape == actual_document.shape == nemo_query.shape == nemo_document.shape == (2, 16)
     torch.testing.assert_close(actual_query, expected_query)
     torch.testing.assert_close(actual_document, expected_document)
     torch.testing.assert_close(nemo_query, expected_query)
@@ -722,6 +748,42 @@ def test_nemo_bi_encoder_explicit_options_override_sentence_transformer_metadata
 
     assert reloaded.pooling == "last"
     assert reloaded.l2_normalize is True
+
+
+def test_nemo_bi_encoder_uses_defaults_without_sentence_transformer_metadata():
+    from nemo_automodel._transformers import retrieval
+
+    config = PretrainedConfig()
+
+    assert retrieval._resolve_bi_encoder_options(config, None, None, None) == ("avg", True)
+
+
+def test_sentence_transformer_source_lowercasing_is_rejected(tmp_path):
+    from nemo_automodel._transformers import retrieval
+
+    (tmp_path / "1_Pooling").mkdir()
+    (tmp_path / "modules.json").write_text(
+        json.dumps(
+            [
+                {"idx": 0, "path": "", "type": "sentence_transformers.models.Transformer"},
+                {"idx": 1, "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+            ]
+        )
+    )
+    (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps({"pooling_mode_mean_tokens": True}))
+    (tmp_path / "sentence_bert_config.json").write_text(json.dumps({"do_lower_case": True}))
+
+    with pytest.raises(ValueError, match="do_lower_case=True"):
+        retrieval._load_sentence_transformer_wrapper_options(str(tmp_path), {})
+
+
+def test_sentence_transformer_metadata_load_fails_closed_on_unexpected_hub_error(monkeypatch):
+    from nemo_automodel._transformers import retrieval
+
+    monkeypatch.setattr(retrieval, "hf_hub_download", MagicMock(side_effect=OSError("offline")))
+
+    with pytest.raises(RuntimeError, match="Unable to load Sentence Transformers metadata modules.json"):
+        retrieval._load_sentence_transformer_json("org/model", "modules.json", {})
 
 
 def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):
