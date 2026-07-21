@@ -114,16 +114,19 @@ def _build_backbone_from_extracted_submodel(
     model_type = getattr(text_config, "model_type", "")
     task_map = SUPPORTED_BACKBONES.get(model_type.lower())
     has_supported_target = task_map is not None and task in task_map
-    uses_stock_ministral_embedding = model_type.lower() == "ministral3" and task == "embedding"
 
     if task_map is not None and not has_supported_target and task != "score":
         raise ValueError(
             f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: {', '.join(task_map)}."
         )
 
-    if uses_stock_ministral_embedding:
+    if model_type.lower() == "ministral3" and task == "embedding":
         config = _clone_pretrained_config(text_config)
         config.is_causal = False
+        if pooling is not None:
+            config.pooling = pooling
+        if temperature is not None:
+            config.temperature = temperature
         try:
             backbone_class = MODEL_MAPPING[type(config)]
         except KeyError as exc:
@@ -145,6 +148,10 @@ def _build_backbone_from_extracted_submodel(
         config_dict = text_config.to_dict()
         config_dict.pop("model_type", None)
         config = config_class(**config_dict)
+        if pooling is not None:
+            config.pooling = pooling
+        if temperature is not None:
+            config.temperature = temperature
 
     if source_commit_hash is None:
         source_commit_hash = getattr(text_config, "_commit_hash", None)
@@ -154,12 +161,8 @@ def _build_backbone_from_extracted_submodel(
     attn_implementation = getattr(text_config, "_attn_implementation", None)
     if attn_implementation is not None:
         config._attn_implementation = attn_implementation
-    if (has_supported_target or uses_stock_ministral_embedding) and pooling is not None:
-        config.pooling = pooling
     if num_labels is not None:
         config.num_labels = num_labels
-    if (has_supported_target or uses_stock_ministral_embedding) and temperature is not None:
-        config.temperature = temperature
 
     return _load_from_extracted_state(backbone_class, config, extracted_model)
 
