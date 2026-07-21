@@ -46,6 +46,14 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate the two halves of the RoPE feature axis.
+
+    Args:
+        x: Tensor of shape [..., rotary_dim], where rotary_dim is even.
+
+    Returns:
+        Tensor of shape [..., rotary_dim].
+    """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
@@ -57,6 +65,17 @@ def _apply_rotary_pos_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE to query and key states.
+
+    Args:
+        q: Query tensor of shape [batch, heads, sequence, head_dim].
+        k: Key tensor of shape [batch, key_value_heads, sequence, head_dim].
+        cos: Cosine tensor of shape [batch, sequence, rotary_dim].
+        sin: Sine tensor of shape [batch, sequence, rotary_dim].
+
+    Returns:
+        Tuple of rotated query and key tensors with the same shapes as ``q`` and ``k``.
+    """
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
     rotary_dim = cos.shape[-1]
@@ -68,6 +87,15 @@ def _apply_rotary_pos_emb(
 
 
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Repeat key/value heads for grouped-query attention.
+
+    Args:
+        hidden_states: Tensor of shape [batch, key_value_heads, sequence, head_dim].
+        n_rep: Number of repeats per key/value head.
+
+    Returns:
+        Tensor of shape [batch, key_value_heads * n_rep, sequence, head_dim].
+    """
     batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
@@ -76,6 +104,16 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 def _convert_bool_4d_mask_to_additive(attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Convert a bool 4D attention mask to additive attention-mask layout.
+
+    Args:
+        attention_mask: Tensor of shape [batch, heads_or_one, sequence, key_sequence].
+            Bool masks use True for visible entries; non-bool masks are already additive.
+        dtype: Floating-point dtype for the additive mask.
+
+    Returns:
+        Additive mask tensor with the same shape, or the original non-bool mask.
+    """
     if attention_mask.ndim != 4 or attention_mask.dtype != torch.bool:
         return attention_mask
     additive = torch.zeros(attention_mask.shape, dtype=dtype, device=attention_mask.device)
@@ -83,6 +121,15 @@ def _convert_bool_4d_mask_to_additive(attention_mask: torch.Tensor, dtype: torch
 
 
 def _derive_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Derive an MoE padding mask from a sequence or attention mask.
+
+    Args:
+        attention_mask: Tensor of shape [batch, sequence] with nonzero valid tokens, or
+            [batch, heads_or_one, sequence, key_sequence] in bool or additive mask layout.
+
+    Returns:
+        Bool tensor of shape [batch, sequence], where True marks padding.
+    """
     if attention_mask.ndim == 2:
         return attention_mask == 0
     if attention_mask.ndim == 4:
@@ -101,6 +148,19 @@ def _fallback_additive_mask(
     attention_mask: torch.Tensor | None = None,
     sliding_window: int | None = None,
 ) -> torch.Tensor:
+    """Build a causal additive attention mask.
+
+    Args:
+        batch_size: Batch size for the returned mask.
+        seq_len: Query and key sequence length.
+        dtype: Floating-point dtype for the additive mask.
+        device: Device for the returned mask.
+        attention_mask: Optional sequence mask of shape [batch, sequence] with nonzero valid tokens.
+        sliding_window: Optional sliding-window size for local attention.
+
+    Returns:
+        Additive mask tensor of shape [batch, 1, sequence, sequence].
+    """
     min_value = torch.finfo(dtype).min
     idx = torch.arange(seq_len, device=device)
     masked = idx.unsqueeze(0) > idx.unsqueeze(1)
@@ -124,6 +184,21 @@ def _ensure_additive_mask(
     attention_mask: torch.Tensor | None,
     sliding_window: int | None,
 ) -> torch.Tensor:
+    """Normalize an optional precomputed mask into additive layout.
+
+    Args:
+        mask: Optional attention mask of shape [batch, heads_or_one, sequence, key_sequence].
+            Bool masks use True for visible entries; additive masks are passed through.
+        batch_size: Batch size used when ``mask`` is absent.
+        seq_len: Query and key sequence length used when ``mask`` is absent.
+        dtype: Floating-point dtype for the additive mask.
+        device: Device for the additive mask.
+        attention_mask: Optional sequence mask of shape [batch, sequence] with nonzero valid tokens.
+        sliding_window: Optional sliding-window size for local attention.
+
+    Returns:
+        Additive mask tensor of shape [batch, heads_or_one, sequence, key_sequence].
+    """
     if mask is None or not isinstance(mask, torch.Tensor):
         return _fallback_additive_mask(batch_size, seq_len, dtype, device, attention_mask, sliding_window)
     return _convert_bool_4d_mask_to_additive(mask, dtype)
@@ -139,6 +214,23 @@ def _eager_attention_forward(
     dropout: float = 0.0,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run eager attention over projected query/key/value states.
+
+    Args:
+        module: Attention module carrying head-repeat metadata.
+        query: Query tensor of shape [batch, heads, sequence, head_dim].
+        key: Key tensor of shape [batch, key_value_heads, key_sequence, head_dim].
+        value: Value tensor of shape [batch, key_value_heads, key_sequence, head_dim].
+        attention_mask: Optional additive mask broadcastable to
+            [batch, heads, sequence, key_sequence].
+        scaling: Multiplicative scale for attention logits.
+        dropout: Attention dropout probability.
+        **kwargs: Ignored attention backend arguments.
+
+    Returns:
+        Tuple of context tensor [batch, sequence, heads, head_dim] and attention weights
+        [batch, heads, sequence, key_sequence].
+    """
     del kwargs
     key_states = _repeat_kv(key, module.num_key_value_groups)
     value_states = _repeat_kv(value, module.num_key_value_groups)
@@ -161,6 +253,22 @@ def _sdpa_attention_forward(
     dropout: float = 0.0,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, None]:
+    """Run SDPA attention over projected query/key/value states.
+
+    Args:
+        module: Attention module carrying head-repeat metadata.
+        query: Query tensor of shape [batch, heads, sequence, head_dim].
+        key: Key tensor of shape [batch, key_value_heads, key_sequence, head_dim].
+        value: Value tensor of shape [batch, key_value_heads, key_sequence, head_dim].
+        attention_mask: Optional additive mask broadcastable to
+            [batch, heads, sequence, key_sequence].
+        scaling: Ignored because SDPA applies its own scale.
+        dropout: Attention dropout probability.
+        **kwargs: Ignored attention backend arguments.
+
+    Returns:
+        Tuple of context tensor [batch, sequence, heads, head_dim] and ``None`` for weights.
+    """
     del scaling, kwargs
     key_states = _repeat_kv(key, module.num_key_value_groups)
     value_states = _repeat_kv(value, module.num_key_value_groups)
