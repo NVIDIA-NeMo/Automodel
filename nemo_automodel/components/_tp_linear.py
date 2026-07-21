@@ -77,7 +77,7 @@ def _tp_linear_forward(
     """Dispatch a TP-safe linear between F.linear, async-TP shaping, and bmm/mm.
 
     Shared by ``TPLinear.forward`` and ``LinearLoRA.forward``.  Eager
-    unsharded/dim-2-sharded inputs use ``F.linear``; async-TP tracing emits the
+    unsharded/last-dimension-sharded inputs use ``F.linear``; async-TP tracing emits the
     fusable native linear graph via ``_async_tp_linear``; every remaining
     compile path and dim-0/1-sharded DTensor input keeps the DTensor-safe
     matmul fallback (``aten.view`` cannot flatten a sharded dimension).
@@ -106,7 +106,9 @@ def _tp_linear_forward(
     # F.linear calls view([b,s,h]->[b*s,h]) which fails when dim 0/1 is sharded
     # (sequence parallelism) or during AOT-autograd tracing with compile.
     x_needs_bmm = (
-        isinstance(x, DTensor) and x.dim() == 3 and any(isinstance(p, Shard) and p.dim < 2 for p in x.placements)
+        isinstance(x, DTensor)
+        and x.dim() == 3
+        and any(isinstance(p, Shard) and p.dim % x.dim() < x.dim() - 1 for p in x.placements)
     )
     if _is_async_tp_linear_enabled() and not x_needs_bmm:
         return _async_tp_linear(x, weight, bias)

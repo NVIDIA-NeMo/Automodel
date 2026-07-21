@@ -204,7 +204,7 @@ class TestTPLinearGraphShaping:
 
 
 class TestTPLinearShardedInputUnderAsyncTp:
-    """Dim-0/1-sharded DTensor inputs must keep the bmm path even under async-TP."""
+    """DTensor placement must select the safe, fusable async-TP graph."""
 
     def test_dim1_sharded_dtensor_takes_bmm_not_async_shaping(self, single_rank_pg):
         """A sequence-sharded DTensor input must bypass async-TP shaping and not crash.
@@ -239,3 +239,34 @@ class TestTPLinearShardedInputUnderAsyncTp:
         bmm_spy.assert_called_once()
         assert isinstance(out, DTensor)
         assert torch.allclose(out.full_tensor(), F.linear(x_local, weight_local, bias_local), atol=1e-6)
+
+    def test_negative_last_dim_shard_takes_async_shaping(self, single_rank_pg):
+        """A row-parallel ``Shard(-1)`` input must take the fusable linear graph.
+
+        Builds a bias-free TPLinear with a row-sharded ``[out_features,
+        in_features]`` weight and feeds a ``[B, S, in_features]`` DTensor input
+        sharded on its last/feature dimension. ``Shard(-1)`` is equivalent to
+        ``Shard(2)`` for this 3-D input and must not be mistaken for batch or
+        sequence sharding.
+        """
+        torch.manual_seed(0)
+        linear = nn.Linear(16, 12, bias=False)
+        linear.__class__ = TPLinear
+        weight_local = linear.weight.detach().clone()
+
+        mesh = DeviceMesh("cpu", torch.arange(1))
+        linear.weight = nn.Parameter(distribute_tensor(weight_local, mesh, [Shard(1)]))
+        x_local = torch.randn(2, 5, 16)
+        x = DTensor.from_local(x_local, mesh, [Shard(-1)], run_check=False)
+
+        with (
+            patch("nemo_automodel.components._tp_linear._is_async_tp_linear_enabled", return_value=True),
+            patch("nemo_automodel.components._tp_linear._async_tp_linear", wraps=_async_tp_linear) as async_spy,
+            patch("torch.bmm", wraps=torch.bmm) as bmm_spy,
+        ):
+            out = linear(x)
+
+        async_spy.assert_called_once()
+        bmm_spy.assert_not_called()
+        assert isinstance(out, DTensor)
+        assert torch.allclose(out.full_tensor(), F.linear(x_local, weight_local), atol=1e-6)

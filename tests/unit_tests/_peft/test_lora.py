@@ -30,6 +30,7 @@ from nemo_automodel.components._peft.lora import (
     apply_memory_efficient_lora,
     patch_linear_module,
 )
+from nemo_automodel.components._tp_linear import _async_tp_linear
 from nemo_automodel.components.distributed.parallel_styles import TPLinear
 from nemo_automodel.shared.import_utils import safe_import_te
 
@@ -635,5 +636,39 @@ def test_linear_lora_dim1_sharded_dtensor_takes_bmm_not_async_shaping(single_ran
 
     async_spy.assert_not_called()
     assert bmm_spy.call_count == 3  # base projection + lora_A + lora_B
+    assert isinstance(out, DTensor)
+    assert torch.allclose(out.full_tensor(), ref, atol=1e-6)
+
+
+def test_linear_lora_negative_last_dim_shard_takes_async_shaping(single_rank_pg):
+    """A ``Shard(-1)`` LoRA input must take the fusable async-TP linear graph.
+
+    Builds a LinearLoRA with replicated base and adapter weights on a
+    world-size-1 mesh and feeds a ``[B, S, in_features]`` DTensor input sharded
+    on its last/feature dimension. The base, LoRA-A, and LoRA-B projections must
+    all avoid the batch/sequence-sharded ``bmm`` fallback.
+    """
+    torch.manual_seed(0)
+    lora = _make_lora_with_random_adapters()
+    x_local = torch.randn(2, 5, 16)
+    ref = lora(x_local)
+
+    mesh = DeviceMesh("cpu", torch.arange(1))
+    for mod in (lora, lora.lora_A, lora.lora_B):
+        mod.weight = nn.Parameter(distribute_tensor(mod.weight.detach().clone(), mesh, [Replicate()]))
+    lora.bias = nn.Parameter(distribute_tensor(lora.bias.detach().clone(), mesh, [Replicate()]))
+    lora.lora_A.__class__ = TPLinear
+    lora.lora_B.__class__ = TPLinear
+    x = DTensor.from_local(x_local, mesh, [Shard(-1)], run_check=False)
+
+    with (
+        patch("nemo_automodel.components._tp_linear._is_async_tp_linear_enabled", return_value=True),
+        patch("nemo_automodel.components._tp_linear._async_tp_linear", wraps=_async_tp_linear) as async_spy,
+        patch("torch.bmm", wraps=torch.bmm) as bmm_spy,
+    ):
+        out = lora(x)
+
+    assert async_spy.call_count == 3  # base projection + lora_A + lora_B
+    bmm_spy.assert_not_called()
     assert isinstance(out, DTensor)
     assert torch.allclose(out.full_tensor(), ref, atol=1e-6)

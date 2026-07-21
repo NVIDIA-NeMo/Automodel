@@ -262,8 +262,9 @@ class LinearLoRA(nn.Linear):
                 (``N`` = flattened tokens).  May be a DTensor: a 3-D DTensor
                 sharded on dim 0 or 1 (e.g. ``Shard(1)`` from sequence
                 parallelism) routes the base projection through ``torch.bmm``;
-                replicated or dim-2-sharded inputs take ``F.linear``, which
-                under async-TP tracing is the fusable native linear graph.
+                replicated or last-dimension-sharded inputs (``Shard(2)`` or
+                ``Shard(-1)``) take ``F.linear``, which under async-TP tracing
+                is the fusable native linear graph.
 
         Returns:
             Tensor: Output of shape ``[..., out_features]`` with the same
