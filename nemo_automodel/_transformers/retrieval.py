@@ -52,6 +52,13 @@ _HF_HUB_METADATA_KWARGS = {
     "revision",
     "token",
 }
+_EXPORT_ONLY_BI_ENCODER_KWARGS = {
+    "query_prompt",
+    "document_prompt",
+    "sentence_transformer_max_seq_length",
+    "similarity_fn_name",
+    "do_lower_case",
+}
 
 
 @dataclass
@@ -61,18 +68,10 @@ class SentenceTransformerExportConfig:
     Attributes:
         query_prompt: Exact prompt prepended to queries, or None when no prompt is configured yet.
         document_prompt: Exact prompt prepended to documents, or None when no prompt is configured yet.
-        max_seq_length: Deployment sequence limit, or None to use the tokenizer or model capability.
-        similarity_fn_name: Sentence Transformers similarity function, or None to derive it.
-        do_lower_case: Transformer preprocessing flag, or None to default to False.
-        include_prompt: Whether pooling includes prompt tokens.
     """
 
     query_prompt: str | None = None
     document_prompt: str | None = None
-    max_seq_length: int | None = None
-    similarity_fn_name: str | None = None
-    do_lower_case: bool | None = None
-    include_prompt: bool = True
 
 
 @dataclass(frozen=True)
@@ -635,7 +634,7 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
             _validate_sentence_transformer_export,
         )
 
-        _validate_sentence_transformer_export(model, export_config, tokenizer, original_model_path)
+        _validate_sentence_transformer_export(model, tokenizer, original_model_path)
 
     model.model.save_pretrained(save_directory)
     if export_config is None:
@@ -687,11 +686,6 @@ class BiEncoderModel(nn.Module):
         model: PreTrainedModel,
         pooling: str = "avg",
         l2_normalize: bool = True,
-        query_prompt: str | None = None,
-        document_prompt: str | None = None,
-        sentence_transformer_max_seq_length: int | None = None,
-        similarity_fn_name: str | None = None,
-        do_lower_case: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
     ):
@@ -701,13 +695,7 @@ class BiEncoderModel(nn.Module):
         self.l2_normalize = l2_normalize
         self.sentence_transformer_export_config: SentenceTransformerExportConfig | None = None
         if _supports_standard_sentence_transformer_export(model, pooling):
-            self.sentence_transformer_export_config = SentenceTransformerExportConfig(
-                query_prompt=query_prompt,
-                document_prompt=document_prompt,
-                max_seq_length=sentence_transformer_max_seq_length,
-                similarity_fn_name=similarity_fn_name,
-                do_lower_case=do_lower_case,
-            )
+            self.sentence_transformer_export_config = SentenceTransformerExportConfig()
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
         self.detach_distributed_inbatch_negatives = detach_distributed_inbatch_negatives
 
@@ -718,11 +706,6 @@ class BiEncoderModel(nn.Module):
         task: str = None,
         pooling: str | None = None,
         l2_normalize: bool | None = None,
-        query_prompt: str | None = None,
-        document_prompt: str | None = None,
-        sentence_transformer_max_seq_length: int | None = None,
-        similarity_fn_name: str | None = None,
-        do_lower_case: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
         trust_remote_code: bool = False,
@@ -732,6 +715,12 @@ class BiEncoderModel(nn.Module):
         effective_task = cls._TASK if cls._TASK is not None else task
         if effective_task is None:
             raise ValueError("task must be specified when calling build()")
+        export_only_kwargs = _EXPORT_ONLY_BI_ENCODER_KWARGS.intersection(hf_kwargs)
+        if export_only_kwargs:
+            names = ", ".join(sorted(export_only_kwargs))
+            raise TypeError(
+                f"Sentence Transformers export metadata is derived from effective NeMo settings; remove: {names}."
+            )
 
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
@@ -760,11 +749,6 @@ class BiEncoderModel(nn.Module):
         if commit_hash is not None:
             metadata_kwargs["revision"] = commit_hash
         saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, metadata_kwargs)
-        if saved_options is not None:
-            if query_prompt is None:
-                query_prompt = saved_options.query_prompt
-            if document_prompt is None:
-                document_prompt = saved_options.document_prompt
         pooling, l2_normalize = _resolve_bi_encoder_options(
             config,
             saved_options,
@@ -784,14 +768,14 @@ class BiEncoderModel(nn.Module):
             model=backbone,
             pooling=pooling,
             l2_normalize=l2_normalize,
-            query_prompt=query_prompt,
-            document_prompt=document_prompt,
-            sentence_transformer_max_seq_length=sentence_transformer_max_seq_length,
-            similarity_fn_name=similarity_fn_name,
-            do_lower_case=do_lower_case,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
             detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
         )
+        if saved_options is not None:
+            encoder.configure_sentence_transformer_prompts(
+                query_prompt=saved_options.query_prompt or "",
+                document_prompt=saved_options.document_prompt or "",
+            )
         encoder.source_model_path = _resolve_cached_source_model_path(
             model_name_or_path,
             backbone.config,
@@ -805,21 +789,12 @@ class BiEncoderModel(nn.Module):
         return encoder
 
     def configure_sentence_transformer_prompts(self, query_prompt: str, document_prompt: str) -> None:
-        """Set the exact prompts used by training and reject conflicting explicit export settings."""
+        """Set the exact prompts used by the current retrieval pipeline."""
         export_config = self.sentence_transformer_export_config
         if export_config is None:
             return
-        for field_name, effective_prompt in (
-            ("query_prompt", query_prompt),
-            ("document_prompt", document_prompt),
-        ):
-            configured_prompt = getattr(export_config, field_name)
-            if configured_prompt is not None and configured_prompt != effective_prompt:
-                raise ValueError(
-                    f"Configured {field_name}={configured_prompt!r} does not match "
-                    f"the training collator prompt {effective_prompt!r}."
-                )
-            setattr(export_config, field_name, effective_prompt)
+        export_config.query_prompt = query_prompt
+        export_config.document_prompt = document_prompt
 
     def disable_sentence_transformer_export(self) -> None:
         """Disable standard export when runtime behavior cannot be represented faithfully."""

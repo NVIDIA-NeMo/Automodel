@@ -14,6 +14,7 @@
 
 """Functional tests for retrieval backbone extraction."""
 
+import inspect
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -160,6 +161,50 @@ def test_save_encoder_pretrained_forwards_is_final_checkpoint(tmp_path, kwargs, 
     )
 
 
+def test_bi_encoder_public_api_excludes_export_format_overrides():
+    from nemo_automodel._transformers import auto_model, retrieval
+
+    export_only_parameters = {
+        "query_prompt",
+        "document_prompt",
+        "sentence_transformer_max_seq_length",
+        "similarity_fn_name",
+        "do_lower_case",
+    }
+    for callable_ in (
+        retrieval.BiEncoderModel.__init__,
+        retrieval.BiEncoderModel.build,
+        auto_model.NeMoAutoModelBiEncoder.from_pretrained,
+    ):
+        parameters = inspect.signature(callable_).parameters
+        assert export_only_parameters.isdisjoint(parameters)
+        assert {"pooling", "l2_normalize"} <= parameters.keys()
+
+    for parameter in export_only_parameters:
+        with pytest.raises(TypeError, match="derived from effective NeMo settings"):
+            retrieval.BiEncoderModel.build("unused", **{parameter: None})
+
+
+def test_effective_pipeline_prompts_replace_restored_export_defaults():
+    from nemo_automodel._transformers import retrieval
+
+    encoder = SimpleNamespace(
+        sentence_transformer_export_config=retrieval.SentenceTransformerExportConfig(
+            query_prompt="saved query: ",
+            document_prompt="saved document: ",
+        )
+    )
+
+    retrieval.BiEncoderModel.configure_sentence_transformer_prompts(
+        encoder,
+        query_prompt="current query: ",
+        document_prompt="current document: ",
+    )
+
+    assert encoder.sentence_transformer_export_config.query_prompt == "current query: "
+    assert encoder.sentence_transformer_export_config.document_prompt == "current document: "
+
+
 def test_direct_standard_export_without_tokenizer_rejects_before_writing(tmp_path):
     from nemo_automodel._transformers import retrieval
 
@@ -173,12 +218,7 @@ def test_direct_standard_export_without_tokenizer_rejects_before_writing(tmp_pat
             num_key_value_heads=1,
         )
     )
-    encoder = retrieval.BiEncoderModel(
-        backbone,
-        pooling="avg",
-        l2_normalize=False,
-        query_prompt="query: ",
-    )
+    encoder = retrieval.BiEncoderModel(backbone, pooling="avg", l2_normalize=False)
     save_dir = tmp_path / "missing_tokenizer"
 
     with pytest.raises(ValueError, match="tokenizer is required"):
@@ -187,7 +227,7 @@ def test_direct_standard_export_without_tokenizer_rejects_before_writing(tmp_pat
     assert not save_dir.exists()
 
 
-def test_direct_standard_export_validates_before_writing(tmp_path):
+def test_direct_standard_export_uses_general_sequence_capabilities(tmp_path):
     from nemo_automodel._transformers import retrieval
 
     backbone = LlamaBidirectionalModel(
@@ -198,21 +238,17 @@ def test_direct_standard_export_validates_before_writing(tmp_path):
             num_hidden_layers=1,
             num_attention_heads=2,
             num_key_value_heads=1,
-            max_position_embeddings=32,
+            max_position_embeddings=64,
         )
     )
-    encoder = retrieval.BiEncoderModel(
-        backbone,
-        pooling="avg",
-        l2_normalize=True,
-        sentence_transformer_max_seq_length=64,
-    )
-    save_dir = tmp_path / "invalid_export"
+    encoder = retrieval.BiEncoderModel(backbone, pooling="avg", l2_normalize=True)
+    tokenizer = _tiny_tokenizer()
+    save_dir = tmp_path / "derived_export"
 
-    with pytest.raises(ValueError, match="exceeds the model's max_position_embeddings"):
-        encoder.save_pretrained(save_dir, tokenizer=_tiny_tokenizer())
+    encoder.save_pretrained(save_dir, tokenizer=tokenizer)
 
-    assert not save_dir.exists()
+    metadata = json.loads((save_dir / "sentence_bert_config.json").read_text())
+    assert metadata == {"max_seq_length": tokenizer.model_max_length, "do_lower_case": False}
 
 
 def test_cached_source_model_path_uses_exact_loaded_revision(tmp_path, monkeypatch):
@@ -435,12 +471,7 @@ def test_bi_encoder_skips_standard_export_for_unrepresentable_pooling(pooling, t
             num_key_value_heads=1,
         )
     )
-    encoder = retrieval.BiEncoderModel(
-        backbone,
-        pooling=pooling,
-        l2_normalize=True,
-        query_prompt="query: ",
-    )
+    encoder = retrieval.BiEncoderModel(backbone, pooling=pooling, l2_normalize=True)
 
     assert encoder.sentence_transformer_export_config is None
     encoder.configure_sentence_transformer_prompts(query_prompt="query: ", document_prompt="passage: ")
@@ -463,12 +494,7 @@ def test_bi_encoder_skips_standard_export_for_multimodal_backbone():
             self.config.llm_config = PretrainedConfig(hidden_size=16)
             self.config.name_or_path = ""
 
-    encoder = retrieval.BiEncoderModel(
-        CompositeBackbone(),
-        pooling="last",
-        l2_normalize=True,
-        query_prompt="query: ",
-    )
+    encoder = retrieval.BiEncoderModel(CompositeBackbone(), pooling="last", l2_normalize=True)
 
     assert encoder.sentence_transformer_export_config is None
     encoder.configure_sentence_transformer_prompts(query_prompt="query: ", document_prompt="passage: ")
@@ -488,12 +514,8 @@ def test_bi_encoder_export_config_uses_deployable_hf_base_classes():
             pooling="avg",
         )
     )
-    encoder = retrieval.BiEncoderModel(
-        backbone,
-        pooling="cls",
-        l2_normalize=True,
-        query_prompt="query: ",
-    )
+    encoder = retrieval.BiEncoderModel(backbone, pooling="cls", l2_normalize=True)
+    encoder.configure_sentence_transformer_prompts(query_prompt="query: ", document_prompt="passage: ")
 
     export_config = encoder.get_hf_export_config()
 
@@ -505,12 +527,6 @@ def test_bi_encoder_export_config_uses_deployable_hf_base_classes():
     assert export_config.is_causal is False
     assert export_config.pooling == "cls"
     assert encoder.config.model_type == "llama_bidirec"
-
-    with pytest.raises(ValueError, match="does not match the training collator prompt"):
-        encoder.configure_sentence_transformer_prompts(
-            query_prompt="different query: ",
-            document_prompt="passage: ",
-        )
 
 
 def test_bi_encoder_export_config_uses_class_model_type_when_source_type_is_retained():
@@ -576,7 +592,8 @@ def test_ministral_embedding_uses_stock_bidirectional_model(tmp_path):
         modified_output = backbone(input_ids=modified_input_ids, attention_mask=attention_mask).last_hidden_state
     assert not torch.allclose(original_output[0, 0], modified_output[0, 0])
 
-    encoder = retrieval.BiEncoderModel(backbone, pooling="avg", l2_normalize=True, query_prompt="query: ")
+    encoder = retrieval.BiEncoderModel(backbone, pooling="avg", l2_normalize=True)
+    encoder.configure_sentence_transformer_prompts(query_prompt="query: ", document_prompt="")
     export_config = encoder.get_hf_export_config()
 
     assert type(export_config) is Ministral3Config
@@ -677,13 +694,8 @@ def test_sentence_transformers_and_nemo_round_trip_generated_ministral_checkpoin
         task="embedding",
         pooling=pooling,
     )
-    encoder = retrieval.BiEncoderModel(
-        backbone,
-        pooling=pooling,
-        l2_normalize=l2_normalize,
-        query_prompt="query: ",
-        document_prompt="passage: ",
-    )
+    encoder = retrieval.BiEncoderModel(backbone, pooling=pooling, l2_normalize=l2_normalize)
+    encoder.configure_sentence_transformer_prompts(query_prompt="query: ", document_prompt="passage: ")
     tokenizer = _tiny_tokenizer()
     raw_texts = ["hello", "hello world"]
     query_texts = [f"query: {text}" for text in raw_texts]
@@ -765,13 +777,8 @@ def test_nemo_bi_encoder_saved_prompts_round_trip_through_reexport(tmp_path):
         task="embedding",
         pooling="avg",
     )
-    encoder = retrieval.BiEncoderModel(
-        backbone,
-        pooling="avg",
-        l2_normalize=True,
-        query_prompt="query: ",
-        document_prompt="passage: ",
-    )
+    encoder = retrieval.BiEncoderModel(backbone, pooling="avg", l2_normalize=True)
+    encoder.configure_sentence_transformer_prompts(query_prompt="query: ", document_prompt="passage: ")
     tokenizer = _tiny_tokenizer()
     first_export = tmp_path / "first_export"
     encoder.save_pretrained(first_export, tokenizer=tokenizer)
@@ -784,14 +791,6 @@ def test_nemo_bi_encoder_saved_prompts_round_trip_through_reexport(tmp_path):
     reloaded.save_pretrained(second_export, tokenizer=tokenizer)
     metadata = json.loads((second_export / "config_sentence_transformers.json").read_text())
     assert metadata["prompts"] == {"query": "query: ", "document": "passage: "}
-
-    explicit = retrieval.BiEncoderModel.build(
-        str(first_export),
-        query_prompt="search: ",
-        document_prompt="index: ",
-    )
-    assert explicit.sentence_transformer_export_config.query_prompt == "search: "
-    assert explicit.sentence_transformer_export_config.document_prompt == "index: "
 
 
 def test_nemo_bi_encoder_uses_defaults_without_sentence_transformer_metadata():

@@ -398,13 +398,10 @@ def test_save_model_generates_sentence_transformer_metadata_from_effective_model
     model.sentence_transformer_export_config = SimpleNamespace(
         query_prompt="query: ",
         document_prompt="passage: ",
-        max_seq_length=8192,
-        similarity_fn_name="cosine",
-        do_lower_case=False,
-        include_prompt=True,
     )
     model.get_hf_export_config = lambda: model.config
     tokenizer = MagicMock()
+    tokenizer.model_max_length = 8192
     weights_path = tmp_path / "step"
 
     checkpointer.save_model(model, str(weights_path), tokenizer=tokenizer)
