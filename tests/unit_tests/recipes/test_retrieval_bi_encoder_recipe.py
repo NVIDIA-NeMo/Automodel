@@ -96,6 +96,16 @@ def test_configure_sentence_transformer_export_binds_exact_static_collator_promp
     assert captured == {"query_prompt": "query: ", "document_prompt": "passage: "}
 
 
+def test_configure_sentence_transformer_export_ignores_collator_when_export_is_disabled():
+    class _Model:
+        sentence_transformer_export_config = None
+
+        def configure_sentence_transformer_prompts(self, **kwargs):
+            raise AssertionError(f"disabled export must not configure prompts: {kwargs}")
+
+    _configure_sentence_transformer_export(_Model(), SimpleNamespace())
+
+
 def test_configure_sentence_transformer_export_disables_export_for_dataset_instructions(caplog):
     class _Model:
         sentence_transformer_export_config = object()

@@ -151,7 +151,7 @@ def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effe
         max_seq_length=4096,
         similarity_fn_name="dot",
         do_lower_case=False,
-        include_prompt=False,
+        include_prompt=True,
     )
     model.get_hf_export_config = lambda: model.config
     tokenizer = MagicMock()
@@ -207,7 +207,7 @@ def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effe
     pooling_config = json.loads((consolidated_dir / "1_Pooling" / "config.json").read_text())
     assert pooling_config["pooling_mode_cls_token"] is True
     assert pooling_config["pooling_mode_mean_tokens"] is False
-    assert pooling_config["include_prompt"] is False
+    assert pooling_config["include_prompt"] is True
     assert pooling_config["word_embedding_dimension"] == 2048
     assert json.loads((consolidated_dir / "config_sentence_transformers.json").read_text()) == {
         "prompts": {"query": "search: ", "document": "index: "},
@@ -447,6 +447,31 @@ def test_generated_sentence_transformer_assets_reject_similarity_that_contradict
     )
 
     with pytest.raises(ValueError, match="does not match"):
+        _save_generated_sentence_transformer_assets(
+            model,
+            export_config,
+            original_model_path=None,
+            hf_metadata_dir=str(tmp_path),
+            tokenizer=SimpleNamespace(model_max_length=512),
+        )
+
+
+def test_generated_sentence_transformer_assets_reject_prompt_exclusion_not_used_by_training(tmp_path):
+    model = SimpleNamespace(
+        pooling="avg",
+        l2_normalize=True,
+        config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
+    )
+    export_config = SimpleNamespace(
+        query_prompt="query: ",
+        document_prompt="passage: ",
+        max_seq_length=512,
+        similarity_fn_name="cosine",
+        do_lower_case=False,
+        include_prompt=False,
+    )
+
+    with pytest.raises(ValueError, match="include_prompt=False"):
         _save_generated_sentence_transformer_assets(
             model,
             export_config,
