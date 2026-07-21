@@ -86,7 +86,7 @@ dependencies = [
     "tiktoken",
     "torch>=2.6.0",
     "torchdata",
-    "transformers==5.12.1",
+    "transformers==5.14.1",
     "wandb>=0.28.0",
     "torchao",
     "mlflow",
@@ -450,7 +450,7 @@ convention = "google"
 
 
 [tool.ruff.lint.isort]
-known-third-party = ["datasets", "transformers", "wandb"]
+known-third-party = ["datasets", "transformers==5.14.1", "wandb"]
 
 [tool.importlinter]
 root_package = "nemo_automodel"
@@ -528,7 +528,7 @@ allowed-unresolved-imports = [
     "transformer_engine",
     "transformer_engine.**",
     "transformer_engine_torch",
-    "transformers.tokenization_utils",
+    "transformers==5.14.1",
     "uccl",
     "uccl.**",
 ]
