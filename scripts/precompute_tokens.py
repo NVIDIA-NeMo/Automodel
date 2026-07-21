@@ -73,6 +73,10 @@ def _process_chunk(args):
     content_tag = tags.get("content_tag", "content")
     user_tag = tags.get("user_tag", "user")
     assistant_tag = tags.get("assistant_tag", "assistant")
+    system_tag = tags.get("system_tag", "system")
+    # Must match the roles kept by _convert_sharegpt_to_conversation, otherwise the
+    # estimate drifts from the sequence actually trained on.
+    counted_roles = (user_tag, assistant_tag, system_tag)
 
     results = []
     for i, line in enumerate(chunk_lines, start=start):
@@ -82,7 +86,7 @@ def _process_chunk(args):
         texts = []
         for msg in sample.get(messages_col, []):
             role = msg.get(role_tag, "")
-            if role not in (user_tag, assistant_tag):
+            if role not in counted_roles:
                 continue
             content = msg.get(content_tag, "")
             text = _MEDIA_TAG_RE.sub("", content).strip()
