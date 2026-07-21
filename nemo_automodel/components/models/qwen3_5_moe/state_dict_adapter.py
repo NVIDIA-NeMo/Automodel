@@ -86,7 +86,8 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
 
     Loading paths:
       DCP path:  to_hf renames+transposes native→HF, DCP loads into DTensors,
-                 from_hf renames+transposes HF→native. DTensors pass through.
+                 and from_hf renames+transposes HF→native. Split MTP experts
+                 are locally reassembled before restoring the complete EP mesh.
       Init path: from_hf receives plain tensors from safetensors, slices to local EP
                  shard, transposes, and wraps in DTensor via create_dtensor_from_local.
 
@@ -180,7 +181,8 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
     ) -> dict[str, Any]:
         """Rename HF keys to native keys and transpose expert tensors.
 
-        DTensors (DCP path): rename + transpose, no slicing — DCP handles sharding.
+        DTensors (DCP path): rename + transpose; split MTP experts are locally
+        reassembled without applying EP-shard slicing again.
         Plain tensors (init path): slice to local EP shard, transpose, create DTensor.
         """
         self._uses_model_prefix = any(key.startswith("model.") for key in hf_state_dict if not key.startswith("mtp."))
@@ -300,7 +302,18 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
 
             gate_up_tensor = torch.stack(gate_up_tensors, dim=0).to(self.dtype)
             down_tensor = torch.stack(down_tensors, dim=0).to(self.dtype)
-            if ep_shard_size > 1:
+            split_tensors_are_dtensors = state_dict_utils.is_dtensor(gate_up_tensor)
+            if split_tensors_are_dtensors != state_dict_utils.is_dtensor(down_tensor):
+                raise TypeError("MTP split gate/up and down expert weights must use the same tensor type")
+
+            if split_tensors_are_dtensors:
+                # DCP split-expert values retain the non-EP placements after
+                # ``split_experts_weights_dtensor_aware`` removes the expert mesh
+                # dimension. Recover their already-sharded local storage before
+                # rebuilding the native tensor on the complete expert mesh.
+                gate_up_tensor = gate_up_tensor.to_local()
+                down_tensor = down_tensor.to_local()
+            elif ep_shard_size > 1:
                 for tensor_name, local_tensor in (("gate_and_up_projs", gate_up_tensor), ("down_projs", down_tensor)):
                     if local_tensor.shape[1] % ep_shard_size != 0:
                         raise ValueError(
