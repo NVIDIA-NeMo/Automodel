@@ -61,6 +61,8 @@ model:
   text_config:
     # FusedLinearCrossEntropy consumes the decoder hidden states directly.
     output_hidden_states: true
+    # Qwen3.5 stores MTP expert projections as per-expert tensors in HF checkpoints.
+    mtp_expert_hf_layout: split
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa

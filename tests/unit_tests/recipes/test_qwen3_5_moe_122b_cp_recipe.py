@@ -31,6 +31,7 @@ def test_qwen3_5_moe_122b_example_declares_scaling_contract() -> None:
     assert raw_config["model"]["pretrained_model_name_or_path"] == "Qwen/Qwen3.5-122B-A10B"
     assert raw_config["model"]["attn_implementation"] == "sdpa"
     assert raw_config["model"]["text_config"]["output_hidden_states"] is True
+    assert raw_config["model"]["text_config"]["mtp_expert_hf_layout"] == "split"
     assert raw_config["distributed"]["cp_size"] == 16
     assert raw_config["distributed"]["ep_size"] == 8
     assert raw_config["distributed"]["activation_checkpointing"] is True
