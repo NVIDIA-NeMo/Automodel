@@ -22,7 +22,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PretrainedConfig, PreTrainedModel
+from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import logging
 
@@ -31,15 +31,6 @@ from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 logger = logging.get_logger(__name__)
-
-
-def _clone_pretrained_config(config: PretrainedConfig) -> PretrainedConfig:
-    """Clone a config while retaining private source-revision metadata."""
-    cloned_config = config.__class__.from_dict(config.to_dict())
-    commit_hash = getattr(config, "_commit_hash", None)
-    if commit_hash is not None:
-        cloned_config._commit_hash = commit_hash
-    return cloned_config
 
 
 def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedModel:
@@ -121,7 +112,7 @@ def _build_backbone_from_extracted_submodel(
         )
 
     if model_type.lower() == "ministral3" and task == "embedding":
-        config = _clone_pretrained_config(text_config)
+        config = text_config.__class__.from_dict(text_config.to_dict())
         config.is_causal = False
         if pooling is not None:
             config.pooling = pooling
@@ -132,7 +123,7 @@ def _build_backbone_from_extracted_submodel(
         except KeyError as exc:
             raise ValueError(f"No HuggingFace base model found for '{model_type}'.") from exc
     elif task == "score" and not has_supported_target:
-        config = _clone_pretrained_config(text_config)
+        config = text_config.__class__.from_dict(text_config.to_dict())
         try:
             backbone_class = MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING[type(config)]
         except KeyError as exc:
