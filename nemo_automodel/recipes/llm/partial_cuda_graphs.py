@@ -1014,6 +1014,7 @@ class PartialCudaGraphManager:
         model_parts: list[nn.Module],
         *,
         activation_checkpointing: bool = False,
+        activation_checkpointing_modules: tuple[str, ...] | None = None,
         pipeline_parallel: bool = False,
     ) -> PartialCudaGraphManager | None:
         """Discover graph targets from an already-built training model."""
@@ -1039,24 +1040,33 @@ class PartialCudaGraphManager:
                 "microbatches and overwrite static CUDA graph buffers before backward consumes them"
             )
         if activation_checkpointing:
+            moe_graph_compatible = activation_checkpointing_modules == ("attention",)
             if any("attn" in part.backend.cuda_graph_modules for part in enabled_parts):
                 raise RuntimeError(
                     "Whole-attention CUDA graphs do not support activation checkpointing; "
                     "use te_dpa or disable activation checkpointing"
                 )
-            if any("moe" in part.backend.cuda_graph_modules for part in enabled_parts):
+            if any("moe" in part.backend.cuda_graph_modules for part in enabled_parts) and not moe_graph_compatible:
                 raise RuntimeError("Full MoE CUDA graphs do not support activation checkpointing")
-            if any(
-                "moe_router" in part.backend.cuda_graph_modules or "moe_preprocess" in part.backend.cuda_graph_modules
-                for part in enabled_parts
+            if (
+                any(
+                    "moe_router" in part.backend.cuda_graph_modules
+                    or "moe_preprocess" in part.backend.cuda_graph_modules
+                    for part in enabled_parts
+                )
+                and not moe_graph_compatible
             ):
                 raise RuntimeError(
                     "PyTorch activation checkpointing cannot recompute across the partial MoE router/preprocess "
                     "CUDA graph scope; use attention-only graphs or disable router/preprocess graphs"
                 )
             logger.info(
-                "Partial CUDA graphs are enabled with PyTorch activation checkpointing; "
-                "checkpoint recomputation will use the same guarded graph entry points"
+                "Partial CUDA graphs are enabled with PyTorch activation checkpointing; %s",
+                (
+                    "MoE execution remains outside the attention-only checkpoint boundary"
+                    if moe_graph_compatible
+                    else "checkpoint recomputation will use the same guarded graph entry points"
+                ),
             )
         model = model_parts[0]
         backend = model.backend

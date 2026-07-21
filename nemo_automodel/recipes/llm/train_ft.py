@@ -800,6 +800,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.partial_cuda_graph_manager = PartialCudaGraphManager.from_model_parts(
             self.model_parts,
             activation_checkpointing=bool(self.activation_checkpointing),
+            activation_checkpointing_modules=getattr(
+                getattr(self, "moe_parallel_config", None), "activation_checkpointing_modules", None
+            ),
             pipeline_parallel=bool(self.pp_enabled),
         )
         self._partial_cuda_graph_capture_pending = self.partial_cuda_graph_manager is not None

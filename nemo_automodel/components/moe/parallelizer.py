@@ -66,6 +66,44 @@ def _is_selective_ac(activation_checkpointing: object) -> bool:
     )
 
 
+def _apply_attention_only_ac(
+    model: nn.Module,
+    activation_checkpointing_scope: str | list[str] | tuple[str, ...],
+) -> None:
+    """Checkpoint decoder attention while leaving every MoE sublayer outside recompute.
+
+    The structural boundary is required by full-MoE CUDA graphs: checkpointing
+    the complete decoder block would replay the expert graph during backward and
+    invalidate its paged saved-tensor lifecycle.
+
+    Args:
+        model: MoE model whose decoder attention modules are wrapped in place.
+        activation_checkpointing_scope: Layer groups selected for activation
+            checkpointing. Decoder attention is wrapped for ``"all"`` or
+            ``"language"``; multimodal towers retain their existing policy.
+    """
+    from nemo_automodel.components.distributed.config import normalize_activation_checkpointing_scope
+
+    scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
+    wrapped = 0
+    if "all" in scopes or "language" in scopes:
+        for _parent_layers, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
+            for name in ("self_attn", "attention", "attn"):
+                attention = getattr(block, name, None)
+                if isinstance(attention, nn.Module):
+                    setattr(block, name, ptd_checkpoint_wrapper(attention, preserve_rng_state=True))
+                    wrapped += 1
+                    break
+        if wrapped == 0:
+            raise RuntimeError("activation_checkpointing_modules=['attention'] found no decoder attention modules")
+        logger.info(
+            "Applied attention-only activation checkpointing to %d decoder layers; MoE sublayers remain outside "
+            "the checkpoint boundary",
+            wrapped,
+        )
+    _apply_multimodal_tower_ac(model, scopes)
+
+
 def _is_deepseek_v4_model(model: torch.nn.Module) -> bool:
     config = getattr(model, "config", None)
     if getattr(config, "model_type", None) == "deepseek_v4":
@@ -371,6 +409,7 @@ def apply_ac(
     hidden_size: int | None = None,
     num_experts: int | None = None,
     selective: bool = False,
+    activation_checkpointing_modules: tuple[str, ...] | None = None,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
 ):
     """Apply activation checkpointing to the model.
@@ -387,6 +426,9 @@ def apply_ac(
             (shared with the dense FSDP2 path) to each block. Takes precedence over
             ``ignore_router``; the shared policy already saves expert-parallel communication
             collectives and ``topk``, so it composes with expert parallelism.
+        activation_checkpointing_modules: Optional structural checkpoint boundaries.
+            ``("attention",)`` checkpoints decoder attention only and keeps MoE
+            execution outside recompute so full-MoE CUDA graphs remain replay-safe.
         activation_checkpointing_scope: Which layer groups to checkpoint -- the same field
             and semantics as the generic FSDP2/DDP path. ``"all"`` (the default) checkpoints
             the text/MoE decoder blocks plus the trainable vision tower; ``"language"`` the
@@ -407,6 +449,15 @@ def apply_ac(
 
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
     checkpoint_decoder = "all" in scopes or "language" in scopes
+    if activation_checkpointing_modules is not None:
+        if selective:
+            raise ValueError(
+                "activation_checkpointing_modules cannot be combined with operator-level selective checkpointing"
+            )
+        if activation_checkpointing_modules != ("attention",):
+            raise ValueError("MoE activation_checkpointing_modules currently supports only ('attention',)")
+        _apply_attention_only_ac(model, activation_checkpointing_scope)
+        return
     if checkpoint_decoder and not selective and not ignore_router:
         logger.warning(
             "Activation checkpointing is enabled with ignore_router_for_ac=False. The MoE "
@@ -832,6 +883,7 @@ def parallelize_model(
     ep_shard_axis_names: tuple[str, ...] | None = None,
     activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = True,
+    activation_checkpointing_modules: tuple[str, ...] | None = None,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
@@ -899,11 +951,15 @@ def parallelize_model(
 
         apply_ep(model, moe_mesh[ep_axis_name], moe_mesh=moe_mesh)
 
+    if activation_checkpointing_modules is not None and not activation_checkpointing:
+        raise ValueError("activation_checkpointing_modules requires activation_checkpointing to be enabled")
+
     if activation_checkpointing:
         apply_ac(
             model,
             ignore_router=ignore_router_for_ac,
             selective=_is_selective_ac(activation_checkpointing),
+            activation_checkpointing_modules=activation_checkpointing_modules,
             activation_checkpointing_scope=activation_checkpointing_scope,
         )
 

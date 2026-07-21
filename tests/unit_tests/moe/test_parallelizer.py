@@ -971,7 +971,11 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     apply_ep_mock.assert_called_once()
     # AC enabled
     apply_ac_mock.assert_called_once_with(
-        model, ignore_router=True, selective=False, activation_checkpointing_scope="all"
+        model,
+        ignore_router=True,
+        selective=False,
+        activation_checkpointing_modules=None,
+        activation_checkpointing_scope="all",
     )
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args
@@ -2104,6 +2108,50 @@ def test_parallelize_model_passes_selective_to_apply_ac(monkeypatch):
     _, kwargs = apply_ac_mock.call_args
     assert kwargs.get("selective") is True
     assert kwargs.get("ignore_router") is True
+
+
+def test_apply_ac_attention_boundary_keeps_moe_outside_checkpoint(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class Attention(P.nn.Module):
+        pass
+
+    blocks = [DummyBlock(), DummyBlock()]
+    attentions = []
+    for block in blocks:
+        block.self_attn = Attention()
+        attentions.append(block.self_attn)
+    model = DummyModel(blocks)
+    wrappers = [object(), object()]
+    wrapper_mock = MagicMock(side_effect=wrappers)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
+
+    P.apply_ac(
+        model,
+        activation_checkpointing_modules=("attention",),
+        activation_checkpointing_scope="language",
+    )
+
+    assert [call.args[0] for call in wrapper_mock.call_args_list] == attentions
+    assert all(call.kwargs == {"preserve_rng_state": True} for call in wrapper_mock.call_args_list)
+    assert [block.self_attn for block in blocks] == wrappers
+    assert all(isinstance(block.mlp, DummyMoE) for block in blocks)
+    assert model.layers.registered == {}
+
+
+def test_parallelize_model_rejects_checkpoint_modules_without_checkpointing(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+
+    with pytest.raises(ValueError, match="requires activation_checkpointing"):
+        P.parallelize_model(
+            model=DummyModel([]),
+            world_mesh=world_mesh,
+            moe_mesh=None,
+            dp_axis_names=("dp",),
+            activation_checkpointing=False,
+            activation_checkpointing_modules=("attention",),
+        )
 
 
 def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):

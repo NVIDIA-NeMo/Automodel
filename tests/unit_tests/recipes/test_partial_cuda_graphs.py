@@ -754,6 +754,19 @@ def test_rejects_full_moe_with_activation_checkpointing():
         partial_graphs.PartialCudaGraphManager.from_model_parts([model], activation_checkpointing=True)
 
 
+def test_allows_full_moe_outside_attention_checkpoint_boundary():
+    model = _Model(te_dpa=False, moe=True, router=False, preprocess=False)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts(
+        [model],
+        activation_checkpointing=True,
+        activation_checkpointing_modules=("attention",),
+    )
+
+    assert manager is not None
+    assert [entry.name for entry in manager.entries] == ["test_moe.layers.0.moe"]
+    manager.close()
+
+
 def test_rejects_pipeline_parallel_until_validated():
     with pytest.raises(RuntimeError, match="do not support pipeline parallelism yet"):
         partial_graphs.PartialCudaGraphManager.from_model_parts(

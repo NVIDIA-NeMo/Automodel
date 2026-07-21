@@ -47,6 +47,7 @@ def test_setup_forwards_runtime_safety_context(monkeypatch):
     discover.assert_called_once_with(
         model_parts,
         activation_checkpointing=True,
+        activation_checkpointing_modules=None,
         pipeline_parallel=False,
     )
     assert recipe.partial_cuda_graph_manager is manager
