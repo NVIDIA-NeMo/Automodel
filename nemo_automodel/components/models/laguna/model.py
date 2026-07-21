@@ -308,6 +308,14 @@ class LagunaRMSNorm(nn.Module):
         nn.init.ones_(self.weight)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply RMS normalization while computing variance in fp32.
+
+        Args:
+            hidden_states: Tensor of shape [..., hidden].
+
+        Returns:
+            Tensor of shape [..., hidden].
+        """
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -353,6 +361,15 @@ class LagunaRotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute RoPE cosine and sine tables.
+
+        Args:
+            x: Activation tensor of shape [batch, sequence, hidden], used for device and dtype.
+            position_ids: Position tensor of shape [batch, sequence].
+
+        Returns:
+            Tuple of cosine and sine tensors, each of shape [batch, sequence, rotary_dim].
+        """
         inv_freq = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids = position_ids[:, None, :].float()
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
@@ -684,6 +701,18 @@ class LagunaModel(nn.Module):
         attention_mask: torch.Tensor | dict[str, torch.Tensor] | None,
         position_ids: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        """Build additive attention masks for full and sliding Laguna layers.
+
+        Args:
+            inputs_embeds: Input embedding tensor of shape [batch, sequence, hidden].
+            attention_mask: Optional sequence mask of shape [batch, sequence], 4D bool/additive
+                mask, or mapping with masks keyed by "full_attention" and "sliding_attention".
+            position_ids: Position tensor of shape [batch, sequence].
+
+        Returns:
+            Mapping from attention type to additive masks of shape
+            [batch, heads_or_one, sequence, key_sequence].
+        """
         batch_size, seq_len = inputs_embeds.shape[:2]
         if isinstance(attention_mask, dict):
             full = attention_mask.get("full_attention")
