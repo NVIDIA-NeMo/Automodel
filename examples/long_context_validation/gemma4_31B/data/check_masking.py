@@ -29,32 +29,32 @@ For a few samples it reports:
 """
 
 import argparse
-import json
 
 from transformers import AutoTokenizer
 
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
 
 GEMMA4 = "/path/to/checkpoints/hf_gemma4_31b_it"
-JSONL = ("/path/to/coderforge_cache/"
-         "togethercomputer_CoderForge-Preview_filtered_reward1_seq65536/data.jsonl")
+JSONL = "/path/to/coderforge_cache/togethercomputer_CoderForge-Preview_filtered_reward1_seq65536/data.jsonl"
 
 
 def contiguous_spans(labels, keep):
     """Yield (start, end) index ranges where (labels[i] != -100) == keep."""
     spans, s = [], None
-    for i, l in enumerate(labels):
-        cond = (l != -100)
+    for i, lab in enumerate(labels):
+        cond = lab != -100
         if cond == keep and s is None:
             s = i
         elif cond != keep and s is not None:
-            spans.append((s, i)); s = None
+            spans.append((s, i))
+            s = None
     if s is not None:
         spans.append((s, len(labels)))
     return spans
 
 
 def main():
+    """Load the training ChatDataset and report the label mask for a few samples."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=4)
     ap.add_argument("--seq-length", type=int, default=65536)
@@ -62,8 +62,9 @@ def main():
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(GEMMA4)
-    ds = ChatDataset(path_or_dataset_id=args.jsonl, tokenizer=tok, split="train",
-                     seq_length=args.seq_length, padding="do_not_pad")
+    ds = ChatDataset(
+        path_or_dataset_id=args.jsonl, tokenizer=tok, split="train", seq_length=args.seq_length, padding="do_not_pad"
+    )
     print(f"Dataset size: {len(ds)}")
 
     for i in range(min(args.n, len(ds))):
@@ -91,14 +92,16 @@ def main():
         msk_spans = contiguous_spans(labels, keep=False)
         if sup_spans:
             a, b = sup_spans[0]
-            print(f"  first SUPERVISED span [{a}:{b}] ->\n    {tok.decode(ids[a:min(b, a+80)])!r}")
+            print(f"  first SUPERVISED span [{a}:{b}] ->\n    {tok.decode(ids[a : min(b, a + 80)])!r}")
         if msk_spans:
             a, b = msk_spans[0]
-            print(f"  first MASKED span [{a}:{b}] ->\n    {tok.decode(ids[a:min(b, a+80)])!r}")
+            print(f"  first MASKED span [{a}:{b}] ->\n    {tok.decode(ids[a : min(b, a + 80)])!r}")
 
-    print("\nVERDICT: supervised fraction should be moderate (roughly 10-60% for agent"
-          " transcripts), 106 present in supervised spans, assistant text supervised &"
-          " system/user/tool text masked. All-masked or ~all-supervised => masking bug.")
+    print(
+        "\nVERDICT: supervised fraction should be moderate (roughly 10-60% for agent"
+        " transcripts), 106 present in supervised spans, assistant text supervised &"
+        " system/user/tool text masked. All-masked or ~all-supervised => masking bug."
+    )
 
 
 if __name__ == "__main__":
