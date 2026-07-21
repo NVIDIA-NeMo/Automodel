@@ -19,6 +19,7 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.laguna.config import LagunaConfig
 from nemo_automodel.components.models.laguna.model import LagunaForCausalLM
 from nemo_automodel.components.moe.layers import MoE
+from nemo_automodel.components.moe.megatron import moe_utils
 
 
 def _backend() -> BackendConfig:
@@ -73,6 +74,26 @@ def _dense_tiny_config() -> LagunaConfig:
 def test_laguna_forward_tiny_config():
     model = LagunaForCausalLM(_dense_tiny_config(), backend=_backend())
     model.eval()
+
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    attention_mask = torch.ones_like(input_ids)
+    with torch.no_grad():
+        output = model(input_ids=input_ids, attention_mask=attention_mask)
+
+    assert output.logits.shape == (1, 4, 32)
+
+
+def test_laguna_forward_tiny_config_with_moe_layer(monkeypatch):
+    def weighted_swiglu_eager(y: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        y1, y2 = torch.chunk(y, 2, -1)
+        return (torch.nn.functional.silu(y1) * y2 * weights).to(y.dtype)
+
+    # Keep this Laguna smoke independent of torch.compile availability; shared MoE tests cover the compiled helper.
+    monkeypatch.setattr(moe_utils, "weighted_swiglu", weighted_swiglu_eager)
+    model = LagunaForCausalLM(_tiny_config(), backend=_backend())
+    model.eval()
+
+    assert isinstance(model.model.layers["1"].mlp, MoE)
 
     input_ids = torch.tensor([[1, 2, 3, 4]])
     attention_mask = torch.ones_like(input_ids)
