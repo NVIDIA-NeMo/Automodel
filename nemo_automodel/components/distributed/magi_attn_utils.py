@@ -94,6 +94,13 @@ _ACTIVE_ATTN_SPEC: Optional["AttnMaskSpec"] = None
 # id(cp_group) -> (spec_fingerprint, built_key), so all layers in a step reuse one key.
 _FLEX_KEY_CACHE: dict = {}
 
+# Consumption guard for the per-step AttnMaskSpec. A spec is "armed" when stamped on the
+# attention modules and "consumed" when a magi attention forward actually reads it. If a
+# spec is armed but never consumed, the model silently used a non-magi attention (e.g.
+# flash_attention_2 / sdpa) and the mask would be dropped -- we raise instead.
+_SPEC_ARMED: bool = False
+_SPEC_CONSUMED: bool = False
+
 
 @dataclass
 class AttnMaskSpec:
@@ -358,6 +365,7 @@ def make_magi_attn_func(softmax_scale: Optional[float] = None):  # pragma: no co
         if spec is None:
             spec = get_active_attn_spec()
         if spec is not None:
+            _mark_attn_spec_consumed()
             key = _flex_key_for(
                 cp_group,
                 spec,
@@ -435,7 +443,23 @@ def register_magi_attention() -> None:  # pragma: no cover - requires GPU + magi
                 **kwargs,
             )
 
-        if getattr(module, "_magi_self_key", False):
+        attn_spec = getattr(module, "_magi_attn_spec", None)
+        if attn_spec is not None:
+            # Arbitrary AttnSlice mask (packing / sliding-window / prefix-tree) carried on
+            # the module by :func:`set_attn_spec_on_attention`. The mask rides on ``module``
+            # (already in the HF attention signature) rather than a process-global, so the
+            # HF-registered forward honors it exactly as the custom-model attn_func does --
+            # giving attn_implementation="magi" the same mask support as backend.attn="magi".
+            # cp_size==1 (no dispatch); the flex key encodes the full mask.
+            magi_attn_key = _flex_key_for(
+                cp_group,
+                attn_spec,
+                num_heads_q=query.shape[1],
+                num_heads_kv=key.shape[1],
+                head_dim=query.shape[3],
+            )
+            _mark_attn_spec_consumed()
+        elif getattr(module, "_magi_self_key", False):
             # VLM (cp_size==1) path: the post-image-merge LM sequence length is only
             # known here (query dim 2: [b, nh, s, hd]) and may differ from input_ids
             # length. Build a no-dispatch causal key matching the actual q length.
@@ -503,6 +527,41 @@ def _set_cp_group_on_attention(model, cp_group) -> None:
     for module in model.modules():
         if "Attention" in type(module).__name__:
             module.cp_group = cp_group
+
+
+def _set_attn_spec_on_attention(model, spec: Optional["AttnMaskSpec"]) -> None:
+    """Stamp the per-step :class:`AttnMaskSpec` on every attention sub-module.
+
+    The HF-registered magi forward reads the spec from ``module`` (a carrier already in
+    the attention call signature) rather than a process-global, so the mask is scoped to
+    this model's attention modules and the HF interface stays signature-clean. Call every
+    step with ``spec`` (or ``None`` to clear). Arms the consumption guard: if the previous
+    step's spec was never consumed by a magi forward, the model silently fell back to a
+    non-magi attention and the mask was dropped -- raise rather than train on the wrong mask.
+
+    Args:
+        model: the (possibly FSDP-wrapped) model whose attention modules to stamp.
+        spec: the mask spec for this step, or ``None`` for plain causal / no mask.
+    """
+    global _SPEC_ARMED, _SPEC_CONSUMED
+    if _SPEC_ARMED and not _SPEC_CONSUMED:
+        raise RuntimeError(
+            "A magi AttnMaskSpec was activated for the previous step but no magi attention "
+            "consumed it: the model is not routing attention through magi (it silently used "
+            "its default attention, e.g. flash_attention_2). Set model.attn_implementation='magi' "
+            "on an HF-style model, or model.backend.attn='magi' on a factory-based custom model."
+        )
+    for module in model.modules():
+        if "Attention" in type(module).__name__:
+            module._magi_attn_spec = spec
+    _SPEC_ARMED = spec is not None
+    _SPEC_CONSUMED = False
+
+
+def _mark_attn_spec_consumed() -> None:
+    """Record that a magi attention forward read the active :class:`AttnMaskSpec`."""
+    global _SPEC_CONSUMED
+    _SPEC_CONSUMED = True
 
 
 def magi_prepare_batch(  # pragma: no cover - requires GPU + magi_attention
