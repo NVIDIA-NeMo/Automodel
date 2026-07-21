@@ -1,0 +1,136 @@
+-- allium: 3
+-- sentence-transformer-export.allium
+
+-- Scope: Saving and loading text bi-encoders through the shared NeMo and
+-- Sentence Transformers checkpoint boundary.
+-- Includes: wrapper-option precedence, embedding parity, similarity and
+-- preprocessing consistency, and preservation of legal notices.
+-- Excludes: training objectives, tokenizer implementation, unsupported
+-- pooling modes, multimodal encoders, and remote repository transport.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value LegalAsset {
+    name: String
+    content: String
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum PoolingMode {
+    avg
+    cls
+    last
+}
+
+enum SimilarityFunction {
+    cosine
+    dot
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity EncoderCheckpoint {
+    pooling: PoolingMode?
+    l2_normalize: Boolean?
+    similarity: SimilarityFunction?
+    do_lower_case: Boolean?
+    legal_assets: Set<LegalAsset>
+}
+
+entity EncoderLoadRequest {
+    checkpoint: EncoderCheckpoint
+    explicit_pooling: PoolingMode?
+    explicit_l2_normalize: Boolean?
+}
+
+entity LoadedEncoder {
+    source: EncoderCheckpoint
+    pooling: PoolingMode
+    l2_normalize: Boolean
+}
+
+entity EncoderExportRequest {
+    encoder: LoadedEncoder
+    explicit_similarity: SimilarityFunction?
+    do_lower_case: Boolean
+}
+
+entity SentenceTransformerExport {
+    source: LoadedEncoder
+    pooling: PoolingMode
+    l2_normalize: Boolean
+    similarity: SimilarityFunction
+    do_lower_case: Boolean
+    legal_assets: Set<LegalAsset>
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule ResolveLoadedEncoderBehavior {
+    when: request: EncoderLoadRequest.created
+    ensures: LoadedEncoder.created(
+        source: request.checkpoint,
+        pooling:
+            if request.explicit_pooling != null: request.explicit_pooling
+            else if request.checkpoint.pooling != null: request.checkpoint.pooling
+            else: avg,
+        l2_normalize:
+            if request.explicit_l2_normalize != null: request.explicit_l2_normalize
+            else if request.checkpoint.l2_normalize != null: request.checkpoint.l2_normalize
+            else: true
+    )
+}
+
+rule ExportCompatibleEncoder {
+    when: request: EncoderExportRequest.created
+    requires: request.do_lower_case = false
+    requires:
+        request.explicit_similarity = null
+        or (request.encoder.l2_normalize and request.explicit_similarity = cosine)
+        or (not request.encoder.l2_normalize and request.explicit_similarity = dot)
+    ensures: SentenceTransformerExport.created(
+        source: request.encoder,
+        pooling: request.encoder.pooling,
+        l2_normalize: request.encoder.l2_normalize,
+        similarity:
+            if request.encoder.l2_normalize: cosine
+            else: dot,
+        do_lower_case: false,
+        legal_assets: request.encoder.source.legal_assets
+    )
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant ExportPreservesEmbeddingBehavior {
+    for export in SentenceTransformerExports:
+        export.pooling = export.source.pooling
+        and export.l2_normalize = export.source.l2_normalize
+}
+
+invariant SimilarityMatchesNormalization {
+    for export in SentenceTransformerExports:
+        (export.l2_normalize implies export.similarity = cosine)
+        and (not export.l2_normalize implies export.similarity = dot)
+}
+
+invariant ExportDoesNotIntroduceLowercasing {
+    for export in SentenceTransformerExports:
+        export.do_lower_case = false
+}
+
+invariant ExportPreservesLegalAssets {
+    for export in SentenceTransformerExports:
+        export.legal_assets = export.source.source.legal_assets
+}
