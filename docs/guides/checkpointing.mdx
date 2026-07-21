@@ -73,6 +73,8 @@ For example, set `max_recent_checkpoints: 2` to retain the two most recent check
 
 Bounded retention supports only local file system checkpoint directories. If `checkpoint.checkpoint_dir` uses `msc://` storage, leave `max_recent_checkpoints` unset. Setting it raises `ValueError`.
 
+Bounded retention removes only standard `epoch_<E>_step_<S>` checkpoint directories. It does not remove recipe-specific exports, such as retrieval distillation `step_<S>` directories.
+
 Leave the value unset, or set it to `null`, to keep all intermediate checkpoints:
 
 ```yaml
@@ -344,7 +346,7 @@ NeMo AutoModel can write checkpoints asynchronously to reduce training stalls ca
 - **Requirements**: PyTorch ≥ 2.9.0. If an older version is detected, async mode is automatically disabled.
 - **Behavior**: At most one checkpoint is written at a time. The next save waits for the previous write to finish.
 - **Publication**: The `LATEST` symbolic link is updated after the asynchronous save completes. For intermediate checkpoints, publication can be deferred until the next save call. Before shutting down, each recipe waits for the final asynchronous checkpoint and publishes `LATEST` before closing the checkpointer.
-- **PEFT**: Adapter model files are written synchronously on rank 0; optimizer states can still use async.
+- **PEFT**: Adapter model files are written synchronously on rank 0; optimizer states can still be written asynchronously.
 
 ## Advanced Usage: Save Additional States
 You can also save additional states in NeMo AutoModel. By default, we also automatically checkpoint the `dataloader`, `rng`, and `step_scheduler` states which are necessary to resume training accurately. In full, a Safetensors consolidated checkpoint will look like this:

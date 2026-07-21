@@ -21,6 +21,8 @@ calls this once at the end to wait the write and flush the deferred symlinks.
 
 from types import SimpleNamespace
 
+import torch
+
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
 
 
@@ -61,6 +63,20 @@ def test_finalize_with_no_pending_only_waits():
     assert r._waited == [1]
     assert r._latest == []
     assert r._best == []
+
+
+def test_finalize_uses_recipe_process_group(monkeypatch):
+    process_group = object()
+    barriers = []
+    r = _recipe(pending="/ckpt/epoch_1_step_10", best_pending=None)
+    r.mesh_context = SimpleNamespace(process_group=process_group)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda group=None: barriers.append(group))
+
+    r._finalize_pending_checkpoint()
+
+    assert barriers == [process_group, process_group]
 
 
 def test_finalize_is_noop_when_checkpointing_disabled():

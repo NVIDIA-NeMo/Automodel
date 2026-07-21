@@ -989,6 +989,39 @@ def test_non_finite_restored_best_metric_does_not_block_future_best(tmp_path, no
     assert recipe_inst._best_val_loss == 0.5
 
 
+@pytest.mark.parametrize("malformed_losses", ["null", "42", "[]", '{"val_loss": 1' + "0" * 400 + "}"])
+def test_malformed_restored_best_metric_does_not_block_future_best(tmp_path, malformed_losses):
+    """Malformed LOWEST_VAL metadata is ignored when initializing the restored best."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    old_checkpoint = tmp_path / "epoch_0_step_100"
+    new_checkpoint = tmp_path / "epoch_0_step_200"
+    old_checkpoint.mkdir()
+    new_checkpoint.mkdir()
+    (old_checkpoint / "losses.json").write_text(malformed_losses)
+    recipe_inst._update_checkpoint_symlink("LOWEST_VAL", str(old_checkpoint))
+
+    recipe_inst._update_best_symlink(str(new_checkpoint), 0.5, "val_loss")
+
+    assert _read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == new_checkpoint
+    assert recipe_inst._best_val_loss == 0.5
+
+
+def test_non_utf8_restored_best_metric_does_not_block_future_best(tmp_path):
+    """Unreadable LOWEST_VAL metadata is ignored when initializing the restored best."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    old_checkpoint = tmp_path / "epoch_0_step_100"
+    new_checkpoint = tmp_path / "epoch_0_step_200"
+    old_checkpoint.mkdir()
+    new_checkpoint.mkdir()
+    (old_checkpoint / "losses.json").write_bytes(b"\xff")
+    recipe_inst._update_checkpoint_symlink("LOWEST_VAL", str(old_checkpoint))
+
+    recipe_inst._update_best_symlink(str(new_checkpoint), 0.5, "val_loss")
+
+    assert _read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == new_checkpoint
+    assert recipe_inst._best_val_loss == 0.5
+
+
 @pytest.mark.parametrize("non_finite_value", [float("nan"), float("inf"), float("-inf")])
 def test_non_finite_live_metric_does_not_replace_best_pointer(tmp_path, non_finite_value):
     """A live non-finite validation metric is never eligible for LOWEST_VAL."""

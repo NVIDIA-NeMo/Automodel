@@ -160,7 +160,9 @@ def _read_checkpoint_metric(checkpoint: Path, metric_key: str | None) -> float |
     try:
         with open(checkpoint / "losses.json", "r") as f:
             losses = json.load(f)
-    except (OSError, TypeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(losses, Mapping):
         return None
 
     candidate_keys = []
@@ -173,7 +175,7 @@ def _read_checkpoint_metric(checkpoint: Path, metric_key: str | None) -> float |
             continue
         try:
             value = float(losses[key])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if math.isfinite(value):
             return value

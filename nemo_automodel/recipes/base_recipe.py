@@ -427,12 +427,13 @@ class BaseRecipe:
 
         is_dist_initialized = torch.distributed.is_initialized()
         is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+        process_group = getattr(getattr(self, "mesh_context", None), "process_group", None)
         if prev_pending is not None:
             if is_rank_0:
                 self._update_latest_symlink(prev_pending)
             setattr(self, "_last_pending_checkpoint_dir", None)
             if is_dist_initialized:
-                torch.distributed.barrier()
+                _dist_barrier(process_group)
 
         if prev_best_pending is not None:
             if is_rank_0 and prev_best_pending.get("val") is not None:
@@ -443,12 +444,12 @@ class BaseRecipe:
                 )
             setattr(self, "_last_pending_best_checkpoint_info", None)
             if is_dist_initialized:
-                torch.distributed.barrier()
+                _dist_barrier(process_group)
 
         if is_rank_0:
             self._prune_old_checkpoints()
         if is_dist_initialized:
-            torch.distributed.barrier()
+            _dist_barrier(process_group)
 
     def _finalize_pending_checkpoint(self) -> None:
         """Wait for the final async checkpoint, publish it, and apply retention."""
