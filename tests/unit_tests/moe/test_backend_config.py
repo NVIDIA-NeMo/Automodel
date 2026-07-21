@@ -187,6 +187,7 @@ class TestBackendConfigExpertsDispatcherValidation:
                 cuda_graph=CudaGraphConfig(modules=["moe"], moe_capacity_factor=capacity_factor),
             )
 
+
 class TestBackendConfigFakeGateNoise:
     """Test BackendConfig fake_gate_noise field."""
 
@@ -578,13 +579,28 @@ class TestBackendConfigPartialCudaGraphs:
                 moe_paged_stash=True,
                 moe_paged_stash_page_size=0,
             )
-        for invalid_factor in (0, 0.5, float("nan"), float("inf")):
-            with pytest.raises(ValueError, match="buffer_size_factor must be finite and at least 1.0"):
+        for invalid_factor in (0, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="buffer_size_factor must be positive and finite"):
                 CudaGraphConfig(
                     modules=["moe"],
                     moe_capacity_factor=1.25,
                     moe_paged_stash=True,
                     moe_paged_stash_buffer_size_factor=invalid_factor,
+                )
+        with pytest.raises(ValueError, match="at least 1.0x total capacity"):
+            CudaGraphConfig(
+                modules=["moe"],
+                moe_capacity_factor=1.25,
+                moe_paged_stash=True,
+                moe_paged_stash_buffer_size_factor=0.5,
+            )
+        for invalid_host_factor in (-0.1, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="buffer_size_factor_cpu must be non-negative and finite"):
+                CudaGraphConfig(
+                    modules=["moe"],
+                    moe_capacity_factor=1.25,
+                    moe_paged_stash=True,
+                    moe_paged_stash_buffer_size_factor_cpu=invalid_host_factor,
                 )
 
         config = BackendConfig(
@@ -597,3 +613,17 @@ class TestBackendConfigPartialCudaGraphs:
             ),
         )
         assert config.cuda_graph.moe_paged_stash is True
+
+        spill_config = BackendConfig(
+            experts="te",
+            dispatcher="torch",
+            cuda_graph=CudaGraphConfig(
+                modules=["moe"],
+                moe_capacity_factor=1.25,
+                moe_paged_stash=True,
+                moe_paged_stash_buffer_size_factor=0.25,
+                moe_paged_stash_buffer_size_factor_cpu=0.8,
+            ),
+        )
+        assert spill_config.cuda_graph.moe_paged_stash_buffer_size_factor == 0.25
+        assert spill_config.cuda_graph.moe_paged_stash_buffer_size_factor_cpu == 0.8

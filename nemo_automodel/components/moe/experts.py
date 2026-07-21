@@ -1034,6 +1034,7 @@ class GroupedExpertsTE(nn.Module):
                 enabled=True,
                 page_size=backend.cuda_graph.moe_paged_stash_page_size,
                 buffer_size_factor=backend.cuda_graph.moe_paged_stash_buffer_size_factor,
+                host_buffer_size_factor=backend.cuda_graph.moe_paged_stash_buffer_size_factor_cpu,
             )
 
         # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
