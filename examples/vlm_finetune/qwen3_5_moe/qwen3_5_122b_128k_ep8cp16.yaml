@@ -17,6 +17,11 @@
 # activation checkpointing. The 128-rank layout is CP16 x DP8; EP8 is composed
 # over that mesh by the MoE parallelizer.
 #
+# This topology completed a 10-step, 128K validation run on mixed text, image,
+# and video data containing individual approximately 120K-token examples. The
+# public MedPix dataset below keeps this example reproducible; its 128K packs
+# are assembled from independent single-image samples.
+#
 # Example Slurm allocation (16 nodes x 8 GPUs):
 #   srun --nodes=16 --ntasks-per-node=1 automodel \
 #     examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp16.yaml \
@@ -102,8 +107,6 @@ loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
-  # MedPix-VQA contains single-image question/answer samples. The 128K context
-  # is formed by packing independent samples, not by native long-context or video examples.
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
   path_or_dataset: mmoukouba/MedPix-VQA
   split: train
