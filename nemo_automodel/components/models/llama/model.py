@@ -51,6 +51,11 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
+from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
@@ -341,7 +346,6 @@ class LlamaModel(LlamaPreTrainedModel):
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
@@ -393,6 +397,7 @@ class LlamaModel(LlamaPreTrainedModel):
 class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
     """Llama model with causal language modeling head."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -402,7 +407,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = True
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = False
 
@@ -420,6 +425,8 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         config: LlamaConfig,
         backend: Optional[BackendConfig] = None,
     ):
+        reject_unsupported_tie_word_embeddings(type(self), config)
+        warn_deprecated_model_class("LlamaForCausalLM")
         super().__init__(config)
         self.config = config
         self.backend = backend or BackendConfig()
@@ -431,6 +438,12 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         self.state_dict_adapter = LlamaStateDictAdapter(config=self.config)
         # Initialize weights and apply final processing
         self.post_init()
+
+        # Transformers v5 does not reliably tie this custom model from the
+        # dict-shaped _tied_weights_keys alone. Explicitly honor the config
+        # flag after initialization.
+        if getattr(config, "tie_word_embeddings", False):
+            self.tie_weights()
 
         # Convert to configured dtype if specified
         if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
@@ -451,6 +464,10 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        if getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def set_decoder(self, decoder):
         self.model = decoder

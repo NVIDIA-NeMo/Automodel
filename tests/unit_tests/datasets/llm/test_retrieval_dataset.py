@@ -311,13 +311,13 @@ def test_make_retrieval_dataset_train_and_eval(tmp_path, monkeypatch):
     train_file = _make_train_file(tmp_path, corpus_dir, data_len=2)
 
     # Train mode: set_transform uses n_passages - 1 negatives
-    ds_train = rd.make_retrieval_dataset(
+    ds_train = rd.RetrievalDatasetConfig(
         data_dir_list=str(train_file),
         data_type="train",
         n_passages=3,
         max_train_samples=1,
         cycle_positive_docs=True,
-    )
+    ).build()
     assert len(ds_train) == 1
     assert hasattr(ds_train, "set_epoch")
     ex = ds_train[0]
@@ -351,6 +351,100 @@ def test_textqa_get_all_ids(tmp_path, monkeypatch):
     )
     _, corpus = rd.load_corpus(str(corpus_dir))
     assert corpus.get_all_ids() == ["1", "2"]
+
+
+def test_colpali_dataset_uses_image_filename_ids(monkeypatch):
+    """ColPaliDataset should expose image documents keyed by image_filename."""
+    monkeypatch.setattr(
+        rd,
+        "load_dataset",
+        _mock_hf_load_dataset_returning(
+            [
+                {
+                    "image_filename": "z-page.png",
+                    "image": "image-z",
+                    "nr_ocr": "ocr-z",
+                    "complex_ocr": "complex-z",
+                },
+                {
+                    "image_filename": "a-page.png",
+                    "image": "image-a",
+                    "nr_ocr": "ocr-a",
+                    "complex_ocr": "complex-a",
+                },
+            ]
+        ),
+    )
+
+    corpus = rd.ColPaliDataset("colpali-path")
+
+    assert corpus.path == "colpali-path"
+    assert corpus.get_all_ids() == ["a-page.png", "z-page.png"]
+    assert corpus.get_document_by_id("z-page.png") == {
+        "text": "",
+        "image": "image-z",
+        "nr_ocr": "ocr-z",
+        "complex_ocr": "complex-z",
+    }
+
+
+def test_wikissnq_dataset_uses_docid_ids(monkeypatch):
+    """WikiSSNQDataset should expose image documents keyed by docid."""
+    monkeypatch.setattr(
+        rd,
+        "load_dataset",
+        _mock_hf_load_dataset_returning(
+            [
+                {
+                    "docid": "doc-b",
+                    "image": "image-b",
+                    "nr_ocr": "ocr-b",
+                    "complex_ocr": "complex-b",
+                },
+                {
+                    "docid": "doc-a",
+                    "image": "image-a",
+                    "nr_ocr": "ocr-a",
+                    "complex_ocr": "complex-a",
+                },
+            ]
+        ),
+    )
+
+    corpus = rd.WikiSSNQDataset("wikissnq-path")
+
+    assert corpus.path == "wikissnq-path"
+    assert corpus.get_all_ids() == ["doc-a", "doc-b"]
+    assert corpus.get_document_by_id("doc-a") == {
+        "text": "",
+        "image": "image-a",
+        "nr_ocr": "ocr-a",
+        "complex_ocr": "complex-a",
+    }
+
+
+def test_docmatix_dataset_loads_images_config_and_row_image_ids(monkeypatch):
+    """DocMatixDataset should read the images config and resolve row_image IDs."""
+    calls = []
+    backing_dataset = Dataset.from_list(
+        [
+            {"images": ["image-0-0", "image-0-1"]},
+            {"images": ["image-1-0"]},
+        ]
+    )
+
+    def fake_load_dataset(path, config):
+        calls.append((path, config))
+        return {"train": backing_dataset}
+
+    monkeypatch.setattr(rd, "load_dataset", fake_load_dataset)
+
+    corpus = rd.DocMatixDataset("docmatix-path")
+
+    assert calls == [("docmatix-path", "images")]
+    assert corpus.path == "docmatix-path"
+    assert corpus.get_all_ids() == ["0_0", "1_0"]
+    assert corpus.get_document_by_id("0_1") == {"text": "", "image": "image-0-1", "nr_ocr": ""}
 
 
 def test_load_corpus_metadata_missing_file(tmp_path):

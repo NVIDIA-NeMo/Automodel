@@ -26,11 +26,15 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerForConditionalGeneration as HFQwen3OmniMoeThinkerForConditionalGeneration,
 )
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-    Qwen3OmniMoeThinkerTextRotaryEmbedding,
+    Qwen3OmniMoeThinkerTextRotaryEmbedding as HFQwen3OmniMoeThinkerTextRotaryEmbedding,
 )
 
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module, initialize_rms_norm_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype, compute_lm_head_logits
 from nemo_automodel.components.models.qwen3_moe.model import Block
 from nemo_automodel.components.models.qwen3_omni_moe.state_dict_adapter import Qwen3OmniMoeStateDictAdapter
@@ -38,6 +42,22 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+
+class Qwen3OmniMoeThinkerTextRotaryEmbedding(HFQwen3OmniMoeThinkerTextRotaryEmbedding):
+    """Ensure HF rotary frequency buffers stay fp32 across module-wide casts."""
+
+    def _apply(self, fn: Any, recurse: bool = True):
+        fp32_buffers = {
+            name: buf.detach().clone().to(torch.float32)
+            for name, buf in self.named_buffers(recurse=False)
+            if name in ("inv_freq", "original_inv_freq")
+        }
+        result = super()._apply(fn, recurse=recurse)
+        for name, fp32_buffer in fp32_buffers.items():
+            current = getattr(self, name)
+            self.register_buffer(name, fp32_buffer.to(device=current.device), persistent=False)
+        return result
 
 
 class Qwen3OmniMoeThinkerTextModel(
@@ -203,6 +223,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 ):
     """Qwen3OmniMoe Thinker for Conditional Generation with multimodal support."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -241,6 +263,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     ):
         base_config = config.thinker_config if hasattr(config, "thinker_config") else config
         backend = backend or BackendConfig()
+        reject_unsupported_tie_word_embeddings(type(self), config)
 
         # _init_model() only overrides the top-level hf_config.torch_dtype; for
         # Omni configs the real params live under thinker_config.text_config /

@@ -48,12 +48,15 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
 from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import (
     BaseRecipe,
     _find_latest_checkpoint,
@@ -61,19 +64,54 @@ from nemo_automodel.recipes.base_recipe import (
     _resolve_restore_from_to_ckpt_dir,
 )
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_compile,
+    apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
+    raise_if_peft_configured,
     should_sync_grads,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
+def _all_reduce_sum(value: torch.Tensor) -> torch.Tensor:
+    """Sum a scalar metric tensor across all distributed ranks in place."""
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
-        value = value / dist.get_world_size()
     return value
+
+
+def _packing_kwargs(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Sequence-packing metadata from a dataloader batch (empty dict when unpacked)."""
+    if "seq_lens" not in batch:
+        return {}
+    return {
+        "position_ids": batch["position_ids"],
+        "seq_lens": batch["seq_lens"],
+        "doc_remaining": batch["doc_remaining"],
+    }
+
+
+def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_size: int) -> None:
+    """Reject sequence-packing configs the DFlash path cannot honor (fail fast at setup).
+
+    Context parallelism shards the sequence and strips the block-causal mask packing
+    relies on, and a FlashAttention target packs documents from per-document
+    ``position_ids`` only at batch size 1.
+    """
+    if cp_size > 1:
+        raise NotImplementedError(
+            "Sequence packing (packed_sequence_size>0) is not supported with context parallelism "
+            "(distributed.cp_size>1) in DFlash; CP shards the sequence and strips the block-causal mask "
+            "packing relies on. Set cp_size=1 or packed_sequence_size=0."
+        )
+    if "flash" in target_attn_impl and micro_batch_size > 1:
+        raise ValueError(
+            "Sequence packing with a FlashAttention target requires micro_batch_size=1 "
+            f"(got {micro_batch_size}); set micro_batch_size=1 or load the target with "
+            "attn_implementation='sdpa'."
+        )
 
 
 def _all_ranks_have_valid(local_has_valid: int, is_ddp: bool, device) -> bool:
@@ -94,6 +132,23 @@ def _all_ranks_have_valid(local_has_valid: int, is_ddp: bool, device) -> bool:
     return bool(flag.item())
 
 
+def _submesh_or_none(device_mesh, name: str):
+    """Return the named (flattened) submesh, or None if absent / no mesh.
+
+    Uses ``get_flat_mesh`` so ``_flatten()``-created axes ("dp") resolve across
+    torch versions. The "dp" axis excludes "tp", so keying the draft DDP group,
+    the dataloader sampler, and the checkpointer dp_rank on it replicates the
+    draft across tensor-parallel ranks (every TP rank in a draft replica sees the
+    same batch).
+    """
+    if device_mesh is None:
+        return None
+    try:
+        return get_flat_mesh(device_mesh, name)
+    except KeyError:
+        return None
+
+
 class TrainDFlashRecipe(BaseRecipe):
     """Recipe for DFlash draft-model training on Qwen3-style dense / MoE targets."""
 
@@ -110,6 +165,7 @@ class TrainDFlashRecipe(BaseRecipe):
 
         recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
+        raise_if_peft_configured(self.cfg, type(self).__name__)
 
         target_path = recipe_cfg.target_model_name_or_path
         target_config = AutoConfig.from_pretrained(
@@ -123,19 +179,7 @@ class TrainDFlashRecipe(BaseRecipe):
         )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
-        target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
-        target_kwargs = {}
-        if target_attn_implementation is not None:
-            target_kwargs["attn_implementation"] = target_attn_implementation
-        self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
-            target_path,
-            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
-            torch_dtype=self.compute_dtype,
-            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
-            **target_kwargs,
-        )
-        self.target_model.to(self.device)
-        self.target_model.requires_grad_(False)
+        self.target_model = self._build_target_model(recipe_cfg, target_path)
 
         # Resolve the captured target layers once and share them between the
         # target wrapper (what to capture) and the draft config (the ``fc`` input
@@ -146,11 +190,21 @@ class TrainDFlashRecipe(BaseRecipe):
             recipe_cfg.get("target_layer_ids", None)
             or build_target_layer_ids(num_target_layers, draft_num_hidden_layers)
         )
-        self.target_wrapper = HFDFlashTargetModel(self.target_model, target_layer_ids=target_layer_ids)
+        self.target_wrapper = self._build_target_wrapper(target_layer_ids)
 
         self.block_size = int(recipe_cfg.get("block_size", 16))
         self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_config.vocab_size)
 
+        # ``packed_sequence_size > 0`` enables sequence packing; the DFlash target,
+        # block mask, anchor sampling, and draft RoPE all consume the block-causal
+        # packing metadata (position_ids / seq_lens / doc_remaining) the loader emits.
+        packed_sequence_size = int(recipe_cfg.get("packed_sequence_size", 0) or 0)
+        if packed_sequence_size > 0:
+            _validate_packing_gates(
+                cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
+                target_attn_impl=getattr(self.target_model.config, "_attn_implementation", None) or "",
+                micro_batch_size=int(recipe_cfg.micro_batch_size),
+            )
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
             tokenizer=self.tokenizer,
@@ -162,6 +216,8 @@ class TrainDFlashRecipe(BaseRecipe):
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            packed_sequence_size=packed_sequence_size,
+            dp_mesh=self.dp_mesh,
         )
         self.val_dataloader = None
         if recipe_cfg.get("val_data_path", None):
@@ -176,6 +232,8 @@ class TrainDFlashRecipe(BaseRecipe):
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                packed_sequence_size=packed_sequence_size,
+                dp_mesh=self.dp_mesh,
             )
 
         # DFlash draft config: a small non-causal Qwen3 stack that reuses the
@@ -190,10 +248,7 @@ class TrainDFlashRecipe(BaseRecipe):
         draft_config["max_window_layers"] = draft_num_hidden_layers
         draft_config["num_target_layers"] = num_target_layers
         draft_config["block_size"] = self.block_size
-        draft_config["dflash_config"] = {
-            "mask_token_id": self.mask_token_id,
-            "target_layer_ids": target_layer_ids,
-        }
+        draft_config["dflash_config"] = self._build_dflash_config(recipe_cfg, target_layer_ids)
         # A single knob drives both the trainer's mask format and the draft's
         # attention function -- they must agree (a flex BlockMask only works with
         # the flex attention fn, a dense bool mask only with sdpa/eager).
@@ -201,24 +256,25 @@ class TrainDFlashRecipe(BaseRecipe):
         draft_config_obj = Qwen3Config.from_dict(draft_config)
         draft_config_obj._attn_implementation = attention_backend
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede the DDP wrap.
+        apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
+        # Optional torch.compile of the draft, in place; after the fp8 swap.
+        apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
 
-        trainer_module = DFlashTrainerModule(
-            draft_model=self.draft_model,
-            target_lm_head=self.target_model.get_output_embeddings(),
-            target_embed_tokens=self.target_model.get_input_embeddings(),
-            mask_token_id=self.mask_token_id,
-            block_size=self.block_size,
-            attention_backend=attention_backend,
-            num_anchors=int(recipe_cfg.get("num_anchors", 512)),
-            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", None),
-        ).to(self.device)
+        trainer_module = self._build_trainer_module(attention_backend, recipe_cfg).to(self.device)
         if self.dist_env.world_size > 1:
+            # The frozen target lm_head / embed_tokens are held as non-registered
+            # references on the trainer, so DDP only sees the plain draft params
+            # (no sharded DTensor params to broadcast). The draft's gradient
+            # all-reduce is restricted to the "dp" sub-axis (see
+            # ``_draft_ddp_process_group``).
             trainer_module = DistributedDataParallel(
                 trainer_module,
                 device_ids=[self.device.index] if self.device.type == "cuda" else None,
                 output_device=self.device.index if self.device.type == "cuda" else None,
                 broadcast_buffers=False,
                 find_unused_parameters=False,
+                process_group=self._draft_ddp_process_group(),
             )
         self.trainer_module = trainer_module
 
@@ -260,9 +316,177 @@ class TrainDFlashRecipe(BaseRecipe):
         self._resume_epoch = 0
         self._skipped_micro_batches = 0
 
-        self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)), ranked=self.dist_env.world_size > 1)
+        # Seed by the dp coordinate, not the global rank: the draft is replicated
+        # across cp (and tp) ranks and must sample the SAME anchor positions each
+        # step, else the replicas diverge. _get_dp_rank() returns the global rank
+        # when there is no mesh, so the plain data-parallel path is unchanged.
+        self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)) + self._get_dp_rank(), ranked=False)
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
+
+        self.wandb_run = None
+        if self.dist_env.is_main and self.cfg.get("wandb", None) is not None:
+            suppress_wandb_log_messages()
+            self.wandb_run = init_wandb_run(
+                self.cfg.wandb.to_dict(),
+                self.cfg.to_dict(),
+                default_name=type(self).__name__.lower() + "_" + str(target_path).rstrip("/").split("/")[-1],
+            )
+
+    def _build_target_model(self, recipe_cfg, target_path: str) -> torch.nn.Module:
+        """Load the frozen (optionally tensor-parallel) target model.
+
+        With a ``distributed:`` section and ``tp_size>1`` the target is sharded
+        in place by ``from_pretrained`` (its FSDP2 parallelize plan); the small
+        draft stays replicated and runs DDP over the "dp" axis (which excludes
+        "tp"), and the trainer module gathers the target's vocab-sharded lm_head
+        / embed_tokens outputs. Absent, the original single-GPU-per-rank DP path
+        is used. Sets ``self.dist_setup`` / ``self.device_mesh`` / ``self.dp_mesh``
+        as a side effect and returns the (grad-disabled) target.
+        """
+        target_attn_implementation = recipe_cfg.get("target_attn_implementation", None)
+        target_kwargs = dict(
+            trust_remote_code=recipe_cfg.get("trust_remote_code", False),
+            torch_dtype=self.compute_dtype,
+            force_hf=bool(recipe_cfg.get("target_force_hf", False)),
+        )
+        if target_attn_implementation is not None:
+            target_kwargs["attn_implementation"] = target_attn_implementation
+        self.dist_setup = None
+        self.device_mesh = None
+        self.dp_mesh = None
+        # The target forward runs CP on "cp" (long-context memory relief); the draft,
+        # dataloader sampler, and checkpointer key on "dp" (which excludes cp/tp, so
+        # cp ranks in a dp group share data and draft weights). None without a mesh.
+        self.cp_mesh = None
+        if self.cfg.get("distributed", None) is not None:
+            self.dist_setup = create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+            self.device_mesh = self.dist_setup.mesh_context.device_mesh
+            self.dp_mesh = _submesh_or_none(self.device_mesh, "dp")
+            self.cp_mesh = _submesh_or_none(self.device_mesh, "cp")
+            target_kwargs["distributed_setup"] = self.dist_setup
+            # CP gathers the target's captured layers back to the full sequence; that
+            # gather does not yet handle a TP-sharded (DTensor) sequence, so the two
+            # can't be combined. TP alone (draft replicated over "dp") is fine.
+            cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+            if cp_size > 1 and int(self.cfg.get("distributed.tp_size", 1) or 1) > 1:
+                raise NotImplementedError(
+                    "Context parallelism (cp_size>1) combined with tensor parallelism (tp_size>1) is not "
+                    "yet supported for DFlash; the CP sequence gather does not handle a TP-sharded target "
+                    "output. Set tp_size=1 or cp_size=1."
+                )
+            # The CP hook intercepts the target's F.scaled_dot_product_attention call, so
+            # the target must run HuggingFace SDPA: force_hf picks the HF class and
+            # target_attn_implementation=sdpa keeps it off FA2 (the HF auto-select default
+            # when flash-attn is installed), which would bypass the hook and leave each rank
+            # attending only its own shard.
+            if cp_size > 1:
+                if not bool(recipe_cfg.get("target_force_hf", False)):
+                    raise NotImplementedError(
+                        "Context parallelism (cp_size>1) requires recipe_args.target_force_hf=true so the "
+                        "frozen target runs HuggingFace SDPA, which the CP K/V-gather hook intercepts."
+                    )
+                if recipe_cfg.get("target_attn_implementation", None) != "sdpa":
+                    raise NotImplementedError(
+                        "Context parallelism (cp_size>1) requires recipe_args.target_attn_implementation=sdpa; "
+                        "any other backend (e.g. flash_attention_2) bypasses the K/V-gather hook, so each rank "
+                        "silently attends only its own shard."
+                    )
+        target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        if self.dist_setup is None:
+            # ``nn.Module.to`` is in-place; the sharded path is already placed by
+            # ``from_pretrained``.
+            target_model.to(self.device)
+        target_model.requires_grad_(False)
+        return target_model
+
+    def _draft_ddp_process_group(self):
+        """Process group for the draft's gradient all-reduce.
+
+        With tensor parallelism the draft is replicated across tp ranks, so a
+        full-world all-reduce would average duplicate gradients; restrict it to
+        the "dp" sub-axis (which excludes tp) so it reduces only across real data
+        replicas. Without a mesh (tp_size=1) ``dp_mesh`` is None -> return None ->
+        the default full-world group, unchanged.
+        """
+        if self.dp_mesh is not None and self.dp_mesh.size() < self.dist_env.world_size:
+            return self.dp_mesh.get_group()
+        return None
+
+    def _build_target_wrapper(self, target_layer_ids: list[int]) -> HFDFlashTargetModel:
+        """Build the frozen-target hidden-state capture wrapper.
+
+        Subclasses override to capture extra teacher signals (e.g. JetSpec also
+        captures the target logits for its forward-KL distillation).
+        """
+        return HFDFlashTargetModel(
+            self.target_model, target_layer_ids=target_layer_ids, cp_mesh=getattr(self, "cp_mesh", None)
+        )
+
+    def _build_dflash_config(self, recipe_cfg, target_layer_ids: list[int]) -> dict:
+        """Build the draft ``dflash_config`` block. Subclasses extend it (e.g. Domino)."""
+        return {
+            "mask_token_id": self.mask_token_id,
+            "target_layer_ids": target_layer_ids,
+        }
+
+    def _build_trainer_module(self, attention_backend: str, recipe_cfg):
+        """Build the trainer wrapper. Subclasses override to swap the wrapper (e.g. Domino)."""
+        return DFlashTrainerModule(
+            draft_model=self.draft_model,
+            target_lm_head=self.target_model.get_output_embeddings(),
+            target_embed_tokens=self.target_model.get_input_embeddings(),
+            mask_token_id=self.mask_token_id,
+            block_size=self.block_size,
+            attention_backend=attention_backend,
+            num_anchors=int(recipe_cfg.get("num_anchors", 512)),
+            # Paper default (Appendix A.1) for the shipped block_size=16 configs;
+            # matches DFlashDecayLoss's own default. Set null explicitly in YAML
+            # to disable the position decay (uniform weighting).
+            loss_decay_gamma=recipe_cfg.get("loss_decay_gamma", 7.0),
+            # ``or`` folds an explicit ``loss_type: null`` back to the default,
+            # matching the null convention of loss_decay_gamma above.
+            loss_type=str(recipe_cfg.get("loss_type", None) or "dflash"),
+            prefix_weight_base=float(recipe_cfg.get("prefix_weight_base", 0.9)),
+        )
+
+    def _run_trainer_step(self, target_batch):
+        """Run one trainer-module forward. Subclasses override to inject extra inputs (e.g. lambda_base)."""
+        return self.trainer_module(
+            input_ids=target_batch.input_ids,
+            hidden_states=target_batch.hidden_states,
+            loss_mask=target_batch.loss_mask,
+            position_ids=target_batch.position_ids,
+            seq_lens=target_batch.seq_lens,
+            doc_remaining=target_batch.doc_remaining,
+        )
+
+    def _log_extra_train_metrics(self, epoch_idx: int) -> None:
+        """Hook for subclasses to log extra per-step metrics at a log point (no-op here)."""
+
+    def _extra_train_wandb_metrics(self, metrics) -> dict[str, float]:
+        """Return algorithm-specific W&B metrics for one training step."""
+        return {"train/accept_len": float(metrics.accept_len)}
+
+    def _extra_eval_metric_sums(self, metrics) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Return additional validation numerator and denominator pairs.
+
+        The base DFlash metrics are accumulated directly by :meth:`_run_eval`.
+        Subclasses use this hook for extra scalar statistics, with both tensors
+        on the same device as ``metrics.loss`` so they can participate in the
+        same ordered distributed SUM reductions.
+        """
+        return {}
+
+    def _empty_extra_eval_metric_sums(self) -> dict[str, list[torch.Tensor]]:
+        """Create zeroed subclass validation accumulators on the trainer device."""
+        return {}
+
+    def _wandb_log(self, data: dict[str, float], step: int) -> None:
+        """Log scalar metrics to the rank-zero W&B run when configured."""
+        run = getattr(self, "wandb_run", None)
+        if run is not None:
+            run.log(data, step=step)
 
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
@@ -318,7 +542,15 @@ class TrainDFlashRecipe(BaseRecipe):
             ckpt_kwargs["model_state_dict_keys"] = draft_state_dict_keys
 
         self.checkpoint_config = CheckpointingConfig(**ckpt_kwargs)
-        dp_rank = dist.get_rank() if dist.is_initialized() else 0
+        # The draft is replicated (never TP-sharded), so key the checkpoint shard
+        # on the dp coordinate -- identical for every tp rank in a replica --
+        # rather than the global rank. dp_mesh is None without a mesh (tp_size=1)
+        # -> global rank, unchanged. tp_rank stays 0 (the draft is not sharded).
+        dp_rank = (
+            self.dp_mesh.get_local_rank()
+            if getattr(self, "dp_mesh", None) is not None
+            else (dist.get_rank() if dist.is_initialized() else 0)
+        )
         self.checkpointer = Checkpointer(
             config=self.checkpoint_config, dp_rank=dp_rank, tp_rank=0, pp_rank=0, moe_mesh=None
         )
@@ -393,7 +625,12 @@ class TrainDFlashRecipe(BaseRecipe):
             is_final_checkpoint=is_final_checkpoint,
         )
         self.checkpointer.save_optimizer(self.optimizer, draft_model, path, self.lr_scheduler)
-        self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
+        # The checkpointer keys the rng file on dp_rank, but cp peers share a dp_rank
+        # (and, being seeded per dp_rank, hold identical rng state), so every peer would
+        # torch.save the same rng_dp_rank_N.pt and race on a shared FS; let only the
+        # first cp peer write it.
+        if self.cp_mesh is None or self.cp_mesh.get_local_rank() == 0:
+            self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
         if is_rank_0:
             self._save_extra_state(path, epoch=epoch)
@@ -472,12 +709,28 @@ class TrainDFlashRecipe(BaseRecipe):
         self._load_extra_state(ckpt_dir)
 
     def _load_extra_state(self, ckpt_dir: str) -> None:
-        """Restore DFlash meta: global_step and epoch."""
+        """Restore DFlash meta: global_step and epoch, and validate mask_token_id."""
         meta_path = os.path.join(ckpt_dir, "dflash_meta.pt")
         if os.path.exists(meta_path):
             meta = torch.load(meta_path, weights_only=False, map_location="cpu")
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
+            # ``mask_token_id`` comes only from the resume YAML (it is not
+            # restored from the checkpoint); the draft's ``embed_tokens`` row at
+            # that id is the learned "predict here" signal and the inference
+            # runtime fills block slots with the same id. A resume YAML whose
+            # ``mask_token_id`` disagrees with the trained one silently points the
+            # mask slots at an untrained embedding row and degrades acceptance
+            # with no error, so fail loudly on a mismatch. Legacy checkpoints
+            # saved before this field existed (``None``) skip the check.
+            saved_mask_token_id = meta.get("mask_token_id", None)
+            if saved_mask_token_id is not None and int(saved_mask_token_id) != int(self.mask_token_id):
+                raise ValueError(
+                    f"mask_token_id mismatch on resume: the checkpoint at {ckpt_dir} was trained with "
+                    f"mask_token_id={int(saved_mask_token_id)}, but recipe_args.mask_token_id="
+                    f"{int(self.mask_token_id)}. The draft's mask-slot embedding was learned at the "
+                    f"checkpoint's id; set recipe_args.mask_token_id={int(saved_mask_token_id)} to resume."
+                )
 
     def _log_saved_checkpoint(self, kind: str, epoch: int, step: int) -> None:
         """Log a saved checkpoint on rank 0 when checkpointing is enabled."""
@@ -519,9 +772,15 @@ class TrainDFlashRecipe(BaseRecipe):
         if self.val_dataloader is None:
             return None
         self.trainer_module.eval()
-        total_loss = torch.zeros((), device=self.device)
-        total_acc = torch.zeros((), device=self.device)
-        total_batches = torch.zeros((), device=self.device)
+        totals = {
+            "loss_sum": torch.zeros((), device=self.device),
+            "loss_weight": torch.zeros((), device=self.device),
+            "correct_tokens": torch.zeros((), device=self.device),
+            "valid_tokens": torch.zeros((), device=self.device),
+            "accept_len_sum": torch.zeros((), device=self.device),
+            "valid_blocks": torch.zeros((), device=self.device),
+        }
+        extra_totals = self._empty_extra_eval_metric_sums()
         with torch.no_grad():
             for batch in self.val_dataloader:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -529,28 +788,45 @@ class TrainDFlashRecipe(BaseRecipe):
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     loss_mask=batch["loss_mask"],
+                    **_packing_kwargs(batch),
                 )
                 try:
-                    metrics = self.trainer_module(
-                        input_ids=target_batch.input_ids,
-                        hidden_states=target_batch.hidden_states,
-                        loss_mask=target_batch.loss_mask,
-                    )
+                    # Route through the same seam as training so subclass-specific
+                    # inputs (Domino's lambda_base, JetSpec's target_logits) are wired.
+                    metrics = self._run_trainer_step(target_batch)
                 except NoValidAnchorsError:
                     # Every sample in this micro-batch is too short to form a block;
                     # skip it without counting, mirroring the training loop.
                     continue
-                total_loss += metrics.loss.detach()
-                total_acc += metrics.accuracy.detach()
-                total_batches += 1
-        total_loss = _all_reduce_mean(total_loss)
-        total_acc = _all_reduce_mean(total_acc)
-        total_batches = _all_reduce_mean(total_batches)
+                loss_weight = metrics.loss_weight.detach()
+                valid_tokens = metrics.valid_tokens.detach()
+                totals["loss_sum"] += metrics.loss.detach() * loss_weight
+                totals["loss_weight"] += loss_weight
+                totals["correct_tokens"] += metrics.correct_tokens.detach()
+                totals["valid_tokens"] += valid_tokens
+                totals["accept_len_sum"] += metrics.accept_len_sum.detach()
+                totals["valid_blocks"] += metrics.valid_blocks.detach()
+                for name, (numerator, denominator) in self._extra_eval_metric_sums(metrics).items():
+                    extra_totals[name][0] += numerator
+                    extra_totals[name][1] += denominator
+        for value in totals.values():
+            _all_reduce_sum(value)
+        for numerator, denominator in extra_totals.values():
+            _all_reduce_sum(numerator)
+            _all_reduce_sum(denominator)
         self.trainer_module.train()
-        return {
-            "val_loss": (total_loss / total_batches.clamp_min(1)).item(),
-            "val_accuracy": (total_acc / total_batches.clamp_min(1)).item(),
+        result = {
+            "val_loss": (totals["loss_sum"] / totals["loss_weight"].clamp_min(1)).item(),
+            "val_accuracy": (totals["correct_tokens"] / totals["valid_tokens"].clamp_min(1)).item(),
+            "val_accept_len": (totals["accept_len_sum"] / totals["valid_blocks"].clamp_min(1)).item(),
         }
+        result.update(
+            {
+                name: (numerator / denominator.clamp_min(1)).item()
+                for name, (numerator, denominator) in extra_totals.items()
+            }
+        )
+        return result
 
     def run_train_validation_loop(self):
         """Run the DFlash training loop."""
@@ -561,134 +837,163 @@ class TrainDFlashRecipe(BaseRecipe):
                 logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
             return
 
-        for epoch_idx in range(start_epoch, self.num_epochs):
-            if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
-                self.train_dataloader.sampler.set_epoch(epoch_idx)
+        pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
+        try:
+            for epoch_idx in range(start_epoch, self.num_epochs):
+                if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
+                    self.train_dataloader.sampler.set_epoch(epoch_idx)
 
-            running_loss = 0.0
-            running_acc = 0.0
-            running_micro = 0
-            epoch_loss = 0.0
-            micro_step = 0
-            pending_micro_batches = 0
-            completed_steps = 0
-            last_batch_idx = -1
-            num_batches = len(self.train_dataloader)
-            is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
-            for batch_idx, batch in enumerate(self.train_dataloader):
-                last_batch_idx = batch_idx
-                batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-                target_batch = self.target_wrapper.generate_batch(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    loss_mask=batch["loss_mask"],
-                )
-                sync_grads = should_sync_grads(
-                    pending_micro_batches=pending_micro_batches,
-                    grad_accumulation_steps=self.grad_accumulation_steps,
-                    batch_idx=batch_idx,
-                    batches_per_epoch=num_batches,
-                    is_ddp=is_ddp,
-                )
-                sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
-                with sync_ctx:
-                    local_has_valid = 1
-                    try:
-                        metrics = self.trainer_module(
-                            input_ids=target_batch.input_ids,
-                            hidden_states=target_batch.hidden_states,
-                            loss_mask=target_batch.loss_mask,
-                        )
-                        loss = metrics.loss / self.grad_accumulation_steps
-                    except NoValidAnchorsError:
-                        # Every sample in this micro-batch is too short to form a
-                        # block; nothing to learn from it on this rank.
-                        local_has_valid = 0
-                    # Decide skip-vs-backward in lockstep so a per-rank skip never
-                    # leaves one rank issuing its gradient all-reduce alone (DDP
-                    # hang) or desyncs the accumulation windows: if ANY rank has no
-                    # valid anchors, ALL ranks skip this micro-batch together.
-                    all_have_valid = _all_ranks_have_valid(local_has_valid, is_ddp, self.device)
-                    if all_have_valid:
-                        loss.backward()
-                if not all_have_valid:
-                    self._skipped_micro_batches += 1
-                    continue
+                running_loss = 0.0
+                running_acc = 0.0
+                running_micro = 0
+                epoch_loss = 0.0
+                micro_step = 0
+                pending_micro_batches = 0
+                completed_steps = 0
+                last_batch_idx = -1
+                num_batches = len(self.train_dataloader)
+                is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
+                for batch_idx, batch in enumerate(self.train_dataloader):
+                    last_batch_idx = batch_idx
+                    batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+                    target_batch = self.target_wrapper.generate_batch(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        loss_mask=batch["loss_mask"],
+                        **_packing_kwargs(batch),
+                    )
+                    sync_grads = should_sync_grads(
+                        pending_micro_batches=pending_micro_batches,
+                        grad_accumulation_steps=self.grad_accumulation_steps,
+                        batch_idx=batch_idx,
+                        batches_per_epoch=num_batches,
+                        is_ddp=is_ddp,
+                    )
+                    sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
+                    with sync_ctx:
+                        local_has_valid = 1
+                        try:
+                            metrics = self._run_trainer_step(target_batch)
+                            loss = metrics.loss / self.grad_accumulation_steps
+                        except NoValidAnchorsError:
+                            # Every sample in this micro-batch is too short to form a
+                            # block; nothing to learn from it on this rank.
+                            local_has_valid = 0
+                        # Decide skip-vs-backward in lockstep so a per-rank skip never
+                        # leaves one rank issuing its gradient all-reduce alone (DDP
+                        # hang) or desyncs the accumulation windows: if ANY rank has no
+                        # valid anchors, ALL ranks skip this micro-batch together.
+                        all_have_valid = _all_ranks_have_valid(local_has_valid, is_ddp, self.device)
+                        if all_have_valid:
+                            loss.backward()
+                    if not all_have_valid:
+                        self._skipped_micro_batches += 1
+                        continue
 
-                running_loss += metrics.loss.detach().item()
-                running_acc += metrics.accuracy.detach().item()
-                running_micro += 1
-                epoch_loss += metrics.loss.detach().item()
-                micro_step += 1
-                pending_micro_batches += 1
+                    running_loss += metrics.loss.detach().item()
+                    running_acc += metrics.accuracy.detach().item()
+                    running_micro += 1
+                    epoch_loss += metrics.loss.detach().item()
+                    micro_step += 1
+                    pending_micro_batches += 1
 
-                if pending_micro_batches == self.grad_accumulation_steps:
+                    if pending_micro_batches == self.grad_accumulation_steps:
+                        torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                        self.optimizer.step()
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self.lr_scheduler.step()
+                        self.runtime.global_step += 1
+                        if pbar is not None:
+                            pbar.update(1)
+                        completed_steps += 1
+                        pending_micro_batches = 0
+                        self._maybe_save_step_checkpoint(epoch_idx)
+
+                        if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
+                            # Average over the micro-batches accumulated since the last
+                            # log, not over optimizer steps: with grad_accumulation_steps>1
+                            # (or skipped short micro-batches) the two differ, and dividing
+                            # by log_every_steps would inflate the reported loss/acc.
+                            avg_loss = running_loss / max(1, running_micro)
+                            avg_acc = running_acc / max(1, running_micro)
+                            current_lr = self.lr_scheduler.get_last_lr()[0]
+                            if pbar is not None:
+                                pbar.set_postfix(
+                                    loss=f"{avg_loss:.4f}",
+                                    acc=f"{avg_acc:.4f}",
+                                    lr=f"{current_lr:.2e}",
+                                )
+                            logger.info(
+                                "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
+                                epoch_idx,
+                                self.runtime.global_step,
+                                avg_loss,
+                                avg_acc,
+                                current_lr,
+                            )
+                            self._log_extra_train_metrics(epoch_idx)
+                            if getattr(self, "wandb_run", None) is not None:
+                                wandb_data = {
+                                    "train/loss": avg_loss,
+                                    "train/accuracy": avg_acc,
+                                    "train/lr": current_lr,
+                                    "train/epoch": epoch_idx,
+                                }
+                                wandb_data.update(self._extra_train_wandb_metrics(metrics))
+                                self._wandb_log(wandb_data, step=self.runtime.global_step)
+                            running_loss = 0.0
+                            running_acc = 0.0
+                            running_micro = 0
+
+                # Flush the trailing partial accumulation window (see EAGLE recipes
+                # for the rescale rationale).
+                if pending_micro_batches > 0:
+                    scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
+                    for p in self.trainer_module.parameters():
+                        if p.grad is not None:
+                            p.grad.mul_(scale)
                     torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.lr_scheduler.step()
                     self.runtime.global_step += 1
+                    if pbar is not None:
+                        pbar.update(1)
                     completed_steps += 1
                     pending_micro_batches = 0
                     self._maybe_save_step_checkpoint(epoch_idx)
 
-                    if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
-                        # Average over the micro-batches accumulated since the last
-                        # log, not over optimizer steps: with grad_accumulation_steps>1
-                        # (or skipped short micro-batches) the two differ, and dividing
-                        # by log_every_steps would inflate the reported loss/acc.
-                        logger.info(
-                            "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
-                            epoch_idx,
-                            self.runtime.global_step,
-                            running_loss / max(1, running_micro),
-                            running_acc / max(1, running_micro),
-                            self.lr_scheduler.get_last_lr()[0],
+                eval_metrics = self._run_eval()
+                if self.dist_env.is_main:
+                    msg = (
+                        f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps} "
+                        f"skipped_short_micro_batches={self._skipped_micro_batches}"
+                    )
+                    if eval_metrics is not None:
+                        msg += " " + " ".join(f"{name}={value:.4f}" for name, value in eval_metrics.items())
+                        self._wandb_log(
+                            {name.replace("val_", "val/", 1): value for name, value in eval_metrics.items()},
+                            step=self.runtime.global_step,
                         )
-                        running_loss = 0.0
-                        running_acc = 0.0
-                        running_micro = 0
+                    logger.info(msg)
 
-            # Flush the trailing partial accumulation window (see EAGLE recipes
-            # for the rescale rationale).
-            if pending_micro_batches > 0:
-                scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
-                for p in self.trainer_module.parameters():
-                    if p.grad is not None:
-                        p.grad.mul_(scale)
-                torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
-                self.optimizer.step()
-                self.optimizer.zero_grad(set_to_none=True)
-                self.lr_scheduler.step()
-                self.runtime.global_step += 1
-                completed_steps += 1
-                pending_micro_batches = 0
-                self._maybe_save_step_checkpoint(epoch_idx)
+                if getattr(self, "save_checkpoint_every_epoch", False) and last_batch_idx >= 0:
+                    avg_loss = epoch_loss / max(1, micro_step) if micro_step else None
+                    self.save_checkpoint(
+                        epoch=epoch_idx + 1,
+                        step=self.runtime.global_step,
+                        train_loss=avg_loss,
+                        val_loss=eval_metrics,
+                        best_metric_key="val_loss",
+                        is_final_checkpoint=epoch_idx + 1 >= self.num_epochs,
+                    )
+                    self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
 
-            eval_metrics = self._run_eval()
-            if self.dist_env.is_main:
-                msg = (
-                    f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps} "
-                    f"skipped_short_micro_batches={self._skipped_micro_batches}"
-                )
-                if eval_metrics is not None:
-                    msg += f" val_loss={eval_metrics['val_loss']:.4f} val_accuracy={eval_metrics['val_accuracy']:.4f}"
-                logger.info(msg)
-
-            if getattr(self, "save_checkpoint_every_epoch", False) and last_batch_idx >= 0:
-                avg_loss = epoch_loss / max(1, micro_step) if micro_step else None
-                self.save_checkpoint(
-                    epoch=epoch_idx + 1,
-                    step=self.runtime.global_step,
-                    train_loss=avg_loss,
-                    val_loss=eval_metrics,
-                    best_metric_key="val_loss",
-                    is_final_checkpoint=epoch_idx + 1 >= self.num_epochs,
-                )
-                self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
-
-        self._maybe_save_final_checkpoint(self.num_epochs)
-        self._finalize_pending_checkpoint()
+            self._maybe_save_final_checkpoint(self.num_epochs)
+            self._finalize_pending_checkpoint()
+        finally:
+            if pbar is not None:
+                pbar.close()
 
 
 def main(config_path: str | None = None):

@@ -94,7 +94,7 @@ def is_gated_activation(activation: str) -> bool:
     Non-gated activations (ReLU²) only use up_proj, requiring up_projs tensor
     with shape [n_experts, dim, inter_dim] - 50% memory savings.
     """
-    return activation in ("swiglu", "quick_geglu", "geglu")
+    return activation in ("swiglu", "swigluoai", "quick_geglu", "geglu")
 
 
 def _permute_tokens_for_grouped_mm(
@@ -353,7 +353,12 @@ class GroupedExperts(nn.Module):
                 return torch.cat(gathered, dim=0)
 
             x = _all_gather_dim0_var(x, differentiable=True)
-            weights = _all_gather_dim0_var(weights.float(), differentiable=False)
+            # Routing probabilities participate in the main-loss gradient.
+            # A plain ``dist.all_gather`` detaches every gathered tensor and
+            # silently leaves the router trainable only through auxiliary
+            # losses.  Use the same autograd-safe variable-length gather as
+            # activations so each source rank receives its local weight grad.
+            weights = _all_gather_dim0_var(weights.float(), differentiable=True)
             indices = _all_gather_dim0_var(indices, differentiable=False)
             token_mask = _all_gather_dim0_var(token_mask, differentiable=False)
 
@@ -556,6 +561,29 @@ def quick_geglu_deepep(
 
 
 @torch.compile(fullgraph=True, options={"max_autotune": True})
+def swiglu_oai_deepep(x, permuted_probs, alpha: float = 1.702, limit: float = 7.0):
+    """SwiGLU-OAI (GPT-OSS / MiniMax-M3) activation for grouped experts.
+
+    Computes ``gate * sigmoid(alpha * gate) * (up + 1)`` in fp32 with gate
+    clamped ``max=limit`` and up clamped ``+/-limit`` (when ``limit > 0``).
+
+    Unlike :func:`quick_geglu_deepep` (which expects an *interleaved* gate/up
+    layout, ``x[..., ::2]`` / ``x[..., 1::2]``), this reads the *concatenated*
+    ``[gate | up]`` layout produced by ``MoESplitExpertsStateDictMixin``
+    (``torch.cat([gate_t, up_t], dim=-1)``), matching sglang's
+    ``swiglu_no_interleaved_with_alpha_and_limit``.
+    """
+    gate, up = torch.chunk(x, 2, dim=-1)
+    gate = gate.float()
+    up = up.float()
+    if limit > 0.0:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+    inter = gate * torch.sigmoid(alpha * gate) * (up + 1.0)
+    return (inter * permuted_probs).to(x.dtype)
+
+
+@torch.compile(fullgraph=True, options={"max_autotune": True})
 def relu2_deepep(x, permuted_probs):
     """ReLU² activation for DeepEP: relu(x)^2
 
@@ -599,6 +627,12 @@ def get_expert_activation_for_deepep(config: MoEConfig):
         if getattr(config, "swiglu_limit", 0.0) > 0.0:
             return partial(swiglu_clamped_deepep, limit=config.swiglu_limit)
         return weighted_bias_swiglu_impl
+    elif config.expert_activation == "swigluoai":
+        return partial(
+            swiglu_oai_deepep,
+            alpha=config.activation_alpha,
+            limit=config.activation_limit,
+        )
     elif config.expert_activation == "quick_geglu":
         return partial(
             quick_geglu_deepep,
@@ -1291,9 +1325,29 @@ class GroupedExpertsTE(nn.Module):
             output1 = self.gate_up_linear(permuted_local_hidden_states, m_splits)
             output1 = self.expert_activation(output1, permuted_probs)
             output2 = self.down_linear(output1, m_splits)
+            # The down-projection bias must be weighted by the per-token routing probability
+            # (permuted_probs), matching GroupedExperts ("expert_out + down_bias * w") and
+            # GroupedExpertsDeepEP ("_apply_bias(output2, down_bias, ..., permuted_probs)").
+            # TE's GroupedLinear adds the down bias UNWEIGHTED inside the GEMM, so each of the
+            # top-k expert contributions carries a full prob-independent bias that is then
+            # summed in the combine step, producing a large systematic offset (e.g. gpt-oss-20b
+            # step-0 loss ~8.2 vs the correct ~4.5). Add the missing (prob - 1) * down_bias term
+            # so the net down-bias contribution becomes prob * down_bias.
+            if self.expert_bias:
+                down_bias = self._get_stacked_bias(self.down_linear)
+                if down_bias is not None:
+                    splits_t = torch.as_tensor(m_splits, device=output2.device)
+                    output2 = _apply_bias(output2, down_bias, splits_t, permuted_probs - 1.0)
         else:
             # Handle edge case: no tokens routed to local experts
-            # Perform dummy computation for gradient flow
+            # Perform dummy computation for gradient flow.  Touching only
+            # ``weight0`` leaves every other local expert with ``grad=None``;
+            # that skips momentum decay, decoupled weight decay, and its
+            # optimizer step.  Grouped GEMM instead produces explicit zero
+            # gradients for all experts, so attach a zero-valued dependency to
+            # every local GroupedLinear parameter.  Indexing one element is
+            # sufficient for autograd to materialize the full zero gradient
+            # without reducing over the (potentially very large) weight.
             def to_local(tensor):
                 if isinstance(tensor, DTensor):
                     return tensor.to_local()
@@ -1303,6 +1357,15 @@ class GroupedExpertsTE(nn.Module):
             output1 = torch.matmul(x[0] * 0, to_local(self.gate_up_linear.weight0).T)
             output1_ = self.expert_activation(output1, permuted_probs)
             output2 = torch.matmul(output1_, to_local(self.down_linear.weight0).T)
+            all_expert_dependency = output2.new_zeros(())
+            for grouped_linear in (self.gate_up_linear, self.down_linear):
+                for parameter in grouped_linear.parameters():
+                    local_parameter = to_local(parameter)
+                    if local_parameter.numel() > 0:
+                        all_expert_dependency = (
+                            all_expert_dependency + local_parameter.reshape(-1)[0].to(output2.dtype) * 0
+                        )
+            output2 = output2 + all_expert_dependency
 
         if fp8_active and actual_m_splits is not None:
             output2 = self.fp8_unpadding(output2, actual_m_splits)

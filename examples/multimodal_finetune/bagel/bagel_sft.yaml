@@ -11,6 +11,7 @@ recipe: FinetuneRecipeForMultimodal
 seed: 4396
 
 step_scheduler:
+  gc_every_steps: 10
   global_batch_size: 8
   local_batch_size: 1
   max_steps: 100
@@ -23,6 +24,10 @@ dist_env:
   timeout_minutes: 30
 
 model:
+  # Transformer Engine is enabled for BAGEL's language-model Linear and RMSNorm layers.
+  backend:
+    linear: te
+    rms_norm: te
   _target_: nemo_automodel.NeMoAutoModelForMultimodalLM.from_pretrained
   pretrained_model_name_or_path: ByteDance-Seed/BAGEL-7B-MoT
   torch_dtype: float32
@@ -33,6 +38,8 @@ model:
   # directory as a sidecar.
   # vae_path: /path/to/ae.safetensors
   # max_latent_size: 64
+  # Set to 0 to encode the whole image batch at once.
+  vae_encode_micro_batch_size: 1
 
 checkpoint:
   enabled: false
@@ -115,9 +122,9 @@ dataset:
       num_used_data:
         - 1000
       weight: 1
-  expected_num_tokens: 10240
-  max_num_tokens: 11520
-  max_num_tokens_per_sample: 10240
+  expected_num_tokens: 32768
+  max_num_tokens: 36864
+  max_num_tokens_per_sample: 16384
   prefer_buffer_before: 16384
   max_buffer_size: 50
   vit_patch_size: 14
@@ -125,8 +132,8 @@ dataset:
   interpolate_pos: false
   data_seed: 42
   text_cond_dropout_prob: 0.1
-  vit_cond_dropout_prob: 0.4
-  vae_cond_dropout_prob: 0.1
+  vit_cond_dropout_prob: 0.3
+  vae_cond_dropout_prob: 0.3
   # VAE-side downsample: vae.downsample (8) * latent_patch_size (2) = 16.
   vae_image_downsample: 16
   max_latent_size: 64
@@ -143,6 +150,14 @@ optimizer:
   betas: [0.9, 0.95]
   eps: 1.0e-15
   weight_decay: 0.0
+  # foreach=false: on torch>=2.12, AdamW's _foreach_* ops over FSDP2-sharded (DTensor) params
+  # are re-planned by DTensor's sharding propagator every step via the *uncached* path (a
+  # foreach op's list argument isn't cached), leaking OpStrategy/OpSpec + FakeTensor dispatch-
+  # cache entries (~19.6k Python objects/step -> growing gen-2 GC pauses -> throughput sinks
+  # monotonically over a run). Single-tensor ops (foreach=false) hit the sharding cache, so
+  # nothing accumulates; the optimizer is a tiny slice of step time, so the cost is ~0.8%.
+  # Remove once the DTensor foreach path is fixed upstream.
+  foreach: false
 
 lr_scheduler:
   schedule: constant
@@ -163,6 +178,7 @@ ema:
   decay: 0.9999
 
 wandb:
+  enable: false
   project: bagel-finetuning
   mode: disabled
   name: bagel_7b_mot_sft

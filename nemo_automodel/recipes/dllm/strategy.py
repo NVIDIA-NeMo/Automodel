@@ -45,10 +45,12 @@ from nemo_automodel.components.datasets.dllm.corruption import (
     corrupt_all_masked,
     corrupt_blockwise,
     corrupt_uniform,
+    corrupt_uniform_random,
 )
 from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loss.dllm_loss import (
+    BlockDiffusionCrossEntropyLoss,
     HybridDiffusionLLMLoss,
     IDLMLoss,
     MDLMCrossEntropyLoss,
@@ -154,8 +156,14 @@ class DLLMStrategy(ABC):
         eps: float,
         block_size: Optional[int],
         half_life_ratio: Optional[float],
+        generator: Optional[torch.Generator] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return ``(noisy_input_ids, noise_mask, p_mask)``."""
+        """Return ``(noisy_input_ids, noise_mask, p_mask)``.
+
+        ``generator`` (optional): a step-seeded ``torch.Generator`` for the
+        corruption draws so noise reproduces on resume. Strategies that draw from
+        the global RNG may ignore it; ``block_diffusion`` threads it through.
+        """
 
     @abstractmethod
     def prepare_batch(
@@ -179,7 +187,9 @@ class MDLMStrategy(DLLMStrategy):
     def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
         return MDLMCrossEntropyLoss()
 
-    def apply_corruption(self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio):
+    def apply_corruption(
+        self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio, generator=None
+    ):
         return corrupt_uniform(input_ids, loss_mask, mask_token_id, eps=eps)
 
     def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
@@ -206,7 +216,9 @@ class HybridStrategy(DLLMStrategy):
     def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
         return HybridDiffusionLLMLoss(alpha=float(dllm_cfg.get("ar_loss_alpha", 1.0)))
 
-    def apply_corruption(self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio):
+    def apply_corruption(
+        self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio, generator=None
+    ):
         if block_size is None:
             return corrupt_uniform(input_ids, loss_mask, mask_token_id, eps=eps)
         return corrupt_blockwise(
@@ -279,7 +291,11 @@ class IDLMStrategy(DLLMStrategy):
                 f"dllm.mask_token_id={recipe.mask_token_id} is outside the model vocab (size {vocab_size})."
             )
 
-    def apply_corruption(self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio):
+    def apply_corruption(
+        self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio, generator=None
+    ):
+        # `generator` is accepted for interface compatibility but unused: all-masked
+        # corruption is deterministic.
         return corrupt_all_masked(input_ids, loss_mask, mask_token_id)
 
     def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
@@ -413,7 +429,11 @@ class DFlashStrategy(DLLMStrategy):
     # by the abstract interface; forward_backward overrides both paths.
     # ------------------------------------------------------------------
 
-    def apply_corruption(self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio):
+    def apply_corruption(
+        self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio, generator=None
+    ):
+        # generator is accepted for signature parity with the base/other strategies
+        # (the recipe passes it unconditionally); DFlash draws from the global RNG.
         return corrupt_uniform(input_ids, loss_mask, mask_token_id, eps=eps)
 
     def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
@@ -875,11 +895,135 @@ class DFlashStrategy(DLLMStrategy):
                 (microbatch_loss * recipe._get_dp_group_size(include_cp=True)).backward()
 
 
+class BlockDiffusionStrategy(DLLMStrategy):
+    """Strategy for ``diffusion_gemma`` block-diffusion SFT (single-turn v1).
+
+    - Loss: :class:`BlockDiffusionCrossEntropyLoss` (flat CE, no ``1/p``, no AR).
+    - Corruption: :func:`corrupt_uniform_random` — per-block ``t~U(eps,1)``,
+      supervised positions replaced with uniform random vocab tokens (no
+      ``[MASK]``). Requires ``vocab_size`` (see :meth:`create_loss_fn`).
+    - Normalization: ``"supervised"`` (denominator = all supervised canvas-token
+      count, matching Google's all-canvas loss support — NOT corrupted-only).
+    - Batch: the encoder sees the **clean full sequence** (prompt + response);
+      the decoder canvas is the **noised response region only**, sliced and the
+      block-causal mask built by ``DiffusionGemmaSFTRecipe`` (the recipe owns
+      the response-window construction because it also needs the sliced loss
+      tensors). :meth:`prepare_batch` only assigns the encoder input and the
+      full noised sequence; :meth:`split_prompt_response` gives the per-example
+      prompt boundary the recipe slices on.
+
+    v1 is **single-turn only**: multi-turn ``ChatDataset`` ``loss_mask`` is
+    ``0..0 1..1 0..0 1..1`` (not a contiguous suffix), so the prompt|response
+    split is ill-defined. Interleaved multi-turn masking is deferred.
+    """
+
+    def __init__(self) -> None:
+        # vocab_size is needed by corrupt_uniform_random but is not part of the
+        # apply_corruption ABC signature (which passes mask_token_id, unused
+        # here). It is captured from the dllm config in create_loss_fn, which the
+        # recipe always calls during setup before any corruption runs.
+        self._vocab_size: int | None = None
+
+    @property
+    def normalization_mode(self) -> str:
+        # "supervised": denominator = ALL supervised canvas tokens (corrupted +
+        # uncorrupted), matching Google's all-canvas loss support. Was "noise"
+        # (corrupted-only) — the loss-support bug.
+        return "supervised"
+
+    def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
+        vocab_size = dllm_cfg.get("vocab_size", None)
+        if vocab_size is not None:
+            self._vocab_size = int(vocab_size)
+        return BlockDiffusionCrossEntropyLoss()
+
+    def apply_corruption(
+        self, input_ids, loss_mask, mask_token_id, *, eps, block_size, half_life_ratio, generator=None
+    ):
+        if self._vocab_size is None:
+            raise ValueError(
+                "BlockDiffusionStrategy requires dllm.vocab_size to be set in the config "
+                "(uniform random-token corruption samples replacements over [0, vocab_size); "
+                "there is no mask_token_id)."
+            )
+        # One corruption level t per example (block_size=None), matching Google's
+        # scheme: a single canvas is scored per step, so per-block t is moot.
+        return corrupt_uniform_random(
+            input_ids,
+            loss_mask,
+            self._vocab_size,
+            block_size=None,
+            eps=eps,
+            generator=generator,
+        )
+
+    def pre_step(self, recipe, batches) -> tuple[int, int]:
+        """Per-microbatch corruption, threading ``microbatch_idx`` into the seed.
+
+        Same sidecar stashing as the base ``pre_step``, but passes ``microbatch_idx``
+        to ``recipe._apply_corruption`` so each grad-accum microbatch draws distinct,
+        resume-reproducible block-diffusion noise.
+        """
+        num_noise = 0
+        num_supervised = 0
+        for microbatch_idx, batch in enumerate(batches):
+            noisy_input_ids, noise_mask, p_mask = recipe._apply_corruption(
+                batch["input_ids"], batch["loss_mask"], microbatch_idx=microbatch_idx
+            )
+            batch["_noisy_input_ids"] = noisy_input_ids
+            batch["_noise_mask"] = noise_mask
+            batch["_p_mask"] = p_mask
+            batch["_clean_input_ids"] = batch["input_ids"].clone()
+            num_noise += int(noise_mask.sum().item())
+            num_supervised += int(batch["loss_mask"].sum().item())
+        return num_noise, num_supervised
+
+    @staticmethod
+    def split_prompt_response(
+        input_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Single-turn boundary: prefix length(s) and a per-position response mask.
+
+        Returns ``(prefix_lengths, response_mask)`` where ``prefix_lengths[b]`` is
+        the index of the first supervised (``loss_mask == 1``) position in row
+        ``b`` (the start of the response) and ``response_mask`` is the boolean
+        mask of response positions (``position >= prefix_length``). Used by the
+        ``_forward_backward_step`` override to build ``canvas_ids`` and the
+        block-causal mask's ``prefix_lengths``.
+
+        Single-turn assumption: ``loss_mask`` is a single contiguous suffix.
+        """
+        lm = loss_mask.bool()
+        has_sup = lm.any(dim=1)
+        first_sup = torch.argmax(lm.int(), dim=1)  # first True index; 0 if none
+        # Rows with no supervised token: treat the whole row as prompt.
+        prefix_lengths = torch.where(has_sup, first_sup, torch.full_like(first_sup, input_ids.shape[1]))
+        positions = torch.arange(input_ids.shape[1], device=input_ids.device)[None, :]
+        response_mask = positions >= prefix_lengths[:, None]
+        return prefix_lengths, response_mask
+
+    def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
+        # Encoder sees the CLEAN full sequence (prompt + response); the decoder
+        # canvas is the noised sequence. Bidirectional model -> drop attention_mask.
+        # ``DiffusionGemmaSFTRecipe._forward_backward_step`` then slices
+        # ``canvas_ids`` (and the matching loss tensors) to the response region
+        # and builds the block-causal ``decoder_attention_mask`` — that slicing
+        # lives in the recipe because it must also reshape the loss tensors,
+        # which are not visible here.
+        batch["input_ids"] = clean_input_ids
+        batch["canvas_ids"] = noisy_input_ids
+        batch.pop("attention_mask", None)
+        batch.pop("use_cache", None)
+        return batch
+
+
 DLLM_STRATEGIES: Dict[str, type] = {
     "mdlm": MDLMStrategy,
     "hybrid": HybridStrategy,
     "idlm": IDLMStrategy,
     "dflash": DFlashStrategy,
+    "block_diffusion": BlockDiffusionStrategy,
 }
 
 

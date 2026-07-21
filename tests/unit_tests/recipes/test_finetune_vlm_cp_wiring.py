@@ -23,7 +23,7 @@ full recipe — exercising the code shape that gets shipped:
     forward pre-hooks fire)
   - Pop *all* umbrella keys from batch after prepare step
   - Update batch with the prepared dict (which carries ``inputs_embeds``)
-  - Validation: do NOT pop labels before make_cp_batch_and_ctx
+  - Validation: count labels after make_cp_batch_and_ctx and inside train_ctx
   - Validation: position_ids ``.to(self.dist_env.device)`` (not model.device)
 """
 
@@ -52,8 +52,7 @@ def _train_cp_prepare(_model, batch, *, pp_enabled=False, has_first_stage=True):
         return batch
     if not pp_enabled or has_first_stage:
         mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-        with torch.no_grad():
-            prepared = _model(_pre_embed_only=True, **mm_kwargs)
+        prepared = _model(_pre_embed_only=True, **mm_kwargs)
         for k in VLM_INPUT_KEYS:
             batch.pop(k, None)
         batch.update(prepared)
@@ -173,24 +172,49 @@ def test_train_cp_prepare_skipped_when_model_has_no_prepare_model_inputs_for_cp(
     assert "inputs_embeds" not in out
 
 
-def test_train_cp_prepare_uses_torch_no_grad():
-    """Vision tower runs under no_grad so the recipe doesn't accidentally
-    accumulate grads through the (frozen) vision encoder."""
+def test_train_cp_prepare_allows_grad_through_pre_embed():
+    """Pre-embed must keep grad enabled for trainable multimodal towers."""
 
     class _GradSensitive:
+        def __init__(self):
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
         def prepare_model_inputs_for_cp(self, **kw):
             return {"inputs_embeds": torch.zeros(1, 4, 8)}
 
         def __call__(self, **kw):
-            assert not torch.is_grad_enabled(), "prepare step must run under torch.no_grad()"
-            return {"inputs_embeds": torch.zeros(1, 4, 8)}
+            assert torch.is_grad_enabled(), "prepare step must keep gradients enabled"
+            return {"inputs_embeds": self.weight * torch.ones(1, 4, 8)}
 
     model = _GradSensitive()
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 4]]),
         "labels": torch.tensor([[1, 2, 3, 4]]),
     }
-    _train_cp_prepare(model, batch)
+    with torch.enable_grad():
+        out = _train_cp_prepare(model, batch)
+
+    assert out["inputs_embeds"].requires_grad
+
+
+def test_train_cp_prepare_keeps_only_model_returned_cp_metadata():
+    """The recipe should not preserve VLM metadata itself after pre-embed.
+
+    Model-specific CP metadata, such as Gemma4 ``mm_token_type_ids``, must be
+    returned from the model's pre-embed call when later attention needs it.
+    """
+    mm_token_type_ids = torch.tensor([[1, 1, 0, 0]])
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "mm_token_type_ids": mm_token_type_ids,
+        "labels": torch.tensor([[1, 2, 3, 4]]),
+    }
+    out = _train_cp_prepare(_SpyVLM(prepared={"inputs_embeds": torch.zeros(1, 4, 8)}), dict(batch))
+    assert "mm_token_type_ids" not in out
+
+    prepared = {"inputs_embeds": torch.zeros(1, 4, 8), "mm_token_type_ids": mm_token_type_ids}
+    out = _train_cp_prepare(_SpyVLM(prepared=prepared), dict(batch))
+    assert torch.equal(out["mm_token_type_ids"], mm_token_type_ids)
 
 
 def test_train_cp_prepare_pp_first_stage_preembeds_inputs():
@@ -439,11 +463,24 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
         ),
     )
 
-    def _build_dataloader(*args, **kwargs):
+    def _build_dataloader(**kwargs):
         dataloader_calls.append(kwargs)
-        return "dl", "processor"
+        return SimpleNamespace(dataloader="dl", processor="processor")
 
-    monkeypatch.setattr(vlm_finetune, "build_dataloader", _build_dataloader)
+    loader_config = SimpleNamespace(
+        packing=None,
+        resolve_packing_attn_implementation=lambda **kwargs: None,
+        build=_build_dataloader,
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.vlm_dataloader",
+        property(lambda self: loader_config),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.vlm_validation_dataloader",
+        property(lambda self: None),
+    )
+    monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
         "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
         lambda self, *args, **kwargs: SimpleNamespace(step=0, epoch=0, epochs=[]),
@@ -515,21 +552,35 @@ def test_setup_skips_pp_media_prechunk_when_cp_preembeds_vlm_inputs(
 # -----------------------------------------------------------------------------
 
 
-def test_val_does_not_pop_labels_before_make_cp_batch_and_ctx():
-    """Reproduce the bug fix at finetune.py:1239 — val must compute
-    ``num_label_tokens`` from ``batch["labels"]`` WITHOUT popping the labels,
-    because ``make_cp_batch_and_ctx`` registers labels as a CP buffer."""
+class _ShardLabelsOnEnter:
+    def __init__(self, labels, local_labels):
+        self.labels = labels
+        self.local_labels = local_labels
+
+    def __enter__(self):
+        self.labels.resize_(self.local_labels.shape)
+        self.labels.copy_(self.local_labels)
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def test_val_counts_label_tokens_inside_cp_context_after_labels_are_sharded():
+    """Validation must count label tokens after CP has exposed the local shard."""
     labels = torch.tensor([[1, 2, -100, 4]])
-    batch = {
-        "input_ids": torch.tensor([[1, 2, 3, 4]]),
-        "labels": labels,
-    }
-    # The recipe-side line under test:
-    num_label_tokens = (batch["labels"] != -100).sum().item()
-    assert num_label_tokens == 3
-    # labels must STILL be in batch (not popped) so cp_utils can read it
-    assert "labels" in batch
-    assert batch["labels"] is labels
+    batch = {"labels": labels}
+    local_labels = torch.tensor([[1, -100]])
+
+    def train_ctx():
+        return _ShardLabelsOnEnter(labels, local_labels)
+
+    labels = batch.pop("labels")
+    pre_context_count = (labels != -100).sum().item()
+    with train_ctx():
+        local_num_label_tokens = (labels != -100).sum().item()
+
+    assert pre_context_count == 3
+    assert local_num_label_tokens == 1
 
 
 def test_val_pos_ids_uses_dist_env_device_not_model_device():
@@ -607,4 +658,56 @@ def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
     assert loss_call[1] is True, "total_loss must include CP ranks"
     assert tokens_call[1] is False, "total_tokens must NOT be summed over CP ranks"
     # val_loss = (2.0 * 3 tokens) / 3 tokens == 2.0
+    assert result.metrics["val_loss"] == pytest.approx(2.0)
+
+
+def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
+    """With CP active and a model exposing prepare_model_inputs_for_cp, the
+    validation loop must run the model's _pre_embed_only pass before sharding.
+    Guards finetune.py:_run_validation_epoch CP pre-embed branch."""
+    from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
+
+    monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(vlm_finetune, "make_cp_batch_and_ctx", lambda mesh, batch: (nullcontext, batch))
+    monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
+    monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
+
+    pre_embed_calls = []
+
+    class _Model(torch.nn.Module):
+        def eval(self):
+            return self
+
+        def prepare_model_inputs_for_cp(self, **kwargs):  # marker presence matters
+            return {"inputs_embeds": torch.zeros(1, 4, 8)}
+
+        def forward(self, _pre_embed_only=False, **batch):
+            if _pre_embed_only:
+                pre_embed_calls.append(set(batch))
+                return self.prepare_model_inputs_for_cp(**batch)
+            return SimpleNamespace(logits=torch.zeros(1, 4, 8), hidden_states=None)
+
+    class _DM(dict):
+        mesh_dim_names = ["cp"]
+
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.model_parts = [_Model()]
+    recipe.loss_fn = object()
+    recipe.device_mesh = _DM(cp=SimpleNamespace(size=lambda: 2))
+    recipe.pp_enabled = False
+    recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
+    recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
+    recipe.optimizer = [SimpleNamespace(param_groups=[{"lr": 0.001}])]
+    recipe._maybe_add_drafter_loss = lambda *, out, base_loss, labels, model, num_label_tokens: base_loss
+    recipe._dp_allreduce = lambda tensor, include_cp=False: tensor
+
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "pixel_values": torch.randn(1, 3, 8, 8),
+        "labels": torch.tensor([[1, 2, -100, 4]]),
+    }
+
+    result = recipe._run_validation_epoch([batch])
+
+    assert pre_embed_calls, "the _pre_embed_only pass must run when CP is active"
     assert result.metrics["val_loss"] == pytest.approx(2.0)

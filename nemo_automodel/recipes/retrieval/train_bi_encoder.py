@@ -17,16 +17,18 @@ from __future__ import annotations
 import logging
 import pathlib
 import time
+from collections import deque
 from contextlib import nullcontext
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 import wandb
-from torch.utils.data import IterableDataset
-from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed.config import DDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -35,6 +37,7 @@ from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_mes
 from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+from nemo_automodel.components.utils.compile_utils import build_compile_config
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
@@ -45,7 +48,32 @@ logger = logging.getLogger(__name__)
 
 def _uses_multi_vector_scoring(model) -> bool:
     """Return whether the model emits token-level embeddings for MaxSim scoring."""
+    model = _unwrap_model_for_attrs(model)
     return getattr(model, "pooling", None) in {"colbert", "multi_vector"}
+
+
+def _unwrap_model_for_attrs(model):
+    """Return the underlying model object for configuration-style attribute reads."""
+    return getattr(model, "module", model)
+
+
+def _get_autocast_ctx(distributed_config):
+    """Return the optional recipe-level autocast context."""
+    autocast_dtype = getattr(distributed_config, "autocast_dtype", None)
+    if autocast_dtype is None or not torch.cuda.is_available():
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=autocast_dtype)
+
+
+def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
+    """Return infrastructure kwargs forwarded to model instantiation."""
+    kwargs = {
+        "distributed_setup": distributed_setup,
+        "peft_config": peft_config,
+    }
+    if cfg.get("compile", None) is not None:
+        kwargs["compile_config"] = build_compile_config(cfg.compile)
+    return kwargs
 
 
 def contrastive_scores_and_labels(
@@ -150,44 +178,6 @@ def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
     return query_batch_dict, doc_batch_dict
 
 
-def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_world_size=1):
-    """Build a DataLoader for encoder training."""
-    with ScopedRNG(seed=seed, ranked=True):
-        with FirstRankPerNode():
-            dataset = cfg_dl.dataset.instantiate()
-
-        collate_fn = None
-        if hasattr(cfg_dl, "collate_fn") and hasattr(cfg_dl.collate_fn, "_target_"):
-            collate_fn = cfg_dl.collate_fn.instantiate(tokenizer=tokenizer)
-
-        if not isinstance(dataset, IterableDataset):
-            shuffle = cfg_dl.get("shuffle", True)
-            if "shuffle" in cfg_dl:
-                del cfg_dl.shuffle
-
-            dist_sampler_kwargs = {
-                "num_replicas": dp_world_size,
-                "rank": dp_rank,
-                "shuffle": shuffle,
-            }
-            sampler = StatefulDistributedSampler(
-                dataset,
-                seed=seed,
-                drop_last=True,
-                **dist_sampler_kwargs,
-            )
-            dl_kwargs = {"sampler": sampler, "batch_size": batch_size}
-        else:
-            logging.info("Using IterableDataset; skipping sampler.")
-            dl_kwargs = {"dataset": dataset, "batch_size": batch_size}
-
-        dl_kwargs["dataset"] = dataset
-        if collate_fn is not None:
-            dl_kwargs["collate_fn"] = collate_fn
-
-        return cfg_dl.instantiate(**dl_kwargs)
-
-
 class TrainBiEncoderRecipe(BaseRecipe):
     """Recipe for training encoder models with contrastive learning."""
 
@@ -195,6 +185,31 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
         self.temperature = self.cfg.get("temperature", 1.0)
+
+    def _build_optimizer_param_groups(self) -> list[dict[str, Any]]:
+        """Build optimizer parameter groups for trainable model parameters."""
+        model = self.model_parts[0]
+        decay_params = []
+        no_decay_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            name_l = name.lower()
+            if name.endswith(".bias") or ("norm" in name_l):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        assert decay_params or no_decay_params, "no trainable parameters found"
+
+        param_groups = []
+        if decay_params:
+            param_groups.append({"params": decay_params})
+        if no_decay_params:
+            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+
+        logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
+        return param_groups
 
     def setup(self):
         """Build all components needed for training/validation/logging/checkpointing."""
@@ -258,36 +273,17 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
 
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
+            kwargs = _get_model_instantiate_kwargs(self.cfg, self.distributed_setup, self.peft_config)
             model = self.cfg.model.instantiate(
-                distributed_setup=self.distributed_setup,
-                peft_config=self.peft_config,
+                **kwargs,
             )
 
         self.model_parts = [model]
         self.pp = None
 
-        # Apply weight decay only to non-bias/non-norm params
-        decay_params = []
-        no_decay_params = []
-        for name, param in self.model_parts[0].named_parameters():
-            if not param.requires_grad:
-                continue
-            name_l = name.lower()
-            if name.endswith(".bias") or ("norm" in name_l):
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-
-        assert decay_params or no_decay_params, "no trainable parameters found"
-
-        param_groups = []
-        if decay_params:
-            param_groups.append({"params": decay_params})
-        if no_decay_params:
-            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
-
-        logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
-        self.optimizer = [self.cfg.get("optimizer").instantiate(params=param_groups)]
+        param_groups = self._build_optimizer_param_groups()
+        optimizer = self.cfg.optimizer.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
+        self.optimizer = [optimizer]
         warn_if_torch_adam_with_bf16_params(
             optimizer=self.optimizer,
             is_peft=self.peft_config is not None,
@@ -295,35 +291,36 @@ class TrainBiEncoderRecipe(BaseRecipe):
             logger=logger,
         )
 
+        # Might be tokenizer or processor (for VLMs)
         self.tokenizer = self.cfg.tokenizer.instantiate()
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            self.tokenizer.padding_side = "left"
+        tokenizer = self.tokenizer.tokenizer if isinstance(self.tokenizer, ProcessorMixin) else self.tokenizer
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = self.tokenizer.eos_token
+            tokenizer.padding_side = "left"
 
-        self.dataloader = build_dataloader(
-            self.cfg.dataloader,
-            self.tokenizer,
-            seed=self.cfg.get("seed", 42),
-            batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-            dp_rank=self._get_dp_rank(),
-            dp_world_size=self._get_dp_group_size(),
-        )
-        self.train_n_passages = self.cfg.get("dataloader.dataset.n_passages", 1)
+        dataloader_config = self.cfg.dataloader
+        if dataloader_config is None:
+            raise ValueError("Retrieval training requires a top-level dataset config")
+
+        def materialize_loader(config):
+            build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
+            with ScopedRNG(seed=config.seed, ranked=True):
+                return config.build(
+                    tokenizer=self.tokenizer,
+                    dataset_build_context=build_context,
+                    dp_rank=self._get_dp_rank(),
+                    dp_world_size=self._get_dp_group_size(),
+                )
+
+        self.dataloader = materialize_loader(dataloader_config)
+        self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
 
         self.val_dataloader = None
-        if "validation_dataloader" in self.cfg:
-            val_batch_size = self.cfg.get(
-                "validation_dataloader.batch_size", self.cfg.get("step_scheduler.local_batch_size", 1)
-            )
-            self.val_dataloader = build_dataloader(
-                self.cfg.validation_dataloader,
-                self.tokenizer,
-                seed=self.cfg.get("seed", 42),
-                batch_size=val_batch_size,
-                dp_rank=self._get_dp_rank(),
-                dp_world_size=self._get_dp_group_size(),
-            )
-            self.val_n_passages = self.cfg.get("validation_dataloader.dataset.n_passages", self.train_n_passages)
+        validation_configs = self.cfg.validation_dataloaders
+        if validation_configs:
+            validation_config = next(iter(validation_configs.values()))
+            self.val_dataloader = materialize_loader(validation_config)
+            self.val_n_passages = getattr(validation_config.dataset_config, "n_passages", self.train_n_passages)
 
         self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
@@ -345,6 +342,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.metric_logger_valid = build_metric_logger(
             pathlib.Path(self.checkpointer.config.checkpoint_dir) / "validation.jsonl"
         )
+        self.loss_average_window = deque(maxlen=self.step_scheduler.loss_average_window_steps)
 
         restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.load_checkpoint(restore_from)
@@ -403,7 +401,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         query, passage = _unpack_qp(batch)
 
         model = self.model_parts[0]
-        train_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
+        train_ctx = _get_autocast_ctx(self.distributed_config)
         sync_ctx = (
             get_sync_ctx(
                 model,
@@ -415,12 +413,18 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
 
         with train_ctx, sync_ctx:
+            if is_train:
+                if query is not None:
+                    query["run_dummy_vision"] = False
+                if passage is not None:
+                    passage["run_dummy_vision"] = True
             q_reps = model(query)
             p_reps = model(passage)
+            attr_model = _unwrap_model_for_attrs(model)
 
             n_passages = self.train_n_passages
             use_multi_vector_scoring = _uses_multi_vector_scoring(model)
-            if is_train and getattr(model, "do_distributed_inbatch_negative", False):
+            if is_train and getattr(attr_model, "do_distributed_inbatch_negative", False):
                 from nemo_automodel.components.models.common.inbatch_neg_utils import (
                     dist_gather_tensor,
                     dist_gather_tensor_with_dim1_padding,
@@ -431,7 +435,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                 dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
                 rank = torch.distributed.get_rank() if dist_initialized else 0
                 world_size = torch.distributed.get_world_size() if dist_initialized else 1
-                preserve_gather_grad = not getattr(model, "detach_distributed_inbatch_negatives", True)
+                preserve_gather_grad = not getattr(attr_model, "detach_distributed_inbatch_negatives", True)
 
                 if use_multi_vector_scoring:
                     all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
@@ -455,7 +459,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     )
                     scores = torch.mm(q_reps, all_p.t())
                     labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
-                if model.l2_normalize:
+                if attr_model.l2_normalize:
                     scores = scores / self.temperature
                 passage_doc_ids = batch.get("passage_doc_ids")
                 if passage_doc_ids is not None:
@@ -477,7 +481,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     )
                 else:
                     scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
-                if model.l2_normalize:
+                if attr_model.l2_normalize:
                     scores = scores / self.temperature
             loss = F.cross_entropy(scores, labels)
 
@@ -507,6 +511,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
             foreach=True,
             num_label_tokens=None,  # Not applicable for encoder
             dp_group_size=self._get_dp_group_size(include_cp=True),
+            use_torch_clip_grad_norm=isinstance(self.distributed_config, DDPConfig),
         )
 
         self.checkpointer.maybe_wait_for_staging()
@@ -525,12 +530,15 @@ class TrainBiEncoderRecipe(BaseRecipe):
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
             reporting_loss = reporting_loss / self._get_dp_group_size(include_cp=True)
         reporting_loss = reporting_loss.cpu().item()
+        self.loss_average_window.append(reporting_loss)
+        average_loss = sum(self.loss_average_window) / len(self.loss_average_window)
         elapsed = time.perf_counter() - self.timestamp
         self.timestamp = time.perf_counter()
         mem_allocated = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
 
         metrics = {
             "loss": reporting_loss,
+            "loss_avg_window": average_loss,
             "grad_norm": grad_norm,
             "lr": lr,
             "mem": mem_allocated,
@@ -542,6 +550,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
             epoch=self.step_scheduler.epoch,
             metrics=metrics,
         )
+
+    def _extract_scoring_reps(self, model_output):
+        """Return the embedding tensor used for validation scoring from a forward output.
+
+        The base bi-encoder forward returns an embedding tensor directly. Subclasses whose
+        forward returns a richer structure (e.g. the distillation student, which returns
+        ``(pooled, projected, intermediate_outputs)``) should override this to select the
+        tensor to score with.
+        """
+        return model_output
 
     def _run_validation_epoch(self, val_dataloader):
         """Run validation for one epoch and compute loss, accuracy@1, and MRR."""
@@ -561,8 +579,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     query, passage = _unpack_qp(batch)
 
                     model = self.model_parts[0]
-                    q_reps = model(query)
-                    p_reps = model(passage)
+                    q_reps = self._extract_scoring_reps(model(query))
+                    p_reps = self._extract_scoring_reps(model(passage))
 
                     if _uses_multi_vector_scoring(model):
                         scores, labels = maxsim_scores_and_labels(
@@ -573,7 +591,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         )
                     else:
                         scores, labels = contrastive_scores_and_labels(q_reps, p_reps, self.val_n_passages)
-                    if model.l2_normalize:
+                    attr_model = _unwrap_model_for_attrs(model)
+                    if attr_model.l2_normalize:
                         scores = scores / self.temperature
                     loss = F.cross_entropy(scores, labels)
 
@@ -633,10 +652,11 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.metric_logger_train.log(log_data)
 
         logging.info(
-            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s".format(
+            "step {} | epoch {} | loss {:.4f} | loss_avg_window {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | time {:.2f}s".format(
                 log_data.step,
                 log_data.epoch,
                 log_data.metrics["loss"],
+                log_data.metrics["loss_avg_window"],
                 log_data.metrics["grad_norm"],
                 log_data.metrics["lr"],
                 log_data.metrics["mem"],

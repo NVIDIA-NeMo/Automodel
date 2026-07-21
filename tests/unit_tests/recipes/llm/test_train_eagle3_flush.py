@@ -259,3 +259,47 @@ def test_logging_path_is_exercised(tmp_path):
     recipe = _build_recipe(tmp_path, num_samples=4, grad_accum=2, log_every=1)
     recipe.run_train_validation_loop()
     assert recipe.runtime.global_step == 2
+
+
+# ---------------------------------------------------------------------------
+# Progress bar: one update per optimizer step, postfix at log points, closed
+# ---------------------------------------------------------------------------
+
+
+class _FakeProgressBar:
+    def __init__(self):
+        self.n = 0
+        self.postfix = None
+        self.closed = False
+
+    def update(self, count=1):
+        self.n += count
+
+    def set_postfix(self, **kwargs):
+        self.postfix = kwargs
+
+    def close(self):
+        self.closed = True
+
+
+def test_progress_bar_advances_per_optim_step(tmp_path, monkeypatch):
+    fake = _FakeProgressBar()
+    monkeypatch.setattr(TrainEagle3Recipe, "_make_progress_bar", lambda self, **kwargs: fake)
+    # 5 samples / accum 3 -> one full window + one trailing flush = 2 steps.
+    recipe = _build_recipe(tmp_path, num_samples=5, grad_accum=3, log_every=1)
+    recipe.run_train_validation_loop()
+    assert fake.n == recipe.runtime.global_step == 2
+    assert fake.closed
+    assert set(fake.postfix) == {"loss", "acc", "lr"}
+
+
+def test_epoch_save_final_flag_only_on_last_epoch(tmp_path):
+    """With ``save_checkpoint_every_epoch`` over multiple epochs, only the last
+    epoch's save is the run's final checkpoint -- ``save_consolidated: final``
+    keys its HF safetensors export off that flag."""
+    recipe = _build_recipe(tmp_path, num_samples=4, grad_accum=2, num_epochs=2)
+    recipe.save_checkpoint_every_epoch = True
+    saves = []
+    recipe.save_checkpoint = lambda **kw: saves.append((kw["epoch"], kw["is_final_checkpoint"]))
+    recipe.run_train_validation_loop()
+    assert saves == [(1, False), (2, True)]

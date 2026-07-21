@@ -111,6 +111,7 @@ optimizer:
   weight_decay: 0.0
 
 wandb:
+  enable: false
   project: huiyingl_workspace
   entity: Nemo-automodel
   name: mistral4-medpix
@@ -119,3 +120,13 @@ ci:
   recipe_owner: akoumpa
   nodes: 4
   time: "00:30:00"
+  checkpoint_robustness:
+    # PP=4 with pp_microbatch_size=1 requires at least four pipeline microbatches.
+    step_scheduler.local_batch_size: 4
+    check_source_load_parity: true
+    hf_device_map_auto: true
+    # Transformers' load-time dequantization leaves Mistral4 expert weights in
+    # FP8, while native forward requires an optional kernel absent from CI.
+    # Preserve the native layout while loading, then dequantize before forward.
+    hf_source_post_load_dequantize: true
+    tokenizer_name: mistralai/Mistral-Small-4-119B-2603

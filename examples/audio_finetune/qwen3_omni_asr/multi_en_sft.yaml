@@ -55,8 +55,8 @@ model:
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: te
-    enable_deepep: true
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -64,7 +64,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: result/checkpoints/qwen3_omni_asr_multi_en
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
@@ -126,6 +126,7 @@ optimizer:
   weight_decay: 0.0
 
 wandb:
+  enable: false
   project: ${oc.env:WANDB_PROJECT,qwen3-omni-asr-multi-en}
   name: ${oc.env:WANDB_NAME,qwen3_omni_asr_multi_en_fullft}
   dir: ${oc.env:WANDB_DIR,result/wandb}

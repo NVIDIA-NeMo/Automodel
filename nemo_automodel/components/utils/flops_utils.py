@@ -574,6 +574,55 @@ def _nemotronh_moe_layer_flops(config, gbs, seq_len):
     return routed_expert_flops + shared_expert_flops + gate_flops + latent_proj_flops
 
 
+def _nemotronh_mtp_flops(config, gbs, seq_len, num_mtp_layers, mtp_block_types, use_repeated_layer):
+    """Model FLOPs for the Multi-Token-Prediction (MTP) head of Nemotron-3 Super/Ultra.
+
+    The head predicts ``num_mtp_layers`` (N) additional tokens. Each of the N depths runs
+    the MTP block pattern once, plus a depth-fusion projection (``eh_proj``: cat[enorm(embed),
+    hnorm(hidden)] of size 2*hidden -> hidden) and a vocab projection (weight-tied lm_head).
+
+    Repeated layer: when ``use_repeated_layer`` is True the model builds a SINGLE physical
+    depth (``mtp_block_types`` lists its sublayers) and reuses it across all N depths -- but
+    it still EXECUTES once per depth, so the block compute is N x the physical sublayers.
+    That N x is the repeated layer's FLOPs. When False, ``mtp_block_types`` already spans all
+    N physical depths, so the block runs once.
+
+    These settings are NOT fully recoverable from the HF config (it retains only the physical
+    depth count and omits the block pattern), so callers pass the effective values read from
+    the built model: ``num_mtp_layers = model.mtp_config.num_layers`` and
+    ``mtp_block_types = [s.block_type for s in model.mtp.layers]``.
+
+    Args:
+        num_mtp_layers: effective MTP depths actually run (model.mtp_config.num_layers).
+        mtp_block_types: block types ("mamba"/"attention"/"mlp"/"moe") of the physical MTP
+            sublayers (model.mtp.layers).
+        use_repeated_layer: True if the physical depth is reused across the N depths.
+    """
+    if not num_mtp_layers or not mtp_block_types:
+        return 0
+
+    hs = config.hidden_size
+    vocab_size = config.vocab_size
+    num_tokens = gbs * seq_len
+
+    per_block_fn = {
+        "mamba": _mamba_layer_flops,
+        "attention": _non_mla_attn_layer_flops,
+        "mlp": _nemotronh_mlp_layer_flops,
+        "moe": _nemotronh_moe_layer_flops,
+    }
+    physical_block_flops = sum(per_block_fn[bt](config, gbs, seq_len) for bt in mtp_block_types if bt in per_block_fn)
+    # Repeated: physical sublayers execute once per depth -> N x. Non-repeated: mtp_block_types
+    # already spans all N depths, so the listed blocks run once.
+    block_flops = physical_block_flops * (num_mtp_layers if use_repeated_layer else 1)
+
+    # Per-depth depth-fusion (eh_proj: 2H -> H) and weight-tied vocab projection (lm_head).
+    eh_proj_flops = num_mtp_layers * 6 * num_tokens * (2 * hs) * hs
+    lm_head_flops = num_mtp_layers * 6 * num_tokens * hs * vocab_size
+
+    return block_flops + eh_proj_flops + lm_head_flops
+
+
 def _non_mla_attn_layer_flops(config, gbs, seq_len):
     """Model FLOPs for attention layer"""
     hs = config.hidden_size
@@ -788,7 +837,9 @@ def gpt_oss_flops(config, gbs=1, seq_len=None):
         config.moe_ffn_hidden_size if hasattr(config, "moe_ffn_hidden_size") else config.intermediate_size
     )
     moe_router_topk = config.num_experts_per_tok
-    kv_channels = config.kv_channels if hasattr(config, "kv_channels") else (hidden_size // num_attention_heads)
+    kv_channels = getattr(config, "head_dim", None)
+    if kv_channels is None:
+        kv_channels = getattr(config, "kv_channels", hidden_size // num_attention_heads)
     swa_window_size = config.window_size[0] if hasattr(config, "window_size") and config.window_size else 128
     window_attn_skip_freq = config.window_attn_skip_freq if hasattr(config, "window_attn_skip_freq") else 2
 

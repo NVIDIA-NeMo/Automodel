@@ -198,12 +198,24 @@ class LoRASwiGLUMLPFunction(torch.autograd.Function):
             d_x = torch.addmm(d_e @ gW, d_R, gA)
             d_x = d_x.addmm_(d_g, uW).addmm_(d_Q, uA).view(ctx.orig_shape)
 
+        # Each returned gradient must live on the same device as its corresponding input. Under
+        # pipeline-parallel graph construction torch tracks the LoRA parameters on the meta device
+        # while the activations (and the grads computed from them) are on cuda, so it rejected the
+        # cuda grads ("invalid gradient ... expected device meta but got cuda"). Move each LoRA grad
+        # onto its parameter's device: a no-op in normal single-device training, and correct in the
+        # PP/meta graph pass (the real gradients still flow on the cuda execution passes).
+        d_gA, d_gB = d_gA.to(gA.device), d_gB.to(gB.device)
+        d_uA, d_uB = d_uA.to(uA.device), d_uB.to(uB.device)
+        d_dA, d_dB = d_dA.to(dA.device), d_dB.to(dB.device)
+        if d_x is not None:
+            d_x = d_x.to(x.device)
+
         # order matches forward(x, gW, gA, gB, gS, uW, uA, uB, uS, dW, dA, dB, dS)
         return (d_x, None, d_gA, d_gB, None, None, d_uA, d_uB, None, None, d_dA, d_dB, None)
 
 
 def _fusible(module) -> bool:
-    """A LoRA linear is fusible when it is a plain (non-DoRA, dropout-free, non-DTensor) adapter."""
+    """A LoRA linear is fusible when it is a plain materialized adapter."""
     lora_A = getattr(module, "lora_A", None)
     lora_B = getattr(module, "lora_B", None)
     if lora_A is None or lora_B is None:
@@ -212,8 +224,22 @@ def _fusible(module) -> bool:
         return False
     if getattr(module, "dropout_p", 0.0) and module.training:
         return False
-    for w in (module.weight, lora_A.weight, lora_B.weight):
+    # QLoRA / quantized base weights are stored as packed buffers (e.g. bitsandbytes 4-bit
+    # carries a ``quant_state`` and a flattened weight shaped like ``(1, out*in/2)`` rather than
+    # a 2D ``(out_features, in_features)`` matrix). The fused path calls ``F.linear(x, base_weight)``
+    # directly, which fails for a packed buffer ("mat1 and mat2 shapes cannot be multiplied"); bail
+    # so the per-linear ``LinearLoRA.forward`` path (which dequantizes the base) handles it instead.
+    base_w = module.weight
+    if getattr(base_w, "quant_state", None) is not None or getattr(module, "quant_state", None) is not None:
+        return False
+    out_features = getattr(module, "out_features", None)
+    in_features = getattr(module, "in_features", None)
+    if out_features is not None and in_features is not None and tuple(base_w.shape) != (out_features, in_features):
+        return False
+    for w in (base_w, lora_A.weight, lora_B.weight):
         if isinstance(w, DTensor):
+            return False
+        if getattr(w, "is_meta", False):
             return False
     return True
 
@@ -305,6 +331,14 @@ class LoRAReLU2MLPFunction(torch.autograd.Function):
         if needs_x:
             d_x = torch.addmm(d_e @ uW, d_Q, uA).view(ctx.orig_shape)
 
+        # See LoRASwiGLUMLPFunction.backward: return each LoRA grad on its parameter's device so the
+        # pipeline-parallel meta graph pass (params on meta, activations on cuda) doesn't reject the
+        # cuda grads. No-op in normal single-device training.
+        d_uA, d_uB = d_uA.to(uA.device), d_uB.to(uB.device)
+        d_dA, d_dB = d_dA.to(dA.device), d_dB.to(dB.device)
+        if d_x is not None:
+            d_x = d_x.to(x.device)
+
         # order matches forward(x, uW, uA, uB, uS, dW, dA, dB, dS)
         return (d_x, None, d_uA, d_uB, None, None, d_dA, d_dB, None)
 
@@ -378,8 +412,8 @@ def _is_relu2_mlp(module) -> bool:
     return getattr(module, "activation", None) == "relu2"
 
 
-def _projs_are_lora(module, projs) -> bool:
-    return all(getattr(getattr(module, proj), "lora_A", None) is not None for proj in projs)
+def _projs_are_fusible(module, projs) -> bool:
+    return all(_fusible(getattr(module, proj)) for proj in projs)
 
 
 def _swiglu_forward(mod, orig_forward):
@@ -403,11 +437,12 @@ def install_fused_lora_mlp(model) -> int:
 
     Intended to be called by the LoRA matcher after the projections have been patched to
     ``LinearLoRA``. Handles SiLU-SwiGLU MLPs (gate/up/down) via :func:`fused_lora_swiglu_mlp` and
-    non-gated ReLU² MLPs (up/down) via :func:`fused_lora_relu2_mlp`. The installed ``forward`` falls
-    back to the module's original per-linear ``forward`` whenever fusion does not apply at runtime —
-    notably once the projections become ``DTensor`` under tensor/expert parallelism, or for DoRA /
-    active dropout. This keeps the fused memory win on single-GPU and pure-DP while staying correct
-    (and identical to the unfused path) under sharding.
+    non-gated ReLU² MLPs (up/down) via :func:`fused_lora_relu2_mlp`. A wrapper is installed only when
+    the projections are fusible and materialized at install time. The installed ``forward`` still
+    falls back to the module's original per-linear ``forward`` whenever fusion stops applying at
+    runtime, for example once projections become ``DTensor`` under tensor/expert parallelism, or for
+    DoRA / active dropout. This keeps the fused memory win on single-GPU and pure-DP while staying
+    correct (and identical to the unfused path) under sharding and PP/meta construction.
 
     Returns the number of MLP modules whose ``forward`` was swapped. Idempotent.
     """
@@ -415,9 +450,9 @@ def install_fused_lora_mlp(model) -> int:
     for mlp in model.modules():
         if getattr(mlp, "_lora_mlp_fused", False):
             continue
-        if _is_silu_swiglu_mlp(mlp) and _projs_are_lora(mlp, ("gate_proj", "up_proj", "down_proj")):
+        if _is_silu_swiglu_mlp(mlp) and _projs_are_fusible(mlp, ("gate_proj", "up_proj", "down_proj")):
             mlp.forward = _swiglu_forward(mlp, mlp.forward)
-        elif _is_relu2_mlp(mlp) and _projs_are_lora(mlp, ("up_proj", "down_proj")):
+        elif _is_relu2_mlp(mlp) and _projs_are_fusible(mlp, ("up_proj", "down_proj")):
             mlp.forward = _relu2_forward(mlp, mlp.forward)
         else:
             continue

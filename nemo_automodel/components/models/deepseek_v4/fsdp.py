@@ -38,6 +38,10 @@ _DSV4_FP32_MODULE_SUFFIXES = (
     "self_attn.compressor.indexer.ape_param",
 )
 
+_DSV4_RETURNED_FP32_PARAMETER_CLASS_NAMES = {
+    "DeepseekV4FP32Parameter",
+}
+
 
 def _hca_param_sync_group_from_1d_mesh(mesh):
     """Return the 1D PyTorch FSDP2 group used for HCA graph alignment.
@@ -167,6 +171,20 @@ def _iter_dsv4_fp32_modules(module: nn.Module):
         yield submodule
 
 
+def _fp32_module_fsdp_kwargs(module: nn.Module, fsdp_kwargs: dict) -> dict:
+    if module.__class__.__name__ not in _DSV4_RETURNED_FP32_PARAMETER_CLASS_NAMES:
+        return fsdp_kwargs
+
+    # These holders return their raw parameter tensor to the parent module. If
+    # FSDP2 reshards immediately after the holder's tiny forward, the parent can
+    # observe a zero-storage tensor while still inside its own forward/autograd.
+    if fsdp_kwargs.get("reshard_after_forward") is False:
+        return fsdp_kwargs
+    holder_kwargs = dict(fsdp_kwargs)
+    holder_kwargs["reshard_after_forward"] = False
+    return holder_kwargs
+
+
 def _attach_hca_param_sync_group(module: nn.Module, mesh) -> None:
     process_group = _hca_param_sync_group_from_1d_mesh(mesh)
     for submodule in module.modules():
@@ -190,6 +208,7 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
         _attach_hca_param_sync_group(module, mesh)
 
     if _floating_param_dtypes(module) == {torch.float32}:
+        fsdp_kwargs = _fp32_module_fsdp_kwargs(module, fsdp_kwargs)
         return _fully_shard_once(
             module,
             mesh=mesh,
@@ -216,7 +235,7 @@ def fully_shard_deepseek_v4(module: nn.Module, mesh, mp_policy, offload_policy=N
             mp_policy=mp_policy,
             offload_policy=offload_policy,
             fp32_policy=True,
-            **fsdp_kwargs,
+            **_fp32_module_fsdp_kwargs(fp32_module, fsdp_kwargs),
         )
 
     ignored_params = set(fsdp_kwargs.get("ignored_params") or ())

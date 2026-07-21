@@ -311,12 +311,21 @@ def _import_parallelizer_with_stubs(monkeypatch):
 
     mesh_utils_stub = types.ModuleType("nemo_automodel.components.distributed.mesh_utils")
     mesh_utils_stub.get_submesh = lambda mesh, axis_names: mesh[axis_names]
+    mesh_utils_stub.get_fsdp_dp_mesh = lambda mesh, *_axis_names: mesh[("dp_replicate", "dp_shard_cp")]
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.mesh_utils", mesh_utils_stub)
 
     # Stub dtype_from_str utility
     shared_utils_stub = types.ModuleType("nemo_automodel.shared.utils")
     shared_utils_stub.dtype_from_str = lambda val, default=None: default
     monkeypatch.setitem(sys.modules, "nemo_automodel.shared.utils", shared_utils_stub)
+
+    parallel_styles_stub = types.ModuleType("nemo_automodel.components.distributed.parallel_styles")
+    parallel_styles_stub.translate_to_lora = lambda style: style
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.parallel_styles",
+        parallel_styles_stub,
+    )
 
     return importlib.import_module("nemo_automodel.components.moe.parallelizer")
 
@@ -462,6 +471,30 @@ def test_apply_ep_parallelizes_moe_experts(monkeypatch):
     assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
 
 
+def test_apply_ep_parallelizes_diffusion_style_block_moe(monkeypatch):
+    """Diffusion Gemma exposes the MoE branch as block.moe, not block.mlp."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    parallelize_module_mock = MagicMock()
+    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+
+    class DiffusionBlock:
+        def __init__(self):
+            self.moe = DummyMoE()
+
+    block = DiffusionBlock()
+    model = type("Outer", (), {"model": DummyModel([block])})()
+    ep_mesh = type("Mesh", (), {"size": lambda self: 2})()
+
+    P.apply_ep(model, ep_mesh)
+
+    assert parallelize_module_mock.call_count == 1
+    _, kwargs = parallelize_module_mock.call_args
+    assert kwargs["module"] is block.moe.experts
+    assert kwargs["device_mesh"] is ep_mesh
+    assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
+
+
 def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     wrapper_returns = [object(), object()]
@@ -498,7 +531,25 @@ def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     assert len(model.layers.registered) == 2
 
 
-def test_apply_ac_uses_block_local_checkpointing_when_available(monkeypatch):
+def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "ptd_checkpoint_wrapper", MagicMock(side_effect=lambda block, **kw: block))
+    monkeypatch.setattr(P, "create_selective_checkpoint_contexts", MagicMock(return_value="CTX"))
+    logger_mock = MagicMock()
+    monkeypatch.setattr(P, "logger", logger_mock)
+
+    # ignore_router=False under (non-selective) AC recomputes the router -> warn.
+    P.apply_ac(DummyModel([DummyBlock()]), ignore_router=False, hidden_size=7168, num_experts=256)
+    assert logger_mock.warning.call_count == 1
+    assert "ignore_router_for_ac" in logger_mock.warning.call_args[0][0]
+
+    # ignore_router=True (the default) saves the router output -> no warning.
+    logger_mock.reset_mock()
+    P.apply_ac(DummyModel([DummyBlock()]), ignore_router=True, hidden_size=7168, num_experts=256)
+    logger_mock.warning.assert_not_called()
+
+
+def test_apply_ac_uses_generic_wrapper_even_when_block_local_checkpointing_is_available(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
 
     class BlockWithLocalAC(DummyBlock):
@@ -511,14 +562,17 @@ def test_apply_ac_uses_block_local_checkpointing_when_available(monkeypatch):
 
     block = BlockWithLocalAC()
     model = DummyModel([block])
-    wrapper_mock = MagicMock()
+    wrapped = object()
+    wrapper_mock = MagicMock(return_value=wrapped)
     monkeypatch.setattr(P, "ptd_checkpoint_wrapper", wrapper_mock)
 
     P.apply_ac(model, ignore_router=True, hidden_size=7168, num_experts=256)
 
-    wrapper_mock.assert_not_called()
-    assert block.activation_checkpointing is True
-    assert model.layers.registered["0"] is block
+    wrapper_mock.assert_called_once()
+    assert wrapper_mock.call_args.kwargs["preserve_rng_state"] is True
+    assert callable(wrapper_mock.call_args.kwargs["context_fn"])
+    assert block.activation_checkpointing is False
+    assert model.layers.registered["0"] is wrapped
 
 
 def test_apply_ac_custom_policy_respects_hidden_and_expert_dims(monkeypatch):
@@ -593,6 +647,7 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
 
     fsdp_mesh = type("Mesh", (), {"size": lambda self: 2})()
     ep_shard_mesh = type("Mesh", (), {"size": lambda self: 2})()
+    offload_policy = object()
 
     P.apply_fsdp(
         model=model,
@@ -600,6 +655,7 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
         ep_enabled=True,
         ep_shard_enabled=True,
         ep_shard_mesh=ep_shard_mesh,
+        offload_policy=offload_policy,
     )
 
     # Experts should have a dedicated shard call
@@ -609,6 +665,7 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     _, experts_kwargs = experts_call
     assert experts_kwargs["mesh"] is ep_shard_mesh
     assert experts_kwargs["reshard_after_forward"] is False
+    assert experts_kwargs["offload_policy"] is offload_policy
     assert callable(experts_kwargs["shard_placement_fn"])  # lambda _: Shard(1)
 
     # Block should be sharded with ignored_params when ep_enabled
@@ -629,6 +686,145 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
 
     model_call = _find_call_by_first_arg(fully_shard_mock, model)
     assert model_call is not None and model_call[1]["mesh"] is fsdp_mesh
+
+
+def test_shard_fp32_param_holders_shards_each_holder(monkeypatch):
+    """``_shard_fp32_param_holders`` fully_shards each model-owned fp32 holder."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+
+    holder_param = object()
+
+    class Holder:
+        def parameters(self, recurse=False):
+            return iter([holder_param])
+
+    holder = Holder()
+    block = type(
+        "Block",
+        (),
+        {"named_modules": lambda self: iter([("", self), ("linear_attn._fp32_params", holder)])},
+    )()
+
+    mesh = object()
+    ignored = P._shard_fp32_param_holders(block, mesh, reshard_after_forward=False, offload_policy=None)
+
+    assert ignored == {holder_param}
+    holder_call = _find_call_by_first_arg(fully_shard_mock, holder)
+    assert holder_call is not None
+    _, kwargs = holder_call
+    assert kwargs["mesh"] is mesh
+    assert kwargs["reshard_after_forward"] is False
+
+
+def test_apply_fsdp_shards_model_owned_fp32_holders(monkeypatch):
+    """apply_fsdp shards each model-owned ``_fp32_params`` holder per block."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="FP32_MP"))
+
+    holder_param = object()
+
+    class Holder:
+        def parameters(self, recurse=False):
+            return iter([holder_param])
+
+    holder = Holder()
+
+    class BlockWithHolder:
+        def __init__(self):
+            self.mlp = DummyMoE()
+
+        def named_modules(self):
+            return iter([("", self), ("linear_attn._fp32_params", holder)])
+
+    block = BlockWithHolder()
+    model = DummyModel([block])
+    fsdp_mesh = object()
+    mp_policy = MagicMock()
+
+    P.apply_fsdp(
+        model=model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=False,
+        ep_shard_enabled=False,
+        ep_shard_mesh=None,
+        mp_policy=mp_policy,
+    )
+
+    # The holder is sharded as its own fp32 unit before the block-level shard.
+    holder_call = _find_call_by_first_arg(fully_shard_mock, holder)
+    assert holder_call is not None
+    _, holder_kwargs = holder_call
+    assert holder_kwargs["mesh"] is fsdp_mesh
+    assert holder_kwargs["mp_policy"] == "FP32_MP"
+
+    block_call = _find_call_by_first_arg(fully_shard_mock, block)
+    assert block_call is not None
+    assert holder_param in block_call[1]["ignored_params"]
+
+
+def test_apply_fsdp_skips_separate_wrapping_for_tied_embeddings(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    fully_shard_mock = MagicMock()
+    monkeypatch.setattr(P, "fully_shard", fully_shard_mock)
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    block = DummyBlock(mlp=DummyMoE())
+    shared_weight = object()
+    embed = types.SimpleNamespace(weight=shared_weight)
+    lm_head = types.SimpleNamespace(weight=shared_weight)
+    inner_model = DummyModel([block], embed_tokens=embed)
+    outer_model = types.SimpleNamespace(model=inner_model, lm_head=lm_head)
+    fsdp_mesh = object()
+
+    P.apply_fsdp(
+        model=outer_model,
+        fsdp_mesh=fsdp_mesh,
+        ep_enabled=True,
+        ep_shard_enabled=False,
+        ep_shard_mesh=None,
+        wrap_outer_model=True,
+    )
+
+    assert _find_call_by_first_arg(fully_shard_mock, embed) is None
+    assert _find_call_by_first_arg(fully_shard_mock, lm_head) is None
+    assert _find_call_by_first_arg(fully_shard_mock, inner_model) is None
+
+    outer_call = _find_call_by_first_arg(fully_shard_mock, outer_model)
+    assert outer_call is not None and outer_call[1]["mesh"] is fsdp_mesh
+
+
+def test_apply_fsdp_rejects_cross_root_tied_embeddings_without_outer_wrap(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+    monkeypatch.setattr(P, "fully_shard", MagicMock())
+    monkeypatch.setattr(P, "MixedPrecisionPolicy", MagicMock(return_value="MP_POLICY"))
+
+    shared_weight = object()
+    inner_model = DummyModel(
+        [DummyBlock(mlp=DummyMoE())],
+        embed_tokens=types.SimpleNamespace(weight=shared_weight),
+    )
+    outer_model = types.SimpleNamespace(
+        model=inner_model,
+        lm_head=types.SimpleNamespace(weight=shared_weight),
+    )
+
+    with pytest.raises(ValueError, match="wrap_outer_model=False"):
+        P.apply_fsdp(
+            model=outer_model,
+            fsdp_mesh=object(),
+            ep_enabled=True,
+            ep_shard_enabled=False,
+            wrap_outer_model=False,
+        )
 
 
 def test_apply_fsdp_without_ep_enabled_has_no_ignored_params(monkeypatch):
@@ -739,6 +935,33 @@ class FakeMoeMesh:
         return MeshView(self._sizes[key])
 
 
+def test_parallelize_model_uses_root_preserving_hsdp_mesh(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    mesh_utils = sys.modules["nemo_automodel.components.distributed.mesh_utils"]
+    hsdp_mesh = MeshView(16)
+    get_fsdp_dp_mesh_mock = MagicMock(return_value=hsdp_mesh)
+    monkeypatch.setattr(mesh_utils, "get_fsdp_dp_mesh", get_fsdp_dp_mesh_mock)
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+
+    world_mesh = FakeWorldMesh(
+        {("dp_replicate", "dp_shard_cp"): 16, "tp": 1},
+        mesh_dim_names=["dp_replicate", "dp_shard", "cp", "tp"],
+    )
+    model = type("Outer", (), {"moe_config": type("MoeConfig", (), {"n_routed_experts": 128})()})()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=None,
+        dp_axis_names=("dp_replicate", "dp_shard_cp"),
+        activation_checkpointing=False,
+    )
+
+    get_fsdp_dp_mesh_mock.assert_called_once_with(world_mesh, "dp_replicate", "dp_shard_cp")
+    assert apply_fsdp_mock.call_args.args[1] is hsdp_mesh
+
+
 def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     apply_ep_mock = MagicMock()
@@ -775,7 +998,9 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     )
     apply_ep_mock.assert_called_once()
     # AC enabled
-    apply_ac_mock.assert_called_once_with(model, ignore_router=False, selective=False)
+    apply_ac_mock.assert_called_once_with(
+        model, ignore_router=True, selective=False, activation_checkpointing_scope="all"
+    )
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args
     # handle positional or keyword invocations
@@ -792,7 +1017,36 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     assert ep_shard_mesh_arg.size() == 2
 
 
-def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypatch):
+def test_parallelize_model_accepts_top_level_moe_config(monkeypatch):
+    """Custom MoE models may expose moe_config on the outer model itself."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_ep_mock = MagicMock()
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_ep", apply_ep_mock)
+    monkeypatch.setattr(P, "apply_ac", MagicMock())
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+
+    world_mesh = FakeWorldMesh({"dp": 1, ("dp",): 1}, mesh_dim_names=["dp"])
+    moe_mesh = FakeMoeMesh({"ep": 2})
+    model = type("Outer", (), {"moe_config": type("MC", (), {"n_routed_experts": 4})()})()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=moe_mesh,
+        dp_axis_names=("dp",),
+        cp_axis_name=None,
+        tp_axis_name=None,
+        ep_axis_name="ep",
+        ep_shard_axis_names=None,
+        activation_checkpointing=False,
+    )
+
+    apply_ep_mock.assert_called_once()
+    apply_fsdp_mock.assert_not_called()
+
+
+def test_parallelize_model_rejects_missing_safe_tp_plan_and_invalid_ep_divisibility(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     world_mesh_bad_tp = FakeWorldMesh({"tp": 2, "cp": 1}, mesh_dim_names=["tp", "cp"])
     moe_mesh = FakeMoeMesh({"ep": 2})
@@ -807,8 +1061,9 @@ def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypa
 
     model = Outer()
 
-    # TP size != 1 -> assertion
-    with pytest.raises(AssertionError):
+    # TP requires a registered or explicit plan that passes MoE ownership validation.
+    monkeypatch.setattr(P, "_resolve_moe_tp_plan", MagicMock(side_effect=ValueError("No safe TP plan")))
+    with pytest.raises(ValueError, match="No safe TP plan"):
         P.parallelize_model(
             model=model,
             world_mesh=world_mesh_bad_tp,
@@ -835,6 +1090,191 @@ def test_parallelize_model_asserts_on_invalid_tp_cp_and_ep_divisibility(monkeypa
             ep_axis_name="ep",
             ep_shard_axis_names=None,
             activation_checkpointing=False,
+        )
+
+
+def test_validate_moe_tp_plan_allows_shared_experts_and_rejects_routed_experts(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    safe = {
+        "model.language_model.layers.*.mlp.shared_experts.gate_proj": object(),
+        "model.language_model.layers.*.mlp.shared_experts.down_proj": object(),
+        "lm_head": object(),
+    }
+    assert P._validate_moe_tp_plan(safe) is safe
+
+    for unsafe_path in (
+        "model.layers.*.mlp.experts",
+        "model.layers.*.mlp.experts.*.gate_proj",
+        "model.layers.*.mlp.gate_and_up_projs",
+        "model.layers.*.mlp.down_projs",
+        "model.layers.*.mlp.gate",
+        "model.layers.*.mlp.router",
+        "model.layers.*.mlp.shared_expert_gate",
+        "model.layers.*.mlp",
+    ):
+        with pytest.raises(ValueError, match="EP-owned"):
+            P._validate_moe_tp_plan({unsafe_path: object()})
+
+
+def test_validate_moe_tp_plan_expands_wildcards_and_rejects_zero_matches(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+
+    class ConcreteModel:
+        def named_modules(self):
+            for name in (
+                "",
+                "model.layers.0.mlp",
+                "model.layers.0.mlp.shared_experts",
+                "model.layers.0.mlp.shared_experts.gate_proj",
+                "model.layers.0.mlp.shared_expert_gate",
+                "lm_head",
+            ):
+                yield name, object()
+
+    model = ConcreteModel()
+    safe = {"model.layers.*.mlp.shared_experts.gate_proj": object(), "lm_head": object()}
+    assert P._validate_moe_tp_plan(safe, model=model) is safe
+
+    with pytest.raises(ValueError, match="EP-owned"):
+        P._validate_moe_tp_plan({"model.layers.*.mlp.shared_expert_*": object()}, model=model)
+    with pytest.raises(ValueError, match="must each match"):
+        P._validate_moe_tp_plan({"model.layers.*.does_not_exist": object()}, model=model)
+
+
+def test_resolve_moe_tp_plan_rejects_sequence_parallel_fail_closed(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    with pytest.raises(ValueError, match="sequence_parallel=True"):
+        P._resolve_moe_tp_plan(
+            object(),
+            sequence_parallel=True,
+            tp_shard_plan={"lm_head": object()},
+            tp_size=2,
+        )
+
+
+def test_resolve_moe_tp_plan_uses_registered_factory_without_dense_fallback(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    optimized_stub = types.ModuleType("nemo_automodel.components.distributed.optimized_tp_plans")
+    factory = MagicMock(return_value={"lm_head": object()})
+    optimized_stub.PARALLELIZE_FUNCTIONS = {"registered.Model": factory}
+    optimized_stub._get_class_qualname = lambda cls: "registered.Model"
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.optimized_tp_plans",
+        optimized_stub,
+    )
+
+    model = type("RegisteredMoe", (), {})()
+    plan = P._resolve_moe_tp_plan(
+        model,
+        sequence_parallel=False,
+        tp_shard_plan=None,
+        tp_size=2,
+    )
+
+    assert set(plan) == {"lm_head"}
+    factory.assert_called_once_with(model, False)
+
+
+def test_resolve_moe_tp_plan_propagates_registered_factory_failure(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    optimized_stub = types.ModuleType("nemo_automodel.components.distributed.optimized_tp_plans")
+
+    def broken_factory(model, sequence_parallel):
+        raise RuntimeError("architecture-specific plan failed")
+
+    optimized_stub.PARALLELIZE_FUNCTIONS = {"BrokenMoe": broken_factory}
+    optimized_stub._get_class_qualname = lambda cls: "not.registered"
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_automodel.components.distributed.optimized_tp_plans",
+        optimized_stub,
+    )
+
+    with pytest.raises(ValueError, match="architecture-specific plan failed"):
+        P._resolve_moe_tp_plan(
+            type("BrokenMoe", (), {})(),
+            sequence_parallel=False,
+            tp_shard_plan=None,
+            tp_size=2,
+        )
+
+
+def test_parallelize_model_applies_tp_before_cp_ep_ac_and_fsdp(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    calls = []
+    safe_plan = {"model.layers.*.mlp.shared_experts.up_proj": object()}
+    monkeypatch.setattr(P, "_resolve_moe_tp_plan", MagicMock(return_value=safe_plan))
+    monkeypatch.setattr(P, "parallelize_module", MagicMock(side_effect=lambda *args: calls.append("tp")))
+    monkeypatch.setattr(P, "apply_cp", MagicMock(side_effect=lambda *args: calls.append("cp")))
+    monkeypatch.setattr(P, "apply_ep", MagicMock(side_effect=lambda *args, **kwargs: calls.append("ep")))
+    monkeypatch.setattr(P, "apply_ac", MagicMock(side_effect=lambda *args, **kwargs: calls.append("ac")))
+    monkeypatch.setattr(P, "apply_fsdp", MagicMock(side_effect=lambda *args, **kwargs: calls.append("fsdp")))
+    monkeypatch.setattr(P, "ensure_tied_lm_head", MagicMock(side_effect=lambda model: calls.append("tie")))
+
+    world_mesh = FakeWorldMesh(
+        {"tp": 2, "cp": 2, ("dp",): 2},
+        mesh_dim_names=["dp", "cp", "tp"],
+    )
+    moe_mesh = FakeMoeMesh({"ep": 2})
+    model = type(
+        "Outer",
+        (),
+        {"moe_config": type("MC", (), {"n_routed_experts": 4})()},
+    )()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=moe_mesh,
+        dp_axis_names=("dp",),
+        cp_axis_name="cp",
+        tp_axis_name="tp",
+        ep_axis_name="ep",
+        activation_checkpointing=True,
+    )
+
+    assert calls == ["tp", "tie", "cp", "ep", "ac", "fsdp"]
+    assert model._nemo_moe_tp_requires_replica_sync is True
+    assert model._nemo_moe_tp_requires_pretrained_weights is True
+    P._resolve_moe_tp_plan.assert_called_once_with(
+        model,
+        sequence_parallel=False,
+        tp_shard_plan=None,
+        tp_size=2,
+    )
+
+
+def test_parallelize_model_forwards_offload_policy_to_fsdp(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+    sentinel = object()
+    P.parallelize_model(
+        model=object(),
+        world_mesh=world_mesh,
+        moe_mesh=None,
+        dp_axis_names=("dp",),
+        offload_policy=sentinel,
+    )
+
+    assert apply_fsdp_mock.call_args.kwargs["offload_policy"] is sentinel
+
+
+def test_parallelize_model_rejects_async_tp_for_custom_moe(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    world_mesh = FakeWorldMesh({"tp": 2}, mesh_dim_names=["tp"])
+
+    with pytest.raises(ValueError, match="enable_async_tensor_parallel=True"):
+        P.parallelize_model(
+            model=object(),
+            world_mesh=world_mesh,
+            moe_mesh=None,
+            dp_axis_names=(),
+            tp_axis_name="tp",
+            enable_async_tensor_parallel=True,
         )
 
 
@@ -1623,8 +2063,8 @@ def test_parallelize_model_passes_ignore_router_for_ac_to_apply_ac(monkeypatch):
     assert kwargs.get("ignore_router") is True
 
 
-def test_parallelize_model_ignore_router_for_ac_defaults_to_false(monkeypatch):
-    """Test that parallelize_model defaults ignore_router_for_ac to False."""
+def test_parallelize_model_ignore_router_for_ac_defaults_to_true(monkeypatch):
+    """Test that parallelize_model defaults ignore_router_for_ac to True."""
     P = _import_parallelizer_with_stubs(monkeypatch)
     apply_ac_mock = MagicMock()
     monkeypatch.setattr(P, "apply_ac", apply_ac_mock)
@@ -1652,10 +2092,10 @@ def test_parallelize_model_ignore_router_for_ac_defaults_to_false(monkeypatch):
         activation_checkpointing=True,
     )
 
-    # Verify apply_ac was called with ignore_router=False (default)
+    # Verify apply_ac was called with ignore_router=True (default)
     apply_ac_mock.assert_called_once()
     args, kwargs = apply_ac_mock.call_args
-    assert kwargs.get("ignore_router") is False
+    assert kwargs.get("ignore_router") is True
     # Full (True) AC is not selective.
     assert kwargs.get("selective") is False
 
@@ -1691,7 +2131,7 @@ def test_parallelize_model_passes_selective_to_apply_ac(monkeypatch):
     apply_ac_mock.assert_called_once()
     _, kwargs = apply_ac_mock.call_args
     assert kwargs.get("selective") is True
-    assert kwargs.get("ignore_router") is False
+    assert kwargs.get("ignore_router") is True
 
 
 def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
@@ -2223,9 +2663,18 @@ class _FakeBlockWithAttn:
             self.attention_type = attention_type
 
 
-def test_apply_cp_skips_non_te_attention(monkeypatch):
-    """apply_cp should skip blocks whose attn_module is not DotProductAttention."""
+def _stub_dense_cp_hooks(monkeypatch):
+    cp_utils_stub = types.ModuleType("nemo_automodel.components.distributed.cp_utils")
+    cp_utils_stub.attach_context_parallel_hooks = MagicMock()
+    cp_utils_stub.attach_cp_sdpa_hooks = MagicMock()
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.cp_utils", cp_utils_stub)
+    return cp_utils_stub
+
+
+def test_apply_cp_warns_on_unsupported_non_te_attention(monkeypatch):
+    """Non-TE, non-model-owned attention is unsupported under CP: warn, no hooks."""
     P = _import_parallelizer_with_stubs(monkeypatch)
+    cp_utils_stub = _stub_dense_cp_hooks(monkeypatch)
 
     # Stub DotProductAttention in the TE import inside apply_cp
     te_attn_stub = types.ModuleType("transformer_engine.pytorch.attention")
@@ -2238,7 +2687,7 @@ def test_apply_cp_skips_non_te_attention(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", types.ModuleType("transformer_engine.pytorch"))
     monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", te_attn_stub)
 
-    non_te_attn = _FakeAttnModule()  # not a DotProductAttention
+    non_te_attn = _FakeAttnModule()  # not a DotProductAttention, no setup_cp_attention
     block = _FakeBlockWithAttn(non_te_attn)
     model = DummyModel([block])
 
@@ -2249,8 +2698,76 @@ def test_apply_cp_skips_non_te_attention(monkeypatch):
     dist_stub = sys.modules["torch.distributed"]
     dist_stub.get_process_group_ranks = MagicMock(return_value=[0, 1])
 
-    # Should not raise — just skip the non-TE block
     P.apply_cp(model, cp_mesh)
+
+    assert model._cp_enabled is True
+    # No generic CP hooks are attached for unsupported attention.
+    cp_utils_stub.attach_context_parallel_hooks.assert_not_called()
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_not_called()
+
+
+def test_apply_cp_model_owned_calls_setup_cp_attention(monkeypatch):
+    """A self_attn exposing setup_cp_attention installs its own CP attention; no generic hooks."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    cp_utils_stub = _stub_dense_cp_hooks(monkeypatch)
+
+    te_attn_stub = types.ModuleType("transformer_engine.pytorch.attention")
+
+    class DotProductAttention:
+        pass
+
+    te_attn_stub.DotProductAttention = DotProductAttention
+    monkeypatch.setitem(sys.modules, "transformer_engine", types.ModuleType("transformer_engine"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", types.ModuleType("transformer_engine.pytorch"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", te_attn_stub)
+
+    non_te_attn = _FakeAttnModule()  # not a DotProductAttention
+    block = _FakeBlockWithAttn(non_te_attn)
+    # The model owns its CP attention (e.g. Gemma4's ring) via setup_cp_attention.
+    block.self_attn.setup_cp_attention = MagicMock()
+    model = DummyModel([block])
+
+    cp_mesh = MagicMock()
+    cp_mesh.get_group.return_value = MagicMock()
+    sys.modules["torch.distributed"].get_process_group_ranks = MagicMock(return_value=[0, 1])
+
+    P.apply_cp(model, cp_mesh)
+
+    # Model-owned: setup_cp_attention is called; no generic hooks are attached.
+    block.self_attn.setup_cp_attention.assert_called_once_with(cp_mesh)
+    cp_utils_stub.attach_context_parallel_hooks.assert_not_called()
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_not_called()
+
+
+def test_apply_cp_skips_attention_without_attn_module(monkeypatch):
+    """HF attention without attn_module uses dense CP hooks, not TE CP setup."""
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    cp_utils_stub = _stub_dense_cp_hooks(monkeypatch)
+
+    te_attn_stub = types.ModuleType("transformer_engine.pytorch.attention")
+
+    class DotProductAttention:
+        pass
+
+    te_attn_stub.DotProductAttention = DotProductAttention
+    monkeypatch.setitem(sys.modules, "transformer_engine", types.ModuleType("transformer_engine"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", types.ModuleType("transformer_engine.pytorch"))
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.attention", te_attn_stub)
+
+    class AttentionWithoutAttnModuleBlock:
+        layer_type = "full_attention"
+
+        def __init__(self):
+            self.self_attn = _FakeAttnModule()
+            self.mlp = object()
+
+    model = DummyModel([AttentionWithoutAttnModuleBlock()])
+    cp_mesh = MagicMock()
+
+    P.apply_cp(model, cp_mesh)
+    cp_mesh.get_group.assert_not_called()
+    # Unsupported (non-TE, non-model-owned) attention -> warn, no hooks.
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_not_called()
 
 
 def _setup_te_and_dist_stubs(monkeypatch, DotProductAttention):
@@ -2316,8 +2833,9 @@ def test_apply_cp_uses_attention_type_and_all_gather_for_sliding_attention(monke
 
 
 def test_apply_cp_mixed_te_and_non_te(monkeypatch):
-    """apply_cp should configure TE blocks and skip non-TE blocks in the same model."""
+    """apply_cp configures TE blocks; unsupported non-TE blocks warn (no hooks)."""
     P = _import_parallelizer_with_stubs(monkeypatch)
+    cp_utils_stub = _stub_dense_cp_hooks(monkeypatch)
 
     class DotProductAttention:
         def __init__(self):
@@ -2336,8 +2854,9 @@ def test_apply_cp_mixed_te_and_non_te(monkeypatch):
 
     P.apply_cp(model, cp_mesh)
 
-    # TE block configured, non-TE block skipped (no error)
     te_attn.set_context_parallel_group.assert_called_once()
+    # The non-TE block is unsupported under CP -> warn, no generic hooks.
+    cp_utils_stub.attach_cp_sdpa_hooks.assert_not_called()
 
 
 # ============================================================================

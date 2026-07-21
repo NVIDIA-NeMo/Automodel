@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import types
 from unittest.mock import MagicMock, Mock, patch
 
@@ -25,6 +26,10 @@ from torch.distributed.pipelining.schedules import (
 from nemo_automodel.components.distributed.pipelining.functional import (
     _get_hidden_and_vocab_size,
     _precompute_stage_shapes,
+    _set_stage_metas,
+    _use_static_pipeline_stage_metadata,
+    _warmup_pipeline_stage_neighbors,
+    _wrap_stage_forward_to_emit_tensor,
     build_pipeline_schedule,
     calculate_virtual_stages,
     generate_hf_model_fqn_per_model_part,
@@ -754,6 +759,30 @@ class TestPrecomputeStageShapes:
 
         return types.SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab_size)
 
+    def test_sets_static_metadata_for_new_pipeline_stage_api(self, monkeypatch):
+        """New PipelineStage stores static metadata in _user_meta."""
+        stage_module = __import__("torch.distributed.pipelining.stage", fromlist=["extract_tensor_metas"])
+
+        def extract_tensor_metas(tensors):
+            return tuple(
+                types.SimpleNamespace(shape=tensor.shape, dtype=tensor.dtype, requires_grad=tensor.requires_grad)
+                for tensor in tensors
+            )
+
+        monkeypatch.setattr(stage_module, "extract_tensor_metas", extract_tensor_metas, raising=False)
+        stage = types.SimpleNamespace(_user_meta=types.SimpleNamespace(inputs=None, outputs=None))
+        inputs = (
+            torch.empty(2, 16, device="meta", dtype=torch.long),
+            torch.empty(2, 16, 64, device="meta", dtype=torch.bfloat16),
+        )
+        outputs = (torch.empty(2, 16, 64, device="meta", dtype=torch.bfloat16),)
+
+        _set_stage_metas(stage, inputs, outputs)
+
+        assert stage._user_meta.inputs[0].requires_grad is False
+        assert stage._user_meta.inputs[1].requires_grad is True
+        assert stage._user_meta.outputs[0].requires_grad is True
+
     def test_first_stage_shapes(self):
         """First stage input should be [mb, seq_len] int64, output [mb, seq_len, hidden]."""
         stage = self._make_stage(is_first=True, is_last=False, has_lm_head=False)
@@ -813,6 +842,19 @@ class TestPrecomputeStageShapes:
         out_call = stage._configure_outputs_meta.call_args[0][0]
         assert out_call[0].shape == (2, 16, 64)
 
+    def test_last_stage_fused_ce_emits_hidden_states(self):
+        """Fused-CE last stage keeps lm_head but skips its projection, so its
+        output is [mb, seq_len, hidden] rather than [mb, seq_len, vocab]."""
+        stage = self._make_stage(is_first=False, is_last=True, has_lm_head=True)
+        stage.submod._pp_return_hidden_states = True
+        config = self._make_config(hidden_size=64, vocab_size=128)
+
+        _precompute_stage_shapes([stage], config, microbatch_size=2, seq_len=16)
+
+        out_call = stage._configure_outputs_meta.call_args[0][0]
+        # Last dim is hidden (64), not vocab (128): the flag skips the lm_head projection
+        assert out_call[0].shape == (2, 16, 64)
+
     def test_multi_stage_pipeline(self):
         """Test with 3 stages (first, middle, last with lm_head)."""
         stages = [
@@ -870,9 +912,10 @@ class TestPrecomputeStageShapes:
         out_call = stage._configure_outputs_meta.call_args[0][0]
         assert out_call[0].shape == (2, 16, 64)
 
+    @patch("nemo_automodel.components.distributed.pipelining.functional._warmup_pipeline_stage_neighbors")
     @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")
     @patch("nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule")
-    def test_pipeline_model_with_seq_len(self, mock_build_schedule, mock_split_stages):
+    def test_pipeline_model_with_seq_len(self, mock_build_schedule, mock_split_stages, mock_warmup_neighbors):
         """Test that pipeline_model calls _precompute_stage_shapes when seq_len is provided."""
         mock_world_mesh = MagicMock()
         mock_pp_mesh = Mock()
@@ -907,6 +950,7 @@ class TestPrecomputeStageShapes:
         assert mock_stage1.inputs_meta[0].shape == (2, 16)  # input_ids for first stage
         assert mock_stage2.inputs_meta is not None
         assert mock_stage2.inputs_meta[0].shape == (2, 16, 64)  # hidden_states
+        mock_warmup_neighbors.assert_called_once_with(mock_stage1)
 
     @patch("nemo_automodel.components.distributed.pipelining.functional.split_model_into_stages")
     @patch("nemo_automodel.components.distributed.pipelining.functional.build_pipeline_schedule")
@@ -943,6 +987,89 @@ class TestPrecomputeStageShapes:
 
         # inputs_meta should remain None (serial shape inference at runtime)
         assert mock_stage.inputs_meta is None
+
+
+@pytest.mark.skipif(
+    not hasattr(importlib.import_module("torch.distributed.pipelining._utils"), "InferenceMode"),
+    reason="requires the torch>=2.12 pipelining InferenceMode internals",
+)
+class TestStaticPipelineStageMetadata:
+    """Test the Torch 2.12 static metadata warm-up compatibility path."""
+
+    @pytest.mark.parametrize(
+        ("group_rank", "send_peers", "recv_peers"),
+        [(0, [1, 3], [1, 3]), (1, [0, 2], [0, 2])],
+    )
+    @patch("nemo_automodel.components.distributed.pipelining.functional.time.sleep")
+    @patch("torch.cuda.device_count", return_value=8)
+    @patch("torch.distributed.get_process_group_ranks", return_value=[8, 72, 136, 200])
+    @patch("torch.distributed.pipelining._utils.InferenceMode.needs_dynamic", return_value=False)
+    @patch("torch.cuda.synchronize")
+    @patch("torch.distributed.irecv")
+    @patch("torch.distributed.isend")
+    def test_warms_neighbor_communicators(
+        self,
+        isend,
+        irecv,
+        synchronize,
+        _needs_dynamic,
+        _get_group_ranks,
+        _device_count,
+        sleep,
+        group_rank,
+        send_peers,
+        recv_peers,
+    ):
+        from torch.distributed.pipelining._utils import InferenceMode
+
+        class Schedule:
+            _has_backward = True
+
+            def _warmup_p2p(self):
+                raise AssertionError("native Torch 2.12 warm-up should be replaced")
+
+        class Stage:
+            _user_meta = object()
+            _inference_mode = None
+            device = torch.device("cpu")
+            group = Mock()
+            group_size = 4
+
+        Stage.group.rank.return_value = group_rank
+        schedule = Schedule()
+        stages = [Stage(), Stage()]
+
+        _warmup_pipeline_stage_neighbors(stages[0])
+        _use_static_pipeline_stage_metadata(schedule, stages)
+        schedule._warmup_p2p(stages, has_backward=True, p2p_done=False)
+
+        assert all(stage._inference_mode == InferenceMode.STATIC for stage in stages)
+        assert [mock_call.kwargs["group_dst"] for mock_call in isend.call_args_list] == send_peers
+        assert [mock_call.kwargs["group_src"] for mock_call in irecv.call_args_list] == recv_peers
+        assert all(mock_call.kwargs["group"] is stages[0].group for mock_call in isend.call_args_list)
+        assert all(mock_call.kwargs["group"] is stages[0].group for mock_call in irecv.call_args_list)
+        assert isend.return_value.wait.call_count == len(send_peers)
+        assert irecv.return_value.wait.call_count == len(recv_peers)
+        synchronize.assert_called_once_with(stages[0].device)
+        sleep.assert_called_once_with(2)
+
+    @patch("torch.distributed.pipelining._utils.InferenceMode.needs_dynamic", return_value=True)
+    def test_keeps_native_warmup_for_dynamic_metadata(self, _needs_dynamic):
+        class Schedule:
+            _has_backward = True
+
+            def _warmup_p2p(self):
+                return "native"
+
+        class Stage:
+            _user_meta = object()
+
+        schedule = Schedule()
+        original_warmup = schedule._warmup_p2p
+
+        _use_static_pipeline_stage_metadata(schedule, [Stage()])
+
+        assert schedule._warmup_p2p == original_warmup
 
 
 class TestGetHiddenAndVocabSize:
@@ -1355,3 +1482,107 @@ class TestSplitModelIntoStagesKeepListHook:
         for stage_fqns in lists:
             assert "model.custom_shared" not in stage_fqns
             assert "custom_last" not in stage_fqns
+
+
+class TestWrapStageForwardToEmitTensor:
+    """A PP stage forward must emit tensors, not a HF ModelOutput.
+
+    Regression test for the ``CausalLMOutputWithPast' object has no attribute
+    'shape'`` crash: custom ``*ForCausalLM`` forwards return a
+    ``CausalLMOutputWithPast`` (fused-linear-CE), but ``torch.distributed.pipelining``
+    calls ``.shape`` on each output leaf. The kept outer forward (``_pp_keep_self_forward``
+    models, and MoE configs with ``patch_causal_lm_model=False``) must be unwrapped.
+    """
+
+    def test_unwraps_model_output_to_logits(self):
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+
+        logits = torch.randn(2, 3, 8)
+
+        class FinalStage(torch.nn.Module):
+            def forward(self, x, position_ids=None):
+                return CausalLMOutputWithPast(logits=logits, hidden_states=None)
+
+        m = FinalStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        out = m(torch.randn(2, 3, 8))
+        assert isinstance(out, torch.Tensor)
+        assert torch.equal(out, logits)
+
+    def test_nonfinal_stage_passthrough_hidden_states(self):
+        # lm_head is None on non-final stages -> compute_lm_head_logits returns
+        # CausalLMOutputWithPast(logits=hidden_states); unwrap must yield that tensor.
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+
+        hidden = torch.randn(2, 3, 8)
+
+        class MidStage(torch.nn.Module):
+            def forward(self, x):
+                return CausalLMOutputWithPast(logits=hidden, hidden_states=None)
+
+        m = MidStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        assert torch.equal(m(torch.randn(2, 3, 8)), hidden)
+
+    def test_grad_flows_through_unwrapped_logits(self):
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+
+        class FinalStage(torch.nn.Module):
+            def forward(self, x):
+                return CausalLMOutputWithPast(logits=x * 2, hidden_states=None)
+
+        m = FinalStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        x = torch.randn(2, 3, 8, requires_grad=True)
+        m(x).sum().backward()
+        assert x.grad is not None
+
+    def test_bare_tensor_return_is_unchanged(self):
+        # Patched-forward path (create_pipeline_forward_causal_lm) already returns a tensor.
+        class TensorStage(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        m = TensorStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        x = torch.randn(2, 3, 8)
+        assert torch.equal(m(x), x + 1)
+
+    def test_tuple_return_is_preserved(self):
+        # MTP last stage emits (logits, *mtp_per_depth_h, seq_idx); must not be unwrapped.
+        class TupleStage(torch.nn.Module):
+            def forward(self, x):
+                return (x, x * 3, torch.zeros(2, 3, dtype=torch.int32))
+
+        m = TupleStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        out = m(torch.randn(2, 3, 8))
+        assert isinstance(out, tuple) and len(out) == 3
+
+    def test_idempotent(self):
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+
+        class FinalStage(torch.nn.Module):
+            def forward(self, x):
+                return CausalLMOutputWithPast(logits=x, hidden_states=None)
+
+        m = FinalStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        first = m.forward
+        _wrap_stage_forward_to_emit_tensor(m)
+        assert m.forward is first  # second call is a no-op
+
+    def test_forward_signature_is_preserved(self):
+        # PP / kwarg-filtering introspects the forward signature; it must survive wrapping.
+        import inspect
+
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+
+        class FinalStage(torch.nn.Module):
+            def forward(self, input_ids, position_ids=None, attention_mask=None):
+                return CausalLMOutputWithPast(logits=input_ids, hidden_states=None)
+
+        m = FinalStage()
+        _wrap_stage_forward_to_emit_tensor(m)
+        params = list(inspect.signature(m.forward).parameters)
+        assert params == ["input_ids", "position_ids", "attention_mask"]

@@ -19,9 +19,15 @@ import types
 import pytest
 import torch
 
-from nemo_automodel.components.loss.dllm_loss import DFlashDecayLoss, IDLMLoss, MDLMCrossEntropyLoss
+from nemo_automodel.components.loss.dllm_loss import (
+    BlockDiffusionCrossEntropyLoss,
+    DFlashDecayLoss,
+    IDLMLoss,
+    MDLMCrossEntropyLoss,
+)
 from nemo_automodel.recipes.dllm.strategy import (
     DLLM_STRATEGIES,
+    BlockDiffusionStrategy,
     DFlashStrategy,
     HybridStrategy,
     IDLMStrategy,
@@ -311,7 +317,13 @@ class TestIDLMStrategy:
         loss_mask = torch.zeros(2, 16, dtype=torch.long)
         loss_mask[:, 8:] = 1  # supervised region = response
         noisy, noise_mask, _ = strategy.apply_corruption(
-            input_ids, loss_mask, mask_token_id=999, eps=0.0, block_size=None, half_life_ratio=None
+            input_ids,
+            loss_mask,
+            mask_token_id=999,
+            eps=0.0,
+            block_size=None,
+            half_life_ratio=None,
+            generator=torch.Generator(),  # accepted (recipe passes it) though corruption is deterministic
         )
         # All-masked: every supervised position masked, prompt untouched.
         assert torch.equal(noise_mask, loss_mask.bool())
@@ -813,3 +825,78 @@ class TestDFlashSampleAnchorBlocksOverlapping:
         assert keep[0].all()  # long sample kept
         assert (~keep[1]).all()  # short sample fully dropped
         assert bm[1].sum().item() == 0  # short sample contributes no loss
+
+
+class TestBlockDiffusionStrategy:
+    @pytest.fixture
+    def strategy(self):
+        return BlockDiffusionStrategy()
+
+    def test_registered(self):
+        assert "block_diffusion" in DLLM_STRATEGIES
+        assert isinstance(get_dllm_strategy("block_diffusion"), BlockDiffusionStrategy)
+
+    def test_normalization_mode_is_supervised(self, strategy):
+        # All supervised canvas tokens are scored (matches Google's canvas_mask
+        # loss support), so the denominator is the supervised count, not corrupted.
+        assert strategy.normalization_mode == "supervised"
+
+    def test_create_loss_fn_is_block_diffusion(self, strategy):
+        loss_fn = strategy.create_loss_fn({"vocab_size": 100})
+        assert isinstance(loss_fn, BlockDiffusionCrossEntropyLoss)
+
+    def test_apply_corruption_requires_vocab_size(self, strategy):
+        """apply_corruption raises if vocab_size was never captured via create_loss_fn."""
+        ids = torch.randint(0, 100, (2, 16))
+        lm = torch.ones(2, 16, dtype=torch.long)
+        with pytest.raises(ValueError, match="vocab_size"):
+            strategy.apply_corruption(ids, lm, mask_token_id=999, eps=1e-3, block_size=8, half_life_ratio=None)
+
+    def test_apply_corruption_random_tokens(self, strategy):
+        """After create_loss_fn captures vocab_size, corruption uses random tokens, p_mask=ones."""
+        strategy.create_loss_fn({"vocab_size": 50})
+        torch.manual_seed(0)
+        ids = torch.randint(0, 50, (2, 16))
+        lm = torch.ones(2, 16, dtype=torch.long)
+        noisy, noise_mask, p_mask = strategy.apply_corruption(
+            ids, lm, mask_token_id=999, eps=1e-3, block_size=8, half_life_ratio=None
+        )
+        assert noisy.shape == (2, 16)
+        assert (noisy >= 0).all() and (noisy < 50).all()
+        assert (noisy != 999).all(), "block diffusion must not use a mask token id"
+        assert torch.equal(p_mask, torch.ones(2, 16))
+
+    def test_split_prompt_response_contiguous_suffix(self):
+        ids = torch.zeros(3, 8, dtype=torch.long)
+        loss_mask = torch.tensor(
+            [
+                [0, 0, 0, 1, 1, 1, 1, 1],
+                [0, 0, 0, 0, 0, 0, 1, 1],
+                [1, 1, 1, 1, 1, 1, 1, 1],
+            ]
+        )
+        prefix_lengths, response_mask = BlockDiffusionStrategy.split_prompt_response(ids, loss_mask)
+        assert prefix_lengths.tolist() == [3, 6, 0]
+        assert response_mask[0].tolist() == [0, 0, 0, 1, 1, 1, 1, 1]
+        assert response_mask[2].all()
+
+    def test_split_prompt_response_no_supervised(self):
+        """A row with no supervised token is treated as all prompt (empty response)."""
+        ids = torch.zeros(1, 8, dtype=torch.long)
+        loss_mask = torch.zeros(1, 8, dtype=torch.long)
+        prefix_lengths, response_mask = BlockDiffusionStrategy.split_prompt_response(ids, loss_mask)
+        assert prefix_lengths.item() == 8
+        assert not response_mask.any()
+
+    def test_prepare_batch_sets_canvas_and_clean_inputs(self, strategy):
+        clean = torch.randint(0, 100, (2, 16))
+        noisy = torch.randint(0, 100, (2, 16))
+        noise_mask = torch.zeros(2, 16, dtype=torch.bool)
+        batch = {"input_ids": clean.clone(), "attention_mask": torch.ones(2, 16), "use_cache": True}
+        result = strategy.prepare_batch(batch, noisy, noise_mask, clean)
+        # Encoder sees the clean full sequence; decoder canvas is the noised sequence.
+        assert torch.equal(result["input_ids"], clean)
+        assert torch.equal(result["canvas_ids"], noisy)
+        # Bidirectional model -> attention_mask / use_cache dropped.
+        assert "attention_mask" not in result
+        assert "use_cache" not in result

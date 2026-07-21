@@ -1,0 +1,35 @@
+---
+title: "Omni Models"
+description: ""
+position: 5
+---
+Omni models go beyond image-text understanding to support additional modalities such as audio, video, or a combination of all — text, image, audio, and video in a single unified model.
+
+## Run Omni Models with NeMo AutoModel
+
+To run omni models with NeMo AutoModel, use NeMo container version [`26.06.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=26.06.00) or later. If the model you want to fine-tune requires newer source than the container provides, use a current checkout so the package and its example recipes stay on one revision:
+
+```bash
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv sync --locked --all-groups --all-extras --extra vlm-media
+```
+
+For other installation options, see our [NeMo AutoModel Installation Guide](/get-started/installation).
+
+<Note>
+Omni models such as Qwen3-Omni need the `vlm-media` extra included in the source-sync command above for video/vision preprocessing; it is not installed in the Docker container by default. See [Media Extras](/get-started/installation#media-extras-video--image-decode).
+</Note>
+
+## Supported Models
+
+| Owner | Model | Modalities | Architecture |
+|---|---|---|---|
+| Qwen / Alibaba Cloud | [Qwen3-Omni](/model-coverage/omni/qwen3-omni) | Text · Image · Audio · Video | `Qwen3OmniForConditionalGeneration` |
+| Qwen / Alibaba Cloud | [Qwen2.5-Omni](/model-coverage/omni/qwen2-5-omni) | Text · Image · Audio · Video | `Qwen2_5OmniForConditionalGeneration` |
+| Microsoft | [Phi-4-multimodal](/model-coverage/omni/phi-4-multimodal) | Text · Image · Audio | `Phi4MultimodalForCausalLM` |
+| NVIDIA | [Nemotron-3-Nano-Omni](/model-coverage/omni/nemotron-omni) | Text · Image · Audio | `NemotronH_Nano_Omni_Reasoning_V3` |
+
+## Fine-Tune Omni Models
+
+All supported omni models can be fine-tuned using full SFT or PEFT (LoRA) approaches. See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n) for general setup instructions.

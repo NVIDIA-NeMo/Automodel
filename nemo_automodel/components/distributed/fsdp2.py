@@ -18,11 +18,16 @@ from typing import Optional
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.activation_checkpointing import (
+    apply_submodule_checkpointing,
+    detect_kv_sharing_and_maybe_disable_cache,
     is_selective_activation_checkpointing,
 )
 from nemo_automodel.components.distributed.config import FSDP2Config
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
 from nemo_automodel.components.distributed.parallelizer import (
+    _extract_model_layer_groups,
+    _filter_layer_groups_for_activation_checkpointing,
+    _should_use_hf_native_gradient_checkpointing,
     apply_selective_activation_checkpointing,
     fsdp2_strategy_parallelize,
 )
@@ -98,7 +103,9 @@ class FSDP2Manager:
         self.mp_policy = config.mp_policy
         self.offload_policy = config.offload_policy
         self.activation_checkpointing = config.activation_checkpointing
+        self.activation_checkpointing_scope = config.activation_checkpointing_scope
         self.defer_fsdp_grad_sync = config.defer_fsdp_grad_sync
+        self.reshard_after_forward = config.reshard_after_forward
         self.enable_async_tensor_parallel = config.enable_async_tensor_parallel
         self.enable_compile = config.enable_compile
         self.enable_fsdp2_prefetch = config.enable_fsdp2_prefetch
@@ -115,18 +122,33 @@ class FSDP2Manager:
         Returns:
             The parallelized model.
         """
-        if get_world_size_safe() == 1:
-            logger.info("World size is 1, skipping parallelization.")
+        if get_world_size_safe() == 1 or self.device_mesh.size() == 1:
+            logger.info("World size or FSDP mesh size is 1, skipping parallelization.")
             if self.activation_checkpointing:
                 if is_selective_activation_checkpointing(self.activation_checkpointing):
                     # Selective AC works on a plain model (no FSDP required), so
                     # honor it on a single GPU instead of silently falling back
                     # to full HF gradient checkpointing.
-                    apply_selective_activation_checkpointing(model, enable_compile=self.enable_compile)
-                elif hasattr(model, "gradient_checkpointing_enable"):
-                    model.gradient_checkpointing_enable()
+                    apply_selective_activation_checkpointing(
+                        model,
+                        enable_compile=self.enable_compile,
+                        activation_checkpointing_scope=self.activation_checkpointing_scope,
+                    )
                 else:
-                    logger.error("Model does not support gradient checkpointing.")
+                    layer_groups = _extract_model_layer_groups(model)
+                    layers, ac_scopes = _filter_layer_groups_for_activation_checkpointing(
+                        layer_groups,
+                        self.activation_checkpointing_scope,
+                    )
+                    if _should_use_hf_native_gradient_checkpointing(
+                        model,
+                        layer_groups,
+                        ac_scopes,
+                        enable_compile=self.enable_compile,
+                    ):
+                        model.gradient_checkpointing_enable()
+                    else:
+                        apply_submodule_checkpointing(layers, detect_kv_sharing_and_maybe_disable_cache(model))
             return model
 
         if self.config.patch_is_packed_sequence:
@@ -145,6 +167,8 @@ class FSDP2Manager:
             enable_fsdp2_prefetch=self.enable_fsdp2_prefetch,
             fsdp2_backward_prefetch_depth=self.fsdp2_backward_prefetch_depth,
             fsdp2_forward_prefetch_depth=self.fsdp2_forward_prefetch_depth,
+            reshard_after_forward=self.reshard_after_forward,
+            activation_checkpointing_scope=self.activation_checkpointing_scope,
         )
 
         return model

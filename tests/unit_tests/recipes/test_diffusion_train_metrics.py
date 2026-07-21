@@ -301,29 +301,33 @@ def _minimal_diffusion_recipe_cfg(
     adapter_type="hunyuan",
     attention_backend="flash_varlen",
     optimize_hunyuan_flash_varlen_mask=True,
+    checkpoint=None,
 ):
-    return ConfigNode(
-        {
-            "model": {
-                "pretrained_model_name_or_path": "dummy-model",
-                "attention_backend": attention_backend,
-                "optimize_hunyuan_flash_varlen_mask": optimize_hunyuan_flash_varlen_mask,
-            },
-            "flow_matching": {"adapter_type": adapter_type},
-            "optim": {"learning_rate": 1.0e-4},
-            "performance": {},
-            "step_scheduler": {
-                "num_epochs": 1,
-                "local_batch_size": 1,
-                "global_batch_size": 1,
-                "ckpt_every_steps": 1,
-            },
-        }
-    )
+    cfg = {
+        "model": {
+            "pretrained_model_name_or_path": "dummy-model",
+            "attention_backend": attention_backend,
+            "optimize_hunyuan_flash_varlen_mask": optimize_hunyuan_flash_varlen_mask,
+        },
+        "flow_matching": {"adapter_type": adapter_type},
+        "optim": {"learning_rate": 1.0e-4},
+        "performance": {},
+        "step_scheduler": {
+            "num_epochs": 1,
+            "local_batch_size": 1,
+            "global_batch_size": 1,
+            "ckpt_every_steps": 1,
+        },
+    }
+    if checkpoint is not None:
+        cfg["checkpoint"] = checkpoint
+    return ConfigNode(cfg)
 
 
 def _patch_lightweight_diffusion_recipe_setup(monkeypatch):
-    monkeypatch.setattr(diffusion_train, "initialize_distributed", lambda *args, **kwargs: SimpleNamespace(is_main=False))
+    monkeypatch.setattr(
+        diffusion_train, "initialize_distributed", lambda *args, **kwargs: SimpleNamespace(is_main=False)
+    )
     monkeypatch.setattr(diffusion_train, "setup_logging", lambda: None)
     monkeypatch.setattr(diffusion_train, "StatefulRNG", lambda *args, **kwargs: SimpleNamespace())
     monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
@@ -399,6 +403,41 @@ def test_diffusion_recipe_enables_hunyuan_flash_varlen_mask_optimization_before_
     enable_optimization.assert_called_once_with()
 
 
+def test_diffusion_recipe_forwards_consolidation_timeout(monkeypatch):
+    class StopAfterCheckpointConfig(Exception):
+        pass
+
+    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
+    model = SimpleNamespace(transformer=nn.Linear(1, 1), state_dict=lambda: {"weight": torch.ones(1)})
+    monkeypatch.setattr(
+        diffusion_train,
+        "build_model_and_optimizer",
+        MagicMock(return_value=(model, object(), None)),
+    )
+
+    from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
+
+    monkeypatch.setattr(hunyuan_module, "enable_hunyuan_flash_varlen_mask_optimization", MagicMock(return_value=True))
+    checkpoint_config = MagicMock(side_effect=StopAfterCheckpointConfig)
+    monkeypatch.setattr(diffusion_train, "CheckpointingConfig", checkpoint_config)
+    recipe = TrainDiffusionRecipe(
+        _minimal_diffusion_recipe_cfg(
+            checkpoint={
+                "enabled": True,
+                "checkpoint_dir": "checkpoints",
+                "model_save_format": "safetensors",
+                "save_consolidated": "final",
+                "consolidation_timeout_minutes": 45,
+            }
+        )
+    )
+
+    with pytest.raises(StopAfterCheckpointConfig):
+        recipe.setup()
+
+    assert checkpoint_config.call_args.kwargs["consolidation_timeout_minutes"] == 45
+
+
 class _TinyTransformer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -460,7 +499,49 @@ def test_build_diffusion_parallel_manager_args_parses_ddp_config():
         "_manager_type": "ddp",
         "world_size": 4,
         "activation_checkpointing": True,
+        "activation_checkpointing_scope": ("all",),
+        "broadcast_buffers": False,
         "find_unused_parameters": False,
+        "static_graph": False,
+        "bucket_cap_mb": None,
+        "gradient_as_bucket_view": False,
+        "autocast_dtype": None,
+    }
+
+
+def test_build_diffusion_parallel_manager_args_accepts_confignode_fsdp_config():
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=ConfigNode({"dp_size": 8, "cpu_offload": False}),
+        ddp_cfg=None,
+        world_size=8,
+        dtype=torch.bfloat16,
+        lora_enabled=False,
+    )
+
+    assert manager_args["_manager_type"] == "fsdp2"
+    assert manager_args["dp_size"] == 8
+
+
+def test_build_diffusion_parallel_manager_args_accepts_confignode_ddp_config():
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=None,
+        ddp_cfg=ConfigNode({"backend": "nccl", "activation_checkpointing": False}),
+        world_size=4,
+        dtype=torch.bfloat16,
+        lora_enabled=False,
+    )
+
+    assert manager_args == {
+        "_manager_type": "ddp",
+        "world_size": 4,
+        "activation_checkpointing": False,
+        "activation_checkpointing_scope": ("all",),
+        "broadcast_buffers": False,
+        "find_unused_parameters": False,
+        "static_graph": False,
+        "bucket_cap_mb": None,
+        "gradient_as_bucket_view": False,
+        "autocast_dtype": None,
     }
 
 

@@ -49,8 +49,7 @@ def _normalize_activation_checkpointing(value: Any) -> bool | str:
     """Normalize YAML activation checkpointing values.
 
     ``True`` keeps the existing full checkpointing behavior. ``"selective"``
-    enables PyTorch selective activation checkpointing for supported FSDP2
-    paths.
+    enables PyTorch selective activation checkpointing for supported paths.
     """
     if value is None:
         return False
@@ -157,14 +156,25 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
             strategy_kwargs["autocast_dtype"] = dtype_from_str(val)
 
     ep_size: int = parallelism.get("ep_size") or 1
-    if activation_checkpointing == "selective" and strategy_name != "fsdp2":
-        raise ValueError("selective activation checkpointing is supported only for FSDP2 configs.")
+    if activation_checkpointing == "selective" and strategy_name not in {"fsdp2", "ddp"}:
+        raise ValueError("selective activation checkpointing is supported only for FSDP2 and DDP configs.")
 
-    # YAML-level sanity: silently discard sub-configs that don't apply to the
-    # current parallelism sizes (e.g. pipeline section present but pp_size=1,
-    # which is common when a YAML template is overridden via CLI).
+    # `distributed.pipeline` and `pp_size` are validated asymmetrically:
+    #   * pipeline block with pp_size<=1 -> WARN (inert; block ignored). This is
+    #     often intentional -- a recipe keeps the pipeline section as a reference
+    #     and toggles pp_size via CLI (e.g. ep8/pp1 vs ep4/pp2 parity debugging),
+    #     and tests load such configs with `--distributed.pp_size 1`. A hard error
+    #     can't be fixed by a static YAML edit when pp_size is overridden at launch.
+    #   * pp_size>1 with no pipeline block -> ERROR. This is an unambiguous
+    #     misconfiguration: PP is requested but the schedule/microbatch size are
+    #     unspecified. (An explicit empty `pipeline: {}` opts into defaults.)
     pp_size: int = parallelism.get("pp_size") or 1
     if pipeline_dict is not None and pp_size <= 1:
+        logger.warning(
+            "`distributed.pipeline` is set but pp_size=%d (<= 1): pipeline parallelism "
+            "is disabled and the pipeline settings are ignored. Set pp_size > 1 to enable it.",
+            pp_size,
+        )
         pipeline_dict = None
     if moe_dict is not None and ep_size <= 1:
         moe_dict = None
@@ -177,7 +187,12 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
             pipeline_dict["dtype"] = dtype_from_str(pipeline_dict["dtype"])
         pipeline_config = PipelineConfig(**pipeline_dict)
     elif pp_size > 1:
-        pipeline_config = PipelineConfig()
+        raise ValueError(
+            f"`pp_size={pp_size}` (> 1) enables pipeline parallelism but no "
+            "`distributed.pipeline` block was provided. Add a `distributed.pipeline` "
+            "section (e.g. `pp_schedule`, `pp_microbatch_size`); an empty "
+            "`pipeline: {}` selects defaults."
+        )
     else:
         pipeline_config = None
 
@@ -234,15 +249,42 @@ def _distributed_cfg_to_dict(cfg: Any | None) -> dict:
     if cfg is None:
         return {}
     if isinstance(cfg, dict):
+        distributed_cfg = cfg.get("distributed")
+        if isinstance(distributed_cfg, dict):
+            return distributed_cfg.copy()
         return cfg.copy()
     distributed_cfg = cfg.distributed
     return distributed_cfg.to_dict() if hasattr(distributed_cfg, "to_dict") else dict(distributed_cfg)
+
+
+def _dist_env_timeout_minutes(cfg: Any | None) -> int | None:
+    """Return top-level ``dist_env.timeout_minutes`` when available."""
+    if cfg is None:
+        return None
+    if isinstance(cfg, dict):
+        dist_env = cfg.get("dist_env")
+        if isinstance(dist_env, dict):
+            return dist_env.get("timeout_minutes")
+        return None
+
+    getter = getattr(cfg, "get", None)
+    if callable(getter):
+        return getter("dist_env.timeout_minutes", None)
+
+    dist_env = getattr(cfg, "dist_env", None)
+    if dist_env is None:
+        return None
+    if isinstance(dist_env, dict):
+        return dist_env.get("timeout_minutes")
+    return getattr(dist_env, "timeout_minutes", None)
 
 
 def create_distributed_setup_from_config(
     cfg: Any | None = None,
     world_size: Optional[int] = None,
     *,
+    timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
     strategy: str | None = None,
     dp_size: int | None = None,
     dp_replicate_size: int | None = None,
@@ -270,6 +312,10 @@ def create_distributed_setup_from_config(
         world_size: Total number of processes in the job. If ``None`` (default),
             the value is auto-detected from ``torch.distributed`` if initialized,
             or from the ``WORLD_SIZE`` environment variable, falling back to ``1``.
+        timeout_minutes: Optional timeout for process groups created by
+            ``DeviceMesh`` axes. If omitted and ``cfg`` is a top-level recipe
+            config, ``dist_env.timeout_minutes`` is used.
+        ranks: Optional ordered global ranks used by this setup's device mesh.
         strategy: Distributed strategy name (``fsdp2``, ``megatron_fsdp``,
             ``megatron-fsdp``, ``mfsdp``, or ``ddp``).
         dp_size: Data-parallel size. If ``None``, inferred by mesh creation.
@@ -310,6 +356,7 @@ def create_distributed_setup_from_config(
         if value is not None:
             cfg_dict[key] = value
 
+    mesh_timeout_minutes = timeout_minutes if timeout_minutes is not None else _dist_env_timeout_minutes(cfg)
     parsed = parse_distributed_section(cfg_dict)
     return DistributedSetup.build(
         strategy=parsed["strategy_config"],
@@ -318,6 +365,8 @@ def create_distributed_setup_from_config(
         moe_parallel_config=parsed["moe_parallel_config"],
         activation_checkpointing=parsed["activation_checkpointing"],
         world_size=world_size,
+        timeout_minutes=mesh_timeout_minutes,
+        ranks=ranks,
     )
 
 

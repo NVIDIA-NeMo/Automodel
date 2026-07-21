@@ -14,7 +14,6 @@
 
 import importlib.util
 import logging
-import warnings
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -176,7 +175,8 @@ class BackendConfig:
             manager instance across MoE layers.
         dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should return asynchronously
             and allocate dispatched tensors on the communication stream.
-        enable_deepep: Deprecated. Use dispatcher="deepep" and experts="gmm" instead.
+        enable_deepep: Removed and ignored. Logs a warning if set; configure "dispatcher"
+            and "experts" explicitly instead.
         fake_balanced_gate: If True, replace the learned Gate with FakeBalancedGate
             that assigns tokens to experts without learned routing weights.
         fake_gate_noise: Noise level [0, 1] for FakeBalancedGate. When > 0, uses
@@ -210,7 +210,7 @@ class BackendConfig:
     dispatcher_num_sms: int = 20
     dispatcher_share_token_dispatcher: bool = True
     dispatcher_async_dispatch: bool = False
-    enable_deepep: bool | None = None  # Deprecated: use dispatcher="deepep" instead
+    enable_deepep: bool | None = None  # Removed: ignored with a warning; set dispatcher/experts explicitly
     fake_balanced_gate: bool = False
     # Approximate max/mean load ratios (64 experts, top-8, 4096 tokens):
     # 0.0→1.00x, 0.1→~1.2x, 0.3→~1.6x, 0.5→~2.0x, 1.0→~2.8x.
@@ -228,6 +228,14 @@ class BackendConfig:
     compile_attn: bool = False
 
     def __post_init__(self):
+        # TEMPORARY: force TE fused RoPE off globally. The fused kernel computes cos/sin
+        # in fp32 in-kernel while HF/vLLM rotate with bf16 tables, breaking logprob parity
+        # in some models. See #3027. This is the one chokepoint every BackendConfig passes
+        # through, so it also overrides an explicit rope_fusion=True from a recipe/config.
+        if self.rope_fusion:
+            logger.warning("rope_fusion is temporarily force-disabled globally (see #3027).")
+        self.rope_fusion = False
+
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
         if isinstance(self.te_fp8, dict):
             self.te_fp8 = TEFp8Config(**self.te_fp8)
@@ -235,21 +243,17 @@ class BackendConfig:
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)
 
-        # Handle deprecated enable_deepep parameter
+        # enable_deepep was removed. It is no longer honored; warn (once, on rank 0) if a stale
+        # config still sets it so the user migrates to explicit dispatcher/experts. The field is
+        # retained only so loading an old config does not crash this kw_only dataclass.
         if self.enable_deepep is not None:
-            warnings.warn(
-                "enable_deepep is deprecated and will be removed in a future release. "
-                "Use experts='gmm' and dispatcher='deepep' instead of enable_deepep=True, "
-                "or dispatcher='torch' instead of enable_deepep=False.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if self.enable_deepep:
-                self.experts = "gmm"
-                self.dispatcher = "deepep"
-            else:
-                self.dispatcher = "torch"
-            # Clear the deprecated field after conversion
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                logger.warning(
+                    "enable_deepep is no longer supported and is ignored. "
+                    "Set 'dispatcher' (deepep/hybridep/torch) and 'experts' explicitly instead. "
+                    "Previously enable_deepep=True was equivalent to experts=gmm + dispatcher=deepep, "
+                    "and enable_deepep=False to dispatcher=torch."
+                )
             self.enable_deepep = None
 
         # Backward compatibility
@@ -273,7 +277,7 @@ class BackendConfig:
             )
 
 
-@torch.compile(fullgraph=True, dynamic=True)
+@torch.compile(dynamic=True)
 def _float32_rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards."""
     input_dtype = x.dtype
@@ -455,7 +459,9 @@ def get_rope_config(config) -> tuple[float, dict, float]:
     return rope_theta, rope_parameters, partial_rotary_factor
 
 
-def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -> None:
+def cast_model_to_dtype(
+    model: nn.Module, dtype: torch.dtype = torch.bfloat16, skip_modules: tuple[str, ...] = ()
+) -> None:
     """Cast model parameters to the target dtype, keeping fp32 modules in full precision.
 
     Respects ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` on
@@ -463,27 +469,85 @@ def cast_model_to_dtype(model: nn.Module, dtype: torch.dtype = torch.bfloat16) -
 
     Uses ``nn.Module.to()`` which is safe for both plain tensors and DTensors
     (FSDP2 sharded parameters).  When the model is already FSDP2-sharded
-    (parameters are DTensors), only buffers of matching modules are restored
-    to fp32 (parameters are left as-is since FSDP2 requires uniform dtype).
+    (parameters are DTensors), strict fp32 modules are restored to fp32 because
+    they are expected to be isolated as uniform fp32 FSDP units. Non-strict fp32
+    hints only restore matching buffers, since their parameters may share an
+    FSDP unit with lower-precision parameters.
 
     Args:
         model: The model whose parameters should be cast.
         dtype: Target dtype (e.g. ``torch.bfloat16``).
+        skip_modules: Names of immediate submodules to leave entirely untouched
+            (kept at their current dtype). Unlike the ``_keep_in_fp32_modules``
+            restore path, these are *detached* during the cast so ``model.to()``
+            never visits them — the only reliable way to preserve an fp32
+            parameter once it is FSDP2-sharded (post-shard ``.data`` reassignment
+            does not stick). The caller must guarantee each skipped submodule is
+            its own dtype-uniform FSDP group (e.g. Qwen3.5's ``_fp32_params``
+            holder, sharded separately in fp32), so leaving it fp32 cannot break
+            FSDP's uniform-dtype rule.
     """
     fp32_keywords = _get_fp32_module_keywords(model)
+    strict_fp32_keywords = _get_strict_fp32_module_keywords(model)
+    has_dtensor_params = _has_dtensor_params(model)
 
-    model.to(dtype)
+    if has_dtensor_params:
+        fp32_snapshots = _snapshot_fp32_tensors(
+            model,
+            parameter_keywords=strict_fp32_keywords,
+            buffer_keywords=fp32_keywords,
+        )
+    else:
+        fp32_snapshots = _snapshot_fp32_tensors(
+            model,
+            parameter_keywords=fp32_keywords,
+            buffer_keywords=fp32_keywords,
+        )
+
+    # Detach skip_modules so ``model.to(dtype)`` does not descend into them. This
+    # preserves their exact dtype (e.g. fp32 master weights) through the cast.
+    detached: list[tuple[nn.Module, str, nn.Module]] = []
+    if skip_modules:
+        for _, parent in model.named_modules():
+            for child_name, child in list(parent._modules.items()):
+                if child is not None and child_name in skip_modules:
+                    detached.append((parent, child_name, child))
+                    parent._modules[child_name] = None
+
+    try:
+        model.to(dtype)
+    finally:
+        for parent, child_name, child in detached:
+            parent._modules[child_name] = child
+
     if fp32_keywords:
-        if _has_dtensor_params(model):
-            logger.warning(
-                "Model parameters are DTensors (FSDP2) — skipping fp32 parameter "
-                "restoration for keywords=%s. Only buffers will be restored to fp32. "
-                "FSDP2 requires uniform dtype within each parameter group.",
-                fp32_keywords,
+        if has_dtensor_params:
+            if strict_fp32_keywords:
+                _restore_fp32_tensor_snapshots(
+                    model,
+                    parameter_snapshots=fp32_snapshots[0],
+                    buffer_snapshots={},
+                )
+
+            buffer_only_keywords = [kw for kw in fp32_keywords if kw not in strict_fp32_keywords]
+            if buffer_only_keywords:
+                logger.warning(
+                    "Model parameters are DTensors (FSDP2) — skipping fp32 parameter "
+                    "restoration for non-strict keywords=%s. Only buffers will be restored to fp32. "
+                    "FSDP2 requires uniform dtype within each parameter group.",
+                    buffer_only_keywords,
+                )
+            _restore_fp32_tensor_snapshots(
+                model,
+                parameter_snapshots={},
+                buffer_snapshots=fp32_snapshots[1],
             )
-            _restore_fp32_buffers(model, fp32_keywords)
         else:
-            _restore_fp32_modules(model, fp32_keywords)
+            _restore_fp32_tensor_snapshots(
+                model,
+                parameter_snapshots=fp32_snapshots[0],
+                buffer_snapshots=fp32_snapshots[1],
+            )
 
 
 @contextmanager
@@ -511,8 +575,8 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
 
     ``_keep_in_fp32_modules`` / ``_keep_in_fp32_modules_strict`` handling is delegated to
     ``cast_model_to_dtype``: on an unsharded model those modules' params and buffers are restored
-    to fp32 on exit; on a sharded model only their buffers are (sharded fp32 params are pinned at
-    shard time, since FSDP2 forbids mixed dtypes within a group).
+    to fp32 on exit; on a sharded model, strict fp32 modules are restored while non-strict modules
+    only have their buffers restored.
 
     Args:
         model: The model to run in fp32 within the context.
@@ -535,6 +599,13 @@ def yield_fp32_model(model: nn.Module, restore_dtype: torch.dtype | None = None)
         cast_model_to_dtype(model, restore_dtype)
 
 
+def _get_strict_fp32_module_keywords(model: nn.Module) -> list[str]:
+    val = getattr(model, "_keep_in_fp32_modules_strict", None)
+    if not isinstance(val, (list, set, tuple)):
+        return []
+    return list(dict.fromkeys(val))
+
+
 def _get_fp32_module_keywords(model: nn.Module) -> list[str]:
     """Collect module name patterns that must remain in fp32.
 
@@ -550,7 +621,9 @@ def _get_fp32_module_keywords(model: nn.Module) -> list[str]:
     keywords: list[str] = []
     for attr in ("_keep_in_fp32_modules_strict", "_keep_in_fp32_modules"):
         val = getattr(model, attr, None)
-        if isinstance(val, list):
+        # HuggingFace's PreTrainedModel.__init__ normalizes a class-level
+        # list[str] into an instance-level set[str], so accept both (and tuple).
+        if isinstance(val, (list, set, tuple)):
             keywords.extend(val)
 
     # de-duplicate while preserving order
@@ -564,6 +637,66 @@ def _has_dtensor_params(model: nn.Module) -> bool:
     except ImportError:
         return False
     return any(isinstance(p, DTensor) for p in model.parameters())
+
+
+def _snapshot_fp32_tensors(
+    model: nn.Module,
+    *,
+    parameter_keywords: list[str],
+    buffer_keywords: list[str],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Clone fp32-preserved tensors before a broad dtype cast.
+
+    Casting ``fp32 -> bf16 -> fp32`` restores the dtype but not the original
+    values. Snapshot the matching tensors first so strict fp32 state such as
+    router correction bias or recurrent-decay parameters is restored exactly.
+    """
+    parameter_snapshots = {
+        name: param.detach().to(torch.float32).clone()
+        for name, param in model.named_parameters()
+        if param.is_floating_point() and any(keyword in name for keyword in parameter_keywords)
+    }
+    buffer_snapshots = {
+        name: buf.detach().to(torch.float32).clone()
+        for name, buf in model.named_buffers(remove_duplicate=False)
+        if buf.is_floating_point() and any(keyword in name for keyword in buffer_keywords)
+    }
+    return parameter_snapshots, buffer_snapshots
+
+
+def _restore_fp32_tensor_snapshots(
+    model: nn.Module,
+    *,
+    parameter_snapshots: dict[str, torch.Tensor],
+    buffer_snapshots: dict[str, torch.Tensor],
+) -> None:
+    """Restore fp32-preserved tensors from pre-cast snapshots."""
+    named_parameters = dict(model.named_parameters())
+    for name, snapshot in parameter_snapshots.items():
+        param = named_parameters.get(name)
+        if param is None:
+            continue
+        param.data = snapshot.to(dtype=torch.float32)
+
+    for name, snapshot in buffer_snapshots.items():
+        # ActivationWrapper forwards __getattr__ / __setattr__ to the wrapped
+        # module. Try the literal FQN first for buffers registered on the wrapped
+        # leaf, then strip the wrapper alias as a fallback for forwarded names.
+        candidate_names = [name]
+        stripped_name = name.replace("._checkpoint_wrapped_module", "")
+        if stripped_name != name:
+            candidate_names.append(stripped_name)
+
+        for candidate_name in candidate_names:
+            module_name, _, buffer_name = candidate_name.rpartition(".")
+            try:
+                module = model.get_submodule(module_name) if module_name else model
+            except AttributeError:
+                continue
+            if buffer_name not in module._buffers:
+                continue
+            module._buffers[buffer_name] = snapshot.to(dtype=torch.float32)
+            break
 
 
 def _restore_fp32_modules(model: nn.Module, fp32_keywords: list[str]) -> None:

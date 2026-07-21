@@ -1,6 +1,7 @@
 seed: 42
 
 wandb:
+  enable: false
   project: wan-t2v-flow-matching
   mode: online
   # Stage name is auto-appended (e.g. wan2_2_t2v_fm_high_noise) when model.stage is set.

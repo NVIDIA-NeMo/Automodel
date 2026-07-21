@@ -36,79 +36,7 @@ from nemo_automodel.components.moe.experts import (
 from nemo_automodel.components.moe.megatron.moe_utils import (
     MoEAuxLossAutoScaler,
 )
-
-_shared_experts_stream: Optional[torch.cuda.Stream] = None
-
-
-def _record_stream_safe(t: torch.Tensor, stream: Optional[torch.cuda.Stream]) -> None:
-    """Tell the caching allocator that ``stream`` uses ``t``'s storage.
-
-    Required whenever a tensor allocated on one CUDA stream is read/written on
-    another stream: without it the allocator may recycle the block while
-    ``stream`` is still using it (cross-stream use-after-free -> corrupted
-    values). No-op for non-CUDA tensors; handles DTensor by recording on the
-    local shard.
-    """
-    if stream is None or not isinstance(t, torch.Tensor):
-        return
-    local = t.to_local() if hasattr(t, "to_local") else t
-    if local.is_cuda:
-        local.record_stream(stream)
-
-
-class _SharedExpertStreamFork(torch.autograd.Function):
-    """Fork the shared-expert input ``x`` into the side stream.
-
-    Data-identity op; it only enforces cross-stream ordering + allocator safety
-    so the side-stream overlap is correct in BOTH passes. A raw ``wait_stream``
-    is forward-only and has no backward mirror, which (together with missing
-    ``record_stream``) is the cross-stream race that corrupts gradients.
-
-    * forward (main stream): the side stream waits for main so it observes ``x``.
-    * backward (main stream): ``grad_x`` was produced by the shared-expert
-      subgraph on the side stream, so main waits for side before that gradient
-      is accumulated into ``x``'s ``.grad`` alongside the main-stream branches.
-    """
-
-    @staticmethod
-    def forward(ctx, x, side_stream):
-        ctx.main_stream = torch.cuda.current_stream()
-        ctx.side_stream = side_stream
-        side_stream.wait_stream(ctx.main_stream)
-        _record_stream_safe(x, side_stream)
-        return x
-
-    @staticmethod
-    def backward(ctx, grad_x):
-        ctx.main_stream.wait_stream(ctx.side_stream)
-        _record_stream_safe(grad_x, ctx.main_stream)
-        return grad_x, None
-
-
-class _SharedExpertStreamJoin(torch.autograd.Function):
-    """Join the shared-expert output ``z`` back to the main stream.
-
-    * forward (main stream): main waits for the side stream so ``z`` is ready
-      before it is added to the routed output. Applied AFTER ``experts()`` is
-      launched so the shared-expert compute overlaps the dispatch comm.
-    * backward (main stream): ``grad_z`` is produced on the main stream by the
-      ``y + z`` add; the side stream waits for main before the shared-expert
-      subgraph (replayed on the side stream) consumes it.
-    """
-
-    @staticmethod
-    def forward(ctx, z, side_stream):
-        ctx.main_stream = torch.cuda.current_stream()
-        ctx.side_stream = side_stream
-        ctx.main_stream.wait_stream(side_stream)
-        _record_stream_safe(z, ctx.main_stream)
-        return z
-
-    @staticmethod
-    def backward(ctx, grad_z):
-        ctx.side_stream.wait_stream(ctx.main_stream)
-        _record_stream_safe(grad_z, ctx.side_stream)
-        return grad_z, None
+from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 
 
 class MLP(nn.Module):
@@ -359,6 +287,12 @@ class Gate(nn.Module):
         self._last_expert_load: Optional[torch.Tensor] = None
         self._last_aux_loss: Optional[torch.Tensor] = None
 
+        # Rollout Routing Replay (R3): owns a handle only when enabled so the
+        # default routing path stays a no-op.
+        self.router_replay: Optional[RouterReplay] = (
+            RouterReplay() if getattr(config, "enable_routing_replay", False) else None
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -396,9 +330,16 @@ class Gate(nn.Module):
                 scores = scores.softmax(dim=-1, dtype=self.gate_precision or torch.float32)
                 original_scores = scores
                 indices = torch.topk(scores, k=self.topk, dim=-1)[1]
+                indices = replay_selection(self.router_replay, indices)
                 weights = scores.gather(1, indices)
             else:
                 values, indices = torch.topk(scores, k=self.topk, dim=-1)
+                replayed = replay_selection(self.router_replay, indices)
+                if replayed is not indices:
+                    # Replay swapped the selection: re-gather the values for the
+                    # replayed experts. Skipped (zero overhead) on the default path.
+                    values = scores.gather(1, replayed)
+                    indices = replayed
                 weights = values.softmax(dim=1, dtype=self.gate_precision or torch.float32)
                 # Use full softmax for aux_loss so P_i represents proper probabilities.
                 # Raw logits can be negative, causing aux_loss to diverge negative.
@@ -424,6 +365,7 @@ class Gate(nn.Module):
                 scores_for_choice = (scores_for_choice * mask.unsqueeze(-1)).flatten(1)
 
             indices = torch.topk(scores_for_choice, self.topk, dim=-1)[1]
+            indices = replay_selection(self.router_replay, indices)
             # Final weights gathered from UNBIASED softmax scores
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sqrtsoftplus":
@@ -435,6 +377,7 @@ class Gate(nn.Module):
                 scores = scores + self.e_score_correction_bias
 
             indices = torch.topk(scores, self.topk, dim=-1)[1]
+            indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
         elif self.score_func == "sigmoid_with_bias":
             scores = scores.sigmoid()
@@ -455,6 +398,7 @@ class Gate(nn.Module):
                 )
 
             indices = torch.topk(scores_for_choice, k=self.topk, dim=-1, sorted=False)[1]
+            indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
         else:
             scores = scores.sigmoid()
@@ -476,6 +420,7 @@ class Gate(nn.Module):
                 scores = (scores * mask.unsqueeze(-1)).flatten(1)
 
             indices = torch.topk(scores, self.topk, dim=-1)[1]
+            indices = replay_selection(self.router_replay, indices)
             weights = original_scores.gather(1, indices)
 
         if self.norm_topk_prob and self.topk > 1:
@@ -795,37 +740,15 @@ class MoE(nn.Module):
 
         weights, indices, aux_loss = self.gate(x, token_mask, cp_mesh)
 
-        # Shared-expert output (optionally gated).  Run on a side CUDA stream to
-        # overlap with the grouped-expert dispatch comm.  The fork/join autograd
-        # fences (_SharedExpertStreamFork / _SharedExpertStreamJoin) make the
-        # overlap correct in BOTH forward and backward: a raw wait_stream is
-        # forward-only, and its missing backward mirror plus the missing
-        # record_stream is a cross-stream race that corrupts gradients (grad-norm
-        # explosion at high tokens/microbatch on some hardware).  shared_experts
-        # stays in the normal autograd graph, so FSDP2's post-backward
-        # reduce-scatter hooks and gradient accumulation are unaffected; expert
-        # parallelism only touches the routed ``experts`` path on the main stream.
+        # Shared-expert output (optionally gated), computed inline on the main stream.
         z = None
-        side_stream = None
         if self.shared_experts is not None:
-            global _shared_experts_stream
-            if _shared_experts_stream is None:
-                _shared_experts_stream = torch.cuda.Stream()
-            side_stream = _shared_experts_stream
+            z = self.shared_experts(x)
+            if self.shared_expert_gate is not None:
+                z = torch.nn.functional.sigmoid(self.shared_expert_gate(x)) * z
 
-            # Fork into the side stream (fences main->side fwd, side->main bwd).
-            x_se = _SharedExpertStreamFork.apply(x, side_stream)
-            with torch.cuda.stream(side_stream):
-                z = self.shared_experts(x_se)
-                if self.shared_expert_gate is not None:
-                    z = torch.nn.functional.sigmoid(self.shared_expert_gate(x_se)) * z
-
-        # Routed experts on the main stream — runs concurrently with the
-        # shared-expert side stream above; the join below waits for it.
+        # Routed experts on the main stream.
         y = self.experts(x_latent, token_mask, weights, indices)
-        if side_stream is not None:
-            # Join back to the main stream (fences side->main fwd, main->side bwd).
-            z = _SharedExpertStreamJoin.apply(z, side_stream)
 
         if self.fc2_latent_proj is not None:
             y = self.fc2_latent_proj(y)

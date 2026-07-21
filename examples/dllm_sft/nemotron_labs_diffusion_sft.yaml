@@ -29,6 +29,7 @@ dist_env:
 seed: 42
 
 wandb:
+  enable: false
   project: dllm-baseline
   name: am-nemotron-labs-diffusion-sft
 
@@ -107,3 +108,10 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
+
+# Included in the dllm_sft nightly CI scope (tests/ci_tests/configs/dllm_sft).
+# Heavier than llada (8B, tp2, seq 8192, CPU offload); cold-cache budget covers
+# 8B download + tulu-3 + train + consolidate + reload + generate.
+ci:
+  recipe_owner: zyzhou5
+  time: "02:00:00"

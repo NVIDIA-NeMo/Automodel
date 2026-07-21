@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Configuration for fine-tuning Gemma 4 5B with MedPix dataset for image description
-# torchrun --nproc-per-node=2 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_4b.yaml
+# Configuration for fine-tuning Gemma 4 E4B with MedPix dataset for image description
+# PR 2237 changed the default reduce_dtype from bfloat16 to fp32, which causes OOMs on E4B with 2 GPUs.
+# Although it can be made to run on 2 GPUs by setting reduce_dtype back to bfloat16 and AC=True, its still very 
+# tight. Hence, using 8 GPUs to run this recipe.
+# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_4b.yaml
 
 recipe: FinetuneRecipeForVLM
 

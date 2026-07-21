@@ -42,7 +42,7 @@ class MoEConfig:
     norm_topk_prob: bool
     router_bias: bool = False
     expert_bias: bool = False
-    expert_activation: Literal["swiglu", "quick_geglu", "geglu", "relu2"] = "swiglu"
+    expert_activation: Literal["swiglu", "swigluoai", "quick_geglu", "geglu", "relu2"] = "swiglu"
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
     # When > 0, ``expert_activation="swiglu"`` dispatches to a clamped FP32
@@ -57,6 +57,10 @@ class MoEConfig:
     shared_expert_activation: str = "swiglu"  # Activation for shared experts ("swiglu" or "relu2")
     force_e_score_correction_bias: bool = False  # Force creation of e_score_correction_bias buffer
     moe_latent_size: int | None = None
+    # Rollout Routing Replay (R3): when True, each gate records/replays its top-k
+    # expert selection so RL training reuses the rollout's routing decisions. See
+    # nemo_automodel.components.moe.router_replay.
+    enable_routing_replay: bool = False
 
     @property
     def expert_dim(self) -> int:

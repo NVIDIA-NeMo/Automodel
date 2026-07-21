@@ -28,6 +28,7 @@ from nemo_automodel._transformers.auto_model import (
     _consume_config_overrides,
     _get_next_fallback_attn,
     _init_model,
+    _maybe_reject_tie_word_embeddings_flip,
     _patch_attention,
     _patch_remote_code_compat,
     _resolve_distributed_setup,
@@ -247,7 +248,10 @@ class TestPatchAttention:
         obj = DummyModule()
         custom_sdpa_method = [SDPBackend.FLASH_ATTENTION]
 
-        with patch("nemo_automodel._transformers.kernel_patches.sdpa_kernel") as mock_sdpa_kernel:
+        with (
+            patch("nemo_automodel._transformers.kernel_patches.sdpa_kernel") as mock_sdpa_kernel,
+            patch("nemo_automodel._transformers.kernel_patches._set_global_sdpa_backends") as mock_global_sdpa,
+        ):
             result = _patch_attention(obj, custom_sdpa_method)
 
             assert result is obj
@@ -257,6 +261,7 @@ class TestPatchAttention:
             # Call forward and verify sdpa_kernel was called with the custom method
             output = obj.forward(5)
             assert output == 6  # Original forward logic still works
+            mock_global_sdpa.assert_called_once_with(custom_sdpa_method)
             mock_sdpa_kernel.assert_called_once_with(custom_sdpa_method)
 
 
@@ -354,9 +359,13 @@ class TestModelRuntimePatches:
             self.config = types.SimpleNamespace(architectures=architectures)
 
     def test_apply_model_runtime_patches_dispatches_by_architecture(self):
+        # The registry mechanism is exercised with a temporary test entry — the
+        # built-in registry no longer ships any entries (Qwen3.5 builds its
+        # CP/fp32-gate modules at construction instead of patching at load time).
+        import nemo_automodel._transformers.kernel_patches as kp
         from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
 
-        model = self._DummyModel(["Qwen3_5ForCausalLM"])
+        model = self._DummyModel(["FakeArchForCausalLM"])
         mesh = types.SimpleNamespace(cp_size=1)
         calls = []
 
@@ -365,20 +374,26 @@ class TestModelRuntimePatches:
             return model
 
         fake_module = types.SimpleNamespace(apply_model_runtime_patches=fake_hook)
+        test_registry = {"FakeArchForCausalLM": ("fake.module.path", "apply_model_runtime_patches")}
 
-        with patch(
-            "nemo_automodel._transformers.kernel_patches.importlib.import_module",
-            return_value=fake_module,
-        ) as mock_import:
+        with (
+            patch.object(kp, "_MODEL_RUNTIME_PATCHES", test_registry),
+            patch(
+                "nemo_automodel._transformers.kernel_patches.importlib.import_module",
+                return_value=fake_module,
+            ) as mock_import,
+        ):
             assert apply_model_runtime_patches(model, mesh) is model
 
-        mock_import.assert_called_once_with("nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn")
+        mock_import.assert_called_once_with("fake.module.path")
         assert calls == [(model, mesh)]
 
     def test_apply_model_runtime_patches_deduplicates_hook_specs(self):
+        # Two architectures sharing one hook spec must invoke the hook once.
+        import nemo_automodel._transformers.kernel_patches as kp
         from nemo_automodel._transformers.kernel_patches import apply_model_runtime_patches
 
-        model = self._DummyModel(["Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"])
+        model = self._DummyModel(["FakeArchA", "FakeArchB"])
         mesh = types.SimpleNamespace(cp_size=2)
         calls = []
 
@@ -387,10 +402,15 @@ class TestModelRuntimePatches:
             return model
 
         fake_module = types.SimpleNamespace(apply_model_runtime_patches=fake_hook)
+        shared_spec = ("fake.module.path", "apply_model_runtime_patches")
+        test_registry = {"FakeArchA": shared_spec, "FakeArchB": shared_spec}
 
-        with patch(
-            "nemo_automodel._transformers.kernel_patches.importlib.import_module",
-            return_value=fake_module,
+        with (
+            patch.object(kp, "_MODEL_RUNTIME_PATCHES", test_registry),
+            patch(
+                "nemo_automodel._transformers.kernel_patches.importlib.import_module",
+                return_value=fake_module,
+            ),
         ):
             assert apply_model_runtime_patches(model, mesh) is model
 
@@ -1552,6 +1572,51 @@ class TestBuildModelRetryDepth:
         assert result is sentinel_model
         assert order == ["runtime_patches", "infrastructure"]
 
+    def test_custom_model_gets_sdpa_patch_when_method_resolved(self):
+        """Custom models need resolved SDPA method constraints too, e.g. to exclude cuDNN under AC."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        sdpa_method = [object()]
+        build_kwargs.update(is_hf_model=False, use_sdpa_patching=True, sdpa_method=sdpa_method)
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("sdpa", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model", return_value=(True, sentinel_model)),
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch(
+                "nemo_automodel._transformers.auto_model._patch_attention", return_value=sentinel_model
+            ) as mock_patch,
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+
+        assert result is sentinel_model
+        mock_patch.assert_called_once_with(sentinel_model, sdpa_method)
+
+    def test_custom_model_skips_sdpa_patch_when_method_is_default(self):
+        """Keep the custom-model default path unchanged when no SDPA method was resolved."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        sentinel_model = MagicMock()
+        build_kwargs.update(is_hf_model=False, use_sdpa_patching=True, sdpa_method=None)
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("sdpa", False)),
+            patch("nemo_automodel._transformers.auto_model._init_model", return_value=(True, sentinel_model)),
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch(
+                "nemo_automodel._transformers.auto_model._patch_attention", return_value=sentinel_model
+            ) as mock_patch,
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch("nemo_automodel._transformers.auto_model.apply_model_infrastructure", return_value=sentinel_model),
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+
+        assert result is sentinel_model
+        mock_patch.assert_not_called()
+
     def test_meta_tensor_runtime_error_retries_without_meta_device(self):
         """RuntimeError with 'meta tensors' triggers retry without meta device."""
         build_kwargs, mock_config = self._make_build_kwargs()
@@ -1917,3 +1982,67 @@ class TestPatchRemoteCodeCompat:
         # Existing values should be preserved
         assert model.all_tied_weights_keys == ["existing.key"]
         assert model.config.use_cache is True
+
+
+class TestMaybeRejectTieWordEmbeddingsFlip:
+    """Layer 2 from_pretrained flip guard (_maybe_reject_tie_word_embeddings_flip).
+
+    from_pretrained accepts str | os.PathLike sources, so the guard must normalize
+    path-like inputs with os.fspath() and enforce the checkpoint's raw
+    tie_word_embeddings for both — a pathlib.Path local checkpoint must not bypass
+    the check. Non-path sources are skipped and a failed raw-config re-read is
+    conservative (never blocks the load).
+    """
+
+    @staticmethod
+    def _requested_config(tied):
+        return types.SimpleNamespace(tie_word_embeddings=tied, architectures=["DummyForCausalLM"])
+
+    @staticmethod
+    def _patch_raw_config(**kwargs):
+        return patch(
+            "nemo_automodel._transformers.auto_model.AutoConfig.from_pretrained",
+            **kwargs,
+        )
+
+    def test_str_source_flip_rejected(self):
+        raw = types.SimpleNamespace(tie_word_embeddings=True)
+        with self._patch_raw_config(return_value=raw):
+            with pytest.raises(NotImplementedError, match="flipping the flag is not supported"):
+                _maybe_reject_tie_word_embeddings_flip("org/tied-model", self._requested_config(tied=False), {})
+
+    def test_pathlib_path_source_flip_rejected(self):
+        from pathlib import Path
+
+        raw = types.SimpleNamespace(tie_word_embeddings=True)
+        with self._patch_raw_config(return_value=raw):
+            with pytest.raises(NotImplementedError, match="flipping the flag is not supported"):
+                _maybe_reject_tie_word_embeddings_flip(
+                    Path("/ckpts/tied-model"), self._requested_config(tied=False), {}
+                )
+
+    def test_pathlib_path_source_matching_value_passes(self):
+        from pathlib import Path
+
+        raw = types.SimpleNamespace(tie_word_embeddings=True)
+        with self._patch_raw_config(return_value=raw):
+            _maybe_reject_tie_word_embeddings_flip(Path("/ckpts/tied-model"), self._requested_config(tied=True), {})
+
+    def test_pathlib_path_normalized_to_str_for_raw_read(self):
+        from pathlib import Path
+
+        raw = types.SimpleNamespace(tie_word_embeddings=True)
+        with self._patch_raw_config(return_value=raw) as mock_from_pretrained:
+            _maybe_reject_tie_word_embeddings_flip(Path("/ckpts/tied-model"), self._requested_config(tied=True), {})
+        (source,) = mock_from_pretrained.call_args.args
+        assert isinstance(source, str)
+        assert source == str(Path("/ckpts/tied-model"))
+
+    def test_non_path_source_skipped(self):
+        with self._patch_raw_config() as mock_from_pretrained:
+            _maybe_reject_tie_word_embeddings_flip(None, self._requested_config(tied=False), {})
+        mock_from_pretrained.assert_not_called()
+
+    def test_raw_config_read_failure_does_not_block(self):
+        with self._patch_raw_config(side_effect=OSError("offline")):
+            _maybe_reject_tie_word_embeddings_flip("org/unreachable", self._requested_config(tied=False), {})

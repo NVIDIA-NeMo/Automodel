@@ -47,8 +47,8 @@ model:
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
-    experts: te
-    enable_deepep: true
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -116,4 +116,14 @@ freeze_config:
 
 ci:
   recipe_owner: HuiyingLi
+  nodes: 1
   time: "00:30:00"
+  checkpoint_robustness:
+    check_source_load_parity: true
+    hf_kl_threshold: 2e-2
+    hf_device_map_auto: true
+    resume_loss_threshold: 1e-2
+    source_load_kl_threshold: 1e-2
+    source_load_mean_kl_threshold: 3e-3
+    source_load_cosine_threshold: 0.9985
+    tokenizer_name: Qwen/Qwen3-VL-30B-A3B-Instruct

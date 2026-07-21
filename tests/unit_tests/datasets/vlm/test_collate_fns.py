@@ -73,6 +73,7 @@ class DummyDefaultProcessor:
         truncation=False,
         return_tensors,
         return_dict=True,
+        processor_kwargs=None,
     ):
         assert tokenize and return_tensors == "pt" and return_dict
         batch_size = len(conv_list)
@@ -694,9 +695,11 @@ def test_default_collate_fn_with_max_length(collate_mod, fake_qwen_utils, monkey
     processor = MaxLengthProcessor()
     collate_mod.default_collate_fn([{"conversation": CONVERSATION}], processor, max_length=512)
 
-    assert captured_kwargs.get("max_length") == 512
-    assert captured_kwargs.get("padding") == "max_length"
-    assert captured_kwargs.get("truncation") is True
+    # processing kwargs are now nested under processor_kwargs (transformers>=5)
+    proc_kwargs = captured_kwargs.get("processor_kwargs", {})
+    assert proc_kwargs.get("max_length") == 512
+    assert proc_kwargs.get("padding") == "max_length"
+    assert proc_kwargs.get("truncation") is True
 
 
 def test_default_collate_fn_without_max_length(collate_mod, fake_qwen_utils, monkeypatch):
@@ -718,8 +721,9 @@ def test_default_collate_fn_without_max_length(collate_mod, fake_qwen_utils, mon
     processor = NoMaxLengthProcessor()
     collate_mod.default_collate_fn([{"conversation": CONVERSATION}], processor)
 
-    assert "max_length" not in captured_kwargs
-    assert captured_kwargs.get("padding") is True
+    proc_kwargs = captured_kwargs.get("processor_kwargs", {})
+    assert "max_length" not in proc_kwargs
+    assert proc_kwargs.get("padding") is True
 
 
 def test_kimi_vl_collate_fn_registered(collate_mod):
@@ -2712,9 +2716,10 @@ def test_default_collate_fn_truncation_by_default(collate_mod, fake_qwen_utils, 
         max_length=512,
     )
 
-    assert captured_kwargs.get("truncation") is True
-    assert captured_kwargs.get("max_length") == 512
-    assert captured_kwargs.get("padding") == "max_length"
+    proc_kwargs = captured_kwargs.get("processor_kwargs", {})
+    assert proc_kwargs.get("truncation") is True
+    assert proc_kwargs.get("max_length") == 512
+    assert proc_kwargs.get("padding") == "max_length"
 
 
 def test_default_collate_fn_no_truncation_with_drop_overlong(collate_mod, fake_qwen_utils, monkeypatch):
@@ -2745,9 +2750,10 @@ def test_default_collate_fn_no_truncation_with_drop_overlong(collate_mod, fake_q
         drop_overlong=True,
     )
 
-    assert captured_kwargs.get("truncation") is False
-    assert captured_kwargs.get("max_length") == 512
-    assert captured_kwargs.get("padding") == "max_length"
+    proc_kwargs = captured_kwargs.get("processor_kwargs", {})
+    assert proc_kwargs.get("truncation") is False
+    assert proc_kwargs.get("max_length") == 512
+    assert proc_kwargs.get("padding") == "max_length"
 
 
 def test_estimate_media_tokens_with_pil_image(collate_mod):
@@ -3082,6 +3088,16 @@ class TestNeatPackedVlmCollaterAttnImpl:
         # SDPA produces 4D block-causal mask
         assert result["attention_mask"].ndim == 4
 
+    def test_single_sequence_omits_packed_seq_ids(self):
+        """A single (unpacked) sequence carries no ``_packed_seq_ids``; the all-gather
+        CP path synthesizes the trivial one-document map downstream (see
+        ``cp_utils._synthesize_single_document_seq_ids``)."""
+        from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
+
+        batch = [self._make_packed_sample(4, 0)]
+        result = neat_packed_vlm_collater(batch, max_length=6, attn_implementation="sdpa")
+        assert "_packed_seq_ids" not in result
+
     def test_fixed_max_length_pads_to_max(self):
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
@@ -3172,3 +3188,83 @@ def test_gemma4_inject_thinking_prefix_accepts_processor_or_tokenizer(collate_mo
     out_proc = collate_mod.gemma4_inject_thinking_prefix(batch_a, _Processor())
     out_tok = collate_mod.gemma4_inject_thinking_prefix(batch_b, _GemmaTokenizerStub())
     assert torch.equal(out_proc["input_ids"], out_tok["input_ids"])
+
+
+def _thd_vlm_make_sample(doc_lens, n_img_patches=0):
+    import torch
+
+    seq = sum(doc_lens)
+    input_ids = torch.arange(1, seq + 1, dtype=torch.long)
+    labels = input_ids.clone()
+    attention_mask = torch.cat([torch.full((d,), i + 1, dtype=torch.long) for i, d in enumerate(doc_lens)])
+    position_ids = torch.cat([torch.arange(d) for d in doc_lens]).unsqueeze(0).expand(3, -1).contiguous()
+    sample = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+    if n_img_patches:
+        sample["pixel_values"] = torch.randn(n_img_patches, 8)
+        sample["image_grid_thw"] = torch.tensor([[1, 2, 2]])
+    return sample
+
+
+def test_thd_vlm_collater_mrope_shapes_and_seq_lens():
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+
+    batch = [_thd_vlm_make_sample([3, 2], 4), _thd_vlm_make_sample([4], 4)]
+    out = packed_sequence_thd_vlm_collater(batch, padding_idx=0)
+    assert tuple(out["input_ids"].shape) == (2, 5)
+    assert tuple(out["position_ids"].shape) == (3, 2, 5)
+    assert out["seq_lens"].tolist() == [[3, 2], [4, -1000]]
+    assert out["seq_lens_padded"].tolist() == [[3, 2], [5, -1000]]
+    assert out["qkv_format"] == "thd"
+    assert tuple(out["pixel_values"].shape) == (8, 8)
+    assert tuple(out["image_grid_thw"].shape) == (2, 3)
+    thd_in = {k: out[k] for k in ("input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded", "qkv_format")}
+    thd = process_input_for_thd(thd_in)
+    assert tuple(thd["input_ids"].shape) == (10,)
+    assert tuple(thd["position_ids"].shape) == (3, 1, 10)
+    assert thd["cu_seqlens"].tolist() == [0, 3, 5, 10]
+
+
+def test_thd_vlm_collater_both_padded_pad_between_seqs():
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+    from nemo_automodel.components.distributed.thd_utils import process_input_for_thd
+
+    out = packed_sequence_thd_vlm_collater([_thd_vlm_make_sample([2]), _thd_vlm_make_sample([3])], padding_idx=0)
+    assert out["seq_lens"].tolist() == [[2], [3]]
+    assert out["seq_lens_padded"].tolist() == [[3], [3]]
+    thd_in = {k: out[k] for k in ("input_ids", "labels", "position_ids", "seq_lens", "seq_lens_padded", "qkv_format")}
+    thd = process_input_for_thd(thd_in)
+    assert thd["cu_seqlens"].tolist() == [0, 2, 5]
+    assert thd["cu_seqlens_padded"].tolist() == [0, 3, 6]
+
+
+def test_thd_vlm_collater_1d_position_ids():
+    import torch
+
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+
+    sample = _thd_vlm_make_sample([3, 2])
+    sample["position_ids"] = torch.arange(5)
+    out = packed_sequence_thd_vlm_collater([sample], padding_idx=0)
+    assert tuple(out["position_ids"].shape) == (1, 5)
+
+
+def test_thd_vlm_collater_fixed_max_length_pads():
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+
+    out = packed_sequence_thd_vlm_collater([_thd_vlm_make_sample([3])], padding_idx=0, max_length=8)
+    assert tuple(out["input_ids"].shape) == (1, 8)
+    assert tuple(out["position_ids"].shape) == (3, 1, 8)
+    assert out["seq_lens"].tolist() == [[3]]
+    assert out["seq_lens_padded"].tolist() == [[8]]
+
+
+def test_thd_vlm_collater_empty_batch():
+    from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+
+    assert packed_sequence_thd_vlm_collater([]) == {}

@@ -232,6 +232,12 @@ def _build_diffusion_parallel_manager_args(
     if compute_dtype is None:
         compute_dtype = dtype
 
+    # The recipe passes ConfigNode sections, which support .to_dict() but not dict().
+    if hasattr(fsdp_cfg, "to_dict"):
+        fsdp_cfg = fsdp_cfg.to_dict()
+    if hasattr(ddp_cfg, "to_dict"):
+        ddp_cfg = ddp_cfg.to_dict()
+
     if fsdp_cfg is not None and ddp_cfg is not None:
         raise ValueError(
             "Cannot specify both 'fsdp' and 'ddp' configurations. "
@@ -979,6 +985,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             model_cache_dir=model_cache_dir if model_cache_dir is not None else HF_HUB_CACHE,
             model_repo_id=self.model_id,
             save_consolidated=checkpoint_cfg.get("save_consolidated", False),
+            consolidation_timeout_minutes=checkpoint_cfg.get("consolidation_timeout_minutes", 30),
             is_peft=self.peft_cfg is not None,
             model_state_dict_keys=model_state_dict_keys,
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
@@ -991,15 +998,16 @@ class TrainDiffusionRecipe(BaseRecipe):
             moe_mesh=None,
         )
 
-        dataloader_cfg = self.cfg.get("data.dataloader")
-        if not hasattr(dataloader_cfg, "instantiate"):
-            raise RuntimeError("data.dataloader must be a config node with instantiate()")
-
-        self.dataloader, self.sampler = dataloader_cfg.instantiate(
+        dataloader_config = self.cfg.diffusion_dataloader
+        if dataloader_config is None:
+            raise ValueError("Diffusion training requires a data.dataloader config")
+        dataloader_build = dataloader_config.build(
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             batch_size=self.cfg.get("step_scheduler.local_batch_size"),
         )
+        self.dataloader = dataloader_build.dataloader
+        self.sampler = dataloader_build.sampler
 
         self.raw_steps_per_epoch = len(self.dataloader)
         if self.raw_steps_per_epoch == 0:

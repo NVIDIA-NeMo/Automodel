@@ -120,3 +120,10 @@ modify it. Use the current year (2026).
 6. **No commented-out code** without explanation
 7. **Optional imports** guarded with `safe_import()`
 8. **No cross-component imports** between `components/` subdirectories
+
+## Automated Review
+
+The review-only maintainability heuristics and thresholds live in
+`.github/workflows/claude-review.yml`. Keep repository-wide coding rules here
+and automated-review prompt policy there so the detailed checklist has one
+source of truth.

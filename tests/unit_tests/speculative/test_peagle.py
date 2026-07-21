@@ -746,3 +746,35 @@ def test_gradient_checkpointing_matches_uncheckpointed_forward():
     assert base_grads, "expected non-empty gradients"
     for name in base_grads:
         torch.testing.assert_close(ckpt_grads[name], base_grads[name], rtol=1e-3, atol=1e-4)
+
+
+def test_peagle_flex_attention_compiles_with_dynamic_shapes(monkeypatch):
+    """The module-level flex_attention compile must request dynamic shapes.
+
+    COD subsampling gives every rank/batch a different flat sequence length, so
+    a static-by-default first compile re-specializes (a full max-autotune pass)
+    per new length and never matches a shared Inductor cache across processes.
+    Reloading under a mocked ``torch.compile`` is the only way to observe the
+    kwargs of an import-time compile.
+    """
+    import importlib
+
+    import nemo_automodel.components.speculative.eagle.peagle_draft as peagle_draft
+
+    captured = {}
+
+    def compile_fn(fn, **kwargs):
+        captured["fn"] = fn
+        captured["kwargs"] = kwargs
+        return fn
+
+    monkeypatch.setattr(torch, "compile", compile_fn)
+    try:
+        importlib.reload(peagle_draft)
+        assert captured["fn"] is peagle_draft.flex_attention
+        assert captured["kwargs"] == {"mode": "max-autotune-no-cudagraphs", "dynamic": True}
+    finally:
+        # Re-execute the module under the real torch.compile so later tests see
+        # the production lazy-compiled callable, not the mocked passthrough.
+        monkeypatch.undo()
+        importlib.reload(peagle_draft)

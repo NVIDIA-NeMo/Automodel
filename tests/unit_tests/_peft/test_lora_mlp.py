@@ -14,6 +14,8 @@
 
 """Parity tests for the fused LoRA SwiGLU MLP autograd function."""
 
+# ruff: noqa: E741
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -46,8 +48,12 @@ def test_fused_lora_mlp_matches_reference_fp32():
     # reference
     xr = x0.clone().requires_grad_(True)
     ref_p = {k: v.clone().requires_grad_(True) for k, v in dict(gA=gA, gB=gB, uA=uA, uB=uB, dA=dA, dB=dB).items()}
-    (_ref_mlp(xr, gW, ref_p["gA"], ref_p["gB"], gS, uW, ref_p["uA"], ref_p["uB"], uS,
-              dW, ref_p["dA"], ref_p["dB"], dS) * gout).sum().backward()
+    (
+        _ref_mlp(
+            xr, gW, ref_p["gA"], ref_p["gB"], gS, uW, ref_p["uA"], ref_p["uB"], uS, dW, ref_p["dA"], ref_p["dB"], dS
+        )
+        * gout
+    ).sum().backward()
 
     # fused
     xf = x0.clone().requires_grad_(True)
@@ -155,6 +161,50 @@ def test_fused_helper_declines_on_dropout_and_dora():
     gate = _make_lora(H, I, R)
     gate.use_dora = True
     assert fused_lora_swiglu_mlp(gate, up, down, x) is None
+
+
+def test_fused_helper_declines_on_quantized_base():
+    """QLoRA/quantized base weights are packed buffers, not a 2D (out, in) matrix; the fused path
+    must decline so the per-linear (dequantizing) path handles them.
+
+    Regression for AM-435: with a 4-bit-packed base, ``F.linear(x, base_weight)`` in the fused
+    forward failed with "mat1 and mat2 shapes cannot be multiplied (Nx4096 and 1x14680064)".
+    """
+    H, I, R = 64, 96, 8
+    up, down = _make_lora(H, I, R), _make_lora(I, H, R)
+    x = torch.randn(2, 16, H)
+
+    # (a) packed/flattened base weight (shape != (out_features, in_features))
+    gate_packed = _make_lora(H, I, R)
+    gate_packed.weight = nn.Parameter(torch.zeros(1, I * H // 2), requires_grad=False)
+    assert fused_lora_swiglu_mlp(gate_packed, up, down, x) is None
+
+    # (b) bitsandbytes-style quant_state marker on the module
+    gate_qs = _make_lora(H, I, R)
+    gate_qs.quant_state = object()
+    assert fused_lora_swiglu_mlp(gate_qs, up, down, x) is None
+
+
+def test_fused_helper_declines_on_meta_weights():
+    """FSDP/PP graph construction can leave projection params on meta; direct F.linear must not run."""
+    H, I, R = 64, 96, 8
+    gate, up, down = _make_lora(H, I, R), _make_lora(H, I, R), _make_lora(I, H, R)
+    x = torch.randn(2, 16, H)
+
+    gate.weight = nn.Parameter(torch.empty_like(gate.weight, device="meta"), requires_grad=False)
+    assert fused_lora_swiglu_mlp(gate, up, down, x) is None
+
+
+def test_install_skips_meta_weight_mlp():
+    """Do not install a fused MLP wrapper when any projection weight is still on meta."""
+    from nemo_automodel.components._peft.lora_mlp import install_fused_lora_mlp
+
+    H, I, R = 64, 96, 8
+    mlp = _lora_swiglu_mlp(H, I, R)
+    mlp.gate_proj.weight = nn.Parameter(torch.empty_like(mlp.gate_proj.weight, device="meta"), requires_grad=False)
+
+    assert install_fused_lora_mlp(mlp) == 0
+    assert not getattr(mlp, "_lora_mlp_fused", False)
 
 
 def _lora_swiglu_mlp(H, I, R):

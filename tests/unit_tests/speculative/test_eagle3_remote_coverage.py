@@ -99,8 +99,11 @@ def test_parse_args_explicit():
 )
 def test_main_wires_server(monkeypatch, argv, expected_nccl_port):
     fake_model = mock.MagicMock()
+    # ``NeMoAutoModelForCausalLM`` is imported lazily inside ``_build_hf_target``
+    # (so the sglang engine needs no HF stack), so patch it at its source module.
     monkeypatch.setattr(
-        serve_target.NeMoAutoModelForCausalLM, "from_pretrained", mock.MagicMock(return_value=fake_model)
+        "nemo_automodel._transformers.auto_model.NeMoAutoModelForCausalLM.from_pretrained",
+        mock.MagicMock(return_value=fake_model),
     )
     monkeypatch.setattr(serve_target, "HFEagle3TargetModel", mock.MagicMock(return_value="wrapper"))
     captured = {}
@@ -144,6 +147,22 @@ def test_nccl_port_nondigit_falls_back(monkeypatch):
     assert client._nccl_port() == 8100  # 8000 default + 100
 
 
+def test_init_nccl_skips_server_when_locally_unavailable(monkeypatch):
+    """No local NCCL support (e.g. an sglang-free client) must not ask the server
+    to init NCCL -- otherwise the server blocks on a rendezvous the client can
+    never complete. The client falls back to wire immediately instead."""
+    from nemo_automodel.components.speculative.eagle.remote import client as client_mod
+
+    monkeypatch.setattr(client_mod, "nccl_transport_available", lambda: False)
+    client = _ServerClient("http://h:8001", timeout=1, max_retries=0)
+    sent = []
+    monkeypatch.setattr(client, "request", lambda endpoint, *_a, **_k: sent.append(endpoint) or b"{}")
+
+    assert client._init_nccl() is False
+    assert protocol.EP_INIT_NCCL not in sent  # server was never contacted
+    assert client._nccl is None
+
+
 # ── _ServerClient.request: retry / failure ───────────────────────────────
 
 
@@ -178,6 +197,58 @@ def test_close_swallows_request_errors(monkeypatch):
     monkeypatch.setattr(client, "request", mock.MagicMock(side_effect=Exception("server gone")))
     # No NCCL transport was created (disabled); close must not raise.
     client.close()
+
+
+# ── _ServerClient.generate: hot-path retry (wire) vs single-shot (NCCL) ───
+
+
+def test_generate_wire_path_retries_then_succeeds(monkeypatch):
+    """The wire ``/generate`` path reuses request()'s retry: a transient failure
+    on the per-step hot path recovers instead of aborting training. NCCL is
+    forced off module-wide, so this is the wire path."""
+    client = _ServerClient("http://h:1", timeout=1, max_retries=2)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    body = wire.encode_to_bytes({"x": torch.arange(3)})
+    ok = mock.MagicMock(content=body)
+    ok.raise_for_status.return_value = None
+    calls = {"n": 0}
+
+    def _post(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise requests.ConnectionError("reset")
+        return ok
+
+    monkeypatch.setattr(client._session, "post", _post)
+    out = client.generate(b"payload")
+    assert calls["n"] == 2
+    torch.testing.assert_close(out["x"], torch.arange(3))
+
+
+def test_generate_wire_path_exhausts_retries(monkeypatch):
+    """A persistent transport failure on the wire path surfaces as RuntimeError
+    after exhausting retries (same contract as request())."""
+    client = _ServerClient("http://h:1", timeout=1, max_retries=1)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    monkeypatch.setattr(client._session, "post", mock.MagicMock(side_effect=requests.Timeout("slow")))
+    with pytest.raises(RuntimeError, match="failed after 2 attempts"):
+        client.generate(b"payload")
+
+
+def test_generate_nccl_path_does_not_retry(monkeypatch):
+    """The NCCL path is single-shot by design: retrying the POST would trigger a
+    second server-side send and desync the data-plane group, so a transient
+    failure must propagate immediately (the POST is issued exactly once)."""
+    client = _ServerClient("http://h:1", timeout=1, max_retries=3)
+    # Simulate an initialized NCCL transport so generate() takes the NCCL branch.
+    client._nccl_attempted = True
+    client._nccl = mock.MagicMock(is_initialized=True)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    post = mock.MagicMock(side_effect=requests.ConnectionError("reset"))
+    monkeypatch.setattr(client._session, "post", post)
+    with pytest.raises(requests.ConnectionError):
+        client.generate(b"payload")
+    assert post.call_count == 1
 
 
 # ── _AsyncHandle / RemoteEagle3TargetModel surface ───────────────────────

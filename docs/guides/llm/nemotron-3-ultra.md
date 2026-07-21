@@ -26,7 +26,7 @@ For the full HellaSwag dataset wrapper used in NeMo Automodel, see [`nemo_automo
 
 A ready-to-use PEFT (LoRA) recipe ships at [`examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft_gb200.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft_gb200.yaml), validated on 4 × GB200 (16 GPUs). An H100-oriented variant — same recipe, `deepep` dispatcher and `ep_size: 32` for a 4 × 8 H100 allocation — ships at [`examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_ultra_v3_hellaswag_peft.yaml).
 
-NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.md) guide.
+NeMo Automodel supports several ways to launch training — via the Automodel CLI with Slurm, interactive sessions, `torchrun`, and more. For full details on all launch options (Slurm batch jobs, multi-node configuration, environment variables, etc.), see the [Run on a Cluster](https://github.com/NVIDIA-NeMo/Automodel/blob/main/docs/launcher/slurm.mdx) guide.
 
 ### Standalone Slurm Script
 
@@ -54,9 +54,9 @@ The Slurm script below is the one used to fine-tune Nemotron-3-Ultra on 4 × GB2
 set -uo pipefail
 
 # --- Credentials ---
-export HF_TOKEN=<your-hf-token>
+export HF_TOKEN="<your-hf-token>"
 export HF_HOME=/your/shared/hf_cache
-export WANDB_API_KEY=<your-wandb-key>
+export WANDB_API_KEY="<your-wandb-key>"
 
 export CONT=nvcr.io/nvidia/nemo-automodel:26.04.00
 export CONT_NAME=nemo-automodel-2604
@@ -100,5 +100,5 @@ srun \
 The recipe was validated with LoRA PEFT on HellaSwag on a 4 × GB200 (16-GPU) allocation, using the hybrid Mamba-2 / MoE Ultra backbone with MTP and Transformer Engine kernels. Training loss decreased steadily over the run (≈2.67 → ≈1.6), confirming healthy convergence end-to-end through model load, THD-packed data, FSDP2 + expert parallelism, and safetensors checkpointing.
 
 <p align="center">
-  <img src="nemotron_ultra_loss.png" alt="Nemotron-3 Ultra Training Loss Curve" width="600">
+  <img src="nemotron_ultra_loss.png" alt="Nemotron-3 Ultra Training Loss Curve" width="600" />
 </p>

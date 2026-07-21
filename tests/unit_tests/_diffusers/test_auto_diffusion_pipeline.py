@@ -35,6 +35,19 @@ pytestmark = pytest.mark.skipif(
 MODULE_PATH = "nemo_automodel._diffusers.auto_diffusion_pipeline"
 
 
+@pytest.fixture(autouse=True)
+def _no_hf_cache_resolution():
+    """Keep unit tests offline.
+
+    ``from_pretrained``/``from_config`` resolve the repo id to a local HF
+    snapshot dir via ``resolve_diffusion_model_dir``. Tests pass fake repo ids
+    (e.g. ``"dummy"``), so leaving this unmocked makes the helper hit the Hub.
+    Pass the id through unchanged instead.
+    """
+    with patch(f"{MODULE_PATH}.resolve_diffusion_model_dir", side_effect=lambda model_id: model_id):
+        yield
+
+
 class DummyModule(torch.nn.Module):
     def __init__(self):
         super().__init__()

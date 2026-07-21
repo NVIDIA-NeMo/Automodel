@@ -20,8 +20,8 @@ recipe body only ever sees typed component configs and calls
 ``self.cfg.<section>.build(...)`` directly.
 
 Known sections are exposed as cached, typed attributes that own a ``build()``:
-``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler`` map to component config
-dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
+``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm`` map to
+component config dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
 ``build_optimizer_config`` / ``build_loss_config`` (which own a ``build()``),
@@ -39,7 +39,9 @@ YAML-free.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Mapping
+from dataclasses import fields, is_dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
@@ -50,9 +52,14 @@ from nemo_automodel.components.training.step_scheduler import StepSchedulerConfi
 if TYPE_CHECKING:
     from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderConfig
+    from nemo_automodel.components.datasets.loader import DataloaderConfig
+    from nemo_automodel.components.datasets.multimodal.loader import BagelDataloaderConfig
+    from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig, VlmProcessorConfig
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
+    from nemo_automodel.components.training.prewarm import PrewarmConfig
 
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
 # to ``StepSchedulerConfig.build(...)`` separately (not config fields).
@@ -91,6 +98,19 @@ def _callable_and_kwargs(cfg: Any) -> tuple[Callable[..., Any], dict[str, Any]]:
     if hasattr(cfg, "instantiate"):
         return cfg.instantiate, {}
     raise AttributeError("Config must provide _target_, be callable, or provide instantiate()")
+
+
+def _target_kwargs(node: Any) -> tuple[Any, dict[str, Any]]:
+    """``(target, kwargs)`` for a loader ``make_*`` resolver from a config node.
+
+    ``None`` → ``(None, {})``; a bare string (a ``make_*`` registry key or dotted path) → ``(node, {})``;
+    otherwise a ``_target_`` section resolved via :func:`_callable_and_kwargs`.
+    """
+    if node is None:
+        return None, {}
+    if isinstance(node, str):
+        return node, {}
+    return _callable_and_kwargs(node)
 
 
 def _model_name_from_cfg(cfg_model: Any) -> str | None:
@@ -159,6 +179,407 @@ class RecipeConfig:
         return build_optimizer_config(factory, kwargs)
 
     @cached_property
+    def dataloader(self) -> "DataloaderConfig" | None:
+        dataset_node, dataloader_node = self._dataset_and_dataloader_nodes()
+        if dataset_node is None:
+            return None
+        return self._resolve_dataloader(dataset_node, dataloader_node)
+
+    def _dataset_and_dataloader_nodes(
+        self,
+        *,
+        dataset_key: str = "dataset",
+        dataloader_key: str = "dataloader",
+    ) -> tuple[Any | None, dict[str, Any]]:
+        """Return separate dataset and dataloader nodes, accepting the legacy nested dataset form."""
+        dataset_node = self._raw.get(dataset_key, None)
+        dataloader_node = _as_dict(self._raw.get(dataloader_key, None))
+        nested_dataset_node = dataloader_node.pop("dataset", None)
+        if nested_dataset_node is not None:
+            warnings.warn(
+                f"`{dataloader_key}.dataset` is deprecated; move it to the top-level `{dataset_key}` field.",
+                FutureWarning,
+                stacklevel=3,
+            )
+            if dataset_node is None:
+                dataset_node = nested_dataset_node
+        return dataset_node, dataloader_node
+
+    def _packing_config(self):
+        """Resolve the recipe's optional sequence-packing strategy config."""
+        from nemo_automodel.components.datasets.loader import make_packing_config
+
+        ps = _as_dict(self._raw.get("packed_sequence", None))
+        if ps.get("packed_sequence_size", 0) > 0:
+            return make_packing_config(ps.pop("packing_strategy", "thd"), ps)
+        return None
+
+    def _resolve_dataloader(self, dataset_node: Any, dataloader_node: Any) -> "DataloaderConfig":
+        """Resolve YAML dataset/loader blocks into one typed dataloader config."""
+        from torch.utils.data import DataLoader
+        from torchdata.stateful_dataloader import StatefulDataLoader
+
+        from nemo_automodel.components.datasets.llm.megatron.sampler import MegatronSamplerConfig
+        from nemo_automodel.components.datasets.loader import (
+            DataloaderConfig,
+            DatasetBuildSchedule,
+            ScheduledDatasetConfig,
+            make_collate_fn,
+            make_dataset_config,
+        )
+
+        target, dataset_kwargs = _callable_and_kwargs(dataset_node)
+        dataset_kwargs.pop("tokenizer", None)
+        dataset_config = make_dataset_config(target, dataset_kwargs)
+
+        loader_kwargs = _as_dict(dataloader_node)
+        loader_target = loader_kwargs.pop("_target_", None)
+        supported_loader_targets = {
+            None,
+            "torch.utils.data.DataLoader",
+            "torchdata.stateful_dataloader.StatefulDataLoader",
+            DataLoader,
+            StatefulDataLoader,
+        }
+        if loader_target not in supported_loader_targets:
+            raise ValueError(
+                f"Unsupported dataloader _target_ {loader_target!r}; typed recipes use ParallelAwareDataloader"
+            )
+        collate = make_collate_fn(*_target_kwargs(loader_kwargs.pop("collate_fn", None)))
+
+        schedule = DatasetBuildSchedule(
+            local_batch_size=self._raw.get("step_scheduler.local_batch_size", 1),
+            global_batch_size=self._raw.get("step_scheduler.global_batch_size", 1),
+            max_steps=self._raw.get("step_scheduler.max_steps", None),
+            val_check_interval=self._raw.get("step_scheduler.val_every_steps", None),
+        )
+        dataloader_type = loader_kwargs.pop("dataloader_type", None)
+        batch_sampler_config = None
+        if isinstance(dataset_config, ScheduledDatasetConfig):
+            if dataloader_type not in (None, "single", "cyclic"):
+                raise ValueError(
+                    f"Unsupported Megatron dataloader_type {dataloader_type!r}; expected 'single' or 'cyclic'"
+                )
+            batch_sampler_config = MegatronSamplerConfig(
+                micro_batch_size=schedule.local_batch_size,
+                global_batch_size=schedule.global_batch_size,
+                dataloader_type=dataloader_type or "single",
+            )
+        elif dataloader_type is not None:
+            raise ValueError("dataloader_type is only supported by Megatron dataset configs")
+
+        config_fields = {
+            "shuffle",
+            "group_by_length",
+            "shuffle_buffer_size",
+            "batch_size",
+            "num_workers",
+            "pin_memory",
+            "persistent_workers",
+            "prefetch_factor",
+            "drop_last",
+        }
+        unknown = sorted(set(loader_kwargs) - config_fields)
+        if unknown:
+            raise TypeError(f"Unexpected dataloader config field(s): {', '.join(unknown)}")
+
+        return DataloaderConfig(
+            dataset_config=dataset_config,
+            packing=self._packing_config(),
+            batch_sampler_config=batch_sampler_config,
+            dataset_build_schedule=schedule if isinstance(dataset_config, ScheduledDatasetConfig) else None,
+            shuffle=loader_kwargs.pop("shuffle", None),
+            group_by_length=loader_kwargs.pop("group_by_length", False),
+            shuffle_buffer_size=loader_kwargs.pop("shuffle_buffer_size", 10000),
+            batch_size=loader_kwargs.pop("batch_size", schedule.local_batch_size),
+            seed=self._raw.get("seed", 42),
+            collate_fn=collate,
+            num_workers=loader_kwargs.pop("num_workers", 0),
+            pin_memory=loader_kwargs.pop("pin_memory", False),
+            persistent_workers=loader_kwargs.pop("persistent_workers", False),
+            prefetch_factor=loader_kwargs.pop("prefetch_factor", None),
+            drop_last=loader_kwargs.pop("drop_last", False),
+        )
+
+    @cached_property
+    def validation_dataloaders(self) -> dict[str, "DataloaderConfig"]:
+        """One :class:`DataloaderConfig` per ``validation_dataset*`` block (mirrors :meth:`dataloader`)."""
+
+        def _name(key: str) -> str:
+            key = key.replace("validation_dataset", "")
+            if len(key) > 1 and key[0] in ("_", "-", "."):
+                key = key[1:]
+            return key or "default"
+
+        default_node, val_dl_node = self._dataset_and_dataloader_nodes(
+            dataset_key="validation_dataset",
+            dataloader_key="validation_dataloader",
+        )
+        dataset_nodes = {"default": default_node} if default_node is not None else {}
+        for key in filter(lambda k: k.startswith("validation_dataset"), self._raw.to_dict().keys()):
+            node = self._raw.get(key, None)
+            if node is None:
+                continue
+            dataset_nodes[_name(key)] = node
+        return {name: self._resolve_dataloader(node, val_dl_node) for name, node in dataset_nodes.items()}
+
+    @staticmethod
+    def _resolve_vlm_processor(node: Any) -> "VlmProcessorConfig":
+        """Resolve an optional processor section into its typed component config."""
+        from nemo_automodel.components.datasets.vlm.loader import VlmProcessorConfig
+
+        if node is None:
+            return VlmProcessorConfig()
+        kwargs = _as_dict(node)
+        target = kwargs.pop("_target_", None)
+        if target is None:
+            return VlmProcessorConfig(kwargs=kwargs)
+        if not callable(target):
+            raise TypeError(f"VLM processor _target_ must resolve to a callable, got {target!r}")
+        return VlmProcessorConfig(factory=target, kwargs=kwargs)
+
+    @classmethod
+    def resolve_vlm_dataloader(
+        cls,
+        dataset_node: Any,
+        dataloader_node: Any,
+        *,
+        processor_node: Any = None,
+        packed_sequence_node: Any = None,
+    ) -> "VlmDataloaderConfig":
+        """Resolve VLM YAML sections into one typed input-pipeline config.
+
+        Args:
+            dataset_node: Dataset config node containing its ``_target_`` and declarative fields.
+            dataloader_node: StatefulDataLoader config node.
+            processor_node: Optional processor factory or AutoProcessor keyword config.
+            packed_sequence_node: Optional top-level VLM neat-packing config.
+
+        Returns:
+            Typed VLM input-pipeline config ready for runtime ``build`` arguments.
+        """
+        from torchdata.stateful_dataloader import StatefulDataLoader
+
+        from nemo_automodel.components.datasets.loader import make_dataset_config
+        from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
+        from nemo_automodel.components.datasets.vlm.loader import VlmCollatorConfig, VlmDataloaderConfig
+        from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
+
+        target, dataset_kwargs = _callable_and_kwargs(dataset_node)
+        chat_template = dataset_kwargs.pop("chat_template", None)
+        legacy_packing = dataset_kwargs.pop("packing", None)
+        dataset_pretokenize = dataset_kwargs.pop("pretokenize", None)
+        dataset_max_length = dataset_kwargs.get("max_length", None)
+        truncate = dataset_kwargs.pop("truncate", dataset_max_length is not None)
+        inject_fake_images = dataset_kwargs.pop("inject_fake_images", True)
+        dataset_config = make_dataset_config(target, dataset_kwargs)
+
+        packed = _as_dict(packed_sequence_node)
+        if packed_sequence_node is not None:
+            packing_enabled = packed.get("pack_size", 0) > 0
+            packing_node = packed if packing_enabled else None
+            pretokenize = packed.get("pretokenize", packing_enabled)
+            max_length = packed.get("max_length", dataset_max_length)
+        else:
+            legacy = _as_dict(legacy_packing)
+            packing_enabled = bool(legacy.get("enabled", False))
+            packing_node = legacy if packing_enabled else None
+            pretokenize = dataset_pretokenize if dataset_pretokenize is not None else dataset_max_length is not None
+            max_length = dataset_max_length
+
+        pretokenization = None
+        if pretokenize:
+            post_tokenize_hook = packing_node.get("post_tokenize_hook_fn", None) if packing_node else None
+            if post_tokenize_hook is not None and not callable(post_tokenize_hook):
+                raise TypeError("packed_sequence.post_tokenize_hook_fn must resolve to a callable")
+            pretokenization = PreTokenizedDatasetWrapperConfig(
+                max_length=max_length,
+                truncate=truncate,
+                inject_fake_images=inject_fake_images,
+                post_tokenize_hook=post_tokenize_hook,
+            )
+
+        packing = None
+        if packing_node is not None:
+            packing_fields = {
+                "pack_size",
+                "drop_long_samples",
+                "max_packs",
+                "packing_ratio",
+                "balance_media_tokens",
+                "collate_max_length",
+                "attn_implementation",
+                "packing_format",
+                "enabled",
+                "pretokenize",
+                "max_length",
+                "post_tokenize_hook_fn",
+            }
+            unknown = sorted(set(packing_node) - packing_fields)
+            if unknown:
+                raise TypeError(f"Unexpected VLM packing config field(s): {', '.join(unknown)}")
+            packing = NeatPackConfig(
+                pack_size=packing_node.get("pack_size", max_length or 2048),
+                drop_long_samples=packing_node.get("drop_long_samples", False),
+                max_packs=packing_node.get("max_packs", None),
+                packing_ratio=packing_node.get("packing_ratio", 1.0),
+                balance_media_tokens=packing_node.get("balance_media_tokens", True),
+                collate_max_length=packing_node.get("collate_max_length", None),
+                attn_implementation=packing_node.get("attn_implementation", None),
+                packing_format=packing_node.get("packing_format", "neat"),
+            )
+
+        loader_kwargs = _as_dict(dataloader_node)
+        loader_target = loader_kwargs.pop("_target_", None)
+        if loader_target not in (None, "torchdata.stateful_dataloader.StatefulDataLoader", StatefulDataLoader):
+            raise ValueError(f"Unsupported VLM dataloader _target_ {loader_target!r}; expected StatefulDataLoader")
+        collate_node = loader_kwargs.pop("collate_fn", None)
+        collator = None
+        if collate_node is not None:
+            factory, collate_kwargs = _target_kwargs(collate_node)
+            if not callable(factory):
+                raise TypeError(f"VLM collate_fn must resolve to a callable, got {factory!r}")
+            collator = VlmCollatorConfig(factory=factory, kwargs=collate_kwargs)
+
+        loader_fields = {
+            "shuffle",
+            "num_workers",
+            "pin_memory",
+            "persistent_workers",
+            "prefetch_factor",
+            "drop_last",
+        }
+        unknown = sorted(set(loader_kwargs) - loader_fields)
+        if unknown:
+            raise TypeError(f"Unexpected VLM dataloader config field(s): {', '.join(unknown)}")
+
+        return VlmDataloaderConfig(
+            dataset_config=dataset_config,
+            processor_config=cls._resolve_vlm_processor(processor_node),
+            pretokenization=pretokenization,
+            packing=packing,
+            collator=collator,
+            chat_template=chat_template,
+            shuffle=loader_kwargs.pop("shuffle", True),
+            num_workers=loader_kwargs.pop("num_workers", 0),
+            pin_memory=loader_kwargs.pop("pin_memory", False),
+            persistent_workers=loader_kwargs.pop("persistent_workers", False),
+            prefetch_factor=loader_kwargs.pop("prefetch_factor", None),
+            drop_last=loader_kwargs.pop("drop_last", False),
+        )
+
+    @cached_property
+    def vlm_dataloader(self) -> "VlmDataloaderConfig" | None:
+        """Typed VLM training input-pipeline config."""
+        dataset_node = self._raw.get("dataset", None)
+        if dataset_node is None:
+            return None
+        return self.resolve_vlm_dataloader(
+            dataset_node,
+            self._raw.get("dataloader", None),
+            processor_node=self._raw.get("processor", None),
+            packed_sequence_node=self._raw.get("packed_sequence", None),
+        )
+
+    @cached_property
+    def vlm_validation_dataloader(self) -> "VlmDataloaderConfig" | None:
+        """Typed VLM validation input-pipeline config."""
+        dataset_node = self._raw.get("validation_dataset", None)
+        if dataset_node is None:
+            return None
+        return self.resolve_vlm_dataloader(
+            dataset_node,
+            self._raw.get("validation_dataloader", None),
+            processor_node=self._raw.get("processor", None),
+        )
+
+    @staticmethod
+    def resolve_diffusion_dataloader(node: Any) -> "DiffusionDataloaderConfig":
+        """Resolve a diffusion dataloader YAML target to its typed config.
+
+        Args:
+            node: ``data.dataloader`` config node containing a supported legacy builder target.
+
+        Returns:
+            Typed dataloader config whose ``build`` accepts runtime rank and batch-size values.
+        """
+        from nemo_automodel.components.datasets.diffusion.collate_fns import (
+            TextToImageDataloaderConfig,
+            TextToVideoDataloaderConfig,
+        )
+        from nemo_automodel.components.datasets.diffusion.meta_files_dataset import MetaFilesDataloaderConfig
+        from nemo_automodel.components.datasets.diffusion.mock_dataloader import MockWanDataloaderConfig
+
+        target, kwargs = _callable_and_kwargs(node)
+        module = getattr(target, "__module__", None)
+        name = getattr(target, "__qualname__", getattr(target, "__name__", None))
+        target_path = f"{module}.{name}" if module and name else target
+        config_types = {
+            "nemo_automodel.components.datasets.diffusion.collate_fns.build_text_to_image_multiresolution_dataloader": (
+                TextToImageDataloaderConfig
+            ),
+            "nemo_automodel.components.datasets.diffusion.collate_fns.build_video_multiresolution_dataloader": (
+                TextToVideoDataloaderConfig
+            ),
+            "nemo_automodel.components.datasets.diffusion.meta_files_dataset.build_dataloader": (
+                MetaFilesDataloaderConfig
+            ),
+            "nemo_automodel.components.datasets.diffusion.mock_dataloader.build_mock_dataloader": (
+                MockWanDataloaderConfig
+            ),
+        }
+        config_type = config_types.get(target_path, target)
+        if not is_dataclass(config_type) or not hasattr(config_type, "build"):
+            raise ValueError(f"Unsupported diffusion dataloader _target_ {target_path!r}")
+        valid = {field.name for field in fields(config_type)}
+        unknown = sorted(set(kwargs) - valid)
+        if unknown:
+            raise TypeError(f"Unexpected diffusion dataloader config field(s): {', '.join(unknown)}")
+        if "base_resolution" in kwargs:
+            kwargs["base_resolution"] = tuple(kwargs["base_resolution"])
+        return config_type(**kwargs)
+
+    @cached_property
+    def diffusion_dataloader(self) -> "DiffusionDataloaderConfig" | None:
+        """Typed diffusion dataloader config resolved from ``data.dataloader``."""
+        node = self._raw.get("data.dataloader", None)
+        return self.resolve_diffusion_dataloader(node) if node is not None else None
+
+    @cached_property
+    def bagel_dataloader(self) -> "BagelDataloaderConfig" | None:
+        """Typed packed-dataset and dataloader config for BAGEL recipes."""
+        from nemo_automodel.components.datasets.multimodal.datasets import BagelDatasetConfig
+        from nemo_automodel.components.datasets.multimodal.loader import BagelDataloaderConfig
+
+        dataset_node = self._raw.get("dataset", None)
+        if dataset_node is None:
+            return None
+        dataset_kwargs = _as_dict(dataset_node)
+        dataset_target = dataset_kwargs.pop("_target_", None)
+        if dataset_target is not None:
+            raise ValueError("BAGEL dataset config does not support _target_; use its typed dataset fields")
+        valid_dataset_fields = {field.name for field in fields(BagelDatasetConfig)}
+        unknown = sorted(set(dataset_kwargs) - valid_dataset_fields)
+        if unknown:
+            raise TypeError(f"Unexpected BAGEL dataset config field(s): {', '.join(unknown)}")
+        dataset_config = BagelDatasetConfig(**dataset_kwargs)
+
+        loader_kwargs = _as_dict(self._raw.get("dataloader", None))
+        loader_target = loader_kwargs.pop("_target_", None)
+        if loader_target is not None:
+            raise ValueError("BAGEL dataloader config does not support _target_; use its typed loader fields")
+        valid_loader_fields = {"num_workers", "pin_memory", "prefetch_factor"}
+        unknown = sorted(set(loader_kwargs) - valid_loader_fields)
+        if unknown:
+            raise TypeError(f"Unexpected BAGEL dataloader config field(s): {', '.join(unknown)}")
+        return BagelDataloaderConfig(
+            dataset_config=dataset_config,
+            num_workers=loader_kwargs.pop("num_workers", 1),
+            pin_memory=loader_kwargs.pop("pin_memory", True),
+            prefetch_factor=loader_kwargs.pop("prefetch_factor", 2),
+        )
+
+    @cached_property
     def loss_fn(self) -> "LossConfig" | None:
         from nemo_automodel.components.loss import build_loss_config
 
@@ -177,6 +598,13 @@ class RecipeConfig:
         from nemo_automodel.components.loss.mtp import MTPLossConfig
 
         return MTPLossConfig()
+
+    @cached_property
+    def prewarm(self) -> "PrewarmConfig | None":
+        from nemo_automodel.components.training.prewarm import PrewarmConfig
+
+        node = self._raw.get("prewarm", None)
+        return PrewarmConfig(**_section_kwargs(node)) if node else None
 
     @cached_property
     def checkpoint(self) -> "CheckpointingConfig":

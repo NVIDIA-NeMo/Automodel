@@ -26,12 +26,31 @@ from nemo_automodel.components.optim.optimizer import (
     LRSchedulerConfig,
     OptimizerConfig,
     OptimizerFromFactoryConfig,
+    ParamGroupOverride,
+    _drop_empty_local_shards,
     build_optimizer,
+    build_optimizer_config,
 )
+from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 
 
 def _model():
     return nn.Linear(4, 4)
+
+
+class _RouterModel(nn.Module):
+    """Model whose parameter names include a distinguishable ``router`` subtree."""
+
+    def __init__(self):
+        super().__init__()
+        self.mlp = nn.Linear(4, 4)
+        self.router = nn.Linear(4, 2)
+        self.norm = nn.LayerNorm(4)
+
+
+def _groups_by_role(optimizer):
+    """Map a built optimizer's param groups to {"router"|"default": group}."""
+    return {("router" if g.get("lr_mult", 1.0) != 1.0 else "default"): g for g in optimizer.param_groups}
 
 
 def _params():
@@ -89,6 +108,20 @@ class TestOptimizerConfigBase:
     def test_base_build_not_implemented(self):
         with pytest.raises(NotImplementedError):
             OptimizerConfig()._build_optimizer(_params())
+
+    def test_build_from_param_groups_preserves_group_options(self):
+        model = _model()
+        params = list(model.parameters())
+        param_groups = [
+            {"params": [params[0]], "weight_decay": 0.1},
+            {"params": [params[1]], "weight_decay": 0.0},
+        ]
+
+        opt = AdamWConfig(lr=1e-3, weight_decay=0.1).build_from_param_groups(param_groups)
+
+        assert isinstance(opt, torch.optim.AdamW)
+        assert opt.param_groups[0]["weight_decay"] == 0.1
+        assert opt.param_groups[1]["weight_decay"] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +198,18 @@ class TestOptimizerFromFactoryConfig:
     def test_build_requires_callable_factory(self):
         with pytest.raises(AssertionError, match="must be a callable"):
             OptimizerFromFactoryConfig(factory=None).build(_model())
+
+    def test_build_from_param_groups_uses_factory(self):
+        cfg = OptimizerFromFactoryConfig(
+            factory=torch.optim.SGD,
+            kwargs={"lr": 0.01, "momentum": 0.9},
+        )
+        params = list(_model().parameters())
+        opt = cfg.build_from_param_groups([{"params": [params[0]]}, {"params": [params[1]], "weight_decay": 0.0}])
+
+        assert isinstance(opt, torch.optim.SGD)
+        assert len(opt.param_groups) == 2
+        assert opt.param_groups[0]["momentum"] == 0.9
 
 
 # ---------------------------------------------------------------------------
@@ -395,3 +440,185 @@ class TestLRSchedulerConfig:
         ss = self._step_scheduler(epoch_len=100, num_epochs=10, max_steps=20)
         scheds = LRSchedulerConfig(lr_warmup_steps=1).build(opt, ss)
         assert scheds[0].lr_decay_steps == 20  # min(num_epochs*epoch_len=1000, max_steps=20)
+
+
+# ---------------------------------------------------------------------------
+# Per-parameter-group LR overrides (issue #2961)
+# ---------------------------------------------------------------------------
+
+
+class TestParamGroupOverrides:
+    def test_dict_overrides_are_coerced(self):
+        cfg = AdamWConfig(param_group_overrides=[{"pattern": "router", "lr_mult": 0.1}])
+        assert cfg.param_group_overrides == [ParamGroupOverride(pattern="router", lr_mult=0.1, wd_mult=1.0)]
+
+    def test_invalid_override_type_raises(self):
+        with pytest.raises(TypeError, match="param_group_overrides"):
+            AdamWConfig(param_group_overrides=["router"])
+
+    def test_no_overrides_single_group(self):
+        opt = AdamWConfig(lr=1e-3).build(_RouterModel())[0]
+        assert len(opt.param_groups) == 1
+
+    @pytest.mark.parametrize("target", ["adamw", "torch.optim.AdamW", "torch.optim.Adam"])
+    def test_groups_by_pattern_typed_and_factory(self, target):
+        # Same behavior whether the config is the typed AdamWConfig ("adamw") or the
+        # factory path (dotted torch import) that carries overrides inside kwargs.
+        cfg = build_optimizer_config(
+            target,
+            {
+                "lr": 1e-3,
+                "weight_decay": 0.1,
+                "param_group_overrides": [{"pattern": "router", "lr_mult": 0.1, "wd_mult": 0.0}],
+            },
+        )
+        opt = cfg.build(_RouterModel())[0]
+
+        assert len(opt.param_groups) == 2
+        groups = _groups_by_role(opt)
+        # router params (2: weight + bias) grouped separately, carrying the multipliers.
+        assert len(groups["router"]["params"]) == 2
+        assert groups["router"]["lr_mult"] == 0.1
+        assert groups["router"]["wd_mult"] == 0.0
+        # Stored lr is the unscaled base for every group; the scheduler applies lr_mult.
+        assert groups["router"]["lr"] == pytest.approx(1e-3)
+        assert groups["default"]["lr"] == pytest.approx(1e-3)
+        # default group is placed first so base-LR detection reads the unscaled lr.
+        assert opt.param_groups[0]["lr"] == pytest.approx(1e-3)
+
+    def test_non_matching_pattern_dropped(self, caplog):
+        with caplog.at_level("WARNING"):
+            opt = AdamWConfig(lr=1e-3, param_group_overrides=[ParamGroupOverride("does-not-exist", 0.5)]).build(
+                _RouterModel()
+            )[0]
+        assert len(opt.param_groups) == 1  # empty override group dropped
+        assert "matched no parameters" in caplog.text
+
+    def test_first_matching_override_wins(self):
+        # "router" and a broader ".*" both match router params; first override wins.
+        cfg = AdamWConfig(
+            lr=1e-3,
+            param_group_overrides=[
+                ParamGroupOverride("router", lr_mult=0.1),
+                ParamGroupOverride(".*", lr_mult=0.5),
+            ],
+        )
+        opt = cfg.build(_RouterModel())[0]
+        by_mult = {g.get("lr_mult", 1.0): g for g in opt.param_groups}
+        assert set(by_mult) == {0.1, 0.5}
+        assert len(by_mult[0.1]["params"]) == 2  # router weight + bias only
+
+    def test_constructor_kwargs_excludes_overrides(self):
+        # param_group_overrides must not leak into the torch optimizer constructor.
+        cfg = AdamWConfig(param_group_overrides=[ParamGroupOverride("router")])
+        assert "param_group_overrides" not in cfg._constructor_kwargs()
+
+    def test_scheduler_applies_lr_mult_and_wd_mult(self):
+        cfg = AdamWConfig(lr=1e-3, weight_decay=0.1, param_group_overrides=[ParamGroupOverride("router", 0.1, 0.0)])
+        opt = cfg.build(_RouterModel())[0]
+        scheduler = OptimizerParamScheduler(
+            opt,
+            init_lr=1e-3,
+            max_lr=1e-3,
+            min_lr=1e-3,
+            lr_warmup_steps=0,
+            lr_decay_steps=100,
+            lr_decay_style="constant",
+            start_wd=0.1,
+            end_wd=0.1,
+            wd_incr_steps=100,
+            wd_incr_style="constant",
+        )
+        scheduler.step(1)
+        groups = _groups_by_role(opt)
+        assert groups["router"]["lr"] == pytest.approx(1e-4)  # 1e-3 * 0.1
+        assert groups["default"]["lr"] == pytest.approx(1e-3)
+        assert groups["router"]["weight_decay"] == pytest.approx(0.0)  # 0.1 * 0.0
+        assert groups["default"]["weight_decay"] == pytest.approx(0.1)
+
+    def test_all_params_matched_no_double_scaling(self):
+        # When every param matches an override there is no unscaled default group.
+        # The stored lr must stay unscaled so LRSchedulerConfig's base_lr detection
+        # (param_groups[0]["lr"]) is correct and the scheduler scales exactly once.
+        cfg = AdamWConfig(lr=1e-3, param_group_overrides=[ParamGroupOverride(".*", lr_mult=0.1)])
+        opt = cfg.build(_RouterModel())[0]
+        assert len(opt.param_groups) == 1  # only the override group, no default
+        assert opt.param_groups[0]["lr"] == pytest.approx(1e-3)  # unscaled at construction
+
+        step_scheduler = MagicMock()
+        step_scheduler.epoch_len = 100
+        step_scheduler.num_epochs = 1
+        step_scheduler.max_steps = 100
+        step_scheduler.grad_acc_steps = 1
+        scheduler = LRSchedulerConfig(lr_warmup_steps=0, lr_decay_style="constant").build(opt, step_scheduler)[0]
+        scheduler.step(1)
+        # exactly one 0.1 factor applied (1e-4), not 1e-5 (double-scaled).
+        assert opt.param_groups[0]["lr"] == pytest.approx(1e-4)
+
+    def test_factory_reads_overrides_from_inherited_field(self):
+        # Overrides set on the factory config's own field (not nested in kwargs) are honored.
+        cfg = OptimizerFromFactoryConfig(
+            factory=torch.optim.AdamW,
+            kwargs={"lr": 1e-3},
+            param_group_overrides=[ParamGroupOverride("router", lr_mult=0.1)],
+        )
+        opt = cfg.build(_RouterModel())[0]
+        assert len(opt.param_groups) == 2
+        assert _groups_by_role(opt)["router"]["lr_mult"] == 0.1
+
+
+def _real_param():
+    return nn.Parameter(torch.zeros(4, 4))
+
+
+def _empty_param():
+    # numel() == 0 stands in for a DTensor whose rank-local shard is empty:
+    # _local_numel returns .numel() for a plain tensor, so a zero-element tensor
+    # exercises the same "locally empty on this rank" path without a real mesh.
+    return nn.Parameter(torch.zeros(0, 4))
+
+
+class TestDropEmptyLocalShards:
+    """CPU coverage for the TE-FusedAdam zero-numel-shard guard, both input shapes.
+
+    ``_drop_empty_local_shards`` guards TransformerEngine ``FusedAdam`` (whose
+    ``multi_tensor_apply`` faults on empty tensors) against FSDP2 params whose
+    rank-local shard is empty. It accepts either a flat param list or the
+    per-group dicts produced by ``param_group_overrides``; the grouped shape is
+    what per-parameter-group LR adds on top of the pre-existing flat guard.
+    """
+
+    def test_flat_list_drops_empty_keeps_real(self):
+        p_real, p_empty = _real_param(), _empty_param()
+        out = _drop_empty_local_shards([p_real, p_empty])
+        assert len(out) == 1 and out[0] is p_real
+
+    def test_flat_list_all_empty_raises(self):
+        with pytest.raises(ValueError, match="zero-numel local shard"):
+            _drop_empty_local_shards([_empty_param(), _empty_param()])
+
+    def test_param_groups_drop_empty_and_preserve_options(self):
+        p0, p1, p_empty = _real_param(), _real_param(), _empty_param()
+        groups = [
+            {"params": [p0, p_empty], "lr_mult": 1.0, "wd_mult": 1.0},
+            {"params": [p1], "lr_mult": 0.1, "wd_mult": 0.0},
+        ]
+        out = _drop_empty_local_shards(groups)
+
+        # Empty shard dropped from group 0; both groups survive with real params.
+        assert len(out) == 2
+        assert len(out[0]["params"]) == 1 and out[0]["params"][0] is p0
+        assert len(out[1]["params"]) == 1 and out[1]["params"][0] is p1
+        # Per-group LR/WD options carried through unchanged.
+        assert out[0]["lr_mult"] == 1.0 and out[0]["wd_mult"] == 1.0
+        assert out[1]["lr_mult"] == 0.1 and out[1]["wd_mult"] == 0.0
+        # Fresh dicts are returned; the input group dicts are not mutated in place.
+        assert groups[0]["params"][0] is p0 and groups[0]["params"][1] is p_empty
+
+    def test_param_group_fully_empty_raises(self):
+        groups = [
+            {"params": [_real_param()], "lr_mult": 1.0},
+            {"params": [_empty_param()], "lr_mult": 0.1},
+        ]
+        with pytest.raises(ValueError, match="param group 1"):
+            _drop_empty_local_shards(groups)

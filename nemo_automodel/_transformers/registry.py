@@ -66,6 +66,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.deepseek_v4.model", "DeepseekV4ForCausalLM"),
         ),
         (
+            "DiffusionGemmaForBlockDiffusion",
+            ("nemo_automodel.components.models.diffusion_gemma.model", "DiffusionGemmaForBlockDiffusion"),
+        ),
+        (
             "Ernie4_5_MoeForCausalLM",
             ("nemo_automodel.components.models.ernie4_5.model", "Ernie4_5_MoeForCausalLM"),
         ),
@@ -118,12 +122,23 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.llama_bidirectional.model", "LlamaBidirectionalModel", {"retrieval"}),
         ),
         (
+            "LlamaNemotronVLModel",
+            ("nemo_automodel.components.models.llama_nemotron_vl.model", "LlamaNemotronVLModel", {"retrieval"}),
+        ),
+        (
             "LlamaForCausalLM",
             ("nemo_automodel.components.models.llama.model", "LlamaForCausalLM"),
         ),
         (
             "MiniMaxM2ForCausalLM",
             ("nemo_automodel.components.models.minimax_m2.model", "MiniMaxM2ForCausalLM"),
+        ),
+        (
+            "MiniMaxM3SparseForConditionalGeneration",
+            (
+                "nemo_automodel.components.models.minimax_m3_vl.model",
+                "MiniMaxM3SparseForConditionalGeneration",
+            ),
         ),
         (
             "MiMoV2FlashForCausalLM",
@@ -251,6 +266,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.step3p5.model", "Step3p5ForCausalLM"),
         ),
         (
+            "InklingForConditionalGeneration",
+            ("nemo_automodel.components.models.inkling.model", "InklingForConditionalGeneration"),
+        ),
+        (
             "Step3p7ForConditionalGeneration",
             ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
         ),
@@ -267,13 +286,29 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
+    "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
+    "minimax_m3_vl": ("nemo_automodel.components.models.minimax_m3_vl.config", "MiniMaxM3VLConfig"),
     "mistral4": ("nemo_automodel.components.models.mistral4.configuration", "Mistral4Config"),
     "step3p5v": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p5VConfig"),
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
+}
+
+# model_types whose custom model implementation reads fields that only our
+# config class provides. When a transformers release starts shipping its own
+# config for one of these model_types (same model_type string, often the same
+# class name), the skip-if-built-in registration below would silently hand the
+# native config to our custom model and break its field protocol at init
+# (transformers 5.12 added minimax_m3_vl whose vision config drops rope_theta
+# -> ``'MiniMaxM3VLVisionConfig' object has no attribute 'rope_theta'``).
+# These entries override the built-in registration instead. Entries NOT listed
+# here keep the built-in config when one exists (mistral4's custom model was
+# written against the native config and runs green with it).
+_CUSTOM_CONFIG_OVERRIDES_BUILTIN = {
+    "minimax_m3_vl",
 }
 
 
@@ -282,13 +317,15 @@ def _register_custom_configs() -> None:
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
     for model_type, (module_path, cls_name) in _CUSTOM_CONFIG_REGISTRATIONS.items():
-        if model_type not in CONFIG_MAPPING:
-            try:
-                mod = importlib.import_module(module_path)
-                cfg_cls = getattr(mod, cls_name)
-                AutoConfig.register(model_type, cfg_cls)
-            except Exception:
-                logger.debug("Failed to register config for model_type=%s", model_type, exc_info=True)
+        is_builtin = model_type in CONFIG_MAPPING
+        if is_builtin and model_type not in _CUSTOM_CONFIG_OVERRIDES_BUILTIN:
+            continue
+        try:
+            mod = importlib.import_module(module_path)
+            cfg_cls = getattr(mod, cls_name)
+            AutoConfig.register(model_type, cfg_cls, exist_ok=is_builtin)
+        except Exception:
+            logger.debug("Failed to register config for model_type=%s", model_type, exc_info=True)
 
 
 _register_custom_configs()

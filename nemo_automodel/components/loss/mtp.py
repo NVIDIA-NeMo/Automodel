@@ -19,7 +19,12 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-from nemo_automodel.components.loss.utils import _get_final_hidden_states, _get_lm_head_module, calculate_loss
+from nemo_automodel.components.loss.utils import (
+    _get_final_hidden_states,
+    _get_lm_head_module,
+    _get_lm_head_weight,
+    calculate_loss,
+)
 from nemo_automodel.components.models.common.mtp import get_mtp_loss_scaling_factor, roll_tensor
 
 
@@ -35,6 +40,7 @@ def calculate_mtp_loss(
     ignore_index: int = -100,
     cu_seqlens: Optional[torch.Tensor] = None,
     seq_idx: Optional[torch.Tensor] = None,
+    lm_weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute the DeepSeek-V3 Multi-Token Prediction auxiliary loss.
 
@@ -63,6 +69,9 @@ def calculate_mtp_loss(
             Equality classes are what matter; absolute values can be any
             ints. Takes precedence over ``cu_seqlens``. Used to mask label
             rolls whose source position lies in a different sub-sequence.
+        lm_weight: Optional caller-materialized LM-head weight. Supplying this
+            lets the main loss and all MTP depths share one DTensor
+            ``full_tensor()`` gather on the FusedLinearCrossEntropy path.
 
     Returns:
         Scalar MTP loss with autograd graph.
@@ -84,6 +93,15 @@ def calculate_mtp_loss(
     D = len(mtp_outputs)
     cur_labels = labels
     total = mtp_outputs[0].new_zeros(())
+
+    # Materialize the (possibly DTensor-sharded) LM head ONCE for all depths
+    # under FusedLinearCrossEntropy. calculate_loss would otherwise re-gather it
+    # (full_tensor) per depth; each gathered copy is retained for backward and
+    # they accumulate on-device -> OOM for large-vocab MoE. One shared gather is
+    # numerically identical (same weight); grads from every depth accumulate into
+    # it and collapse to a single reduce-scatter on the sharded parameter.
+    if isinstance(loss_fn, FusedLinearCrossEntropy) and lm_weight is None:
+        lm_weight = _get_lm_head_weight(model)
 
     if seq_idx is None and cu_seqlens is not None:
         cs = cu_seqlens
@@ -143,6 +161,7 @@ def calculate_mtp_loss(
                 hidden_states=mtp_output,
                 labels=masked,
                 model=model,
+                lm_weight=lm_weight,
                 num_label_tokens=num_label_tokens,
             )
         else:
@@ -202,9 +221,25 @@ class PipelineCausalLMLoss(nn.Module):
         return None, output
 
     def forward(self, output, labels: torch.Tensor) -> torch.Tensor:
+        """Last-stage pipeline loss (main CE plus optional MTP aux CE).
+
+        B=microbatch, S=seq, H=hidden, V=vocab.
+
+        Args:
+            output: bare hidden states ``[B, S, H]`` (FusedLinearCrossEntropy
+                path), a HF output with logits ``[B, S, V]``, or an MTP tuple
+                ``(logits, *mtp_per_depth_h[, seq_idx])`` with ``seq_idx``
+                ``[B, S]`` int32. A tuple with FusedLinearCrossEntropy raises.
+            labels: target token ids ``[B, S]`` int64.
+
+        Returns:
+            Scalar loss tensor.
+        """
         seq_idx_mb, output = self._extract_seq_idx_tail(output)
 
         if isinstance(output, tuple):
+            if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                raise ValueError("FusedLinearCrossEntropy is not supported with MTP under pipeline parallelism")
             logits = output[0]
             hidden_states = None
             mtp_per_depth_h = None
@@ -216,18 +251,28 @@ class PipelineCausalLMLoss(nn.Module):
                     mtp_per_depth_h = list(output[1:])
             model_scaling_factor = get_mtp_loss_scaling_factor(self.model)
         else:
-            logits = getattr(output, "logits", output)
-            hidden_states = _get_final_hidden_states(output)
             mtp_per_depth_h = getattr(output, "mtp_per_depth_h", None)
             mtp_per_depth_logits = getattr(output, "mtp_per_depth_logits", None)
             model_scaling_factor = getattr(output, "mtp_loss_scaling_factor", get_mtp_loss_scaling_factor(self.model))
+            if isinstance(self.loss_fn, FusedLinearCrossEntropy) and isinstance(output, torch.Tensor):
+                logits = None
+                hidden_states = output
+            else:
+                logits = getattr(output, "logits", output)
+                hidden_states = _get_final_hidden_states(output)
 
+        # Gather the LM head at most once and thread it through the main loss and
+        # every MTP depth (avoids redundant per-call full_tensor() gathers).
+        shared_lm_weight = (
+            _get_lm_head_weight(self.model) if isinstance(self.loss_fn, FusedLinearCrossEntropy) else None
+        )
         loss = calculate_loss(
             self.loss_fn,
             logits=logits,
             labels=labels,
             model=self.model,
             hidden_states=hidden_states,
+            lm_weight=shared_lm_weight,
         )
         if (mtp_per_depth_h is not None or mtp_per_depth_logits is not None) and self.model.training:
             scaling_factor = self.scaling_factor if self.scaling_factor is not None else model_scaling_factor
@@ -241,6 +286,7 @@ class PipelineCausalLMLoss(nn.Module):
                 ignore_index=self.ignore_index,
                 cu_seqlens=self.cu_seqlens,
                 seq_idx=seq_idx_mb,
+                lm_weight=shared_lm_weight,
             )
         return loss
 

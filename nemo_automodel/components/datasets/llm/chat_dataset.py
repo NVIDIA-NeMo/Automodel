@@ -17,10 +17,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Iterator, List, Optional, Sequence, Union
 
 from datasets import VerificationMode, load_dataset
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 from torch.utils.data import Dataset
 
 from nemo_automodel.components.datasets.llm.formatting_utils import (
@@ -315,6 +319,59 @@ def _conversations_to_messages(conversations: Any) -> List[Dict[str, Any]]:
     return messages
 
 
+@dataclass
+class ChatDatasetConfig:
+    """Construction-time configuration for :class:`ChatDataset` (tokenizer is a build arg)."""
+
+    accepts_tokenizer: ClassVar[bool] = True
+
+    path_or_dataset_id: str | Sequence[str]
+    """HF dataset id, local JSON/JSONL path(s), Parquet file, or Parquet directory."""
+    split: str | None = None
+    """Dataset split or slice (e.g. ``train``, ``train[1024:]``)."""
+    name: str | None = None
+    """Optional Hub subset / config name."""
+    seq_length: int | None = None
+    """Maximum sequence length for padding and truncation in formatting."""
+    padding: str | bool = "do_not_pad"
+    """Padding mode for ``format_chat_template``."""
+    truncation: str | bool = "do_not_truncate"
+    """Truncation mode for ``format_chat_template``."""
+    start_of_turn_token: str | None = None
+    """Optional token marking assistant turns for answer-only loss."""
+    chat_template: str | None = None
+    """Optional Jinja template string overriding ``tokenizer.chat_template``."""
+    shuffle_seed: int | None = None
+    """If set, shuffles Hub/Parquet data before applying a split slice."""
+    mask_reasoning_content: bool = False
+    """If ``True``, exclude rendered reasoning traces from the loss mask."""
+    mask_history: bool = False
+    """If ``True``, supervise only the final assistant turn."""
+    unshifted: bool = False
+    """Passed through to ``format_chat_template``."""
+    skip_invalid_samples: bool = False
+    """If ``True``, skip malformed JSONL lines when reading local files."""
+
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None") -> "ChatDataset":
+        """Build a :class:`ChatDataset` from this :class:`ChatDatasetConfig` and a runtime tokenizer."""
+        return ChatDataset(
+            path_or_dataset_id=self.path_or_dataset_id,
+            tokenizer=tokenizer,
+            split=self.split,
+            name=self.name,
+            seq_length=self.seq_length,
+            padding=self.padding,
+            truncation=self.truncation,
+            start_of_turn_token=self.start_of_turn_token,
+            chat_template=self.chat_template,
+            shuffle_seed=self.shuffle_seed,
+            mask_reasoning_content=self.mask_reasoning_content,
+            mask_history=self.mask_history,
+            unshifted=self.unshifted,
+            skip_invalid_samples=self.skip_invalid_samples,
+        )
+
+
 class ChatDataset(Dataset):
     """Dataset for OpenAI-format tool-calling chat transcripts.
 
@@ -340,6 +397,7 @@ class ChatDataset(Dataset):
         chat_template: Optional[str] = None,
         shuffle_seed: Optional[int] = None,
         mask_reasoning_content: bool = False,
+        mask_history: bool = False,
         unshifted: bool = False,
         skip_invalid_samples: bool = False,
     ) -> None:
@@ -357,6 +415,12 @@ class ChatDataset(Dataset):
             chat_template: Optional Jinja template string overriding ``tokenizer.chat_template``.
             shuffle_seed: If set, shuffles Hub/Parquet data before applying a split slice.
             mask_reasoning_content: If ``True``, exclude rendered reasoning traces from the loss mask.
+            mask_history: If ``True``, supervise only the FINAL assistant turn and treat all
+                earlier turns as (clean) prompt context. Multi-turn conversations otherwise
+                supervise every assistant turn, yielding a gappy loss_mask; downstream
+                consumers that require a single contiguous supervised suffix (e.g. the
+                block-diffusion response window, matching Google's prompt+single-response
+                data model) need this. No-op for single-turn data.
             unshifted: Passed through to ``format_chat_template``.
             skip_invalid_samples: If ``True``, skip malformed JSONL lines when reading local files (warning logs
                 include skip counts). If ``False``, a bad line raises. Does not skip invalid structured rows after
@@ -378,6 +442,7 @@ class ChatDataset(Dataset):
         self.truncation = truncation
         self.start_of_turn_token = start_of_turn_token
         self.mask_reasoning_content = mask_reasoning_content
+        self.mask_history = mask_history
         self.unshifted = unshifted
         self.skip_invalid_samples = skip_invalid_samples
 
@@ -395,6 +460,29 @@ class ChatDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.dataset)
+
+    @staticmethod
+    def _keep_last_supervised_run(seq: List[int], unsupervised_value: int) -> None:
+        """In place, keep only the final contiguous supervised run; mask the rest.
+
+        Supervised positions are those ``!= unsupervised_value`` (0 for ``loss_mask``,
+        -100 for ``labels``). Used for ``mask_history``: a multi-turn conversation has
+        one supervised run per assistant turn separated by unsupervised user turns;
+        this collapses it to the last turn so the supervised tokens form a single
+        suffix.
+        """
+        last = -1
+        for i in range(len(seq) - 1, -1, -1):
+            if seq[i] != unsupervised_value:
+                last = i
+                break
+        if last < 0:
+            return
+        start = last
+        while start - 1 >= 0 and seq[start - 1] != unsupervised_value:
+            start -= 1
+        for i in range(start):
+            seq[i] = unsupervised_value
 
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
         row = self.dataset[idx]
@@ -437,4 +525,13 @@ class ChatDataset(Dataset):
             mask_reasoning_content=self.mask_reasoning_content,
             unshifted=self.unshifted,
         )
+        if self.mask_history:
+            # Collapse multi-turn supervision to the final assistant turn so the
+            # supervised tokens are a single contiguous suffix (prior turns become
+            # clean prompt context) — required by the block-diffusion response window
+            # and matching Google's prompt+single-response data model.
+            if "loss_mask" in sample:
+                self._keep_last_supervised_run(sample["loss_mask"], 0)
+            if "labels" in sample:
+                self._keep_last_supervised_run(sample["labels"], -100)
         return sample

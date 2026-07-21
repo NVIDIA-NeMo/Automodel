@@ -89,9 +89,9 @@ def is_tokenizer(object):
         object (any): the object to check.
 
     Returns:
-        bool: returns True if object is a tokenizer or VLM processor.
+        bool: returns True if object is a VLM processor or tokenizer.
     """
-    return isinstance(object, (PreTrainedTokenizerBase, ProcessorMixin))
+    return isinstance(object, (ProcessorMixin, PreTrainedTokenizerBase))
 
 
 def is_lr_scheduler(object):
@@ -199,12 +199,12 @@ def _is_rank_0() -> bool:
     return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
 
 
-def _dist_barrier() -> None:
+def _dist_barrier(group=None) -> None:
     """Barrier if torch.distributed is initialized.
     TODO(@akoumpa): deprecate in favor of deviemesh api
     """
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=group)
 
 
 class BaseRecipe:
@@ -319,7 +319,7 @@ class BaseRecipe:
             # clear and remember the last completed path
             setattr(self, "_last_pending_checkpoint_dir", None)
             if is_dist_initialized:
-                torch.distributed.barrier()
+                _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
         # If a previous async checkpoint just finished, also update the "best" symlink now (if pending)
         prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
@@ -328,7 +328,7 @@ class BaseRecipe:
                 self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
             setattr(self, "_last_pending_best_checkpoint_info", None)
             if is_dist_initialized:
-                torch.distributed.barrier()
+                _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
         path = self.checkpointer.config.checkpoint_dir
         path = os.path.join(path, f"epoch_{epoch}_step_{step}")
@@ -364,7 +364,7 @@ class BaseRecipe:
                     logger.warning("Failed to write checkpoint loss metadata to %s", f.name, exc_info=True)
 
         if is_dist_initialized:
-            torch.distributed.barrier()
+            _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
         model, optimizer, scheduler, tokenizer, config = None, None, None, None, None
         step_scheduler = getattr(self, "step_scheduler", None)
@@ -448,7 +448,7 @@ class BaseRecipe:
         self.checkpointer.save_optimizer(optimizer, model, path, scheduler)
         save_config(config.raw_config, path)
         if is_dist_initialized:
-            torch.distributed.barrier()
+            _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
         # Update latest symlink according to sync/async behavior
         if getattr(self.checkpointer.config, "is_async", False):
@@ -464,7 +464,7 @@ class BaseRecipe:
                 if best_val_metric is not None:
                     self._update_best_symlink(path, float(best_val_metric))
             if is_dist_initialized:
-                torch.distributed.barrier()
+                _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
         # Release NCCL workspace and DCP gather scratch back to the allocator.
         # Without this, the next training step's backward sees a fragmented
@@ -538,14 +538,14 @@ class BaseRecipe:
                 self._update_latest_symlink(prev_pending)
             setattr(self, "_last_pending_checkpoint_dir", None)
             if is_dist_initialized:
-                torch.distributed.barrier()
+                _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
         prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
         if prev_best_pending is not None:
             if is_rank_0 and prev_best_pending.get("val") is not None:
                 self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
             setattr(self, "_last_pending_best_checkpoint_info", None)
             if is_dist_initialized:
-                torch.distributed.barrier()
+                _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
 
     def _validate_checkpoint_dir_exists(self, ckpt_dir: str, restore_from: str, is_rank_0: bool) -> None:
         """Validate resolved checkpoint directory exists; raise FileNotFoundError with a helpful message."""
@@ -563,7 +563,7 @@ class BaseRecipe:
             error_msg = f"Checkpoint directory does not exist: {ckpt_dir}"
 
         # Ensure all ranks fail together (before raising)
-        _dist_barrier()
+        _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
         raise FileNotFoundError(error_msg)
 
     def _load_checkpoint_tracked_state(self, ckpt_dir: str):
@@ -832,19 +832,23 @@ class BaseRecipe:
         if not self.device_mesh:
             return None
 
+        dp_mesh = get_flat_mesh(self.device_mesh, "dp")
         if include_cp and self.device_mesh["cp"].size() > 1:
-            return get_flat_mesh(self.device_mesh, "dp_cp").get_group()
-        return get_flat_mesh(self.device_mesh, "dp").get_group()
+            dp_mesh = get_flat_mesh(self.device_mesh, "dp_cp")
+        if dp_mesh.size() == 1:
+            return None
+        return dp_mesh.get_group()
 
     def _get_dp_group_size(self, include_cp: bool = False):
-        dp_group = self._get_dp_group(include_cp=include_cp)
-        if dp_group is None:
-            # For DDP without a device mesh, all ranks form a single
-            # data-parallel group whose size equals the world size.
+        if not self.device_mesh:
             if dist.is_initialized():
                 return dist.get_world_size()
             return 1
-        return dp_group.size()
+
+        dp_mesh = get_flat_mesh(self.device_mesh, "dp")
+        if include_cp and self.device_mesh["cp"].size() > 1:
+            dp_mesh = get_flat_mesh(self.device_mesh, "dp_cp")
+        return dp_mesh.size()
 
     def _get_cp_group_size(self):
         if not self.device_mesh or self.device_mesh["cp"].size() == 1:
@@ -858,9 +862,12 @@ class BaseRecipe:
                 return dist.get_rank()
             return 0
 
+        dp_mesh = get_flat_mesh(self.device_mesh, "dp")
         if include_cp and self.device_mesh["cp"].size() > 1:
-            return get_flat_mesh(self.device_mesh, "dp_cp").get_local_rank()
-        return get_flat_mesh(self.device_mesh, "dp").get_local_rank()
+            dp_mesh = get_flat_mesh(self.device_mesh, "dp_cp")
+        if dp_mesh.size() == 1:
+            return 0
+        return dp_mesh.get_local_rank()
 
     def _get_tp_rank(self):
         if not self.device_mesh or self.device_mesh["tp"].size() == 1:
@@ -873,23 +880,46 @@ class BaseRecipe:
             return 0
         return self.device_mesh.get_local_rank("pp")
 
+    def _get_pp_group(self):
+        """Return the pipeline-parallel process group, or None when pp is disabled.
+
+        Threaded to the checkpointer so PEFT adapters are gathered across PP
+        stages at save time; without it the on-disk adapter only contains the
+        local stage's layers (see ``_gather_peft_state_dict_across_pp``).
+        """
+        dm = self.device_mesh
+        if dm is None or "pp" not in dm.mesh_dim_names or dm["pp"].size() == 1:
+            return None
+        return dm["pp"].get_group()
+
     def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)
-        if dp_group is not None:
-            tensor = tensor.cuda()
+        if self.device_mesh and dp_group is None:
+            return tensor
+        if dp_group is not None or dist.is_initialized():
+            if not tensor.is_cuda and torch.cuda.is_available():
+                tensor = tensor.cuda()
             dist.all_reduce(tensor, op=op, group=dp_group)
             tensor = tensor.cpu()
         return tensor
 
-    def _make_progress_bar(self):
-        """Create a tqdm progress bar on rank 0; returns None on other ranks."""
+    def _make_progress_bar(self, total: int | None = None, initial: int = 0):
+        """Create a tqdm progress bar on rank 0; returns None on other ranks.
+
+        Without arguments the totals come from ``self.step_scheduler``; recipes
+        without a step scheduler (e.g. the EAGLE family) pass ``total`` and
+        ``initial`` explicitly.
+        """
         if not _is_rank_0():
             return None
         from tqdm import tqdm
 
+        if total is None:
+            total = getattr(self.step_scheduler, "max_steps", None)
+            initial = getattr(self.step_scheduler, "step", 0)
         return tqdm(
-            total=getattr(self.step_scheduler, "max_steps", None),
-            initial=getattr(self.step_scheduler, "step", 0),
+            total=total,
+            initial=initial,
             desc="Training",
             unit="step",
             dynamic_ncols=True,
