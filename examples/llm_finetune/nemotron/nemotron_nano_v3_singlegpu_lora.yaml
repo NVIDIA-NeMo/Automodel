@@ -80,3 +80,6 @@ optimizer:
   eps: 1e-8
   lr: 1.0e-5
   weight_decay: 0
+
+ci:
+  nproc_per_node: 1
