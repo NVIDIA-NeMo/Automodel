@@ -34,8 +34,8 @@ pure function of ``(cp_mesh, padded_seq_len)`` (contiguous, round-robin)
 provide it at construction; data-dependent layouts (THD ``cu_seqlens``
 partitioning, magi's dispatch solver) start as None and report the partition
 they computed as :class:`ShardLayout`, which the dispatch stores on the
-sharder — sharders are built per resolution/hook call, so facts never leak
-across steps. Before the first ``shard_batch`` their token verbs
+sharder — sharders are built per resolution/hook call, so the layout never
+leaks across steps. Before the first ``shard_batch`` their token verbs
 raise.
 The sharder carries no backend tag: nothing may branch on which backend
 produced it.
@@ -99,17 +99,17 @@ def identity_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | 
 
 
 def shard_batch_identity(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id: int = 0):
-    """``shard_batch`` of the identity sharder: a no-op with length facts.
+    """``shard_batch`` of the identity sharder: a no-op that returns a trivial shard layout.
 
     Returned by the dispatch when no CP prep applies, so callers hold working
     token verbs at every cp_size (nothing was padded: original == padded).
     """
     del cp_mesh, tp_mesh, loss_mask, padding_token_id
     primary = batch.get("inputs_embeds", batch.get("input_ids"))
-    facts = None
+    layout = None
     if primary is not None and primary.dim() >= 2:
-        facts = ShardLayout(original_seq_len=primary.shape[1], padded_seq_len=primary.shape[1])
-    return contextlib.nullcontext, batch, facts
+        layout = ShardLayout(original_seq_len=primary.shape[1], padded_seq_len=primary.shape[1])
+    return contextlib.nullcontext, batch, layout
 
 
 def round_robin_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
@@ -209,7 +209,7 @@ class ShardLayout:
     """What a ``shard_batch`` learned about the layout it just applied.
 
     Returned as the third element of ``shard_batch`` and stored on the sharder
-    by the dispatch (``sharder.shard_layout = facts``), so the token verbs can
+    by the dispatch (``sharder.shard_layout = layout``), so the token verbs can
     accept and return tensors in the CALLER's coordinates: pad is an internal
     detail of the CP layout.
 
@@ -244,8 +244,8 @@ class ContextParallelismSharder:
         shard_batch: ``(cp_mesh, tp_mesh, batch, *, loss_mask=None,
             padding_token_id=0) -> (ctx_factory, batch, ShardLayout | None)``.
             Pads and shards the batch, installs any backend-owned attention
-            transport, and reports the layout facts it computed; the dispatch
-            stores them as ``shard_layout`` for the token verbs.
+            transport, and reports the shard layout it computed; the dispatch
+            stores it as ``shard_layout`` for the token verbs.
         local_token_global_indices: ``(cp_mesh, padded_seq_len, device) ->
             LongTensor`` with the global position of each local token —
             closed-form for contiguous/round-robin layouts; None for
@@ -253,7 +253,7 @@ class ContextParallelismSharder:
             ``shard_layout`` (their token verbs raise before the first shard).
         shard_layout: The :class:`ShardLayout` of the last ``shard_batch``, set
             by the dispatch. Sharders are built per resolution/hook call, so
-            facts never leak across steps.
+            the layout never leaks across steps.
     """
 
     shard_batch: Callable[..., tuple[Callable, dict[str, Any], "ShardLayout | None"]]
@@ -261,8 +261,8 @@ class ContextParallelismSharder:
     shard_layout: "ShardLayout | None" = None
 
     def _indices(self, cp_mesh, padded_seq_len: int, device) -> torch.Tensor:
-        facts = self.shard_layout or _NO_SHARD_LAYOUT
-        captured = facts.local_token_global_indices
+        layout = self.shard_layout or _NO_SHARD_LAYOUT
+        captured = layout.local_token_global_indices
         if captured is not None:
             # Data-dependent layout: use the partition the shard reported, and
             # validate the requested length against it so a mismatched tensor
@@ -305,31 +305,33 @@ class ContextParallelismSharder:
 
         Any other length raises instead of silently sharding the wrong slice.
         """
-        facts = self.shard_layout or _NO_SHARD_LAYOUT
-        if facts.input_token_stream_positions is not None and tuple(tensor.shape) == tuple(
-            facts.input_token_stream_positions.shape
+        layout = self.shard_layout or _NO_SHARD_LAYOUT
+        if layout.input_token_stream_positions is not None and tuple(tensor.shape) == tuple(
+            layout.input_token_stream_positions.shape
         ):
             if fill is None:
                 raise ValueError("sharding an input-coordinate tensor on a repositioned layout requires `fill`")
-            positions = facts.input_token_stream_positions.to(tensor.device)
+            positions = layout.input_token_stream_positions.to(tensor.device)
             valid = positions >= 0
-            padded = torch.full((tensor.shape[0], facts.padded_seq_len), fill, dtype=tensor.dtype, device=tensor.device)
+            padded = torch.full(
+                (tensor.shape[0], layout.padded_seq_len), fill, dtype=tensor.dtype, device=tensor.device
+            )
             padded[valid.nonzero(as_tuple=True)[0], positions[valid]] = tensor[valid]
             tensor, seq_dim = padded, 1
-        elif facts.input_row_shape is not None and tuple(tensor.shape[: len(facts.input_row_shape)]) == tuple(
-            facts.input_row_shape
+        elif layout.input_row_shape is not None and tuple(tensor.shape[: len(layout.input_row_shape)]) == tuple(
+            layout.input_row_shape
         ):
-            tensor = tensor.reshape(-1, *tensor.shape[len(facts.input_row_shape) :])
+            tensor = tensor.reshape(-1, *tensor.shape[len(layout.input_row_shape) :])
             seq_dim = 0
 
         length = tensor.shape[seq_dim]
-        if facts.padded_seq_len is not None and length != facts.padded_seq_len:
-            if fill is not None and facts.original_seq_len is not None and length == facts.original_seq_len:
-                tensor = _pad_tensor_seq_dim_(tensor, seq_dim, facts.padded_seq_len - length, fill)
+        if layout.padded_seq_len is not None and length != layout.padded_seq_len:
+            if fill is not None and layout.original_seq_len is not None and length == layout.original_seq_len:
+                tensor = _pad_tensor_seq_dim_(tensor, seq_dim, layout.padded_seq_len - length, fill)
             else:
                 raise ValueError(
-                    f"This ContextParallelismSharder sharded a batch of padded_seq_len={facts.padded_seq_len} "
-                    f"(original_seq_len={facts.original_seq_len}), got a tensor of length {length} on dim {seq_dim}. "
+                    f"This ContextParallelismSharder sharded a batch of padded_seq_len={layout.padded_seq_len} "
+                    f"(original_seq_len={layout.original_seq_len}), got a tensor of length {length} on dim {seq_dim}. "
                     "Pass the original-length tensor with an explicit `fill`, or pre-pad it yourself."
                 )
         indices = self._indices(cp_mesh, tensor.shape[seq_dim], tensor.device)
@@ -349,31 +351,31 @@ class ContextParallelismSharder:
         coordinates using the shard layout: sliced back to ``original_seq_len``,
         un-flattened to ``input_row_shape`` (THD), or mapped through the
         reported position map (``fill`` for input positions whose tokens were
-        dropped, e.g. re-padded pack slots). Raises when no facts are present
+        dropped, e.g. re-padded pack slots). Raises when no layout is present
         (nothing to trim to).
         """
-        facts = self.shard_layout or _NO_SHARD_LAYOUT
+        layout = self.shard_layout or _NO_SHARD_LAYOUT
         padded_seq_len = tensor.shape[seq_dim] * (cp_mesh.size() if cp_mesh is not None else 1)
         indices = self._indices(cp_mesh, padded_seq_len, tensor.device)
         full = gather_token_tensor_by_indices(cp_mesh, tensor, indices, seq_dim=seq_dim)
         if not trim:
             return full
-        if facts.padded_seq_len is not None and full.shape[seq_dim] != facts.padded_seq_len:
+        if layout.padded_seq_len is not None and full.shape[seq_dim] != layout.padded_seq_len:
             raise ValueError(
                 f"gathered length {full.shape[seq_dim]} on dim {seq_dim} != reported "
-                f"padded_seq_len {facts.padded_seq_len}; the local shard does not match "
+                f"padded_seq_len {layout.padded_seq_len}; the local shard does not match "
                 "the batch this sharder last sharded (or no collective ran)."
             )
-        if facts.input_token_stream_positions is not None:
+        if layout.input_token_stream_positions is not None:
             if fill is None:
                 raise ValueError("trimming to input coordinates on a repositioned layout requires `fill`")
-            positions = facts.input_token_stream_positions.to(full.device)
+            positions = layout.input_token_stream_positions.to(full.device)
             out = full.gather(1, positions.clamp(min=0).to(torch.long))
             return out.masked_fill(positions < 0, fill)
-        if facts.input_row_shape is not None:
-            return full.reshape(*facts.input_row_shape, *full.shape[seq_dim + 1 :])
-        if facts.original_seq_len is not None:
-            return full.narrow(seq_dim, 0, facts.original_seq_len)
+        if layout.input_row_shape is not None:
+            return full.reshape(*layout.input_row_shape, *full.shape[seq_dim + 1 :])
+        if layout.original_seq_len is not None:
+            return full.narrow(seq_dim, 0, layout.original_seq_len)
         raise NotImplementedError(
             "This ContextParallelismSharder has no shard layout to trim to; "
             "gather with trim=False and restore the layout with the batch metadata "
@@ -814,8 +816,8 @@ def shard_batch_load_balanced(
     # TODO(@akoumparouli): surface these in the future.
     enable_loss_parallel: bool = False
     enable_compiled_autograd: bool = False
-    facts = ShardLayout(original_seq_len=seq_len, padded_seq_len=seq_len + (-seq_len) % cp_divisor)
-    return get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch, facts
+    layout = ShardLayout(original_seq_len=seq_len, padded_seq_len=seq_len + (-seq_len) % cp_divisor)
+    return get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch, layout
 
 
 def shard_batch_aux_only(
@@ -914,8 +916,8 @@ def shard_batch_aux_only(
         cp_no_restore_buffers=cp_no_restore_buffers,
         cp_rotate_method="allgather",  # TODO: expose through cfg
     )
-    facts = ShardLayout(original_seq_len=seq_len, padded_seq_len=seq_len + (-seq_len) % cp_divisor)
-    return get_train_context(False, False, cp_ctx), batch, facts
+    layout = ShardLayout(original_seq_len=seq_len, padded_seq_len=seq_len + (-seq_len) % cp_divisor)
+    return get_train_context(False, False, cp_ctx), batch, layout
 
 
 def shard_sequence_for_cp(
