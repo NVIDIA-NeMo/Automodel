@@ -49,7 +49,7 @@ Override preset defaults::
         --checkpoint <path> \
         --sampler nemotron --temperature 0.5 --steps 2048
 
-Infilling (LLaDA and Nemotron samplers)::
+Infilling (LLaDA sampler)::
 
     python examples/dllm_generate/generate.py \
         --checkpoint <path> \
@@ -241,7 +241,14 @@ class DLLMSampler:
                     cur[transfer_idx] = x0[transfer_idx]
                     x[:, block_slice] = cur
                 else:
+                    # Restrict the candidate set to the current block BEFORE top-k
+                    # selection (matching the official LLaDA sampler and the KV-cache
+                    # branch above). Out-of-window positions must never win transfer
+                    # slots: cancelling them after selection leaves the block's
+                    # schedule underfilled, stranding mask tokens in the output.
                     mask_idx = x == self.mask_id
+                    mask_idx[:, :block_start] = False
+                    mask_idx[:, block_end:] = False
                     logits = self.model(x, attention_mask=attention_mask).logits
                     x0, transfer_idx = get_transfer_index(
                         logits,
@@ -252,9 +259,6 @@ class DLLMSampler:
                         num_transfer_tokens=num_transfer_tokens[:, i],
                         threshold=cfg.threshold,
                     )
-                    for j in range(B):
-                        transfer_idx[j, :block_start] = False
-                        transfer_idx[j, block_end:] = False
                     x[transfer_idx] = x0[transfer_idx]
 
                 if cfg.eos_token_id is not None:
@@ -335,7 +339,13 @@ class DLLMSampler:
 
             transfer_schedule = get_num_transfer_tokens(block_mask, steps_per_block)
             for s in range(transfer_schedule.size(1)):
+                # Restrict the candidate set to this block's window BEFORE top-k
+                # (see the analogous fix in ``sample``): out-of-window masks must
+                # not steal transfer slots from the block's schedule.
                 mask_full = x == self.mask_id
+                for j in range(B):
+                    mask_full[j, :start] = False
+                    mask_full[j, start + widths[j] :] = False
                 logits = self.model(x, attention_mask=attention_mask).logits
                 x0, transfer_index = get_transfer_index(
                     logits,
@@ -345,9 +355,6 @@ class DLLMSampler:
                     x,
                     num_transfer_tokens=transfer_schedule[:, s],
                 )
-                for j in range(B):
-                    transfer_index[j, :start] = False
-                    transfer_index[j, start + widths[j] :] = False
                 x[transfer_index] = x0[transfer_index]
 
         return x
@@ -506,6 +513,8 @@ def main():
 
     if args.infill and args.sampler == "llada2":
         parser.error("--infill is not supported by the LLaDA2 generation path")
+    if args.infill and args.sampler == "nemotron":
+        parser.error("--infill is not supported by the Nemotron generation path (the tokenizer has no mask token)")
 
     try:
         checkpoint_path = resolve_checkpoint(args.checkpoint)

@@ -29,7 +29,7 @@ Usage::
 
     python -m torch.distributed.run --nproc-per-node=8 \\
         nemo_automodel/recipes/dllm/train_ft.py \\
-        -c examples/dllm_sft/mdlm_sft.yaml
+        -c examples/dllm_sft/llada_sft.yaml
 """
 
 from __future__ import annotations
@@ -232,17 +232,20 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         Returns:
             Tuple of (noisy_input_ids, noise_mask, p_mask).
         """
-        # Step/rank/microbatch-seeded generator so the D3PM corruption noise is a
-        # deterministic function of (step, microbatch, rank) and reproduces exactly
+        # Step/dp-rank/microbatch-seeded generator so the corruption noise is a
+        # deterministic function of (step, microbatch, dp_rank) and reproduces exactly
         # on checkpoint resume. Corruption previously drew from the GLOBAL RNG, whose
         # state is not faithfully reinstated at the first post-resume draw, so a
         # resumed run trained on a different noise realization (the resume loss/grad
         # spike). Mirrors the already-resume-safe block-selection (+1<<42) and
         # self-conditioning (+0) step-seeded generators; the distinct (+2<<42) offset
-        # decorrelates the three streams, and the rank term preserves per-DP-rank
-        # noise diversity (each rank corrupts its own microbatch independently).
+        # decorrelates the three streams. Seeding by DP rank (not global rank) keeps
+        # the noise identical across ranks that share a batch — TP/CP peers all hold
+        # the same dp_rank and MUST corrupt identically, or the sharded forward
+        # all-reduces partial activations computed from different inputs — while
+        # distinct DP ranks (which hold distinct data) still draw distinct noise.
         step = int(self.step_scheduler.step)
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        rank = self._get_dp_rank(include_cp=True) if torch.distributed.is_initialized() else 0
         seed = (
             int(getattr(self, "_self_cond_base_seed", 42))
             + 7919 * step
@@ -1153,7 +1156,7 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
 def main(config_path=None):
     """Main entry point for dLLM SFT recipe."""
     if config_path is None:
-        config_path = "examples/dllm_sft/mdlm_sft.yaml"
+        config_path = "examples/dllm_sft/llada_sft.yaml"
     cfg = parse_args_and_load_config(config_path)
     recipe_name = cfg.get("recipe", "DiffusionLMSFTRecipe")
     recipe_cls = DiffusionGemmaSFTRecipe if recipe_name == "DiffusionGemmaSFTRecipe" else DiffusionLMSFTRecipe

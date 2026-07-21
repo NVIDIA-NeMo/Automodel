@@ -15,6 +15,7 @@
 """Tests for the example dLLM generation entry point."""
 
 import sys
+import types
 from dataclasses import replace
 from pathlib import Path
 
@@ -24,7 +25,14 @@ import torch
 EXAMPLE_DIR = Path(__file__).resolve().parents[4] / "examples" / "dllm_generate"
 sys.path.insert(0, str(EXAMPLE_DIR))
 
-from generate import SAMPLERS, LLaDA2Sampler, encode_generation_prompts, generate_llada2, main  # noqa: E402
+from generate import (  # noqa: E402
+    SAMPLERS,
+    LLaDA2Sampler,
+    LLaDASampler,
+    encode_generation_prompts,
+    generate_llada2,
+    main,
+)
 
 
 class _FakeLLaDA2(torch.nn.Module):
@@ -135,3 +143,58 @@ def test_llada2_infill_is_rejected_before_loading(monkeypatch, capsys):
         main()
 
     assert "--infill is not supported by the LLaDA2 generation path" in capsys.readouterr().err
+
+
+class _FakeDenoiser(torch.nn.Module):
+    """Rigged denoiser: always predicts token 7, with confidence strictly
+    increasing by position. Under multi-block decoding, the highest-confidence
+    masked positions therefore always sit in FUTURE blocks — the exact setup
+    where selecting over the full sequence (instead of the current block)
+    wastes transfer slots and strands mask tokens."""
+
+    def __init__(self, vocab_size: int = 16):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+        self.vocab_size = vocab_size
+
+    def forward(self, x, attention_mask=None):
+        B, L = x.shape
+        logits = torch.zeros(B, L, self.vocab_size)
+        logits[:, :, 7] = 5.0 + 0.1 * torch.arange(L, dtype=torch.float32).unsqueeze(0)
+        return types.SimpleNamespace(logits=logits)
+
+
+def test_multi_block_sampling_unmasks_every_scheduled_position():
+    """Regression: with block_size < max_new_tokens, out-of-window positions
+    must not win top-k transfer slots — every block's schedule must fully
+    unmask its own window, leaving zero mask tokens in the output."""
+    mask_id = 9
+    sampler = LLaDASampler(
+        _FakeDenoiser(),
+        mask_id=mask_id,
+        eos_id=None,
+        steps=4,
+        max_new_tokens=8,
+        block_size=4,
+        temperature=0.0,
+        use_kv_cache=False,
+        eos_token_id=None,
+    )
+
+    out = sampler.sample([[1, 2]])
+
+    assert (out == mask_id).sum().item() == 0, "residual mask tokens: block schedules were underfilled"
+    assert (out[0, 2:] == 7).all(), "every generated position should hold the denoiser's prediction"
+
+
+def test_nemotron_infill_is_rejected_before_loading(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["generate.py", "--checkpoint", "unused", "--prompt", "hello", "--sampler", "nemotron", "--infill"],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        main()
+
+    assert "--infill is not supported by the Nemotron generation path" in capsys.readouterr().err

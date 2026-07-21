@@ -40,7 +40,10 @@ model:
   trust_remote_code: true
 
 checkpoint:
-  enabled: false
+  enabled: true
+  checkpoint_dir: dllm_checkpoints/llada_sft/
+  model_save_format: safetensors
+  save_consolidated: final  # final step exports the consolidated HF dir generate.py loads
 
 distributed:
   strategy: fsdp2
