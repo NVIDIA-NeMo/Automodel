@@ -644,20 +644,34 @@ def test_ministral_embedding_uses_bidirectional_flash_attention(tmp_path, monkey
         assert call["is_causal"] is False
 
 
-def test_sentence_transformers_loads_generated_ministral_checkpoint(tmp_path):
-    sentence_transformers = pytest.importorskip("sentence_transformers")
+@pytest.mark.parametrize(
+    ("pooling", "l2_normalize"),
+    [
+        ("avg", True),
+        ("cls", True),
+        ("last", True),
+        ("avg", False),
+    ],
+)
+def test_sentence_transformers_and_nemo_round_trip_generated_ministral_checkpoint(
+    tmp_path,
+    pooling,
+    l2_normalize,
+):
+    from sentence_transformers import SentenceTransformer
+
     from nemo_automodel._transformers import retrieval
 
     model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
     backbone = retrieval.build_encoder_backbone(
         model_name_or_path=str(model_dir),
         task="embedding",
-        pooling="avg",
+        pooling=pooling,
     )
     encoder = retrieval.BiEncoderModel(
         backbone,
-        pooling="avg",
-        l2_normalize=True,
+        pooling=pooling,
+        l2_normalize=l2_normalize,
         query_prompt="query: ",
         document_prompt="passage: ",
     )
@@ -666,15 +680,48 @@ def test_sentence_transformers_loads_generated_ministral_checkpoint(tmp_path):
     with torch.no_grad():
         expected_query = encoder(tokenizer(["query: hello"], return_tensors="pt"))
         expected_document = encoder(tokenizer(["passage: hello"], return_tensors="pt"))
-    save_dir = tmp_path / "sentence_transformers_ministral"
+    save_dir = tmp_path / f"sentence_transformers_ministral_{pooling}_{l2_normalize}"
     encoder.save_pretrained(save_dir, tokenizer=tokenizer)
 
-    reloaded = sentence_transformers.SentenceTransformer(str(save_dir), device="cpu")
-    actual_query = reloaded.encode_query(["hello"], convert_to_tensor=True)
-    actual_document = reloaded.encode_document(["hello"], convert_to_tensor=True)
-    assert actual_query.shape == actual_document.shape == (1, 16)
+    sentence_transformer = SentenceTransformer(str(save_dir), device="cpu")
+    actual_query = sentence_transformer.encode_query(["hello"], convert_to_tensor=True)
+    actual_document = sentence_transformer.encode_document(["hello"], convert_to_tensor=True)
+    nemo_reloaded = retrieval.BiEncoderModel.build(str(save_dir))
+    nemo_reloaded.eval()
+    with torch.no_grad():
+        nemo_query = nemo_reloaded(tokenizer(["query: hello"], return_tensors="pt"))
+        nemo_document = nemo_reloaded(tokenizer(["passage: hello"], return_tensors="pt"))
+
+    assert nemo_reloaded.pooling == pooling
+    assert nemo_reloaded.l2_normalize is l2_normalize
+    assert actual_query.shape == actual_document.shape == nemo_query.shape == nemo_document.shape == (1, 16)
     torch.testing.assert_close(actual_query, expected_query)
     torch.testing.assert_close(actual_document, expected_document)
+    torch.testing.assert_close(nemo_query, expected_query)
+    torch.testing.assert_close(nemo_document, expected_document)
+
+
+def test_nemo_bi_encoder_explicit_options_override_sentence_transformer_metadata(tmp_path):
+    from nemo_automodel._transformers import retrieval
+
+    model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="embedding",
+        pooling="cls",
+    )
+    encoder = retrieval.BiEncoderModel(backbone, pooling="cls", l2_normalize=False)
+    save_dir = tmp_path / "explicit_override"
+    encoder.save_pretrained(save_dir, tokenizer=_tiny_tokenizer())
+
+    reloaded = retrieval.BiEncoderModel.build(
+        str(save_dir),
+        pooling="last",
+        l2_normalize=True,
+    )
+
+    assert reloaded.pooling == "last"
+    assert reloaded.l2_normalize is True
 
 
 def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):

@@ -1216,8 +1216,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        pooling: str = "avg",
-        l2_normalize: bool = True,
+        pooling: str | None = None,
+        l2_normalize: bool | None = None,
         query_prompt: str | None = None,
         document_prompt: str | None = None,
         sentence_transformer_max_seq_length: int | None = None,
@@ -1234,8 +1234,10 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
-            pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.).
-            l2_normalize: Whether to L2-normalize embeddings.
+            pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.). When omitted, standard
+                Sentence Transformers metadata is restored when available, otherwise defaults to ``'avg'``.
+            l2_normalize: Whether to L2-normalize embeddings. When omitted, the standard Sentence Transformers
+                module stack is restored when available, otherwise defaults to ``True``.
             query_prompt: Exact query prompt written to Sentence Transformers metadata.
             document_prompt: Exact document prompt written to Sentence Transformers metadata.
             sentence_transformer_max_seq_length: Deployment sequence limit written to Sentence Transformers

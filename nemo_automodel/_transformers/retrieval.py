@@ -15,6 +15,7 @@
 """Encoder models for bi-encoder and cross-encoder tasks."""
 
 import inspect
+import json
 import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -23,7 +24,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from huggingface_hub import try_to_load_from_cache
+from huggingface_hub import hf_hub_download, try_to_load_from_cache
+from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
 from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PretrainedConfig, PreTrainedModel
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import logging
@@ -36,6 +38,20 @@ logger = logging.get_logger(__name__)
 
 
 _STANDARD_SENTENCE_TRANSFORMER_POOLING_TYPES = frozenset({"avg", "cls", "last"})
+_SENTENCE_TRANSFORMER_POOLING_KEYS = {
+    "avg": "pooling_mode_mean_tokens",
+    "cls": "pooling_mode_cls_token",
+    "last": "pooling_mode_lasttoken",
+}
+_BI_ENCODER_DEFAULT_POOLING = "avg"
+_BI_ENCODER_DEFAULT_L2_NORMALIZE = True
+_HF_HUB_METADATA_KWARGS = {
+    "cache_dir",
+    "force_download",
+    "local_files_only",
+    "revision",
+    "token",
+}
 
 
 @dataclass
@@ -57,6 +73,114 @@ class SentenceTransformerExportConfig:
     similarity_fn_name: str | None = None
     do_lower_case: bool | None = None
     include_prompt: bool = True
+
+
+@dataclass(frozen=True)
+class SentenceTransformerWrapperOptions:
+    """Bi-encoder wrapper behavior represented by standard Sentence Transformers modules."""
+
+    pooling: str
+    l2_normalize: bool
+
+
+def _load_sentence_transformer_json(
+    model_name_or_path: str,
+    filename: str,
+    hf_kwargs: dict,
+) -> object | None:
+    """Load a standard Sentence Transformers JSON asset from a local path or the Hub."""
+    subfolder = hf_kwargs.get("subfolder")
+    if os.path.isdir(model_name_or_path):
+        root = os.path.join(model_name_or_path, subfolder) if subfolder else model_name_or_path
+        asset_path = os.path.join(root, filename)
+        if not os.path.isfile(asset_path):
+            return None
+    else:
+        download_kwargs = {key: hf_kwargs[key] for key in _HF_HUB_METADATA_KWARGS if key in hf_kwargs}
+        if "token" not in download_kwargs and "use_auth_token" in hf_kwargs:
+            download_kwargs["token"] = hf_kwargs["use_auth_token"]
+        try:
+            asset_path = hf_hub_download(
+                repo_id=model_name_or_path,
+                filename=filename,
+                subfolder=subfolder,
+                **download_kwargs,
+            )
+        except (EntryNotFoundError, LocalEntryNotFoundError):
+            return None
+        except Exception as exc:
+            logger.warning("Unable to load Sentence Transformers metadata %s: %s", filename, exc)
+            return None
+
+    with open(asset_path) as f:
+        return json.load(f)
+
+
+def _load_sentence_transformer_wrapper_options(
+    model_name_or_path: str,
+    hf_kwargs: dict,
+) -> SentenceTransformerWrapperOptions | None:
+    """Restore pooling and normalization from the standard Sentence Transformers module stack."""
+    modules = _load_sentence_transformer_json(model_name_or_path, "modules.json", hf_kwargs)
+    if modules is None:
+        return None
+    if not isinstance(modules, list):
+        raise ValueError("Sentence Transformers modules.json must contain a list of modules.")
+
+    pooling_modules = [
+        module
+        for module in modules
+        if isinstance(module, dict) and module.get("type") == "sentence_transformers.models.Pooling"
+    ]
+    if len(pooling_modules) != 1:
+        raise ValueError("Sentence Transformers metadata must contain exactly one standard Pooling module.")
+
+    pooling_path = pooling_modules[0].get("path")
+    if not isinstance(pooling_path, str) or not pooling_path:
+        raise ValueError("Sentence Transformers Pooling metadata must reference a module path.")
+    pooling_config = _load_sentence_transformer_json(
+        model_name_or_path,
+        os.path.join(pooling_path, "config.json"),
+        hf_kwargs,
+    )
+    if not isinstance(pooling_config, dict):
+        raise ValueError("Sentence Transformers Pooling config.json is missing or invalid.")
+
+    active_pooling_keys = {
+        key for key, value in pooling_config.items() if key.startswith("pooling_mode_") and bool(value)
+    }
+    matching_pooling = [
+        pooling
+        for pooling, metadata_key in _SENTENCE_TRANSFORMER_POOLING_KEYS.items()
+        if metadata_key in active_pooling_keys
+    ]
+    if len(active_pooling_keys) != 1 or len(matching_pooling) != 1:
+        raise ValueError(
+            "Sentence Transformers pooling metadata cannot be represented by a single NeMo avg, cls, or last mode."
+        )
+
+    l2_normalize = any(
+        isinstance(module, dict) and module.get("type") == "sentence_transformers.models.Normalize"
+        for module in modules
+    )
+    return SentenceTransformerWrapperOptions(pooling=matching_pooling[0], l2_normalize=l2_normalize)
+
+
+def _resolve_bi_encoder_options(
+    config: PretrainedConfig,
+    saved_options: SentenceTransformerWrapperOptions | None,
+    pooling: str | None,
+    l2_normalize: bool | None,
+) -> tuple[str, bool]:
+    """Resolve explicit wrapper arguments, then standard saved metadata, then defaults."""
+    if pooling is None:
+        if saved_options is not None:
+            pooling = saved_options.pooling
+        else:
+            pooling = getattr(config, "pooling", None) or _BI_ENCODER_DEFAULT_POOLING
+    if l2_normalize is None:
+        l2_normalize = saved_options.l2_normalize if saved_options is not None else _BI_ENCODER_DEFAULT_L2_NORMALIZE
+    return pooling, l2_normalize
 
 
 def _resolve_cached_source_model_path(model_name_or_path: str, config, hf_kwargs: dict) -> str | None:
@@ -280,6 +404,7 @@ def build_encoder_backbone(
     extract_submodel: Optional[str] = None,
     num_labels: Optional[int] = None,
     temperature: Optional[float] = None,
+    loaded_config: PretrainedConfig | None = None,
     **hf_kwargs,
 ) -> PreTrainedModel:
     """Build an encoder backbone from a pretrained checkpoint.
@@ -309,6 +434,7 @@ def build_encoder_backbone(
             (e.g. ``"language_model"`` to extract the text backbone from a VLM).
         num_labels: Number of labels for reranking/classification backbones.
         temperature: Optional retrieval score temperature for custom retrieval backbones.
+        loaded_config: A previously loaded config used to keep model and metadata resolution on the same revision.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
     Returns:
@@ -318,7 +444,28 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
-    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+    config_load_kwargs = {
+        key: hf_kwargs[key]
+        for key in (
+            "cache_dir",
+            "code_revision",
+            "force_download",
+            "local_files_only",
+            "proxies",
+            "revision",
+            "subfolder",
+            "token",
+            "use_auth_token",
+        )
+        if key in hf_kwargs
+    }
+    config = loaded_config
+    if config is None:
+        config = AutoConfig.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **config_load_kwargs,
+        )
     model_type = getattr(config, "model_type", "")
 
     if extract_submodel is not None:
@@ -520,8 +667,8 @@ class BiEncoderModel(nn.Module):
         cls,
         model_name_or_path: str,
         task: str = None,
-        pooling: str = "avg",
-        l2_normalize: bool = True,
+        pooling: str | None = None,
+        l2_normalize: bool | None = None,
         query_prompt: str | None = None,
         document_prompt: str | None = None,
         sentence_transformer_max_seq_length: int | None = None,
@@ -539,8 +686,44 @@ class BiEncoderModel(nn.Module):
 
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
+        config_load_kwargs = {
+            key: hf_kwargs[key]
+            for key in (
+                "cache_dir",
+                "code_revision",
+                "force_download",
+                "local_files_only",
+                "proxies",
+                "revision",
+                "subfolder",
+                "token",
+                "use_auth_token",
+            )
+            if key in hf_kwargs
+        }
+        config = AutoConfig.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **config_load_kwargs,
+        )
+        metadata_kwargs = dict(hf_kwargs)
+        commit_hash = getattr(config, "_commit_hash", None)
+        if commit_hash is not None:
+            metadata_kwargs["revision"] = commit_hash
+        saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, metadata_kwargs)
+        pooling, l2_normalize = _resolve_bi_encoder_options(
+            config,
+            saved_options,
+            pooling,
+            l2_normalize,
+        )
         backbone = build_encoder_backbone(
-            model_name_or_path, effective_task, trust_remote_code=trust_remote_code, pooling=pooling, **hf_kwargs
+            model_name_or_path,
+            effective_task,
+            trust_remote_code=trust_remote_code,
+            pooling=pooling,
+            loaded_config=config,
+            **hf_kwargs,
         )
 
         encoder = cls(
