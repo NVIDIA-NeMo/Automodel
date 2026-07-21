@@ -280,22 +280,7 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
-    config_load_kwargs = {
-        key: hf_kwargs[key]
-        for key in (
-            "cache_dir",
-            "code_revision",
-            "force_download",
-            "local_files_only",
-            "proxies",
-            "revision",
-            "subfolder",
-            "token",
-            "use_auth_token",
-        )
-        if key in hf_kwargs
-    }
-    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **config_load_kwargs)
+    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
     model_type = getattr(config, "model_type", "")
 
     if extract_submodel is not None:
@@ -312,17 +297,17 @@ def build_encoder_backbone(
         )
 
     if model_type.lower() == "ministral3" and task == "embedding":
-        config.is_causal = False
-        if pooling is not None:
-            config.pooling = pooling
-        if temperature is not None:
-            config.temperature = temperature
-        return AutoModel.from_pretrained(
+        backbone = AutoModel.from_pretrained(
             model_name_or_path,
-            config=config,
             trust_remote_code=trust_remote_code,
             **hf_kwargs,
         )
+        backbone.config.is_causal = False
+        if pooling is not None:
+            backbone.config.pooling = pooling
+        if temperature is not None:
+            backbone.config.temperature = temperature
+        return backbone
 
     BidirectionalModelClass = _get_supported_backbone_class(model_type, task)
     if BidirectionalModelClass is not None:
