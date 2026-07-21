@@ -1,0 +1,140 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# CoderForge agent SFT on the BASE Gemma-4-31B (google/gemma-4-31B -> hf_gemma4_31b) — RETRAIN v2.
+#
+# WHY v2: the first base run (gemma4_31b_base_coderforge_cp8_64k_16node.yaml, lr 5e-6, 224/300 steps
+# ~0.15B tok) scored 0% on SWE-bench because it never learned to emit the gemma4 tool-call special
+# tokens (<|tool_call>=48 / <tool_call|>=49 / <|"|>=52) — it emitted the plain-text `call:name{...}`
+# approximation, which vLLM's gemma4 parser (regex over 48..49) can't structure. Root cause (verified,
+# 2026-07-09): pure UNDERFITTING, NOT freezing/tokenizer/serve —
+#   - `freeze_embeddings` is a NO-OP in this recipe path (apply_parameter_freezing never reads it);
+#     with freeze_language_model:false the embeddings + tied LM head were already TRAINABLE.
+#   - tokenizers byte-identical across base/-it; training LABELS contain 48/49/52 (rendered a real
+#     CoderForge sample: 48 x43, 49 x43, 52 x90).
+#   - in-distribution probe (probe_indist.py, job 13650661): step_224 emits <|tool_call> 0/3 even under
+#     exact training rendering -> capability gap, not prompt-format shift.
+# The -it model already had these tokens (Google instruct-tuning) so the small budget sufficed for it.
+# FIX = more budget + faster LR so a RAW base learns the new tool-call format from scratch.
+#
+# DELTAS vs v1: lr 5e-6 -> 1e-5 (install new behavior fast; the earlier 6440 grad spike at 1e-5 was
+# CLIPPED by max_norm=1.0 and never diverged), max_steps 300 -> 800 (~0.5B tok), ckpt_every 75 -> 100.
+# KEEP: clip_grad_norm 1.0 (safety net), warmup 60 (gentle ramp on a fragile base), cosine + min_lr
+# stretched over the full 800 steps, freeze_language_model:false (embeds/head trainable — the only
+# thing that matters), pure base (NO warm-start from -it, per the base-vs-it comparison).
+# LIVE GUARDRAIL: watch grad_norm over the first ~50 steps; if it is SUSTAINED hard-clipping at 1e-5
+# (effective-LR distortion), drop toward 7.5e-6 and restart — a destabilized base is worse than a slow
+# one. CONVERGENCE METRIC (not loss): per-consolidated-ckpt one-call tool smoke test (probe_indist.py
+# path B) -> the step where structured tool-calling switches on; early kill-check if not on by ~300-400.
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 16       # dp16 x local_batch_size 1
+  local_batch_size: 1
+  ckpt_every_steps: 100       # consolidated HF ckpt at 100/200/.../800 (smoke test + preemption safety)
+  val_every_steps: 999999
+  max_steps: 800              # ~0.5B tok. NOTE: to train LONGER do NOT just bump this + resume — the
+                              # DCP scheduler state reloads at min_lr (5e-7) and stays there (verified
+                              # 2026-07-10). Use the fresh-continuation recipe (loads step_799
+                              # consolidated + a NEW cosine schedule): *_cont800.yaml.
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: /path/to/checkpoints/hf_gemma4_31b
+  torch_dtype: torch.bfloat16
+  attn_implementation: sdpa   # dense CP requires sdpa (model-owned p2p ring); no TE attn backend
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  text_config:
+    use_cache: false
+    output_hidden_states: true  # required by FusedLinearCrossEntropy
+
+processor:
+  padding_side: right
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /path/to/coderforge_ckpts/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps/
+  model_save_format: safetensors
+  save_consolidated: every    # each save -> consolidated HF ckpt (SWE-bench-evaluable)
+  v4_compatible: true         # consolidated assets load under transformers v4 (vLLM serving)
+
+distributed:
+  strategy: fsdp2
+  dp_size: none               # auto: 128 / (tp1 * cp8) = 16
+  tp_size: 1
+  cp_size: 8                  # 65536 / (2*8) = 4096 -> divisible; 8192 tokens/rank
+  sequence_parallel: false
+  activation_checkpointing: true
+
+clip_grad_norm:
+  max_norm: 1.0                # safety net — held the ~6440 grad spike stable at 1e-5, no divergence
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+  logit_softcapping: 30.0
+  reduction: sum
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: /path/to/coderforge_cache/togethercomputer_CoderForge-Preview_filtered_reward1_seq65536/data.jsonl
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: /path/to/checkpoints/hf_gemma4_31b
+  split: train
+  seq_length: 65536
+  padding: do_not_pad
+  shuffle_seed: 42
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater_vlm
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5                   # v2: back up from 5e-6 to install the new tool-call format fast
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+lr_scheduler:
+  lr_decay_style: cosine       # cosine horizon = max_steps (800) -> decay stretched over the full run
+  lr_warmup_steps: 60          # gentle ramp on the fragile base (kept from v1)
+  min_lr: 5.0e-7
+
+freeze_config:
+  freeze_embeddings: true      # NO-OP in this path (apply_parameter_freezing ignores it); kept for parity
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false # embeddings + tied LM head trainable — required to learn tokens 48/49/52
+
+wandb:
+  enable: true
+  project: cp_validation
+  entity: nvidia
+  name: gemma4_31b_base_coderforge_cp8_64k_1e5_800steps

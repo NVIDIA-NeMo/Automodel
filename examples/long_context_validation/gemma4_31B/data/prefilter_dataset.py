@@ -46,18 +46,18 @@ guarantees no training sample is truncated (truncation drops the terminal
 
 Usage:
     # Analysis-first: tokenize once, print the coverage curve, cache analyzed JSONL
-    python examples/convergence/coderforge/data/prefilter_dataset.py \
+    python examples/long_context_validation/gemma4_31B/data/prefilter_dataset.py \
         --model /path/to/hf_gemma4_31b_it \
         --cache_dir ./cached
 
     # Produce a training-ready cache at a chosen seq_length (cheap if analyzed)
-    python examples/convergence/coderforge/data/prefilter_dataset.py \
+    python examples/long_context_validation/gemma4_31B/data/prefilter_dataset.py \
         --model /path/to/hf_gemma4_31b_it \
         --cache_dir ./cached \
         --seq_length 32768
 
     # Quick smoke test on a handful of trajectories
-    python examples/convergence/coderforge/data/prefilter_dataset.py \
+    python examples/long_context_validation/gemma4_31B/data/prefilter_dataset.py \
         --model /path/to/hf_gemma4_31b_it --max_samples 20 --seq_length 16384
 
     # Use the cached JSONL in a training config:
