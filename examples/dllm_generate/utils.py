@@ -141,8 +141,8 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada"):
 
     Args:
         checkpoint_path: Path to the HF-format checkpoint directory.
-        sampler_name: ``"llada"``, ``"llada2"``, or ``"nemotron"``. Adjusts
-            tokenizer setup and model construction kwargs for the chosen family.
+        sampler_name: ``"llada"``, ``"llada2"``, ``"nemotron"``, or ``"gemma"``.
+            Adjusts tokenizer setup and model construction for the chosen family.
 
     Returns:
         ``(model, tokenizer, mask_id, eos_id)``.
@@ -152,6 +152,17 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada"):
     _patch_remote_code_compat()
 
     tokenizer = NeMoAutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
+
+    if sampler_name == "gemma":
+        # DiffusionGemma generation runs through the diffusion sampler that
+        # ships with ``transformers`` (>= 5.11). Load the stock HF class
+        # directly: the NeMoAuto wrapper resolves this architecture to the
+        # Automodel *training* implementation, which has no ``generate``.
+        from transformers import DiffusionGemmaForBlockDiffusion
+
+        model = DiffusionGemmaForBlockDiffusion.from_pretrained(checkpoint_path, dtype="auto", device_map="auto").eval()
+        return model, tokenizer, None, tokenizer.eos_token_id
+
     if sampler_name == "llada":
         if tokenizer.mask_token is None:
             tokenizer.add_special_tokens({"mask_token": "<|mdm_mask|>"})
