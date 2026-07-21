@@ -121,7 +121,6 @@ _MEGATRON_FSDP_050_REQUIRED_MSG = (
     "megatron_fsdp.MixedPrecisionPolicy could not be imported: NeMo Automodel requires megatron-fsdp==0.5.0"
 )
 
-# TODO(boxiangw): Change to MegatronFSDP once it got published
 HAVE_MEGATRON_FSDP = False
 logging.getLogger("megatron_fsdp").setLevel(logging.WARNING)
 try:
