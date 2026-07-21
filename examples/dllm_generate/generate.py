@@ -19,6 +19,7 @@ Provides ``DLLMSampler`` (core logic) with preset subclasses:
 - ``LLaDASampler``: no-cache, full-forward defaults.
 - ``LLaDA2Sampler``: built-in block-refinement generation defaults.
 - ``NemotronLabsDLLMSampler``: KV-cache block-diffusion defaults.
+- ``IDLMSampler``: I-DLM introspective strided decoding (Dream logit shift).
 
 Usage
 -----
@@ -28,6 +29,14 @@ LLaDA generation::
         --checkpoint <path> \
         --prompt "Explain what a neural network is." \
         --sampler llada
+
+I-DLM generation (``--mask_id`` is the reserved token used at training,
+e.g. 151669 for the Qwen3-based I-DLM checkpoint)::
+
+    python examples/dllm_generate/generate.py \
+        --checkpoint <path> \
+        --prompt "Explain what a neural network is." \
+        --sampler idlm --mask_id 151669
 
 LLaDA2 generation::
 
@@ -116,6 +125,12 @@ class DLLMSampler:
 
     default_config: SamplerConfig = SamplerConfig()
 
+    #: Next-token "logit shift". ``0`` reads the logit at position ``p`` to fill
+    #: mask ``p`` (standard masked diffusion, LLaDA). ``1`` reads the logit at
+    #: position ``p-1`` — the Dream-style shift I-DLM is trained with, where the
+    #: hidden state at ``i`` predicts token ``i+1``. Overridden by ``IDLMSampler``.
+    logit_shift: int = 0
+
     def __init__(self, model, mask_id: int, eos_id: int, **overrides):
         self.model = model
         self.mask_id = mask_id
@@ -123,6 +138,26 @@ class DLLMSampler:
         self.device = next(model.parameters()).device
         if overrides:
             self.default_config = replace(self.default_config, **overrides)
+
+    def _apply_logit_shift(self, logits: torch.Tensor) -> torch.Tensor:
+        """Align a next-token-shifted model's logits to the position they fill.
+
+        Args:
+            logits: Model logits of shape ``[batch, sequence, vocab]``, where row
+                ``i`` is the distribution over token ``i + logit_shift``.
+
+        Returns:
+            Logits of shape ``[batch, sequence, vocab]`` re-indexed so row ``p``
+            is the distribution predicting the token at position ``p``. The first
+            ``logit_shift`` rows are zeroed (they land on the prompt, which is
+            never masked, so they are ignored downstream).
+        """
+        s = self.logit_shift
+        if s == 0:
+            return logits
+        shifted = torch.zeros_like(logits)
+        shifted[:, s:] = logits[:, :-s]
+        return shifted
 
     def _set_diffusion_lm(self, enabled: bool):
         """Toggle the ``diffusion_lm`` flag on attention layers.
@@ -160,6 +195,12 @@ class DLLMSampler:
 
         use_kv_cache = cfg.use_kv_cache
         block_size = cfg.block_size
+
+        # The logit shift reads position p-1 to fill mask p. In the block-sliced
+        # KV path that predecessor lives in the cache (not in the current
+        # forward's logits), so the standalone shifted sampler runs full-forward.
+        if self.logit_shift and use_kv_cache:
+            raise ValueError("logit_shift (I-DLM) requires use_kv_cache=False for the standalone sampler.")
 
         if isinstance(inputs[0], list):
             inputs = [torch.as_tensor(p, dtype=torch.long, device=self.device) for p in inputs]
@@ -242,7 +283,7 @@ class DLLMSampler:
                     x[:, block_slice] = cur
                 else:
                     mask_idx = x == self.mask_id
-                    logits = self.model(x, attention_mask=attention_mask).logits
+                    logits = self._apply_logit_shift(self.model(x, attention_mask=attention_mask).logits)
                     x0, transfer_idx = get_transfer_index(
                         logits,
                         cfg.temperature,
@@ -336,7 +377,7 @@ class DLLMSampler:
             transfer_schedule = get_num_transfer_tokens(block_mask, steps_per_block)
             for s in range(transfer_schedule.size(1)):
                 mask_full = x == self.mask_id
-                logits = self.model(x, attention_mask=attention_mask).logits
+                logits = self._apply_logit_shift(self.model(x, attention_mask=attention_mask).logits)
                 x0, transfer_index = get_transfer_index(
                     logits,
                     cfg.temperature,
@@ -413,10 +454,51 @@ class NemotronLabsDLLMSampler(DLLMSampler):
     )
 
 
+class IDLMSampler(DLLMSampler):
+    """I-DLM introspective strided decoding (Yu et al., 2026; arXiv:2604.11035).
+
+    I-DLM converts an AR model into a diffusion LM trained with a Dream-style
+    logit shift (the hidden state at ``i`` predicts token ``i+1``) under strict
+    causal attention. This standalone preset honours that contract:
+
+    - ``logit_shift = 1`` — fill mask ``p`` from the logit at position ``p-1``.
+      Without the shift a shifted checkpoint decodes garbage.
+    - The checkpoint is a causal LM, so the shared full-forward path already
+      attends causally (no bidirectional dLLM masking) — matching I-DLM's
+      strict-causal inference. ``use_kv_cache=False`` keeps the shifted decode
+      exact (the block-sliced KV path cannot see the ``p-1`` predecessor).
+    - ``block_size`` is the decode stride N (paper eval uses N=4); within each
+      block, confident masked positions are accepted in parallel via the
+      ``threshold`` rule, the diffusion parallelism over the AR baseline.
+
+    The production engine is SGLang's ``IDLMBlockN`` (``--dllm-algorithm
+    IDLMBlockN``): each forward emits one clean AR anchor plus N-1 speculative
+    tokens that the next forward verifies left-to-right (``r = p/q``; greedy
+    argmax-verify), making it lossless-equivalent to AR decoding. That
+    speculative KV-cache engine is out of scope here; this preset is the portable
+    full-forward reference decode, mirroring ``NemotronLabsDLLMSampler``.
+    """
+
+    logit_shift = 1
+
+    default_config = SamplerConfig(
+        steps=256,
+        max_new_tokens=256,
+        block_size=4,
+        temperature=0.0,
+        remasking="low_confidence",
+        use_kv_cache=False,
+        threshold=0.9,
+        causal_context=False,
+        eos_token_id=None,  # resolved from tokenizer at runtime
+    )
+
+
 SAMPLERS = {
     "llada": LLaDASampler,
     "llada2": LLaDA2Sampler,
     "nemotron": NemotronLabsDLLMSampler,
+    "idlm": IDLMSampler,
 }
 
 
@@ -495,6 +577,13 @@ def main():
     parser.add_argument("--remasking", default=None, choices=["low_confidence", "random"])
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument(
+        "--mask_id",
+        type=int,
+        default=None,
+        help="Override the mask token id (required for I-DLM, whose Qwen3 tokenizer "
+        "has no mask token; use the reserved id from training, e.g. 151669).",
+    )
+    parser.add_argument(
         "--no_kv_cache",
         action="store_true",
         help="Disable KV cache (also disables causal context)",
@@ -517,7 +606,14 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    model, tokenizer, mask_id, eos_id = load_model_and_tokenizer(checkpoint_path, sampler_name=args.sampler)
+    model, tokenizer, mask_id, eos_id = load_model_and_tokenizer(
+        checkpoint_path, sampler_name=args.sampler, mask_id_override=args.mask_id
+    )
+    if mask_id is None:
+        parser.error(
+            f"Could not resolve a mask token id for sampler {args.sampler!r}; "
+            "pass --mask_id (e.g. 151669 for the Qwen3-based I-DLM checkpoint)."
+        )
 
     overrides = {}
     for key in [
@@ -536,7 +632,7 @@ def main():
     if args.no_kv_cache:
         overrides["use_kv_cache"] = False
         overrides["causal_context"] = False
-    if args.sampler == "nemotron" and "eos_token_id" not in overrides:
+    if args.sampler in ("nemotron", "idlm") and "eos_token_id" not in overrides:
         overrides["eos_token_id"] = eos_id
 
     sampler_cls = SAMPLERS[args.sampler]
