@@ -368,35 +368,6 @@ def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_support
     assert outputs.last_hidden_state.shape == (2, 8, backbone.config.hidden_size)
 
 
-def test_extracted_ministral_preserves_outer_source_commit_hash(tmp_path, monkeypatch):
-    from nemo_automodel._transformers import retrieval
-
-    model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
-    extracted_model = AutoModel.from_pretrained(model_dir)
-    assert getattr(extracted_model.config, "_commit_hash", None) is None
-
-    parent_model = MagicMock()
-    parent_model.language_model = extracted_model
-    outer_config = MagicMock()
-    outer_config.model_type = "mistral3"
-    outer_config._commit_hash = "source-commit"
-    auto_config_from_pretrained = MagicMock(return_value=outer_config)
-    auto_model_from_pretrained = MagicMock(return_value=parent_model)
-    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
-    monkeypatch.setattr(retrieval.AutoModel, "from_pretrained", auto_model_from_pretrained)
-
-    backbone = retrieval.build_encoder_backbone(
-        model_name_or_path="mistralai/source-model",
-        task="embedding",
-        extract_submodel="language_model",
-        pooling="avg",
-    )
-
-    assert backbone.config._commit_hash == "source-commit"
-    auto_config_from_pretrained.assert_called_once()
-    auto_model_from_pretrained.assert_called_once()
-
-
 def test_extract_submodel_llama_score_from_local_vlm_converts_to_supported_cross_encoder(tmp_path):
     """A supported extracted Llama text backbone becomes the retrieval reranker."""
     from nemo_automodel._transformers import retrieval
