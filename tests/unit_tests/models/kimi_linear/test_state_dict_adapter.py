@@ -4,9 +4,11 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from torch.distributed._tensor.placement_types import Replicate, Shard
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.kimi_linear.state_dict_adapter import KimiLinearStateDictAdapter
+from nemo_automodel.components.moe import state_dict_utils
 from nemo_automodel.components.moe.config import MoEConfig
 
 
@@ -64,6 +66,40 @@ def backend():
 @pytest.fixture
 def adapter(config, moe_config, backend):
     return KimiLinearStateDictAdapter(config, moe_config, backend, dtype=torch.bfloat16)
+
+
+class _FakeMesh:
+    def __init__(self, *, rank: int, size: int, names: tuple[str, ...]):
+        self._rank = rank
+        self._size = size
+        self.mesh_dim_names = names
+
+    def get_local_rank(self) -> int:
+        return self._rank
+
+    def size(self) -> int:
+        return self._size
+
+
+class _FakeDTensor:
+    def __init__(self, *, local_tensor: torch.Tensor, placement: object, mesh: _FakeMesh):
+        """Create a DTensor-like wrapper for adapter unit tests.
+
+        Args:
+            local_tensor: Rank-local expert tensor of shape [local_experts, ...].
+            placement: DTensor placement metadata attached to the fake value.
+            mesh: Device mesh metadata attached to the fake value.
+        """
+        self._local_tensor = local_tensor
+        self.placements = (placement,)
+        self.device_mesh = mesh
+
+    def to_local(self) -> torch.Tensor:
+        return self._local_tensor
+
+
+def _patch_fake_dtensor(monkeypatch):
+    monkeypatch.setattr(state_dict_utils, "is_dtensor", lambda tensor: isinstance(tensor, _FakeDTensor))
 
 
 def _make_hf_expert_state(n_experts: int, inter_dim: int, dim: int) -> dict[str, torch.Tensor]:
@@ -182,3 +218,83 @@ def test_convert_single_tensor_to_hf_respects_exclude_regex(adapter):
     )
 
     assert result == []
+
+
+def test_split_experts_weights_dtensor_replicate_returns_all_experts(adapter, monkeypatch):
+    _patch_fake_dtensor(monkeypatch)
+    local_tensor = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    weight = _FakeDTensor(
+        local_tensor=local_tensor,
+        placement=Replicate(),
+        mesh=_FakeMesh(rank=1, size=2, names=("tp",)),
+    )
+
+    split = adapter._split_experts_weights(weight, n_experts=4)
+
+    assert torch.equal(torch.stack(split), local_tensor)
+    assert adapter._last_expert_ids == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    ("rank", "expected_ids"),
+    [
+        (0, [0, 1, 2]),
+        (1, [3, 4]),
+    ],
+)
+def test_split_experts_weights_dtensor_shard_uses_uneven_expert_distribution(
+    adapter,
+    monkeypatch,
+    rank,
+    expected_ids,
+):
+    _patch_fake_dtensor(monkeypatch)
+    local_tensor = torch.arange(len(expected_ids) * 2, dtype=torch.float32).reshape(len(expected_ids), 2)
+    weight = _FakeDTensor(
+        local_tensor=local_tensor,
+        placement=Shard(0),
+        mesh=_FakeMesh(rank=rank, size=2, names=("tp",)),
+    )
+
+    split = adapter._split_experts_weights(weight, n_experts=5)
+
+    assert torch.equal(torch.stack(split), local_tensor)
+    assert adapter._last_expert_ids == expected_ids
+
+
+def test_split_experts_weights_dtensor_shard_uses_active_ep_submesh(adapter, monkeypatch):
+    _patch_fake_dtensor(monkeypatch)
+    active_mesh = _FakeMesh(rank=0, size=99, names=("dp", "ep"))
+    ep_mesh = _FakeMesh(rank=2, size=3, names=("ep",))
+    calls = []
+
+    def fake_get_submesh(mesh, dims):
+        calls.append((mesh, dims))
+        return ep_mesh
+
+    monkeypatch.setattr(state_dict_utils, "get_submesh", fake_get_submesh)
+    adapter._active_device_mesh = active_mesh
+    local_tensor = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    weight = _FakeDTensor(
+        local_tensor=local_tensor,
+        placement=Shard(0),
+        mesh=_FakeMesh(rank=0, size=99, names=("tp",)),
+    )
+
+    split = adapter._split_experts_weights(weight, n_experts=8)
+
+    assert torch.equal(torch.stack(split), local_tensor)
+    assert adapter._last_expert_ids == [6, 7]
+    assert calls == [(active_mesh, ("ep",))]
+
+
+def test_split_experts_weights_dtensor_shard_validates_local_expert_count(adapter, monkeypatch):
+    _patch_fake_dtensor(monkeypatch)
+    weight = _FakeDTensor(
+        local_tensor=torch.zeros(1, 2),
+        placement=Shard(0),
+        mesh=_FakeMesh(rank=0, size=2, names=("tp",)),
+    )
+
+    with pytest.raises(ValueError, match="Expected local Kimi expert tensor first dimension to be 3"):
+        adapter._split_experts_weights(weight, n_experts=5)
