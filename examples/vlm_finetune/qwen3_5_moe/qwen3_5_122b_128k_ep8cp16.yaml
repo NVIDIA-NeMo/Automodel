@@ -1,0 +1,150 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Qwen3.5-122B-A10B long-context VLM scaling probe: 128K neat packing,
+# EP=8, CP=16, trainable vision tower, frame-level vision sharding, and full
+# activation checkpointing. The 128-rank layout is CP16 x DP8; EP8 is composed
+# over that mesh by the MoE parallelizer.
+#
+# Example Slurm allocation (16 nodes x 8 GPUs):
+#   srun --nodes=16 --ntasks-per-node=1 automodel \
+#     examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp16.yaml \
+#     --nnodes 16 --nproc-per-node 8
+
+recipe: FinetuneRecipeForVLM
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 100000
+  val_every_steps: 100000
+  save_checkpoint_every_epoch: false
+  num_epochs: 10
+  gc_every_steps: 20
+  max_steps: 10
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+  deterministic: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.5-122B-A10B
+  attn_implementation: sdpa
+  torch_dtype: torch.bfloat16
+  output_hidden_states: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: hybridep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.5-122B-A10B
+  min_pixels: 65536
+  max_pixels: 4194304
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 16
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  defer_fsdp_grad_sync: false
+  cp_vision_sharding:
+    enabled: true
+    min_tokens: 0
+    cost_alpha: auto
+
+freeze_config:
+  freeze_embeddings: false
+  freeze_vision_tower: false
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+packed_sequence:
+  pretokenize: true
+  max_length: 131072
+  pack_size: 131072
+  collate_max_length: 131072
+  packing_ratio: 0.95
+  drop_long_samples: true
+  balance_media_tokens: true
+  max_packs: 128
+  attn_implementation: sdpa
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: false
+  drop_last: true
+
+clip_grad_norm:
+  max_norm: 1.0
+
+optimizer:
+  # Empty FSDP shards from small trainable ViT parameters are filtered by the
+  # shared optimizer factory before Transformer Engine sees them.
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 1.0e-5
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.float32
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 1
+
+# wandb:
+#   enable: true
+#   project: yuhez_workspace
+#   entity: Nemo-automodel
+#   name: qwen3-5-122b-128k-ep8cp16-train-vit
+#   dir: logs/qwen3-5-122b-128k-ep8cp16/wandb  # pragma: allowlist secret

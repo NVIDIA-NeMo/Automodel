@@ -334,10 +334,13 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
                 indices=indices,
             )
 
+        from nemo_automodel.components.distributed.blockdiag_cp import current_blockdiag_cp_state
+
         return self._forward_with_cp(
             hidden_states,
             position_ids=position_ids,
             seq_index=seq_index,
+            blockdiag_state=current_blockdiag_cp_state(),
         )
 
     # ------------------------------------------------------------------
@@ -500,46 +503,87 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         *,
         position_ids: torch.Tensor | None,
         seq_index: torch.Tensor | None,
+        blockdiag_state: dict | None = None,
     ) -> torch.Tensor:
+        """Run FLA GatedDeltaNet over a context-parallel sequence shard.
+
+        Args:
+            hidden_states: Local hidden states of shape ``[batch, local_sequence,
+                hidden]``. The sequence axis uses contiguous rank order when
+                ``blockdiag_state`` is active, otherwise PyTorch CP's
+                head-tail round-robin order.
+            position_ids: Optional local positions of shape ``[batch,
+                local_sequence]`` or mRoPE positions of shape ``[axes, batch,
+                local_sequence]``.
+            seq_index: Optional global token indices of shape
+                ``[local_sequence]`` or ``[batch, local_sequence]`` for the
+                round-robin layout.
+            blockdiag_state: Optional packed CP state. Its ``doc_ids`` tensor has
+                shape ``[batch, global_sequence]`` and its packed cumulative
+                lengths reset conv/GDN recurrence at document boundaries.
+
+        Returns:
+            Local GatedDeltaNet output of shape ``[batch, local_sequence,
+            hidden]`` in the same sequence layout as ``hidden_states``.
+        """
         from fla.ops.cp import build_cp_context
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_chunk_gated_delta_rule
 
         batch_size, seq_len, _ = hidden_states.shape
 
-        cp_group = self._cp_mesh.get_group()
-        cp_rank = dist.get_rank(cp_group)
         cp_size = self._cp_mesh.size()
-
-        local_positions = self._extract_local_seq_index(seq_index, seq_len)
-        if local_positions is None:
-            local_positions = self._build_dual_chunk_local_positions(
-                seq_len=seq_len,
-                cp_size=cp_size,
-                cp_rank=cp_rank,
-                device=hidden_states.device,
+        cp_group = blockdiag_state["group"] if blockdiag_state is not None else self._cp_mesh.get_group()
+        group_size = dist.get_world_size(cp_group)
+        if group_size != cp_size:
+            raise RuntimeError(
+                f"Qwen3.5-MoE GDN CP process-group size ({group_size}) does not match cp_mesh.size() ({cp_size})"
             )
+        cp_rank = dist.get_rank(cp_group)
+
+        uses_contiguous_layout = blockdiag_state is not None
+        local_positions = None
+        if not uses_contiguous_layout:
+            local_positions = self._extract_local_seq_index(seq_index, seq_len)
+            if local_positions is None:
+                local_positions = self._build_dual_chunk_local_positions(
+                    seq_len=seq_len,
+                    cp_size=cp_size,
+                    cp_rank=cp_rank,
+                    device=hidden_states.device,
+                )
 
         # ---- Build FLA CP context (once, reused for every sequence) ----
         # After undoing the load-balanced attention layout, each rank again owns a
         # contiguous chunk of a dense global sequence of length seq_len * cp_size.
         global_seq_len = seq_len * cp_size
-        cu_seqlens_single = torch.tensor(
-            [0, global_seq_len],
-            dtype=torch.long,
-            device=hidden_states.device,
-        )
-        cp_context = build_cp_context(
-            cu_seqlens=cu_seqlens_single,
-            group=cp_group,
-            conv1d_kernel_size=self.conv_kernel_size,
-        )
+        if uses_contiguous_layout:
+            cu_seqlens = blockdiag_state["packed_cu_seqlens"]
+            cp_context = build_cp_context(
+                cu_seqlens=cu_seqlens,
+                group=cp_group,
+                conv1d_kernel_size=self.conv_kernel_size,
+                cu_seqlens_cpu=blockdiag_state["packed_cu_seqlens_cpu"],
+            )
+        else:
+            cu_seqlens_single = torch.tensor(
+                [0, global_seq_len],
+                dtype=torch.long,
+                device=hidden_states.device,
+            )
+            cp_context = build_cp_context(
+                cu_seqlens=cu_seqlens_single,
+                group=cp_group,
+                conv1d_kernel_size=self.conv_kernel_size,
+            )
         # Attention runs on a load-balanced CP layout, but conv + recurrent state
         # propagation require rank-order sequential tokens.
-        hidden_states, sorted_positions = self._undo_attention_load_balancing(
-            hidden_states,
-            local_positions,
-            cp_group,
-        )
+        sorted_positions = None
+        if not uses_contiguous_layout:
+            hidden_states, sorted_positions = self._undo_attention_load_balancing(
+                hidden_states,
+                local_positions,
+                cp_group,
+            )
 
         # ---- Projections (batched, pointwise) ----
         mixed_qkv = self.in_proj_qkv(hidden_states)  # [B, S_local, conv_dim]
@@ -598,12 +642,13 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         output = self.out_proj(core_attn_out)
-        output = self._redo_attention_load_balancing(
-            output,
-            local_positions,
-            sorted_positions,
-            cp_group=cp_group,
-        )
+        if not uses_contiguous_layout:
+            output = self._redo_attention_load_balancing(
+                output,
+                local_positions,
+                sorted_positions,
+                cp_group=cp_group,
+            )
         return output
 
 
