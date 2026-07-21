@@ -502,12 +502,16 @@ def _enable_context_parallel(
     """
     from diffusers import ContextParallelConfig
 
-    from nemo_automodel._diffusers.diffusers_patches import apply_native_flash_backward_patch
+    from nemo_automodel._diffusers.diffusers_patches import (
+        apply_cudnn_attention_patch,
+        apply_native_flash_backward_patch,
+    )
     from nemo_automodel.components.distributed.mesh_utils import create_ring_ulysses_mesh
 
-    # Interim fix for the diffusers<=0.39 _native_flash backward bug on the CP
-    # path; feature-detected, no-op once upstream ships the fix.
+    # Interim fixes for the diffusers<=0.39 _native_flash/_native_cudnn backward
+    # bugs on the CP path; feature-detected, no-ops once upstream ships the fix.
     apply_native_flash_backward_patch()
+    apply_cudnn_attention_patch()
 
     cp_size = int(manager_args.get("cp_size", 1))
     ring_degree = int(manager_args.get("cp_ring_degree", 1))
