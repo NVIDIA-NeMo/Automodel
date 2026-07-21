@@ -71,6 +71,10 @@ flow_matching:
 
 fsdp:
   tp_size: 1
+  # Context parallelism (Ulysses attention via diffusers>=0.39): set cp_size > 1 to
+  # shard the video token sequence across GPUs for long sequences. The post-patchify
+  # sequence length must be divisible by cp_size, and dp_size must satisfy
+  # dp * tp * cp * pp == world size (e.g. dp_size: 4, cp_size: 2 on 8 GPUs).
   cp_size: 1
   pp_size: 1
   dp_replicate_size: 1
