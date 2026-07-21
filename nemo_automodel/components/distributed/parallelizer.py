@@ -106,9 +106,6 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
 from nemo_automodel._transformers.v4_patches.rotary import _is_nemotron_flash_config
-from nemo_automodel.components.distributed.megatron_fsdp_compat import (
-    _patch_megatron_fsdp_050_tp_dtensor_reshape_with_consensus,
-)
 from nemo_automodel.components.distributed.optimized_tp_plans import (
     LLAMA_NEMOTRON_SUPER_TP_PLAN_NAME,
     PARALLELIZE_FUNCTIONS,
@@ -2467,24 +2464,6 @@ def megatron_fsdp_strategy_parallelize(
     if dp_mesh.size() > 1:
         # TODO(boxiangw): remove this once HSDP is supported.
         assert dp_mesh.ndim == 1, "Hybrid-sharding not supported"
-
-    # Megatron-FSDP 0.5.0 bypasses the wrapped root module's forward hooks for
-    # every sharded topology. With Torch-native TP it also reshapes flat buffer
-    # slices using global trailing dimensions, and it frees side-stream gather
-    # storage without recording the consuming compute stream. Install the exact
-    # locked, atomic compatibility set for every DP-sharded model before TP can
-    # mutate it; the TP consensus group may legitimately contain one rank.
-    # Unknown ABIs fail on all ranks before any parameter collective can diverge.
-    # dp_mesh.size() == 1 is deliberately out of scope: that topology (e.g.
-    # world_size=2 with tp=2) returns the TP-only model below without ever
-    # calling fully_shard, so none of the patched megatron_fsdp code paths
-    # (make_fsdp_dtensor, allocator free, MegatronFSDP.forward,
-    # update_main_grads) can execute and no compat set is installed there.
-    if dp_mesh.size() > 1:
-        _patch_megatron_fsdp_050_tp_dtensor_reshape_with_consensus(
-            tp_group=tp_mesh.get_group(),
-            dp_group=dp_mesh.get_group(),
-        )
 
     # TP sharding.
     if tp_mesh.size() > 1:

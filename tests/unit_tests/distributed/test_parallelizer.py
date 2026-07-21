@@ -488,19 +488,10 @@ class TestMegatronFSDPStrategyParallelize:
             import_classes_mock,
             raising=False,
         )
-        compat_patch_mock = MagicMock()
-        monkeypatch.setattr(
-            parallelizer,
-            "_patch_megatron_fsdp_050_tp_dtensor_reshape_with_consensus",
-            compat_patch_mock,
-            raising=True,
-        )
-
         return {
             "megatron_fsdp": megatron_fsdp_mock,
             "parallelize_module": parallelize_module_mock,
             "import_classes": import_classes_mock,
-            "compat_patch": compat_patch_mock,
         }
 
     def test_basic_megatron_fsdp_with_default_mesh_names(self, mock_device_mesh_megatron_fsdp, mock_megatron_fsdp_env):
@@ -524,10 +515,6 @@ class TestMegatronFSDPStrategyParallelize:
         call_kwargs = mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.call_args[1]
         assert call_kwargs["dp_shard_dim"] == "dp"
         assert call_kwargs["tp_dim"] == "tp"
-        mock_megatron_fsdp_env["compat_patch"].assert_called_once_with(
-            tp_group=tp_mesh.get_group(),
-            dp_group=dp_mesh.get_group(),
-        )
 
     def test_explicit_unit_modules_take_precedence_over_derivation(
         self, mock_device_mesh_megatron_fsdp, mock_megatron_fsdp_env, monkeypatch
@@ -758,13 +745,8 @@ class TestMegatronFSDPStrategyParallelize:
                 report_nan_in_param_grad=False,
             )
 
-    def test_megatron_fsdp_dp1_skips_wrapper_and_compat_patch(self, mock_megatron_fsdp_env):
-        """dp==1 (e.g. world=2, tp=2) returns the TP-only model without fully_shard.
-
-        Because no megatron_fsdp runtime code executes on this topology, the
-        0.5.0 compatibility set must not be installed either — that is the
-        documented reason the compat gate matches the dp>1 wrapping gate.
-        """
+    def test_megatron_fsdp_dp1_skips_wrapper(self, mock_megatron_fsdp_env):
+        """dp==1 (e.g. world=2, tp=2) returns the TP-only model without fully_shard."""
         mesh = MagicMock(spec=DeviceMesh)
         mesh.device_type = "cpu"
         dp_mesh = MagicMock()
@@ -785,7 +767,6 @@ class TestMegatronFSDPStrategyParallelize:
             tp_shard_plan={},
         )
 
-        mock_megatron_fsdp_env["compat_patch"].assert_not_called()
         mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.assert_not_called()
         mock_megatron_fsdp_env["parallelize_module"].assert_called_once()
         assert result_model is model
