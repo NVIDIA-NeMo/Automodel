@@ -732,6 +732,12 @@ class GroupedExpertsDeepEP(nn.Module):
         super().__init__()
 
         self.config = config
+        if config.route_weight_after_down_proj:
+            raise ValueError(
+                "route_weight_after_down_proj is not supported by GroupedExpertsDeepEP. "
+                "Use BackendConfig(dispatcher='torch') or implement post-down-projection routing weights "
+                "for the DeepEP expert backend."
+            )
         # "torch_mm_mxfp8" dispatches identically to "torch_mm" but routes the grouped
         # GEMMs through torchao's MXFP8 kernel (see _torch_mm_experts_fwd).
         self.use_torch_mm = backend is not None and backend.experts in ("torch_mm", "torch_mm_mxfp8")
@@ -977,6 +983,13 @@ class GroupedExpertsTE(nn.Module):
             dispatcher_share_token_dispatcher: Whether to share a flex dispatcher communication manager across layers.
             dispatcher_async_dispatch: Whether DeepEP/UCCL-EP dispatch should run asynchronously.
         """
+        if config.route_weight_after_down_proj:
+            raise ValueError(
+                "route_weight_after_down_proj is not supported by GroupedExpertsTE. "
+                "Use BackendConfig(dispatcher='torch') or implement post-down-projection routing weights "
+                "for the TE expert backend."
+            )
+
         from transformer_engine.pytorch import GroupedLinear
 
         from nemo_automodel.components.models.common.utils import _patch_te_modules

@@ -826,6 +826,13 @@ class TestGroupedExpertsForwardLoopDTensorBias:
 class TestGroupedExpertsDeepEP:
     """Test GroupedExpertsDeepEP module."""
 
+    def test_grouped_experts_deepep_rejects_route_weight_after_down_projection(self, moe_config):
+        """DeepEP must fail loudly until it implements post-down-projection route weights."""
+        moe_config.route_weight_after_down_proj = True
+
+        with pytest.raises(ValueError, match="GroupedExpertsDeepEP"):
+            GroupedExpertsDeepEP(moe_config)
+
     def test_grouped_experts_deepep_init(self, moe_config):
         """Test GroupedExpertsDeepEP initialization."""
         experts = GroupedExpertsDeepEP(moe_config)
@@ -1135,6 +1142,16 @@ class TestNonGatedActivations:
             swiglu_config.dim,
             swiglu_config.moe_inter_dim * 2,
         )
+
+
+def test_grouped_experts_te_rejects_route_weight_after_down_projection_without_te_import(moe_config):
+    """TE must fail loudly before importing optional TE when route weights would be applied incorrectly."""
+    from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+    moe_config.route_weight_after_down_proj = True
+
+    with pytest.raises(ValueError, match="GroupedExpertsTE"):
+        GroupedExpertsTE(moe_config)
 
 
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
