@@ -20,6 +20,7 @@ import shutil
 import socket
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 import torch
 
@@ -470,21 +471,35 @@ class BaseRecipe:
         """
         ckpt_root = self.checkpointer.config.checkpoint_dir
         link_path = os.path.join(ckpt_root, link_name)
-        if os.path.lexists(link_path):
-            os.remove(link_path)
         txt_path = f"{link_path}.txt"
-        if os.path.exists(txt_path):
-            os.remove(txt_path)
 
         ckpt_root_abs = os.path.abspath(ckpt_root)
         target_abs = os.path.abspath(target_dir)
         relative_target = os.path.relpath(target_abs, start=ckpt_root_abs)
+        temp_path = os.path.join(ckpt_root, f".{link_name}.{uuid4().hex}.tmp")
         try:
-            os.symlink(relative_target, link_path)
-        except OSError:
-            # Fallback: write a text file containing the target path if symlinks aren't supported
-            with open(f"{link_path}.txt", "w") as f:
-                f.write(relative_target)
+            try:
+                os.symlink(relative_target, temp_path)
+            except OSError:
+                if os.path.lexists(temp_path):
+                    os.remove(temp_path)
+                # Fallback: publish a text pointer when symlinks aren't supported.
+                with open(temp_path, "x") as f:
+                    f.write(relative_target)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, txt_path)
+                temp_path = ""
+                if os.path.lexists(link_path):
+                    os.remove(link_path)
+            else:
+                os.replace(temp_path, link_path)
+                temp_path = ""
+                if os.path.exists(txt_path):
+                    os.remove(txt_path)
+        finally:
+            if temp_path and os.path.lexists(temp_path):
+                os.remove(temp_path)
 
     def _remove_checkpoint_pointer(self, link_name: str) -> None:
         """Remove a checkpoint pointer symlink and fallback text file."""
@@ -510,7 +525,11 @@ class BaseRecipe:
 
         ckpt_root = Path(self.checkpointer.config.checkpoint_dir)
         checkpoints = _list_existing_checkpoints(ckpt_root)
-        protected_checkpoints = _find_pointer_protected_checkpoints(ckpt_root, checkpoints)
+        try:
+            protected_checkpoints = _find_pointer_protected_checkpoints(ckpt_root, checkpoints)
+        except OSError:
+            logger.warning("Failed to scan checkpoint pointers in %s; skipping pruning", ckpt_root, exc_info=True)
+            return
         retained_window = set(checkpoints[-max_recent_checkpoints:])
         checkpoints_to_delete = [
             checkpoint for checkpoint in checkpoints if checkpoint not in retained_window | protected_checkpoints

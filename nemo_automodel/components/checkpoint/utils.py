@@ -14,6 +14,7 @@
 
 import json
 import logging
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -170,9 +171,11 @@ def _read_checkpoint_metric(checkpoint: Path, metric_key: str | None) -> float |
         if key not in losses:
             continue
         try:
-            return float(losses[key])
+            value = float(losses[key])
         except (TypeError, ValueError):
             continue
+        if math.isfinite(value):
+            return value
     return None
 
 
@@ -187,23 +190,16 @@ def _find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path]
     if not ckpt_root.exists():
         return protected
 
-    try:
-        entries = list(ckpt_root.iterdir())
-    except OSError:
-        logger.warning("Failed to scan checkpoint pointers in %s", ckpt_root, exc_info=True)
-        return protected
+    entries = list(ckpt_root.iterdir())
 
     for entry in entries:
         raw_target = None
         if os.path.islink(entry):
-            try:
-                raw_target = os.readlink(entry)
-            except OSError:
-                continue
+            raw_target = os.readlink(entry)
         elif _is_checkpoint_pointer_text_file(entry):
             try:
                 raw_target = entry.read_text().strip()
-            except (OSError, UnicodeError):
+            except UnicodeError:
                 continue
 
         target = _resolve_checkpoint_pointer_target(ckpt_root, raw_target) if raw_target else None

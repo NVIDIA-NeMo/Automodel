@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.checkpoint.utils import _find_latest_checkpoint
+from nemo_automodel.components.checkpoint.utils import _find_latest_checkpoint, _read_checkpoint_pointer
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.recipes.base_recipe import BaseRecipe, is_distributed_stateful
@@ -923,6 +923,69 @@ def test_checkpoint_retention_preserves_text_fallback_pointer_target(tmp_path):
             (tmp_path / "PINNED.txt").write_text("epoch_0_step_100/losses.json")
 
     assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_300"]
+
+
+def test_checkpoint_retention_pointer_scan_failure_skips_pruning(tmp_path, monkeypatch, caplog):
+    """Pointer discovery failures preserve every checkpoint rather than risking deletion of a pinned target."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+    for step in [100, 200, 300]:
+        (tmp_path / f"epoch_0_step_{step}").mkdir()
+    recipe_inst._update_checkpoint_symlink("PINNED", str(tmp_path / "epoch_0_step_100"))
+
+    def fail_pointer_scan(_ckpt_root, _checkpoints):
+        raise OSError("pointer scan failed")
+
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe._find_pointer_protected_checkpoints", fail_pointer_scan)
+    with caplog.at_level(logging.WARNING):
+        recipe_inst._prune_old_checkpoints()
+
+    assert _checkpoint_dir_names(tmp_path) == [
+        "epoch_0_step_100",
+        "epoch_0_step_200",
+        "epoch_0_step_300",
+    ]
+    assert "skipping pruning" in caplog.text
+
+
+@pytest.mark.parametrize("non_finite_value", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_restored_best_metric_does_not_block_future_best(tmp_path, non_finite_value):
+    """A non-finite metric in LOWEST_VAL metadata is ignored when initializing the restored best."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+    old_checkpoint = tmp_path / "epoch_0_step_100"
+    new_checkpoint = tmp_path / "epoch_0_step_200"
+    old_checkpoint.mkdir()
+    new_checkpoint.mkdir()
+    (old_checkpoint / "losses.json").write_text(f'{{"val_loss": {non_finite_value}}}')
+    recipe_inst._update_checkpoint_symlink("LOWEST_VAL", str(old_checkpoint))
+
+    recipe_inst._update_best_symlink(str(new_checkpoint), 0.5, "val_loss")
+
+    assert _read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == new_checkpoint
+    assert recipe_inst._best_val_loss == 0.5
+
+
+def test_checkpoint_pointer_replace_failure_preserves_existing_target(tmp_path, monkeypatch):
+    """A failed atomic pointer swap leaves the previously published pointer intact."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    old_checkpoint = tmp_path / "epoch_0_step_100"
+    new_checkpoint = tmp_path / "epoch_0_step_200"
+    old_checkpoint.mkdir()
+    new_checkpoint.mkdir()
+    recipe_inst._update_checkpoint_symlink("LATEST", str(old_checkpoint))
+    real_replace = os.replace
+
+    def fail_latest_replace(source, destination):
+        if os.fspath(destination) == os.fspath(tmp_path / "LATEST"):
+            raise OSError("filesystem full")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_latest_replace)
+
+    with pytest.raises(OSError, match="filesystem full"):
+        recipe_inst._update_checkpoint_symlink("LATEST", str(new_checkpoint))
+
+    assert _read_checkpoint_pointer(tmp_path, "LATEST") == old_checkpoint
+    assert not list(tmp_path.glob(".LATEST.*.tmp"))
 
 
 def test_checkpoint_retention_preserves_lowest_val_after_resume(tmp_path):
