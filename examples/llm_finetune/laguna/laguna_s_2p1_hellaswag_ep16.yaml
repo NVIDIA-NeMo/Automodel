@@ -128,6 +128,7 @@ optimizer:
   weight_decay: 0.0
 
 wandb:
+  enable: false
   project: laguna-s-2p1-sft
   name: laguna_s_2p1_hellaswag_ep16_torch_dispatch
   dir: wandb
