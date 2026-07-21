@@ -304,6 +304,11 @@ def make_cp_blockdiag_batch_and_ctx(
         # GPU->CPU .item() syncs. The flash/te varlen path reads this; the dense
         # fallback ignores it.
         "varlen_meta": kernels.precompute_blockdiag_varlen_meta(doc_ids, row_offset, local_len, device),
+        "model_state": state_module.BlockdiagCpModelState(
+            group=group,
+            packed_cu_seqlens=packed_cu_seqlens,
+            packed_cu_seqlens_cpu=packed_cu_seqlens_cpu,
+        ),
     }
 
     @contextlib.contextmanager

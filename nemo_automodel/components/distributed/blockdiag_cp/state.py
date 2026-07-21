@@ -15,7 +15,7 @@
 """Runtime knobs and activation-checkpoint-safe state for block-diagonal CP.
 
 The knob normalization (synonym maps and defaults) lives here, in a
-dependency-free leaf, so every consumer (the kernel-side
+kernel-independent leaf, so every consumer (the kernel-side
 :func:`configure_cp_varlen` entry point and any policy-side config parser)
 derives the accepted values from the same table and can never disagree on
 synonyms or defaults.
@@ -23,7 +23,11 @@ synonyms or defaults.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
+
+from torch import Tensor
+from torch.distributed import ProcessGroup
 
 # Canonical value -> accepted synonyms (each canonical is also a synonym of itself).
 ATTN_BACKEND_SYNONYMS: dict[str, tuple[str, ...]] = {
@@ -43,6 +47,24 @@ KV_EXCHANGE_DEFAULT = "allgather"
 # Canonical user-facing values (single source for config schemas + docs).
 ATTN_BACKEND_VALUES: tuple[str, ...] = tuple(ATTN_BACKEND_SYNONYMS)
 KV_EXCHANGE_VALUES: tuple[str, ...] = tuple(KV_EXCHANGE_SYNONYMS)
+
+
+@dataclass(frozen=True)
+class BlockdiagCpModelState:
+    """Typed model-facing view of an active block-diagonal CP step.
+
+    Args:
+        group: Process group that shards the sequence across context-parallel ranks.
+        packed_cu_seqlens: Global packed-document boundaries of shape
+            ``[num_documents + 1]`` on the compute device.
+        packed_cu_seqlens_cpu: CPU copy of ``packed_cu_seqlens`` with shape
+            ``[num_documents + 1]`` for FLA's host-side CP planning.
+    """
+
+    group: ProcessGroup
+    packed_cu_seqlens: Tensor
+    packed_cu_seqlens_cpu: Tensor
+
 
 _ATTN_BACKEND_REVERSE = {syn: canon for canon, syns in ATTN_BACKEND_SYNONYMS.items() for syn in syns}
 _KV_EXCHANGE_REVERSE = {syn: canon for canon, syns in KV_EXCHANGE_SYNONYMS.items() for syn in syns}
@@ -186,7 +208,8 @@ class _ThreadSharedVar:
 
 
 # Per-step state read by the block-diagonal SDPA (set by make_cp_blockdiag_batch_and_ctx).
-# Holds: {"group", "doc_ids" [B, S_full] int, "row_offset" int, "seq_dim": 2, ...}.
+# Holds internal runtime fields plus a typed ``model_state`` view for model-owned
+# recurrent-attention integrations.
 _CP_BLOCKDIAG_STATE = _ThreadSharedVar()
 
 # Sentinel: counts block-diagonal CP attention invocations (the CP path actually
@@ -196,7 +219,7 @@ _CP_BLOCKDIAG_STATE = _ThreadSharedVar()
 _CP_ATTN_FIRE_COUNT: list[int] = [0]
 
 
-def current_blockdiag_cp_state() -> dict | None:
+def current_blockdiag_cp_state() -> BlockdiagCpModelState | None:
     """Return the active block-diagonal CP step state, or ``None``.
 
     The state is published by
@@ -206,10 +229,11 @@ def current_blockdiag_cp_state() -> dict | None:
     document boundaries as the softmax-attention transport.
 
     Returns:
-        The active step-state mapping, including full-sequence ``doc_ids`` of
-        shape ``[batch, sequence]``, or ``None`` outside the CP context.
+        The immutable model-facing state, whose packed-boundary tensors have
+        shape ``[num_documents + 1]``, or ``None`` outside the CP context.
     """
-    return _CP_BLOCKDIAG_STATE.get()
+    step_state = _CP_BLOCKDIAG_STATE.get()
+    return None if step_state is None else step_state["model_state"]
 
 
 def reset_cp_attn_fire_count() -> None:

@@ -53,10 +53,15 @@ from nemo_automodel.components.distributed.blockdiag_cp.packed import (
     enable_cp1_packed_varlen,
 )
 from nemo_automodel.components.distributed.blockdiag_cp.runtime import cp_blockdiag_sdpa
-from nemo_automodel.components.distributed.blockdiag_cp.state import configure_cp_varlen, current_blockdiag_cp_state
+from nemo_automodel.components.distributed.blockdiag_cp.state import (
+    BlockdiagCpModelState,
+    configure_cp_varlen,
+    current_blockdiag_cp_state,
+)
 
 __all__ = [
     "attach_cp1_packed_varlen_hooks",
+    "BlockdiagCpModelState",
     "configure_cp_varlen",
     "current_blockdiag_cp_state",
     "cp_blockdiag_sdpa",

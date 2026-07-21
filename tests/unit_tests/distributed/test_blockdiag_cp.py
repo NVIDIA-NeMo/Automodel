@@ -278,6 +278,11 @@ def test_blockdiag_batch_synthesizes_and_shards_padding_mask(monkeypatch):
         assert torch.equal(state["packed_cu_seqlens"], torch.tensor([0, 2, 3, 8]))
         assert torch.equal(state["packed_cu_seqlens_cpu"], torch.tensor([0, 2, 3, 8]))
         assert state["varlen_meta"]["n_real"] == 0  # all-padding local chunk
+        model_state = bd_state.current_blockdiag_cp_state()
+        assert isinstance(model_state, bd_state.BlockdiagCpModelState)
+        assert model_state.group is state["group"]
+        assert model_state.packed_cu_seqlens is state["packed_cu_seqlens"]
+        assert model_state.packed_cu_seqlens_cpu is state["packed_cu_seqlens_cpu"]
     assert bd_state._CP_BLOCKDIAG_STATE.get() is None  # ctx exit restores the slot
 
 
