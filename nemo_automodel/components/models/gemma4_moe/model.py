@@ -1518,12 +1518,12 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if per_layer_inputs is not None:
             per_layer_inputs = shard_sequence_for_cp_contiguous(cp_mesh, per_layer_inputs, seq_dim=1)[0]
         mm_local = shard_sequence_for_cp_contiguous(cp_mesh, mm_full, seq_dim=1, pad_value=0)[0]
-        vision_group_local = shard_sequence_for_cp_contiguous(
+        vision_group_local, _, _ = shard_sequence_for_cp_contiguous(
             cp_mesh,
             vision_group_ids_full,
             seq_dim=1,
             pad_value=-1,
-        )[0]
+        )
         return {
             "inputs_embeds": inputs_embeds,
             "per_layer_inputs": per_layer_inputs,
