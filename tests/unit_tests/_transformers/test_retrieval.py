@@ -213,6 +213,7 @@ def test_build_encoder_backbone_forwards_hub_location_kwargs_to_config_and_model
         cache_dir="/cache",
         local_files_only=True,
         use_auth_token="legacy-token",
+        torch_dtype=torch.bfloat16,
     )
     auto_model_from_pretrained.assert_called_once_with(
         "org/model",
@@ -250,6 +251,21 @@ def test_standard_ministral_score_uses_sequence_classification_model(tmp_path):
     with torch.no_grad():
         outputs = backbone(input_ids=input_ids, attention_mask=attention_mask)
     assert outputs.logits.shape == (2, 1)
+
+
+def test_ministral_embedding_preserves_hf_config_overrides(tmp_path):
+    """Valid HuggingFace config overrides retain native loader behavior."""
+    from nemo_automodel._transformers import retrieval
+
+    model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
+
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="embedding",
+        output_attentions=True,
+    )
+
+    assert backbone.config.output_attentions is True
 
 
 def test_ministral_embedding_uses_stock_bidirectional_model(tmp_path):
