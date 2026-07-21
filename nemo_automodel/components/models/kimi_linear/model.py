@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 import math
 from dataclasses import dataclass
@@ -914,7 +915,7 @@ class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         super().__init__()
         reject_unsupported_tie_word_embeddings(type(self), config)
         self.config = config
-        self.backend = backend or BackendConfig()
+        self.backend = copy.copy(backend) if backend is not None else BackendConfig()
         if self.backend.gate_precision is None:
             self.backend.gate_precision = torch.float32
         moe_overrides = kwargs.pop("moe_overrides", None)

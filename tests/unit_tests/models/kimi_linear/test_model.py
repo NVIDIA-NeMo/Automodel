@@ -60,6 +60,12 @@ def _backend_config() -> BackendConfig:
     )
 
 
+def _assert_floating_state_finite(model: torch.nn.Module) -> None:
+    for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+        if tensor.is_floating_point():
+            assert torch.isfinite(tensor).all(), name
+
+
 def test_update_moe_gate_bias_no_op_when_factor_zero():
     model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
     moe_layer = model.model.layers["1"].block_sparse_moe
@@ -71,12 +77,19 @@ def test_update_moe_gate_bias_no_op_when_factor_zero():
     mock_update_bias.assert_not_called()
 
 
-def test_tiny_kimi_with_kda_constructs_when_fla_available():
+def test_tiny_kimi_with_kda_initializes_fp32_params_when_fla_available():
     _require_fla()
 
     model = KimiLinearForCausalLM(_tiny_kimi_config(use_kda=True), backend=_backend_config())
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    kda_attn = model.model.layers["0"].self_attn
 
     assert model.model.layers["0"].is_linear_attn
+    assert kda_attn.A_log.dtype == torch.float32
+    assert kda_attn.dt_bias.dtype == torch.float32
+    assert torch.isfinite(kda_attn.A_log).all()
+    assert torch.isfinite(kda_attn.dt_bias).all()
+    _assert_floating_state_finite(model)
 
 
 def test_kimi_moe_uses_hf_routing_numerics():
@@ -87,6 +100,16 @@ def test_kimi_moe_uses_hf_routing_numerics():
     assert moe_layer.gate.router_weights_fp32
     assert moe_layer.gate.router_weight_uses_score_correction_bias
     assert moe_layer.experts.route_weight_after_down_proj
+
+
+def test_kimi_defaults_gate_precision_without_mutating_backend_config():
+    backend = _backend_config()
+
+    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=backend)
+
+    assert backend.gate_precision is None
+    assert model.backend is not backend
+    assert model.backend.gate_precision == torch.float32
 
 
 def test_initialize_weights_respects_explicit_buffer_device_on_cpu():
@@ -108,9 +131,7 @@ def test_checkpoint_free_initialize_and_eval_forward_runs_hf_order_moe():
     model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
     model.eval()
 
-    for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
-        if tensor.is_floating_point():
-            assert torch.isfinite(tensor).all(), name
+    _assert_floating_state_finite(model)
 
     moe_layer = model.model.layers["1"]
     input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)
