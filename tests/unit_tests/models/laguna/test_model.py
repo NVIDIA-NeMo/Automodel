@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
@@ -93,6 +94,14 @@ def test_laguna_moe_defaults_match_checkpoint_routing():
     assert model.model.moe_config.n_shared_experts == 1
     assert sparse_layer.gate.e_score_correction_bias is not None
     assert model.backend.gate_precision is torch.float32
+
+
+def test_laguna_rejects_unsupported_swa_attention_sink():
+    cfg = _tiny_config()
+    cfg.swa_attention_sink_enabled = True
+
+    with pytest.raises(NotImplementedError, match="swa_attention_sink_enabled=True"):
+        LagunaForCausalLM(cfg, backend=_backend())
 
 
 def test_laguna_attention_uses_per_layer_head_counts_and_per_head_gate():

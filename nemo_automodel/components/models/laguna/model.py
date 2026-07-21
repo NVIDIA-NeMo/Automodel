@@ -322,11 +322,6 @@ class LagunaAttention(nn.Module):
         else:
             self.g_proj = None
 
-        if self.is_sliding and getattr(config, "swa_attention_sink_enabled", False):
-            self.sink = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
-        else:
-            self.sink = None
-
         self.q_norm = LagunaRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         self.k_norm = LagunaRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
 
@@ -337,6 +332,20 @@ class LagunaAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run Laguna attention for one decoder layer.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+            position_embeddings: Tuple of cosine and sine RoPE tensors, each of shape
+                [batch, sequence, rotary_dim].
+            attention_mask: Optional additive mask broadcastable to
+                [batch, heads, sequence, key_sequence].
+            **kwargs: Additional attention backend arguments.
+
+        Returns:
+            Tuple of attention output [batch, sequence, hidden] and optional attention weights
+            [batch, heads, sequence, key_sequence].
+        """
         batch, seq_len = hidden_states.shape[:2]
         query_states = self.q_proj(hidden_states).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(
@@ -402,8 +411,6 @@ class LagunaAttention(nn.Module):
                 nn.init.zeros_(linear.bias)
         self.q_norm.reset_parameters()
         self.k_norm.reset_parameters()
-        if self.sink is not None:
-            nn.init.zeros_(self.sink)
 
 
 class LagunaBlock(nn.Module):
@@ -441,6 +448,20 @@ class LagunaBlock(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        """Run a decoder block.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+            attention_mask: Optional additive attention mask broadcastable to
+                [batch, heads, sequence, key_sequence].
+            position_embeddings: Tuple of cosine and sine RoPE tensors, each of shape
+                [batch, sequence, rotary_dim].
+            padding_mask: Optional bool tensor of shape [batch, sequence], where True marks padding.
+            **kwargs: Additional attention backend arguments.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, _ = self.self_attn(
@@ -489,6 +510,8 @@ class LagunaModel(nn.Module):
         self.backend = backend
         if moe_config is not None and moe_overrides is not None:
             raise ValueError("Cannot pass both moe_config and moe_overrides; use one or the other.")
+        if config.swa_attention_sink_enabled:
+            raise NotImplementedError("Laguna swa_attention_sink_enabled=True is not supported in Automodel.")
         if config.moe_apply_router_weight_on_input:
             raise NotImplementedError("Laguna moe_apply_router_weight_on_input=True is not supported in Automodel.")
         if float(config.moe_router_logit_softcapping or 0.0) > 0.0:
@@ -621,6 +644,22 @@ class LagunaModel(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        """Run the Laguna decoder stack.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence].
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
+            position_ids: Optional position IDs of shape [batch, sequence].
+            attention_mask: Optional 2D bool/int mask of shape [batch, sequence], a 4D additive
+                mask, or a mapping with per-attention-type masks keyed by "full_attention" and
+                "sliding_attention".
+            padding_mask: Optional bool tensor of shape [batch, sequence], where True marks tokens
+                excluded from MoE routing.
+            **kwargs: Additional attention backend arguments.
+
+        Returns:
+            Final hidden states of shape [batch, sequence, hidden].
+        """
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("input_ids or inputs_embeds must be provided")
@@ -678,7 +717,7 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     """Causal LM wrapper for Laguna with Automodel checkpoint adapters."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
-    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "rotary_emb", "sink"]
+    _keep_in_fp32_modules_strict = ["mlp.gate.e_score_correction_bias", "rotary_emb"]
     _skip_init_weights_on_load = True
 
     @dataclass(frozen=True)
@@ -766,6 +805,27 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast:
+        """Run the Laguna causal language model.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence].
+            inputs_embeds: Optional embeddings of shape [batch, sequence, hidden].
+            position_ids: Optional position IDs of shape [batch, sequence].
+            attention_mask: Optional 2D bool/int mask of shape [batch, sequence], a 4D additive
+                mask, or a mapping with per-attention-type masks keyed by "full_attention" and
+                "sliding_attention".
+            padding_mask: Optional bool tensor of shape [batch, sequence], where True marks tokens
+                excluded from MoE routing.
+            past_key_values: Unsupported KV-cache state.
+            use_cache: Unsupported cache flag.
+            logits_to_keep: If 0, compute logits for all sequence positions. If an int or tensor,
+                compute logits only for the selected trailing positions.
+            output_hidden_states: When true, include final hidden states in the output.
+            **kwargs: Additional attention backend arguments.
+
+        Returns:
+            Causal LM output with logits and optional hidden states.
+        """
         if past_key_values is not None or use_cache:
             raise NotImplementedError("LagunaForCausalLM currently supports training forwards without KV cache.")
         output_hidden_states = (
