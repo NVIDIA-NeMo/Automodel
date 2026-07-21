@@ -69,9 +69,58 @@ coverage run \
     --durations 32 \
     --durations-min=0 \
     $TEST_DIR \
+    --junitxml=junit.xml \
     -o log_cli=true \
     -o log_cli_level=INFO \
     -vs -m "not pleasefixme" --tb=short -rA \
     $SHARD_ARGS \
     $ADDITIONAL_ARGS
-coverage combine -q
+PYTEST_RC=$?
+set -e
+
+# Emit failed-tests reports that the CI "Failed tests" log sections cat:
+#   failed_summary.txt  -- one line per failing test
+#   failed_traces.txt   -- full traceback per failing test
+python3 - <<'PY' 2>/dev/null || true
+import glob
+import xml.etree.ElementTree as ET
+
+fails = []
+for path in sorted(glob.glob("junit*.xml")):
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError:
+        continue
+    for tc in root.iter("testcase"):
+        bad = tc.find("failure")
+        if bad is None:
+            bad = tc.find("error")
+        if bad is None:
+            continue
+        loc = tc.get("file") or tc.get("classname", "").replace(".", "/")
+        nodeid = loc + "::" + (tc.get("name") or "")
+        msg = (bad.get("message") or "").strip().splitlines()
+        msg1 = msg[0][:200] if msg else ""
+        # element text is pytest's longrepr (the traceback); fall back to the summary message
+        detail = (bad.text or bad.get("message") or "").rstrip()
+        fails.append((nodeid, msg1, detail))
+
+header = ("%d failing test(s):" % len(fails)) if fails else "No failing tests."
+
+with open("failed_summary.txt", "w") as fh:
+    fh.write(header + "\n")
+    for nodeid, msg1, _ in fails:
+        fh.write("FAILED " + nodeid + (("  -  " + msg1) if msg1 else "") + "\n")
+
+with open("failed_traces.txt", "w") as fh:
+    fh.write(header + "\n")
+    for nodeid, _, detail in fails:
+        fh.write("\n" + "_" * 78 + "\n")
+        fh.write("FAILED " + nodeid + "\n\n")
+        fh.write(detail + "\n")
+PY
+
+if [ "$PYTEST_RC" -eq 0 ]; then
+    coverage combine -q
+fi
+exit "$PYTEST_RC"
