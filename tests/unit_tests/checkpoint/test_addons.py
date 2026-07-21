@@ -148,10 +148,6 @@ def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effe
     model.sentence_transformer_export_config = SimpleNamespace(
         query_prompt="search: ",
         document_prompt="index: ",
-        max_seq_length=4096,
-        similarity_fn_name="dot",
-        do_lower_case=False,
-        include_prompt=True,
     )
     model.get_hf_export_config = lambda: model.config
     tokenizer = MagicMock()
@@ -215,7 +211,7 @@ def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effe
         "similarity_fn_name": "dot",
     }
     assert json.loads((consolidated_dir / "sentence_bert_config.json").read_text()) == {
-        "max_seq_length": 4096,
+        "max_seq_length": 8192,
         "do_lower_case": False,
     }
     assert (consolidated_dir / "model.safetensors").read_text() == "new weights"
@@ -246,10 +242,6 @@ def test_generated_sentence_transformer_assets_regenerate_semantics_and_preserve
     export_config = SimpleNamespace(
         query_prompt=None,
         document_prompt=None,
-        max_seq_length=None,
-        similarity_fn_name=None,
-        do_lower_case=None,
-        include_prompt=True,
     )
     tokenizer = SimpleNamespace(model_max_length=512)
 
@@ -280,30 +272,26 @@ def test_generated_sentence_transformer_assets_regenerate_semantics_and_preserve
 
 def test_inferred_sentence_transformer_max_seq_length_uses_smallest_finite_capability():
     model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=512))
-    tokenizer = SimpleNamespace(model_max_length=4096)
 
     assert (
         _resolve_sentence_transformer_max_seq_length(
             model,
-            SimpleNamespace(max_seq_length=None),
-            tokenizer,
+            SimpleNamespace(model_max_length=4096),
         )
         == 512
     )
     assert (
         _resolve_sentence_transformer_max_seq_length(
             model,
-            SimpleNamespace(max_seq_length=256),
-            tokenizer,
+            SimpleNamespace(model_max_length=256),
         )
         == 256
     )
 
-    with pytest.raises(ValueError, match="exceeds the model's max_position_embeddings"):
+    with pytest.raises(ValueError, match="Unable to determine"):
         _resolve_sentence_transformer_max_seq_length(
-            model,
-            SimpleNamespace(max_seq_length=1024),
-            tokenizer,
+            SimpleNamespace(config=SimpleNamespace(max_position_embeddings=None)),
+            SimpleNamespace(model_max_length=10**30),
         )
 
 
@@ -330,10 +318,6 @@ def test_generated_sentence_transformer_assets_remove_training_tokenizer_state(t
     export_config = SimpleNamespace(
         query_prompt="query: ",
         document_prompt="passage: ",
-        max_seq_length=None,
-        similarity_fn_name=None,
-        do_lower_case=None,
-        include_prompt=True,
     )
 
     _save_generated_sentence_transformer_assets(
@@ -376,10 +360,6 @@ def test_generated_sentence_transformer_assets_preserve_repository_and_model_roo
     export_config = SimpleNamespace(
         query_prompt="",
         document_prompt="",
-        max_seq_length=512,
-        similarity_fn_name="cosine",
-        do_lower_case=False,
-        include_prompt=True,
     )
 
     _save_generated_sentence_transformer_assets(
@@ -407,10 +387,6 @@ def test_generated_sentence_transformer_assets_reject_unrepresentable_pooling(tm
     export_config = SimpleNamespace(
         query_prompt="",
         document_prompt="",
-        max_seq_length=512,
-        similarity_fn_name="dot",
-        do_lower_case=False,
-        include_prompt=True,
     )
 
     with pytest.raises(ValueError, match="cannot be represented"):
@@ -423,87 +399,33 @@ def test_generated_sentence_transformer_assets_reject_unrepresentable_pooling(tm
         )
 
 
-@pytest.mark.parametrize(
-    ("l2_normalize", "similarity_fn_name"),
-    [(False, "cosine"), (True, "dot")],
-)
-def test_generated_sentence_transformer_assets_reject_similarity_that_contradicts_normalization(
+@pytest.mark.parametrize(("l2_normalize", "expected_similarity"), [(False, "dot"), (True, "cosine")])
+def test_generated_sentence_transformer_assets_derive_interoperability_metadata(
     tmp_path,
     l2_normalize,
-    similarity_fn_name,
+    expected_similarity,
 ):
     model = SimpleNamespace(
         pooling="avg",
         l2_normalize=l2_normalize,
         config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
     )
-    export_config = SimpleNamespace(
-        query_prompt="",
-        document_prompt="",
-        max_seq_length=512,
-        similarity_fn_name=similarity_fn_name,
-        do_lower_case=False,
-        include_prompt=True,
+    export_config = SimpleNamespace(query_prompt="query: ", document_prompt="passage: ")
+
+    _save_generated_sentence_transformer_assets(
+        model,
+        export_config,
+        original_model_path=None,
+        hf_metadata_dir=str(tmp_path),
+        tokenizer=SimpleNamespace(model_max_length=512),
     )
 
-    with pytest.raises(ValueError, match="does not match"):
-        _save_generated_sentence_transformer_assets(
-            model,
-            export_config,
-            original_model_path=None,
-            hf_metadata_dir=str(tmp_path),
-            tokenizer=SimpleNamespace(model_max_length=512),
-        )
-
-
-def test_generated_sentence_transformer_assets_reject_prompt_exclusion_not_used_by_training(tmp_path):
-    model = SimpleNamespace(
-        pooling="avg",
-        l2_normalize=True,
-        config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
-    )
-    export_config = SimpleNamespace(
-        query_prompt="query: ",
-        document_prompt="passage: ",
-        max_seq_length=512,
-        similarity_fn_name="cosine",
-        do_lower_case=False,
-        include_prompt=False,
-    )
-
-    with pytest.raises(ValueError, match="include_prompt=False"):
-        _save_generated_sentence_transformer_assets(
-            model,
-            export_config,
-            original_model_path=None,
-            hf_metadata_dir=str(tmp_path),
-            tokenizer=SimpleNamespace(model_max_length=512),
-        )
-
-
-def test_generated_sentence_transformer_assets_reject_lowercasing_not_used_by_training(tmp_path):
-    model = SimpleNamespace(
-        pooling="avg",
-        l2_normalize=True,
-        config=SimpleNamespace(hidden_size=8, max_position_embeddings=512),
-    )
-    export_config = SimpleNamespace(
-        query_prompt="",
-        document_prompt="",
-        max_seq_length=512,
-        similarity_fn_name="cosine",
-        do_lower_case=True,
-        include_prompt=True,
-    )
-
-    with pytest.raises(ValueError, match="do_lower_case=True"):
-        _save_generated_sentence_transformer_assets(
-            model,
-            export_config,
-            original_model_path=None,
-            hf_metadata_dir=str(tmp_path),
-            tokenizer=SimpleNamespace(model_max_length=512),
-        )
+    sentence_config = json.loads((tmp_path / "config_sentence_transformers.json").read_text())
+    pooling_config = json.loads((tmp_path / "1_Pooling" / "config.json").read_text())
+    transformer_config = json.loads((tmp_path / "sentence_bert_config.json").read_text())
+    assert sentence_config["similarity_fn_name"] == expected_similarity
+    assert pooling_config["include_prompt"] is True
+    assert transformer_config == {"max_seq_length": 512, "do_lower_case": False}
 
 
 def test_generated_sentence_transformer_assets_require_tokenizer(tmp_path):
@@ -515,10 +437,6 @@ def test_generated_sentence_transformer_assets_require_tokenizer(tmp_path):
     export_config = SimpleNamespace(
         query_prompt="",
         document_prompt="",
-        max_seq_length=512,
-        similarity_fn_name="cosine",
-        do_lower_case=False,
-        include_prompt=True,
     )
 
     with pytest.raises(ValueError, match="tokenizer is required"):
@@ -539,10 +457,6 @@ def test_consolidated_hf_addon_validates_sentence_transformer_export_on_nonzero_
     model.sentence_transformer_export_config = SimpleNamespace(
         query_prompt="",
         document_prompt="",
-        max_seq_length=512,
-        similarity_fn_name="dot",
-        do_lower_case=False,
-        include_prompt=True,
     )
 
     with (

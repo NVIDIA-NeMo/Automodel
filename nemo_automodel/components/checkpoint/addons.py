@@ -147,22 +147,10 @@ def _read_source_sentence_transformer_max_seq_length(original_model_path: str | 
 
 def _resolve_sentence_transformer_max_seq_length(
     model_part: nn.Module,
-    export_config,
     tokenizer,
     original_model_path: str | None = None,
 ) -> int:
     """Resolve deployment sequence length without using training-time truncation."""
-    if export_config.max_seq_length is not None:
-        max_seq_length = int(export_config.max_seq_length)
-        if max_seq_length <= 0:
-            raise ValueError("sentence_transformer_max_seq_length must be positive.")
-        model_max_seq_length = getattr(getattr(model_part, "config", None), "max_position_embeddings", None)
-        if model_max_seq_length is not None:
-            model_max_seq_length = int(model_max_seq_length)
-            if 0 < model_max_seq_length < 1_000_000_000 and max_seq_length > model_max_seq_length:
-                raise ValueError("sentence_transformer_max_seq_length exceeds the model's max_position_embeddings.")
-        return max_seq_length
-
     source_max_seq_length = _read_source_sentence_transformer_max_seq_length(original_model_path)
     if source_max_seq_length is not None:
         model_max_seq_length = getattr(getattr(model_part, "config", None), "max_position_embeddings", None)
@@ -190,7 +178,6 @@ def _resolve_sentence_transformer_max_seq_length(
 
 def _validate_sentence_transformer_export(
     model_part: nn.Module,
-    export_config,
     tokenizer,
     original_model_path: str | None = None,
 ) -> None:
@@ -207,22 +194,7 @@ def _validate_sentence_transformer_export(
     if tokenizer is None:
         raise ValueError("A tokenizer is required to export a loadable Sentence Transformers checkpoint.")
 
-    normalize = bool(getattr(model_part, "l2_normalize", False))
-    expected_similarity = "cosine" if normalize else "dot"
-    similarity_fn_name = export_config.similarity_fn_name
-    if similarity_fn_name is not None and similarity_fn_name != expected_similarity:
-        raise ValueError(
-            f"similarity_fn_name={similarity_fn_name!r} does not match l2_normalize={normalize}; "
-            f"expected {expected_similarity!r}."
-        )
-    if not export_config.include_prompt:
-        raise ValueError("include_prompt=False is unsupported because the NeMo training pipeline pools prompt tokens.")
-    if export_config.do_lower_case:
-        raise ValueError(
-            "do_lower_case=True is unsupported because the NeMo training pipeline does not lowercase text."
-        )
-
-    _resolve_sentence_transformer_max_seq_length(model_part, export_config, tokenizer, original_model_path)
+    _resolve_sentence_transformer_max_seq_length(model_part, tokenizer, original_model_path)
 
 
 def _save_generated_sentence_transformer_assets(
@@ -233,7 +205,7 @@ def _save_generated_sentence_transformer_assets(
     tokenizer,
 ) -> None:
     """Generate Sentence Transformers metadata from the effective bi-encoder behavior."""
-    _validate_sentence_transformer_export(model_part, export_config, tokenizer, original_model_path)
+    _validate_sentence_transformer_export(model_part, tokenizer, original_model_path)
     pooling = getattr(model_part, "pooling", None)
     model_config = getattr(model_part, "config", None)
     embedding_dimension = getattr(model_config, "hidden_size", None)
@@ -242,9 +214,7 @@ def _save_generated_sentence_transformer_assets(
     document_prompt = export_config.document_prompt or ""
 
     normalize = bool(getattr(model_part, "l2_normalize", False))
-    similarity_fn_name = export_config.similarity_fn_name
-    if similarity_fn_name is None:
-        similarity_fn_name = "cosine" if normalize else "dot"
+    similarity_fn_name = "cosine" if normalize else "dot"
 
     modules = [
         {
@@ -278,13 +248,11 @@ def _save_generated_sentence_transformer_assets(
         "pooling_mode_mean_sqrt_len_tokens": False,
         "pooling_mode_weightedmean_tokens": False,
         "pooling_mode_lasttoken": False,
-        "include_prompt": bool(export_config.include_prompt),
+        "include_prompt": True,
     }
     pooling_config[_SENTENCE_TRANSFORMER_POOLING_KEYS[pooling]] = True
 
-    max_seq_length = _resolve_sentence_transformer_max_seq_length(
-        model_part, export_config, tokenizer, original_model_path
-    )
+    max_seq_length = _resolve_sentence_transformer_max_seq_length(model_part, tokenizer, original_model_path)
     do_lower_case = False
 
     os.makedirs(os.path.join(hf_metadata_dir, "1_Pooling"), exist_ok=True)
@@ -415,7 +383,6 @@ class ConsolidatedHFAddon:
         if sentence_transformer_export_config is not None:
             _validate_sentence_transformer_export(
                 export_model,
-                sentence_transformer_export_config,
                 tokenizer,
                 original_model_path,
             )
