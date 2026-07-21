@@ -84,7 +84,17 @@ def _fused_kda_gate(g: torch.Tensor, a_log: torch.Tensor, head_dim: int, dt_bias
 
 
 def _torch_kda_gate(g: torch.Tensor, a_log: torch.Tensor, head_dim: int, dt_bias: torch.Tensor) -> torch.Tensor:
-    """Torch equivalent of FLA's KDA gate."""
+    """Torch equivalent of FLA's KDA gate.
+
+    Args:
+        g: Tensor of shape [batch, sequence, heads * head_dim] or [batch, sequence, heads, head_dim].
+        a_log: Tensor of shape [1, 1, heads, 1].
+        head_dim: Per-head KDA dimension.
+        dt_bias: Tensor of shape [heads * head_dim].
+
+    Returns:
+        Tensor of shape [batch, sequence, heads, head_dim].
+    """
     gate = g if g.shape[-1] == head_dim else g.reshape(*g.shape[:-1], -1, head_dim)
     num_heads = gate.shape[-2]
     gate = gate.float() + dt_bias.float().view(num_heads, head_dim)
@@ -92,6 +102,15 @@ def _torch_kda_gate(g: torch.Tensor, a_log: torch.Tensor, head_dim: int, dt_bias
 
 
 def _index_first_axis(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """Gather rows from the first axis while preserving trailing tensor layout.
+
+    Args:
+        x: Tensor of shape [tokens, ...], with arbitrary trailing axes.
+        indices: Tensor of shape [selected_tokens] containing first-axis row indices.
+
+    Returns:
+        Tensor of shape [selected_tokens, ...], with the same trailing axes as ``x``.
+    """
     other_shape = x.shape[1:]
     return (
         x.reshape(x.shape[0], -1)
@@ -101,12 +120,31 @@ def _index_first_axis(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
 
 
 def _index_put_first_axis(x: torch.Tensor, indices: torch.Tensor, first_axis_dim: int) -> torch.Tensor:
+    """Scatter rows into the first axis while preserving trailing tensor layout.
+
+    Args:
+        x: Tensor of shape [selected_tokens, ...], with arbitrary trailing axes.
+        indices: Tensor of shape [selected_tokens] containing destination row indices.
+        first_axis_dim: Size of the output first axis.
+
+    Returns:
+        Tensor of shape [first_axis_dim, ...], with the same trailing axes as ``x``.
+    """
     y = torch.zeros(first_axis_dim, *x.shape[1:], device=x.device, dtype=x.dtype)
     y[indices] = x
     return y
 
 
 def _get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Build metadata for converting padded batches to flattened valid tokens.
+
+    Args:
+        attention_mask: Binary mask tensor of shape [batch, sequence] where 1 marks valid tokens.
+
+    Returns:
+        Tuple containing ``indices`` of shape [total_valid_tokens], ``cu_seqlens`` of shape [batch + 1],
+        and ``max_seqlen`` for the longest unpadded sequence.
+    """
     mask = attention_mask.bool()
     lengths = mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(mask.flatten(), as_tuple=False).flatten()
@@ -116,6 +154,17 @@ def _get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.T
 
 
 def _pad_input(hidden_states: torch.Tensor, indices: torch.Tensor, batch_size: int, seq_len: int) -> torch.Tensor:
+    """Restore flattened valid tokens to padded batch layout.
+
+    Args:
+        hidden_states: Tensor of shape [total_valid_tokens, ...], with arbitrary trailing axes.
+        indices: Tensor of shape [total_valid_tokens] containing flattened padded-batch row indices.
+        batch_size: Number of sequences in the padded output batch.
+        seq_len: Sequence length in the padded output batch.
+
+    Returns:
+        Tensor of shape [batch, sequence, ...], with the same trailing axes as ``hidden_states``.
+    """
     output = _index_put_first_axis(hidden_states, indices, batch_size * seq_len)
     return output.reshape(batch_size, seq_len, *hidden_states.shape[1:])
 
@@ -126,6 +175,16 @@ def _make_causal_mask(
     *,
     dtype: torch.dtype,
 ) -> torch.Tensor | None:
+    """Create the additive causal attention mask for padded full attention.
+
+    Args:
+        inputs_embeds: Tensor of shape [batch, sequence, hidden].
+        attention_mask: Optional binary mask tensor of shape [batch, sequence] where 1 marks valid tokens.
+        dtype: Floating-point dtype used for the additive mask values.
+
+    Returns:
+        Additive causal mask tensor of shape [batch, 1, sequence, sequence], or None.
+    """
     batch_size, seq_len = inputs_embeds.shape[:2]
     min_value = torch.finfo(dtype).min
     mask = torch.full((seq_len, seq_len), min_value, device=inputs_embeds.device, dtype=dtype)
@@ -159,27 +218,6 @@ class KimiRMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
-
-    def reset_parameters(self) -> None:
-        nn.init.ones_(self.weight)
-
-
-class KimiRMSNormGated(nn.Module):
-    """Kimi sigmoid-gated RMSNorm with fp32 variance computation."""
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6, dtype: torch.dtype = torch.bfloat16) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        hidden_states = hidden_states * self.weight.float()
-        hidden_states = hidden_states * gate.float().sigmoid()
-        return hidden_states.to(input_dtype)
 
     def reset_parameters(self) -> None:
         nn.init.ones_(self.weight)
