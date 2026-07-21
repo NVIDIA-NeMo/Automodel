@@ -40,6 +40,7 @@ from nemo_automodel.shared.tied_weights import (
 
 logger = logging.getLogger(__name__)
 _AUTOMODEL_CHECKPOINT_RE = re.compile(r"^epoch_\d+_step_(\d+)$")
+_CHECKPOINT_STEP_RE = re.compile(r"step_(\d+)$")
 
 
 def get_rank_safe() -> int:
@@ -105,17 +106,22 @@ def format_output_file_count(count: int) -> str:
 
 
 def _checkpoint_step_num(path: Path) -> int:
-    """Return the AutoModel checkpoint step number, or -1 when the name is not owned by AutoModel."""
-    match = _AUTOMODEL_CHECKPOINT_RE.fullmatch(path.name)
+    """Return the trailing checkpoint step number, or -1 when the name is not a checkpoint."""
+    match = _CHECKPOINT_STEP_RE.search(path.name)
     return int(match.group(1)) if match else -1
 
 
 def _list_existing_checkpoints(ckpt_root: Path) -> list[Path]:
-    """Return existing AutoModel checkpoint directories under ckpt_root."""
+    """Return existing checkpoint directories whose names end in ``step_<N>``."""
     if not ckpt_root.exists():
         return []
-    checkpoints = [path for path in ckpt_root.glob("epoch_*_step_*") if path.is_dir() and not path.is_symlink()]
+    checkpoints = [path for path in ckpt_root.glob("*step_*") if path.is_dir() and not path.is_symlink()]
     return sorted((path for path in checkpoints if _checkpoint_step_num(path) >= 0), key=_checkpoint_step_num)
+
+
+def list_automodel_checkpoints(ckpt_root: Path) -> list[Path]:
+    """Return canonical AutoModel ``epoch_<E>_step_<S>`` checkpoint directories."""
+    return [path for path in _list_existing_checkpoints(ckpt_root) if _AUTOMODEL_CHECKPOINT_RE.fullmatch(path.name)]
 
 
 def _resolve_checkpoint_pointer_target(ckpt_root: Path, raw_target: str) -> Path | None:
@@ -272,7 +278,7 @@ def _find_latest_checkpoint(checkpoint_dir):
 
     Preference order:
       1) Valid LATEST symlink or txt file under checkpoint_dir
-      2) Highest step directory under checkpoint_dir matching *step_*
+      2) Highest step directory under checkpoint_dir whose name ends in ``step_<N>``
 
     Returns:
         Path (or str) of the latest checkpoint directory, or None.

@@ -248,15 +248,15 @@ def test_dp_allreduce_uses_world_group_without_device_mesh(tmp_path, monkeypatch
 
 
 def test_find_latest_checkpoint(tmp_path):
-    """Verify that latest checkpoint discovery uses AutoModel-owned checkpoint directories."""
+    """Verify that latest checkpoint discovery supports legacy step-based directory names."""
     (tmp_path / "epoch_0_step_1").mkdir()
-    (tmp_path / "step_20").mkdir()  # should be ignored: not an AutoModel checkpoint name
+    (tmp_path / "step_20").mkdir()
     (tmp_path / "epoch_3_step_5").mkdir()
     (tmp_path / "misc").mkdir()  # should be ignored
 
     latest = _find_latest_checkpoint(tmp_path)
     assert latest is not None
-    assert latest.name == "epoch_3_step_5", "Did not pick the highest AutoModel checkpoint directory"
+    assert latest.name == "step_20", "Did not pick the highest step directory"
 
 
 @pytest.mark.skipif(not HAS_ET, reason="expecttest required")
@@ -805,6 +805,8 @@ def test_checkpoint_retention_ignores_non_automodel_step_directories(tmp_path):
     backup_dir = tmp_path / "backup_step_50"
     backup_dir.mkdir()
     (backup_dir / "keep.txt").write_text("not an AutoModel checkpoint")
+    legacy_checkpoint = tmp_path / "step_300"
+    legacy_checkpoint.mkdir()
     recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
 
     for step in [100, 200]:
@@ -816,6 +818,7 @@ def test_checkpoint_retention_ignores_non_automodel_step_directories(tmp_path):
 
     assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_200"]
     assert (backup_dir / "keep.txt").read_text() == "not an AutoModel checkpoint"
+    assert legacy_checkpoint.is_dir()
 
 
 def test_checkpoint_retention_ignores_non_pointer_text_files(tmp_path):

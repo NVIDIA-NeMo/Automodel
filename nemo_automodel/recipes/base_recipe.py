@@ -48,10 +48,10 @@ from nemo_automodel.components.checkpoint.utils import (
     _find_latest_checkpoint,
     _find_pointer_protected_checkpoints,
     _format_missing_checkpoint_dir_error,
-    _list_existing_checkpoints,
     _read_checkpoint_metric,
     _read_checkpoint_pointer,
     _resolve_restore_from_to_ckpt_dir,
+    list_automodel_checkpoints,
 )
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
@@ -526,7 +526,7 @@ class BaseRecipe:
             return
 
         ckpt_root = Path(self.checkpointer.config.checkpoint_dir)
-        checkpoints = _list_existing_checkpoints(ckpt_root)
+        checkpoints = list_automodel_checkpoints(ckpt_root)
         try:
             protected_checkpoints = _find_pointer_protected_checkpoints(ckpt_root, checkpoints)
         except (OSError, UnicodeError):
