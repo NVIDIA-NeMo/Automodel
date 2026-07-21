@@ -32,6 +32,7 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from nemo_automodel.components.models.nemotron_omni.model import (
     NemotronOmniForConditionalGeneration,
@@ -225,6 +226,7 @@ def test_forward_sound_skipped_when_no_sound_encoder():
 def test_forward_cp_shards_embedded_sequence():
     """With a CP mesh installed, forward embeds+splices the full sequence then
     keeps this rank's round-robin chunk pair, so the LM sees the local shard."""
+    sdpa_before = F.scaled_dot_product_attention
     model = _make_omni_stub()
     model.cp_mesh = _FakeCPMesh(2)
     input_ids = torch.tensor([[1, IMG_TOKEN_ID, IMG_TOKEN_ID, 4, 5, 6, 7, 8]])  # len 8 == multiple of 2*cp
@@ -232,6 +234,7 @@ def test_forward_cp_shards_embedded_sequence():
         model, input_ids=input_ids, pixel_values=torch.zeros(2, 3, 4, 4), image_flags=torch.tensor([[1], [1]])
     )
     assert out.shape == (1, 4, HIDDEN)  # 8 // cp_size(2) = 4 local tokens
+    assert F.scaled_dot_product_attention is sdpa_before
 
 
 # -----------------------------------------------------------------------------

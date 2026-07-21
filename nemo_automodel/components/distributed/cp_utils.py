@@ -51,6 +51,18 @@ def cp_dispatcher_suspended(cp_mesh):
     if cp_mesh is None or cp_mesh.size() <= 1:
         yield
         return
+    import torch.nn.functional as F_module
+
+    current_sdpa = F_module.scaled_dot_product_attention
+    dispatcher_was_enabled = (
+        getattr(current_sdpa, "__module__", None)
+        == "torch.distributed.tensor.experimental._context_parallel._attention"
+        and getattr(current_sdpa, "__name__", None) == "inner_fn"
+    )
+    if not dispatcher_was_enabled:
+        yield
+        return
+
     # torch-internal: the legacy context_parallel enables its SDPA monkeypatch via
     # these _impl toggles with the attention seq dim (2 for [B, heads, seq, dim]).
     from torch.distributed.tensor.experimental._context_parallel._attention import (  # noqa: PLC0415
