@@ -1090,3 +1090,124 @@ def test_select_active_transformer_noop_on_single_transformer_pipeline():
     _select_active_transformer(pipe, "transformer")
 
     assert pipe.transformer is t1
+
+
+# =============================================================================
+# _enable_context_parallel tests
+# =============================================================================
+
+
+def _cp_module():
+    module = Mock(spec=["enable_parallelism", "_cp_plan"])
+    module._cp_plan = {"": Mock()}
+    return module
+
+
+def _fsdp2_manager_mock():
+    from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
+
+    manager = Mock(spec=FSDP2Manager)
+    manager.device_mesh = Mock()
+    return manager
+
+
+def test_enable_context_parallel_derives_mesh_and_enables(monkeypatch):
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _enable_context_parallel
+    from nemo_automodel.components.distributed import mesh_utils
+
+    cp_mesh = Mock()
+    create_mesh = Mock(return_value=cp_mesh)
+    monkeypatch.setattr(mesh_utils, "create_ring_ulysses_mesh", create_mesh)
+
+    module = _cp_module()
+    manager = _fsdp2_manager_mock()
+    _enable_context_parallel(module, "transformer", manager, {"cp_size": 2})
+
+    create_mesh.assert_called_once_with(manager.device_mesh, ring_degree=1, ulysses_degree=2)
+    module.enable_parallelism.assert_called_once()
+    config = module.enable_parallelism.call_args.kwargs["config"]
+    assert config.ring_degree == 1
+    assert config.ulysses_degree == 2
+    assert config.mesh is cp_mesh
+
+
+def test_enable_context_parallel_rejects_ddp_manager():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _enable_context_parallel
+    from nemo_automodel.components.distributed.ddp import DDPManager
+
+    manager = Mock(spec=DDPManager)
+    with pytest.raises(ValueError, match="requires the fsdp2 manager"):
+        _enable_context_parallel(_cp_module(), "transformer", manager, {"cp_size": 2})
+
+
+def test_enable_context_parallel_rejects_ring_degree():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _enable_context_parallel
+
+    with pytest.raises(ValueError, match="cp_ring_degree > 1 is not supported"):
+        _enable_context_parallel(
+            _cp_module(),
+            "transformer",
+            _fsdp2_manager_mock(),
+            {"cp_size": 2, "cp_ring_degree": 2, "cp_ulysses_degree": 1},
+        )
+
+
+def test_enable_context_parallel_rejects_mismatched_split():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _enable_context_parallel
+
+    with pytest.raises(ValueError, match="must equal cp_size"):
+        _enable_context_parallel(
+            _cp_module(),
+            "transformer",
+            _fsdp2_manager_mock(),
+            {"cp_size": 2, "cp_ulysses_degree": 4},
+        )
+
+
+def test_enable_context_parallel_requires_cp_plan():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _enable_context_parallel
+
+    module = Mock(spec=["enable_parallelism", "_cp_plan"])
+    module._cp_plan = None
+    with pytest.raises(ValueError, match="_cp_plan"):
+        _enable_context_parallel(module, "transformer", _fsdp2_manager_mock(), {"cp_size": 2})
+
+
+def test_apply_parallelization_enables_cp_before_parallelize(monkeypatch):
+    from nemo_automodel._diffusers import auto_diffusion_pipeline as adp
+
+    call_order = []
+    module = torch.nn.Linear(2, 2)
+    pipe = SimpleNamespace(components={"transformer": module})
+
+    manager = Mock()
+    manager.parallelize = Mock(side_effect=lambda m: call_order.append("parallelize") or m)
+    monkeypatch.setattr(adp, "_create_parallel_manager", Mock(return_value=manager))
+    monkeypatch.setattr(adp, "_init_parallelizer", Mock())
+    monkeypatch.setattr(
+        adp, "_enable_context_parallel", Mock(side_effect=lambda *a, **k: call_order.append("enable_cp"))
+    )
+    monkeypatch.setattr(adp.torch.distributed, "is_initialized", Mock(return_value=True))
+
+    adp._apply_parallelization(pipe, {"transformer": {"cp_size": 2}})
+
+    assert call_order == ["enable_cp", "parallelize"]
+
+
+def test_apply_parallelization_skips_cp_when_disabled(monkeypatch):
+    from nemo_automodel._diffusers import auto_diffusion_pipeline as adp
+
+    module = torch.nn.Linear(2, 2)
+    pipe = SimpleNamespace(components={"transformer": module})
+
+    manager = Mock()
+    manager.parallelize = Mock(side_effect=lambda m: m)
+    monkeypatch.setattr(adp, "_create_parallel_manager", Mock(return_value=manager))
+    monkeypatch.setattr(adp, "_init_parallelizer", Mock())
+    enable_cp = Mock()
+    monkeypatch.setattr(adp, "_enable_context_parallel", enable_cp)
+    monkeypatch.setattr(adp.torch.distributed, "is_initialized", Mock(return_value=True))
+
+    adp._apply_parallelization(pipe, {"transformer": {"cp_size": 1}})
+
+    enable_cp.assert_not_called()
