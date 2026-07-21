@@ -98,6 +98,16 @@ def is_gated_activation(activation: str) -> bool:
 
 
 def _unweighted_swiglu(input: torch.Tensor, *, swiglu_limit: float = 0.0) -> torch.Tensor:
+    """Apply SwiGLU to fused gate/up projections without routing weights.
+
+    Args:
+        input: Fused gate/up tensor of shape [..., 2 * inter], with arbitrary leading dimensions. The last
+            dimension is split into gate and up halves of size inter.
+        swiglu_limit: Optional clamp applied to gate/up before activation; disabled when <= 0.
+
+    Returns:
+        Tensor of shape [..., inter].
+    """
     gate, up = torch.chunk(input, 2, dim=-1)
     if swiglu_limit > 0.0:
         dtype = input.dtype
