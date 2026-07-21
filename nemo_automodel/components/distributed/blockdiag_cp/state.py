@@ -196,6 +196,22 @@ _CP_BLOCKDIAG_STATE = _ThreadSharedVar()
 _CP_ATTN_FIRE_COUNT: list[int] = [0]
 
 
+def current_blockdiag_cp_state() -> dict | None:
+    """Return the active block-diagonal CP step state, or ``None``.
+
+    The state is published by
+    :func:`~nemo_automodel.components.distributed.blockdiag_cp.batch.make_cp_blockdiag_batch_and_ctx`
+    for the duration of forward and backward. Model-owned recurrent-attention
+    implementations use it to share the same contiguous layout and packed
+    document boundaries as the softmax-attention transport.
+
+    Returns:
+        The active step-state mapping, including full-sequence ``doc_ids`` of
+        shape ``[batch, sequence]``, or ``None`` outside the CP context.
+    """
+    return _CP_BLOCKDIAG_STATE.get()
+
+
 def reset_cp_attn_fire_count() -> None:
     """Zero the CP-attention fire counter (call before each forward)."""
     _CP_ATTN_FIRE_COUNT[0] = 0
