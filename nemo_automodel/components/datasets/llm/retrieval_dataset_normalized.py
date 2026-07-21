@@ -45,7 +45,7 @@ from nemo_automodel.shared.import_utils import safe_import
 
 _VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
 _NORMALIZED_RETRIEVAL_FORMAT = "nemo_automodel_normalized_vl_retrieval_arrow"
-_SUPPORTED_FORMAT_VERSIONS = frozenset({1, 2, 3})
+_NORMALIZED_RETRIEVAL_FORMAT_VERSION = 1
 
 
 class NormalizedDataEntryConfig(TypedDict, total=False):
@@ -132,46 +132,6 @@ def _decode_image_bytes(image_bytes: bytes | None) -> Any:
         return image.convert("RGB")
 
 
-def _parse_doc_refs(value: Any, *, field_name: str) -> list[dict[str, str]]:
-    if isinstance(value, str):
-        refs = json.loads(value)
-    else:
-        refs = value
-    if refs is None:
-        return []
-    if not isinstance(refs, list):
-        raise ValueError(f"Normalized retrieval field '{field_name}' must be a list, got {type(refs).__name__}")
-    normalized = []
-    for doc in refs:
-        if isinstance(doc, dict) and "id" in doc:
-            normalized.append({"id": str(doc["id"])})
-        else:
-            normalized.append({"id": str(doc)})
-    return normalized
-
-
-def _parse_json_ref_column(value: Any, *, field_name: str) -> Any:
-    if isinstance(value, list):
-        return [_parse_doc_refs(item, field_name=field_name) for item in value]
-    return _parse_doc_refs(value, field_name=field_name)
-
-
-class _JsonRefRetrievalTransform:
-    """Adapter for version-1 bundles whose train refs were stored as JSON strings."""
-
-    def __init__(self, transform: RetrievalTransform) -> None:
-        self._transform = transform
-
-    def __call__(self, examples):
-        examples = dict(examples)
-        examples["pos_doc"] = _parse_json_ref_column(examples.pop("pos_doc_json"), field_name="pos_doc")
-        examples["neg_doc"] = _parse_json_ref_column(examples.pop("neg_doc_json"), field_name="neg_doc")
-        return self._transform(examples)
-
-    def set_epoch(self, epoch: int) -> None:
-        self._transform.set_epoch(epoch)
-
-
 class NormalizedArrowCorpusDataset(AbstractDataset):
     """Local Arrow corpus addressable by document id."""
 
@@ -205,10 +165,10 @@ def _load_metadata(bundle_root: Path) -> dict[str, Any]:
     if metadata.get("format") != _NORMALIZED_RETRIEVAL_FORMAT:
         raise ValueError(f"Unsupported normalized retrieval format: {metadata.get('format')!r}")
     version = metadata.get("version")
-    if isinstance(version, bool) or not isinstance(version, int) or version not in _SUPPORTED_FORMAT_VERSIONS:
+    if isinstance(version, bool) or not isinstance(version, int) or version != _NORMALIZED_RETRIEVAL_FORMAT_VERSION:
         raise ValueError(
             f"Unsupported normalized retrieval format version {version!r} in {metadata_path}; "
-            f"supported versions are {sorted(_SUPPORTED_FORMAT_VERSIONS)}. "
+            f"supported version is {_NORMALIZED_RETRIEVAL_FORMAT_VERSION}. "
             "Regenerate the bundle with a supported AutoModel version."
         )
     logger.info(
@@ -330,7 +290,6 @@ def _load_normalized_bundle_components(
 
 
 def _build_transform(
-    dataset: Any,
     corpus_dict: dict[str, CorpusInfo],
     *,
     model_type: str,
@@ -350,8 +309,6 @@ def _build_transform(
         model_type=model_type,
         cycle_positive_docs=cycle_positive_docs,
     )
-    if "pos_doc_json" in dataset.column_names:
-        return _JsonRefRetrievalTransform(transform)
     return transform
 
 
@@ -426,7 +383,6 @@ def make_normalized_retrieval_dataset(
 
     corpus_dict = _merge_corpus_dicts(source_corpus_dicts)
     transform = _build_transform(
-        dataset,
         corpus_dict,
         model_type=model_type,
         data_type=data_type,

@@ -53,8 +53,7 @@ from nemo_automodel.shared.import_utils import safe_import
 logger = logging.getLogger(__name__)
 
 _NORMALIZED_RETRIEVAL_FORMAT = "nemo_automodel_normalized_vl_retrieval_arrow"
-_SOURCE_METADATA_VERSION = 2
-_TOP_LEVEL_METADATA_VERSION = 3
+_NORMALIZED_RETRIEVAL_FORMAT_VERSION = 1
 _TRAIN_COMPLETION_FILENAME = ".complete.json"
 
 
@@ -331,10 +330,10 @@ def _load_top_level_metadata(output_dir: Path) -> dict[str, Any]:
     if metadata.get("format") != _NORMALIZED_RETRIEVAL_FORMAT:
         raise ValueError(f"Unsupported normalized retrieval format: {metadata.get('format')!r}")
     version = metadata.get("version")
-    if isinstance(version, bool) or not isinstance(version, int) or version != _TOP_LEVEL_METADATA_VERSION:
+    if isinstance(version, bool) or not isinstance(version, int) or version != _NORMALIZED_RETRIEVAL_FORMAT_VERSION:
         raise ValueError(
             f"Cannot append to normalized retrieval bundle version {version!r} in {metadata_path}; "
-            f"supported version is {_TOP_LEVEL_METADATA_VERSION}. "
+            f"supported version is {_NORMALIZED_RETRIEVAL_FORMAT_VERSION}. "
             "Regenerate the bundle with a supported AutoModel version."
         )
     if "sources" not in metadata:
@@ -416,14 +415,6 @@ def _arrow_shard_paths(path: Path, filename_prefix: str) -> list[Path]:
     return sorted(path.glob(f"{filename_prefix}-*.arrow"))
 
 
-def _parse_doc_refs(value: Any) -> list[dict[str, str]]:
-    if isinstance(value, str):
-        value = json.loads(value)
-    if value is None:
-        return []
-    return _normalize_doc_refs(value, field_name="doc refs")
-
-
 def _collect_refs_from_train_shards(train_dir: Path) -> tuple[list[str], int, dict[str, set[str]]] | None:
     """Read existing train shards from a previous interrupted run."""
     completion_path = train_dir / _TRAIN_COMPLETION_FILENAME
@@ -460,16 +451,11 @@ def _collect_refs_from_train_shards(train_dir: Path) -> tuple[list[str], int, di
     try:
         for path in train_paths:
             shard = datasets.Dataset.from_file(str(path))
-            column_names = set(shard.column_names)
             for row in shard:
                 corpus_id = str(row["corpus_id"])
                 refs = refs_by_corpus.setdefault(corpus_id, set())
-                if "pos_doc_json" in column_names:
-                    pos_doc = _parse_doc_refs(row["pos_doc_json"])
-                    neg_doc = _parse_doc_refs(row["neg_doc_json"])
-                else:
-                    pos_doc = _parse_doc_refs(row["pos_doc"])
-                    neg_doc = _parse_doc_refs(row["neg_doc"])
+                pos_doc = _normalize_doc_refs(row["pos_doc"], field_name="pos_doc")
+                neg_doc = _normalize_doc_refs(row["neg_doc"], field_name="neg_doc")
                 refs.update(doc["id"] for doc in pos_doc)
                 refs.update(doc["id"] for doc in neg_doc)
             num_records += len(shard)
@@ -716,7 +702,7 @@ def _prepare_single_normalized_dataset(
     dataset_size = len(dataset) if hasattr(dataset, "__len__") else None
     metadata = {
         "format": _NORMALIZED_RETRIEVAL_FORMAT,
-        "version": _SOURCE_METADATA_VERSION,
+        "version": _NORMALIZED_RETRIEVAL_FORMAT_VERSION,
         "data_dir_list": data_dir_list,
         "dataset_size": dataset_size,
         "max_samples": max_samples,
@@ -908,7 +894,7 @@ def _finalize_normalized_sources(
     ]
     metadata = {
         "format": _NORMALIZED_RETRIEVAL_FORMAT,
-        "version": _TOP_LEVEL_METADATA_VERSION,
+        "version": _NORMALIZED_RETRIEVAL_FORMAT_VERSION,
         "data_dir_list": data_dir_list,
         "num_records": sum(int(source["num_records"]) for source in source_metadata),
         "samples_per_shard": samples_per_shard,

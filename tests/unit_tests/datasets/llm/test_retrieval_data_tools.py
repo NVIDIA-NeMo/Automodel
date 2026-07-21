@@ -186,11 +186,10 @@ def test_retrieval_tools_read_current_top_level_dataset_config(tmp_path):
     assert dataset_cfg["n_passages"] == 3
 
 
-@pytest.mark.parametrize("version", [1, 2, 3])
-def test_normalized_metadata_accepts_supported_versions_and_logs_contents(tmp_path, caplog, version):
+def test_normalized_metadata_accepts_current_version_and_logs_contents(tmp_path, caplog):
     metadata = {
         "format": "nemo_automodel_normalized_vl_retrieval_arrow",
-        "version": version,
+        "version": 1,
         "num_records": 2,
         "sources": [
             {
@@ -212,7 +211,7 @@ def test_normalized_metadata_accepts_supported_versions_and_logs_contents(tmp_pa
     assert json.dumps(metadata, sort_keys=True, separators=(",", ":")) in caplog.text
 
 
-@pytest.mark.parametrize("version", [None, True, "3", 4])
+@pytest.mark.parametrize("version", [None, True, 1.0, "1", 2, 3])
 def test_normalized_metadata_rejects_missing_or_unsupported_versions(tmp_path, version):
     metadata = {"format": "nemo_automodel_normalized_vl_retrieval_arrow"}
     if version is not None:
@@ -223,7 +222,7 @@ def test_normalized_metadata_rejects_missing_or_unsupported_versions(tmp_path, v
         nd._load_metadata(tmp_path)
 
 
-@pytest.mark.parametrize("version", [None, True, 3.0, "3", 4])
+@pytest.mark.parametrize("version", [None, True, 1.0, "1", 2, 3])
 def test_normalized_append_rejects_missing_or_unsupported_top_level_version(tmp_path, version):
     metadata = {
         "format": "nemo_automodel_normalized_vl_retrieval_arrow",
@@ -554,7 +553,7 @@ def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_p
     )
 
     assert metadata["format"] == "nemo_automodel_normalized_vl_retrieval_arrow"
-    assert metadata["version"] == 3
+    assert metadata["version"] == 1
     assert metadata["num_records"] == 2
     assert len(metadata["sources"]) == 1
     assert metadata["sources"][0]["source_index"] == 0
@@ -566,7 +565,7 @@ def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_p
     assert (output_dir / "metadata.json").is_file()
     source_dir = output_dir / "sources" / "source-00000"
     source_metadata = json.loads((source_dir / "metadata.json").read_text(encoding="utf-8"))
-    assert source_metadata["version"] == 2
+    assert source_metadata["version"] == 1
     assert source_metadata["train_shards"] == ["train/train-00000.arrow"]
     assert source_metadata["corpora"][0]["num_docs"] == 3
 
@@ -778,7 +777,7 @@ def test_prepare_normalized_vl_retrieval_data_preserves_source_bundles(tmp_path,
         jpeg_quality=90,
     )
 
-    assert metadata["version"] == 3
+    assert metadata["version"] == 1
     assert metadata["num_records"] == 4
     assert [source["path"] for source in metadata["sources"]] == ["sources/source-00000", "sources/source-00001"]
 
