@@ -134,6 +134,7 @@ wandb:
   dir: wandb
 
 ci:
+  recipe_owner: HuiyingLi
   # pp_size(1) * ep_size(16) = 16 GPUs => 2 nodes (8 H100/node).
   nodes: 2
   time: "01:00:00"
