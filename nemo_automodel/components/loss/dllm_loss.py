@@ -627,6 +627,7 @@ class IDLMLoss(nn.Module):
         valid_mask: torch.Tensor,
         *,
         seq_len: int,
+        num_diffusion_tokens: Optional[int] = None,
     ) -> DLLMLossOutput:
         """Compute the I-DLM block-diffusion loss.
 
@@ -637,6 +638,13 @@ class IDLMLoss(nn.Module):
             answer_mask: Bool mask of supervised (response) positions, ``[B, L]``.
             valid_mask: Bool/long padding-validity mask, shape ``[B, L]``.
             seq_len: Length ``L`` of one copy.
+            num_diffusion_tokens: Global, DP-all-reduced supervised-token count
+                used as the loss denominator (summed across grad-accum
+                microbatches and data-parallel ranks). Pass this so the loss is a
+                proper global token-mean — required for the recipe's
+                ``(loss * dp_group_size).backward()`` scaling to give
+                DP/grad-accum-invariant gradients. Falls back to the local
+                supervised count when ``None`` (single-process use / unit tests).
 
         Returns:
             :class:`DLLMLossOutput` with the combined ``total_loss`` and
@@ -651,7 +659,12 @@ class IDLMLoss(nn.Module):
         shift_target = target_ids[:, 1:]
         supervise = answer_mask[:, 1:].bool() & valid_mask[:, 1:].bool()
         weight = supervise.to(torch.float32)
-        denom = supervise.sum().clamp_min(1)
+        # Global token count keeps the denominator constant across ranks and
+        # microbatches; the ratio in auto_balance is denominator-independent.
+        if num_diffusion_tokens is not None:
+            denom = max(int(num_diffusion_tokens), 1)
+        else:
+            denom = supervise.sum().clamp_min(1)
 
         ce_noisy = (_compute_per_token_nll(noisy_logits[:, :-1, :], shift_target) * weight).sum() / denom
         ce_clean = (_compute_per_token_nll(clean_logits[:, :-1, :], shift_target) * weight).sum() / denom

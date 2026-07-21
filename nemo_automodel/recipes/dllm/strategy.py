@@ -366,7 +366,9 @@ class IDLMStrategy(DLLMStrategy):
                 use_cache=False,
             )
             logits = out.logits if not torch.is_tensor(out) else out
-            loss_result = recipe.dllm_loss_fn(logits, clean_input_ids, noise_mask, attn, seq_len=L)
+            loss_result = recipe.dllm_loss_fn(
+                logits, clean_input_ids, noise_mask, attn, seq_len=L, num_diffusion_tokens=num_diffusion_tokens
+            )
             microbatch_loss = loss_result.total_loss
             loss_buffer.append(microbatch_loss.detach().clone())
             recipe._dllm_loss_buffer.append(loss_result.dllm_loss)

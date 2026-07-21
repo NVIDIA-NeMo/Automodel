@@ -571,6 +571,26 @@ class TestIDLMLoss:
         assert torch.isfinite(out.total_loss)
         assert out.total_loss.item() > 0
 
+    def test_normalization_by_num_diffusion_tokens(self):
+        """A global denominator rescales the loss vs the local supervised count.
+
+        The recipe passes an all-reduced ``num_diffusion_tokens`` so the loss is a
+        DP/grad-accum-invariant token-mean; here we assert the denominator swap is
+        exact (local sum-of-CE divided by the supplied global count).
+        """
+        from nemo_automodel.components.loss.dllm_loss import IDLMLoss
+
+        logits, target, answer_mask, valid_mask, L = self._inputs()
+        loss_fn = IDLMLoss(clean_loss_weight=0.2)
+        local = loss_fn(logits, target, answer_mask, valid_mask, seq_len=L)
+
+        # Recover the un-normalised (summed) loss from the local-denominator run.
+        local_denom = (answer_mask[:, 1:].bool() & valid_mask[:, 1:].bool()).sum().clamp_min(1)
+        global_denom = 97
+        summed = local.total_loss * local_denom
+        out = loss_fn(logits, target, answer_mask, valid_mask, seq_len=L, num_diffusion_tokens=global_denom)
+        assert torch.isclose(out.total_loss, summed / global_denom, atol=1e-5)
+
 
 def _init_single_process_group():
     """Trivial single-process gloo group for DTensor tests (mirrors test_kd_loss)."""
