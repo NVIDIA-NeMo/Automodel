@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Gemma 4 31B CoderForge agent SFT — 16 nodes / 128 GPUs, single 4h-window run (~0.30B tokens).
-# Topology: cp8 x dp16 (128/(1*8)=16), gbs=16 (one trajectory per dp rank), max_steps=450
-# (~7,200 trajectories, ~0.30B tokens at ~42.3k tok/traj) — fits one batch-partition 4h window
+# Gemma 4 31B CoderForge agent SFT — 16 nodes / 128 GPUs, single 4h-window run (~0.20B tokens).
+# Topology: cp8 x dp16 (128/(1*8)=16), gbs=16 (one trajectory per dp rank), max_steps=300
+# (~4,800 trajectories, ~0.20B tokens at ~42.3k tok/traj) — fits one batch-partition 4h window
 # at the smoke run's ~192 tok/s/GPU. Mid-run CONSOLIDATED checkpoints every 150 steps
-# (steps 150/300/450) for SWE-bench eval AND preemption insurance.
+# (steps 150/300) for SWE-bench eval AND preemption insurance.
 # Derived from gemma4_31b_coderforge_cp8_64k.yaml (validated on 2 nodes; loss 0.80->0.25).
 
 recipe: FinetuneRecipeForVLM
@@ -24,9 +24,9 @@ recipe: FinetuneRecipeForVLM
 step_scheduler:
   global_batch_size: 16       # dp16 x local_batch_size 1
   local_batch_size: 1
-  ckpt_every_steps: 150       # consolidated HF ckpt at 150/300/450 (eval + preemption safety)
+  ckpt_every_steps: 150       # consolidated HF ckpt at 150/300 (eval + preemption safety)
   val_every_steps: 999999
-  max_steps: 450              # ~0.30B tokens (~7.2k trajectories)
+  max_steps: 300              # ~0.20B tokens (~4.8k trajectories)
   num_epochs: 1
 
 dist_env:
@@ -84,7 +84,7 @@ dataset:
   split: train
   seq_length: 65536
   padding: do_not_pad
-  shuffle_seed: 42            # sample the ~7.2k-trajectory budget across all 135k
+  shuffle_seed: 42            # sample the ~4.8k-trajectory budget across all 135k
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
