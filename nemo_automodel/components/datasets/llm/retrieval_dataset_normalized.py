@@ -44,6 +44,8 @@ from nemo_automodel.components.datasets.llm.retrieval_dataset import (
 from nemo_automodel.shared.import_utils import safe_import
 
 _VALID_MODEL_TYPES = ("bi_encoder", "cross_encoder")
+_NORMALIZED_RETRIEVAL_FORMAT = "nemo_automodel_normalized_vl_retrieval_arrow"
+_SUPPORTED_FORMAT_VERSIONS = frozenset({1, 2, 3})
 
 
 class NormalizedDataEntryConfig(TypedDict, total=False):
@@ -200,8 +202,20 @@ def _load_metadata(bundle_root: Path) -> dict[str, Any]:
     if not metadata_path.is_file():
         raise FileNotFoundError(f"Normalized retrieval metadata not found: {metadata_path}")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if metadata.get("format") != "nemo_automodel_normalized_vl_retrieval_arrow":
+    if metadata.get("format") != _NORMALIZED_RETRIEVAL_FORMAT:
         raise ValueError(f"Unsupported normalized retrieval format: {metadata.get('format')!r}")
+    version = metadata.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version not in _SUPPORTED_FORMAT_VERSIONS:
+        raise ValueError(
+            f"Unsupported normalized retrieval format version {version!r} in {metadata_path}; "
+            f"supported versions are {sorted(_SUPPORTED_FORMAT_VERSIONS)}. "
+            "Regenerate the bundle with a supported AutoModel version."
+        )
+    logger.info(
+        "Normalized retrieval bundle metadata: path=%s metadata=%s",
+        bundle_root,
+        json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+    )
     return metadata
 
 

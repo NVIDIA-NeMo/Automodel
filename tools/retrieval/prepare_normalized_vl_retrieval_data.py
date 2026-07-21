@@ -52,6 +52,9 @@ from nemo_automodel.shared.import_utils import safe_import
 
 logger = logging.getLogger(__name__)
 
+_NORMALIZED_RETRIEVAL_FORMAT = "nemo_automodel_normalized_vl_retrieval_arrow"
+_SOURCE_METADATA_VERSION = 2
+_TOP_LEVEL_METADATA_VERSION = 3
 _TRAIN_COMPLETION_FILENAME = ".complete.json"
 
 
@@ -325,8 +328,15 @@ def _load_top_level_metadata(output_dir: Path) -> dict[str, Any]:
     if not metadata_path.is_file():
         raise FileNotFoundError(f"Normalized retrieval metadata not found: {metadata_path}")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if metadata.get("format") != "nemo_automodel_normalized_vl_retrieval_arrow":
+    if metadata.get("format") != _NORMALIZED_RETRIEVAL_FORMAT:
         raise ValueError(f"Unsupported normalized retrieval format: {metadata.get('format')!r}")
+    version = metadata.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != _TOP_LEVEL_METADATA_VERSION:
+        raise ValueError(
+            f"Cannot append to normalized retrieval bundle version {version!r} in {metadata_path}; "
+            f"supported version is {_TOP_LEVEL_METADATA_VERSION}. "
+            "Regenerate the bundle with a supported AutoModel version."
+        )
     if "sources" not in metadata:
         raise ValueError(
             f"Cannot append to legacy normalized bundle without top-level sources metadata: {metadata_path}"
@@ -705,8 +715,8 @@ def _prepare_single_normalized_dataset(
     )
     dataset_size = len(dataset) if hasattr(dataset, "__len__") else None
     metadata = {
-        "format": "nemo_automodel_normalized_vl_retrieval_arrow",
-        "version": 2,
+        "format": _NORMALIZED_RETRIEVAL_FORMAT,
+        "version": _SOURCE_METADATA_VERSION,
         "data_dir_list": data_dir_list,
         "dataset_size": dataset_size,
         "max_samples": max_samples,
@@ -897,8 +907,8 @@ def _finalize_normalized_sources(
         for source_idx, source_entry in enumerate(source_entries)
     ]
     metadata = {
-        "format": "nemo_automodel_normalized_vl_retrieval_arrow",
-        "version": 3,
+        "format": _NORMALIZED_RETRIEVAL_FORMAT,
+        "version": _TOP_LEVEL_METADATA_VERSION,
         "data_dir_list": data_dir_list,
         "num_records": sum(int(source["num_records"]) for source in source_metadata),
         "samples_per_shard": samples_per_shard,

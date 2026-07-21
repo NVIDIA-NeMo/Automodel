@@ -119,7 +119,8 @@ for example listing both `/path/to/normalized_vl_retrieval` and
 There are two supported workflows.
 
 The simplest workflow is to prepare the new source into a separate normalized bundle, then list both bundle roots in
-the training `data_dir_list`. This avoids modifying the existing bundle.
+the training `data_dir_list`. This avoids modifying the existing bundle and is the recommended approach when you need
+to reproduce earlier training runs from the same paths.
 
 If you want one shared bundle path, use append mode. Run prep with a config that contains only the new source(s), the
 same `OUT_DIR`, and `APPEND=1`:
@@ -134,6 +135,10 @@ tools/retrieval/submit_prepare_normalized_vl_retrieval_data_cpu.sh
 Append mode skips exact duplicate source entries already present in metadata. It stages each new source in a temporary
 directory and updates top-level metadata only after all new sources finish. It does not deduplicate documents across
 different sources, so do not re-list old sources under a modified path or config entry.
+
+Append changes the bundle's source composition. Once you use a bundle for a reproducible training run, treat that
+bundle as immutable or use separate bundles for later additions. When training loads normalized data, it logs the
+existing top-level and source metadata, including the format version, source list, record counts, and shard paths.
 
 ### Resume an Interrupted Preparation Run
 

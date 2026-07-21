@@ -186,6 +186,57 @@ def test_retrieval_tools_read_current_top_level_dataset_config(tmp_path):
     assert dataset_cfg["n_passages"] == 3
 
 
+@pytest.mark.parametrize("version", [1, 2, 3])
+def test_normalized_metadata_accepts_supported_versions_and_logs_contents(tmp_path, caplog, version):
+    metadata = {
+        "format": "nemo_automodel_normalized_vl_retrieval_arrow",
+        "version": version,
+        "num_records": 2,
+        "sources": [
+            {
+                "source_index": 0,
+                "source_key": "source-key",
+                "source_entry": "train.json",
+                "path": "sources/source-00000",
+                "num_records": 2,
+            }
+        ],
+    }
+    (tmp_path / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    with caplog.at_level("INFO", logger=nd.__name__):
+        loaded = nd._load_metadata(tmp_path)
+
+    assert loaded == metadata
+    assert f"path={tmp_path}" in caplog.text
+    assert json.dumps(metadata, sort_keys=True, separators=(",", ":")) in caplog.text
+
+
+@pytest.mark.parametrize("version", [None, True, "3", 4])
+def test_normalized_metadata_rejects_missing_or_unsupported_versions(tmp_path, version):
+    metadata = {"format": "nemo_automodel_normalized_vl_retrieval_arrow"}
+    if version is not None:
+        metadata["version"] = version
+    (tmp_path / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unsupported normalized retrieval format version.*Regenerate"):
+        nd._load_metadata(tmp_path)
+
+
+@pytest.mark.parametrize("version", [None, True, 3.0, "3", 4])
+def test_normalized_append_rejects_missing_or_unsupported_top_level_version(tmp_path, version):
+    metadata = {
+        "format": "nemo_automodel_normalized_vl_retrieval_arrow",
+        "sources": [],
+    }
+    if version is not None:
+        metadata["version"] = version
+    (tmp_path / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Cannot append to normalized retrieval bundle version.*Regenerate"):
+        prep_norm._load_top_level_metadata(tmp_path)
+
+
 def test_normalized_corpus_merge_deduplicates_equal_docs_and_rejects_conflicts():
     datasets = pytest.importorskip("datasets")
 
@@ -451,7 +502,7 @@ def test_warm_cache_launcher_exports_cache_before_python(tmp_path):
         assert job_script.index(export_line) < python_index
 
 
-def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_path, monkeypatch):
+def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_path, monkeypatch, caplog):
     pytest.importorskip("datasets")
     pytest.importorskip("datasets.arrow_writer")
     image_mod = pytest.importorskip("PIL.Image")
@@ -515,16 +566,20 @@ def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_p
     assert (output_dir / "metadata.json").is_file()
     source_dir = output_dir / "sources" / "source-00000"
     source_metadata = json.loads((source_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert source_metadata["version"] == 2
     assert source_metadata["train_shards"] == ["train/train-00000.arrow"]
     assert source_metadata["corpora"][0]["num_docs"] == 3
 
-    dataset = nd.make_normalized_retrieval_dataset(
-        data_dir_list=str(output_dir),
-        n_passages=2,
-        use_dataset_instruction=True,
-    )
+    with caplog.at_level("INFO", logger=nd.__name__):
+        dataset = nd.make_normalized_retrieval_dataset(
+            data_dir_list=str(output_dir),
+            n_passages=2,
+            use_dataset_instruction=True,
+        )
 
     assert len(dataset) == 2
+    assert f"path={output_dir}" in caplog.text
+    assert f"path={source_dir}" in caplog.text
     example = dataset[0]
     assert example["question"] == "Q"
     assert example["doc_text"] == ["positive", "negative"]
