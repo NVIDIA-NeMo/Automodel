@@ -415,6 +415,9 @@ class BiEncoderModel(nn.Module):
         effective_task = cls._TASK if cls._TASK is not None else task
         if effective_task is None:
             raise ValueError("task must be specified when calling build()")
+
+        # Explicit model-specific optimizations are a strict contract: fail if they cannot be applied rather than
+        # silently training with a different backend. Generic Liger and SDPA patches remain best-effort fallbacks.
         if use_te_fused_mlp and not use_custom_llama_backend:
             raise ValueError("use_te_fused_mlp requires use_custom_llama_backend=True")
         if use_te_fused_qkv and not use_custom_llama_backend:
