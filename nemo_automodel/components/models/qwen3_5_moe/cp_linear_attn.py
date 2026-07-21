@@ -26,6 +26,8 @@ When no CP mesh is set, the module delegates to the original HF forward.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -35,6 +37,9 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGated
 
 from nemo_automodel.components.models.common.packing import get_unpad_data, is_indexed_packed_mask
 from nemo_automodel.shared.utils import dtype_from_str
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.blockdiag_cp import BlockdiagCpModelState
 
 
 class _AllGatherConcatFn(Function):
@@ -324,6 +329,29 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         indices: torch.Tensor | None = None,
         seq_index: torch.Tensor | None = None,
     ):
+        """Run GatedDeltaNet with dense, round-robin CP, or packed contiguous CP.
+
+        Args:
+            hidden_states: Hidden states of shape ``[batch, sequence, hidden]``;
+                under CP, ``sequence`` is this rank's local shard.
+            cache_params: Optional Hugging Face recurrent cache.
+            cache_position: Optional token positions of shape ``[sequence]``.
+            attention_mask: Optional validity or document mask of shape
+                ``[batch, sequence]``.
+            position_ids: Optional positions of shape ``[batch, sequence]`` or
+                ``[axes, batch, sequence]``.
+            qkv_format: Optional attention layout tag; unused by this module.
+            cu_seqlens: Optional packed boundaries of shape
+                ``[num_documents + 1]`` for the non-CP path.
+            indices: Optional valid-token indices of shape ``[tokens]`` for the
+                non-CP packed path.
+            seq_index: Optional global token positions of shape ``[sequence]``
+                or ``[batch, sequence]`` for round-robin CP restoration.
+
+        Returns:
+            Hidden states of shape ``[batch, sequence, hidden]`` in the same
+            local sequence layout as ``hidden_states``.
+        """
         # Fast path: no CP → run HF forward with fp32-safe gate computation.
         if self._cp_mesh is None or self._cp_mesh.size() <= 1:
             return self._forward_no_cp(
@@ -503,7 +531,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         *,
         position_ids: torch.Tensor | None,
         seq_index: torch.Tensor | None,
-        blockdiag_state: dict | None = None,
+        blockdiag_state: BlockdiagCpModelState | None = None,
     ) -> torch.Tensor:
         """Run FLA GatedDeltaNet over a context-parallel sequence shard.
 
@@ -518,9 +546,9 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             seq_index: Optional global token indices of shape
                 ``[local_sequence]`` or ``[batch, local_sequence]`` for the
                 round-robin layout.
-            blockdiag_state: Optional packed CP state. Its ``doc_ids`` tensor has
-                shape ``[batch, global_sequence]`` and its packed cumulative
-                lengths reset conv/GDN recurrence at document boundaries.
+            blockdiag_state: Optional packed CP state whose cumulative-length
+                tensors have shape ``[num_documents + 1]`` and reset conv/GDN
+                recurrence at document boundaries.
 
         Returns:
             Local GatedDeltaNet output of shape ``[batch, local_sequence,
@@ -532,7 +560,7 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         batch_size, seq_len, _ = hidden_states.shape
 
         cp_size = self._cp_mesh.size()
-        cp_group = blockdiag_state["group"] if blockdiag_state is not None else self._cp_mesh.get_group()
+        cp_group = blockdiag_state.group if blockdiag_state is not None else self._cp_mesh.get_group()
         group_size = dist.get_world_size(cp_group)
         if group_size != cp_size:
             raise RuntimeError(
@@ -557,12 +585,12 @@ class CPAwareGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         # contiguous chunk of a dense global sequence of length seq_len * cp_size.
         global_seq_len = seq_len * cp_size
         if uses_contiguous_layout:
-            cu_seqlens = blockdiag_state["packed_cu_seqlens"]
+            cu_seqlens = blockdiag_state.packed_cu_seqlens
             cp_context = build_cp_context(
                 cu_seqlens=cu_seqlens,
                 group=cp_group,
                 conv1d_kernel_size=self.conv_kernel_size,
-                cu_seqlens_cpu=blockdiag_state["packed_cu_seqlens_cpu"],
+                cu_seqlens_cpu=blockdiag_state.packed_cu_seqlens_cpu,
             )
         else:
             cu_seqlens_single = torch.tensor(
