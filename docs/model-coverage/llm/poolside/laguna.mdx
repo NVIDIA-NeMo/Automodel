@@ -1,0 +1,37 @@
+---
+title: "Laguna"
+description: ""
+---
+[Laguna](https://huggingface.co/poolsideai) is Poolside's hybrid-attention MoE language model family. The Automodel implementation targets full SFT with expert parallelism for large Laguna checkpoints such as the local MistyBasin dump.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Text Generation (MoE, hybrid attention) |
+| **Architecture** | `LagunaForCausalLM` |
+| **Parameters** | 100B+ total for the MistyBasin checkpoint |
+| **HF Org** | [poolsideai](https://huggingface.co/poolsideai) |
+
+</Info>
+
+## Architecture
+
+- `LagunaForCausalLM`
+- Layer-specific attention head counts, QK RMSNorm, and softplus attention output gating.
+- Full and sliding-window attention layers can use separate RoPE settings.
+- MoE blocks use `nemo_automodel.components.moe.layers.MoE` with sigmoid routing, top-k probability normalization, fp32 gate compute, correction bias loading, one shared expert, and grouped expert weights for EP.
+
+## Example Recipes
+
+| Recipe | Description |
+|---|---|
+| [mistybasin_hellaswag_ep16.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/laguna/mistybasin_hellaswag_ep16.yaml) | SFT — MistyBasin Laguna on HellaSwag with EP16 |
+
+## Run the Recipe
+
+```bash
+uv run automodel --nproc-per-node=8 examples/llm_finetune/laguna/mistybasin_hellaswag_ep16.yaml
+```
+
+For multi-node launches, submit through your cluster launcher with two 8-GPU nodes for the default `ep_size: 16`.
