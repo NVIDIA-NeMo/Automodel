@@ -62,8 +62,15 @@ def _tiny_config() -> LagunaConfig:
     return cfg
 
 
+def _dense_tiny_config() -> LagunaConfig:
+    cfg = _tiny_config()
+    cfg.mlp_layer_types = ["dense", "dense"]
+    cfg.mlp_only_layers = [0, 1]
+    return cfg
+
+
 def test_laguna_forward_tiny_config():
-    model = LagunaForCausalLM(_tiny_config(), backend=_backend())
+    model = LagunaForCausalLM(_dense_tiny_config(), backend=_backend())
     model.eval()
 
     input_ids = torch.tensor([[1, 2, 3, 4]])
