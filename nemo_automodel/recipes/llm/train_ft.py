@@ -1303,7 +1303,32 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
 
-            for batch in val_dataloader:
+            # Keep every rank in lockstep over validation batches. The MoE expert
+            # forward issues collectives over the EP group; with uneven per-rank
+            # validation shard sizes, ranks would issue those collectives a
+            # different number of times and deadlock (observed at end-of-training
+            # validation on EP MoE models). Drive the loop by a global-MIN
+            # "does every rank still have a batch?" all-reduce so all ranks run
+            # exactly the same number of forwards (= global-min batch count).
+            # ``len(dataloader)`` is not relied upon (StatefulDataLoader may not
+            # define it).
+            dist_active = torch.distributed.is_available() and torch.distributed.is_initialized()
+            val_iter = iter(val_dataloader)
+            while True:
+                try:
+                    batch = next(val_iter)
+                    has_batch = 1
+                except StopIteration:
+                    batch = None
+                    has_batch = 0
+                if dist_active:
+                    flag = torch.tensor(has_batch, dtype=torch.long, device=self.dist_env.device)
+                    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+                    if int(flag.item()) == 0:
+                        break
+                elif has_batch == 0:
+                    break
+
                 loss_buffer = []
                 num_label_tokens = (batch["labels"] != -100).sum().item()
                 self._forward_backward_step(
@@ -1546,8 +1571,28 @@ def main(config_path=None):
         config_path = pathlib.Path(__file__).parent.resolve() / "llama_3_2_1b_hellaswag.yaml"
     cfg = parse_args_and_load_config(config_path)
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    trainer.setup()
-    trainer.run_train_validation_loop()
+    try:
+        trainer.setup()
+        trainer.run_train_validation_loop()
+    finally:
+        # Tear down the distributed process group so the process exits cleanly.
+        # Without this, NCCL/the elastic agent waits on the still-initialized
+        # group and the run hangs at shutdown after the final step.
+        _destroy_process_group_if_initialized()
+
+
+def _destroy_process_group_if_initialized() -> None:
+    """Best-effort barrier + ``destroy_process_group`` so ranks exit together."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return
+    try:
+        torch.distributed.barrier()
+    except Exception as exc:  # a rank may have already exited; destroy anyway
+        logger.warning("Barrier before process-group teardown failed: %s", exc)
+    try:
+        torch.distributed.destroy_process_group()
+    except Exception as exc:
+        logger.warning("destroy_process_group failed during teardown: %s", exc)
 
 
 if __name__ == "__main__":

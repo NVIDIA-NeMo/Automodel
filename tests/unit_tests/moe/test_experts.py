@@ -759,7 +759,10 @@ class TestGroupedExpertsDeepEP:
             assert hasattr(experts, "token_dispatcher")
             assert experts.ep_size == 2
             assert experts.ep_rank == 0
-            mock_init_buffer.assert_called_once_with(mock_mesh.get_group.return_value)
+            # The DeepEP NVSHMEM buffer is allocated lazily (in FusedDispatch.forward),
+            # not eagerly in init_token_dispatcher — the revert that fixed the single-node
+            # load-time OOM. So init_token_dispatcher must NOT call _init_deepep_buffer.
+            mock_init_buffer.assert_not_called()
 
     def test_grouped_experts_deepep_apply_bias_no_bias(self, moe_config):
         """Test _apply_bias method with no bias."""
