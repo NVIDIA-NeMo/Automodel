@@ -110,7 +110,3 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-
-ci:
-  nodes: 32
-  time: "00:30:00"
