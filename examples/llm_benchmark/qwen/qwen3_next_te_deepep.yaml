@@ -60,6 +60,13 @@ distributed:
 
   moe:
     reshard_after_forward: false
+    # fake_balanced_gate (below) routes deterministically, so the MoE router output is
+    # identical on the activation-checkpointing backward recompute. Recompute it
+    # (ignore_router_for_ac: false) rather than saving it: the selective-checkpointing
+    # path that saves the router is slower for this HybridEP + grouped-expert config, and
+    # saving is unnecessary when routing is deterministic. Keeps the default (true, which
+    # avoids a CheckpointError when routing can differ on recompute) for real-gate recipes.
+    ignore_router_for_ac: false
 
 dist_env:
   backend: nccl
