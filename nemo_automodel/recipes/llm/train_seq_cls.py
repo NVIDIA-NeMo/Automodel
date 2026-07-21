@@ -210,8 +210,7 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
-        self._finalize_pending_checkpoint()
-        self.checkpointer.close()
+        self._finalize_and_close_checkpointer()
 
     def _run_train_optim_step(self, batches):
         model = self.model_parts[0]

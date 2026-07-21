@@ -38,7 +38,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     load_hf_safetensors_state_dict,
     save_config,
 )
-from nemo_automodel.components.checkpoint.utils import _find_latest_checkpoint, _resolve_restore_from_to_ckpt_dir
+from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import (
     build_eagle3_dataloader,
@@ -1556,7 +1556,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         ckpt_root = self.checkpoint_config.checkpoint_dir
 
         if restore_from:
-            ckpt_dir = _resolve_restore_from_to_ckpt_dir(ckpt_root, restore_from)
+            ckpt_dir = resolve_restore_from_to_checkpoint_dir(ckpt_root, restore_from)
             if ckpt_dir is None:
                 if is_rank_0:
                     logger.warning("restore_from='LATEST' but no checkpoint found in %s", ckpt_root)
@@ -1564,7 +1564,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             if not os.path.isdir(ckpt_dir):
                 raise FileNotFoundError(f"Checkpoint directory does not exist: {ckpt_dir}")
         else:
-            auto = _find_latest_checkpoint(ckpt_root)
+            auto = find_latest_checkpoint(ckpt_root)
             if auto is None:
                 return
             ckpt_dir = str(auto)

@@ -134,7 +134,7 @@ def _resolve_checkpoint_pointer_target(ckpt_root: Path, raw_target: str) -> Path
     return Path(os.path.abspath(target))
 
 
-def _read_checkpoint_pointer(ckpt_root: str | Path, link_name: str) -> Path | None:
+def read_checkpoint_pointer(ckpt_root: str | Path, link_name: str) -> Path | None:
     """Resolve a checkpoint pointer symlink or fallback text file."""
     root = Path(ckpt_root)
     link_path = root / link_name
@@ -161,7 +161,7 @@ def _checkpoint_contains_target(checkpoint: Path, target: Path) -> bool:
     return target_abs == checkpoint_abs or checkpoint_abs in target_abs.parents
 
 
-def _read_checkpoint_metric(checkpoint: Path, metric_key: str | None) -> float | None:
+def read_checkpoint_metric(checkpoint: Path, metric_key: str | None) -> float | None:
     """Read a validation metric from checkpoint loss metadata."""
     try:
         with open(checkpoint / "losses.json", "r") as f:
@@ -193,7 +193,7 @@ def _is_checkpoint_pointer_text_file(path: Path, mode: int) -> bool:
     return stat.S_ISREG(mode) and path.suffix == ".txt" and path.stem.isupper()
 
 
-def _find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path]) -> set[Path]:
+def find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path]) -> set[Path]:
     """Return checkpoints targeted by top-level symlinks or symlink fallback text files."""
     protected = set()
     if not ckpt_root.exists():
@@ -219,7 +219,7 @@ def _find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path]
     return protected
 
 
-def _resolve_restore_from_to_ckpt_dir(checkpoint_dir: str, restore_from: str) -> str | None:
+def resolve_restore_from_to_checkpoint_dir(checkpoint_dir: str | Path, restore_from: str) -> str | None:
     """
     Resolve restore_from to a checkpoint directory.
 
@@ -229,11 +229,11 @@ def _resolve_restore_from_to_ckpt_dir(checkpoint_dir: str, restore_from: str) ->
     """
     # Handle checkpoint-root pointers such as LATEST and LOWEST_VAL.
     if os.path.sep not in restore_from and not os.path.isabs(restore_from):
-        pointed_checkpoint = _read_checkpoint_pointer(checkpoint_dir, restore_from)
+        pointed_checkpoint = read_checkpoint_pointer(checkpoint_dir, restore_from)
         if pointed_checkpoint is not None and pointed_checkpoint.is_dir():
             return os.fspath(pointed_checkpoint)
     if restore_from.upper() == "LATEST":
-        return _find_latest_checkpoint(checkpoint_dir)
+        return find_latest_checkpoint(checkpoint_dir)
 
     # If restore_from is just a directory name (no path separator), treat it as
     # relative to checkpoint_dir. Otherwise use as-is (absolute or relative path).
@@ -242,7 +242,7 @@ def _resolve_restore_from_to_ckpt_dir(checkpoint_dir: str, restore_from: str) ->
     return restore_from
 
 
-def _format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str, resolved_ckpt_dir: str) -> str:
+def format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str, resolved_ckpt_dir: str) -> str:
     """Format a helpful error message for a missing checkpoint directory."""
     error_msg = [
         f"\n{'=' * 80}",
@@ -272,7 +272,7 @@ def _format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str,
     return "\n".join(error_msg)
 
 
-def _find_latest_checkpoint(checkpoint_dir):
+def find_latest_checkpoint(checkpoint_dir: str | Path) -> str | Path | None:
     """
     Resolve the most recent checkpoint directory.
 
@@ -287,7 +287,7 @@ def _find_latest_checkpoint(checkpoint_dir):
     if not root.exists():
         return
 
-    latest = _read_checkpoint_pointer(root, "LATEST")
+    latest = read_checkpoint_pointer(root, "LATEST")
     if latest is not None and latest.is_dir():
         return os.fspath(latest)
 

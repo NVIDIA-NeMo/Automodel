@@ -21,6 +21,7 @@ calls this once at the end to wait the write and flush the deferred symlinks.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
@@ -92,3 +93,20 @@ def test_finalize_is_noop_without_checkpointer():
     r = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
     # No checkpointer attribute at all (e.g. checkpointing never set up).
     r._finalize_pending_checkpoint()  # must not raise
+
+
+def test_finalize_and_close_closes_checkpointer_when_finalization_fails():
+    events = []
+    r = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    r.checkpointer = SimpleNamespace(close=lambda: events.append("close"))
+
+    def fail_finalize():
+        events.append("finalize")
+        raise RuntimeError("publication failed")
+
+    r._finalize_pending_checkpoint = fail_finalize
+
+    with pytest.raises(RuntimeError, match="publication failed"):
+        r._finalize_and_close_checkpointer()
+
+    assert events == ["finalize", "close"]

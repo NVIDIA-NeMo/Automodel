@@ -45,7 +45,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     save_config,
 )
-from nemo_automodel.components.checkpoint.utils import _find_latest_checkpoint, _resolve_restore_from_to_ckpt_dir
+from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -666,7 +666,7 @@ class TrainDFlashRecipe(BaseRecipe):
         ckpt_root = self.checkpoint_config.checkpoint_dir
 
         if restore_from:
-            ckpt_dir = _resolve_restore_from_to_ckpt_dir(ckpt_root, restore_from)
+            ckpt_dir = resolve_restore_from_to_checkpoint_dir(ckpt_root, restore_from)
             if ckpt_dir is None:
                 if is_rank_0:
                     logger.warning("restore_from='LATEST' but no checkpoint found in %s", ckpt_root)
@@ -674,7 +674,7 @@ class TrainDFlashRecipe(BaseRecipe):
             if not os.path.isdir(ckpt_dir):
                 raise FileNotFoundError(f"Checkpoint directory does not exist: {ckpt_dir}")
         else:
-            auto = _find_latest_checkpoint(ckpt_root)
+            auto = find_latest_checkpoint(ckpt_root)
             if auto is None:
                 return
             ckpt_dir = str(auto)
@@ -981,10 +981,7 @@ class TrainDFlashRecipe(BaseRecipe):
                     self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
 
             self._maybe_save_final_checkpoint(self.num_epochs)
-            self._finalize_pending_checkpoint()
-            checkpointer = getattr(self, "checkpointer", None)
-            if checkpointer is not None:
-                checkpointer.close()
+            self._finalize_and_close_checkpointer()
         finally:
             if pbar is not None:
                 pbar.close()

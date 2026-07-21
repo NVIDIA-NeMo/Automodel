@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.checkpoint.utils import _find_latest_checkpoint, _read_checkpoint_pointer
+from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, read_checkpoint_pointer
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.recipes.base_recipe import BaseRecipe, is_distributed_stateful
@@ -254,7 +254,7 @@ def test_find_latest_checkpoint(tmp_path):
     (tmp_path / "epoch_3_step_5").mkdir()
     (tmp_path / "misc").mkdir()  # should be ignored
 
-    latest = _find_latest_checkpoint(tmp_path)
+    latest = find_latest_checkpoint(tmp_path)
     assert latest is not None
     assert latest.name == "step_20", "Did not pick the highest step directory"
 
@@ -938,7 +938,7 @@ def test_checkpoint_retention_pointer_scan_failure_skips_pruning(tmp_path, monke
     def fail_pointer_scan(_ckpt_root, _checkpoints):
         raise OSError("pointer scan failed")
 
-    monkeypatch.setattr("nemo_automodel.recipes.base_recipe._find_pointer_protected_checkpoints", fail_pointer_scan)
+    monkeypatch.setattr("nemo_automodel.recipes.base_recipe.find_pointer_protected_checkpoints", fail_pointer_scan)
     with caplog.at_level(logging.WARNING):
         recipe_inst._prune_old_checkpoints()
 
@@ -988,7 +988,7 @@ def test_non_finite_restored_best_metric_does_not_block_future_best(tmp_path, no
 
     recipe_inst._update_best_symlink(str(new_checkpoint), 0.5, "val_loss")
 
-    assert _read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == new_checkpoint
+    assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == new_checkpoint
     assert recipe_inst._best_val_loss == 0.5
 
 
@@ -1005,7 +1005,7 @@ def test_malformed_restored_best_metric_does_not_block_future_best(tmp_path, mal
 
     recipe_inst._update_best_symlink(str(new_checkpoint), 0.5, "val_loss")
 
-    assert _read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == new_checkpoint
+    assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == new_checkpoint
     assert recipe_inst._best_val_loss == 0.5
 
 
@@ -1021,7 +1021,7 @@ def test_non_utf8_restored_best_metric_does_not_block_future_best(tmp_path):
 
     recipe_inst._update_best_symlink(str(new_checkpoint), 0.5, "val_loss")
 
-    assert _read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == new_checkpoint
+    assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == new_checkpoint
     assert recipe_inst._best_val_loss == 0.5
 
 
@@ -1037,7 +1037,7 @@ def test_non_finite_live_metric_does_not_replace_best_pointer(tmp_path, non_fini
 
     recipe_inst._update_best_symlink(str(new_checkpoint), non_finite_value, "val_loss")
 
-    assert _read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == old_checkpoint
+    assert read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == old_checkpoint
     assert recipe_inst._best_val_loss == 0.5
 
 
@@ -1061,7 +1061,7 @@ def test_checkpoint_pointer_replace_failure_preserves_existing_target(tmp_path, 
     with pytest.raises(OSError, match="filesystem full"):
         recipe_inst._update_checkpoint_symlink("LATEST", str(new_checkpoint))
 
-    assert _read_checkpoint_pointer(tmp_path, "LATEST") == old_checkpoint
+    assert read_checkpoint_pointer(tmp_path, "LATEST") == old_checkpoint
     assert not list(tmp_path.glob(".LATEST.*.tmp"))
 
 

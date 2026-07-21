@@ -45,13 +45,13 @@ except ImportError:
 
 from nemo_automodel.components.checkpoint.checkpointing import save_config
 from nemo_automodel.components.checkpoint.utils import (
-    _find_latest_checkpoint,
-    _find_pointer_protected_checkpoints,
-    _format_missing_checkpoint_dir_error,
-    _read_checkpoint_metric,
-    _read_checkpoint_pointer,
-    _resolve_restore_from_to_ckpt_dir,
+    find_latest_checkpoint,
+    find_pointer_protected_checkpoints,
+    format_missing_checkpoint_dir_error,
     list_automodel_checkpoints,
+    read_checkpoint_metric,
+    read_checkpoint_pointer,
+    resolve_restore_from_to_checkpoint_dir,
 )
 from nemo_automodel.components.config.loader import ConfigNode, config_to_yaml_str
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
@@ -465,6 +465,16 @@ class BaseRecipe:
         async_wait()
         self._complete_pending_checkpoint()
 
+    def _finalize_and_close_checkpointer(self) -> None:
+        """Finalize pending checkpoint publication and always close the checkpointer."""
+        checkpointer = getattr(self, "checkpointer", None)
+        if checkpointer is None:
+            return
+        try:
+            self._finalize_pending_checkpoint()
+        finally:
+            checkpointer.close()
+
     def _update_checkpoint_symlink(self, link_name: str, target_dir: str) -> None:
         """
         Create or update a symlink named `link_name` under the checkpoint root
@@ -515,7 +525,7 @@ class BaseRecipe:
 
     def _remove_stale_checkpoint_pointer(self, link_name: str) -> None:
         """Remove a checkpoint pointer when its target no longer exists."""
-        target = _read_checkpoint_pointer(self.checkpointer.config.checkpoint_dir, link_name)
+        target = read_checkpoint_pointer(self.checkpointer.config.checkpoint_dir, link_name)
         if target is not None and not target.is_dir():
             self._remove_checkpoint_pointer(link_name)
 
@@ -528,7 +538,7 @@ class BaseRecipe:
         ckpt_root = Path(self.checkpointer.config.checkpoint_dir)
         checkpoints = list_automodel_checkpoints(ckpt_root)
         try:
-            protected_checkpoints = _find_pointer_protected_checkpoints(ckpt_root, checkpoints)
+            protected_checkpoints = find_pointer_protected_checkpoints(ckpt_root, checkpoints)
         except (OSError, UnicodeError):
             logger.warning("Failed to scan checkpoint pointers in %s; skipping pruning", ckpt_root, exc_info=True)
             return
@@ -551,10 +561,10 @@ class BaseRecipe:
         """Initialize best validation loss from the existing LOWEST_VAL pointer after resume."""
         if self._best_val_loss != float("inf"):
             return
-        target = _read_checkpoint_pointer(self.checkpointer.config.checkpoint_dir, "LOWEST_VAL")
+        target = read_checkpoint_pointer(self.checkpointer.config.checkpoint_dir, "LOWEST_VAL")
         if target is None or not target.is_dir():
             return
-        existing_best = _read_checkpoint_metric(target, metric_key)
+        existing_best = read_checkpoint_metric(target, metric_key)
         if existing_best is not None:
             self._best_val_loss = existing_best
 
@@ -591,7 +601,7 @@ class BaseRecipe:
 
         # Build helpful error message on rank 0
         if is_rank_0:
-            error_msg = _format_missing_checkpoint_dir_error(
+            error_msg = format_missing_checkpoint_dir_error(
                 checkpoint_dir=self.checkpointer.config.checkpoint_dir,
                 restore_from=restore_from,
                 resolved_ckpt_dir=ckpt_dir,
@@ -655,7 +665,7 @@ class BaseRecipe:
         is_rank_0 = _is_rank_0()
 
         if restore_from:
-            ckpt_dir = _resolve_restore_from_to_ckpt_dir(self.checkpointer.config.checkpoint_dir, restore_from)
+            ckpt_dir = resolve_restore_from_to_checkpoint_dir(self.checkpointer.config.checkpoint_dir, restore_from)
             if ckpt_dir is None:
                 # LATEST keyword with no checkpoints found
                 if is_rank_0:
@@ -667,7 +677,7 @@ class BaseRecipe:
             self._validate_checkpoint_dir_exists(ckpt_dir, restore_from=restore_from, is_rank_0=is_rank_0)
         else:
             # Auto-detect latest checkpoint
-            ckpt_dir = _find_latest_checkpoint(self.checkpointer.config.checkpoint_dir)
+            ckpt_dir = find_latest_checkpoint(self.checkpointer.config.checkpoint_dir)
             if ckpt_dir is None:
                 return
             ckpt_dir = str(ckpt_dir)
