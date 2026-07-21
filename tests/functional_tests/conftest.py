@@ -148,6 +148,7 @@ _BOOLEAN_OVERRIDES = [
     "check_source_load_parity",
     "check_resume",
     "hf_device_map_auto",
+    "hf_source_post_load_dequantize",
 ]
 
 

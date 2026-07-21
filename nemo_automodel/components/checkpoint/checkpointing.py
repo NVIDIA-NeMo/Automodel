@@ -19,6 +19,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -286,23 +287,33 @@ class _AsyncSaveContext:
     staging_active: bool = False
 
 
-def _uses_deferred_consolidation(config: CheckpointingConfig) -> bool:
-    """Whether async saves defer distributed HF consolidation to a background thread."""
-    return (
-        config.is_async
-        and not config.single_rank_consolidation
-        and _should_write_consolidated_safetensors(config, is_final_checkpoint=True)
-    )
-
-
 def _new_gloo_process_group(
     process_group: torch.distributed.ProcessGroup | None,
+    timeout: timedelta | None = None,
 ) -> torch.distributed.ProcessGroup:
-    """Create a Gloo group with the same membership as ``process_group``."""
+    """Create a Gloo group with the same membership as ``process_group``.
+
+    Args:
+        process_group: Source process group whose membership should be preserved.
+        timeout: Optional timeout for operations executed on the new group.
+
+    Returns:
+        The newly created Gloo process group.
+    """
     if process_group is None:
+        if timeout is not None:
+            return torch.distributed.new_group(backend="gloo", timeout=timeout)
         return torch.distributed.new_group(backend="gloo")
+    ranks = torch.distributed.get_process_group_ranks(process_group)
+    if timeout is not None:
+        return torch.distributed.new_group(
+            ranks=ranks,
+            backend="gloo",
+            timeout=timeout,
+            use_local_synchronization=True,
+        )
     return torch.distributed.new_group(
-        ranks=torch.distributed.get_process_group_ranks(process_group),
+        ranks=ranks,
         backend="gloo",
         use_local_synchronization=True,
     )
@@ -414,6 +425,7 @@ class Checkpointer:
         pp_rank: int,
         moe_mesh: Optional[DeviceMesh] = None,
         process_group: torch.distributed.ProcessGroup | None = None,
+        pp_group: Optional["torch.distributed.ProcessGroup"] = None,
     ) -> None:
         """
         Initialize the checkpointer.
@@ -425,9 +437,13 @@ class Checkpointer:
             pp_rank: Pipeline parallel rank for the current process.
             moe_mesh: Optional device mesh used for MoE when adapting state dicts.
             process_group: Process group used for distributed checkpoint collectives.
+            pp_group: Optional pipeline-parallel process group. Passed to
+                ``ModelState`` so PEFT adapters are gathered across PP stages at
+                save time (complete adapter under ``pp_size > 1``).
         """
         self.config = config
         self.moe_mesh = moe_mesh
+        self.pp_group = pp_group
         self.dp_rank = dp_rank
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
@@ -436,20 +452,27 @@ class Checkpointer:
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
         self._optim_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
+        self._consolidation_process_group = None
         if self.config.is_async:
             self._model_ctx.stager = DefaultStager()
             self._optim_ctx.stager = DefaultStager()
             self._model_ctx.process_group = _new_gloo_process_group(process_group)
             self._optim_ctx.process_group = _new_gloo_process_group(process_group)
-
-        # Deferred consolidation runs on a background thread once the async upload
-        # completes; its collectives need a dedicated Gloo group so they never
-        # interleave with training collectives issued from the main thread.
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=process_group) > 1
+            and _should_write_hf_metadata(self.config)
+            and self.config.save_consolidated != SaveConsolidatedMode.FALSE
+            and not self.config.single_rank_consolidation
+        ):
+            # Every rank evaluates the same config-owned condition and must create
+            # process groups in the same order.
+            self._consolidation_process_group = _new_gloo_process_group(
+                process_group,
+                timeout=timedelta(minutes=self.config.consolidation_timeout_minutes),
+            )
         self._consolidation_thread: threading.Thread | None = None
         self._consolidation_error: BaseException | None = None
-        self._consolidation_pg: torch.distributed.ProcessGroup | None = None
-        if _uses_deferred_consolidation(self.config) and torch.distributed.is_initialized():
-            self._consolidation_pg = _new_gloo_process_group(process_group)
 
         self._addons = []
         if _should_write_hf_metadata(self.config):
@@ -502,8 +525,11 @@ class Checkpointer:
         defer_consolidation = (
             should_write_consolidated and self.config.is_async and not self.config.single_rank_consolidation
         )
+        consolidation_process_group = (
+            self._consolidation_process_group if self._consolidation_process_group is not None else self.process_group
+        )
 
-        model_state = ModelState(model, self.config.is_peft)
+        model_state = ModelState(model, self.config.is_peft, pp_group=self.pp_group)
         state_dict = model_state.state_dict()
 
         # Convert to HF format if using custom model implementations.
@@ -539,7 +565,7 @@ class Checkpointer:
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 original_model_path=self._get_original_model_path(model_state),
                 v4_compatible=self.config.v4_compatible,
-                process_group=self.process_group,
+                process_group=consolidation_process_group,
             )
         self._maybe_write_offline_consolidation_script(model_dir)
 
@@ -556,7 +582,7 @@ class Checkpointer:
             addon.post_save(
                 consolidated_path=consolidated_dir,
                 hf_metadata_path=hf_metadata_dir,
-                process_group=self.process_group,
+                process_group=consolidation_process_group,
             )
 
         if consolidate_on_all_ranks:
@@ -568,7 +594,7 @@ class Checkpointer:
                 use_staging=self.config.staging_dir is not None,
                 staging_dir=self.config.staging_dir,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
-                process_group=self.process_group,
+                process_group=consolidation_process_group,
             )
             if self.config.diffusers_compatible:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -1159,7 +1185,11 @@ class Checkpointer:
                     use_staging=self.config.staging_dir is not None,
                     staging_dir=self.config.staging_dir,
                     fqn_to_dtype_mapping=fqn_to_dtype_mapping,
-                    process_group=self._consolidation_pg,
+                    process_group=(
+                        self._consolidation_process_group
+                        if self._consolidation_process_group is not None
+                        else self.process_group
+                    ),
                 )
                 if self.config.diffusers_compatible and is_rank_0():
                     _maybe_rename_index_for_diffusers(consolidated_dir)
@@ -1251,14 +1281,15 @@ class Checkpointer:
             self._model_ctx.stager.close()
         if self._optim_ctx.stager is not None:
             self._optim_ctx.stager.close()
+        consolidation_process_group = self._consolidation_process_group
+        self._consolidation_process_group = None
         if torch.distributed.is_initialized():
             for context in (self._model_ctx, self._optim_ctx):
                 if context.process_group is not None:
                     torch.distributed.destroy_process_group(context.process_group)
                     context.process_group = None
-            if self._consolidation_pg is not None:
-                torch.distributed.destroy_process_group(self._consolidation_pg)
-                self._consolidation_pg = None
+            if consolidation_process_group is not None:
+                torch.distributed.destroy_process_group(consolidation_process_group)
 
     def _do_load(
         self,

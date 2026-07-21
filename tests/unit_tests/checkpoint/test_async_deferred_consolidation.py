@@ -110,7 +110,7 @@ class TestAsyncDeferredConsolidation:
         assert kwargs["input_dir"] == str(tmp_path / "step_1" / "model")
         assert kwargs["output_dir"] == str(tmp_path / "step_1" / "model" / "consolidated")
         assert kwargs["fqn_to_index_mapping"] == {"w": 1}
-        assert kwargs["process_group"] is checkpointer._consolidation_pg
+        assert kwargs["process_group"] is checkpointer._consolidation_process_group
         assert checkpointer._consolidation_thread is None
 
     @patch("nemo_automodel.components.checkpoint.checkpointing.consolidate_safetensors_files_on_every_rank")
@@ -235,8 +235,8 @@ class TestAsyncDeferredConsolidation:
         assert mock_dcp.async_save.call_args.kwargs["async_stager"] is stager
 
 
-class TestConsolidationProcessGroupCreation:
-    """__init__ creates the dedicated Gloo group only when deferred consolidation can run."""
+class TestAsyncConsolidationProcessGroupCreation:
+    """Async checkpointing creates the timeout-protected consolidation group when needed."""
 
     def _make_config(self, **overrides):
         config = CheckpointingConfig(
@@ -257,6 +257,7 @@ class TestConsolidationProcessGroupCreation:
         sentinel = MagicMock(name="gloo_pg")
         with (
             patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
             patch(
                 "nemo_automodel.components.checkpoint.checkpointing._new_gloo_process_group",
                 return_value=sentinel,
@@ -268,15 +269,15 @@ class TestConsolidationProcessGroupCreation:
 
     def test_created_for_async_final_consolidation(self):
         checkpointer, sentinel = self._build(self._make_config(save_consolidated="final"))
-        assert checkpointer._consolidation_pg is sentinel
+        assert checkpointer._consolidation_process_group is sentinel
 
     def test_not_created_when_consolidation_disabled(self):
         checkpointer, _ = self._build(self._make_config(save_consolidated="false"))
-        assert checkpointer._consolidation_pg is None
+        assert checkpointer._consolidation_process_group is None
 
     def test_not_created_for_single_rank_consolidation(self):
         checkpointer, _ = self._build(self._make_config(single_rank_consolidation=True))
-        assert checkpointer._consolidation_pg is None
+        assert checkpointer._consolidation_process_group is None
 
     def test_not_created_without_distributed(self):
         config = self._make_config()
@@ -289,14 +290,7 @@ class TestConsolidationProcessGroupCreation:
             patch("nemo_automodel.components.checkpoint.checkpointing.DefaultStager", MagicMock()),
         ):
             checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-        assert checkpointer._consolidation_pg is None
-
-    def test_not_created_in_sync_mode(self):
-        config = self._make_config()
-        config.is_async = False
-        with patch("torch.distributed.is_initialized", return_value=True):
-            checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
-        assert checkpointer._consolidation_pg is None
+        assert checkpointer._consolidation_process_group is None
 
     def test_close_destroys_consolidation_group(self):
         checkpointer, consolidation_pg = self._build(self._make_config())
@@ -310,4 +304,4 @@ class TestConsolidationProcessGroupCreation:
             checkpointer.close()
 
         destroy_process_group.assert_called_once_with(consolidation_pg)
-        assert checkpointer._consolidation_pg is None
+        assert checkpointer._consolidation_process_group is None

@@ -16,7 +16,7 @@ import builtins
 import json
 import logging
 import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -25,6 +25,7 @@ from safetensors.torch import load_file, save_file
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     _write_sub_tensor_to_file_optimized,
     consolidate_safetensors_files,
+    consolidate_safetensors_files_on_every_rank,
     resolve_dtype_cast,
 )
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
@@ -414,6 +415,60 @@ def test_resolve_dtype_cast_accepts_aliases_and_none():
     assert resolve_dtype_cast("none") is None
     assert resolve_dtype_cast("bf16") is torch.bfloat16
     assert resolve_dtype_cast("torch.float16") is torch.float16
+
+
+@pytest.mark.run_only_on("CPU")
+def test_every_rank_consolidation_uses_supplied_group_for_barrier():
+    process_group = MagicMock()
+    call_order = []
+
+    def _record_barrier(*args, **kwargs):
+        call_order.append("barrier")
+
+    def _record_index_write(*args, **kwargs):
+        call_order.append("index")
+
+    with (
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.is_available",
+            return_value=True,
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.is_initialized",
+            return_value=True,
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.get_rank",
+            return_value=0,
+        ) as get_rank,
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.get_world_size",
+            return_value=2,
+        ) as get_world_size,
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.barrier",
+            side_effect=_record_barrier,
+        ) as barrier,
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors._consolidate_safetensors_files"
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors."
+            "_write_overall_metadata_file_from_shards",
+            side_effect=_record_index_write,
+        ),
+    ):
+        consolidate_safetensors_files_on_every_rank(
+            input_dir="input",
+            output_dir="output",
+            fqn_to_index_mapping={"weight": 1},
+            process_group=process_group,
+        )
+
+    get_rank.assert_called_once_with(group=process_group)
+    get_world_size.assert_called_once_with(group=process_group)
+    barrier.assert_called_once_with(group=process_group)
+    assert call_order == ["barrier", "index"]
 
 
 # =============================================================================

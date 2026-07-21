@@ -458,6 +458,72 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     assert recipe.optimizer[0].zero_grad_called
 
 
+@pytest.mark.cuda(False)
+def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.mesh_context = SimpleNamespace(cp_size=1)
+    recipe.processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=7))
+    recipe.model_parts = [_TensorModel()]
+    recipe.pp_enabled = False
+    recipe.magi = SimpleNamespace(enabled=False)
+    recipe.distributed_config = None
+    recipe.loss_fn = object()
+    recipe.step_scheduler = SimpleNamespace(is_remote_logging_step=False)
+    recipe._get_dp_group_size = lambda include_cp=True: 1
+    captured = {}
+
+    def make_thd_batch(device_mesh, batch, **kwargs):
+        captured.update(kwargs)
+        return nullcontext, batch
+
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx", make_thd_batch)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.get_sync_ctx", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.calculate_loss",
+        lambda *args, **kwargs: torch.tensor(1.0, requires_grad=True),
+    )
+
+    recipe._forward_backward_step(
+        idx=0,
+        batch={
+            "input_ids": torch.tensor([[1, 2]]),
+            "labels": torch.tensor([[2, -100]]),
+            "qkv_format": "thd",
+        },
+        loss_buffer=[],
+        num_label_tokens=1,
+        num_batches=1,
+    )
+
+    assert captured == {"use_te": True, "padding_token_id": 7}
+
+
+@pytest.mark.cuda(False)
+def test_forward_backward_step_rejects_thd_with_context_parallelism():
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.mesh_context = SimpleNamespace(cp_size=2)
+    recipe.model_parts = [_TensorModel()]
+    recipe.pp_enabled = False
+    recipe.magi = SimpleNamespace(enabled=False)
+
+    with pytest.raises(NotImplementedError, match="currently supports cp_size=1 only"):
+        recipe._forward_backward_step(
+            idx=0,
+            batch={
+                "input_ids": torch.tensor([[1, 2]]),
+                "labels": torch.tensor([[2, -100]]),
+                "qkv_format": "thd",
+            },
+            loss_buffer=[],
+            num_label_tokens=1,
+            num_batches=1,
+        )
+
+
 def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
     """Shared setup for _run_train_optim_step tests with pp_enabled=True."""
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
@@ -3115,6 +3181,69 @@ class TestChunkVlmMedia:
         assert model._vlm_num_patches_chunks is None
         assert model._vlm_patch_newline_mask_chunks is None
         assert model._vlm_chunk_idx is None
+
+    @pytest.mark.parametrize("schedule_flag", ["_stage_forward_initialized", "_stages_forward_initialized"])
+    def test_stage_media_replays_first_chunk_after_dynamic_metadata_forward(self, schedule_flag):
+        class MediaConsumer(nn.Module):
+            def forward(self):
+                chunk = self._vlm_pixel_values_chunks[self._vlm_chunk_idx]
+                self._vlm_chunk_idx += 1
+                return chunk
+
+        model = MediaConsumer()
+        schedule = SimpleNamespace(**{schedule_flag: False})
+        stage = SimpleNamespace(is_first=True)
+        pp = SimpleNamespace(
+            info=SimpleNamespace(has_first_stage=True, schedule=schedule, stages=[stage]),
+        )
+        first_chunk = torch.tensor([1.0])
+        second_chunk = torch.tensor([2.0])
+        batch = {
+            VLM_PP_MEDIA_KEY: {
+                "pixel_values": [first_chunk, second_chunk],
+                "image_grid_hws": [torch.ones(1), torch.ones(1)],
+            }
+        }
+
+        with stage_vlm_media_for_pp(pp, [model], batch):
+            metadata_output = model()
+            first_microbatch_output = model()
+            second_microbatch_output = model()
+
+            assert torch.equal(metadata_output, first_chunk)
+            assert torch.equal(first_microbatch_output, first_chunk)
+            assert torch.equal(second_microbatch_output, second_chunk)
+            assert model._vlm_chunk_idx == 2
+
+    @pytest.mark.parametrize("analytical_metadata,forward_initialized", [(True, False), (False, True)])
+    def test_stage_media_does_not_replay_without_dynamic_metadata_forward(
+        self, analytical_metadata, forward_initialized
+    ):
+        class MediaConsumer(nn.Module):
+            def forward(self):
+                chunk = self._vlm_pixel_values_chunks[self._vlm_chunk_idx]
+                self._vlm_chunk_idx += 1
+                return chunk
+
+        model = MediaConsumer()
+        schedule = SimpleNamespace(_stage_forward_initialized=forward_initialized)
+        stage = SimpleNamespace(is_first=True)
+        if analytical_metadata:
+            stage._configure_outputs_meta = lambda *_args: None
+        pp = SimpleNamespace(
+            info=SimpleNamespace(has_first_stage=True, schedule=schedule, stages=[stage]),
+        )
+        first_chunk = torch.tensor([1.0])
+        batch = {
+            VLM_PP_MEDIA_KEY: {
+                "pixel_values": [first_chunk],
+                "image_grid_hws": [torch.ones(1)],
+            }
+        }
+
+        with stage_vlm_media_for_pp(pp, [model], batch):
+            assert torch.equal(model(), first_chunk)
+            assert model._vlm_chunk_idx == 1
 
     def test_prepare_flat_patches_without_image_grid(self):
         pixel_values = torch.arange(5 * 2 * 2 * 2 * 3).reshape(5, 2, 2, 2, 3)

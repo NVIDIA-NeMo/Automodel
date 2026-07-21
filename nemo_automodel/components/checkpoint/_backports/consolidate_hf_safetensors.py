@@ -1021,6 +1021,12 @@ def consolidate_safetensors_files_on_every_rank(
             fqn_to_dtype_mapping=fqn_to_dtype_mapping,
         )
 
+    # Do not publish the index until every rank has written its assigned shard.
+    if dist.is_available() and dist.is_initialized():
+        logger.debug("Rank %d: Waiting for all ranks to complete...", rank)
+        dist.barrier(group=process_group)
+        logger.debug("Rank %d: All ranks have completed.", rank)
+
     # Write overall model.index.safetensors.json file with weight map (rank 0 only)
     if rank == 0:
         _write_overall_metadata_file_from_shards(
@@ -1038,10 +1044,5 @@ def consolidate_safetensors_files_on_every_rank(
         time.time() - start_time,
     )
 
-    # Wait for all ranks to complete
-    if dist.is_available() and dist.is_initialized():
-        logger.debug("Rank %d: Waiting for all ranks to complete...", rank)
-        dist.barrier(group=process_group)
-        logger.debug("Rank %d: All ranks have completed.", rank)
-        if rank == 0:
-            logger.debug("Total time taken: %.2f secs.", time.time() - start_time)
+    if rank == 0:
+        logger.debug("Total time taken: %.2f secs.", time.time() - start_time)
