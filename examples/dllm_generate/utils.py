@@ -184,6 +184,24 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada"):
     return model, tokenizer, mask_id, eos_id
 
 
+def merge_adapter(model, adapter_path: str):
+    """Merge a PEFT adapter checkpoint into the loaded base model for inference.
+
+    Automodel PEFT training writes ``adapter_model.safetensors`` plus an
+    HF-format ``adapter_config.json``, so the standard ``peft`` library can
+    load it. The adapters are merged into the base weights and the PEFT
+    wrapper is dropped, keeping the generation code path identical to
+    full-SFT checkpoints.
+    """
+    try:
+        from peft import PeftModel
+    except ImportError as err:
+        raise ImportError("Loading --adapter checkpoints requires the 'peft' package (uv pip install peft)") from err
+
+    merged = PeftModel.from_pretrained(model, adapter_path).merge_and_unload()
+    return merged.eval()
+
+
 # ---------------------------------------------------------------------------
 # Response trimming
 # ---------------------------------------------------------------------------
