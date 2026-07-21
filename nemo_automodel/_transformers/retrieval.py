@@ -311,9 +311,6 @@ def build_encoder_backbone(
             source_commit_hash=getattr(config, "_commit_hash", None),
         )
 
-    if model_type.lower() == "ministral3" and task != "embedding":
-        raise ValueError(f"Unsupported task '{task}' for model type '{model_type}'. Available tasks: embedding.")
-
     if model_type.lower() == "ministral3" and task == "embedding":
         config.is_causal = False
         if pooling is not None:

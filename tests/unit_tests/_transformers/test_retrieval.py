@@ -21,7 +21,10 @@ import pytest
 import torch
 import torch.nn as nn
 from transformers import AutoModel, Ministral3Config, Mistral3Config
-from transformers.models.ministral3.modeling_ministral3 import Ministral3Model
+from transformers.models.ministral3.modeling_ministral3 import (
+    Ministral3ForSequenceClassification,
+    Ministral3Model,
+)
 
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalForSequenceClassification,
@@ -224,14 +227,29 @@ def test_build_encoder_backbone_forwards_hub_location_kwargs_to_config_and_model
     )
 
 
-@pytest.mark.parametrize("task", ["score", "unsupported"])
-def test_direct_ministral_rejects_non_embedding_tasks(tmp_path, task):
+def test_standard_ministral_score_uses_sequence_classification_model(tmp_path):
+    """Standard Ministral score checkpoints retain the HuggingFace reranker path."""
     from nemo_automodel._transformers import retrieval
 
-    model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
+    model_dir, source_state_dict = _save_tiny_ministral_text_model(tmp_path)
 
-    with pytest.raises(ValueError, match=f"Unsupported task '{task}'.*Available tasks: embedding"):
-        retrieval.build_encoder_backbone(model_name_or_path=str(model_dir), task=task, num_labels=1)
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="score",
+        num_labels=1,
+    )
+
+    assert type(backbone) is Ministral3ForSequenceClassification
+    assert backbone.config.model_type == "ministral3"
+    assert backbone.config.num_labels == 1
+    _assert_state_dict_equal(source_state_dict, backbone.model.state_dict())
+
+    input_ids = torch.randint(0, backbone.config.vocab_size, (2, 4))
+    attention_mask = torch.ones_like(input_ids)
+    backbone.eval()
+    with torch.no_grad():
+        outputs = backbone(input_ids=input_ids, attention_mask=attention_mask)
+    assert outputs.logits.shape == (2, 1)
 
 
 def test_ministral_embedding_uses_stock_bidirectional_model(tmp_path):
