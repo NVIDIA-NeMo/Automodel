@@ -1366,10 +1366,10 @@ class TestBuildCheckpointConfig:
         assert any("falling back" in rec.message.lower() for rec in caplog.records)
         assert config.is_peft is True
         assert config.model_save_format == SerializationFormat.SAFETENSORS
-        # checkpoint_dir and max_recent_checkpoints are preserved from the user config
+        # The builder preserves `checkpoint_dir` and `max_recent_checkpoints` from the user configuration.
         assert config.checkpoint_dir == "/user/ckpt/"
         assert config.max_recent_checkpoints == 2
-        # incompatible torch_save options are coerced; save_consolidated falls back to the default "final"
+        # The builder coerces incompatible `torch_save` options and restores the default `save_consolidated="final"`.
         assert config.save_consolidated.value == "final"
         assert config.is_async is False
 

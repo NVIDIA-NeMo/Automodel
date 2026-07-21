@@ -484,7 +484,7 @@ class BaseRecipe:
             except OSError:
                 if os.path.lexists(temp_path):
                     os.remove(temp_path)
-                # Fallback: publish a text pointer when symlinks aren't supported.
+                # Fallback: publish a text pointer when symbolic links are not supported.
                 with open(temp_path, "x") as f:
                     f.write(relative_target)
                     f.flush()
@@ -860,8 +860,9 @@ class BaseRecipe:
         max_recent_checkpoints = checkpoint_config.max_recent_checkpoints
         if max_recent_checkpoints is None:
             return "disabled; keeping all checkpoints (checkpoint.max_recent_checkpoints=None)"
+        checkpoint_label = "checkpoint directory" if max_recent_checkpoints == 1 else "checkpoint directories"
         return (
-            f"keeping the most recent {max_recent_checkpoints} checkpoint(s), "
+            f"keeping the most recent {max_recent_checkpoints} {checkpoint_label}, "
             "plus pointer-protected checkpoints "
             f"(checkpoint.max_recent_checkpoints={max_recent_checkpoints})"
         )

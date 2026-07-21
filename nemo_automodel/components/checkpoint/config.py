@@ -121,8 +121,8 @@ class CheckpointingConfig:
     # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
     best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
     consolidation_timeout_minutes: int = 30  # Timeout for inline consolidated-export synchronization.
-    # Retain this many recent checkpoint directories. Checkpoints targeted by checkpoint-root pointers
-    # such as LATEST and LOWEST_VAL are preserved in addition. None keeps all checkpoints.
+    # Retain this many recent checkpoint directories. Preserve checkpoints targeted by checkpoint-root pointers,
+    # such as `LATEST` and `LOWEST_VAL`, in addition to the recent window. `None` keeps all checkpoints.
     max_recent_checkpoints: int | None = None
 
     def __post_init__(self):

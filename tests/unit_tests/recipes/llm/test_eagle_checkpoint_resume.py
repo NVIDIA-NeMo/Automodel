@@ -453,7 +453,7 @@ def test_eagle_async_checkpoint_retention_prunes_completed_window(tmp_path, reci
 
 
 def test_eagle1_final_checkpoint_saved_before_close(tmp_path):
-    """EAGLE-1 saves the final checkpoint before finalizing/closing async checkpointing."""
+    """EAGLE-1 saves the final checkpoint before finalizing and closing async checkpointing."""
     recipe = _bare_eagle1_recipe(tmp_path)
     recipe.num_epochs = 1
     recipe.grad_accumulation_steps = 1

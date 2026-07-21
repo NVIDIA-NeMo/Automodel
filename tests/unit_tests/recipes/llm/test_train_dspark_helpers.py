@@ -220,7 +220,7 @@ def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog)
         TrainDSparkRecipe._build_checkpointer(obj, "target/repo")
 
     assert built
-    assert "Checkpoint retention: keeping the most recent 1 checkpoint(s)" in caplog.text
+    assert "Checkpoint retention: keeping the most recent 1 checkpoint directory" in caplog.text
 
 
 def test_run_train_validation_loop_finalizes_before_close():

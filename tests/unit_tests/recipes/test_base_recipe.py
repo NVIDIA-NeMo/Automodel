@@ -744,7 +744,7 @@ def test_step_scheduler_log_includes_checkpoint_retention_policy(tmp_path, caplo
         recipe_inst._log_step_scheduler_details(step_scheduler)
 
     assert "Checkpoint retention" in caplog.text
-    assert "keeping the most recent 2 checkpoint(s)" in caplog.text
+    assert "keeping the most recent 2 checkpoint directories" in caplog.text
     assert "plus pointer-protected checkpoints" in caplog.text
     assert "checkpoint.max_recent_checkpoints=2" in caplog.text
 
@@ -1030,7 +1030,7 @@ def test_checkpoint_pointer_replace_failure_preserves_existing_target(tmp_path, 
 
 
 def test_checkpoint_retention_preserves_lowest_val_after_resume(tmp_path):
-    """After resume, a worse validation checkpoint must not replace the previous LOWEST_VAL target."""
+    """After resuming, a worse validation checkpoint must not replace the previous LOWEST_VAL target."""
     recipe_a = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
 
     for step, val_loss in [(100, 0.1), (200, 0.9)]:

@@ -58,18 +58,20 @@ These symbolic links eliminate the need to manually track checkpoint names or se
 
 ## Checkpoint Retention
 
-By default, NeMo AutoModel keeps all intermediate checkpoints. To reduce disk growth from frequent checkpoint saves, set a bounded recent checkpoint window:
+By default, NeMo AutoModel keeps all intermediate checkpoints. To limit disk usage when checkpoints are saved frequently, configure a bounded recent-checkpoint window:
 
 ```yaml
 checkpoint:
   max_recent_checkpoints: 2
 ```
 
-`max_recent_checkpoints` controls how many recent checkpoint directories are retained by step. It is not a hard cap on the total number of checkpoint directories. Checkpoint-root pointers, including `LATEST`, `LOWEST_VAL`, other top-level symlinks, and pointer `.txt` fallback files, protect their targets in addition to the recent window. This keeps resume-from-latest behavior reliable and preserves explicitly referenced checkpoints, such as the best validation checkpoint.
+`max_recent_checkpoints` sets the number of checkpoint directories in the recent window, ordered by step. It is not a hard limit on the total number of checkpoint directories.
 
-For example, if `max_recent_checkpoints: 2` and `LOWEST_VAL` points to an older checkpoint outside the most recent two saves, NeMo AutoModel keeps the two most recent checkpoints plus the `LOWEST_VAL` target.
+Checkpoint-root pointers protect their targets in addition to the recent window. These pointers include `LATEST`, `LOWEST_VAL`, other top-level symbolic links, and `.txt` fallback pointer files. This behavior supports reliable resumption from the latest checkpoint and preserves explicitly referenced checkpoints, such as the best validation checkpoint.
 
-Bounded retention currently applies to local filesystem checkpoint directories. Leave `max_recent_checkpoints` unset when `checkpoint.checkpoint_dir` uses `msc://` storage.
+For example, set `max_recent_checkpoints: 2` to retain the two most recent checkpoints. If `LOWEST_VAL` points to an older checkpoint, NeMo AutoModel also retains the `LOWEST_VAL` target.
+
+Bounded retention supports only local file system checkpoint directories. If `checkpoint.checkpoint_dir` uses `msc://` storage, leave `max_recent_checkpoints` unset. Setting it raises `ValueError`.
 
 Leave the value unset, or set it to `null`, to keep all intermediate checkpoints:
 
@@ -341,7 +343,7 @@ NeMo AutoModel can write checkpoints asynchronously to reduce training stalls ca
 - **Enable** (CLI): add `--checkpoint.is_async True` to your run command.
 - **Requirements**: PyTorch ≥ 2.9.0. If an older version is detected, async mode is automatically disabled.
 - **Behavior**: At most one checkpoint is written at a time. The next save waits for the previous write to finish.
-- **Publication**: The `LATEST` symlink is updated after the async save completes, which can be deferred until the next save call for intermediate checkpoints. Before shutdown completes, recipes wait for the final async checkpoint and publish `LATEST` before closing the checkpointer.
+- **Publication**: The `LATEST` symbolic link is updated after the asynchronous save completes. For intermediate checkpoints, publication can be deferred until the next save call. Before shutting down, each recipe waits for the final asynchronous checkpoint and publishes `LATEST` before closing the checkpointer.
 - **PEFT**: Adapter model files are written synchronously on rank 0; optimizer states can still use async.
 
 ## Advanced Usage: Save Additional States
