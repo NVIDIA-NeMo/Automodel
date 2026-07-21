@@ -245,14 +245,45 @@ class TestMoE:
         assert result["moe_parallel_config"].wrap_outer_model is False
 
     def test_attention_checkpoint_boundary_is_normalized(self):
-        cfg = {"ep_size": 2, "moe": {"activation_checkpointing_modules": ["attention", "attention"]}}
+        cfg = {
+            "ep_size": 2,
+            "activation_checkpointing": True,
+            "moe": {"activation_checkpointing_modules": ["attn", "attn"]},
+        }
         result = parse_distributed_section(cfg)
-        assert result["moe_parallel_config"].activation_checkpointing_modules == ("attention",)
+        assert result["moe_parallel_config"].activation_checkpointing_modules == ("attn",)
+
+    def test_attention_checkpoint_boundary_requires_expert_parallelism(self):
+        with pytest.raises(ValueError, match="requires ep_size > 1"):
+            parse_distributed_section(
+                {
+                    "ep_size": 1,
+                    "activation_checkpointing": True,
+                    "moe": {"activation_checkpointing_modules": ["attn"]},
+                }
+            )
+
+    @pytest.mark.parametrize("activation_checkpointing", [False, "selective"])
+    def test_attention_checkpoint_boundary_rejects_incompatible_ac(self, activation_checkpointing):
+        with pytest.raises(ValueError, match="activation_checkpointing_modules"):
+            parse_distributed_section(
+                {
+                    "ep_size": 2,
+                    "activation_checkpointing": activation_checkpointing,
+                    "moe": {"activation_checkpointing_modules": ["attn"]},
+                }
+            )
 
     @pytest.mark.parametrize("modules", [[], ["mlp"], "attention", [1]])
     def test_attention_checkpoint_boundary_rejects_unsupported_values(self, modules):
         with pytest.raises(ValueError, match="activation_checkpointing_modules"):
-            parse_distributed_section({"ep_size": 2, "moe": {"activation_checkpointing_modules": modules}})
+            parse_distributed_section(
+                {
+                    "ep_size": 2,
+                    "activation_checkpointing": True,
+                    "moe": {"activation_checkpointing_modules": modules},
+                }
+            )
 
     def test_empty_moe_dict_uses_defaults(self):
         result = parse_distributed_section({"ep_size": 2, "moe": {}})

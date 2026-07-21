@@ -451,6 +451,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self._partial_cuda_graph_capture_pending = False
         self._partial_cuda_graph_paged_stash_enabled = False
         self._partial_cuda_graph_paged_stash_reruns = 0
+        self._partial_cuda_graph_logged_host_spill = False
 
     # ------------------ build phase ------------------
     def _create_distributed_setup(self) -> DistributedSetup:
@@ -803,6 +804,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             activation_checkpointing_modules=getattr(
                 getattr(self, "moe_parallel_config", None), "activation_checkpointing_modules", None
             ),
+            activation_checkpointing_scope=getattr(
+                getattr(self, "distributed_config", None), "activation_checkpointing_scope", ("all",)
+            ),
             pipeline_parallel=bool(self.pp_enabled),
         )
         self._partial_cuda_graph_capture_pending = self.partial_cuda_graph_manager is not None
@@ -830,7 +834,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logger.info("Partial MoE paged stash prepared: %s", stash_manager.diagnostics())
         self.partial_cuda_graph_manager.capture()
         if getattr(self, "_partial_cuda_graph_paged_stash_enabled", False):
-            overflow_ranks = self._paged_stash_overflow_rank_count(stash_manager)
+            overflow_ranks, host_spill_ranks, imbalance_ranks = self._paged_stash_rank_counts(stash_manager)
+            if host_spill_ranks:
+                logger.info("MoE paged stash used pinned-host pages during capture on %d ranks", host_spill_ranks)
+            if imbalance_ranks:
+                self._close_partial_cuda_graphs()
+                raise RuntimeError(
+                    "MoE paged stash did not recover every page during CUDA graph capture on "
+                    f"{imbalance_ranks} ranks; partial CUDA graphs were disabled"
+                )
             if overflow_ranks:
                 self._close_partial_cuda_graphs()
                 raise RuntimeError(
@@ -1260,23 +1272,33 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             return None
         return self.rng.state_dict()
 
-    def _paged_stash_overflow_rank_count(self, stash_manager) -> int:
-        """Collectively count ranks whose device-resident paged-stash flag is set.
+    def _paged_stash_rank_counts(self, stash_manager) -> tuple[int, int, int]:
+        """Collectively count overflow, host-spill, and allocator-imbalance ranks.
 
         Args:
             stash_manager: Active process-local paged-stash manager.
 
         Returns:
-            Number of overflowing ranks. The only device-to-host synchronization occurs after every rank has
-            entered the collective.
+            A tuple ``(overflow_ranks, host_spill_ranks, imbalance_ranks)``. The only device-to-host synchronization
+            occurs after every rank has entered the collective.
         """
         overflow = stash_manager.check_overflow()
-        if overflow is None:
-            raise RuntimeError("Active partial MoE paged stash has no overflow flag")
-        overflow_ranks = overflow.reshape(-1)[0].ne(0).to(dtype=torch.int32)
+        host_spill = stash_manager.check_host_spill()
+        imbalance = stash_manager.check_allocator_imbalance()
+        if overflow is None or host_spill is None or imbalance is None:
+            raise RuntimeError("Active partial MoE paged stash has incomplete device status flags")
+        rank_flags = torch.stack(
+            (
+                overflow.reshape(-1)[0].ne(0),
+                host_spill.reshape(-1)[0].ne(0),
+                imbalance.reshape(-1)[0].ne(0),
+            )
+        ).to(dtype=torch.int32)
         if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(overflow_ranks, op=torch.distributed.ReduceOp.SUM)
-        return int(overflow_ranks.item())
+            torch.distributed.all_reduce(rank_flags, op=torch.distributed.ReduceOp.SUM)
+        counts = tuple(int(count) for count in rank_flags.tolist())
+        stash_manager.clear_host_spill()
+        return counts
 
     def _rerun_after_paged_stash_overflow(
         self,
@@ -1305,7 +1327,16 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         stash_manager = get_paged_stash_manager()
         if not stash_manager.is_active:
             return loss_buffer
-        overflow_ranks = self._paged_stash_overflow_rank_count(stash_manager)
+        overflow_ranks, host_spill_ranks, imbalance_ranks = self._paged_stash_rank_counts(stash_manager)
+        if host_spill_ranks and not getattr(self, "_partial_cuda_graph_logged_host_spill", False):
+            logger.info("MoE paged stash is spilling activations to pinned host memory on %d ranks", host_spill_ranks)
+            self._partial_cuda_graph_logged_host_spill = True
+        if imbalance_ranks:
+            self._close_partial_cuda_graphs()
+            raise RuntimeError(
+                "MoE paged stash did not recover every CUDA/host page on "
+                f"{imbalance_ranks} ranks; partial CUDA graphs were disabled"
+            )
         if overflow_ranks == 0:
             stash_manager.finish_iteration()
             return loss_buffer

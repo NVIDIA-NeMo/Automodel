@@ -172,7 +172,7 @@ class MoEParallelizerConfig:
             recompute so routing metadata remains stable.
         activation_checkpointing_modules: Optional decoder submodule boundaries to
             checkpoint instead of wrapping the complete block. The first supported
-            boundary is ``"attention"``; leaving this unset preserves the existing
+            boundary is ``"attn"``; leaving this unset preserves the existing
             whole-block behavior.
     """
 
@@ -195,10 +195,10 @@ class MoEParallelizerConfig:
         if not all(isinstance(module, str) for module in self.activation_checkpointing_modules):
             raise ValueError("MoE activation_checkpointing_modules entries must be strings.")
         modules = tuple(dict.fromkeys(self.activation_checkpointing_modules))
-        unsupported = set(modules) - {"attention"}
+        unsupported = set(modules) - {"attn"}
         if unsupported:
             raise ValueError(
-                f"MoE activation_checkpointing_modules currently supports only 'attention'; got {sorted(unsupported)}."
+                f"MoE activation_checkpointing_modules currently supports only 'attn'; got {sorted(unsupported)}."
             )
         if not modules:
             raise ValueError("MoE activation_checkpointing_modules must not be empty when specified.")

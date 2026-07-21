@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import logging
 import math
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -48,9 +49,11 @@ from nemo_automodel.components.moe.paged_stash_ops import (
     paged_stash_pop_kernel,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class PagedStashOverflowError(RuntimeError):
-    """Raised after an iteration whose fixed CUDA page capacity was exceeded."""
+    """Raised after an iteration whose fixed CUDA and host page capacity was exceeded."""
 
 
 class _PagedStashState(enum.Enum):
@@ -65,7 +68,7 @@ def _storage_dtype(dtype: torch.dtype) -> torch.dtype:
 
 
 class _PagedStashBuffer:
-    """One circular GPU page allocator for a dtype and per-token width."""
+    """CUDA pages plus optional pinned-host spill pages for one activation layout."""
 
     def __init__(
         self,
@@ -76,6 +79,8 @@ class _PagedStashBuffer:
         device: torch.device,
         dtype: torch.dtype,
         overflow: torch.Tensor,
+        host_spill: torch.Tensor,
+        num_host_tokens: int = 0,
     ) -> None:
         """Allocate one fixed-shape circular page buffer.
 
@@ -86,6 +91,8 @@ class _PagedStashBuffer:
             device: CUDA device that owns the page buffer.
             dtype: Bit-preserving storage dtype for each token element.
             overflow: Device scalar with shape ``[1]`` shared by every buffer.
+            host_spill: Device scalar with shape ``[1]`` set when any tensor spills to host.
+            num_host_tokens: Minimum number of token rows the pinned-host spill buffer must hold.
         """
         if num_tokens <= 0:
             raise ValueError(f"Paged stash buffer capacity must be positive, got {num_tokens}")
@@ -94,19 +101,32 @@ class _PagedStashBuffer:
         self.device = device
         self.dtype = dtype
         self.overflow = overflow
-        self.num_pages = math.ceil(num_tokens / page_size)
-        self.total_tokens = self.num_pages * page_size
-        self.storage = torch.empty((self.total_tokens, hidden_size), dtype=dtype, device=device)
-        self.free_list = torch.arange(self.num_pages, dtype=torch.int64, device=device)
-        self.head = torch.zeros(1, dtype=torch.int64, device=device)
-        self.tail = torch.full((1,), self.num_pages, dtype=torch.int64, device=device)
-        self.capacity = torch.full((1,), self.num_pages, dtype=torch.int64, device=device)
-        self._reset_free_list = torch.arange(self.num_pages, dtype=torch.int64, device=device)
-        self._reset_tail = torch.full((1,), self.num_pages, dtype=torch.int64, device=device)
+        self.host_spill = host_spill
+
+        self.num_cuda_pages = math.ceil(num_tokens / page_size)
+        self.total_cuda_tokens = self.num_cuda_pages * page_size
+        self.cuda_storage = torch.empty((self.total_cuda_tokens, hidden_size), dtype=dtype, device=device)
+        self.num_host_pages = math.ceil(num_host_tokens / page_size) if num_host_tokens > 0 else 0
+        self.total_host_tokens = self.num_host_pages * page_size
+        self.host_storage = (
+            torch.empty((self.total_host_tokens, hidden_size), dtype=dtype, device="cpu", pin_memory=True)
+            if self.num_host_pages
+            else None
+        )
+
+        self.free_list_cuda = torch.arange(self.num_cuda_pages, dtype=torch.int64, device=device)
+        self.free_list_host = torch.arange(self.num_host_pages, dtype=torch.int64, device=device)
+        self.head = torch.zeros(2, dtype=torch.int64, device=device)
+        self.tail = torch.tensor([self.num_cuda_pages, self.num_host_pages], dtype=torch.int64, device=device)
+        self.capacity = torch.tensor([self.num_cuda_pages, self.num_host_pages], dtype=torch.int64, device=device)
+        self._reset_free_list_cuda = torch.arange(self.num_cuda_pages, dtype=torch.int64, device=device)
+        self._reset_free_list_host = torch.arange(self.num_host_pages, dtype=torch.int64, device=device)
+        self._reset_tail = torch.tensor([self.num_cuda_pages, self.num_host_pages], dtype=torch.int64, device=device)
 
     def reset(self) -> None:
         """Restore the allocator without creating graph-unsafe temporary tensors."""
-        self.free_list.copy_(self._reset_free_list)
+        self.free_list_cuda.copy_(self._reset_free_list_cuda)
+        self.free_list_host.copy_(self._reset_free_list_host)
         self.head.zero_()
         self.tail.copy_(self._reset_tail)
 
@@ -124,6 +144,7 @@ class _RecordedTensor:
     tensor: torch.Tensor
     key: tuple[torch.dtype, int]
     charged_tokens: int
+    allocation_id: int
     released: bool = False
 
 
@@ -167,38 +188,46 @@ class _PagedTensor:
         self.dtype = tensor.dtype
         self.device = tensor.device
         self.page_record = torch.empty(math.ceil(max_num_tokens / page_size), dtype=torch.int64, device=tensor.device)
-        self._new_head = torch.empty(1, dtype=torch.int64, device=tensor.device)
-        self._new_tail = torch.empty(1, dtype=torch.int64, device=tensor.device)
+        self.spilled_to_host = torch.empty(1, dtype=torch.int64, device=tensor.device)
+        self._new_head = torch.empty(2, dtype=torch.int64, device=tensor.device)
+        self._new_tail = torch.empty(2, dtype=torch.int64, device=tensor.device)
 
     def offload(self, buffer: _PagedStashBuffer) -> None:
         """Pack live rows and release the original activation reference.
 
         Args:
-            buffer: Circular page storage with shape ``[num_pages * page_size, hidden_size]``. The copy mutates its
-                free-list head, page storage, and shared overflow scalar on the current CUDA stream.
+            buffer: CUDA and optional pinned-host circular page storage. The copy mutates its free-list heads, page
+                storage, and shared overflow scalar on the current CUDA stream.
         """
         if self._tensor is None:
             raise RuntimeError("Paged tensor was stashed more than once")
         storage_dtype = _storage_dtype(self.dtype)
         source = self._tensor.view(storage_dtype).reshape(self.max_num_tokens, self.hidden_size)
         grid = (max(1, min(self.max_num_tokens, 2048)),)
+        self.spilled_to_host.zero_()
+        host_storage = buffer.host_storage if buffer.host_storage is not None else buffer.cuda_storage
         paged_stash_copy_kernel[grid](
             source,
-            buffer.storage,
+            buffer.cuda_storage,
+            host_storage,
             self.num_tokens_tensor,
             self.live_token_mask,
             self.live_token_offsets,
-            buffer.free_list,
+            buffer.free_list_cuda,
+            buffer.free_list_host,
             buffer.head,
             buffer.tail,
             buffer.capacity,
             self.page_record,
             buffer.overflow,
+            buffer.host_spill,
+            self.spilled_to_host,
             self._new_head,
             PAGE_SIZE=self.page_size,
             HIDDEN_SIZE=self.hidden_size,
             MAX_NUM_TOKENS=self.max_num_tokens,
             BLOCK_SIZE=GLOBAL_BLOCK_SIZE,
+            HAS_HOST_BUFFER=buffer.host_storage is not None,
         )
         buffer.head.copy_(self._new_head)
         self._original_tensor = self._tensor
@@ -223,15 +252,19 @@ class _PagedTensor:
         storage_dtype = _storage_dtype(self.dtype)
         destination = self._tensor.view(storage_dtype).reshape(self.max_num_tokens, self.hidden_size)
         grid = (max(1, min(self.max_num_tokens, 2048)),)
+        host_storage = buffer.host_storage if buffer.host_storage is not None else buffer.cuda_storage
         paged_stash_pop_kernel[grid](
-            buffer.storage,
+            buffer.cuda_storage,
+            host_storage,
             destination,
             self.num_tokens_tensor,
             self.live_token_mask,
             self.live_token_offsets,
             self.page_record,
+            self.spilled_to_host,
             buffer.overflow,
-            buffer.free_list,
+            buffer.free_list_cuda,
+            buffer.free_list_host,
             buffer.tail,
             buffer.capacity,
             self._new_tail,
@@ -515,16 +548,20 @@ class PagedStashManager:
         self._disable_depth = 0
         self._page_size = 64
         self._buffer_size_factor = 1.1
+        self._host_buffer_size_factor = 0.0
         self._next_group_id = 0
         self._current_group: _GroupState | None = None
         self._group_tensors: dict[int, list[_PagedTensor]] = {}
         self._group_saved_tensor_counts: dict[int, int] = {}
         self._recorded_peak_tokens: dict[tuple[torch.dtype, int], int] = {}
         self._recorded_current_tokens: dict[tuple[torch.dtype, int], int] = {}
+        self._recorded_events: dict[tuple[torch.dtype, int], list[tuple[str, int, int]]] = {}
+        self._next_recorded_allocation_id = 0
         self._record_device: torch.device | None = None
         self._recording_invalid_reason: str | None = None
         self._buffers: dict[tuple[torch.dtype, int], _PagedStashBuffer] = {}
         self._overflow: torch.Tensor | None = None
+        self._host_spill: torch.Tensor | None = None
         self._backward_group_stack: list[int] = []
         self._backward_in_progress_group_id: int | None = None
 
@@ -544,6 +581,7 @@ class PagedStashManager:
         enabled: bool,
         page_size: int = 64,
         buffer_size_factor: float = 1.1,
+        host_buffer_size_factor: float = 0.0,
     ) -> None:
         """Enable a recording warmup or disable a quiescent manager.
 
@@ -553,8 +591,10 @@ class PagedStashManager:
         Args:
             enabled: Whether to record and then page explicitly registered activations.
             page_size: Positive number of token rows per page.
-            buffer_size_factor: Finite allocation headroom relative to recorded peak usage. Values below ``1.0``
-                cannot hold the warmup workload and are rejected.
+            buffer_size_factor: Fraction of recorded peak usage allocated in CUDA memory. It must be positive; when
+                it is below one, ``host_buffer_size_factor`` must provide enough total capacity.
+            host_buffer_size_factor: Fraction of recorded peak usage allocated in pinned host memory. Zero disables
+                host spill. CUDA and host factors must sum to at least one.
         """
         if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
             raise ValueError(f"page_size must be positive, got {page_size}")
@@ -562,20 +602,37 @@ class PagedStashManager:
             isinstance(buffer_size_factor, bool)
             or not isinstance(buffer_size_factor, (int, float))
             or not math.isfinite(float(buffer_size_factor))
-            or buffer_size_factor < 1.0
+            or buffer_size_factor <= 0.0
         ):
-            raise ValueError(f"buffer_size_factor must be finite and at least 1.0, got {buffer_size_factor}")
+            raise ValueError(f"buffer_size_factor must be positive and finite, got {buffer_size_factor}")
+        if (
+            isinstance(host_buffer_size_factor, bool)
+            or not isinstance(host_buffer_size_factor, (int, float))
+            or not math.isfinite(float(host_buffer_size_factor))
+            or host_buffer_size_factor < 0.0
+        ):
+            raise ValueError(f"host_buffer_size_factor must be non-negative and finite, got {host_buffer_size_factor}")
+        if buffer_size_factor + host_buffer_size_factor < 1.0:
+            raise ValueError("buffer_size_factor and host_buffer_size_factor must provide at least 1.0x total capacity")
         if self._current_group is not None or self._group_tensors:
             raise RuntimeError("Cannot reconfigure paged stash while groups are live")
         if not enabled:
             self.close()
             return
         if self._state is not _PagedStashState.DISABLED:
-            if page_size != self._page_size or not math.isclose(buffer_size_factor, self._buffer_size_factor):
-                raise RuntimeError("All paged-stash experts must use the same page_size and buffer_size_factor")
+            if (
+                page_size != self._page_size
+                or not math.isclose(buffer_size_factor, self._buffer_size_factor)
+                or not math.isclose(host_buffer_size_factor, self._host_buffer_size_factor)
+            ):
+                raise RuntimeError(
+                    "All paged-stash experts must use the same page_size, buffer_size_factor, and "
+                    "host_buffer_size_factor"
+                )
             return
         self._page_size = page_size
         self._buffer_size_factor = buffer_size_factor
+        self._host_buffer_size_factor = host_buffer_size_factor
         self._state = _PagedStashState.RECORDING
 
     @contextlib.contextmanager
@@ -689,7 +746,15 @@ class PagedStashManager:
             current = self._recorded_current_tokens.get(key, 0) + charged_tokens
             self._recorded_current_tokens[key] = current
             self._recorded_peak_tokens[key] = max(self._recorded_peak_tokens.get(key, 0), current)
-            return _RecordedTensor(tensor=tensor, key=key, charged_tokens=charged_tokens)
+            allocation_id = self._next_recorded_allocation_id
+            self._next_recorded_allocation_id += 1
+            self._recorded_events.setdefault(key, []).append(("allocate", allocation_id, charged_tokens))
+            return _RecordedTensor(
+                tensor=tensor,
+                key=key,
+                charged_tokens=charged_tokens,
+                allocation_id=allocation_id,
+            )
 
         if self._state is not _PagedStashState.ACTIVE:
             return tensor
@@ -724,6 +789,7 @@ class PagedStashManager:
                 if current < 0:
                     raise RuntimeError(f"Paged stash recording underflow for layout {saved.key}")
                 self._recorded_current_tokens[saved.key] = current
+                self._recorded_events[saved.key].append(("release", saved.allocation_id, saved.charged_tokens))
                 saved.released = True
             return saved.tensor
         if isinstance(saved, _PagedTensor):
@@ -827,19 +893,98 @@ class PagedStashManager:
         if not HAVE_TRITON:
             raise RuntimeError("Paged stash requires Triton")
 
-        self._overflow = torch.zeros(1, dtype=torch.int64, device=self._record_device)
-        for (dtype, hidden_size), peak_tokens in self._recorded_peak_tokens.items():
-            capacity = max(1, math.ceil(peak_tokens * self._buffer_size_factor))
-            storage_dtype = _storage_dtype(dtype)
-            self._buffers[dtype, hidden_size] = _PagedStashBuffer(
-                num_tokens=capacity,
-                hidden_size=hidden_size,
-                page_size=self._page_size,
-                device=self._record_device,
-                dtype=storage_dtype,
-                overflow=self._overflow,
+        capacity_plan: dict[tuple[torch.dtype, int], tuple[int, int]] = {}
+        for key, peak_tokens in self._recorded_peak_tokens.items():
+            cuda_capacity = math.ceil(peak_tokens * self._buffer_size_factor / self._page_size) * self._page_size
+            host_capacity = (
+                math.ceil(peak_tokens * self._host_buffer_size_factor / self._page_size) * self._page_size
+                if self._host_buffer_size_factor
+                else 0
             )
+            self._validate_recorded_placement(key, cuda_capacity, host_capacity)
+            capacity_plan[key] = (cuda_capacity, host_capacity)
+
+        cuda_bytes = {}
+        host_bytes = {}
+        for (dtype, hidden_size), (cuda_capacity, host_capacity) in capacity_plan.items():
+            element_size = torch.empty((), dtype=_storage_dtype(dtype)).element_size()
+            cuda_bytes[dtype, hidden_size] = cuda_capacity * hidden_size * element_size
+            host_bytes[dtype, hidden_size] = host_capacity * hidden_size * element_size
+        logger.info(
+            "Paged stash allocation plan: cuda_bytes=%s total_cuda_bytes=%d host_bytes=%s total_host_bytes=%d",
+            cuda_bytes,
+            sum(cuda_bytes.values()),
+            host_bytes,
+            sum(host_bytes.values()),
+        )
+
+        overflow = torch.zeros(1, dtype=torch.int64, device=self._record_device)
+        host_spill = torch.zeros(1, dtype=torch.int64, device=self._record_device)
+        buffers: dict[tuple[torch.dtype, int], _PagedStashBuffer] = {}
+        try:
+            for (dtype, hidden_size), (capacity, host_capacity) in capacity_plan.items():
+                storage_dtype = _storage_dtype(dtype)
+                try:
+                    buffers[dtype, hidden_size] = _PagedStashBuffer(
+                        num_tokens=capacity,
+                        hidden_size=hidden_size,
+                        page_size=self._page_size,
+                        device=self._record_device,
+                        dtype=storage_dtype,
+                        overflow=overflow,
+                        host_spill=host_spill,
+                        num_host_tokens=host_capacity,
+                    )
+                except Exception as error:
+                    raise RuntimeError(
+                        f"Paged stash allocation failed for layout {(dtype, hidden_size)}: "
+                        f"cuda_bytes={cuda_bytes[dtype, hidden_size]}, "
+                        f"pinned_host_bytes={host_bytes[dtype, hidden_size]}"
+                    ) from error
+        except Exception:
+            buffers.clear()
+            raise
+        self._overflow = overflow
+        self._host_spill = host_spill
+        self._buffers = buffers
         self._state = _PagedStashState.ACTIVE
+
+    def _validate_recorded_placement(
+        self,
+        key: tuple[torch.dtype, int],
+        cuda_capacity: int,
+        host_capacity: int,
+    ) -> None:
+        """Simulate CUDA-first whole-tensor placement for one recorded layout."""
+        available = {"cuda": cuda_capacity, "host": host_capacity}
+        allocations: dict[int, tuple[str, int]] = {}
+        for event, allocation_id, charged_tokens in self._recorded_events.get(key, []):
+            if event == "allocate":
+                if available["cuda"] >= charged_tokens:
+                    tier = "cuda"
+                elif available["host"] >= charged_tokens:
+                    tier = "host"
+                else:
+                    raise RuntimeError(
+                        "Paged stash CUDA/host factors cannot reproduce the recorded whole-tensor allocation "
+                        f"order for layout {key}: allocation={charged_tokens} rows, "
+                        f"available_cuda={available['cuda']}, available_host={available['host']}. "
+                        "Increase one buffer factor; CUDA and host free pages are not fungible within one tensor."
+                    )
+                available[tier] -= charged_tokens
+                allocations[allocation_id] = (tier, charged_tokens)
+                continue
+            if event != "release" or allocation_id not in allocations:
+                raise RuntimeError(f"Invalid paged-stash recording event for layout {key}: {(event, allocation_id)}")
+            tier, expected_tokens = allocations.pop(allocation_id)
+            if charged_tokens != expected_tokens:
+                raise RuntimeError(
+                    f"Paged-stash recording release changed size for layout {key}: "
+                    f"expected {expected_tokens}, got {charged_tokens}"
+                )
+            available[tier] += charged_tokens
+        if allocations:
+            raise RuntimeError(f"Paged-stash recording has unreleased allocations for layout {key}: {allocations}")
 
     def finish_iteration(self) -> None:
         """Synchronously validate overflow after a single-rank forward/backward.
@@ -864,6 +1009,14 @@ class PagedStashManager:
             raise PagedStashOverflowError(
                 "MoE paged stash capacity overflowed; discard this attempt and rerun without paged stash"
             )
+        for key, buffer in self._buffers.items():
+            available_pages = buffer.tail - buffer.head
+            if not torch.equal(available_pages, buffer.capacity):
+                raise RuntimeError(
+                    f"Paged stash allocator did not recover every CUDA/host page for layout {key}: "
+                    f"head={buffer.head.tolist()}, tail={buffer.tail.tolist()}, "
+                    f"capacity={buffer.capacity.tolist()}"
+                )
 
     def check_overflow(self) -> torch.Tensor | None:
         """Return the device-resident overflow flag without synchronizing the host.
@@ -873,6 +1026,36 @@ class PagedStashManager:
         """
         return self._overflow
 
+    def check_host_spill(self) -> torch.Tensor | None:
+        """Return whether host pages were used since the flag was last cleared.
+
+        Returns:
+            An integer CUDA tensor with shape ``[1]``, or ``None`` before fixed buffers have been prepared.
+        """
+        return self._host_spill
+
+    def check_allocator_imbalance(self) -> torch.Tensor | None:
+        """Return a device flag when any CUDA or host free list remains charged.
+
+        Returns:
+            An integer CUDA tensor with shape ``[1]``, or ``None`` before fixed buffers have been prepared.
+        """
+        if self._overflow is None:
+            return None
+        if not self._buffers:
+            return torch.zeros_like(self._overflow)
+        return (
+            torch.stack([(buffer.tail - buffer.head).ne(buffer.capacity).any() for buffer in self._buffers.values()])
+            .any()
+            .to(dtype=torch.int64)
+            .reshape(1)
+        )
+
+    def clear_host_spill(self) -> None:
+        """Clear the host-use diagnostic after its distributed result has been consumed."""
+        if self._host_spill is not None:
+            self._host_spill.zero_()
+
     def reset_after_overflow(self) -> None:
         """Clear overflow metadata after the graph using these buffers is destroyed."""
         if self._current_group is not None or self._group_tensors or self._group_saved_tensor_counts:
@@ -881,6 +1064,8 @@ class PagedStashManager:
             raise RuntimeError("Cannot reset paged stash while expert backward is live")
         if self._overflow is not None:
             self._overflow.zero_()
+        if self._host_spill is not None:
+            self._host_spill.zero_()
         for buffer in self._buffers.values():
             buffer.reset()
 
@@ -888,11 +1073,13 @@ class PagedStashManager:
         """Drop fixed pages and start a fresh eager profile after graph teardown."""
         page_size = self._page_size
         buffer_size_factor = self._buffer_size_factor
+        host_buffer_size_factor = self._host_buffer_size_factor
         self.close()
         self.configure(
             enabled=True,
             page_size=page_size,
             buffer_size_factor=buffer_size_factor,
+            host_buffer_size_factor=host_buffer_size_factor,
         )
 
     def diagnostics(self) -> dict[str, Any]:
@@ -901,9 +1088,15 @@ class PagedStashManager:
             "state": self._state.value,
             "page_size": self._page_size,
             "buffer_size_factor": self._buffer_size_factor,
+            "host_buffer_size_factor": self._host_buffer_size_factor,
             "recorded_peak_tokens": dict(self._recorded_peak_tokens),
-            "buffer_tokens": {key: buffer.total_tokens for key, buffer in self._buffers.items()},
-            "buffer_bytes": {key: buffer.storage.nbytes for key, buffer in self._buffers.items()},
+            "buffer_tokens": {key: buffer.total_cuda_tokens for key, buffer in self._buffers.items()},
+            "buffer_bytes": {key: buffer.cuda_storage.nbytes for key, buffer in self._buffers.items()},
+            "host_buffer_tokens": {key: buffer.total_host_tokens for key, buffer in self._buffers.items()},
+            "host_buffer_bytes": {
+                key: buffer.host_storage.nbytes if buffer.host_storage is not None else 0
+                for key, buffer in self._buffers.items()
+            },
             "live_groups": len(self._group_tensors),
             "backward_schedule_depth": len(self._backward_group_stack),
             "backward_in_progress_group_id": self._backward_in_progress_group_id,
@@ -919,14 +1112,17 @@ class PagedStashManager:
             raise RuntimeError("Cannot close paged stash while expert backward is live")
         self._buffers.clear()
         self._overflow = None
+        self._host_spill = None
         self._recorded_peak_tokens.clear()
         self._recorded_current_tokens.clear()
+        self._recorded_events.clear()
         self._record_device = None
         self._recording_invalid_reason = None
         self._group_saved_tensor_counts.clear()
         self._backward_group_stack.clear()
         self._backward_in_progress_group_id = None
         self._next_group_id = 0
+        self._next_recorded_allocation_id = 0
         self._disable_depth = 0
         self._state = _PagedStashState.DISABLED
 

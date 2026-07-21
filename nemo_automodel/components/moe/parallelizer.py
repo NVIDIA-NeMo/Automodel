@@ -68,7 +68,7 @@ def _is_selective_ac(activation_checkpointing: object) -> bool:
 
 def _apply_attention_only_ac(
     model: nn.Module,
-    activation_checkpointing_scope: str | list[str] | tuple[str, ...],
+    scopes: tuple[str, ...],
 ) -> None:
     """Checkpoint decoder attention while leaving every MoE sublayer outside recompute.
 
@@ -78,28 +78,39 @@ def _apply_attention_only_ac(
 
     Args:
         model: MoE model whose decoder attention modules are wrapped in place.
-        activation_checkpointing_scope: Layer groups selected for activation
-            checkpointing. Decoder attention is wrapped for ``"all"`` or
-            ``"language"``; multimodal towers retain their existing policy.
+        scopes: Normalized layer groups selected for activation checkpointing.
+            Decoder attention is wrapped for ``"all"`` or ``"language"``;
+            multimodal towers retain their existing policy.
     """
-    from nemo_automodel.components.distributed.config import normalize_activation_checkpointing_scope
+    from nemo_automodel.components.distributed.activation_checkpointing import (
+        apply_submodule_checkpointing,
+        detect_kv_sharing_and_maybe_disable_cache,
+        sdpa_backend_snapshot_context_fn,
+    )
 
-    scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
-    wrapped = 0
     if "all" in scopes or "language" in scopes:
-        for _parent_layers, _layer_id, block in _iter_transformer_and_mtp_blocks(model):
-            for name in ("self_attn", "attention", "attn"):
-                attention = getattr(block, name, None)
-                if isinstance(attention, nn.Module):
-                    setattr(block, name, ptd_checkpoint_wrapper(attention, preserve_rng_state=True))
-                    wrapped += 1
-                    break
-        if wrapped == 0:
-            raise RuntimeError("activation_checkpointing_modules=['attention'] found no decoder attention modules")
+        blocks = [block for _parent_layers, _layer_id, block in _iter_transformer_and_mtp_blocks(model)]
+        if not any(
+            isinstance(getattr(block, name, None), nn.Module)
+            for block in blocks
+            for name in ("self_attn", "attention", "attn")
+        ):
+            raise RuntimeError("activation_checkpointing_modules=['attn'] found no decoder attention modules")
+        if detect_kv_sharing_and_maybe_disable_cache(model):
+            raise RuntimeError(
+                "activation_checkpointing_modules=['attn'] does not support KV-sharing models because "
+                "attention recompute would write shared K/V state twice"
+            )
+        apply_submodule_checkpointing(
+            blocks,
+            has_kv_sharing=False,
+            checkpoint_modules=("attn",),
+            context_fn=sdpa_backend_snapshot_context_fn,
+        )
         logger.info(
             "Applied attention-only activation checkpointing to %d decoder layers; MoE sublayers remain outside "
             "the checkpoint boundary",
-            wrapped,
+            len(blocks),
         )
     _apply_multimodal_tower_ac(model, scopes)
 
@@ -411,7 +422,7 @@ def apply_ac(
     selective: bool = False,
     activation_checkpointing_modules: tuple[str, ...] | None = None,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
-):
+) -> None:
     """Apply activation checkpointing to the model.
 
     Args:
@@ -427,7 +438,7 @@ def apply_ac(
             ``ignore_router``; the shared policy already saves expert-parallel communication
             collectives and ``topk``, so it composes with expert parallelism.
         activation_checkpointing_modules: Optional structural checkpoint boundaries.
-            ``("attention",)`` checkpoints decoder attention only and keeps MoE
+            ``("attn",)`` checkpoints decoder attention only and keeps MoE
             execution outside recompute so full-MoE CUDA graphs remain replay-safe.
         activation_checkpointing_scope: Which layer groups to checkpoint -- the same field
             and semantics as the generic FSDP2/DDP path. ``"all"`` (the default) checkpoints
@@ -454,9 +465,9 @@ def apply_ac(
             raise ValueError(
                 "activation_checkpointing_modules cannot be combined with operator-level selective checkpointing"
             )
-        if activation_checkpointing_modules != ("attention",):
-            raise ValueError("MoE activation_checkpointing_modules currently supports only ('attention',)")
-        _apply_attention_only_ac(model, activation_checkpointing_scope)
+        if activation_checkpointing_modules != ("attn",):
+            raise ValueError("MoE activation_checkpointing_modules currently supports only ('attn',)")
+        _apply_attention_only_ac(model, scopes)
         return
     if checkpoint_decoder and not selective and not ignore_router:
         logger.warning(
@@ -701,6 +712,13 @@ def apply_fsdp(
         ignored_params = None
         if isinstance(moe_module, MoE) and ep_enabled:
             ignored_params = set(moe_module.experts.parameters())
+            if not ep_shard_enabled:
+                # EP already partitions whole experts across ranks. These local
+                # parameters are intentionally excluded from every FSDP unit,
+                # so their storage addresses remain stable across iterations.
+                # Partial MoE CUDA graphs use this marker to avoid a second
+                # long-lived copy of every expert weight.
+                moe_module.experts._nemo_cuda_graph_stable_parameter_storage = True
 
         # Shard model-owned fp32 holders on their own and exclude their params from
         # the block's FSDP unit to keep the block dtype-uniform.
@@ -893,8 +911,18 @@ def parallelize_model(
     tp_shard_plan: dict[str, ParallelStyle] | str | None = None,
     sequence_parallel: bool = False,
     enable_async_tensor_parallel: bool = False,
-):
+) -> None:
     """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism."""
+
+    if activation_checkpointing_modules is not None:
+        if activation_checkpointing_modules != ("attn",):
+            raise ValueError("activation_checkpointing_modules currently supports only ('attn',)")
+        if not activation_checkpointing:
+            raise ValueError("activation_checkpointing_modules requires activation_checkpointing to be enabled")
+        if _is_selective_ac(activation_checkpointing):
+            raise ValueError(
+                "activation_checkpointing_modules cannot be combined with operator-level selective checkpointing"
+            )
 
     tp_enabled = tp_axis_name is not None and world_mesh[tp_axis_name].size() > 1
     if tp_enabled:
@@ -950,9 +978,6 @@ def parallelize_model(
         )
 
         apply_ep(model, moe_mesh[ep_axis_name], moe_mesh=moe_mesh)
-
-    if activation_checkpointing_modules is not None and not activation_checkpointing:
-        raise ValueError("activation_checkpointing_modules requires activation_checkpointing to be enabled")
 
     if activation_checkpointing:
         apply_ac(

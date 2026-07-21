@@ -389,7 +389,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     logger.debug("Optimizer step")
 
             # Match the training-loop lifecycle: record one complete eager
-            # optimizer step, then capture outside the measured iteration.
+            # optimizer step, then capture outside the measured iteration. The
+            # training recipe has already cleared gradients at this point; do
+            # the same here so graph staging does not overlap a complete model
+            # gradient set with its long-lived static input surfaces.
+            if getattr(self, "_partial_cuda_graph_capture_pending", False):
+                for opt in self.optimizer:
+                    opt.zero_grad(set_to_none=True)
             self._capture_partial_cuda_graphs_after_eager_step()
 
             # Synchronize num_label_tokens across DP ranks

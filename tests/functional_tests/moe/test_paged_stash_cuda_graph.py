@@ -199,6 +199,45 @@ def test_active_stash_restores_sparse_rows_and_zeros_padding():
     manager.close()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA and Triton are required")
+def test_active_stash_spills_complete_tensor_to_pinned_host():
+    """Force the live tensor past CUDA capacity and verify pinned-host restore parity."""
+    manager = PagedStashManager()
+    manager.configure(
+        enabled=True,
+        page_size=2,
+        buffer_size_factor=0.25,
+        host_buffer_size_factor=1.0,
+    )
+
+    warmup = torch.randn(8, 4, device="cuda", requires_grad=True)
+    warmup_mask = torch.tensor([True, False, True, True, False, True, False, True], device="cuda")
+    warmup_group = manager.group(name="warmup", max_num_tokens=8, live_token_mask=warmup_mask)
+    warmup_for_compute = warmup_group.start(warmup)
+    with warmup_group:
+        warmup_output = _SegmentedSquare.apply(warmup_group.mark_activation(warmup_for_compute))
+    warmup_group.commit(warmup_output).sum().backward()
+    manager.prepare()
+
+    # Five live rows require three pages. The CUDA fraction above allocates one
+    # page, so the kernel must place this complete saved tensor in host pages.
+    tensor = torch.randn(8, 4, device="cuda", requires_grad=True)
+    live_mask = torch.tensor([True, True, False, True, False, True, False, True], device="cuda")
+    group = manager.group(name="active", max_num_tokens=8, live_token_mask=live_mask)
+    tensor_for_compute = group.start(tensor)
+    with group:
+        output = _SegmentedSquare.apply(group.mark_activation(tensor_for_compute))
+    group.commit(output).sum().backward()
+
+    expected = torch.zeros_like(tensor)
+    expected[live_mask] = 2 * tensor.detach()[live_mask]
+    torch.testing.assert_close(tensor.grad, expected)
+    assert manager.check_overflow().item() == 0
+    assert manager.check_host_spill().item() == 1
+    manager.finish_iteration()
+    manager.close()
+
+
 def _asymmetric_overflow_worker(rank: int, world_size: int, init_method: str) -> None:
     """Verify a single-rank overflow makes every rank discard and retry."""
     torch.cuda.set_device(rank)
@@ -212,6 +251,9 @@ def _asymmetric_overflow_worker(rank: int, world_size: int, init_method: str) ->
     stash_manager = SimpleNamespace(
         is_active=True,
         check_overflow=lambda: torch.tensor([rank == 0], dtype=torch.int64, device="cuda"),
+        check_host_spill=lambda: torch.zeros(1, dtype=torch.int64, device="cuda"),
+        check_allocator_imbalance=lambda: torch.zeros(1, dtype=torch.int64, device="cuda"),
+        clear_host_spill=lambda: None,
         close=lambda: events.append("stash-close"),
     )
     paged_stash._PAGED_STASH_MANAGER = stash_manager
@@ -276,11 +318,24 @@ def test_asymmetric_overflow_retries_on_every_rank():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA and Triton are required")
-def test_te_grouped_linear_paged_stash_matches_eager_across_graph_replays():
-    """Compare BF16 graph output/gradients/update with eager and force page reuse."""
+@pytest.mark.parametrize(
+    ("cuda_buffer_factor", "host_buffer_factor", "expect_host_spill"),
+    [(1.0, 0.0, False), (0.25, 1.0, True)],
+)
+def test_te_grouped_linear_paged_stash_matches_eager_across_graph_replays(
+    cuda_buffer_factor: float,
+    host_buffer_factor: float,
+    expect_host_spill: bool,
+):
+    """Compare BF16 graph output/gradients/update with CUDA and host page reuse."""
     te = pytest.importorskip("transformer_engine.pytorch")
     stash_manager = PagedStashManager()
-    stash_manager.configure(enabled=True, page_size=2, buffer_size_factor=1.0)
+    stash_manager.configure(
+        enabled=True,
+        page_size=2,
+        buffer_size_factor=cuda_buffer_factor,
+        host_buffer_size_factor=host_buffer_factor,
+    )
     target = _GraphableTEExperts(stash_manager, te.GroupedLinear)
     optimizer = torch.optim.SGD(target.parameters(), lr=0.01)
     graph_manager = PartialCudaGraphManager(
@@ -313,7 +368,10 @@ def test_te_grouped_linear_paged_stash_matches_eager_across_graph_replays():
         stash_manager.prepare()
         graph_manager.capture()
         assert stash_manager.check_overflow().item() == 0
+        assert bool(stash_manager.check_host_spill().item()) is expect_host_spill
+        assert stash_manager.check_allocator_imbalance().item() == 0
         stash_manager.finish_iteration()
+        stash_manager.clear_host_spill()
         optimizer.zero_grad(set_to_none=True)
 
         replay_masks = (
@@ -351,7 +409,10 @@ def test_te_grouped_linear_paged_stash_matches_eager_across_graph_replays():
                 torch.testing.assert_close(parameter.grad, eager_parameter_gradients[name])
 
             assert stash_manager.check_overflow().item() == 0
+            assert bool(stash_manager.check_host_spill().item()) is expect_host_spill
+            assert stash_manager.check_allocator_imbalance().item() == 0
             stash_manager.finish_iteration()
+            stash_manager.clear_host_spill()
             if replay_index == 0:
                 optimizer.step()
                 for name, parameter in target.named_parameters():

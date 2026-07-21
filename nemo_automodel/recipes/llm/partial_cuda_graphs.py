@@ -347,12 +347,19 @@ class _TensorOnlyCallAdapter(nn.Module):
 class _ExplicitParameterCallAdapter(nn.Module):
     """Present module parameters as graph inputs instead of captured module state."""
 
-    def __init__(self, target: nn.Module, captured_call: _CapturedCall) -> None:
+    def __init__(
+        self,
+        target: nn.Module,
+        captured_call: _CapturedCall,
+        *,
+        share_parameter_storage: bool = False,
+    ) -> None:
         super().__init__()
         self.graph_target = target
         self.__dict__["target"] = target
         self.captured_call = captured_call
         self.dynamic_input_count = len(captured_call.sample_tensors)
+        self.share_parameter_storage = share_parameter_storage
 
         named_parameters = tuple(target.named_parameters())
         if not named_parameters:
@@ -364,6 +371,7 @@ class _ExplicitParameterCallAdapter(nn.Module):
         self.parameter_metadata = tuple(_tensor_metadata(parameter) for _name, parameter in named_parameters)
         self.buffer_storage = _named_buffer_storage(target)
         capture_parameters = []
+        parameter_data_ptrs = []
         for name, parameter in named_parameters:
             if not isinstance(parameter, nn.Parameter):
                 raise RuntimeError(
@@ -371,17 +379,20 @@ class _ExplicitParameterCallAdapter(nn.Module):
                     f"{name!r} is {type(parameter).__name__}"
                 )
             _require_local_parameter_storage(name, parameter)
-            # Always use a fresh leaf, even when the target is not FSDP-owned.
-            # Persistent model Parameters may already own AccumulateGrad nodes
-            # created on the eager stream; capturing those nodes can make TE's
-            # backward graph depend on the wrong stream. TE directly uses this
-            # clone as its static input, so this is one staging allocation rather
-            # than a clone followed by a second TE-owned parameter copy.
-            capture_parameter = parameter.detach().clone(memory_format=torch.preserve_format)
+            parameter_data_ptrs.append(parameter.data_ptr())
+            # A detached tensor is always a fresh autograd leaf, avoiding the
+            # model Parameter's pre-existing AccumulateGrad node during capture.
+            # EP-local experts are explicitly excluded from FSDP and may share
+            # their stable storage. FSDP-owned targets require an independent
+            # static allocation because their gathered storage is transient.
+            capture_parameter = parameter.detach()
+            if not share_parameter_storage:
+                capture_parameter = capture_parameter.clone(memory_format=torch.preserve_format)
             capture_parameter.requires_grad_(parameter.requires_grad)
             capture_parameters.append(capture_parameter)
         self.capture_parameters = tuple(capture_parameters)
-        self.cloned_parameter_bytes = _tensor_bytes(self.capture_parameters)
+        self.parameter_data_ptrs = tuple(parameter_data_ptrs)
+        self.cloned_parameter_bytes = 0 if share_parameter_storage else _tensor_bytes(self.capture_parameters)
 
     def parameters(self, recurse: bool = True) -> Iterator[nn.Parameter]:
         """Hide the registered target parameters from TE module-parameter discovery."""
@@ -424,6 +435,11 @@ class _ExplicitParameterCallAdapter(nn.Module):
                     f"CUDA graph parameter metadata changed for {name!r}: "
                     f"expected {expected_metadata}, got {actual_metadata}"
                 )
+            if self.share_parameter_storage and parameter.data_ptr() != self.parameter_data_ptrs[index]:
+                raise RuntimeError(
+                    f"CUDA graph parameter storage changed for {name!r}: expected data_ptr "
+                    f"{self.parameter_data_ptrs[index]}, got {parameter.data_ptr()}"
+                )
         buffer_storage = _named_buffer_storage(self.target)
         if buffer_storage != self.buffer_storage:
             raise RuntimeError(
@@ -464,6 +480,7 @@ class _PartialGraphEntry:
         pool_group: str | None = None,
         capture_input_variants: int = 1,
         explicit_parameters: bool = False,
+        share_parameter_storage: bool = False,
         capture_owner: nn.Module | None = None,
         retain_graph_in_backward: bool = False,
     ):
@@ -476,6 +493,7 @@ class _PartialGraphEntry:
             raise ValueError("capture_input_variants must be positive")
         self.capture_input_variants = capture_input_variants
         self.explicit_parameters = explicit_parameters
+        self.share_parameter_storage = share_parameter_storage
         self.capture_owner = capture_owner
         self.retain_graph_in_backward = retain_graph_in_backward
         self.original_forward = target.forward
@@ -575,7 +593,11 @@ class _PartialGraphEntry:
         if captured_call is None:
             raise RuntimeError(f"Partial CUDA graph target {self.name!r} was not called during iteration 0")
         if self.explicit_parameters:
-            adapter = _ExplicitParameterCallAdapter(self.target, captured_call)
+            adapter = _ExplicitParameterCallAdapter(
+                self.target,
+                captured_call,
+                share_parameter_storage=self.share_parameter_storage,
+            )
         else:
             adapter = _TensorOnlyCallAdapter(self.target, captured_call)
         adapter.train(self.target.training)
@@ -858,7 +880,7 @@ def _build_whole_attention_entry(
 def _build_te_dpa_entry(
     block: _DiscoveredBlock,
     target: nn.Module,
-    activation_checkpointing: bool,
+    _activation_checkpointing: bool,
 ) -> _PartialGraphEntry:
     """Build one TE fused-attention graph entry."""
     _require_parameterless_target("te_dpa", block, target)
@@ -867,10 +889,9 @@ def _build_te_dpa_entry(
         target=target,
         pool_group="te_dpa",
         canonicalizer=_canonicalize_bf16_fused_attention,
-        # Reentrant checkpointing invokes attention once under no-grad and once
-        # under grad-enabled recompute. Each contract needs its own TE graph
-        # because requires_grad is a replay invariant.
-        capture_input_variants=2 if activation_checkpointing else 1,
+        # AutoModel uses non-reentrant checkpointing: both the original forward
+        # and backward-time recompute are grad-enabled and share one contract.
+        capture_input_variants=1,
     )
 
 
@@ -911,12 +932,15 @@ def _build_moe_execution_entry(
             "Full MoE CUDA graphs do not support nested FSDP expert sharding (ep_shard > 1); "
             "the expert parameters must be owned by the transformer block"
         )
-    capture_owner = block.capture_owner if isinstance(block.capture_owner, FSDPModule) else None
+    share_parameter_storage = bool(getattr(target, "_nemo_cuda_graph_stable_parameter_storage", False))
+    capture_owner = None if share_parameter_storage else block.capture_owner
+    capture_owner = capture_owner if isinstance(capture_owner, FSDPModule) else None
     return _PartialGraphEntry(
         name=f"{block.name}.moe",
         target=target,
         pool_group="moe",
         explicit_parameters=True,
+        share_parameter_storage=share_parameter_storage,
         capture_owner=capture_owner,
         retain_graph_in_backward=True,
     )
@@ -1015,6 +1039,7 @@ class PartialCudaGraphManager:
         *,
         activation_checkpointing: bool = False,
         activation_checkpointing_modules: tuple[str, ...] | None = None,
+        activation_checkpointing_scope: tuple[str, ...] = ("all",),
         pipeline_parallel: bool = False,
     ) -> PartialCudaGraphManager | None:
         """Discover graph targets from an already-built training model."""
@@ -1039,8 +1064,11 @@ class PartialCudaGraphManager:
                 "Partial CUDA graphs require one local model part; virtual pipeline chunks can interleave "
                 "microbatches and overwrite static CUDA graph buffers before backward consumes them"
             )
-        if activation_checkpointing:
-            moe_graph_compatible = activation_checkpointing_modules == ("attention",)
+        decoder_checkpointing = activation_checkpointing and (
+            "all" in activation_checkpointing_scope or "language" in activation_checkpointing_scope
+        )
+        if decoder_checkpointing:
+            moe_graph_compatible = activation_checkpointing_modules == ("attn",)
             if any("attn" in part.backend.cuda_graph_modules for part in enabled_parts):
                 raise RuntimeError(
                     "Whole-attention CUDA graphs do not support activation checkpointing; "
