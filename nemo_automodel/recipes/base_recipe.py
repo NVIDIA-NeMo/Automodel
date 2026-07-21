@@ -15,6 +15,7 @@
 import getpass
 import json
 import logging
+import math
 import os
 import shutil
 import socket
@@ -527,7 +528,7 @@ class BaseRecipe:
         checkpoints = _list_existing_checkpoints(ckpt_root)
         try:
             protected_checkpoints = _find_pointer_protected_checkpoints(ckpt_root, checkpoints)
-        except OSError:
+        except (OSError, UnicodeError):
             logger.warning("Failed to scan checkpoint pointers in %s; skipping pruning", ckpt_root, exc_info=True)
             return
         retained_window = set(checkpoints[-max_recent_checkpoints:])
@@ -570,6 +571,9 @@ class BaseRecipe:
         that points to the checkpoint with the lowest validation loss.
         Only called on rank 0.
         """
+        if not math.isfinite(val_loss):
+            logger.warning("Ignoring non-finite validation metric for checkpoint %s: %s", target_dir, val_loss)
+            return
         self._initialize_best_val_loss_from_pointer(metric_key)
         # Update best checkpoint if this one is better
         if val_loss < self._best_val_loss:

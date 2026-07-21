@@ -947,6 +947,31 @@ def test_checkpoint_retention_pointer_scan_failure_skips_pruning(tmp_path, monke
     assert "skipping pruning" in caplog.text
 
 
+def test_checkpoint_retention_pointer_classification_failure_skips_pruning(tmp_path, monkeypatch):
+    """An I/O error while identifying a top-level pointer must fail closed."""
+    recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
+    for step in [100, 200, 300]:
+        (tmp_path / f"epoch_0_step_{step}").mkdir()
+    recipe_inst._update_checkpoint_symlink("PINNED", str(tmp_path / "epoch_0_step_100"))
+    path_type = type(tmp_path)
+    real_lstat = path_type.lstat
+
+    def fail_pinned_lstat(path, *args, **kwargs):
+        if path == tmp_path / "PINNED":
+            raise OSError("cannot classify pointer")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(path_type, "lstat", fail_pinned_lstat)
+
+    recipe_inst._prune_old_checkpoints()
+
+    assert _checkpoint_dir_names(tmp_path) == [
+        "epoch_0_step_100",
+        "epoch_0_step_200",
+        "epoch_0_step_300",
+    ]
+
+
 @pytest.mark.parametrize("non_finite_value", ["NaN", "Infinity", "-Infinity"])
 def test_non_finite_restored_best_metric_does_not_block_future_best(tmp_path, non_finite_value):
     """A non-finite metric in LOWEST_VAL metadata is ignored when initializing the restored best."""
@@ -961,6 +986,22 @@ def test_non_finite_restored_best_metric_does_not_block_future_best(tmp_path, no
     recipe_inst._update_best_symlink(str(new_checkpoint), 0.5, "val_loss")
 
     assert _read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == new_checkpoint
+    assert recipe_inst._best_val_loss == 0.5
+
+
+@pytest.mark.parametrize("non_finite_value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_live_metric_does_not_replace_best_pointer(tmp_path, non_finite_value):
+    """A live non-finite validation metric is never eligible for LOWEST_VAL."""
+    recipe_inst = _ToyRecipe(tmp_path)
+    old_checkpoint = tmp_path / "epoch_0_step_100"
+    new_checkpoint = tmp_path / "epoch_0_step_200"
+    old_checkpoint.mkdir()
+    new_checkpoint.mkdir()
+    recipe_inst._update_best_symlink(str(old_checkpoint), 0.5, "val_loss")
+
+    recipe_inst._update_best_symlink(str(new_checkpoint), non_finite_value, "val_loss")
+
+    assert _read_checkpoint_pointer(tmp_path, "LOWEST_VAL") == old_checkpoint
     assert recipe_inst._best_val_loss == 0.5
 
 
@@ -1044,10 +1085,10 @@ def test_checkpoint_retention_prune_failure_is_nonfatal(tmp_path, monkeypatch):
     assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_200"]
 
 
-def test_checkpoint_retention_ignores_unreadable_top_level_text_files(tmp_path):
-    """Retention ignores unrelated text files that are not valid checkpoint pointers."""
+def test_checkpoint_retention_unreadable_pointer_text_skips_pruning(tmp_path):
+    """An unreadable pointer-like text file makes pointer discovery fail closed."""
     recipe_inst = _ToyRecipe(tmp_path, max_recent_checkpoints=1)
-    (tmp_path / "NOT_A_POINTER.txt").write_bytes(bytes([0xFF, 0xFE]))
+    (tmp_path / "PINNED.txt").write_bytes(bytes([0xFF, 0xFE]))
 
     for step in [100, 200]:
         x = torch.randn(4, 2)
@@ -1056,7 +1097,7 @@ def test_checkpoint_retention_ignores_unreadable_top_level_text_files(tmp_path):
         recipe_inst.optimizer.step()
         recipe_inst.save_checkpoint(epoch=0, step=step, train_loss=float(loss.item()))
 
-    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_200"]
+    assert _checkpoint_dir_names(tmp_path) == ["epoch_0_step_100", "epoch_0_step_200"]
 
 
 def test_checkpoint_retention_async_finalization_prunes_pending_checkpoint(tmp_path):

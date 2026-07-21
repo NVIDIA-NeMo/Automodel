@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import re
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -179,9 +180,9 @@ def _read_checkpoint_metric(checkpoint: Path, metric_key: str | None) -> float |
     return None
 
 
-def _is_checkpoint_pointer_text_file(path: Path) -> bool:
+def _is_checkpoint_pointer_text_file(path: Path, mode: int) -> bool:
     """Return whether path looks like a symlink fallback checkpoint pointer."""
-    return path.is_file() and path.suffix == ".txt" and path.stem.isupper()
+    return stat.S_ISREG(mode) and path.suffix == ".txt" and path.stem.isupper()
 
 
 def _find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path]) -> set[Path]:
@@ -194,13 +195,11 @@ def _find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path]
 
     for entry in entries:
         raw_target = None
-        if os.path.islink(entry):
+        entry_mode = entry.lstat().st_mode
+        if stat.S_ISLNK(entry_mode):
             raw_target = os.readlink(entry)
-        elif _is_checkpoint_pointer_text_file(entry):
-            try:
-                raw_target = entry.read_text().strip()
-            except UnicodeError:
-                continue
+        elif _is_checkpoint_pointer_text_file(entry, entry_mode):
+            raw_target = entry.read_text().strip()
 
         target = _resolve_checkpoint_pointer_target(ckpt_root, raw_target) if raw_target else None
         if target is None:
