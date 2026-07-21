@@ -82,4 +82,5 @@ optimizer:
   weight_decay: 0
 
 ci:
+  time: "00:30:00"
   nproc_per_node: 1
