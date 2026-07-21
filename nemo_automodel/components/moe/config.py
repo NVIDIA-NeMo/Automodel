@@ -51,7 +51,7 @@ class MoEConfig:
     # Default 0.0 preserves the existing ``weighted_bias_swiglu_impl`` path.
     swiglu_limit: float = 0.0
     softmax_before_topk: bool = False
-    router_topk_sorted: bool = True
+    router_topk_sorted: bool = False
     router_weights_fp32: bool = False
     router_weight_uses_score_correction_bias: bool = False
     route_weight_after_down_proj: bool = False

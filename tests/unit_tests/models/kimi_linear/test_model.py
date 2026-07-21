@@ -144,3 +144,19 @@ def test_checkpoint_free_initialize_and_eval_forward_runs_hf_order_moe():
     mock_hf_order.assert_called_once()
     assert output.logits.shape == (2, 3, model.vocab_size)
     assert torch.isfinite(output.logits).all()
+
+
+def test_hf_order_eval_moe_matches_standard_grouped_experts_path():
+    torch.manual_seed(0)
+    model = KimiLinearForCausalLM(_tiny_kimi_config(), backend=_backend_config())
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    model.eval()
+    moe_layer = model.model.layers["1"]
+    moe = moe_layer.block_sparse_moe
+    hidden_states = torch.randn(2, 3, model.config.hidden_size)
+
+    with torch.inference_mode():
+        hf_order = moe_layer._moe_infer_hf_order(moe, moe.experts, hidden_states)
+        standard = moe(hidden_states, None)
+
+    torch.testing.assert_close(hf_order, standard, rtol=1e-5, atol=1e-6)
