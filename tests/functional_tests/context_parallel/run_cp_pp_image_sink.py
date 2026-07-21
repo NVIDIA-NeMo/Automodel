@@ -19,7 +19,7 @@ pre-embed sink. Media rides the existing per-microbatch side channel
 (prepare_vlm_media_for_pp -> stage_vlm_media_for_pp -> stage-0 chunk pull); the
 in-forward embed + vision splice runs on the microbatch's full sequence with the
 CP ring dispatcher suspended around the (non-causal, unsharded) vision tower
-(cp_dispatcher_suspended), then shard_sequence_for_cp shards the result. Two
+(cp_dispatcher_suspended), then shard_sequence_for_cp_round_robin shards the result. Two
 images of different sizes across two samples exercise the sample-aware chunker.
 
 Asserts: 20 clean steps (no double-backward), finite loss, cp2xpp2 == cp2xpp1

@@ -17,7 +17,7 @@
 Drives the REAL AutoPipeline split + schedule.step under cp2xpp2 (4 GPUs) and
 cp2xpp1 (2 GPUs) with a tiny random-init text-only config, exercising the whole
 sunk layer-2 contract: the sharder-only hook, the in-forward embed +
-shard_sequence_for_cp, the asymmetric get_pipeline_stage_metas (full-length
+shard_sequence_for_cp_round_robin, the asymmetric get_pipeline_stage_metas (full-length
 first-stage ids, local sharded outputs), and per-microbatch backward. Asserts:
 
   (1) 20 steps run clean -- no "backward through the graph a second time"

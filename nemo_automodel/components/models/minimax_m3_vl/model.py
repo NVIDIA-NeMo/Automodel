@@ -30,7 +30,7 @@ from nemo_automodel.components.distributed.cp_sharder import (
     ContextParallelismSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
-    shard_sequence_for_cp,
+    shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.models.common import (
     BackendConfig,
@@ -545,7 +545,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
 
         Under context parallelism the first stage embeds the full sequence and
         shards it to this rank's round-robin chunk pair inside forward
-        (see :func:`shard_sequence_for_cp`), so every stage output and every
+        (see :func:`shard_sequence_for_cp_round_robin`), so every stage output and every
         later-stage input carries the LOCAL (padded-to-``2*cp`` then ``//cp``)
         sequence length while the first stage's input stays full-length. At
         ``cp_size == 1`` the lengths coincide and the layout is symmetric.
@@ -651,7 +651,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         no-grad aux streams (labels/position_ids/loss_mask/padding_mask) via
         :func:`shard_batch_aux_only`, leaving ``input_ids`` and the multimodal inputs
         full-length; the forward then embeds + splices and calls
-        :func:`shard_sequence_for_cp` per microbatch, so embeddings and vision stay
+        :func:`shard_sequence_for_cp_round_robin` per microbatch, so embeddings and vision stay
         trainable under CP. Nothing is consumed here.
         Defining this method is the opt-in signal the recipe checks
         (``hasattr(model, "prepare_model_inputs_for_cp")``).
@@ -730,7 +730,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         # Media under CP×PP rides the same per-microbatch side channel as cp1×PP:
         # stage_vlm_media_for_pp stashed grid-aware pixel chunks (pulled just above),
         # and the embed + vision splice below runs on this microbatch's FULL sequence
-        # before shard_sequence_for_cp shards it. So the CP shard composes with the
+        # before shard_sequence_for_cp_round_robin shards it. So the CP shard composes with the
         # media staging without changing the stage metas (the first-stage input is
         # still input_ids [mb, S]; media never enters the stage tensor stream).
 
@@ -753,7 +753,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             # freshly embedded full sequence (aux streams + ring-SDPA context aligned
             # by shard_batch_aux_only). Differentiable: gradients reach embeddings/vision.
             if cp_size > 1:
-                inputs_embeds, _, _ = shard_sequence_for_cp(self.cp_mesh, inputs_embeds, seq_dim=1)
+                inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
 
         hidden = self.model(
             None,

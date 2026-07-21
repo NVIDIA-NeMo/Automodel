@@ -676,7 +676,7 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
                     mod._cp_mesh = cp_mesh
             # Hand the CP submesh to the model so a forward that embeds and
             # sequence-shards its own primary stream (Megatron-style per-microbatch
-            # CP; see shard_sequence_for_cp / shard_batch_aux_only) can build this
+            # CP; see shard_sequence_for_cp_round_robin / shard_batch_aux_only) can build this
             # rank's round-robin shard.
             model.cp_mesh = cp_mesh
 

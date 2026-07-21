@@ -27,7 +27,7 @@ from nemo_automodel.components.distributed.cp_sharder import (
     ContextParallelismSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
-    shard_sequence_for_cp,
+    shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -521,7 +521,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
 
         Embedding and the vision multimodal scatter now run inside ``forward``
         per microbatch (see the CP branch that calls ``get_multimodal_embeddings``
-        + ``prepare_inputs_embeds`` + :func:`shard_sequence_for_cp`). The returned
+        + ``prepare_inputs_embeds`` + :func:`shard_sequence_for_cp_round_robin`). The returned
         :class:`ContextParallelismSharder` round-robin-shards only the no-grad aux
         streams (labels/position_ids/loss_mask/padding_mask) and leaves
         ``input_ids`` and the media inputs full-length for the forward. Step3.7
@@ -653,7 +653,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
                 image_embeds=kwargs.get("image_embeds", None),
             )
             inputs_embeds = self.model.prepare_inputs_embeds(input_ids, multimodal_embeddings)
-            inputs_embeds, _, _ = shard_sequence_for_cp(self.cp_mesh, inputs_embeds, seq_dim=1)
+            inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
             input_ids = None
             # Media consumed into inputs_embeds; drop so self.model does not re-splice.
             for media_key in (

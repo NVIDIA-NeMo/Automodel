@@ -81,7 +81,7 @@ from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.distributed.cp_sharder import (
     ContextParallelismSharder,
     contiguous_local_indices,
-    slice_sequence_for_cp_contiguous,
+    shard_sequence_for_cp_contiguous,
 )
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -1514,11 +1514,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         # stream, on the same layout the aux-only sharder used (pad sentinels match
         # the dispatch-level contiguous shard: mm_token_type_ids -> 0, vision group
         # ids -> -1, embeds / per-layer inputs -> 0).
-        inputs_embeds = slice_sequence_for_cp_contiguous(cp_mesh, inputs_embeds, seq_dim=1)[0]
+        inputs_embeds = shard_sequence_for_cp_contiguous(cp_mesh, inputs_embeds, seq_dim=1)[0]
         if per_layer_inputs is not None:
-            per_layer_inputs = slice_sequence_for_cp_contiguous(cp_mesh, per_layer_inputs, seq_dim=1)[0]
-        mm_local = slice_sequence_for_cp_contiguous(cp_mesh, mm_full, seq_dim=1, pad_value=0)[0]
-        vision_group_local = slice_sequence_for_cp_contiguous(cp_mesh, vision_group_ids_full, seq_dim=1, pad_value=-1)[
+            per_layer_inputs = shard_sequence_for_cp_contiguous(cp_mesh, per_layer_inputs, seq_dim=1)[0]
+        mm_local = shard_sequence_for_cp_contiguous(cp_mesh, mm_full, seq_dim=1, pad_value=0)[0]
+        vision_group_local = shard_sequence_for_cp_contiguous(cp_mesh, vision_group_ids_full, seq_dim=1, pad_value=-1)[
             0
         ]
         return {

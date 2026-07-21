@@ -255,16 +255,18 @@ def test_shard_batch_contiguous_respects_pad_multiple():
 
 
 # ---------------------------------------------------------------------------
-# shard_sequence_for_cp (in-forward round-robin shard, differentiable)
+# shard_sequence_for_cp_round_robin (in-forward round-robin shard, differentiable)
 # ---------------------------------------------------------------------------
-def test_shard_sequence_for_cp_roundtrips_across_ranks():
+def test_shard_sequence_for_cp_round_robin_roundtrips_across_ranks():
     """Sharding all ranks and reassembling reproduces the full padded sequence;
     the appended CP-pad slots are zero (pad_value=0)."""
     cp_size, seq = 2, 6  # divisor 2*cp = 4 -> pad to 8
     full = torch.randn(1, seq, 4)
     parts, idxs = [], []
     for rank in range(cp_size):
-        local, idx, padded_len = cs.shard_sequence_for_cp(_FakeMesh(cp_size, rank), full.clone(), pad_value=0.0)
+        local, idx, padded_len = cs.shard_sequence_for_cp_round_robin(
+            _FakeMesh(cp_size, rank), full.clone(), pad_value=0.0
+        )
         assert padded_len == 8
         assert local.shape == (1, 4, 4)  # 8 / cp_size
         parts.append(local)
@@ -274,28 +276,28 @@ def test_shard_sequence_for_cp_roundtrips_across_ranks():
     torch.testing.assert_close(rebuilt[:, seq:], torch.zeros(1, 2, 4))
 
 
-def test_shard_sequence_for_cp_matches_round_robin_layout():
+def test_shard_sequence_for_cp_round_robin_matches_round_robin_layout():
     """The kept positions are exactly this rank's round_robin_local_indices."""
     full = torch.arange(8).view(1, 8, 1).float()
     for rank in (0, 1):
-        local, idx, _ = cs.shard_sequence_for_cp(_FakeMesh(2, rank), full.clone())
+        local, idx, _ = cs.shard_sequence_for_cp_round_robin(_FakeMesh(2, rank), full.clone())
         expected_idx = cs.round_robin_local_indices(_FakeMesh(2, rank), 8)
         assert torch.equal(idx, expected_idx)
         torch.testing.assert_close(local, full.index_select(1, expected_idx))
 
 
-def test_shard_sequence_for_cp_is_differentiable():
+def test_shard_sequence_for_cp_round_robin_is_differentiable():
     """Gradient reaches exactly the input positions this rank owns."""
     full = torch.randn(1, 8, 3, requires_grad=True)
-    local, idx, _ = cs.shard_sequence_for_cp(_FakeMesh(2, 0), full)
+    local, idx, _ = cs.shard_sequence_for_cp_round_robin(_FakeMesh(2, 0), full)
     local.sum().backward()
     touched = (full.grad.abs().sum(dim=(0, 2)) > 0).nonzero().flatten()
     assert torch.equal(touched, idx.sort().values)
 
 
-def test_shard_sequence_for_cp_identity_without_cp():
+def test_shard_sequence_for_cp_round_robin_identity_without_cp():
     full = torch.randn(1, 5, 2)
-    local, idx, padded_len = cs.shard_sequence_for_cp(_FakeMesh(1), full)
+    local, idx, padded_len = cs.shard_sequence_for_cp_round_robin(_FakeMesh(1), full)
     assert local is full and padded_len == 5
     assert torch.equal(idx, torch.arange(5))
 
@@ -385,14 +387,14 @@ def test_shard_batch_contiguous_extra_seq_keys():
 
 
 # ---------------------------------------------------------------------------
-# shard_batch_contiguous(shard_primary=False) + slice_sequence_for_cp_contiguous
+# shard_batch_contiguous(shard_primary=False) + shard_sequence_for_cp_contiguous
 # (Megatron-style contiguous CP: aux streams sliced by the sharder, the primary
 # embedded and sliced inside the model forward). The contract is bit-exact
 # slice-equivalence with the primary-inclusive shard (shard_primary=True).
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("cp_size,rank", [(2, 0), (2, 1), (4, 3)])
 def test_aux_only_contiguous_slice_equivalence_with_shard_batch_contiguous(cp_size, rank):
-    """Aux-only contiguous shard + in-forward slice_sequence_for_cp_contiguous
+    """Aux-only contiguous shard + in-forward shard_sequence_for_cp_contiguous
     reproduces shard_batch_contiguous exactly: same primary slice, same aux
     slices, same padding. The primary rides an ``inputs_embeds`` float tensor so
     the primary slice is compared value-for-value."""
@@ -422,7 +424,7 @@ def test_aux_only_contiguous_slice_equivalence_with_shard_batch_contiguous(cp_si
     # Primary is left full-length + untouched by the aux-only sharder.
     assert aux_out["inputs_embeds"] is full_embeds
     assert aux_out["inputs_embeds"].shape == (1, seq, hidden)
-    local_primary, local_idx, padded_len = cs.slice_sequence_for_cp_contiguous(
+    local_primary, local_idx, padded_len = cs.shard_sequence_for_cp_contiguous(
         mesh, aux_out["inputs_embeds"], seq_dim=1
     )
 
@@ -457,28 +459,28 @@ def test_shard_batch_contiguous_aux_only_keeps_input_ids_full(monkeypatch):
     assert (layout.original_seq_len, layout.padded_seq_len) == (6, 8)
 
 
-def test_slice_sequence_for_cp_contiguous_is_differentiable():
+def test_shard_sequence_for_cp_contiguous_is_differentiable():
     """Gradient reaches exactly this rank's contiguous positions of the primary."""
     full = torch.randn(1, 8, 3, requires_grad=True)
-    local, idx, _ = cs.slice_sequence_for_cp_contiguous(_FakeMesh(2, 1), full)
+    local, idx, _ = cs.shard_sequence_for_cp_contiguous(_FakeMesh(2, 1), full)
     local.sum().backward()
     touched = (full.grad.abs().sum(dim=(0, 2)) > 0).nonzero().flatten()
     assert torch.equal(touched, idx.sort().values)
     assert torch.equal(idx, torch.arange(4, 8))  # rank 1 owns the second half
 
 
-def test_slice_sequence_for_cp_contiguous_identity_without_cp():
+def test_shard_sequence_for_cp_contiguous_identity_without_cp():
     full = torch.randn(1, 5, 2)
-    local, idx, padded_len = cs.slice_sequence_for_cp_contiguous(_FakeMesh(1), full)
+    local, idx, padded_len = cs.shard_sequence_for_cp_contiguous(_FakeMesh(1), full)
     assert local is full and padded_len == 5
     assert torch.equal(idx, torch.arange(5))
 
 
-def test_slice_sequence_for_cp_contiguous_respects_pad_multiple():
+def test_shard_sequence_for_cp_contiguous_respects_pad_multiple():
     """The divisor is cp_size * max(pad_multiple, 2): a 4D per-layer-inputs tensor
     (seq axis 1) pads and slices on the same layout as the 3D embeds."""
     full = torch.arange(6 * 2 * 3, dtype=torch.float32).view(1, 6, 2, 3)  # [B, S, L, H]
-    local, idx, padded_len = cs.slice_sequence_for_cp_contiguous(_FakeMesh(2, 0), full, pad_multiple=4)
+    local, idx, padded_len = cs.shard_sequence_for_cp_contiguous(_FakeMesh(2, 0), full, pad_multiple=4)
     assert padded_len == 8  # cp_size(2) * max(4, 2) = 8
     assert local.shape == (1, 4, 2, 3)
     torch.testing.assert_close(idx, torch.arange(4))

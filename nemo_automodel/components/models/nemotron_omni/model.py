@@ -38,7 +38,7 @@ from nemo_automodel.components.distributed.cp_sharder import (
     ContextParallelismSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
-    shard_sequence_for_cp,
+    shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.distributed.cp_utils import cp_dispatcher_suspended
 from nemo_automodel.components.models.common import BackendConfig
@@ -785,7 +785,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         Embedding and the image/video/audio multimodal scatter now run inside
         ``forward`` per microbatch (the existing ``inputs_embeds is None`` block),
         which then round-robin shards the result with
-        :func:`shard_sequence_for_cp`. The returned
+        :func:`shard_sequence_for_cp_round_robin`. The returned
         :class:`ContextParallelismSharder` round-robin-shards only the no-grad aux
         streams (labels/position_ids/loss_mask/padding_mask) and leaves
         ``input_ids`` and the media inputs full-length for the forward. NemotronOmni
@@ -1026,7 +1026,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         # pre-embed and stays differentiable. Skipped when inputs_embeds is pre-sharded.
         cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
         if cp_size > 1 and not _embeds_pre_built:
-            inputs_embeds, _, _ = shard_sequence_for_cp(self.cp_mesh, inputs_embeds, seq_dim=1)
+            inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
 
         # Forward through the LLM. ``logits_to_keep`` gates the lm_head projection
         # (0 -> all positions; N -> last N) and ``output_hidden_states`` makes the

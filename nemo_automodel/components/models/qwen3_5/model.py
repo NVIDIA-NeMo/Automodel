@@ -42,7 +42,7 @@ from nemo_automodel.components.distributed.cp_sharder import (
     ContextParallelismSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
-    shard_sequence_for_cp,
+    shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -1243,7 +1243,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
             )
-            inputs_embeds, _, _ = shard_sequence_for_cp(self.cp_mesh, inputs_embeds, seq_dim=1)
+            inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
             input_ids = None
             pixel_values = None
             pixel_values_videos = None

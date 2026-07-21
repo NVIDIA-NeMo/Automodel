@@ -18,7 +18,7 @@ Exercises the sunk CP path end to end: ``prepare_cp_forward`` invokes the
 sharder-only ``prepare_model_inputs_for_cp`` hook (``shard_batch_aux_only``
 round-robin shards labels/position_ids and installs the ring-SDPA context), and
 ``MiniMaxM3SparseForConditionalGeneration.forward`` embeds the full sequence then
-``shard_sequence_for_cp`` shards ``inputs_embeds`` per rank. The unsharded cp2
+``shard_sequence_for_cp_round_robin`` shards ``inputs_embeds`` per rank. The unsharded cp2
 logits must match the cp1 eager forward.
 
   cp1 eager (cp_mesh unset)  ==  cp2 (apply_cp + prepare_cp_forward + in-forward shard)

@@ -85,7 +85,7 @@ def make_contiguous_aux_only_shard_cp_batch_and_ctx(
     forward then embeds, splices vision, builds ``per_layer_inputs`` and the
     ``_gemma4_vision_group_ids`` / ``mm_token_type_ids`` ring metadata on the full
     sequence and contiguously slices them per microbatch (see
-    ``slice_sequence_for_cp_contiguous``), so the embeddings and vision tower are
+    ``shard_sequence_for_cp_contiguous``), so the embeddings and vision tower are
     trainable under CP and the PP×CP shared pre-embed graph no longer exists.
 
     ``_packed_seq_ids`` is synthesized full (from the full ``padding_mask``) and

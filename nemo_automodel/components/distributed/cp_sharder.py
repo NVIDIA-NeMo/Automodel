@@ -457,7 +457,7 @@ def shard_batch_contiguous(
     the aux streams — the dispatch-level shard (e.g. DSV4). When False the primary
     and pixel streams are left FULL-length for a model that embeds and slices them
     inside its own forward per microbatch (e.g. Gemma4; see
-    :func:`slice_sequence_for_cp_contiguous`). The padded layout is identical
+    :func:`shard_sequence_for_cp_contiguous`). The padded layout is identical
     either way, so the two paths stay bit-for-bit slice-equivalent.
 
     Args:
@@ -556,7 +556,7 @@ def shard_batch_contiguous(
     # from the same full batch, then keeps one contiguous sequence shard. The
     # padded length equals the primary's post-pad length whether or not the
     # primary itself was padded here, so the aux-only slice matches the primary
-    # slice the model computes with :func:`slice_sequence_for_cp_contiguous`.
+    # slice the model computes with :func:`shard_sequence_for_cp_contiguous`.
     batch["labels"] = labels
     cp_rank = _cp_rank(cp_mesh)
 
@@ -839,7 +839,7 @@ def shard_batch_aux_only(
     ``extra_seq_buffers``) exactly like the load-balanced path, installs the same
     ring-SDPA ``context_parallel`` context, and leaves the primary stream
     full-length in the batch for the model to embed and shard via
-    :func:`shard_sequence_for_cp`.
+    :func:`shard_sequence_for_cp_round_robin`.
 
     Because the primary stream never enters the ``context_parallel`` buffer list,
     the grad-carrying-buffer constraint (``resize_`` rejects tensors requiring
@@ -920,7 +920,7 @@ def shard_batch_aux_only(
     return get_train_context(False, False, cp_ctx), batch, layout
 
 
-def shard_sequence_for_cp(
+def shard_sequence_for_cp_round_robin(
     cp_mesh, tensor: torch.Tensor, *, seq_dim: int = 1, pad_value: float | int = 0
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Pad and round-robin shard a full-length sequence tensor inside a model forward.
@@ -962,12 +962,12 @@ def shard_sequence_for_cp(
     return local, local_indices, padded_seq_len
 
 
-def slice_sequence_for_cp_contiguous(
+def shard_sequence_for_cp_contiguous(
     cp_mesh, tensor: torch.Tensor, *, seq_dim: int = 1, pad_value: float | int = 0, pad_multiple: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Pad and contiguously shard a full-length sequence tensor inside a model forward.
 
-    The contiguous peer of :func:`shard_sequence_for_cp`: a model that keeps one
+    The contiguous peer of :func:`shard_sequence_for_cp_round_robin`: a model that keeps one
     contiguous ``seq_start:seq_end`` slice per CP rank (model-owned p2p ring, e.g.
     Gemma4) and leaves its primary stream full-length (see
     :func:`shard_batch_contiguous` with ``shard_primary=False``) calls this on
