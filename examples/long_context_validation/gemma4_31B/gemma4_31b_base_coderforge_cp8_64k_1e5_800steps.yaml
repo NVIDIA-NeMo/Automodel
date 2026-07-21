@@ -134,7 +134,8 @@ freeze_config:
   freeze_language_model: false # embeddings + tied LM head trainable — required to learn tokens 48/49/52
 
 wandb:
-  enable: true
-  project: cp_validation
-  entity: nvidia
-  name: gemma4_31b_base_coderforge_cp8_64k_1e5_800steps
+  enable: false
+  project: <your_wandb_project>
+  entity: <your_wandb_entity>
+  name: <your_wandb_name>
+  dir: <your_wandb_save_dir>

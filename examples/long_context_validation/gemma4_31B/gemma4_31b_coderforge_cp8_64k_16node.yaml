@@ -112,7 +112,8 @@ freeze_config:
   freeze_language_model: false
 
 wandb:
-  enable: true
-  project: cp_validation
-  entity: nvidia
-  name: gemma4_31b_coderforge_cp8_64k_16node_0p3B
+  enable: false
+  project: <your_wandb_project>
+  entity: <your_wandb_entity>
+  name: <your_wandb_name>
+  dir: <your_wandb_save_dir>
