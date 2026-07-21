@@ -365,7 +365,16 @@ class KimiKDAFp32Params(nn.Module):
         self.dt_bias = nn.Parameter(torch.empty(projection_size, dtype=torch.float32))
 
     def forward(self, g: torch.Tensor, head_dim: int, use_fused_gate: bool = True) -> torch.Tensor:
-        """Compute KDA decay gate while holder params are unsharded by FSDP."""
+        """Compute KDA decay gate while holder params are unsharded by FSDP.
+
+        Args:
+            g: Tensor of shape [batch, sequence, heads * head_dim].
+            head_dim: Per-head KDA dimension.
+            use_fused_gate: Whether to use FLA's fused KDA gate kernel.
+
+        Returns:
+            Tensor of shape [batch, sequence, heads, head_dim].
+        """
         a_log = self.A_log.contiguous()
         dt_bias = self.dt_bias.contiguous()
         if use_fused_gate:
@@ -595,6 +604,15 @@ class KimiDecoderLayer(nn.Module):
         return residual + hidden_states
 
     def _moe(self, hidden_states: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
+        """Run a Kimi MoE layer.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+            padding_mask: Optional boolean tensor of shape [batch, sequence], where true marks padding tokens.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+        """
         moe = unwrap_checkpoint_wrapper(self.block_sparse_moe)
         if not isinstance(moe, MoE):
             raise TypeError(f"Expected Kimi MoE layer, got {type(moe).__name__}.")
@@ -618,6 +636,16 @@ class KimiDecoderLayer(nn.Module):
         experts: GroupedExperts,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        """Run Kimi inference MoE in the same expert-ordered loop as the HF reference.
+
+        Args:
+            moe: MoE module containing the router and optional shared experts.
+            experts: Grouped routed experts for the layer.
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+        """
         orig_shape = hidden_states.shape
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
         token_mask = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
@@ -755,6 +783,15 @@ class KimiLinearModel(nn.Module):
         attention_mask: torch.Tensor | None,
         cache_position: torch.Tensor,
     ) -> torch.Tensor | None:
+        """Select the padding mask passed to KDA layers.
+
+        Args:
+            attention_mask: Optional binary padding mask tensor of shape [batch, sequence].
+            cache_position: Tensor of shape [sequence] containing current token positions.
+
+        Returns:
+            Binary padding mask tensor of shape [batch, sequence], or None when no KDA mask is needed.
+        """
         if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
             return None
         return attention_mask
@@ -818,10 +855,8 @@ class KimiLinearModel(nn.Module):
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        buffer_device = (
-            buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
-            if torch.cuda.is_available()
-            else torch.device("cpu")
+        buffer_device = buffer_device or (
+            torch.device(f"cuda:{torch.cuda.current_device()}") if torch.cuda.is_available() else torch.device("cpu")
         )
         init_std = self.config.initializer_range
         with buffer_device:
@@ -980,10 +1015,8 @@ class KimiLinearForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         buffer_device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
-        buffer_device = (
-            buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
-            if torch.cuda.is_available()
-            else torch.device("cpu")
+        buffer_device = buffer_device or (
+            torch.device(f"cuda:{torch.cuda.current_device()}") if torch.cuda.is_available() else torch.device("cpu")
         )
         self.model.init_weights(buffer_device)
         final_out_std = self.config.hidden_size**-0.5
