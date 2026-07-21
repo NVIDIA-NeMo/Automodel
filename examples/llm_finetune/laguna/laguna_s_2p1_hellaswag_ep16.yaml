@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# SFT recipe for the local MistyBasin Laguna checkpoint.
+# SFT recipe for Poolside Laguna S 2.1.
 #
 # Hardware target: 2 nodes x 8 GPUs for full SFT with EP16 + FSDP2.
-#   automodel examples/llm_finetune/laguna/mistybasin_hellaswag_ep16.yaml --nproc-per-node 8
+#   automodel examples/llm_finetune/laguna/laguna_s_2p1_hellaswag_ep16.yaml --nproc-per-node 8
 #
 # EP size must divide num_experts (256). ep_size=16 -> 16 experts/rank.
 
@@ -40,7 +40,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/mistybasin/mistybasin-s-2p1_vv1
+  pretrained_model_name_or_path: poolside/Laguna-S-2.1
   trust_remote_code: false
   torch_dtype: bfloat16
   attn_implementation: sdpa
@@ -58,7 +58,7 @@ model:
 
 checkpoint:
   enabled: false
-  checkpoint_dir: checkpoints/mistybasin_laguna_hellaswag_ep16_torch_dispatch
+  checkpoint_dir: checkpoints/laguna_s_2p1_hellaswag_ep16_torch_dispatch
   model_save_format: safetensors
   save_consolidated: final
 
@@ -86,7 +86,7 @@ dataset:
   pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/mistybasin/mistybasin-s-2p1_vv1
+    pretrained_model_name_or_path: poolside/Laguna-S-2.1
     trust_remote_code: false
 
 packed_sequence:
@@ -108,7 +108,7 @@ validation_dataset:
   pad_to_max_length: false
   tokenizer:
     _target_: transformers.AutoTokenizer.from_pretrained
-    pretrained_model_name_or_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemofw/users/huiyingl/mistybasin/mistybasin-s-2p1_vv1
+    pretrained_model_name_or_path: poolside/Laguna-S-2.1
     trust_remote_code: false
 
 validation_dataloader:
@@ -128,8 +128,8 @@ optimizer:
   weight_decay: 0.0
 
 wandb:
-  project: mistybasin-laguna-sft
-  name: mistybasin_laguna_hellaswag_ep16_torch_dispatch
+  project: laguna-s-2p1-sft
+  name: laguna_s_2p1_hellaswag_ep16_torch_dispatch
   dir: wandb
 
 ci:
