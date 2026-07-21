@@ -98,7 +98,6 @@ def _build_backbone_from_extracted_submodel(
     pooling: Optional[str],
     num_labels: Optional[int],
     temperature: Optional[float],
-    source_commit_hash: Optional[str] = None,
 ) -> PreTrainedModel:
     """Build a task-specific retrieval backbone from an extracted text submodel."""
     text_config = extracted_model.config
@@ -143,11 +142,6 @@ def _build_backbone_from_extracted_submodel(
             config.pooling = pooling
         if temperature is not None:
             config.temperature = temperature
-
-    if source_commit_hash is None:
-        source_commit_hash = getattr(text_config, "_commit_hash", None)
-    if source_commit_hash is not None:
-        config._commit_hash = source_commit_hash
 
     attn_implementation = getattr(text_config, "_attn_implementation", None)
     if attn_implementation is not None:
@@ -284,7 +278,6 @@ def build_encoder_backbone(
             pooling=pooling,
             num_labels=num_labels,
             temperature=temperature,
-            source_commit_hash=getattr(config, "_commit_hash", None),
         )
 
     if model_type.lower() == "ministral3" and task == "embedding":
