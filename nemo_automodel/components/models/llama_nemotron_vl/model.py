@@ -388,6 +388,39 @@ class OptimizedLlamaBidirectionalModel(PreTrainedModel):
         return_dict: bool | None = None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
+        """Run the optimized bidirectional LLaMA stack.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence]. Mutually
+                exclusive with ``inputs_embeds``.
+            attention_mask: Optional padding mask of shape [batch, sequence].
+            position_ids: Optional absolute position IDs of shape [batch, sequence].
+            past_key_values: Optional cache whose per-layer key and value tensors
+                have shape [batch, key_value_heads, cached_sequence, head_dim].
+            inputs_embeds: Optional token embeddings of shape [batch, sequence,
+                hidden]. Mutually exclusive with ``input_ids``.
+            cache_position: Optional tensor of shape [sequence] containing absolute
+                positions for cache updates.
+            bidirectional_mask: Optional precomputed mask of shape [batch, sequence]
+                for FlashAttention 2, or [batch, 1, sequence, key_value_sequence]
+                for eager and SDPA attention.
+            bidirectional_mask_precomputed: Whether ``bidirectional_mask`` is ready
+                for the selected attention backend.
+            use_cache: Whether to create or update ``past_key_values``.
+            output_hidden_states: Whether to return the embedding output and every
+                decoder-layer output.
+            return_dict: Whether to return ``BaseModelOutputWithPast`` instead of a tuple.
+            **kwargs: Additional decoder-layer arguments. Tensor-valued entries use
+                the layouts required by the selected attention backend.
+
+        Returns:
+            ``BaseModelOutputWithPast`` whose ``last_hidden_state`` has shape
+            [batch, sequence, hidden], whose cached key and value tensors have shape
+            [batch, key_value_heads, cached_sequence, head_dim], and whose optional
+            ``hidden_states`` entries each have shape [batch, sequence, hidden]. If
+            ``return_dict`` is false, these populated fields are returned as a tuple
+            in the same order.
+        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if (input_ids is None) ^ (inputs_embeds is not None):

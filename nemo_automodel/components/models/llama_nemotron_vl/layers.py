@@ -106,6 +106,28 @@ class OptimizedLlamaAttention(nn.Module):
         cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply bidirectional self-attention.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+            position_embeddings: Tuple containing cosine and sine tensors of shape
+                [batch, sequence, head_dim]. With fused RoPE, a third raw-frequency
+                tensor of shape [sequence, 1, 1, head_dim] is also accepted.
+            attention_mask: Optional tensor of shape [batch, key_value_sequence] for
+                FlashAttention 2, or [batch, 1, sequence, key_value_sequence] for
+                eager and SDPA attention.
+            past_key_values: Optional cache whose per-layer key and value tensors
+                have shape [batch, key_value_heads, cached_sequence, head_dim].
+            cache_position: Optional tensor of shape [sequence] containing absolute
+                positions for cache updates.
+            **kwargs: Additional Transformers attention arguments. Tensor-valued
+                entries use the layouts required by the selected attention backend.
+
+        Returns:
+            A tuple containing the attention output tensor of shape [batch, sequence,
+            hidden] and attention weights of shape [batch, heads, sequence,
+            key_value_sequence].
+        """
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -169,6 +191,14 @@ class OptimizedLlamaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the SwiGLU MLP.
+
+        Args:
+            x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+
+        Returns:
+            Tensor of shape [..., hidden] with the same leading dimensions as ``x``.
+        """
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -205,6 +235,14 @@ class OptimizedFusedTERMSNormMLP(nn.Module):
                 self.fused.fc2_bias.copy_(down_proj.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply fused RMSNorm and SwiGLU MLP projections.
+
+        Args:
+            x: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+
+        Returns:
+            Tensor of shape [..., hidden] with the same leading dimensions as ``x``.
+        """
         return self.fused(x)
 
 
@@ -242,6 +280,17 @@ class OptimizedFusedTERMSNormQKV(nn.Module):
                 self.fused.bias.copy_(torch.cat([q_proj.bias, k_proj.bias, v_proj.bias], dim=0))
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply fused RMSNorm and concatenated QKV projection.
+
+        Args:
+            x: Tensor of shape [batch, sequence, hidden].
+
+        Returns:
+            A tuple containing query, key, and value tensors split from the fused
+            last axis in that order. Query has shape [batch, sequence,
+            query_heads * head_dim]; key and value each have shape [batch, sequence,
+            key_value_heads * head_dim].
+        """
         qkv = self.fused(x)
         return qkv.split(self.sizes, dim=-1)
 
@@ -272,6 +321,29 @@ class OptimizedLlamaDecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
+        """Apply one optimized bidirectional LLaMA decoder layer.
+
+        Args:
+            hidden_states: Tensor of shape [batch, sequence, hidden].
+            attention_mask: Optional tensor of shape [batch, key_value_sequence] for
+                FlashAttention 2, or [batch, 1, sequence, key_value_sequence] for
+                eager and SDPA attention.
+            position_ids: Optional tensor of shape [batch, sequence] containing
+                absolute token positions.
+            past_key_values: Optional cache whose per-layer key and value tensors
+                have shape [batch, key_value_heads, cached_sequence, head_dim].
+            use_cache: Whether to update ``past_key_values`` during attention.
+            cache_position: Optional tensor of shape [sequence] containing absolute
+                positions for cache updates.
+            position_embeddings: Optional tuple containing cosine and sine tensors
+                of shape [batch, sequence, head_dim]. With fused RoPE, a third
+                raw-frequency tensor of shape [sequence, 1, 1, head_dim] is accepted.
+            **kwargs: Additional Transformers attention arguments. Tensor-valued
+                entries use the layouts required by the selected attention backend.
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+        """
         residual = hidden_states
         if getattr(self, "input_layernorm", None) is not None:
             hidden_states = self.input_layernorm(hidden_states)
@@ -411,6 +483,16 @@ class FusedTESiglipTransformerLayer(nn.Module):
             fused_mlp.fc2_bias.copy_(source_mlp.fc2.bias)
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        """Apply the fused Transformer Engine SigLIP encoder layer.
+
+        Args:
+            hidden_states: Tensor of shape [batch, vision_sequence, hidden].
+            *args: Compatibility positional arguments; tensor values are ignored.
+            **kwargs: Compatibility keyword arguments; tensor values are ignored.
+
+        Returns:
+            Tensor of shape [batch, vision_sequence, hidden].
+        """
         return self.fused(
             hidden_states,
             attention_mask=None,
@@ -430,6 +512,18 @@ class FusedTESiglipEncoderLayer(nn.Module):
         self.mlp = FusedTESiglipTransformerLayer(source_layer)
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        """Apply the stock-compatible fused SigLIP encoder wrapper.
+
+        Args:
+            hidden_states: Tensor of shape [batch, vision_sequence, hidden].
+            *args: Compatibility positional arguments forwarded to the fused layer;
+                tensor values are ignored there.
+            **kwargs: Compatibility keyword arguments forwarded to the fused layer;
+                tensor values are ignored there.
+
+        Returns:
+            Tensor of shape [batch, vision_sequence, hidden].
+        """
         return self.mlp(hidden_states, *args, **kwargs)
 
 
