@@ -147,6 +147,8 @@ def _clip_grad_norm_impl(
             g = p.grad
             if isinstance(g, DTensor):
                 g = g.full_tensor() if has_partial else g.to_local()
+            if g.numel() == 0:
+                continue
             g_abs_max = g.detach().abs().max().to(device=target_device, dtype=torch.float64)
             local_max = torch.maximum(local_max, g_abs_max)
 
@@ -168,6 +170,8 @@ def _clip_grad_norm_impl(
             g = p.grad
             if isinstance(g, DTensor):
                 g = g.full_tensor() if has_partial else g.to_local()
+            if g.numel() == 0:
+                continue
             g = g.detach().abs().div(local_max)
             if norm_type == 2.0:
                 local_val = local_val + g.square().sum(dtype=torch.float64)
