@@ -1165,7 +1165,6 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
     ):
-
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
