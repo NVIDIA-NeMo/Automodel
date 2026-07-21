@@ -195,6 +195,3 @@ docs/fern/product-docs/
 docs/fern/versions/v0.4/pages/
 
 training_logs/
-
-# Local state for resumable Allium specification loops.
-.allium-loop/
