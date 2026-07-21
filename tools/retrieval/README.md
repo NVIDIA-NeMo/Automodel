@@ -4,7 +4,7 @@ This directory contains CPU-side utilities for preparing retrieval training data
 
 ## Which Option Should I Use?
 
-For full-scale vision-language retrieval, prepare **normalized Arrow** on CPU nodes before requesting GPUs.
+For full-scale vision-language (VL) retrieval, prepare **normalized Arrow** on CPU nodes before requesting GPUs.
 
 **Do not start full-scale VL training directly from unprepared raw sources.** Loading a large image corpus and building
 its dataset cache can substantially delay the first training step. In a multi-GPU job, the GPUs remain allocated during
@@ -18,7 +18,7 @@ nodes first, then point the training config at the generated Arrow dataset.
 - **Warm HF cache:** use the CPU cache-warming script when the original dataset factory starts slowly and you do not want
   to change the dataset configuration.
 
-Although some filenames include `vl`, the preparation scripts also accept text-only corpora. Normalization can still
+Although some file names include `vl`, the preparation scripts also accept text-only corpora. Normalization can still
 help with an unusually large text corpus or when you need a portable dataset.
 
 ## Normalized Arrow (Recommended for Full-Scale VL)
@@ -180,7 +180,7 @@ The same `CACHE_DIR` should be mounted into GPU training and exported as `HF_HOM
 
 HF cache reuse is exact-key based. A warm cache is reused only when the later training run uses the same cache directory
 and the same effective dataset fingerprint. The fingerprint can change if the same source data is referenced through a
-different mount alias, symlink, or config path, for example `/lustre/fsw/...` versus `/lustre/fs11/...`.
+different mount alias, symlink, or config path, for example `/lustre/fsw/...` compared to `/lustre/fs11/...`.
 
 For local/non-Slurm use:
 
@@ -200,14 +200,14 @@ Measured on the Nemotron VL 1B image-retrieval training set used in debugging, w
 
 | Path | What it stores | Size observed | Recommendation |
 | --- | --- | ---: | --- |
-| Original HF cache | Hugging Face cache fingerprints and materialized source corpora under `HF_DATASETS_CACHE` | `3.7T` in one observed active cache dir; varies by cache history | Fast when warm, but not portable and can grow with each fingerprint/config/path variant |
-| Normalized Arrow | Train refs plus deduplicated local corpus Arrow shards | `176G` | Recommended full-dataset portable format |
+| Original HF cache | Hugging Face cache fingerprints and materialized source corpora under `HF_DATASETS_CACHE` | `3.7 TB` in one observed active cache dir, which varies by cache history | Fast when warm, but not portable and can grow with each fingerprint/config/path variant |
+| Normalized Arrow | Train refs plus deduplicated local corpus Arrow shards | `176 GB` | Recommended full-dataset portable format |
 
 The exact HF cache size can vary because Hugging Face Datasets may keep multiple fingerprints, source downloads,
 intermediate Arrow files, and old variants. Normalized Arrow is an explicit dataset artifact, so the size is much more
 predictable.
 
-## Adding New Corpus Schemas
+## Add New Corpus Schemas
 
 For new corpus schemas, use the original AutoModel extension point:
 

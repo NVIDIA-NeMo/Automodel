@@ -3,12 +3,15 @@ title: "Retrieval Dataset (Embedding Fine-Tuning)"
 description: ""
 position: 3
 ---
+
+## Introduction
+
 NeMo AutoModel supports **retrieval model fine-tuning** using a retrieval-style dataset: each training example is a
 **query** paired with **one positive** document and **one or more negative** documents.
 
 Choose the dataset config based on where your data is in the preparation flow:
 
-| Data | Dataset config | Best for |
+| Data | Dataset Config | Best For |
 | --- | --- | --- |
 | Source retrieval data | `RetrievalDatasetConfig` | Typical text retrieval and smaller experiments |
 | A prepared normalized Arrow bundle | `NormalizedRetrievalDatasetConfig` | Full-scale or image-heavy VL retrieval |
@@ -26,16 +29,18 @@ training-time schema:
 - `question`: query string
 - `doc_text`: list of document texts in the order `[positive, negative_1, negative_2, ...]`
 - `doc_image`: list of images (or empty strings), aligned with `doc_text`
-- `query_instruction` / `passage_instruction`: optional, used when `use_dataset_instruction: true` and the corpus provides instructions through metadata
+- `query_instruction` or `passage_instruction`: optional, used when `use_dataset_instruction: true` and the corpus
+  provides instructions through metadata
 
 ## Raw Input Formats
 
 Use `RetrievalDatasetConfig` for data that has not been normalized. It supports two local file layouts. Compatible
 `hf://` sources use the same corpus ID-based logical schema as the first layout.
 
-### Corpus ID-Based JSON (Merlin/NeMo-Retriever Style)
+### Corpus ID-Based JSON (Merlin or NeMo Retriever Style)
 
-This is the format used by NeMo retriever pipelines where documents live in a separate **corpus** and training examples reference documents by **ID**.
+This is the format used by NeMo Retriever pipelines where documents live in a separate **corpus** and training
+examples reference documents by **ID**.
 
 #### Training File Example (Single JSON)
 
@@ -155,4 +160,4 @@ dataloader:
 ## Requirements
 
 - `pos_doc` must be **non-empty**.
-- If training requests negatives (e.g., `n_passages > 1`), `neg_doc` must contain **at least one** document.
+- If training requests negatives (for example, `n_passages > 1`), `neg_doc` must contain **at least one** document.

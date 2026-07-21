@@ -39,18 +39,18 @@ a small candidate set and you want a stronger reranking stage.
 Before running the examples:
 
 - Use an AutoModel environment with the full GPU training dependencies installed. The NGC container is the safest path
-  for multi-GPU runs; for source checkouts, see [Installation](/get-started/installation) and run
+  for multi-GPU runs. For source checkouts, refer to [Installation](/get-started/installation) and run
   `uv sync --frozen --extra all`.
-- Run the example commands from a source checkout or an NGC/container workspace that contains the repository
-  `examples/` tree. The YAML configs and mining helpers below are repo-relative; if you use an installed package
-  without the repository, copy the referenced config/script files into your own project and update the paths.
-- From a source checkout, use `uv run automodel ...`; from an installed environment that has local copies of the
+- Run the example commands from a source checkout or an NGC container workspace that contains the repository
+  `examples/` tree. The YAML configs and mining helpers below are repo-relative. If you use an installed package
+  without the repository, copy the referenced config or script files into your own project and update the paths.
+- From a source checkout, use `uv run automodel ...`. From an installed environment that has local copies of the
   configs, use `automodel ...`.
 - Accept access terms for the configured Hugging Face model and set `HF_TOKEN`, or replace the model path with a model
   your environment can download. See the support matrix below before swapping model families.
 - Make sure every rank can read the dataset paths or `hf://` sources.
 
-The commands below use `automodel`; if you are running from a source checkout, prefix them with `uv run`. For direct
+The commands below use `automodel`. If you are running from a source checkout, prefix them with `uv run`. For direct
 `torchrun` commands, use `uv run torchrun ...` from a source checkout, or activate an installed environment first.
 
 Start with a one-GPU smoke test. The timestamped checkpoint directory keeps this first command from silently resuming
@@ -68,11 +68,11 @@ automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 1 \
 ```
 
 `max_train_samples` shortens the training rows after the configured `hf://` split and corpus are loaded. This is a
-training-step smoke test, not a cheap data-loading smoke test; first-run downloads and corpus loading can still take
-time and disk. For a tiny data-loading test, point the config at a small local retrieval JSON/JSONL sample.
+training-step smoke test, not a cheap data-loading smoke test. First-run downloads and corpus loading can still take
+time and disk. For a tiny data-loading test, point the config at a small local retrieval JSON or JSONL sample.
 
 The first artifact to check is `training.jsonl` under `checkpoint.checkpoint_dir`. JSONL metrics are buffered, so
-stdout/stderr are still the best live signal during a very short run.
+stdout or stderr are still the best live signal during a very short run.
 
 Scale the Llama 3.2 1B bi-encoder example to the GPUs on your machine:
 
@@ -104,7 +104,7 @@ explicit `--step_scheduler.global_batch_size` override. For example, 6 GPUs can 
 | Better ranking for a small shortlist | Cross-encoder | Scores each query-passage pair jointly, which is slower but usually more accurate. |
 | Better negatives for the next training run | Hard-negative mining | Uses a trained bi-encoder to find confusing passages for each query. |
 
-| Component | Bi-encoder | Cross-encoder |
+| Component | Bi-Encoder | Cross-Encoder |
 |-----------|------------|---------------|
 | Recipe | `TrainBiEncoderRecipe` | `TrainCrossEncoderRecipe` |
 | Model target | `nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained` | `nemo_automodel.NeMoAutoModelCrossEncoder.from_pretrained` |
@@ -117,21 +117,21 @@ query-passage pair into one sequence and predicts a score for each candidate pas
 
 Supported model families and effective retrieval kwargs:
 
-| Model `config.model_type` | Bi-encoder behavior | Cross-encoder behavior | Effective retrieval kwargs |
+| Model `config.model_type` | Bi-Encoder Behavior | Cross-Encoder Behavior | Effective Retrieval Kwargs |
 |---------------------------|---------------------|------------------------|----------------------------|
 | `llama`, `llama_bidirec` | Uses `LlamaBidirectionalModel` | Uses `LlamaBidirectionalForSequenceClassification` | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. Cross-encoder: `pooling`, `num_labels`, and `temperature` on the Llama scoring config. |
-| `ministral3`, `ministral3_bidirec` | Uses `Ministral3BidirectionalModel` | Direct cross-encoder scoring is not supported by the custom retrieval registry today; use a different direct cross-encoder backbone. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. |
-| Any other Hugging Face model type | Falls back to `AutoModel` | Falls back to `AutoModelForSequenceClassification` only when the model type is not listed above | Bi-encoder fallback receives standard Hugging Face `from_pretrained` kwargs; `pooling` and `l2_normalize` still apply in the AutoModel wrapper. Cross-encoder fallback forwards `num_labels`; do not assume custom `pooling` or `temperature` are accepted unless that HF class documents them. |
+| `ministral3`, `ministral3_bidirec` | Uses `Ministral3BidirectionalModel` | Direct cross-encoder scoring is not supported by the custom retrieval registry today. Use a different direct cross-encoder backbone. | Bi-encoder: `pooling`, wrapper-level `l2_normalize`, and top-level recipe `temperature`. |
+| Any other Hugging Face model type | Falls back to `AutoModel` | Falls back to `AutoModelForSequenceClassification` only when the model type is not listed above | Bi-encoder fallback receives standard Hugging Face `from_pretrained` kwargs, and `pooling` and `l2_normalize` still apply in the AutoModel wrapper. Cross-encoder fallback forwards `num_labels`. Do not assume custom `pooling` or `temperature` are accepted unless that HF class documents them. |
 
 Known model types with a registry entry fail fast when the requested retrieval task is unsupported rather than falling
 back silently. For example, direct `ministral3` loading is supported for bi-encoder embeddings but not for the
 cross-encoder scoring recipe. If you are extracting a text tower from a parent checkpoint, set
-`model.extract_submodel: language_model`; extracted text backbones use the extraction path, where supported extracted
+`model.extract_submodel: language_model`. Extracted text backbones use the extraction path, where supported extracted
 types use registered retrieval classes and unsupported extracted types can fall back to Hugging Face sequence
 classification for cross-encoder scoring.
 
 Treat unregistered decoder-only fallback models as an architecture experiment, not just a drop-in model swap. Registered
-retrieval backbones such as the Llama bidirectional path use retrieval-specific attention behavior; a vanilla
+retrieval backbones such as the Llama bidirectional path use retrieval-specific attention behavior. A vanilla
 Hugging Face `AutoModel` fallback can keep the source model's original causal behavior, which may be lower quality for
 symmetric embedding retrieval.
 
@@ -140,10 +140,10 @@ symmetric embedding retrieval.
 Use the retrieval dataset format described in [Retrieval Dataset](/datasets/retrieval-dataset). Choose the data path that
 matches the workflow you need:
 
-| Data path | Use when | Notes |
+| Data Path | Use When | Notes |
 |-----------|----------|-------|
-| `hf://` AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires an AutoModel-style HF subset with a companion corpus split. |
-| Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record; no document IDs are available for same-document masking. |
+| `hf://` AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires an AutoModel-style Hugging Face subset with a companion corpus split. |
+| Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record. No document IDs are available for same-document masking. |
 | Corpus ID-based JSON | You need hard-negative mining, reusable corpora, or same-document masking | Records reference document IDs in a local corpus that can be loaded by Hugging Face `datasets`. |
 | Normalized Arrow | You are preparing a full-scale or image-heavy vision-language retrieval dataset | Stores query rows and referenced corpus documents in portable local Arrow shards, avoiding repeated image-corpus loading and preparation in GPU jobs. |
 
@@ -152,6 +152,7 @@ Do not start full-scale VL training directly from unprepared raw sources. Loadin
 dataset cache can substantially delay the first training step while the GPUs are already allocated. Across a multi-GPU
 job, that startup can waste GPU-hours before optimization begins. Run the normalized dataset preparation script on CPU
 nodes first, then train from the generated Arrow dataset.
+
 </Warning>
 
 For typical text-only retrieval, the original `make_retrieval_dataset` path is usually sufficient. If its initial startup
@@ -163,19 +164,20 @@ tools support text-only and vision-language retrieval.
 
 The key field requirements differ by raw source:
 
-| Source | Required query field | Required document fields |
+| Source | Required Query Field | Required Document Fields |
 |--------|----------------------|--------------------------|
 | Corpus ID JSON | `question` | `question_id`, `corpus_id`, non-empty `pos_doc`, and present `neg_doc` |
-| `hf://` AutoModel schema | `question` | non-empty `pos_doc`; `neg_doc` is optional in the source but required before training with negatives |
+| `hf://` AutoModel schema | `question` | non-empty `pos_doc`. The `neg_doc` field is optional in the source but required before training with negatives |
 | Inline JSONL | `query` or `question` | non-empty `pos_doc`, and present `neg_doc` |
 
-`neg_doc` must be present for local JSON and JSONL sources. It may be `[]` only when `n_passages: 1`; when
+`neg_doc` must be present for local JSON and JSONL sources. It may be `[]` only when `n_passages: 1`. When
 `n_passages > 1`, provide at least one negative.
 
 <Warning>
 `n_passages: 1` is useful for schema checks or custom negative strategies, but it is not a good default training setup.
 The standard bi-encoder and cross-encoder recipes need at least one negative candidate for meaningful contrastive or
 reranking supervision, unless you add a custom strategy such as qrels-aware in-batch negatives.
+
 </Warning>
 For quick custom experiments, inline JSONL is the simplest format. Use the inline dataset factory for these files, and
 switch to corpus ID-based JSON before hard-negative mining or full-corpus evaluation:
@@ -204,14 +206,14 @@ data_dir_list:
 `n_passages` controls the size of each query group. For example, `n_passages: 5` means one positive and four negatives.
 Training uses the first item in `pos_doc` as the positive, then takes negatives from `neg_doc` in order. If a record has
 fewer negatives than requested, negatives are repeated cyclically to fill the group. Treat repetition as a fallback for
-shape compatibility; for real training and validation, prefer enough distinct negatives or lower `n_passages`.
+shape compatibility. For real training and validation, prefer enough distinct negatives or lower `n_passages`.
 
 The training recipe does not load a separate qrels file. Materialize qrels into retrieval records before fine-tuning.
 For training, `pos_doc[0]` is the supervised positive. For mining, keep every known positive for the query in `pos_doc`
-so the miner can exclude those IDs; it does not read an external qrels file. If you expand multi-positive queries into
+so the miner can exclude those IDs. It does not read an external qrels file. If you expand multi-positive queries into
 one row per positive, make sure sibling positives are removed from `neg_doc` and audited out of mined negatives before
 training. For a multi-positive input row, `examples/retrieval/data_utils/unroll_pos_docs.py` emits only a suffixed
-`question_id` plus `question`, `corpus_id`, `pos_doc`, and `neg_doc`; it does not add `original_question_id`. Keep a
+`question_id` plus `question`, `corpus_id`, `pos_doc`, and `neg_doc`. It does not add `original_question_id`. Keep a
 separate mapping from each suffixed ID to its source question if you need that lineage. The current miner also normalizes
 rows to the required retrieval fields and does not preserve extra row metadata. Also keep sibling-positive rows out of
 the same in-batch-negative training batch, disable distributed in-batch negatives, or add qrels-aware sampling/masking.
@@ -297,13 +299,13 @@ distributed:
 
 For a cross-encoder, change `recipe`, `model._target_`, `dataloader.dataset.model_type`, and `dataloader.collate_fn`
 to the cross-encoder values shown below. Also set `model.num_labels: 1`, set the loss temperature under
-`model.temperature`, replace `q_max_len` / `p_max_len` with `rerank_max_length` in the collator, and use a separate
+`model.temperature`, replace `q_max_len` and `p_max_len` with `rerank_max_length` in the collator, and use a separate
 `checkpoint.checkpoint_dir` such as `./output/llama3_2_1b_cross_encoder/checkpoints`.
 
 ## Configure a Bi-Encoder
 
 A bi-encoder config has four important parts: the model, tokenizer, retrieval dataset, and `BiEncoderCollator`. This
-snippet is an excerpt; keep the scheduler, optimizer, checkpoint, and distributed sections from the full config or one
+code block is an excerpt. Keep the scheduler, optimizer, checkpoint, and distributed sections from the full config or one
 of the examples.
 
 ```yaml
@@ -345,7 +347,7 @@ dataloader:
   num_workers: 0
 ```
 
-Important knobs:
+The following parameters are important for your bi-encoder configuration:
 
 - `pooling`: controls how token hidden states become one embedding. Common single-vector choices are `avg`, `cls`,
   `last`, and `weighted_avg`. The shipped hard-negative miner currently loads the bi-encoder wrapper with its default
@@ -359,10 +361,10 @@ Important knobs:
 - `do_distributed_inbatch_negative`: optional model setting that treats passages from other data-parallel ranks as
   additional negatives. Enable it with `model.do_distributed_inbatch_negative: true` or the CLI override
   `--model.do_distributed_inbatch_negative true`. Today it all-gathers over the default process group, so use it only
-  for pure DP/FSDP retrieval runs (`tp_size: 1`, `cp_size: 1`). Same-document masking requires `doc_id` fields from
-  corpus-backed or custom datasets; inline JSONL does not provide duplicate-document masking. For multi-positive queries
-  expanded into separate rows, keep it disabled unless your sampler or masking prevents sibling positives from becoming
-  negatives. Keep it disabled for ColBERT-style pooling.
+  for pure data-parallel or FSDP2 retrieval runs (`tp_size: 1`, `cp_size: 1`). Same-document masking requires `doc_id`
+  fields from corpus-backed or custom datasets. Inline JSONL does not provide duplicate-document masking. For
+  multi-positive queries expanded into separate rows, keep it disabled unless your sampler or masking prevents sibling
+  positives from becoming negatives. Keep it disabled for ColBERT-style pooling.
 
 The complete example is
 [examples/retrieval/bi_encoder/llama3_2_1b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama3_2_1b.yaml).
@@ -371,7 +373,7 @@ The complete example is
 
 A cross-encoder config uses the same retrieval dataset factory, but sets `model_type: cross_encoder` and uses
 `CrossEncoderCollator`. The dataset transform flattens each query with its positive and negative passages so the model
-scores each query-passage pair. This snippet is an excerpt; keep the same scheduler, optimizer, checkpoint, and
+scores each query-passage pair. This code block is an excerpt. Keep the same scheduler, optimizer, checkpoint, and
 distributed structure as the bi-encoder config.
 
 ```yaml
@@ -410,7 +412,7 @@ dataloader:
   num_workers: 0
 ```
 
-Important knobs:
+The following parameters are important for your cross-encoder configuration:
 
 - `rerank_max_length`: maximum combined query-passage sequence length.
 - `prompt_template`: controls how the pair is serialized before tokenization. It must include `{query}` and `{passage}`.
@@ -423,7 +425,7 @@ The complete example is
 ## Distributed Launch and Batch Size
 
 Launch single-node examples with `automodel <config.yaml> --nproc-per-node <gpus>`. The retrieval recipes support
-data-parallel training through the configured distributed strategy; pipeline parallelism is not supported for encoder
+data-parallel training through the configured distributed strategy. Pipeline parallelism is not supported for encoder
 recipes today.
 
 For multi-node runs, launch with your cluster launcher or an external `torchrun` command so every node has an explicit
@@ -441,7 +443,7 @@ uv run torchrun \
 
 Use a shared or pre-populated Hugging Face cache on every node, make dataset paths visible to every rank, and use a
 unique `checkpoint_dir` for each experiment. For multi-node training, `checkpoint_dir` must be on a shared, persistent
-filesystem mounted at the same path from every node; relative `./output/...` paths are appropriate only when they resolve
+filesystem mounted at the same path from every node. Relative `./output/...` paths are appropriate only when they resolve
 to shared storage. Increase `dist_env.timeout_minutes` for first model downloads, slow shared filesystems, multi-node
 collectives, or large checkpoint writes.
 
@@ -458,8 +460,8 @@ In pure data parallelism, `data_parallel_size` is the total GPU count. With tens
 
 `local_batch_size` is the number of query groups per rank. For memory pressure, reduce
 `step_scheduler.local_batch_size` first, then sequence lengths (`q_max_len`, `p_max_len`, or `rerank_max_length`), then
-`n_passages`. Bi-encoders scale memory with query length plus `local_batch_size * n_passages` passage sequences;
-cross-encoders scale with `local_batch_size * n_passages` combined query-passage sequences.
+`n_passages`. Bi-encoders scale memory with query length plus `local_batch_size * n_passages` passage sequences.
+Cross-encoders scale with `local_batch_size * n_passages` combined query-passage sequences.
 
 Current retrieval datasets are map-style datasets loaded in each process, not streaming distributed inputs. Before a
 multi-node run, either populate the Hugging Face cache on each node or place it on storage available to every node. Also
@@ -498,10 +500,10 @@ validation_dataloader:
 ```
 
 Validation logs `val_loss`, `val_acc1`, and `val_mrr` to `validation.jsonl` under `checkpoint.checkpoint_dir`. These
-metrics measure ranking within each candidate group in the validation file; they are not full-corpus Recall@K or nDCG
+metrics measure ranking within each candidate group in the validation file. They are not full-corpus Recall@K or nDCG
 metrics. For cross-encoder validation, use `model_type: cross_encoder` and `CrossEncoderCollator` instead. In multi-rank
-runs, validation uses the same distributed sampler path as training and can drop tail examples to keep rank shapes even;
-make the validation set divisible by the data-parallel world size or run validation on one GPU when you need every
+runs, validation uses the same distributed sampler path as training and can drop tail examples to keep rank shapes even.
+Make the validation set divisible by the data-parallel world size or run validation on one GPU when you need every
 candidate group included.
 
 ```bash
@@ -524,10 +526,10 @@ evaluation stack or a small script around the consolidated checkpoint and report
 repeatable: query count, corpus size, qrels source, judged/unjudged handling, exact versus ANN search settings, K
 values, baseline checkpoint, and whether confidence intervals or significance tests were used. At minimum, make the
 script inputs explicit: a consolidated bi-encoder checkpoint, a corpus table with stable document IDs, a query table with
-stable query IDs, qrels keyed by those IDs, the query/passage prefixes and max lengths, and the K values to report.
+stable query IDs, qrels keyed by those IDs, the query and passage prefixes and max lengths, and the K values to report.
 
 For cross-encoders, freeze a first-stage retriever, rerank its top-K candidates, and report reranking metrics on that
-same candidate set. Also report first-stage candidate recall or coverage: if a query's positive document is missing
+same candidate set. Also report first-stage candidate recall or coverage. If a query's positive document is missing
 from the retriever top-K, count that query as a miss rather than dropping it from reranker evaluation. Do not compare
 cross-encoder candidate-group validation directly to full-corpus bi-encoder metrics.
 
@@ -541,9 +543,9 @@ but may not update during a short smoke test:
 tail -f ./output/llama3_2_1b_encoder/checkpoints/training.jsonl
 ```
 
-Use stdout/stderr as the live per-step signal today. Watch `loss`, `grad_norm`, learning rate, GPU memory, and step time
+Use stdout or stderr as the live per-step signal today. Watch `loss`, `grad_norm`, learning rate, GPU memory, and step time
 before scaling to a longer run. On preempted or timed-out jobs, recent buffered JSONL metrics may be missing even when
-stdout/stderr showed them.
+stdout or stderr showed them.
 
 The examples include a commented `wandb` block. Enable it when you want remote tracking, and tune
 `step_scheduler.log_remote_every_steps` to control remote logging cadence.
@@ -583,7 +585,7 @@ negatives back to each query. The miner enforces that the file resolves to exact
 every row's `corpus_id` matches that corpus or that `question_id` values are unique. Validate those invariants before
 mining. Duplicate question IDs overwrite one another in the miner's result lookup.
 
-The bi-encoder quickstart uses `hf://` sources; the cross-encoder quickstart already uses local retrieval JSON paths. The
+The bi-encoder quickstart uses `hf://` sources. The cross-encoder quickstart already uses local retrieval JSON paths. The
 miner currently reads a local corpus-backed retrieval JSON file instead of `hf://` URIs directly. For
 `nvidia/embed-nemotron-dataset-v1`, restore the maintained local layout with:
 
@@ -595,7 +597,7 @@ uv run python examples/retrieval/bi_encoder/llama_embed_nemotron_8b/data_prepara
 The script has no subset selector. It scans the repository and restores every discovered directory containing a
 `corpus.parquet`. For each discovered subset `<name>`, it writes
 `./embed_nemotron_dataset_v1/<name>/<name>.json` and
-`./embed_nemotron_dataset_v1/<name>/corpus/train.parquet`; the JSON stores the corpus directory as an absolute path. For
+`./embed_nemotron_dataset_v1/<name>/corpus/train.parquet`. The JSON stores the corpus directory as an absolute path. For
 example, use `./embed_nemotron_dataset_v1/FEVER/FEVER.json` as the FEVER mining input. The maintained
 `examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml` recipe consumes this same output
 layout through its `data_dir_list` entries.
@@ -603,7 +605,7 @@ layout through its `data_dir_list` entries.
 Before launching the miner, load the resulting JSON with the retrieval dataset path or a short smoke run to verify the
 schema and document IDs. The `llama3_2_1b.yaml` quickstart trains from both `FEVER` and
 `SyntheticClassificationData`; the maintained Llama-Embed-Nemotron recipe lists all of its restored training subsets.
-For a full train -> mine -> retrain loop, mine each desired restored subset separately, give each mined output and
+For a full training, mining, and retraining loop, mine each desired restored subset separately, give each mined output and
 embedding cache its own run-specific path, then list all mined JSON files in the next config's `data_dir_list`. Replacing
 a multi-source config with only one mined file intentionally trains on that subset only.
 
@@ -648,11 +650,11 @@ uv run torchrun \
 ```
 
 Replace `epoch_0_step_499` with the explicit checkpoint directory that you want to mine from. If you only have
-`LATEST.txt`, read it first and substitute the resolved `epoch_*_step_*` directory; the mining script loads the
+`LATEST.txt`, read it first and substitute the resolved `epoch_*_step_*` directory. The mining script loads the
 Hugging Face export directly and does not apply AutoModel's checkpoint resolver. The miner creates the output parent
 directory and opens `train_file_output_path` with write mode, so an existing file is replaced without prompting. It has no
 `overwrite_output` setting. Use a new run-specific output path and check that it does not exist before launch. The miner
-preserves the input's top-level `corpus` value without rewriting relative paths; if the output JSON moves to a different
+preserves the input's top-level `corpus` value without rewriting relative paths. If the output JSON moves to a different
 directory, use an absolute corpus path or arrange the output directory so the unchanged relative path still resolves.
 
 Key mining settings accepted by the recipe (the checked-in
@@ -662,11 +664,11 @@ Key mining settings accepted by the recipe (the checked-in
   has too few non-positive candidates. Margin-filtered candidates are down-scored to `-inf` but can still appear in the
   top-k result when too few finite candidates remain, so inspect scores and per-query counts before training.
 - `hard_neg_margin` and `hard_neg_margin_type`: filter near-positive candidates. With `hard_neg_margin_type: perc`,
-  candidates scoring above `min_positive_score * hard_neg_margin` are set to `-inf`; with `abs`, candidates scoring
+  candidates scoring above `min_positive_score * hard_neg_margin` are set to `-inf`. With `abs`, candidates scoring
   above `min_positive_score - hard_neg_margin` are set to `-inf`. Inspect mined samples when positive scores are low or
   negative.
 - `query_prefix` and `passage_prefix`: keep these semantically consistent with the bi-encoder training config. The
-  miner concatenates prefixes directly, while `BiEncoderCollator` inserts a space after non-empty prefixes; include the
+  miner concatenates prefixes directly, while `BiEncoderCollator` inserts a space after non-empty prefixes. Include the
   trailing space in mining prefixes. The miner supports static prefixes only. If training used
   `use_dataset_instruction: true`, materialize the same instruction text into the mining input or equivalent static
   prefixes before mining.
@@ -680,7 +682,7 @@ Key mining settings accepted by the recipe (the checked-in
   `flash_attention_2` pinned.
 - `cache_embeddings_dir`: required for distributed mining so ranks can share cached passage embeddings. Rank `0`
   assembles the final embedding cache and score outputs, so plan memory and local disk accordingly. In multi-node
-  mining, this must be a shared writable path mounted at the same location on every node; node-local cache paths leave
+  mining, this must be a shared writable path mounted at the same location on every node. Node-local cache paths leave
   rank `0` unable to read remote-rank shards.
 - Cache reuse: use a new empty cache directory for every model, mining input, prefix, sequence length,
   `corpus_chunk_size`, and world-size combination. Query shards and corpus chunks are reused when their expected filenames
@@ -696,7 +698,7 @@ Key mining settings accepted by the recipe (the checked-in
 not pass `--mining.pooling` or `--mining.l2_normalize`. The current miner calls
 `NeMoAutoModelBiEncoder.from_pretrained` without those arguments and therefore uses the wrapper defaults (`avg` and
 `true`). Use this helper only when those settings match training. For other settings, use a custom mining workflow that
-loads the encoder with the required wrapper arguments; AutoModel does not ship a metadata-retrofit exporter.
+loads the encoder with the required wrapper arguments. AutoModel does not ship a metadata-retrofit exporter.
 
 Hard-negative mining parallelizes embedding generation across ranks, but the final exact scoring step still runs on
 rank `0` and materializes the full document embedding matrix there. For very large corpora, use a smaller mining slice
@@ -707,8 +709,8 @@ the previous run used multiple sources, list the mined file for each source. Har
 listed in each input row's `pos_doc`, but it cannot read an external qrels file or know every semantically relevant
 duplicate. Put all known positive IDs for the query in the mining input, deduplicate the corpus, inspect mined samples,
 filter duplicate IDs and non-finite scores such as `-inf` from mined outputs, and avoid mining from validation or test
-corpora. If you unroll multi-positive training data, mine from rows that still carry every known positive in `pos_doc`;
-otherwise sibling positives can be mined as false negatives. The miner rebuilds each row from the normalized retrieval
+corpora. If you unroll multi-positive training data, mine from rows that still carry every known positive in `pos_doc`.
+Otherwise sibling positives can be mined as false negatives. The miner rebuilds each row from the normalized retrieval
 fields, refreshes `neg_doc` and positive-document scores, and drops extra row-level metadata such as
 `original_question_id`.
 
@@ -751,10 +753,10 @@ direct Hugging Face and mining loads expect a real exported model path. If your 
 symlink, read that file and substitute the resolved checkpoint directory before calling `from_pretrained()` or
 `mine_hard_negatives.py`.
 
-PEFT/LoRA runs save adapter artifacts under the checkpoint `model/` directory instead of the full consolidated export
+PEFT or LoRA runs save adapter artifacts under the checkpoint `model` directory instead of the full consolidated export
 path above. Resume LoRA training from the AutoModel checkpoint directory, but use full fine-tuning when you need the
 `model/consolidated` path for the mining command shown in this guide. If you need mining or serving from LoRA weights,
-first produce a HF-loadable merged/exported encoder with your adapter workflow and point
+first produce a Hugging Face-loadable merged or exported encoder with your adapter workflow and point
 `--mining.model_name_or_path` at that exported directory.
 
 The `LATEST` symlink points to the most recent checkpoint when it is valid. To resume from the latest resolved
@@ -835,7 +837,7 @@ ranking = torch.argsort(logits, descending=True)
 
 Bi-encoder scores are comparable only within the same model, tokenizer, prefix, max-length, pooling, normalization, and
 indexing setup. Mining scores are raw embedding similarities from that exact setup. Cross-encoder logits are
-uncalibrated reranking signals; do not mix them with bi-encoder scores or use one global threshold across model
+uncalibrated reranking signals. Do not mix them with bi-encoder scores or use one global threshold across model
 versions without calibration.
 
 ## Troubleshooting
@@ -846,11 +848,11 @@ versions without calibration.
 | Dataset records fail to load | Check the supported schemas in [Retrieval Dataset](/datasets/retrieval-dataset). |
 | Loss does not move | Verify the positive passage is first and negatives are not duplicates of the positive. |
 | Poor retrieval quality | Mine harder negatives and align train/inference prefixes. |
-| OOM at startup or first batch | Lower `local_batch_size`, `q_max_len`, `p_max_len`, or `rerank_max_length`; use LoRA for larger backbones. |
+| OOM at startup or first batch | Lower `local_batch_size`, `q_max_len`, `p_max_len`, or `rerank_max_length`, and use LoRA for larger backbones. |
 | Distributed launch times out | Increase `dist_env.timeout_minutes`, especially for first model downloads, slow filesystems, or multi-node runs. |
 | Batch-size assertion fails | Set `global_batch_size` to a multiple of `local_batch_size * data_parallel_size`. |
-| `training.jsonl` does not update during a smoke test | Use stdout/stderr for live monitoring; JSONL metrics are buffered before flush. |
-| Run resumes unexpectedly | Use a new or empty `checkpoint_dir`; AutoModel auto-detects compatible checkpoints when `restore_from` is omitted. |
+| `training.jsonl` does not update during a smoke test | Use stdout or stderr for live monitoring. JSONL metrics are buffered before flush. |
+| Run resumes unexpectedly | Use a new or empty `checkpoint_dir`. AutoModel auto-detects compatible checkpoints when `restore_from` is omitted. |
 | Different mining and training behavior | Match tokenizer settings, max lengths, and prefix text including trailing spaces across training and mining. |
 
 ## Related Files
