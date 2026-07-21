@@ -228,6 +228,36 @@ dev = [
 ]
 
 [tool.uv]
+override-dependencies = [
+    "cuda-bindings; sys_platform == 'never'",
+    "cuda-pathfinder; sys_platform == 'never'",
+    "flash-attn; sys_platform == 'never'",
+    "nvidia-cublas; sys_platform == 'never'",
+    "nvidia-cuda-cupti; sys_platform == 'never'",
+    "nvidia-cuda-nvrtc; sys_platform == 'never'",
+    "nvidia-cuda-runtime; sys_platform == 'never'",
+    "nvidia-cudnn-cu13; sys_platform == 'never'",
+    "nvidia-cufft; sys_platform == 'never'",
+    "nvidia-cufile; sys_platform == 'never'",
+    "nvidia-curand; sys_platform == 'never'",
+    "nvidia-cusolver; sys_platform == 'never'",
+    "nvidia-cusparse; sys_platform == 'never'",
+    "nvidia-cusparselt-cu13; sys_platform == 'never'",
+    "nvidia-nccl-cu13; sys_platform == 'never'",
+    "nvidia-nvjitlink; sys_platform == 'never'",
+    "nvidia-nvshmem-cu13; sys_platform == 'never'",
+    "nvidia-nvtx; sys_platform == 'never'",
+    "torch; sys_platform == 'never'",
+    "torchao; sys_platform == 'never'",
+    "torchcodec; sys_platform == 'never'",
+    "torchvision; sys_platform == 'never'",
+    "transformer-engine; sys_platform == 'never'",
+    "transformer-engine-cu13; sys_platform == 'never'",
+    "transformer-engine-torch; sys_platform == 'never'",
+    "triton; sys_platform == 'never'",
+    # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin
+    "urllib3>=2.6.3",
+]
 managed = true
 default-groups = ["build", "docs", "test"]
 no-build-isolation-package = [
@@ -268,12 +298,6 @@ constraint-dependencies = [
     # bundled TVM and breaks the tilelang kernels (SIGABRT/instability on the GPU
     # paths). Upstream capped it to <=0.1.11 (tile-ai/tilelang#2373); mirror that.
     "apache-tvm-ffi<=0.1.11",
-]
-override-dependencies = [
-    "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
-    # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin
-    "urllib3>=2.7.0",
-    "thrift>=0.23.0",
 ]
 prerelease = "allow"
 
