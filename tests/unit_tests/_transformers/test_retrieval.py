@@ -223,6 +223,9 @@ def test_cached_source_model_path_uses_exact_loaded_revision(tmp_path, monkeypat
     assert retrieval._resolve_cached_source_model_path(
         str(local_root), SimpleNamespace(), {"subfolder": "encoder"}
     ) == str(local_root / "encoder")
+    assert retrieval._resolve_cached_source_repository_path(
+        str(local_root), str(local_root / "encoder"), {"subfolder": "encoder"}
+    ) == str(local_root)
 
     cached_config = tmp_path / "snapshot" / "encoder" / "config.json"
     cached_config.parent.mkdir(parents=True)
@@ -237,6 +240,9 @@ def test_cached_source_model_path_uses_exact_loaded_revision(tmp_path, monkeypat
     )
 
     assert result == str(cached_config.parent)
+    assert retrieval._resolve_cached_source_repository_path("org/model", result, {"subfolder": "encoder"}) == str(
+        tmp_path / "snapshot"
+    )
     cache_lookup.assert_called_once_with(
         "org/model",
         "encoder/config.json",

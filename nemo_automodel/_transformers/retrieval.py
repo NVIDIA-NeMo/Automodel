@@ -215,6 +215,27 @@ def _resolve_cached_source_model_path(model_name_or_path: str, config, hf_kwargs
     return None
 
 
+def _resolve_cached_source_repository_path(
+    model_name_or_path: str,
+    source_model_path: str | None,
+    hf_kwargs: dict,
+) -> str | None:
+    """Resolve the repository or snapshot root for a model loaded from a subfolder."""
+    if source_model_path is None:
+        return None
+    subfolder = hf_kwargs.get("subfolder")
+    if not subfolder:
+        return source_model_path
+    if os.path.isdir(model_name_or_path):
+        return model_name_or_path
+
+    repository_path = source_model_path
+    for part in os.path.normpath(subfolder).split(os.sep):
+        if part not in ("", "."):
+            repository_path = os.path.dirname(repository_path)
+    return repository_path
+
+
 def _clone_pretrained_config(config: PretrainedConfig) -> PretrainedConfig:
     """Clone a config while retaining private source-revision metadata."""
     cloned_config = config.__class__.from_dict(config.to_dict())
@@ -751,6 +772,11 @@ class BiEncoderModel(nn.Module):
         encoder.source_model_path = _resolve_cached_source_model_path(
             model_name_or_path,
             backbone.config,
+            hf_kwargs,
+        )
+        encoder.source_repository_path = _resolve_cached_source_repository_path(
+            model_name_or_path,
+            encoder.source_model_path,
             hf_kwargs,
         )
         return encoder

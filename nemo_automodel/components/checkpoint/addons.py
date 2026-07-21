@@ -59,16 +59,28 @@ def _write_json(path: str, value) -> None:
         f.write("\n")
 
 
-def _copy_source_legal_assets(original_model_path: str | None, hf_metadata_dir: str) -> None:
-    """Preserve legal notices without inheriting source model semantics."""
-    if original_model_path is None or not os.path.isdir(original_model_path):
-        return
+def _copy_source_legal_assets(
+    original_model_path: str | None,
+    hf_metadata_dir: str,
+    source_repository_path: str | None = None,
+) -> None:
+    """Preserve repository- and model-root legal notices without inheriting other source semantics."""
+    source_roots = []
+    for source_root in (source_repository_path, original_model_path):
+        if source_root is None or not os.path.isdir(source_root):
+            continue
+        if any(os.path.samefile(source_root, existing_root) for existing_root in source_roots):
+            continue
+        source_roots.append(source_root)
 
-    for item in os.scandir(original_model_path):
-        normalized_name = item.name.lower()
-        is_legal_asset = normalized_name == ".gitattributes" or normalized_name.startswith(_SOURCE_LEGAL_ASSET_PREFIXES)
-        if item.is_file() and is_legal_asset:
-            shutil.copy2(item.path, os.path.join(hf_metadata_dir, item.name))
+    for source_root in source_roots:
+        for item in os.scandir(source_root):
+            normalized_name = item.name.lower()
+            is_legal_asset = normalized_name == ".gitattributes" or normalized_name.startswith(
+                _SOURCE_LEGAL_ASSET_PREFIXES
+            )
+            if item.is_file() and is_legal_asset:
+                shutil.copy2(item.path, os.path.join(hf_metadata_dir, item.name))
 
 
 def _remove_stale_text_processor_assets(hf_metadata_dir: str) -> None:
@@ -290,7 +302,11 @@ def _save_generated_sentence_transformer_assets(
     _write_json(os.path.join(hf_metadata_dir, "1_Pooling", "config.json"), pooling_config)
     _restore_source_tokenizer_serialization_state(original_model_path, hf_metadata_dir)
     _remove_stale_text_processor_assets(hf_metadata_dir)
-    _copy_source_legal_assets(original_model_path, hf_metadata_dir)
+    _copy_source_legal_assets(
+        original_model_path,
+        hf_metadata_dir,
+        source_repository_path=getattr(model_part, "source_repository_path", None),
+    )
 
 
 def _save_generated_hf_assets(
