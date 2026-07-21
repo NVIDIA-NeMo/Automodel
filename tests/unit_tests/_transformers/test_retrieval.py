@@ -178,12 +178,12 @@ def test_extract_submodel_llama_embedding_from_local_vlm_converts_to_supported_b
     assert outputs.last_hidden_state.shape == (2, 8, backbone.config.hidden_size)
 
 
-def test_build_encoder_backbone_forwards_hub_location_kwargs_to_config_and_model(monkeypatch):
-    """Config and weights resolve from the same Hub location and revision."""
+def test_ministral_embedding_forwards_hf_kwargs_to_config_and_model(monkeypatch):
+    """Ministral config and weights receive the same native loader options."""
     from nemo_automodel._transformers import retrieval
 
     config = MagicMock()
-    config.model_type = "qwen3"
+    config.model_type = "ministral3"
     backbone = MagicMock()
     auto_config_from_pretrained = MagicMock(return_value=config)
     auto_model_from_pretrained = MagicMock(return_value=backbone)
