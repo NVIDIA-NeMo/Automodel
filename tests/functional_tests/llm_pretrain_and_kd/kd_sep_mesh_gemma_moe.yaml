@@ -1,0 +1,110 @@
+recipe: KnowledgeDistillationRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  max_steps: 3
+  num_epochs: 1
+  ckpt_every_steps: 100
+  val_every_steps: 100
+  log_remote_every_steps: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: google/gemma-4-E2B-it
+  torch_dtype: bfloat16
+  force_hf: true
+  attn_implementation: eager
+
+teacher_model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: google/gemma-4-26B-A4B-it
+  torch_dtype: bfloat16
+  trust_remote_code: true
+  force_hf: true
+  attn_implementation: eager
+
+offload_teacher_model: false
+separate_meshes: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: 8
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: false
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: /workspace/results/kd_sep_mesh/shared_moe
+  model_save_format: torch_save
+  save_consolidated: false
+
+clip_grad_norm:
+  max_norm: 1.0
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+  fp32_upcast: true
+
+kd_ratio: 0.5
+kd_loss_fn:
+  _target_: nemo_automodel.components.loss.kd_loss.KDLoss
+  ignore_index: -100
+  temperature: 1.0
+  fp32_upcast: true
+  chunk_size: 4096
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 0.0
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+
+dataset:
+  _target_: tests.functional_tests.llm_pretrain_and_kd.kd_separate_mesh_test_utils.make_tiny_kd_sft_dataset
+  tokenizer:
+    pretrained_model_name_or_path: google/gemma-4-26B-A4B-it
+  num_samples: 24
+  seq_length: 64
+  prompt: Explain knowledge distillation and distributed validation.
+  completion: >-
+    ## Knowledge Distillation and Distributed Validation Explained
+
+    Here's a breakdown of Knowledge Distillation and Distributed Validation, explaining what they are, why they are used,
+    and how they support reliable model development. Knowledge distillation transfers behavior from a larger teacher
+    model to a smaller student model, while distributed validation compares losses and gradients across parallel layouts.
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+  num_workers: 0
+
+wandb:
+  entity: Nemo-automodel
+  project: kd_sep_mesh
+  name: shared_moe_hf_dp8
+  group: gemma4_e2b__gemma4_26b_a4b
+  job_type: parity
+  tags: [kd, shared-mesh, moe-teacher, cw-dfw]
+  dir: /workspace/results/kd_sep_mesh/wandb

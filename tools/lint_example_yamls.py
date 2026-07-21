@@ -43,6 +43,14 @@ EXCLUDED_RECIPE_PREFIXES = (
 
 EXCLUDED_RECIPE_FILES = {
     Path("examples/retrieval/data_utils/mining_config.yaml"),
+    # Command-only configs: launched via
+    # `python -m nemo_automodel.recipes.llm.precompute_dspark_dist -c <config>`
+    # (torchrun for multi-node), so they have no recipe-class entry point by design.
+    Path("examples/speculative/dspark/deepseek_v4_flash_dspark_precompute.yaml"),
+    Path("examples/speculative/dspark/glm_5.2_dspark_precompute.yaml"),
+    # A plain YAML list of bench_sweep.py dataset entries, not a recipe config
+    # (consumed via --datasets-config, launched with python -m ... bench_sweep).
+    Path("examples/speculative/bench_sweep/spec_bench_datasets.yaml"),
 }
 
 RECIPE_TARGET_HELP = (
@@ -86,6 +94,7 @@ def lint_yaml_text(text: str, path: Path, automodel_dir: Path) -> list[LintError
 
     key_lines = _top_level_key_lines(document)
     errors = _lint_top_level_keys(path, key_lines)
+    errors.extend(_lint_wandb_disabled(path, data, key_lines))
     if _should_require_recipe(path, automodel_dir):
         errors.extend(_lint_recipe_target(path, data, key_lines, automodel_dir))
     return errors
@@ -121,6 +130,41 @@ def _lint_top_level_keys(path: Path, key_lines: list[tuple[str, int]]) -> list[L
         errors.append(LintError(path, ci_line, "Top-level `ci` section must be the last section."))
 
     return errors
+
+
+def _lint_wandb_disabled(path: Path, data: dict, key_lines: list[tuple[str, int]]) -> list[LintError]:
+    """Require an example ``wandb:`` block to set ``enable: false``.
+
+    Weights & Biases logging is opt-in for examples: a present ``wandb:`` block
+    logs by default, which fails or noisily logs for anyone who runs the example
+    without W&B credentials. Example configs ship the block with ``enable: false``
+    so users opt in by flipping it to ``true`` (no need to comment/uncomment the
+    block). A config with no ``wandb:`` block is fine.
+
+    Args:
+        path: Path of the YAML file being linted.
+        data: The parsed YAML mapping.
+        key_lines: ``(key, line)`` pairs for the document's top-level keys.
+
+    Returns:
+        A lint error if a top-level ``wandb`` block is present without
+        ``enable: false``.
+    """
+    if "wandb" not in data:
+        return []
+    wandb_line = dict(key_lines).get("wandb", 1)
+    block = data.get("wandb")
+    enable = block.get("enable") if isinstance(block, dict) else None
+    if enable is False:
+        return []
+    return [
+        LintError(
+            path,
+            wandb_line,
+            "Example `wandb:` block must set `enable: false` (W&B logging is opt-in); "
+            "add `enable: false` so users opt in by flipping it to `true`.",
+        )
+    ]
 
 
 def _lint_recipe_target(

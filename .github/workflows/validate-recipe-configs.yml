@@ -21,6 +21,7 @@ on:
       - 'examples/**/*.yaml'
       - 'tests/ci_tests/utils/validate_nightly_recipes.py'
       - 'tests/ci_tests/utils/validate_generate_ci.py'
+      - 'tests/ci_tests/utils/validate_new_recipe_ci.py'
       - 'tests/ci_tests/utils/generate_ci_tests.py'
       - 'tools/lint_example_yamls.py'
 
@@ -30,6 +31,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -54,3 +57,17 @@ jobs:
 
       - name: Validate generate_ci_tests across all (folder, scope) combos
         run: .venv-validator/bin/python tests/ci_tests/utils/validate_generate_ci.py --automodel-dir .
+
+      - name: Validate ci section on newly added recipes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Diff all of examples/; the validator filters by suffix and CI-enablement.
+          added=$(git diff --name-only --diff-filter=A "$BASE_SHA...$HEAD_SHA" -- examples/)
+          if [ -z "$added" ]; then
+            echo "No newly added files under examples/ in this PR; skipping."
+            exit 0
+          fi
+          echo "$added"
+          echo "$added" | xargs .venv-validator/bin/python tests/ci_tests/utils/validate_new_recipe_ci.py --automodel-dir .

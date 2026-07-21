@@ -18,42 +18,45 @@ import torch
 import torch.distributed as dist
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes._dist_setup import setup_distributed
-from nemo_automodel.recipes.llm.train_ft import build_dataloader, build_distributed
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
+from nemo_automodel.recipes._typed_config import RecipeConfig
+from nemo_automodel.recipes.llm.train_ft import _build_tokenizer
 
 """
 This test is to make sure that JSONL dataset can be checkpointed and loaded correctly.
 """
+
 
 def gather_helper(input_tensor):
     tensor_list = [torch.zeros_like(input_tensor) for _ in range(2)]
     dist.all_gather(tensor_list, input_tensor)
     return tensor_list
 
+
 def test_megatron_data_sharding():
     cfg_path = Path(__file__).parents[4] / "examples" / "llm_pretrain" / "megatron_pretrain_gpt2.yaml"
     cfg = parse_args_and_load_config(cfg_path)
-    dist_env = build_distributed(cfg.get("dist_env", {}))
-    dist_setup = setup_distributed(cfg, world_size=dist_env.world_size)
-    device_mesh = dist_setup.device_mesh
+    dist_env = initialize_distributed(
+        backend=cfg.get("dist_env", {}).get("backend", "nccl"),
+        timeout_minutes=cfg.get("dist_env", {}).get("timeout_minutes", 1),
+    )
+    mesh_context = create_distributed_setup_from_config(cfg, world_size=dist_env.world_size).mesh_context
+    device_mesh = mesh_context.device_mesh
     dp_rank = device_mesh["dp"].get_local_rank()
     dp_world_size = device_mesh["dp"].size()
     tp_world_size = device_mesh["tp"].size()
 
-    dataset = build_dataloader(
-        cfg_ds=cfg.dataset,
-        cfg_dl=cfg.dataloader,
-        cfg_model=cfg.model,
-        cfg_ps={},
-        seed=42,
-        local_batch_size=cfg.step_scheduler.local_batch_size,
-        global_batch_size=cfg.step_scheduler.global_batch_size,
-        max_steps=None,
-        val_check_interval=10,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        pp_enabled=False,
-    )[0]
+    for key, value in {"max_steps": None, "val_every_steps": 10}.items():
+        if not hasattr(cfg.step_scheduler, key):
+            raise ValueError(f"step_scheduler config has no field {key!r}")
+        setattr(cfg.step_scheduler, key, value)
+    # Megatron datasets require a tokenizer; the recipe supplies it via runtime (build(tokenizer=...)),
+    # so build it here the same way (from the dataset/model config) instead of relying on the default.
+    _, tokenizer = _build_tokenizer(cfg.model, cfg.dataset)
+    dataset = RecipeConfig(cfg).dataloader.build(
+        dp_rank=dp_rank, dp_world_size=dp_world_size, pp_enabled=False, tokenizer=tokenizer
+    )
 
     # fast-forward. not necessary, but we want to make sure the dataset is not at the beginning.
     for i, batch in enumerate(dataset):
@@ -64,7 +67,9 @@ def test_megatron_data_sharding():
     batch_to_test = {k: v.to(dist.get_rank()) for k, v in batch_to_test.items()}
 
     # ensure that labels are inputs left shifted by 1
-    assert torch.all(batch_to_test["labels"][:, :-1] == batch_to_test["input_ids"][:, 1:]), "Labels are not inputs left shifted by 1"
+    assert torch.all(batch_to_test["labels"][:, :-1] == batch_to_test["input_ids"][:, 1:]), (
+        "Labels are not inputs left shifted by 1"
+    )
 
     dist.barrier()
     del dataset

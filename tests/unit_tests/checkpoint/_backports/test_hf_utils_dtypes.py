@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for ``_backports/hf_utils.DTYPE_MAP`` FP8-scale extensions.
+"""Tests for ``_backports/hf_utils.DTYPE_MAP`` extensions.
 
 DeepSeek V4 (and other quantized HF checkpoints) emit FP8-scale tensors with
 dtype tags ``F8_E5M2`` and ``F8_E8M0`` that the upstream
 ``safetensors.torch._TYPES`` map does not yet recognize.  The in-tree backport
 extends ``DTYPE_MAP`` so the in-tree HF storage reader can decode them.
+
+``BOOL`` is a standard safetensors dtype but was missing from the map, so
+saving a state dict with a bool buffer (e.g. the EAGLE-3 draft-vocab
+``selected_token_mask``) in safetensors format crashed the final checkpoint
+save of a finished training run.
 """
 
 import pytest
@@ -32,10 +37,11 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import DTYPE_MAP
         ("F8_E4M3", torch.float8_e4m3fn),
         ("F8_E5M2", torch.float8_e5m2),
         ("F8_E8M0", torch.float8_e8m0fnu),
+        ("BOOL", torch.bool),
     ],
 )
-def test_dtype_map_contains_fp8_dtypes(key, expected_dtype):
-    """All three FP8 variants emitted by DSV4-style checkpoints must be mapped."""
+def test_dtype_map_contains_extended_dtypes(key, expected_dtype):
+    """FP8 variants (DSV4-style checkpoints) and BOOL (bool buffers) must be mapped."""
     assert key in DTYPE_MAP, f"{key} missing from DTYPE_MAP"
     assert DTYPE_MAP[key] is expected_dtype
 
@@ -55,3 +61,10 @@ def test_dtype_map_preserves_existing_entries():
     }
     for key, dtype in expected.items():
         assert DTYPE_MAP.get(key) is dtype, f"DTYPE_MAP[{key!r}] regressed"
+
+
+def test_write_path_maps_torch_bool():
+    """Pin the crash site: the safetensors writer's dtype-str lookup."""
+    from nemo_automodel.components.checkpoint._backports.filesystem import _to_safetensors_dtype_str
+
+    assert _to_safetensors_dtype_str(torch.bool) == "BOOL"

@@ -169,7 +169,10 @@ class LlamaRotaryEmbedding(nn.Module):
         self.rope_fusion = rope_fusion
         self.dtype = getattr(config, "torch_dtype", None) or torch.float32
 
-        # Map rope types to their respective computation functions
+        # ``default`` and ``llama3`` have local fast-path implementations. Every
+        # other schedule (``yarn``, ``linear``, ``dynamic``, ``longrope``, ...)
+        # is delegated to transformers' canonical ``ROPE_INIT_FUNCTIONS`` so the
+        # frequencies and attention scaling match HuggingFace exactly.
         rope_functions = {
             "default": _compute_default_inv_freq,
             "llama3": _compute_llama3_inv_freq,
@@ -179,9 +182,32 @@ class LlamaRotaryEmbedding(nn.Module):
         _, rope_scaling = _get_rope_config(config)
         rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
 
-        # Fallback to llama3 as the robust default if type is not in our map
-        compute_fn = rope_functions.get(rope_type, _compute_llama3_inv_freq)
+        # Resolve the compute function. An unrecognised ``rope_type`` previously
+        # fell back silently to the llama3 NTK schedule, which yields wrong
+        # frequencies for YaRN/linear/dynamic configs -- a latent bug, e.g. for
+        # an EAGLE dense draft that inherits a YaRN target's ``rope_scaling``.
+        # Delegate such types to transformers instead of guessing.
+        compute_fn = rope_functions.get(rope_type)
+        if compute_fn is None:
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+            compute_fn = ROPE_INIT_FUNCTIONS.get(rope_type)
+            if compute_fn is None:
+                supported = sorted(set(rope_functions) | set(ROPE_INIT_FUNCTIONS))
+                raise ValueError(f"Unsupported RoPE rope_type={rope_type!r}; expected one of {supported}.")
         inv_freq, self.attention_scaling = compute_fn(config, device)
+
+        # Keep the config + compute fn so ``_build_cache`` can recompute ``inv_freq``
+        # in float32. ``LlamaForCausalLM.__init__`` casts the whole model via
+        # ``self.to(config.torch_dtype)``, and ``nn.Module.to`` rounds floating-point
+        # buffers -- so the ``inv_freq`` buffer registered below is downcast to bf16.
+        # Building the cos/sin tables from that bf16-rounded buffer degrades RoPE
+        # precision relative to HuggingFace (which keeps ``inv_freq`` in float32) and
+        # surfaces as a large logit divergence when a checkpoint is reloaded in
+        # vanilla HF. Recomputing from config keeps the tables float32-accurate
+        # regardless of the model's parameter dtype.
+        self._rope_config = config
+        self._inv_freq_compute_fn = compute_fn
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("_cos_cache", None, persistent=False)
@@ -192,9 +218,14 @@ class LlamaRotaryEmbedding(nn.Module):
         """Build cos/sin cache in config dtype for positions [0, seq_len)."""
         self.max_seq_len_cached = seq_len
 
-        # Compute in float32 for precision, then convert to target dtype
+        # Compute in float32 for precision, then convert to target dtype.
+        # Recompute inv_freq from config instead of reading ``self.inv_freq``: the
+        # registered buffer is rounded to the model dtype (e.g. bf16) by the
+        # model-wide ``.to()`` in ``LlamaForCausalLM.__init__``, and upcasting a
+        # bf16 buffer back to float32 cannot recover the lost precision. See __init__.
         t = torch.arange(seq_len, device=device, dtype=torch.float32)
-        inv_freq = self.inv_freq.to(device=device, dtype=torch.float32)
+        inv_freq, _ = self._inv_freq_compute_fn(self._rope_config, device)
+        inv_freq = inv_freq.to(device=device, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)  # [seq, head_dim]
 
@@ -204,6 +235,11 @@ class LlamaRotaryEmbedding(nn.Module):
             # TE fused rope expects raw angles in [seq, 1, 1, head_dim] format
             self._freqs_cache = emb.to(self.dtype).unsqueeze(1).unsqueeze(1).contiguous()
 
+    def _ensure_cache(self, seq_len: int, device: torch.device) -> None:
+        """Build or grow the cos/sin cache so it covers positions ``[0, seq_len)``."""
+        if self._cos_cache is None or seq_len > self.max_seq_len_cached:
+            self._build_cache(seq_len, device)
+
     @torch.no_grad()
     def forward(
         self,
@@ -212,6 +248,21 @@ class LlamaRotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (cos, sin) for the given positions.
 
+        In the non-fused path ``cos`` / ``sin`` are gathered by the *values* in
+        ``position_ids``, so non-contiguous positions receive the correct rotary
+        phase: EAGLE TTT depth offsets (``arange(seq_len) + step_idx``), packed
+        sequences, and context parallelism all pass
+        ``position_ids != arange(seq_len)``. The earlier implementation returned
+        ``cos_cache[:seq_len]``, which keyed only on the sequence *length* and
+        silently ignored the position values. For the common
+        ``position_ids == arange(seq_len)`` case the gather is numerically
+        identical to that slice.
+
+        The fused TE path (``rope_fusion=True``) consumes raw angles indexed by
+        sequence position and assumes contiguous ``[0, seq_len)`` positions, so
+        it keeps the legacy contiguous slice and does NOT honor non-contiguous
+        ``position_ids``.
+
         Args:
             x: Input tensor (used for device and dtype)
             position_ids: Position IDs tensor [batch, seq_len]
@@ -219,18 +270,26 @@ class LlamaRotaryEmbedding(nn.Module):
         Returns:
             (cos, sin) tensors [batch, seq_len, head_dim]
         """
-        seq_len = position_ids.shape[-1]
-
-        # Build cache if needed
-        if self._cos_cache is None or seq_len > self.max_seq_len_cached:
-            self._build_cache(seq_len, x.device)
-
-        # Slice cache and expand for batch
-        cos = self._cos_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
-        sin = self._sin_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
-
         if self.rope_fusion:
+            # The fused TE kernel indexes raw angles by sequence position and
+            # assumes contiguous ``[0, seq_len)`` positions, so it only needs the
+            # cache sized to ``seq_len`` -- and must avoid the ``position_ids``
+            # host-device sync below on this default GPU training path.
+            seq_len = position_ids.shape[-1]
+            self._ensure_cache(seq_len, x.device)
+            cos = self._cos_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
+            sin = self._sin_cache[:seq_len].unsqueeze(0).expand(position_ids.shape[0], -1, -1)
             return cos, sin, self._freqs_cache[:seq_len]
+
+        # Non-fused: gather per-position. Size the cache to the highest requested
+        # position -- ``position_ids`` can exceed its own length (e.g. EAGLE TTT
+        # passes ``arange(seq_len) + k``), so ``seq_len`` alone is not a safe
+        # upper bound. This ``.item()`` sync only runs on the non-fused path.
+        needed = max(int(position_ids.max().item()) + 1, position_ids.shape[-1])
+        self._ensure_cache(needed, x.device)
+        # Gather per-position; identical to ``cos_cache[:seq_len]`` for arange.
+        cos = self._cos_cache[position_ids]
+        sin = self._sin_cache[position_ids]
         return cos, sin
 
 

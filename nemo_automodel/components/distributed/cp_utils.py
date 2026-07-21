@@ -101,6 +101,24 @@ def create_context_parallel_ctx(
     )
 
 
+def _shard_grad_buffer_for_cp(buffer: torch.Tensor, seq_dim: int, cp_mesh: DeviceMesh) -> torch.Tensor:
+    """Shard a gradient-bearing buffer with CP's head-tail load-balancing order."""
+    cp_size = cp_mesh.size()
+    num_chunks = 2 * cp_size
+    seq_len = buffer.shape[seq_dim]
+    if seq_len % num_chunks != 0:
+        raise ValueError(f"CP sequence length {seq_len} must be divisible by {num_chunks}")
+
+    chunk_size = seq_len // num_chunks
+    # ``cp_mesh`` is the 1D CP submesh selected from the full device mesh, so
+    # this is the rank within the CP process group even when the root mesh also
+    # has HSDP replicate/shard dimensions.
+    cp_rank = cp_mesh.get_local_rank()
+    head_chunk = buffer.narrow(seq_dim, cp_rank * chunk_size, chunk_size)
+    tail_chunk = buffer.narrow(seq_dim, (num_chunks - cp_rank - 1) * chunk_size, chunk_size)
+    return torch.cat((head_chunk, tail_chunk), dim=seq_dim)
+
+
 def attach_context_parallel_hooks(model: torch.nn.Module):
     """Attach forward pre-hooks to self_attn modules to fix attention masks for context parallelism.
 
@@ -193,6 +211,33 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             target.register_forward_hook(_post_hook, always_call=True)
 
 
+def unshard_context_parallel_tensor(
+    cp_mesh: DeviceMesh,
+    tensor: torch.Tensor,
+    *,
+    seq_dim: int,
+) -> torch.Tensor:
+    """Restore a tensor from PyTorch's load-balanced context-parallel layout.
+
+    Args:
+        cp_mesh: One-dimensional context-parallel mesh of size ``C``.
+        tensor: Tensor of shape ``[..., local_sequence, ...]`` whose sequence
+            axis is selected by ``seq_dim`` and uses PyTorch's load-balanced CP
+            layout.
+        seq_dim: Axis containing the local sequence extent.
+
+    Returns:
+        Replicated tensor of shape ``[..., sequence, ...]`` with the same axis
+        order and full sequence extent on ``seq_dim``.
+    """
+    if cp_mesh.size() <= 1:
+        return tensor
+    from torch.distributed.tensor.experimental._attention import context_parallel_unshard
+
+    (unsharded,) = context_parallel_unshard(cp_mesh, [tensor], seq_dims=[seq_dim])
+    return unsharded
+
+
 def make_cp_batch_and_ctx(
     device_mesh,
     batch,
@@ -201,20 +246,41 @@ def make_cp_batch_and_ctx(
     padding_token_id: int = 0,
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
+    extra_seq_buffers: dict[str, int] | None = None,
 ):
-    """
-    Build a CP context manager and shards a batch. If the input device_mesh is None or the size
-    of the context_parallel submesh is 1, this function is effectively a no-op.
+    """Build a context-parallel context and register sequence-bearing batch tensors.
+
+    The returned context shards registered sequence axes across the CP mesh and
+    leaves the corresponding batch entries in their per-rank local layout.
 
     Args:
-        cp_mesh (DeviceMesh): The device mesh for context parallel.
-        batch (Dict[str, torch.Tensor]): The input batch containing (string, torch.Tensor)
+        device_mesh: Device mesh containing optional ``cp`` and ``tp`` axes.
+        batch: Mapping containing ``input_ids`` as a tensor of shape
+            ``[batch, sequence]`` or ``inputs_embeds`` as a tensor of shape
+            ``[batch, sequence, hidden]``; ``labels`` as a tensor of shape
+            ``[batch, sequence]``; and optional sequence-aligned tensors.
+            Standard ``position_ids`` have shape ``[batch, sequence]`` and
+            multimodal RoPE positions have shape
+            ``[position_channels, batch, sequence]``. Dtype and device are
+            preserved.
+        loss_mask: Optional tensor of shape ``[batch, sequence]`` sharded with
+            the labels.
+        use_te: Whether to convert the batch to Transformer Engine's packed THD
+            layout instead of PyTorch's padded CP layout.
+        padding_token_id: Token id used when padding ``input_ids``.
+        num_chunks: Number of packed THD chunks for the TE path.
+        seq_lens_padding_value: Sentinel used for padded sequence lengths in
+            the TE path.
+        extra_seq_buffers: Additional batch keys mapped to their sequence axis.
+            For example, ``{"teacher_logits": 1}`` registers a tensor of shape
+            ``[batch, sequence, vocab]``. Floating-point extra buffers are
+            zero-padded when CP divisibility requires padding.
 
     Returns:
-        tuple (contextmanager, dict[str, torch.Tensor]): Returns a tuple with a context manager
-        and a new batch. The context manager is either nullcontext (no CP) or CP context manager as
-        returned by `create_context_parallel_ctx`. The batch has also been passed to
-        `create_context_parallel_ctx` and is accordingly sharded.
+        A pair of ``(context_factory, batch)``. Calling ``context_factory()``
+        enters the CP region. Registered tensors retain their semantic axis
+        order with a per-rank ``local_sequence`` extent while inside the context.
+        With CP size one, the batch is returned unchanged.
     """
     from contextlib import nullcontext
 
@@ -231,7 +297,16 @@ def make_cp_batch_and_ctx(
     cp_mesh = _get_submesh(device_mesh, "cp")
     tp_mesh = _get_submesh(device_mesh, "tp")
 
+    # A model that owns its CP attention can attach a batch-sharding callable to
+    # the batch in its pre-embed step. Honor it instead of the default
+    # load-balanced context_parallel path so the implementation stays with the model.
+    cp_make_batch_fn = batch.pop("_cp_make_batch_fn", None)
+    if cp_make_batch_fn is not None:
+        return cp_make_batch_fn(cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id)
+
     if use_te:
+        if extra_seq_buffers:
+            raise ValueError("extra_seq_buffers are not supported by the TE THD context-parallel path")
         return nullcontext, make_cp_batch_for_te(
             cp_mesh,
             batch,
@@ -309,6 +384,15 @@ def make_cp_batch_and_ctx(
         cp_seq_dims.append(1)
         cp_no_restore_buffers.add(padding_mask)
 
+    for key, seq_dim in (extra_seq_buffers or {}).items():
+        if key not in batch:
+            raise KeyError(f"Extra CP sequence buffer {key!r} is missing from the batch")
+        buffer = batch[key]
+        batch_buffer_keys[len(cp_buffers)] = key
+        cp_buffers.append(buffer)
+        cp_seq_dims.append(seq_dim)
+        cp_no_restore_buffers.add(buffer)
+
     # Pad sequence length to be divisible by 2 * cp_size (required by
     # context_parallel load balancing). The inputs_embeds path can hit
     # arbitrary seq lengths from the VLM collator, so we pad here rather
@@ -347,6 +431,19 @@ def make_cp_batch_and_ctx(
         # downstream consumer reading from the dict sees the padded shape.
         for idx, key in batch_buffer_keys.items():
             batch[key] = cp_buffers[idx]
+
+    # PyTorch's legacy context_parallel buffers API shards in place with
+    # ``resize_``/``copy_``. ``resize_`` rejects tensors that require gradients,
+    # and detaching inputs_embeds here would silently stop gradients to trainable
+    # embeddings and multimodal towers. Apply the same default head-tail shard
+    # out of place so autograd remains connected, then let context_parallel
+    # mutate only the integer/mask buffers.
+    primary_seq_tensor = cp_buffers[0]
+    if primary_seq_tensor.requires_grad:
+        batch[primary_key] = _shard_grad_buffer_for_cp(primary_seq_tensor, cp_seq_dims[0], cp_mesh)
+        cp_no_restore_buffers.remove(primary_seq_tensor)
+        cp_buffers = cp_buffers[1:]
+        cp_seq_dims = cp_seq_dims[1:]
 
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,

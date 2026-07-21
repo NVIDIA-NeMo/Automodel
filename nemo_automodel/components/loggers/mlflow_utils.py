@@ -14,9 +14,7 @@
 
 import contextlib
 import logging
-import os
 import sys
-from pathlib import Path
 from typing import Any, Callable, Dict, Optional, cast
 
 import torch
@@ -37,102 +35,37 @@ def configure_mlflow(cfg: Any) -> Optional[Any]:
     Returns the active run on rank 0, or None when MLflow is not configured
     or on non-rank-0 processes.
     """
+    # Back-compat shim. All MLflow setup logic lives in MLflowConfig.build (the
+    # single implementation); recipes construct MLflowConfig via RecipeConfig.mlflow
+    # and call build() directly. This wrapper maps a raw cfg's `mlflow:` block onto
+    # the typed config so existing callers keep working.
+    from nemo_automodel.components.loggers.loggers import MLflowConfig
+
     if not (dist.is_initialized() and dist.get_rank() == 0):
         return None
     mlflow_config = cfg.get("mlflow", {})
     if not mlflow_config:
         return None
 
-    try:
-        import mlflow
-    except ImportError as e:
-        raise ImportError("MLflow is not installed. Please install it with: uv add mlflow") from e
-
-    if uri := mlflow_config.get("tracking_uri", None):
-        mlflow.set_tracking_uri(uri)
-
-    experiment_name = mlflow_config.get("experiment_name", "automodel-experiment")
-    artifact_location = mlflow_config.get("artifact_location", None)
-    try:
-        experiment = mlflow.get_experiment_by_name(experiment_name)
-        experiment_id = (
-            experiment.experiment_id
-            if experiment is not None
-            else mlflow.create_experiment(name=experiment_name, artifact_location=artifact_location)
-        )
-    except Exception as e:
-        logger.warning(f"Failed to create/get experiment: {e}")
-        experiment_id = "0"
-
     # ConfigNode (Automodel's YAML wrapper) needs .to_dict(); plain dicts —
     # which appear as the fallback when `tags:` is absent — don't have it.
     raw_tags = mlflow_config.get("tags", {})
     tags = raw_tags.to_dict() if hasattr(raw_tags, "to_dict") else dict(raw_tags)
 
-    # Resume the previous MLflow run on restart, instead of starting a new
-    # one. The run id comes from MLFLOW_RUN_ID (an explicit user override,
-    # always honoured) or from a `mlflow_run_id` sidecar in the checkpoint
-    # dir. `mlflow.resume` (default true) gates the *implicit* sidecar
-    # lookup only; the env var remains effective even with `resume: false`.
-    # The sidecar is always written below so a future `resume: true` launch
-    # (or post-hoc recovery via the env var) can still find the most recent
-    # run for this checkpoint dir.
-    resume_enabled = mlflow_config.get("resume", True)
-    ckpt_dir = cfg.get("checkpoint.checkpoint_dir", None)
-    sidecar = Path(ckpt_dir) / "mlflow_run_id" if ckpt_dir else None
-    existing_run_id = os.environ.get("MLFLOW_RUN_ID") or (
-        sidecar.read_text().strip() if resume_enabled and sidecar and sidecar.exists() else None
-    )
-
-    # UI "Description" field — surfaced via the `mlflow.note.content` tag.
-    if description := mlflow_config.get("description", None):
-        tags["mlflow.note.content"] = description
-
-    run = mlflow.start_run(
-        experiment_id=experiment_id,
-        run_id=existing_run_id,  # None → new run; set → resume the same run
-        run_name=mlflow_config.get("run_name", ""),  # ignored when run_id provided
+    config = MLflowConfig(
+        experiment_name=mlflow_config.get("experiment_name", "automodel-experiment"),
+        run_name=mlflow_config.get("run_name", ""),
+        tracking_uri=mlflow_config.get("tracking_uri", None),
+        artifact_location=mlflow_config.get("artifact_location", None),
         tags=tags,
+        resume=mlflow_config.get("resume", True),
+        description=mlflow_config.get("description", None),
+        flatten_depth=mlflow_config.get("flatten_depth", 1),
     )
-
-    # Persist the run_id so a future restart can resume this run.
-    if existing_run_id is None and sidecar is not None:
-        sidecar.parent.mkdir(parents=True, exist_ok=True)
-        sidecar.write_text(run.info.run_id)
-
-    _install_mlflow_failure_hook()
-
-    # `use_orig_values=True` renders callables as dotted-path strings (e.g.
-    # `torch.utils.data.default_collate`) instead of `to_dict()`'s raw repr
-    # (`<function ... at 0x7f...>`), which embeds an in-process memory address
-    # and would log different values on every run. The same dict is used for
-    # params and the artifact so they stay consistent.
-    # `redact_sensitive` is left at its default (off): the substring matcher
-    # treats "tokenizer" as a secret due to the "token" substring, and secrets
-    # in this project come from env vars.
-    config_dict = cfg.to_yaml_dict(use_orig_values=True)
-
-    # On resume, params from the original run are already logged; re-logging
-    # would raise MlflowException for any value that has legitimately changed
-    # (e.g. `step_scheduler.max_steps` after a budget extension). Instead the
-    # snapshot is written as a timestamped artifact so each launch's config
-    # is preserved.
-    if existing_run_id is None:
-        # `mlflow.flatten_depth` controls nested-config flattening. Default 1
-        # matches the prior implementation, keeping existing runs comparable.
-        flatten_depth = mlflow_config.get("flatten_depth", 1)
-        mlflow.log_params(flatten_params_for_mlflow(config_dict, max_depth=flatten_depth))
-        mlflow.log_dict(config_dict, "config.yaml")
-    else:
-        from datetime import datetime, timezone
-
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        mlflow.log_dict(config_dict, f"config.resumed-{ts}.yaml")
-
-    logger.info(f"MLflow run started: {run.info.run_id}")
-    logger.info(f"View run at: {mlflow.get_tracking_uri()}/#/experiments/{experiment_id}/runs/{run.info.run_id}")
-
-    return run
+    return config.build(
+        checkpoint_dir=cfg.get("checkpoint.checkpoint_dir", None),
+        run_config=cfg.to_yaml_dict(use_orig_values=True),
+    )
 
 
 def flatten_params_for_mlflow(

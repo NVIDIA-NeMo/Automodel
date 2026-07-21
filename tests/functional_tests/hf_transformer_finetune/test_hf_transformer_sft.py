@@ -29,6 +29,8 @@ HF_TRANSFORMER_LLAMA3_CUSTOM_FILENAME = "L2_HF_Transformer_PEFT_Benchmark_Llama_
 HF_TRANSFORMER_QWEN2_CUSTOM_FILENAME = "L2_HF_Transformer_PEFT_Benchmark_qwen2_custom.sh"
 HF_TRANSFORMER_NEMOTRON_NANO_V3_4LAYER_CUSTOM_FILENAME = "L2_HF_Transformer_Nemotron_Nano_v3_MoE_custom.sh"
 HF_TRANSFORMER_PP_DYNAMIC_SEQLEN_SFT_FILENAME = "L2_HF_Transformer_w_PP_Dynamic_SeqLen_SFT.sh"
+HF_TRANSFORMER_PP_FINCE_SFT_FILENAME = "L2_HF_Transformer_w_PP_FinCE_SFT.sh"
+
 
 class TestHFTransformerFinetune:
     def test_hf_transformer_sft(self):
@@ -113,5 +115,11 @@ class TestHFTransformerFinetune:
     def test_hf_transformer_pp_dynamic_seqlen_sft(self):
         try:
             run_test_script(TEST_FOLDER, HF_TRANSFORMER_PP_DYNAMIC_SEQLEN_SFT_FILENAME)
+        finally:
+            shutil.rmtree("checkpoints/", ignore_errors=True)
+
+    def test_hf_transformer_pp_fince_sft(self):
+        try:
+            run_test_script(TEST_FOLDER, HF_TRANSFORMER_PP_FINCE_SFT_FILENAME)
         finally:
             shutil.rmtree("checkpoints/", ignore_errors=True)

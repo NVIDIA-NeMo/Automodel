@@ -120,12 +120,22 @@ def test_collator_end_to_end_no_prefix():
 def test_collator_with_prefix_and_pad_multiple():
     tok = FakeTokenizer()
     collator = rc.BiEncoderCollator(
-        tokenizer=tok, q_max_len=32, p_max_len=32, query_prefix="Q:", passage_prefix="D:", padding=True, pad_to_multiple_of=4
+        tokenizer=tok,
+        q_max_len=32,
+        p_max_len=32,
+        query_prefix="Q:",
+        passage_prefix="D:",
+        padding=True,
+        pad_to_multiple_of=4,
     )
     # Make varying lengths so padding is exercised and rounded to multiple-of 4
     batch = [
         {"question": "short", "doc_text": ["tiny", "a bit longer"], "doc_image": ["", ""]},
-        {"question": "this is a somewhat longer question", "doc_text": ["short doc", "this is a longish doc text"], "doc_image": ["", ""]},
+        {
+            "question": "this is a somewhat longer question",
+            "doc_text": ["short doc", "this is a longish doc text"],
+            "doc_image": ["", ""],
+        },
     ]
     out = collator(batch)
     # Verify padding rounded to multiple of 4
@@ -220,3 +230,42 @@ def test_collator_with_dataset_instruction():
     # The instruction adds 12 words, so we should see significantly more tokens
     assert with_instruction_tokens > without_instruction_tokens
     assert with_instruction_tokens - without_instruction_tokens > 10  # At least 10 more tokens from instruction
+
+
+def test_make_vision_collator_from_processor_method_returns_bound_method():
+    class FakeProcessor:
+        def process_queries_documents_biencoder(self, features):
+            return {"features": features}
+
+    processor = FakeProcessor()
+    with pytest.deprecated_call(match="use ProcessorMethodCollator"):
+        collator = rc.make_vision_collator_from_processor_method(processor, "process_queries_documents_biencoder")
+
+    assert collator.__self__ is processor
+    assert collator.__func__ is FakeProcessor.process_queries_documents_biencoder
+    assert collator([{"question": "Q"}]) == {"features": [{"question": "Q"}]}
+
+
+def test_processor_method_collator_resolves_method_once():
+    class FakeProcessor:
+        resolve_count = 0
+
+        def __getattribute__(self, name):
+            if name == "process_queries_documents_biencoder":
+                type(self).resolve_count += 1
+            return super().__getattribute__(name)
+
+        def process_queries_documents_biencoder(self, features):
+            return {"features": features}
+
+    processor = FakeProcessor()
+    collator = rc.ProcessorMethodCollator(processor, "process_queries_documents_biencoder")
+
+    assert collator([{"question": "Q1"}]) == {"features": [{"question": "Q1"}]}
+    assert collator([{"question": "Q2"}]) == {"features": [{"question": "Q2"}]}
+    assert FakeProcessor.resolve_count == 1
+
+
+def test_make_vision_collator_from_processor_method_missing_method_raises():
+    with pytest.deprecated_call(match="use ProcessorMethodCollator"), pytest.raises(AttributeError):
+        rc.make_vision_collator_from_processor_method(object(), "missing_collator")

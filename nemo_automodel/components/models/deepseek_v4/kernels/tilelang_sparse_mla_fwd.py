@@ -25,13 +25,9 @@
 #   - Single-head KV: kv shape [B, S_kv, D] (no kv_group, no D/D_tail split)
 #   - Index shape: [B, S, topk] (no kv_group dim)
 #   - Output: [B, S, H, D] + LSE [B, S, H]
-try:
-    import tilelang
-    from tilelang import language as T
-except ImportError as _e:
-    # See comment in tilelang_indexer_bwd.py.
-    raise ImportError(f"UnavailableError: tilelang is required for {__name__}: {_e}") from _e
 import torch
+
+from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import T, tilelang
 
 
 @tilelang.jit(

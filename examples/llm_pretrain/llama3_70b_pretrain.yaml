@@ -14,8 +14,10 @@
 
 
 # To run this recipe:
-#   automodel examples/llm_pretrain/llama3_70b_pretrain.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
+#   cp slurm.sub my_cluster.sub
+#   # In my_cluster.sub, set CONFIG to this file and request 4 nodes x 8 GPUs.
+#   sbatch my_cluster.sub
+# This config uses dp_size=2, tp_size=4, and pp_size=4, so the configured world size is 32 GPUs.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
@@ -32,10 +34,12 @@ dist_env:
 
 # Model
 # Option 1 – shorthand builder
+# Keep model storage in bf16 and use TE FusedAdam below for fp32 master
+# weights + fp32 Adam EMA buffers during pre-training.
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.1-70B
-  torch_dtype: bf16
+  torch_dtype: bfloat16
   trust_remote_code: True
 
 checkpoint:
@@ -77,21 +81,38 @@ loss_fn:
 
 # Optimizer
 optimizer:
-  _target_: torch.optim.AdamW
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   lr: 2.0e-5
   betas: [0.9, 0.95]
   weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
 
 # DDP / FSDP2 / etc
 distributed:
   strategy: fsdp2
-  dp_size: none
+  dp_size: 2
   tp_size: 4
   cp_size: 1  # Change to 2 once packed sequence is supported with CP
   pp_size: 4
 
   sequence_parallel: false
   activation_checkpointing: true
+
+  # FSDP2 mixed-precision policy. The defaults applied by FSDP2Config are the
+  # values shown here (Megatron-style: bf16 compute, fp32 gradient reduction);
+  # the block is included explicitly so the canonical pattern is discoverable
+  # from a recipe. See docs/guides/mixed-precision-training.md for the trade-offs.
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+    cast_forward_inputs: true
 
   pipeline:
     pp_schedule: interleaved1f1b

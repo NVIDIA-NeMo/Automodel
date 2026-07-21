@@ -65,6 +65,9 @@ class _FakeDraftModel(nn.Module):
         super().__init__()
         self.layer = nn.Linear(4, 4)
 
+    def set_vocab_mapping(self, selected_token_ids):
+        pass
+
 
 class _FakeEagle1TrainerModule(nn.Module):
     def __init__(self):
@@ -104,6 +107,8 @@ def _bare_eagle3_recipe(tmp_path) -> TrainEagle3Recipe:
     recipe.tokenizer = None
     recipe.dist_env = SimpleNamespace(is_main=True, world_size=1)
     recipe.trainer_module = _FakeEagle3TrainerModule()
+    recipe.draft_model = recipe.trainer_module.draft_model
+    recipe.target_wrapper = None
     recipe.optimizer = torch.optim.AdamW(recipe.trainer_module.parameters(), lr=1e-4)
     recipe.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(recipe.optimizer, lambda s: 1.0)
     recipe.runtime = SimpleNamespace(global_step=0)

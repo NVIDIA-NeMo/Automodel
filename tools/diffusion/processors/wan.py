@@ -13,12 +13,17 @@
 # limitations under the License.
 
 """
-Wan2.1 video model processor for preprocessing.
+Wan video model processors for preprocessing.
 
-Handles Wan2.1-T2V models (1.3B and 14B variants) with:
+Handles Wan2.1-T2V and Wan2.2-T2V-A14B with:
 - AutoencoderKLWan for video encoding
 - UMT5 text encoder for text conditioning
 - Latent normalization using latents_mean and latents_std
+
+Wan2.1 and Wan2.2 share the same VAE class and UMT5 text encoder, but their
+hub weights and ``latents_mean`` / ``latents_std`` may differ. Use the
+``wan2.2`` processor to preprocess data targeting Wan2.2 finetuning so the
+cache stays clearly separated from any existing Wan2.1 cache.
 """
 
 import html
@@ -114,7 +119,14 @@ class WanProcessor(BaseVideoProcessor):
         # UMT5 requires bfloat16 (float16 causes overflow/zeros in attention and layer norm)
         text_encoder_dtype = torch.bfloat16 if "cuda" in device else torch.float32
 
+        from nemo_automodel._diffusers._hf_cache import resolve_diffusion_model_dir
+
         logger.info("[Wan] Loading models from %s...", model_name)
+
+        # Resolve to a local snapshot dir once so the per-component subfolder
+        # loads below reuse the warm HF cache instead of re-validating over the
+        # network on every run.
+        model_name = resolve_diffusion_model_dir(model_name)
 
         # Load text encoder
         logger.info("  Loading UMT5 text encoder...")
@@ -353,7 +365,35 @@ class WanProcessor(BaseVideoProcessor):
             "video_path": metadata.get("video_path"),
             # Processing settings
             "deterministic_latents": metadata.get("deterministic", True),
-            "model_version": "wan2.1",
+            "model_version": self.model_version,
             "processing_mode": metadata.get("mode", "video"),
             "model_type": self.model_type,
         }
+
+    @property
+    def model_version(self) -> str:
+        return "wan2.1"
+
+
+@ProcessorRegistry.register("wan2.2")
+class Wan22Processor(WanProcessor):
+    """
+    Processor for Wan2.2-T2V-A14B (two-stage) video model.
+
+    Wan2.2 reuses the same ``AutoencoderKLWan`` VAE class and UMT5 text encoder
+    as Wan2.1, but pulls VAE / text-encoder weights from the A14B hub. Cache
+    files emitted by this processor record ``model_version: "wan2.2"`` so
+    Wan2.1 and Wan2.2 caches remain unambiguous side-by-side.
+    """
+
+    @property
+    def model_type(self) -> str:
+        return "wan22"
+
+    @property
+    def model_version(self) -> str:
+        return "wan2.2"
+
+    @property
+    def default_model_name(self) -> str:
+        return "Wan-AI/Wan2.2-T2V-A14B-Diffusers"

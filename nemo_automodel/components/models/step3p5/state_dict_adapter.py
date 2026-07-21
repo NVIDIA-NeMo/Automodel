@@ -22,14 +22,14 @@ HF Format (Step3p5):
     model.layers.{L}.moe.up_proj.weight      # [n_exp, inter, dim]
     model.layers.{L}.moe.down_proj.weight    # [n_exp, dim, inter]
     model.layers.{L}.moe.gate.weight         # [n_exp, dim] (router)
-    model.layers.{L}.moe.router_bias         # [n_exp] (router bias, optional)
+        model.layers.{L}.moe.router_bias         # [n_exp] (post-sigmoid router correction bias, optional)
     model.layers.{L}.share_expert.*.weight   # Shared expert
 
 Native Format (Automodel):
     model.layers.{L}.moe.experts.gate_and_up_projs  # [n_exp, dim, 2*inter]
     model.layers.{L}.moe.experts.down_projs         # [n_exp, inter, dim]
     model.layers.{L}.moe.gate.weight                # [n_exp, dim]
-    model.layers.{L}.moe.gate.bias                  # [n_exp]
+    model.layers.{L}.moe.gate.e_score_correction_bias # [n_exp]
     model.layers.{L}.share_expert.*.weight
 
 Note: Router gate weights and shared expert weights pass through with the same key names.
@@ -205,8 +205,9 @@ class Step3p5StateDictAdapter(StateDictAdapter):
             r"(?P<prefix>(?:model\.)?(?:language_model\.)?)layers\.(?P<layer>\d+)\.moe\.(?P<proj>gate_proj|up_proj|down_proj)\.weight"
         )
 
-        # Pattern for router gate weights that need expert slicing for EP
-        # HF Step3p5 uses moe.gate.weight and moe.router_bias (not moe.gate.bias)
+        # Pattern for router gate weights that need expert slicing for EP.
+        # HF Step3p5 uses moe.router_bias as a post-sigmoid expert-selection
+        # correction, not as a linear bias term.
         router_gate_pattern = re.compile(
             r"(?P<prefix>(?:model\.)?(?:language_model\.)?)layers\.(?P<layer>\d+)\.moe\.(?P<param>gate\.weight|gate\.bias|router_bias|gate\.e_score_correction_bias)"
         )
@@ -296,9 +297,10 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                 prefix = router_m.group("prefix") or ""
                 layer_num = router_m.group("layer")
 
-                # Map HF router_bias to native gate.bias
+                # Map HF router_bias to the native correction buffer used by
+                # Gate(score_func="sigmoid_with_bias").
                 if param == "router_bias":
-                    native_key = f"{prefix}layers.{layer_num}.moe.gate.bias"
+                    native_key = f"{prefix}layers.{layer_num}.moe.gate.e_score_correction_bias"
                 else:
                     native_key = key
 
@@ -421,7 +423,16 @@ class Step3p5StateDictAdapter(StateDictAdapter):
                 (f"{prefix}layers.{layer_num}.moe.down_proj.weight", down_weight),
             ]
 
-        # Handle moe.gate.bias -> router_bias mapping for to_hf
+        # Handle native correction bias -> HF router_bias mapping for to_hf.
+        if ".moe.gate.e_score_correction_bias" in fqn:
+            layer_match = re.search(r"layers\.(\d+)", fqn)
+            if layer_match is None:
+                return None
+            layer_num = layer_match.group(1)
+            return [(f"{prefix}layers.{layer_num}.moe.router_bias", tensor)]
+
+        # Backward compatibility for older native checkpoints that stored the
+        # Step3 router correction in gate.bias.
         if ".moe.gate.bias" in fqn:
             layer_match = re.search(r"layers\.(\d+)", fqn)
             if layer_match is None:

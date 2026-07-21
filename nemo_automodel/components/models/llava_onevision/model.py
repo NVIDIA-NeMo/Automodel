@@ -26,6 +26,7 @@ In-memory tree:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -34,6 +35,11 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
+from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.llava_onevision.rice_vit import RiceTransformer
 
 LOGGER = logging.getLogger(__name__)
@@ -281,7 +287,18 @@ class LLaVAOneVision1_5_Model(nn.Module):
 class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module):
     """LLaVA-OneVision-1.5 for conditional generation (Rice ViT + Qwen3 text)."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     config_class = Llavaonevision1_5Config
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
 
     @classmethod
     def from_config(cls, config, **kwargs):
@@ -302,6 +319,7 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
     ):
         super().__init__()
         self.config = config
+        reject_unsupported_tie_word_embeddings(type(self), config)
         if attn_implementation is None:
             attn_implementation = getattr(config, "_attn_implementation", None) or "eager"
         self.model = LLaVAOneVision1_5_Model(config, attn_implementation=attn_implementation)
@@ -353,8 +371,16 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
         pixel_values_videos: Optional[torch.FloatTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
+        output_hidden_states: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.model.text_config, "output_hidden_states", False)
+        )
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -369,7 +395,8 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
         )
 
         hidden_states = outputs.last_hidden_state
-        logits = self.lm_head(hidden_states)
+
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None:
@@ -383,6 +410,6 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
             loss=loss,
             logits=logits,
             past_key_values=getattr(outputs, "past_key_values", None),
-            hidden_states=getattr(outputs, "hidden_states", None),
+            hidden_states=hidden_states if output_hidden_states else None,
             attentions=getattr(outputs, "attentions", None),
         )

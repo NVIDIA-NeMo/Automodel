@@ -35,7 +35,7 @@ on:
 
 jobs:
   code-freeze:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@v0.86.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@v1.4.2
     with:
       library-name: NeMo-Automodel
       python-package: nemo_automodel
@@ -49,74 +49,9 @@ jobs:
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
       PAT: ${{ secrets.PAT }}
 
-  bump-docs-versions:
-    needs: [code-freeze]
-    runs-on: ubuntu-latest
-    env:
-      VERSION: ${{ needs.code-freeze.outputs.release-branch }}
-      DRY_RUN: ${{ inputs.dry-run }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          ref: main
-          token: ${{ secrets.PAT }}
-
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Update versions1.json
-        run: |
-          version_number=$(echo ${VERSION} | sed 's/^r//')
-
-          # Remove (latest) tag from previous latest entry, insert new version after nightly
-          jq --arg ver "$version_number" '
-            map(if .name then del(.name) else . end)
-            | [.[0]] + [{"name": ($ver + " (latest)"), "version": $ver, "url": "https://docs.nvidia.com/nemo/automodel/latest/"}] + .[1:]
-          ' docs/versions1.json > tmp.json && mv tmp.json docs/versions1.json
-
-      - name: Commit changes
-        id: commit-versions1
-        run: |
-          git add docs/versions1.json
-          git commit -m "[bot]: Update docs-versions after code-freeze for ${VERSION}"
-          commit_hash=$(git rev-parse HEAD)
-          echo "commit_hash=${commit_hash}" | tee -a $GITHUB_OUTPUT
-
-          if [[ "$DRY_RUN" != "true" ]]; then
-            git push
-          fi
-
-      - name: Switch to release branch
-        run: |
-          git fetch origin ${{ needs.code-freeze.outputs.release-branch }}
-          git checkout ${{ needs.code-freeze.outputs.release-branch }}
-
-      - name: Cherry-pick docs-versions commit
-        run: |
-          git cherry-pick ${{ steps.commit-versions1.outputs.commit_hash }}
-
-      - name: Update project.json
-        run: |
-          version_number=$(echo ${VERSION} | sed 's/^r//')
-
-          jq --arg ver "$version_number" \
-            '. = {"version": $ver, "name": "nemo-automodel"}' \
-            docs/project.json > tmp.json && mv tmp.json docs/project.json
-
-      - name: Update conf.py
-        run: |
-          version_number=$(echo ${VERSION} | sed 's/^r//')
-          sed -i "s/release = .*/release = \"${version_number}\"/" docs/conf.py
-
-      - name: Commit changes
-        run: |
-          git add docs/project.json
-          git add docs/conf.py
-          git commit -m "Bump docs version to ${VERSION}"
-
-          if [[ "$DRY_RUN" != "true" ]]; then
-            git push
-          fi
+  # bump-docs-versions: the Sphinx-era docs/versions1.json, docs/project.json,
+  # and docs/conf.py no longer exist; Fern manages version metadata via
+  # docs/fern/docs.yml `versions:` and docs/fern/versions/*.yml. The
+  # equivalent step under Fern is to add a new version pin in those files
+  # and tag docs/v<X>.<Y>.0 to trigger publish-fern-docs.yml — done by hand
+  # at release cut time, not on every code freeze.

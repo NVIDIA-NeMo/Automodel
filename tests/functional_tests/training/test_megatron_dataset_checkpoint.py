@@ -20,19 +20,25 @@ import torch
 
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.recipes._dist_setup import setup_distributed
-from nemo_automodel.recipes.llm.train_ft import build_dataloader, build_distributed
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
+from nemo_automodel.recipes._typed_config import RecipeConfig
+from nemo_automodel.recipes.llm.train_ft import _build_tokenizer
 
 """
 This test is to make sure that JSONL dataset can be checkpointed and loaded correctly.
 """
 
+
 def test_megatron_dataset_checkpointing():
     cfg_path = Path(__file__).parents[4] / "examples" / "llm_pretrain" / "megatron_pretrain_gpt2.yaml"
     cfg = parse_args_and_load_config(cfg_path)
-    dist_env = build_distributed(cfg.get("dist_env", {}))
-    dist_setup = setup_distributed(cfg, world_size=dist_env.world_size)
-    device_mesh = dist_setup.device_mesh
+    dist_env = initialize_distributed(
+        backend=cfg.get("dist_env", {}).get("backend", "nccl"),
+        timeout_minutes=cfg.get("dist_env", {}).get("timeout_minutes", 1),
+    )
+    mesh_context = create_distributed_setup_from_config(cfg, world_size=dist_env.world_size).mesh_context
+    device_mesh = mesh_context.device_mesh
     dp_rank = device_mesh["dp"].get_local_rank()
     dp_world_size = device_mesh["dp"].size()
     tp_rank = device_mesh["tp"].get_local_rank()
@@ -56,20 +62,23 @@ def test_megatron_dataset_checkpointing():
         pp_rank=pp_rank,
     )
 
-    dataset = build_dataloader(
-        cfg_ds=cfg.dataset,
-        cfg_dl=cfg.dataloader,
-        cfg_model=cfg.model,
-        cfg_ps={},
-        seed=42,
-        local_batch_size=2,
-        global_batch_size=4,
-        max_steps=None,
-        val_check_interval=10,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        pp_enabled=False,
-    )[0]
+    # Override the example config's batch sizes / schedule with the small values this test needs.
+    schedule_overrides = {
+        "local_batch_size": 2,
+        "global_batch_size": 4,
+        "max_steps": None,
+        "val_every_steps": 10,
+    }
+    for key, value in schedule_overrides.items():
+        if not hasattr(cfg.step_scheduler, key):
+            raise ValueError(f"step_scheduler config has no field {key!r}")
+        setattr(cfg.step_scheduler, key, value)
+    # Megatron datasets require a tokenizer; the recipe supplies it via runtime (build(tokenizer=...)),
+    # so build it here the same way (from the dataset/model config) instead of relying on the default.
+    _, tokenizer = _build_tokenizer(cfg.model, cfg.dataset)
+    dataset = RecipeConfig(cfg).dataloader.build(
+        dp_rank=dp_rank, dp_world_size=dp_world_size, pp_enabled=False, tokenizer=tokenizer
+    )
 
     # fast-forward. not necessary, but we want to make sure the dataset is not at the beginning.
     for i, batch in enumerate(dataset):
@@ -96,31 +105,24 @@ def test_megatron_dataset_checkpointing():
         assert os.access(path, os.R_OK), f"Expected {path} to be readable"
         assert path.stat().st_size > 0, f"Expected {path} to be non-empty"
 
-    dataset = build_dataloader(
-        cfg_ds=cfg.dataset,
-        cfg_dl=cfg.dataloader,
-        cfg_model=cfg.model,
-        cfg_ps={},
-        seed=42,
-        local_batch_size=2,
-        global_batch_size=4,
-        max_steps=None,
-        val_check_interval=10,
-        dp_rank=dp_rank,
-        dp_world_size=dp_world_size,
-        pp_enabled=False,
-    )[0]
+    dataset = RecipeConfig(cfg).dataloader.build(
+        dp_rank=dp_rank, dp_world_size=dp_world_size, pp_enabled=False, tokenizer=tokenizer
+    )
 
     initial_batch = next(iter(dataset))
     for k in ["input_ids", "labels"]:
-        assert torch.any(initial_batch[k] != expected_batch[k]), f"Initial batch key {k, initial_batch[k]} should not be equal to expected batch key {k, expected_batch[k]}"
+        assert torch.any(initial_batch[k] != expected_batch[k]), (
+            f"Initial batch key {k, initial_batch[k]} should not be equal to expected batch key {k, expected_batch[k]}"
+        )
 
     # load checkpoint
     checkpointer.load_on_dp_ranks(dataset, "dataloader", cfg.checkpoint.checkpoint_dir)
 
     for i, batch in enumerate(dataset):
         for k in batch.keys():
-            assert torch.all(batch[k] == expected_batch[k]), f"Batch key {k, batch[k]} is not equal to expected batch key {k, expected_batch[k]}"
+            assert torch.all(batch[k] == expected_batch[k]), (
+                f"Batch key {k, batch[k]} is not equal to expected batch key {k, expected_batch[k]}"
+            )
         break
 
     torch.distributed.barrier(device_mesh["dp"].get_group())

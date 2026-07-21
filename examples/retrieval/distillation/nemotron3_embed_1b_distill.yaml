@@ -1,0 +1,125 @@
+# Usage (8 GPUs, single node):
+#   automodel --nproc-per-node 8 examples/retrieval/distillation/nemotron3_embed_1b_distill.yaml
+
+recipe: EmbeddingDistillRecipe
+
+seed: 42
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 5
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 4
+  ckpt_every_steps: 500
+  num_epochs: 1
+
+model:
+  _target_: nemo_automodel._transformers.retrieval.RetrieverStudentWithProjection.build
+  pretrained_model_name_or_path: <your_path>
+  teacher_hidden_size: 4096
+  pooling: avg
+  l2_normalize: false
+  capture_layers: []
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+teacher_model:
+  _target_: nemo_automodel._transformers.retrieval.RetrieverTeacherEmbeddingEncoder.build
+  pretrained_model_name_or_path: <your_path>
+  pooling: avg
+  l2_normalize: false
+  capture_layers: []
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+tokenizer:
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: <your_path>
+  add_eos_token: false
+  padding_side: left
+  force_hf: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    model_type: bi_encoder
+    n_passages: 5
+    seed: 42
+    do_shuffle: true
+    data_type: train
+    data_dir_list:
+      - hf://nvidia/embed-nemotron-dataset-v1/FEVER # 50k
+      - hf://nvidia/embed-nemotron-dataset-v1/SyntheticClassificationData # 100k
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.BiEncoderDistillCollator
+    q_max_len: 512
+    p_max_len: 512
+    query_prefix: "query:"
+    passage_prefix: "passage:"
+    pad_to_multiple_of: 8
+  shuffle: true
+  num_workers: 2
+
+# ------------------------------------------------------------------------
+# Loss building blocks (instances are built whether or not their weight is
+# active, so the recipe-level weights below drive the actual loss mix).
+# ------------------------------------------------------------------------
+distill_loss:
+  _target_: nemo_automodel.components.loss.embedding_distill.EmbeddingDistillLoss
+  reduction: mean
+
+mse_loss:
+  _target_: nemo_automodel.components.loss.embedding_distill.EmbeddingMSELoss
+  normalize: false
+  reduction: mean
+
+infonce_distill_loss:
+  _target_: nemo_automodel.components.loss.infonce.InfoNCEDistillLoss
+  temperature: 0.05
+  direction: q2d
+  use_in_batch_negatives: true
+  normalize: true
+  divergence: kl
+  cross_device_negatives: true
+
+# ------------------------------------------------------------------------
+# Active loss mix example:
+#   total = 1.0 * cosine + 1.0 * mse + 0 * nce_distill
+# (i.e. Cosine similarity + MSE alignment + InfoNCE-distill listwise KD)
+# ------------------------------------------------------------------------
+distill_loss_weight: 1.0
+mse_loss_weight: 1.0
+nce_distill_loss_weight: 0.0
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 1.0e-5
+  weight_decay: 0.01
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+
+lr_scheduler:
+  lr_warmup_steps: 200
+  lr_decay_style: cosine
+
+clip_grad_norm:
+  max_norm: 1.0
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: <your_path>
+  model_save_format: safetensors
+  save_consolidated: true

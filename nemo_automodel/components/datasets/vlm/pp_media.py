@@ -24,6 +24,9 @@ VLM_PP_MEDIA_KEY = "_vlm_pp_media_chunks"
 
 _VLM_MEDIA_KEYS = (
     "pixel_values",
+    "patch_pixel_values",
+    "num_patches",
+    "patch_newline_mask",
     "image_grid_hws",
     "image_grid_thw",
     "image_sizes",
@@ -119,6 +122,87 @@ def chunk_vlm_media(
     return pixel_values_chunks, image_grid_chunks
 
 
+def chunk_step3_media(
+    pixel_values: torch.Tensor,
+    *,
+    batch_size: int,
+    n_microbatches: int,
+    num_patches: torch.Tensor | None = None,
+    patch_pixel_values: torch.Tensor | None = None,
+    patch_newline_mask: torch.Tensor | None = None,
+) -> dict[str, list[torch.Tensor]]:
+    """Chunk image tensors with per-sample patch counts for PP microbatches.
+
+    Step3 processors emit one full image per sample in ``pixel_values`` and a
+    flat list of optional crop patches in ``patch_pixel_values``. ``num_patches``
+    maps samples to the flat patch tensor. Processors may also emit
+    ``pixel_values`` itself as a flat patch tensor using the same mapping.
+
+    Args:
+        pixel_values: Either ``[batch, ...]`` (one image tensor per sample) or a
+            row-flattened ``[total_patches, ...]`` tensor whose patches are
+            concatenated along axis 0 in sample order, where
+            ``total_patches == sum(num_patches)``.
+        batch_size: Number of samples in the batch.
+        n_microbatches: Number of PP microbatches to split the batch into.
+        num_patches: Tensor of shape ``[batch]``; entry ``i`` is the patch count
+            for sample ``i``. Defaults to all-zeros when the processor emits no
+            crop patches.
+        patch_pixel_values: Optional row-flattened crop patches of shape
+            ``[total_patches, ...]`` indexed by ``num_patches``.
+        patch_newline_mask: Optional tensor of shape ``[total_patches]`` marking
+            patch-row newline positions, indexed by ``num_patches``.
+
+    Returns:
+        dict[str, list[torch.Tensor]]: Per-microbatch slices keyed by
+        ``pixel_values`` and ``num_patches`` (plus ``patch_pixel_values`` and
+        ``patch_newline_mask`` when provided). ``pixel_values`` is sliced along
+        the patch axis for the flat layout and along the sample axis otherwise.
+    """
+    if num_patches is None:
+        num_patches = torch.zeros(batch_size, dtype=torch.long, device=pixel_values.device)
+    else:
+        num_patches = num_patches.to(dtype=torch.long).view(-1)
+        if num_patches.numel() != batch_size:
+            raise ValueError(
+                f"num_patches must have length batch_size={batch_size}, got shape={tuple(num_patches.shape)}."
+            )
+
+    flat_pixel_values = pixel_values.shape[0] != batch_size
+    if flat_pixel_values and int(num_patches.sum().item()) != pixel_values.shape[0]:
+        raise ValueError(
+            "VLM PP chunking cannot align pixel_values with num_patches: "
+            f"pixel_values.shape={tuple(pixel_values.shape)}, sum(num_patches)={int(num_patches.sum().item())}."
+        )
+
+    samples_per_mb = -(-batch_size // n_microbatches)
+    cumsum_patches = torch.cumsum(num_patches.cpu(), dim=0)
+
+    result: dict[str, list[torch.Tensor]] = {
+        "pixel_values": [],
+        "num_patches": [],
+    }
+    if patch_pixel_values is not None:
+        result["patch_pixel_values"] = []
+    if patch_newline_mask is not None:
+        result["patch_newline_mask"] = []
+
+    for mb_idx in range(n_microbatches):
+        sample_start = mb_idx * samples_per_mb
+        sample_end = min(sample_start + samples_per_mb, batch_size)
+        patch_start = 0 if sample_start == 0 else int(cumsum_patches[sample_start - 1].item())
+        patch_end = int(cumsum_patches[sample_end - 1].item()) if sample_end > 0 else patch_start
+        pixel_start, pixel_end = (patch_start, patch_end) if flat_pixel_values else (sample_start, sample_end)
+        result["pixel_values"].append(pixel_values[pixel_start:pixel_end])
+        result["num_patches"].append(num_patches[sample_start:sample_end])
+        if patch_pixel_values is not None:
+            result["patch_pixel_values"].append(patch_pixel_values[patch_start:patch_end])
+        if patch_newline_mask is not None:
+            result["patch_newline_mask"].append(patch_newline_mask[patch_start:patch_end])
+
+    return result
+
+
 def _select_image_grid(
     image_grid_hws: torch.Tensor | None,
     image_grid_thw: torch.Tensor | None,
@@ -154,6 +238,9 @@ def prepare_vlm_media_for_pp(
         return batch
 
     pixel_values = batch.pop("pixel_values", None)
+    patch_pixel_values = batch.pop("patch_pixel_values", None)
+    num_patches = batch.pop("num_patches", None)
+    patch_newline_mask = batch.pop("patch_newline_mask", None)
     image_grid_hws = batch.pop("image_grid_hws", None)
     image_grid_thw = batch.pop("image_grid_thw", None)
     image_sizes = batch.pop("image_sizes", None)
@@ -167,10 +254,15 @@ def prepare_vlm_media_for_pp(
     pp_media: dict[str, list[torch.Tensor]] = {}
 
     if pixel_values is not None and image_grid is None:
-        raise ValueError(
-            "VLM PP media prep requires media metadata with pixel_values. Expected one of "
-            "image_grid_hws, image_grid_thw, image_sizes, or image_position_ids."
+        step3_media = chunk_step3_media(
+            pixel_values,
+            batch_size=batch_size,
+            n_microbatches=n_microbatches,
+            num_patches=num_patches,
+            patch_pixel_values=patch_pixel_values,
+            patch_newline_mask=patch_newline_mask,
         )
+        pp_media.update(step3_media)
 
     if pixel_values_videos is not None and video_grid_thw is None:
         raise ValueError("VLM PP media prep requires video_grid_thw with pixel_values_videos.")
@@ -227,17 +319,39 @@ def wrap_vlm_collate_for_pp(
     return wrapper
 
 
+def _will_run_forward_metadata_inference(pp: Any) -> bool:
+    """Return whether the next schedule step will probe stage 0 with a real forward."""
+    schedule = getattr(pp.info, "schedule", None)
+    stages = getattr(pp.info, "stages", None)
+    if schedule is None or not stages:
+        return False
+
+    first_stage = next((stage for stage in stages if getattr(stage, "is_first", False)), None)
+    if first_stage is None or hasattr(first_stage, "_configure_outputs_meta"):
+        return False
+
+    if hasattr(schedule, "_stage_forward_initialized"):
+        return not schedule._stage_forward_initialized
+    if hasattr(schedule, "_stages_forward_initialized"):
+        return not schedule._stages_forward_initialized
+    return False
+
+
 @contextmanager
 def stage_vlm_media_for_pp(pp: Any, model_parts: list[torch.nn.Module], batch: MutableMapping[str, Any]):
     """Attach dataloader-prepared VLM media chunks to PP stage 0 for one schedule call."""
     pp_media = batch.pop(VLM_PP_MEDIA_KEY, None)
     stage0_model = model_parts[0] if pp_media and getattr(pp.info, "has_first_stage", False) else None
     staged = False
+    metadata_forward_hook = None
 
     if stage0_model is not None:
         if "pixel_values" in pp_media:
             stage0_model._vlm_pixel_values_chunks = pp_media["pixel_values"]
             stage0_model._vlm_image_grid_hws_chunks = pp_media.get("image_grid_hws")
+            stage0_model._vlm_num_patches_chunks = pp_media.get("num_patches")
+            stage0_model._vlm_patch_pixel_values_chunks = pp_media.get("patch_pixel_values")
+            stage0_model._vlm_patch_newline_mask_chunks = pp_media.get("patch_newline_mask")
             staged = True
         if "pixel_values_videos" in pp_media:
             stage0_model._vlm_pixel_values_videos_chunks = pp_media["pixel_values_videos"]
@@ -245,13 +359,25 @@ def stage_vlm_media_for_pp(pp: Any, model_parts: list[torch.nn.Module], batch: M
             staged = True
         if staged:
             stage0_model._vlm_chunk_idx = 0
+            if _will_run_forward_metadata_inference(pp):
+
+                def reset_media_cursor_after_metadata_forward(_module, _args, _output):
+                    stage0_model._vlm_chunk_idx = 0
+                    metadata_forward_hook.remove()
+
+                metadata_forward_hook = stage0_model.register_forward_hook(reset_media_cursor_after_metadata_forward)
 
     try:
         yield
     finally:
+        if metadata_forward_hook is not None:
+            metadata_forward_hook.remove()
         if staged and stage0_model is not None:
             stage0_model._vlm_pixel_values_chunks = None
             stage0_model._vlm_image_grid_hws_chunks = None
+            stage0_model._vlm_num_patches_chunks = None
+            stage0_model._vlm_patch_pixel_values_chunks = None
+            stage0_model._vlm_patch_newline_mask_chunks = None
             stage0_model._vlm_pixel_values_videos_chunks = None
             stage0_model._vlm_video_grid_thw_chunks = None
             stage0_model._vlm_chunk_idx = None

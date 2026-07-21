@@ -1,0 +1,126 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Gemma 4 31B (dense) VLM perf recipe: sequence-packed to 16k under Ring P2P CP8.
+# The head_dim=512 full-attention ring chunks run through the FFPA CuTeDSL varlen
+# kernel; sliding-window layers use Flex. Data is the built-in synthetic VLM mock
+# (nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset) — random
+# images + responses sized so each packed 16k sequence is full — so the recipe is
+# fully self-contained and CI-runnable with no data download or local prep.
+# torchrun --nproc-per-node=8 examples/vlm_finetune/finetune.py -c examples/vlm_finetune/gemma4/gemma4_31b_ffpa_mock_packing_cp8_16k.yaml
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 1
+  local_batch_size: 1
+  ckpt_every_steps: 999999
+  val_every_steps: 999999
+  max_steps: 200
+  num_epochs: 50
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: google/gemma-4-31B-it
+  torch_dtype: torch.bfloat16
+  # CP installs the model-owned ring by swapping SDPA, so HF init must use sdpa
+  # (ffpa bypasses the swap and is rejected with cp_size>1).
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  text_config:
+    use_cache: false
+    cp_full_attn_backend: ffpa  # route head_dim=512 full-attention ring chunks through FFPA varlen
+
+processor:
+  padding_side: right
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true  # required for 31B to fit
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
+  num_samples: 256
+  num_images_per_sample: 1
+  image_size: [896, 896]
+  max_length: 2048
+  seed: 42
+
+# pack_size must be divisible by 2*cp_size (16 here): 16384 / 16 = 1024.
+packed_sequence:
+  pretokenize: true
+  max_length: 16384
+  pack_size: 16384
+  packing_ratio: 0.9
+  drop_long_samples: true
+  post_tokenize_hook_fn: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_inject_thinking_prefix
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
+  num_samples: 16
+  num_images_per_sample: 1
+  image_size: [896, 896]
+  max_length: 2048
+  seed: 43
+  # Validation is unpacked and uses gemma4_prefix_collate_fn on raw conversations,
+  # so disable pre-tokenization here (training packs via packed_sequence above).
+  pretokenize: false
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+ci:
+  recipe_owner: Butterfingrz
+  env_vars:
+    MAX_STEPS: 10

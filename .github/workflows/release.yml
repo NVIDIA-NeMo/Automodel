@@ -42,9 +42,13 @@ on:
         default: true
         type: boolean
       publish-docs:
-        description: Publish docs
+        # Sphinx docs (conf.py) were retired in favor of Fern; the Fern site
+        # publishes via .github/workflows/publish-fern-docs.yml, not this
+        # release pipeline. Default off so the FW-CI finalize stage skips its
+        # Sphinx build-docs/publish-docs jobs (which would fail: no conf.py).
+        description: Publish docs (Sphinx; retired — leave false, Fern publishes separately)
         required: false
-        default: true
+        default: false
         type: boolean
       version-bump-branch:
         description: Branch for version bump
@@ -80,7 +84,7 @@ jobs:
       !cancelled() && !failure()
       && !(needs.pre-flight.outputs.docs_only == 'true'
            || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@v1.0.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@v1.4.3
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       python-package: nemo_automodel
@@ -96,8 +100,10 @@ jobs:
       no-build-isolation: true
       app-id: ${{ vars.BOT_ID }}
       gh-release-use-changelog-builder: ${{ inputs.generate-changelog || false }}
-      publish-docs: ${{ inputs.publish-docs || true }}
-      docs-target-path: nemo/automodel
+      # Sphinx docs retired (no docs/conf.py); Fern publishes via
+      # publish-fern-docs.yml. Keep this false so _release_finalize.yml skips
+      # its Sphinx build-docs/publish-docs jobs.
+      publish-docs: ${{ inputs.publish-docs || false }}
       gh-release-from-tag: ${{ inputs.gh-release-from-tag || '' }}
       restrict-to-admins: true
     secrets: inherit  # pragma: allowlist secret

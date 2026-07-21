@@ -24,6 +24,14 @@ RUN pip install --no-build-isolation --no-binary=mamba-ssm,causal-conv1d \
 RUN --mount=type=bind,source=tests/ci_tests/requirements_deploy.txt,target=/tmp/requirements_deploy.txt \
     pip install -r /tmp/requirements_deploy.txt
 
+# DeepSeek-V4 deploy paths can import the TileLang-backed model code. The deploy
+# image does not run the project `uv sync`, so install the same TileLang stack
+# explicitly here.
+ARG TILELANG_VERSION=0.1.11
+ARG TILEKERNELS_VERSION=1.0.0
+RUN pip install --no-cache-dir "apache-tvm-ffi<=0.1.11" "tilelang==${TILELANG_VERSION}" && \
+    pip install --no-cache-dir --no-deps "tile-kernels==${TILEKERNELS_VERSION}"
+
 COPY . /opt/Automodel
 WORKDIR /opt/Automodel
 

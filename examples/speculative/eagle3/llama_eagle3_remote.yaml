@@ -1,0 +1,64 @@
+recipe: TrainEagle3Recipe
+
+# Remote (train-inference disaggregated) EAGLE-3 training.
+#
+# The frozen target model runs as a standalone server (see
+# ``nemo_automodel.components.speculative.serve_target``); this training
+# process holds only the draft model and pulls precomputed supervision over
+# HTTP + NCCL. Start the server first, e.g.:
+#
+#   python -m nemo_automodel.components.speculative.serve_target \
+#       --target meta-llama/Llama-3.2-1B --host 0.0.0.0 --port 8001
+#
+# then launch this recipe pointing ``remote_urls`` at it. Everything else is
+# identical to the co-located MVP config (llama_eagle3_mvp.yaml).
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: meta-llama/Llama-3.2-1B
+
+  # --- remote backend ---
+  # ``colocated`` (default) loads the target on the training GPU; ``remote``
+  # talks to one or more serve_target instances.
+  target_model_backend: remote
+  # One URL per target server. With multiple servers the prefetch pipeline
+  # round-robins requests across them.
+  remote_urls: ["http://127.0.0.1:8001"]
+  # Prefetch depth overlaps target inference with draft training. Capped to the
+  # number of servers (one in-flight request per server). 0 disables prefetch
+  # (pure disaggregation). Requires the remote backend.
+  target_prefetch_depth: 1
+  # remote_timeout: 120
+  # remote_max_retries: 3
+
+  train_data_path: /path/to/train.jsonl
+  val_data_path: null
+  train_split: null
+  val_split: null
+  output_dir: ./outputs/eagle3_llama_remote
+  seq_length: 1024
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 0
+  num_epochs: 1
+  ttt_steps: 4
+  draft_vocab_size: 8192
+  freeze_embeddings: true
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/eagle3_llama_remote/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true

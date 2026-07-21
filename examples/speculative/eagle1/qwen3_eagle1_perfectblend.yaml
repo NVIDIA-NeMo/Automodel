@@ -24,6 +24,7 @@ recipe_args:
   shuffle_seed: 42
   log_every_steps: 10
   max_grad_norm: 1.0
+  # mask_reasoning_content: true   # exclude <think>...</think> reasoning traces from loss
 
 optimizer:
   lr: 1.0e-4

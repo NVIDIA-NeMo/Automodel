@@ -1,0 +1,48 @@
+model:
+  pretrained_model_name_or_path: "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+  # Two-transformer loading. Either, both, or neither may be set:
+  #   - both unset  → use the hub-pretrained weights for both stages
+  #   - one set     → swap that stage's weights, leave the other stage at hub baseline
+  #   - both set    → swap both stages' weights
+  # Each path should be a training checkpoint dir produced by
+  # examples/diffusion/finetune/wan2_2_t2v_flow.yaml with the matching model.stage.
+  checkpoint_high_noise: ./WAN22_CKPT/wan22_high/epoch_19_step_99
+  checkpoint_low_noise: ./WAN22_CKPT/wan22_low/epoch_19_step_99
+
+inference:
+  num_inference_steps: 50
+  # High-noise stage guidance (used for timesteps >= boundary_ratio * num_train_timesteps).
+  guidance_scale: 5.0
+  height: 480
+  width: 832
+  dtype: "bfloat16"
+  max_samples: 10
+  prompts:
+    - "The video shows a scene from an anime, featuring two characters standing on a ledge or shelf. The camera is static. A door opens from the left, revealing a man. The man is Caucasian, appears to be in his late 30s, and is dressed in outdoor attire. He wears a tan vest over a white shirt, paired with light brown pants and brown shoes. A rope is slung over his shoulder, and he has a backpack on. He also sports goggles on his forehead. He walks to the center of the frame. To the right of the man, a young girl stands with her arms crossed. She has fair skin and red hair styled with two small buns on top of her head. She wears a red dress with a matching bag slung over her shoulder and brown boots. The background is dark, with a window visible behind them. The scene is dimly lit, creating a somber mood. The man speaks"
+    - "The video presents a close-up shot of an animated young man with fair skin, likely of East Asian descent, with short, dark blue hair that is neatly styled. He is wearing a white, collared shirt with the top buttons undone. The camera is static, maintaining a steady focus on his face. The background features a soft, blurred mix of green and blue hues, suggesting an outdoor setting with trees and sky. The young man's expression is thoughtful and slightly melancholic. His eyes are downcast, and his mouth is slightly downturned. He appears to be listening intently or reflecting on something. The overall style of the video is reminiscent of a classic anime or animated film, with soft lines and gentle color palettes."
+    - "The video is a still shot of a scene from an animated movie. The camera is static and shows a narrow, dimly lit hallway. At the end of the hallway, a young girl with short, dark hair stands on a slightly elevated platform. She is wearing a red dress and faces away from the camera. The hallway is cluttered with various objects. On the left side, there are tools leaning against the wall. The walls are made of corrugated metal. On the right side, there is a shelf with a large glass jar on it. In the center of the hallway, there are pipes and metal objects. The overall style is reminiscent of Studio Ghibli's animation style, with detailed backgrounds and a soft color palette."
+  pipeline_kwargs:
+    # Must satisfy (num_frames - 1) % 4 == 0 due to Wan VAE's 4x temporal downsample.
+    # Valid choices: 1, 5, 9, ..., 57, 61, 65, ..., 81. 60 is invalid; use 57 or 61.
+    num_frames: 61
+    negative_prompt: ""
+    # Low-noise stage guidance (used for timesteps < boundary_ratio * num_train_timesteps).
+    # Wan2.2 A14B uses asymmetric guidance: a stronger scale on the high-noise stage
+    # and a milder one on the low-noise stage. Tune per-prompt as needed.
+    guidance_scale_2: 5.0
+
+output:
+  output_dir: "./inference_outputs"
+  fps: 16
+
+distributed: null
+
+vae:
+  enable_slicing: true
+  enable_tiling: true
+  # WanPipeline cpu_offload_seq cycles text_encoder->transformer->transformer_2->vae,
+  # so enabling cpu offload keeps only one transformer on GPU at a time. Strongly
+  # recommended for A14B (two 14B transformers won't co-reside on a single GPU).
+  enable_cpu_offload: true
+
+seed: 42

@@ -1,0 +1,66 @@
+recipe: TrainEagle3Recipe
+
+# EAGLE-3 with tensor parallelism on the (colocated) target.
+#
+# TP shards the frozen target's linears (column/row parallel) across the "tp"
+# device submesh, so a target that does not fit on a single GPU (e.g. a large
+# dense Qwen3) can still supply supervision in-process. The draft is small and
+# stays replicated: it runs data-parallel over the "dp" axis (which excludes
+# "tp"), so every TP rank in a draft replica sees the same batch. The target's
+# column-parallel lm_head returns vocab-sharded logits; the target wrapper
+# gathers them to a full tensor before the draft-vocab projection. Notes:
+#   * TP requires the fsdp2 strategy and world_size > 1; tp_size must divide the
+#     number of GPUs and the target's attention head count.
+#     dp_size = world_size / (tp_size * cp_size * pp_size).
+#   * TP only shards the colocated target (not the remote / offline backends).
+#   * Combined TP + CP is not yet supported; keep cp_size: 1.
+#   * The target must expose a tensor-parallel plan (Qwen3 / Llama dense do).
+#
+# Run (single node, tp_size=2 over 2 GPUs):
+#   automodel examples/speculative/eagle3/qwen3_eagle3_tp.yaml \
+#       --nproc-per-node 2 --distributed.tp_size=2
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-4B
+  # Pin the target to SDPA to dodge the Qwen3 FA2 s_aux=None crash; TP itself
+  # works with any backend the target supports.
+  target_attn_implementation: sdpa
+  draft_attn_implementation: flash_attention_2
+  train_data_path: ./cache/dataset/perfectblend-messages
+  val_data_path: null
+  train_split: "train[:64]"
+  val_split: null
+  output_dir: ./outputs/eagle3_qwen3_4b_tp
+  seq_length: 2048
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 0
+  num_epochs: 1
+  ttt_steps: 7
+  draft_vocab_size: 32000
+  freeze_embeddings: true
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 1
+  max_grad_norm: 1.0
+  packed_sequence_size: 0
+
+rng:
+  seed: 42
+
+distributed:
+  strategy: fsdp2
+  tp_size: 2
+  cp_size: 1
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: false

@@ -12,27 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import sys
 import types
-import importlib.util
-import pytest
+from unittest.mock import Mock, patch
+
 import torch
-from unittest.mock import Mock, patch, MagicMock
 
 # Mock fast_hadamard_transform before importing deepseek_v32 modules
 try:
     import fast_hadamard_transform  # noqa: F401
 except ImportError:
-    if 'fast_hadamard_transform' not in sys.modules:
-        mock_hadamard = types.ModuleType('fast_hadamard_transform')
-        mock_hadamard.__spec__ = importlib.util.spec_from_loader('fast_hadamard_transform', loader=None)
+    if "fast_hadamard_transform" not in sys.modules:
+        mock_hadamard = types.ModuleType("fast_hadamard_transform")
+        mock_hadamard.__spec__ = importlib.util.spec_from_loader("fast_hadamard_transform", loader=None)
         mock_hadamard.hadamard_transform = lambda x, scale: x
-        sys.modules['fast_hadamard_transform'] = mock_hadamard
+        sys.modules["fast_hadamard_transform"] = mock_hadamard
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.deepseek_v32.config import DeepseekV32Config
 from nemo_automodel.components.models.deepseek_v32.state_dict_adapter import DeepSeekV32StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.models.common import BackendConfig
 
 
 class TestDeepSeekV32StateDictAdapter:
@@ -62,7 +62,7 @@ class TestDeepSeekV32StateDictAdapter:
 
     def create_mock_backend_config(self, **overrides):
         backend = Mock(spec=BackendConfig)
-        backend.enable_deepep = False
+        backend.dispatcher = "torch"
 
         for key, value in overrides.items():
             setattr(backend, key, value)
@@ -76,10 +76,7 @@ class TestDeepSeekV32StateDictAdapter:
         backend = self.create_mock_backend_config()
 
         adapter = DeepSeekV32StateDictAdapter(
-            config=config,
-            moe_config=moe_config,
-            backend=backend,
-            dtype=torch.float16
+            config=config, moe_config=moe_config, backend=backend, dtype=torch.float16
         )
 
         assert adapter.config == config
@@ -138,7 +135,7 @@ class TestDeepSeekV32StateDictAdapterQuantization:
 
     def create_mock_backend_config(self, **overrides):
         backend = Mock(spec=BackendConfig)
-        backend.enable_deepep = False
+        backend.dispatcher = "torch"
 
         for key, value in overrides.items():
             setattr(backend, key, value)
@@ -156,7 +153,7 @@ class TestDeepSeekV32StateDictAdapterQuantization:
         tensor = torch.randn(256, 128)
         fqn = "model.layers.0.self_attn.q_a_proj.weight"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
             assert len(result) == 2
@@ -176,7 +173,7 @@ class TestDeepSeekV32StateDictAdapterQuantization:
         tensor = torch.randn(256)
         fqn = "model.layers.0.input_layernorm.weight"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
             assert len(result) == 1
@@ -195,7 +192,7 @@ class TestDeepSeekV32StateDictAdapterQuantization:
         tensor_weight = torch.randn(64)
         fqn_weight = "model.layers.0.self_attn.indexer.k_norm.weight"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn_weight, tensor_weight, quantization=True)
 
             assert len(result) == 1
@@ -206,7 +203,7 @@ class TestDeepSeekV32StateDictAdapterQuantization:
         tensor_bias = torch.randn(64)
         fqn_bias = "model.layers.0.self_attn.indexer.k_norm.bias"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn_bias, tensor_bias, quantization=True)
 
             assert len(result) == 1
@@ -225,7 +222,7 @@ class TestDeepSeekV32StateDictAdapterQuantization:
         tensor = torch.randn(256, 128)
         fqn = "model.layers.0.self_attn.indexer.wq_b.weight"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
             assert len(result) == 2
@@ -237,7 +234,7 @@ class TestDeepSeekV32StateDictAdapterQuantization:
         tensor_wk = torch.randn(256, 128)
         fqn_wk = "model.layers.0.self_attn.indexer.wk.weight"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn_wk, tensor_wk, quantization=True)
 
             assert len(result) == 2
@@ -257,7 +254,7 @@ class TestDeepSeekV32StateDictAdapterQuantization:
         tensor = torch.randn(256, 128)
         fqn = "model.layers.0.self_attn.indexer.weights_proj.weight"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
             assert len(result) == 1
@@ -292,7 +289,7 @@ class TestDeepSeekV32StateDictAdapterAddQuantization:
 
     def create_mock_backend_config(self, **overrides):
         backend = Mock(spec=BackendConfig)
-        backend.enable_deepep = False
+        backend.dispatcher = "torch"
 
         for key, value in overrides.items():
             setattr(backend, key, value)
@@ -394,7 +391,7 @@ class TestDeepSeekV32StateDictAdapterExcludeKeyRegex:
 
     def create_mock_backend_config(self, **overrides):
         backend = Mock(spec=BackendConfig)
-        backend.enable_deepep = False
+        backend.dispatcher = "torch"
 
         for key, value in overrides.items():
             setattr(backend, key, value)
@@ -412,7 +409,7 @@ class TestDeepSeekV32StateDictAdapterExcludeKeyRegex:
         tensor = torch.randn(256, 128)
         fqn = "model.layers.0.self_attn.q_a_proj.weight"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             # With regex that matches the key
             result = adapter.convert_single_tensor_to_hf(
                 fqn, tensor, quantization=False, exclude_key_regex=r".*q_a_proj.*"
@@ -432,7 +429,7 @@ class TestDeepSeekV32StateDictAdapterExcludeKeyRegex:
         tensor = torch.randn(256, 128)
         fqn = "model.layers.0.self_attn.q_a_proj.weight"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             # With regex that doesn't match the key
             result = adapter.convert_single_tensor_to_hf(
                 fqn, tensor, quantization=False, exclude_key_regex=r".*kv_proj.*"
@@ -453,7 +450,7 @@ class TestDeepSeekV32StateDictAdapterExcludeKeyRegex:
         tensor = torch.randn(256, 128)
         fqn = "model.layers.0.self_attn.q_a_proj.weight"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=False)
 
             # Without quantization, should just return the tensor
@@ -491,7 +488,7 @@ class TestDeepSeekV32StateDictAdapterInheritance:
 
     def create_mock_backend_config(self, **overrides):
         backend = Mock(spec=BackendConfig)
-        backend.enable_deepep = False
+        backend.dispatcher = "torch"
 
         for key, value in overrides.items():
             setattr(backend, key, value)
@@ -555,7 +552,7 @@ class TestDeepSeekV32StateDictAdapterBlockSize:
 
     def create_mock_backend_config(self, **overrides):
         backend = Mock(spec=BackendConfig)
-        backend.enable_deepep = False
+        backend.dispatcher = "torch"
 
         for key, value in overrides.items():
             setattr(backend, key, value)
@@ -565,8 +562,8 @@ class TestDeepSeekV32StateDictAdapterBlockSize:
     def test_scale_shape_calculation(self):
         """Test that scale shape is calculated correctly."""
         from nemo_automodel.components.models.deepseek_v3.state_dict_adapter import (
-            calculate_scale_shape,
             BLOCK_SIZE,
+            calculate_scale_shape,
         )
 
         # Test with tensor that divides evenly by block size
@@ -588,7 +585,7 @@ class TestDeepSeekV32StateDictAdapterBlockSize:
         tensor = torch.randn(256, 128)
         fqn = "model.layers.0.self_attn.q_a_proj.weight"
 
-        with patch.object(adapter, '_convert_single_merged_expert_to_hf_split_experts', return_value=None):
+        with patch.object(adapter, "_convert_single_merged_expert_to_hf_split_experts", return_value=None):
             result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
 
             # Should have weight and scale_inv

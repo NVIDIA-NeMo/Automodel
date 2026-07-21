@@ -2,7 +2,7 @@
 
 This document explains how to fine-tune Gemma 3 and Gemma 3n using NeMo AutoModel. It outlines key operations, including initiating SFT and PEFT-LoRA runs and managing experiment configurations using YAML.
 
-To set up your environment to run NeMo AutoModel, follow the [Installation Guide](https://github.com/NVIDIA-NeMo/Automodel#-install-nemo-automodel).
+To set up your environment to run NeMo AutoModel, follow the [Installation Guide](/get-started/installation).
 
 ## Data
 
@@ -59,35 +59,21 @@ NeMo AutoModel provides specialized collate functions for different VLM processo
 Both Gemma 3 and Gemma 3n models work seamlessly with the Hugging Face `AutoProcessor` and use the default collate function:
 
 ```python
+from nemo_automodel.components.datasets.vlm.collate_fns import default_collate_fn
+from transformers import AutoProcessor
+
 processor = AutoProcessor.from_pretrained("google/gemma-3-4b-it")
 # For Gemma 3n, get processor:
 # processor = AutoProcessor.from_pretrained("google/gemma-3n-e4b-it")
 
-# For Gemma 3 and Gemma 3n, use the default collate function
-def default_collate_fn(examples: list, processor) -> dict[str, torch.Tensor]:
-    batch = processor.apply_chat_template(
-        [example["conversation"] for example in examples],
-        tokenize=True,
-        add_generation_prompt=False,
-        return_tensors="pt",
-        return_dict=True,
-    )
-
-    labels = batch["input_ids"].clone()[:, 1:]
-    labels = torch.cat([labels, -100 * torch.ones_like(labels[:, :1])], dim=1)
-    batch["labels"] = labels
-    loss_mask = create_batch_loss_masks(
-        batch["input_ids"], processor, start_of_response_token=start_of_response_token
-    )
-    batch["loss_mask"] = loss_mask
-
-    return batch
+# For Gemma 3 and Gemma 3n, call the maintained default collate function.
+batch = default_collate_fn([dataset[0]], processor)
 ```
 
 The default collate function:
 - Applies the processor's chat template to convert message lists into model-ready inputs.
-- Creates labels for training to guide supervised learning.
-- Masks prompts and special tokens so that only answer tokens are considered during loss calculation.
+- Builds labels from the template's assistant-turn markers and shifts inputs and labels for next-token prediction.
+- Masks non-assistant regions with `-100` while retaining assistant content and its closing stop token as training targets.
 
 ### Preprocess Custom Datasets
 
@@ -131,15 +117,15 @@ NeMo AutoModel uses a flexible configuration system that combines YAML configura
 
 The simplest way to run fine-tuning is with a YAML configuration file. We provide configs for both Gemma 3 and Gemma 3n.
 
-:::{note}
-These VLM recipes require the optional `vlm` dependency set. If you see `ImportError: qwen_vl_utils is not installed`, install VLM dependencies first:
+<Note>
+These VLM recipes require the optional `vlm` dependency set, plus `vlm-media` for Qwen vision preprocessing (`qwen_vl_utils`). If you see `ImportError: qwen_vl_utils is not installed`, install both first:
 
 ```bash
-uv sync --frozen --extra vlm
+uv sync --frozen --extra vlm --extra vlm-media
 ```
 
-(If you're using pip: `pip3 install "nemo-automodel[vlm]"`.)
-:::
+(If you're using pip: `pip3 install "nemo-automodel[vlm,vlm-media]"`.)
+</Note>
 
 #### Run Gemma 3 Fine-Tuning
 
@@ -178,7 +164,7 @@ automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix.yaml \
     --step_scheduler.ckpt_every_steps 100 \
     --step_scheduler.max_steps 1000 \
     --optimizer.lr 2e-5 \
-    --rng.seed 1234
+    --seed 1234
 ```
 
 ### Configure Model Freezing
@@ -189,7 +175,6 @@ With the freezing configuration, you can selectively freeze specific parts of th
 
 ```yaml
 freeze_config:
-  freeze_embeddings: true        # Freeze embeddings
   freeze_vision_tower: true      # Freeze vision encoder (recommended for VLMs)
   freeze_audio_tower: true       # Freeze audio encoder (for multimodal models)
   freeze_language_model: false   # Allow language model adaptation
@@ -205,17 +190,16 @@ To run PEFT with Gemma 3:
 automodel examples/vlm_finetune/gemma3/gemma3_vl_4b_medpix_peft.yaml
 ```
 
-The LoRA configuration excludes vision and audio components from adaptation to preserve pre-trained visual representations:
+The LoRA configuration excludes vision components and the language-model head from adaptation to preserve pre-trained visual representations:
 
 ```yaml
 peft:
-  peft_fn: nemo_automodel._peft.lora.apply_lora_to_linear_modules
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
   match_all_linear: False
-  exclude_modules:  # exclude all vision and audio modules and lm_head
+  exclude_modules:  # exclude all vision modules and lm_head
     - "*vision_tower*"
     - "*vision*"
     - "*visual*"
-    - "*audio*"
     - "*image_encoder*"
     - "*lm_head*"
   dim: 8
@@ -249,7 +233,7 @@ checkpoint:
 You can enable W&B logging by setting your API key and configuring the logger:
 
 ```bash
-export WANDB_API_KEY=<YOUR_WANDB_API_KEY>
+export WANDB_API_KEY="your-wandb-api-key"
 ```
 
 Then, add the W&B configuration to your YAML file:
@@ -259,7 +243,7 @@ wandb:
   project: nemo_automodel_vlm
   entity: your_entity
   name: gemma3_medpix_vqa_experiment
-  save_dir: ./wandb_logs
+  dir: ./wandb_logs
 ```
 
 ## Run Inference
@@ -276,7 +260,7 @@ The inference functionality is provided through [`examples/vlm_generate/generate
 uv run examples/vlm_generate/generate.py \
     --checkpoint-path /path/to/checkpoint \
     --prompt "Describe this image." \
-    --base-model google/gemma-3-4b-it \
+    --base-model-path google/gemma-3-4b-it \
     --image /path/to/image.jpg
 ```
 
@@ -288,11 +272,12 @@ For models trained on MedPix-VQA, load the trained checkpoint and generate outpu
 uv run examples/vlm_generate/generate.py \
     --checkpoint-path vlm_checkpoints/epoch_0_step_200 \
     --prompt "What medical condition is shown in this image?" \
-    --base-model google/gemma-3-4b-it \
+    --base-model-path google/gemma-3-4b-it \
     --image medical_image.jpg
 ```
 
-When checkpoints are saved from PEFT training, they contain only the adapter weights. To use them for generation, you need to specify the PEFT configuration.
+For a PEFT checkpoint, the script detects `model/adapter_model.safetensors`, restores the LoRA configuration from `model/adapter_config.json` and `model/automodel_peft_config.json`, applies LoRA to the base model, and loads the adapter weights automatically. Supply the original base model with `--base-model-path`; no separate PEFT flags are required.
+
 Run the following command to load and generate from adapters trained on MedPix-VQA:
 
 ```bash
@@ -300,9 +285,7 @@ uv run examples/vlm_generate/generate.py \
     --checkpoint-path peft_vlm_checkpoints/epoch_0_step_200/ \
     --prompt "What medical condition is shown in this image?" \
     --image-url medical_image.jpg \
-    --base-model google/gemma-3-4b-it \
-    --is-peft \
-    --peft-exclude-modules *vision_tower* *vision* *visual* *audio* *image_encoder* *lm_head*
+    --base-model-path google/gemma-3-4b-it
 ```
 
 Given the following image:

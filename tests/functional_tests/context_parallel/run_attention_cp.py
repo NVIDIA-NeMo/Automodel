@@ -51,6 +51,7 @@ import torch.distributed as dist
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+
 def dual_chunk_swap_unsplit(chunks_per_rank, cp_size, seq_dim=1):
     """Reconstruct full sequence from DualChunkSwap-ordered rank outputs."""
     all_chunks = [None] * (2 * cp_size)
@@ -157,6 +158,7 @@ def _compare_results(
 # Packed-sequence batch creation (used by qwen3_moe / deepseek_v3 thd_te)
 # ---------------------------------------------------------------------------
 
+
 def create_packed_sequence_batch(batch_size, seq_lens_per_batch, device, padding_token_id=0):
     """
     Create a packed sequence batch for testing.
@@ -213,6 +215,7 @@ def create_packed_sequence_batch(batch_size, seq_lens_per_batch, device, padding
 # ---------------------------------------------------------------------------
 # Model factory
 # ---------------------------------------------------------------------------
+
 
 def get_model_config_and_attention(model_type, device):
     """Get model configuration and attention layer based on model type.
@@ -271,7 +274,11 @@ def get_model_config_and_attention(model_type, device):
         from nemo_automodel.components.models.gpt_oss.rope_utils import position_ids_to_freqs_cis
 
         def get_freqs_cis(position_ids, qkv_format, cp_size=1):
-            return position_ids_to_freqs_cis(rope, position_ids, qkv_format, cp_size=cp_size)
+            # Build freqs in the layout the (possibly globally-disabled, see #3027) fused-RoPE
+            # setting actually uses, so the frequencies match the attention's RoPE path.
+            return position_ids_to_freqs_cis(
+                rope, position_ids, qkv_format, for_fused_rope=backend.rope_fusion, cp_size=cp_size
+            )
 
     elif model_type == "deepseek_v3":
         from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
@@ -323,7 +330,9 @@ def get_model_config_and_attention(model_type, device):
         attn_with_cp = MLA(config, backend).to(device).to(torch.bfloat16)
 
         def get_freqs_cis(position_ids, qkv_format, cp_size=1):
-            return freqs_cis_from_position_ids(position_ids, rope_freqs, qkv_format=qkv_format, for_fused_rope=True, cp_size=cp_size)
+            return freqs_cis_from_position_ids(
+                position_ids, rope_freqs, qkv_format=qkv_format, for_fused_rope=backend.rope_fusion, cp_size=cp_size
+            )
 
     elif model_type == "nemotron_v3":
 
@@ -349,6 +358,7 @@ def get_model_config_and_attention(model_type, device):
 # NemotronV3 attention pair creation
 # ---------------------------------------------------------------------------
 
+
 def _create_nemotron_v3_attn_pair(config, backend, device):
     """Create a pair of identical NemotronV3Attention modules with synced weights."""
     from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Attention
@@ -370,8 +380,8 @@ def _create_nemotron_v3_attn_pair(config, backend, device):
 # Config: bshd_te
 # ---------------------------------------------------------------------------
 
-def run_bshd_te(model_type, config, rank, world_size, device,
-                attn_no_cp=None, attn_with_cp=None, get_freqs_cis=None):
+
+def run_bshd_te(model_type, config, rank, world_size, device, attn_no_cp=None, attn_with_cp=None, get_freqs_cis=None):
     """3D BSHD input with TE p2p CP and DualChunkSwap.
 
     Only supported for nemotron_v3 (qwen3_moe / deepseek_v3 do not use this config).
@@ -465,8 +475,8 @@ def run_bshd_te(model_type, config, rank, world_size, device,
 # Config: thd_te
 # ---------------------------------------------------------------------------
 
-def run_thd_te(model_type, config, rank, world_size, device,
-               attn_no_cp=None, attn_with_cp=None, get_freqs_cis=None):
+
+def run_thd_te(model_type, config, rank, world_size, device, attn_no_cp=None, attn_with_cp=None, get_freqs_cis=None):
     """THD input with TE p2p CP.
 
     For qwen3_moe / deepseek_v3: uses make_cp_batch_for_te + apply_cp flow.
@@ -475,15 +485,15 @@ def run_thd_te(model_type, config, rank, world_size, device,
     if model_type == "nemotron_v3":
         return _run_thd_te_nemotron_v3(config, rank, world_size, device)
     else:
-        return _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device,
-                                         attn_no_cp, attn_with_cp, get_freqs_cis)
+        return _run_thd_te_qwen_deepseek(
+            model_type, config, rank, world_size, device, attn_no_cp, attn_with_cp, get_freqs_cis
+        )
 
 
-def _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device,
-                               attn_no_cp, attn_with_cp, get_freqs_cis):
+def _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device, attn_no_cp, attn_with_cp, get_freqs_cis):
     """THD test flow for qwen3_moe / deepseek_v3 (preserves original run_test behavior)."""
     try:
-        import transformer_engine.pytorch  # This creates transformer_engine_torch module
+        import transformer_engine.pytorch  # noqa: F401 This creates transformer_engine_torch module
         import transformer_engine_torch as tex
     except ImportError:
         if rank == 0:
@@ -521,7 +531,9 @@ def _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device,
     )
 
     total_tokens_no_cp = batch_no_cp["input_ids"].shape[0]
-    x_no_cp = torch.randn(total_tokens_no_cp, config.hidden_size, device=device, dtype=torch.bfloat16, requires_grad=True)
+    x_no_cp = torch.randn(
+        total_tokens_no_cp, config.hidden_size, device=device, dtype=torch.bfloat16, requires_grad=True
+    )
 
     freqs_cis_no_cp = get_freqs_cis(batch_no_cp["position_ids"], qkv_format="thd")
 
@@ -537,7 +549,11 @@ def _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device,
     output_no_cp = attn_no_cp(
         x_no_cp,
         freqs_cis=freqs_cis_no_cp,
-        cu_seqlens=batch_no_cp["cu_seqlens"],
+        # thd_utils now emits ``cu_seqlens`` as REAL lengths and a separate
+        # ``cu_seqlens_padded``; TE attention operates on the padded token
+        # layout (the input is padded to slot width), so use the padded
+        # boundaries here — matching the CP path's _shard output.
+        cu_seqlens=batch_no_cp.get("cu_seqlens_padded", batch_no_cp["cu_seqlens"]),
         max_seqlen=max_seqlen_no_cp,
         qkv_format=batch_no_cp.get("qkv_format", "thd"),
     )
@@ -806,8 +822,8 @@ def _run_thd_te_nemotron_v3(config, rank, world_size, device):
 # Config: bshd_sdpa
 # ---------------------------------------------------------------------------
 
-def run_bshd_sdpa(model_type, config, rank, world_size, device,
-                  attn_no_cp=None, attn_with_cp=None, get_freqs_cis=None):
+
+def run_bshd_sdpa(model_type, config, rank, world_size, device, attn_no_cp=None, attn_with_cp=None, get_freqs_cis=None):
     """3D BSHD input with DTensor context_parallel() and SDPA backend.
 
     Only supported for nemotron_v3 (qwen3_moe / deepseek_v3 do not use this config).
@@ -946,9 +962,7 @@ def main():
     torch.cuda.manual_seed_all(42)
 
     # Get model configuration and attention layers
-    config, attn_no_cp, attn_with_cp, get_freqs_cis = get_model_config_and_attention(
-        args.model_type, device
-    )
+    config, attn_no_cp, attn_with_cp, get_freqs_cis = get_model_config_and_attention(args.model_type, device)
 
     # Run selected configs and collect results
     results = {}
@@ -957,7 +971,11 @@ def main():
         runner = CONFIG_RUNNERS[config_name]
         try:
             results[config_name] = runner(
-                args.model_type, config, rank, world_size, device,
+                args.model_type,
+                config,
+                rank,
+                world_size,
+                device,
                 attn_no_cp=attn_no_cp,
                 attn_with_cp=attn_with_cp,
                 get_freqs_cis=get_freqs_cis,

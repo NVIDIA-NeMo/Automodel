@@ -15,9 +15,11 @@
 
 # Workflow 1 of 2 for Fern doc previews.
 #
-# Collects the fern/ sources and PR metadata from the (possibly untrusted) PR
-# branch and uploads them as an artifact. No secrets are used here, so this is
-# safe to run on fork PRs via the regular pull_request trigger.
+# Collects the docs/ sources (Fern config under docs/fern/ AND the nightly MDX
+# content at the docs/ top level, which nightly.yml references via ../../) plus
+# PR metadata from the (possibly untrusted) PR branch and uploads them as an
+# artifact. No secrets are used here, so this is safe to run on fork PRs via
+# the regular pull_request trigger.
 #
 # The companion workflow (fern-docs-preview-comment.yml) picks up the artifact,
 # builds the preview with DOCS_FERN_TOKEN, and posts the PR comment.
@@ -27,7 +29,7 @@ name: "Preview Fern Docs: Build"
 on:
   pull_request:
     paths:
-      - 'fern/**'
+      - 'docs/**'
       - '.github/workflows/fern-docs-preview-build.yml'
 
 permissions:
@@ -41,6 +43,17 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+
+      # The frozen v0.4 pages are archived off main; restore them into the working
+      # copy so the uploaded artifact carries every version train. The companion
+      # comment workflow never checks out the repo -- it only consumes this
+      # artifact -- so the stitch must happen here, before upload. Fetching the
+      # base repo's own archive ref uses the checkout credentials, no extra secret.
+      - name: Stitch archived version pages
+        uses: ./.github/actions/stitch-fern-versions
+        with:
+          archived-versions: |
+            v0.4=docs-archive
 
       - name: Save PR metadata
         env:
@@ -57,7 +70,10 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fern-preview
+          # Upload the whole docs/ tree: the Fern build (run from docs/fern/)
+          # resolves nightly page paths via ../../<rel>.mdx into docs/, so the
+          # content pages must travel with the config.
           path: |
-            fern/
+            docs/
             preview-metadata/
           retention-days: 1

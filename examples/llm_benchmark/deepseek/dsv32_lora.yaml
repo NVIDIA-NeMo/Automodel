@@ -107,3 +107,5 @@ optimizer:
 ci:
   time: "00:30:00"
   nodes: 16
+  env_vars:
+    HF_HUB_OFFLINE: "0"

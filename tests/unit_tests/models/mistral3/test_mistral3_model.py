@@ -14,6 +14,7 @@
 
 from unittest.mock import patch
 
+import pytest
 import torch
 from transformers import AutoConfig, AutoModel
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -26,7 +27,7 @@ from nemo_automodel.components.models.mistral3.model import (
 )
 
 
-def tiny_config() -> Ministral3Config:
+def tiny_config(**overrides) -> Ministral3Config:
     cfg = Ministral3Config(
         vocab_size=32,
         hidden_size=16,
@@ -37,6 +38,7 @@ def tiny_config() -> Ministral3Config:
         head_dim=8,
         max_position_embeddings=64,
         attention_dropout=0.0,
+        **overrides,
     )
     # Ensure eager attention path in tests to avoid optional backends.
     cfg._attn_implementation = "eager"
@@ -86,6 +88,11 @@ class TestMinistral3Model:
 
 
 class TestMinistral3ForCausalLM:
+    def test_rejects_tied_word_embeddings(self):
+        # UNTIED_ONLY: the guard raises at the top of __init__ before construction.
+        with pytest.raises(NotImplementedError, match="does not support tie_word_embeddings=True"):
+            Ministral3ForCausalLM(tiny_config(tie_word_embeddings=True))
+
     def test_forward_emits_logits(self):
         cfg = tiny_config()
         model = Ministral3ForCausalLM(cfg)

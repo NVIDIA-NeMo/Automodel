@@ -36,6 +36,8 @@ SHAPE_KEY = "shape"
 DATA_KEY = "data"
 DTYPE_KEY = "dtype"
 DATA_OFFSETS_KEY = "data_offsets"
+FQN_TO_DTYPE_MAPPING_FILENAME = "fqn_to_dtype_mapping.json"
+FQN_TO_FILE_INDEX_MAPPING_FILENAME = "fqn_to_file_index_mapping.json"
 
 DTYPE_MAP = {
     "F16": torch.float16,
@@ -50,6 +52,9 @@ DTYPE_MAP = {
     "F8_E4M3": torch.float8_e4m3fn,
     "F8_E5M2": torch.float8_e5m2,
     "F8_E8M0": torch.float8_e8m0fnu,
+    # Standard safetensors dtype; without it, bool buffers (e.g. EAGLE-3's
+    # draft-vocab masks) crash the safetensors checkpoint save.
+    "BOOL": torch.bool,
 }
 
 HF_DCP_VERSION: float = 1.0

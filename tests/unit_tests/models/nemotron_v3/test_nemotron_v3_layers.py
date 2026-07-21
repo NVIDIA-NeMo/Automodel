@@ -26,14 +26,14 @@ from nemo_automodel.components.moe.config import MoEConfig
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
 
 try:
-    import mamba_ssm
+    import mamba_ssm  # noqa: F401
+
     _has_mamba_ssm = True
 except ImportError:
     _has_mamba_ssm = False
 
 skip_if_no_mamba = pytest.mark.skipif(
-    not torch.cuda.is_available() or not _has_mamba_ssm,
-    reason="CUDA and mamba_ssm required for Mamba Triton kernels"
+    not torch.cuda.is_available() or not _has_mamba_ssm, reason="CUDA and mamba_ssm required for Mamba Triton kernels"
 )
 
 
@@ -216,7 +216,7 @@ class TestNemotronV3Block:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -376,9 +376,7 @@ class TestNemotronV3Block:
         block.init_weights(buffer_device=device)
 
         # Verify biases are zeroed
-        assert torch.allclose(
-            block.mixer.q_proj.bias, torch.zeros_like(block.mixer.q_proj.bias)
-        )
+        assert torch.allclose(block.mixer.q_proj.bias, torch.zeros_like(block.mixer.q_proj.bias))
 
     def test_block_init_weights_mlp(self, config, backend):
         """Test weight initialization for MLP block."""
@@ -389,9 +387,7 @@ class TestNemotronV3Block:
         block.init_weights(buffer_device=device)
 
         # Weights should be initialized (not all zeros)
-        assert not torch.allclose(
-            block.mixer.up_proj.weight, torch.zeros_like(block.mixer.up_proj.weight)
-        )
+        assert not torch.allclose(block.mixer.up_proj.weight, torch.zeros_like(block.mixer.up_proj.weight))
 
     def test_block_uses_relu2_for_mlp(self, config, backend):
         """Test that MLP block uses relu2 activation by default."""
@@ -437,6 +433,56 @@ class TestNemotronV3MambaRMSNormGated:
 
 class TestNemotronV3Mamba2Mixer:
     """Test NemotronV3Mamba2Mixer module initialization."""
+
+    def test_full_tensor_if_dtensor_clones_gathered_value(self, monkeypatch):
+        """Gathered fp32 holder outputs must not alias storage FSDP may reshard."""
+        from nemo_automodel.components.models.nemotron_v3 import layers as layers_mod
+
+        full = torch.arange(4, dtype=torch.float32, requires_grad=True)
+
+        class FakeDTensor:
+            def full_tensor(self):
+                return full
+
+        monkeypatch.setattr(layers_mod, "DTensor", FakeDTensor)
+
+        gathered = layers_mod._full_tensor_if_dtensor(FakeDTensor())
+
+        assert torch.equal(gathered, full)
+        assert gathered.data_ptr() != full.data_ptr()
+        gathered.sum().backward()
+        assert torch.equal(full.grad, torch.ones_like(full))
+
+    def test_full_tensor_if_dtensor_clones_regular_tensor(self):
+        """FSDP can reshard a regular-looking tensor returned from an fp32 holder."""
+        from nemo_automodel.components.models.nemotron_v3 import layers as layers_mod
+
+        tensor = torch.arange(4, dtype=torch.float32, requires_grad=True)
+
+        gathered = layers_mod._full_tensor_if_dtensor(tensor)
+
+        assert torch.equal(gathered, tensor)
+        assert gathered.data_ptr() != tensor.data_ptr()
+        gathered.sum().backward()
+        assert torch.equal(tensor.grad, torch.ones_like(tensor))
+
+    def test_get_fp32_ssm_params_passes_reference(self, config):
+        """FSDP2 root pre-forward expects a non-empty args tuple for the holder."""
+        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+
+        mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
+        reference = torch.randn(1, 2, mixer.in_proj.out_features)
+        seen = {}
+
+        def fake_forward(ref=None):
+            seen["reference"] = ref
+            return mixer.A_log, mixer.dt_bias, mixer.D
+
+        mixer._fp32_params.forward = fake_forward
+
+        mixer._get_fp32_ssm_params(reference)
+
+        assert seen["reference"] is reference
 
     @pytest.fixture
     def config(self):
@@ -492,6 +538,14 @@ class TestNemotronV3Mamba2Mixer:
         assert mixer.A_log.shape == (config.mamba_num_heads,)
         assert mixer.D.shape == (config.mamba_num_heads,)
 
+        params = dict(mixer.named_parameters())
+        assert "_fp32_params.A_log" in params
+        assert "_fp32_params.dt_bias" in params
+        assert "_fp32_params.D" in params
+        assert "A_log" not in mixer._parameters
+        assert "dt_bias" not in mixer._parameters
+        assert "D" not in mixer._parameters
+
         # Check no_weight_decay attributes
         assert getattr(mixer.A_log, "_no_weight_decay", False)
         assert getattr(mixer.D, "_no_weight_decay", False)
@@ -521,7 +575,7 @@ class TestBackwardCompatibility:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -562,3 +616,117 @@ class TestBackwardCompatibility:
         hidden = torch.randn(2, 8, config.hidden_size, dtype=torch.bfloat16)
         out = block(hidden)
         assert out.shape == (2, 8, config.hidden_size)
+
+
+class TestMambaMixerSeqIdxConstruction:
+    """Regression tests for the seq_idx construction in NemotronV3Mamba2Mixer.
+
+    The mamba kernel asserts ``seq_idx.shape == (batch_size, seqlen)``. When
+    the model receives a (B, S, H) BSHD batch with a globally-cumulated
+    ``cu_seqlens`` (derived in ``model.py`` from a 2D attention_mask), the
+    pre-fix mixer produced ``seq_idx`` of shape ``(1, S)`` and crashed. After
+    the fix the mixer must produce a per-row ``seq_idx`` of shape ``(B, S)``.
+    """
+
+    @pytest.fixture
+    def config(self):
+        # Small dimensions so CPU init is fast.
+        return MockNemotronV3Config(
+            hidden_size=64,
+            mamba_num_heads=4,
+            mamba_head_dim=16,
+            n_groups=1,
+            ssm_state_size=8,
+            chunk_size=8,
+            conv_kernel=4,
+        )
+
+    @staticmethod
+    def _patch_mamba_kernel(monkeypatch, capture):
+        """Install a fake ``mamba_split_conv1d_scan_combined`` that records
+        the ``seq_idx`` kwarg and returns a correctly-shaped output tensor."""
+        import sys
+        import types
+
+        def _fake_kernel(projected_states, *args, **kwargs):
+            capture["seq_idx"] = kwargs.get("seq_idx", None)
+            # Out shape matches the projected gate path: (B, S, intermediate_size)
+            # after the outproj_weight matmul → (B, S, hidden_size).
+            outproj_weight = kwargs["outproj_weight"]
+            B, S, _ = projected_states.shape
+            return projected_states.new_zeros((B, S, outproj_weight.shape[0]))
+
+        # Stub the import chain so the deferred ``from mamba_ssm.ops.triton.
+        # ssd_combined import mamba_split_conv1d_scan_combined`` resolves to
+        # our fake without requiring the real package.
+        for name in ("mamba_ssm", "mamba_ssm.ops", "mamba_ssm.ops.triton"):
+            if name not in sys.modules:
+                monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+        fake_ssd = types.ModuleType("mamba_ssm.ops.triton.ssd_combined")
+        fake_ssd.mamba_split_conv1d_scan_combined = _fake_kernel
+        monkeypatch.setitem(sys.modules, "mamba_ssm.ops.triton.ssd_combined", fake_ssd)
+
+    def test_bshd_b_gt_1_with_cu_seqlens_yields_per_row_seq_idx(self, monkeypatch, config):
+        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+
+        mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
+
+        B, S = 2, 16
+        hidden_states = torch.randn(B, S, config.hidden_size)
+        # cu_seqlens as model.py derives it from a 2D attention_mask: a global
+        # cumsum across the batch (one boundary per row).
+        cu_seqlens = torch.tensor([0, S, 2 * S], dtype=torch.int32)
+
+        capture: dict = {}
+        self._patch_mamba_kernel(monkeypatch, capture)
+        mixer.forward(hidden_states, cu_seqlens=cu_seqlens)
+
+        seq_idx = capture["seq_idx"]
+        assert seq_idx is not None, "mamba kernel did not receive a seq_idx"
+        assert seq_idx.shape == (B, S), f"expected (B, S)=({B}, {S}), got {tuple(seq_idx.shape)}"
+        assert seq_idx.dtype == torch.int32
+
+    def test_bshd_b_eq_1_with_cu_seqlens_keeps_flat_construction(self, monkeypatch, config):
+        """When B == 1 (THD flat layout), the legacy searchsorted construction
+        still applies and should yield shape (1, S)."""
+        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+
+        mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
+
+        B, S = 1, 16
+        hidden_states = torch.randn(B, S, config.hidden_size)
+        # Two intra-row sub-sequences: boundaries at positions 8 and 16.
+        cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
+
+        capture: dict = {}
+        self._patch_mamba_kernel(monkeypatch, capture)
+        mixer.forward(hidden_states, cu_seqlens=cu_seqlens)
+
+        seq_idx = capture["seq_idx"]
+        assert seq_idx is not None
+        assert seq_idx.shape == (1, S)
+        # right=True so boundary positions map to the new sub-seq.
+        assert seq_idx[0, :8].tolist() == [0] * 8
+        assert seq_idx[0, 8:].tolist() == [1] * 8
+
+    def test_bshd_b_gt_1_passes_through_upstream_seq_idx(self, monkeypatch, config):
+        """If seq_idx is supplied upstream (e.g. via _packed_seq_ids), the
+        construction path must NOT override it — neat-packing semantics."""
+        from nemo_automodel.components.models.nemotron_v3.layers import NemotronV3Mamba2Mixer
+
+        mixer = NemotronV3Mamba2Mixer(config, layer_idx=0)
+
+        B, S = 2, 16
+        hidden_states = torch.randn(B, S, config.hidden_size)
+        # Pretend the wrapper has already set seq_idx from _packed_seq_ids.
+        upstream = torch.tensor(
+            [[0] * 8 + [1] * 8, [0] * 6 + [1] * 5 + [2] * 5],
+            dtype=torch.int32,
+        )
+
+        capture: dict = {}
+        self._patch_mamba_kernel(monkeypatch, capture)
+        mixer.forward(hidden_states, cu_seqlens=torch.tensor([0, 16, 32], dtype=torch.int32), seq_idx=upstream)
+
+        seq_idx = capture["seq_idx"]
+        assert seq_idx is upstream, "upstream seq_idx must not be replaced by the construction path"

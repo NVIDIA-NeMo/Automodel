@@ -14,9 +14,10 @@
 
 """Unit tests for HFCheckpointingMixin."""
 
+from unittest.mock import MagicMock
+
 import pytest
 import torch.nn as nn
-from unittest.mock import MagicMock
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
@@ -54,6 +55,7 @@ class TestHFCheckpointingMixinSavePretrained:
             weights_path="/tmp/test",
             peft_config=None,
             tokenizer=None,
+            is_final_checkpoint=False,
         )
 
     def test_save_pretrained_passes_peft_config(self):
@@ -69,6 +71,7 @@ class TestHFCheckpointingMixinSavePretrained:
             weights_path="/tmp/test",
             peft_config=peft_config,
             tokenizer=None,
+            is_final_checkpoint=False,
         )
 
     def test_save_pretrained_passes_tokenizer(self):
@@ -84,6 +87,22 @@ class TestHFCheckpointingMixinSavePretrained:
             weights_path="/tmp/test",
             peft_config=None,
             tokenizer=mock_tokenizer,
+            is_final_checkpoint=False,
+        )
+
+    def test_save_pretrained_passes_is_final_checkpoint(self):
+        """Test that save_pretrained() forwards explicit final checkpoint state."""
+        model = SimpleModelWithMixin()
+        mock_checkpointer = MagicMock()
+
+        model.save_pretrained("/tmp/test", checkpointer=mock_checkpointer, is_final_checkpoint=True)
+
+        mock_checkpointer.save_model.assert_called_once_with(
+            model=model,
+            weights_path="/tmp/test",
+            peft_config=None,
+            tokenizer=None,
+            is_final_checkpoint=True,
         )
 
 

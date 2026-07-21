@@ -180,6 +180,75 @@ class _StubTokenizerChatWithReasoning(_StubTokenizerPlain):  # noqa: D401
         return ids
 
 
+class _RecordingPaddingTokenizer(_StubTokenizerPlain):
+    """Stub tokenizer that records ``padding_side`` during ``__call__``.
+
+    Used to assert that ``format_prompt_completion`` flips the side to
+    ``"right"`` for the duration of the tokenize call and restores the
+    original value after — including when the original is ``"left"`` (the
+    transformers v5.8 ``LlamaTokenizer`` class default).
+    """
+
+    padding_side = "right"
+
+    def __call__(self, text, *, add_special_tokens=True, padding=None, truncation=None, max_length=None):
+        self.padding_side_during_call = self.padding_side
+        return super().__call__(
+            text,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            truncation=truncation,
+            max_length=max_length,
+        )
+
+
+@pytest.mark.parametrize("initial_side", ["left", "right"])
+def test_format_prompt_completion_forces_right_padding_and_restores(initial_side):
+    """Covers the padding_side save/restore wrapper for both initial sides.
+
+    Each call goes through every line of the wrapper (save, set, try, finally,
+    restore), so the parametrize ensures the inner ``if _saved_padding_side
+    is not None`` branches are exercised regardless of which session codecov
+    looks at.
+    """
+    tok = _RecordingPaddingTokenizer()
+    tok.padding_side = initial_side
+    out = format_prompt_completion(
+        tok,
+        "Context Q?",
+        "A.",
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+    )
+    assert tok.padding_side_during_call == "right"
+    assert tok.padding_side == initial_side
+    assert "input_ids" in out and "labels" in out
+
+
+def test_format_prompt_completion_without_padding_side_attr_is_a_noop_for_the_wrapper():
+    """Covers the False branches of the padding_side wrapper.
+
+    When the tokenizer has no ``padding_side`` attribute (e.g.
+    ``_StubTokenizerPlain``), ``getattr`` returns ``None`` and the
+    ``if _saved_padding_side is not None`` set/restore branches must
+    short-circuit without touching the tokenizer.
+    """
+    tok = _StubTokenizerPlain()
+    assert not hasattr(tok, "padding_side")
+    out = format_prompt_completion(
+        tok,
+        "Context Q?",
+        "A.",
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+    )
+    # No attribute was created on the tokenizer as a side effect.
+    assert not hasattr(tok, "padding_side")
+    assert "input_ids" in out and "labels" in out
+
+
 def testformat_prompt_completion_answer_only_mask():
     tok = _StubTokenizerPlain()
     context = "Context"
@@ -515,6 +584,95 @@ def test_apply_chat_template_can_mask_reasoning_content_without_generation_kwd()
     assert masked["labels"][masked["input_ids"].index(step_id)] == -100
     assert masked["labels"][masked["input_ids"].index(final_id)] != -100
     assert masked["labels"][masked["input_ids"].index(answer_id)] != -100
+
+
+def test_format_chat_template_train_on_last_turn_only_masks_earlier_turns():
+    # Only the final assistant turn stays supervised; earlier turns are dropped.
+    tok = _StubTokenizerChatNoGenMultiTurn()
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "alpha beta"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "gamma delta"},
+    ]
+    common = dict(eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id, answer_only_loss_mask=True)
+
+    all_turns = format_chat_template(tok, formatted_text=[m.copy() for m in messages], **common)
+    last_only = format_chat_template(
+        tok, formatted_text=[m.copy() for m in messages], train_on_last_turn_only=True, **common
+    )
+
+    all_supervised = {v for v in all_turns["labels"] if v != -100}
+    last_supervised = {v for v in last_only["labels"] if v != -100}
+
+    for word in ("alpha", "beta", "gamma", "delta"):
+        assert tok._id_for_token(word) in all_supervised
+    assert tok._id_for_token("gamma") in last_supervised
+    assert tok._id_for_token("delta") in last_supervised
+    assert tok._id_for_token("alpha") not in last_supervised
+    assert tok._id_for_token("beta") not in last_supervised
+
+
+class _StubTokenizerChatNoGenReasoningSplitsContent(_StubTokenizerChatNoGen):
+    """Assistant content renders both BEFORE and AFTER the reasoning block.
+
+    Mirrors templates that emit text, then a ``<think>`` block, then more text
+    (or a tool call), so a masked reasoning span sits between two supervised
+    content spans within the same turn.
+    """
+
+    chat_template = "<dummy reasoning_content template>"
+
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+        ids: List[int] = [self._start_of_turn_token_id]
+        for msg in messages:
+            ids.append(self._id_for_token(f"<{msg['role']}>"))
+            if msg["role"] == "assistant" and msg.get("reasoning_content"):
+                words = str(msg["content"]).split()
+                head, tail = words[:1], words[1:]
+                ids.extend(self._id_for_token(t) for t in head)
+                ids.append(self._id_for_token("<think>"))
+                ids.extend(self._id_for_token(t) for t in str(msg["reasoning_content"]).split())
+                ids.append(self._id_for_token("</think>"))
+                ids.extend(self._id_for_token(t) for t in tail)
+            else:
+                ids.extend(self._id_for_token(t) for t in str(msg["content"]).split())
+        ids.append(self.eos_token_id)
+        if kwargs.get("return_dict", False):
+            return {"input_ids": ids}
+        return ids
+
+
+def test_format_chat_template_last_turn_only_keeps_content_around_masked_reasoning():
+    # Regression: the final turn renders as [head][<think>why</think>][tail].
+    # The last-turn restriction must run on the hole-free mask, so masking the
+    # reasoning hole does not also drop the supervised "head" before it (the old
+    # order kept only the last contiguous run, i.e. just "tail").
+    tok = _StubTokenizerChatNoGenReasoningSplitsContent()
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "earlierturn"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "head tail", "reasoning_content": "why"},
+    ]
+
+    out = format_chat_template(
+        tok,
+        formatted_text=[m.copy() for m in messages],
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+        answer_only_loss_mask=True,
+        mask_reasoning_content=True,
+        train_on_last_turn_only=True,
+    )
+
+    supervised = {v for v in out["labels"] if v != -100}
+    # Both content spans of the last turn stay supervised.
+    assert tok._id_for_token("head") in supervised
+    assert tok._id_for_token("tail") in supervised
+    # The reasoning hole is masked, and the earlier assistant turn is dropped.
+    assert tok._id_for_token("why") not in supervised
+    assert tok._id_for_token("earlierturn") not in supervised
 
 
 # pad_token_id == eos_token_id overlap tests
@@ -948,9 +1106,9 @@ class TestFormatChatTemplateNoEosAfterTruncation:
         # All labels must be exactly seq_length
         assert len(out["labels"]) == seq_length
         # The last label must be -100 (padding), NOT eos_token_id
-        assert (
-            out["labels"][-1] == -100
-        ), f"Last label should be -100 (padding) after truncation, got {out['labels'][-1]}"
+        assert out["labels"][-1] == -100, (
+            f"Last label should be -100 (padding) after truncation, got {out['labels'][-1]}"
+        )
 
     def test_eos_still_appended_when_not_truncated(self):
         tok = _StubTokenizerChatTruncating()

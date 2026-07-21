@@ -86,6 +86,9 @@ env:
   LOCAL_BATCH_SIZE:
     target: step_scheduler.local_batch_size
     phases: [nightly, release, convergence, performance]
+  EP_SIZE:
+    target: distributed.ep_size
+    phases: [nightly, release, convergence, performance]
 
 # Computed dynamic overrides. `format` is str.format() over env vars + built-in `date`.
 computed:
@@ -110,6 +113,7 @@ computed:
 # resolved YAML's ci.<phase> block but does not apply them to the top-level.
 fixture_keys:
   checkpoint_robustness:
+    - check_source_load_parity
     - check_fused_qkv_keys
     - check_phantom_keys
     - check_resume
@@ -119,8 +123,12 @@ fixture_keys:
     - hf_device_map_auto
     - hf_kl_threshold
     - kl_threshold
+    - hf_source_post_load_dequantize
     - no_check_resume
     - resume_loss_threshold
     - skip_hf_reload
+    - source_load_cosine_threshold
+    - source_load_kl_threshold
+    - source_load_mean_kl_threshold
     - tokenizer_name
     - trust_remote_code

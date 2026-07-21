@@ -103,3 +103,9 @@ optimizer:
 #   entity: <your_wandb_entity>
 #   name: llama3_3_70b_instruct_squad_qlora_spark
 #   save_dir: <your_wandb_save_dir> 
+
+ci:
+  recipe_owner: akoumpa
+  time: "00:30:00"
+  nproc_per_node: 1
+  cluster_tag: digits

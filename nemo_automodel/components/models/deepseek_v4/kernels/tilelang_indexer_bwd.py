@@ -20,16 +20,9 @@
 #   Original source:
 # https://github.com/yueming-yuan/miles/blob/e561465d0b9bbf06188b7a5e2020dc7fd691f732/miles_plugins/models/deepseek_v4/ops/kernel/tilelang_indexer_bwd.py
 # Adapted from miles_plugins/models/glm5/ops/tilelang_indexer_bwd.py for DeepSeek-V4.
-try:
-    import tilelang as tl
-    import tilelang.language as T
-except ImportError as _e:
-    # Re-raise as ImportError so callers using ``safe_import_from`` /
-    # ``pytest.importorskip`` skip cleanly. The "UnavailableError" tag in
-    # the message is what FW-CI ``check_imports`` greps for to classify
-    # this optional-dep failure as gracefully handled.
-    raise ImportError(f"UnavailableError: tilelang is required for {__name__}: {_e}") from _e
 import torch
+
+from nemo_automodel.components.models.deepseek_v4.kernels._tilelang import T, tilelang as tl
 
 BF16 = T.bfloat16
 FP32 = T.float32

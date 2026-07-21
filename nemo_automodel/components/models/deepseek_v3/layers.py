@@ -12,11 +12,14 @@
 # See the License for the specific governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Any
 
 import torch
 from torch import nn
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+
+logger = logging.getLogger(__name__)
 
 from nemo_automodel.components.attention.utils import (
     initialize_attn_module_and_func,
@@ -32,6 +35,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     apply_rotary_emb_qk,
     yarn_get_mscale,
 )
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class MLA(nn.Module):
@@ -55,6 +59,7 @@ class MLA(nn.Module):
         rms_norm_impl = backend.rms_norm
 
         hidden_size = config.hidden_size
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
 
         if self.q_lora_rank is None:
             self.q_proj = initialize_linear_module(
@@ -62,19 +67,25 @@ class MLA(nn.Module):
                 in_features=hidden_size,
                 out_features=self.n_heads * self.qk_head_dim,
                 bias=False,
+                dtype=dtype,
             )
         else:
             self.q_a_proj = initialize_linear_module(
-                linear_impl=linear_impl, in_features=hidden_size, out_features=self.q_lora_rank, bias=False
+                linear_impl=linear_impl,
+                in_features=hidden_size,
+                out_features=self.q_lora_rank,
+                bias=False,
+                dtype=dtype,
             )
             self.q_a_layernorm = initialize_rms_norm_module(
-                rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, eps=config.rms_norm_eps
+                rms_norm_impl=rms_norm_impl, dim=self.q_lora_rank, eps=config.rms_norm_eps, dtype=dtype
             )
             self.q_b_proj = initialize_linear_module(
                 linear_impl=linear_impl,
                 in_features=self.q_lora_rank,
                 out_features=self.n_heads * self.qk_head_dim,
                 bias=False,
+                dtype=dtype,
             )
 
         self.kv_a_proj_with_mqa = initialize_linear_module(
@@ -82,21 +93,24 @@ class MLA(nn.Module):
             in_features=hidden_size,
             out_features=self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
+            dtype=dtype,
         )
         self.kv_a_layernorm = initialize_rms_norm_module(
-            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, eps=config.rms_norm_eps
+            rms_norm_impl=rms_norm_impl, dim=self.kv_lora_rank, eps=config.rms_norm_eps, dtype=dtype
         )
         self.kv_b_proj = initialize_linear_module(
             linear_impl=linear_impl,
             in_features=self.kv_lora_rank,
             out_features=self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
+            dtype=dtype,
         )
         self.o_proj = initialize_linear_module(
             linear_impl=linear_impl,
             in_features=self.n_heads * self.v_head_dim,
             out_features=hidden_size,
             bias=False,
+            dtype=dtype,
         )
         self.softmax_scale = self.qk_head_dim**-0.5
 
@@ -119,7 +133,35 @@ class MLA(nn.Module):
             softmax_scale=self.softmax_scale,
         )
 
+        # Optionally fuse the MLA forward's many small ops (lora down/up projections,
+        # RoPE, latent reshapes, SDPA) with torch.compile(fullgraph=True). Only valid
+        # with a compilable attention backend — TE's fused attention is a custom-autograd
+        # black box that fullgraph can't trace. seq_len is fixed here so dynamic=False.
+        # Driven by the generic backend.compile_attn flag (the MLA is one attention module).
+        self._compiled_forward = None
+        if backend.compile_attn:
+            if attn_impl != "sdpa":
+                logger.warning(
+                    "backend.compile_attn ignored: requires attn='sdpa' (got attn='%s'); "
+                    "TE fused attention is not fullgraph-compilable.",
+                    attn_impl,
+                )
+            else:  # pragma: no cover - torch.compile path exercised on GPU benchmark runs only
+                logger.warning("compile MLA forward: torch.compile(fullgraph=True) the MLA forward (attn=sdpa).")
+                self._compiled_forward = torch.compile(self._forward_impl, fullgraph=True, dynamic=False)
+
     def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        **attn_kwargs: Any,
+    ):
+        if self._compiled_forward is not None:  # pragma: no cover - compiled path only on GPU benchmark runs
+            return self._compiled_forward(x, freqs_cis, attention_mask, **attn_kwargs)
+        return self._forward_impl(x, freqs_cis, attention_mask, **attn_kwargs)
+
+    def _forward_impl(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,

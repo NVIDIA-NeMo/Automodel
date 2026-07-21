@@ -44,8 +44,8 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: false
-    experts: te
-    enable_deepep: true
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 
@@ -53,7 +53,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2

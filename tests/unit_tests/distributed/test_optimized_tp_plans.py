@@ -48,6 +48,7 @@ from nemo_automodel.components.distributed.optimized_tp_plans import (
 
 class MockModel:
     """Mock model class for testing."""
+
     def __init__(self, model_type="llama", tie_word_embeddings=False):
         self.config = SimpleNamespace(tie_word_embeddings=tie_word_embeddings)
         self.__class__ = {
@@ -62,6 +63,7 @@ class MockModel:
 
 class MockDeviceMesh:
     """Mock device mesh for testing."""
+
     def __init__(self):
         pass
 
@@ -85,17 +87,15 @@ class TestRotaryEmbedParallel:
         # Mock sequence sharding
         sequence_sharding = [Shard(1)]
 
-        result = RotaryEmbedParallel._prepare_input_fn(
-            sequence_sharding, mod, inputs, device_mesh
-        )
+        result = RotaryEmbedParallel._prepare_input_fn(sequence_sharding, mod, inputs, device_mesh)
 
         # Should return same type with original inputs unchanged
         assert type(result) == type(inputs)
         assert result[0] == mock_dtensor1
         assert result[1] == mock_dtensor2
 
-    @patch('torch.distributed.get_rank')
-    @patch.object(DTensor, 'from_local')
+    @patch("torch.distributed.get_rank")
+    @patch.object(DTensor, "from_local")
     def test_prepare_input_fn_with_tensor(self, mock_from_local, mock_get_rank):
         """Test _prepare_input_fn when input is regular tensor."""
         mock_get_rank.return_value = 0
@@ -114,29 +114,27 @@ class TestRotaryEmbedParallel:
         mod = Mock()
         sequence_sharding = [Shard(1)]
 
-        result = RotaryEmbedParallel._prepare_input_fn(
-            sequence_sharding, mod, inputs, device_mesh
-        )
+        RotaryEmbedParallel._prepare_input_fn(sequence_sharding, mod, inputs, device_mesh)
 
         # Should have called from_local twice
         assert mock_from_local.call_count == 2
 
         # First call should be for sequence parallel sharding
         first_call = mock_from_local.call_args_list[0]
-        assert first_call[1]['local_tensor'] is tensor1
-        assert first_call[1]['device_mesh'] is device_mesh
-        assert first_call[1]['placements'] == sequence_sharding
-        assert first_call[1]['run_check'] is True
+        assert first_call[1]["local_tensor"] is tensor1
+        assert first_call[1]["device_mesh"] is device_mesh
+        assert first_call[1]["placements"] == sequence_sharding
+        assert first_call[1]["run_check"] is True
 
         # Second call should be for replication
         second_call = mock_from_local.call_args_list[1]
-        assert second_call[1]['local_tensor'] is tensor2
-        assert second_call[1]['device_mesh'] is device_mesh
-        assert second_call[1]['placements'] == (Replicate(),)
-        assert second_call[1]['run_check'] is False
+        assert second_call[1]["local_tensor"] is tensor2
+        assert second_call[1]["device_mesh"] is device_mesh
+        assert second_call[1]["placements"] == (Replicate(),)
+        assert second_call[1]["run_check"] is False
 
-    @patch('torch.distributed.get_rank')
-    @patch.object(DTensor, 'from_local')
+    @patch("torch.distributed.get_rank")
+    @patch.object(DTensor, "from_local")
     def test_prepare_input_fn_value_error(self, mock_from_local, mock_get_rank):
         """Test _prepare_input_fn handles ValueError properly."""
         mock_get_rank.return_value = 1
@@ -149,9 +147,7 @@ class TestRotaryEmbedParallel:
         sequence_sharding = [Shard(1)]
 
         with pytest.raises(ValueError) as exc_info:
-            RotaryEmbedParallel._prepare_input_fn(
-                sequence_sharding, mod, inputs, device_mesh
-            )
+            RotaryEmbedParallel._prepare_input_fn(sequence_sharding, mod, inputs, device_mesh)
 
         # Should wrap original error with helpful context
         assert "Failed to shard tensor for sequence parallelism" in str(exc_info.value)
@@ -169,9 +165,7 @@ class TestRotaryEmbedParallel:
         mod = Mock()
         device_mesh = MockDeviceMesh()
 
-        result = RotaryEmbedParallel._prepare_output_fn(
-            True, mod, outputs, device_mesh
-        )
+        result = RotaryEmbedParallel._prepare_output_fn(True, mod, outputs, device_mesh)
 
         # Should call to_local on both outputs
         assert mock_dtensor1.to_local.called
@@ -186,9 +180,7 @@ class TestRotaryEmbedParallel:
         mod = Mock()
         device_mesh = MockDeviceMesh()
 
-        result = RotaryEmbedParallel._prepare_output_fn(
-            False, mod, outputs, device_mesh
-        )
+        result = RotaryEmbedParallel._prepare_output_fn(False, mod, outputs, device_mesh)
 
         # Should not call to_local
         assert not mock_dtensor1.to_local.called
@@ -474,16 +466,12 @@ class TestParallelPlanStructure:
             # Test without sequence parallel
             plan = func(model, sequence_parallel=False)
             for pattern, style in plan.items():
-                assert isinstance(style, valid_styles), (
-                    f"Invalid style {type(style)} for pattern {pattern}"
-                )
+                assert isinstance(style, valid_styles), f"Invalid style {type(style)} for pattern {pattern}"
 
             # Test with sequence parallel
             plan_sp = func(model, sequence_parallel=True)
             for pattern, style in plan_sp.items():
-                assert isinstance(style, valid_styles), (
-                    f"Invalid style {type(style)} for pattern {pattern} with SP"
-                )
+                assert isinstance(style, valid_styles), f"Invalid style {type(style)} for pattern {pattern} with SP"
 
     def test_module_patterns_are_strings(self):
         """Test that all module patterns are strings."""
@@ -519,13 +507,12 @@ class TestParallelPlanStructure:
                 assert pattern in plan_sp
 
 
-
-
 class TestParallelizeMistral3Vlm:
     """_parallelize_mistral3_vlm + PARALLELIZE_FUNCTIONS registration for Mistral3 VLM."""
 
     def test_paths_under_model_language_model_prefix(self):
         from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_mistral3_vlm
+
         plan = _parallelize_mistral3_vlm(model=None)
         # Every text-decoder rule must be scoped to model.language_model.* —
         # without this prefix scoping (the original bug), MLP weights stayed
@@ -539,6 +526,7 @@ class TestParallelizeMistral3Vlm:
         from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
 
         from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_mistral3_vlm
+
         plan = _parallelize_mistral3_vlm(model=None)
         prefix = "model.language_model.layers.*"
         # qkv + gate + up are colwise; o + down are rowwise (Ministral3 GQA pattern).
@@ -560,6 +548,7 @@ class TestParallelizeMistral3Vlm:
         from torch.distributed.tensor.parallel import ColwiseParallel
 
         from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_mistral3_vlm
+
         plan = _parallelize_mistral3_vlm(model=None)
         # lm_head sits at the top level (not nested under model.language_model)
         # in HF's Mistral3ForConditionalGeneration; sharding it on dim=-1
@@ -582,10 +571,88 @@ class TestParallelizeMistral3Vlm:
         from nemo_automodel.components.models.mistral3_vlm.model import (
             Mistral3FP8VLMForConditionalGeneration,
         )
+
         for cls in (Mistral3ForConditionalGeneration, Mistral3FP8VLMForConditionalGeneration):
             qn = _get_class_qualname(cls)
             assert qn in PARALLELIZE_FUNCTIONS, f"{qn} not registered"
             assert PARALLELIZE_FUNCTIONS[qn] is _parallelize_mistral3_vlm
+
+
+class TestParallelizeFalconH1:
+    """_parallelize_falcon_h1 + PARALLELIZE_FUNCTIONS registration for Falcon-H1.
+
+    Falcon-H1 is a hybrid Transformer + Mamba2 model. HF ships only
+    ``_tp_plan = {"lm_head": "colwise_gather_output"}`` and names its MLP
+    ``feed_forward`` (not ``mlp``), so the generic fallback plan left the
+    dominant feed_forward weights replicated across TP ranks and OOMed
+    Falcon-H1-34B. These tests pin the dedicated plan.
+    """
+
+    def test_attention_and_feed_forward_styles(self):
+        from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_falcon_h1
+
+        plan = _parallelize_falcon_h1(model=None)
+        prefix = "model.layers.*"
+        # q/k/v + gate/up are colwise; o + down are rowwise (GQA pattern).
+        for k in (
+            f"{prefix}.self_attn.q_proj",
+            f"{prefix}.self_attn.k_proj",
+            f"{prefix}.self_attn.v_proj",
+            f"{prefix}.feed_forward.gate_proj",
+            f"{prefix}.feed_forward.up_proj",
+        ):
+            assert isinstance(plan[k], ColwiseParallel), f"{k} should be colwise"
+        for k in (
+            f"{prefix}.self_attn.o_proj",
+            f"{prefix}.feed_forward.down_proj",
+        ):
+            assert isinstance(plan[k], RowwiseParallel), f"{k} should be rowwise"
+
+    def test_mlp_is_feed_forward_not_mlp(self):
+        """The MLP must be addressed as ``feed_forward`` — the root cause of the
+        OOM was the generic plan targeting ``mlp.*`` (which Falcon-H1 does not
+        have), leaving the dominant MLP weights replicated."""
+        from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_falcon_h1
+
+        plan = _parallelize_falcon_h1(model=None)
+        assert any(k.startswith("model.layers.*.feed_forward.") for k in plan)
+        assert not any(".mlp." in k for k in plan), "Falcon-H1 has no mlp.* modules"
+
+    def test_mamba_branch_left_replicated(self):
+        """The Mamba2 mixer is not TP-shardable with stock kernels and must be
+        omitted from the plan (left replicated)."""
+        from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_falcon_h1
+
+        plan = _parallelize_falcon_h1(model=None)
+        assert not any(".mamba" in k for k in plan), "mamba.* must stay replicated"
+
+    def test_sequence_parallel_is_ignored_not_crashing(self):
+        # ParallelStyle objects have no __eq__, so compare structure (keys +
+        # style types) rather than object identity.
+        from nemo_automodel.components.distributed.optimized_tp_plans import _parallelize_falcon_h1
+
+        plan_off = _parallelize_falcon_h1(model=None, sequence_parallel=False)
+        plan_on = _parallelize_falcon_h1(model=None, sequence_parallel=True)
+        assert plan_off.keys() == plan_on.keys()
+        assert {k: type(v) for k, v in plan_off.items()} == {k: type(v) for k, v in plan_on.items()}
+
+    def test_class_registered_by_qualname_and_bare_name(self):
+        """Falcon-H1 may load natively (transformers.models.falcon_h1.*) or via
+        trust_remote_code (transformers_modules.<hash>.*); both must resolve to
+        the dedicated plan, otherwise the parallelizer falls through to the
+        default plan whose paths don't match and weights stay unsharded."""
+        from nemo_automodel.components.distributed.optimized_tp_plans import (
+            PARALLELIZE_FUNCTIONS,
+            _parallelize_falcon_h1,
+        )
+
+        for key in (
+            "transformers.models.falcon_h1.modeling_falcon_h1.FalconH1ForCausalLM",
+            "FalconH1ForCausalLM",
+        ):
+            assert key in PARALLELIZE_FUNCTIONS, f"{key} not registered"
+            assert PARALLELIZE_FUNCTIONS[key] is _parallelize_falcon_h1
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

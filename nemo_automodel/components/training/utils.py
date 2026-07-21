@@ -181,6 +181,7 @@ def clip_grad_norm(
     device_mesh: DeviceMesh | None = None,
     pp_axis_name: str | None = None,
     foreach: bool = True,
+    use_torch_clip_grad_norm: bool = False,
 ):
     """Common gradient clipping helper.
 
@@ -203,6 +204,7 @@ def clip_grad_norm(
         ep_axis_name: Expert parallel axis name (unused, kept for API compatibility).
         pp_axis_name: Pipeline parallel axis name.
         foreach: Whether to use foreach implementation for clipping.
+        use_torch_clip_grad_norm: Use PyTorch's optimized regular-tensor clipping path when possible.
 
     Returns:
         Total gradient norm as a float.
@@ -219,15 +221,31 @@ def clip_grad_norm(
         assert pp_axis_name is not None, "pp_axis_name must be provided when pp_enabled is True"
         pp_mesh = device_mesh[pp_axis_name] if device_mesh is not None else None
 
-    # Use the new sharding-aware implementation
-    grad_norm = _clip_grad_norm_impl(
-        parameters=parameters,
-        max_norm=max_grad_norm,
-        norm_type=norm_type,
-        error_if_nonfinite=False,
-        foreach=foreach,
-        pp_mesh=pp_mesh,
-    )
+    can_use_torch_clip = use_torch_clip_grad_norm and pp_mesh is None
+    if can_use_torch_clip:
+        for p in parameters:
+            if isinstance(p, DTensor) or isinstance(p.grad, DTensor):
+                can_use_torch_clip = False
+                break
+
+    if can_use_torch_clip:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            parameters,
+            max_grad_norm,
+            norm_type=norm_type,
+            error_if_nonfinite=False,
+            foreach=foreach,
+        )
+    else:
+        # Use the sharding-aware implementation for DTensor, PP, EP, and mixed placement cases.
+        grad_norm = _clip_grad_norm_impl(
+            parameters=parameters,
+            max_norm=max_grad_norm,
+            norm_type=norm_type,
+            error_if_nonfinite=False,
+            foreach=foreach,
+            pp_mesh=pp_mesh,
+        )
 
     # Convert to float for API compatibility
     if isinstance(grad_norm, torch.Tensor):
@@ -286,6 +304,28 @@ def prepare_for_final_backward(model_parts: list[torch.nn.Module], pp_enabled: b
             mp.prepare_for_final_backward(pp_enabled=pp_enabled)
 
 
+def get_expert_tp_replication_factor(
+    model_parts: list[torch.nn.Module],
+    device_mesh: DeviceMesh | None,
+) -> int:
+    """Return the TP token-replication factor for custom-MoE expert gradients.
+
+    The custom-MoE tensor-parallel path keeps the token path (attention,
+    router) replicated across TP ranks, so every TP rank feeds the same tokens
+    into the expert-parallel all-gather and each expert gradient is accumulated
+    ``tp_size`` times. ``scale_grads_and_clip_grad_norm`` divides expert
+    gradients by this factor to restore the correct scale.
+    """
+    if device_mesh is None or "tp" not in (device_mesh.mesh_dim_names or ()):
+        return 1
+    tp_size = device_mesh["tp"].size()
+    if tp_size <= 1:
+        return 1
+    if any(getattr(part, "_nemo_moe_tp_requires_replica_sync", False) for part in model_parts):
+        return int(tp_size)
+    return 1
+
+
 @torch.no_grad()
 def scale_grads_and_clip_grad_norm(
     max_grad_norm: float | None,
@@ -300,11 +340,14 @@ def scale_grads_and_clip_grad_norm(
     foreach: bool = True,
     num_label_tokens: int | None = None,
     dp_group_size: int | None = None,
+    expert_tp_replication_factor: int = 1,
+    use_torch_clip_grad_norm: bool = False,
 ):
     """Scale gradients for PP/EP in a single pass, then clip.
 
     - PP scaling: divide all local grads by (num_label_tokens / dp_group_size).
-    - EP scaling: for parameters on the expert axis, divide grads by (dp_group_size / ep_shard_size).
+    - EP scaling: for parameters on the expert axis, divide grads by
+      ``(dp_group_size / ep_shard_size) * expert_tp_replication_factor``.
     - Finally, perform grad clipping with PP/EP-aware reductions.
     """
 
@@ -315,11 +358,17 @@ def scale_grads_and_clip_grad_norm(
             candidate = num_label_tokens / dp_group_size
             pp_divisor = float(candidate) if candidate != 0 else None
 
+    if not isinstance(expert_tp_replication_factor, int) or isinstance(expert_tp_replication_factor, bool):
+        raise TypeError("expert_tp_replication_factor must be an integer")
+    if expert_tp_replication_factor < 1:
+        raise ValueError("expert_tp_replication_factor must be >= 1")
+
     ep_ratio: float | None = None
     if moe_mesh is not None and dp_group_size is not None:
         ep_shard_size = moe_mesh["ep_shard"].size() if "ep_shard" in moe_mesh.mesh_dim_names else 1
         if ep_shard_size > 0:
             ep_ratio = float(dp_group_size) / float(ep_shard_size)
+            ep_ratio *= float(expert_tp_replication_factor)
 
     # Single pass over parameters to apply both scalings where applicable
     if pp_divisor is not None or ep_ratio is not None:
@@ -330,7 +379,8 @@ def scale_grads_and_clip_grad_norm(
                 if pp_divisor is not None:
                     p.grad.div_(pp_divisor)
                 if ep_ratio is not None:
-                    # Scale expert gradients by EP ratio.
+                    # Scale expert gradients by the FSDP/EP ratio and by any
+                    # identical TP token replicas that were gathered inside EP.
                     # DTensor experts: check device mesh for EP sharding axis
                     # Non-DTensor experts (e.g., DeepEP): check param name
                     is_ep_sharded_dtensor = (
@@ -356,6 +406,7 @@ def scale_grads_and_clip_grad_norm(
         device_mesh=device_mesh,
         pp_axis_name=pp_axis_name,
         foreach=foreach,
+        use_torch_clip_grad_norm=use_torch_clip_grad_norm,
     )
 
 

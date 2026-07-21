@@ -11,3 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from nemo_automodel.components.loss.loss import (
+    LOSS_CONFIG_REGISTRY,
+    FusedLinearCEConfig,
+    KDLossConfig,
+    LossConfig,
+    LossFromFactoryConfig,
+    MaskedCrossEntropyConfig,
+    TEParallelCEConfig,
+    build_loss_config,
+    build_loss_module,
+)
+
+__all__ = [
+    "LOSS_CONFIG_REGISTRY",
+    "FusedLinearCEConfig",
+    "KDLossConfig",
+    "LossConfig",
+    "LossFromFactoryConfig",
+    "MaskedCrossEntropyConfig",
+    "TEParallelCEConfig",
+    "build_loss_config",
+    "build_loss_module",
+]

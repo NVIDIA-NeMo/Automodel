@@ -64,7 +64,7 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cv17_dataset
+  _target_: nemo_automodel.components.datasets.audio.datasets.make_cv17_dataset
   path_or_dataset: ysdede/commonvoice_17_tr_fixed
   split: train
 
@@ -76,7 +76,7 @@ dataloader:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.phi4_mm_collate_fn
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_cv17_dataset
+  _target_: nemo_automodel.components.datasets.audio.datasets.make_cv17_dataset
   path_or_dataset: ysdede/commonvoice_17_tr_fixed
   split: validation
 

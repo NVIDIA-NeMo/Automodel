@@ -1,0 +1,42 @@
+---
+title: "Inkling"
+description: "Fine-tune Thinking Machines Lab's 975B multimodal MoE model with pipeline and expert parallelism."
+---
+
+[Inkling](https://huggingface.co/thinkingmachines/Inkling) is a multimodal Mixture-of-Experts model from Thinking Machines Lab. It accepts text, image, video, and audio inputs and generates text.
+
+<Info>
+
+| | |
+|---|---|
+| **Task** | Image-Text-to-Text / Audio-Text-to-Text |
+| **Architecture** | `InklingForConditionalGeneration` |
+| **Parameters** | 975B total / 41B active |
+| **Precision** | BF16 |
+| **HF Org** | [thinkingmachines](https://huggingface.co/thinkingmachines) |
+
+</Info>
+
+## Architecture
+
+Inkling uses a 66-layer decoder with hybrid local and global attention. Each sparse feed-forward layer routes a token to 6 of 256 experts and also evaluates 2 shared experts. Images and video use a hierarchical patch encoder, while audio uses discrete dMel tokens.
+
+NeMo AutoModel retains the checkpoint's fused expert layout and supports pipeline parallelism and expert parallelism for full-parameter fine-tuning.
+
+## Example HF Models
+
+| Model | HF ID |
+|---|---|
+| Inkling BF16 | [`thinkingmachines/Inkling`](https://huggingface.co/thinkingmachines/Inkling) |
+
+## Example Recipes
+
+| Recipe | Dataset | Description |
+|---|---|---|
+| [inkling_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/inkling/inkling_medpix.yaml) | MedPix-VQA | Full SFT with PP8 and EP32 |
+
+The model requires a multi-node launch. Adjust the data, pipeline, and expert-parallel dimensions to the available cluster before running the recipe.
+
+## Hugging Face Model Card
+
+- [thinkingmachines/Inkling](https://huggingface.co/thinkingmachines/Inkling)

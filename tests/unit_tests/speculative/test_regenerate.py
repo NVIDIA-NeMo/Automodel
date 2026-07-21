@@ -29,6 +29,7 @@ from nemo_automodel.components.speculative.regenerate import (
     _existing_shard_indices,
     _extract_prompt_messages,
     _process_shard,
+    _regenerate_one,
     _validate_args,
     _write_shard,
 )
@@ -152,6 +153,7 @@ def test_resume_manifest_mismatch_raises(tmp_path: Path):
         max_new_tokens=128,
         temperature=0.0,
         top_p=1.0,
+        reasoning="none",
     )
     manifest = _build_manifest(args)
     (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -180,6 +182,7 @@ def test_resume_without_manifest_and_existing_shards_raises(tmp_path: Path):
         "max_new_tokens": 128,
         "temperature": 0.0,
         "top_p": 1.0,
+        "reasoning": "none",
     }
     with pytest.raises(ValueError, match="manifest.json is missing"):
         _ensure_manifest_compatible(tmp_path, manifest, resume=True, existing_shards={0})
@@ -201,6 +204,7 @@ def test_fresh_run_with_existing_shards_refuses_to_clobber(tmp_path: Path):
         max_new_tokens=128,
         temperature=0.0,
         top_p=1.0,
+        reasoning="none",
     )
     with pytest.raises(ValueError, match="already contains"):
         _ensure_manifest_compatible(
@@ -226,6 +230,7 @@ def test_fresh_run_into_empty_dir_writes_manifest(tmp_path: Path):
         max_new_tokens=128,
         temperature=0.0,
         top_p=1.0,
+        reasoning="none",
     )
     manifest = _build_manifest(args)
     _ensure_manifest_compatible(tmp_path, manifest, resume=False, existing_shards=set())
@@ -248,6 +253,7 @@ def test_build_manifest_excludes_self_referential_and_operational_fields():
         shard_size=1000,
         max_new_tokens=128,
         temperature=0.0,
+        reasoning="none",
         top_p=1.0,
         # Operational knobs that intentionally do NOT belong in the manifest.
         concurrency=99,
@@ -417,6 +423,7 @@ def _run_args(tmp_path: Path, *, resume: bool, shard_size: int = 2) -> SimpleNam
         max_retries=0,
         resume=resume,
         log_level="INFO",
+        reasoning="none",
     )
 
 
@@ -490,6 +497,28 @@ def test_run_resume_skips_already_written_shards(tmp_path: Path, monkeypatch):
     assert (tmp_path / "shard-000000.parquet").stat().st_mtime_ns == shard0_mtime_before
 
 
+def test_run_fresh_into_nonempty_dir_refuses_to_clobber(tmp_path: Path, monkeypatch):
+    """End-to-end: a fresh run (no --resume) against a dir with shards must abort
+    before rewriting the manifest or touching any shard. Guards the _run wiring:
+    the shard scan must not be gated on --resume, or the guard sees an empty set."""
+    from nemo_automodel.components.speculative import regenerate as regen
+
+    (tmp_path / "shard-000000.parquet").write_bytes(b"previous-run-data")
+    monkeypatch.setattr(
+        regen,
+        "_import_aiohttp",
+        lambda: SimpleNamespace(ClientSession=None, ClientTimeout=lambda total=None: None),
+    )
+
+    args = _run_args(tmp_path, resume=False)
+    with pytest.raises(ValueError, match="already contains"):
+        asyncio.run(regen._run(args))
+
+    # Nothing was clobbered: the old shard is intact and no manifest was written.
+    assert (tmp_path / "shard-000000.parquet").read_bytes() == b"previous-run-data"
+    assert not (tmp_path / "manifest.json").exists()
+
+
 class _SequentialSession:
     """Returns a pre-defined sequence of _FakeResponse objects, one per POST call."""
 
@@ -524,7 +553,7 @@ def test_chat_completion_retries_on_5xx_then_succeeds(monkeypatch):
 
     result = asyncio.run(_chat_completion(session, "http://stub/completions", {}, timeout_s=1.0, max_retries=3))
 
-    assert result == "ok"
+    assert result == {"role": "assistant", "content": "ok"}
     assert session.call_count == 3
     assert len(sleep_calls) == 2  # slept once after each failed attempt
     assert sleep_calls[0] == 1.0  # 2**0 = 1
@@ -551,3 +580,49 @@ def test_chat_completion_raises_after_max_retries_exhausted(monkeypatch):
     # max_retries=2 → 3 total attempts, 2 sleeps
     assert session.call_count == 3
     assert len(sleep_calls) == 2
+
+
+def test_reasoning_disable_sends_top_level_chat_template_kwargs():
+    """--reasoning disable must land as a top-level request field, not extra_body.
+
+    ``extra_body`` is an OpenAI Python-client convenience merged into the body
+    client-side; this script POSTs raw JSON, so a literal ``extra_body`` key is
+    silently ignored by the server and thinking stays enabled.
+    """
+    session = _FakeSession(lambda payload: "ok")
+    gen_cfg = GenerationConfig(model="m", max_new_tokens=8, temperature=0.0, top_p=1.0, reasoning="disable")
+
+    asyncio.run(
+        _regenerate_one(
+            session,
+            url="http://server/v1/chat/completions",
+            prompt=[{"role": "user", "content": "q"}],
+            gen_cfg=gen_cfg,
+            timeout_s=10.0,
+            max_retries=0,
+        )
+    )
+
+    (call,) = session.calls
+    assert call["json"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "extra_body" not in call["json"]
+
+
+def test_reasoning_none_sends_no_chat_template_kwargs():
+    session = _FakeSession(lambda payload: "ok")
+    gen_cfg = GenerationConfig(model="m", max_new_tokens=8, temperature=0.0, top_p=1.0, reasoning="none")
+
+    asyncio.run(
+        _regenerate_one(
+            session,
+            url="http://server/v1/chat/completions",
+            prompt=[{"role": "user", "content": "q"}],
+            gen_cfg=gen_cfg,
+            timeout_s=10.0,
+            max_retries=0,
+        )
+    )
+
+    (call,) = session.calls
+    assert "chat_template_kwargs" not in call["json"]
+    assert "extra_body" not in call["json"]

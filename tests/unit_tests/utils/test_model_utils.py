@@ -76,6 +76,19 @@ def test_print_trainable_parameters_counts(dummy_model, caplog, monkeypatch):
     # Check logging output
     assert "Trainable parameters" in caplog.text
     assert "Total parameters" in caplog.text
+    # Default header label
+    assert "Model summary:" in caplog.text
+
+
+def test_print_trainable_parameters_custom_name(dummy_model, caplog):
+    """The ``name`` label customizes the summary header (e.g. the draft model
+    in speculative-decoding training)."""
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    model_utils.print_trainable_parameters(dummy_model, name="Draft")
+    assert "Draft summary:" in caplog.text
+    assert "Model summary:" not in caplog.text
 
 
 def test_print_trainable_parameters_non_zero_rank(dummy_model, capsys, monkeypatch):

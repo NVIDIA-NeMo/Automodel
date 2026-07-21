@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import glob
 import json
 import logging
 import os
+from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import ClassVar, Dict, List, Optional, Union
 
 import torch.distributed as dist
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -27,8 +30,99 @@ from nemo_automodel.components.datasets.llm.megatron.builder import BlendedMegat
 from nemo_automodel.components.datasets.llm.megatron.gpt_dataset import GPTDatasetConfig
 from nemo_automodel.components.datasets.llm.megatron.indexed_dataset import ObjectStorageConfig, _is_object_storage_path
 from nemo_automodel.components.datasets.llm.megatron.megatron_utils import compile_helper, get_blend_from_list
+from nemo_automodel.components.datasets.loader import DatasetBuildSchedule
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MegatronPretrainingConfig:
+    """Construction-time configuration for :class:`MegatronPretraining` (tokenizer is a build arg)."""
+
+    # The Megatron ``BlendedMegatronDatasetBuilder`` synchronizes index-cache construction across *all* ranks
+    # via ``torch.distributed.barrier()``. It must therefore run with every rank participating, not behind the
+    # ``FirstRankPerNode`` rank-0-first gate the loader applies by default (which would deadlock the builder's
+    # internal collectives). Recipes check this typed capability and do not apply their rank-0-first context.
+    builds_on_all_ranks: ClassVar[bool] = True
+    accepts_tokenizer: ClassVar[bool] = True
+    requires_training_schedule: ClassVar[bool] = True
+
+    paths: Path | list[str] | dict[str, list[str]]
+    """Paths of the data distributions (single path, list, dict, or path to a JSON blend file)."""
+    seq_length: int = 2048
+    """Sequence length."""
+    create_attention_mask: bool = False
+    """Whether to generate attention masks (not supported with fused/flash attention)."""
+    seed: int = 1234
+    """Seed for generating the GPT dataset."""
+    split: str = "900,50,50"
+    """Comma-separated train/validation/test ratios (unused if ``paths`` is a dict)."""
+    index_mapping_dir: str | None = None
+    """Directory to write index mapping files."""
+    num_dataset_builder_threads: int = 1
+    """Number of threads to use for dataset building."""
+    num_train_samples: int | None = None
+    """Number of training samples (defaults to total train steps x global batch size)."""
+    num_val_samples: int | None = None
+    """Number of validation samples."""
+    num_test_samples: int | None = None
+    """Number of test samples."""
+    trainer_limit_val_batches: int | float = 1
+    """Limit for validation batches."""
+    trainer_limit_test_batches: int | float = 1
+    """Limit for test batches."""
+    mmap_bin_files: bool = True
+    """Whether to memory-map .bin files."""
+    splits_to_build: str | list[str] | None = None
+    """Splits to build (None builds all splits)."""
+    object_storage_config: dict[str, object] | ObjectStorageConfig | None = None
+    """Configuration for reading .bin/.idx files from S3/MSC."""
+
+    def build(
+        self,
+        *,
+        tokenizer: PreTrainedTokenizerBase | None,
+        training_schedule: DatasetBuildSchedule,
+    ) -> object:
+        """Build the Megatron pretraining torch ``Dataset`` (for ``DataloaderConfig.dataset_config``).
+
+        Constructs the :class:`MegatronPretraining` builder, runs its ``build()``, and returns the requested
+        split via ``get_dataset``. Batch sizes and scheduler limits are runtime values owned by the recipe's
+        step scheduler, so they arrive through ``training_schedule`` rather than being duplicated in YAML.
+
+        Args:
+            tokenizer: Runtime tokenizer used by the Megatron GPT dataset.
+            training_schedule: Local/global batch sizes and train/validation cadence from the recipe.
+
+        Returns:
+            Requested Megatron dataset split.
+        """
+        mp = MegatronPretraining(
+            paths=self.paths,
+            seq_length=self.seq_length,
+            tokenizer=tokenizer,
+            micro_batch_size=training_schedule.local_batch_size,
+            global_batch_size=training_schedule.global_batch_size,
+            create_attention_mask=self.create_attention_mask,
+            seed=self.seed,
+            split=self.split,
+            index_mapping_dir=self.index_mapping_dir,
+            num_dataset_builder_threads=self.num_dataset_builder_threads,
+            num_train_samples=self.num_train_samples,
+            num_val_samples=self.num_val_samples,
+            num_test_samples=self.num_test_samples,
+            trainer_max_steps=training_schedule.max_steps,
+            trainer_val_check_interval=(
+                training_schedule.val_check_interval if training_schedule.val_check_interval is not None else 1000
+            ),
+            trainer_limit_val_batches=self.trainer_limit_val_batches,
+            trainer_limit_test_batches=self.trainer_limit_test_batches,
+            mmap_bin_files=self.mmap_bin_files,
+            splits_to_build=self.splits_to_build,
+            object_storage_config=self.object_storage_config,
+        )
+        mp.build()
+        return mp.get_dataset(split=self.splits_to_build)
 
 
 class MegatronPretraining:
