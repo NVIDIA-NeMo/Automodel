@@ -134,13 +134,17 @@ this uses `lr 1e-5` with a 60-step warmup over `max_steps=800` (~0.5B tokens) an
 `clip_grad_norm=1.0` (the base has volatile early grads). `freeze_language_model:
 false` keeps the embeddings + tied LM head trainable — required to learn 48/49.
 
-_W&B loss curve: (to be added)_
+<p align="center">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_sft.png" alt="Gemma4-31B base SFT training loss curve on CoderForge" width="700">
+</p>
 
 ### IT model fine-tune
 
 `gemma4_31b_coderforge_cp8_64k_16node.yaml` — SFT on the instruct-tuned
 `google/gemma-4-31B-it`, for `max_steps=450`, ~0.30B tokens.
 
-_W&B loss curve: (to be added)_
+<p align="center">
+  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/examples/long_context_validation/gemma4_31B/gemma4_31b_it_coderforge_sft.png" alt="Gemma4-31B IT model SFT training loss curve on CoderForge" width="700">
+</p>
 
 ## Phase 3 — SWE-bench Verified evaluation — *next*
