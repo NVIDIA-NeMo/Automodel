@@ -7,8 +7,7 @@ This module provides a modified Ministral3Model that uses bidirectional (non-cau
 attention, suitable for generating embeddings where each token should attend
 to all other tokens in the sequence. Standard ``ministral3`` embedding checkpoints
 use the stock HuggingFace model with ``is_causal=False``; this custom architecture
-remains available for ``ministral3_bidirec`` checkpoints and future task-specific
-extensions.
+remains available for ``ministral3_bidirec`` checkpoints.
 """
 
 from dataclasses import dataclass
