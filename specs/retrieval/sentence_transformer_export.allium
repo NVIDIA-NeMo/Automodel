@@ -17,6 +17,12 @@ value LegalAsset {
     content: String
 }
 
+value EmbeddingObservation {
+    input_ids: List<Integer>
+    attention_mask: List<Integer>
+    values: List<Decimal>
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -41,6 +47,9 @@ entity EncoderCheckpoint {
     l2_normalize: Boolean?
     similarity: SimilarityFunction?
     do_lower_case: Boolean?
+    embedding_observations: Set<EmbeddingObservation>
+    -- Top-level LICENSE*/NOTICE* assets from the repository and model roots;
+    -- a model-root asset replaces a same-named repository-root asset.
     legal_assets: Set<LegalAsset>
 }
 
@@ -54,12 +63,14 @@ entity LoadedEncoder {
     source: EncoderCheckpoint
     pooling: PoolingMode
     l2_normalize: Boolean
+    embedding_observations: Set<EmbeddingObservation>
 }
 
 entity EncoderExportRequest {
     encoder: LoadedEncoder
+    tokenizer_available: Boolean
     explicit_similarity: SimilarityFunction?
-    do_lower_case: Boolean
+    do_lower_case: Boolean?
 }
 
 entity SentenceTransformerExport {
@@ -68,6 +79,7 @@ entity SentenceTransformerExport {
     l2_normalize: Boolean
     similarity: SimilarityFunction
     do_lower_case: Boolean
+    embedding_observations: Set<EmbeddingObservation>
     legal_assets: Set<LegalAsset>
 }
 
@@ -77,6 +89,7 @@ entity SentenceTransformerExport {
 
 rule ResolveLoadedEncoderBehavior {
     when: request: EncoderLoadRequest.created
+    requires: request.checkpoint.do_lower_case != true
     ensures: LoadedEncoder.created(
         source: request.checkpoint,
         pooling:
@@ -86,13 +99,15 @@ rule ResolveLoadedEncoderBehavior {
         l2_normalize:
             if request.explicit_l2_normalize != null: request.explicit_l2_normalize
             else if request.checkpoint.l2_normalize != null: request.checkpoint.l2_normalize
-            else: true
+            else: true,
+        embedding_observations: request.checkpoint.embedding_observations
     )
 }
 
 rule ExportCompatibleEncoder {
     when: request: EncoderExportRequest.created
-    requires: request.do_lower_case = false
+    requires: request.tokenizer_available
+    requires: request.do_lower_case != true
     requires:
         request.explicit_similarity = null
         or (request.encoder.l2_normalize and request.explicit_similarity = cosine)
@@ -105,6 +120,7 @@ rule ExportCompatibleEncoder {
             if request.encoder.l2_normalize: cosine
             else: dot,
         do_lower_case: false,
+        embedding_observations: request.encoder.embedding_observations,
         legal_assets: request.encoder.source.legal_assets
     )
 }
@@ -117,6 +133,7 @@ invariant ExportPreservesEmbeddingBehavior {
     for export in SentenceTransformerExports:
         export.pooling = export.source.pooling
         and export.l2_normalize = export.source.l2_normalize
+        and export.embedding_observations = export.source.embedding_observations
 }
 
 invariant SimilarityMatchesNormalization {
