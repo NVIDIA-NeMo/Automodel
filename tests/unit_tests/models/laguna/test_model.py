@@ -71,6 +71,15 @@ def _dense_tiny_config() -> LagunaConfig:
     return cfg
 
 
+def _patch_weighted_swiglu(monkeypatch) -> None:
+    def weighted_swiglu_eager(y: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        y1, y2 = torch.chunk(y, 2, -1)
+        return (torch.nn.functional.silu(y1) * y2 * weights).to(y.dtype)
+
+    # Keep Laguna CPU smokes independent of torch.compile availability; shared MoE tests cover the compiled helper.
+    monkeypatch.setattr(moe_utils, "weighted_swiglu", weighted_swiglu_eager)
+
+
 def test_laguna_forward_tiny_config():
     model = LagunaForCausalLM(_dense_tiny_config(), backend=_backend())
     model.eval()
@@ -84,12 +93,7 @@ def test_laguna_forward_tiny_config():
 
 
 def test_laguna_forward_tiny_config_with_moe_layer(monkeypatch):
-    def weighted_swiglu_eager(y: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        y1, y2 = torch.chunk(y, 2, -1)
-        return (torch.nn.functional.silu(y1) * y2 * weights).to(y.dtype)
-
-    # Keep this Laguna smoke independent of torch.compile availability; shared MoE tests cover the compiled helper.
-    monkeypatch.setattr(moe_utils, "weighted_swiglu", weighted_swiglu_eager)
+    _patch_weighted_swiglu(monkeypatch)
     model = LagunaForCausalLM(_tiny_config(), backend=_backend())
     model.eval()
 
@@ -101,6 +105,24 @@ def test_laguna_forward_tiny_config_with_moe_layer(monkeypatch):
         output = model(input_ids=input_ids, attention_mask=attention_mask)
 
     assert output.logits.shape == (1, 4, 32)
+
+
+def test_laguna_initialize_weights_cpu_path(monkeypatch):
+    _patch_weighted_swiglu(monkeypatch)
+    model = LagunaForCausalLM(_tiny_config(), backend=_backend())
+
+    model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+    sparse_layer = model.model.layers["1"].mlp
+
+    assert sparse_layer.gate.e_score_correction_bias.dtype == torch.float32
+    assert all(torch.isfinite(param).all().item() for param in model.parameters())
+
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    attention_mask = torch.ones_like(input_ids)
+    with torch.no_grad():
+        output = model(input_ids=input_ids, attention_mask=attention_mask)
+
+    assert torch.isfinite(output.logits).all()
 
 
 def test_laguna_moe_defaults_match_checkpoint_routing():
