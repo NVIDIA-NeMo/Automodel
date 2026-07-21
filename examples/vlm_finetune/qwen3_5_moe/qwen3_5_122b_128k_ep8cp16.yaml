@@ -102,6 +102,8 @@ loss_fn:
   _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
 
 dataset:
+  # MedPix-VQA contains single-image question/answer samples. The 128K context
+  # is formed by packing independent samples, not by native long-context or video examples.
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
   path_or_dataset: mmoukouba/MedPix-VQA
   split: train
