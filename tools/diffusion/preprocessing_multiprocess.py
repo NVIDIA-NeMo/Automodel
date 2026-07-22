@@ -794,8 +794,14 @@ def _process_video_video_mode(args: Tuple) -> Optional[Dict]:
         if hasattr(_worker_processor, "encode_first_frame"):
             image_embeds = _worker_processor.encode_first_frame(first_frame, _worker_models, _worker_device)
 
+        # Encode the audio track for audio-video models (if processor supports it)
+        audio_encodings = {}
+        if hasattr(_worker_processor, "encode_audio"):
+            audio_encodings = _worker_processor.encode_audio(video_path, actual_frames, _worker_models, _worker_device)
+
         # Prepare metadata
         metadata = {
+            **audio_encodings,
             "original_resolution": (orig_width, orig_height),
             "bucket_resolution": (target_width, target_height),
             "bucket_id": bucket_id,
@@ -1192,7 +1198,7 @@ Examples:
         "--processor",
         type=str,
         required=True,
-        choices=["wan", "wan2.1", "wan2.2", "hunyuan", "hunyuanvideo", "hunyuanvideo-1.5"],
+        choices=["wan", "wan2.1", "wan2.2", "hunyuan", "hunyuanvideo", "hunyuanvideo-1.5", "ltx2"],
     )
     video_parser.add_argument("--model_name", type=str, default=None, help="Model name (uses processor default)")
     video_parser.add_argument("--mode", type=str, default="video", choices=["video", "frames"], help="Processing mode")

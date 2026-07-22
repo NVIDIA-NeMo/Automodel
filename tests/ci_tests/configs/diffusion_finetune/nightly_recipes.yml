@@ -18,6 +18,8 @@ configs:
   - hunyuan_t2v_flow.yaml
   - flux_t2i_flow.yaml
   - qwen_image_t2i_flow.yaml
+  - ltx2_3_t2v_flow.yaml
   - wan2_1_t2v_flow_lora.yaml
   - hunyuan_t2v_flow_lora.yaml
   - flux_t2i_flow_lora.yaml
+  - ltx2_3_t2v_flow_lora.yaml

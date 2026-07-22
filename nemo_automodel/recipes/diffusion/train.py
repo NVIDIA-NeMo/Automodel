@@ -469,7 +469,7 @@ def build_model_and_optimizer(
             - Optional: pipeline_cls, load_full_pipeline
         peft_cfg: PeftConfig instance or None. When provided, only LoRA params
             are trained; base weights are frozen and sharded by FSDP2 for memory.
-        model_type: "flux" | "wan" | "hunyuan". Required when peft_cfg is provided.
+        model_type: "flux" | "flux2" | "wan" | "hunyuan" | "ltx2". Required when peft_cfg is provided.
         active_transformer: For two-transformer pipelines (Wan2.2), select which
             transformer to finetune. ``"transformer"`` (default for Wan2.2 = high-noise)
             or ``"transformer_2"`` (low-noise). The unused transformer is dropped
@@ -889,7 +889,8 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.model_type = self.cfg.get("model.model_type", None)
         if self.peft_cfg is not None and not self.model_type:
             raise ValueError(
-                "model.model_type must be set when peft config is provided. Options: 'flux', 'flux2', 'wan', 'hunyuan'"
+                "model.model_type must be set when peft config is provided. "
+                "Options: 'flux', 'flux2', 'wan', 'hunyuan', 'ltx2'"
             )
 
         lora_status = (

@@ -1,0 +1,92 @@
+seed: 42
+
+wandb:
+  enable: false
+  project: ltx2-video-training
+  mode: online
+  name: ltx2_3_t2v_fm
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  # Diffusers-layout conversion of Lightricks/LTX-2.3 (the official repo is weights-only).
+  pretrained_model_name_or_path: "dg845/LTX-2.3-Diffusers"
+  mode: "finetune"
+  torch_dtype: bfloat16
+  compute_dtype: bfloat16
+
+optim:
+  learning_rate: 2e-5  # LTX-2.3 reference SFT learning rate
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0
+  min_lr: 1e-6
+
+fsdp:
+  dp_size: 8
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  cpu_offload: false
+  activation_checkpointing: true
+  use_hf_tp_plan: false
+
+# Matches the LTX-2.3 reference SFT recipe: plain uniform sigma in
+# [0.001, 0.999], no flow shift, no sigma loss weighting, no CFG dropout.
+# The ltx2 adapter noises the audio latents with the same per-sample sigma
+# and adds the audio flow-matching MSE via the auxiliary-loss hook.
+flow_matching:
+  adapter_type: "ltx2"
+  adapter_kwargs:
+    audio_loss_weight: 1.0
+    fps: 24.0
+  timestep_sampling: "uniform"
+  use_sigma_noise: false
+  sigma_min: 0.001
+  sigma_max: 0.999
+  num_train_timesteps: 1000
+  i2v_prob: 0.0
+  cfg_dropout_prob: 0.0
+  use_loss_weighting: false
+  log_interval: 1000
+  summary_log_interval: 100
+
+step_scheduler:
+  num_epochs: 30
+  local_batch_size: 1
+  global_batch_size: 8
+  ckpt_every_steps: 1000
+  log_every: 10
+  # max_steps: null  # Set to limit training to a specific number of steps
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    # Cache produced by: python -m tools.diffusion.preprocessing_multiprocess video \
+    #   --processor ltx2 --output_format pt --num_frames 121 ...
+    cache_dir: PATH_TO_YOUR_DATA
+    model_type: ltx2
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+    num_workers: 2
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: safetensors
+  save_consolidated: final
+  diffusers_compatible: true
+  restore_from: null
+
+ci:
+  recipe_owner: pthombre
+  time: "01:30:00"
