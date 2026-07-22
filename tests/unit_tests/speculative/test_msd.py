@@ -125,6 +125,7 @@ def test_msd_trainer_masks_supervision_and_backpropagates() -> None:
     assert torch.isfinite(metrics.loss)
     assert target_hidden.grad is not None
     assert torch.isfinite(target_hidden.grad).all()
+    assert lm_head.weight.grad is None
 
 
 class _TinyLanguageBackbone(nn.Module):

@@ -135,7 +135,7 @@ class MSDTrainerModule(nn.Module):
         weight = self._target_lm_head.weight
         if hasattr(weight, "full_tensor"):
             weight = weight.full_tensor()
-        return F.linear(hidden_states, weight)
+        return F.linear(hidden_states, weight.detach())
 
     def forward(
         self,
