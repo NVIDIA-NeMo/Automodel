@@ -4153,7 +4153,7 @@ requires-dist = [
     { name = "pybind11" },
     { name = "pyyaml" },
     { name = "pyyaml", marker = "extra == 'cli'" },
-    { name = "quack-kernels", git = "https://github.com/akoumpa/quack.git?rev=aa9b6256f615aabe369ff2c9d445b9be7ca0c233" },
+    { name = "quack-kernels", git = "https://github.com/akoumpa/quack.git?rev=6dbcedd9caba0e32a5ea87555a8d527ad2ab98e7" },
     { name = "qwen-omni-utils", marker = "extra == 'vlm-media'" },
     { name = "qwen-vl-utils", marker = "extra == 'vlm-media'" },
     { name = "sentencepiece", marker = "extra == 'extra'" },
@@ -6160,11 +6160,11 @@ wheels = [
 [[package]]
 name = "quack-kernels"
 version = "0.6.1"
-source = { git = "https://github.com/akoumpa/quack.git?rev=aa9b6256f615aabe369ff2c9d445b9be7ca0c233#aa9b6256f615aabe369ff2c9d445b9be7ca0c233" }
+source = { git = "https://github.com/akoumpa/quack.git?rev=6dbcedd9caba0e32a5ea87555a8d527ad2ab98e7#6dbcedd9caba0e32a5ea87555a8d527ad2ab98e7" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "einops" },
-    { name = "nvidia-cutlass-dsl" },
+    { name = "nvidia-cutlass-dsl", marker = "sys_platform == 'linux'" },
     { name = "torch-c-dlpack-ext" },
 ]
 
