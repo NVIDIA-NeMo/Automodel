@@ -81,6 +81,7 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
         with open(config_path) as f:
             raw_cfg = yaml.safe_load(f)
         ci_robustness = raw_cfg.get("ci", {}).get("checkpoint_robustness") or {}
+        no_check_resume = ci_robustness.pop("no_check_resume", False)
         for key, value in ci_robustness.items():
             if key in custom:
                 continue
@@ -90,6 +91,8 @@ def _extract_custom_args(argv: list[str]) -> tuple[dict[str, str | bool], list[s
                 custom[key] = True
             elif not isinstance(value, bool):
                 custom[key] = str(value)
+        if not no_check_resume and "check_resume" not in custom:
+            custom["check_resume"] = True
     return custom, remaining
 
 

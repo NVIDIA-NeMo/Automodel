@@ -159,3 +159,4 @@ ci:
     cosine_threshold: 0.999
     hf_cosine_threshold: 0.999
     check_hf_reload: true
+    check_resume: true
