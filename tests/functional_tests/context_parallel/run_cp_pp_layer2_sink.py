@@ -53,17 +53,47 @@ def build_step3p7(device):
 
     layers = 4
     cfg = Step3p7Config(
-        vision_config={"width": 8, "layers": 0, "heads": 2, "num_channels": 3, "image_size": 8, "patch_size": 2,
-                       "mlp_ratio": 2.0, "hidden_act": "gelu", "use_ln_pre": False, "use_ln_post": False,
-                       "use_abs_posemb": False, "use_rope2d": False},
-        text_config={"hidden_size": 16, "intermediate_size": 32, "num_attention_heads": 4, "num_attention_groups": 2,
-                     "num_hidden_layers": layers, "vocab_size": 32, "moe_num_experts": 2, "moe_top_k": 1,
-                     "moe_intermediate_size": 8, "share_expert_dims": 8, "head_dim": 4, "torch_dtype": "bfloat16",
-                     "moe_layers_enum": (), "layer_types": ["full_attention"] * layers, "num_nextn_predict_layers": 1},
+        vision_config={
+            "width": 8,
+            "layers": 0,
+            "heads": 2,
+            "num_channels": 3,
+            "image_size": 8,
+            "patch_size": 2,
+            "mlp_ratio": 2.0,
+            "hidden_act": "gelu",
+            "use_ln_pre": False,
+            "use_ln_post": False,
+            "use_abs_posemb": False,
+            "use_rope2d": False,
+        },
+        text_config={
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_attention_heads": 4,
+            "num_attention_groups": 2,
+            "num_hidden_layers": layers,
+            "vocab_size": 32,
+            "moe_num_experts": 2,
+            "moe_top_k": 1,
+            "moe_intermediate_size": 8,
+            "share_expert_dims": 8,
+            "head_dim": 4,
+            "torch_dtype": "bfloat16",
+            "moe_layers_enum": (),
+            "layer_types": ["full_attention"] * layers,
+            "num_nextn_predict_layers": 1,
+        },
         image_token_id=31,
     )
-    backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", dispatcher="torch",
-                            rope_fusion=False, enable_hf_state_dict_adapter=False)
+    backend = BackendConfig(
+        attn="sdpa",
+        linear="torch",
+        rms_norm="torch",
+        dispatcher="torch",
+        rope_fusion=False,
+        enable_hf_state_dict_adapter=False,
+    )
     model = Step3p7ForConditionalGeneration(cfg, backend=backend)
     model.initialize_weights(dtype=torch.bfloat16)
     return model.to(device).to(torch.bfloat16)
@@ -75,23 +105,63 @@ def build_minimax(device):
     from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
 
     tiny = dict(
-        hidden_size=64, intermediate_size=32, dense_intermediate_size=48, shared_intermediate_size=32,
-        num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=16, rotary_dim=8,
-        partial_rotary_factor=0.5, vocab_size=128, max_position_embeddings=512, rms_norm_eps=1e-6,
-        rope_theta=10000.0, num_local_experts=4, num_experts_per_tok=2, n_shared_experts=1,
-        moe_layer_freq=[0, 1, 1, 1], use_gemma_norm=True, use_qk_norm=True, qk_norm_type="per_head",
-        scoring_func="sigmoid", use_routing_bias=True, routed_scaling_factor=2.0, swiglu_alpha=1.702,
-        swiglu_limit=7.0, num_mtp_modules=0, sparse_attention_config=dict(use_sparse_attention=False),
+        hidden_size=64,
+        intermediate_size=32,
+        dense_intermediate_size=48,
+        shared_intermediate_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        rotary_dim=8,
+        partial_rotary_factor=0.5,
+        vocab_size=128,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+        moe_layer_freq=[0, 1, 1, 1],
+        use_gemma_norm=True,
+        use_qk_norm=True,
+        qk_norm_type="per_head",
+        scoring_func="sigmoid",
+        use_routing_bias=True,
+        routed_scaling_factor=2.0,
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+        num_mtp_modules=0,
+        sparse_attention_config=dict(use_sparse_attention=False),
     )
     vision = dict(
-        hidden_size=32, num_attention_heads=4, num_hidden_layers=2, intermediate_size=64, patch_size=2,
-        num_channels=3, rope_theta=10000.0, hidden_act="gelu", layer_norm_eps=1e-5,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        intermediate_size=64,
+        patch_size=2,
+        num_channels=3,
+        rope_theta=10000.0,
+        hidden_act="gelu",
+        layer_norm_eps=1e-5,
         img_token_compression_config={"spatial_merge_size": 2, "temporal_patch_size": 2},
     )
-    backend = BackendConfig(linear="torch", attn="sdpa", rms_norm="torch", rope_fusion=False,
-                            dispatcher="torch", fake_balanced_gate=False, enable_hf_state_dict_adapter=False)
-    cfg = MiniMaxM3VLConfig(vision_config=dict(vision), text_config={**tiny, "torch_dtype": "bfloat16"},
-                            image_token_index=100, video_token_index=101, projector_hidden_size=tiny["hidden_size"])
+    backend = BackendConfig(
+        linear="torch",
+        attn="sdpa",
+        rms_norm="torch",
+        rope_fusion=False,
+        dispatcher="torch",
+        fake_balanced_gate=False,
+        enable_hf_state_dict_adapter=False,
+    )
+    cfg = MiniMaxM3VLConfig(
+        vision_config=dict(vision),
+        text_config={**tiny, "torch_dtype": "bfloat16"},
+        image_token_index=100,
+        video_token_index=101,
+        projector_hidden_size=tiny["hidden_size"],
+    )
     model = MiniMaxM3SparseForConditionalGeneration(cfg, backend=backend)
     model.initialize_weights(dtype=torch.bfloat16)
     return model.to(device).to(torch.bfloat16)
@@ -105,7 +175,7 @@ def main():
 
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
+    from nemo_automodel.components.distributed import ContextParallelRuntime
     from nemo_automodel.components.distributed.pipelining import AutoPipeline
     from nemo_automodel.components.moe.parallelizer import apply_cp
 
@@ -113,6 +183,7 @@ def main():
     pp_size = 1 if pp1 else 2
     cp_size = world // pp_size
     mesh = init_device_mesh("cuda", (pp_size, 1, cp_size), mesh_dim_names=("pp", "dp", "cp"))
+    cp_runtime = ContextParallelRuntime(device_mesh=mesh)
 
     which = os.environ.get("NEMO_CP_PP_MODEL", "minimax")
     torch.manual_seed(0)
@@ -146,8 +217,16 @@ def main():
     seqlen = 32
     if pp_size > 1:
         pp = AutoPipeline(
-            world_mesh=mesh, moe_mesh=None, pp_axis_name="pp", dp_axis_names=("dp",), cp_axis_name="cp",
-            pp_schedule="1f1b", pp_microbatch_size=1, pp_batch_size=2, device=device, dtype=torch.bfloat16,
+            world_mesh=mesh,
+            moe_mesh=None,
+            pp_axis_name="pp",
+            dp_axis_names=("dp",),
+            cp_axis_name="cp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            device=device,
+            dtype=torch.bfloat16,
             pp_seq_len=seqlen,
         ).build(model, loss_fn=loss_fn, parallelize_fn=cp_only_parallelize)
         model_part0, has_last, has_first = pp.parts[0], pp.info.has_last_stage, pp.info.has_first_stage
@@ -162,7 +241,8 @@ def main():
         dist.broadcast(input_ids, src=0)
         pos = torch.arange(seqlen, device=device).unsqueeze(0).expand(2, -1).contiguous()
         batch = {"input_ids": input_ids.clone(), "labels": input_ids.clone(), "position_ids": pos.clone()}
-        train_ctx, batch, _ = prepare_cp_forward(model_part0, mesh, batch)
+        prepared_cp = cp_runtime.prepare_forward(model_part0, batch)
+        train_ctx, batch = prepared_cp.context, prepared_cp.batch
         labels = batch.pop("labels")
         if pp_size > 1:
             with train_ctx():

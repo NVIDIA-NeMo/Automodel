@@ -177,9 +177,6 @@ def test_teacher_worker_serves_each_wave_until_stop(monkeypatch, recipe_module, 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
 def test_teacher_forward_separate_materializes_logits(monkeypatch, recipe_module, recipe_cls, _):
-    monkeypatch.setattr(
-        recipe_module, "prepare_cp_forward", lambda model, mesh, batch, **kwargs: (nullcontext, batch, None)
-    )
     materialized = []
     monkeypatch.setattr(
         recipe_module,
@@ -189,6 +186,9 @@ def test_teacher_forward_separate_materializes_logits(monkeypatch, recipe_module
     recipe = object.__new__(recipe_cls)
     recipe.kd_mesh_bridge = SimpleNamespace(move_to_device=lambda batch: batch)
     recipe.device_mesh = None
+    recipe.cp_runtime = SimpleNamespace(
+        prepare_forward=lambda model, batch, **kwargs: SimpleNamespace(context=nullcontext, batch=batch)
+    )
     recipe.teacher_model = _Teacher()
     if recipe_module is llm_kd:
         recipe.pp_enabled = False

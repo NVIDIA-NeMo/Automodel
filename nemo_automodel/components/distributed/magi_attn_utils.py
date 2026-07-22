@@ -50,7 +50,7 @@ from typing import Any, Optional
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.distributed.cp_utils import _make_cp_batch_and_ctx, make_cp_batch_for_te
+from nemo_automodel.components.distributed.cp_utils import make_cp_batch_for_te
 
 logger = logging.getLogger(__name__)
 
@@ -718,12 +718,10 @@ def magi_prepare_vlm(
 
 @dataclass
 class MagiState:
-    """Resolved MagiAttention wiring for a recipe, produced by :func:`setup_magi`.
+    """Resolved MagiAttention wiring owned by ``ContextParallelRuntime``.
 
-    A single handle (stored as ``self.magi``) replacing the scattered
-    ``magi_enabled``/``magi_custom``/``magi_cp_group``/``magi_cp_size`` recipe
-    attributes. When MagiAttention is not configured, ``enabled`` is False and the
-    per-step methods are no-ops, so recipes can call them unconditionally.
+    When MagiAttention is not configured, ``enabled`` is false and per-step
+    methods are no-ops.
     """
 
     enabled: bool = False
@@ -795,8 +793,15 @@ class MagiState:
             # cu_seqlens -> the magi attn_func builds the per-document mask.
             # position_ids here are per-document RoPE positions, not stream
             # indices, so no index map is exposed.
-            _, batch, _ = _make_cp_batch_and_ctx(
-                device_mesh, batch, use_te=True, padding_token_id=pad_id, num_chunks=num_chunks
+            cp_mesh = None
+            if device_mesh is not None and "cp" in (getattr(device_mesh, "mesh_dim_names", None) or ()):
+                cp_mesh = device_mesh["cp"]
+            batch = make_cp_batch_for_te(
+                cp_mesh,
+                batch,
+                qkv_format="thd",
+                padding_token_id=pad_id,
+                num_chunks=num_chunks,
             )
         return nullcontext, batch, local_indices
 
@@ -865,16 +870,38 @@ class MagiState:
         return (batch, local_indices) if return_local_indices else batch
 
 
-def setup_magi(cfg, device_mesh, *, domain: str = "llm", label: str = "") -> MagiState:
-    """Resolve MagiAttention from config: register the backend and CP group.
+def _config_value(config: object, key: str, default: object = None) -> object:
+    """Read one field from an attribute- or mapping-style config object."""
+    if config is None:
+        return default
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    return getattr(config, key, default)
+
+
+def setup_magi(model_config: object, device_mesh, *, domain: str = "llm", label: str = "") -> MagiState:
+    """Resolve MagiAttention from model config and bind its runtime resources.
 
     Enabled when the model is configured with ``attn_implementation="magi"`` (HF) or
     ``backend.attn="magi"`` (custom models). Returns a :class:`MagiState`
     (``enabled=False`` when magi is not configured). ``label`` is an optional suffix
     for the log line (e.g. ``"VLM language backbone"``).
+
+    Args:
+        model_config: Model construction config containing either ``backend.attn``
+            or ``attn_implementation``.
+        device_mesh: Full runtime device mesh containing an optional ``cp`` axis.
+        domain: Recipe domain, either ``"llm"`` or ``"vlm"``.
+        label: Optional diagnostic label.
+
+    Returns:
+        Resolved Magi runtime state. The state is disabled when the configured
+        attention backend is not Magi.
     """
-    custom = str(cfg.get("model.backend.attn", "")) == "magi"
-    enabled = custom or str(cfg.get("model.attn_implementation", "")) == "magi"
+    backend_config = _config_value(model_config, "backend")
+    custom = str(_config_value(backend_config, "attn", "")) == "magi"
+    enabled = custom or str(_config_value(model_config, "attn_implementation", "")) == "magi"
     if not enabled:
         return MagiState(domain=domain)
 

@@ -21,7 +21,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.distributed import cp_utils as cp_utils_mod
 from nemo_automodel.components.loss import kd_loss as kd_loss_module
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.recipes.vlm import kd as vlm_kd
@@ -43,6 +42,20 @@ class _DeviceMesh:
 
     def __getitem__(self, key: str) -> _MeshDim:
         return self._dims[key]
+
+
+class _NoOpCPRuntime:
+    def __init__(self, device_mesh=None):
+        self.device_mesh = device_mesh
+        self.calls = []
+
+    def prepare_forward(self, model, batch, **kwargs):
+        del kwargs
+        cp_active = self.device_mesh is not None and self.device_mesh["cp"].size() > 1
+        if cp_active:
+            model.prepare_model_inputs_for_cp(batch)
+        self.calls.append(dict(batch))
+        return SimpleNamespace(context=nullcontext, batch=batch)
 
 
 class _StudentVLM(nn.Module):
@@ -89,6 +102,7 @@ def _make_recipe(*, student: nn.Module, teacher: nn.Module, kd_loss_fn: KDLoss, 
     recipe = object.__new__(vlm_kd.KnowledgeDistillationRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.device_mesh = device_mesh
+    recipe.cp_runtime = _NoOpCPRuntime(device_mesh)
     recipe.pp_enabled = False
     recipe.model_parts = [student]
     recipe.teacher_model = teacher
@@ -160,14 +174,6 @@ def test_vlm_kd_uses_tp_kd_loss_path(monkeypatch, trivial_pg):
 
 
 def test_vlm_kd_cp_prepare_shards_input_ids_and_teacher_embeds_them(monkeypatch):
-    make_cp_calls = []
-
-    def fake_make_cp_batch_and_ctx(device_mesh, batch, *args, **kwargs):
-        make_cp_calls.append((device_mesh, dict(batch)))
-        return nullcontext, batch, None
-
-    monkeypatch.setattr(cp_utils_mod, "_make_cp_batch_and_ctx", fake_make_cp_batch_and_ctx)
-
     student = _StudentVLM(hidden_size=8)
     teacher = _TeacherVLM(hidden_size=8)
     recipe = _make_recipe(
@@ -190,8 +196,8 @@ def test_vlm_kd_cp_prepare_shards_input_ids_and_teacher_embeds_them(monkeypatch)
     # Sunk student: the sharder-only hook consumes nothing, so input_ids (not
     # inputs_embeds) flows to CP; the teacher embeds those input_ids itself.
     assert len(student.pre_embed_calls) == 1
-    assert len(make_cp_calls) == 1
-    cp_batch = make_cp_calls[0][1]
+    assert len(recipe.cp_runtime.calls) == 1
+    cp_batch = recipe.cp_runtime.calls[0]
     assert "input_ids" in cp_batch
     assert "inputs_embeds" not in cp_batch
     assert "labels" in cp_batch

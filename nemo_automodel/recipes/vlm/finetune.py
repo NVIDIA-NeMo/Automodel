@@ -47,10 +47,9 @@ from nemo_automodel._transformers import (
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
+from nemo_automodel.components.distributed import ContextParallelRuntime
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -385,10 +384,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
 class FinetuneRecipeForVLM(BaseRecipe):
     """Recipe for fine-tuning a VLM model."""
 
-    # MagiAttention is disabled until setup() resolves it from config; this
-    # disabled default keeps the train step working if setup() is skipped (e.g.
-    # unit tests that exercise the step directly). It is read-only.
-    magi = MagiState()
+    cp_runtime = ContextParallelRuntime(domain="vlm")
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -442,10 +438,12 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not self._should_setup_training_components():
             return
 
-        # MagiAttention (FFA) backend for the language backbone; the vision tower
-        # stays on SDPA. Enabled via model.attn_implementation="magi" (HF VLMs) or
-        # model.backend.attn="magi" (custom VLMs, e.g. qwen3_vl_moe).
-        self.magi = setup_magi(self.cfg, self.device_mesh, domain="vlm", label="VLM language backbone")
+        self.cp_runtime = ContextParallelRuntime.build(
+            self.cfg.model,
+            device_mesh=self.device_mesh,
+            domain="vlm",
+            label="VLM language backbone",
+        )
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
@@ -806,25 +804,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
             for k in VLM_INPUT_KEYS:
                 if k != "input_ids":
                     batch.pop(k, None)
-        # THD packed VLM inputs (qkv_format='thd' from the packing collator) use TE
-        # sequence metadata even without context parallelism (#3052); CP over THD for
-        # mRoPE VLMs is not implemented.
-        _use_te_vlm = batch.get("qkv_format", None) == "thd"
-        if _use_te_vlm and self.mesh_context.cp_size > 1:
-            raise NotImplementedError(
-                "THD packing (packing_format='thd') for VLM currently supports cp_size=1 only; "
-                "context-parallel THD for mRoPE VLMs is not yet implemented."
-            )
         _padding_id = getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
-        train_ctx, batch, _ = prepare_cp_forward(
+        prepared_cp = self.cp_runtime.prepare_forward(
             self.model_parts[0],
-            self.device_mesh,
             batch,
-            magi=self.magi,
-            use_te=_use_te_vlm,
             padding_token_id=_padding_id,
-            invoke_pre_embed=True,
         )
+        train_ctx, batch = prepared_cp.context, prepared_cp.batch
         labels = batch.pop("labels")
 
         if self.pp_enabled:
@@ -1111,12 +1097,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 }
                 num_label_tokens = (batch["labels"] != -100).sum().item()
 
-                train_ctx, batch, _ = prepare_cp_forward(
+                prepared_cp = self.cp_runtime.prepare_forward(
                     self.model_parts[0],
-                    self.device_mesh,
                     batch,
-                    invoke_pre_embed=not self.pp_enabled,
                 )
+                train_ctx, batch = prepared_cp.context, prepared_cp.batch
                 labels = batch.pop("labels")
                 with train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)

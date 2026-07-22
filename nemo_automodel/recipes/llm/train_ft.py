@@ -51,10 +51,9 @@ from nemo_automodel._transformers.infrastructure import (
 from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.distributed import ContextParallelRuntime
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
@@ -117,41 +116,12 @@ def _get_model_name(cfg_model):
         return None
 
 
-def _uses_te_dot_product_attention(model_or_cfg):
-    """Check whether the model uses TE DotProductAttention.
-
-    Accepts either an instantiated nn.Module (preferred — inspects actual modules)
-    or a config object (fallback — checks backend.attn string).
-    """
-    if isinstance(model_or_cfg, torch.nn.Module):
-        try:
-            from transformer_engine.pytorch.attention import DotProductAttention
-        except ImportError:
-            return False
-        return any(isinstance(m, DotProductAttention) for m in model_or_cfg.modules())
-    # Config fallback for call sites before model is built
-    return (
-        hasattr(model_or_cfg, "backend") and hasattr(model_or_cfg.backend, "attn") and model_or_cfg.backend.attn == "te"
-    )
-
-
-def _uses_thd_collater(cfg_dataloader):
-    """Return True if the dataloader's collate_fn is ``packed_sequence_thd_collater``.
-
-    ``collate_fn`` ends in ``_fn``, so ConfigNode resolves the YAML dotted-path string to
-    the actual callable at load time — the value here is always the function, never a string.
-    """
-    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
-
-    return getattr(cfg_dataloader, "collate_fn", None) is packed_sequence_thd_collater
-
-
 def _should_pack_validation(cfg: RecipeConfig, model: nn.Module) -> bool:
     """Return whether validation must use the configured training packer."""
     if cfg.get("packed_sequence.packed_sequence_size", 0) <= 0:
         return False
 
-    validation_uses_thd = _uses_thd_collater(cfg.get("validation_dataloader", None))
+    validation_uses_thd = any(loader.emits_thd_batches for loader in cfg.validation_dataloaders.values())
     if validation_uses_thd:
         return True
 
@@ -159,11 +129,10 @@ def _should_pack_validation(cfg: RecipeConfig, model: nn.Module) -> bool:
         callable(getattr(model, "should_pack_validation_with_training", None))
         and model.should_pack_validation_with_training()
     )
-    magi_backend = (
-        str(cfg.get("model.backend.attn", "")) == "magi" or str(cfg.get("model.attn_implementation", "")) == "magi"
-    )
-    backend_requires_packing = _uses_te_dot_product_attention(cfg.model) or magi_backend or model_requires_packing
-    return backend_requires_packing and _uses_thd_collater(cfg.get("dataloader", None))
+    from nemo_automodel.components.models.common.packing import get_attn_implementation
+
+    backend_requires_packing = get_attn_implementation(cfg.model) in {"te", "magi"} or model_requires_packing
+    return backend_requires_packing and cfg.dataloader.emits_thd_batches
 
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
@@ -430,10 +399,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     This class orchestrates training, from setup to main training loop.
     """
 
-    # MagiAttention is disabled until setup() resolves it from config; this
-    # disabled default keeps _forward_backward_step working if setup() is skipped
-    # (e.g. unit tests that exercise the step directly). It is read-only.
-    magi = MagiState()
+    cp_runtime = ContextParallelRuntime()
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -492,9 +458,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self._should_setup_training_components():
             return
 
-        # MagiAttention (FFA / context-parallel) backend, enabled via
-        # model.attn_implementation="magi" (HF) or model.backend.attn="magi" (custom).
-        self.magi = setup_magi(self.cfg, self.device_mesh)
+        self.cp_runtime = ContextParallelRuntime.build(self.cfg.model, device_mesh=self.device_mesh)
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
@@ -519,7 +483,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build loss_fn (will be set on pipeline_config if PP enabled)
         self.loss_fn = self.cfg.loss_fn.build()
-        if self.magi.hf_dispatch and isinstance(self.loss_fn, FusedLinearCrossEntropy):  # pragma: no cover
+        if self.cp_runtime.requires_full_logits and isinstance(
+            self.loss_fn, FusedLinearCrossEntropy
+        ):  # pragma: no cover
             raise ValueError(
                 "The magi HF backend needs full logits and is incompatible with "
                 "FusedLinearCrossEntropy; use a logits-based loss (e.g. MaskedCrossEntropy)."
@@ -534,12 +500,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.mesh_context.pp_size}"
             )
 
-            # THD override logic
-            if (
-                self.mesh_context.cp_size > 1
-                and _uses_te_dot_product_attention(self.cfg.model)
-                and _uses_thd_collater(self.cfg.get("dataloader", None))
-            ):
+            if self.mesh_context.cp_size > 1 and self.cfg.dataloader.emits_thd_batches:
                 pp_microbatch_size = 1
                 pp_batch_size = pp_batch_size // self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
                 logging.info(
@@ -972,24 +933,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
-        _thd_collater = _uses_thd_collater(self.cfg.get("dataloader", None))
-        # Gate THD/cu_seqlens processing on the dataset being THD-packed, not on TE
-        # attention being present on this rank: both TE attention and mamba need
-        # cu_seqlens, and gating on attention would drop PP stages with no attention
-        # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream.
-        _use_te_value = _thd_collater
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
-        # Single CP dispatch: magi / model-owned (ContextParallelismSharder) / TE-THD / generic
-        # torch context_parallel.
-        train_ctx, batch, _ = prepare_cp_forward(
+        prepared_cp = self.cp_runtime.prepare_forward(
             self.model_parts[0] if hasattr(self, "model_parts") else None,
-            self.device_mesh,
             batch,
-            magi=self.magi,
-            use_te=_use_te_value,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_num_chunks_value,
         )
+        train_ctx, batch = prepared_cp.context, prepared_cp.batch
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 

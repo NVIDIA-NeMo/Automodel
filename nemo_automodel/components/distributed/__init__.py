@@ -19,12 +19,17 @@ from nemo_automodel.components.distributed.config import (
     MegatronFSDPConfig,
     MoEParallelizerConfig,
 )
+from nemo_automodel.components.distributed.cp_runtime import ContextParallelRuntime, CPForward
+from nemo_automodel.components.distributed.cp_sharder import CPTokenLayout
 from nemo_automodel.components.distributed.init_utils import DistInfo, initialize_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 
 __all__ = [
     "DDPConfig",
+    "CPForward",
+    "CPTokenLayout",
+    "ContextParallelRuntime",
     "DistributedSetup",
     "DistInfo",
     "FSDP2Config",

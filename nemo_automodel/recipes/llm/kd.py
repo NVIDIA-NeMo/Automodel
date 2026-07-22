@@ -51,7 +51,6 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DistributedSetup
-from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
@@ -78,8 +77,6 @@ from nemo_automodel.recipes.kd_utils import (
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _get_num_thd_chunks,
-    _uses_te_dot_product_attention,
-    _uses_thd_collater,
     build_model,
 )
 
@@ -493,12 +490,11 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         """
         batch = self.kd_mesh_bridge.move_to_device(batch)
         sequence_length = batch["labels"].shape[1]
-        train_ctx, batch, _ = prepare_cp_forward(
+        prepared_cp = self.cp_runtime.prepare_forward(
             self.teacher_model,
-            self.device_mesh,
             batch,
-            use_te=False,
         )
+        train_ctx, batch = prepared_cp.context, prepared_cp.batch
         labels = batch.pop("labels")
         with train_ctx(), torch.no_grad():
             if self.pp_enabled:
@@ -592,20 +588,14 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             self._get_separate_teacher_logits(batch) if getattr(self, "separate_meshes", False) else None
         )
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
-        if separate_teacher_logits is not None:
-            batch["teacher_logits"] = separate_teacher_logits
-        labels = batch.pop("labels")
-        # KD has not wired model-owned CP; skip the pre-embed hook explicitly.
-        # Separate-mesh teacher logits ride the batch through CP sharding.
-        train_ctx, batch, _ = prepare_cp_forward(
+        prepared_cp = self.cp_runtime.prepare_forward(
             self.model_parts[0],
-            self.device_mesh,
             batch,
-            loss_mask=labels,
-            invoke_pre_embed=False,
-            extra_seq_buffers={"teacher_logits": 1} if separate_teacher_logits is not None else None,
         )
-        separate_teacher_logits = batch.pop("teacher_logits", None)
+        train_ctx, batch = prepared_cp.context, prepared_cp.batch
+        labels = batch.pop("labels")
+        if separate_teacher_logits is not None:
+            separate_teacher_logits = prepared_cp.tokens.shard(separate_teacher_logits, seq_dim=1, fill=0)
 
         model = self.model_parts[0]
         sync_ctx = (
@@ -709,20 +699,15 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             )
             for k, v in batch.items()
         }
-        if separate_teacher_logits is not None:
-            batch["teacher_logits"] = separate_teacher_logits
-        # KD has not wired model-owned CP; skip the pre-embed hook explicitly.
-        train_ctx, batch, _ = prepare_cp_forward(
+        prepared_cp = self.cp_runtime.prepare_forward(
             self.model_parts[0],
-            self.device_mesh,
             batch,
-            use_te=_uses_te_dot_product_attention(self.cfg.model) and _uses_thd_collater(self.cfg.dataloader),
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_get_num_thd_chunks(True, self.cfg),
-            invoke_pre_embed=False,
-            extra_seq_buffers={"teacher_logits": 1} if separate_teacher_logits is not None else None,
         )
-        separate_teacher_logits = batch.pop("teacher_logits", None)
+        train_ctx, batch = prepared_cp.context, prepared_cp.batch
+        if separate_teacher_logits is not None:
+            separate_teacher_logits = prepared_cp.tokens.shard(separate_teacher_logits, seq_dim=1, fill=0)
         labels = batch.pop("labels")
         input_ids = batch.pop("input_ids")
         batch_filtered = {k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)}

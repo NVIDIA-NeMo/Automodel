@@ -26,6 +26,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from nemo_automodel.components.distributed import cp_runtime
 from nemo_automodel.components.distributed import cp_sharder as cm
 from nemo_automodel.components.distributed import cp_utils as cu
 
@@ -231,9 +232,9 @@ def test_shard_batch_contiguous_raises_when_not_divisible(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _make_cp_batch_and_ctx use_te routing
+# THD runtime routing
 # ---------------------------------------------------------------------------
-def test_make_cp_batch_and_ctx_use_te_routes_to_te_builder():
+def test_runtime_routes_thd_batch_to_te_builder():
     sentinel = {"te": True}
 
     class _DM(dict):
@@ -241,8 +242,14 @@ def test_make_cp_batch_and_ctx_use_te_routes_to_te_builder():
 
     dm = _DM(cp=_FakeMesh(size=2))
     # The TE sharder requests the partition indices alongside the batch.
-    with mock.patch.object(cu, "make_cp_batch_for_te", return_value=(sentinel, None)) as te:
-        ctx, out, _ = cu._make_cp_batch_and_ctx(dm, {"input_ids": torch.zeros(1, 4, dtype=torch.long)}, use_te=True)
+    batch = {
+        "input_ids": torch.zeros(1, 4, dtype=torch.long),
+        "qkv_format": "thd",
+        "seq_lens": torch.tensor([[4]]),
+        "seq_lens_padded": torch.tensor([[4]]),
+    }
+    with mock.patch.object(cp_runtime, "make_cp_batch_for_te", return_value=(sentinel, None)) as te:
+        prepared = cp_runtime.ContextParallelRuntime(device_mesh=dm).prepare_forward(None, batch)
     te.assert_called_once()
     assert te.call_args.kwargs["return_local_indices"] is True
-    assert out is sentinel
+    assert prepared.batch is sentinel

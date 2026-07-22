@@ -18,13 +18,13 @@ These reproduce the ``_forward_backward_step``-style and
 ``_run_validation_epoch``-style batch handling without instantiating the
 full recipe — exercising the code shape that gets shipped:
 
-  - Invoke the sharder-only ``prepare_model_inputs_for_cp`` directly through
-    ``prepare_cp_forward`` (a plain method call; nothing consumed, so input_ids
+  - Invoke the sharder-only ``prepare_model_inputs_for_cp`` through the CP
+    runtime (a plain method call; nothing consumed, so input_ids
     and multimodal inputs stay in the batch for the model's own forward)
   - PP gating: the sharder-only hook is invoked on every stage (all PP-capable
     VLMs are sunk — they embed + shard in their own forward); media is dropped on
     non-first stages so those stage forwards see only text inputs
-  - Validation: count labels after _make_cp_batch_and_ctx and inside train_ctx
+  - Validation: count labels after CP preparation and inside the train context
   - Validation: position_ids ``.to(self.dist_env.device)`` (not model.device)
 """
 
@@ -38,8 +38,24 @@ import torch
 
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.distributed import cp_utils as cp_utils_mod
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
+
+
+class _NoOpCPRuntime:
+    """Recipe-wiring test double that invokes the model hook without transport."""
+
+    def __init__(self, seen_batch=None):
+        self.seen_batch = seen_batch
+
+    def prepare_forward(self, model, batch, *, num_chunks=1, **kwargs):
+        del kwargs
+        hook = getattr(model, "prepare_model_inputs_for_cp", None)
+        if callable(hook):
+            prepared = hook(batch, num_chunks=num_chunks)
+            batch.update({key: value for key, value in prepared.items() if key != "cp_sharder"})
+        if self.seen_batch is not None:
+            self.seen_batch.update(batch)
+        return SimpleNamespace(context=nullcontext, batch=batch)
 
 
 def _make_recipe_with_pp_stages(*, pp_enabled=True, has_first_stage=True, pp_microbatch_size=2):
@@ -118,6 +134,8 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     recipe = object.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.device_mesh = _FakeCPMesh()
+    seen_cp_batch = {}
+    recipe.cp_runtime = _NoOpCPRuntime(seen_cp_batch)
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.model_parts = [model]
     recipe.pp_enabled = True
@@ -136,13 +154,6 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
         "pixel_values": torch.zeros(2, 3, 4, 4),
         "labels": labels,
     }
-    seen_cp_batch = {}
-
-    def _make_cp_batch_and_ctx(device_mesh, cp_batch, *args, **kwargs):
-        seen_cp_batch.update(cp_batch)
-        return nullcontext, cp_batch, None
-
-    monkeypatch.setattr(cp_utils_mod, "_make_cp_batch_and_ctx", _make_cp_batch_and_ctx)
     monkeypatch.setattr(vlm_finetune, "stage_vlm_media_for_pp", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(FinetuneRecipeForVLM, "_maybe_set_pp_first_stage_embed_input_meta", lambda self, mi: None)
 
@@ -191,6 +202,8 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     recipe = object.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.device_mesh = _FakeCPMesh()
+    seen_cp_batch = {}
+    recipe.cp_runtime = _NoOpCPRuntime(seen_cp_batch)
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.model_parts = [model]
     recipe.pp_enabled = True
@@ -209,13 +222,6 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
         "pixel_values": torch.zeros(2, 3, 4, 4),
         "labels": labels,
     }
-    seen_cp_batch = {}
-
-    def _make_cp_batch_and_ctx(device_mesh, cp_batch, *args, **kwargs):
-        seen_cp_batch.update(cp_batch)
-        return nullcontext, cp_batch, None
-
-    monkeypatch.setattr(cp_utils_mod, "_make_cp_batch_and_ctx", _make_cp_batch_and_ctx)
     monkeypatch.setattr(vlm_finetune, "stage_vlm_media_for_pp", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(FinetuneRecipeForVLM, "_maybe_set_pp_first_stage_embed_input_meta", lambda self, mi: None)
 
@@ -481,7 +487,6 @@ def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
 
     # No-op replacements for the heavy collaborators.
     monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
-    monkeypatch.setattr(cp_utils_mod, "_make_cp_batch_and_ctx", lambda mesh, batch, *a, **k: (nullcontext, batch, None))
     monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
     monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
 
@@ -534,7 +539,6 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
     from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
     monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
-    monkeypatch.setattr(cp_utils_mod, "_make_cp_batch_and_ctx", lambda mesh, batch, *a, **k: (nullcontext, batch, None))
     monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
     monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
 
@@ -558,6 +562,7 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
     recipe.model_parts = [_Model()]
     recipe.loss_fn = object()
     recipe.device_mesh = _DM(cp=SimpleNamespace(size=lambda: 2))
+    recipe.cp_runtime = _NoOpCPRuntime()
     recipe.pp_enabled = False
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)

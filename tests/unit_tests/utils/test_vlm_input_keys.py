@@ -79,7 +79,7 @@ def test_vlm_input_keys_covers_phi4mm_audio_keys():
 
 def test_vlm_input_keys_does_not_include_labels_or_position_ids():
     """labels and position_ids are NOT multimodal inputs — they are CP buffers
-    handled by ``_make_cp_batch_and_ctx`` and must not be popped by the recipe."""
+    handled by ``ContextParallelRuntime.prepare_forward`` and must not be popped by the recipe."""
     assert "labels" not in VLM_INPUT_KEYS
     assert "position_ids" not in VLM_INPUT_KEYS
     assert "attention_mask" not in VLM_INPUT_KEYS

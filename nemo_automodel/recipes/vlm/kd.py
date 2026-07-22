@@ -52,7 +52,6 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DistributedSetup
-from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -264,7 +263,8 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         model = self.teacher_model
         # Single CP dispatch: invokes the teacher's pre-embed hook (when CP is
         # active and the model has one) and shards the batch.
-        train_ctx, batch, _ = prepare_cp_forward(model, self.device_mesh, batch)
+        prepared_cp = self.cp_runtime.prepare_forward(model, batch)
+        train_ctx, batch = prepared_cp.context, prepared_cp.batch
         batch.pop("labels")
         with train_ctx(), torch.no_grad():
             teacher_batch = filter_forward_kwargs(model, batch)
@@ -324,18 +324,13 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             )
             for k, v in batch.items()
         }
-        if separate_teacher_logits is not None:
-            batch["teacher_logits"] = separate_teacher_logits
-
-        # Separate-mesh teacher logits ride the batch through CP sharding.
-        train_ctx, batch, _ = prepare_cp_forward(
+        prepared_cp = self.cp_runtime.prepare_forward(
             self.model_parts[0],
-            self.device_mesh,
             batch,
-            invoke_pre_embed=not self.pp_enabled,
-            extra_seq_buffers={"teacher_logits": 1} if separate_teacher_logits is not None else None,
         )
-        separate_teacher_logits = batch.pop("teacher_logits", None)
+        train_ctx, batch = prepared_cp.context, prepared_cp.batch
+        if separate_teacher_logits is not None:
+            separate_teacher_logits = prepared_cp.tokens.shard(separate_teacher_logits, seq_dim=1, fill=0)
         labels = batch.pop("labels")
 
         model = self.model_parts[0]

@@ -135,7 +135,7 @@ def main():
     from torch.distributed.device_mesh import init_device_mesh
 
     from nemo_automodel.components.datasets.vlm.pp_media import prepare_vlm_media_for_pp, stage_vlm_media_for_pp
-    from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
+    from nemo_automodel.components.distributed import ContextParallelRuntime
     from nemo_automodel.components.distributed.pipelining import AutoPipeline
     from nemo_automodel.components.moe.parallelizer import apply_cp
 
@@ -143,6 +143,7 @@ def main():
     pp_size = 1 if pp1 else 2
     cp_size = world // pp_size
     mesh = init_device_mesh("cuda", (pp_size, 1, cp_size), mesh_dim_names=("pp", "dp", "cp"))
+    cp_runtime = ContextParallelRuntime(device_mesh=mesh, domain="vlm")
 
     torch.manual_seed(0)
     model = build_minimax(device)
@@ -191,7 +192,8 @@ def main():
             batch = prepare_vlm_media_for_pp(batch, batch_size=2, n_microbatches=2)
         else:
             batch.update({"pixel_values": pv, "image_grid_thw": grid})
-        train_ctx, batch, _ = prepare_cp_forward(model_part0, mesh, batch)
+        prepared_cp = cp_runtime.prepare_forward(model_part0, batch)
+        train_ctx, batch = prepared_cp.context, prepared_cp.batch
         labels = batch.pop("labels")
         if pp_size > 1:
             with train_ctx(), stage_vlm_media_for_pp(pp, pp.parts, batch):

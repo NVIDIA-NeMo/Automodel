@@ -222,7 +222,7 @@ def build_dsv4_cp_causal_padding_mask(
 # ---------------------------------------------------------------------------
 # Model-owned CP batch sharding (Miles-style contiguous query shard).
 #
-# The CP dispatch (``cp_utils.prepare_cp_forward``) delegates manual all-gather CP to the model
+# The CP runtime delegates manual all-gather CP to the model
 # via the ``ContextParallelismSharder`` returned by ``prepare_model_inputs_for_cp``. DSV4's
 # sharder pads + contiguously shards the sequence per CP rank (via the shared
 # contiguous implementation in ``components/distributed/cp_sharder.py``) and
