@@ -120,9 +120,16 @@ class CheckpointingConfig:
     diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
     # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
     best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
+    consolidation_timeout_minutes: int = 30  # Timeout for inline consolidated-export synchronization.
+    # Retain this many recent checkpoint directories. Preserve checkpoints targeted by checkpoint-root pointers,
+    # such as `LATEST` and `LOWEST_VAL`, in addition to the recent window. `None` keeps all checkpoints.
+    max_recent_checkpoints: int | None = None
 
     def __post_init__(self):
         """Resolve the cache dir, enforce PEFT constraints, and coerce the save format/mode."""
+        if self.consolidation_timeout_minutes <= 0:
+            raise ValueError("checkpoint.consolidation_timeout_minutes must be greater than 0")
+
         if self.model_cache_dir is None:
             self.model_cache_dir = hf_constants.HF_HUB_CACHE
 
@@ -137,6 +144,19 @@ class CheckpointingConfig:
             )
             self.model_save_format = "safetensors"
             self.save_consolidated = SaveConsolidatedMode.FINAL
+
+        if self.max_recent_checkpoints is not None:
+            if (
+                isinstance(self.max_recent_checkpoints, bool)
+                or not isinstance(self.max_recent_checkpoints, int)
+                or self.max_recent_checkpoints < 1
+            ):
+                raise ValueError("checkpoint.max_recent_checkpoints must be unset or a positive integer")
+            if str(self.checkpoint_dir).startswith("msc://"):
+                raise ValueError(
+                    "checkpoint.max_recent_checkpoints is only supported for local checkpoint directories; "
+                    "unset it when checkpoint.checkpoint_dir uses msc:// storage"
+                )
 
         # Convert a raw string such as "safetensors" into the right Enum.
         formats = [v.value for v in SerializationFormat]
@@ -187,6 +207,7 @@ class CheckpointingConfig:
         pp_rank: int,
         moe_mesh: DeviceMesh | None = None,
         process_group: ProcessGroup | None = None,
+        pp_group: ProcessGroup | None = None,
     ) -> Checkpointer:
         """Build the :class:`Checkpointer` engine for this config.
 
@@ -200,6 +221,9 @@ class CheckpointingConfig:
             pp_rank: Pipeline-parallel rank.
             moe_mesh: Optional device mesh for MoE checkpointing.
             process_group: Process group used for distributed checkpoint collectives.
+            pp_group: Optional pipeline-parallel process group. Threaded to the
+                PEFT save path so adapter weights are gathered across PP stages
+                (required for complete adapters when ``pp_size > 1``).
 
         Returns:
             Configured :class:`Checkpointer`.
@@ -213,6 +237,7 @@ class CheckpointingConfig:
             pp_rank=pp_rank,
             moe_mesh=moe_mesh,
             process_group=process_group,
+            pp_group=pp_group,
         )
 
 

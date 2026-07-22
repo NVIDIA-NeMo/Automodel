@@ -45,6 +45,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     save_config,
 )
+from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -57,12 +58,7 @@ from nemo_automodel.components.speculative.dflash.registry import resolve_dflash
 from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
-from nemo_automodel.recipes.base_recipe import (
-    BaseRecipe,
-    _find_latest_checkpoint,
-    _is_checkpoint_model_config_compatible,
-    _resolve_restore_from_to_ckpt_dir,
-)
+from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_compile,
     apply_draft_fp8,
@@ -554,6 +550,7 @@ class TrainDFlashRecipe(BaseRecipe):
         self.checkpointer = Checkpointer(
             config=self.checkpoint_config, dp_rank=dp_rank, tp_rank=0, pp_rank=0, moe_mesh=None
         )
+        self._log_checkpoint_retention_policy(self.checkpoint_config)
 
     def _module(self):
         return (
@@ -577,29 +574,14 @@ class TrainDFlashRecipe(BaseRecipe):
             return
         self.checkpointer.async_wait()
 
-        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
-        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
-
         ckpt_root = self.checkpoint_config.checkpoint_dir
         path = os.path.join(str(ckpt_root), f"epoch_{epoch}_step_{step}")
         is_dist_initialized = dist.is_initialized()
         is_rank_0 = (not is_dist_initialized) or dist.get_rank() == 0
-        best_val_metric = (
-            val_loss.get(next(iter(val_loss.keys())) if len(val_loss) == 1 else best_metric_key) if val_loss else None
-        )
+        best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
+        best_val_metric = val_loss.get(best_metric_name) if val_loss else None
 
-        if prev_pending is not None:
-            if is_rank_0:
-                self._update_latest_symlink(prev_pending)
-            setattr(self, "_last_pending_checkpoint_dir", None)
-            if is_dist_initialized:
-                dist.barrier()
-        if prev_best_pending is not None:
-            if is_rank_0 and prev_best_pending.get("val") is not None:
-                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
-            setattr(self, "_last_pending_best_checkpoint_info", None)
-            if is_dist_initialized:
-                dist.barrier()
+        self._complete_pending_checkpoint()
 
         if is_rank_0:
             if os.path.exists(path):
@@ -629,7 +611,8 @@ class TrainDFlashRecipe(BaseRecipe):
         # (and, being seeded per dp_rank, hold identical rng state), so every peer would
         # torch.save the same rng_dp_rank_N.pt and race on a shared FS; let only the
         # first cp peer write it.
-        if self.cp_mesh is None or self.cp_mesh.get_local_rank() == 0:
+        cp_mesh = getattr(self, "cp_mesh", None)
+        if cp_mesh is None or cp_mesh.get_local_rank() == 0:
             self.checkpointer.save_on_dp_ranks(self.rng, "rng", path)
 
         if is_rank_0:
@@ -643,13 +626,21 @@ class TrainDFlashRecipe(BaseRecipe):
 
         if getattr(self.checkpointer.config, "is_async", False):
             setattr(self, "_last_pending_checkpoint_dir", path)
-            if best_val_metric is not None:
-                setattr(self, "_last_pending_best_checkpoint_info", {"path": path, "val": float(best_val_metric)})
+            setattr(
+                self,
+                "_last_pending_best_checkpoint_info",
+                {
+                    "path": path,
+                    "val": float(best_val_metric) if best_val_metric is not None else None,
+                    "metric_key": best_metric_name,
+                },
+            )
         else:
             if is_rank_0:
                 self._update_latest_symlink(path)
                 if best_val_metric is not None:
-                    self._update_best_symlink(path, float(best_val_metric))
+                    self._update_best_symlink(path, float(best_val_metric), best_metric_name)
+                self._prune_old_checkpoints()
             if is_dist_initialized:
                 dist.barrier()
 
@@ -675,7 +666,7 @@ class TrainDFlashRecipe(BaseRecipe):
         ckpt_root = self.checkpoint_config.checkpoint_dir
 
         if restore_from:
-            ckpt_dir = _resolve_restore_from_to_ckpt_dir(ckpt_root, restore_from)
+            ckpt_dir = resolve_restore_from_to_checkpoint_dir(ckpt_root, restore_from)
             if ckpt_dir is None:
                 if is_rank_0:
                     logger.warning("restore_from='LATEST' but no checkpoint found in %s", ckpt_root)
@@ -683,7 +674,7 @@ class TrainDFlashRecipe(BaseRecipe):
             if not os.path.isdir(ckpt_dir):
                 raise FileNotFoundError(f"Checkpoint directory does not exist: {ckpt_dir}")
         else:
-            auto = _find_latest_checkpoint(ckpt_root)
+            auto = find_latest_checkpoint(ckpt_root)
             if auto is None:
                 return
             ckpt_dir = str(auto)
@@ -990,7 +981,7 @@ class TrainDFlashRecipe(BaseRecipe):
                     self._log_saved_checkpoint("epoch", epoch_idx + 1, self.runtime.global_step)
 
             self._maybe_save_final_checkpoint(self.num_epochs)
-            self._finalize_pending_checkpoint()
+            self._finalize_and_close_checkpointer()
         finally:
             if pbar is not None:
                 pbar.close()
