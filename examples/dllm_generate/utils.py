@@ -184,7 +184,43 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada"):
     return model, tokenizer, mask_id, eos_id
 
 
-def merge_adapter(model, adapter_path: str):
+# Native Automodel DiffusionGemma module paths -> HF DiffusionGemmaForBlockDiffusion
+# paths. The two implementations share the same leaf modules (split q/k/v/o and
+# gate/up/down projections) but nest the layer stack differently, so LoRA
+# adapters trained on the native class need this re-parenting before the HF
+# class (the only one that ships ``generate()``) can inject them.
+GEMMA_ADAPTER_KEY_MAP = {"model.layers.": "model.decoder.layers."}
+
+
+def translate_adapter(adapter_path: str, key_map: dict[str, str]) -> str:
+    """Write a module-path-translated copy of a PEFT adapter checkpoint.
+
+    Only the key *addresses* change (tensor values are untouched); returns the
+    directory holding the translated copy.
+    """
+    import json
+    import tempfile
+
+    from safetensors.torch import load_file, save_file
+
+    def tr(key: str) -> str:
+        for old, new in key_map.items():
+            key = key.replace(old, new)
+        return key
+
+    out_dir = tempfile.mkdtemp(prefix="adapter_translated_")
+    tensors = load_file(os.path.join(adapter_path, "adapter_model.safetensors"))
+    save_file({tr(k): v for k, v in tensors.items()}, os.path.join(out_dir, "adapter_model.safetensors"))
+    with open(os.path.join(adapter_path, "adapter_config.json")) as f:
+        cfg = json.load(f)
+    if isinstance(cfg.get("target_modules"), list):
+        cfg["target_modules"] = [tr(t) for t in cfg["target_modules"]]
+    with open(os.path.join(out_dir, "adapter_config.json"), "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+    return out_dir
+
+
+def merge_adapter(model, adapter_path: str, key_map: dict[str, str] | None = None):
     """Merge a PEFT adapter checkpoint into the loaded base model for inference.
 
     Automodel PEFT training writes ``adapter_model.safetensors`` plus an
@@ -192,12 +228,21 @@ def merge_adapter(model, adapter_path: str):
     load it. The adapters are merged into the base weights and the PEFT
     wrapper is dropped, keeping the generation code path identical to
     full-SFT checkpoints.
+
+    Args:
+        model: The loaded base model to merge into.
+        adapter_path: Directory with the adapter checkpoint.
+        key_map: Optional module-path translation applied first, for families
+            whose training implementation names modules differently from the
+            inference class (see ``GEMMA_ADAPTER_KEY_MAP``).
     """
     try:
         from peft import PeftModel
     except ImportError as err:
         raise ImportError("Loading --adapter checkpoints requires the 'peft' package (uv pip install peft)") from err
 
+    if key_map:
+        adapter_path = translate_adapter(adapter_path, key_map)
     merged = PeftModel.from_pretrained(model, adapter_path).merge_and_unload()
     return merged.eval()
 
