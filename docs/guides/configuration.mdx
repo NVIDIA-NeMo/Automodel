@@ -100,6 +100,8 @@ Rows with a non-finite L2 norm or a norm at or below `min_norm` are replaced wit
 
 This option is intended for diagnosed checkpoint defects where rare token IDs produce extreme input-embedding gradients. It is disabled when the section is absent and is not currently supported with pipeline parallelism.
 
+For diagnosis, safety behavior, verification steps, and performance impact, see [Repair Damaged Input-Embedding Rows](/model-coverage/troubleshooting#repair-damaged-input-embedding-rows).
+
 ## Interpolate Environment Variables in YAML
 
 NeMo AutoModel supports env var interpolation inside YAML **string values**.
