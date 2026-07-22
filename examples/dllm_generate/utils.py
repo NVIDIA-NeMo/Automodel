@@ -220,14 +220,49 @@ def translate_adapter(adapter_path: str, key_map: dict[str, str]) -> str:
     return out_dir
 
 
+def _manual_merge_lora(model, adapter_path: str) -> None:
+    """Merge a LoRA adapter into ``model``'s weights in place, without ``PeftModel``.
+
+    ``peft``'s ``PeftModel`` wrapper assumes a standard autoregressive
+    generation interface (``prepare_inputs_for_generation``) that the
+    DiffusionGemma class does not implement. Since merging is just
+    ``W += (alpha / r) * B @ A`` per adapted linear, do it directly against the
+    base ``state_dict`` so any model — diffusion or AR — can be adapted.
+    """
+    import json
+
+    from safetensors.torch import load_file
+
+    tensors = load_file(os.path.join(adapter_path, "adapter_model.safetensors"))
+    with open(os.path.join(adapter_path, "adapter_config.json")) as f:
+        cfg = json.load(f)
+    r = int(cfg["r"])
+    scale = float(cfg.get("lora_alpha", r)) / r
+
+    sd = model.state_dict()
+    bases = {k[: -len(".lora_A.weight")] for k in tensors if k.endswith(".lora_A.weight")}
+    merged = 0
+    for base in bases:
+        a = tensors[base + ".lora_A.weight"]
+        b = tensors[base + ".lora_B.weight"]
+        weight_key = base.replace("base_model.model.", "", 1) + ".weight"
+        if weight_key not in sd:
+            raise KeyError(f"adapter targets {weight_key!r} which is absent from the base model")
+        w = sd[weight_key]
+        delta = (b.to(torch.float32) @ a.to(torch.float32)) * scale
+        w.add_(delta.to(w.dtype).to(w.device))
+        merged += 1
+    if merged == 0:
+        raise ValueError("no LoRA modules found in adapter checkpoint")
+
+
 def merge_adapter(model, adapter_path: str, key_map: dict[str, str] | None = None):
     """Merge a PEFT adapter checkpoint into the loaded base model for inference.
 
     Automodel PEFT training writes ``adapter_model.safetensors`` plus an
-    HF-format ``adapter_config.json``, so the standard ``peft`` library can
-    load it. The adapters are merged into the base weights and the PEFT
-    wrapper is dropped, keeping the generation code path identical to
-    full-SFT checkpoints.
+    HF-format ``adapter_config.json``. Adapters are merged into the base
+    weights and the PEFT wrapper is dropped, keeping the generation code path
+    identical to full-SFT checkpoints.
 
     Args:
         model: The loaded base model to merge into.
@@ -236,13 +271,24 @@ def merge_adapter(model, adapter_path: str, key_map: dict[str, str] | None = Non
             whose training implementation names modules differently from the
             inference class (see ``GEMMA_ADAPTER_KEY_MAP``).
     """
-    try:
-        from peft import PeftModel
-    except ImportError as err:
-        raise ImportError("Loading --adapter checkpoints requires the 'peft' package (uv pip install peft)") from err
-
     if key_map:
         adapter_path = translate_adapter(adapter_path, key_map)
+
+    # DiffusionGemma (and other non-AR diffusion models) don't implement the
+    # standard generation interface (``prepare_inputs_for_generation``) that
+    # ``PeftModel`` assumes, so wrapping them fails. Detect that up front and
+    # merge the LoRA weights directly instead — checked BEFORE any peft
+    # wrapping so a partial injection can't corrupt the base state_dict.
+    try:
+        from peft import PeftModel
+    except ImportError:
+        _manual_merge_lora(model, adapter_path)
+        return model.eval()
+
+    if not hasattr(model, "prepare_inputs_for_generation"):
+        _manual_merge_lora(model, adapter_path)
+        return model.eval()
+
     merged = PeftModel.from_pretrained(model, adapter_path).merge_and_unload()
     return merged.eval()
 
