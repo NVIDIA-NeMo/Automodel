@@ -168,3 +168,8 @@ lr_scheduler:
 #   entity: Nemo-automodel
 #   name: qwen3-5-122b-128k-ep8cp16-train-vit
 #   dir: logs/qwen3-5-122b-128k-ep8cp16/wandb  # pragma: allowlist secret
+
+ci:
+  recipe_owner: yuhez
+  time: "01:00:00"
+  nodes: 16
