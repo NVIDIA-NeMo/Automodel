@@ -77,7 +77,6 @@ from nemo_automodel.recipes.kd_utils import (
 )
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
-    _get_num_thd_chunks,
     build_model,
 )
 
@@ -716,7 +715,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             self.device_mesh,
             batch,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-            num_chunks=_get_num_thd_chunks(True, self.cfg),
+            num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size,
             invoke_pre_embed=False,
             extra_seq_buffers={"teacher_logits": 1} if separate_teacher_logits is not None else None,
         )

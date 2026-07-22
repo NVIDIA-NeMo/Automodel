@@ -51,6 +51,7 @@ from nemo_automodel._transformers.infrastructure import (
 from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.loader import DataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -117,64 +118,36 @@ def _get_model_name(cfg_model):
         return None
 
 
-def _uses_te_dot_product_attention(model_or_cfg):
-    """Check whether the model uses TE DotProductAttention.
-
-    Accepts either an instantiated nn.Module (preferred — inspects actual modules)
-    or a config object (fallback — checks backend.attn string).
-    """
-    if isinstance(model_or_cfg, torch.nn.Module):
-        try:
-            from transformer_engine.pytorch.attention import DotProductAttention
-        except ImportError:
-            return False
-        return any(isinstance(m, DotProductAttention) for m in model_or_cfg.modules())
-    # Config fallback for call sites before model is built
-    return (
-        hasattr(model_or_cfg, "backend") and hasattr(model_or_cfg.backend, "attn") and model_or_cfg.backend.attn == "te"
-    )
-
-
-def _uses_thd_collater(cfg_dataloader):
-    """Return True if the dataloader's collate_fn is ``packed_sequence_thd_collater``.
-
-    ``collate_fn`` ends in ``_fn``, so ConfigNode resolves the YAML dotted-path string to
-    the actual callable at load time — the value here is always the function, never a string.
-    """
-    from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
-
-    return getattr(cfg_dataloader, "collate_fn", None) is packed_sequence_thd_collater
-
-
-def _should_pack_validation(cfg: RecipeConfig, model: nn.Module) -> bool:
+def _should_pack_validation(
+    training_dataloader: DataloaderConfig | None,
+    validation_dataloader: DataloaderConfig,
+    model: nn.Module,
+) -> bool:
     """Return whether validation must use the configured training packer."""
-    if cfg.get("packed_sequence.packed_sequence_size", 0) <= 0:
+    if validation_dataloader.packing is None:
         return False
-
-    validation_uses_thd = _uses_thd_collater(cfg.get("validation_dataloader", None))
-    if validation_uses_thd:
+    if replace(validation_dataloader, packing=None).emits_thd:
         return True
-
+    if training_dataloader is None or not training_dataloader.emits_thd:
+        return False
     model_requires_packing = bool(
         callable(getattr(model, "should_pack_validation_with_training", None))
         and model.should_pack_validation_with_training()
     )
-    magi_backend = (
-        str(cfg.get("model.backend.attn", "")) == "magi" or str(cfg.get("model.attn_implementation", "")) == "magi"
+    model_config = getattr(model, "config", None)
+    attention_backend = getattr(getattr(model, "backend", None), "attn", None) or getattr(
+        model_config, "_attn_implementation", None
     )
-    backend_requires_packing = _uses_te_dot_product_attention(cfg.model) or magi_backend or model_requires_packing
-    return backend_requires_packing and _uses_thd_collater(cfg.get("dataloader", None))
+    return (
+        attention_backend in ("te", "magi")
+        or bool(getattr(model, "_te_attention_injected", False))
+        or model_requires_packing
+    )
 
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
     """Return whether the recipe should attach PP causal-mask precomputation."""
     return getattr(model_config, "model_type", None) != "deepseek_v4"
-
-
-def _get_num_thd_chunks(pp_enabled, cfg):
-    if pp_enabled:
-        return cfg.get("step_scheduler.local_batch_size", 1) // cfg.get("distributed.pipeline.pp_microbatch_size", 1)
-    return 1
 
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
@@ -537,8 +510,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             # THD override logic
             if (
                 self.mesh_context.cp_size > 1
-                and _uses_te_dot_product_attention(self.cfg.model)
-                and _uses_thd_collater(self.cfg.get("dataloader", None))
+                and self.cfg.get("model.backend.attn", self.cfg.get("model.attn_implementation", None)) == "te"
+                and self.cfg.dataloader is not None
+                and self.cfg.dataloader.emits_thd
             ):
                 pp_microbatch_size = 1
                 pp_batch_size = pp_batch_size // self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
@@ -700,9 +674,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
 
         self.dataloader = materialize_loader(self.cfg.dataloader)
-        pack_validation = _should_pack_validation(self.cfg, self.model_parts[0])
         self.val_dataloaders = {
-            name: materialize_loader(dl_config if pack_validation else replace(dl_config, packing=None))
+            name: materialize_loader(
+                dl_config
+                if _should_pack_validation(self.cfg.dataloader, dl_config, self.model_parts[0])
+                else replace(dl_config, packing=None)
+            )
             for name, dl_config in self.cfg.validation_dataloaders.items()
         }
         # Optional tool-call accuracy evaluator for agent SFT runs.
@@ -972,13 +949,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
-        _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
         cp_sharder = ContextParallelSharder(
             self.model_parts[0] if hasattr(self, "model_parts") else None,
             self.device_mesh,
             batch,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-            num_chunks=_num_chunks_value,
+            num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1,
         )
         train_ctx, batch = cp_sharder.shard(batch)
         labels = batch.pop("labels")
