@@ -583,8 +583,6 @@ def _transform_func(
     use_dataset_instruction: bool = False,
     epoch: int = 0,
     use_text_in_document: bool = False,
-    use_ocr_text: str | None = None,
-    prob_sample_orc_text_with_image: float = 1.0,
 ):
     """
     Transform function to convert from raw format to training format.
@@ -596,8 +594,6 @@ def _transform_func(
         use_dataset_instruction: Whether to use instruction from dataset's metadata
         epoch: Current epoch for cycling through positive documents
         use_text_in_document: Whether image documents should also include their text
-        use_ocr_text: OCR field to include (``simple_ocr`` or ``complex_ocr``)
-        prob_sample_orc_text_with_image: Probability of including OCR text with an image
     """
     # Handle both batched and single examples
     is_batched = isinstance(examples["question"], list)
@@ -682,11 +678,6 @@ def _transform_func(
                 text = cur_doc["text"]
             elif use_text_in_document and cur_doc["image"]:
                 text = " " + cur_doc["text"] if cur_doc["text"] else ""
-                if use_ocr_text and random.random() < prob_sample_orc_text_with_image:
-                    if use_ocr_text == "simple_ocr" and cur_doc.get("nr_ocr"):
-                        text += " " + cur_doc["nr_ocr"]
-                    elif use_ocr_text == "complex_ocr" and cur_doc.get("complex_ocr"):
-                        text += " " + cur_doc["complex_ocr"]
                 text = text.strip()
             else:
                 text = ""
@@ -731,8 +722,6 @@ def _cross_encoder_transform_func(
     use_dataset_instruction: bool = False,
     epoch: int = 0,
     use_text_in_document: bool = False,
-    use_ocr_text: str | None = None,
-    prob_sample_orc_text_with_image: float = 1.0,
 ):
     """
     Transform function to convert from raw format to cross-encoder training format.
@@ -746,8 +735,6 @@ def _cross_encoder_transform_func(
         use_dataset_instruction,
         epoch=epoch,
         use_text_in_document=use_text_in_document,
-        use_ocr_text=use_ocr_text,
-        prob_sample_orc_text_with_image=prob_sample_orc_text_with_image,
     )
     return flatten_bi_encoder_to_cross_encoder(data)
 
@@ -767,8 +754,6 @@ class RetrievalTransform:
         model_type: str = "bi_encoder",
         cycle_positive_docs: bool = False,
         use_text_in_document: bool = False,
-        use_ocr_text: str | None = None,
-        prob_sample_orc_text_with_image: float = 1.0,
     ):
         if model_type not in _VALID_MODEL_TYPES:
             raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
@@ -778,8 +763,6 @@ class RetrievalTransform:
         self.model_type = model_type
         self.cycle_positive_docs = cycle_positive_docs
         self.use_text_in_document = use_text_in_document
-        self.use_ocr_text = use_ocr_text
-        self.prob_sample_orc_text_with_image = prob_sample_orc_text_with_image
         self.epoch = 0
 
     def __call__(self, examples):
@@ -792,8 +775,6 @@ class RetrievalTransform:
                 use_dataset_instruction=self.use_dataset_instruction,
                 epoch=epoch,
                 use_text_in_document=self.use_text_in_document,
-                use_ocr_text=self.use_ocr_text,
-                prob_sample_orc_text_with_image=self.prob_sample_orc_text_with_image,
             )
         return _transform_func(
             examples,
@@ -802,8 +783,6 @@ class RetrievalTransform:
             use_dataset_instruction=self.use_dataset_instruction,
             epoch=epoch,
             use_text_in_document=self.use_text_in_document,
-            use_ocr_text=self.use_ocr_text,
-            prob_sample_orc_text_with_image=self.prob_sample_orc_text_with_image,
         )
 
     def set_epoch(self, epoch: int):
@@ -824,8 +803,6 @@ def make_retrieval_dataset(
     use_dataset_instruction: bool = False,
     cycle_positive_docs: bool = False,
     use_text_in_document: bool = False,
-    use_ocr_text: str | None = None,
-    prob_sample_orc_text_with_image: float = 1.0,
 ):
     """
     Load and return dataset in retrieval format for encoder training.
@@ -855,8 +832,6 @@ def make_retrieval_dataset(
             Defaults to ``False`` (always use the first positive document). Set to ``True`` only
             when a query has multiple positive documents and you want to rotate through them by epoch.
         use_text_in_document: Whether image documents should also include their text.
-        use_ocr_text: OCR field to include (``simple_ocr`` or ``complex_ocr``).
-        prob_sample_orc_text_with_image: Probability of including OCR text with an image.
 
     Returns:
         A HuggingFace Dataset where each example is a dict with keys:
@@ -949,8 +924,6 @@ def make_retrieval_dataset(
             model_type,
             cycle_positive_docs,
             use_text_in_document,
-            use_ocr_text,
-            prob_sample_orc_text_with_image,
         )
         dataset.set_transform(transform)
         if cycle_positive_docs:
@@ -970,8 +943,6 @@ def make_retrieval_dataset(
             model_type,
             cycle_positive_docs,
             use_text_in_document,
-            use_ocr_text,
-            prob_sample_orc_text_with_image,
         )
         dataset.set_transform(transform)
 
@@ -1011,10 +982,6 @@ class RetrievalDatasetConfig:
     """Whether to rotate through multiple positive documents by epoch during training."""
     use_text_in_document: bool = False
     """Whether image documents should also include their text."""
-    use_ocr_text: str | None = None
-    """OCR field to include (``simple_ocr`` or ``complex_ocr``)."""
-    prob_sample_orc_text_with_image: float = 1.0
-    """Probability of including OCR text with an image."""
 
     def build(self) -> Dataset:
         """Build the retrieval :class:`~datasets.Dataset` from this :class:`RetrievalDatasetConfig`."""
@@ -1031,8 +998,6 @@ class RetrievalDatasetConfig:
             use_dataset_instruction=self.use_dataset_instruction,
             cycle_positive_docs=self.cycle_positive_docs,
             use_text_in_document=self.use_text_in_document,
-            use_ocr_text=self.use_ocr_text,
-            prob_sample_orc_text_with_image=self.prob_sample_orc_text_with_image,
         )
 
 
