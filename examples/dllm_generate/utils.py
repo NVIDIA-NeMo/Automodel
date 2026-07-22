@@ -160,7 +160,11 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada"):
         # Automodel *training* implementation, which has no ``generate``.
         from transformers import DiffusionGemmaForBlockDiffusion
 
-        model = DiffusionGemmaForBlockDiffusion.from_pretrained(checkpoint_path, dtype="auto", device_map="auto").eval()
+        # bfloat16 explicitly: SFT consolidates fp32 master weights (104 GB for 26B) which
+        # cannot fit one GPU; "auto" would honor that dtype and shunt weights to meta/offload.
+        model = DiffusionGemmaForBlockDiffusion.from_pretrained(
+            checkpoint_path, dtype="bfloat16", device_map="cuda"
+        ).eval()
         return model, tokenizer, None, tokenizer.eos_token_id
 
     if sampler_name == "llada":

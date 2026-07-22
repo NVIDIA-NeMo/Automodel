@@ -494,7 +494,7 @@ def generate_gemma(model, tokenizer, inputs, config: SamplerConfig, eos_id: int)
         raise ValueError("DiffusionGemma generation requires a tokenizer EOS token ID")
 
     pad_id = tokenizer.pad_token_id if getattr(tokenizer, "pad_token_id", None) is not None else eos_id
-    device = next(model.parameters()).device
+    device = getattr(model, "device", None) or next(model.parameters()).device
     sequences = []
     for prompt_ids in inputs:
         prompt_tensor = torch.as_tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
