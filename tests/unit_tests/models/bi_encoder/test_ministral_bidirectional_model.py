@@ -444,3 +444,11 @@ def test_mistral3_vlm_runs_dummy_vision_inside_model_forward(monkeypatch):
     assert outputs["inputs_embeds"].shape == (1, 2, 4)
     outputs["inputs_embeds"].sum().backward()
     assert model.vision_tower.weight.grad is not None
+
+    events.clear()
+    input_ids = torch.tensor([[3, 4]])
+    outputs = model(input_ids=input_ids, run_dummy_vision=False)
+
+    assert events == ["parent"]
+    assert torch.equal(outputs["input_ids"], input_ids)
+    assert outputs["inputs_embeds"] is None
