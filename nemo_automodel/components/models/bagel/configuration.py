@@ -35,12 +35,47 @@ instance so that:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Union
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Dict, Literal, Optional, Union
 
 from transformers import Qwen2Config
 from transformers.configuration_utils import PretrainedConfig
 
 from nemo_automodel.components.models.bagel.modeling_siglip_navit import SiglipVisionConfig
+
+
+@dataclass(frozen=True, kw_only=True)
+class BagelBackendConfig:
+    """Backends that BAGEL allows users to select."""
+
+    linear: Literal["torch", "te"] = "torch"
+    rms_norm: Literal["torch", "torch_fp32", "te"] = "torch_fp32"
+
+    def __post_init__(self) -> None:
+        if self.linear not in {"torch", "te"}:
+            raise ValueError(f"Unsupported BAGEL linear backend: {self.linear!r}")
+        if self.rms_norm not in {"torch", "torch_fp32", "te"}:
+            raise ValueError(f"Unsupported BAGEL RMSNorm backend: {self.rms_norm!r}")
+
+
+def resolve_bagel_backend(backend: Any = None) -> BagelBackendConfig:
+    """Resolve a mapping against BAGEL's stable torch defaults."""
+    if backend is None:
+        return BagelBackendConfig()
+    if isinstance(backend, BagelBackendConfig):
+        return backend
+
+    if hasattr(backend, "to_dict"):
+        backend = backend.to_dict()
+    if not isinstance(backend, Mapping):
+        raise TypeError(f"BAGEL backend must be a mapping or BagelBackendConfig, got {type(backend)!r}")
+
+    overrides = dict(backend)
+    unknown_fields = sorted(overrides.keys() - {"linear", "rms_norm"})
+    if unknown_fields:
+        raise TypeError(f"Unknown BAGEL backend field(s): {unknown_fields}")
+    return BagelBackendConfig(**overrides)
 
 
 def _coerce_text_config(cfg: Union[Dict[str, Any], Qwen2Config, None]) -> Qwen2Config:
