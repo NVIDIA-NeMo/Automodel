@@ -102,6 +102,19 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
     pipeline_dict: Optional[dict] = cfg.pop("pipeline", None)
     moe_dict: Optional[dict] = cfg.pop("moe", None)
     activation_checkpointing = _normalize_activation_checkpointing(cfg.pop("activation_checkpointing", False))
+    activation_checkpointing_modules = (
+        moe_dict.get("activation_checkpointing_modules") if moe_dict is not None else None
+    )
+    if activation_checkpointing_modules is not None:
+        if not activation_checkpointing:
+            raise ValueError(
+                "distributed.moe.activation_checkpointing_modules requires activation_checkpointing to be enabled"
+            )
+        if activation_checkpointing == "selective":
+            raise ValueError(
+                "distributed.moe.activation_checkpointing_modules cannot be combined with "
+                "activation_checkpointing='selective'"
+            )
 
     # Strip Hydra / OmegaConf meta keys (e.g. ``_target_``, ``_recursive_``,
     # ``_convert_``) that may leak from YAML configs.  They have no meaning
@@ -176,6 +189,8 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
             pp_size,
         )
         pipeline_dict = None
+    if moe_dict is not None and moe_dict.get("activation_checkpointing_modules") is not None and ep_size <= 1:
+        raise ValueError("distributed.moe.activation_checkpointing_modules requires ep_size > 1")
     if moe_dict is not None and ep_size <= 1:
         moe_dict = None
 

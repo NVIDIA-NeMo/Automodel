@@ -675,6 +675,7 @@ def test_apply_fsdp_calls_with_ignored_params_and_shard_for_experts(monkeypatch)
     assert block_kwargs["mp_policy"] == "MP_POLICY"
     ignored = block_kwargs.get("ignored_params")
     assert isinstance(ignored, set) and len(ignored) == len(list(experts.parameters()))
+    assert not hasattr(experts, "_nemo_cuda_graph_stable_parameter_storage")
 
     # embed, lm_head and model should also be sharded on fsdp_mesh
     embed_call = _find_call_by_first_arg(fully_shard_mock, embed)
@@ -971,7 +972,11 @@ def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
     apply_ep_mock.assert_called_once()
     # AC enabled
     apply_ac_mock.assert_called_once_with(
-        model, ignore_router=True, selective=False, activation_checkpointing_scope="all"
+        model,
+        ignore_router=True,
+        selective=False,
+        activation_checkpointing_modules=None,
+        activation_checkpointing_scope="all",
     )
     # FSDP called with combined flags and derived meshes
     args, kwargs = apply_fsdp_mock.call_args
@@ -2106,6 +2111,43 @@ def test_parallelize_model_passes_selective_to_apply_ac(monkeypatch):
     assert kwargs.get("ignore_router") is True
 
 
+@pytest.mark.parametrize(
+    ("activation_checkpointing", "modules", "message"),
+    [
+        (False, ("attn",), "requires activation_checkpointing"),
+        ("selective", ("attn",), "cannot be combined"),
+        (True, ("mlp",), "supports only"),
+    ],
+)
+def test_parallelize_model_rejects_invalid_checkpoint_modules_before_mutation(
+    monkeypatch,
+    activation_checkpointing,
+    modules,
+    message,
+):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    world_mesh = FakeWorldMesh({("dp",): 2}, mesh_dim_names=["dp"])
+    apply_ep_mock = MagicMock()
+    apply_cp_mock = MagicMock()
+    parallelize_module_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_ep", apply_ep_mock)
+    monkeypatch.setattr(P, "apply_cp", apply_cp_mock)
+    monkeypatch.setattr(P, "parallelize_module", parallelize_module_mock)
+
+    with pytest.raises(ValueError, match=message):
+        P.parallelize_model(
+            model=DummyModel([]),
+            world_mesh=world_mesh,
+            moe_mesh=None,
+            dp_axis_names=("dp",),
+            activation_checkpointing=activation_checkpointing,
+            activation_checkpointing_modules=modules,
+        )
+    apply_ep_mock.assert_not_called()
+    apply_cp_mock.assert_not_called()
+    parallelize_module_mock.assert_not_called()
+
+
 def test_apply_ac_selective_wraps_blocks_with_shared_policy(monkeypatch):
     """selective=True wraps every block with the shared dense selective policy and
     does not require hidden_size/num_experts (router dims are only needed for the
@@ -2491,6 +2533,7 @@ def test_apply_fsdp_uses_moe_for_ignored_params(monkeypatch):
     assert isinstance(ignored, set)
     moe_params = set(moe.experts.parameters())
     assert ignored == moe_params
+    assert moe.experts._nemo_cuda_graph_stable_parameter_storage is True
 
 
 def test_parallelize_model_passes_mp_policy_to_apply_fsdp(monkeypatch):

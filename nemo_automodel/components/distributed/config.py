@@ -165,17 +165,44 @@ class DistributedSetup:
 
 @dataclass
 class MoEParallelizerConfig:
-    """Configuration for MoE model parallelization (EP + FSDP settings)."""
+    """Configuration for MoE model parallelization (EP + FSDP settings).
+
+    Attributes:
+        ignore_router_for_ac: Preserve router outputs across activation-checkpoint
+            recompute so routing metadata remains stable.
+        activation_checkpointing_modules: Optional decoder submodule boundaries to
+            checkpoint instead of wrapping the complete block. The first supported
+            boundary is ``"attn"``; leaving this unset preserves the existing
+            whole-block behavior.
+    """
 
     # Default True: under activation checkpointing the MoE router output must be saved
     # rather than recomputed. Recomputing the router can route a different number of tokens
     # per expert than the forward pass, which makes torch.utils.checkpoint raise a
     # CheckpointError on the backward recompute.
     ignore_router_for_ac: bool = True
+    activation_checkpointing_modules: list[str] | tuple[str, ...] | None = None
     reshard_after_forward: bool = False
     lm_head_precision: Optional[Union[str, torch.dtype]] = None
     wrap_outer_model: bool = True
     mp_policy: Optional[MixedPrecisionPolicy] = None
+
+    def __post_init__(self) -> None:
+        if self.activation_checkpointing_modules is None:
+            return
+        if not isinstance(self.activation_checkpointing_modules, (list, tuple)):
+            raise ValueError("MoE activation_checkpointing_modules must be a list or tuple of module names.")
+        if not all(isinstance(module, str) for module in self.activation_checkpointing_modules):
+            raise ValueError("MoE activation_checkpointing_modules entries must be strings.")
+        modules = tuple(dict.fromkeys(self.activation_checkpointing_modules))
+        unsupported = set(modules) - {"attn"}
+        if unsupported:
+            raise ValueError(
+                f"MoE activation_checkpointing_modules currently supports only 'attn'; got {sorted(unsupported)}."
+            )
+        if not modules:
+            raise ValueError("MoE activation_checkpointing_modules must not be empty when specified.")
+        self.activation_checkpointing_modules = modules
 
     def to_dict(self) -> Dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}

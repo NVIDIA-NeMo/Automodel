@@ -730,10 +730,11 @@ def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
 def test_instantiate_infrastructure_threads_ac_scope_into_moe_parallelize_fn():
     """Expert-parallel configs must inherit the strategy config's normalized AC scope."""
     from nemo_automodel._transformers.infrastructure import instantiate_infrastructure
-    from nemo_automodel.components.distributed.config import DDPConfig
+    from nemo_automodel.components.distributed.config import DDPConfig, MoEParallelizerConfig
     from nemo_automodel.components.moe.parallelizer import parallelize_model
 
     distributed_config = DDPConfig(activation_checkpointing=True, activation_checkpointing_scope="vision")
+    moe_config = MoEParallelizerConfig(activation_checkpointing_modules=["attn"])
     mesh = SimpleNamespace(ep_size=2, pp_size=1, device_mesh=None, moe_mesh=None)
 
     # The manager needs an initialized process group; the scope is read from the
@@ -741,6 +742,7 @@ def test_instantiate_infrastructure_threads_ac_scope_into_moe_parallelize_fn():
     with patch(f"{_INFRA_MODULE}._instantiate_distributed", return_value=None):
         _, _, parallelize_fn, _ = instantiate_infrastructure(
             distributed_config=distributed_config,
+            moe_parallel_config=moe_config,
             mesh=mesh,
         )
 
@@ -748,3 +750,4 @@ def test_instantiate_infrastructure_threads_ac_scope_into_moe_parallelize_fn():
     assert parallelize_fn.keywords["activation_checkpointing"] is True
     # DDPConfig.__post_init__ normalizes the scope; the partial must carry it through.
     assert parallelize_fn.keywords["activation_checkpointing_scope"] == ("vision",)
+    assert parallelize_fn.keywords["activation_checkpointing_modules"] == ("attn",)

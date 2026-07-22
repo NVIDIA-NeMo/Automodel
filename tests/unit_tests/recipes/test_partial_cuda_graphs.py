@@ -186,6 +186,7 @@ def test_full_moe_scope_uses_explicit_parameters(monkeypatch):
 
     monkeypatch.setattr(partial_graphs, "_get_make_graphed_callables", lambda: make_graphed_callables)
     model = _Model(te_dpa=False, moe=True, router=False, preprocess=False)
+    model.model.layers["0"].mlp.experts._nemo_cuda_graph_stable_parameter_storage = True
     manager = partial_graphs.PartialCudaGraphManager.from_model_parts([model])
     assert manager is not None
     entry = manager.entries[0]
@@ -200,6 +201,7 @@ def test_full_moe_scope_uses_explicit_parameters(monkeypatch):
 
     assert entry.name == "test_moe.layers.0.moe"
     assert entry.explicit_parameters is True
+    assert entry.share_parameter_storage is True
     assert len(captured_sample_args[0][0]) == 5
     manager.close()
 
@@ -284,6 +286,43 @@ def test_explicit_parameter_adapter_uses_fresh_parameter_storage():
     adapter(*adapter.capture_inputs).sum().backward()
     assert all(parameter.grad is not None for parameter in adapter.capture_parameters)
     assert all(parameter.grad is None for parameter in target_parameters)
+
+
+def test_explicit_parameter_adapter_can_alias_stable_parameter_storage():
+    target = _Attention()
+    graph_input = torch.randn(2, 4, requires_grad=True)
+    captured_call = partial_graphs._CapturedCall.from_call((graph_input,), {})
+    adapter = partial_graphs._ExplicitParameterCallAdapter(
+        target,
+        captured_call,
+        share_parameter_storage=True,
+    )
+
+    target_parameters = tuple(target.parameters())
+    assert adapter.cloned_parameter_bytes == 0
+    assert all(capture is not target for capture, target in zip(adapter.capture_parameters, target_parameters))
+    assert all(
+        capture.data_ptr() == target.data_ptr()
+        for capture, target in zip(adapter.capture_parameters, target_parameters)
+    )
+
+    with torch.no_grad():
+        target_parameters[0].add_(1)
+    torch.testing.assert_close(adapter.capture_parameters[0], target_parameters[0])
+
+
+def test_explicit_parameter_adapter_rejects_replaced_shared_parameter_storage():
+    target = _Attention()
+    captured_call = partial_graphs._CapturedCall.from_call((torch.ones(2, 4),), {})
+    adapter = partial_graphs._ExplicitParameterCallAdapter(
+        target,
+        captured_call,
+        share_parameter_storage=True,
+    )
+    target.q_proj.weight = nn.Parameter(target.q_proj.weight.detach().clone())
+
+    with pytest.raises(RuntimeError, match="parameter storage changed"):
+        adapter.replay_inputs((torch.ones(2, 4),))
 
 
 def test_explicit_parameter_adapter_rejects_replaced_buffer_storage():
@@ -752,6 +791,32 @@ def test_rejects_full_moe_with_activation_checkpointing():
     model = _Model(te_dpa=False, moe=True, router=False, preprocess=False)
     with pytest.raises(RuntimeError, match="Full MoE CUDA graphs do not support activation checkpointing"):
         partial_graphs.PartialCudaGraphManager.from_model_parts([model], activation_checkpointing=True)
+
+
+def test_allows_full_moe_outside_attention_checkpoint_boundary():
+    model = _Model(te_dpa=False, moe=True, router=False, preprocess=False)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts(
+        [model],
+        activation_checkpointing=True,
+        activation_checkpointing_modules=("attn",),
+    )
+
+    assert manager is not None
+    assert [entry.name for entry in manager.entries] == ["test_moe.layers.0.moe"]
+    manager.close()
+
+
+def test_allows_full_moe_when_checkpointing_excludes_decoder():
+    model = _Model(te_dpa=False, moe=True, router=False, preprocess=False)
+    manager = partial_graphs.PartialCudaGraphManager.from_model_parts(
+        [model],
+        activation_checkpointing=True,
+        activation_checkpointing_scope=("vision",),
+    )
+
+    assert manager is not None
+    assert [entry.name for entry in manager.entries] == ["test_moe.layers.0.moe"]
+    manager.close()
 
 
 def test_rejects_pipeline_parallel_until_validated():

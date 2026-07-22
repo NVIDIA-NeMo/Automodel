@@ -209,7 +209,11 @@ class BackendConfig:
             and expert inputs that participate in autograd.
         cuda_graph_moe_paged_stash_page_size: Number of token rows per paged-stash page.
         cuda_graph_moe_paged_stash_buffer_size_factor: Multiplicative page-buffer headroom
-            over the iteration-0 observed peak. Must be finite and at least one.
+            over the iteration-0 observed peak allocated in CUDA memory. It may be below one
+            when host spill supplies the remaining capacity.
+        cuda_graph_moe_paged_stash_buffer_size_factor_cpu: Fraction of the iteration-0
+            observed peak allocated in pinned host memory. Zero disables host spill; CUDA
+            and host factors must sum to at least one.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
@@ -252,6 +256,7 @@ class BackendConfig:
     cuda_graph_moe_paged_stash: bool = False
     cuda_graph_moe_paged_stash_page_size: int = 64
     cuda_graph_moe_paged_stash_buffer_size_factor: float = 1.1
+    cuda_graph_moe_paged_stash_buffer_size_factor_cpu: float = 0.0
 
     def __post_init__(self):
         # TEMPORARY: force TE fused RoPE off globally. The fused kernel computes cos/sin
@@ -315,9 +320,19 @@ class BackendConfig:
                 isinstance(factor, bool)
                 or not isinstance(factor, (int, float))
                 or not math.isfinite(float(factor))
-                or factor < 1.0
+                or factor <= 0.0
             ):
-                raise ValueError("cuda_graph_moe_paged_stash_buffer_size_factor must be finite and at least 1.0")
+                raise ValueError("cuda_graph_moe_paged_stash_buffer_size_factor must be positive and finite")
+            host_factor = self.cuda_graph_moe_paged_stash_buffer_size_factor_cpu
+            if (
+                isinstance(host_factor, bool)
+                or not isinstance(host_factor, (int, float))
+                or not math.isfinite(float(host_factor))
+                or host_factor < 0.0
+            ):
+                raise ValueError("cuda_graph_moe_paged_stash_buffer_size_factor_cpu must be non-negative and finite")
+            if factor + host_factor < 1.0:
+                raise ValueError("CUDA and host paged-stash buffer factors must provide at least 1.0x total capacity")
 
         # enable_deepep was removed. It is no longer honored; warn (once, on rank 0) if a stale
         # config still sets it so the user migrates to explicit dispatcher/experts. The field is
