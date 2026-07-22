@@ -440,7 +440,7 @@ def make_tulu3_dataset(
     ``messages`` field is converted with the same helper the meta-JSON path uses
     (:func:`_convert_sharegpt_to_conversation`), so the resulting data composition is
     **identical** to dumping the split to JSONL and loading it via
-    :func:`make_meta_dataset`: no turn cap, ``system`` turns dropped, every row kept
+    :func:`make_meta_dataset`: no turn cap, ``system`` turns preserved, every row kept
     in the original split order. Conversations are text-only (no ``image`` entries),
     so batches carry no ``pixel_values`` / vision tensors.
 
