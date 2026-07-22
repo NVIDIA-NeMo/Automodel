@@ -29,7 +29,7 @@ import contextlib
 import pytest
 import torch
 
-from nemo_automodel.components.distributed import cp_utils as _cu
+from nemo_automodel.components.distributed.context_parallel import utils as _cu
 
 
 class _DummySubMesh:
@@ -555,7 +555,7 @@ def test_padding_attention_mask_pad_value_is_zero(monkeypatch):
     the function so this case is moot, but the PAD_FILL table is the right
     place to encode the semantic in case the strip is ever revisited.
     """
-    from nemo_automodel.components.distributed import cp_sharder as _cs
+    from nemo_automodel.components.distributed.context_parallel import sharder as _cs
 
     # Just verify the PAD_FILL table itself maps attention_mask -> False
     # (the runtime code path is currently unreachable because attention_mask

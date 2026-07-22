@@ -21,7 +21,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.distributed import cp_utils as cp_utils_mod
+from nemo_automodel.components.distributed.context_parallel import utils as cp_utils_mod
 from nemo_automodel.components.loss import kd_loss as kd_loss_module
 from nemo_automodel.components.loss.kd_loss import KDLoss
 from nemo_automodel.recipes.vlm import kd as vlm_kd

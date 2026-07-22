@@ -179,7 +179,7 @@ def test_prepare_model_inputs_for_cp_is_sharder_only(vlm_model):
     ContextParallelSharder whose shard_batch is the aux-only round-robin shard.
     Embedding + vision splice + sequence shard now run inside forward, so the raw
     batch (input_ids, pixel_values) is left intact for the forward to consume."""
-    from nemo_automodel.components.distributed.cp_sharder import (
+    from nemo_automodel.components.distributed.context_parallel.sharder import (
         ContextParallelSharder,
         round_robin_local_indices,
         shard_batch_aux_only,

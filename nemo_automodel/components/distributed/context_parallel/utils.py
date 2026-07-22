@@ -19,7 +19,7 @@ from typing import Any, List, Optional, Set
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.distributed.cp_sharder import (
+from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     ShardLayout,
     identity_local_indices,
@@ -302,7 +302,7 @@ def _magi_state_from_model(model, device_mesh):
     """Recreate the per-forward Magi handle from the model and device mesh."""
     if model is None or _attention_backend(model) != "magi":
         return None
-    from nemo_automodel.components.distributed.magi_attn_utils import MagiState, get_cp_group
+    from nemo_automodel.components.distributed.context_parallel.magi import MagiState, get_cp_group
 
     cp_group = get_cp_group(device_mesh)
     return MagiState(
@@ -434,7 +434,7 @@ def _resolve_cp_sharder(
         # Backend-owned prep (MagiAttention): magi manages its own CP transport,
         # so like the TE path shard_batch returns (nullcontext, prepped_batch).
         # All magi internals (HF-vs-custom, recipe domain, cp group) stay in
-        # magi_attn_utils. The dispatch-solver partition is data-dependent, so
+        # context_parallel.magi. The dispatch-solver partition is data-dependent, so
         # shard_batch installs the index map it just computed (magi's
         # get_position_ids) on the sharder for the token verbs.
         def _shard_batch_magi(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):

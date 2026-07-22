@@ -50,7 +50,7 @@ from typing import Any, Optional
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.distributed.cp_utils import _make_cp_batch_and_ctx, make_cp_batch_for_te
+from nemo_automodel.components.distributed.context_parallel.utils import _make_cp_batch_and_ctx, make_cp_batch_for_te
 
 logger = logging.getLogger(__name__)
 

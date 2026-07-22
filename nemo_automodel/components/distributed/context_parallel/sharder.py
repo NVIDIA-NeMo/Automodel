@@ -44,7 +44,7 @@ This module also hosts the framework's ``shard_batch`` implementations: the
 shared contiguous-shard batch prep used by models whose CP ranks own contiguous
 sequence slices (Gemma4, DeepSeek V4), and the torch ``context_parallel``
 round-robin load-balanced prep with its index map. The TE/THD and magi preps
-live with their dependencies (``cp_utils``, ``magi_attn_utils``); the
+live with their dependencies (``context_parallel.utils``, ``context_parallel.magi``); the
 dispatcher wraps them into sharders at resolution time.
 """
 
@@ -293,7 +293,7 @@ class ContextParallelSharder:
             invoke_pre_embed: Whether to invoke a model-owned CP preparation hook.
             extra_seq_buffers: Additional batch keys mapped to their sequence axes.
         """
-        from nemo_automodel.components.distributed.cp_utils import _prepare_cp_sharder
+        from nemo_automodel.components.distributed.context_parallel.utils import _prepare_cp_sharder
 
         resolved = _prepare_cp_sharder(
             model,
@@ -837,9 +837,8 @@ def shard_batch_load_balanced(
         ``(ctx_factory, batch, ShardLayout)`` where entering ``ctx_factory()``
         installs the SDPA-kernel + ``context_parallel`` context for the forward.
     """
-    # Call-time import: the torch-CP transport machinery stays in cp_utils
-    # (NeMo-RL imports it from there), and cp_utils imports this module.
-    from nemo_automodel.components.distributed.cp_utils import (  # noqa: PLC0415
+    # Call-time import avoids a cycle: utils imports this module's strategy helpers.
+    from nemo_automodel.components.distributed.context_parallel.utils import (  # noqa: PLC0415
         _shard_grad_buffer_for_cp,
         create_context_parallel_ctx,
         get_train_context,
@@ -973,7 +972,7 @@ def shard_batch_aux_only(
         The layout's ``padded_seq_len`` is what the model must pad its primary
         stream to before sharding.
     """
-    from nemo_automodel.components.distributed.cp_utils import (  # noqa: PLC0415
+    from nemo_automodel.components.distributed.context_parallel.utils import (  # noqa: PLC0415
         create_context_parallel_ctx,
         get_train_context,
     )

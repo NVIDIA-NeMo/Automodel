@@ -41,8 +41,8 @@ def main():
 
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed.cp_sharder import shard_batch_aux_only
-    from nemo_automodel.components.distributed.cp_utils import cp_dispatcher_suspended
+    from nemo_automodel.components.distributed.context_parallel.sharder import shard_batch_aux_only
+    from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 
     mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("cp",))
     cp_mesh = mesh["cp"]

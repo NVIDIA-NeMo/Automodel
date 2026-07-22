@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for :pyfile:`nemo_automodel/components/distributed/mamba_cp.py`.
+"""Unit tests for :pyfile:`nemo_automodel/components/distributed/context_parallel/mamba.py`.
 
 Tests mock the distributed process group so they can run on CPU-only CI
 systems while still verifying dimension calculations, parameter slicing,
@@ -27,7 +27,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
 # ---------------------------------------------------------------------------
 # Lightweight stubs for torch.distributed.ProcessGroup
@@ -391,7 +391,9 @@ class TestGroupReplication:
             H_local = H // cp_size
             return torch.randn(batch_size, L_local * cp_size, H_local)
 
-        with patch("nemo_automodel.components.distributed.mamba_cp._all_to_all_cp2hp", side_effect=fake_cp2hp):
+        with patch(
+            "nemo_automodel.components.distributed.context_parallel.mamba._all_to_all_cp2hp", side_effect=fake_cp2hp
+        ):
             mcp.pre_conv_ssm(projected)
 
         assert len(captured_calls) == 5, f"Expected 5 all-to-all calls, got {len(captured_calls)}"
@@ -438,7 +440,9 @@ class TestGroupReplication:
             H_local = H // cp_size
             return torch.randn(batch_size, L_local * cp_size, H_local)
 
-        with patch("nemo_automodel.components.distributed.mamba_cp._all_to_all_cp2hp", side_effect=fake_cp2hp):
+        with patch(
+            "nemo_automodel.components.distributed.context_parallel.mamba._all_to_all_cp2hp", side_effect=fake_cp2hp
+        ):
             mcp.pre_conv_ssm(projected)
 
         b_state_input = captured_calls[2]
@@ -483,7 +487,9 @@ class TestPrePostConvSsmShapes:
             H_local = H_t // cp_size
             return torch.randn(B_t, L_t * cp_size, H_local)
 
-        with patch("nemo_automodel.components.distributed.mamba_cp._all_to_all_cp2hp", side_effect=fake_cp2hp):
+        with patch(
+            "nemo_automodel.components.distributed.context_parallel.mamba._all_to_all_cp2hp", side_effect=fake_cp2hp
+        ):
             output = mcp.pre_conv_ssm(projected)
 
         d_inner_local = d_inner // cp_size
@@ -526,7 +532,9 @@ class TestPrePostConvSsmShapes:
             H_out = H_t * cp_size
             return torch.randn(B_t, L_out, H_out)
 
-        with patch("nemo_automodel.components.distributed.mamba_cp._all_to_all_hp2cp", side_effect=fake_hp2cp):
+        with patch(
+            "nemo_automodel.components.distributed.context_parallel.mamba._all_to_all_hp2cp", side_effect=fake_hp2cp
+        ):
             output = mcp.post_conv_ssm(ssm_output)
 
         assert output.shape == (B, L_local, d_inner), f"Expected ({B}, {L_local}, {d_inner}), got {output.shape}"
@@ -555,7 +563,7 @@ class TestAllToAllLayoutTransforms:
 
     def test_cp2hp_shape(self):
         """Verify _all_to_all_cp2hp output shape with identity all-to-all."""
-        from nemo_automodel.components.distributed.mamba_cp import _all_to_all_cp2hp
+        from nemo_automodel.components.distributed.context_parallel.mamba import _all_to_all_cp2hp
 
         cp_size = 2
         B, L_local, H = 2, 4, 8
@@ -563,14 +571,16 @@ class TestAllToAllLayoutTransforms:
 
         inp = torch.randn(B, L_local, H)
 
-        with patch("nemo_automodel.components.distributed.mamba_cp._all_to_all", side_effect=lambda t, g: t):
+        with patch(
+            "nemo_automodel.components.distributed.context_parallel.mamba._all_to_all", side_effect=lambda t, g: t
+        ):
             out = _all_to_all_cp2hp(inp, pg, B)
 
         assert out.shape == (B, L_local * cp_size, H // cp_size)
 
     def test_hp2cp_shape(self):
         """Verify _all_to_all_hp2cp output shape with identity all-to-all."""
-        from nemo_automodel.components.distributed.mamba_cp import _all_to_all_hp2cp
+        from nemo_automodel.components.distributed.context_parallel.mamba import _all_to_all_hp2cp
 
         cp_size = 2
         B, L_global, H_local = 2, 8, 4
@@ -578,7 +588,9 @@ class TestAllToAllLayoutTransforms:
 
         inp = torch.randn(B, L_global, H_local)
 
-        with patch("nemo_automodel.components.distributed.mamba_cp._all_to_all", side_effect=lambda t, g: t):
+        with patch(
+            "nemo_automodel.components.distributed.context_parallel.mamba._all_to_all", side_effect=lambda t, g: t
+        ):
             out = _all_to_all_hp2cp(inp, pg, B)
 
         assert out.shape == (B, L_global // cp_size, H_local * cp_size)

@@ -21,7 +21,7 @@ model embeds, splices vision, builds ``per_layer_inputs`` and the flex-ring mask
 metadata inside its forward and contiguously slices them there; the dispatch-time
 sharder therefore only touches the no-grad auxiliary streams.
 
-The generic slicing lives in ``components/distributed/cp_sharder.py``; this
+The generic slicing lives in ``components/distributed/context_parallel/sharder.py``; this
 module owns the one Gemma4-specific piece the aux-only shard still needs: the
 ``_packed_seq_ids`` document-boundary synthesis its manual CP attention mask
 builder requires (its pad-region zeros depend on the global pad tail, which the
@@ -35,7 +35,7 @@ from typing import Any
 
 import torch
 
-from nemo_automodel.components.distributed.cp_sharder import (
+from nemo_automodel.components.distributed.context_parallel.sharder import (
     convert_attention_mask_to_padding_mask,
     shard_batch_contiguous,
 )

@@ -60,7 +60,7 @@ except ModuleNotFoundError:
     Qwen3_5MoeVisionRotaryEmbedding = _make_missing("Qwen3_5MoeVisionRotaryEmbedding")
     HFQwen3_5MoeModel = _make_missing("Qwen3_5MoeModel")
 
-from nemo_automodel.components.distributed.cp_sharder import (
+from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
@@ -963,7 +963,9 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         # splice runs in-forward under an active CP ring context it must suspend the
         # ring dispatcher, or torch's load-balanced ring SDPA all-gathers the vision
         # Q/K/V and rejects the non-causal attention. No-op when CP is inactive.
-        from nemo_automodel.components.distributed.cp_utils import cp_dispatcher_suspended  # noqa: PLC0415
+        from nemo_automodel.components.distributed.context_parallel.utils import (
+            cp_dispatcher_suspended,  # noqa: PLC0415
+        )
 
         with cp_dispatcher_suspended(self.cp_mesh):
             if pixel_values is not None:

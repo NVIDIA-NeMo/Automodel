@@ -28,8 +28,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-import nemo_automodel.components.distributed.magi_attn_utils as mu
-from nemo_automodel.components.distributed.magi_attn_utils import AttnMaskSpec, MagiState, setup_magi
+import nemo_automodel.components.distributed.context_parallel.magi as mu
+from nemo_automodel.components.distributed.context_parallel.magi import AttnMaskSpec, MagiState, setup_magi
 
 
 class _FakeCfg:

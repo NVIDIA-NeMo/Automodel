@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the ContextParallelSharder contract in components/distributed/cp_sharder.py.
+"""Unit tests for the ContextParallelSharder contract in components/distributed/context_parallel/sharder.py.
 
 Collectives are not exercised here (CPU CI): the tests cover the pure layout
 math — local index generation, index-based token-tensor shard, gathered-shard
@@ -26,7 +26,7 @@ import contextlib
 import pytest
 import torch
 
-from nemo_automodel.components.distributed import cp_sharder as cs
+from nemo_automodel.components.distributed.context_parallel import sharder as cs
 
 
 class _FakeMesh:
@@ -316,7 +316,7 @@ def test_shard_batch_aux_only_matches_load_balanced(monkeypatch):
     """The aux-only shard pads labels/position_ids/loss_mask identically to the
     load-balanced shard but leaves the primary stream full-length and out of the
     CP buffer list."""
-    from nemo_automodel.components.distributed import cp_utils
+    from nemo_automodel.components.distributed.context_parallel import utils as cp_utils
 
     captured: dict = {}
 
@@ -363,7 +363,7 @@ def test_shard_batch_aux_only_matches_load_balanced(monkeypatch):
 
 def test_shard_batch_aux_only_reports_padded_layout(monkeypatch):
     """The returned ShardLayout carries the primary stream's target padded length."""
-    from nemo_automodel.components.distributed import cp_utils
+    from nemo_automodel.components.distributed.context_parallel import utils as cp_utils
 
     monkeypatch.setattr(cp_utils, "create_context_parallel_ctx", lambda *a, **k: contextlib.nullcontext())
     monkeypatch.setattr(cp_utils, "get_train_context", lambda *a, **k: contextlib.nullcontext)

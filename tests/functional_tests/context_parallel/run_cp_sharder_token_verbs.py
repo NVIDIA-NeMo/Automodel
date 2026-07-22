@@ -34,8 +34,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
-from nemo_automodel.components.distributed.cp_sharder import round_robin_local_indices
-from nemo_automodel.components.distributed.cp_utils import _resolve_cp_sharder
+from nemo_automodel.components.distributed.context_parallel.sharder import round_robin_local_indices
+from nemo_automodel.components.distributed.context_parallel.utils import _resolve_cp_sharder
 
 
 def main() -> None:

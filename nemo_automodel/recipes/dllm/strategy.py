@@ -42,7 +42,7 @@ from nemo_automodel.components.datasets.dllm.corruption import (
     corrupt_uniform,
     corrupt_uniform_random,
 )
-from nemo_automodel.components.distributed.cp_sharder import ContextParallelSharder
+from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loss.dllm_loss import (
     BlockDiffusionCrossEntropyLoss,

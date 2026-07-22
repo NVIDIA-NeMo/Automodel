@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.distributed.cp_sharder import (
+from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     round_robin_local_indices,
     shard_batch_aux_only,

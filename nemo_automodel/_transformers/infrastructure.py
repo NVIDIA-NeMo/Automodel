@@ -748,7 +748,7 @@ def apply_model_infrastructure(
     # is not excluded by the _uses_te_attention check, so gate on ep_size: only
     # dense (non-MoE) models need this pass.
     if mesh.cp_size > 1 and mesh.ep_size <= 1 and not _uses_te_attention(model):
-        from nemo_automodel.components.distributed.cp_utils import (
+        from nemo_automodel.components.distributed.context_parallel.utils import (
             attach_context_parallel_hooks,
             attach_cp_sdpa_hooks,
         )

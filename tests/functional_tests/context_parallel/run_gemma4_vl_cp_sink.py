@@ -58,7 +58,7 @@ def main():
 
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed.cp_sharder import ContextParallelSharder
+    from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
     from nemo_automodel.components.models.common import BackendConfig
     from nemo_automodel.components.models.gemma4_moe.model import (
         Gemma4Config,

@@ -1279,7 +1279,7 @@ def test_forward_backward_step_pp_uses_eval_for_validation(monkeypatch):
 
     # Mock _make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
@@ -1313,7 +1313,7 @@ def test_forward_backward_step_pp_uses_step_for_training(monkeypatch):
 
     # Mock _make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
@@ -1347,7 +1347,7 @@ def test_forward_backward_step_pp_non_first_stage_uses_eval_for_validation(monke
 
     # Mock _make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
@@ -1383,7 +1383,7 @@ def test_forward_backward_step_pp_non_first_stage_uses_step_for_training(monkeyp
 
     # Mock _make_cp_batch_and_ctx to return a no-op context manager
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
@@ -1445,7 +1445,7 @@ def test_run_validation_epoch_pp_sends_loss_from_last_stage_to_main(monkeypatch)
 
     # Mock _make_cp_batch_and_ctx
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
@@ -1505,7 +1505,7 @@ def test_run_validation_epoch_pp_main_rank_receives_from_last_stage(monkeypatch)
     monkeypatch.setattr(recipe, "_dp_allreduce", mock_dp_allreduce)
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *args, **kwargs: (nullcontext, batch, None),
     )
 
@@ -2390,7 +2390,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
         def prepare_model_inputs_for_cp(self, batch, **kwargs):
             self.prepared = True
             self.num_chunks = kwargs.get("num_chunks")
-            from nemo_automodel.components.distributed.cp_sharder import (
+            from nemo_automodel.components.distributed.context_parallel.sharder import (
                 ContextParallelSharder,
                 contiguous_local_indices,
             )
@@ -2445,7 +2445,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
         return logits.mean()
 
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.cp_utils._make_cp_batch_and_ctx",
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *a, **k: (nullcontext, batch, None),
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_loss", _fake_calc_loss)

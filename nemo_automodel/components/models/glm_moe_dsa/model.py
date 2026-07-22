@@ -349,7 +349,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """
         from functools import partial  # noqa: PLC0415
 
-        from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
+        from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
             ContextParallelSharder,
             contiguous_local_indices,
         )

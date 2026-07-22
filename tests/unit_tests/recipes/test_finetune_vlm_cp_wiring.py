@@ -38,7 +38,7 @@ import torch
 
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.distributed import cp_utils as cp_utils_mod
+from nemo_automodel.components.distributed.context_parallel import utils as cp_utils_mod
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for :pyfile:`nemo_automodel/components/distributed/cp_utils.py`.
+"""Unit tests for :pyfile:`nemo_automodel/components/distributed/context_parallel/utils.py`.
 
 The real implementation relies heavily on ``torch.distributed`` and GPU-specific
 behavior.  These unit-tests therefore *mock* the heavyweight distributed pieces
@@ -29,8 +29,8 @@ import pytest
 import torch
 
 # Import module under test
-from nemo_automodel.components.distributed import cp_utils as _cu
-from nemo_automodel.components.distributed.cp_sharder import (
+from nemo_automodel.components.distributed.context_parallel import utils as _cu
+from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     contiguous_local_indices,
     round_robin_local_indices,
@@ -926,7 +926,7 @@ def test_te_sharder_captures_row_shape(monkeypatch):
 
 def test_resolve_cp_sharder_layers():
     """Resolution order: model-owned > magi > TE > generic round-robin > none."""
-    from nemo_automodel.components.distributed.cp_sharder import round_robin_local_indices
+    from nemo_automodel.components.distributed.context_parallel.sharder import round_robin_local_indices
 
     cp2 = _DummySubMesh(2)
     model_sharder = _contiguous_sharder()

@@ -135,7 +135,7 @@ def main():
     from torch.distributed.device_mesh import init_device_mesh
 
     from nemo_automodel.components.datasets.vlm.pp_media import prepare_vlm_media_for_pp, stage_vlm_media_for_pp
-    from nemo_automodel.components.distributed.cp_sharder import ContextParallelSharder
+    from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
     from nemo_automodel.components.distributed.pipelining import AutoPipeline
     from nemo_automodel.components.moe.parallelizer import apply_cp
 

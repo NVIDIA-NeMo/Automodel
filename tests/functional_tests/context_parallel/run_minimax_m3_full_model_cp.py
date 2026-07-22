@@ -105,7 +105,7 @@ def main():
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor.experimental._attention import context_parallel_unshard
 
-    from nemo_automodel.components.distributed.cp_sharder import ContextParallelSharder
+    from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
     from nemo_automodel.components.models.common import BackendConfig
     from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
     from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM

@@ -26,7 +26,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.distributed.cp_sharder import (
+from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
@@ -598,7 +598,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         # this embed+splice runs in-forward under an active CP ring context it must
         # suspend the ring dispatcher, or torch's load-balanced ring SDPA rejects
         # the non-causal attention. No-op when CP is inactive.
-        from nemo_automodel.components.distributed.cp_utils import cp_dispatcher_suspended  # noqa: PLC0415
+        from nemo_automodel.components.distributed.context_parallel.utils import (
+            cp_dispatcher_suspended,  # noqa: PLC0415
+        )
 
         with cp_dispatcher_suspended(self.cp_mesh):
             features = self.vision_tower(pixel_values, self._to_grid_list(grid_thw))
