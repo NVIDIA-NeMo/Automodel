@@ -172,7 +172,11 @@ def test_multi_block_sampling_unmasks_every_scheduled_position():
     sampler = LLaDASampler(
         _FakeDenoiser(),
         mask_id=mask_id,
-        eos_id=None,
+        # A real EOS id (any int distinct from mask_id=9 and the denoiser's
+        # prediction 7): sample() fills the canvas with eos_id, so None would
+        # break torch.full. 0 keeps the assertions strict — a stranded position
+        # would read back as 0, not 7.
+        eos_id=0,
         steps=4,
         max_new_tokens=8,
         block_size=4,
