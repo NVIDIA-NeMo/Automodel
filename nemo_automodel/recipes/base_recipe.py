@@ -882,6 +882,18 @@ class BaseRecipe:
             return 0
         return self.device_mesh.get_local_rank("pp")
 
+    def _get_pp_group(self):
+        """Return the pipeline-parallel process group, or None when pp is disabled.
+
+        Threaded to the checkpointer so PEFT adapters are gathered across PP
+        stages at save time; without it the on-disk adapter only contains the
+        local stage's layers (see ``_gather_peft_state_dict_across_pp``).
+        """
+        dm = self.device_mesh
+        if dm is None or "pp" not in dm.mesh_dim_names or dm["pp"].size() == 1:
+            return None
+        return dm["pp"].get_group()
+
     def _dp_allreduce(self, tensor, op=dist.ReduceOp.SUM, include_cp: bool = False):
         dp_group = self._get_dp_group(include_cp=include_cp)
         if self.device_mesh and dp_group is None:

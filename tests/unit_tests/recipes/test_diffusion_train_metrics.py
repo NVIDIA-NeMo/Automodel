@@ -301,25 +301,27 @@ def _minimal_diffusion_recipe_cfg(
     adapter_type="hunyuan",
     attention_backend="flash_varlen",
     optimize_hunyuan_flash_varlen_mask=True,
+    checkpoint=None,
 ):
-    return ConfigNode(
-        {
-            "model": {
-                "pretrained_model_name_or_path": "dummy-model",
-                "attention_backend": attention_backend,
-                "optimize_hunyuan_flash_varlen_mask": optimize_hunyuan_flash_varlen_mask,
-            },
-            "flow_matching": {"adapter_type": adapter_type},
-            "optim": {"learning_rate": 1.0e-4},
-            "performance": {},
-            "step_scheduler": {
-                "num_epochs": 1,
-                "local_batch_size": 1,
-                "global_batch_size": 1,
-                "ckpt_every_steps": 1,
-            },
-        }
-    )
+    cfg = {
+        "model": {
+            "pretrained_model_name_or_path": "dummy-model",
+            "attention_backend": attention_backend,
+            "optimize_hunyuan_flash_varlen_mask": optimize_hunyuan_flash_varlen_mask,
+        },
+        "flow_matching": {"adapter_type": adapter_type},
+        "optim": {"learning_rate": 1.0e-4},
+        "performance": {},
+        "step_scheduler": {
+            "num_epochs": 1,
+            "local_batch_size": 1,
+            "global_batch_size": 1,
+            "ckpt_every_steps": 1,
+        },
+    }
+    if checkpoint is not None:
+        cfg["checkpoint"] = checkpoint
+    return ConfigNode(cfg)
 
 
 def _patch_lightweight_diffusion_recipe_setup(monkeypatch):
@@ -399,6 +401,41 @@ def test_diffusion_recipe_enables_hunyuan_flash_varlen_mask_optimization_before_
         recipe.setup()
 
     enable_optimization.assert_called_once_with()
+
+
+def test_diffusion_recipe_forwards_consolidation_timeout(monkeypatch):
+    class StopAfterCheckpointConfig(Exception):
+        pass
+
+    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
+    model = SimpleNamespace(transformer=nn.Linear(1, 1), state_dict=lambda: {"weight": torch.ones(1)})
+    monkeypatch.setattr(
+        diffusion_train,
+        "build_model_and_optimizer",
+        MagicMock(return_value=(model, object(), None)),
+    )
+
+    from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
+
+    monkeypatch.setattr(hunyuan_module, "enable_hunyuan_flash_varlen_mask_optimization", MagicMock(return_value=True))
+    checkpoint_config = MagicMock(side_effect=StopAfterCheckpointConfig)
+    monkeypatch.setattr(diffusion_train, "CheckpointingConfig", checkpoint_config)
+    recipe = TrainDiffusionRecipe(
+        _minimal_diffusion_recipe_cfg(
+            checkpoint={
+                "enabled": True,
+                "checkpoint_dir": "checkpoints",
+                "model_save_format": "safetensors",
+                "save_consolidated": "final",
+                "consolidation_timeout_minutes": 45,
+            }
+        )
+    )
+
+    with pytest.raises(StopAfterCheckpointConfig):
+        recipe.setup()
+
+    assert checkpoint_config.call_args.kwargs["consolidation_timeout_minutes"] == 45
 
 
 class _TinyTransformer(nn.Module):
