@@ -45,8 +45,6 @@ exempt_configs:
     reason: "Deprecated for 26.10 (Mistral 7B)"
   mistral_nemo_2407_hellaswag_fp8:
     reason: "Deprecated for 26.10 (Mistral NeMo)"
-  mistral_nemo_2407_squad:
-    reason: "Deprecated for 26.10 (Mistral NeMo)"
   mistral_nemo_2407_squad_peft:
     reason: "Deprecated for 26.10 (Mistral NeMo)"
   mixtral-8x7b-v0-1_squad:
