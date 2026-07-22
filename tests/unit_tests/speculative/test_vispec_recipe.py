@@ -438,7 +438,7 @@ def _patch_setup_dependencies(monkeypatch, tmp_path, dataloader_batches=2):
     monkeypatch.setattr(f"{module}.AutoProcessor", SimpleNamespace(from_pretrained=lambda *a, **k: object()))
     monkeypatch.setattr(f"{module}.NeMoAutoTokenizer", SimpleNamespace(from_pretrained=lambda *a, **k: object()))
     monkeypatch.setattr(
-        f"{module}.NeMoAutoModelForImageTextToText",
+        f"{module}.AutoModelForImageTextToText",
         SimpleNamespace(from_pretrained=lambda *a, **k: _StubTarget()),
     )
     monkeypatch.setattr(f"{module}.build_dspark_vlm_dataloader", lambda **kwargs: [None] * dataloader_batches)
@@ -479,7 +479,7 @@ def _patch_stage1_setup_dependencies(monkeypatch, tmp_path, dataloader_batches=2
     monkeypatch.setattr(f"{module}.AutoConfig", SimpleNamespace(from_pretrained=lambda *a, **k: target_config))
     monkeypatch.setattr(f"{module}.NeMoAutoTokenizer", SimpleNamespace(from_pretrained=lambda *a, **k: object()))
     monkeypatch.setattr(
-        f"{module}.NeMoAutoModelForImageTextToText",
+        f"{module}.AutoModelForImageTextToText",
         SimpleNamespace(from_pretrained=lambda *a, **k: _StubTarget()),
     )
     monkeypatch.setattr(f"{module}.build_eagle3_dataloader", lambda **kwargs: [None] * dataloader_batches)

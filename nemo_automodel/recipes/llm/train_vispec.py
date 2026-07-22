@@ -38,9 +38,8 @@ import pathlib
 
 import torch
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoConfig, AutoProcessor
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
-from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.checkpoint.checkpointing import load_hf_safetensors_state_dict
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
@@ -62,6 +61,7 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_compile,
     apply_draft_fp8,
     raise_if_peft_configured,
+    raise_if_target_not_materialized,
 )
 from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
 
@@ -181,14 +181,23 @@ class TrainVispecRecipe(TrainEagle1Recipe):
         )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
-        self.target_model = NeMoAutoModelForImageTextToText.from_pretrained(
+        # Load the frozen target through transformers directly rather than the
+        # NeMoAuto wrapper. That wrapper initializes on the meta device whenever
+        # world_size > 1 and no sharding infrastructure was requested, expecting a
+        # later FSDP2 wrap to materialize the weights. ViSpec keeps one full
+        # frozen replica per rank and never shards, so nothing materializes them:
+        # ``.to(device)`` would turn meta tensors into uninitialized memory and the
+        # draft would silently distill against a random teacher. Nothing here uses
+        # the wrapper's features; the target is only read through ``.model``,
+        # ``.lm_head`` and ``.get_input_embeddings()``.
+        self.target_model = AutoModelForImageTextToText.from_pretrained(
             target_path,
             trust_remote_code=trust_remote_code,
             torch_dtype=self.compute_dtype,
-            force_hf=bool(recipe_cfg.get("target_force_hf", True)),
         )
         self.target_model.to(self.device)
         self.target_model.requires_grad_(False)
+        raise_if_target_not_materialized(self.target_model, target_path)
         self.target_wrapper = HFVispecTargetModel(
             self.target_model,
             image_token_id=_resolve_image_token_id(target_config, self.processor),
@@ -374,14 +383,23 @@ class TrainVispecStage1Recipe(TrainEagle1Recipe):
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(target_path, trust_remote_code=trust_remote_code)
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
-        self.target_model = NeMoAutoModelForImageTextToText.from_pretrained(
+        # Load the frozen target through transformers directly rather than the
+        # NeMoAuto wrapper. That wrapper initializes on the meta device whenever
+        # world_size > 1 and no sharding infrastructure was requested, expecting a
+        # later FSDP2 wrap to materialize the weights. ViSpec keeps one full
+        # frozen replica per rank and never shards, so nothing materializes them:
+        # ``.to(device)`` would turn meta tensors into uninitialized memory and the
+        # draft would silently distill against a random teacher. Nothing here uses
+        # the wrapper's features; the target is only read through ``.model``,
+        # ``.lm_head`` and ``.get_input_embeddings()``.
+        self.target_model = AutoModelForImageTextToText.from_pretrained(
             target_path,
             trust_remote_code=trust_remote_code,
             torch_dtype=self.compute_dtype,
-            force_hf=bool(recipe_cfg.get("target_force_hf", True)),
         )
         self.target_model.to(self.device)
         self.target_model.requires_grad_(False)
+        raise_if_target_not_materialized(self.target_model, target_path)
         self.target_wrapper = HFEagleTargetModel(self.target_model)
 
         packed_sequence_size = int(recipe_cfg.get("packed_sequence_size", 0) or 0)
