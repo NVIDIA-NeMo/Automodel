@@ -233,6 +233,34 @@ class LinearLoRA(nn.Linear):
         weight_norm = torch.linalg.norm(weight + self.scale * delta_w, dim=1).to(weight.dtype)
         return weight_norm.detach()
 
+    def materialize_effective_weight(self) -> torch.Tensor:
+        """Return the differentiable dense weight represented by this LoRA layer.
+
+        Returns:
+            Tensor of shape [out_features, in_features] containing the frozen base
+            weight plus the scaled LoRA update.
+
+        Raises:
+            RuntimeError: If training-time dropout makes one fixed effective weight
+                unable to represent the layer's stochastic forward pass.
+            NotImplementedError: If DoRA, a delegated linear implementation, or an
+                unsupported quantized or non-strided weight layout is active.
+        """
+        if self.training and self.dropout_p > 0.0:
+            raise RuntimeError("materialize_effective_weight does not support active LoRA training dropout")
+        if self.use_dora:
+            raise NotImplementedError("materialize_effective_weight does not support DoRA")
+        if getattr(self, "super_fwd", None) is not None or getattr(self, "quant_state", None) is not None:
+            raise NotImplementedError(
+                "materialize_effective_weight supports only ordinary torch linear weights, not delegated or "
+                "quantized linear implementations"
+            )
+        if self.weight.layout != torch.strided or self.weight.is_quantized:
+            raise NotImplementedError(
+                "materialize_effective_weight supports only dense, strided, non-quantized linear weights"
+            )
+        return self.weight + self.scale * (self.lora_B.weight @ self.lora_A.weight)
+
     def _should_use_memory_efficient_lora(self, x: torch.Tensor) -> bool:
         """Return whether this LoRA branch can use the custom autograd path."""
         if not getattr(self, "use_memory_efficient_lora", False):

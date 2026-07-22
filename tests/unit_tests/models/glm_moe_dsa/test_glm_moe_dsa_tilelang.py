@@ -21,6 +21,7 @@ import pytest
 import torch
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
+from nemo_automodel.components._peft.lora import LinearLoRA, PeftConfig, apply_lora_to_linear_modules
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.glm_moe_dsa import cp as cp_mod
 from nemo_automodel.components.models.glm_moe_dsa import layers as layer_mod
@@ -918,6 +919,91 @@ def test_sparse_mla_absorbed_matches_dense():
     assert cosine > 0.99, f"sparse MLA cosine vs dense oracle too low: {cosine:.5f}"
 
 
+@requires_kernels
+def test_sparse_mla_lora_effective_weight_matches_dense_forward_and_backward():
+    """BF16 TileLang must match the dense oracle for materialized LoRA K/V weights."""
+    torch.manual_seed(0)
+    dev = "cuda"
+    base = torch.nn.Linear(
+        KV_LORA,
+        N_HEADS * (QK_NOPE + V_HEAD),
+        bias=False,
+        device=dev,
+        dtype=torch.bfloat16,
+    )
+    with torch.no_grad():
+        base.weight.normal_(std=KV_LORA**-0.5)
+    tilelang_lora = LinearLoRA(base, dim=8, alpha=16).train()
+    reference_lora = LinearLoRA(base, dim=8, alpha=16).train()
+    with torch.no_grad():
+        tilelang_lora.lora_A.weight.normal_(std=0.02)
+        tilelang_lora.lora_B.weight.normal_(std=0.02)
+        reference_lora.lora_A.weight.copy_(tilelang_lora.lora_A.weight)
+        reference_lora.lora_B.weight.copy_(tilelang_lora.lora_B.weight)
+
+    q_nope = torch.randn(T, N_HEADS, QK_NOPE, device=dev, dtype=torch.bfloat16, requires_grad=True)
+    q_pe = torch.randn(T, N_HEADS, ROPE, device=dev, dtype=torch.bfloat16, requires_grad=True)
+    kv_c = torch.randn(T, KV_LORA, device=dev, dtype=torch.bfloat16, requires_grad=True)
+    k_pe = torch.randn(T, ROPE, device=dev, dtype=torch.bfloat16, requires_grad=True)
+    q_nope_ref = q_nope.detach().clone().requires_grad_(True)
+    q_pe_ref = q_pe.detach().clone().requires_grad_(True)
+    kv_c_ref = kv_c.detach().clone().requires_grad_(True)
+    k_pe_ref = k_pe.detach().clone().requires_grad_(True)
+    topk_idx = _causal_topk_indices(T, TOPK, dev)
+    scale = QK_HEAD**-0.5
+
+    weight = tilelang_lora.materialize_effective_weight().view(N_HEADS, QK_NOPE + V_HEAD, KV_LORA)
+    w_kc = weight[:, :QK_NOPE, :]
+    w_vc = weight[:, QK_NOPE:, :]
+    q_absorbed = torch.einsum("thd,hdc->thc", q_nope, w_kc)
+    q_tl = torch.cat([q_absorbed, q_pe], dim=-1)
+    kv_latent = torch.cat([kv_c, k_pe], dim=-1).unsqueeze(1)
+    out_tl = ok.tilelang_sparse_attention(q_tl, kv_latent, topk_idx.view(T, 1, TOPK).contiguous(), w_vc, scale)
+
+    reference_weight = reference_lora.materialize_effective_weight().view(
+        N_HEADS,
+        QK_NOPE + V_HEAD,
+        KV_LORA,
+    )
+    out_ref = _dense_sparse_mla(
+        q_nope_ref,
+        q_pe_ref,
+        kv_c_ref,
+        k_pe_ref,
+        reference_weight[:, :QK_NOPE, :],
+        reference_weight[:, QK_NOPE:, :],
+        topk_idx,
+        scale,
+    )
+    output_cosine = torch.nn.functional.cosine_similarity(
+        out_tl.float().flatten(),
+        out_ref.float().flatten(),
+        dim=0,
+    ).item()
+    assert output_cosine > 0.99, f"LoRA sparse MLA output cosine too low: {output_cosine:.5f}"
+
+    output_grad = torch.randn_like(out_tl)
+    out_tl.backward(output_grad)
+    out_ref.backward(output_grad.float())
+    gradient_pairs = {
+        "q_nope": (q_nope.grad, q_nope_ref.grad),
+        "q_pe": (q_pe.grad, q_pe_ref.grad),
+        "kv_c": (kv_c.grad, kv_c_ref.grad),
+        "k_pe": (k_pe.grad, k_pe_ref.grad),
+        "lora_A": (tilelang_lora.lora_A.weight.grad, reference_lora.lora_A.weight.grad),
+        "lora_B": (tilelang_lora.lora_B.weight.grad, reference_lora.lora_B.weight.grad),
+    }
+    for name, (actual_grad, reference_grad) in gradient_pairs.items():
+        assert actual_grad is not None and reference_grad is not None
+        assert torch.isfinite(actual_grad).all() and torch.isfinite(reference_grad).all()
+        gradient_cosine = torch.nn.functional.cosine_similarity(
+            actual_grad.float().flatten(),
+            reference_grad.float().flatten(),
+            dim=0,
+        ).item()
+        assert gradient_cosine > 0.99, f"LoRA sparse MLA {name} gradient cosine too low: {gradient_cosine:.5f}"
+
+
 def _small_dsa_config():
     return GlmMoeDsaConfig(
         vocab_size=256,
@@ -1222,7 +1308,153 @@ def test_mla_tilelang_sparse_attention_dispatches_absorbed_thd(monkeypatch):
     assert captured["topk_indices"] is topk_indices
     assert captured["w_vc"].shape == (config.num_attention_heads, config.v_head_dim, config.kv_lora_rank)
     assert captured["w_vc"].dtype == torch.bfloat16
+    expected_w_vc = mla.kv_b_proj.weight.view(
+        config.num_attention_heads,
+        config.qk_nope_head_dim + config.v_head_dim,
+        config.kv_lora_rank,
+    )[:, config.qk_nope_head_dim :, :]
+    torch.testing.assert_close(captured["w_vc"], expected_w_vc)
     assert captured["softmax_scale"] == mla.softmax_scale
+
+
+def test_mla_tilelang_uses_lora_effective_kv_b_weight_and_gradients(monkeypatch):
+    """Production PEFT injection must affect both absorbed K and V TileLang weights."""
+    torch.manual_seed(0)
+    config = _small_dsa_config()
+    backend = BackendConfig(attn="tilelang", linear="torch", rms_norm="torch", rope_fusion=False)
+    mla = GlmMoeDsaMLA(config, backend, skip_topk=True)
+    mla.o_proj = torch.nn.Identity()
+    matched = apply_lora_to_linear_modules(
+        mla,
+        PeftConfig(
+            target_modules=["kv_b_proj"],
+            dim=4,
+            alpha=8,
+            dropout=0.0,
+            use_memory_efficient_lora=False,
+        ),
+    )
+    assert matched == 1
+    assert isinstance(mla.kv_b_proj, LinearLoRA)
+    with torch.no_grad():
+        mla.kv_b_proj.lora_A.weight.normal_(std=0.2)
+        mla.kv_b_proj.lora_B.weight.normal_(std=0.2)
+
+    monkeypatch.setattr(layer_mod, "should_use_tilelang", lambda *args, **kwargs: True)
+    captured = {}
+
+    def fake_tilelang_sparse_attention(q, kv_latent, topk_indices, w_vc, softmax_scale):
+        """Apply a differentiable sparse-kernel stand-in.
+
+        Args:
+            q: Tensor of shape [tokens, heads, kv_lora_rank + rope_dim], with the
+                absorbed query followed by rotary query channels.
+            kv_latent: Tensor of shape [tokens, 1, kv_lora_rank + rope_dim].
+            topk_indices: Tensor of shape [tokens, 1, topk].
+            w_vc: Tensor of shape [heads, value_dim, kv_lora_rank].
+            softmax_scale: Attention score scale, unused by this stand-in.
+
+        Returns:
+            Tensor of shape [tokens, heads, value_dim].
+        """
+        captured.update(q=q, kv_latent=kv_latent, topk_indices=topk_indices, w_vc=w_vc)
+        return torch.einsum("thc,hvc->thv", q[..., : config.kv_lora_rank], w_vc)
+
+    monkeypatch.setattr(layer_mod, "tilelang_sparse_attention", fake_tilelang_sparse_attention)
+    x = torch.randn(4, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
+    topk_indices = torch.zeros(4, 1, config.index_topk, dtype=torch.int32)
+
+    with torch.no_grad():
+        q_resid = mla.q_a_layernorm(mla.q_a_proj(x))
+        q = mla.q_b_proj(q_resid).view(4, config.num_attention_heads, config.qk_head_dim)
+        q_nope = q[..., : config.qk_nope_head_dim]
+        effective_weight = mla.kv_b_proj.materialize_effective_weight().view(
+            config.num_attention_heads,
+            config.qk_nope_head_dim + config.v_head_dim,
+            config.kv_lora_rank,
+        )
+        expected_q_absorbed = torch.einsum(
+            "thd,hdc->thc",
+            q_nope,
+            effective_weight[:, : config.qk_nope_head_dim, :].to(q_nope.dtype),
+        )
+        expected_w_vc = effective_weight[:, config.qk_nope_head_dim :, :].to(torch.bfloat16)
+
+    out = mla(
+        x,
+        _freqs(4, config.qk_rope_head_dim),
+        prev_topk_indices=topk_indices,
+    )
+
+    torch.testing.assert_close(captured["q"][..., : config.kv_lora_rank], expected_q_absorbed)
+    torch.testing.assert_close(captured["w_vc"], expected_w_vc)
+    out.float().square().mean().backward()
+    for grad in (x.grad, mla.kv_b_proj.lora_A.weight.grad, mla.kv_b_proj.lora_B.weight.grad):
+        assert grad is not None
+        assert torch.isfinite(grad).all()
+        assert torch.count_nonzero(grad) > 0
+
+
+def test_mla_tilelang_zero_initialized_lora_b_updates_then_enables_lora_a(monkeypatch):
+    """A cold-start TileLang KV adapter must begin learning at the first optimizer step."""
+    torch.manual_seed(0)
+    config = _small_dsa_config()
+    backend = BackendConfig(attn="tilelang", linear="torch", rms_norm="torch", rope_fusion=False)
+    mla = GlmMoeDsaMLA(config, backend, skip_topk=True)
+    mla.o_proj = torch.nn.Identity()
+    matched = apply_lora_to_linear_modules(
+        mla,
+        PeftConfig(
+            target_modules=["kv_b_proj"],
+            dim=4,
+            alpha=8,
+            dropout=0.0,
+            use_memory_efficient_lora=False,
+        ),
+    )
+    assert matched == 1
+    assert isinstance(mla.kv_b_proj, LinearLoRA)
+    assert torch.count_nonzero(mla.kv_b_proj.lora_B.weight) == 0
+
+    monkeypatch.setattr(layer_mod, "should_use_tilelang", lambda *args, **kwargs: True)
+
+    def fake_tilelang_sparse_attention(q, kv_latent, topk_indices, w_vc, softmax_scale):
+        del kv_latent, topk_indices, softmax_scale
+        return torch.einsum("thc,hvc->thv", q[..., : config.kv_lora_rank], w_vc)
+
+    monkeypatch.setattr(layer_mod, "tilelang_sparse_attention", fake_tilelang_sparse_attention)
+    optimizer = torch.optim.AdamW(
+        [mla.kv_b_proj.lora_A.weight, mla.kv_b_proj.lora_B.weight],
+        lr=1.0e-4,
+    )
+    x = torch.randn(4, config.hidden_size, dtype=torch.bfloat16)
+    topk_indices = torch.zeros(4, 1, config.index_topk, dtype=torch.int32)
+    freqs = _freqs(4, config.qk_rope_head_dim)
+    initial_a = mla.kv_b_proj.lora_A.weight.detach().clone()
+    initial_b = mla.kv_b_proj.lora_B.weight.detach().clone()
+
+    first_out = mla(x, freqs, prev_topk_indices=topk_indices)
+    first_out.float().square().mean().backward()
+    first_a_grad = mla.kv_b_proj.lora_A.weight.grad
+    first_b_grad = mla.kv_b_proj.lora_B.weight.grad
+    assert first_a_grad is not None and torch.count_nonzero(first_a_grad) == 0
+    assert first_b_grad is not None and torch.isfinite(first_b_grad).all()
+    assert torch.count_nonzero(first_b_grad) > 0
+    optimizer.step()
+
+    torch.testing.assert_close(mla.kv_b_proj.lora_A.weight, initial_a)
+    assert not torch.equal(mla.kv_b_proj.lora_B.weight, initial_b)
+    assert torch.count_nonzero(mla.kv_b_proj.lora_B.weight) > 0
+
+    optimizer.zero_grad(set_to_none=True)
+    second_out = mla(x, freqs, prev_topk_indices=topk_indices)
+    second_out.float().square().mean().backward()
+    second_a_grad = mla.kv_b_proj.lora_A.weight.grad
+    second_b_grad = mla.kv_b_proj.lora_B.weight.grad
+    assert second_a_grad is not None and torch.isfinite(second_a_grad).all()
+    assert torch.count_nonzero(second_a_grad) > 0
+    assert second_b_grad is not None and torch.isfinite(second_b_grad).all()
+    assert torch.count_nonzero(second_b_grad) > 0
 
 
 def test_mla_tilelang_cp_gathers_kv_before_sparse_attention(monkeypatch):
