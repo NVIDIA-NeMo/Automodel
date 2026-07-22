@@ -37,15 +37,16 @@ import logging
 import pathlib
 
 import torch
-from safetensors.torch import load_file
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoConfig, AutoProcessor
 
 from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+from nemo_automodel.components.checkpoint.checkpointing import load_hf_safetensors_state_dict
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.datasets.vlm.dspark_collate import build_dspark_vlm_dataloader
+from nemo_automodel.components.datasets.vlm.utils import set_image_pixel_bounds
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
@@ -57,6 +58,11 @@ from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTarget
 from nemo_automodel.components.speculative.eagle.vispec_core import VispecTrainerModule
 from nemo_automodel.components.speculative.eagle.vispec_target import HFVispecTargetModel
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
+from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_compile,
+    apply_draft_fp8,
+    raise_if_peft_configured,
+)
 from nemo_automodel.recipes.llm.train_eagle1 import TrainEagle1Recipe
 
 logger = logging.getLogger(__name__)
@@ -84,67 +90,38 @@ def _resolve_image_token_id(target_config, processor) -> int:
     return int(processor.tokenizer.convert_tokens_to_ids(image_token))
 
 
-def _load_draft_state_dict(draft_init_from: str) -> dict[str, torch.Tensor]:
-    """Read a stage-1 draft state dict from a file or a checkpoint directory.
+def _resolve_draft_export(draft_init_from: str) -> str:
+    """Resolve a stage-1 checkpoint path to the directory holding its shards.
+
+    ``load_hf_safetensors_state_dict`` reads a directory of shards (honoring an
+    index file), but it returns ``None`` rather than raising when the directory
+    holds none, and it does not look one level down. The checkpointer writes the
+    export under ``<checkpoint>/model/consolidated``, so accepting the checkpoint
+    root is what makes the config path usable, and a missing export has to fail
+    loudly: silently loading nothing would train stage 2 from a random draft.
 
     Args:
         draft_init_from: A ``.safetensors`` file, or a directory holding the
-            consolidated export (searched one level deep, so both the
-            checkpoint root and its ``model/consolidated`` subdirectory work).
+            consolidated export, or a directory one level above it.
 
     Returns:
-        The merged state dict across every shard found.
+        The path to hand to ``load_hf_safetensors_state_dict``.
 
     Raises:
-        FileNotFoundError: If no ``.safetensors`` file is under the path.
+        FileNotFoundError: If no ``.safetensors`` file is at or under the path.
     """
     path = pathlib.Path(draft_init_from)
     if path.is_file():
-        return load_file(str(path))
-    shards = sorted(path.glob("*.safetensors")) or sorted(path.glob("*/*.safetensors"))
-    if not shards:
-        raise FileNotFoundError(
-            f"recipe_args.draft_weights path {draft_init_from} holds no .safetensors file. Point it at the "
-            "stage-1 consolidated export directory (checkpoints/<step>/model/consolidated) or at one of its shards."
-        )
-    state_dict: dict[str, torch.Tensor] = {}
-    for shard in shards:
-        state_dict.update(load_file(str(shard)))
-    return state_dict
-
-
-def _apply_image_token_budget(processor, recipe_cfg) -> None:
-    """Clamp the processor's image resolution so vision tokens cannot crowd out the answer.
-
-    A ViSpec batch is truncated to ``seq_length``, and the assistant turn the
-    draft is supervised on sits at the *end* of the sequence. Qwen VL processors
-    default to a per-image ``max_pixels`` large enough to emit more vision tokens
-    than the whole budget, in which case truncation removes the assistant turn
-    outright: the label scan then finds no assistant marker, ``loss_mask`` comes
-    back all zeros, and the step contributes an exactly-zero loss. Capping the
-    resolution keeps room for the answer.
-
-    Args:
-        processor: The target's ``AutoProcessor``.
-        recipe_cfg: The ``recipe_args`` config node. Reads the optional
-            ``image_max_pixels`` / ``image_min_pixels`` keys; a key left unset
-            leaves the processor's own default in place.
-    """
-    image_processor = getattr(processor, "image_processor", None)
-    if image_processor is None:
-        return
-    for key in ("image_max_pixels", "image_min_pixels"):
-        value = recipe_cfg.get(key, None)
-        if value is None:
-            continue
-        attribute = key.removeprefix("image_")
-        setattr(image_processor, attribute, int(value))
-        # transformers >= 5 reads the bounds off ``size`` when it is present,
-        # falling back to the flat attributes only when it is not.
-        size = getattr(image_processor, "size", None)
-        if isinstance(size, dict) and attribute in size:
-            size[attribute] = int(value)
-        logger.info("ViSpec: capped processor %s at %d", attribute, int(value))
+        return str(path)
+    if any(path.glob("*.safetensors")):
+        return str(path)
+    nested = sorted(p.parent for p in path.glob("*/*.safetensors"))
+    if nested:
+        return str(nested[0])
+    raise FileNotFoundError(
+        f"recipe_args.draft_init_from {draft_init_from} holds no .safetensors file. Point it at the stage-1 "
+        "consolidated export directory (checkpoints/<step>/model/consolidated) or at one of its shards."
+    )
 
 
 def _seed_draft_initialization(recipe_cfg) -> int:
@@ -173,6 +150,7 @@ class TrainVispecRecipe(TrainEagle1Recipe):
 
         recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
+        raise_if_peft_configured(self.cfg, type(self).__name__)
         # The draft compresses per-sample image spans, so its sequence length is
         # sample-dependent and cannot be batched. Gradient accumulation, not a
         # larger micro-batch, is how this recipe scales its effective batch size.
@@ -196,7 +174,11 @@ class TrainVispecRecipe(TrainEagle1Recipe):
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(target_path, trust_remote_code=trust_remote_code)
         self.processor = AutoProcessor.from_pretrained(target_path, trust_remote_code=trust_remote_code)
-        _apply_image_token_budget(self.processor, recipe_cfg)
+        set_image_pixel_bounds(
+            self.processor,
+            max_pixels=recipe_cfg.get("image_max_pixels", None),
+            min_pixels=recipe_cfg.get("image_min_pixels", None),
+        )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
         self.target_model = NeMoAutoModelForImageTextToText.from_pretrained(
@@ -232,6 +214,7 @@ class TrainVispecRecipe(TrainEagle1Recipe):
                 shuffle=False,
                 num_workers=recipe_cfg.get("num_workers", 0),
                 distributed=self.dist_env.world_size > 1,
+                inject_fake_image=False,
             )
 
         # The draft is a text-only transformer over the target's language tower,
@@ -246,6 +229,8 @@ class TrainVispecRecipe(TrainEagle1Recipe):
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
         self._load_stage1_draft(recipe_cfg.get("draft_init_from", None))
+        apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
+        apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
         print_trainable_parameters(self.draft_model, name="Draft")
 
         trainer_module = VispecTrainerModule(
@@ -281,14 +266,14 @@ class TrainVispecRecipe(TrainEagle1Recipe):
                 file, or ``None`` to train the draft from scratch. A directory
                 is the practical form: the checkpointer names the export by
                 shard (``model-00001-of-0000N.safetensors``), so there is no
-                fixed file name to point at.
-
-        Raises:
-            FileNotFoundError: If the path holds no ``.safetensors`` file.
+                fixed file name to point at. Resolution is delegated to
+                ``load_hf_safetensors_state_dict``, the same helper the EAGLE-3
+                recipe uses for its own warm start, so a sharded export with an
+                index file loads identically on both paths.
         """
         if not draft_init_from:
             return
-        state_dict = _load_draft_state_dict(draft_init_from)
+        state_dict = load_hf_safetensors_state_dict(_resolve_draft_export(draft_init_from))
         missing, unexpected = self.draft_model.load_state_dict(state_dict, strict=False)
         vispec_only = {name for name in missing if name.startswith(("img_adaptor.", "img_fc."))}
         unresolved = [name for name in missing if name not in vispec_only]
@@ -375,6 +360,7 @@ class TrainVispecStage1Recipe(TrainEagle1Recipe):
 
         recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
+        raise_if_peft_configured(self.cfg, type(self).__name__)
         self.dp_mesh = None
         self.moe_mesh = None
         self.device_mesh = None
@@ -441,6 +427,8 @@ class TrainVispecStage1Recipe(TrainEagle1Recipe):
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
+        apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
+        apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
         print_trainable_parameters(self.draft_model, name="Draft")
 
         trainer_module = EagleTrainerModule(

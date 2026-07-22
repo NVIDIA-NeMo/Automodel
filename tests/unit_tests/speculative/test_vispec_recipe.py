@@ -32,7 +32,6 @@ from nemo_automodel.components.speculative.eagle.vispec_target import HFVispecTa
 from nemo_automodel.recipes.llm.train_vispec import (
     TrainVispecRecipe,
     TrainVispecStage1Recipe,
-    _apply_image_token_budget,
     _resolve_image_token_id,
     _seed_draft_initialization,
 )
@@ -121,26 +120,6 @@ class TestImageTokenResolution:
         config = SimpleNamespace(image_token_id=None)
         with pytest.raises(ValueError, match="image token"):
             _resolve_image_token_id(config, SimpleNamespace(image_token=None))
-
-
-class TestImageTokenBudget:
-    def test_caps_both_flat_attributes_and_the_size_dict(self):
-        processor = SimpleNamespace(
-            image_processor=SimpleNamespace(max_pixels=99, min_pixels=1, size={"max_pixels": 99, "min_pixels": 1})
-        )
-        _apply_image_token_budget(processor, {"image_max_pixels": 802816, "image_min_pixels": 3136})
-        assert processor.image_processor.max_pixels == 802816
-        assert processor.image_processor.min_pixels == 3136
-        assert processor.image_processor.size == {"max_pixels": 802816, "min_pixels": 3136}
-
-    def test_unset_keys_leave_the_processor_default_alone(self):
-        processor = SimpleNamespace(image_processor=SimpleNamespace(max_pixels=99, min_pixels=1))
-        _apply_image_token_budget(processor, {})
-        assert processor.image_processor.max_pixels == 99
-        assert processor.image_processor.min_pixels == 1
-
-    def test_processor_without_an_image_processor_is_a_no_op(self):
-        _apply_image_token_budget(SimpleNamespace(), {"image_max_pixels": 802816})
 
 
 class TestDraftInitializationSeed:

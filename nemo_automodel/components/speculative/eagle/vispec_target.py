@@ -31,31 +31,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-
-def _shift_left_with_zero(tensor: torch.Tensor) -> torch.Tensor:
-    """Shift a batched sequence tensor left by one and zero-fill the tail.
-
-    Args:
-        tensor: Tensor of shape [batch, sequence, ...]; any trailing dimensions.
-
-    Returns:
-        Tensor of the same shape, with index ``i`` holding the input's index
-        ``i + 1`` and the last position zeroed.
-    """
-    tail = torch.zeros_like(tensor[:, :1])
-    return torch.cat((tensor[:, 1:], tail), dim=1)
-
-
-def _to_full_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """Materialize a possibly-sharded tensor as a plain local tensor.
-
-    Args:
-        tensor: Tensor (or DTensor) of any shape.
-
-    Returns:
-        Tensor of the same global shape; a no-op for an already-plain tensor.
-    """
-    return tensor.full_tensor() if hasattr(tensor, "full_tensor") else tensor
+from nemo_automodel.components.speculative.eagle.target_v12 import (
+    _shift_left_with_zero,
+    _to_full_tensor,
+)
 
 
 @dataclass
@@ -96,6 +75,22 @@ class HFVispecTargetModel:
     def __init__(self, model: nn.Module, *, image_token_id: int):
         self.model = model.eval()
         self.image_token_id = int(image_token_id)
+        # The base model is fixed for this wrapper's lifetime, so resolve what its
+        # forward accepts once instead of rebuilding a Signature on every
+        # micro-batch of the training loop.
+        forward_params = inspect.signature(self.model.model.forward).parameters
+        self._accepted_params = frozenset(forward_params)
+        # A VLM base model declares its vision tensors explicitly but funnels the
+        # HF-generic flags through a ``**kwargs`` catch-all, so a plain
+        # ``name in parameters`` test never matches them and the flags are
+        # silently dropped, leaving ``use_cache`` on its config default and
+        # allocating a full-sequence KV cache on every capture forward.
+        has_var_keyword = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in forward_params.values())
+        self._extra_kwargs = {
+            name: False
+            for name in ("output_attentions", "use_cache")
+            if name in self._accepted_params or has_var_keyword
+        }
 
     def get_input_embeddings(self) -> nn.Module:
         """Return the target model input embeddings."""
@@ -128,17 +123,8 @@ class HFVispecTargetModel:
             VispecTargetBatch, with every tensor on the target's device.
         """
         base_model = self.model.model
-        forward_params = inspect.signature(base_model.forward).parameters
-        accepted = {name: value for name, value in multimodal_inputs.items() if name in forward_params}
-        # A VLM base model declares its vision tensors explicitly but funnels the
-        # HF-generic flags through a ``**kwargs`` catch-all, so a plain
-        # ``name in forward_params`` test never matches them and the flags are
-        # silently dropped -- leaving ``use_cache`` on its config default, which
-        # allocates a full-sequence KV cache on every capture forward for nothing.
-        has_var_keyword = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in forward_params.values())
-        extra_kwargs = {
-            name: False for name in ("output_attentions", "use_cache") if name in forward_params or has_var_keyword
-        }
+        accepted = {name: value for name, value in multimodal_inputs.items() if name in self._accepted_params}
+        extra_kwargs = self._extra_kwargs
 
         outputs = base_model(
             input_ids=input_ids,

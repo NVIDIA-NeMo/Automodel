@@ -53,6 +53,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
+from nemo_automodel.components.datasets.vlm.utils import set_image_pixel_bounds
 from nemo_automodel.shared.import_utils import safe_import
 
 logger = logging.getLogger(__name__)
@@ -221,26 +222,6 @@ def _load_target_model(model_path: str) -> torch.nn.Module:
     return model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
 
-def _apply_image_token_budget(processor, config: RegenerationConfig) -> None:
-    """Clamp the processor image resolution to what stage-2 training will use.
-
-    Args:
-        processor: The target's ``AutoProcessor``.
-        config: The active regeneration settings.
-    """
-    image_processor = getattr(processor, "image_processor", None)
-    if image_processor is None:
-        return
-    for attribute, value in (("max_pixels", config.image_max_pixels), ("min_pixels", config.image_min_pixels)):
-        if value is None:
-            continue
-        setattr(image_processor, attribute, int(value))
-        size = getattr(image_processor, "size", None)
-        if isinstance(size, dict) and attribute in size:
-            size[attribute] = int(value)
-        logger.info("Capped processor %s at %d", attribute, int(value))
-
-
 def _load_source_dataset(dataset_path: str, split: str):
     """Load a source corpus from either a dataset ID or a local JSON file.
 
@@ -273,7 +254,7 @@ def regenerate(config: RegenerationConfig) -> Path:
     data_path = output_dir / "data.jsonl"
 
     processor = AutoProcessor.from_pretrained(config.model)
-    _apply_image_token_budget(processor, config)
+    set_image_pixel_bounds(processor, max_pixels=config.image_max_pixels, min_pixels=config.image_min_pixels)
     model = _load_target_model(config.model)
 
     dataset = _load_source_dataset(config.dataset, config.split).shuffle(seed=config.shuffle_seed)
