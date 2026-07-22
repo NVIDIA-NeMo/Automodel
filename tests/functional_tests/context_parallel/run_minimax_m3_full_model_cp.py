@@ -175,7 +175,7 @@ def main():
     }
     prepared_cp = ContextParallelRuntime(device_mesh=device_mesh).prepare_forward(None, batch)
     train_ctx, batch = prepared_cp.context, prepared_cp.batch
-    with torch.no_grad(), train_ctx():
+    with torch.no_grad(), train_ctx:
         logits_local = _logits(model(input_ids=batch["input_ids"], position_ids=batch["position_ids"])).float()
 
     (logits_cp_full,) = context_parallel_unshard(device_mesh["cp"], [logits_local], seq_dims=[1])

@@ -474,7 +474,7 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
         def prepare_forward(self, model, batch, **kwargs):
             captured.update(kwargs)
             captured["qkv_format"] = batch["qkv_format"]
-            return SimpleNamespace(context=nullcontext, batch=batch)
+            return SimpleNamespace(context=nullcontext(), batch=batch)
 
     recipe.cp_runtime = _CapturingRuntime()
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.get_sync_ctx", lambda *args, **kwargs: nullcontext())

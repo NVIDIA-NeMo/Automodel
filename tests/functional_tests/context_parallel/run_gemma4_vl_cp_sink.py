@@ -170,7 +170,7 @@ def main():
     # input_ids full) and the legacy recipe-level pre-embed path (batch carries the
     # pre-embedded, dispatch-sharded inputs_embeds) -- letting old-vs-new cp2 logits
     # be compared directly.
-    with torch.no_grad(), train_ctx():
+    with torch.no_grad(), train_ctx:
         logits_local = model(**batch).logits.float()
     if rank == 0:
         print("[progress] cp2 sunk forward done", flush=True)

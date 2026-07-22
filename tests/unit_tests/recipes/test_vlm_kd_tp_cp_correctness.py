@@ -55,7 +55,7 @@ class _NoOpCPRuntime:
         if cp_active:
             model.prepare_model_inputs_for_cp(batch)
         self.calls.append(dict(batch))
-        return SimpleNamespace(context=nullcontext, batch=batch)
+        return SimpleNamespace(context=nullcontext(), batch=batch)
 
 
 class _StudentVLM(nn.Module):

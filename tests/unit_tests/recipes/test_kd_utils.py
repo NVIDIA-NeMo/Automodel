@@ -141,20 +141,20 @@ def test_materialize_teacher_logits_uses_cp_layout_and_removes_padding():
     local = torch.tensor([[[1.0], [2.0]]])
 
     class Tokens:
-        def gather(self, tensor, *, seq_dim, trim):
+        def gather(self, tensor, *, seq_dim, fill):
             """Gather local teacher logits through the prepared CP layout.
 
             Args:
                 tensor: Tensor of shape [batch=1, local_sequence=2, vocab=1].
                 seq_dim: Sequence axis, which must be one.
-                trim: Whether the CP layout removes its padding.
+                fill: Value used for input positions absent from the prepared layout.
 
             Returns:
                 Tensor of shape [batch=1, sequence=4, vocab=1].
             """
             assert tensor is local
             assert seq_dim == 1
-            assert trim is True
+            assert fill == 0
             return torch.tensor([[[1.0], [2.0], [3.0], [0.0]]])
 
     result = kd_utils.materialize_teacher_logits(local, tokens=Tokens(), sequence_length=3)
@@ -166,19 +166,19 @@ def test_materialize_teacher_logits_returns_detached_contiguous_tensor():
     logits = torch.arange(8.0, requires_grad=True).reshape(1, 4, 2)
 
     class Tokens:
-        def gather(self, tensor, *, seq_dim, trim):
+        def gather(self, tensor, *, seq_dim, fill):
             """Expand local logits to the full sequence.
 
             Args:
                 tensor: Tensor of shape [batch=1, sequence=4, vocab=2].
                 seq_dim: Sequence axis, which must be one.
-                trim: Whether the CP layout removes its padding.
+                fill: Value used for input positions absent from the prepared layout.
 
             Returns:
                 Tensor of shape [batch=1, sequence=4, vocab=2].
             """
             assert seq_dim == 1
-            assert trim is True
+            assert fill == 0
             return tensor
 
     result = kd_utils.materialize_teacher_logits(logits, tokens=Tokens(), sequence_length=3)

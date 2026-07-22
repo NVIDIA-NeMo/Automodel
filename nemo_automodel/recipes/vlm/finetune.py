@@ -852,7 +852,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with sync_ctx, train_ctx():
+            with sync_ctx, train_ctx:
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory

@@ -188,7 +188,9 @@ def test_teacher_forward_separate_materializes_logits(monkeypatch, recipe_module
     recipe.kd_mesh_bridge = SimpleNamespace(move_to_device=lambda batch: batch)
     recipe.device_mesh = None
     recipe.cp_runtime = SimpleNamespace(
-        prepare_forward=lambda model, batch, **kwargs: SimpleNamespace(context=nullcontext, batch=batch, tokens=tokens)
+        prepare_forward=lambda model, batch, **kwargs: SimpleNamespace(
+            context=nullcontext(), batch=batch, tokens=tokens
+        )
     )
     recipe.teacher_model = _Teacher()
     if recipe_module is llm_kd:

@@ -343,7 +343,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             if is_train
             else nullcontext()
         )
-        with sync_ctx, train_ctx():
+        with sync_ctx, train_ctx:
             # Teacher forward (no grad) — free intermediates immediately.
             if separate_teacher_logits is None:
                 with (
