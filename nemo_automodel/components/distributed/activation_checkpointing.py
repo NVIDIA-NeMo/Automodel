@@ -399,7 +399,12 @@ def apply_submodule_checkpointing(
         wrapped_counts["mlp"] += _wrap_first_existing_attr(layer, ("mlp", "feed_forward", "ffn"), context_fn=context_fn)
         wrapped_counts["attention"] += _wrap_first_existing_attr(
             layer,
-            ("self_attn", "attention", "attn"),
+            # "linear_attn" covers hybrid linear-attention blocks (e.g. Qwen3-Next /
+            # Qwen3.5 Gated DeltaNet layers), which name their mixer "linear_attn"
+            # rather than "self_attn". Without it those layers are never wrapped and
+            # long-context training OOMs. A hybrid block has either "self_attn" or
+            # "linear_attn" (never both), so first-match wrapping stays unambiguous.
+            ("self_attn", "attention", "attn", "linear_attn"),
             skip=has_kv_sharing,
             context_fn=context_fn,
         )
