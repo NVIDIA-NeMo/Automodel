@@ -160,12 +160,40 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada"):
         # Automodel *training* implementation, which has no ``generate``.
         from transformers import DiffusionGemmaForBlockDiffusion
 
-        # bfloat16 explicitly: SFT consolidates fp32 master weights (104 GB for 26B) which
-        # cannot fit one GPU; "auto" would honor that dtype and shunt weights to meta/offload.
-        model = DiffusionGemmaForBlockDiffusion.from_pretrained(
-            checkpoint_path, dtype="bfloat16", device_map="cuda"
-        ).eval()
-        return model, tokenizer, None, tokenizer.eos_token_id
+        # DiffusionGemma SFT saves ONLY the trained decoder (state_dict_adapter:
+        # "frozen base ... is loaded separately"); the frozen encoder that reads
+        # the prompt is not exported. So load the FULL base model recorded in the
+        # checkpoint's config (``_name_or_path``) for a complete encoder, then
+        # overlay the fine-tuned decoder weights on top. bfloat16 explicitly:
+        # SFT consolidates fp32 master weights (104 GB for 26B) which cannot fit
+        # one GPU; "auto" would honor that dtype and offload to meta.
+        cfg_path = os.path.join(checkpoint_path, "config.json")
+        is_local_ckpt = os.path.isfile(cfg_path)
+        base_id = checkpoint_path
+        if is_local_ckpt:
+            import json
+
+            with open(cfg_path) as f:
+                base_id = json.load(f).get("_name_or_path", checkpoint_path)
+
+        model = DiffusionGemmaForBlockDiffusion.from_pretrained(base_id, dtype="bfloat16", device_map="cuda")
+
+        if is_local_ckpt and os.path.realpath(str(base_id)) != os.path.realpath(checkpoint_path):
+            import glob
+
+            from safetensors.torch import load_file
+
+            overlay = {}
+            for shard in sorted(glob.glob(os.path.join(checkpoint_path, "*.safetensors"))):
+                overlay.update(load_file(shard))
+            missing, unexpected = model.load_state_dict(overlay, strict=False)
+            # every fine-tuned tensor must land somewhere; encoder keys are absent
+            # from the overlay and correctly kept from the base.
+            if unexpected:
+                raise RuntimeError(f"fine-tuned decoder keys not found in base model: {unexpected[:5]}")
+            print(f"[gemma] overlaid {len(overlay)} fine-tuned decoder tensors onto base {base_id}")
+
+        return model.eval(), tokenizer, None, tokenizer.eos_token_id
 
     if sampler_name == "llada":
         if tokenizer.mask_token is None:
