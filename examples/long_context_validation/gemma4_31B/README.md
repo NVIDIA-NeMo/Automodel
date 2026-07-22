@@ -56,7 +56,9 @@ higher-length pass is a cheap re-filter (no re-tokenization) that emits a new
 ### Gemma4 specifics (verified)
 
 - **Tokenizer/template** come from the local checkpoint dir (`chat_template.jinja`
-  + `tokenizer.json`). Point `--model` at it.
+  + `tokenizer.json`). Point `--model` at it. The base `google/gemma-4-31B` ships
+  **no `chat_template.jinja`** — copy it from `google/gemma-4-31B-it` into the base
+  checkpoint dir before running data prep or training (the tokenizer is identical).
 - The Gemma4 template has **no real `{% generation %}` block**, so
   `return_assistant_tokens_mask` is all-zeros. `ChatDataset` detects this and
   falls back to `_build_multiturn_assistant_mask`, which supervises every
@@ -74,16 +76,16 @@ higher-length pass is a cheap re-filter (no re-tokenization) that emits a new
 ```bash
 # 1. Analyze: tokenize once, print the coverage curve (retention vs seq_length),
 #    cache the analyzed JSONL. Pick seq_length from the curve at your retention target.
-MODEL=/path/to/hf_gemma4_31b_it bash data/prefilter.sh
+MODEL=/path/to/hf_gemma4_31b bash data/prefilter.sh
 
 # 2. Produce a training-ready cache at the chosen seq_length (cheap re-filter, no
 #    re-tokenization — so a larger seq_length later is a quick second run).
-MODEL=/path/to/hf_gemma4_31b_it SEQ_LENGTH=65536 bash data/prefilter.sh
+MODEL=/path/to/hf_gemma4_31b SEQ_LENGTH=65536 bash data/prefilter.sh
 
 # 3. Validate the cache through the exact ChatDataset training path.
 python data/validate_data.py \
     --dataset data/cached/togethercomputer_CoderForge-Preview_filtered_reward1_seq65536/data.jsonl \
-    --model /path/to/hf_gemma4_31b_it \
+    --model /path/to/hf_gemma4_31b \
     --seq_length 65536 --num-samples 200
 ```
 
@@ -120,31 +122,20 @@ dataset:
 
 ## Phase 2 — Training recipe (Gemma4 31B + CP)
 
-Both recipes run Gemma4-31B on 16 nodes / 128 GPUs, `cp8 × dp16`, `gbs=16`, 64K
+`gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml` — SFT on the **base**
+`google/gemma-4-31B`, on 16 nodes / 128 GPUs, `cp8 × dp16`, `gbs=16`, 64K
 sequence length, `FusedLinearCrossEntropy`, and the `ChatDataset` + THD collate
-path (via `packed_sequence_thd_collater_vlm`) that preserves tools. Both set
+path (via `packed_sequence_thd_collater_vlm`) that preserves tools. It sets
 `save_consolidated` so the resulting HF checkpoint is SWE-bench-evaluable.
 
-### Base model fine-tune
-
-`gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml` — SFT on the **base**
-`google/gemma-4-31B`. The base model must learn the Gemma4
-tool-call special tokens (`<|tool_call>`=48 / `<tool_call|>`=49) from scratch, so
-this uses `lr 1e-5` with a 60-step warmup over `max_steps=800` (~0.5B tokens) and
-`clip_grad_norm=1.0` (the base has volatile early grads). `freeze_language_model:
-false` keeps the embeddings + tied LM head trainable — required to learn 48/49.
+The base model must learn the Gemma4 tool-call special tokens (`<|tool_call>`=48
+/ `<tool_call|>`=49) from scratch, so this uses `lr 1e-5` with a 60-step warmup
+over `max_steps=800` (~0.5B tokens) and `clip_grad_norm=1.0` (the base has
+volatile early grads). `freeze_language_model: false` keeps the embeddings + tied
+LM head trainable — required to learn 48/49.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_sft.png" alt="Gemma4-31B base SFT training loss curve on CoderForge" width="700">
-</p>
-
-### IT model fine-tune
-
-`gemma4_31b_coderforge_cp8_64k_16node.yaml` — SFT on the instruct-tuned
-`google/gemma-4-31B-it`, for `max_steps=300`, ~0.20B tokens.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/NVIDIA-NeMo/Automodel/main/examples/long_context_validation/gemma4_31B/gemma4_31b_it_coderforge_sft.png" alt="Gemma4-31B IT model SFT training loss curve on CoderForge" width="700">
 </p>
 
 ## Phase 3 — SWE-bench Verified evaluation — *next*

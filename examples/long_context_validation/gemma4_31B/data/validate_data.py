@@ -37,7 +37,7 @@ Exits non-zero if any assertion fails.
 Usage:
     python validate_data.py \
         --dataset ./cached/togethercomputer_CoderForge-Preview_filtered_reward1_seq32768/data.jsonl \
-        --model /path/to/hf_gemma4_31b_it \
+        --model /path/to/hf_gemma4_31b \
         --seq_length 32768 \
         --num-samples 200
 """

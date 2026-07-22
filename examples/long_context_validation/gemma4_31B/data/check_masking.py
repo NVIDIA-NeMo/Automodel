@@ -34,7 +34,7 @@ from transformers import AutoTokenizer
 
 from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
 
-GEMMA4 = "/path/to/checkpoints/hf_gemma4_31b_it"
+GEMMA4 = "/path/to/checkpoints/hf_gemma4_31b"
 JSONL = "/path/to/coderforge_cache/togethercomputer_CoderForge-Preview_filtered_reward1_seq65536/data.jsonl"
 
 

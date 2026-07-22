@@ -19,16 +19,16 @@
 # Override any default via environment variables or append extra CLI args.
 #
 # Usage:
-#   MODEL=/path/to/hf_gemma4_31b_it ./prefilter.sh                 # analyze + coverage curve
-#   MODEL=/path/to/hf_gemma4_31b_it SEQ_LENGTH=32768 ./prefilter.sh # also write a training cache
-#   MODEL=/path/to/hf_gemma4_31b_it ./prefilter.sh --max_samples 20 # smoke test
+#   MODEL=/path/to/hf_gemma4_31b ./prefilter.sh                 # analyze + coverage curve
+#   MODEL=/path/to/hf_gemma4_31b SEQ_LENGTH=32768 ./prefilter.sh # also write a training cache
+#   MODEL=/path/to/hf_gemma4_31b ./prefilter.sh --max_samples 20 # smoke test
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Defaults (override via env vars). MODEL must point at the Gemma4 checkpoint dir.
-MODEL="${MODEL:?Set MODEL to the Gemma4 checkpoint dir, e.g. /path/to/hf_gemma4_31b_it}"
+MODEL="${MODEL:?Set MODEL to the Gemma4 checkpoint dir, e.g. /path/to/hf_gemma4_31b}"
 DATASET="${DATASET:-togethercomputer/CoderForge-Preview}"
 NAME="${NAME:-trajectories}"
 SPLIT="${SPLIT:-filtered_reward1}"
