@@ -89,7 +89,11 @@ def _process_chunk(args):
             if role not in counted_roles:
                 continue
             content = msg.get(content_tag, "")
-            text = _MEDIA_TAG_RE.sub("", content).strip()
+            # The dataset converter expands media placeholders only in user turns.
+            # Preserve them in system and assistant turns to match their rendered text.
+            if role == user_tag:
+                content = _MEDIA_TAG_RE.sub("", content)
+            text = content.strip()
             if text:
                 texts.append(text)
 

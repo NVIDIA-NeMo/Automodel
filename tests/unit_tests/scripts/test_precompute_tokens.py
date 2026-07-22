@@ -109,19 +109,20 @@ def test_custom_system_tag(word_tokenizer):
     assert sample["_text_tokens"] == 5
 
 
-def test_media_tags_stripped_and_empty_sample_is_zero(word_tokenizer):
-    """Media placeholders do not count, and a sample with no text yields 0."""
+def test_media_tags_stripped_only_from_user_turns(word_tokenizer):
+    """Only user media placeholders are removed from the token-count estimate."""
     with_media, empty = _run(
         [
             {
                 "messages": [
+                    {"role": "system", "content": "system <image> prompt"},
                     {"role": "user", "content": "<image> describe this"},
-                    {"role": "assistant", "content": "a cat"},
+                    {"role": "assistant", "content": "a <video> cat"},
                 ]
             },
             {"messages": [{"role": "user", "content": "<image>"}]},
         ],
     )
 
-    assert with_media["_text_tokens"] == 4
+    assert with_media["_text_tokens"] == 8
     assert empty["_text_tokens"] == 0
