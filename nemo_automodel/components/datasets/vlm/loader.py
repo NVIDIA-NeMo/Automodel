@@ -30,7 +30,12 @@ from transformers import AutoProcessor, ProcessorMixin
 
 from nemo_automodel.components.datasets.llm.formatting_utils import _resolve_chat_template
 from nemo_automodel.components.datasets.loader import DatasetConfig, TokenizerDatasetConfig
-from nemo_automodel.components.datasets.vlm.collate_fns import COLLATE_FNS, neat_packed_vlm_collater, pad_collate_fn
+from nemo_automodel.components.datasets.vlm.collate_fns import (
+    COLLATE_FNS,
+    neat_packed_vlm_collater,
+    packed_sequence_thd_vlm_collater,
+    pad_collate_fn,
+)
 from nemo_automodel.components.datasets.vlm.datasets import PreTokenizedDatasetWrapperConfig
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 from nemo_automodel.components.datasets.vlm.pp_media import wrap_vlm_collate_for_pp
@@ -241,12 +246,20 @@ class VlmDataloaderConfig:
                 get_rope_index=get_rope_index,
                 processor=processor,
             )
-            collate_fn: VlmCollateFn = partial(
-                neat_packed_vlm_collater,
-                padding_idx=padding_idx,
-                max_length=self.packing.collate_max_length,
-                attn_implementation=packing_attn_implementation,
-            )
+            if self.packing.packing_format == "thd":
+                logger.info("Configured VLM THD packing (Transformer Engine, qkv_format=thd)")
+                collate_fn = partial(
+                    packed_sequence_thd_vlm_collater,
+                    padding_idx=padding_idx,
+                    max_length=self.packing.collate_max_length,
+                )
+            else:
+                collate_fn = partial(
+                    neat_packed_vlm_collater,
+                    padding_idx=padding_idx,
+                    max_length=self.packing.collate_max_length,
+                    attn_implementation=packing_attn_implementation,
+                )
         elif self.collator is not None:
             collate_fn = self.collator.build(processor=processor)
         elif self.pretokenization is not None:
