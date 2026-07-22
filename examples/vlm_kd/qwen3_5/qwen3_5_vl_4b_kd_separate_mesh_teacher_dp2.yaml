@@ -41,7 +41,7 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.5-4B
-  torch_dtype: bfloat16
+  torch_dtype: float32
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
@@ -107,15 +107,11 @@ kd_loss_fn:
   chunk_size: 512
 
 optimizer:
-  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  _target_: torch.optim.AdamW
   lr: 5e-5
   weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1e-8
-  adam_w_mode: true
-  bias_correction: true
-  master_weights: true
-  master_weight_dtype: torch.float32
 
 lr_scheduler:
   lr_warmup_steps: 30
