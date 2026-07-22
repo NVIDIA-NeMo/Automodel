@@ -29,7 +29,7 @@ from unittest import mock
 import pytest
 import torch
 
-from nemo_automodel.components.distributed.cp_sharder import shard_batch_contiguous
+from nemo_automodel.components.distributed.context_parallel.sharder import shard_batch_contiguous
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4Config,

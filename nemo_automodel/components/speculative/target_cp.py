@@ -19,7 +19,7 @@ along the sequence and gather its captured hidden states / logits back to the
 full sequence before handing them to the draft. That flow is specific to
 speculative decoding -- it needs no gradients through the target and no
 model-owned CP sharder -- so it lives here rather than in the shared
-``components/distributed/cp_utils`` surface.
+``components/distributed/context_parallel/utils`` surface.
 """
 
 from typing import Callable, List, Optional

@@ -34,13 +34,13 @@ from transformers import AutoConfig, AutoModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.distributed.cp_sharder import (
-    ContextParallelismSharder,
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
 )
-from nemo_automodel.components.distributed.cp_utils import cp_dispatcher_suspended
+from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -786,7 +786,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         ``forward`` per microbatch (the existing ``inputs_embeds is None`` block),
         which then round-robin shards the result with
         :func:`shard_sequence_for_cp_round_robin`. The returned
-        :class:`ContextParallelismSharder` round-robin-shards only the no-grad aux
+        :class:`ContextParallelSharder` round-robin-shards only the no-grad aux
         streams (labels/position_ids/loss_mask/padding_mask) and leaves
         ``input_ids`` and the media inputs full-length for the forward. NemotronOmni
         uses plain 1-D positions, so no ``position_ids`` are computed here.
@@ -798,7 +798,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         """
         del batch, num_chunks
         return {
-            "cp_sharder": ContextParallelismSharder(
+            "cp_sharder": ContextParallelSharder(
                 shard_batch=shard_batch_aux_only,
                 local_token_global_indices=round_robin_local_indices,
             )

@@ -15,7 +15,7 @@
 """GPU CP forward-equivalence for the Gemma4 in-forward pre-embed shard (L1, 2 GPUs).
 
 Exercises the sunk contiguous-CP path end to end for the E-series-shaped dense
-Gemma4: ``prepare_cp_forward`` invokes the sharder-only
+Gemma4: ``ContextParallelSharder`` invokes the sharder-only
 ``prepare_model_inputs_for_cp`` hook (``shard_batch_contiguous(shard_primary=False)``
 shards labels/position_ids and the synthesized ``_packed_seq_ids``; the model records
 ``cp_mesh`` and installs its p2p flex ring), and
@@ -24,7 +24,7 @@ shards labels/position_ids and the synthesized ``_packed_seq_ids``; the model re
 slices this rank's shard. The unsharded cp2 logits must match the cp1 eager
 forward.
 
-  cp1 eager (cp_mesh unset)  ==  cp2 (apply_cp + prepare_cp_forward + in-forward slice)
+  cp1 eager (cp_mesh unset)  ==  cp2 (apply_cp + ContextParallelSharder + in-forward slice)
 
 vision-bidirectional mask is driven by ``mm_token_type_ids`` (a vision block) so
 the ``_gemma4_vision_group_ids`` cumsum-then-slice path is exercised without
@@ -58,7 +58,7 @@ def main():
 
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
+    from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
     from nemo_automodel.components.models.common import BackendConfig
     from nemo_automodel.components.models.gemma4_moe.model import (
         Gemma4Config,
@@ -146,7 +146,7 @@ def main():
     if rank == 0:
         print("[progress] cp1 eager forward done", flush=True)
 
-    # cp2: the recipe path -- apply_cp installs the ring, prepare_cp_forward runs the
+    # cp2: the recipe path -- apply_cp installs the ring, ContextParallelSharder runs the
     # sharder-only hook (aux-only contiguous shard), forward embeds + contiguously
     # slices this rank's shard.
     device_mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("cp",))
@@ -158,7 +158,8 @@ def main():
     }
     if mm_arg is not None:
         batch["mm_token_type_ids"] = mm_arg.clone()
-    train_ctx, batch, _ = prepare_cp_forward(model, device_mesh, batch)
+    cp_sharder = ContextParallelSharder(model, device_mesh, batch)
+    train_ctx, batch = cp_sharder.shard(batch)
     batch.pop("labels", None)
     # Drop the synthesized single-document _packed_seq_ids: it reaches the ring by
     # the identical contiguous slice in old and new (unit-proven slice-equivalence),

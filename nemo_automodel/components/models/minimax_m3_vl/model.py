@@ -26,8 +26,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from nemo_automodel.components.distributed.cp_sharder import (
-    ContextParallelismSharder,
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
@@ -598,7 +598,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         # this embed+splice runs in-forward under an active CP ring context it must
         # suspend the ring dispatcher, or torch's load-balanced ring SDPA rejects
         # the non-causal attention. No-op when CP is inactive.
-        from nemo_automodel.components.distributed.cp_utils import cp_dispatcher_suspended  # noqa: PLC0415
+        from nemo_automodel.components.distributed.context_parallel.utils import (
+            cp_dispatcher_suspended,  # noqa: PLC0415
+        )
 
         with cp_dispatcher_suspended(self.cp_mesh):
             features = self.vision_tower(pixel_values, self._to_grid_list(grid_thw))
@@ -647,7 +649,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     ) -> dict[str, Any]:
         """Return a sharder-only CP backend; embed + splice + shard happen in forward.
 
-        The returned :class:`ContextParallelismSharder` round-robin-shards only the
+        The returned :class:`ContextParallelSharder` round-robin-shards only the
         no-grad aux streams (labels/position_ids/loss_mask/padding_mask) via
         :func:`shard_batch_aux_only`, leaving ``input_ids`` and the multimodal inputs
         full-length; the forward then embeds + splices and calls
@@ -662,7 +664,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         """
         del batch, num_chunks
         return {
-            "cp_sharder": ContextParallelismSharder(
+            "cp_sharder": ContextParallelSharder(
                 shard_batch=shard_batch_aux_only,
                 local_token_global_indices=round_robin_local_indices,
             )

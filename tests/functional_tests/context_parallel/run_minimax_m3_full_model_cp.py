@@ -20,7 +20,8 @@ function it reconstructs with -- self-consistent but blind to layout mismatches)
 drives the WHOLE model exactly as recipes/vlm/finetune.py does under CP:
 
   apply_cp(model, cp_mesh)                      # sets _cp_mesh on the sparse layers
-  train_ctx, batch, _ = prepare_cp_forward(None, ...) # torch context_parallel shards the seq
+  cp_sharder = ContextParallelSharder(None, ...)
+  train_ctx, batch = cp_sharder.shard(batch)          # torch context_parallel shards the seq
   with train_ctx(): logits_local = model(**batch)
   logits_full = context_parallel_unshard(...)   # undo the load-balanced layout
 
@@ -104,7 +105,7 @@ def main():
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor.experimental._attention import context_parallel_unshard
 
-    from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
+    from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
     from nemo_automodel.components.models.common import BackendConfig
     from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLTextConfig
     from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForCausalLM
@@ -173,7 +174,8 @@ def main():
         "labels": input_ids.clone(),  # required by the CP dispatch
         "position_ids": position_ids.clone(),
     }
-    train_ctx, batch, _ = prepare_cp_forward(None, device_mesh, batch)
+    cp_sharder = ContextParallelSharder(None, device_mesh, batch)
+    train_ctx, batch = cp_sharder.shard(batch)
     with torch.no_grad(), train_ctx():
         logits_local = _logits(model(input_ids=batch["input_ids"], position_ids=batch["position_ids"])).float()
 

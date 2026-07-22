@@ -289,8 +289,8 @@ def test_from_pretrained_uses_step3p7_config(monkeypatch):
 
 
 def test_prepare_model_inputs_for_cp_is_sharder_only():
-    from nemo_automodel.components.distributed.cp_sharder import (
-        ContextParallelismSharder,
+    from nemo_automodel.components.distributed.context_parallel.sharder import (
+        ContextParallelSharder,
         round_robin_local_indices,
         shard_batch_aux_only,
     )
@@ -303,7 +303,7 @@ def test_prepare_model_inputs_for_cp_is_sharder_only():
     assert "inputs_embeds" not in result
     assert set(result) == {"cp_sharder"}
     sharder = result["cp_sharder"]
-    assert isinstance(sharder, ContextParallelismSharder)
+    assert isinstance(sharder, ContextParallelSharder)
     assert sharder.shard_batch is shard_batch_aux_only
     assert sharder.local_token_global_indices is round_robin_local_indices
 

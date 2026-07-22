@@ -51,7 +51,7 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DistributedSetup
-from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
+from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
@@ -77,9 +77,6 @@ from nemo_automodel.recipes.kd_utils import (
 )
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
-    _get_num_thd_chunks,
-    _uses_te_dot_product_attention,
-    _uses_thd_collater,
     build_model,
 )
 
@@ -493,12 +490,12 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         """
         batch = self.kd_mesh_bridge.move_to_device(batch)
         sequence_length = batch["labels"].shape[1]
-        train_ctx, batch, _ = prepare_cp_forward(
+        cp_sharder = ContextParallelSharder(
             self.teacher_model,
             self.device_mesh,
             batch,
-            use_te=False,
         )
+        train_ctx, batch = cp_sharder.shard(batch)
         labels = batch.pop("labels")
         with train_ctx(), torch.no_grad():
             if self.pp_enabled:
@@ -597,7 +594,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         labels = batch.pop("labels")
         # KD has not wired model-owned CP; skip the pre-embed hook explicitly.
         # Separate-mesh teacher logits ride the batch through CP sharding.
-        train_ctx, batch, _ = prepare_cp_forward(
+        cp_sharder = ContextParallelSharder(
             self.model_parts[0],
             self.device_mesh,
             batch,
@@ -605,6 +602,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             invoke_pre_embed=False,
             extra_seq_buffers={"teacher_logits": 1} if separate_teacher_logits is not None else None,
         )
+        train_ctx, batch = cp_sharder.shard(batch)
         separate_teacher_logits = batch.pop("teacher_logits", None)
 
         model = self.model_parts[0]
@@ -712,16 +710,16 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if separate_teacher_logits is not None:
             batch["teacher_logits"] = separate_teacher_logits
         # KD has not wired model-owned CP; skip the pre-embed hook explicitly.
-        train_ctx, batch, _ = prepare_cp_forward(
+        cp_sharder = ContextParallelSharder(
             self.model_parts[0],
             self.device_mesh,
             batch,
-            use_te=_uses_te_dot_product_attention(self.cfg.model) and _uses_thd_collater(self.cfg.dataloader),
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-            num_chunks=_get_num_thd_chunks(True, self.cfg),
+            num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size,
             invoke_pre_embed=False,
             extra_seq_buffers={"teacher_logits": 1} if separate_teacher_logits is not None else None,
         )
+        train_ctx, batch = cp_sharder.shard(batch)
         separate_teacher_logits = batch.pop("teacher_logits", None)
         labels = batch.pop("labels")
         input_ids = batch.pop("input_ids")

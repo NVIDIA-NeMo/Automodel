@@ -46,7 +46,7 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.dllm.collate import DLLMCollator
-from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
+from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loggers.mlflow_utils import to_float_metrics
@@ -309,7 +309,8 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         model = self.model_parts[0]
 
         # Context parallel setup (no labels to pass for dLLM)
-        train_ctx, batch, _ = prepare_cp_forward(None, self.device_mesh, batch)
+        cp_sharder = ContextParallelSharder(None, self.device_mesh, batch)
+        train_ctx, batch = cp_sharder.shard(batch)
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
         sync_ctx = (
             get_sync_ctx(
@@ -1083,7 +1084,8 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
         p_mask = window["p_mask"]
 
         model = self.model_parts[0]
-        train_ctx, batch, _ = prepare_cp_forward(None, self.device_mesh, batch)
+        cp_sharder = ContextParallelSharder(None, self.device_mesh, batch)
+        train_ctx, batch = cp_sharder.shard(batch)
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
         sync_ctx = (
             get_sync_ctx(

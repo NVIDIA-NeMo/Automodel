@@ -222,10 +222,10 @@ def build_dsv4_cp_causal_padding_mask(
 # ---------------------------------------------------------------------------
 # Model-owned CP batch sharding (Miles-style contiguous query shard).
 #
-# The CP dispatch (``cp_utils.prepare_cp_forward``) delegates manual all-gather CP to the model
-# via the ``ContextParallelismSharder`` returned by ``prepare_model_inputs_for_cp``. DSV4's
+# ``ContextParallelSharder`` construction delegates manual all-gather CP to the model
+# via the ``ContextParallelSharder`` returned by ``prepare_model_inputs_for_cp``. DSV4's
 # sharder pads + contiguously shards the sequence per CP rank (via the shared
-# contiguous implementation in ``components/distributed/cp_sharder.py``) and
+# contiguous implementation in ``components/distributed/context_parallel/sharder.py``) and
 # hands the CP process group to the forward (``_dsv4_cp_group``) so DSV4
 # attention can all-gather K/V.
 # ---------------------------------------------------------------------------
@@ -288,7 +288,7 @@ def _repad_dsv4_packed_batch(
 
     batch_size = primary.shape[0]
     # Per-row map from input position to rebuilt-row column (-1 = input pad
-    # slot whose token was dropped); the ContextParallelismSharder token verbs restore the
+    # slot whose token was dropped); the ContextParallelSharder token verbs restore the
     # caller's coordinates through it.
     input_positions = torch.full((batch_size, primary.shape[1]), -1, dtype=torch.long, device=primary.device)
     rebuilt_primary = []
@@ -433,7 +433,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
 ):
     """Contiguously shard a batch for DeepSeek V4 Miles-style context parallelism.
 
-    Exposed as ``ContextParallelismSharder.shard_batch`` (via ``functools.partial`` to bind
+    Exposed as ``ContextParallelSharder.shard_batch`` (via ``functools.partial`` to bind
     ``pad_multiple``) and invoked by the CP dispatch. HybridEP can
     first max-reduce packed lengths so every rank contributes a uniform token count.
     Each CP rank then keeps one ``seq_start:seq_end`` slice; DSV4 attention all-gathers
@@ -447,7 +447,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     """
     import contextlib
 
-    from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
+    from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
         ShardLayout,
         convert_attention_mask_to_padding_mask,
         shard_batch_contiguous,

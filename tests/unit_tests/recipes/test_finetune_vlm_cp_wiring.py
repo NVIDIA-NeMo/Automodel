@@ -19,12 +19,12 @@ These reproduce the ``_forward_backward_step``-style and
 full recipe — exercising the code shape that gets shipped:
 
   - Invoke the sharder-only ``prepare_model_inputs_for_cp`` directly through
-    ``prepare_cp_forward`` (a plain method call; nothing consumed, so input_ids
+    ``ContextParallelSharder`` construction (a plain method call; nothing consumed, so input_ids
     and multimodal inputs stay in the batch for the model's own forward)
   - PP gating: the sharder-only hook is invoked on every stage (all PP-capable
     VLMs are sunk — they embed + shard in their own forward); media is dropped on
     non-first stages so those stage forwards see only text inputs
-  - Validation: count labels after _make_cp_batch_and_ctx and inside train_ctx
+  - Validation: count labels after ``ContextParallelSharder.shard`` and inside train_ctx
   - Validation: position_ids ``.to(self.dist_env.device)`` (not model.device)
 """
 
@@ -38,8 +38,22 @@ import torch
 
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.distributed import cp_utils as cp_utils_mod
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
+
+
+def _identity_cp_shard(sharder, batch):
+    """Bypass CP transport while preserving constructor-side strategy resolution.
+
+    Args:
+        sharder: Sharder whose resolved strategy is not exercised by this test.
+        batch: Mutable model-input mapping whose tensor values retain their
+            existing shapes.
+
+    Returns:
+        The null context factory and the same input mapping.
+    """
+    del sharder
+    return nullcontext, batch
 
 
 def _make_recipe_with_pp_stages(*, pp_enabled=True, has_first_stage=True, pp_microbatch_size=2):
@@ -138,11 +152,22 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     }
     seen_cp_batch = {}
 
-    def _make_cp_batch_and_ctx(device_mesh, cp_batch, *args, **kwargs):
-        seen_cp_batch.update(cp_batch)
-        return nullcontext, cp_batch, None
+    def _shard(sharder, cp_batch):
+        """Capture the global model-input mapping before CP transport.
 
-    monkeypatch.setattr(cp_utils_mod, "_make_cp_batch_and_ctx", _make_cp_batch_and_ctx)
+        Args:
+            sharder: Sharder configured by the VLM recipe.
+            cp_batch: Mutable model-input mapping whose tensor values have
+                global batch and sequence extents.
+
+        Returns:
+            The null context factory and the same input mapping.
+        """
+        del sharder
+        seen_cp_batch.update(cp_batch)
+        return nullcontext, cp_batch
+
+    monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _shard)
     monkeypatch.setattr(vlm_finetune, "stage_vlm_media_for_pp", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(FinetuneRecipeForVLM, "_maybe_set_pp_first_stage_embed_input_meta", lambda self, mi: None)
 
@@ -211,11 +236,22 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     }
     seen_cp_batch = {}
 
-    def _make_cp_batch_and_ctx(device_mesh, cp_batch, *args, **kwargs):
-        seen_cp_batch.update(cp_batch)
-        return nullcontext, cp_batch, None
+    def _shard(sharder, cp_batch):
+        """Capture the global model-input mapping before CP transport.
 
-    monkeypatch.setattr(cp_utils_mod, "_make_cp_batch_and_ctx", _make_cp_batch_and_ctx)
+        Args:
+            sharder: Sharder configured by the VLM recipe.
+            cp_batch: Mutable model-input mapping whose tensor values have
+                global batch and sequence extents.
+
+        Returns:
+            The null context factory and the same input mapping.
+        """
+        del sharder
+        seen_cp_batch.update(cp_batch)
+        return nullcontext, cp_batch
+
+    monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _shard)
     monkeypatch.setattr(vlm_finetune, "stage_vlm_media_for_pp", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(FinetuneRecipeForVLM, "_maybe_set_pp_first_stage_embed_input_meta", lambda self, mi: None)
 
@@ -481,7 +517,7 @@ def test_run_validation_epoch_does_not_sum_tokens_over_cp(monkeypatch):
 
     # No-op replacements for the heavy collaborators.
     monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
-    monkeypatch.setattr(cp_utils_mod, "_make_cp_batch_and_ctx", lambda mesh, batch, *a, **k: (nullcontext, batch, None))
+    monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _identity_cp_shard)
     monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
     monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
 
@@ -534,7 +570,7 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
     from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
     monkeypatch.setattr(vlm_finetune, "ScopedRNG", lambda *a, **k: nullcontext())
-    monkeypatch.setattr(cp_utils_mod, "_make_cp_batch_and_ctx", lambda mesh, batch, *a, **k: (nullcontext, batch, None))
+    monkeypatch.setattr(vlm_finetune.ContextParallelSharder, "shard", _identity_cp_shard)
     monkeypatch.setattr(vlm_finetune, "filter_forward_kwargs", lambda model, batch: batch)
     monkeypatch.setattr(vlm_finetune, "calculate_loss", lambda *a, **k: torch.tensor(2.0))
 

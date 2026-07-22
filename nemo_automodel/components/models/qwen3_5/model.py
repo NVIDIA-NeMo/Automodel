@@ -38,8 +38,8 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Model as HFQwen3_5Model,
 )
 
-from nemo_automodel.components.distributed.cp_sharder import (
-    ContextParallelismSharder,
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
@@ -991,7 +991,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         (a) computes the mRoPE ``position_ids`` on the *full* (unsharded) sequence
         via ``get_rope_index`` and returns them for :func:`shard_batch_aux_only`
         to round-robin-shard on the mRoPE axis, and (b) returns the
-        :class:`ContextParallelismSharder`. ``input_ids`` and the media inputs are
+        :class:`ContextParallelSharder`. ``input_ids`` and the media inputs are
         left in the batch for the forward; ``mm_token_type_ids`` is consumed here
         (only ``get_rope_index`` needs it) so the sharded forward never sees a
         full-length copy.
@@ -1047,7 +1047,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             self.model.rope_deltas = rope_deltas
 
         return {
-            "cp_sharder": ContextParallelismSharder(
+            "cp_sharder": ContextParallelSharder(
                 shard_batch=shard_batch_aux_only,
                 local_token_global_indices=round_robin_local_indices,
             ),
@@ -1089,7 +1089,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         # splice runs in-forward under an active CP ring context it must suspend the
         # ring dispatcher, or torch's load-balanced ring SDPA all-gathers the vision
         # Q/K/V and rejects the non-causal attention. No-op when CP is inactive.
-        from nemo_automodel.components.distributed.cp_utils import cp_dispatcher_suspended  # noqa: PLC0415
+        from nemo_automodel.components.distributed.context_parallel.utils import (
+            cp_dispatcher_suspended,  # noqa: PLC0415
+        )
 
         with cp_dispatcher_suspended(self.cp_mesh):
             if pixel_values is not None:

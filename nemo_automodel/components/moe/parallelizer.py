@@ -798,7 +798,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                     type(attn_module).__name__ if attn_module is not None else type(self_attn).__name__,
                 )
         elif layer_type == "mamba":
-            from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+            from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
             mixer = block.self_attn  # NemotronV3Block.self_attn aliases mixer
             mixer.cp = MambaContextParallel(

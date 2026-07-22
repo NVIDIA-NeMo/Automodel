@@ -14,7 +14,7 @@
 
 """Signature contract for the sharder-only ``prepare_model_inputs_for_cp`` CP hook.
 
-``prepare_cp_forward`` invokes each hook-aware model directly as
+``ContextParallelSharder`` construction invokes each hook-aware model directly as
 ``model.prepare_model_inputs_for_cp(batch, num_chunks=n)`` (a plain method: the
 sharder-only hook touches no weights, so no ``__call__`` / FSDP2 unshard routing).
 Every model that answers the CP protocol must therefore expose that method with a
@@ -50,5 +50,5 @@ def test_prepare_model_inputs_for_cp_binds_dispatch_call(module_path, class_name
         pytest.fail(
             f"{class_name}.prepare_model_inputs_for_cp cannot be called as "
             f"model.prepare_model_inputs_for_cp(batch, num_chunks=n): {err}. "
-            "The CP dispatch in prepare_cp_forward calls it exactly that way."
+            "ContextParallelSharder construction calls it exactly that way."
         )

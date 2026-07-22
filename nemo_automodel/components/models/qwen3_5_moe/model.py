@@ -60,8 +60,8 @@ except ModuleNotFoundError:
     Qwen3_5MoeVisionRotaryEmbedding = _make_missing("Qwen3_5MoeVisionRotaryEmbedding")
     HFQwen3_5MoeModel = _make_missing("Qwen3_5MoeModel")
 
-from nemo_automodel.components.distributed.cp_sharder import (
-    ContextParallelismSharder,
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
@@ -867,7 +867,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         computes the mRoPE ``position_ids`` on the full (unsharded) sequence via
         ``get_rope_index`` and returns them for :func:`shard_batch_aux_only` to
         round-robin-shard on the mRoPE axis, plus the
-        :class:`ContextParallelismSharder`. ``input_ids`` and the media inputs are
+        :class:`ContextParallelSharder`. ``input_ids`` and the media inputs are
         left in the batch for the forward; ``mm_token_type_ids`` is consumed here
         (only ``get_rope_index`` needs it).
 
@@ -922,7 +922,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             self.model.rope_deltas = rope_deltas
 
         return {
-            "cp_sharder": ContextParallelismSharder(
+            "cp_sharder": ContextParallelSharder(
                 shard_batch=shard_batch_aux_only,
                 local_token_global_indices=round_robin_local_indices,
             ),
@@ -963,7 +963,9 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         # splice runs in-forward under an active CP ring context it must suspend the
         # ring dispatcher, or torch's load-balanced ring SDPA all-gathers the vision
         # Q/K/V and rejects the non-causal attention. No-op when CP is inactive.
-        from nemo_automodel.components.distributed.cp_utils import cp_dispatcher_suspended  # noqa: PLC0415
+        from nemo_automodel.components.distributed.context_parallel.utils import (
+            cp_dispatcher_suspended,  # noqa: PLC0415
+        )
 
         with cp_dispatcher_suspended(self.cp_mesh):
             if pixel_values is not None:

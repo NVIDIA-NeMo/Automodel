@@ -14,13 +14,13 @@
 
 import contextlib
 from functools import partial
-from typing import List, Optional, Set
+from typing import Any, List, Optional, Set
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.distributed.cp_sharder import (
-    ContextParallelismSharder,
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
     ShardLayout,
     identity_local_indices,
     round_robin_local_indices,
@@ -269,25 +269,68 @@ def _mesh_dim_size(device_mesh, dim: str) -> int:
     return submesh.size() if submesh is not None else 0
 
 
-def prepare_cp_forward(
-    model,
-    device_mesh,
-    batch,
+def _attention_backend(model) -> str | None:
+    """Read the configured attention backend from a live model."""
+    backend = getattr(getattr(model, "backend", None), "attn", None)
+    if backend is not None:
+        return str(backend)
+    config = getattr(model, "config", None)
+    for candidate in (config, getattr(config, "text_config", None)):
+        implementation = getattr(candidate, "_attn_implementation", None) or getattr(
+            candidate, "_attn_implementation_internal", None
+        )
+        if implementation is not None:
+            return str(implementation)
+    return None
+
+
+def _uses_te_attention(model) -> bool:
+    """Whether a live model uses native or injected TE attention."""
+    return _attention_backend(model) == "te" or bool(getattr(model, "_te_attention_injected", False))
+
+
+def _is_multimodal_model(model) -> bool:
+    """Whether a live model owns a vision or audio tower."""
+    config = getattr(model, "config", None)
+    return any(getattr(config, name, None) is not None for name in ("vision_config", "audio_config")) or any(
+        getattr(model, name, None) is not None
+        for name in ("visual", "vision_model", "vision_tower", "audio_model", "audio_tower")
+    )
+
+
+def _magi_state_from_model(model, device_mesh):
+    """Recreate the per-forward Magi handle from the model and device mesh."""
+    if model is None or _attention_backend(model) != "magi":
+        return None
+    from nemo_automodel.components.distributed.context_parallel.magi import MagiState, get_cp_group
+
+    cp_group = get_cp_group(device_mesh)
+    return MagiState(
+        enabled=True,
+        custom=getattr(getattr(model, "backend", None), "attn", None) == "magi",
+        cp_group=cp_group,
+        cp_size=cp_group.size() if cp_group is not None else 1,
+        domain="vlm" if _is_multimodal_model(model) else "llm",
+        device_mesh=device_mesh,
+    )
+
+
+def _prepare_cp_sharder(
+    model: Any,
+    device_mesh: DeviceMesh | None,
+    batch: dict[str, Any],
     *,
-    magi=None,
-    use_te: bool = False,
     padding_token_id: int = 0,
     num_chunks: int = 1,
-    loss_mask=None,
+    loss_mask: torch.Tensor | None = None,
     invoke_pre_embed: bool = True,
     extra_seq_buffers: Optional[dict[str, int]] = None,
-):
-    """Single CP dispatch for a training/eval forward: hook -> sharder -> (ctx, batch).
+) -> ContextParallelSharder:
+    """Resolve and configure a CP sharder for its public constructor.
 
-    Collapses the per-recipe CP branching into one call: the model hook may
-    return a ContextParallelismSharder, ``_make_cp_batch_and_ctx`` resolves it against the
-    framework-owned sharders (magi / TE / generic torch ``context_parallel``)
-    and calls ``shard_batch``. When CP is active and the model exposes
+    The model hook may return a ContextParallelSharder; otherwise this
+    function resolves a framework-owned sharder from the live model's attention
+    backend and the batch's token layout. When CP is active and the model exposes
     ``prepare_model_inputs_for_cp``, that sharder-only hook is invoked directly as
     a plain method (it constructs a sharder and touches no weights; embed / vision
     splice / sequence shard run in the model's own forward per microbatch).
@@ -295,15 +338,8 @@ def prepare_cp_forward(
     Args:
         model: The (first) model part, or None (e.g. no-model contexts).
         device_mesh: The full device mesh (``cp``/``tp`` submeshes are read).
-        batch: The full-sequence batch; mutated and sharded in place.
-        magi: Optional recipe MagiState, threaded to ``_make_cp_batch_and_ctx``
-            where it occupies the same dispatch rung as the TE path. Its
-            recipe domain is bound at ``setup_magi``; for llm-domain magi the
-            model hook is skipped (mirrors the recipes' historical branching),
-            while vlm-domain magi still runs the pre-embed first (vision stays
-            on SDPA under magi).
-        use_te: THD-packed collator is active (TE/THD sharding; also magi's
-            ``is_thd``).
+        batch: The full-sequence batch. Model hook updates are merged in place;
+            :meth:`ContextParallelSharder.shard` performs the actual sharding.
         padding_token_id: Pad sentinel for ``input_ids``.
         num_chunks: THD chunk count, forwarded to the hook and TE sharding.
         loss_mask: Optional per-token mask forwarded to the batch sharding.
@@ -315,22 +351,24 @@ def prepare_cp_forward(
             batch on the generic torch path (rejected on the TE THD path;
             ignored by backends that own their transport).
     Returns:
-        ``(ctx_factory, batch, sharder)`` — the resolved :class:`ContextParallelismSharder`
-        (the identity sharder when no CP prep applies), whose token
-        verbs keep per-token tensors aligned with the sharded inputs.
+        The resolved and mesh-configured :class:`ContextParallelSharder` (the
+        identity sharder when no CP prep applies).
     """
 
-    magi_enabled = magi is not None and getattr(magi, "enabled", False)
+    batch_is_thd = batch.get("qkv_format") == "thd"
+    magi_state = _magi_state_from_model(model, device_mesh)
+    magi_enabled = magi_state is not None and getattr(magi_state, "enabled", False)
+    backend_uses_thd = batch_is_thd and (magi_enabled or _uses_te_attention(model))
     cp_sharder = None
     has_hook = model is not None and hasattr(model, "prepare_model_inputs_for_cp")
     effective_cp_size = _mesh_dim_size(device_mesh, "cp")
 
     # llm-domain magi replaces the whole batch prep (no model has both a CP
     # hook and magi); vlm-domain magi composes with the vision pre-embed.
-    magi_replaces_hook = magi_enabled and getattr(magi, "domain", "llm") == "llm"
-    model_owns_thd = use_te and bool(getattr(model, "supports_thd", False))
+    magi_replaces_hook = magi_enabled and getattr(magi_state, "domain", "llm") == "llm"
+    model_owns_thd = batch_is_thd and bool(getattr(model, "supports_thd", False))
     if (effective_cp_size > 1 or model_owns_thd) and has_hook and not magi_replaces_hook and invoke_pre_embed:
-        # Every CP hook is sharder-only: it constructs a ContextParallelismSharder
+        # Every CP hook is sharder-only: it constructs a ContextParallelSharder
         # and consumes nothing (embed / vision splice / sequence shard happen in the
         # model's own forward). It touches no weights — a plain method call, no
         # ``__call__`` routing or FSDP2 unshard — and leaves the batch intact.
@@ -338,32 +376,41 @@ def prepare_cp_forward(
         cp_sharder = prepared.get("cp_sharder")
         batch.update({key: value for key, value in prepared.items() if key != "cp_sharder"})
 
-    return _make_cp_batch_and_ctx(
-        device_mesh,
-        batch,
-        loss_mask,
-        use_te=use_te,
-        padding_token_id=padding_token_id,
+    cp_mesh = _get_submesh(device_mesh, "cp")
+    if backend_uses_thd and extra_seq_buffers:
+        raise ValueError("extra_seq_buffers are not supported by the TE THD context-parallel path")
+    strategy = _resolve_cp_sharder(
+        cp_mesh,
+        cp_sharder,
+        magi=magi_state,
+        is_thd=backend_uses_thd,
         num_chunks=num_chunks,
-        magi=magi,
+        seq_lens_padding_value=-1000,
         model=model,
-        cp_sharder=cp_sharder,
         extra_seq_buffers=extra_seq_buffers,
+    )
+    return ContextParallelSharder(
+        device_mesh=device_mesh,
+        shard_batch=strategy.shard_batch,
+        local_token_global_indices=strategy.local_token_global_indices,
+        shard_layout=strategy.shard_layout,
+        loss_mask=loss_mask,
+        padding_token_id=padding_token_id,
     )
 
 
 def _resolve_cp_sharder(
     cp_mesh,
-    model_sharder: Optional[ContextParallelismSharder],
+    model_sharder: Optional[ContextParallelSharder],
     *,
     magi,
-    use_te: bool,
+    is_thd: bool,
     num_chunks: int,
     seq_lens_padding_value: int,
     model,
     extra_seq_buffers: Optional[dict[str, int]] = None,
-) -> ContextParallelismSharder:
-    """Resolve the ContextParallelismSharder for this forward: model-owned > magi > TE > generic > none.
+) -> ContextParallelSharder:
+    """Resolve the ContextParallelSharder for this forward: model-owned > magi > TE > generic > none.
 
     Always returns a sharder: when no CP prep applies, an identity sharder,
     so callers hold working token verbs at every cp_size and
@@ -378,7 +425,7 @@ def _resolve_cp_sharder(
     """
     cp_active = cp_mesh is not None and cp_mesh.size() > 1
 
-    # A model that owns its CP attention returns a ContextParallelismSharder from its CP
+    # A model that owns its CP attention returns a ContextParallelSharder from its CP
     # input-prep hook. Honor it instead of any framework-owned path so the
     # implementation stays with the model.
     if model_sharder is not None:
@@ -388,7 +435,7 @@ def _resolve_cp_sharder(
         # Backend-owned prep (MagiAttention): magi manages its own CP transport,
         # so like the TE path shard_batch returns (nullcontext, prepped_batch).
         # All magi internals (HF-vs-custom, recipe domain, cp group) stay in
-        # magi_attn_utils. The dispatch-solver partition is data-dependent, so
+        # context_parallel.magi. The dispatch-solver partition is data-dependent, so
         # shard_batch installs the index map it just computed (magi's
         # get_position_ids) on the sharder for the token verbs.
         def _shard_batch_magi(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
@@ -399,7 +446,7 @@ def _resolve_cp_sharder(
                 batch,
                 padding_token_id=padding_token_id,
                 num_chunks=num_chunks,
-                is_thd=use_te,
+                is_thd=is_thd,
                 model=model,
                 return_local_indices=True,
             )
@@ -424,9 +471,9 @@ def _resolve_cp_sharder(
                 )
             return contextlib.nullcontext, prepped, layout
 
-        return ContextParallelismSharder(shard_batch=_shard_batch_magi, local_token_global_indices=None)
+        return ContextParallelSharder(shard_batch=_shard_batch_magi)
 
-    if use_te:
+    if is_thd:
         # The THD partition is data-dependent (cu_seqlens), so shard_batch
         # installs the index map it just computed on the sharder for the token
         # verbs (chunked streams carry none). The BSHD->THD flatten is a pure
@@ -453,17 +500,17 @@ def _resolve_cp_sharder(
                 )
             return contextlib.nullcontext, prepped, layout
 
-        return ContextParallelismSharder(shard_batch=_shard_batch_te, local_token_global_indices=None)
+        return ContextParallelSharder(shard_batch=_shard_batch_te)
 
     if cp_active:
-        return ContextParallelismSharder(
+        return ContextParallelSharder(
             shard_batch=partial(shard_batch_load_balanced, extra_seq_buffers=extra_seq_buffers),
             local_token_global_indices=round_robin_local_indices,
         )
 
     # No CP prep applies: the identity sharder, so callers hold working token
     # verbs at every cp_size.
-    return ContextParallelismSharder(
+    return ContextParallelSharder(
         shard_batch=shard_batch_identity,
         local_token_global_indices=identity_local_indices,
     )
@@ -506,13 +553,13 @@ def _make_cp_batch_and_ctx(
     seq_lens_padding_value: int = -1000,
     magi=None,
     model=None,
-    cp_sharder: Optional[ContextParallelismSharder] = None,
+    cp_sharder: Optional[ContextParallelSharder] = None,
     extra_seq_buffers: Optional[dict[str, int]] = None,
 ):
     """
-    Resolve a ContextParallelismSharder and shard the batch; a no-op when no CP prep applies.
+    Resolve a ContextParallelSharder and shard the batch; a no-op when no CP prep applies.
 
-    Every CP backend is a :class:`ContextParallelismSharder`. A model that owns its CP
+    Every CP backend is a :class:`ContextParallelSharder`. A model that owns its CP
     attention returns one from its ``prepare_model_inputs_for_cp`` hook
     (threaded here as ``cp_sharder`` — an explicit parameter, never a batch
     key, so the batch stays pure tensors); the framework constructs one for
@@ -527,7 +574,7 @@ def _make_cp_batch_and_ctx(
         batch (Dict[str, torch.Tensor]): The input batch containing (string, torch.Tensor)
 
     Returns:
-        tuple (contextmanager, dict[str, torch.Tensor], ContextParallelismSharder): The forward
+        tuple (contextmanager, dict[str, torch.Tensor], ContextParallelSharder): The forward
         context factory (nullcontext when the backend owns its transport or CP
         is inactive), the prepared/sharded batch, and the resolved sharder —
         callers use its token verbs (``shard_token_tensor`` /
@@ -536,25 +583,29 @@ def _make_cp_batch_and_ctx(
     """
 
     cp_mesh = _get_submesh(device_mesh, "cp")
-    tp_mesh = _get_submesh(device_mesh, "tp")
 
     if use_te and extra_seq_buffers:
         raise ValueError("extra_seq_buffers are not supported by the TE THD context-parallel path")
 
-    sharder = _resolve_cp_sharder(
+    strategy = _resolve_cp_sharder(
         cp_mesh,
         cp_sharder,
         magi=magi,
-        use_te=use_te,
+        is_thd=use_te,
         num_chunks=num_chunks,
         seq_lens_padding_value=seq_lens_padding_value,
         model=model,
         extra_seq_buffers=extra_seq_buffers,
     )
-    ctx, batch, layout = sharder.shard_batch(
-        cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id
+    sharder = ContextParallelSharder(
+        device_mesh=device_mesh,
+        shard_batch=strategy.shard_batch,
+        local_token_global_indices=strategy.local_token_global_indices,
+        shard_layout=strategy.shard_layout,
+        loss_mask=loss_mask,
+        padding_token_id=padding_token_id,
     )
-    sharder.shard_layout = layout
+    ctx, batch = sharder.shard(batch)
     return ctx, batch, sharder
 
 
@@ -598,7 +649,7 @@ def make_cp_batch_for_te(
         return_local_indices (bool): Also return this rank's local-token global
             index map (the ``thd_get_partitioned_indices`` partition; an
             identity arange when CP is inactive; None in chunked mode, where
-            each chunk is its own token space). Used by the THD ContextParallelismSharder's
+            each chunk is its own token space). Used by the THD ContextParallelSharder's
             token verbs.
 
     Returns:
@@ -715,7 +766,7 @@ def _shard_thd_chunk_for_te(
 
     # The partition is the same for every token-aligned key; it is also this
     # rank's local-token global index map, returned so the caller can install
-    # it on the THD sharder (ContextParallelismSharder token verbs).
+    # it on the THD sharder (ContextParallelSharder token verbs).
     local_indices = tex.thd_get_partitioned_indices(
         filtered_cu_seqlens_padded, batch["input_ids"].size(0), cp_size, cp_rank
     )
