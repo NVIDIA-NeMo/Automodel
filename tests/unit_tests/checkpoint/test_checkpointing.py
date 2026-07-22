@@ -2695,11 +2695,17 @@ class TestDoLoad:
 
         mock_msc.open.assert_not_called()
 
-    def test_peft_optimizer_under_model_named_parent_uses_dcp(self):
-        """A parent named model_checkpoints must not route optimizer state through the PEFT adapter loader."""
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/output/model_checkpoints/run/step-100/optim",
+            "/output/models/run/step-100/optim",
+        ],
+    )
+    def test_peft_optimizer_under_model_named_parent_uses_dcp(self, path):
+        """Model-prefixed parents must not route optimizer state through the PEFT adapter loader."""
         ckptr = self._make_checkpointer(is_peft=True)
         state_dict = {"optim": {"state": {}}}
-        path = "/output/model_checkpoints/run/step-100/optim"
 
         with (
             patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
@@ -2881,11 +2887,17 @@ class TestDoSavePEFT:
         mock_msc.open.assert_not_called()
         mock_sf.assert_called_once()
 
-    def test_optimizer_under_model_named_parent_uses_dcp(self):
-        """A parent named model_checkpoints must not route optimizer state through the PEFT adapter saver."""
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/output/model_checkpoints/run/step-100/optim",
+            "/output/models/run/step-100/optim",
+        ],
+    )
+    def test_optimizer_under_model_named_parent_uses_dcp(self, path):
+        """Model-prefixed parents must not route optimizer state through the PEFT adapter saver."""
         ckptr = _make_ckptr(is_peft=True, is_async=False)
         state_dict = {"optim": {"state": {}}}
-        path = "/output/model_checkpoints/run/step-100/optim"
 
         with (
             patch("nemo_automodel.components.checkpoint.checkpointing.dcp") as mock_dcp,
