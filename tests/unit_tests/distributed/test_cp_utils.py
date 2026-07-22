@@ -29,7 +29,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.distributed.context_parallel import runtime as _runtime
-from nemo_automodel.components.distributed.context_parallel import transport as _ct
+from nemo_automodel.components.distributed.context_parallel import sharder as _cs
 
 # Import module under test
 from nemo_automodel.components.distributed.context_parallel import utils as _cu
@@ -262,8 +262,8 @@ def test_runtime_prepare_forward_mm_token_type_ids_do_not_select_manual(monkeypa
         calls["cp_context"] = cp_context
         return contextlib.nullcontext
 
-    monkeypatch.setattr(_ct, "create_context_parallel_ctx", fake_create_context_parallel_ctx)
-    monkeypatch.setattr(_ct, "get_train_context", fake_get_train_context)
+    monkeypatch.setattr(_cs, "_create_context_parallel_ctx", fake_create_context_parallel_ctx)
+    monkeypatch.setattr(_cs, "_get_train_context", fake_get_train_context)
 
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 4]]),
@@ -765,8 +765,8 @@ def test_runtime_merges_model_hook_batch_updates(monkeypatch):
         cp_context_kwargs.update(kwargs)
         return "cp_ctx"
 
-    monkeypatch.setattr(_ct, "create_context_parallel_ctx", fake_create_context_parallel_ctx)
-    monkeypatch.setattr(_ct, "get_train_context", lambda *a, **kw: contextlib.nullcontext)
+    monkeypatch.setattr(_cs, "_create_context_parallel_ctx", fake_create_context_parallel_ctx)
+    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: contextlib.nullcontext)
 
     position_ids = torch.arange(3 * 1 * 4).view(3, 1, 4)
     image_grid_thw = torch.tensor([[1, 2, 2]])
@@ -895,8 +895,8 @@ def test_round_robin_sharder_captures_lengths_and_pads_token_tensors(monkeypatch
     """The generic sharder captures original/padded lengths at shard time so the
     token verbs accept caller-coordinate tensors: unpadded down (with explicit
     fill), trimmed back up, and loud errors on mismatched lengths."""
-    monkeypatch.setattr(_ct, "create_context_parallel_ctx", lambda **kw: "cp_ctx")
-    monkeypatch.setattr(_ct, "get_train_context", lambda *a, **kw: contextlib.nullcontext)
+    monkeypatch.setattr(_cs, "_create_context_parallel_ctx", lambda **kw: "cp_ctx")
+    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: contextlib.nullcontext)
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}

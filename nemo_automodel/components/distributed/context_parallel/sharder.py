@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -57,7 +58,69 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.distributed.context_parallel import transport
+ContextFactory = Callable[[], AbstractContextManager[None]]
+
+
+def _get_train_context(
+    enable_loss_parallel: bool,
+    enable_compiled_autograd: bool,
+    cp_context: AbstractContextManager[None] | None = None,
+) -> ContextFactory:
+    """Build the context entered around a context-parallel forward."""
+
+    @contextlib.contextmanager
+    def context():
+        with contextlib.ExitStack() as stack:
+            if enable_loss_parallel:
+                stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
+
+            if enable_compiled_autograd:
+                stack.enter_context(torch._dynamo.utils.maybe_enable_compiled_autograd(True))
+
+            if cp_context is not None:
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+
+                stack.enter_context(sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]))
+                stack.enter_context(cp_context)
+
+            yield
+
+    return context
+
+
+def _create_context_parallel_ctx(
+    cp_mesh: DeviceMesh,
+    cp_buffers: list[torch.Tensor],
+    cp_seq_dims: list[int],
+    cp_no_restore_buffers: set[torch.Tensor],
+    cp_rotate_method: str | None = None,
+) -> AbstractContextManager[None]:
+    """Create the PyTorch SDPA context used by the generic CP sharder.
+
+    Args:
+        cp_mesh: One-dimensional context-parallel device mesh.
+        cp_buffers: Tensors of arbitrary rank with sequence axes selected by
+            ``cp_seq_dims``. The context shards these tensors in place while active.
+        cp_seq_dims: Sequence-axis index for each tensor in ``cp_buffers``.
+        cp_no_restore_buffers: Members of ``cp_buffers`` that remain in their
+            per-rank local layout after the context exits.
+        cp_rotate_method: Optional Q/K/V rotation implementation.
+
+    Returns:
+        Context manager that applies generic SDPA context parallelism.
+    """
+    from torch.distributed.tensor.experimental import context_parallel
+    from torch.distributed.tensor.experimental._attention import set_rotate_method
+
+    if cp_rotate_method is not None:
+        set_rotate_method(cp_rotate_method)
+
+    return context_parallel(
+        cp_mesh,
+        buffers=cp_buffers,
+        buffer_seq_dims=cp_seq_dims,
+        no_restore_buffers=cp_no_restore_buffers,
+    )
 
 
 def _cp_rank(cp_mesh) -> int:
@@ -247,7 +310,7 @@ class ShardBatch(Protocol):
         *,
         loss_mask: torch.Tensor | None = None,
         padding_token_id: int = 0,
-    ) -> tuple[transport.ContextFactory, dict[str, Any], ShardLayout | None]:
+    ) -> tuple[ContextFactory, dict[str, Any], ShardLayout | None]:
         """Shard sequence-bearing tensors in ``batch`` and report their layout."""
 
 
@@ -273,6 +336,19 @@ class ContextParallelismSharder:
 
     shard_batch: ShardBatch
     local_token_global_indices: LocalIndexFn | None
+
+    @classmethod
+    def sdpa(cls) -> "ContextParallelismSharder":
+        """Build the generic load-balanced SDPA context-parallel strategy.
+
+        Returns:
+            Sharder using head-tail round-robin token ownership and PyTorch's
+            SDPA context-parallel attention implementation.
+        """
+        return cls(
+            shard_batch=shard_batch_load_balanced,
+            local_token_global_indices=round_robin_local_indices,
+        )
 
 
 @dataclass(frozen=True)
@@ -829,12 +905,21 @@ def shard_batch_load_balanced(
     # mutate only the integer/mask buffers.
     primary_seq_tensor = cp_buffers[0]
     if primary_seq_tensor.requires_grad:
-        batch[primary_key] = transport.shard_grad_buffer_for_cp(primary_seq_tensor, cp_seq_dims[0], cp_mesh)
+        local_indices = round_robin_local_indices(
+            cp_mesh,
+            primary_seq_tensor.shape[cp_seq_dims[0]],
+            device=primary_seq_tensor.device,
+        )
+        batch[primary_key] = shard_token_tensor_by_indices(
+            primary_seq_tensor,
+            local_indices,
+            seq_dim=cp_seq_dims[0],
+        )
         cp_no_restore_buffers.remove(primary_seq_tensor)
         cp_buffers = cp_buffers[1:]
         cp_seq_dims = cp_seq_dims[1:]
 
-    cp_ctx = transport.create_context_parallel_ctx(
+    cp_ctx = _create_context_parallel_ctx(
         cp_mesh=cp_mesh,
         cp_buffers=cp_buffers,
         cp_seq_dims=cp_seq_dims,
@@ -845,7 +930,7 @@ def shard_batch_load_balanced(
     enable_loss_parallel: bool = False
     enable_compiled_autograd: bool = False
     layout = ShardLayout(original_seq_len=seq_len, padded_seq_len=seq_len + (-seq_len) % cp_divisor)
-    return transport.get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch, layout
+    return _get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch, layout
 
 
 def shard_batch_aux_only(
@@ -919,7 +1004,7 @@ def shard_batch_aux_only(
         cp_buffers, cp_seq_dims, cp_no_restore_buffers, batch_buffer_keys, seq_len, cp_divisor, batch
     )
 
-    cp_ctx = transport.create_context_parallel_ctx(
+    cp_ctx = _create_context_parallel_ctx(
         cp_mesh=cp_mesh,
         cp_buffers=cp_buffers,
         cp_seq_dims=cp_seq_dims,
@@ -927,7 +1012,7 @@ def shard_batch_aux_only(
         cp_rotate_method="allgather",  # TODO: expose through cfg
     )
     layout = ShardLayout(original_seq_len=seq_len, padded_seq_len=seq_len + (-seq_len) % cp_divisor)
-    return transport.get_train_context(False, False, cp_ctx), batch, layout
+    return _get_train_context(False, False, cp_ctx), batch, layout
 
 
 def shard_sequence_for_cp_round_robin(

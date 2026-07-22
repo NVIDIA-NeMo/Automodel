@@ -24,15 +24,13 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
 from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextFactory,
     ContextParallelismSharder,
     CPTokenLayout,
     ShardLayout,
     identity_local_indices,
-    round_robin_local_indices,
     shard_batch_identity,
-    shard_batch_load_balanced,
 )
-from nemo_automodel.components.distributed.context_parallel.transport import ContextFactory
 from nemo_automodel.components.distributed.context_parallel.utils import make_cp_batch_for_te
 
 
@@ -249,10 +247,7 @@ class ContextParallelRuntime:
             return ContextParallelismSharder(shard_batch=shard_batch_thd, local_token_global_indices=None)
 
         if cp_active:
-            return ContextParallelismSharder(
-                shard_batch=shard_batch_load_balanced,
-                local_token_global_indices=round_robin_local_indices,
-            )
+            return ContextParallelismSharder.sdpa()
 
         return ContextParallelismSharder(
             shard_batch=shard_batch_identity,

@@ -15,6 +15,6 @@
 """Context-parallel runtime, layouts, and backend integrations."""
 
 from nemo_automodel.components.distributed.context_parallel.runtime import ContextParallelRuntime, CPForward
-from nemo_automodel.components.distributed.context_parallel.sharder import CPTokenLayout
+from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelismSharder, CPTokenLayout
 
-__all__ = ["CPForward", "CPTokenLayout", "ContextParallelRuntime"]
+__all__ = ["CPForward", "CPTokenLayout", "ContextParallelismSharder", "ContextParallelRuntime"]
