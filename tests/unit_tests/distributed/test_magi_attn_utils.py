@@ -283,6 +283,17 @@ class TestMagiStateVlmBatch:
         _, batch = st.prepare_vlm_batch(model, {"input_ids": torch.zeros(1, 4, dtype=torch.long)})
         assert not hasattr(model.language_model.self_attn, "_magi_self_key")
 
+    def test_make_cp_batch_derives_multimodal_behavior_from_model(self):
+        model = _VLM()
+        st = MagiState(enabled=True, custom=False, cp_group=None, cp_size=1)
+        batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
+
+        prepared, local_indices = st.make_cp_batch(None, batch, model=model, return_local_indices=True)
+
+        assert prepared is batch
+        assert local_indices is None
+        assert model.language_model.self_attn._magi_self_key is True
+
 
 class TestPackedCpDocSeqlens:
     """Regression for the packed-CP key spanning the padded THD layout.

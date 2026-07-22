@@ -17,7 +17,7 @@
 import contextlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -35,14 +35,32 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
 from nemo_automodel.components.distributed.context_parallel.transport import ContextFactory
 from nemo_automodel.components.distributed.context_parallel.utils import make_cp_batch_for_te
 
-CPDomain = Literal["llm", "vlm"]
-
 
 def _get_submesh(device_mesh: DeviceMesh | None, dim: str) -> DeviceMesh | None:
     """Return a named submesh, or ``None`` when the mesh or axis is absent."""
     if device_mesh is None or dim not in (getattr(device_mesh, "mesh_dim_names", None) or ()):
         return None
     return device_mesh[dim]
+
+
+def _is_multimodal_model(model: torch.nn.Module | None) -> bool:
+    """Return the live model's multimodal-input capability."""
+    if model is None:
+        return False
+    supports = getattr(model, "supports", None)
+    if supports is not None and hasattr(supports, "is_multimodal"):
+        return bool(supports.is_multimodal)
+    config = getattr(model, "config", None)
+    if config is not None and any(
+        getattr(config, name, None) is not None for name in ("vision_config", "audio_config")
+    ):
+        return True
+    has_language_model = any(getattr(model, name, None) is not None for name in ("language_model", "text_model"))
+    has_media_model = any(
+        getattr(model, name, None) is not None
+        for name in ("visual", "vision_model", "vision_tower", "audio_model", "audio_tower")
+    )
+    return has_language_model and has_media_model
 
 
 @dataclass(frozen=True)
@@ -75,7 +93,6 @@ class ContextParallelRuntime:
     """
 
     device_mesh: DeviceMesh | None = None
-    domain: CPDomain = "llm"
     _magi: MagiState = field(default_factory=MagiState, repr=False)
 
     @classmethod
@@ -84,8 +101,6 @@ class ContextParallelRuntime:
         model_config: object,
         *,
         device_mesh: DeviceMesh | None,
-        domain: CPDomain = "llm",
-        label: str = "",
     ) -> "ContextParallelRuntime":
         """Resolve backend intent from model config and bind CP resources.
 
@@ -97,16 +112,13 @@ class ContextParallelRuntime:
                 attention backend.
             device_mesh: Full runtime device mesh containing optional ``cp`` and
                 ``tp`` axes.
-            domain: Recipe domain controlling Magi LLM versus VLM preparation.
-            label: Optional diagnostic label for backend setup.
 
         Returns:
             Runtime ready to prepare batches for model forwards.
         """
         return cls(
             device_mesh=device_mesh,
-            domain=domain,
-            _magi=setup_magi(model_config, device_mesh, domain=domain, label=label),
+            _magi=setup_magi(model_config, device_mesh),
         )
 
     @property
@@ -282,7 +294,7 @@ class ContextParallelRuntime:
 
         Raises:
             ValueError: If a THD batch omits required sequence metadata.
-            NotImplementedError: If VLM THD context parallelism is requested.
+            NotImplementedError: If multimodal THD context parallelism is requested.
             TypeError: If a model CP hook does not return the sharder contract.
         """
         is_thd = batch.get("qkv_format") == "thd"
@@ -293,16 +305,17 @@ class ContextParallelRuntime:
 
         cp_mesh = _get_submesh(self.device_mesh, "cp")
         cp_active = cp_mesh is not None and cp_mesh.size() > 1
-        if self.domain == "vlm" and is_thd and cp_active:
+        is_multimodal = _is_multimodal_model(model)
+        if is_multimodal and is_thd and cp_active:
             raise NotImplementedError(
-                "THD packing for VLM currently supports cp_size=1 only; "
-                "context-parallel THD for mRoPE VLMs is not implemented."
+                "THD packing for multimodal models currently supports cp_size=1 only; "
+                "multimodal THD context parallelism is not implemented."
             )
 
         model_sharder = None
         hook = getattr(model, "prepare_model_inputs_for_cp", None) if model is not None else None
         model_owns_thd = is_thd and bool(getattr(model, "supports_thd", False))
-        magi_replaces_hook = self._magi.enabled and self.domain == "llm"
+        magi_replaces_hook = self._magi.enabled and not is_multimodal
         if (cp_active or model_owns_thd) and callable(hook) and not magi_replaces_hook:
             prepared = hook(batch, num_chunks=num_chunks)
             if not isinstance(prepared, Mapping):

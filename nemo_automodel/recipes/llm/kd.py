@@ -525,7 +525,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                         [
                             materialize_teacher_logits(
                                 microbatch_logits,
-                                device_mesh=self.device_mesh,
+                                tokens=prepared_cp.tokens,
                                 sequence_length=sequence_length,
                             )
                             for microbatch_logits in captured_logits
@@ -542,7 +542,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             return logits
         return materialize_teacher_logits(
             logits,
-            device_mesh=self.device_mesh,
+            tokens=prepared_cp.tokens,
             sequence_length=sequence_length,
         )
 

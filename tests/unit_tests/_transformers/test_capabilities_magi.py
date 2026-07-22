@@ -57,6 +57,19 @@ def test_uses_magi_attention_no_backend():
     assert _uses_magi_attention(SimpleNamespace()) is False
 
 
+def test_is_multimodal_derived_from_model_config():
+    model = _BackendModel("sdpa")
+    model.config.vision_config = SimpleNamespace()
+
+    assert ModelSupports(model).is_multimodal is True
+
+
+def test_text_model_is_not_multimodal():
+    model = _BackendModel("sdpa")
+
+    assert ModelSupports(model).is_multimodal is False
+
+
 # --------------------------------------------------------------------------- #
 # supports_cp / supports_sequence_packing / supports_cp_with_sequence_packing
 # --------------------------------------------------------------------------- #

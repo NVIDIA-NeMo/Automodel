@@ -152,6 +152,20 @@ def _is_hybrid(model: "nn.Module") -> bool:
     return False
 
 
+def _is_multimodal(model: "nn.Module") -> bool:
+    """Return whether the live model combines a language backbone with media inputs."""
+    config = getattr(model, "config", None)
+    media_config_fields = ("vision_config", "audio_config")
+    if config is not None and any(getattr(config, field, None) is not None for field in media_config_fields):
+        return True
+
+    language_fields = ("language_model", "text_model")
+    media_fields = ("visual", "vision_model", "vision_tower", "audio_model", "audio_tower")
+    return any(getattr(model, field, None) is not None for field in language_fields) and any(
+        getattr(model, field, None) is not None for field in media_fields
+    )
+
+
 class ModelSupports:
     """Queryable feature-support descriptor attached to a model instance.
 
@@ -206,6 +220,11 @@ class ModelSupports:
         from nemo_automodel._transformers.registry import ModelRegistry
 
         return ModelRegistry.has_custom_model(self._model_cls.__name__)
+
+    @property
+    def is_multimodal(self) -> bool:
+        """Whether the model fuses media inputs with a language token stream."""
+        return _is_multimodal(self._model)
 
     # parallelism
 

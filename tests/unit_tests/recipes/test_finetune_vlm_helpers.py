@@ -505,8 +505,10 @@ def test_forward_backward_step_rejects_thd_with_context_parallelism():
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.device_mesh = _DummyCPDeviceMesh(cp_size=2)
-    recipe.cp_runtime = ContextParallelRuntime(device_mesh=recipe.device_mesh, domain="vlm")
-    recipe.model_parts = [_TensorModel()]
+    recipe.cp_runtime = ContextParallelRuntime(device_mesh=recipe.device_mesh)
+    model = _TensorModel()
+    model.supports = SimpleNamespace(is_multimodal=True)
+    recipe.model_parts = [model]
     recipe.pp_enabled = False
 
     with pytest.raises(NotImplementedError, match="currently supports cp_size=1 only"):

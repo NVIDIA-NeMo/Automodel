@@ -178,16 +178,17 @@ def test_teacher_worker_serves_each_wave_until_stop(monkeypatch, recipe_module, 
 @pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
 def test_teacher_forward_separate_materializes_logits(monkeypatch, recipe_module, recipe_cls, _):
     materialized = []
+    tokens = object()
     monkeypatch.setattr(
         recipe_module,
         "materialize_teacher_logits",
-        lambda logits, *, device_mesh, sequence_length: materialized.append((device_mesh, sequence_length)) or logits,
+        lambda logits, *, tokens, sequence_length: materialized.append((tokens, sequence_length)) or logits,
     )
     recipe = object.__new__(recipe_cls)
     recipe.kd_mesh_bridge = SimpleNamespace(move_to_device=lambda batch: batch)
     recipe.device_mesh = None
     recipe.cp_runtime = SimpleNamespace(
-        prepare_forward=lambda model, batch, **kwargs: SimpleNamespace(context=nullcontext, batch=batch)
+        prepare_forward=lambda model, batch, **kwargs: SimpleNamespace(context=nullcontext, batch=batch, tokens=tokens)
     )
     recipe.teacher_model = _Teacher()
     if recipe_module is llm_kd:
@@ -196,7 +197,7 @@ def test_teacher_forward_separate_materializes_logits(monkeypatch, recipe_module
     logits = recipe._teacher_forward_separate({"input_ids": torch.tensor([[1, 2]]), "labels": torch.tensor([[1, 2]])})
 
     assert logits.shape == (1, 2, 4)
-    assert materialized == [(None, 2)]
+    assert materialized == [(tokens, 2)]
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,base_cls", _RECIPE_CASES)

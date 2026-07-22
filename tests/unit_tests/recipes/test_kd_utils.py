@@ -137,41 +137,55 @@ def test_loss_comparator_rejects_mismatched_kd_settings():
         _compare_pair("teacher_tp2", [baseline], [candidate], 0.01, 0.01)
 
 
-def test_materialize_teacher_logits_unshards_cp_and_removes_padding(monkeypatch):
-    cp_mesh = SimpleNamespace(size=lambda: 2)
-
-    class Mesh:
-        mesh_dim_names = ("cp",)
-
-        def __getitem__(self, name):
-            assert name == "cp"
-            return cp_mesh
-
+def test_materialize_teacher_logits_uses_cp_layout_and_removes_padding():
     local = torch.tensor([[[1.0], [2.0]]])
 
-    def unshard(mesh, tensor, *, seq_dim):
-        """Expand local logits to the full sequence.
+    class Tokens:
+        def gather(self, tensor, *, seq_dim, trim):
+            """Gather local teacher logits through the prepared CP layout.
 
-        Args:
-            mesh: Mock context-parallel mesh.
-            tensor: Tensor of shape ``[batch=1, local_sequence=2, vocab=1]``
-                containing local logits.
-            seq_dim: Sequence axis, which must be one.
+            Args:
+                tensor: Tensor of shape [batch=1, local_sequence=2, vocab=1].
+                seq_dim: Sequence axis, which must be one.
+                trim: Whether the CP layout removes its padding.
 
-        Returns:
-            Tensor of shape ``[batch=1, sequence=4, vocab=1]`` containing full
-            logits.
-        """
-        assert mesh is cp_mesh
-        assert tensor is local
-        assert seq_dim == 1
-        return torch.tensor([[[1.0], [2.0], [3.0], [0.0]]])
+            Returns:
+                Tensor of shape [batch=1, sequence=4, vocab=1].
+            """
+            assert tensor is local
+            assert seq_dim == 1
+            assert trim is True
+            return torch.tensor([[[1.0], [2.0], [3.0], [0.0]]])
 
-    monkeypatch.setattr(kd_utils, "unshard_context_parallel_tensor", unshard)
-
-    result = kd_utils.materialize_teacher_logits(local, device_mesh=Mesh(), sequence_length=3)
+    result = kd_utils.materialize_teacher_logits(local, tokens=Tokens(), sequence_length=3)
 
     assert torch.equal(result, torch.tensor([[[1.0], [2.0], [3.0]]]))
+
+
+def test_materialize_teacher_logits_returns_detached_contiguous_tensor():
+    logits = torch.arange(8.0, requires_grad=True).reshape(1, 4, 2)
+
+    class Tokens:
+        def gather(self, tensor, *, seq_dim, trim):
+            """Expand local logits to the full sequence.
+
+            Args:
+                tensor: Tensor of shape [batch=1, sequence=4, vocab=2].
+                seq_dim: Sequence axis, which must be one.
+                trim: Whether the CP layout removes its padding.
+
+            Returns:
+                Tensor of shape [batch=1, sequence=4, vocab=2].
+            """
+            assert seq_dim == 1
+            assert trim is True
+            return tensor
+
+    result = kd_utils.materialize_teacher_logits(logits, tokens=Tokens(), sequence_length=3)
+
+    assert result.shape == (1, 3, 2)
+    assert result.is_contiguous()
+    assert not result.requires_grad
 
 
 def test_shared_kd_setup_keeps_existing_world(monkeypatch):

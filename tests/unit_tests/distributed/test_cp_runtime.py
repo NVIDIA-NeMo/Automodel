@@ -56,12 +56,12 @@ def test_build_resolves_backend_from_model_config(monkeypatch):
     monkeypatch.setattr(
         cp_runtime,
         "setup_magi",
-        lambda config, device_mesh, **kwargs: calls.append((config, device_mesh, kwargs)) or magi,
+        lambda config, device_mesh: calls.append((config, device_mesh)) or magi,
     )
 
-    runtime = ContextParallelRuntime.build(model_config, device_mesh=mesh, domain="vlm", label="language")
+    runtime = ContextParallelRuntime.build(model_config, device_mesh=mesh)
 
-    assert calls == [(model_config, mesh, {"domain": "vlm", "label": "language"})]
+    assert calls == [(model_config, mesh)]
     assert runtime.requires_full_logits is True
 
 
@@ -101,8 +101,34 @@ def test_prepare_forward_returns_identity_token_layout_without_cp():
     assert torch.equal(prepared.tokens.gather(tensor, trim=True), tensor)
 
 
-def test_vlm_runtime_rejects_thd_with_context_parallelism():
-    runtime = ContextParallelRuntime(device_mesh=_DeviceMesh(cp_size=2), domain="vlm")
+def test_multimodal_model_rejects_thd_with_context_parallelism():
+    runtime = ContextParallelRuntime(device_mesh=_DeviceMesh(cp_size=2))
+    model = torch.nn.Module()
+    model.supports = SimpleNamespace(is_multimodal=True)
 
     with pytest.raises(NotImplementedError, match="supports cp_size=1 only"):
-        runtime.prepare_forward(None, _thd_batch())
+        runtime.prepare_forward(model, _thd_batch())
+
+
+def test_multimodal_detection_falls_back_to_model_config():
+    runtime = ContextParallelRuntime(device_mesh=_DeviceMesh(cp_size=2))
+    model = torch.nn.Module()
+    model.supports = SimpleNamespace()
+    model.config = SimpleNamespace(vision_config=SimpleNamespace())
+
+    with pytest.raises(NotImplementedError, match="supports cp_size=1 only"):
+        runtime.prepare_forward(model, _thd_batch())
+
+
+def test_text_model_thd_does_not_depend_on_recipe_domain(monkeypatch):
+    monkeypatch.setattr(
+        cp_runtime,
+        "make_cp_batch_for_te",
+        lambda cp_mesh, batch, **kwargs: (batch, torch.tensor([0, 2])),
+    )
+    model = torch.nn.Module()
+    model.supports = SimpleNamespace(is_multimodal=False)
+
+    prepared = ContextParallelRuntime(device_mesh=_DeviceMesh(cp_size=2)).prepare_forward(model, _thd_batch())
+
+    assert prepared.batch["qkv_format"] == "thd"

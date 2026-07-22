@@ -272,7 +272,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             logits = getattr(output, "logits", output).detach()
         return materialize_teacher_logits(
             logits,
-            device_mesh=self.device_mesh,
+            tokens=prepared_cp.tokens,
             sequence_length=sequence_length,
         )
 

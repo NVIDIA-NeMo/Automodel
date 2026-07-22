@@ -384,7 +384,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
 class FinetuneRecipeForVLM(BaseRecipe):
     """Recipe for fine-tuning a VLM model."""
 
-    cp_runtime = ContextParallelRuntime(domain="vlm")
+    cp_runtime = ContextParallelRuntime()
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -441,8 +441,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.cp_runtime = ContextParallelRuntime.build(
             self.cfg.model,
             device_mesh=self.device_mesh,
-            domain="vlm",
-            label="VLM language backbone",
         )
 
         if self.dist_env.is_main and self.cfg.wandb is not None:

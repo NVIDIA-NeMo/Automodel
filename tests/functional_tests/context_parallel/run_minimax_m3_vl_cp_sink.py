@@ -138,7 +138,7 @@ def main():
     device_mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("cp",))
     apply_cp(model, device_mesh["cp"])
     batch = {"input_ids": input_ids.clone(), "labels": input_ids.clone(), "position_ids": position_ids.clone()}
-    prepared_cp = ContextParallelRuntime(device_mesh=device_mesh, domain="vlm").prepare_forward(model, batch)
+    prepared_cp = ContextParallelRuntime(device_mesh=device_mesh).prepare_forward(model, batch)
     train_ctx, batch = prepared_cp.context, prepared_cp.batch
     batch.pop("labels", None)
     with torch.no_grad(), train_ctx():

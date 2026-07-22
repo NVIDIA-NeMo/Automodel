@@ -25,11 +25,10 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.distributed.config import DDPConfig, DistributedSetup
-from nemo_automodel.components.distributed.context_parallel.utils import unshard_context_parallel_tensor
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, parse_distributed_section
 
 if TYPE_CHECKING:
-    from torch.distributed.device_mesh import DeviceMesh
+    from nemo_automodel.components.distributed.context_parallel.sharder import CPTokenLayout
 
 RUN_TEACHER = 1
 STOP_TEACHER = 0
@@ -46,7 +45,7 @@ class _ConfigLike(Protocol):
 def materialize_teacher_logits(
     logits: torch.Tensor,
     *,
-    device_mesh: "DeviceMesh",
+    tokens: "CPTokenLayout",
     sequence_length: int,
 ) -> torch.Tensor:
     """Reconstruct full teacher logits across TP and CP before mesh transport.
@@ -56,7 +55,8 @@ def materialize_teacher_logits(
             teacher logits. It may be a vocabulary-sharded ``DTensor`` with
             ``Shard(-1)`` placement and/or have a per-rank load-balanced
             ``local_sequence`` extent under CP.
-        device_mesh: Teacher mesh containing optional ``tp`` and ``cp`` axes.
+        tokens: Batch-bound context-parallel token layout used for the teacher
+            forward.
         sequence_length: Unpadded global sequence length to retain.
 
     Returns:
@@ -66,9 +66,7 @@ def materialize_teacher_logits(
     """
     if isinstance(logits, DTensor):
         logits = logits.full_tensor()
-    mesh_dim_names = getattr(device_mesh, "mesh_dim_names", ())
-    if device_mesh is not None and "cp" in mesh_dim_names and device_mesh["cp"].size() > 1:
-        logits = unshard_context_parallel_tensor(device_mesh["cp"], logits, seq_dim=1)
+    logits = tokens.gather(logits, seq_dim=1, trim=True)
     return logits.narrow(1, 0, sequence_length).detach().contiguous()
 
 

@@ -158,7 +158,7 @@ def main():
     }
     if mm_arg is not None:
         batch["mm_token_type_ids"] = mm_arg.clone()
-    prepared_cp = ContextParallelRuntime(device_mesh=device_mesh, domain="vlm").prepare_forward(model, batch)
+    prepared_cp = ContextParallelRuntime(device_mesh=device_mesh).prepare_forward(model, batch)
     train_ctx, batch = prepared_cp.context, prepared_cp.batch
     batch.pop("labels", None)
     # Drop the synthesized single-document _packed_seq_ids: it reaches the ring by

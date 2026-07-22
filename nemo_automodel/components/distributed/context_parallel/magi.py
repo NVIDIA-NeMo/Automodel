@@ -683,6 +683,24 @@ def _iter_language_model_attention(model):
             yield module
 
 
+def _is_multimodal_model(model) -> bool:
+    """Return whether the live model fuses media with a language token stream."""
+    supports = getattr(model, "supports", None)
+    if supports is not None and hasattr(supports, "is_multimodal"):
+        return bool(supports.is_multimodal)
+    config = getattr(model, "config", None)
+    if config is not None and any(
+        getattr(config, name, None) is not None for name in ("vision_config", "audio_config")
+    ):
+        return True
+    has_language_model = any(getattr(model, name, None) is not None for name in ("language_model", "text_model"))
+    has_media_model = any(
+        getattr(model, name, None) is not None
+        for name in ("visual", "vision_model", "vision_tower", "audio_model", "audio_tower")
+    )
+    return has_language_model and has_media_model
+
+
 def magi_prepare_vlm(
     model,
     batch: dict,
@@ -728,7 +746,6 @@ class MagiState:
     custom: bool = False  # custom-model factory backend (vs HF attn_implementation)
     cp_group: Optional["dist.ProcessGroup"] = None
     cp_size: int = 1
-    domain: str = "llm"  # recipe domain ("llm" | "vlm"), bound at setup
     device_mesh: Optional[Any] = None  # full device mesh, bound at setup (cp=1 THD conversion)
 
     @property
@@ -832,9 +849,8 @@ class MagiState:
         Called by the CP dispatch at the same rung
         as the TE path: magi manages its own CP transport, so the context is
         implicitly ``nullcontext`` and only the prepped batch is returned.
-        Everything recipe-static (domain, cp group, device mesh, HF-vs-custom)
-        was bound at :func:`setup_magi`; ``model`` is passed opaquely for
-        per-step key/spec stamping on attention modules.
+        Backend state and runtime resources were bound at :func:`setup_magi`;
+        model capabilities select input preparation for each forward.
 
         Args:
             cp_mesh: The context-parallel submesh. Unused — magi owns its
@@ -847,7 +863,7 @@ class MagiState:
             model: The model part whose attention modules receive keys/specs.
             return_local_indices: Also return the local-token global index map
                 from the dispatch that just ran (None on paths that do not
-                dispatch, e.g. cp=1 THD conversion and the VLM domain). Used
+                dispatch, e.g. cp=1 THD conversion and multimodal models). Used
                 by the magi ContextParallelismSharder's token verbs.
 
         Returns:
@@ -856,7 +872,7 @@ class MagiState:
         """
         del cp_mesh
         local_indices = None
-        if self.domain == "vlm":
+        if _is_multimodal_model(model):
             _, batch = self.prepare_vlm_batch(model, batch)
         else:
             _, batch, local_indices = self.prepare_llm_batch(
@@ -880,7 +896,7 @@ def _config_value(config: object, key: str, default: object = None) -> object:
     return getattr(config, key, default)
 
 
-def setup_magi(model_config: object, device_mesh, *, domain: str = "llm", label: str = "") -> MagiState:
+def setup_magi(model_config: object, device_mesh) -> MagiState:
     """Resolve MagiAttention from model config and bind its runtime resources.
 
     Enabled when the model is configured with ``attn_implementation="magi"`` (HF) or
@@ -892,8 +908,6 @@ def setup_magi(model_config: object, device_mesh, *, domain: str = "llm", label:
         model_config: Model construction config containing either ``backend.attn``
             or ``attn_implementation``.
         device_mesh: Full runtime device mesh containing an optional ``cp`` axis.
-        domain: Recipe domain, either ``"llm"`` or ``"vlm"``.
-        label: Optional diagnostic label.
 
     Returns:
         Resolved Magi runtime state. The state is disabled when the configured
@@ -903,7 +917,7 @@ def setup_magi(model_config: object, device_mesh, *, domain: str = "llm", label:
     custom = str(_config_value(backend_config, "attn", "")) == "magi"
     enabled = custom or str(_config_value(model_config, "attn_implementation", "")) == "magi"
     if not enabled:
-        return MagiState(domain=domain)
+        return MagiState()
 
     if not is_magi_available():
         raise RuntimeError(
@@ -921,11 +935,8 @@ def setup_magi(model_config: object, device_mesh, *, domain: str = "llm", label:
         # the custom-model attn_func is a closure; it reads the cp_group from here.
         set_active_cp_group(cp_group)
     logger.info(
-        "MagiAttention enabled%s (%s, cp_size=%d).",
-        f" for {label}" if label else "",
+        "MagiAttention enabled (%s, cp_size=%d).",
         "custom-model factory" if custom else "HF backend",
         cp_size,
     )
-    return MagiState(
-        enabled=True, custom=custom, cp_group=cp_group, cp_size=cp_size, domain=domain, device_mesh=device_mesh
-    )
+    return MagiState(enabled=True, custom=custom, cp_group=cp_group, cp_size=cp_size, device_mesh=device_mesh)

@@ -143,7 +143,7 @@ def main():
     pp_size = 1 if pp1 else 2
     cp_size = world // pp_size
     mesh = init_device_mesh("cuda", (pp_size, 1, cp_size), mesh_dim_names=("pp", "dp", "cp"))
-    cp_runtime = ContextParallelRuntime(device_mesh=mesh, domain="vlm")
+    cp_runtime = ContextParallelRuntime(device_mesh=mesh)
 
     torch.manual_seed(0)
     model = build_minimax(device)

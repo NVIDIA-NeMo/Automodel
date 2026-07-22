@@ -15,7 +15,6 @@
 import contextlib
 
 import torch
-from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
 
@@ -157,33 +156,6 @@ def attach_cp_sdpa_hooks(model: torch.nn.Module, cp_mesh) -> None:
             target.register_forward_pre_hook(_pre_hook, with_kwargs=True)
             # always_call=True ensures _original_sdpa is restored even if the forward raises.
             target.register_forward_hook(_post_hook, always_call=True)
-
-
-def unshard_context_parallel_tensor(
-    cp_mesh: DeviceMesh,
-    tensor: torch.Tensor,
-    *,
-    seq_dim: int,
-) -> torch.Tensor:
-    """Restore a tensor from PyTorch's load-balanced context-parallel layout.
-
-    Args:
-        cp_mesh: One-dimensional context-parallel mesh of size ``C``.
-        tensor: Tensor of shape ``[..., local_sequence, ...]`` whose sequence
-            axis is selected by ``seq_dim`` and uses PyTorch's load-balanced CP
-            layout.
-        seq_dim: Axis containing the local sequence extent.
-
-    Returns:
-        Replicated tensor of shape ``[..., sequence, ...]`` with the same axis
-        order and full sequence extent on ``seq_dim``.
-    """
-    if cp_mesh.size() <= 1:
-        return tensor
-    from torch.distributed.tensor.experimental._attention import context_parallel_unshard
-
-    (unsharded,) = context_parallel_unshard(cp_mesh, [tensor], seq_dims=[seq_dim])
-    return unsharded
 
 
 def make_cp_batch_for_te(

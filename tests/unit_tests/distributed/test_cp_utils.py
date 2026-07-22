@@ -668,12 +668,39 @@ def test_magi_dispatches_at_the_te_rung():
 
     class _FakeMagi:
         enabled = True
-        domain = "llm"
 
         def make_cp_batch(
-            self, cp_mesh, batch, *, padding_token_id, num_chunks, is_thd, model, return_local_indices=False
+            self,
+            cp_mesh,
+            batch,
+            *,
+            padding_token_id,
+            num_chunks,
+            is_thd,
+            model,
+            return_local_indices=False,
         ):
-            seen.update(cp_mesh=cp_mesh, model=model, is_thd=is_thd, pad=padding_token_id, chunks=num_chunks)
+            """Capture Magi dispatch arguments.
+
+            Args:
+                cp_mesh: Context-parallel mesh selected by the runtime.
+                batch: Mapping containing ``input_ids`` of shape [batch, sequence].
+                padding_token_id: Input padding token ID.
+                num_chunks: Number of packed-sequence chunks.
+                is_thd: Whether the input batch uses THD layout.
+                model: Model passed to runtime preparation.
+                return_local_indices: Whether to return a token-index map.
+
+            Returns:
+                Prepared batch, optionally paired with no token-index map.
+            """
+            seen.update(
+                cp_mesh=cp_mesh,
+                model=model,
+                is_thd=is_thd,
+                pad=padding_token_id,
+                chunks=num_chunks,
+            )
             return ({"prepared": True}, None) if return_local_indices else {"prepared": True}
 
     model = SimpleNamespace()  # no prepare_model_inputs_for_cp -> hook path skipped
@@ -811,7 +838,6 @@ class _FakeMagiState:
     """Fake MagiState whose dispatch returns a fixed local index map."""
 
     enabled = True
-    domain = "llm"
     cp_size = 2
 
     def __init__(self, local_indices):
