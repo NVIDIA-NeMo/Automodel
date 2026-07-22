@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.distributed.cp_sharder import (
-    ContextParallelismSharder,
+    ContextParallelSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
@@ -647,7 +647,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
     ) -> dict[str, Any]:
         """Return a sharder-only CP backend; embed + splice + shard happen in forward.
 
-        The returned :class:`ContextParallelismSharder` round-robin-shards only the
+        The returned :class:`ContextParallelSharder` round-robin-shards only the
         no-grad aux streams (labels/position_ids/loss_mask/padding_mask) via
         :func:`shard_batch_aux_only`, leaving ``input_ids`` and the multimodal inputs
         full-length; the forward then embeds + splices and calls
@@ -662,9 +662,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         """
         del batch, num_chunks
         return {
-            "cp_sharder": ContextParallelismSharder(
-                shard_batch=shard_batch_aux_only,
-                local_token_global_indices=round_robin_local_indices,
+            "cp_sharder": ContextParallelSharder._from_strategy(
+                shard_batch_aux_only,
+                round_robin_local_indices,
             )
         }
 

@@ -52,7 +52,7 @@ from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
+from nemo_automodel.components.distributed.cp_sharder import ContextParallelSharder
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.mesh import MeshContext
@@ -972,24 +972,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
-        _thd_collater = _uses_thd_collater(self.cfg.get("dataloader", None))
-        # Gate THD/cu_seqlens processing on the dataset being THD-packed, not on TE
-        # attention being present on this rank: both TE attention and mamba need
-        # cu_seqlens, and gating on attention would drop PP stages with no attention
-        # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream.
-        _use_te_value = _thd_collater
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
-        # Single CP dispatch: magi / model-owned (ContextParallelismSharder) / TE-THD / generic
-        # torch context_parallel.
-        train_ctx, batch, _ = prepare_cp_forward(
+        cp_sharder = ContextParallelSharder(
             self.model_parts[0] if hasattr(self, "model_parts") else None,
             self.device_mesh,
             batch,
-            magi=self.magi,
-            use_te=_use_te_value,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
             num_chunks=_num_chunks_value,
         )
+        train_ctx, batch = cp_sharder.shard(batch)
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 

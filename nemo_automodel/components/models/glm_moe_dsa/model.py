@@ -350,21 +350,21 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         from functools import partial  # noqa: PLC0415
 
         from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
-            ContextParallelismSharder,
+            ContextParallelSharder,
             contiguous_local_indices,
         )
 
         if getattr(self.backend, "attn", None) != "tilelang":
             raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
 
-        cp_sharder = ContextParallelismSharder(
-            shard_batch=partial(
+        cp_sharder = ContextParallelSharder._from_strategy(
+            partial(
                 shard_glm_dsa_packed_cp_batch,
                 num_chunks=int(num_chunks),
             ),
             # Contiguous over the packed THD token axis: rank r keeps
             # tokens [r * T/cp, (r + 1) * T/cp).
-            local_token_global_indices=contiguous_local_indices,
+            contiguous_local_indices,
         )
         return {"cp_sharder": cp_sharder}
 

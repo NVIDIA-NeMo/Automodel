@@ -15,7 +15,7 @@
 """CPU unit tests for DeepSeek V4 model-owned context-parallel batch prep.
 
 Covers the model-owned CP path that runs without a real process group:
-``make_dsv4_contiguous_shard_cp_batch_and_ctx`` (the ``ContextParallelismSharder.shard_batch``
+``make_dsv4_contiguous_shard_cp_batch_and_ctx`` (the ``ContextParallelSharder.shard_batch``
 callable), the scalar group helpers, ``dsv4_cp_local_seq_multiple``, and the
 sharder-only ``DeepseekV4ForCausalLM`` CP-prep hook (``prepare_model_inputs_for_cp``).
 """

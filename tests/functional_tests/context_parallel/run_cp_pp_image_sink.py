@@ -135,7 +135,7 @@ def main():
     from torch.distributed.device_mesh import init_device_mesh
 
     from nemo_automodel.components.datasets.vlm.pp_media import prepare_vlm_media_for_pp, stage_vlm_media_for_pp
-    from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
+    from nemo_automodel.components.distributed.cp_sharder import ContextParallelSharder
     from nemo_automodel.components.distributed.pipelining import AutoPipeline
     from nemo_automodel.components.moe.parallelizer import apply_cp
 
@@ -191,7 +191,8 @@ def main():
             batch = prepare_vlm_media_for_pp(batch, batch_size=2, n_microbatches=2)
         else:
             batch.update({"pixel_values": pv, "image_grid_thw": grid})
-        train_ctx, batch, _ = prepare_cp_forward(model_part0, mesh, batch)
+        cp_sharder = ContextParallelSharder(model_part0, mesh, batch)
+        train_ctx, batch = cp_sharder.shard(batch)
         labels = batch.pop("labels")
         if pp_size > 1:
             with train_ctx(), stage_vlm_media_for_pp(pp, pp.parts, batch):

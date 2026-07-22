@@ -129,9 +129,9 @@ def _forward_embeds(model, **forward_kwargs):
 
 def test_prepare_model_inputs_for_cp_is_sharder_only():
     """The CP hook is sharder-only: it consumes nothing and returns a
-    ContextParallelismSharder; embed + splice + shard run inside forward."""
+    ContextParallelSharder; embed + splice + shard run inside forward."""
     from nemo_automodel.components.distributed.cp_sharder import (
-        ContextParallelismSharder,
+        ContextParallelSharder,
         round_robin_local_indices,
         shard_batch_aux_only,
     )
@@ -143,7 +143,7 @@ def test_prepare_model_inputs_for_cp_is_sharder_only():
 
     assert set(out) == {"cp_sharder"}
     sharder = out["cp_sharder"]
-    assert isinstance(sharder, ContextParallelismSharder)
+    assert isinstance(sharder, ContextParallelSharder)
     assert sharder.shard_batch is shard_batch_aux_only
     assert sharder.local_token_global_indices is round_robin_local_indices
     # nothing consumed: input_ids / media stay for the forward

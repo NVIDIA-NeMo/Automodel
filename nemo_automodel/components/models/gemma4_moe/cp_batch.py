@@ -26,7 +26,7 @@ module owns the one Gemma4-specific piece the aux-only shard still needs: the
 ``_packed_seq_ids`` document-boundary synthesis its manual CP attention mask
 builder requires (its pad-region zeros depend on the global pad tail, which the
 forward -- holding only this rank's slice -- cannot reconstruct). Gemma4's
-``prepare_model_inputs_for_cp`` exposes it through the ``ContextParallelismSharder``
+``prepare_model_inputs_for_cp`` exposes it through the ``ContextParallelSharder``
 it returns under the ``"cp_sharder"`` batch key, which the CP dispatch invokes in
 place of the default load-balanced ``context_parallel`` path.
 """
@@ -77,7 +77,7 @@ def make_contiguous_aux_only_shard_cp_batch_and_ctx(
 ):
     """Aux-only contiguous CP shard for Gemma4's sunk (in-forward) pre-embed.
 
-    Exposed as ``ContextParallelismSharder.shard_batch`` by Gemma4's sharder-only
+    Exposed as ``ContextParallelSharder.shard_batch`` by Gemma4's sharder-only
     ``prepare_model_inputs_for_cp``. It shards only the no-grad auxiliary streams
     (``labels`` / ``position_ids`` / ``loss_mask`` / ``padding_mask`` plus the
     synthesized ``_packed_seq_ids`` document map) and leaves ``input_ids`` /

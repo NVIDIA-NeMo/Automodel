@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the ContextParallelismSharder contract in components/distributed/cp_sharder.py.
+"""Unit tests for the ContextParallelSharder contract in components/distributed/cp_sharder.py.
 
 Collectives are not exercised here (CPU CI): the tests cover the pure layout
 math — local index generation, index-based token-tensor shard, gathered-shard
-reordering — and the ContextParallelismSharder default/override resolution.
+reordering — and the ContextParallelSharder default/override resolution.
 """
 
 from __future__ import annotations
@@ -129,43 +129,44 @@ def test_gather_token_tensor_identity_without_cp():
 
 
 # ---------------------------------------------------------------------------
-# ContextParallelismSharder default/override resolution
+# ContextParallelSharder default/override resolution
 # ---------------------------------------------------------------------------
 def test_sharder_default_shard_token_tensor_uses_indices():
-    sharder = cs.ContextParallelismSharder(
+    sharder = cs.ContextParallelSharder._from_strategy(
         shard_batch=lambda *a, **k: (contextlib.nullcontext, {}, None),
         local_token_global_indices=cs.contiguous_local_indices,
-    )
+    )._bind(_FakeMesh(2, 1), None)
     full = torch.randn(1, 8)
-    local = sharder.shard_token_tensor(_FakeMesh(2, 1), full, seq_dim=1)
+    local = sharder.shard_token_tensor(full, seq_dim=1)
     torch.testing.assert_close(local, full[:, 4:])
 
 
 def test_shard_batch_contiguous_records_shard_layout():
     """shard_batch reports original/padded lengths as ShardLayout; once installed,
     the token verbs accept caller-coordinate tensors and reject mismatched ones."""
-    sharder = cs.ContextParallelismSharder(
+    sharder = cs.ContextParallelSharder._from_strategy(
         shard_batch=None,
         local_token_global_indices=cs.contiguous_local_indices,
     )
     mesh = _FakeMesh(2, 0)
+    sharder._bind(mesh, None)
     batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
     _, _, layout = cs.shard_batch_contiguous(mesh, None, batch)  # pads 6 -> 8
     sharder.shard_layout = layout
 
     assert (sharder.shard_layout.original_seq_len, sharder.shard_layout.padded_seq_len) == (6, 8)
     # down: unpadded tensor auto-pads with the explicit fill, rank 0 owns [0:4]
-    local = sharder.shard_token_tensor(mesh, torch.arange(6.0).unsqueeze(0), fill=-1.0)
+    local = sharder.shard_token_tensor(torch.arange(6.0).unsqueeze(0), fill=-1.0)
     assert torch.equal(local, torch.tensor([[0.0, 1.0, 2.0, 3.0]]))
     # the pad_multiple silent-misalignment window is closed: a plausible but
     # wrong length raises even though it divides cp_size
     with pytest.raises(ValueError, match="padded_seq_len=8"):
-        sharder.shard_token_tensor(mesh, torch.zeros(1, 4))
+        sharder.shard_token_tensor(torch.zeros(1, 4))
     # up: trim validates the gathered length against the captured layout (no
     # collective runs in this single-process test, so the gather stays local
     # and the guard must fire rather than mis-trim)
     with pytest.raises(ValueError, match="reported padded_seq_len 8"):
-        sharder.gather_token_tensor(mesh, torch.zeros(1, 4), trim=True)
+        sharder.gather_token_tensor(torch.zeros(1, 4), trim=True)
 
 
 def test_sharder_repositioned_layout_round_trips_input_coordinates():
@@ -174,60 +175,66 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
     columns and dropped input pad slots come back as fill."""
     # input row: [a, b, PAD] -> rebuilt row: [a, b, X, X] (doc re-padded to 4)
     positions = torch.tensor([[0, 1, -1]])
-    sharder = cs.ContextParallelismSharder(
+    sharder = cs.ContextParallelSharder._from_strategy(
         shard_batch=None,
         local_token_global_indices=cs.contiguous_local_indices,
         shard_layout=cs.ShardLayout(padded_seq_len=4, input_token_stream_positions=positions),
     )
     mesh = _FakeMesh(2, 0)  # rank 0 owns columns [0:2]
-    local = sharder.shard_token_tensor(mesh, torch.tensor([[10.0, 20.0, 99.0]]), fill=0.0)
+    sharder._bind(mesh, None)
+    local = sharder.shard_token_tensor(torch.tensor([[10.0, 20.0, 99.0]]), fill=0.0)
     assert torch.equal(local, torch.tensor([[10.0, 20.0]]))
     with pytest.raises(ValueError, match="fill"):
-        sharder.shard_token_tensor(mesh, torch.tensor([[10.0, 20.0, 99.0]]))
+        sharder.shard_token_tensor(torch.tensor([[10.0, 20.0, 99.0]]))
 
     # up: gather (identity at cp<=1 here) then map back to input coordinates
     full_rows = torch.tensor([[10.0, 20.0, 7.0, 7.0]])
-    out = sharder.gather_token_tensor(_FakeMesh(1), full_rows, trim=True, fill=-5.0)
+    sharder._bind(_FakeMesh(1), None)
+    out = sharder.gather_token_tensor(full_rows, trim=True, fill=-5.0)
     assert torch.equal(out, torch.tensor([[10.0, 20.0, -5.0]]))
     with pytest.raises(ValueError, match="fill"):
-        sharder.gather_token_tensor(_FakeMesh(1), full_rows, trim=True)
+        sharder.gather_token_tensor(full_rows, trim=True)
 
 
 def test_gather_trim_raises_without_captured_facts():
-    sharder = cs.ContextParallelismSharder(
+    sharder = cs.ContextParallelSharder._from_strategy(
         shard_batch=None,
         local_token_global_indices=cs.contiguous_local_indices,
     )
+    sharder._bind(_FakeMesh(1), None)
     with pytest.raises(NotImplementedError, match="no shard layout to trim to"):
-        sharder.gather_token_tensor(_FakeMesh(1), torch.zeros(1, 4), trim=True)
+        sharder.gather_token_tensor(torch.zeros(1, 4), trim=True)
 
 
 def test_reported_indices_validate_stream_length():
     # Reported index maps flatten + cast to long, and reject a padded_seq_len
     # that does not match the partition the shard reported.
-    sharder = cs.ContextParallelismSharder(
+    sharder = cs.ContextParallelSharder._from_strategy(
         shard_batch=lambda *a, **k: (contextlib.nullcontext, {}, None),
         local_token_global_indices=None,
         shard_layout=cs.ShardLayout(local_token_global_indices=torch.tensor([[1, 0]], dtype=torch.int32)),
     )
-    assert torch.equal(sharder._indices(_FakeMesh(2, 0), 4, None), torch.tensor([1, 0]))
-    assert torch.equal(sharder._indices(None, 2, None), torch.tensor([1, 0]))  # no mesh -> cp_size 1
+    sharder._bind(_FakeMesh(2, 0), None)
+    assert torch.equal(sharder._indices(4, None), torch.tensor([1, 0]))
+    sharder._bind(None, None)
+    assert torch.equal(sharder._indices(2, None), torch.tensor([1, 0]))  # no mesh -> cp_size 1
+    sharder._bind(_FakeMesh(2, 0), None)
     with pytest.raises(ValueError, match="does not match"):
-        sharder._indices(_FakeMesh(2, 0), 6, None)
+        sharder._indices(6, None)
 
 
 def test_sharder_token_verbs_unavailable_for_data_dependent_layouts():
     # THD/magi layouts depend on batch content (cu_seqlens / dispatch solver),
     # so their framework sharders carry no index map and the token-tensor verbs
     # must fail loudly rather than shard the wrong slice.
-    sharder = cs.ContextParallelismSharder(
+    sharder = cs.ContextParallelSharder._from_strategy(
         shard_batch=lambda *a, **k: (contextlib.nullcontext, {}, None),
         local_token_global_indices=None,
-    )
+    )._bind(_FakeMesh(2, 0), None)
     with pytest.raises(NotImplementedError, match="data-dependent"):
-        sharder.shard_token_tensor(_FakeMesh(2, 0), torch.randn(1, 8))
+        sharder.shard_token_tensor(torch.randn(1, 8))
     with pytest.raises(NotImplementedError, match="data-dependent"):
-        sharder.gather_token_tensor(_FakeMesh(2, 0), torch.randn(1, 4))
+        sharder.gather_token_tensor(torch.randn(1, 4))
 
 
 # ---------------------------------------------------------------------------

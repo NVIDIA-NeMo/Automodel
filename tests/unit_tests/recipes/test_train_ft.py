@@ -2391,12 +2391,12 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
             self.prepared = True
             self.num_chunks = kwargs.get("num_chunks")
             from nemo_automodel.components.distributed.cp_sharder import (
-                ContextParallelismSharder,
+                ContextParallelSharder,
                 contiguous_local_indices,
             )
 
             return {
-                "cp_sharder": ContextParallelismSharder(
+                "cp_sharder": ContextParallelSharder._from_strategy(
                     shard_batch=lambda cp_mesh, tp_mesh, batch, **k: (nullcontext, batch, None),
                     local_token_global_indices=contiguous_local_indices,
                 )
@@ -2454,6 +2454,8 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.filter_forward_kwargs", lambda model, batch: batch)
 
     batch = {"input_ids": torch.randn(1, 4, 4), "labels": torch.zeros(1, 4, dtype=torch.long)}
+    if uses_thd:
+        batch["qkv_format"] = "thd"
     loss_buffer = []
     recipe._forward_backward_step(
         idx=0, batch=batch, loss_buffer=loss_buffer, num_label_tokens=None, num_batches=1, is_train=True

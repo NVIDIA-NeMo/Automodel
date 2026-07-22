@@ -79,7 +79,7 @@ except (ModuleNotFoundError, ImportError, AttributeError):
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.distributed.cp_sharder import (
-    ContextParallelismSharder,
+    ContextParallelSharder,
     contiguous_local_indices,
     shard_sequence_for_cp_contiguous,
 )
@@ -1004,7 +1004,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     def _cp_shard_batch_aux_only(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
         """Gemma4-owned aux-only CP batch sharder that also self-installs the ring.
 
-        Exposed as ``ContextParallelismSharder.shard_batch`` by the sharder-only
+        Exposed as ``ContextParallelSharder.shard_batch`` by the sharder-only
         ``prepare_model_inputs_for_cp``. The CP dispatch calls it with the CP
         submesh, which is the one place Gemma4 reliably receives ``cp_mesh`` on a
         model-owned path (dense variants are not guaranteed to run the MoE
@@ -1436,7 +1436,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         """Return a sharder-only CP backend; embed + splice + slice happen in forward.
 
         Sunk (Megatron-style per-microbatch) CP: the returned
-        :class:`ContextParallelismSharder` contiguously shards only the no-grad
+        :class:`ContextParallelSharder` contiguously shards only the no-grad
         aux streams (labels/position_ids/loss_mask/padding_mask + the synthesized
         ``_packed_seq_ids`` document map) via
         :func:`make_contiguous_aux_only_shard_cp_batch_and_ctx` and leaves
@@ -1457,9 +1457,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if batch.get("input_ids") is None:
             raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
         return {
-            "cp_sharder": ContextParallelismSharder(
-                shard_batch=self._cp_shard_batch_aux_only,
-                local_token_global_indices=contiguous_local_indices,
+            "cp_sharder": ContextParallelSharder._from_strategy(
+                self._cp_shard_batch_aux_only,
+                contiguous_local_indices,
             )
         }
 

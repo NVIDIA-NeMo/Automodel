@@ -753,7 +753,7 @@ class MagiState:
         context). ``local_indices`` is the global stream position of every
         local token on the paths that dispatch the sequence (magi's
         ``get_position_ids``), None otherwise; the framework installs it on
-        the magi ContextParallelismSharder for the token-tensor verbs.
+        the magi ContextParallelSharder for the token-tensor verbs.
         """
         # cp=1 prefix-tree mask: the datasets layer cannot import this module (component
         # independence), so the collate attaches the tree structure and the spec is built
@@ -843,7 +843,7 @@ class MagiState:
             return_local_indices: Also return the local-token global index map
                 from the dispatch that just ran (None on paths that do not
                 dispatch, e.g. cp=1 THD conversion and the VLM domain). Used
-                by the magi ContextParallelismSharder's token verbs.
+                by the magi ContextParallelSharder's token verbs.
 
         Returns:
             The dispatched (magi-sharded) batch, or ``(batch, local_indices)``

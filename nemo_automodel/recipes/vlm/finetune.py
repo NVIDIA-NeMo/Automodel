@@ -48,7 +48,7 @@ from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
+from nemo_automodel.components.distributed.cp_sharder import ContextParallelSharder
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
@@ -816,15 +816,14 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 "context-parallel THD for mRoPE VLMs is not yet implemented."
             )
         _padding_id = getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
-        train_ctx, batch, _ = prepare_cp_forward(
+        cp_sharder = ContextParallelSharder(
             self.model_parts[0],
             self.device_mesh,
             batch,
-            magi=self.magi,
-            use_te=_use_te_vlm,
             padding_token_id=_padding_id,
             invoke_pre_embed=True,
         )
+        train_ctx, batch = cp_sharder.shard(batch)
         labels = batch.pop("labels")
 
         if self.pp_enabled:
@@ -1111,12 +1110,13 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 }
                 num_label_tokens = (batch["labels"] != -100).sum().item()
 
-                train_ctx, batch, _ = prepare_cp_forward(
+                cp_sharder = ContextParallelSharder(
                     self.model_parts[0],
                     self.device_mesh,
                     batch,
                     invoke_pre_embed=not self.pp_enabled,
                 )
+                train_ctx, batch = cp_sharder.shard(batch)
                 labels = batch.pop("labels")
                 with train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)

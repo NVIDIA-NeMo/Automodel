@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-rank functional test for the ContextParallelismSharder token verbs (L1, 2+ GPUs).
+"""Multi-rank functional test for the ContextParallelSharder token verbs (L1, 2+ GPUs).
 
 The single-process unit suite can only exercise the identity early-returns of
 ``gather_token_tensor``; this driver runs the real collectives:
@@ -47,8 +47,8 @@ def main() -> None:
     cp_mesh = mesh["cp"]
 
     sharder = _resolve_cp_sharder(
-        cp_mesh, None, magi=None, use_te=False, num_chunks=1, seq_lens_padding_value=-1000, model=None
-    )
+        cp_mesh, None, magi=None, is_thd=False, num_chunks=1, seq_lens_padding_value=-1000, model=None
+    )._bind(cp_mesh, None)
 
     # Shard a batch whose length needs CP padding (6 -> 8 at cp=2) so the
     # captured layout (original=6, padded=8) drive fill/trim below.
@@ -57,22 +57,21 @@ def main() -> None:
         "input_ids": torch.arange(seq_len, device=device).unsqueeze(0),
         "labels": torch.arange(seq_len, device=device).unsqueeze(0),
     }
-    _, _, layout = sharder.shard_batch(cp_mesh, None, batch)
-    sharder.shard_layout = layout
+    sharder.shard(batch)
     padded = sharder.shard_layout.padded_seq_len
     assert sharder.shard_layout.original_seq_len == seq_len, sharder.shard_layout.original_seq_len
     assert padded == seq_len + (-seq_len) % (2 * world), padded
 
     # --- down: caller-coordinate tensor rides the same layout -------------
     full = torch.arange(float(seq_len), device=device).unsqueeze(0)
-    local = sharder.shard_token_tensor(cp_mesh, full, fill=-1.0)
+    local = sharder.shard_token_tensor(full, fill=-1.0)
     indices = round_robin_local_indices(cp_mesh, padded, device=device)
     expected_local = torch.where(indices < seq_len, indices.float(), torch.tensor(-1.0, device=device)).unsqueeze(0)
     assert torch.equal(local, expected_local), (rank, local.tolist(), expected_local.tolist())
 
     # --- up: differentiable gather + trim back to caller coordinates ------
     local_leaf = local.detach().clone().requires_grad_(True)
-    gathered = sharder.gather_token_tensor(cp_mesh, local_leaf, trim=True)
+    gathered = sharder.gather_token_tensor(local_leaf, trim=True)
     assert gathered.shape == (1, seq_len), gathered.shape
     # global order restored: position i holds the token with global index i
     assert torch.equal(gathered, full), (rank, gathered.tolist())

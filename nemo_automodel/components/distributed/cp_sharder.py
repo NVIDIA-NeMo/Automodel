@@ -14,13 +14,13 @@
 
 """Context-parallel batch-sharding contract.
 
-Every CP backend is a :class:`ContextParallelismSharder`. A model that owns its CP batch
+Every CP backend is a :class:`ContextParallelSharder`. A model that owns its CP batch
 sharding and attention transport returns one from
 ``prepare_model_inputs_for_cp`` under the ``"cp_sharder"`` batch key; the
 framework constructs its own for the remaining backends (torch
 ``context_parallel`` round-robin, TE/THD, MagiAttention) so
-the CP dispatch (``cp_utils.prepare_cp_forward``) reduces to resolving a sharder and calling
-``shard_batch``. This replaces the retired private batch keys
+constructing :class:`ContextParallelSharder` resolves and binds the backend;
+callers then invoke ``sharder.shard(batch)``. This replaces the retired private batch keys
 (``_cp_make_batch_fn``, ``_cp_metadata_seq_dims``, ``_cp_metadata_pad_values``,
 ``_cp_full_logits_grad_touch``).
 
@@ -57,6 +57,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
 
 
 def _cp_rank(cp_mesh) -> int:
@@ -236,15 +237,14 @@ class ShardLayout:
     input_token_stream_positions: torch.Tensor | None = None
 
 
-@dataclass
-class ContextParallelismSharder:
+class ContextParallelSharder:
     """CP backend description: how a batch is sharded and where local tokens live.
 
     Attributes:
         shard_batch: ``(cp_mesh, tp_mesh, batch, *, loss_mask=None,
             padding_token_id=0) -> (ctx_factory, batch, ShardLayout | None)``.
             Pads and shards the batch, installs any backend-owned attention
-            transport, and reports the shard layout it computed; the dispatch
+            transport, and reports the shard layout it computed; :meth:`shard`
             stores it as ``shard_layout`` for the token verbs.
         local_token_global_indices: ``(cp_mesh, padded_seq_len, device) ->
             LongTensor`` with the global position of each local token —
@@ -252,22 +252,131 @@ class ContextParallelismSharder:
             data-dependent layouts, whose partition arrives with
             ``shard_layout`` (their token verbs raise before the first shard).
         shard_layout: The :class:`ShardLayout` of the last ``shard_batch``, set
-            by the dispatch. Sharders are built per resolution/hook call, so
+            by :meth:`shard`. Sharders are built per resolution/hook call, so
             the layout never leaks across steps.
     """
 
     shard_batch: Callable[..., tuple[Callable, dict[str, Any], "ShardLayout | None"]]
     local_token_global_indices: Callable[..., torch.Tensor] | None
-    shard_layout: "ShardLayout | None" = None
+    shard_layout: "ShardLayout | None"
+    _cp_mesh: Any
+    _tp_mesh: Any
+    _loss_mask: torch.Tensor | None
+    _padding_token_id: int
 
-    def _indices(self, cp_mesh, padded_seq_len: int, device) -> torch.Tensor:
+    def __init__(
+        self,
+        model: torch.nn.Module | None,
+        device_mesh: DeviceMesh | None,
+        batch: dict[str, Any],
+        *,
+        padding_token_id: int = 0,
+        num_chunks: int = 1,
+        loss_mask: torch.Tensor | None = None,
+        invoke_pre_embed: bool = True,
+        extra_seq_buffers: dict[str, int] | None = None,
+    ) -> None:
+        """Resolve and bind context-parallel sharding for one forward.
+
+        Args:
+            model: Model whose attention backend and CP preparation hook select
+                the sharding strategy, or None for the generic strategy.
+            device_mesh: Device mesh containing optional ``cp`` and ``tp`` axes.
+            batch: Mutable input mapping. Token tensors normally have shape
+                [batch, sequence, ...]; THD source batches declare
+                ``qkv_format="thd"`` and are flattened during :meth:`shard`.
+                Model hook metadata is merged into this mapping in place.
+            padding_token_id: Value used to pad ``input_ids`` on the sequence axis.
+            num_chunks: Number of THD chunks created during sharding.
+            loss_mask: Optional tensor of shape [batch, sequence] sharded with
+                the batch.
+            invoke_pre_embed: Whether to invoke a model-owned CP preparation hook.
+            extra_seq_buffers: Additional batch keys mapped to their sequence axes.
+        """
+        from nemo_automodel.components.distributed.cp_utils import _prepare_cp_sharder
+
+        resolved = _prepare_cp_sharder(
+            model,
+            device_mesh,
+            batch,
+            padding_token_id=padding_token_id,
+            num_chunks=num_chunks,
+            loss_mask=loss_mask,
+            invoke_pre_embed=invoke_pre_embed,
+            extra_seq_buffers=extra_seq_buffers,
+        )
+        self.shard_batch = resolved.shard_batch
+        self.local_token_global_indices = resolved.local_token_global_indices
+        self.shard_layout = resolved.shard_layout
+        self._cp_mesh = resolved._cp_mesh
+        self._tp_mesh = resolved._tp_mesh
+        self._loss_mask = resolved._loss_mask
+        self._padding_token_id = resolved._padding_token_id
+
+    @classmethod
+    def _from_strategy(
+        cls,
+        shard_batch: Callable[..., tuple[Callable, dict[str, Any], "ShardLayout | None"]],
+        local_token_global_indices: Callable[..., torch.Tensor] | None,
+        shard_layout: "ShardLayout | None" = None,
+    ) -> "ContextParallelSharder":
+        """Construct an unresolved sharder from a backend strategy.
+
+        Args:
+            shard_batch: Backend callback that shards token tensors along their
+                sequence axis and returns the resulting batch and layout.
+            local_token_global_indices: Callback returning a tensor of shape
+                [local_tokens] containing each local token's global position.
+            shard_layout: Optional previously captured layout. Its
+                ``local_token_global_indices`` tensor has shape [local_tokens].
+
+        Returns:
+            Unbound sharder for internal backend and model-hook composition.
+        """
+        sharder = cls.__new__(cls)
+        sharder.shard_batch = shard_batch
+        sharder.local_token_global_indices = local_token_global_indices
+        sharder.shard_layout = shard_layout
+        sharder._cp_mesh = None
+        sharder._tp_mesh = None
+        sharder._loss_mask = None
+        sharder._padding_token_id = 0
+        return sharder
+
+    def _bind(
+        self,
+        cp_mesh,
+        tp_mesh,
+        *,
+        loss_mask: torch.Tensor | None = None,
+        padding_token_id: int = 0,
+    ) -> "ContextParallelSharder":
+        """Bind the per-forward meshes and batch-sharding options."""
+        self._cp_mesh = cp_mesh
+        self._tp_mesh = tp_mesh
+        self._loss_mask = loss_mask
+        self._padding_token_id = padding_token_id
+        return self
+
+    def shard(self, batch: dict[str, Any]) -> tuple[Callable, dict[str, Any]]:
+        """Shard a batch and retain its layout for token-aligned tensors."""
+        ctx, batch, self.shard_layout = self.shard_batch(
+            self._cp_mesh,
+            self._tp_mesh,
+            batch,
+            loss_mask=self._loss_mask,
+            padding_token_id=self._padding_token_id,
+        )
+        return ctx, batch
+
+    def _indices(self, padded_seq_len: int, device) -> torch.Tensor:
         layout = self.shard_layout or _NO_SHARD_LAYOUT
         captured = layout.local_token_global_indices
         if captured is not None:
             # Data-dependent layout: use the partition the shard reported, and
             # validate the requested length against it so a mismatched tensor
             # cannot be silently mis-sharded.
-            cp_size = cp_mesh.size() if cp_mesh is not None else 1
+            cp_size = self._cp_mesh.size() if self._cp_mesh is not None else 1
             expected = captured.numel() * cp_size
             if padded_seq_len != expected:
                 raise ValueError(
@@ -278,14 +387,14 @@ class ContextParallelismSharder:
             return captured.reshape(-1).to(device=device, dtype=torch.long)
         if self.local_token_global_indices is None:
             raise NotImplementedError(
-                "This ContextParallelismSharder has a data-dependent token layout; its index map "
+                "This ContextParallelSharder has a data-dependent token layout; its index map "
                 "arrives with the shard layout — token-tensor shard/gather are unavailable before "
                 "the first shard."
             )
-        return self.local_token_global_indices(cp_mesh, padded_seq_len, device)
+        return self.local_token_global_indices(self._cp_mesh, padded_seq_len, device)
 
     def shard_token_tensor(
-        self, cp_mesh, tensor: torch.Tensor, seq_dim: int = 1, fill: float | int | None = None
+        self, tensor: torch.Tensor, seq_dim: int = 1, fill: float | int | None = None
     ) -> torch.Tensor:
         """Shard a full-length token-aligned tensor exactly like the model inputs.
 
@@ -330,16 +439,15 @@ class ContextParallelismSharder:
                 tensor = _pad_tensor_seq_dim_(tensor, seq_dim, layout.padded_seq_len - length, fill)
             else:
                 raise ValueError(
-                    f"This ContextParallelismSharder sharded a batch of padded_seq_len={layout.padded_seq_len} "
+                    f"This ContextParallelSharder sharded a batch of padded_seq_len={layout.padded_seq_len} "
                     f"(original_seq_len={layout.original_seq_len}), got a tensor of length {length} on dim {seq_dim}. "
                     "Pass the original-length tensor with an explicit `fill`, or pre-pad it yourself."
                 )
-        indices = self._indices(cp_mesh, tensor.shape[seq_dim], tensor.device)
+        indices = self._indices(tensor.shape[seq_dim], tensor.device)
         return shard_token_tensor_by_indices(tensor, indices, seq_dim=seq_dim)
 
     def gather_token_tensor(
         self,
-        cp_mesh,
         tensor: torch.Tensor,
         seq_dim: int = 1,
         trim: bool = False,
@@ -355,9 +463,9 @@ class ContextParallelismSharder:
         (nothing to trim to).
         """
         layout = self.shard_layout or _NO_SHARD_LAYOUT
-        padded_seq_len = tensor.shape[seq_dim] * (cp_mesh.size() if cp_mesh is not None else 1)
-        indices = self._indices(cp_mesh, padded_seq_len, tensor.device)
-        full = gather_token_tensor_by_indices(cp_mesh, tensor, indices, seq_dim=seq_dim)
+        padded_seq_len = tensor.shape[seq_dim] * (self._cp_mesh.size() if self._cp_mesh is not None else 1)
+        indices = self._indices(padded_seq_len, tensor.device)
+        full = gather_token_tensor_by_indices(self._cp_mesh, tensor, indices, seq_dim=seq_dim)
         if not trim:
             return full
         if layout.padded_seq_len is not None and full.shape[seq_dim] != layout.padded_seq_len:
@@ -377,7 +485,7 @@ class ContextParallelismSharder:
         if layout.original_seq_len is not None:
             return full.narrow(seq_dim, 0, layout.original_seq_len)
         raise NotImplementedError(
-            "This ContextParallelismSharder has no shard layout to trim to; "
+            "This ContextParallelSharder has no shard layout to trim to; "
             "gather with trim=False and restore the layout with the batch metadata "
             "(padding_mask / cu_seqlens)."
         )
@@ -718,7 +826,7 @@ def shard_batch_load_balanced(
 ):
     """Shard a batch with torch ``context_parallel`` round-robin load balancing.
 
-    ``ContextParallelismSharder.shard_batch`` implementation for the default framework-owned CP
+    ``ContextParallelSharder.shard_batch`` implementation for the default framework-owned CP
     path (layout ``"round_robin"``, indices from
     :func:`round_robin_local_indices`). Assumes an active CP mesh (size > 1).
     ``padding_token_id`` is accepted per the contract but unused: CP-pad slots

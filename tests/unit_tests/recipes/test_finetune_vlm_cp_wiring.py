@@ -19,7 +19,7 @@ These reproduce the ``_forward_backward_step``-style and
 full recipe — exercising the code shape that gets shipped:
 
   - Invoke the sharder-only ``prepare_model_inputs_for_cp`` directly through
-    ``prepare_cp_forward`` (a plain method call; nothing consumed, so input_ids
+    ``ContextParallelSharder`` construction (a plain method call; nothing consumed, so input_ids
     and multimodal inputs stay in the batch for the model's own forward)
   - PP gating: the sharder-only hook is invoked on every stage (all PP-capable
     VLMs are sunk — they embed + shard in their own forward); media is dropped on

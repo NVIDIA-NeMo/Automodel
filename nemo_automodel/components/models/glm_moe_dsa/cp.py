@@ -176,7 +176,7 @@ def shard_glm_dsa_packed_cp_batch(
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
 ):
-    """``ContextParallelismSharder.shard_batch`` wrapper for GLM DSA packed CP."""
+    """``ContextParallelSharder.shard_batch`` wrapper for GLM DSA packed CP."""
     layout = _packed_cp_layout(batch, num_chunks=num_chunks)
     ctx_factory, sharded_batch = make_glm_dsa_packed_cp_batch_and_ctx(
         cp_mesh,

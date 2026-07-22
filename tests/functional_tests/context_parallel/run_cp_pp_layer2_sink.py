@@ -105,7 +105,7 @@ def main():
 
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed.cp_utils import prepare_cp_forward
+    from nemo_automodel.components.distributed.cp_sharder import ContextParallelSharder
     from nemo_automodel.components.distributed.pipelining import AutoPipeline
     from nemo_automodel.components.moe.parallelizer import apply_cp
 
@@ -162,7 +162,8 @@ def main():
         dist.broadcast(input_ids, src=0)
         pos = torch.arange(seqlen, device=device).unsqueeze(0).expand(2, -1).contiguous()
         batch = {"input_ids": input_ids.clone(), "labels": input_ids.clone(), "position_ids": pos.clone()}
-        train_ctx, batch, _ = prepare_cp_forward(model_part0, mesh, batch)
+        cp_sharder = ContextParallelSharder(model_part0, mesh, batch)
+        train_ctx, batch = cp_sharder.shard(batch)
         labels = batch.pop("labels")
         if pp_size > 1:
             with train_ctx():
