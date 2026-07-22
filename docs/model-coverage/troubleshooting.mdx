@@ -32,6 +32,12 @@ Gradient clipping does not repair the checkpoint. A very large but finite global
 Use embedding-row repair only for a diagnosed checkpoint defect. It does not correct NaNs caused by invalid data, an unstable loss, an unsuitable precision mode, optimizer state, or another model operation.
 </Warning>
 
+### Why Rare Tokens Expose the Problem Late
+
+A rare token is the trigger, not the defect. Its input-embedding row is already damaged in the checkpoint. Because an input embedding receives a gradient only when its token ID is present in a batch, a damaged row for a frequent token fails early while a damaged row for a rare token can remain hidden for hundreds of steps. Full-vocabulary mock data samples those IDs much sooner and therefore reproduces the failure quickly.
+
+Rarity by itself does not mean an embedding is damaged. Reserved or domain-specific tokens can be uncommon and still have healthy rows. Diagnose rows from their non-finite or anomalously small norms and confirm that the corresponding output rows are usable.
+
 ### Diagnose the Failure
 
 An isolated input-embedding defect is likely when several of these observations agree:
@@ -100,4 +106,4 @@ If gradients remain non-finite or extreme after repair, stop and investigate the
 
 ### Performance Impact
 
-Embedding-row repair performs one embedding-table scan and a small number of distributed reductions during setup. It installs no per-step hook and does not rescan rows during training. After setup, gradient clipping follows the normal training path without repeatedly scaling healthy model gradients because of the repaired rows.
+Embedding-row repair performs one embedding-table scan and a small number of distributed reductions during setup. It repairs every row that meets the configured damage threshold, whether its token is frequent, rare, or absent from the current dataset. It deliberately does not count corpus frequencies, install a per-step hook, or rescan rows during training. After setup, gradient clipping follows the normal training path without repeatedly scaling healthy model gradients because of the repaired rows.
