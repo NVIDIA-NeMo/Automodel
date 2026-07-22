@@ -31,6 +31,12 @@ from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagl
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
 from nemo_automodel.components.speculative.eagle.msd import MSDTrainerModule, MultimodalEagleDraftModel
+from nemo_automodel.components.speculative.eagle.msd_curriculum import (
+    MSDCurriculum,
+    MSDCurriculumConfig,
+    MSDCurriculumPhase,
+    MSDDataSource,
+)
 from nemo_automodel.components.speculative.eagle.msd_target import HFMSDTargetModel
 from nemo_automodel.components.speculative.eagle.peagle_trainer import PEagleTrainerModule
 from nemo_automodel.components.speculative.eagle.registry import (
@@ -54,6 +60,10 @@ __all__ = [
     "HFEagleTargetModel",
     "HFMSDTargetModel",
     "MSDTrainerModule",
+    "MSDCurriculum",
+    "MSDCurriculumConfig",
+    "MSDCurriculumPhase",
+    "MSDDataSource",
     "MultimodalEagleDraftModel",
     "HFEagle3TargetModel",
     "LlamaEagleDraftModel",
