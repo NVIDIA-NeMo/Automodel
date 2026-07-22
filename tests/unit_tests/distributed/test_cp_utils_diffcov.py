@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Targeted unit tests for context-parallel helper paths in cp_utils.
+"""Targeted unit tests for context-parallel helper paths in context_parallel.utils.
 
 These exercise the CP attention SDPA-swap hooks, the linear-attn position hook,
 the classic DTensor _cp_sdpa path (DTensor mocked), padding/prepare helpers, and
@@ -26,9 +26,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.distributed import cp_runtime
-from nemo_automodel.components.distributed import cp_sharder as cm
-from nemo_automodel.components.distributed import cp_utils as cu
+from nemo_automodel.components.distributed.context_parallel import runtime as cp_runtime
+from nemo_automodel.components.distributed.context_parallel import sharder as cm
+from nemo_automodel.components.distributed.context_parallel import utils as cu
 
 
 @pytest.fixture(autouse=True)

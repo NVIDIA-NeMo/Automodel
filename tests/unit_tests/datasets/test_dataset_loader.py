@@ -34,7 +34,6 @@ from nemo_automodel.components.datasets.loader import (
     make_collate_fn,
     make_packing_config,
 )
-from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 
@@ -137,18 +136,6 @@ def test_dataloader_build_instantiates_collator_once():
 
     assert list(loader) == [["query: one"], ["query: two"]]
     assert TokenizerAwareCollator.init_count == 1
-
-
-@pytest.mark.parametrize(
-    ("config", "expected"),
-    [
-        (DataloaderConfig(StaticDatasetConfig([]), packing=ThdPackingConfig(packed_sequence_size=16)), True),
-        (DataloaderConfig(StaticDatasetConfig([]), collate_fn=packed_sequence_thd_collater), True),
-        (DataloaderConfig(StaticDatasetConfig([])), False),
-    ],
-)
-def test_dataloader_config_reports_thd_batch_format(config, expected):
-    assert config.emits_thd_batches is expected
 
 
 def test_recipe_config_resolves_top_level_retrieval_dataset_and_collator():

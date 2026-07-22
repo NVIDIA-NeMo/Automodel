@@ -331,10 +331,6 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def should_pack_validation_with_training(self) -> bool:
-        """GLM DSA TileLang kernels require validation to use the THD packed layout."""
-        return getattr(self.backend, "attn", None) == "tilelang"
-
     def prepare_model_inputs_for_cp(
         self,
         batch: dict[str, Any],
@@ -349,7 +345,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """
         from functools import partial  # noqa: PLC0415
 
-        from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
+        from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
             ContextParallelismSharder,
             contiguous_local_indices,
         )

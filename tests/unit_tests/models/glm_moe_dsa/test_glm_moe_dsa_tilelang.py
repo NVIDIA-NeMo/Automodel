@@ -1084,15 +1084,6 @@ def test_indexer_cp_rejects_unpacked_bshd(monkeypatch):
         )
 
 
-def test_glm_dsa_tilelang_declares_validation_packing():
-    config = _small_dsa_config()
-    tilelang_backend = BackendConfig(attn="tilelang", linear="torch", rms_norm="torch", rope_fusion=False)
-    sdpa_backend = BackendConfig(attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False)
-
-    assert GlmMoeDsaForCausalLM(config, backend=tilelang_backend).should_pack_validation_with_training() is True
-    assert GlmMoeDsaForCausalLM(config, backend=sdpa_backend).should_pack_validation_with_training() is False
-
-
 def test_glm_dsa_tilelang_pipeline_metas_use_thd_shapes():
     config = _small_dsa_config()
     backend = BackendConfig(attn="tilelang", linear="torch", rms_norm="torch", rope_fusion=False)
@@ -1144,7 +1135,7 @@ def test_glm_dsa_prepare_model_inputs_for_cp_binds_batch_sharder():
     prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.arange(8).view(1, 8)}, num_chunks=3)
 
     sharder = prepared["cp_sharder"]
-    from nemo_automodel.components.distributed.cp_sharder import contiguous_local_indices
+    from nemo_automodel.components.distributed.context_parallel.sharder import contiguous_local_indices
 
     assert sharder.local_token_global_indices is contiguous_local_indices
     fn = sharder.shard_batch

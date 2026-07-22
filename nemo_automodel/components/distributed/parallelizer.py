@@ -510,7 +510,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
             for layer in layers:
                 if hasattr(layer, "block_type") and layer.block_type == "mamba":
-                    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+                    from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
                     mixer = layer.mixer
                     mixer.cp = MambaContextParallel(

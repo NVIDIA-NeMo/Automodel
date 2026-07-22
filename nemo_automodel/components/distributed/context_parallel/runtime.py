@@ -22,7 +22,8 @@ from typing import Any, Literal
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.distributed.cp_sharder import (
+from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
+from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelismSharder,
     CPTokenLayout,
     ShardLayout,
@@ -31,9 +32,8 @@ from nemo_automodel.components.distributed.cp_sharder import (
     shard_batch_identity,
     shard_batch_load_balanced,
 )
-from nemo_automodel.components.distributed.cp_transport import ContextFactory
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_for_te
-from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
+from nemo_automodel.components.distributed.context_parallel.transport import ContextFactory
+from nemo_automodel.components.distributed.context_parallel.utils import make_cp_batch_for_te
 
 CPDomain = Literal["llm", "vlm"]
 

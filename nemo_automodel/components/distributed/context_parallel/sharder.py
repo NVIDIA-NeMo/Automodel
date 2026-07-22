@@ -42,7 +42,7 @@ This module also hosts the framework's ``shard_batch`` implementations: the
 shared contiguous-shard batch prep used by models whose CP ranks own contiguous
 sequence slices (Gemma4, DeepSeek V4), and the torch ``context_parallel``
 round-robin load-balanced prep with its index map. The TE/THD and magi preps
-live with their dependencies (``cp_utils``, ``magi_attn_utils``); the
+live with their dependencies (``utils``, ``magi``); the
 dispatcher wraps them into sharders at resolution time.
 """
 
@@ -57,7 +57,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.distributed import cp_transport
+from nemo_automodel.components.distributed.context_parallel import transport
 
 
 def _cp_rank(cp_mesh) -> int:
@@ -247,7 +247,7 @@ class ShardBatch(Protocol):
         *,
         loss_mask: torch.Tensor | None = None,
         padding_token_id: int = 0,
-    ) -> tuple[cp_transport.ContextFactory, dict[str, Any], ShardLayout | None]:
+    ) -> tuple[transport.ContextFactory, dict[str, Any], ShardLayout | None]:
         """Shard sequence-bearing tensors in ``batch`` and report their layout."""
 
 
@@ -829,12 +829,12 @@ def shard_batch_load_balanced(
     # mutate only the integer/mask buffers.
     primary_seq_tensor = cp_buffers[0]
     if primary_seq_tensor.requires_grad:
-        batch[primary_key] = cp_transport.shard_grad_buffer_for_cp(primary_seq_tensor, cp_seq_dims[0], cp_mesh)
+        batch[primary_key] = transport.shard_grad_buffer_for_cp(primary_seq_tensor, cp_seq_dims[0], cp_mesh)
         cp_no_restore_buffers.remove(primary_seq_tensor)
         cp_buffers = cp_buffers[1:]
         cp_seq_dims = cp_seq_dims[1:]
 
-    cp_ctx = cp_transport.create_context_parallel_ctx(
+    cp_ctx = transport.create_context_parallel_ctx(
         cp_mesh=cp_mesh,
         cp_buffers=cp_buffers,
         cp_seq_dims=cp_seq_dims,
@@ -845,7 +845,7 @@ def shard_batch_load_balanced(
     enable_loss_parallel: bool = False
     enable_compiled_autograd: bool = False
     layout = ShardLayout(original_seq_len=seq_len, padded_seq_len=seq_len + (-seq_len) % cp_divisor)
-    return cp_transport.get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch, layout
+    return transport.get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch, layout
 
 
 def shard_batch_aux_only(
@@ -919,7 +919,7 @@ def shard_batch_aux_only(
         cp_buffers, cp_seq_dims, cp_no_restore_buffers, batch_buffer_keys, seq_len, cp_divisor, batch
     )
 
-    cp_ctx = cp_transport.create_context_parallel_ctx(
+    cp_ctx = transport.create_context_parallel_ctx(
         cp_mesh=cp_mesh,
         cp_buffers=cp_buffers,
         cp_seq_dims=cp_seq_dims,
@@ -927,7 +927,7 @@ def shard_batch_aux_only(
         cp_rotate_method="allgather",  # TODO: expose through cfg
     )
     layout = ShardLayout(original_seq_len=seq_len, padded_seq_len=seq_len + (-seq_len) % cp_divisor)
-    return cp_transport.get_train_context(False, False, cp_ctx), batch, layout
+    return transport.get_train_context(False, False, cp_ctx), batch, layout
 
 
 def shard_sequence_for_cp_round_robin(

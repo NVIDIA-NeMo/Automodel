@@ -69,7 +69,7 @@ class TestPrepareModelInputsForCP:
     def test_returns_sharder_and_positions_only(self):
         """Sharder-only hook: no inputs_embeds (the forward embeds), full mRoPE
         positions returned for the aux shard, mm_token_type_ids consumed."""
-        from nemo_automodel.components.distributed.cp_sharder import (
+        from nemo_automodel.components.distributed.context_parallel.sharder import (
             ContextParallelismSharder,
             round_robin_local_indices,
             shard_batch_aux_only,

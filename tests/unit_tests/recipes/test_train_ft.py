@@ -44,7 +44,6 @@ from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callab
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _build_pp_collate_wrapper,
-    _should_pack_validation,
     build_model,
     compute_trust_remote_code_from_model,
 )
@@ -321,52 +320,6 @@ def test_validation_dataloaders_skip_packing_without_pack_size():
     )
 
     assert RecipeConfig(cfg).validation_dataloaders["default"].packing is None
-
-
-@pytest.mark.parametrize("attn", ["magi", "te", "sdpa"])
-def test_should_pack_validation_for_explicit_thd_collater(attn):
-    collate_fn = "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"
-    cfg = RecipeConfig(
-        ConfigNode(
-            {
-                "model": {"backend": {"attn": attn}},
-                "dataset": {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"},
-                "dataloader": {"collate_fn": collate_fn},
-                "validation_dataset": {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"},
-                "validation_dataloader": {"collate_fn": collate_fn},
-                "packed_sequence": {"packed_sequence_size": 1024},
-            }
-        )
-    )
-
-    assert _should_pack_validation(cfg, nn.Module()) is True
-
-
-def test_should_not_pack_validation_without_pack_size():
-    cfg = RecipeConfig(ConfigNode({"model": {}, "packed_sequence": {"packed_sequence_size": 0}}))
-
-    assert _should_pack_validation(cfg, nn.Module()) is False
-
-
-def test_should_pack_validation_when_model_requires_training_layout():
-    collate_fn = "nemo_automodel.components.datasets.utils.packed_sequence_thd_collater"
-    cfg = RecipeConfig(
-        ConfigNode(
-            {
-                "model": {"backend": {"attn": "sdpa"}},
-                "dataset": {"_target_": "tests.unit_tests.recipes.test_train_ft.DummyMapDataset"},
-                "dataloader": {"collate_fn": collate_fn},
-                "validation_dataloader": {},
-                "packed_sequence": {"packed_sequence_size": 1024},
-            }
-        )
-    )
-
-    class ModelRequiresPackedValidation(nn.Module):
-        def should_pack_validation_with_training(self):
-            return True
-
-    assert _should_pack_validation(cfg, ModelRequiresPackedValidation()) is True
 
 
 class DummyLinear(nn.Module):
@@ -2347,7 +2300,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
         def prepare_model_inputs_for_cp(self, batch, **kwargs):
             self.prepared = True
             self.num_chunks = kwargs.get("num_chunks")
-            from nemo_automodel.components.distributed.cp_sharder import (
+            from nemo_automodel.components.distributed.context_parallel.sharder import (
                 ContextParallelismSharder,
                 contiguous_local_indices,
             )

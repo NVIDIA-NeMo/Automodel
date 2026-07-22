@@ -78,7 +78,7 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     CausalLMOutputWithPast = _make_missing("CausalLMOutputWithPast")
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
-from nemo_automodel.components.distributed.cp_sharder import (
+from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelismSharder,
     contiguous_local_indices,
     shard_sequence_for_cp_contiguous,

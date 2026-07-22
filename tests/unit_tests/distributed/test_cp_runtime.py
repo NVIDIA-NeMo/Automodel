@@ -18,8 +18,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nemo_automodel.components.distributed import cp_runtime
-from nemo_automodel.components.distributed.cp_runtime import ContextParallelRuntime, CPForward
+from nemo_automodel.components.distributed.context_parallel import runtime as cp_runtime
+from nemo_automodel.components.distributed.context_parallel.runtime import ContextParallelRuntime, CPForward
 
 
 class _SubMesh:

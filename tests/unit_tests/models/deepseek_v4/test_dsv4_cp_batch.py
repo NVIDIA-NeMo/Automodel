@@ -505,7 +505,7 @@ def test_prepare_model_inputs_for_cp_returns_sharder():
     prepared = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, {"input_ids": torch.arange(8).view(1, 8)})
 
     sharder = prepared["cp_sharder"]
-    from nemo_automodel.components.distributed.cp_sharder import contiguous_local_indices
+    from nemo_automodel.components.distributed.context_parallel.sharder import contiguous_local_indices
 
     assert sharder.local_token_global_indices is contiguous_local_indices
     fn = sharder.shard_batch
@@ -539,10 +539,10 @@ def test_setup_cp_attention_stores_group():
 
 
 def test_module_exposes_pad_helper_noops():
-    from nemo_automodel.components.distributed import cp_sharder
+    from nemo_automodel.components.distributed.context_parallel import sharder
 
     # pad_len <= 0 is a no-op (returns the same tensor object) for both pad helpers.
     t = torch.arange(6).view(1, 6)
-    assert cp_sharder._pad_tensor_seq_dim_(t, 1, 0, 0) is t
+    assert sharder._pad_tensor_seq_dim_(t, 1, 0, 0) is t
     pos = torch.arange(6).view(1, 6)
-    assert cp_sharder._pad_position_ids_seq_dim_(pos, 1, 0) is pos
+    assert sharder._pad_position_ids_seq_dim_(pos, 1, 0) is pos

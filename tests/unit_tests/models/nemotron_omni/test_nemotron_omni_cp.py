@@ -130,7 +130,7 @@ def _forward_embeds(model, **forward_kwargs):
 def test_prepare_model_inputs_for_cp_is_sharder_only():
     """The CP hook is sharder-only: it consumes nothing and returns a
     ContextParallelismSharder; embed + splice + shard run inside forward."""
-    from nemo_automodel.components.distributed.cp_sharder import (
+    from nemo_automodel.components.distributed.context_parallel.sharder import (
         ContextParallelismSharder,
         round_robin_local_indices,
         shard_batch_aux_only,

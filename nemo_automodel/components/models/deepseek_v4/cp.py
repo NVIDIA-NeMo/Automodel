@@ -225,7 +225,7 @@ def build_dsv4_cp_causal_padding_mask(
 # The CP runtime delegates manual all-gather CP to the model
 # via the ``ContextParallelismSharder`` returned by ``prepare_model_inputs_for_cp``. DSV4's
 # sharder pads + contiguously shards the sequence per CP rank (via the shared
-# contiguous implementation in ``components/distributed/cp_sharder.py``) and
+# contiguous implementation in ``components/distributed/context_parallel/sharder.py``) and
 # hands the CP process group to the forward (``_dsv4_cp_group``) so DSV4
 # attention can all-gather K/V.
 # ---------------------------------------------------------------------------
@@ -447,7 +447,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     """
     import contextlib
 
-    from nemo_automodel.components.distributed.cp_sharder import (  # noqa: PLC0415
+    from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
         ShardLayout,
         convert_attention_mask_to_padding_mask,
         shard_batch_contiguous,

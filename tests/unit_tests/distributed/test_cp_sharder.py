@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the ContextParallelismSharder contract in components/distributed/cp_sharder.py.
+"""Unit tests for the ContextParallelismSharder contract in components/distributed/context_parallel/sharder.py.
 
 Collectives are not exercised here (CPU CI): the tests cover the pure layout
 math — local index generation, index-based token-tensor shard, gathered-shard
@@ -26,7 +26,7 @@ import contextlib
 import pytest
 import torch
 
-from nemo_automodel.components.distributed import cp_sharder as cs
+from nemo_automodel.components.distributed.context_parallel import sharder as cs
 
 
 class _FakeMesh:
@@ -314,7 +314,7 @@ def test_shard_batch_aux_only_matches_load_balanced(monkeypatch):
     """The aux-only shard pads labels/position_ids/loss_mask identically to the
     load-balanced shard but leaves the primary stream full-length and out of the
     CP buffer list."""
-    from nemo_automodel.components.distributed import cp_transport
+    from nemo_automodel.components.distributed.context_parallel import transport
 
     captured: dict = {}
 
@@ -322,8 +322,8 @@ def test_shard_batch_aux_only_matches_load_balanced(monkeypatch):
         captured["buffers"] = list(cp_buffers)
         return contextlib.nullcontext()
 
-    monkeypatch.setattr(cp_transport, "create_context_parallel_ctx", _fake_ctx)
-    monkeypatch.setattr(cp_transport, "get_train_context", lambda *a, **k: contextlib.nullcontext)
+    monkeypatch.setattr(transport, "create_context_parallel_ctx", _fake_ctx)
+    monkeypatch.setattr(transport, "get_train_context", lambda *a, **k: contextlib.nullcontext)
 
     cp_size, seq = 2, 6  # -> pad to 8
     mesh = _FakeMesh(cp_size, 0)
@@ -361,10 +361,10 @@ def test_shard_batch_aux_only_matches_load_balanced(monkeypatch):
 
 def test_shard_batch_aux_only_reports_padded_layout(monkeypatch):
     """The returned ShardLayout carries the primary stream's target padded length."""
-    from nemo_automodel.components.distributed import cp_transport
+    from nemo_automodel.components.distributed.context_parallel import transport
 
-    monkeypatch.setattr(cp_transport, "create_context_parallel_ctx", lambda *a, **k: contextlib.nullcontext())
-    monkeypatch.setattr(cp_transport, "get_train_context", lambda *a, **k: contextlib.nullcontext)
+    monkeypatch.setattr(transport, "create_context_parallel_ctx", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(transport, "get_train_context", lambda *a, **k: contextlib.nullcontext)
 
     batch = {"input_ids": torch.arange(6).view(1, 6), "labels": torch.arange(6).view(1, 6)}
     _, _, layout = cs.shard_batch_aux_only(_FakeMesh(2, 0), None, batch)

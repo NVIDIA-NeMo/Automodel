@@ -289,7 +289,7 @@ def test_from_pretrained_uses_step3p7_config(monkeypatch):
 
 
 def test_prepare_model_inputs_for_cp_is_sharder_only():
-    from nemo_automodel.components.distributed.cp_sharder import (
+    from nemo_automodel.components.distributed.context_parallel.sharder import (
         ContextParallelismSharder,
         round_robin_local_indices,
         shard_batch_aux_only,

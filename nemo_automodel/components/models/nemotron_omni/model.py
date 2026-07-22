@@ -34,13 +34,13 @@ from transformers import AutoConfig, AutoModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.distributed.cp_sharder import (
+from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelismSharder,
     round_robin_local_indices,
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
 )
-from nemo_automodel.components.distributed.cp_utils import cp_dispatcher_suspended
+from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (

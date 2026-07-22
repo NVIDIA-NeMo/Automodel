@@ -31,7 +31,6 @@ import logging
 import pathlib
 import time
 from contextlib import nullcontext
-from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Optional
 
 import mlflow
@@ -51,6 +50,7 @@ from nemo_automodel._transformers.infrastructure import (
 from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.loader import ThdPackingConfig
 from nemo_automodel.components.distributed import ContextParallelRuntime
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -114,25 +114,6 @@ def _get_model_name(cfg_model):
         return cfg_model.config.get("pretrained_model_name_or_path", None)
     else:
         return None
-
-
-def _should_pack_validation(cfg: RecipeConfig, model: nn.Module) -> bool:
-    """Return whether validation must use the configured training packer."""
-    if cfg.get("packed_sequence.packed_sequence_size", 0) <= 0:
-        return False
-
-    validation_uses_thd = any(loader.emits_thd_batches for loader in cfg.validation_dataloaders.values())
-    if validation_uses_thd:
-        return True
-
-    model_requires_packing = bool(
-        callable(getattr(model, "should_pack_validation_with_training", None))
-        and model.should_pack_validation_with_training()
-    )
-    from nemo_automodel.components.models.common.packing import get_attn_implementation
-
-    backend_requires_packing = get_attn_implementation(cfg.model) in {"te", "magi"} or model_requires_packing
-    return backend_requires_packing and cfg.dataloader.emits_thd_batches
 
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
@@ -500,7 +481,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.mesh_context.pp_size}"
             )
 
-            if self.mesh_context.cp_size > 1 and self.cfg.dataloader.emits_thd_batches:
+            if self.mesh_context.cp_size > 1 and isinstance(self.cfg.dataloader.packing, ThdPackingConfig):
                 pp_microbatch_size = 1
                 pp_batch_size = pp_batch_size // self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
                 logging.info(
@@ -661,10 +642,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
 
         self.dataloader = materialize_loader(self.cfg.dataloader)
-        pack_validation = _should_pack_validation(self.cfg, self.model_parts[0])
         self.val_dataloaders = {
-            name: materialize_loader(dl_config if pack_validation else replace(dl_config, packing=None))
-            for name, dl_config in self.cfg.validation_dataloaders.items()
+            name: materialize_loader(dl_config) for name, dl_config in self.cfg.validation_dataloaders.items()
         }
         # Optional tool-call accuracy evaluator for agent SFT runs.
         # Presence of the ``tool_call_eval`` block enables it; absence skips it.
