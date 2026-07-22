@@ -287,6 +287,34 @@ def test_cached_source_model_path_uses_exact_loaded_revision(tmp_path, monkeypat
     )
 
 
+def test_cache_hub_source_legal_assets_uses_exact_loaded_revision(monkeypatch):
+    from nemo_automodel._transformers import retrieval
+
+    snapshot_download = MagicMock(return_value="/cache/snapshot")
+    monkeypatch.setattr(retrieval, "snapshot_download", snapshot_download)
+
+    result = retrieval._cache_hub_source_legal_assets(
+        "org/model",
+        SimpleNamespace(_commit_hash="exact-commit"),
+        {
+            "cache_dir": "/cache",
+            "revision": "branch",
+            "use_auth_token": "token",
+            "local_files_only": True,
+        },
+    )
+
+    assert result == "/cache/snapshot"
+    snapshot_download.assert_called_once_with(
+        repo_id="org/model",
+        allow_patterns=retrieval._SOURCE_LEGAL_ASSET_PATTERNS,
+        cache_dir="/cache",
+        local_files_only=True,
+        revision="exact-commit",
+        token="token",
+    )
+
+
 def test_direct_standard_export_preserves_cached_source_deployment_limit(tmp_path):
     from nemo_automodel._transformers import retrieval
 
