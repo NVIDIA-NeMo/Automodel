@@ -14,19 +14,21 @@ model:
   # Diffusers-layout conversion of Lightricks/LTX-2.3 (the official repo is weights-only).
   pretrained_model_name_or_path: "dg845/LTX-2.3-Diffusers"
   mode: "finetune"
-  torch_dtype: bfloat16
+  # fp32 sharded master weights with bf16 compute (FSDP2 casts gathered params
+  # to compute_dtype): the reference SFT recipe trains this way, and at lr 2e-5
+  # per-step updates round away when AdamW is applied directly to bf16 weights.
+  # The optimizer is built over the fp32 shards, so Adam state is fp32 too.
+  torch_dtype: float32
   compute_dtype: bfloat16
 
+# Constant LR (no lr_scheduler block): the LTX-2.3 reference SFT schedule
+# resolves to a flat 2e-5 for the entire run.
 optim:
   learning_rate: 2e-5  # LTX-2.3 reference SFT learning rate
+  clip_grad: 10.0  # reference SFT max grad-norm (recipe default is 1.0)
   optimizer:
     weight_decay: 0.01
     betas: [0.9, 0.999]
-
-lr_scheduler:
-  lr_decay_style: cosine
-  lr_warmup_steps: 0
-  min_lr: 1e-6
 
 fsdp:
   dp_size: 8
