@@ -1319,12 +1319,14 @@ class TestBuildCheckpointConfig:
         assert config.model_cache_dir == "/tmp/cache"
         assert config.save_consolidated.value == "final"
         assert config.is_peft is False
+        assert config.max_recent_checkpoints is None
 
     def test_build_checkpoint_config_with_custom_config(self):
         """Test checkpoint config with custom settings."""
         cfg_ckpt = MagicMock()
         cfg_ckpt.to_dict.return_value = {
             "checkpoint_dir": "/custom/ckpt/",
+            "max_recent_checkpoints": 3,
             "save_consolidated": False,
             "restore_from": "/some/path",  # Should be removed
         }
@@ -1337,6 +1339,7 @@ class TestBuildCheckpointConfig:
         )
 
         assert config.checkpoint_dir == "/custom/ckpt/"
+        assert config.max_recent_checkpoints == 3
         assert config.save_consolidated.value == "false"
         assert config.is_peft is True
 
@@ -1348,6 +1351,7 @@ class TestBuildCheckpointConfig:
         cfg_ckpt.to_dict.return_value = {
             "model_save_format": "torch_save",
             "checkpoint_dir": "/user/ckpt/",
+            "max_recent_checkpoints": 2,
             "save_consolidated": False,
         }
 
@@ -1362,9 +1366,10 @@ class TestBuildCheckpointConfig:
         assert any("falling back" in rec.message.lower() for rec in caplog.records)
         assert config.is_peft is True
         assert config.model_save_format == SerializationFormat.SAFETENSORS
-        # checkpoint_dir is preserved from the user config
+        # The builder preserves `checkpoint_dir` and `max_recent_checkpoints` from the user configuration.
         assert config.checkpoint_dir == "/user/ckpt/"
-        # other user-provided torch_save options are discarded; save_consolidated falls back to the default "final"
+        assert config.max_recent_checkpoints == 2
+        # The builder coerces incompatible `torch_save` options and restores the default `save_consolidated="final"`.
         assert config.save_consolidated.value == "final"
         assert config.is_async is False
 
@@ -3181,6 +3186,69 @@ class TestChunkVlmMedia:
         assert model._vlm_num_patches_chunks is None
         assert model._vlm_patch_newline_mask_chunks is None
         assert model._vlm_chunk_idx is None
+
+    @pytest.mark.parametrize("schedule_flag", ["_stage_forward_initialized", "_stages_forward_initialized"])
+    def test_stage_media_replays_first_chunk_after_dynamic_metadata_forward(self, schedule_flag):
+        class MediaConsumer(nn.Module):
+            def forward(self):
+                chunk = self._vlm_pixel_values_chunks[self._vlm_chunk_idx]
+                self._vlm_chunk_idx += 1
+                return chunk
+
+        model = MediaConsumer()
+        schedule = SimpleNamespace(**{schedule_flag: False})
+        stage = SimpleNamespace(is_first=True)
+        pp = SimpleNamespace(
+            info=SimpleNamespace(has_first_stage=True, schedule=schedule, stages=[stage]),
+        )
+        first_chunk = torch.tensor([1.0])
+        second_chunk = torch.tensor([2.0])
+        batch = {
+            VLM_PP_MEDIA_KEY: {
+                "pixel_values": [first_chunk, second_chunk],
+                "image_grid_hws": [torch.ones(1), torch.ones(1)],
+            }
+        }
+
+        with stage_vlm_media_for_pp(pp, [model], batch):
+            metadata_output = model()
+            first_microbatch_output = model()
+            second_microbatch_output = model()
+
+            assert torch.equal(metadata_output, first_chunk)
+            assert torch.equal(first_microbatch_output, first_chunk)
+            assert torch.equal(second_microbatch_output, second_chunk)
+            assert model._vlm_chunk_idx == 2
+
+    @pytest.mark.parametrize("analytical_metadata,forward_initialized", [(True, False), (False, True)])
+    def test_stage_media_does_not_replay_without_dynamic_metadata_forward(
+        self, analytical_metadata, forward_initialized
+    ):
+        class MediaConsumer(nn.Module):
+            def forward(self):
+                chunk = self._vlm_pixel_values_chunks[self._vlm_chunk_idx]
+                self._vlm_chunk_idx += 1
+                return chunk
+
+        model = MediaConsumer()
+        schedule = SimpleNamespace(_stage_forward_initialized=forward_initialized)
+        stage = SimpleNamespace(is_first=True)
+        if analytical_metadata:
+            stage._configure_outputs_meta = lambda *_args: None
+        pp = SimpleNamespace(
+            info=SimpleNamespace(has_first_stage=True, schedule=schedule, stages=[stage]),
+        )
+        first_chunk = torch.tensor([1.0])
+        batch = {
+            VLM_PP_MEDIA_KEY: {
+                "pixel_values": [first_chunk],
+                "image_grid_hws": [torch.ones(1)],
+            }
+        }
+
+        with stage_vlm_media_for_pp(pp, [model], batch):
+            assert torch.equal(model(), first_chunk)
+            assert model._vlm_chunk_idx == 1
 
     def test_prepare_flat_patches_without_image_grid(self):
         pixel_values = torch.arange(5 * 2 * 2 * 2 * 3).reshape(5, 2, 2, 2, 3)

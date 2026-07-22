@@ -15,7 +15,7 @@
 configs:
   # SFT
   - gemma3n/gemma3n_vl_4b_medpix.yaml
-  - gemma4/gemma4_4b.yaml
+  - gemma4/gemma4_2b.yaml
   - gemma4/gemma4_26b_a4b_moe.yaml
   - internvl/internvl_3_5_4b.yaml
   - mistral/ministral3_3b_medpix.yaml

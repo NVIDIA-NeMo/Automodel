@@ -1053,7 +1053,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
             v.close()
-        self.checkpointer.close()
+        self._finalize_and_close_checkpointer()
 
     @torch.no_grad()
     def _run_validation_epoch(self, val_dataloader):
