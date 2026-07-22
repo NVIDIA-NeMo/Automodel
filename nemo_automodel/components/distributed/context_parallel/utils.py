@@ -326,7 +326,7 @@ def _prepare_cp_sharder(
     invoke_pre_embed: bool = True,
     extra_seq_buffers: Optional[dict[str, int]] = None,
 ) -> ContextParallelSharder:
-    """Resolve and bind a CP sharder for its public constructor.
+    """Resolve and configure a CP sharder for its public constructor.
 
     The model hook may return a ContextParallelSharder; otherwise this
     function resolves a framework-owned sharder from the live model's attention
@@ -351,7 +351,7 @@ def _prepare_cp_sharder(
             batch on the generic torch path (rejected on the TE THD path;
             ignored by backends that own their transport).
     Returns:
-        The resolved and mesh-bound :class:`ContextParallelSharder` (the
+        The resolved and mesh-configured :class:`ContextParallelSharder` (the
         identity sharder when no CP prep applies).
     """
 
@@ -377,10 +377,9 @@ def _prepare_cp_sharder(
         batch.update({key: value for key, value in prepared.items() if key != "cp_sharder"})
 
     cp_mesh = _get_submesh(device_mesh, "cp")
-    tp_mesh = _get_submesh(device_mesh, "tp")
     if backend_uses_thd and extra_seq_buffers:
         raise ValueError("extra_seq_buffers are not supported by the TE THD context-parallel path")
-    sharder = _resolve_cp_sharder(
+    strategy = _resolve_cp_sharder(
         cp_mesh,
         cp_sharder,
         magi=magi_state,
@@ -390,9 +389,11 @@ def _prepare_cp_sharder(
         model=model,
         extra_seq_buffers=extra_seq_buffers,
     )
-    return sharder._bind(
-        cp_mesh,
-        tp_mesh,
+    return ContextParallelSharder(
+        device_mesh=device_mesh,
+        shard_batch=strategy.shard_batch,
+        local_token_global_indices=strategy.local_token_global_indices,
+        shard_layout=strategy.shard_layout,
         loss_mask=loss_mask,
         padding_token_id=padding_token_id,
     )
@@ -582,12 +583,11 @@ def _make_cp_batch_and_ctx(
     """
 
     cp_mesh = _get_submesh(device_mesh, "cp")
-    tp_mesh = _get_submesh(device_mesh, "tp")
 
     if use_te and extra_seq_buffers:
         raise ValueError("extra_seq_buffers are not supported by the TE THD context-parallel path")
 
-    sharder = _resolve_cp_sharder(
+    strategy = _resolve_cp_sharder(
         cp_mesh,
         cp_sharder,
         magi=magi,
@@ -597,9 +597,11 @@ def _make_cp_batch_and_ctx(
         model=model,
         extra_seq_buffers=extra_seq_buffers,
     )
-    sharder._bind(
-        cp_mesh,
-        tp_mesh,
+    sharder = ContextParallelSharder(
+        device_mesh=device_mesh,
+        shard_batch=strategy.shard_batch,
+        local_token_global_indices=strategy.local_token_global_indices,
+        shard_layout=strategy.shard_layout,
         loss_mask=loss_mask,
         padding_token_id=padding_token_id,
     )

@@ -34,8 +34,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
-from nemo_automodel.components.distributed.context_parallel.sharder import round_robin_local_indices
-from nemo_automodel.components.distributed.context_parallel.utils import _resolve_cp_sharder
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    round_robin_local_indices,
+)
 
 
 def main() -> None:
@@ -46,10 +48,6 @@ def main() -> None:
     mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("cp",))
     cp_mesh = mesh["cp"]
 
-    sharder = _resolve_cp_sharder(
-        cp_mesh, None, magi=None, is_thd=False, num_chunks=1, seq_lens_padding_value=-1000, model=None
-    )._bind(cp_mesh, None)
-
     # Shard a batch whose length needs CP padding (6 -> 8 at cp=2) so the
     # captured layout (original=6, padded=8) drive fill/trim below.
     seq_len = 3 * world
@@ -57,6 +55,7 @@ def main() -> None:
         "input_ids": torch.arange(seq_len, device=device).unsqueeze(0),
         "labels": torch.arange(seq_len, device=device).unsqueeze(0),
     }
+    sharder = ContextParallelSharder(None, mesh, batch)
     sharder.shard(batch)
     padded = sharder.shard_layout.padded_seq_len
     assert sharder.shard_layout.original_seq_len == seq_len, sharder.shard_layout.original_seq_len

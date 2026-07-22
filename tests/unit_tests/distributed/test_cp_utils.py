@@ -95,6 +95,16 @@ class _DummyDeviceMesh(dict):
         self.mesh_dim_names = ["cp", "tp"]
 
 
+def _construct_strategy_sharder(strategy, device_mesh):
+    """Construct a mesh-configured sharder from a resolved strategy."""
+    return ContextParallelSharder(
+        device_mesh=device_mesh,
+        shard_batch=strategy.shard_batch,
+        local_token_global_indices=strategy.local_token_global_indices,
+        shard_layout=strategy.shard_layout,
+    )
+
+
 def test_make_cp_batch_and_ctx_no_mesh():
     """When *no* device mesh is provided the call should be a no-op."""
     input_ids = torch.tensor([[1, 2, 3]])
@@ -780,9 +790,10 @@ def test_te_sharder_captures_partition_indices_at_shard_time(monkeypatch):
     monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
 
     cp2 = _DummySubMesh(2)
-    sharder = _cu._resolve_cp_sharder(
+    strategy = _cu._resolve_cp_sharder(
         cp2, None, magi=None, is_thd=True, num_chunks=1, seq_lens_padding_value=-1000, model=None
-    )._bind(cp2, None)
+    )
+    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=2, tp_size=1))
     full = torch.arange(4.0)  # [T] token-aligned tensor, THD seq_dim=0
 
     with pytest.raises(NotImplementedError, match="before the first shard"):
@@ -814,7 +825,7 @@ def test_magi_sharder_captures_hf_dispatch_facts():
     the original length and the verbs work in the caller's [1, S] coordinates."""
     cp2 = _DummySubMesh(2)
     # global padded length 4 = 2 local x cp 2; input was [1, 3] -> tail pad of 1
-    sharder = _cu._resolve_cp_sharder(
+    strategy = _cu._resolve_cp_sharder(
         cp2,
         None,
         magi=_FakeMagiState(torch.tensor([[0, 2]])),
@@ -822,7 +833,8 @@ def test_magi_sharder_captures_hf_dispatch_facts():
         num_chunks=1,
         seq_lens_padding_value=-1000,
         model=None,
-    )._bind(cp2, None)
+    )
+    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=2, tp_size=1))
     sharder.shard({"input_ids": torch.tensor([[1, 2, 3]])})
     assert (sharder.shard_layout.original_seq_len, sharder.shard_layout.padded_seq_len) == (3, 4)
     # down: original-length tensor auto-pads then follows the dispatch permutation
@@ -834,7 +846,7 @@ def test_magi_sharder_captures_packed_row_shape():
     """Packed magi over a THD flatten with no extra dispatch pad: the sharder
     captures the pre-flatten row shape (padded == rows x cols)."""
     cp2 = _DummySubMesh(2)
-    sharder = _cu._resolve_cp_sharder(
+    strategy = _cu._resolve_cp_sharder(
         cp2,
         None,
         magi=_FakeMagiState(torch.tensor([[0, 3]])),
@@ -842,7 +854,8 @@ def test_magi_sharder_captures_packed_row_shape():
         num_chunks=1,
         seq_lens_padding_value=-1000,
         model=None,
-    )._bind(cp2, None)
+    )
+    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=2, tp_size=1))
     sharder.shard({"input_ids": torch.tensor([[1, 2], [3, 4]])})
     assert sharder.shard_layout.input_row_shape == (2, 2)
     assert sharder.shard_layout.padded_seq_len == 4
@@ -910,9 +923,10 @@ def test_te_sharder_captures_row_shape(monkeypatch):
     monkeypatch.setattr(_cu, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
 
     cp1 = _DummySubMesh(1)
-    sharder = _cu._resolve_cp_sharder(
+    strategy = _cu._resolve_cp_sharder(
         cp1, None, magi=None, is_thd=True, num_chunks=1, seq_lens_padding_value=-1000, model=None
-    )._bind(cp1, None)
+    )
+    sharder = _construct_strategy_sharder(strategy, _DummyDeviceMesh(cp_size=1, tp_size=1))
     sharder.shard({"input_ids": torch.arange(4).view(2, 2)})
     assert sharder.shard_layout.input_row_shape == (2, 2)
     assert sharder.shard_layout.padded_seq_len == 4
@@ -944,7 +958,10 @@ def test_resolve_cp_sharder_layers():
     for mesh in (None, _DummySubMesh(1)):
         none_sharder = _cu._resolve_cp_sharder(mesh, None, **common)
         batch = {"input_ids": torch.tensor([[1, 2, 3]])}
-        none_sharder._bind(mesh, None)
+        none_sharder = _construct_strategy_sharder(
+            none_sharder,
+            _DummyDeviceMesh(cp_size=mesh.size() if mesh is not None else 1, tp_size=1) if mesh is not None else None,
+        )
         ctx, out = none_sharder.shard(batch)
         assert ctx is contextlib.nullcontext and out is batch
         # token verbs are identities at cp<=1 (lengths were captured: 3 == 3)

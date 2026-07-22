@@ -19,7 +19,7 @@ sharding and attention transport returns one from
 ``prepare_model_inputs_for_cp`` under the ``"cp_sharder"`` batch key; the
 framework constructs its own for the remaining backends (torch
 ``context_parallel`` round-robin, TE/THD, MagiAttention) so
-constructing :class:`ContextParallelSharder` resolves and binds the backend;
+constructing :class:`ContextParallelSharder` resolves and configures the backend;
 callers then invoke ``sharder.shard(batch)``. This replaces the retired private batch keys
 (``_cp_make_batch_fn``, ``_cp_metadata_seq_dims``, ``_cp_metadata_pad_values``,
 ``_cp_full_logits_grad_touch``).
@@ -51,7 +51,6 @@ dispatcher wraps them into sharders at resolution time.
 from __future__ import annotations
 
 import contextlib
-import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -287,7 +286,8 @@ class ContextParallelSharder:
                 the sharding strategy, or None for the generic strategy. Omit
                 when constructing directly from ``shard_batch``.
             device_mesh: Device mesh containing optional ``cp`` and ``tp`` axes.
-                Omit when constructing directly from ``shard_batch``.
+                Direct strategy construction uses it to configure the sharder;
+                omit it only when returning an unresolved model-owned strategy.
             batch: Mutable input mapping required when resolving a strategy.
                 Token tensors normally have shape
                 [batch, sequence, ...]; THD source batches declare
@@ -311,23 +311,22 @@ class ContextParallelSharder:
         if shard_batch is not None:
             has_resolution_args = (
                 model is not None
-                or device_mesh is not None
                 or batch is not None
-                or padding_token_id != 0
                 or num_chunks != 1
-                or loss_mask is not None
                 or not invoke_pre_embed
                 or extra_seq_buffers is not None
             )
             if has_resolution_args:
-                raise TypeError("shard_batch is mutually exclusive with model, batch, mesh, and resolution options")
+                raise TypeError("shard_batch is mutually exclusive with model, batch, and strategy-resolution options")
+
             self.shard_batch = shard_batch
             self.local_token_global_indices = local_token_global_indices
             self.shard_layout = shard_layout
-            self._cp_mesh = None
-            self._tp_mesh = None
-            self._loss_mask = None
-            self._padding_token_id = 0
+            mesh_dim_names = getattr(device_mesh, "mesh_dim_names", ())
+            self._cp_mesh = device_mesh["cp"] if "cp" in mesh_dim_names else None
+            self._tp_mesh = device_mesh["tp"] if "tp" in mesh_dim_names else None
+            self._loss_mask = loss_mask
+            self._padding_token_id = padding_token_id
             return
         if local_token_global_indices is not None or shard_layout is not None:
             raise TypeError("local_token_global_indices and shard_layout require shard_batch")
@@ -353,56 +352,6 @@ class ContextParallelSharder:
         self._tp_mesh = resolved._tp_mesh
         self._loss_mask = resolved._loss_mask
         self._padding_token_id = resolved._padding_token_id
-
-    @classmethod
-    def _from_strategy(
-        cls,
-        shard_batch: Callable[..., tuple[Callable, dict[str, Any], "ShardLayout | None"]],
-        local_token_global_indices: Callable[..., torch.Tensor] | None,
-        shard_layout: "ShardLayout | None" = None,
-    ) -> "ContextParallelSharder":
-        """Construct an unresolved sharder from a backend strategy.
-
-        .. deprecated:: 0.5.0
-            Use ``ContextParallelSharder(shard_batch=..., ...)`` instead.
-
-        Args:
-            shard_batch: Backend callback that shards token tensors along their
-                sequence axis and returns the resulting batch and layout.
-            local_token_global_indices: Callback returning a tensor of shape
-                [local_tokens] containing each local token's global position.
-            shard_layout: Optional previously captured layout. Its
-                ``local_token_global_indices`` tensor has shape [local_tokens].
-
-        Returns:
-            Unbound sharder for internal backend and model-hook composition.
-        """
-        warnings.warn(
-            "ContextParallelSharder._from_strategy() is deprecated; use the constructor with "
-            "shard_batch= and local_token_global_indices= instead",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return cls(
-            shard_batch=shard_batch,
-            local_token_global_indices=local_token_global_indices,
-            shard_layout=shard_layout,
-        )
-
-    def _bind(
-        self,
-        cp_mesh,
-        tp_mesh,
-        *,
-        loss_mask: torch.Tensor | None = None,
-        padding_token_id: int = 0,
-    ) -> "ContextParallelSharder":
-        """Bind the per-forward meshes and batch-sharding options."""
-        self._cp_mesh = cp_mesh
-        self._tp_mesh = tp_mesh
-        self._loss_mask = loss_mask
-        self._padding_token_id = padding_token_id
-        return self
 
     def shard(self, batch: dict[str, Any]) -> tuple[Callable, dict[str, Any]]:
         """Shard a batch and retain its layout for token-aligned tensors."""
