@@ -92,6 +92,11 @@ dataset:
   seq_length: 1024
   truncation: true
   unshifted: true
+  # LLaDA-8B-Base ships a generation-only chat template that unconditionally
+  # appends an assistant prompt and lacks {% generation %} tags, breaking answer-mask
+  # extraction on multi-turn samples. Use a Llama-3 template with generation tags so
+  # the tokenizer returns the assistant mask directly (supervises response + EOS).
+  chat_template: examples/dllm_sft/llada_chat_template.jinja
   tokenizer:
     pretrained_model_name_or_path: GSAI-ML/LLaDA-8B-Base
     trust_remote_code: true
