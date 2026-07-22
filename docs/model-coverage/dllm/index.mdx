@@ -3,19 +3,19 @@ title: "Diffusion Language Models (dLLMs)"
 description: ""
 position: 6
 ---
-Diffusion language models (dLLMs) generate text by **denoising** rather than left-to-right autoregression. A fixed-length response "canvas" is corrupted and then iteratively refined, so tokens are produced in parallel and can be revised across steps. NeMo AutoModel supports fine-tuning block-diffusion dLLMs with the same recipe-driven, FSDP2/Expert-Parallel training stack used for LLMs and VLMs.
+Diffusion language models (dLLMs) generate text by **denoising** rather than by using left-to-right autoregression. A fixed-length response "canvas" is corrupted and then iteratively refined, so tokens are produced in parallel and can be revised across steps. NeMo AutoModel supports fine-tuning block-diffusion dLLMs with the same recipe-driven FSDP2 and expert parallel training stack used for LLMs and VLMs.
 
 ## Supported Models
 
 | Owner | Model Family | Architectures |
 |---|---|---|
-| GSAI-ML | LLaDA | `LLaDAModelLM` (via HF `trust_remote_code`) |
-| inclusionAI | LLaDA2 | `LLaDA2MoeModelLM` (via HF `trust_remote_code`) |
-| NVIDIA | Nemotron-Labs-Diffusion | `NemotronLabsDiffusionModel` (via HF `trust_remote_code`) |
+| GSAI-ML | LLaDA | `LLaDAModelLM` (using Hugging Face `trust_remote_code`) |
+| inclusionAI | LLaDA2 | `LLaDA2MoeModelLM` (using Hugging Face `trust_remote_code`) |
+| NVIDIA | Nemotron-Labs-Diffusion | `NemotronLabsDiffusionModel` (using Hugging Face `trust_remote_code`) |
 | Google | [DiffusionGemma](/model-coverage/dllm/diffusiongemma) | `DiffusionGemmaForBlockDiffusion` |
 
-LLaDA, LLaDA2, and Nemotron-Labs-Diffusion load through their Hugging Face remote-code implementations; DiffusionGemma has a native NeMo AutoModel implementation.
+LLaDA, LLaDA2, and Nemotron-Labs-Diffusion load through their Hugging Face remote-code implementations. DiffusionGemma has a native NeMo AutoModel implementation.
 
 ## Fine-Tuning
 
-See the [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning) for the full recipe walkthrough covering all four families, and the [DiffusionGemma Fine-Tuning Guide](/recipes-e2e-examples/diffusiongemma) for the block-diffusion training objective (uniform-random token corruption, no `[MASK]`), self-conditioning, and the supported feature set (SFT, LoRA, Expert Parallelism, activation checkpointing).
+The [dLLM Fine-Tuning Guide](/recipes-e2e-examples/dllm-fine-tuning) provides the complete recipe walkthrough for all four families. The [DiffusionGemma Fine-Tuning Guide](/recipes-e2e-examples/diffusiongemma) describes the block-diffusion training objective (uniform random token corruption without `[MASK]`), self-conditioning, and the supported feature set (SFT, LoRA, expert parallelism, and activation checkpointing).
