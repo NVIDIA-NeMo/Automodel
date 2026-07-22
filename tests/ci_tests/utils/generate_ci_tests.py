@@ -136,6 +136,10 @@ def _compute_base_stage(test_folder: str, config: Path, has_robustness: bool) ->
         return "performance"
     if "benchmark" in config.stem:
         return "benchmark"
+    if test_folder == "convergence":
+        # Weekly train-then-eval flow; the .convergence_test template runs
+        # convergence_tests_launcher.sh (train -> IFEval -> threshold gate).
+        return "convergence"
     if test_folder.startswith("diffusion"):
         return "diffusion_peft" if ("lora" in config.stem or "peft" in config.stem) else "diffusion_sft"
     if test_folder.startswith("retrieval"):
