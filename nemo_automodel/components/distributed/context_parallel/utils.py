@@ -261,7 +261,7 @@ def _shard_thd_chunk_for_te(
 
     # The partition is the same for every token-aligned key; it is also this
     # rank's local-token global index map, returned so the caller can install
-    # it on the THD sharder (ContextParallelismSharder token verbs).
+    # it on the THD sharder (CPShardStrategy token verbs).
     local_indices = tex.thd_get_partitioned_indices(
         filtered_cu_seqlens_padded, batch["input_ids"].size(0), cp_size, cp_rank
     )

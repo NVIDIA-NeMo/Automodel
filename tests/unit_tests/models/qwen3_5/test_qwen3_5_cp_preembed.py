@@ -74,8 +74,8 @@ class TestPrepareModelInputsForCP:
     def test_returns_sharder_and_positions_only(self):
         """Sharder-only hook: no inputs_embeds (the forward embeds), full mRoPE
         positions stored for the aux shard, mm_token_type_ids consumed."""
-        from nemo_automodel.components.distributed.context_parallel.sharder import (
-            ContextParallelismSharder,
+        from nemo_automodel.components.distributed.context_parallel._strategy import (
+            CPShardStrategy,
             _round_robin_local_indices,
             _shard_batch_aux_only,
         )
@@ -85,7 +85,7 @@ class TestPrepareModelInputsForCP:
         sharder = model.prepare_model_inputs_for_cp(batch)
 
         assert "inputs_embeds" not in batch  # embedding happens in forward now
-        assert isinstance(sharder, ContextParallelismSharder)
+        assert isinstance(sharder, CPShardStrategy)
         assert sharder.shard_batch is _shard_batch_aux_only
         assert sharder.local_token_global_indices is _round_robin_local_indices
         # position_ids came from get_rope_index (mRoPE [3, B, S]); aux shard slices it.

@@ -49,7 +49,7 @@ class _NoOpCPRuntime:
         self.device_mesh = device_mesh
         self.calls = []
 
-    def prepare_forward(self, model, batch, **kwargs):
+    def shard(self, model, batch, **kwargs):
         del kwargs
         cp_active = self.device_mesh is not None and self.device_mesh["cp"].size() > 1
         if cp_active:
@@ -102,7 +102,7 @@ def _make_recipe(*, student: nn.Module, teacher: nn.Module, kd_loss_fn: KDLoss, 
     recipe = object.__new__(vlm_kd.KnowledgeDistillationRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.device_mesh = device_mesh
-    recipe.cp_runtime = _NoOpCPRuntime(device_mesh)
+    recipe.cp_sharder = _NoOpCPRuntime(device_mesh)
     recipe.pp_enabled = False
     recipe.model_parts = [student]
     recipe.teacher_model = teacher
@@ -196,8 +196,8 @@ def test_vlm_kd_cp_prepare_shards_input_ids_and_teacher_embeds_them(monkeypatch)
     # Sunk student: the sharder-only hook consumes nothing, so input_ids (not
     # inputs_embeds) flows to CP; the teacher embeds those input_ids itself.
     assert len(student.pre_embed_calls) == 1
-    assert len(recipe.cp_runtime.calls) == 1
-    cp_batch = recipe.cp_runtime.calls[0]
+    assert len(recipe.cp_sharder.calls) == 1
+    cp_batch = recipe.cp_sharder.calls[0]
     assert "input_ids" in cp_batch
     assert "inputs_embeds" not in cp_batch
     assert "labels" in cp_batch

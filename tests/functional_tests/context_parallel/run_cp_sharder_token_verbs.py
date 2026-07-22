@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Multi-rank functional test for the CPTokenLayout token verbs (L1, 2+ GPUs).
+"""Multi-rank functional test for prepared CP token operations (L1, 2+ GPUs).
 
 The single-process unit suite can only exercise the identity early-returns of
-``CPTokenLayout.gather``; this driver runs the real collectives:
+the prepared result's ``gather`` method; this driver runs the real collectives:
 
   - shard -> gather round-trips a
     caller-coordinate tensor through the round-robin layout (fill/trim);
@@ -34,8 +34,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
-from nemo_automodel.components.distributed import ContextParallelRuntime
-from nemo_automodel.components.distributed.context_parallel import ContextParallelismSharder
+from nemo_automodel.components.distributed import ContextParallelSharder
+from nemo_automodel.components.distributed.context_parallel._strategy import CPShardStrategy
 
 
 def main() -> None:
@@ -53,15 +53,13 @@ def main() -> None:
         "input_ids": torch.arange(seq_len, device=device).unsqueeze(0),
         "labels": torch.arange(seq_len, device=device).unsqueeze(0),
     }
-    tokens = ContextParallelRuntime(device_mesh=mesh).prepare_forward(None, batch).tokens
-    padded = tokens.shard_layout.padded_seq_len
-    assert tokens.shard_layout.original_seq_len == seq_len, tokens.shard_layout.original_seq_len
-    assert padded == seq_len + (-seq_len) % (2 * world), padded
+    tokens = ContextParallelSharder(device_mesh=mesh).shard(None, batch)
+    padded = seq_len + (-seq_len) % (2 * world)
 
     # --- down: caller-coordinate tensor rides the same layout -------------
     full = torch.arange(float(seq_len), device=device).unsqueeze(0)
     local = tokens.shard(full, fill=-1.0)
-    indices = ContextParallelismSharder.sdpa().local_token_global_indices(cp_mesh, padded, device)
+    indices = CPShardStrategy.sdpa().local_token_global_indices(cp_mesh, padded, device)
     expected_local = torch.where(indices < seq_len, indices.float(), torch.tensor(-1.0, device=device)).unsqueeze(0)
     assert torch.equal(local, expected_local), (rank, local.tolist(), expected_local.tolist())
 

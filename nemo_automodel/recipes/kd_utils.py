@@ -28,7 +28,7 @@ from nemo_automodel.components.distributed.config import DDPConfig, DistributedS
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, parse_distributed_section
 
 if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.context_parallel.sharder import CPTokenLayout
+    from nemo_automodel.components.distributed.context_parallel.api import CPForward
 
 RUN_TEACHER = 1
 STOP_TEACHER = 0
@@ -45,7 +45,7 @@ class _ConfigLike(Protocol):
 def materialize_teacher_logits(
     logits: torch.Tensor,
     *,
-    tokens: "CPTokenLayout",
+    tokens: "CPForward",
     sequence_length: int,
 ) -> torch.Tensor:
     """Reconstruct full teacher logits across TP and CP before mesh transport.

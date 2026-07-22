@@ -175,7 +175,7 @@ def main():
 
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed import ContextParallelRuntime
+    from nemo_automodel.components.distributed import ContextParallelSharder
     from nemo_automodel.components.distributed.pipelining import AutoPipeline
     from nemo_automodel.components.moe.parallelizer import apply_cp
 
@@ -183,7 +183,7 @@ def main():
     pp_size = 1 if pp1 else 2
     cp_size = world // pp_size
     mesh = init_device_mesh("cuda", (pp_size, 1, cp_size), mesh_dim_names=("pp", "dp", "cp"))
-    cp_runtime = ContextParallelRuntime(device_mesh=mesh)
+    cp_sharder = ContextParallelSharder(device_mesh=mesh)
 
     which = os.environ.get("NEMO_CP_PP_MODEL", "minimax")
     torch.manual_seed(0)
@@ -241,7 +241,7 @@ def main():
         dist.broadcast(input_ids, src=0)
         pos = torch.arange(seqlen, device=device).unsqueeze(0).expand(2, -1).contiguous()
         batch = {"input_ids": input_ids.clone(), "labels": input_ids.clone(), "position_ids": pos.clone()}
-        prepared_cp = cp_runtime.prepare_forward(model_part0, batch)
+        prepared_cp = cp_sharder.shard(model_part0, batch)
         train_ctx, batch = prepared_cp.context, prepared_cp.batch
         labels = batch.pop("labels")
         if pp_size > 1:

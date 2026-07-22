@@ -28,27 +28,27 @@ from functools import partial
 import pytest
 import torch
 
-from nemo_automodel.components.distributed.context_parallel import runtime as _runtime
-from nemo_automodel.components.distributed.context_parallel import sharder as _cs
+from nemo_automodel.components.distributed.context_parallel import _strategy as _cs
+from nemo_automodel.components.distributed.context_parallel import api as _runtime
 
 # Import module under test
 from nemo_automodel.components.distributed.context_parallel import utils as _cu
-from nemo_automodel.components.distributed.context_parallel.magi import MagiState
-from nemo_automodel.components.distributed.context_parallel.runtime import ContextParallelRuntime
-from nemo_automodel.components.distributed.context_parallel.sharder import (
-    ContextParallelismSharder,
+from nemo_automodel.components.distributed.context_parallel._strategy import (
     CPShardResult,
+    CPShardStrategy,
     _contiguous_local_indices,
     shard_batch_contiguous,
 )
+from nemo_automodel.components.distributed.context_parallel.api import ContextParallelSharder
+from nemo_automodel.components.distributed.context_parallel.magi import MagiState
 from nemo_automodel.components.models.gemma4_moe import cp_batch as _cm
 
 
-# ContextParallelismSharder used by the model-owned dispatch tests below (passed as an explicit
-# ContextParallelRuntime.prepare_forward parameter; the batch itself stays pure tensors). Exercises the public
+# CPShardStrategy used by the model-owned dispatch tests below (passed as an explicit
+# ContextParallelSharder.shard parameter; the batch itself stays pure tensors). Exercises the public
 # contiguous shard (the production entry DSV4/Gemma4 wrap) on the model-provided per-token keys.
 def _contiguous_sharder():
-    return ContextParallelismSharder.contiguous(
+    return CPShardStrategy.contiguous(
         partial(
             shard_batch_contiguous,
             extra_seq_keys={"per_layer_inputs": 1, "_packed_seq_ids": 1, "mm_token_type_ids": 1},
@@ -131,18 +131,18 @@ def _prepare(
 
         model = _SharderModel()
 
-    runtime = ContextParallelRuntime(device_mesh=device_mesh, _magi=magi or MagiState())
-    prepared = runtime.prepare_forward(
+    runtime = ContextParallelSharder(device_mesh=device_mesh, _magi=magi or MagiState())
+    prepared = runtime.shard(
         model,
         batch,
         padding_token_id=padding_token_id,
         num_chunks=num_chunks,
         loss_mask=loss_mask,
     )
-    return prepared.context, prepared.batch, prepared.tokens
+    return prepared.context, prepared.batch, prepared
 
 
-def test_runtime_prepare_forward_no_mesh():
+def test_runtime_shard_no_mesh():
     """When *no* device mesh is provided the call should be a no-op."""
     input_ids = torch.tensor([[1, 2, 3]])
     labels = torch.tensor([[1, 2, 3]])
@@ -164,7 +164,7 @@ def test_runtime_prepare_forward_no_mesh():
         pass  # nothing should happen
 
 
-def test_runtime_prepare_forward_honors_model_sharder_at_cp_size_one():
+def test_runtime_shard_honors_model_sharder_at_cp_size_one():
     """Native packed models still need their batch transform without CP sharding."""
     device_mesh = _DummyDeviceMesh(cp_size=1, tp_size=1)
     called = False
@@ -182,7 +182,7 @@ def test_runtime_prepare_forward_honors_model_sharder_at_cp_size_one():
         "input_ids": torch.tensor([[1, 2, 3, 4]]),
         "labels": torch.tensor([[1, 2, 3, 4]]),
     }
-    sharder = ContextParallelismSharder(
+    sharder = CPShardStrategy(
         shard_batch=make_native_batch,
         local_token_global_indices=_contiguous_local_indices,
     )
@@ -201,7 +201,7 @@ def test_runtime_prepare_forward_honors_model_sharder_at_cp_size_one():
     assert new_batch["native_thd"] is True
 
 
-def test_runtime_prepare_forward_with_cp(monkeypatch):
+def test_runtime_shard_with_cp(monkeypatch):
     """Verify correct interaction when Context-Parallelism *is* enabled."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # CP enabled (>1)
     # seq_len=4 is divisible by cp_size*2=4 so the cp-divisor padding path is
@@ -229,7 +229,7 @@ def test_runtime_prepare_forward_with_cp(monkeypatch):
     assert new_batch is batch
 
 
-def test_runtime_prepare_forward_pads_to_cp_load_balance_multiple(monkeypatch):
+def test_runtime_shard_pads_to_cp_load_balance_multiple(monkeypatch):
     """CP buffers should be padded to a multiple of 2 * cp_size."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1, cp_rank=1)
     batch = {
@@ -246,7 +246,7 @@ def test_runtime_prepare_forward_pads_to_cp_load_balance_multiple(monkeypatch):
     assert batch["mm_token_type_ids"][0, -1].item() == 0
 
 
-def test_runtime_prepare_forward_mm_token_type_ids_do_not_select_manual(monkeypatch):
+def test_runtime_shard_mm_token_type_ids_do_not_select_manual(monkeypatch):
     """VLM metadata alone should not opt models into manual all-gather CP."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     calls = {}
@@ -271,7 +271,7 @@ def test_runtime_prepare_forward_mm_token_type_ids_do_not_select_manual(monkeypa
     assert torch.equal(new_batch["mm_token_type_ids"], torch.tensor([[0, 1, 1, 0]]))
 
 
-def test_runtime_prepare_forward_supports_inputs_embeds_and_per_layer_inputs(monkeypatch):
+def test_runtime_shard_supports_inputs_embeds_and_per_layer_inputs(monkeypatch):
     """Manual all-gather CP pre-embedding should shard inputs_embeds side inputs."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     inputs_embeds = torch.randn(1, 4, 8)
@@ -292,7 +292,7 @@ def test_runtime_prepare_forward_supports_inputs_embeds_and_per_layer_inputs(mon
     assert torch.equal(batch["labels"], torch.tensor([[1, 2]]))
 
 
-def test_runtime_prepare_forward_pads_and_slices_packed_seq_ids(monkeypatch):
+def test_runtime_shard_pads_and_slices_packed_seq_ids(monkeypatch):
     """Packed document ids should stay aligned with the local CP shard."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1, cp_rank=1)
     batch = {
@@ -308,7 +308,7 @@ def test_runtime_prepare_forward_pads_and_slices_packed_seq_ids(monkeypatch):
     assert torch.equal(batch["_packed_seq_ids"], torch.tensor([[2, 0]]))
 
 
-def test_runtime_prepare_forward_includes_padding_mask(monkeypatch):
+def test_runtime_shard_includes_padding_mask(monkeypatch):
     """Verify that padding_mask is included in CP buffers when present in batch."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     # seq_len=4 is divisible by cp_size*2=4 (no padding triggered).
@@ -325,7 +325,7 @@ def test_runtime_prepare_forward_includes_padding_mask(monkeypatch):
     assert torch.equal(batch["padding_mask"], torch.tensor([[True, False]]))
 
 
-def test_runtime_prepare_forward_3d_mrope_position_ids(monkeypatch):
+def test_runtime_shard_3d_mrope_position_ids(monkeypatch):
     """Verify that 3D mRoPE position_ids [3, B, S] are sharded on dim 2 (sequence), not dim 1 (batch)."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     seq_len = 8  # divisible by cp_size*2 to skip the cp-divisor padding path
@@ -344,7 +344,7 @@ def test_runtime_prepare_forward_3d_mrope_position_ids(monkeypatch):
     assert torch.equal(new_batch["position_ids"], position_ids_3d[:, :, :4])
 
 
-def test_runtime_prepare_forward_2d_position_ids_seq_dim(monkeypatch):
+def test_runtime_shard_2d_position_ids_seq_dim(monkeypatch):
     """Verify that standard 2D position_ids [B, S] are still sharded on dim 1."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     seq_len = 6
@@ -359,7 +359,7 @@ def test_runtime_prepare_forward_2d_position_ids_seq_dim(monkeypatch):
     assert torch.equal(batch["position_ids"], torch.tensor([[0, 1, 2, 3]]))
 
 
-def test_runtime_prepare_forward_3d_mrope_with_loss_mask(monkeypatch):
+def test_runtime_shard_3d_mrope_with_loss_mask(monkeypatch):
     """Verify 3D mRoPE position_ids work correctly with loss_mask."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     seq_len = 4
@@ -377,7 +377,7 @@ def test_runtime_prepare_forward_3d_mrope_with_loss_mask(monkeypatch):
     assert torch.equal(batch["loss_mask"], torch.ones(1, 2))
 
 
-def test_runtime_prepare_forward_pops_attention_mask_when_cp_enabled(monkeypatch):
+def test_runtime_shard_pops_attention_mask_when_cp_enabled(monkeypatch):
     """When CP is enabled, attention_mask should be removed from the batch."""
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     batch = {
@@ -739,7 +739,7 @@ def test_runtime_uses_batch_prepared_by_model_hook(monkeypatch):
                     "image_grid_hws": None,
                 }
             )
-            return ContextParallelismSharder.sdpa_aux()
+            return CPShardStrategy.sdpa_aux()
 
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 4]]),
@@ -748,10 +748,10 @@ def test_runtime_uses_batch_prepared_by_model_hook(monkeypatch):
         "image_grid_hws": torch.tensor([[2, 2]]),
     }
 
-    prepared = ContextParallelRuntime(device_mesh=_DummyDeviceMesh(cp_size=2, tp_size=1)).prepare_forward(
+    prepared = ContextParallelSharder(device_mesh=_DummyDeviceMesh(cp_size=2, tp_size=1)).shard(
         _Model(), batch, num_chunks=3
     )
-    ctx, out, tokens = prepared.context, prepared.batch, prepared.tokens
+    ctx, out, tokens = prepared.context, prepared.batch, prepared
 
     assert hasattr(ctx, "__enter__")
     assert out is batch
@@ -764,8 +764,7 @@ def test_runtime_uses_batch_prepared_by_model_hook(monkeypatch):
     assert out["image_grid_hws"] is None
     assert cp_context_kwargs["cp_buffers"][1] is position_ids
     assert cp_context_kwargs["cp_seq_dims"] == [1, 2]
-    assert tokens.shard_layout.original_seq_len == 4
-    assert tokens.shard_layout.padded_seq_len == 4
+    assert torch.equal(tokens.shard(torch.arange(4).unsqueeze(0)), torch.tensor([[0, 3]]))
 
 
 def test_te_sharder_captures_partition_indices_at_shard_time(monkeypatch):
@@ -811,7 +810,6 @@ def test_magi_sharder_captures_hf_dispatch_facts():
         {"input_ids": torch.tensor([[1, 2, 3]])},
         magi=_FakeMagiState(torch.tensor([[0, 2]])),
     )
-    assert (tokens.shard_layout.original_seq_len, tokens.shard_layout.padded_seq_len) == (3, 4)
     # down: original-length tensor auto-pads then follows the dispatch permutation
     local = tokens.shard(torch.tensor([[10.0, 20.0, 30.0]]), fill=0.0)
     assert torch.equal(local, torch.tensor([[10.0, 30.0]]))
@@ -826,8 +824,6 @@ def test_magi_sharder_captures_packed_row_shape():
         magi=_FakeMagiState(torch.tensor([[0, 3]])),
         use_te=True,
     )
-    assert tokens.shard_layout.input_row_shape == (2, 2)
-    assert tokens.shard_layout.padded_seq_len == 4
     rows = torch.tensor([[10.0, 20.0], [30.0, 40.0]])
     assert torch.equal(tokens.shard(rows), torch.tensor([10.0, 40.0]))
 
@@ -855,7 +851,6 @@ def test_round_robin_sharder_captures_lengths_and_pads_token_tensors(monkeypatch
     batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
     _, _, tokens = _prepare(device_mesh, batch)  # pads 6 -> 8 (2*cp)
 
-    assert (tokens.shard_layout.original_seq_len, tokens.shard_layout.padded_seq_len) == (6, 8)
     # down: unpadded [1, 6] advantages ride with an explicit fill
     local = tokens.shard(torch.arange(6.0).unsqueeze(0), fill=0.0)
     # rank 0 under 2*cp=4 chunks of len 2: chunks 0 and 3 -> positions [0,1,6,7]
@@ -874,7 +869,6 @@ def test_none_sharder_captures_lengths_for_trim():
     device_mesh = _DummyDeviceMesh(cp_size=1, tp_size=1)
     batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
     _, _, tokens = _prepare(device_mesh, batch)
-    assert (tokens.shard_layout.original_seq_len, tokens.shard_layout.padded_seq_len) == (6, 6)
     t = torch.randn(1, 6)
     assert torch.equal(tokens.gather(t), t)
 
@@ -895,9 +889,6 @@ def test_te_sharder_captures_row_shape(monkeypatch):
         {"input_ids": torch.arange(4).view(2, 2)},
         use_te=True,
     )
-    assert tokens.shard_layout.input_row_shape == (2, 2)
-    assert tokens.shard_layout.padded_seq_len == 4
-
     # down: row-coordinate [2, 2] flattens to the stream before sharding
     rows = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     assert torch.equal(tokens.shard(rows), torch.tensor([1.0, 2.0, 3.0, 4.0]))
@@ -907,11 +898,11 @@ def test_te_sharder_captures_row_shape(monkeypatch):
 
 def test_runtime_resolves_sharder_layers():
     """Resolution order: model-owned > magi > TE > generic round-robin > none."""
-    from nemo_automodel.components.distributed.context_parallel.sharder import _round_robin_local_indices
+    from nemo_automodel.components.distributed.context_parallel._strategy import _round_robin_local_indices
 
     model_sharder = _contiguous_sharder()
-    runtime_cp2 = ContextParallelRuntime(device_mesh=_DummyDeviceMesh(cp_size=2, tp_size=1))
-    runtime_cp1 = ContextParallelRuntime(device_mesh=_DummyDeviceMesh(cp_size=1, tp_size=1))
+    runtime_cp2 = ContextParallelSharder(device_mesh=_DummyDeviceMesh(cp_size=2, tp_size=1))
+    runtime_cp1 = ContextParallelSharder(device_mesh=_DummyDeviceMesh(cp_size=1, tp_size=1))
 
     # model-owned wins over everything, including native THD prep at cp<=1
     assert runtime_cp2._resolve_sharder(model_sharder, is_thd=True, num_chunks=1, model=None) is model_sharder

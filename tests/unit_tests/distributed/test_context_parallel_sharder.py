@@ -18,8 +18,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nemo_automodel.components.distributed.context_parallel import runtime as cp_runtime
-from nemo_automodel.components.distributed.context_parallel.runtime import ContextParallelRuntime, CPForward
+from nemo_automodel.components.distributed.context_parallel import api as cp_sharder
+from nemo_automodel.components.distributed.context_parallel.api import ContextParallelSharder, CPForward
 
 
 class _SubMesh:
@@ -54,80 +54,80 @@ def test_build_resolves_backend_from_model_config(monkeypatch):
     calls = []
 
     monkeypatch.setattr(
-        cp_runtime,
+        cp_sharder,
         "setup_magi",
         lambda config, device_mesh: calls.append((config, device_mesh)) or magi,
     )
 
-    runtime = ContextParallelRuntime.build(model_config, device_mesh=mesh)
+    runtime = ContextParallelSharder.build(model_config, device_mesh=mesh)
 
     assert calls == [(model_config, mesh)]
     assert runtime.requires_full_logits is True
 
 
-def test_prepare_forward_derives_thd_from_batch(monkeypatch):
+def test_shard_derives_thd_from_batch(monkeypatch):
     seen = {}
 
     def fake_make_cp_batch_for_te(cp_mesh, batch, **kwargs):
         seen.update(cp_mesh=cp_mesh, batch=batch, kwargs=kwargs)
         return {"input_ids": torch.tensor([1, 2])}, torch.tensor([0, 2])
 
-    monkeypatch.setattr(cp_runtime, "_prepare_thd_batch", fake_make_cp_batch_for_te)
-    prepared = ContextParallelRuntime(device_mesh=_DeviceMesh(cp_size=2)).prepare_forward(None, _thd_batch())
+    monkeypatch.setattr(cp_sharder, "_prepare_thd_batch", fake_make_cp_batch_for_te)
+    prepared = ContextParallelSharder(device_mesh=_DeviceMesh(cp_size=2)).shard(None, _thd_batch())
 
     assert isinstance(prepared, CPForward)
     assert seen["kwargs"]["num_chunks"] == 1
     assert isinstance(prepared.context, contextlib.nullcontext)
-    assert torch.equal(prepared.tokens.shard(torch.arange(4.0), seq_dim=0), torch.tensor([0.0, 2.0]))
+    assert torch.equal(prepared.shard(torch.arange(4.0), seq_dim=0), torch.tensor([0.0, 2.0]))
 
 
-def test_prepare_forward_requires_thd_sequence_metadata():
+def test_shard_requires_thd_sequence_metadata():
     batch = {"input_ids": torch.tensor([[1, 2]]), "qkv_format": "thd"}
 
     with pytest.raises(ValueError, match="seq_lens, seq_lens_padded"):
-        ContextParallelRuntime().prepare_forward(None, batch)
+        ContextParallelSharder().shard(None, batch)
 
 
-def test_prepare_forward_returns_identity_token_layout_without_cp():
+def test_shard_returns_identity_token_layout_without_cp():
     tensor = torch.randn(1, 4, 3)
     batch = {"input_ids": torch.ones(1, 4, dtype=torch.long)}
 
-    prepared = ContextParallelRuntime().prepare_forward(None, batch)
+    prepared = ContextParallelSharder().shard(None, batch)
 
     assert prepared.batch is batch
     assert isinstance(prepared.context, contextlib.nullcontext)
-    assert torch.equal(prepared.tokens.shard(tensor), tensor)
-    assert torch.equal(prepared.tokens.gather(tensor), tensor)
+    assert torch.equal(prepared.shard(tensor), tensor)
+    assert torch.equal(prepared.gather(tensor), tensor)
 
 
 def test_multimodal_model_rejects_thd_with_context_parallelism():
-    runtime = ContextParallelRuntime(device_mesh=_DeviceMesh(cp_size=2))
+    runtime = ContextParallelSharder(device_mesh=_DeviceMesh(cp_size=2))
     model = torch.nn.Module()
     model.supports = SimpleNamespace(is_multimodal=True)
 
     with pytest.raises(NotImplementedError, match="supports cp_size=1 only"):
-        runtime.prepare_forward(model, _thd_batch())
+        runtime.shard(model, _thd_batch())
 
 
 def test_multimodal_detection_falls_back_to_model_config():
-    runtime = ContextParallelRuntime(device_mesh=_DeviceMesh(cp_size=2))
+    runtime = ContextParallelSharder(device_mesh=_DeviceMesh(cp_size=2))
     model = torch.nn.Module()
     model.supports = SimpleNamespace()
     model.config = SimpleNamespace(vision_config=SimpleNamespace())
 
     with pytest.raises(NotImplementedError, match="supports cp_size=1 only"):
-        runtime.prepare_forward(model, _thd_batch())
+        runtime.shard(model, _thd_batch())
 
 
 def test_text_model_thd_does_not_depend_on_recipe_domain(monkeypatch):
     monkeypatch.setattr(
-        cp_runtime,
+        cp_sharder,
         "_prepare_thd_batch",
         lambda cp_mesh, batch, **kwargs: (batch, torch.tensor([0, 2])),
     )
     model = torch.nn.Module()
     model.supports = SimpleNamespace(is_multimodal=False)
 
-    prepared = ContextParallelRuntime(device_mesh=_DeviceMesh(cp_size=2)).prepare_forward(model, _thd_batch())
+    prepared = ContextParallelSharder(device_mesh=_DeviceMesh(cp_size=2)).shard(model, _thd_batch())
 
     assert prepared.batch["qkv_format"] == "thd"

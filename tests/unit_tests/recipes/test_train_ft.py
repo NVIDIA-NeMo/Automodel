@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.distributed import ContextParallelRuntime
+from nemo_automodel.components.distributed import ContextParallelSharder
 
 # Skip decorator for tests that require CUDA
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -2300,16 +2300,16 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
         def prepare_model_inputs_for_cp(self, batch, **kwargs):
             self.prepared = True
             self.num_chunks = kwargs.get("num_chunks")
-            from nemo_automodel.components.distributed.context_parallel.sharder import (
-                ContextParallelismSharder,
+            from nemo_automodel.components.distributed.context_parallel._strategy import (
                 CPShardResult,
+                CPShardStrategy,
             )
 
             def shard_batch(cp_mesh, tp_mesh, batch, **kwargs):
                 del cp_mesh, tp_mesh, kwargs
                 return CPShardResult(nullcontext(), batch)
 
-            return ContextParallelismSharder.contiguous(shard_batch)
+            return CPShardStrategy.contiguous(shard_batch)
 
         def forward(self, **batch):
             logits = self.lin(batch["input_ids"].float())
@@ -2337,7 +2337,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
     fake_mesh = type("_FakeDeviceMesh", (dict,), {"mesh_dim_names": ("cp",)})(fake_mesh)
     object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
     object.__setattr__(recipe, "device_mesh", fake_mesh)
-    object.__setattr__(recipe, "cp_runtime", ContextParallelRuntime(device_mesh=fake_mesh))
+    object.__setattr__(recipe, "cp_sharder", ContextParallelSharder(device_mesh=fake_mesh))
     object.__setattr__(recipe, "pp_enabled", False)
     object.__setattr__(recipe, "tokenizer", SimpleNamespace(pad_token_id=0))
     object.__setattr__(recipe, "te_fp8", None)

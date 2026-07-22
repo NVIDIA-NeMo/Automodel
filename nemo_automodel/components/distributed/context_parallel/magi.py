@@ -735,7 +735,7 @@ def magi_prepare_vlm(
 
 @dataclass
 class MagiState:
-    """Resolved MagiAttention wiring owned by ``ContextParallelRuntime``.
+    """Resolved MagiAttention wiring owned by ``ContextParallelSharder``.
 
     When MagiAttention is not configured, ``enabled`` is false and per-step
     methods are no-ops.

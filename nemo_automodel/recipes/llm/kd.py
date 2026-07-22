@@ -490,7 +490,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         """
         batch = self.kd_mesh_bridge.move_to_device(batch)
         sequence_length = batch["labels"].shape[1]
-        prepared_cp = self.cp_runtime.prepare_forward(
+        prepared_cp = self.cp_sharder.shard(
             self.teacher_model,
             batch,
         )
@@ -525,7 +525,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
                         [
                             materialize_teacher_logits(
                                 microbatch_logits,
-                                tokens=prepared_cp.tokens,
+                                tokens=prepared_cp,
                                 sequence_length=sequence_length,
                             )
                             for microbatch_logits in captured_logits
@@ -542,7 +542,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             return logits
         return materialize_teacher_logits(
             logits,
-            tokens=prepared_cp.tokens,
+            tokens=prepared_cp,
             sequence_length=sequence_length,
         )
 
@@ -588,14 +588,14 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             self._get_separate_teacher_logits(batch) if getattr(self, "separate_meshes", False) else None
         )
         batch = {k: v.to(self.dist_env.device, non_blocking=True) for k, v in batch.items()}
-        prepared_cp = self.cp_runtime.prepare_forward(
+        prepared_cp = self.cp_sharder.shard(
             self.model_parts[0],
             batch,
         )
         train_ctx, batch = prepared_cp.context, prepared_cp.batch
         labels = batch.pop("labels")
         if separate_teacher_logits is not None:
-            separate_teacher_logits = prepared_cp.tokens.shard(separate_teacher_logits, seq_dim=1, fill=0)
+            separate_teacher_logits = prepared_cp.shard(separate_teacher_logits, seq_dim=1, fill=0)
 
         model = self.model_parts[0]
         sync_ctx = (
@@ -699,7 +699,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             )
             for k, v in batch.items()
         }
-        prepared_cp = self.cp_runtime.prepare_forward(
+        prepared_cp = self.cp_sharder.shard(
             self.model_parts[0],
             batch,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
@@ -707,7 +707,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         )
         train_ctx, batch = prepared_cp.context, prepared_cp.batch
         if separate_teacher_logits is not None:
-            separate_teacher_logits = prepared_cp.tokens.shard(separate_teacher_logits, seq_dim=1, fill=0)
+            separate_teacher_logits = prepared_cp.shard(separate_teacher_logits, seq_dim=1, fill=0)
         labels = batch.pop("labels")
         input_ids = batch.pop("input_ids")
         batch_filtered = {k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)}

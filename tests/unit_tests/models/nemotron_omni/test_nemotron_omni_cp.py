@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelismSharder
+from nemo_automodel.components.distributed.context_parallel._strategy import CPShardStrategy
 from nemo_automodel.components.models.nemotron_omni.model import (
     NemotronOmniForConditionalGeneration,
 )
@@ -130,8 +130,8 @@ def _forward_embeds(model, **forward_kwargs):
 
 def test_prepare_model_inputs_for_cp_is_sharder_only():
     """The CP hook is sharder-only: it consumes nothing and returns a
-    ContextParallelismSharder; embed + splice + shard run inside forward."""
-    from nemo_automodel.components.distributed.context_parallel.sharder import (
+    CPShardStrategy; embed + splice + shard run inside forward."""
+    from nemo_automodel.components.distributed.context_parallel._strategy import (
         _round_robin_local_indices,
         _shard_batch_aux_only,
     )
@@ -142,7 +142,7 @@ def test_prepare_model_inputs_for_cp_is_sharder_only():
     out = model.prepare_model_inputs_for_cp(batch)
 
     sharder = out
-    assert isinstance(sharder, ContextParallelismSharder)
+    assert isinstance(sharder, CPShardStrategy)
     assert sharder.shard_batch is _shard_batch_aux_only
     assert sharder.local_token_global_indices is _round_robin_local_indices
     # nothing consumed: input_ids / media stay for the forward
@@ -263,7 +263,7 @@ def test_prepare_model_inputs_for_cp_is_sharder_only_and_skips_lm(monkeypatch):
         }
     )
     # Sharder-only hook: returns the CP sharder, does not embed or call the LM.
-    assert isinstance(sharder, ContextParallelismSharder)
+    assert isinstance(sharder, CPShardStrategy)
 
 
 def test_forward_inputs_embeds_skips_multimodal_scatter_block():

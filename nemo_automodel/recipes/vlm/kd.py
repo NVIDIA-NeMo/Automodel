@@ -263,7 +263,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         model = self.teacher_model
         # Single CP dispatch: invokes the teacher's pre-embed hook (when CP is
         # active and the model has one) and shards the batch.
-        prepared_cp = self.cp_runtime.prepare_forward(model, batch)
+        prepared_cp = self.cp_sharder.shard(model, batch)
         train_ctx, batch = prepared_cp.context, prepared_cp.batch
         batch.pop("labels")
         with train_ctx, torch.no_grad():
@@ -272,7 +272,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             logits = getattr(output, "logits", output).detach()
         return materialize_teacher_logits(
             logits,
-            tokens=prepared_cp.tokens,
+            tokens=prepared_cp,
             sequence_length=sequence_length,
         )
 
@@ -324,13 +324,13 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             )
             for k, v in batch.items()
         }
-        prepared_cp = self.cp_runtime.prepare_forward(
+        prepared_cp = self.cp_sharder.shard(
             self.model_parts[0],
             batch,
         )
         train_ctx, batch = prepared_cp.context, prepared_cp.batch
         if separate_teacher_logits is not None:
-            separate_teacher_logits = prepared_cp.tokens.shard(separate_teacher_logits, seq_dim=1, fill=0)
+            separate_teacher_logits = prepared_cp.shard(separate_teacher_logits, seq_dim=1, fill=0)
         labels = batch.pop("labels")
 
         model = self.model_parts[0]

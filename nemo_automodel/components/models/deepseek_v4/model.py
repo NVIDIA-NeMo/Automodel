@@ -90,7 +90,7 @@ from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelismSharder
+    from nemo_automodel.components.distributed.context_parallel._strategy import CPShardStrategy
 
 
 @dataclass
@@ -842,7 +842,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> "ContextParallelismSharder":
+    ) -> "CPShardStrategy":
         """Model-owned context-parallel batch prep (Miles-style contiguous shard).
 
         Returns a sharder with the config-derived per-rank shard multiple bound. DSV4
@@ -851,11 +851,11 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """
         from functools import partial  # noqa: PLC0415
 
-        from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
-            ContextParallelismSharder,
+        from nemo_automodel.components.distributed.context_parallel._strategy import (  # noqa: PLC0415
+            CPShardStrategy,
         )
 
-        cp_sharder = ContextParallelismSharder.contiguous(
+        cp_sharder = CPShardStrategy.contiguous(
             partial(
                 make_dsv4_contiguous_shard_cp_batch_and_ctx,
                 pad_multiple=dsv4_cp_local_seq_multiple(self.config),

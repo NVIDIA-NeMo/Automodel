@@ -60,8 +60,8 @@ except ModuleNotFoundError:
     Qwen3_5MoeVisionRotaryEmbedding = _make_missing("Qwen3_5MoeVisionRotaryEmbedding")
     HFQwen3_5MoeModel = _make_missing("Qwen3_5MoeModel")
 
-from nemo_automodel.components.distributed.context_parallel.sharder import (
-    ContextParallelismSharder,
+from nemo_automodel.components.distributed.context_parallel._strategy import (
+    CPShardStrategy,
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
@@ -857,16 +857,16 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> ContextParallelismSharder:
+    ) -> CPShardStrategy:
         """Return a sharder-only CP backend plus the full-sequence mRoPE positions.
 
         Embedding and the VLM->LM multimodal scatter now run inside ``forward``
         per microbatch (see :meth:`_embed_and_splice_for_cp`), so this hook only
         computes the mRoPE ``position_ids`` on the full (unsharded) sequence via
         ``get_rope_index`` and stores them in ``batch`` for
-        :meth:`ContextParallelismSharder.sdpa_aux` to round-robin-shard on the
+        :meth:`CPShardStrategy.sdpa_aux` to round-robin-shard on the
         mRoPE axis, plus the
-        :class:`ContextParallelismSharder`. ``input_ids`` and the media inputs are
+        :class:`CPShardStrategy`. ``input_ids`` and the media inputs are
         left in the batch for the forward; ``mm_token_type_ids`` is consumed here
         (only ``get_rope_index`` needs it).
 
@@ -921,7 +921,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             self.model.rope_deltas = rope_deltas
 
         batch.update({"position_ids": position_ids, "mm_token_type_ids": None, **promoted})
-        return ContextParallelismSharder.sdpa_aux()
+        return CPShardStrategy.sdpa_aux()
 
     def _embed_and_splice_for_cp(
         self,

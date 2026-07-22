@@ -44,7 +44,7 @@ from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelismSharder
+    from nemo_automodel.components.distributed.context_parallel._strategy import CPShardStrategy
 
 
 class Block(nn.Module):
@@ -339,7 +339,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> "ContextParallelismSharder":
+    ) -> "CPShardStrategy":
         """Attach GLM DSA's packed THD context-parallel batch sharder.
 
         Args:
@@ -348,14 +348,14 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """
         from functools import partial  # noqa: PLC0415
 
-        from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
-            ContextParallelismSharder,
+        from nemo_automodel.components.distributed.context_parallel._strategy import (  # noqa: PLC0415
+            CPShardStrategy,
         )
 
         if getattr(self.backend, "attn", None) != "tilelang":
             raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
 
-        cp_sharder = ContextParallelismSharder.contiguous(
+        cp_sharder = CPShardStrategy.contiguous(
             partial(
                 shard_glm_dsa_packed_cp_batch,
                 num_chunks=int(num_chunks),

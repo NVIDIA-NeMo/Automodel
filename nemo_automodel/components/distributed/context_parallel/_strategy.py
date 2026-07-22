@@ -14,11 +14,11 @@
 
 """Context-parallel batch-sharding contract.
 
-Every CP backend is a :class:`ContextParallelismSharder`. A model that owns its CP batch
+Every CP backend is a :class:`CPShardStrategy`. A model that owns its CP batch
 sharding and attention transport returns one directly from
 ``prepare_model_inputs_for_cp``;
 the framework constructs its own for the remaining backends (torch
-``context_parallel`` round-robin, TE/THD, MagiAttention) so the CP runtime
+``context_parallel`` round-robin, TE/THD, MagiAttention) so the public sharder
 reduces to resolving a sharder and calling ``shard_batch``. This replaces the retired private batch keys
 (``_cp_make_batch_fn``, ``_cp_metadata_seq_dims``, ``_cp_metadata_pad_values``,
 ``_cp_full_logits_grad_touch``).
@@ -32,7 +32,7 @@ overrides them when it has a cheaper communication pattern. Layouts that are a
 pure function of ``(cp_mesh, padded_seq_len)`` (contiguous, round-robin)
 provide it at construction; data-dependent layouts (THD ``cu_seqlens``
 partitioning, magi's dispatch solver) report the partition they computed as
-:class:`ShardLayout`. The CP runtime combines that result with the mesh into
+:class:`ShardLayout`. The public sharder combines that result with the mesh into
 an immutable :class:`CPTokenLayout`, so backend strategy never carries mutable
 per-batch state.
 The sharder carries no backend tag: nothing may branch on which backend
@@ -307,7 +307,7 @@ _LocalIndexFn = Callable[[DeviceMesh | None, int, torch.device | None], torch.Te
 
 
 @dataclass(frozen=True)
-class ContextParallelismSharder:
+class CPShardStrategy:
     """Immutable CP backend strategy used while preparing one batch.
 
     Attributes:
@@ -327,12 +327,12 @@ class ContextParallelismSharder:
     local_token_global_indices: _LocalIndexFn | None
 
     @classmethod
-    def identity(cls) -> "ContextParallelismSharder":
+    def identity(cls) -> "CPShardStrategy":
         """Build the no-op strategy used when context parallelism is inactive."""
         return cls(shard_batch=_shard_batch_identity, local_token_global_indices=_identity_local_indices)
 
     @classmethod
-    def sdpa(cls) -> "ContextParallelismSharder":
+    def sdpa(cls) -> "CPShardStrategy":
         """Build the generic load-balanced SDPA context-parallel strategy.
 
         Returns:
@@ -345,12 +345,12 @@ class ContextParallelismSharder:
         )
 
     @classmethod
-    def sdpa_aux(cls) -> "ContextParallelismSharder":
+    def sdpa_aux(cls) -> "CPShardStrategy":
         """Build SDPA CP that shards auxiliary streams while models shard embeddings."""
         return cls(shard_batch=_shard_batch_aux_only, local_token_global_indices=_round_robin_local_indices)
 
     @classmethod
-    def contiguous(cls, shard_batch: _ShardBatch) -> "ContextParallelismSharder":
+    def contiguous(cls, shard_batch: _ShardBatch) -> "CPShardStrategy":
         """Bind a model-owned batch preparation to contiguous token ownership."""
         return cls(shard_batch=shard_batch, local_token_global_indices=_contiguous_local_indices)
 
@@ -836,7 +836,7 @@ def _shard_batch_load_balanced(
 ):
     """Shard a batch with torch ``context_parallel`` round-robin load balancing.
 
-    ``ContextParallelismSharder.shard_batch`` implementation for the default framework-owned CP
+    ``CPShardStrategy.shard_batch`` implementation for the default framework-owned CP
     path (layout ``"round_robin"``, indices from
     :func:`_round_robin_local_indices`). Assumes an active CP mesh (size > 1).
     ``padding_token_id`` is accepted per the contract but unused: CP-pad slots

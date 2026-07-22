@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Setup-time context-parallel backend resolution and per-forward preparation."""
+"""Public context-parallel batch sharder."""
 
 import contextlib
 from contextlib import AbstractContextManager
@@ -22,13 +22,13 @@ from typing import Any
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
-from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
-from nemo_automodel.components.distributed.context_parallel.sharder import (
-    ContextParallelismSharder,
+from nemo_automodel.components.distributed.context_parallel._strategy import (
     CPShardResult,
+    CPShardStrategy,
     CPTokenLayout,
     ShardLayout,
 )
+from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
 from nemo_automodel.components.distributed.context_parallel.utils import _prepare_thd_batch
 
 
@@ -69,18 +69,46 @@ class CPForward:
             ``[batch, local_sequence]`` or packed THD ``[local_tokens]``
             according to the selected backend. The input mapping is mutated and
             returned by reference.
-        tokens: Bound token-coordinate operations for sharding additional global
-            tensors and gathering local tensors produced by this forward.
     """
 
     context: AbstractContextManager[None]
     batch: dict[str, Any]
-    tokens: CPTokenLayout
+    _tokens: CPTokenLayout = field(repr=False)
+
+    def shard(self, tensor: torch.Tensor, *, seq_dim: int = 1, fill: int | float | None = None) -> torch.Tensor:
+        """Shard an additional tensor using this forward's token layout.
+
+        Args:
+            tensor: Full tensor of shape ``[..., sequence, ...]`` with the
+                sequence axis selected by ``seq_dim``.
+            seq_dim: Sequence axis in ``tensor``.
+            fill: Value used for positions introduced by CP padding. Required
+                when the tensor has the original unpadded sequence length.
+
+        Returns:
+            Tensor with the same axis order and the sequence axis restricted to
+            this rank's local tokens.
+        """
+        return self._tokens.shard(tensor, seq_dim=seq_dim, fill=fill)
+
+    def gather(self, tensor: torch.Tensor, *, seq_dim: int = 1, fill: int | float | None = None) -> torch.Tensor:
+        """Gather a local tensor into the caller's original token coordinates.
+
+        Args:
+            tensor: Local tensor of shape ``[..., local_sequence, ...]`` with
+                the sequence axis selected by ``seq_dim``.
+            seq_dim: Sequence axis in ``tensor``.
+            fill: Value used for input positions absent from the CP layout.
+
+        Returns:
+            Tensor with the same axis order and the original global sequence axis.
+        """
+        return self._tokens.gather(tensor, seq_dim=seq_dim, fill=fill)
 
 
 @dataclass(frozen=True)
-class ContextParallelRuntime:
-    """Resolved CP backend state shared by all forwards in one recipe runtime.
+class ContextParallelSharder:
+    """Resolve CP backend state and shard batches for model forwards.
 
     Backend intent is resolved once from the model construction config. Runtime
     resources such as the CP mesh and Magi process group are bound here, while
@@ -96,7 +124,7 @@ class ContextParallelRuntime:
         model_config: object,
         *,
         device_mesh: DeviceMesh | None,
-    ) -> "ContextParallelRuntime":
+    ) -> "ContextParallelSharder":
         """Resolve backend intent from model config and bind CP resources.
 
         This runs before model construction because the Magi HF attention
@@ -109,7 +137,7 @@ class ContextParallelRuntime:
                 ``tp`` axes.
 
         Returns:
-            Runtime ready to prepare batches for model forwards.
+            Sharder ready to prepare batches for model forwards.
         """
         return cls(
             device_mesh=device_mesh,
@@ -123,12 +151,12 @@ class ContextParallelRuntime:
 
     def _resolve_sharder(
         self,
-        model_sharder: ContextParallelismSharder | None,
+        model_sharder: CPShardStrategy | None,
         *,
         is_thd: bool,
         num_chunks: int,
         model: torch.nn.Module | None,
-    ) -> ContextParallelismSharder:
+    ) -> CPShardStrategy:
         """Resolve model-owned, Magi, THD, generic, or identity strategy."""
         cp_mesh = _get_submesh(self.device_mesh, "cp")
         cp_active = cp_mesh is not None and cp_mesh.size() > 1
@@ -189,7 +217,7 @@ class ContextParallelRuntime:
                     )
                 return CPShardResult(contextlib.nullcontext(), prepped, layout)
 
-            return ContextParallelismSharder(shard_batch=shard_batch_magi, local_token_global_indices=None)
+            return CPShardStrategy(shard_batch=shard_batch_magi, local_token_global_indices=None)
 
         if is_thd:
 
@@ -236,14 +264,14 @@ class ContextParallelRuntime:
                     )
                 return CPShardResult(contextlib.nullcontext(), prepped, layout)
 
-            return ContextParallelismSharder(shard_batch=shard_batch_thd, local_token_global_indices=None)
+            return CPShardStrategy(shard_batch=shard_batch_thd, local_token_global_indices=None)
 
         if cp_active:
-            return ContextParallelismSharder.sdpa()
+            return CPShardStrategy.sdpa()
 
-        return ContextParallelismSharder.identity()
+        return CPShardStrategy.identity()
 
-    def prepare_forward(
+    def shard(
         self,
         model: torch.nn.Module | None,
         batch: dict[str, Any],
@@ -302,8 +330,8 @@ class ContextParallelRuntime:
         magi_replaces_hook = self._magi.enabled and not is_multimodal
         if (cp_active or model_owns_thd) and callable(hook) and not magi_replaces_hook:
             model_sharder = hook(batch, num_chunks=num_chunks)
-            if not isinstance(model_sharder, ContextParallelismSharder):
-                raise TypeError("prepare_model_inputs_for_cp must return ContextParallelismSharder")
+            if not isinstance(model_sharder, CPShardStrategy):
+                raise TypeError("prepare_model_inputs_for_cp must return CPShardStrategy")
 
         sharder = self._resolve_sharder(
             model_sharder,
@@ -324,4 +352,4 @@ class ContextParallelRuntime:
             local_token_global_indices=sharder.local_token_global_indices,
             shard_layout=prepared.layout or ShardLayout(),
         )
-        return CPForward(context=prepared.context, batch=prepared.batch, tokens=tokens)
+        return CPForward(context=prepared.context, batch=prepared.batch, _tokens=tokens)

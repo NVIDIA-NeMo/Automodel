@@ -41,7 +41,7 @@ def main():
 
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed.context_parallel import ContextParallelismSharder
+    from nemo_automodel.components.distributed.context_parallel._strategy import CPShardStrategy
     from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 
     mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("cp",))
@@ -54,7 +54,7 @@ def main():
         "labels": torch.randint(2, 50, (1, seqlen), device=device),
         "position_ids": torch.arange(seqlen, device=device).unsqueeze(0),
     }
-    train_ctx = ContextParallelismSharder.sdpa_aux().shard_batch(cp_mesh, None, batch).context
+    train_ctx = CPShardStrategy.sdpa_aux().shard_batch(cp_mesh, None, batch).context
 
     def vision_sdpa():
         # A vision-tower-like non-causal attention: [batch, heads, patches, dim].

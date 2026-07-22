@@ -308,7 +308,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         model = self.model_parts[0]
 
         # Context parallel setup (no labels to pass for dLLM)
-        prepared_cp = self.cp_runtime.prepare_forward(None, batch)
+        prepared_cp = self.cp_sharder.shard(None, batch)
         train_ctx, batch = prepared_cp.context, prepared_cp.batch
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
         sync_ctx = (
@@ -1083,7 +1083,7 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
         p_mask = window["p_mask"]
 
         model = self.model_parts[0]
-        prepared_cp = self.cp_runtime.prepare_forward(None, batch)
+        prepared_cp = self.cp_sharder.shard(None, batch)
         train_ctx, batch = prepared_cp.context, prepared_cp.batch
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
         sync_ctx = (

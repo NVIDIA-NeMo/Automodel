@@ -26,8 +26,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nemo_automodel.components.distributed.context_parallel import runtime as cp_runtime
-from nemo_automodel.components.distributed.context_parallel import sharder as cm
+from nemo_automodel.components.distributed.context_parallel import _strategy as cm
+from nemo_automodel.components.distributed.context_parallel import api as cp_sharder
 from nemo_automodel.components.distributed.context_parallel import utils as cu
 
 
@@ -249,8 +249,8 @@ def test_runtime_routes_thd_batch_to_te_builder():
         "seq_lens": torch.tensor([[4]]),
         "seq_lens_padded": torch.tensor([[4]]),
     }
-    with mock.patch.object(cp_runtime, "_prepare_thd_batch", return_value=(sentinel, None)) as te:
-        prepared = cp_runtime.ContextParallelRuntime(device_mesh=dm).prepare_forward(None, batch)
+    with mock.patch.object(cp_sharder, "_prepare_thd_batch", return_value=(sentinel, None)) as te:
+        prepared = cp_sharder.ContextParallelSharder(device_mesh=dm).shard(None, batch)
     te.assert_called_once()
     assert te.call_args.kwargs["num_chunks"] == 1
     assert prepared.batch is sentinel

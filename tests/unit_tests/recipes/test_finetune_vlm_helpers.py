@@ -29,7 +29,7 @@ from nemo_automodel.components.datasets.vlm.pp_media import (
     prepare_vlm_media_for_pp,
     stage_vlm_media_for_pp,
 )
-from nemo_automodel.components.distributed import ContextParallelRuntime
+from nemo_automodel.components.distributed import ContextParallelSharder
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.optim.optimizer import LRSchedulerConfig, build_optimizer_config
 from nemo_automodel.components.training.step_scheduler import StepSchedulerConfig
@@ -471,12 +471,12 @@ def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
     captured = {}
 
     class _CapturingRuntime:
-        def prepare_forward(self, model, batch, **kwargs):
+        def shard(self, model, batch, **kwargs):
             captured.update(kwargs)
             captured["qkv_format"] = batch["qkv_format"]
             return SimpleNamespace(context=nullcontext(), batch=batch)
 
-    recipe.cp_runtime = _CapturingRuntime()
+    recipe.cp_sharder = _CapturingRuntime()
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.get_sync_ctx", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.calculate_loss",
@@ -505,7 +505,7 @@ def test_forward_backward_step_rejects_thd_with_context_parallelism():
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device="cpu")
     recipe.device_mesh = _DummyCPDeviceMesh(cp_size=2)
-    recipe.cp_runtime = ContextParallelRuntime(device_mesh=recipe.device_mesh)
+    recipe.cp_sharder = ContextParallelSharder(device_mesh=recipe.device_mesh)
     model = _TensorModel()
     model.supports = SimpleNamespace(is_multimodal=True)
     recipe.model_parts = [model]
@@ -2202,7 +2202,7 @@ class TestForwardBackwardStepNonPP:
         model = _CPPreEmbedModel()
         non_pp_recipe = _create_non_pp_recipe(model)
         non_pp_recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=2)
-        non_pp_recipe.__dict__["cp_runtime"] = ContextParallelRuntime(device_mesh=non_pp_recipe.device_mesh)
+        non_pp_recipe.__dict__["cp_sharder"] = ContextParallelSharder(device_mesh=non_pp_recipe.device_mesh)
 
         mm_token_type_ids = torch.tensor([[1, 1, 0, 0]])
 

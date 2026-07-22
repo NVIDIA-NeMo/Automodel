@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the ContextParallelismSharder contract in components/distributed/context_parallel/sharder.py.
+"""Unit tests for the CPShardStrategy contract in components/distributed/context_parallel/_strategy.py.
 
 Collectives are not exercised here (CPU CI): the tests cover the pure layout
 math — local index generation, index-based token-tensor shard, gathered-shard
-reordering — and the ContextParallelismSharder default/override resolution.
+reordering — and the CPShardStrategy default/override resolution.
 """
 
 from __future__ import annotations
@@ -26,8 +26,8 @@ import contextlib
 import pytest
 import torch
 
-from nemo_automodel.components.distributed.context_parallel import ContextParallelismSharder
-from nemo_automodel.components.distributed.context_parallel import sharder as cs
+from nemo_automodel.components.distributed.context_parallel import _strategy as cs
+from nemo_automodel.components.distributed.context_parallel._strategy import CPShardStrategy
 
 
 class _FakeMesh:
@@ -93,7 +93,7 @@ def test_round_robin_local_indices_requires_divisibility():
 
 
 def test_sdpa_sharder_is_available_from_context_parallel_api():
-    sharder = ContextParallelismSharder.sdpa()
+    sharder = CPShardStrategy.sdpa()
 
     assert sharder.shard_batch is cs._shard_batch_load_balanced
     assert sharder.local_token_global_indices is cs._round_robin_local_indices
@@ -137,7 +137,7 @@ def test_gather_token_tensor_identity_without_cp():
 
 
 # ---------------------------------------------------------------------------
-# ContextParallelismSharder default/override resolution
+# CPShardStrategy default/override resolution
 # ---------------------------------------------------------------------------
 def test_sharder_default_shard_token_tensor_uses_indices():
     tokens = cs.CPTokenLayout(

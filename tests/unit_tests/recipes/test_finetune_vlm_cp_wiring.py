@@ -38,7 +38,7 @@ import torch
 
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.distributed.context_parallel import ContextParallelismSharder
+from nemo_automodel.components.distributed.context_parallel._strategy import CPShardStrategy
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
@@ -48,7 +48,7 @@ class _NoOpCPRuntime:
     def __init__(self, seen_batch=None):
         self.seen_batch = seen_batch
 
-    def prepare_forward(self, model, batch, *, num_chunks=1, **kwargs):
+    def shard(self, model, batch, *, num_chunks=1, **kwargs):
         del kwargs
         hook = getattr(model, "prepare_model_inputs_for_cp", None)
         if callable(hook):
@@ -135,7 +135,7 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.device_mesh = _FakeCPMesh()
     seen_cp_batch = {}
-    recipe.cp_runtime = _NoOpCPRuntime(seen_cp_batch)
+    recipe.cp_sharder = _NoOpCPRuntime(seen_cp_batch)
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.model_parts = [model]
     recipe.pp_enabled = True
@@ -188,7 +188,7 @@ class _SunkSpyVLM:
     def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
         # Sharder-only: nothing consumed, no inputs_embeds — input_ids stays full.
         self.calls.append({"batch": dict(batch), "num_chunks": num_chunks})
-        return ContextParallelismSharder.identity()
+        return CPShardStrategy.identity()
 
     def __call__(self, **kwargs):
         raise AssertionError("CP prepare must call prepare_model_inputs_for_cp directly, not __call__")
@@ -203,7 +203,7 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.device_mesh = _FakeCPMesh()
     seen_cp_batch = {}
-    recipe.cp_runtime = _NoOpCPRuntime(seen_cp_batch)
+    recipe.cp_sharder = _NoOpCPRuntime(seen_cp_batch)
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.model_parts = [model]
     recipe.pp_enabled = True
@@ -549,7 +549,7 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
 
         def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):  # sharder-only hook
             pre_embed_calls.append(set(batch))
-            return ContextParallelismSharder.identity()
+            return CPShardStrategy.identity()
 
         def forward(self, **batch):
             return SimpleNamespace(logits=torch.zeros(1, 4, 8), hidden_states=None)
@@ -561,7 +561,7 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
     recipe.model_parts = [_Model()]
     recipe.loss_fn = object()
     recipe.device_mesh = _DM(cp=SimpleNamespace(size=lambda: 2))
-    recipe.cp_runtime = _NoOpCPRuntime()
+    recipe.cp_sharder = _NoOpCPRuntime()
     recipe.pp_enabled = False
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)

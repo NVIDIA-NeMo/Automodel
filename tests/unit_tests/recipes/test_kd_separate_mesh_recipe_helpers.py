@@ -178,7 +178,6 @@ def test_teacher_worker_serves_each_wave_until_stop(monkeypatch, recipe_module, 
 @pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
 def test_teacher_forward_separate_materializes_logits(monkeypatch, recipe_module, recipe_cls, _):
     materialized = []
-    tokens = object()
     monkeypatch.setattr(
         recipe_module,
         "materialize_teacher_logits",
@@ -187,11 +186,23 @@ def test_teacher_forward_separate_materializes_logits(monkeypatch, recipe_module
     recipe = object.__new__(recipe_cls)
     recipe.kd_mesh_bridge = SimpleNamespace(move_to_device=lambda batch: batch)
     recipe.device_mesh = None
-    recipe.cp_runtime = SimpleNamespace(
-        prepare_forward=lambda model, batch, **kwargs: SimpleNamespace(
-            context=nullcontext(), batch=batch, tokens=tokens
-        )
-    )
+    prepared = SimpleNamespace(context=nullcontext(), batch=None)
+
+    def shard(model, batch, **kwargs):
+        """Return the prepared result used by the recipe.
+
+        Args:
+            model: Unused teacher model.
+            batch: Mapping containing tensors of shape [batch, sequence].
+            **kwargs: Unused sharding options.
+
+        Returns:
+            Prepared result containing the input batch.
+        """
+        prepared.batch = batch
+        return prepared
+
+    recipe.cp_sharder = SimpleNamespace(shard=shard)
     recipe.teacher_model = _Teacher()
     if recipe_module is llm_kd:
         recipe.pp_enabled = False
@@ -199,7 +210,7 @@ def test_teacher_forward_separate_materializes_logits(monkeypatch, recipe_module
     logits = recipe._teacher_forward_separate({"input_ids": torch.tensor([[1, 2]]), "labels": torch.tensor([[1, 2]])})
 
     assert logits.shape == (1, 2, 4)
-    assert materialized == [(tokens, 2)]
+    assert materialized == [(prepared, 2)]
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,base_cls", _RECIPE_CASES)

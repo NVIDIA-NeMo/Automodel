@@ -78,8 +78,8 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     CausalLMOutputWithPast = _make_missing("CausalLMOutputWithPast")
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
-from nemo_automodel.components.distributed.context_parallel.sharder import (
-    ContextParallelismSharder,
+from nemo_automodel.components.distributed.context_parallel._strategy import (
+    CPShardStrategy,
     shard_sequence_for_cp_contiguous,
 )
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
@@ -1003,7 +1003,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     def _cp_shard_batch_aux_only(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
         """Gemma4-owned aux-only CP batch sharder that also self-installs the ring.
 
-        Exposed as ``ContextParallelismSharder.shard_batch`` by the sharder-only
+        Exposed as ``CPShardStrategy.shard_batch`` by the sharder-only
         ``prepare_model_inputs_for_cp``. The CP dispatch calls it with the CP
         submesh, which is the one place Gemma4 reliably receives ``cp_mesh`` on a
         model-owned path (dense variants are not guaranteed to run the MoE
@@ -1431,11 +1431,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> ContextParallelismSharder:
+    ) -> CPShardStrategy:
         """Return a sharder-only CP backend; embed + splice + slice happen in forward.
 
         Sunk (Megatron-style per-microbatch) CP: the returned
-        :class:`ContextParallelismSharder` contiguously shards only the no-grad
+        :class:`CPShardStrategy` contiguously shards only the no-grad
         aux streams (labels/position_ids/loss_mask/padding_mask + the synthesized
         ``_packed_seq_ids`` document map) via
         :func:`make_contiguous_aux_only_shard_cp_batch_and_ctx` and leaves
@@ -1455,7 +1455,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         del num_chunks
         if batch.get("input_ids") is None:
             raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
-        return ContextParallelismSharder.contiguous(self._cp_shard_batch_aux_only)
+        return CPShardStrategy.contiguous(self._cp_shard_batch_aux_only)
 
     def _cp_sunk_prepare_inputs(
         self,

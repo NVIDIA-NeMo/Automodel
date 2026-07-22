@@ -14,14 +14,14 @@
 
 """GPU CP forward-equivalence for the MiniMax M3 VL in-forward pre-embed shard (L1, 2 GPUs).
 
-Exercises the sunk CP path end to end: ``ContextParallelRuntime.prepare_forward`` invokes the
+Exercises the sunk CP path end to end: ``ContextParallelSharder.shard`` invokes the
 sharder-only ``prepare_model_inputs_for_cp`` hook (``_shard_batch_aux_only``
 round-robin shards labels/position_ids and installs the ring-SDPA context), and
 ``MiniMaxM3SparseForConditionalGeneration.forward`` embeds the full sequence then
 ``shard_sequence_for_cp_round_robin`` shards ``inputs_embeds`` per rank. The unsharded cp2
 logits must match the cp1 eager forward.
 
-  cp1 eager (cp_mesh unset)  ==  cp2 (apply_cp + ContextParallelRuntime.prepare_forward + in-forward shard)
+  cp1 eager (cp_mesh unset)  ==  cp2 (apply_cp + ContextParallelSharder.shard + in-forward shard)
 
 Text-only batch, dense layers (sparse disabled) so torch ``context_parallel`` ring
 SDPA is the transport. bf16 (the dense CP SDPA kernel has no fp32 path); per-token
@@ -50,7 +50,7 @@ def main():
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor.experimental._attention import context_parallel_unshard
 
-    from nemo_automodel.components.distributed import ContextParallelRuntime
+    from nemo_automodel.components.distributed import ContextParallelSharder
     from nemo_automodel.components.models.common import BackendConfig
     from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
     from nemo_automodel.components.models.minimax_m3_vl.model import MiniMaxM3SparseForConditionalGeneration
@@ -133,12 +133,12 @@ def main():
     with torch.no_grad():
         logits_eager = model(input_ids=input_ids, position_ids=position_ids.clone()).float()
 
-    # cp2: the recipe path -- apply_cp installs model.cp_mesh, ContextParallelRuntime.prepare_forward runs
+    # cp2: the recipe path -- apply_cp installs model.cp_mesh, ContextParallelSharder.shard runs
     # the sharder-only hook, forward embeds then in-forward shards inputs_embeds.
     device_mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("cp",))
     apply_cp(model, device_mesh["cp"])
     batch = {"input_ids": input_ids.clone(), "labels": input_ids.clone(), "position_ids": position_ids.clone()}
-    prepared_cp = ContextParallelRuntime(device_mesh=device_mesh).prepare_forward(model, batch)
+    prepared_cp = ContextParallelSharder(device_mesh=device_mesh).shard(model, batch)
     train_ctx, batch = prepared_cp.context, prepared_cp.batch
     batch.pop("labels", None)
     with torch.no_grad(), train_ctx:

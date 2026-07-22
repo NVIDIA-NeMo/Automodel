@@ -12,19 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Context-parallel runtime, layouts, and backend integrations."""
+"""Context-parallel batch sharding."""
 
-from nemo_automodel.components.distributed.context_parallel.runtime import ContextParallelRuntime, CPForward
-from nemo_automodel.components.distributed.context_parallel.sharder import (
-    ContextParallelismSharder,
-    CPShardResult,
-    CPTokenLayout,
-)
+from nemo_automodel.components.distributed.context_parallel.api import ContextParallelSharder
 
-__all__ = [
-    "CPForward",
-    "CPShardResult",
-    "CPTokenLayout",
-    "ContextParallelismSharder",
-    "ContextParallelRuntime",
-]
+__all__ = ["ContextParallelSharder"]

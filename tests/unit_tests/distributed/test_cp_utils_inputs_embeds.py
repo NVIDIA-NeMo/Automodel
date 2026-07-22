@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for ``ContextParallelRuntime.prepare_forward`` accepting ``inputs_embeds`` as the
+"""Tests for ``ContextParallelSharder.shard`` accepting ``inputs_embeds`` as the
 primary sequence tensor (VLM-CP path).
 
 These cover:
@@ -29,8 +29,8 @@ import contextlib
 import pytest
 import torch
 
-from nemo_automodel.components.distributed.context_parallel import sharder as _cs
-from nemo_automodel.components.distributed.context_parallel.runtime import ContextParallelRuntime
+from nemo_automodel.components.distributed.context_parallel import _strategy as _cs
+from nemo_automodel.components.distributed.context_parallel.api import ContextParallelSharder
 
 
 class _DummySubMesh:
@@ -69,9 +69,9 @@ class _DummyHSDPDeviceMesh(_DummyDeviceMesh):
 
 
 def _prepare(device_mesh, batch, loss_mask=None):
-    """Prepare one batch through the public runtime and preserve tuple-style assertions."""
-    prepared = ContextParallelRuntime(device_mesh=device_mesh).prepare_forward(None, batch, loss_mask=loss_mask)
-    return prepared.context, prepared.batch, prepared.tokens
+    """Shard one batch through the public API and preserve tuple-style assertions."""
+    prepared = ContextParallelSharder(device_mesh=device_mesh).shard(None, batch, loss_mask=loss_mask)
+    return prepared.context, prepared.batch, prepared
 
 
 def test_xor_assertion_neither_present(monkeypatch):
@@ -485,8 +485,8 @@ def test_additional_token_tensor_uses_prepared_layout(monkeypatch):
         "labels": torch.arange(6).unsqueeze(0),
     }
 
-    prepared = ContextParallelRuntime(device_mesh=device_mesh).prepare_forward(None, batch)
-    local_teacher_logits = prepared.tokens.shard(teacher_logits, fill=0)
+    prepared = ContextParallelSharder(device_mesh=device_mesh).shard(None, batch)
+    local_teacher_logits = prepared.shard(teacher_logits, fill=0)
 
     assert "teacher_logits" not in batch
     assert local_teacher_logits.shape == (1, 4, 5)
@@ -540,7 +540,7 @@ def test_padding_attention_mask_pad_value_is_zero(monkeypatch):
     the function so this case is moot, but the PAD_FILL table is the right
     place to encode the semantic in case the strip is ever revisited.
     """
-    from nemo_automodel.components.distributed.context_parallel import sharder as _cs
+    from nemo_automodel.components.distributed.context_parallel import _strategy as _cs
 
     # Just verify the PAD_FILL table itself maps attention_mask -> False
     # (the runtime code path is currently unreachable because attention_mask

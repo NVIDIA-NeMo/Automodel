@@ -21,7 +21,7 @@ import contextlib
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.distributed.context_parallel.sharder import CPShardResult, ShardLayout
+from nemo_automodel.components.distributed.context_parallel._strategy import CPShardResult, ShardLayout
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
 
 
@@ -176,7 +176,7 @@ def shard_glm_dsa_packed_cp_batch(
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
 ):
-    """``ContextParallelismSharder.shard_batch`` wrapper for GLM DSA packed CP."""
+    """``CPShardStrategy.shard_batch`` wrapper for GLM DSA packed CP."""
     layout = _packed_cp_layout(batch, num_chunks=num_chunks)
     sharded_batch = _prepare_glm_dsa_packed_cp_batch(
         cp_mesh,

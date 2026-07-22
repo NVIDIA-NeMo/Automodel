@@ -34,8 +34,8 @@ from transformers import AutoConfig, AutoModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.distributed.context_parallel.sharder import (
-    ContextParallelismSharder,
+from nemo_automodel.components.distributed.context_parallel._strategy import (
+    CPShardStrategy,
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
@@ -777,14 +777,14 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> ContextParallelismSharder:
+    ) -> CPShardStrategy:
         """Return a sharder-only CP backend; embed + splice + shard happen in forward.
 
         Embedding and the image/video/audio multimodal scatter now run inside
         ``forward`` per microbatch (the existing ``inputs_embeds is None`` block),
         which then round-robin shards the result with
         :func:`shard_sequence_for_cp_round_robin`. The returned
-        :class:`ContextParallelismSharder` round-robin-shards only the no-grad aux
+        :class:`CPShardStrategy` round-robin-shards only the no-grad aux
         streams (labels/position_ids/loss_mask/padding_mask) and leaves
         ``input_ids`` and the media inputs full-length for the forward. NemotronOmni
         uses plain 1-D positions, so no ``position_ids`` are computed here.
@@ -795,7 +795,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             num_chunks: Accepted for hook-signature parity; unused (round-robin CP).
         """
         del batch, num_chunks
-        return ContextParallelismSharder.sdpa_aux()
+        return CPShardStrategy.sdpa_aux()
 
     def forward(
         self,

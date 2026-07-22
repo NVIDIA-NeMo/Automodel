@@ -15,7 +15,7 @@
 """CPU unit tests for DeepSeek V4 model-owned context-parallel batch prep.
 
 Covers the model-owned CP path that runs without a real process group:
-``make_dsv4_contiguous_shard_cp_batch_and_ctx`` (the ``ContextParallelismSharder.shard_batch``
+``make_dsv4_contiguous_shard_cp_batch_and_ctx`` (the ``CPShardStrategy.shard_batch``
 callable), the scalar group helpers, ``dsv4_cp_local_seq_multiple``, and the
 sharder-only ``DeepseekV4ForCausalLM`` CP-prep hook (``prepare_model_inputs_for_cp``).
 """
@@ -506,7 +506,7 @@ def test_prepare_model_inputs_for_cp_returns_sharder():
     prepared = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, {"input_ids": torch.arange(8).view(1, 8)})
 
     sharder = prepared
-    from nemo_automodel.components.distributed.context_parallel.sharder import _contiguous_local_indices
+    from nemo_automodel.components.distributed.context_parallel._strategy import _contiguous_local_indices
 
     assert sharder.local_token_global_indices is _contiguous_local_indices
     fn = sharder.shard_batch
@@ -539,7 +539,7 @@ def test_setup_cp_attention_stores_group():
 
 
 def test_module_exposes_pad_helper_noops():
-    from nemo_automodel.components.distributed.context_parallel import sharder
+    from nemo_automodel.components.distributed.context_parallel import _strategy as sharder
 
     # pad_len <= 0 is a no-op (returns the same tensor object) for both pad helpers.
     t = torch.arange(6).view(1, 6)

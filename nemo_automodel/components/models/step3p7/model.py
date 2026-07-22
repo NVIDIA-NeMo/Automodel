@@ -23,8 +23,8 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.distributed.context_parallel.sharder import (
-    ContextParallelismSharder,
+from nemo_automodel.components.distributed.context_parallel._strategy import (
+    CPShardStrategy,
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
@@ -514,13 +514,13 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> ContextParallelismSharder:
+    ) -> CPShardStrategy:
         """Return a sharder-only CP backend; embed + splice + shard happen in forward.
 
         Embedding and the vision multimodal scatter now run inside ``forward``
         per microbatch (see the CP branch that calls ``get_multimodal_embeddings``
         + ``prepare_inputs_embeds`` + :func:`shard_sequence_for_cp_round_robin`). The returned
-        :class:`ContextParallelismSharder` round-robin-shards only the no-grad aux
+        :class:`CPShardStrategy` round-robin-shards only the no-grad aux
         streams (labels/position_ids/loss_mask/padding_mask) and leaves
         ``input_ids`` and the media inputs full-length for the forward. Step3.7
         uses plain 1-D positions, so no ``position_ids`` are computed here (the
@@ -534,7 +534,7 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         if batch.get("input_ids") is None:
             raise ValueError("Step3p7 CP pre-embedding requires input_ids.")
         del num_chunks
-        return ContextParallelismSharder.sdpa_aux()
+        return CPShardStrategy.sdpa_aux()
 
     def forward(
         self,

@@ -289,8 +289,8 @@ def test_from_pretrained_uses_step3p7_config(monkeypatch):
 
 
 def test_prepare_model_inputs_for_cp_is_sharder_only():
-    from nemo_automodel.components.distributed.context_parallel.sharder import (
-        ContextParallelismSharder,
+    from nemo_automodel.components.distributed.context_parallel._strategy import (
+        CPShardStrategy,
         _round_robin_local_indices,
         _shard_batch_aux_only,
     )
@@ -302,7 +302,7 @@ def test_prepare_model_inputs_for_cp_is_sharder_only():
     batch = {"input_ids": input_ids, "image_embeds": torch.randn(1, 8)}
     sharder = wrapper.prepare_model_inputs_for_cp(batch)
     assert "inputs_embeds" not in batch
-    assert isinstance(sharder, ContextParallelismSharder)
+    assert isinstance(sharder, CPShardStrategy)
     assert sharder.shard_batch is _shard_batch_aux_only
     assert sharder.local_token_global_indices is _round_robin_local_indices
 

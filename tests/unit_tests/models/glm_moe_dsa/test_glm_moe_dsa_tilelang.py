@@ -1135,7 +1135,7 @@ def test_glm_dsa_prepare_model_inputs_for_cp_binds_batch_sharder():
     prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.arange(8).view(1, 8)}, num_chunks=3)
 
     sharder = prepared
-    from nemo_automodel.components.distributed.context_parallel.sharder import _contiguous_local_indices
+    from nemo_automodel.components.distributed.context_parallel._strategy import _contiguous_local_indices
 
     assert sharder.local_token_global_indices is _contiguous_local_indices
     fn = sharder.shard_batch

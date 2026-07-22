@@ -47,7 +47,7 @@ from nemo_automodel._transformers import (
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches, resolve_get_rope_index
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_pp
-from nemo_automodel.components.distributed import ContextParallelRuntime
+from nemo_automodel.components.distributed import ContextParallelSharder
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
@@ -384,7 +384,7 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
 class FinetuneRecipeForVLM(BaseRecipe):
     """Recipe for fine-tuning a VLM model."""
 
-    cp_runtime = ContextParallelRuntime()
+    cp_sharder = ContextParallelSharder()
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -438,7 +438,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not self._should_setup_training_components():
             return
 
-        self.cp_runtime = ContextParallelRuntime.build(
+        self.cp_sharder = ContextParallelSharder.build(
             self.cfg.model,
             device_mesh=self.device_mesh,
         )
@@ -803,7 +803,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if k != "input_ids":
                     batch.pop(k, None)
         _padding_id = getattr(getattr(getattr(self, "processor", None), "tokenizer", None), "pad_token_id", 0) or 0
-        prepared_cp = self.cp_runtime.prepare_forward(
+        prepared_cp = self.cp_sharder.shard(
             self.model_parts[0],
             batch,
             padding_token_id=_padding_id,
@@ -1095,7 +1095,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 }
                 num_label_tokens = (batch["labels"] != -100).sum().item()
 
-                prepared_cp = self.cp_runtime.prepare_forward(
+                prepared_cp = self.cp_sharder.shard(
                     self.model_parts[0],
                     batch,
                 )

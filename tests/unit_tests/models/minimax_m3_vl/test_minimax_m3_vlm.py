@@ -176,11 +176,11 @@ class _FakeCPMesh:
 
 def test_prepare_model_inputs_for_cp_is_sharder_only(vlm_model):
     """The CP hook is sharder-only: it consumes nothing and returns a
-    ContextParallelismSharder whose shard_batch is the aux-only round-robin shard.
+    CPShardStrategy whose shard_batch is the aux-only round-robin shard.
     Embedding + vision splice + sequence shard now run inside forward, so the raw
     batch (input_ids, pixel_values) is left intact for the forward to consume."""
-    from nemo_automodel.components.distributed.context_parallel.sharder import (
-        ContextParallelismSharder,
+    from nemo_automodel.components.distributed.context_parallel._strategy import (
+        CPShardStrategy,
         _round_robin_local_indices,
         _shard_batch_aux_only,
     )
@@ -193,7 +193,7 @@ def test_prepare_model_inputs_for_cp_is_sharder_only(vlm_model):
     prepared = vlm_model.prepare_model_inputs_for_cp(cp_batch)
 
     sharder = prepared
-    assert isinstance(sharder, ContextParallelismSharder)
+    assert isinstance(sharder, CPShardStrategy)
     assert sharder.shard_batch is _shard_batch_aux_only
     assert sharder.local_token_global_indices is _round_robin_local_indices
     # nothing consumed: the raw streams stay for the forward

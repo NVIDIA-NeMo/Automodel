@@ -51,7 +51,7 @@ from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.loader import ThdPackingConfig
-from nemo_automodel.components.distributed import ContextParallelRuntime
+from nemo_automodel.components.distributed import ContextParallelSharder
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh import MeshContext
@@ -380,7 +380,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
     This class orchestrates training, from setup to main training loop.
     """
 
-    cp_runtime = ContextParallelRuntime()
+    cp_sharder = ContextParallelSharder()
 
     def __init__(self, cfg):
         """Initialize the recipe with configuration.
@@ -439,7 +439,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self._should_setup_training_components():
             return
 
-        self.cp_runtime = ContextParallelRuntime.build(self.cfg.model, device_mesh=self.device_mesh)
+        self.cp_sharder = ContextParallelSharder.build(self.cfg.model, device_mesh=self.device_mesh)
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
@@ -464,7 +464,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Build loss_fn (will be set on pipeline_config if PP enabled)
         self.loss_fn = self.cfg.loss_fn.build()
-        if self.cp_runtime.requires_full_logits and isinstance(
+        if self.cp_sharder.requires_full_logits and isinstance(
             self.loss_fn, FusedLinearCrossEntropy
         ):  # pragma: no cover
             raise ValueError(
@@ -913,7 +913,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             for k, v in batch.items()
         }
         _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
-        prepared_cp = self.cp_runtime.prepare_forward(
+        prepared_cp = self.cp_sharder.shard(
             self.model_parts[0] if hasattr(self, "model_parts") else None,
             batch,
             padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
