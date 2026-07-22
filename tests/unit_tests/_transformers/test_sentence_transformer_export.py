@@ -150,6 +150,7 @@ def test_generated_sentence_transformer_assets_preserve_repository_and_model_roo
     metadata_dir.mkdir()
     (repository_root / "LICENSE.md").write_text("repository license")
     (repository_root / "NOTICE.md").write_text("repository notice")
+    (repository_root / "THIRD_PARTY_NOTICES.md").write_text("third-party notices")
     (repository_root / "COPYING").write_text("copying")
     (repository_root / "legal" / "LICENSE.txt").write_text("nested license")
     (model_root / "LICENSE.md").write_text("model license")
@@ -175,6 +176,7 @@ def test_generated_sentence_transformer_assets_preserve_repository_and_model_roo
 
     assert (metadata_dir / "LICENSE.md").read_text() == "model license"
     assert (metadata_dir / "NOTICE.md").read_text() == "repository notice"
+    assert (metadata_dir / "THIRD_PARTY_NOTICES.md").read_text() == "third-party notices"
     assert not (metadata_dir / "COPYING").exists()
     assert not (metadata_dir / "LICENSE.txt").exists()
 
