@@ -40,7 +40,6 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelismSharder,
-    CPModelPreparation,
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.models.common import BackendConfig
@@ -982,14 +981,15 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> CPModelPreparation:
+    ) -> ContextParallelismSharder:
         """Return a sharder-only CP backend plus the full-sequence mRoPE positions.
 
         Embedding and the VLM->LM multimodal scatter now run inside ``forward``
         per microbatch (see :meth:`_embed_and_splice_for_cp`), so this hook only
         (a) computes the mRoPE ``position_ids`` on the *full* (unsharded) sequence
-        via ``get_rope_index`` and returns them for :meth:`ContextParallelismSharder.sdpa_aux`
-        to round-robin-shard on the mRoPE axis, and (b) returns the
+        via ``get_rope_index`` and stores them in ``batch`` for
+        :meth:`ContextParallelismSharder.sdpa_aux` to round-robin-shard on the
+        mRoPE axis, and (b) returns the
         :class:`ContextParallelismSharder`. ``input_ids`` and the media inputs are
         left in the batch for the forward; ``mm_token_type_ids`` is consumed here
         (only ``get_rope_index`` needs it) so the sharded forward never sees a
@@ -1045,10 +1045,8 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             position_ids, rope_deltas = self.model.get_rope_index(input_ids, **rope_kwargs)
             self.model.rope_deltas = rope_deltas
 
-        return CPModelPreparation(
-            ContextParallelismSharder.sdpa_aux(),
-            {"position_ids": position_ids, "mm_token_type_ids": None, **promoted},
-        )
+        batch.update({"position_ids": position_ids, "mm_token_type_ids": None, **promoted})
+        return ContextParallelismSharder.sdpa_aux()
 
     def _embed_and_splice_for_cp(
         self,

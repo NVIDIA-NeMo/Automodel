@@ -15,7 +15,8 @@
 """Context-parallel batch-sharding contract.
 
 Every CP backend is a :class:`ContextParallelismSharder`. A model that owns its CP batch
-sharding and attention transport returns one in :class:`CPModelPreparation`;
+sharding and attention transport returns one directly from
+``prepare_model_inputs_for_cp``;
 the framework constructs its own for the remaining backends (torch
 ``context_parallel`` round-robin, TE/THD, MagiAttention) so the CP runtime
 reduces to resolving a sharder and calling ``shard_batch``. This replaces the retired private batch keys
@@ -48,9 +49,9 @@ dispatcher wraps them into sharders at resolution time.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import torch
@@ -352,14 +353,6 @@ class ContextParallelismSharder:
     def contiguous(cls, shard_batch: _ShardBatch) -> "ContextParallelismSharder":
         """Bind a model-owned batch preparation to contiguous token ownership."""
         return cls(shard_batch=shard_batch, local_token_global_indices=_contiguous_local_indices)
-
-
-@dataclass(frozen=True)
-class CPModelPreparation:
-    """Model-selected CP sharder and batch values produced by its preparation hook."""
-
-    sharder: ContextParallelismSharder
-    batch_updates: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

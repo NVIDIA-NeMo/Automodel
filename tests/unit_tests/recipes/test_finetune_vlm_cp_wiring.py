@@ -38,7 +38,7 @@ import torch
 
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.distributed.context_parallel import ContextParallelismSharder, CPModelPreparation
+from nemo_automodel.components.distributed.context_parallel import ContextParallelismSharder
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
@@ -52,8 +52,7 @@ class _NoOpCPRuntime:
         del kwargs
         hook = getattr(model, "prepare_model_inputs_for_cp", None)
         if callable(hook):
-            prepared = hook(batch, num_chunks=num_chunks)
-            batch.update(prepared.batch_updates)
+            hook(batch, num_chunks=num_chunks)
         if self.seen_batch is not None:
             self.seen_batch.update(batch)
         return SimpleNamespace(context=nullcontext(), batch=batch)
@@ -189,7 +188,7 @@ class _SunkSpyVLM:
     def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
         # Sharder-only: nothing consumed, no inputs_embeds — input_ids stays full.
         self.calls.append({"batch": dict(batch), "num_chunks": num_chunks})
-        return CPModelPreparation(ContextParallelismSharder.identity())
+        return ContextParallelismSharder.identity()
 
     def __call__(self, **kwargs):
         raise AssertionError("CP prepare must call prepare_model_inputs_for_cp directly, not __call__")
@@ -550,7 +549,7 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
 
         def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):  # sharder-only hook
             pre_embed_calls.append(set(batch))
-            return CPModelPreparation(ContextParallelismSharder.identity())
+            return ContextParallelismSharder.identity()
 
         def forward(self, **batch):
             return SimpleNamespace(logits=torch.zeros(1, 4, 8), hidden_states=None)

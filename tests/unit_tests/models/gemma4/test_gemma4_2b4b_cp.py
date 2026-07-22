@@ -246,8 +246,7 @@ def test_prepare_model_inputs_is_sharder_only_for_e_series():
     cfg.image_token_id = 99
     model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.float32)
     prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])})
-    assert not prepared.batch_updates
-    assert prepared.sharder.shard_batch == model._cp_shard_batch_aux_only
+    assert prepared.shard_batch == model._cp_shard_batch_aux_only
 
 
 def test_cp_sunk_prepare_inputs_slices_per_layer_inputs_on_seq_dim():

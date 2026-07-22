@@ -25,7 +25,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelismSharder,
-    CPModelPreparation,
     CPShardResult,
     CPTokenLayout,
     ShardLayout,
@@ -280,7 +279,7 @@ class ContextParallelRuntime:
         Raises:
             ValueError: If a THD batch omits required sequence metadata.
             NotImplementedError: If multimodal THD context parallelism is requested.
-            TypeError: If a model CP hook does not return the sharder contract.
+            TypeError: If a model CP hook does not return a sharder.
         """
         is_thd = batch.get("qkv_format") == "thd"
         if is_thd:
@@ -302,11 +301,9 @@ class ContextParallelRuntime:
         model_owns_thd = is_thd and bool(getattr(model, "supports_thd", False))
         magi_replaces_hook = self._magi.enabled and not is_multimodal
         if (cp_active or model_owns_thd) and callable(hook) and not magi_replaces_hook:
-            prepared = hook(batch, num_chunks=num_chunks)
-            if not isinstance(prepared, CPModelPreparation):
-                raise TypeError("prepare_model_inputs_for_cp must return CPModelPreparation")
-            model_sharder = prepared.sharder
-            batch.update(prepared.batch_updates)
+            model_sharder = hook(batch, num_chunks=num_chunks)
+            if not isinstance(model_sharder, ContextParallelismSharder):
+                raise TypeError("prepare_model_inputs_for_cp must return ContextParallelismSharder")
 
         sharder = self._resolve_sharder(
             model_sharder,

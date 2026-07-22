@@ -505,7 +505,7 @@ def test_prepare_model_inputs_for_cp_returns_sharder():
     fake_self = SimpleNamespace(config=cfg, backend=SimpleNamespace(dispatcher="hybridep"))
     prepared = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, {"input_ids": torch.arange(8).view(1, 8)})
 
-    sharder = prepared.sharder
+    sharder = prepared
     from nemo_automodel.components.distributed.context_parallel.sharder import _contiguous_local_indices
 
     assert sharder.local_token_global_indices is _contiguous_local_indices
@@ -526,8 +526,8 @@ def test_prepare_model_inputs_for_cp_binds_shard_multiple():
     cfg = SimpleNamespace(compress_ratios=[4])
     fake_self = SimpleNamespace(config=cfg, backend=SimpleNamespace(dispatcher="deepep"))
     out = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, {"input_ids": torch.arange(8).view(1, 8)})
-    assert out.sharder.shard_batch.keywords["pad_multiple"] == 8
-    assert out.sharder.shard_batch.keywords["sync_packed_length"] is False
+    assert out.shard_batch.keywords["pad_multiple"] == 8
+    assert out.shard_batch.keywords["sync_packed_length"] is False
 
 
 def test_setup_cp_attention_stores_group():

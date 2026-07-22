@@ -2302,7 +2302,6 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
             self.num_chunks = kwargs.get("num_chunks")
             from nemo_automodel.components.distributed.context_parallel.sharder import (
                 ContextParallelismSharder,
-                CPModelPreparation,
                 CPShardResult,
             )
 
@@ -2310,7 +2309,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
                 del cp_mesh, tp_mesh, kwargs
                 return CPShardResult(nullcontext(), batch)
 
-            return CPModelPreparation(ContextParallelismSharder.contiguous(shard_batch))
+            return ContextParallelismSharder.contiguous(shard_batch)
 
         def forward(self, **batch):
             logits = self.lin(batch["input_ids"].float())

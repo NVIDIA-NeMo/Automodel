@@ -192,8 +192,7 @@ def test_prepare_model_inputs_for_cp_is_sharder_only(vlm_model):
     cp_batch = {"input_ids": ids, "pixel_values": pixel_values, "image_grid_thw": grid_thw}
     prepared = vlm_model.prepare_model_inputs_for_cp(cp_batch)
 
-    assert not prepared.batch_updates
-    sharder = prepared.sharder
+    sharder = prepared
     assert isinstance(sharder, ContextParallelismSharder)
     assert sharder.shard_batch is _shard_batch_aux_only
     assert sharder.local_token_global_indices is _round_robin_local_indices

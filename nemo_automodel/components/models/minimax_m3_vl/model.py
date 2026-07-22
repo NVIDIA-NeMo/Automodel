@@ -28,7 +28,6 @@ import torch.nn as nn
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelismSharder,
-    CPModelPreparation,
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.models.common import (
@@ -645,7 +644,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> CPModelPreparation:
+    ) -> ContextParallelismSharder:
         """Return a sharder-only CP backend; embed + splice + shard happen in forward.
 
         The returned :class:`ContextParallelismSharder` round-robin-shards only the
@@ -662,7 +661,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             num_chunks: Accepted for hook-signature parity; unused (round-robin CP).
         """
         del batch, num_chunks
-        return CPModelPreparation(ContextParallelismSharder.sdpa_aux())
+        return ContextParallelismSharder.sdpa_aux()
 
     def forward(
         self,

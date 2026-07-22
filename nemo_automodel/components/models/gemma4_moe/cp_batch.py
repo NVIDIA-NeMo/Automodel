@@ -26,8 +26,8 @@ module owns the one Gemma4-specific piece the aux-only shard still needs: the
 ``_packed_seq_ids`` document-boundary synthesis its manual CP attention mask
 builder requires (its pad-region zeros depend on the global pad tail, which the
 forward -- holding only this rank's slice -- cannot reconstruct). Gemma4's
-``prepare_model_inputs_for_cp`` exposes it through the ``ContextParallelismSharder``
-in its typed preparation result, which the CP dispatch invokes in
+``prepare_model_inputs_for_cp`` returns its ``ContextParallelismSharder`` directly,
+which the CP dispatch invokes in
 place of the default load-balanced ``context_parallel`` path.
 """
 

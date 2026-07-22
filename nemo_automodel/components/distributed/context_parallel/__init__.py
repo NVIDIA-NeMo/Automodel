@@ -17,14 +17,12 @@
 from nemo_automodel.components.distributed.context_parallel.runtime import ContextParallelRuntime, CPForward
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelismSharder,
-    CPModelPreparation,
     CPShardResult,
     CPTokenLayout,
 )
 
 __all__ = [
     "CPForward",
-    "CPModelPreparation",
     "CPShardResult",
     "CPTokenLayout",
     "ContextParallelismSharder",

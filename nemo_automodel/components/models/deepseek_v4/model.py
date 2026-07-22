@@ -90,7 +90,7 @@ from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.context_parallel.sharder import CPModelPreparation
+    from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelismSharder
 
 
 @dataclass
@@ -842,11 +842,10 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> "CPModelPreparation":
+    ) -> "ContextParallelismSharder":
         """Model-owned context-parallel batch prep (Miles-style contiguous shard).
 
-        Returns a ``CPModelPreparation`` so the CP dispatch delegates sharding back to this
-        model, with the config-derived per-rank shard multiple bound. DSV4
+        Returns a sharder with the config-derived per-rank shard multiple bound. DSV4
         embeds internally, so (unlike VLM models) this does not pre-embed --
         it leaves ``input_ids`` for the sharding callable.
         """
@@ -854,7 +853,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
             ContextParallelismSharder,
-            CPModelPreparation,
         )
 
         cp_sharder = ContextParallelismSharder.contiguous(
@@ -864,7 +862,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 sync_packed_length=self.backend.dispatcher == "hybridep",
             )
         )
-        return CPModelPreparation(cp_sharder)
+        return cp_sharder
 
     def forward(
         self,

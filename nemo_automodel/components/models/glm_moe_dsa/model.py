@@ -44,7 +44,7 @@ from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 if TYPE_CHECKING:
-    from nemo_automodel.components.distributed.context_parallel.sharder import CPModelPreparation
+    from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelismSharder
 
 
 class Block(nn.Module):
@@ -339,7 +339,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> "CPModelPreparation":
+    ) -> "ContextParallelismSharder":
         """Attach GLM DSA's packed THD context-parallel batch sharder.
 
         Args:
@@ -350,7 +350,6 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
             ContextParallelismSharder,
-            CPModelPreparation,
         )
 
         if getattr(self.backend, "attn", None) != "tilelang":
@@ -362,7 +361,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 num_chunks=int(num_chunks),
             )
         )
-        return CPModelPreparation(cp_sharder)
+        return cp_sharder
 
     def _is_pipeline_parallel_stage(self) -> bool:
         """True when this module is a trimmed pipeline-parallel stage (not the whole model)."""

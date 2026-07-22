@@ -73,7 +73,7 @@ class TestPrepareModelInputsForCP:
 
     def test_returns_sharder_and_positions_only(self):
         """Sharder-only hook: no inputs_embeds (the forward embeds), full mRoPE
-        positions returned for the aux shard, mm_token_type_ids consumed."""
+        positions stored for the aux shard, mm_token_type_ids consumed."""
         from nemo_automodel.components.distributed.context_parallel.sharder import (
             ContextParallelismSharder,
             _round_robin_local_indices,
@@ -81,24 +81,25 @@ class TestPrepareModelInputsForCP:
         )
 
         model = _build_model()
-        out = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[5, 6, 7, 8]])})
+        batch = {"input_ids": torch.tensor([[5, 6, 7, 8]])}
+        sharder = model.prepare_model_inputs_for_cp(batch)
 
-        assert "inputs_embeds" not in out.batch_updates  # embedding happens in forward now
-        sharder = out.sharder
+        assert "inputs_embeds" not in batch  # embedding happens in forward now
         assert isinstance(sharder, ContextParallelismSharder)
         assert sharder.shard_batch is _shard_batch_aux_only
         assert sharder.local_token_global_indices is _round_robin_local_indices
         # position_ids came from get_rope_index (mRoPE [3, B, S]); aux shard slices it.
-        assert out.batch_updates["position_ids"].shape == (3, 1, 4)
+        assert batch["position_ids"].shape == (3, 1, 4)
         # mm_token_type_ids is consumed by get_rope_index -> returned as a None marker.
-        assert out.batch_updates["mm_token_type_ids"] is None
+        assert batch["mm_token_type_ids"] is None
         assert model.model.rope_deltas is not None
 
     def test_input_ids_and_media_not_consumed(self):
         """input_ids stays in the batch for the forward's in-forward embed+splice."""
         model = _build_model()
-        out = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[5, 6, 7, 8]])})
-        assert "input_ids" not in out.batch_updates  # not returned as a None marker -> stays in batch
+        batch = {"input_ids": torch.tensor([[5, 6, 7, 8]])}
+        model.prepare_model_inputs_for_cp(batch)
+        assert "input_ids" in batch
 
     def test_existing_position_ids_not_recomputed(self):
         called = {"count": 0}
@@ -109,10 +110,11 @@ class TestPrepareModelInputsForCP:
 
         model = _build_model(rope_index=_rope)
         pos = torch.arange(4).view(1, 4)
-        out = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[5, 6, 7, 8]]), "position_ids": pos})
+        batch = {"input_ids": torch.tensor([[5, 6, 7, 8]]), "position_ids": pos}
+        model.prepare_model_inputs_for_cp(batch)
 
         assert called["count"] == 0, "get_rope_index must not run when position_ids provided"
-        assert out.batch_updates["position_ids"] is pos
+        assert batch["position_ids"] is pos
 
     def test_image_grid_hws_promoted_to_thw(self):
         """image_grid_hws of shape [N, 2] is promoted to [N, 3] for get_rope_index and
@@ -125,16 +127,12 @@ class TestPrepareModelInputsForCP:
 
         model = _build_model(rope_index=_rope)
         image_grid_hws = torch.tensor([[2, 2]])  # [N, 2]
-        out = model.prepare_model_inputs_for_cp(
-            {
-                "input_ids": torch.tensor([[5, 6, 7, 8]]),
-                "image_grid_hws": image_grid_hws,
-            }
-        )
+        batch = {"input_ids": torch.tensor([[5, 6, 7, 8]]), "image_grid_hws": image_grid_hws}
+        model.prepare_model_inputs_for_cp(batch)
         assert captured["image_grid_thw"].tolist() == [[1, 2, 2]]
-        # promoted grid is returned for the forward; the raw hws key is dropped.
-        assert out.batch_updates["image_grid_thw"].tolist() == [[1, 2, 2]]
-        assert out.batch_updates["image_grid_hws"] is None
+        # promoted grid is stored for the forward; the raw hws key is dropped.
+        assert batch["image_grid_thw"].tolist() == [[1, 2, 2]]
+        assert batch["image_grid_hws"] is None
 
     def test_image_grid_hws_already_thw_passes_through(self):
         """image_grid_hws already shaped [N, 3] is used as-is (no temporal column prepended)."""

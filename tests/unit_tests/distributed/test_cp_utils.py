@@ -37,7 +37,6 @@ from nemo_automodel.components.distributed.context_parallel.magi import MagiStat
 from nemo_automodel.components.distributed.context_parallel.runtime import ContextParallelRuntime
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelismSharder,
-    CPModelPreparation,
     CPShardResult,
     _contiguous_local_indices,
     shard_batch_contiguous,
@@ -128,7 +127,7 @@ def _prepare(
 
             def prepare_model_inputs_for_cp(self, prepared_batch, *, num_chunks):
                 del prepared_batch, num_chunks
-                return CPModelPreparation(cp_sharder)
+                return cp_sharder
 
         model = _SharderModel()
 
@@ -714,8 +713,8 @@ def test_te_dispatches_through_a_framework_sharder(monkeypatch):
     assert batch2 == {"thd": True} and seen["cp_mesh"] is None
 
 
-def test_runtime_merges_model_hook_batch_updates(monkeypatch):
-    """Model-owned hooks may return batch metadata in addition to the sharder."""
+def test_runtime_uses_batch_prepared_by_model_hook(monkeypatch):
+    """Model-owned hooks may prepare batch metadata before returning the sharder."""
 
     cp_context_kwargs = {}
 
@@ -732,15 +731,15 @@ def test_runtime_merges_model_hook_batch_updates(monkeypatch):
         def prepare_model_inputs_for_cp(self, batch, *, num_chunks):
             assert num_chunks == 3
             assert batch["mm_token_type_ids"].shape == (1, 4)
-            return CPModelPreparation(
-                ContextParallelismSharder.sdpa_aux(),
+            batch.update(
                 {
                     "position_ids": position_ids,
                     "mm_token_type_ids": None,
                     "image_grid_thw": image_grid_thw,
                     "image_grid_hws": None,
-                },
+                }
             )
+            return ContextParallelismSharder.sdpa_aux()
 
     batch = {
         "input_ids": torch.tensor([[1, 2, 3, 4]]),

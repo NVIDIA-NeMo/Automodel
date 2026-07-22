@@ -299,10 +299,9 @@ def test_prepare_model_inputs_for_cp_is_sharder_only():
     input_ids = torch.tensor([[1, 31, 2]])
 
     # sharder-only hook: no inputs_embeds (the forward embeds), input_ids kept.
-    result = wrapper.prepare_model_inputs_for_cp({"input_ids": input_ids, "image_embeds": torch.randn(1, 8)})
-    assert "inputs_embeds" not in result.batch_updates
-    assert not result.batch_updates
-    sharder = result.sharder
+    batch = {"input_ids": input_ids, "image_embeds": torch.randn(1, 8)}
+    sharder = wrapper.prepare_model_inputs_for_cp(batch)
+    assert "inputs_embeds" not in batch
     assert isinstance(sharder, ContextParallelismSharder)
     assert sharder.shard_batch is _shard_batch_aux_only
     assert sharder.local_token_global_indices is _round_robin_local_indices
