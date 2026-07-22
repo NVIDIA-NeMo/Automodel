@@ -80,9 +80,14 @@ except (ModuleNotFoundError, ImportError, AttributeError):
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE, MoEConfig
+from nemo_automodel.components.moe.router_replay import RouterReplay, replay_selection
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
@@ -194,12 +199,16 @@ class Gemma4Gate(nn.Module):
     This class reproduces that logic but returns (weights, indices, aux_loss) as expected by GroupedExperts.
     """
 
-    def __init__(self, config: Gemma4TextConfig):
+    def __init__(self, config: Gemma4TextConfig, enable_routing_replay: bool = False):
         super().__init__()
         hidden_size = config.hidden_size
         num_experts = config.num_experts
         self.topk = config.top_k_experts
         self.num_experts = num_experts
+
+        # Rollout Routing Replay (R3): owns a handle only when enabled so the
+        # default routing path stays a no-op.
+        self.router_replay: Optional[RouterReplay] = RouterReplay() if enable_routing_replay else None
 
         # Thread dtype explicitly from config.torch_dtype so the router's own
         # params (proj weight + scale) stay aligned with the rest of the model
@@ -231,6 +240,12 @@ class Gemma4Gate(nn.Module):
         router_probs = F.softmax(expert_scores, dim=-1)
 
         weights, indices = torch.topk(router_probs, k=self.topk, dim=-1)
+        replayed = replay_selection(self.router_replay, indices)
+        if replayed is not indices:
+            # Replay swapped the selection: re-gather the probs for the replayed
+            # experts. Skipped (zero overhead) on the default path.
+            weights = router_probs.gather(-1, replayed)
+            indices = replayed
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-20)
         return weights.to(input_dtype), indices, None
 
@@ -248,8 +263,13 @@ class Gemma4MoE(MoE):
 
     def __init__(self, moe_config: MoEConfig, backend: BackendConfig, text_config: Gemma4TextConfig):
         super().__init__(moe_config, backend)
-        # Replace the gate created by MoE.__init__ with Gemma4-specific gate
-        self.gate = Gemma4Gate(text_config)
+        # Replace the gate created by MoE.__init__ with Gemma4-specific gate.
+        # The shared Gate that MoE.__init__ built registered a RouterReplay handle
+        # when replay is enabled; drop it before the swap so it does not linger as a
+        # dangling, never-driven instance in the global registry.
+        if getattr(self.gate, "router_replay", None) is not None:
+            RouterReplay.instances().remove(self.gate.router_replay)
+        self.gate = Gemma4Gate(text_config, enable_routing_replay=moe_config.enable_routing_replay)
 
     def forward(self, x, padding_mask=None, cp_mesh=None, *, gate_input=None):
         """Forward with optional separate gate input.
@@ -428,6 +448,94 @@ def _derive_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
             return diagonal.logical_not()
         return diagonal != 0
     return attention_mask.bool().logical_not()
+
+
+def get_block_sequence_ids_for_mask(mm_token_type_ids: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Map multimodal token-type ids to per-vision-group block ids.
+
+    Vision tokens (type ``1``/``2``) get a 0-based group index; text tokens get
+    ``-1``. The result is passed as ``block_sequence_ids`` to ``create_causal_mask``
+    so tokens within the same vision group attend bidirectionally while text stays
+    causal. Vendored verbatim from ``transformers.models.gemma4.modeling_gemma4``
+    (transformers 5.12.1) to avoid depending on a transformers-internal helper.
+    """
+    mm_token_type_ids = mm_token_type_ids.to(device)
+
+    is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
+    is_prev_vision = torch.roll(is_vision, shifts=1, dims=-1)
+    is_prev_vision[..., 0] = False
+    new_vision_starts = is_vision & ~is_prev_vision
+    vision_group_ids = torch.cumsum(new_vision_starts.int(), dim=1) - 1
+    block_sequence_ids = torch.where(is_vision, vision_group_ids, -1)
+    return block_sequence_ids
+
+
+def _build_unpacked_gemma4_causal_mask_mapping(
+    config,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    past_key_values,
+    position_ids: torch.Tensor | None,
+    mm_token_type_ids: torch.Tensor | None,
+    pixel_values: torch.Tensor | None,
+    *,
+    is_training: bool,
+) -> dict[str, torch.Tensor]:
+    """Build full and sliding masks for an unpacked Gemma4 batch.
+
+    Args:
+        config: Gemma4 text configuration consumed by Transformers mask builders.
+        inputs_embeds: Tensor of shape ``[batch, sequence, hidden]`` containing
+            input embeddings.
+        attention_mask: Optional tensor of shape ``[batch, sequence]`` for token
+            masks or ``[batch, 1, query, key]`` for additive masks.
+        past_key_values: Optional Transformers cache for the same batch.
+        position_ids: Optional tensor of shape ``[batch, sequence]`` containing
+            token positions.
+        mm_token_type_ids: Optional tensor of shape ``[batch, sequence]``
+            containing multimodal token types.
+        pixel_values: Optional tensor of shape
+            ``[images, channels, height, width]`` containing image pixels. It is
+            forwarded only to the legacy Gemma4 mask builder.
+        is_training: Whether the owning model is in training mode.
+
+    Returns:
+        Mapping from ``full_attention`` and ``sliding_attention`` to tensors of
+        shape ``[batch, 1, query, key]`` or equivalent block masks produced by
+        the active Transformers implementation.
+    """
+    from transformers.models.gemma4 import modeling_gemma4
+
+    legacy_mask_mapping = getattr(modeling_gemma4, "create_causal_mask_mapping", None)
+    if legacy_mask_mapping is not None:
+        return legacy_mask_mapping(
+            config=config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            mm_token_type_ids=mm_token_type_ids,
+            pixel_values=pixel_values,
+            is_training=is_training,
+        )
+
+    from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+
+    block_sequence_ids = torch.full(inputs_embeds.shape[:2], -1, device=inputs_embeds.device)
+    if mm_token_type_ids is not None:
+        block_sequence_ids = get_block_sequence_ids_for_mask(mm_token_type_ids, device=inputs_embeds.device)
+    mask_kwargs = {
+        "config": config,
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": attention_mask,
+        "past_key_values": past_key_values,
+        "position_ids": position_ids,
+        "block_sequence_ids": block_sequence_ids,
+    }
+    return {
+        "full_attention": create_causal_mask(**mask_kwargs),
+        "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+    }
 
 
 def _build_packed_gemma4_causal_mask_mapping(
@@ -677,16 +785,14 @@ class Gemma4MoETextModelBackend(nn.Module):
                 flex_block_size=(32, 32) if getattr(self.config, "head_dim", 0) > 256 else 128,
             )
         elif use_vision_bidirectional_mask:
-            from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
-
-            causal_mask_mapping = create_causal_mask_mapping(
-                config=self.config,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-                mm_token_type_ids=mm_token_type_ids,
-                pixel_values=pixel_values,
+            causal_mask_mapping = _build_unpacked_gemma4_causal_mask_mapping(
+                self.config,
+                inputs_embeds,
+                attention_mask,
+                past_key_values,
+                position_ids,
+                mm_token_type_ids,
+                pixel_values,
                 is_training=self.training,
             )
         else:
@@ -696,7 +802,6 @@ class Gemma4MoETextModelBackend(nn.Module):
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
-                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
@@ -766,6 +871,7 @@ class Gemma4MoEModel(HFGemma4Model):
 # Top-level conditional-generation model
 # ---------------------------------------------------------------------------
 class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditionalGeneration, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.TIED_ONLY
     supports_gradient_checkpointing = True
     # RoPE inv_freq must stay fp32: initialize_weights casts the model to bf16 and
     # nn.Module.to rounds floating buffers; cast_model_to_dtype restores keep-fp32
@@ -909,6 +1015,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     ):
         if not _GEMMA4_HF_AVAILABLE:
             raise UnavailableError("transformers.models.gemma4 is not available.")
+        # Gemma4 is tied by default; untying would need a materialized separate
+        # lm_head NeMo doesn't build, so reject tie_word_embeddings=False up front.
+        reject_unsupported_tie_word_embeddings(type(self), config)
         backend = backend or BackendConfig()
 
         # Merge text_config overrides (e.g. from YAML) into the proper config
@@ -957,9 +1066,13 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             # Dense Gemma4 — keep vanilla HF model. Attach the model-owned p2p ring
             # CP attention to each HF self-attn so setup_cp_attention can install it
             # when CP is enabled. (The MoE path attaches it per Gemma4MoEDecoderLayer.)
+            # ``cp_full_attn_backend: ffpa`` routes the full-attention head_dim=512
+            # ring chunks through the FFPA CuTeDSL kernel (eligibility re-checked per
+            # call in _ring_use_ffpa_varlen); default "flex" preserves prior behavior.
+            use_ffpa_cp = str(getattr(text_config, "cp_full_attn_backend", "flex")).lower() == "ffpa"
             for module in self.modules():
                 if isinstance(module, Gemma4Attention):
-                    attach_gemma4_cp_ring_attention(module)
+                    attach_gemma4_cp_ring_attention(module, use_ffpa=use_ffpa_cp)
             return
 
         # --- MoE path: replace the text model ---

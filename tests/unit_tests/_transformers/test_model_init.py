@@ -26,6 +26,7 @@ from nemo_automodel._transformers.model_init import (
     _has_safetensors,
     _init_model,
     _load_config_with_layer_types_fix,
+    _prepopulate_remote_code_cache,
     _propagate_torch_dtype_to_subconfigs,
     _resolve_model_dir,
     _setup_bnb_loading_kwargs,
@@ -141,7 +142,7 @@ class TestBackendDictCoercion:
         config.name_or_path = "fake/model"
         return config
 
-    def _run_init_model(self, mock_resolve_cls, **extra_kwargs):
+    def _run_init_model(self, mock_resolve_cls, backend_config_resolver=None, **extra_kwargs):
         """Helper to call _init_model with a fake model class and capture kwargs."""
         captured_kwargs = {}
 
@@ -150,6 +151,8 @@ class TestBackendDictCoercion:
             return MagicMock()
 
         fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
+        if backend_config_resolver is not None:
+            fake_model_cls.backend_config_resolver = backend_config_resolver
         mock_resolve_cls.return_value = fake_model_cls
 
         _init_model(
@@ -178,6 +181,24 @@ class TestBackendDictCoercion:
 
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_model_specific_backend_resolver_takes_precedence(self, mock_resolve_cls, _mock_download):
+        """Custom models may merge partial mappings onto model-specific stable defaults."""
+        resolved_backend = object()
+
+        def _resolve_backend(backend):
+            assert backend == {"rms_norm": "te"}
+            return resolved_backend
+
+        captured = self._run_init_model(
+            mock_resolve_cls,
+            backend_config_resolver=_resolve_backend,
+            backend={"rms_norm": "te"},
+        )
+
+        assert captured["backend"] is resolved_backend
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
     def test_backend_config_object_passed_through(self, mock_resolve_cls, _mock_download):
         """A proper BackendConfig should be passed through unchanged."""
         original_backend = BackendConfig(attn="te", linear="te")
@@ -192,6 +213,34 @@ class TestBackendDictCoercion:
         captured = self._run_init_model(mock_resolve_cls)
 
         assert "backend" not in captured
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_process_group_is_forwarded_only_to_weight_download(self, mock_resolve_cls, mock_download):
+        process_group = object()
+
+        captured = self._run_init_model(mock_resolve_cls, _process_group=process_group)
+
+        assert "_process_group" not in captured
+        assert mock_download.call_args.args[1] == "fake/model"
+        assert mock_download.call_args.kwargs == {"process_group": process_group}
+
+
+def test_remote_code_cache_serialization_uses_model_process_group(tmp_path):
+    model_dir = tmp_path / "remote_model"
+    model_dir.mkdir()
+    (model_dir / "modeling_remote.py").write_text("class RemoteModel: pass\n")
+    config = MagicMock(auto_map={"AutoModel": "modeling_remote.RemoteModel"})
+    process_group = object()
+
+    with (
+        patch("nemo_automodel._transformers.model_init.dist_utils.FirstRankPerNode") as first_rank,
+        patch("transformers.dynamic_module_utils.get_cached_module_file", return_value="remote/modeling_remote.py"),
+    ):
+        first_rank.return_value.__enter__.return_value = True
+        _prepopulate_remote_code_cache(config, str(model_dir), {}, process_group=process_group)
+
+    first_rank.assert_called_once_with(group=process_group)
 
 
 class TestGetHfConfigNestedKwargs:
@@ -703,3 +752,97 @@ class TestTryGetRemoteCodeModelCls:
         cfg.auto_map = {"AutoModelForCausalLM": "modeling.MyModel"}
         result = _try_get_remote_code_model_cls(cfg, "/some/path", "AutoModelForCausalLM", {})
         assert result is None
+
+
+class TestTieWeightsNemoConfigGate:
+    """_tie_weights_nemo must honor the controlling tie_word_embeddings flag (#2941).
+
+    ``_nemo_tied_weights_keys`` names the candidate tied keys (pre-v5 list-form
+    ``_tied_weights_keys`` semantics); it does not mean the model is tied.
+    Re-tying an untied model aliases away the trained ``lm_head.weight`` that
+    ``from_pretrained`` just loaded.
+    """
+
+    @staticmethod
+    def _make_model(tie: bool | None) -> nn.Module:
+        from transformers import PretrainedConfig
+
+        class _TinyModel(nn.Module):
+            _nemo_tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.embed_tokens = nn.Embedding(10, 4)
+                self.lm_head = nn.Linear(4, 10, bias=False)
+
+        model = _TinyModel()
+        if tie is not None:
+            model.config = PretrainedConfig(tie_word_embeddings=tie)
+        return model
+
+    def test_untied_config_keeps_separate_lm_head(self):
+        """tie_word_embeddings=False: the loaded lm_head must not be aliased away."""
+        from nemo_automodel._transformers.model_init import _tie_weights_nemo
+
+        model = self._make_model(tie=False)
+        lm_head_before = model.lm_head.weight.detach().clone()
+
+        _tie_weights_nemo(model)
+
+        assert model.lm_head.weight is not model.model.embed_tokens.weight
+        assert model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr()
+        torch.testing.assert_close(model.lm_head.weight, lm_head_before)
+
+    def test_untied_only_policy_overrides_misleading_tied_config(self):
+        """A fixed untied policy prevents re-tying despite an outer True flag."""
+        from nemo_automodel._transformers.model_init import _tie_weights_nemo
+        from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
+
+        model = self._make_model(tie=True)
+        model.tie_word_embeddings_support = TieSupport.UNTIED_ONLY
+
+        _tie_weights_nemo(model)
+
+        assert model.lm_head.weight is not model.model.embed_tokens.weight
+
+    def test_tied_config_reties(self):
+        """tie_word_embeddings=True: keep the #1817 re-tie behavior."""
+        from nemo_automodel._transformers.model_init import _tie_weights_nemo
+
+        model = self._make_model(tie=True)
+        _tie_weights_nemo(model)
+
+        assert model.lm_head.weight is model.model.embed_tokens.weight
+
+    def test_missing_config_still_reties(self):
+        """No config attribute: fall back to the conservative #1817 re-tie."""
+        from nemo_automodel._transformers.model_init import _tie_weights_nemo
+
+        model = self._make_model(tie=None)
+        _tie_weights_nemo(model)
+
+        assert model.lm_head.weight is model.model.embed_tokens.weight
+
+    def test_untied_state_dict_roundtrip_is_lossless(self):
+        """Resume scenario: distinct lm_head/embed weights must survive construct-then-load.
+
+        Before the fix, construction aliased both params to one storage, so
+        ``load_state_dict`` wrote both checkpoint tensors into the same memory
+        (last writer wins) — corrupting embeddings and/or head on resume.
+        """
+        from nemo_automodel._transformers.model_init import _tie_weights_nemo
+
+        source = self._make_model(tie=False)
+        with torch.no_grad():
+            source.model.embed_tokens.weight.uniform_(-1.0, 1.0)
+            source.lm_head.weight.uniform_(-1.0, 1.0)
+        checkpoint = {k: v.detach().clone() for k, v in source.state_dict().items()}
+
+        resumed = self._make_model(tie=False)
+        _tie_weights_nemo(resumed)  # runs at the end of _init_model, before checkpoint load
+        resumed.load_state_dict(checkpoint)
+
+        torch.testing.assert_close(resumed.lm_head.weight, checkpoint["lm_head.weight"])
+        torch.testing.assert_close(resumed.model.embed_tokens.weight, checkpoint["model.embed_tokens.weight"])
+        assert resumed.lm_head.weight.data_ptr() != resumed.model.embed_tokens.weight.data_ptr()

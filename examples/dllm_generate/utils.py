@@ -141,8 +141,8 @@ def load_model_and_tokenizer(checkpoint_path: str, sampler_name: str = "llada"):
 
     Args:
         checkpoint_path: Path to the HF-format checkpoint directory.
-        sampler_name: ``"llada"`` or ``"nemotron"``. Adjusts tokenizer setup and
-            model construction kwargs for the chosen family.
+        sampler_name: ``"llada"``, ``"llada2"``, or ``"nemotron"``. Adjusts
+            tokenizer setup and model construction kwargs for the chosen family.
 
     Returns:
         ``(model, tokenizer, mask_id, eos_id)``.

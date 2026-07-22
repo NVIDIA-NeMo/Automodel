@@ -58,9 +58,10 @@ After training, we serve the target + drafter together via
 | Production | Llama 3.1 8B Instruct | 8x A100 80 GB | ~2 h (1 epoch, 200k samples) |
 
 <Note>
-The target model is loaded in full precision and frozen during training. Only the
-small drafter model (a few transformer layers) has trainable parameters, so GPU
-memory is dominated by the target model size.
+On CUDA, the target model is loaded in BF16 and frozen during training (the CPU
+fallback uses FP32). Only the small drafter is trained; standard EAGLE-3 uses one
+fused decoder layer plus an auxiliary projection. GPU memory is therefore
+dominated by the target model size.
 </Note>
 
 ---
@@ -89,6 +90,18 @@ For SGLang serving (Step 5), install it in the same environment:
 uv pip install "sglang>=0.5.9"
 ```
 
+<Note>
+**SGLang / transformers version compatibility.** SGLang `0.5.9` pins
+`transformers==4.57.1`. The SGLang target backend (`target_model_backend: sglang`)
+and `serve_sglang` run in that environment without issue. The `--compare-hf`
+check in `smoke_sglang_target.py` additionally builds the HuggingFace target
+through `NeMoAutoModelForCausalLM`, which imports `AutoModelForMultimodalLM`
+(available only in `transformers` 5.x), so that single-process comparison cannot
+run as written under `transformers==4.57.1`. To compare the two backends, use a
+`transformers` build that satisfies both, or load the HuggingFace side with plain
+`transformers.AutoModelForCausalLM` wrapped in `HFEagle3TargetModel`.
+</Note>
+
 ---
 
 ## Step 1 — Understand EAGLE Architecture
@@ -102,7 +115,7 @@ next, using a technique called **test-time training (TTT) unroll**:
 ```text
 Target (frozen)          Drafter (trainable)
 ┌──────────────┐         ┌──────────────┐
-│ Llama 3.1 8B │ ──────> │  2-layer     │
+│ Llama 3.1 8B │ ──────> │  1-layer     │
 │              │ hidden  │  transformer │
 │ Full model   │ states  │  + fc fusion │
 │ (frozen)     │         │  + lm_head   │
@@ -116,13 +129,42 @@ Key components:
 
 - **Target model**: The full LLM (e.g., Llama 3.1 8B), completely frozen. Provides
   hidden states from selected intermediate layers as auxiliary inputs to the drafter.
-- **Draft model**: A shallow transformer (typically 2 layers) with:
+- **Draft model**: A shallow transformer (a single fused decoder layer) with:
   - A **fusion layer** (`fc`) that combines auxiliary hidden states from 3 target layers
   - Its own attention layers, MLP, and layer norm
   - A smaller **output vocabulary** (e.g., 8192 or 32000 tokens instead of 128k) to reduce compute
-- **TTT unroll**: The drafter runs multiple autoregressive steps (default 4) during
-  training, with exponentially decaying loss weights (`0.8^i`). This teaches the
-  drafter to make multi-step predictions — exactly what speculative decoding needs.
+- **TTT unroll**: The drafter runs the configured number of autoregressive steps
+  during training; the maintained Llama examples use 4. Loss weights decay as
+  `0.8^i`, teaching the drafter to make multi-step predictions — exactly what
+  speculative decoding needs.
+
+### Supported Target Architectures
+
+The target is resolved from its HF `config.architectures` string through the
+registry in `components/speculative/eagle/registry.py`. Most dense and MoE
+decoders reuse the config-driven Llama-style draft (a one-line registry entry);
+architectures whose RoPE or attention layout the shared draft cannot represent
+get a thin dedicated draft class.
+
+| Target | Draft |
+|--------|-------|
+| Llama, Phi-3, Qwen3 dense, Qwen3-MoE | shared Llama-style dense draft |
+| gpt-oss (`GptOssForCausalLM`) | dedicated draft reproducing gpt-oss YaRN RoPE |
+| DeepSeek-V3 (`DeepseekV3ForCausalLM`) | dedicated MLA draft |
+| Gemma4 (`Gemma4ForConditionalGeneration`) | thin dedicated draft (see below) |
+
+**Gemma4.** Gemma4 ships as a multimodal `Gemma4ForConditionalGeneration` whose
+text decoder config is nested under `config.text_config`; the draft is built
+from that inner config automatically. Set `target_force_hf: true` so the stock
+HuggingFace text-capable model is loaded (the draft hooks the decoder under
+`model.language_model.layers`). The draft consumes only post-block hidden states,
+so it is the same Llama-style dense draft used elsewhere, with two Gemma quirks
+reconciled: the `hidden_activation` (GeGLU) key and Gemma4's nested
+per-attention-type `rope_parameters`, which is flattened to a standard
+full-rotary Llama RoPE on the global (full-attention) base. The saved checkpoint
+keeps the canonical `architectures: ["LlamaEagle3DraftModel"]` layout, so SGLang
+and vLLM serve it with their existing EAGLE-3 Llama head. See
+`examples/speculative/eagle3/gemma4_e2b_eagle3.yaml`.
 
 ### EAGLE-3.1 Drafter Toggles
 
@@ -156,7 +198,7 @@ recipe_args:
 ### How EAGLE-1 Differs
 
 EAGLE-1 is simpler: it uses a single transformer layer, predicts the full
-vocabulary, and trains with a combined loss of MSE on hidden states
+vocabulary, and trains with a combined loss of SmoothL1 (Huber) on hidden states
 (`hidden_loss_weight`) and cross-entropy on tokens (`token_loss_weight`).
 No TTT unroll, no vocabulary mapping.
 
@@ -166,8 +208,9 @@ No TTT unroll, no vocabulary mapping.
 
 ### Data format
 
-EAGLE training expects chat data in the **OpenAI messages format** — either
-JSONL files or HuggingFace datasets with a `messages` column:
+EAGLE training accepts chat data in the **OpenAI messages format**—either JSONL
+files or HuggingFace datasets with a `messages` column—and automatically
+converts supported ShareGPT-style `conversations` rows to that format:
 
 ```json
 {"messages": [
@@ -211,26 +254,12 @@ Sample conversation:
 1. **P...
 ```
 
-<Warning>
-PerfectBlend uses a `conversations` column, but `ChatDataset` expects `messages`.
-Rename the column before training:
-
-```bash
-python -c "
-import pandas as pd
-from pathlib import Path
-src = Path('<download_dir>')
-dst = Path('./data/perfectblend_renamed')
-dst.mkdir(parents=True, exist_ok=True)
-for f in sorted(src.glob('train-*.parquet')):
-    df = pd.read_parquet(f)
-    df = df.rename(columns={'conversations': 'messages'})
-    df.to_parquet(dst / f.name, index=False)
-print('Done. Point train_data_path at:', dst)
-"
-```
-
-</Warning>
+<Note>
+`ChatDataset` automatically converts supported ShareGPT-style rows from the
+`conversations` column to OpenAI-style `messages`, including PerfectBlend's
+`role`/`content` records. A manual conversion is only needed for a dataset with
+unsupported role names or a different conversation schema.
+</Note>
 
 ### Option B: Regenerate answers from your target model
 
@@ -298,7 +327,7 @@ recipe_args:
   target_model_name_or_path: meta-llama/Llama-3.1-8B-Instruct
 
   # Point to your training data (HF dataset id, local parquet dir, or JSONL)
-  train_data_path: ./data/perfectblend_renamed
+  train_data_path: frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct
   val_data_path: null
 
   # Slice to 200k samples for a ~2h training run
@@ -350,7 +379,7 @@ checkpoint:
 | `seq_length` | Context window length (1024 for quick tests, 2048 for production) |
 | `micro_batch_size` | Per-GPU batch size |
 | `grad_accumulation_steps` | Gradient accumulation for larger effective batches |
-| `ttt_steps` | TTT unroll depth; 4 is the default, cost is linear per step |
+| `ttt_steps` | Required TTT unroll depth; maintained Llama examples use 4, and cost is linear per step |
 | `draft_vocab_size` | Draft output vocabulary size; smaller = faster inference |
 | `freeze_embeddings` | Freeze the embedding table copied from the target so only draft layers train (recommended `true`) |
 | `target_attn_implementation` | Optional attention backend for the frozen target (e.g. `sdpa`); defaults to HF auto-select. Set `sdpa` if the target's FlashAttention path is broken on your build (e.g. the Qwen3 FA2 `s_aux` crash) |
@@ -365,7 +394,7 @@ checkpoint:
 ```bash
 torchrun --nproc-per-node=8 \
     -m nemo_automodel.recipes.llm.train_eagle3 \
-    eagle3_llama8b.yaml
+    -c eagle3_llama8b.yaml
 ```
 
 **Single-GPU (quick test with Llama 3.2 1B):**
@@ -374,7 +403,7 @@ For a quick test, use the MVP config with Llama 3.2 1B and a small dataset:
 
 ```bash
 python -m nemo_automodel.recipes.llm.train_eagle3 \
-    examples/speculative/eagle3/llama_eagle3_mvp.yaml
+    -c examples/speculative/eagle3/llama_eagle3_mvp.yaml
 ```
 
 <Tip>
@@ -390,40 +419,36 @@ for a complete example.
 
 ### What to watch
 
-Training loss should drop steadily. Here is a sample log from the PerfectBlend
-200k run on 8x A100:
+At each logging interval, the recipe emits `epoch`, `step`, `train_loss`,
+`train_acc`, an optional `train_tau_sim`, and `lr`. The values below illustrate
+the log format:
 
 ```
-[epoch 0] step   20 | loss 3.4521 | grad_norm  12.84 | lr 8.00e-05 | tokens/s 2841
-[epoch 0] step   40 | loss 2.8973 | grad_norm   8.31 | lr 1.60e-04 | tokens/s 3102
-[epoch 0] step  100 | loss 2.1245 | grad_norm   5.62 | lr 2.00e-04 | tokens/s 3254
-[epoch 0] step  500 | loss 1.5832 | grad_norm   3.17 | lr 1.98e-04 | tokens/s 3198
-[epoch 0] step 1000 | loss 1.3401 | grad_norm   2.45 | lr 1.92e-04 | tokens/s 3221
-[epoch 0] step 3000 | loss 1.1056 | grad_norm   1.89 | lr 1.58e-04 | tokens/s 3245
-[epoch 0] step 6000 | loss 0.9823 | grad_norm   1.52 | lr 0.42e-04 | tokens/s 3230
+epoch=0 step=20 train_loss=3.452100 train_acc=0.214500 train_tau_sim=0.3812 lr=8.000e-05
+epoch=0 step=40 train_loss=2.897300 train_acc=0.267100 train_tau_sim=0.4198 lr=1.600e-04
 ```
 
 ### Checkpoint layout
 
-Each checkpoint is saved under `<checkpoint_dir>/epoch_<E>_step_<S>/`:
+The shown 200k-sample, 8-GPU config does not enable step or epoch checkpoint
+cadence, so it saves only the final checkpoint after 6250 optimizer steps:
 
 ```
 outputs/eagle3_llama8b/checkpoints/
-  epoch_0_step_1000/
-    config.json              # draft model config
-    draft_model.pt           # draft model weights
-    eagle3_meta.pt           # token mapping (selected_token_ids + mask)
-    optimizer.pt             # Adam state (for resume)
-    scheduler.pt             # LR scheduler state
+  epoch_1_step_6250/
+    model/                   # HF-style draft artifacts
+    eagle_meta.pt            # EAGLE metadata and token mapping
+    optim/                   # optimizer and scheduler state
     rng/                     # distributed RNG state
-  epoch_0_step_2000/
-    ...
-  LATEST -> epoch_0_step_6250
+    config.yaml              # training config snapshot
+  LATEST -> epoch_1_step_6250
 ```
 
 ### Resume from checkpoint
 
-If training is interrupted, resume from the latest checkpoint:
+To create intermediate checkpoints that can recover an interrupted run, first
+set a cadence in `recipe_args`, for example `ckpt_every_steps: 1000`. Then resume
+from the latest checkpoint:
 
 ```yaml
 checkpoint:
@@ -441,8 +466,9 @@ checkpoint:
 
 ## Step 5 — Serve with SGLang
 
-The `serve_sglang` helper converts the training checkpoint into an
-HF/SGLang-compatible format and launches the server in one command.
+The `serve_sglang` helper resolves the current HF-style training checkpoint and
+launches the server in one command. It also converts older bare-weight
+checkpoints as a compatibility fallback.
 
 ### Launch the server
 
@@ -457,22 +483,26 @@ python -m nemo_automodel.components.speculative.serve_sglang \
     --port 30000
 ```
 
-On first launch, the helper:
+For a current checkpoint, the helper:
 
-1. Loads `draft_model.pt` and `eagle3_meta.pt` from the checkpoint
-2. Rewrites the architecture name for SGLang compatibility (`LlamaEagle3DraftModel` -> `LlamaForCausalLMEagle3`)
-3. Exports `model.safetensors` and `speculative_token_map.pt` into a `model/` subdirectory
+1. Resolves the checkpoint's HF-style `model/` directory directly
+2. Rewrites the architecture name for SGLang compatibility when needed (`LlamaEagle3DraftModel` -> `LlamaForCausalLMEagle3`)
+3. Uses an existing `model/speculative_token_map.pt`, or generates it from the sibling `eagle_meta.pt` for EAGLE-3
 4. Launches SGLang with the correct speculative decoding flags
+
+For a legacy checkpoint containing `draft_model.pt` and `config.json`, the helper
+exports the weights and rewritten config into `model/`. For EAGLE-3, it uses the
+legacy `eagle3_meta.pt` when present to generate `model/speculative_token_map.pt`.
 
 ### Serving parameters
 
 | Flag | Default | Notes |
 |------|---------|-------|
-| `--algorithm` | — | `EAGLE3` for EAGLE-3 drafters, `EAGLE` for EAGLE-1/2 |
+| `--algorithm` | `EAGLE3` | `EAGLE3` for EAGLE-3 drafters, `EAGLE` for EAGLE-1/2 |
 | `--num-steps` | 3 | Speculative steps per draft iteration |
 | `--topk` | 1 | Branching factor for tree search |
 | `--num-draft-tokens` | 4 | Budget of draft tokens per branch |
-| `--dtype` | auto | Must match training dtype (e.g., `bfloat16`) |
+| `--dtype` | `bfloat16` | Must match training dtype |
 | `--tp-size` | 1 | Tensor parallelism (shards the target model only) |
 | `--print-only` | — | Inspect the resolved command without launching |
 
@@ -555,7 +585,7 @@ Expected output:
 
 EAGLE-1 is simpler and faster to train, making it a good starting point for
 experimentation. It uses a single transformer layer and trains with a combined
-hidden-state MSE + token cross-entropy loss.
+hidden-state SmoothL1 (Huber) + token cross-entropy loss.
 
 ### YAML config
 
@@ -570,7 +600,7 @@ dist_env:
 
 recipe_args:
   target_model_name_or_path: meta-llama/Llama-3.1-8B-Instruct
-  train_data_path: ./data/perfectblend_renamed
+  train_data_path: frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct
   val_data_path: null
   train_split: "train[:200000]"
   val_split: null
@@ -583,7 +613,7 @@ recipe_args:
 
   # EAGLE-1 specific
   draft_num_hidden_layers: 1    # number of draft transformer layers
-  hidden_loss_weight: 1.0       # MSE loss on hidden states
+  hidden_loss_weight: 1.0       # SmoothL1 (Huber) loss on hidden states
   token_loss_weight: 0.1        # cross-entropy loss on tokens
 
   freeze_embeddings: true
@@ -609,7 +639,7 @@ checkpoint:
 ```bash
 torchrun --nproc-per-node=8 \
     -m nemo_automodel.recipes.llm.train_eagle1 \
-    eagle1_llama8b.yaml
+    -c eagle1_llama8b.yaml
 ```
 
 ### Serve
@@ -629,8 +659,8 @@ python -m nemo_automodel.components.speculative.serve_sglang \
 
 | | EAGLE-1 | EAGLE-3 |
 |---|---------|---------|
-| **Draft layers** | 1 (configurable) | 2 (with aux fusion) |
-| **Training objective** | Hidden MSE + token CE | TTT unroll with decay |
+| **Draft layers** | 1 (configurable) | 1 fused decoder layer + auxiliary `fc` projection |
+| **Training objective** | Hidden SmoothL1 (Huber) + token CE | TTT unroll with decay |
 | **Vocabulary** | Full target vocab | Reduced (e.g., 8k-32k) |
 | **Training speed** | Faster | Slower (due to TTT unroll) |
 | **Inference speedup** | Good (2-2.5x) | Better (2.5-3x) |
@@ -646,8 +676,8 @@ python -m nemo_automodel.components.speculative.serve_sglang \
 | [llama_eagle3_mvp_flash_attn.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle3/llama_eagle3_mvp_flash_attn.yaml) | Llama 3.2 1B | EAGLE-3 | With FlashAttention-2 |
 | [llama_eagle3_perfectblend.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle3/llama_eagle3_perfectblend.yaml) | Llama 3.1 8B | EAGLE-3 | Production config, 200k samples |
 | [llama_eagle3_1_perfectblend.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle3_1/llama_eagle3_1_perfectblend.yaml) | Llama 3.1 8B | EAGLE-3.1 | Production config with `fc_norm` + `norm_output` enabled |
-| [llama_eagle1_mvp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle1/llama_eagle1_mvp.yaml) | Llama 3.2 1B | EAGLE-1 | Quick test, single GPU |
-| [llama_eagle2_mvp.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle2/llama_eagle2_mvp.yaml) | Llama 3.2 1B | EAGLE-2 | Same as EAGLE-1 (alias) |
+| [llama_eagle1_perfectblend.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle1/llama_eagle1_perfectblend.yaml) | Llama 3.2 1B | EAGLE-1 | Quick test, single GPU |
+| [llama_eagle2_perfectblend.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/speculative/eagle2/llama_eagle2_perfectblend.yaml) | Llama 3.2 1B | EAGLE-2 | Same as EAGLE-1 (alias) |
 
 ## Troubleshooting
 
@@ -657,6 +687,6 @@ python -m nemo_automodel.components.speculative.serve_sglang \
 | Loss stays flat or NaN | Check `max_grad_norm` (default 1.0), reduce `lr` |
 | SGLang `model not found` error | Ensure `--algorithm` matches the recipe (`EAGLE3` for train_eagle3, `EAGLE` for train_eagle1/2) |
 | `dtype mismatch` at serving | Pass `--dtype bfloat16` to match training precision |
-| `conversations` vs `messages` column error | Rename the column in your dataset (see Step 2 warning) |
-| Checkpoint resume fails | Use `restore_from: LATEST` or the exact subdirectory name like `epoch_0_step_1000` |
+| `conversations` vs `messages` conversion error | Check that each turn uses a supported ShareGPT role and either `role`/`content` or `from`/`value`; `ChatDataset` converts supported rows automatically |
+| Checkpoint resume fails | Use `restore_from: LATEST` or an existing exact subdirectory name such as `epoch_1_step_6250` |
 | Low `accept_length_per_step` at serving | Train longer, use more data, or try regenerating answers with the target model (Option B in Step 2) |

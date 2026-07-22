@@ -49,8 +49,7 @@ def _normalize_activation_checkpointing(value: Any) -> bool | str:
     """Normalize YAML activation checkpointing values.
 
     ``True`` keeps the existing full checkpointing behavior. ``"selective"``
-    enables PyTorch selective activation checkpointing for supported FSDP2
-    paths.
+    enables PyTorch selective activation checkpointing for supported paths.
     """
     if value is None:
         return False
@@ -157,8 +156,8 @@ def parse_distributed_section(cfg_dict: dict) -> dict:
             strategy_kwargs["autocast_dtype"] = dtype_from_str(val)
 
     ep_size: int = parallelism.get("ep_size") or 1
-    if activation_checkpointing == "selective" and strategy_name != "fsdp2":
-        raise ValueError("selective activation checkpointing is supported only for FSDP2 configs.")
+    if activation_checkpointing == "selective" and strategy_name not in {"fsdp2", "ddp"}:
+        raise ValueError("selective activation checkpointing is supported only for FSDP2 and DDP configs.")
 
     # `distributed.pipeline` and `pp_size` are validated asymmetrically:
     #   * pipeline block with pp_size<=1 -> WARN (inert; block ignored). This is
@@ -285,6 +284,7 @@ def create_distributed_setup_from_config(
     world_size: Optional[int] = None,
     *,
     timeout_minutes: int | None = None,
+    ranks: list[int] | tuple[int, ...] | None = None,
     strategy: str | None = None,
     dp_size: int | None = None,
     dp_replicate_size: int | None = None,
@@ -315,6 +315,7 @@ def create_distributed_setup_from_config(
         timeout_minutes: Optional timeout for process groups created by
             ``DeviceMesh`` axes. If omitted and ``cfg`` is a top-level recipe
             config, ``dist_env.timeout_minutes`` is used.
+        ranks: Optional ordered global ranks used by this setup's device mesh.
         strategy: Distributed strategy name (``fsdp2``, ``megatron_fsdp``,
             ``megatron-fsdp``, ``mfsdp``, or ``ddp``).
         dp_size: Data-parallel size. If ``None``, inferred by mesh creation.
@@ -365,6 +366,7 @@ def create_distributed_setup_from_config(
         activation_checkpointing=parsed["activation_checkpointing"],
         world_size=world_size,
         timeout_minutes=mesh_timeout_minutes,
+        ranks=ranks,
     )
 
 

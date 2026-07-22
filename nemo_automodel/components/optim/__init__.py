@@ -26,6 +26,7 @@ from .optimizer import (
     NorMuonConfig,
     OptimizerConfig,
     OptimizerFromFactoryConfig,
+    ParamGroupOverride,
     build_optimizer,
     build_optimizer_config,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "NorMuonConfig",
     "OptimizerConfig",
     "OptimizerFromFactoryConfig",
+    "ParamGroupOverride",
     "OptimizerParamScheduler",
     "build_optimizer",
     "build_optimizer_config",

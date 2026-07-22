@@ -15,6 +15,7 @@ metadata:
 ## Purpose
 
 This skill guides implementation of new model architectures in NeMo AutoModel. Follow the five phases in order.
+<!-- NVSkills signature refresh requested for AM-519. -->
 
 ## Instructions
 
@@ -103,7 +104,7 @@ Download the model's `config.json` from the HuggingFace Hub (or use `AutoConfig.
 - `model_type` -- used for custom config registration in `_CUSTOM_CONFIG_REGISTRATIONS` if HF does not have a built-in config class
 - `hidden_size`, `intermediate_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads` -- sizing
 - `vocab_size` -- needed for tiny test configs
-- `tie_word_embeddings` -- whether lm_head shares weights with embed_tokens
+- `tie_word_embeddings` -- the saved setting in each supported checkpoint; do not infer it from a bare config constructor
 - `hidden_act` -- activation function (e.g., `"silu"` for SwiGLU)
 
 ### 1.2 Determine model type
@@ -190,14 +191,51 @@ See the pattern files for detailed implementation guidance:
 - Dense LLM: [llm-patterns.md](./llm-patterns.md)
 - MoE: [moe-patterns.md](./moe-patterns.md)
 - VLM: [vlm-patterns.md](./vlm-patterns.md)
+- Capabilities and fp32 precision: [capabilities-and-precision.md](./capabilities-and-precision.md)
 
 ### 2.3 Causal LM weight tying
 
-For any CausalLM-style class whose config can enable `tie_word_embeddings`,
-make tying explicit: declare `_tied_weights_keys`, implement `tie_weights()`
-with the actual `lm_head` and input-embedding FQNs, and add tiny tests for
-tied and untied configs. Do not tie architectures with intentionally separate
-heads, asymmetric vocab sizes, or stages that do not own both tensors.
+Every registered model class with a causal `lm_head` must:
+
+- Declare `tie_word_embeddings_support: TieSupport` as `BOTH`, `TIED_ONLY`, or
+  `UNTIED_ONLY`.
+- Call `reject_unsupported_tie_word_embeddings(type(self), config)` at the top
+  of `__init__`, using the original config before unwrapping `text_config` or
+  `thinker_config`.
+
+Only classes with no causal LM head may be explicitly exempted from the registry
+test.
+
+Choose the policy from the implementation and the actual supported checkpoint
+configs, not from a bare config constructor:
+
+- `BOTH`: tied and untied configurations are both supported.
+- `TIED_ONLY`: only a tied configuration is supported.
+- `UNTIED_ONLY`: only an untied configuration is supported.
+
+Runtime helpers must treat `TIED_ONLY` and `UNTIED_ONLY` as authoritative and
+only resolve a per-checkpoint config flag for `BOTH`. All current `BOTH` VLMs
+honor the outer `tie_word_embeddings` flag, so do not add a model-specific
+resolver until a supported `BOTH` model actually requires another config path.
+
+For `BOTH` and `TIED_ONLY`, always declare `_tied_weights_keys` and implement
+`tie_weights()` with the actual `lm_head` and input-embedding FQNs. Do not rely
+on inherited Hugging Face tying, and re-tie after any language-model swap.
+
+Add policy-specific tests:
+
+- `BOTH`: tied aliases; untied does not alias.
+- `TIED_ONLY`: tied aliases; untied is rejected.
+- `UNTIED_ONLY`: weights stay separate; tied is rejected.
+
+Do not tie architectures with intentionally separate heads, asymmetric vocab
+sizes, or stages that do not own both tensors.
+
+For `from_pretrained`, the checkpoint's saved `tie_word_embeddings` value is
+authoritative, even for `BOTH`. The `NeMoAuto*` bridge rejects flips in either
+direction. A model-owned `from_pretrained` that bypasses that bridge must call
+`reject_tie_word_embeddings_flip(checkpoint_config, requested_config,
+model_class_name)`.
 
 ### 2.4 MoE state-dict adapter checklist
 
@@ -257,149 +295,18 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 }
 ```
 
-### 2.7 Declare model capabilities (mandatory)
+### 2.7 Declare capabilities and precision-sensitive params
 
-Every class registered in `MODEL_ARCH_MAPPING` must declare its parallelism
-capabilities. Pick exactly one of the two patterns below — never both, never
-neither. CI enforces this via
-`tests/unit_tests/_transformers/test_model_capabilities.py`, so a new arch
-that omits this declaration will fail the L0 unit-test job.
+Every class registered in `MODEL_ARCH_MAPPING` must declare parallelism
+capabilities, either with a static nested `ModelCapabilities` dataclass or a
+variant-aware `get_capabilities(cls, config)` method. Pick exactly one pattern.
+Capabilities should reflect recipe YAMLs that have been validated end to end.
 
-The canonical `ModelCapabilities` dataclass (four bool fields: `supports_tp`,
-`supports_cp`, `supports_pp`, `supports_ep`) is re-exported at the package
-top level as `nemo_automodel.ModelCapabilities`.
-
-**Convention: declare what is verified by a recipe YAML.** A flag is `True`
-only when at least one `examples/*/*.yaml` for this class sets that
-parallelism axis > 1 (e.g. `pp_size: 4` proves PP). Otherwise leave it
-`False`. The flag is *not* "this code path is plumbed" — it is "this config
-has been validated end-to-end".
-
-#### Pattern A — static `ModelCapabilities` (one class, one capability profile)
-
-Use when the model has no variants or every model that maps to this class shares the same
-parallelism story. Most classes (Llama, Qwen2, GptOss, ...) use this
-pattern. Define a frozen nested dataclass:
-
-```python
-from dataclasses import dataclass
-
-class NewModelForCausalLM(HFCheckpointingMixin, nn.Module):
-    @dataclass(frozen=True)
-    class ModelCapabilities:
-        """Declared parallelism capabilities for this model class."""
-
-        supports_tp: bool = False
-        supports_cp: bool = False
-        supports_pp: bool = False
-        supports_ep: bool = False
-```
-
-#### Pattern B — `get_capabilities(cls, config)` (one class, multiple variants)
-
-Use when the same registered class serves checkpoints/models with *different*
-capability profiles (typical for "family" classes that handle both dense and
-MoE checkpoints, or different model sizes). Do **not** also define a nested
-`ModelCapabilities` dataclass — that placeholder would lie about variants
-the dispatch covers, and CI rejects classes that declare both patterns.
-
-Return the canonical `ModelCapabilities` and branch on a config field that
-cleanly distinguishes the variants:
-
-```python
-from nemo_automodel import ModelCapabilities
-
-
-class Ernie4_5_MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    @classmethod
-    def get_capabilities(cls, config) -> ModelCapabilities:
-        """Return parallelism capabilities for a specific ERNIE-4.5 config.
-
-        Two checkpoint variants share this class:
-          1. baidu/ERNIE-4.5-21B-A3B-PT -- MoE variant (moe_num_experts > 0).
-             Demonstrated by examples/llm_finetune/ernie4_5/ernie4_5_21b_a3b_hellaswag.yaml
-             (ep_size=8).
-          2. baidu/ERNIE-4.5-0.3B-PT -- dense variant. No expert config.
-             Demonstrated by examples/llm_finetune/ernie4_5/ernie4_5_0p3b_hellaswag.yaml
-             (tp/cp/pp/ep all 1).
-        """
-        if getattr(config, "moe_num_experts", 0) > 0:
-            return ModelCapabilities(supports_ep=True)
-        return ModelCapabilities()
-```
-
-The dispatch field must be stable and present on every HF config the class
-sees. Good signals: a model-specific MoE/expert count, a known boolean flag
-(e.g. `enable_moe_block`), or `num_hidden_layers` when variants are far
-apart in depth (Ling-1T ≈80 vs Ling-mini-2.0 ≈20). Avoid heuristics that
-silently miss-classify a new checkpoint.
-
-#### Querying capabilities downstream
-
-The public API auto-dispatches between the two patterns:
-
-```python
-from nemo_automodel import query_capabilities
-
-caps = query_capabilities("baidu/ERNIE-4.5-21B-A3B-PT")
-# -> ModelCapabilities(supports_tp=False, supports_cp=False, supports_pp=False, supports_ep=True)
-```
-
-`query_capabilities` accepts an HF model id, a `PretrainedConfig`, a model
-instance, or the registered class itself. Variant-dispatched classes refuse
-the bare-class form because they need a config to make the decision.
-### 2.7 Keep intrinsically-fp32 params in fp32 compute
-
-Some parameters are numerically unstable in low precision and must be **computed** in fp32
-even when the rest of the model computes in bf16 — e.g. SSM/Mamba `A_log` / `dt_bias`,
-plus `D` for Mamba variants whose reference checkpoints keep it fp32; MoE sigmoid-gate
-bias (`e_score_correction_bias`); attention-sink bias; per-head `scale`.
-If your model has any such params, declare them in `_keep_in_fp32_modules_strict` as
-parameter-name substrings; sharding (`fully_shard_by_dtype`) reads this list and gives those
-params an fp32 compute dtype while everything else uses `mp_policy.param_dtype` (bf16). A
-plain dense LLM with no precision-sensitive params needs nothing here.
-
-Where to declare it:
-
-- **NeMo-native model class** (you own `model.py`): a class attribute, e.g.
-  `_keep_in_fp32_modules_strict = ["e_score_correction_bias"]` (see `deepseek_v4`, `ling_v2`).
-- **Trainable fp32 params inside mixed modules**: do not leave them as bare parameters on a
-  module that also owns bf16 bulk weights. A strict marker identifies the compute dtype, but it
-  does not create an FSDP-isolatable subtree. Move the params into a small `_fp32_params` holder,
-  call the holder in `forward` so FSDP hooks run, return a full tensor from the holder when FSDP
-  exposes the parameter as a `DTensor`, keep the holder out of broad dtype casts with
-  `cast_model_to_dtype(..., skip_modules=("_fp32_params",))`, and make the state-dict adapter
-  strip/route holder keys plus upcast loaded tensors to fp32.
-- **HF-derived models with fp32 runtime params**: build the fp32 structure in the model or layer
-  constructor; do not use a runtime monkeypatch, and do not infer the contract globally from a
-  module path such as `linear_attn` or from an `A_log` parameter name alone.
-
-Always declare the pin for these params. A normal checkpoint load also auto-records each
-param's original HF dtype and uses it as a fallback, but that recording is skipped on the
-quantized, from-scratch, and odd-checkpoint paths — so the explicit pin is the only signal
-that holds across every path.
-
-**Frozen submodules** (e.g. a frozen vision tower in a VLM) are a dtype-mismatch hazard under
-the fp32-master pattern: a frozen part that stays fp32 feeds bf16 trainable modules and trips
-a matmul at the seam. There are two distinct fp32 sources, and both are handled automatically
-(after materialization, checkpoint load, and sharding) by casting each maximal fully-frozen
-submodule toward `mp_policy.param_dtype` (bf16):
-
-- **Parameters** — a frozen submodule *excluded* from FSDP keeps fp32 (plain tensors) and is
-  cast; a frozen submodule that *is* sharded holds DTensor params, which are left to FSDP's
-  all-gather cast (re-casting sharded storage in place would desync FSDP bookkeeping).
-- **Buffers** — FSDP never casts buffers, so a frozen module's fp32 buffers (e.g.
-  standardization constants) would promote bf16 activations back to fp32 via type promotion.
-  Buffers are always plain tensors, so they are cast unconditionally — including inside sharded
-  frozen towers whose params FSDP already handles.
-
-This is safe because frozen modules are never updated. If a *frozen* part is also numerically
-sensitive and must compute in fp32, list it in `_keep_in_fp32_modules_strict` — the cast honors
-those keywords and leaves matching params and buffers in fp32.
-
-A model whose vision path forces fp32 *inside* a forward op that isn't a parameter or buffer
-(e.g. HF Gemma4's `get_image_features` feeding an fp32 activation into a bf16 projector) needs
-a per-model activation cast at that seam, since no parameter/buffer cast can reach it.
+If the model has precision-sensitive parameters such as Mamba `A_log` /
+`dt_bias`, MoE sigmoid gate bias, attention-sink bias, or per-head `scale`,
+declare `_keep_in_fp32_modules_strict` so sharding keeps those params in fp32
+compute. See [capabilities-and-precision.md](./capabilities-and-precision.md)
+for examples, variant dispatch rules, and frozen-submodule dtype guidance.
 
 ---
 
@@ -524,6 +431,9 @@ that only surface in a full parity comparison.
 - [ ] Registered in `MODEL_ARCH_MAPPING` in `_transformers/registry.py`
 - [ ] Registered custom config in `_CUSTOM_CONFIG_REGISTRATIONS` (if applicable)
 - [ ] Declared `ModelCapabilities` nested dataclass (static) OR `get_capabilities(cls, config)` classmethod (variant dispatch, e.g. ERNIE-4.5 MoE vs dense) — never both, never neither
+- [ ] Declared `TieSupport` and called the constructor guard for every class with a causal `lm_head` (or added an explicit no-head exemption) -- see §2.3
+- [ ] Added explicit `_tied_weights_keys` and `tie_weights()` for `BOTH` / `TIED_ONLY`, plus policy-specific alias and rejection tests -- see §2.3
+- [ ] Guarded any model-owned `from_pretrained` that bypasses the `NeMoAuto*` bridge against checkpoint flips -- see §2.3
 - [ ] Created example YAML config
 - [ ] Verified model loads via `NeMoAutoModelForCausalLM.from_pretrained()`
 - [ ] Created unit tests (forward shape, state_dict round-trip)

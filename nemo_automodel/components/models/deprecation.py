@@ -1,0 +1,67 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Deprecation warnings for custom model classes scheduled for removal."""
+
+from __future__ import annotations
+
+import warnings
+
+_DEPRECATED_MODEL_YAMLS: dict[str, tuple[str, ...]] = {
+    "BaichuanForCausalLM": (
+        "examples/llm_finetune/baichuan/baichuan_2_7b_mock_fp8.yaml",
+        "examples/llm_finetune/baichuan/baichuan_2_7b_squad_peft.yaml",
+        "examples/llm_finetune/baichuan/baichuan_2_7b_squad.yaml",
+    ),
+    "Qwen2ForCausalLM": (
+        "examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark.yaml",
+        "examples/llm_benchmark/qwen/custom_qwen2_5_32b_peft_benchmark_2nodes.yaml",
+        "examples/llm_benchmark/qwen/qwen2_5_7b_peft_benchmark.yaml",
+        "examples/llm_finetune/agent/qwen2_5_3b_function_calling.yaml",
+        "examples/llm_finetune/agent/qwen2_5_3b_function_calling_lora.yaml",
+        "examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml",
+        "examples/llm_finetune/qwen/qwen2_5_32b_peft_benchmark.yaml",
+        "examples/llm_finetune/qwen/qwen2_5_7b_hellaswag_fp8.yaml",
+        "examples/llm_finetune/qwen/qwen2_5_7b_instruct_chat.yaml",
+        "examples/llm_finetune/qwen/qwen2_5_7b_squad.yaml",
+        "examples/llm_finetune/qwen/qwen2_5_7b_squad_muon.yaml",
+        "examples/llm_finetune/qwen/qwen2_5_7b_squad_peft.yaml",
+        "examples/llm_finetune/qwen/qwen25_magi_prefix_tree_rollouts.yaml",
+        "examples/llm_finetune/seed/seed_coder_8b_instruct_hellaswag_fp8.yaml",
+        "examples/llm_finetune/seed/seed_coder_8b_instruct_squad.yaml",
+        "examples/llm_finetune/seed/seed_coder_8b_instruct_squad_peft.yaml",
+        "examples/llm_finetune/seed/seed_oss_36B_hellaswag.yaml",
+        "examples/llm_finetune/seed/seed_oss_36B_hellaswag_peft.yaml",
+    ),
+    "KimiVLForConditionalGeneration": ("examples/vlm_finetune/kimi/kimi2vl_cordv2.yaml",),
+}
+
+
+def warn_deprecated_model_class(model_cls_name: str) -> None:
+    """Emit a deprecation warning for custom model classes removed in 26.10.
+
+    Args:
+        model_cls_name: Name of the model class being instantiated.
+    """
+    yaml_paths = _DEPRECATED_MODEL_YAMLS.get(model_cls_name)
+    if yaml_paths is None:
+        return
+
+    yaml_list = ", ".join(yaml_paths)
+    warnings.warn(
+        f"{model_cls_name} is deprecated and will be removed in NeMo AutoModel 26.10 container release and NeMo-Automodel v0.7.0. "
+        f"Associated example configs: {yaml_list}",
+        category=FutureWarning,
+        stacklevel=3,
+    )

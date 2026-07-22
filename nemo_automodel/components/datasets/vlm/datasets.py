@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import io
 import json
 import logging
@@ -20,12 +22,19 @@ import os
 import random
 import re
 import time
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar
 
+import torch
 import torch.utils.data
 from datasets import Image as HfImage
 from datasets import load_dataset
 from PIL import Image
+
+if TYPE_CHECKING:
+    from transformers import ProcessorMixin
 
 from nemo_automodel.components.datasets.vlm.utils import (
     _build_video_metadata,
@@ -35,6 +44,20 @@ from nemo_automodel.components.datasets.vlm.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RdrDatasetConfig:
+    """Construction-time configuration for the RDR dataset."""
+
+    path_or_dataset: str = "quintend/rdr-items"
+    """HuggingFace dataset id or local path for the RDR dataset."""
+    split: str = "train"
+    """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
+
+    def build(self) -> list[dict[str, object]]:
+        """Build the RDR dataset from this config."""
+        return make_rdr_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
 
 def make_rdr_dataset(path_or_dataset="quintend/rdr-items", split="train", **kwargs):
@@ -71,12 +94,35 @@ def make_rdr_dataset(path_or_dataset="quintend/rdr-items", split="train", **kwar
     # return dataset.map(format, batched=False)
 
 
+@dataclass
+class CordV2DatasetConfig:
+    """Construction-time configuration for the CORD-V2 dataset."""
+
+    path_or_dataset: str = "naver-clova-ix/cord-v2"
+    """HuggingFace dataset id or local path for the CORD-V2 dataset."""
+    split: str = "train"
+    """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
+    limit_dataset_samples: int | None = None
+    """Optional maximum number of samples to load."""
+
+    def build(self) -> list[dict[str, object]]:
+        """Build the CORD-V2 dataset from this config."""
+        return make_cord_v2_dataset(
+            path_or_dataset=self.path_or_dataset,
+            split=self.split,
+            limit_dataset_samples=self.limit_dataset_samples,
+        )
+
+
 def make_cord_v2_dataset(
     path_or_dataset="naver-clova-ix/cord-v2",
     split="train",
+    limit_dataset_samples: int | None = None,
     **kwargs,
 ):
     """Load and preprocess the CORD-V2 dataset for image-to-text fine-tuning."""
+    if limit_dataset_samples is not None:
+        split = f"{split}[:{limit_dataset_samples}]"
     dataset = load_dataset(path_or_dataset, split=split)
 
     def format(example):
@@ -110,6 +156,20 @@ def make_cord_v2_dataset(
 
     return [format(example) for example in dataset]
     # return dataset.map(format, batched=False, num_proc=8,remove_columns=["ground_truth"])
+
+
+@dataclass
+class MedPixDatasetConfig:
+    """Construction-time configuration for the MedPix dataset."""
+
+    path_or_dataset: str = "medpix-dataset/medpix-dataset"
+    """HuggingFace dataset id or local path for MedPix."""
+    split: str = "train"
+    """Dataset split to load."""
+
+    def build(self) -> object:
+        """Build the lazily decoded MedPix dataset."""
+        return make_medpix_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
 
 def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="train", **kwargs):
@@ -153,6 +213,20 @@ def make_medpix_dataset(path_or_dataset="medpix-dataset/medpix-dataset", split="
         }
 
     return dataset.with_transform(transform)
+
+
+@dataclass
+class LlavaOnevisionDatasetConfig:
+    """Construction-time configuration for the LLaVA-OneVision dataset."""
+
+    path_or_dataset: str = "liuhaotian/LLaVA-Instruct-150K"
+    """HuggingFace dataset id or local path."""
+    split: str = "train"
+    """Dataset split to load."""
+
+    def build(self) -> list[dict[str, object]]:
+        """Build the LLaVA-OneVision conversation dataset."""
+        return make_llava_onevision_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
 
 def make_llava_onevision_dataset(
@@ -208,6 +282,32 @@ def make_llava_onevision_dataset(
         }
 
     return [format(example) for example in dataset]
+
+
+@dataclass
+class Tulu3MagicoderTextMixDatasetConfig:
+    """Construction-time configuration for the Tulu-3/Magicoder text mixture."""
+
+    tulu_split: str = "train"
+    """Split expression for the Tulu-3 source."""
+    magicoder_split: str = "train"
+    """Split expression for the Magicoder source."""
+    seed: int = 42
+    """Sampling seed for interleaving the two sources."""
+    max_turns: int = 16
+    """Maximum number of turns retained from a Tulu-3 conversation."""
+    limit_total: int | None = None
+    """Optional cap on the merged row count."""
+
+    def build(self) -> list[dict[str, object]]:
+        """Build the text-only Tulu-3/Magicoder mixture."""
+        return make_tulu3_magicoder_text_mix_dataset(
+            tulu_split=self.tulu_split,
+            magicoder_split=self.magicoder_split,
+            seed=self.seed,
+            max_turns=self.max_turns,
+            limit_total=self.limit_total,
+        )
 
 
 def make_tulu3_magicoder_text_mix_dataset(
@@ -325,6 +425,54 @@ def make_tulu3_magicoder_text_mix_dataset(
         if limit_total is not None and len(out) >= limit_total:
             break
     return out
+
+
+def make_tulu3_dataset(
+    path_or_dataset: str = "allenai/tulu-3-sft-mixture",
+    split: str = "train",
+    **kwargs,
+):
+    """Load ``allenai/tulu-3-sft-mixture`` directly from the HF Hub as text-only conversations.
+
+    This avoids the meta-JSON + JSONL data-prep step required by
+    :func:`make_meta_dataset`: point the recipe's ``dataset._target_`` at this
+    function and the Tulu-3 split is pulled straight from the Hub. Each row's
+    ``messages`` field is converted with the same helper the meta-JSON path uses
+    (:func:`_convert_sharegpt_to_conversation`), so the resulting data composition is
+    **identical** to dumping the split to JSONL and loading it via
+    :func:`make_meta_dataset`: no turn cap, ``system`` turns dropped, every row kept
+    in the original split order. Conversations are text-only (no ``image`` entries),
+    so batches carry no ``pixel_values`` / vision tensors.
+
+    The returned dataset stays Arrow-backed (``map``) so the full ~939k-row split is
+    not copied into a Python list.
+
+    Args:
+        path_or_dataset: HF Hub id (or local path) of the Tulu-3 SFT mixture.
+        split: HF split expression (e.g. ``"train"`` or ``"train[:50000]"``).
+        **kwargs: Ignored. Accepted so recipe-level dataset keys (e.g. ``truncate``)
+            that are forwarded to the dataset target do not raise.
+
+    Returns:
+        datasets.Dataset: Rows with a single ``conversation`` column, each a list of
+        ``{"role": "user"|"assistant", "content": [{"type": "text", "text": ...}]}`` turns.
+    """
+    dataset = load_dataset(path_or_dataset, split=split)
+    return dataset.map(_convert_sharegpt_to_conversation, remove_columns=dataset.column_names)
+
+
+@dataclass
+class UnimmChatDatasetConfig:
+    """Construction-time configuration for the UniMM-Chat dataset."""
+
+    path_or_dataset: str = "Yirany/UniMM-Chat"
+    """HuggingFace dataset id or local path for the UniMM-Chat dataset."""
+    split: str = "train"
+    """Dataset split to load (e.g. ``"train"``, ``"test"``)."""
+
+    def build(self) -> list[dict[str, object]]:
+        """Build the UniMM-Chat dataset from this config."""
+        return make_unimm_chat_dataset(path_or_dataset=self.path_or_dataset, split=self.split)
 
 
 def make_unimm_chat_dataset(path_or_dataset="Yirany/UniMM-Chat", split="train", **kwargs):
@@ -783,6 +931,41 @@ class _ExamplesWithStats(list):
     __slots__ = ("stats",)
 
 
+@dataclass
+class MetaDatasetConfig:
+    """Construction-time configuration for the meta (multi-source) VLM dataset."""
+
+    builds_with_data_parallel_rank: ClassVar[bool] = True
+
+    path_or_dataset: str = ""
+    """Path to the meta JSON file that defines the datasets to load."""
+    dataset_names: list[str] | None = None
+    """Names of datasets to load from the meta file. ``None`` loads all."""
+    split: str = "train"
+    """Dataset split to load (passed through for API consistency)."""
+    shard_data: bool = False
+    """If ``True``, each rank loads only its ``1/world_size`` slice."""
+
+    def build(self, *, rank: int | None = None, world_size: int | None = None) -> list[dict[str, object]]:
+        """Build the meta VLM dataset from this config.
+
+        Args:
+            rank: Runtime data-parallel rank. Inferred from ``torch.distributed`` when ``None``.
+            world_size: Runtime data-parallel world size. Inferred from ``torch.distributed`` when ``None``.
+
+        Returns:
+            Materialized multimodal examples from the selected source datasets.
+        """
+        return make_meta_dataset(
+            path_or_dataset=self.path_or_dataset,
+            dataset_names=self.dataset_names,
+            split=self.split,
+            shard_data=self.shard_data,
+            rank=rank,
+            world_size=world_size,
+        )
+
+
 def make_meta_dataset(
     path_or_dataset,
     dataset_names=None,
@@ -1020,6 +1203,118 @@ def make_meta_dataset(
     return result
 
 
+def _resolve_processor_token_id(processor, attr_names, token_names):
+    """Resolve a model-specific media token id from processor/config/tokenizer."""
+    tokenizer = getattr(processor, "tokenizer", processor)
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+
+    config = getattr(processor, "config", None)
+    for source in (processor, config, tokenizer, getattr(tokenizer, "config", None)):
+        if source is None:
+            continue
+        for attr in attr_names:
+            value = getattr(source, attr, None)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str):
+                try:
+                    token_id = tokenizer.convert_tokens_to_ids(value)
+                except Exception:
+                    continue
+                if isinstance(token_id, int) and token_id != unk_id:
+                    return token_id
+    for token in token_names:
+        try:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+        except Exception:
+            continue
+        if isinstance(token_id, int) and token_id != unk_id:
+            return token_id
+    return None
+
+
+def _grid_media_token_count(grid, merge_size: int) -> int:
+    if grid is None:
+        return 0
+    grid_t = torch.as_tensor(grid)
+    if grid_t.numel() == 0:
+        return 0
+    if grid_t.ndim == 1:
+        grid_t = grid_t.view(1, -1)
+    merge_len = int(merge_size) ** 2
+    return int((grid_t.to(torch.long).prod(dim=-1) // merge_len).sum().item())
+
+
+def _media_token_mismatch(input_ids, result, processor) -> str | None:
+    """Return a mismatch description if media grids survived without tokens."""
+    image_token_id = _resolve_processor_token_id(
+        processor,
+        ("image_token_id", "image_token_index", "image_token"),
+        ("<|image_pad|>", "<image>", "<|image|>"),
+    )
+    video_token_id = _resolve_processor_token_id(
+        processor,
+        ("video_token_id", "video_token_index", "video_token"),
+        ("<|video_pad|>", "<video>", "<|video|>"),
+    )
+
+    image_grid = result.get("image_grid_thw")
+    if image_grid is not None and image_token_id is not None:
+        image_merge_size = getattr(getattr(processor, "image_processor", None), "merge_size", 2)
+        expected = _grid_media_token_count(image_grid, image_merge_size)
+        actual = int((input_ids == image_token_id).sum().item())
+        if actual != expected:
+            return f"image tokens={actual}, expected={expected}"
+
+    video_grid = result.get("video_grid_thw")
+    if video_grid is not None and video_token_id is not None:
+        video_merge_size = getattr(getattr(processor, "video_processor", None), "merge_size", 2)
+        expected = _grid_media_token_count(video_grid, video_merge_size)
+        actual = int((input_ids == video_token_id).sum().item())
+        if actual != expected:
+            return f"video tokens={actual}, expected={expected}"
+
+    return None
+
+
+@dataclass
+class PreTokenizedDatasetWrapperConfig:
+    """Construction-time configuration for :class:`PreTokenizedDatasetWrapper`."""
+
+    max_length: int | None = None
+    """Maximum token sequence length. Overlong samples are replaced or truncated."""
+    max_retries: int = 10
+    """Number of retry attempts when a sample fails to tokenize."""
+    truncate: bool = False
+    """If ``True``, truncate overlong samples instead of replacing them."""
+    inject_fake_images: bool = True
+    """If ``True``, inject a fake image into text-only samples for sharded training."""
+    post_tokenize_hook: Callable[[dict[str, object]], dict[str, object]] | None = None
+    """Optional declarative callback applied to each tokenizer result."""
+
+    def build(
+        self,
+        *,
+        dataset: torch.utils.data.Dataset | Sequence[dict[str, object]],
+        processor: "ProcessorMixin",
+    ) -> "PreTokenizedDatasetWrapper":
+        """Build a :class:`PreTokenizedDatasetWrapper` from this config.
+
+        Args:
+            dataset: The raw dataset (conversations) to wrap.
+            processor: HuggingFace processor for tokenization.
+        """
+        return PreTokenizedDatasetWrapper(
+            dataset=dataset,
+            processor=processor,
+            max_length=self.max_length,
+            max_retries=self.max_retries,
+            truncate=self.truncate,
+            post_tokenize_hook=self.post_tokenize_hook,
+            inject_fake_images=self.inject_fake_images,
+        )
+
+
 class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
     """Dataset wrapper that tokenizes samples in ``__getitem__``.
 
@@ -1172,6 +1467,16 @@ class PreTokenizedDatasetWrapper(torch.utils.data.Dataset):
                         for k, v in result.items()
                     }
                     seq_len = ml
+
+                mismatch = _media_token_mismatch(input_ids, result, self.processor)
+                if mismatch is not None:
+                    logger.warning(
+                        "Sample %d: media token mismatch after tokenization/truncation (%s), replacing.",
+                        idx,
+                        mismatch,
+                    )
+                    idx = random.randint(0, len(self.dataset) - 1)
+                    continue
 
                 output = {
                     "input_ids": input_ids,

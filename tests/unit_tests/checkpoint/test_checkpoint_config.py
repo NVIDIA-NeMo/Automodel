@@ -15,8 +15,13 @@
 """Tests for CheckpointingConfig in config.py."""
 
 import pytest
+import torch
 
-from nemo_automodel.components.checkpoint.config import CheckpointingConfig
+from nemo_automodel.components.checkpoint.config import (
+    CheckpointingConfig,
+    _is_geq_torch_2_9,
+    _is_leq_torch_2_7_1,
+)
 
 
 class TestCheckpointingConfig:
@@ -100,6 +105,17 @@ class TestCheckpointingConfig:
         assert cfg.v4_compatible is False
         assert cfg.diffusers_compatible is False
         assert cfg.best_metric_key == "default"
+        assert cfg.consolidation_timeout_minutes == 30
+
+    def test_consolidation_timeout_override(self):
+        cfg = CheckpointingConfig(consolidation_timeout_minutes=45)
+
+        assert cfg.consolidation_timeout_minutes == 45
+
+    @pytest.mark.parametrize("timeout_minutes", [0, -1])
+    def test_consolidation_timeout_must_be_positive(self, timeout_minutes):
+        with pytest.raises(ValueError, match="consolidation_timeout_minutes must be greater than 0"):
+            CheckpointingConfig(consolidation_timeout_minutes=timeout_minutes)
 
     def test_importable_from_checkpointing(self):
         """Verify backward compat: import from checkpointing.py still works."""
@@ -142,3 +158,51 @@ class TestCheckpointingConfig:
         """Without PEFT, torch_save must be honored."""
         cfg = CheckpointingConfig(model_save_format="torch_save", is_peft=False)
         assert cfg.model_save_format.value == "torch_save"
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ("2.7.1", True),
+        ("2.8.0", False),
+        ("2.9.0", False),
+        ("2.10.0", False),
+        ("2.12.1+cu130", False),
+    ],
+)
+def test_torch_leq_2_7_gate_uses_semantic_versioning(monkeypatch, version, expected):
+    monkeypatch.setattr(torch, "__version__", version)
+
+    assert _is_leq_torch_2_7_1() is expected
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ("2.8.0", False),
+        ("2.9.0", True),
+        ("2.10.0", True),
+        ("2.12.1+cu130", True),
+    ],
+)
+def test_torch_geq_2_9_gate_uses_semantic_versioning(monkeypatch, version, expected):
+    monkeypatch.setattr(torch, "__version__", version)
+
+    assert _is_geq_torch_2_9() is expected
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ("2.8.0", False),
+        ("2.9.0", True),
+        ("2.10.0", True),
+        ("2.12.1+cu130", True),
+    ],
+)
+def test_async_checkpointing_gate_uses_semantic_versioning(monkeypatch, version, expected):
+    monkeypatch.setattr(torch, "__version__", version)
+
+    cfg = CheckpointingConfig(is_async=True, save_consolidated=False)
+
+    assert cfg.is_async is expected

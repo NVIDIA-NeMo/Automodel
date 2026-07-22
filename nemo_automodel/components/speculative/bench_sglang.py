@@ -56,33 +56,29 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import sys
-import time
-from dataclasses import dataclass
 from typing import Any
 
-# ``GenerationConfig`` (model + sampling params for a chat completion) is shared
-# with the regeneration tool -- same four fields, same meaning -- so reuse it
-# rather than redefining an identical dataclass here.
+# The chat-completions workload machinery (prompt loading, the timed HTTP pass,
+# throughput / speedup math, shared CLI bounds) is engine-agnostic and shared
+# with ``bench_vllm``; only the acceptance-statistics source below is SGLang's.
+from nemo_automodel.components.speculative.bench_common import (
+    WorkloadResult,
+    _load_prompts,
+    _normalize_server_url,
+    _output_throughput,
+    _report_summary,
+    _run_workload,
+    _speedup,
+    _validate_workload_args,
+)
 from nemo_automodel.components.speculative.regenerate import (
     GenerationConfig,
-    _extract_prompt_messages,
     _import_aiohttp,
 )
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class WorkloadResult:
-    """Aggregate timing for one workload pass against a server."""
-
-    wall_clock_s: float
-    output_tokens: int
-    completed: int
-    failed: int
 
 
 # ---------------------------------------------------------------------------
@@ -150,119 +146,6 @@ def _acceptance_rate(accept_length: float | None, num_steps: int | None) -> floa
     return max(0.0, (accept_length - 1.0) / num_steps)
 
 
-def _speedup(spec_throughput: float | None, baseline_throughput: float | None) -> float | None:
-    """Return ``spec / baseline`` output throughput, or ``None`` if not computable."""
-    if not spec_throughput or not baseline_throughput or baseline_throughput <= 0:
-        return None
-    return spec_throughput / baseline_throughput
-
-
-def _output_throughput(result: WorkloadResult) -> float | None:
-    """Output tokens per wall-clock second, or ``None`` if nothing was timed."""
-    if result.wall_clock_s <= 0 or result.output_tokens <= 0:
-        return None
-    return result.output_tokens / result.wall_clock_s
-
-
-# ---------------------------------------------------------------------------
-# HTTP workload
-# ---------------------------------------------------------------------------
-
-
-def _normalize_server_url(url: str) -> str:
-    """Return the SGLang root URL without a trailing slash or ``/v1`` suffix.
-
-    Chat completions live at ``<root>/v1/chat/completions`` and server info at
-    ``<root>/server_info``; accept either ``http://host:port`` or the OpenAI-style
-    ``http://host:port/v1`` so the flag is forgiving.
-    """
-    root = url.rstrip("/")
-    if root.endswith("/v1"):
-        root = root[: -len("/v1")]
-    return root
-
-
-async def _chat_completion(
-    session,
-    url: str,
-    payload: dict[str, Any],
-    *,
-    timeout_s: float,
-    max_retries: int,
-) -> int:
-    """POST one chat completion and return its ``completion_tokens`` (0 on no usage)."""
-    aiohttp = _import_aiohttp()
-    last_err: Exception | None = None
-    for attempt in range(max_retries + 1):
-        try:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
-                if resp.status >= 500 or resp.status == 429:
-                    text = await resp.text()
-                    raise RuntimeError(f"HTTP {resp.status} from {url}: {text[:200]}")
-                resp.raise_for_status()
-                data = await resp.json()
-                usage = data.get("usage") if isinstance(data, dict) else None
-                if isinstance(usage, dict) and isinstance(usage.get("completion_tokens"), int):
-                    return usage["completion_tokens"]
-                return 0
-        except aiohttp.ClientResponseError:
-            # 5xx and 429 are turned into RuntimeError above, so the only status
-            # that reaches raise_for_status() is a non-429 4xx (400/401/403/404,
-            # ...) -- a client error that will not succeed on retry. Surface it
-            # immediately instead of burning the whole retry budget on it.
-            raise
-        except Exception as exc:  # noqa: BLE001 -- retry transport / 5xx / 429 errors
-            last_err = exc
-            if attempt == max_retries:
-                raise
-            await asyncio.sleep(min(2.0**attempt, 30.0))
-    raise RuntimeError(f"Unreachable: retries exhausted without raising. Last error: {last_err}")
-
-
-async def _run_workload(
-    server: str,
-    prompts: list[list[dict[str, Any]]],
-    gen_cfg: GenerationConfig,
-    *,
-    concurrency: int,
-    timeout_s: float,
-    max_retries: int,
-) -> WorkloadResult:
-    """Send every prompt through ``<server>/v1/chat/completions`` and time the pass."""
-    aiohttp = _import_aiohttp()
-    url = _normalize_server_url(server) + "/v1/chat/completions"
-    semaphore = asyncio.Semaphore(concurrency)
-
-    async def _worker(slot: int, prompt: list[dict[str, Any]]) -> int | None:
-        """Return the request's completion-token count, or ``None`` on failure."""
-        payload = {
-            "model": gen_cfg.model,
-            "messages": prompt,
-            "max_tokens": gen_cfg.max_new_tokens,
-            "temperature": gen_cfg.temperature,
-            "top_p": gen_cfg.top_p,
-        }
-        async with semaphore:
-            try:
-                return await _chat_completion(session, url, payload, timeout_s=timeout_s, max_retries=max_retries)
-            except Exception as exc:  # noqa: BLE001 -- one bad request must not abort the run
-                logger.warning("Request %d failed: %s", slot, exc)
-                return None
-
-    async with aiohttp.ClientSession() as session:
-        start = time.perf_counter()
-        token_counts = await asyncio.gather(*[_worker(i, prompt) for i, prompt in enumerate(prompts)])
-        wall_clock_s = time.perf_counter() - start
-
-    completed = [c for c in token_counts if c is not None]
-    return WorkloadResult(
-        wall_clock_s=wall_clock_s,
-        output_tokens=sum(completed),
-        completed=len(completed),
-        failed=len(token_counts) - len(completed),
-    )
-
-
 async def _fetch_server_info(server: str, *, timeout_s: float) -> dict[str, Any] | None:
     """GET ``<server>/server_info``; return the parsed JSON or ``None`` on failure."""
     aiohttp = _import_aiohttp()
@@ -282,26 +165,6 @@ async def _fetch_server_info(server: str, *, timeout_s: float) -> dict[str, Any]
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
-
-
-def _load_prompts(args: argparse.Namespace) -> list[list[dict[str, Any]]]:
-    """Load up to ``--num-prompts`` chat prompts (trailing assistant turn dropped)."""
-    from nemo_automodel.components.datasets.llm.chat_dataset import _load_openai_messages
-
-    dataset = _load_openai_messages(
-        args.input_data,
-        split=args.split,
-        name=args.dataset_name,
-        shuffle_seed=args.shuffle_seed,
-    )
-    prompts: list[list[dict[str, Any]]] = []
-    for row in dataset:
-        prompt = _extract_prompt_messages(row[args.messages_column])
-        if prompt is not None:
-            prompts.append(prompt)
-        if len(prompts) >= args.num_prompts:
-            break
-    return prompts
 
 
 def _summarize(
@@ -342,22 +205,20 @@ def _summarize(
 
 def _validate_args(args: argparse.Namespace) -> None:
     """Reject invalid CLI values before any network work starts."""
-    if args.num_prompts < 1:
-        raise ValueError(f"--num-prompts must be >= 1, got {args.num_prompts}")
-    if args.concurrency < 1:
-        raise ValueError(f"--concurrency must be >= 1, got {args.concurrency}")
-    if args.max_new_tokens < 1:
-        raise ValueError(f"--max-new-tokens must be >= 1, got {args.max_new_tokens}")
-    if args.max_retries < 0:
-        raise ValueError(f"--max-retries must be >= 0, got {args.max_retries}")
-    if args.timeout_s <= 0:
-        raise ValueError(f"--timeout-s must be > 0, got {args.timeout_s}")
+    _validate_workload_args(args)
     if args.num_steps is not None and args.num_steps < 1:
         raise ValueError(f"--num-steps must be >= 1 when set, got {args.num_steps}")
 
 
-async def _run(args: argparse.Namespace) -> int:
-    """Async driver: load prompts, run the workload(s), report metrics. Returns an exit code."""
+async def _run_summary(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Validate args, run the workload(s), and return the metrics dict.
+
+    Returns ``None`` when no usable prompts were loaded (the caller's cue to
+    report a failure without raising -- a bad ``--num-prompts``/etc. value is a
+    real programming error and still raises via ``_validate_args``). Split out
+    of ``_run`` so ``bench_sweep`` can drive one dataset at a time without the
+    printing / ``--output-json`` side effects below.
+    """
     _validate_args(args)
     gen_cfg = GenerationConfig(
         model=args.model,
@@ -368,7 +229,7 @@ async def _run(args: argparse.Namespace) -> int:
     prompts = _load_prompts(args)
     if not prompts:
         logger.error("No usable prompts loaded from %s; nothing to benchmark.", args.input_data)
-        return 1
+        return None
     logger.info("Benchmarking %d prompts against %s", len(prompts), args.server)
 
     spec_result = await _run_workload(
@@ -406,14 +267,13 @@ async def _run(args: argparse.Namespace) -> int:
             "and is %s a fresh SGLang server? Throughput is still reported.",
             args.server,
         )
+    return summary
 
-    rendered = json.dumps(summary, indent=2)
-    print(rendered)
-    if args.output_json:
-        with open(args.output_json, "w") as f:
-            f.write(rendered + "\n")
-        logger.info("Wrote metrics to %s", args.output_json)
-    return 0
+
+async def _run(args: argparse.Namespace) -> int:
+    """Async driver: compute the benchmark summary and report it. Returns an exit code."""
+    summary = await _run_summary(args)
+    return _report_summary(summary, args.output_json)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -452,6 +312,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="speculative_num_steps fallback for acceptance_rate when /server_info omits it.",
     )
     parser.add_argument("--messages-column", default="messages", help="Column holding the OpenAI messages list.")
+    parser.add_argument(
+        "--prompt-column",
+        default=None,
+        help="Column holding a raw prompt string (or list of turns, first used) instead of --messages-column, "
+        "for datasets that are not already chat-messages-shaped.",
+    )
     parser.add_argument("--split", default="train", help="HF dataset split (supports slice syntax).")
     parser.add_argument("--dataset-name", default=None, help="HF dataset configuration name, if any.")
     parser.add_argument("--shuffle-seed", type=int, default=None, help="Optional shuffle seed before slicing.")
