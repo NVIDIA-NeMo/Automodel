@@ -621,6 +621,45 @@ def test_original_dtype_mapping_applies_adapter_forced_dtypes(tmp_path):
     }
 
 
+def test_original_dtype_mapping_applies_adapter_forced_dtypes_without_hf_reference(tmp_path):
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="",
+        save_consolidated=False,
+        is_peft=False,
+    )
+
+    class Adapter:
+        def forced_hf_dtype_mapping(self, state_dict):
+            assert set(state_dict) == {
+                "backbone.layers.0.mixer.A_log",
+                "backbone.layers.0.mixer.in_proj.weight",
+            }
+            return {
+                "backbone.layers.0.mixer.A_log": "F32",
+                "absent.weight": "F32",
+            }
+
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+    model_state = SimpleNamespace(model=[SimpleNamespace(state_dict_adapter=Adapter())])
+    state_dict = {
+        "backbone.layers.0.mixer.A_log": torch.ones(1, dtype=torch.float32),
+        "backbone.layers.0.mixer.in_proj.weight": torch.ones(1, dtype=torch.float32),
+    }
+
+    with patch(
+        "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+        return_value=None,
+    ):
+        dtype_mapping = checkpointer._maybe_build_original_dtype_mapping(model_state, state_dict)
+
+    assert dtype_mapping == {"backbone.layers.0.mixer.A_log": "F32"}
+
+
 def test_summarize_state_dict_key_diff_reports_missing_and_unexpected():
     summary = _summarize_state_dict_key_diff(
         {"a.weight", "b.bias", "c.weight"},

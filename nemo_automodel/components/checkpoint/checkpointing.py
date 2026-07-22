@@ -1459,31 +1459,29 @@ fi
         self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
     ) -> Optional[dict[str, str]]:
         """
-        Build FQN to original HF safetensors dtype mapping for consolidated export.
+        Build FQN to target safetensors dtype mapping for consolidated export.
 
-        Returns None when the run started from config-only weights or the original HF
-        safetensors headers are not available. In that case consolidation keeps the
-        saved checkpoint dtype unless the user explicitly passes CAST_DTYPE to the
-        offline helper.
+        Original HF safetensors headers provide the baseline mapping when available.
+        Model-owned adapter overrides are applied even for config-only runs so
+        intrinsically fp32 tensors retain their required export dtype.
         """
         if not _should_write_hf_metadata(self.config):
             return None
 
+        model = _unwrap_ddp_model(model_state.model[0])
+        normalized_dtype_mapping: dict[str, str] = {}
         reference_path = _get_hf_safetensors_reference_path(
             self.config.model_cache_dir,
             self.config.model_repo_id,
         )
-        if not reference_path:
-            return None
-
-        model = model_state.model[0]
-        dtype_mapping = get_fqn_to_dtype_mapping(reference_path, getattr(model, "_checkpoint_conversion_mapping", None))
-        if not dtype_mapping:
-            return None
-
-        normalized_dtype_mapping = _normalize_dtype_mapping_to_state_dict_keys(
-            dtype_mapping, list(state_dict.keys()), getattr(model, "base_model_prefix", None)
-        )
+        if reference_path:
+            dtype_mapping = get_fqn_to_dtype_mapping(
+                reference_path, getattr(model, "_checkpoint_conversion_mapping", None)
+            )
+            if dtype_mapping:
+                normalized_dtype_mapping = _normalize_dtype_mapping_to_state_dict_keys(
+                    dtype_mapping, list(state_dict.keys()), getattr(model, "base_model_prefix", None)
+                )
         normalized_dtype_mapping = _apply_adapter_forced_dtype_mapping(model, state_dict, normalized_dtype_mapping)
         return normalized_dtype_mapping or None
 
