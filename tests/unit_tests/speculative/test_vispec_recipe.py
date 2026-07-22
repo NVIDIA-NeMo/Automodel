@@ -189,6 +189,40 @@ class TestComputeMetrics:
         assert recipe._loss_components(metrics)["valid_tokens"] == 0.0
 
 
+class TestStage1InitFromDirectory:
+    def test_loads_every_shard_under_a_directory(self, tmp_path):
+        recipe = _recipe()
+        stage1 = LlamaEagleDraftModel(_config())
+        state = {k: v.contiguous() for k, v in stage1.state_dict().items()}
+        keys = sorted(state)
+        export = tmp_path / "consolidated"
+        export.mkdir()
+        save_file({k: state[k] for k in keys[: len(keys) // 2]}, str(export / "model-00001-of-00002.safetensors"))
+        save_file({k: state[k] for k in keys[len(keys) // 2 :]}, str(export / "model-00002-of-00002.safetensors"))
+
+        img_fc_before = recipe.draft_model.img_fc.weight.clone()
+        recipe._load_stage1_draft(str(export))
+        torch.testing.assert_close(recipe.draft_model.fc.weight, stage1.fc.weight)
+        torch.testing.assert_close(recipe.draft_model.img_fc.weight, img_fc_before)
+
+    def test_finds_the_export_one_level_down(self, tmp_path):
+        recipe = _recipe()
+        stage1 = LlamaEagleDraftModel(_config())
+        export = tmp_path / "model" / "consolidated"
+        export.mkdir(parents=True)
+        save_file(
+            {k: v.contiguous() for k, v in stage1.state_dict().items()},
+            str(export / "model-00001-of-00001.safetensors"),
+        )
+        recipe._load_stage1_draft(str(tmp_path / "model"))
+        torch.testing.assert_close(recipe.draft_model.fc.weight, stage1.fc.weight)
+
+    def test_a_directory_without_safetensors_raises(self, tmp_path):
+        recipe = _recipe()
+        with pytest.raises(FileNotFoundError, match="no .safetensors"):
+            recipe._load_stage1_draft(str(tmp_path))
+
+
 class TestStage1Init:
     def test_none_is_a_no_op(self):
         recipe = _recipe()

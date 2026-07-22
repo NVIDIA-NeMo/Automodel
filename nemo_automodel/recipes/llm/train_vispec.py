@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import pathlib
 
 import torch
 from safetensors.torch import load_file
@@ -80,6 +81,35 @@ def _resolve_image_token_id(target_config, processor) -> int:
             "processor.image_token is set. ViSpec needs it to locate the image positions to compress."
         )
     return int(processor.tokenizer.convert_tokens_to_ids(image_token))
+
+
+def _load_draft_state_dict(draft_init_from: str) -> dict[str, torch.Tensor]:
+    """Read a stage-1 draft state dict from a file or a checkpoint directory.
+
+    Args:
+        draft_init_from: A ``.safetensors`` file, or a directory holding the
+            consolidated export (searched one level deep, so both the
+            checkpoint root and its ``model/consolidated`` subdirectory work).
+
+    Returns:
+        The merged state dict across every shard found.
+
+    Raises:
+        FileNotFoundError: If no ``.safetensors`` file is under the path.
+    """
+    path = pathlib.Path(draft_init_from)
+    if path.is_file():
+        return load_file(str(path))
+    shards = sorted(path.glob("*.safetensors")) or sorted(path.glob("*/*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(
+            f"recipe_args.draft_weights path {draft_init_from} holds no .safetensors file. Point it at the "
+            "stage-1 consolidated export directory (checkpoints/<step>/model/consolidated) or at one of its shards."
+        )
+    state_dict: dict[str, torch.Tensor] = {}
+    for shard in shards:
+        state_dict.update(load_file(str(shard)))
+    return state_dict
 
 
 def _apply_image_token_budget(processor, recipe_cfg) -> None:
@@ -245,12 +275,19 @@ class TrainVispecRecipe(TrainEagle1Recipe):
         an identity pass-through, so stage 2 begins numerically equal to stage 1.
 
         Args:
-            draft_init_from: Path to a stage-1 ``model.safetensors`` file, or
-                ``None`` to train the draft from scratch.
+            draft_init_from: Path to a stage-1 checkpoint, either a directory
+                holding the consolidated export or a single ``.safetensors``
+                file, or ``None`` to train the draft from scratch. A directory
+                is the practical form: the checkpointer names the export by
+                shard (``model-00001-of-0000N.safetensors``), so there is no
+                fixed file name to point at.
+
+        Raises:
+            FileNotFoundError: If the path holds no ``.safetensors`` file.
         """
         if not draft_init_from:
             return
-        state_dict = load_file(draft_init_from)
+        state_dict = _load_draft_state_dict(draft_init_from)
         missing, unexpected = self.draft_model.load_state_dict(state_dict, strict=False)
         vispec_only = {name for name in missing if name.startswith(("img_adaptor.", "img_fc."))}
         unresolved = [name for name in missing if name not in vispec_only]
