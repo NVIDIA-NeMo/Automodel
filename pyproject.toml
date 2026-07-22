@@ -86,7 +86,7 @@ dependencies = [
     "tiktoken",
     "torch>=2.6.0",
     "torchdata",
-    "transformers==5.8.1",
+    "transformers==5.12.1",
     "wandb>=0.28.0",
     "torchao",
     "mlflow",
@@ -122,6 +122,11 @@ cuda = [
     "tile-kernels==1.0.0",
     # tilelang 0.1.11 does not cap its TVM ffi dependency, but 0.1.12 is
     # incompatible with its bundled TVM. Keep pip installs on the known-good ffi.
+    # NOTE: flash-attn-4 (attn_implementation="flash_attention_4") requires
+    # apache-tvm-ffi>=0.1.12,<0.2 -- mutually exclusive with this pin until
+    # tilelang ships a release built against ffi 0.1.12. The container installs
+    # FA4 only when built with INSTALL_FA4=true (docker/Dockerfile), which
+    # upgrades ffi and disables the tilelang backend in that image.
     "apache-tvm-ffi<=0.1.11",
 ]
 cuda_source = [
@@ -129,7 +134,7 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
-ffpa = ["ffpa-attn>=0.1.19"]
+ffpa = ["ffpa-attn>=0.1.19", "nvidia-cutlass-dsl>=4.5.1,<4.6"]
 fla = [
     "flash-linear-attention>=0.4.2",
 ]
@@ -163,6 +168,7 @@ msc = [
     "multi-storage-client>=0.13",
 ]
 vlm-media = [
+    "albumentations",  # required by nemotron-parse processor remote code; pulls opencv-python-headless
     "opencv-python-headless==4.10.0.84",
     "decord; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "qwen-omni-utils",
@@ -213,7 +219,7 @@ linting = [
     "import-linter~=2.4",
     "ty>=0.0.20",
 ]
-test = ["coverage", "pytest", "peft>=0.18.1", "ruamel.yaml", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
+test = ["coverage", "pytest", "pytest-shard", "peft>=0.18.1", "ruamel.yaml", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 dev = [
     "cut-cross-entropy",
     "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
@@ -228,6 +234,7 @@ no-build-isolation-package = [
     "causal-conv1d",
     "deep_ep",
     "flash-attn",
+    "flash-attn-3",  # FA3: source build from Dao-AILab/flash-attention hopper/ (needs image torch)
     "mamba-ssm",
     "nv-grouped-gemm",
     "transformer-engine",

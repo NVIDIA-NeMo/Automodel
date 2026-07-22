@@ -166,7 +166,6 @@ def create_causal_mask_mapping(
         "config": model_config,
         "inputs_embeds": torch.empty((batch_size, seq_len), device=device),
         "attention_mask": attention_mask,
-        "cache_position": position_ids[0],  # Use first row (all rows identical for non-padded data)
         "past_key_values": None,  # Training only
         "position_ids": position_ids,
     }
@@ -221,32 +220,49 @@ def add_causal_masks_to_batch(batch_dict, model_config):
     return batch_dict
 
 
-def default_collater(batch, pad_seq_len_divisible=None):
+def default_collater(
+    batch: list[dict[str, list[int] | torch.Tensor]],
+    pad_seq_len_divisible: int | None = None,
+) -> dict[str, torch.Tensor]:
     """
     Default batch collator that handles padding and batching.
 
+    Sequence-list fields are padded and stacked. Pre-batched tensor fields are concatenated along their first
+    axis, preserving all trailing axes, dtype, and device.
+
     Args:
-        batch: A batch of examples.
-        pad_seq_len_divisible: If provided, pad sequence length to be divisible by this value.
+        batch: Local examples. A list-valued field has shape ``[S_i]`` for example ``i``, where ``S_i`` is its
+            sequence length, and becomes ``[B, S]`` after padding, where ``B`` is the number of examples and
+            ``S`` is the padded maximum. A tensor-valued field is already batched as ``[B_i, ...]`` with
+            arbitrary trailing axes and becomes ``[sum_i(B_i), ...]``. The optional
+            ``___PAD_TOKEN_IDS___`` entry is removed from the first input mapping in place.
+        pad_seq_len_divisible: If set, round padded ``S`` up to a multiple of this value.
 
     Returns:
-        dict: A dictionary containing batched tensors.
+        Mapping of fields to tensors. List-valued inputs become ``torch.int64`` tensors shaped ``[B, S]``;
+        tensor-valued inputs preserve dtype/device and trailing layout. When ``attention_mask`` or
+        ``input_ids`` is present with shape ``[B, S]``, ``padding_mask`` is a boolean ``[B, S]`` tensor.
     """
     pad_token_ids = batch[0].pop("___PAD_TOKEN_IDS___", None)
     # ans contains a dict with:
     # key: str (e.g., "input_ids", "attention_mask", "labels", "loss_mask")
     # value: list[list[int]] (e.g., [[1, 2, 3], [4, 5, 6]])
-    ans = {
-        key: pad_within_micro(
-            extract_key_from_dicts(batch, key),
-            get_pad_token_from_key(key, pad_token_ids),
-            pad_seq_len_divisible,
-        )
-        for key in batch[0].keys()
-    }
+    ans = {}
+    for key in batch[0].keys():
+        values = extract_key_from_dicts(batch, key)
+        if all(isinstance(v, torch.Tensor) for v in values):
+            # Pre-batched fields: each value is a [batch_size, seq_len] tensor; concatenate along the
+            # batch dim rather than treating it as a ragged list[int] to be padded.
+            ans[key] = torch.cat([batchify(v) for v in values], dim=0)
+        else:
+            ans[key] = pad_within_micro(
+                values,
+                get_pad_token_from_key(key, pad_token_ids),
+                pad_seq_len_divisible,
+            )
 
-    # convert to tensors
-    result = {k: batchify(torch.LongTensor(v)) for k, v in ans.items()}
+    # convert to tensors (already-tensor fields are passed through batchify unchanged)
+    result = {k: batchify(v if isinstance(v, torch.Tensor) else torch.LongTensor(v)) for k, v in ans.items()}
 
     # Add padding_mask. Prefer the real attention_mask: matching the pad token *value*
     # (input_ids == pad_token_id) misclassifies real tokens as padding whenever pad_token_id
@@ -384,6 +400,25 @@ def packed_sequence_thd_collater(batch):
     }
 
 
+def packed_sequence_thd_collater_vlm(examples, processor=None, **kwargs):
+    """THD collater adapter for the VLM recipe's ``(examples, processor)`` call convention.
+
+    ``recipes/vlm/finetune.py:build_dataloader`` invokes the configured collate as
+    ``collate_cfg.instantiate(examples=examples, processor=processor)``, whereas
+    :func:`packed_sequence_thd_collater` takes only ``batch``. This thin adapter accepts
+    (and ignores) ``processor`` and any extra kwargs so pre-tokenized ``ChatDataset``
+    samples can use THD / context-parallel batching inside the VLM recipe.
+
+    Args:
+        examples: Batch of samples, forwarded to :func:`packed_sequence_thd_collater`.
+        processor: Unused; accepted only for VLM-recipe call-convention compatibility.
+
+    Returns:
+        dict: THD-format batch (see :func:`packed_sequence_thd_collater`).
+    """
+    return packed_sequence_thd_collater(examples)
+
+
 def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tensor:
     """Convert an indexed attention mask to a 4D block-causal mask.
 
@@ -423,7 +458,8 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     Stacks ``input_ids``, ``labels``, ``position_ids`` and converts the
     indexed ``attention_mask`` to the format required by the attention backend.
 
-    For ``flash_attention_2``: keeps the indexed 2D mask ``[B, S]``.
+    For flash attention (``flash_attention_2`` / ``flash_attention_3`` /
+    ``flash_attention_4``): keeps the indexed 2D mask ``[B, S]``.
     For ``sdpa`` / ``eager``: converts to a 4D block-causal float mask.
 
     Args:
@@ -442,7 +478,7 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
 
-    if attn_implementation == "flash_attention_2":
+    if attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
         mask_out = attention_mask
     else:
         mask_out = _indexed_mask_to_4d_block_causal(attention_mask)

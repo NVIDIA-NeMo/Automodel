@@ -100,23 +100,31 @@ class DistributedSignalHandler:
     Args:
         sig: The signal number to handle (e.g., signal.SIGTERM).
              Defaults to signal.SIGTERM.
+        group: Process group whose ranks participate in signal propagation.
+            Defaults to the global process group.
     """
 
-    def __init__(self, sig: int = signal.SIGTERM) -> None:
+    def __init__(
+        self,
+        sig: int = signal.SIGTERM,
+        group: torch.distributed.ProcessGroup | None = None,
+    ) -> None:
         """
         Constructor for the DistributedSignalHandler.
 
         Args:
             sig (int, optional): The signal to handle. Defaults to signal.SIGTERM.
+            group: Process group whose ranks participate in signal propagation.
         """
         self.sig = sig
+        self.group = group
         self._signal_received = False
         self.released = False
         self.original_handler = None
 
     def signals_received(self) -> list[bool]:
         """
-        Check if any rank in the default group received the signal.
+        Check if any rank in the configured group received the signal.
 
         Uses all_gather to collect the signal status from all ranks.
 
@@ -124,7 +132,7 @@ class DistributedSignalHandler:
             A list of booleans, where each element indicates if the
             corresponding rank received the signal.
         """
-        all_received = all_gather_item(self._signal_received, dtype=torch.int32)
+        all_received = all_gather_item(self._signal_received, dtype=torch.int32, group=self.group)
         return all_received
 
     def __enter__(self) -> "DistributedSignalHandler":

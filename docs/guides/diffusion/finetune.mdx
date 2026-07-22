@@ -15,14 +15,14 @@ Under the hood, NeMo AutoModel uses [flow matching](https://arxiv.org/abs/2210.0
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
 │ 1. Install   │--->│ 2. Prepare   │--->│ 3. Configure │--->│  4. Train    │--->│ 5. Generate  │
 │              │    │    Data      │    │              │    │              │    │              │
-│ pip install  │    │ Encode to    │    │ YAML recipe  │    │ torchrun     │    │ Run inference│
+│ uv sync      │    │ Encode to    │    │ YAML recipe  │    │ torchrun     │    │ Run inference│
 │ or Docker    │    │ .meta files  │    │              │    │              │    │ with ckpt    │
 └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
 ```
 
 | Step | Section | What You Do |
 |------|---------|-------------|
-| **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Install the package via pip or Docker |
+| **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Install the package with uv or Docker |
 | **2. Prepare Data** | [Prepare Your Dataset](#prepare-your-dataset) | Encode raw images/videos into `.meta` latent files |
 | **3. Configure** | [Configure Your Training Recipe](#configure-your-training-recipe) | Write a YAML config specifying model, data, and training settings |
 | **4. Train** | [Fine-Tune the Model](#fine-tune-the-model) | Launch training with `torchrun` on a single node |
@@ -48,7 +48,9 @@ Diffusion fine-tuning needs the `diffusion` extra plus `diffusion-media` (OpenCV
 for image/video preprocessing and imageio-ffmpeg for T2V export):
 
 ```bash
-pip3 install "nemo-automodel[diffusion,diffusion-media]"
+uv venv
+source .venv/bin/activate
+uv pip install "nemo-automodel[diffusion,diffusion-media]"
 ```
 
 Alternatively, if you run into dependency or driver issues, use the pre-built Docker container:

@@ -38,7 +38,11 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
 from nemo_automodel.components.models.bagel.attention_masks import create_sparse_mask
-from nemo_automodel.components.models.bagel.configuration import BagelConfig
+from nemo_automodel.components.models.bagel.configuration import (
+    BagelBackendConfig,
+    BagelConfig,
+    resolve_bagel_backend,
+)
 from nemo_automodel.components.models.bagel.connector import BagelMultiModalProjector
 from nemo_automodel.components.models.bagel.embeddings import BagelGridPositionEmbedding, BagelTimestepEmbedding
 from nemo_automodel.components.models.bagel.modeling_qwen2_packed import Qwen2ForCausalLM
@@ -50,6 +54,10 @@ from nemo_automodel.components.models.bagel.state_dict_adapter import (
     load_bagel_checkpoint_state_dict,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,12 +152,13 @@ class BagelModel(nn.Module):
     ``BagelForUnifiedMultimodal.forward``.
     """
 
-    def __init__(self, config: BagelConfig) -> None:
+    def __init__(self, config: BagelConfig, backend: Optional[BagelBackendConfig] = None) -> None:
         super().__init__()
         self.config = config
+        self.backend = resolve_bagel_backend(backend)
 
         # Text backbone - always present.
-        self.language_model = Qwen2ForCausalLM(config.text_config)
+        self.language_model = Qwen2ForCausalLM(config.text_config, backend=self.backend)
 
         # Understanding-side vision path. Built whenever the BAGEL config keeps
         # visual understanding enabled.
@@ -213,6 +222,10 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
     """
 
     config_class = BagelConfig
+    # BAGEL's served checkpoints are untied; the tie flag lives on the nested
+    # text_config (aliased as llm_config), and the inner Qwen2 LM owns the head.
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+    backend_config_resolver = staticmethod(resolve_bagel_backend)
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -223,11 +236,22 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         supports_pp: bool = False
         supports_ep: bool = False
 
-    def __init__(self, config: BagelConfig) -> None:
+    def __init__(self, config: BagelConfig, backend: Optional[BagelBackendConfig] = None) -> None:
         super().__init__()
+        # Also covers the build_bagel_from_hf_backbones registry-bypass path, which
+        # constructs this class directly. Reads the nested text_config tie flag via
+        # the resolver's get_text_config fallback (BagelConfig has no top-level flag).
+        reject_unsupported_tie_word_embeddings(type(self), config)
         _prepare_config_for_stage(config)
         self.config = config
-        self.model = BagelModel(config)
+        self.backend = resolve_bagel_backend(backend)
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logger.info(
+                "Resolved BAGEL backends: linear=%s, rms_norm=%s",
+                self.backend.linear,
+                self.backend.rms_norm,
+            )
+        self.model = BagelModel(config, backend=self.backend)
         _convert_patch_embedding_for_packed_vit(self.model, config)
 
         # Light state-dict adapter hook used by HFCheckpointingMixin /
@@ -317,7 +341,9 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
             strict: If ``True``, raise on state-dict keys that don't match the
                 adapter patterns. Defaults to ``False`` for compatibility with
                 checkpoint sidecar files.
-            **kwargs: Forwarded to ``BagelConfig.from_pretrained``.
+            **kwargs: Model overrides. ``backend`` is passed to the BAGEL model
+                constructor; the remaining values are forwarded to
+                ``BagelConfig.from_pretrained``.
 
         Returns:
             A fully-initialized ``BagelForUnifiedMultimodal`` with weights
@@ -326,11 +352,12 @@ class BagelForUnifiedMultimodal(HFCheckpointingMixin, nn.Module):
         """
         path = pathlib.Path(pretrained_model_name_or_path)
 
+        backend = kwargs.pop("backend", None)
         cfg = BagelConfig.from_pretrained(str(path), **kwargs)
         cfg.stage = stage
         stage_int = _stage_to_int(stage)
 
-        model = cls(cfg)
+        model = cls(cfg, backend=backend)
 
         sd = load_bagel_checkpoint_state_dict(str(path), stage=stage_int, strict=strict)
         missing, unexpected = model.load_state_dict(sd, strict=False)

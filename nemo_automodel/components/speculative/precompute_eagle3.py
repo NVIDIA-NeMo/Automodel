@@ -73,6 +73,11 @@ from nemo_automodel.components.datasets.llm.eagle3_cache import (
     write_shard,
     write_target_embeddings,
 )
+from nemo_automodel.components.datasets.llm.offline_cache import (
+    dataloader_from_sample,
+    resume_start_sample,
+    write_cache_shards,
+)
 from nemo_automodel.components.speculative.eagle import HFEagle3TargetModel
 from nemo_automodel.components.speculative.eagle.core import _compute_target_distribution
 
@@ -148,6 +153,8 @@ def _ensure_resume_compatible(cache_dir: str, manifest: dict[str, Any], existing
     the old shards and bless them with the new manifest, silently corrupting the
     supervision that training reads back.
     """
+    if existing_shards:
+        resume_start_sample(existing_shards, int(manifest["shard_size"]))
     if not os.path.exists(manifest_path(cache_dir)):
         if existing_shards:
             raise ValueError(
@@ -252,54 +259,30 @@ def _run(args: argparse.Namespace) -> int:
         args.output_dir,
     )
 
-    shard_index = 0
-    chunks: list[dict[str, torch.Tensor]] = []
-    buffered = 0
+    start_sample = resume_start_sample(existing, args.shard_size) if existing else 0
+    dataloader = dataloader_from_sample(dataloader, start_sample)
 
-    def _flush() -> None:
-        # Slicing to ``shard_size`` is exact for a full shard and a harmless
-        # no-op for the trailing partial shard (fewer rows than the slice bound).
-        nonlocal shard_index, chunks, buffered
-        if buffered == 0:
-            return
-        if shard_index not in existing:
-            # Every chunk came from _compute_batch_cache with the same topk, so they
-            # share one key set (full vs top-k) -- merge whatever that batch produced.
-            merged = {k: torch.cat([c[k] for c in chunks], dim=0)[: args.shard_size] for k in chunks[0]}
-            path = write_shard(args.output_dir, shard_index, merged)
-            logger.info("Wrote %s (%d samples)", path, merged["input_ids"].shape[0])
-        chunks = []
-        buffered = 0
-        shard_index += 1
-
-    with torch.no_grad():
-        for batch in dataloader:
-            batch_size = batch["input_ids"].shape[0]
-            if shard_index in existing:
-                # The whole shard is already cached -- advance past its batches
-                # without paying the target forward.
-                buffered += batch_size
-                if buffered >= args.shard_size:
-                    chunks = []
-                    buffered -= args.shard_size
-                    shard_index += 1
-                continue
+    def _compute_from_batch(batch):
+        with torch.no_grad():
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             target_batch = target_wrapper.generate_batch(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 loss_mask=batch["loss_mask"],
             )
-            chunks.append(
-                _compute_batch_cache(
-                    target_batch, selected_token_ids, selected_token_mask, cache_dtype, args.target_probs_topk
-                )
+            return _compute_batch_cache(
+                target_batch, selected_token_ids, selected_token_mask, cache_dtype, args.target_probs_topk
             )
-            buffered += batch_size
-            if buffered >= args.shard_size:
-                _flush()
 
-    _flush()  # trailing partial shard
+    write_cache_shards(
+        dataloader=dataloader,
+        output_dir=args.output_dir,
+        shard_size=args.shard_size,
+        start_shard_index=start_sample // args.shard_size,
+        compute_batch=_compute_from_batch,
+        write_shard_fn=write_shard,
+        logger=logger,
+    )
 
     logger.info("Done. Cache written to %s", args.output_dir)
     return 0

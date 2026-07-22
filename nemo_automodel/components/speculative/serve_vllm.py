@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Serve an Automodel-trained EAGLE-3 / P-EAGLE drafter with vLLM.
+"""Serve an Automodel-trained EAGLE-3 / P-EAGLE / DFlash drafter with vLLM.
 
 This is the vLLM companion to ``serve_sglang``. It exists because the
 parallel-drafting (P-EAGLE) head produced by the EAGLE-3 recipe with
 ``parallel_drafting: true`` is *not* servable by SGLang today (``serve_sglang``
 rejects it); its inference runtime is vLLM's parallel-drafting path
 (vLLM >= 0.16, https://github.com/vllm-project/speculators/pull/480). The same
-entry point also serves a plain (non-parallel) EAGLE-3 draft under vLLM.
+entry point also serves a plain (non-parallel) EAGLE-3 draft under vLLM, and a
+DFlash-family draft (DFlash / JetSpec; vLLM's ``dflash`` method landed in 0.20).
 
 The EAGLE drafter checkpoints produced by the recipes are written by the
 consolidated checkpointer as an HF-style ``model/`` directory
@@ -72,6 +73,19 @@ Typical usage (after training produces a P-EAGLE checkpoint at
 so for a P-EAGLE head it can be omitted. Pass ``--print-only`` to inspect the
 command without launching it; in that mode the on-disk ``architectures`` rewrite
 is skipped and the printed paths reflect what a real launch would produce.
+
+DFlash family: a draft trained by the DFlash / JetSpec recipes (the config's
+``architectures`` is ``["Qwen3DFlashDraftModel"]``) is auto-detected and served
+with vLLM's ``dflash`` method -- ``--method`` can be omitted. Its weights carry
+no ``model.`` wrapper prefix and no embed/lm_head (vLLM shares the target's), so
+only the ``architectures`` rewrite (to vLLM's registered ``DFlashDraftModel``)
+applies, and K defaults to ``block_size - 1`` (a block is one anchor token plus
+``block_size - 1`` mask slots). A JetSpec draft is the same on-disk format
+trained with *causal* in-block attention: the recipe stamps
+``dflash_config.causal=true`` so vLLM matches it at inference; for a JetSpec
+checkpoint trained before that stamp existed, pass ``--dflash-causal``. A Domino
+draft is rejected: its GRU correction head (``prefix_gru`` / ``embed_proj``) has
+no vLLM runtime.
 """
 
 from __future__ import annotations
@@ -117,6 +131,12 @@ _VLLM_EXPORT_DIRNAME = "vllm_export"
 _AUTOMODEL_DRAFT_ARCHITECTURE = "LlamaEagle3DraftModel"
 _VLLM_DRAFT_ARCHITECTURE = "LlamaForCausalLMEagle3"
 
+# The DFlash recipes (DFlash / Domino / JetSpec all share one draft class) write
+# ``architectures=["Qwen3DFlashDraftModel"]``; vLLM's registry routes every
+# DFlash draft on ``DFlashDraftModel``.
+_AUTOMODEL_DFLASH_ARCHITECTURE = "Qwen3DFlashDraftModel"
+_VLLM_DFLASH_ARCHITECTURE = "DFlashDraftModel"
+
 
 def _check_vllm_available() -> None:
     """Verify the ``vllm`` package can actually be imported, else exit (code 2)."""
@@ -139,10 +159,45 @@ def _load_config(config_path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
-def _vllm_config_updates(config: dict[str, Any]) -> dict[str, Any]:
+def _is_dflash_config(config: dict[str, Any]) -> bool:
+    """True when the draft config identifies a DFlash-family draft (DFlash / Domino / JetSpec)."""
+    architectures = config.get("architectures") or []
+    return any(arch in (_AUTOMODEL_DFLASH_ARCHITECTURE, _VLLM_DFLASH_ARCHITECTURE) for arch in architectures)
+
+
+def _resolve_method(cli_method: str | None, config: dict[str, Any]) -> str:
+    """Resolve the vLLM speculative method: explicit ``--method``, else detect from the draft config."""
+    if cli_method is not None:
+        return cli_method
+    return "dflash" if _is_dflash_config(config) else "eagle3"
+
+
+def _dflash_config_updates(config: dict[str, Any], *, dflash_causal: bool) -> dict[str, Any]:
+    """Return the ``config.json`` key changes needed for vLLM to load a DFlash-family draft.
+
+    Only the ``architectures`` rewrite (to vLLM's registered ``DFlashDraftModel``)
+    is required: the draft weights carry no ``model.`` prefix and vLLM reads
+    ``dflash_config.mask_token_id`` / ``dflash_config.target_layer_ids`` where the
+    recipe already writes them. ``--dflash-causal`` additionally stamps
+    ``dflash_config.causal=true`` (a JetSpec draft trained before the recipe
+    stamped it).
+    """
+    dflash_config = dict(config.get("dflash_config") or {})
+    updates: dict[str, Any] = {}
+    if config.get("architectures") != [_VLLM_DFLASH_ARCHITECTURE]:
+        updates["architectures"] = [_VLLM_DFLASH_ARCHITECTURE]
+    if dflash_causal and not dflash_config.get("causal"):
+        dflash_config["causal"] = True
+        updates["dflash_config"] = dflash_config
+    return updates
+
+
+def _vllm_config_updates(config: dict[str, Any], *, dflash_causal: bool = False) -> dict[str, Any]:
     """Return the ``config.json`` key changes needed for vLLM to load this draft.
 
-    Two fixups bridge the Automodel on-disk format to what vLLM reads:
+    A DFlash-family draft gets the DFlash fixups (see ``_dflash_config_updates``).
+    For an EAGLE draft, two fixups bridge the Automodel on-disk format to what
+    vLLM reads:
 
     * ``architectures`` -> the vLLM-canonical ``LlamaForCausalLMEagle3`` (the
       recipe writes the Automodel class name ``LlamaEagle3DraftModel``, which
@@ -155,6 +210,8 @@ def _vllm_config_updates(config: dict[str, Any]) -> dict[str, Any]:
 
     Returns an empty dict when the config already satisfies vLLM.
     """
+    if _is_dflash_config(config):
+        return _dflash_config_updates(config, dflash_causal=dflash_causal)
     updates: dict[str, Any] = {}
     if config.get("architectures") != [_VLLM_DRAFT_ARCHITECTURE]:
         updates["architectures"] = [_VLLM_DRAFT_ARCHITECTURE]
@@ -173,15 +230,15 @@ def _vllm_config_updates(config: dict[str, Any]) -> dict[str, Any]:
     return updates
 
 
-def _rewrite_config_for_vllm(config_path: Path, config: dict[str, Any]) -> None:
-    """Patch ``config_path`` in place with the keys vLLM needs (architectures, pard_token).
+def _rewrite_config_for_vllm(config_path: Path, config: dict[str, Any], *, dflash_causal: bool = False) -> None:
+    """Patch ``config_path`` in place with the keys vLLM needs (see ``_vllm_config_updates``).
 
     Takes the already-parsed ``config`` so the caller's read is not repeated.
     No-op when the config already satisfies vLLM. The write is staged through a
     sibling ``.tmp`` file and finalized with ``os.replace`` so an interrupted
     write cannot leave the destination half-truncated.
     """
-    updates = _vllm_config_updates(config)
+    updates = _vllm_config_updates(config, dflash_causal=dflash_causal)
     if not updates:
         return
     logger.info("Patching draft config for vLLM: %s", updates)
@@ -320,7 +377,9 @@ def _find_draft_dir(draft_path: Path) -> Path | None:
     return None
 
 
-def resolve_draft_artifacts(draft: str, *, dry_run: bool = False) -> tuple[str, dict[str, Any]]:
+def resolve_draft_artifacts(
+    draft: str, *, dry_run: bool = False, dflash_causal: bool = False
+) -> tuple[str, dict[str, Any]]:
     """Resolve a user-supplied drafter path to the directory and config vLLM expects.
 
     Args:
@@ -329,6 +388,9 @@ def resolve_draft_artifacts(draft: str, *, dry_run: bool = False) -> tuple[str, 
             itself) or a Hugging Face Hub repo id.
         dry_run: When True, no on-disk ``architectures`` rewrite is performed and
             the returned paths reflect what a real launch would produce.
+        dflash_causal: When True, stamp ``dflash_config.causal=true`` on a
+            DFlash-family draft (a JetSpec checkpoint trained before the recipe
+            stamped it).
 
     Returns:
         ``(draft_path, config)`` where ``draft_path`` is what vLLM's
@@ -347,11 +409,21 @@ def resolve_draft_artifacts(draft: str, *, dry_run: bool = False) -> tuple[str, 
         raise ValueError(
             f"--draft {draft!r} exists but no config.json + weights were found under it "
             "(looked in ./, model/, model/consolidated/, consolidated/). Point --draft at the "
-            "checkpoint directory produced by an EAGLE-3 / P-EAGLE recipe."
+            "checkpoint directory produced by an EAGLE-3 / P-EAGLE / DFlash / JetSpec recipe."
         )
 
     config_path = draft_dir / "config.json"
     config = _load_config(config_path)
+
+    # A Domino draft is never servable here (its GRU correction head -- prefix_gru /
+    # embed_proj -- has no vLLM runtime, and serving the bare backbone without the
+    # head it was trained with would be wrong), so reject it in --print-only too.
+    if (config.get("dflash_config") or {}).get("projector_type") == "domino":
+        raise ValueError(
+            "this draft was trained by the Domino recipe (dflash_config.projector_type='domino'): "
+            "vLLM's dflash runtime cannot load its GRU correction head (prefix_gru / embed_proj), "
+            "so it is not servable here. Serve a plain DFlash or JetSpec draft instead."
+        )
 
     # Automodel drafts carry a ``self.model`` wrapper prefix on their weights that
     # vLLM cannot load; those need a remapped export. A draft whose weights are
@@ -363,14 +435,23 @@ def resolve_draft_artifacts(draft: str, *, dry_run: bool = False) -> tuple[str, 
         return str(_export_for_vllm(draft_dir, config)), config
 
     if not dry_run:
-        _rewrite_config_for_vllm(config_path, config)
+        _rewrite_config_for_vllm(config_path, config, dflash_causal=dflash_causal)
     return str(draft_dir), config
 
 
-def _resolve_num_speculative_tokens(cli_value: int | None, config: dict[str, Any]) -> int:
-    """Resolve K (number of speculative tokens), defaulting to the draft's ``num_depths``."""
+def _resolve_num_speculative_tokens(cli_value: int | None, config: dict[str, Any], method: str) -> int:
+    """Resolve K: CLI value, else ``block_size - 1`` (DFlash) / ``num_depths`` (EAGLE)."""
     if cli_value is not None:
         return cli_value
+    if method == "dflash":
+        block_size = config.get("block_size")
+        if block_size is None:
+            raise ValueError(
+                "--num-speculative-tokens is required: the DFlash draft config has no ``block_size`` "
+                "to derive it from. Pass the value explicitly, e.g. --num-speculative-tokens 15."
+            )
+        # A DFlash block is one anchor token plus block_size - 1 mask slots.
+        return int(block_size) - 1
     num_depths = config.get("num_depths")
     if num_depths is None:
         raise ValueError(
@@ -386,12 +467,15 @@ def _build_speculative_config(args: argparse.Namespace, draft_path: str, config:
 
     ``parallel_drafting`` is a SpeculativeConfig field that vLLM defaults to
     False; it must be set here for a P-EAGLE head (the draft's own
-    ``config.json`` flag is not auto-promoted to the speculative config).
+    ``config.json`` flag is not auto-promoted to the speculative config). A
+    DFlash draft needs no such flag: vLLM forces parallel drafting for the
+    ``dflash`` method itself.
     """
+    method = _resolve_method(args.method, config)
     speculative_config: dict[str, Any] = {
-        "method": args.method,
+        "method": method,
         "model": draft_path,
-        "num_speculative_tokens": _resolve_num_speculative_tokens(args.num_speculative_tokens, config),
+        "num_speculative_tokens": _resolve_num_speculative_tokens(args.num_speculative_tokens, config, method),
         "draft_tensor_parallel_size": args.draft_tp_size,
     }
     if config.get("parallel_drafting"):
@@ -401,7 +485,7 @@ def _build_speculative_config(args: argparse.Namespace, draft_path: str, config:
 
 def build_vllm_argv(args: argparse.Namespace) -> list[str]:
     """Build the ``python -m vllm.entrypoints.openai.api_server`` argv for a config."""
-    draft_path, config = resolve_draft_artifacts(args.draft, dry_run=args.print_only)
+    draft_path, config = resolve_draft_artifacts(args.draft, dry_run=args.print_only, dflash_causal=args.dflash_causal)
     speculative_config = _build_speculative_config(args, draft_path, config)
 
     argv: list[str] = [
@@ -437,7 +521,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="serve_vllm",
         description=(
-            "Launch vLLM with an Automodel-trained EAGLE-3 / P-EAGLE drafter. "
+            "Launch vLLM with an Automodel-trained EAGLE-3 / P-EAGLE / DFlash drafter. "
             "Requires `uv pip install vllm` in the current environment; vLLM is not "
             "bundled with the Automodel container."
         ),
@@ -451,22 +535,37 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--draft",
         required=True,
         help=(
-            "Path to the drafter checkpoint directory produced by an EAGLE-3 / P-EAGLE recipe "
-            "(e.g. outputs/peagle/checkpoints/epoch_2_step_44326). The ``model/`` and "
+            "Path to the drafter checkpoint directory produced by an EAGLE-3 / P-EAGLE / DFlash / "
+            "JetSpec recipe (e.g. outputs/peagle/checkpoints/epoch_2_step_44326). The ``model/`` and "
             "``model/consolidated/`` subdirs are auto-selected."
         ),
     )
     parser.add_argument(
         "--method",
-        default="eagle3",
-        choices=["eagle", "eagle3"],
-        help="Speculative method passed to vLLM (P-EAGLE uses eagle3 + parallel_drafting).",
+        default=None,
+        choices=["eagle", "eagle3", "dflash"],
+        help=(
+            "Speculative method passed to vLLM (P-EAGLE uses eagle3 + parallel_drafting). "
+            "Defaults to dflash for a DFlash-family draft (detected from the draft config), else eagle3."
+        ),
     )
     parser.add_argument(
         "--num-speculative-tokens",
         type=int,
         default=None,
-        help="K, number of speculative tokens. Defaults to the draft config's num_depths.",
+        help=(
+            "K, number of speculative tokens. Defaults to the draft config's num_depths "
+            "(EAGLE / P-EAGLE) or block_size - 1 (DFlash)."
+        ),
+    )
+    parser.add_argument(
+        "--dflash-causal",
+        action="store_true",
+        help=(
+            "Stamp dflash_config.causal=true on the draft config: needed for a JetSpec draft "
+            "(trained with causal in-block attention) whose checkpoint predates the recipe "
+            "writing the flag itself."
+        ),
     )
     parser.add_argument("--host", default="0.0.0.0", help="Server bind host.")
     parser.add_argument("--port", type=int, default=8000, help="Server port.")

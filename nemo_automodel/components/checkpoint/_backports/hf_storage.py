@@ -200,13 +200,12 @@ class _HuggingFaceStorageWriter(FsspecWriter):
         if self._save_sharded and not self._consolidated_output_path:
             return
         if self._save_sharded:
-            # Use staging for single-rank consolidation path
             consolidate_safetensors_files(
                 input_dir=self.path,
                 output_dir=self._consolidated_output_path,
                 num_threads=self._num_threads_consolidation,
                 fqn_to_index_mapping=self._fqn_to_index_mapping,
-                use_staging=True,
+                use_staging=self._staging_dir is not None,
                 staging_dir=self._staging_dir,
                 fqn_to_dtype_mapping=self._fqn_to_dtype_mapping,
             )

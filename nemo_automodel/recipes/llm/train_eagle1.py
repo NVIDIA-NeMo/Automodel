@@ -35,6 +35,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
     save_config,
 )
+from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
@@ -47,15 +48,13 @@ from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTarget
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
-from nemo_automodel.recipes.base_recipe import (
-    BaseRecipe,
-    _find_latest_checkpoint,
-    _is_checkpoint_model_config_compatible,
-    _resolve_restore_from_to_ckpt_dir,
-)
+from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.llm._spec_train_utils import (
+    apply_draft_compile,
+    apply_draft_fp8,
     make_warmup_cosine_schedule,
     optim_steps_per_epoch,
+    raise_if_peft_configured,
     should_sync_grads,
 )
 
@@ -67,6 +66,47 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
         value = value / dist.get_world_size()
     return value
+
+
+def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_size: int) -> None:
+    """Reject sequence-packing configs the EAGLE-1/2 path cannot honor (fail fast at setup).
+
+    - Context parallelism shards the sequence and strips the 4D block-causal mask
+      packing relies on, and EAGLE-1/2 has no CP sequence-sharding path, so
+      ``cp_size > 1`` with packing would silently train on wrong supervision.
+    - A FlashAttention target infers document boundaries from per-document
+      ``position_ids``, which transformers packs only at batch size 1.
+    """
+    if cp_size > 1:
+        raise NotImplementedError(
+            "Sequence packing (packed_sequence_size>0) is not supported with context parallelism "
+            "(distributed.cp_size>1) in EAGLE-1/2; CP shards the sequence and strips the 4D block-causal "
+            "mask packing relies on. Set cp_size=1 or packed_sequence_size=0."
+        )
+    if "flash" in target_attn_impl and micro_batch_size > 1:
+        raise ValueError(
+            "Sequence packing with a FlashAttention target requires micro_batch_size=1 "
+            f"(got {micro_batch_size}); FlashAttention infers document boundaries from per-document "
+            "position_ids, which transformers packs only at batch size 1. Set micro_batch_size=1 or "
+            "load the target with attn_implementation='sdpa'."
+        )
+
+
+def _packing_kwargs(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Sequence-packing metadata from a dataloader batch (empty dict when unpacked).
+
+    The packed loader (``packed_sequence_size > 0``) emits ``position_ids`` /
+    ``seq_lens`` / ``doc_remaining`` alongside ``input_ids``; the default loader
+    does not. Keyed on ``seq_lens`` so the caller can splat the result into
+    ``HFEagleTargetModel.generate_batch`` unconditionally.
+    """
+    if "seq_lens" not in batch:
+        return {}
+    return {
+        "position_ids": batch["position_ids"],
+        "seq_lens": batch["seq_lens"],
+        "doc_remaining": batch["doc_remaining"],
+    }
 
 
 def _submesh_or_none(device_mesh, name: str):
@@ -101,6 +141,7 @@ class TrainEagle1Recipe(BaseRecipe):
 
         recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
+        raise_if_peft_configured(self.cfg, type(self).__name__)
 
         target_path = recipe_cfg.target_model_name_or_path
         target_config = AutoConfig.from_pretrained(
@@ -157,6 +198,20 @@ class TrainEagle1Recipe(BaseRecipe):
         self.target_model.requires_grad_(False)
         self.target_wrapper = HFEagleTargetModel(self.target_model)
 
+        # ``packed_sequence_size > 0`` enables sequence packing (greedy first-fit
+        # of documents into fixed-width rows), removing the padding waste of the
+        # default ``padding="max_length"`` path. The colocated HF target and the
+        # single-step draft both consume the block-causal packing metadata
+        # (position_ids / seq_lens / doc_remaining) the packed loader emits.
+        packed_sequence_size = int(recipe_cfg.get("packed_sequence_size", 0) or 0)
+        if packed_sequence_size > 0:
+            # Fail fast at setup (before the multi-GPU load + dataloader build) on
+            # packing configs EAGLE-1/2 cannot honor, rather than mid-run.
+            _validate_packing_gates(
+                cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
+                target_attn_impl=getattr(self.target_model.config, "_attn_implementation", None) or "",
+                micro_batch_size=int(recipe_cfg.micro_batch_size),
+            )
         self.train_dataloader = build_eagle3_dataloader(
             data_path=recipe_cfg.train_data_path,
             tokenizer=self.tokenizer,
@@ -168,6 +223,7 @@ class TrainEagle1Recipe(BaseRecipe):
             distributed=self.dist_env.world_size > 1,
             shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
             mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            packed_sequence_size=packed_sequence_size,
             dp_mesh=self.dp_mesh,
         )
         self.val_dataloader = None
@@ -183,6 +239,7 @@ class TrainEagle1Recipe(BaseRecipe):
                 distributed=self.dist_env.world_size > 1,
                 shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
                 mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+                packed_sequence_size=packed_sequence_size,
                 dp_mesh=self.dp_mesh,
             )
 
@@ -197,6 +254,10 @@ class TrainEagle1Recipe(BaseRecipe):
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
+        # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede the DDP wrap.
+        apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
+        # Optional torch.compile of the draft, in place; after the fp8 swap.
+        apply_draft_compile(self.draft_model, self.cfg.get("compile", None))
         # The target's "Model summary" is logged by apply_model_infrastructure when it
         # loads; the draft is built directly, so log its (trainable) summary here too.
         print_trainable_parameters(self.draft_model, name="Draft")
@@ -341,6 +402,7 @@ class TrainEagle1Recipe(BaseRecipe):
             pp_rank=0,
             moe_mesh=None,
         )
+        self._log_checkpoint_retention_policy(self.checkpoint_config)
 
     def _module(self):
         return (
@@ -356,42 +418,31 @@ class TrainEagle1Recipe(BaseRecipe):
         train_loss: float | None = None,
         val_loss: dict[str, float] | None = None,
         best_metric_key: str = "default",
+        is_final_checkpoint: bool = False,
     ) -> None:
         """Persist draft model, optimizer, scheduler, RNG, and EAGLE meta.
 
         Overrides ``BaseRecipe.save_checkpoint`` because EAGLE recipes hold multiple
         ``nn.Module`` attributes (frozen target, target wrapper, trainer module wrapping
         the draft) — only ``draft_model`` should be persisted as the main model.
+
+        ``is_final_checkpoint`` is computed by the caller (this hand-rolled loop
+        has no ``step_scheduler`` for the checkpointer to infer it from);
+        ``save_consolidated: final`` exports HF safetensors only when it is True.
         """
         checkpointer = getattr(self, "checkpointer", None)
         if checkpointer is None or not checkpointer.config.enabled:
             return
         self.checkpointer.async_wait()
 
-        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
-        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
+        self._complete_pending_checkpoint()
 
         ckpt_root = self.checkpoint_config.checkpoint_dir
         path = os.path.join(str(ckpt_root), f"epoch_{epoch}_step_{step}")
         is_dist_initialized = dist.is_initialized()
         is_rank_0 = (not is_dist_initialized) or dist.get_rank() == 0
-        best_val_metric = (
-            val_loss.get(next(iter(val_loss.keys())) if len(val_loss) == 1 else best_metric_key) if val_loss else None
-        )
-
-        if prev_pending is not None:
-            if is_rank_0:
-                self._update_latest_symlink(prev_pending)
-            setattr(self, "_last_pending_checkpoint_dir", None)
-            if is_dist_initialized:
-                dist.barrier()
-
-        if prev_best_pending is not None:
-            if is_rank_0 and prev_best_pending.get("val") is not None:
-                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
-            setattr(self, "_last_pending_best_checkpoint_info", None)
-            if is_dist_initialized:
-                dist.barrier()
+        best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
+        best_val_metric = val_loss.get(best_metric_name) if val_loss else None
 
         if is_rank_0:
             if os.path.exists(path):
@@ -409,8 +460,6 @@ class TrainEagle1Recipe(BaseRecipe):
         if is_dist_initialized:
             dist.barrier()
 
-        step_scheduler = getattr(self, "step_scheduler", None)
-        is_final_checkpoint = bool(getattr(step_scheduler, "is_last_step", False))
         draft_model = self._module().draft_model
         self.checkpointer.save_model(
             draft_model,
@@ -432,13 +481,21 @@ class TrainEagle1Recipe(BaseRecipe):
 
         if getattr(self.checkpointer.config, "is_async", False):
             setattr(self, "_last_pending_checkpoint_dir", path)
-            if best_val_metric is not None:
-                setattr(self, "_last_pending_best_checkpoint_info", {"path": path, "val": float(best_val_metric)})
+            setattr(
+                self,
+                "_last_pending_best_checkpoint_info",
+                {
+                    "path": path,
+                    "val": float(best_val_metric) if best_val_metric is not None else None,
+                    "metric_key": best_metric_name,
+                },
+            )
         else:
             if is_rank_0:
                 self._update_latest_symlink(path)
                 if best_val_metric is not None:
-                    self._update_best_symlink(path, float(best_val_metric))
+                    self._update_best_symlink(path, float(best_val_metric), best_metric_name)
+                self._prune_old_checkpoints()
             if is_dist_initialized:
                 dist.barrier()
 
@@ -460,12 +517,15 @@ class TrainEagle1Recipe(BaseRecipe):
         every = getattr(self, "ckpt_every_steps", None)
         if every is None or every <= 0 or self.runtime.global_step % every != 0:
             return False
+        total_optim_steps = getattr(self, "total_optim_steps", None)
+        is_final_checkpoint = total_optim_steps is not None and self.runtime.global_step >= total_optim_steps
         self.save_checkpoint(
             epoch=epoch,
             step=self.runtime.global_step,
             train_loss=None,
             val_loss=None,
             best_metric_key="val_loss",
+            is_final_checkpoint=is_final_checkpoint,
         )
         self._log_saved_checkpoint("step", epoch, self.runtime.global_step)
         return True
@@ -494,6 +554,7 @@ class TrainEagle1Recipe(BaseRecipe):
             train_loss=None,
             val_loss=None,
             best_metric_key="val_loss",
+            is_final_checkpoint=True,
         )
         self._log_saved_checkpoint("final", completed_epochs, gs)
         return True
@@ -519,7 +580,7 @@ class TrainEagle1Recipe(BaseRecipe):
         ckpt_root = self.checkpoint_config.checkpoint_dir
 
         if restore_from:
-            ckpt_dir = _resolve_restore_from_to_ckpt_dir(ckpt_root, restore_from)
+            ckpt_dir = resolve_restore_from_to_checkpoint_dir(ckpt_root, restore_from)
             if ckpt_dir is None:
                 if is_rank_0:
                     logger.warning("restore_from='LATEST' but no checkpoint found in %s", ckpt_root)
@@ -527,7 +588,7 @@ class TrainEagle1Recipe(BaseRecipe):
             if not os.path.isdir(ckpt_dir):
                 raise FileNotFoundError(f"Checkpoint directory does not exist: {ckpt_dir}")
         else:
-            auto = _find_latest_checkpoint(ckpt_root)
+            auto = find_latest_checkpoint(ckpt_root)
             if auto is None:
                 return
             ckpt_dir = str(auto)
@@ -589,6 +650,7 @@ class TrainEagle1Recipe(BaseRecipe):
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     loss_mask=batch["loss_mask"],
+                    **_packing_kwargs(batch),
                 )
                 metrics = self.trainer_module(
                     input_ids=target_batch.input_ids,
@@ -597,6 +659,9 @@ class TrainEagle1Recipe(BaseRecipe):
                     input_hidden_states=target_batch.input_hidden_states,
                     target_hidden_states=target_batch.target_hidden_states,
                     target_logits=target_batch.target_logits,
+                    position_ids=target_batch.position_ids,
+                    seq_lens=target_batch.seq_lens,
+                    doc_remaining=target_batch.doc_remaining,
                 )
                 total_loss += metrics.loss.detach()
                 total_acc += metrics.accuracy.detach()
@@ -652,6 +717,7 @@ class TrainEagle1Recipe(BaseRecipe):
                         input_ids=batch["input_ids"],
                         attention_mask=batch["attention_mask"],
                         loss_mask=batch["loss_mask"],
+                        **_packing_kwargs(batch),
                     )
                     # Skip DDP's per-micro-batch all-reduce on every micro-batch
                     # except the one an optimizer step immediately follows; that
@@ -672,6 +738,9 @@ class TrainEagle1Recipe(BaseRecipe):
                             input_hidden_states=target_batch.input_hidden_states,
                             target_hidden_states=target_batch.target_hidden_states,
                             target_logits=target_batch.target_logits,
+                            position_ids=target_batch.position_ids,
+                            seq_lens=target_batch.seq_lens,
+                            doc_remaining=target_batch.doc_remaining,
                         )
                         loss = metrics.loss / self.grad_accumulation_steps
                         loss.backward()
@@ -794,10 +863,11 @@ class TrainEagle1Recipe(BaseRecipe):
                         train_loss=avg_loss,
                         val_loss=eval_metrics,
                         best_metric_key="val_loss",
+                        is_final_checkpoint=epoch_idx + 1 >= self.num_epochs,
                     )
 
             self._maybe_save_final_checkpoint(self.num_epochs)
-            self._finalize_pending_checkpoint()
+            self._finalize_and_close_checkpointer()
         finally:
             if pbar is not None:
                 pbar.close()

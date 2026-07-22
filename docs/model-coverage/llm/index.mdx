@@ -8,10 +8,12 @@ Large Language Models (LLMs) power a variety of tasks such as dialogue systems, 
 NeMo AutoModel provides a simple interface for loading and fine-tuning LLMs hosted on the Hugging Face Hub.
 
 ## Run LLMs with NeMo AutoModel
-To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [`26.06.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=26.06.00) or later. If the model you intend to fine-tune requires a newer version of Transformers, you may need to upgrade to the latest version of NeMo AutoModel by running:
+To run LLMs with NeMo AutoModel, make sure you're using NeMo container version [`26.06.00`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/nemo-automodel?version=26.06.00) or later. If the model you intend to fine-tune requires newer source than the container provides, use a current checkout so the package and its example recipes stay on one revision:
 
 ```bash
-pip3 install --upgrade git+git@github.com:NVIDIA-NeMo/AutoModel.git
+git clone https://github.com/NVIDIA-NeMo/Automodel.git
+cd Automodel
+uv sync --locked --all-groups --all-extras
 ```
 
 For other installation options (e.g., uv), see the [NeMo AutoModel Installation Guide](/get-started/installation).
@@ -78,6 +80,7 @@ NeMo AutoModel supports the [AutoModelForCausalLM](https://huggingface.co/transf
 | Tencent | [Hy3-preview](/model-coverage/large-language-models/hy3-preview) | `HYV3ForCausalLM` |
 | Tencent | [Hy-MT2](/model-coverage/large-language-models/hy-mt2) | `HyMT2ForCausalLM` |
 | Xiaomi MiMo | [MiMo-V2-Flash](/model-coverage/large-language-models/mimo-v2-flash) | `MiMoV2FlashForCausalLM` |
+| Poolside | [Laguna](/model-coverage/large-language-models/laguna) | `LagunaForCausalLM` |
 | inclusionAI | [Ling 2.0](/model-coverage/large-language-models/ling-2-0) | `BailingMoeV2ForCausalLM` |
 
 ## Fine-Tuning LLMs with NeMo AutoModel
