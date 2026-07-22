@@ -29,9 +29,9 @@ from nemo_automodel.components._peft.lora_kernel import (
     lora_forward_wrapper,
 )
 from nemo_automodel.components._peft.module_matcher import ModuleMatcher
-from nemo_automodel.components._tp_linear import _tp_linear_forward
 from nemo_automodel.components.moe.layers import GroupedExperts, GroupedExpertsDeepEP, GroupedExpertsTE
 from nemo_automodel.shared.import_utils import safe_import, safe_import_te
+from nemo_automodel.shared.tp_linear import tp_linear_forward
 from nemo_automodel.shared.utils import dtype_from_str
 
 HAS_BNB, bitsandbytes = safe_import("bitsandbytes")
@@ -283,7 +283,7 @@ class LinearLoRA(nn.Linear):
             bias = self.bias
             if bias is not None and bias.numel() == 0:
                 bias = None
-            res = _tp_linear_forward(x, self.weight, bias, mm_for_2d_compile=False)
+            res = tp_linear_forward(x, self.weight, bias, mm_for_2d_compile=False)
 
         if not self.use_dora:
             if self.dropout_position == "pre":

@@ -30,9 +30,9 @@ from nemo_automodel.components._peft.lora import (
     apply_memory_efficient_lora,
     patch_linear_module,
 )
-from nemo_automodel.components._tp_linear import _async_tp_linear
 from nemo_automodel.components.distributed.parallel_styles import TPLinear
 from nemo_automodel.shared.import_utils import safe_import_te
+from nemo_automodel.shared.tp_linear import _async_tp_linear
 
 HAS_TE, transformer_engine = safe_import_te()
 
@@ -628,8 +628,8 @@ def test_linear_lora_dim1_sharded_dtensor_takes_bmm_not_async_shaping(single_ran
     x = DTensor.from_local(x_local, mesh, [Shard(1)], run_check=False)
 
     with (
-        patch("nemo_automodel.components._tp_linear._is_async_tp_linear_enabled", return_value=True),
-        patch("nemo_automodel.components._tp_linear._async_tp_linear") as async_spy,
+        patch("nemo_automodel.shared.tp_linear._is_async_tp_linear_enabled", return_value=True),
+        patch("nemo_automodel.shared.tp_linear._async_tp_linear") as async_spy,
         patch("torch.bmm", wraps=torch.bmm) as bmm_spy,
     ):
         out = lora(x)
@@ -662,8 +662,8 @@ def test_linear_lora_negative_last_dim_shard_takes_async_shaping(single_rank_pg)
     x = DTensor.from_local(x_local, mesh, [Shard(-1)], run_check=False)
 
     with (
-        patch("nemo_automodel.components._tp_linear._is_async_tp_linear_enabled", return_value=True),
-        patch("nemo_automodel.components._tp_linear._async_tp_linear", wraps=_async_tp_linear) as async_spy,
+        patch("nemo_automodel.shared.tp_linear._is_async_tp_linear_enabled", return_value=True),
+        patch("nemo_automodel.shared.tp_linear._async_tp_linear", wraps=_async_tp_linear) as async_spy,
         patch("torch.bmm", wraps=torch.bmm) as bmm_spy,
     ):
         out = lora(x)

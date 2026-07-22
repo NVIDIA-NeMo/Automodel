@@ -23,11 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard, distribute_tensor
 
-from nemo_automodel.components._tp_linear import (
-    _async_tp_linear,
-    _is_async_tp_linear_enabled,
-)
 from nemo_automodel.components.distributed.parallel_styles import TPLinear
+from nemo_automodel.shared.tp_linear import _async_tp_linear, _is_async_tp_linear_enabled
 
 
 @pytest.fixture
@@ -229,8 +226,8 @@ class TestTPLinearShardedInputUnderAsyncTp:
         x = DTensor.from_local(x_local, mesh, [Shard(1)], run_check=False)
 
         with (
-            patch("nemo_automodel.components._tp_linear._is_async_tp_linear_enabled", return_value=True),
-            patch("nemo_automodel.components._tp_linear._async_tp_linear") as async_spy,
+            patch("nemo_automodel.shared.tp_linear._is_async_tp_linear_enabled", return_value=True),
+            patch("nemo_automodel.shared.tp_linear._async_tp_linear") as async_spy,
             patch("torch.bmm", wraps=torch.bmm) as bmm_spy,
         ):
             out = linear(x)
@@ -260,8 +257,8 @@ class TestTPLinearShardedInputUnderAsyncTp:
         x = DTensor.from_local(x_local, mesh, [Shard(-1)], run_check=False)
 
         with (
-            patch("nemo_automodel.components._tp_linear._is_async_tp_linear_enabled", return_value=True),
-            patch("nemo_automodel.components._tp_linear._async_tp_linear", wraps=_async_tp_linear) as async_spy,
+            patch("nemo_automodel.shared.tp_linear._is_async_tp_linear_enabled", return_value=True),
+            patch("nemo_automodel.shared.tp_linear._async_tp_linear", wraps=_async_tp_linear) as async_spy,
             patch("torch.bmm", wraps=torch.bmm) as bmm_spy,
         ):
             out = linear(x)

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Linear graph-shaping helpers shared by dense and PEFT tensor parallelism.
+"""Low-level linear graph-shaping helpers shared by tensor-parallel components.
 
 Inductor's async tensor-parallel pass (``torch._inductor.config._micro_pipeline_tp``)
 fuses collectives with matmuls by pattern-matching the reshape-mm-reshape graph
@@ -67,7 +67,7 @@ def _async_tp_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor |
     return output + bias if bias is not None else output
 
 
-def _tp_linear_forward(
+def tp_linear_forward(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,

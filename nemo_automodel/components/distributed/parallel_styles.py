@@ -26,7 +26,7 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
 )
 
-from nemo_automodel.components._tp_linear import _tp_linear_forward
+from nemo_automodel.shared.tp_linear import tp_linear_forward
 
 
 def _distribute_param(_module, name, device_mesh, src_data_rank, placements):
@@ -84,7 +84,7 @@ class TPLinear(nn.Linear):
             leading dimensions as ``x``; a DTensor if ``x`` and the weight
             are DTensors.
         """
-        return _tp_linear_forward(x, self.weight, self.bias, mm_for_2d_compile=True)
+        return tp_linear_forward(x, self.weight, self.bias, mm_for_2d_compile=True)
 
 
 class ColwiseParallelLora(ColwiseParallel):
