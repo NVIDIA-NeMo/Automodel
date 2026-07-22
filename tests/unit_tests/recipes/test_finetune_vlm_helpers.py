@@ -2240,7 +2240,7 @@ class _CPPreEmbedModel(torch.nn.Module):
         return {}
 
     def forward(self, **kwargs):
-        raise AssertionError("forward should not run: _make_cp_batch_and_ctx raises first")
+        raise AssertionError("forward should not run: ContextParallelSharder.shard raises first")
 
 
 class _CPPreEmbedStop(RuntimeError):
@@ -2253,7 +2253,7 @@ class TestForwardBackwardStepNonPP:
     def test_non_pp_cp_invokes_sharder_only_hook_and_keeps_inputs(self, monkeypatch):
         # Sunk contract: the non-PP CP path invokes the sharder-only hook, which
         # consumes nothing, so input_ids / pixel_values / mm_token_type_ids all
-        # reach _make_cp_batch_and_ctx intact (the model embeds + shards them in
+        # reach ContextParallelSharder.shard intact (the model embeds + shards them in
         # its own forward, not here).
         model = _CPPreEmbedModel()
         non_pp_recipe = _create_non_pp_recipe(model)
@@ -2261,7 +2261,15 @@ class TestForwardBackwardStepNonPP:
 
         mm_token_type_ids = torch.tensor([[1, 1, 0, 0]])
 
-        def _capture_cp_batch(device_mesh, batch, loss_mask=None, **kwargs):
+        def _capture_cp_batch(sharder, batch):
+            """Validate the global model-input mapping before CP transport.
+
+            Args:
+                sharder: Sharder configured by the VLM recipe.
+                batch: Mutable model-input mapping whose tensor values have
+                    global batch and sequence extents.
+            """
+            del sharder
             assert "input_ids" in batch
             assert "pixel_values" in batch
             assert "mm_token_type_ids" in batch
@@ -2270,7 +2278,7 @@ class TestForwardBackwardStepNonPP:
             raise _CPPreEmbedStop
 
         monkeypatch.setattr(
-            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            "nemo_automodel.recipes.vlm.finetune.ContextParallelSharder.shard",
             _capture_cp_batch,
         )
 
