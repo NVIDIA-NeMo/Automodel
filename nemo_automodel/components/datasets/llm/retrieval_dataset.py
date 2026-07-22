@@ -103,6 +103,7 @@ class WikiSSNQDataset(AbstractDataset):
     def get_document_by_id(self, id):
         example = deepcopy(EXAMPLE_TEMPLATE)
         doc = self.data[self.docid2idx[id]]
+        example["text"] = doc["text"]
         example["image"] = doc["image"]
         if "nr_ocr" in doc:
             example["nr_ocr"] = doc["nr_ocr"]
@@ -575,7 +576,16 @@ def _load_hf_sources(hf_entries: List[Tuple[Optional[int], str]], seed: int = 42
     return Dataset.from_list(hf_data), corpus_dict
 
 
-def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False, epoch: int = 0):
+def _transform_func(
+    examples,
+    num_neg_docs,
+    corpus_dict,
+    use_dataset_instruction: bool = False,
+    epoch: int = 0,
+    use_text_in_document: bool = False,
+    use_ocr_text: str | None = None,
+    prob_sample_orc_text_with_image: float = 1.0,
+):
     """
     Transform function to convert from raw format to training format.
 
@@ -585,6 +595,9 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         corpus_dict: Dictionary mapping corpus_id to corpus objects
         use_dataset_instruction: Whether to use instruction from dataset's metadata
         epoch: Current epoch for cycling through positive documents
+        use_text_in_document: Whether image documents should also include their text
+        use_ocr_text: OCR field to include (``simple_ocr`` or ``complex_ocr``)
+        prob_sample_orc_text_with_image: Probability of including OCR text with an image
     """
     # Handle both batched and single examples
     is_batched = isinstance(examples["question"], list)
@@ -667,8 +680,13 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
             # Extract text
             if cur_doc["text"] != "" and not cur_doc["image"]:
                 text = cur_doc["text"]
-            elif cur_doc["image"]:
+            elif use_text_in_document and cur_doc["image"]:
                 text = " " + cur_doc["text"] if cur_doc["text"] else ""
+                if use_ocr_text and random.random() < prob_sample_orc_text_with_image:
+                    if use_ocr_text == "simple_ocr" and cur_doc.get("nr_ocr"):
+                        text += " " + cur_doc["nr_ocr"]
+                    elif use_ocr_text == "complex_ocr" and cur_doc.get("complex_ocr"):
+                        text += " " + cur_doc["complex_ocr"]
                 text = text.strip()
             else:
                 text = ""
@@ -707,14 +725,30 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
 
 
 def _cross_encoder_transform_func(
-    examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False, epoch: int = 0
+    examples,
+    num_neg_docs,
+    corpus_dict,
+    use_dataset_instruction: bool = False,
+    epoch: int = 0,
+    use_text_in_document: bool = False,
+    use_ocr_text: str | None = None,
+    prob_sample_orc_text_with_image: float = 1.0,
 ):
     """
     Transform function to convert from raw format to cross-encoder training format.
     """
     from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import flatten_bi_encoder_to_cross_encoder
 
-    data = _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction, epoch=epoch)
+    data = _transform_func(
+        examples,
+        num_neg_docs,
+        corpus_dict,
+        use_dataset_instruction,
+        epoch=epoch,
+        use_text_in_document=use_text_in_document,
+        use_ocr_text=use_ocr_text,
+        prob_sample_orc_text_with_image=prob_sample_orc_text_with_image,
+    )
     return flatten_bi_encoder_to_cross_encoder(data)
 
 
@@ -732,6 +766,9 @@ class RetrievalTransform:
         use_dataset_instruction: bool = False,
         model_type: str = "bi_encoder",
         cycle_positive_docs: bool = False,
+        use_text_in_document: bool = False,
+        use_ocr_text: str | None = None,
+        prob_sample_orc_text_with_image: float = 1.0,
     ):
         if model_type not in _VALID_MODEL_TYPES:
             raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
@@ -740,6 +777,9 @@ class RetrievalTransform:
         self.use_dataset_instruction = use_dataset_instruction
         self.model_type = model_type
         self.cycle_positive_docs = cycle_positive_docs
+        self.use_text_in_document = use_text_in_document
+        self.use_ocr_text = use_ocr_text
+        self.prob_sample_orc_text_with_image = prob_sample_orc_text_with_image
         self.epoch = 0
 
     def __call__(self, examples):
@@ -751,6 +791,9 @@ class RetrievalTransform:
                 corpus_dict=self.corpus_dict,
                 use_dataset_instruction=self.use_dataset_instruction,
                 epoch=epoch,
+                use_text_in_document=self.use_text_in_document,
+                use_ocr_text=self.use_ocr_text,
+                prob_sample_orc_text_with_image=self.prob_sample_orc_text_with_image,
             )
         return _transform_func(
             examples,
@@ -758,6 +801,9 @@ class RetrievalTransform:
             corpus_dict=self.corpus_dict,
             use_dataset_instruction=self.use_dataset_instruction,
             epoch=epoch,
+            use_text_in_document=self.use_text_in_document,
+            use_ocr_text=self.use_ocr_text,
+            prob_sample_orc_text_with_image=self.prob_sample_orc_text_with_image,
         )
 
     def set_epoch(self, epoch: int):
@@ -777,6 +823,9 @@ def make_retrieval_dataset(
     train_data_select_offset: int = 0,
     use_dataset_instruction: bool = False,
     cycle_positive_docs: bool = False,
+    use_text_in_document: bool = False,
+    use_ocr_text: str | None = None,
+    prob_sample_orc_text_with_image: float = 1.0,
 ):
     """
     Load and return dataset in retrieval format for encoder training.
@@ -805,6 +854,9 @@ def make_retrieval_dataset(
         cycle_positive_docs: Whether training should cycle through positive documents across epochs.
             Defaults to ``False`` (always use the first positive document). Set to ``True`` only
             when a query has multiple positive documents and you want to rotate through them by epoch.
+        use_text_in_document: Whether image documents should also include their text.
+        use_ocr_text: OCR field to include (``simple_ocr`` or ``complex_ocr``).
+        prob_sample_orc_text_with_image: Probability of including OCR text with an image.
 
     Returns:
         A HuggingFace Dataset where each example is a dict with keys:
@@ -891,7 +943,14 @@ def make_retrieval_dataset(
 
         negative_size = n_passages - 1
         transform = RetrievalTransform(
-            negative_size, corpus_dict, use_dataset_instruction, model_type, cycle_positive_docs
+            negative_size,
+            corpus_dict,
+            use_dataset_instruction,
+            model_type,
+            cycle_positive_docs,
+            use_text_in_document,
+            use_ocr_text,
+            prob_sample_orc_text_with_image,
         )
         dataset.set_transform(transform)
         if cycle_positive_docs:
@@ -905,7 +964,14 @@ def make_retrieval_dataset(
         if eval_negative_size is None:
             eval_negative_size = n_passages - 1
         transform = RetrievalTransform(
-            eval_negative_size, corpus_dict, use_dataset_instruction, model_type, cycle_positive_docs
+            eval_negative_size,
+            corpus_dict,
+            use_dataset_instruction,
+            model_type,
+            cycle_positive_docs,
+            use_text_in_document,
+            use_ocr_text,
+            prob_sample_orc_text_with_image,
         )
         dataset.set_transform(transform)
 
@@ -943,6 +1009,12 @@ class RetrievalDatasetConfig:
     """Whether to use the instruction from the dataset's metadata."""
     cycle_positive_docs: bool = False
     """Whether to rotate through multiple positive documents by epoch during training."""
+    use_text_in_document: bool = False
+    """Whether image documents should also include their text."""
+    use_ocr_text: str | None = None
+    """OCR field to include (``simple_ocr`` or ``complex_ocr``)."""
+    prob_sample_orc_text_with_image: float = 1.0
+    """Probability of including OCR text with an image."""
 
     def build(self) -> Dataset:
         """Build the retrieval :class:`~datasets.Dataset` from this :class:`RetrievalDatasetConfig`."""
@@ -958,6 +1030,9 @@ class RetrievalDatasetConfig:
             train_data_select_offset=self.train_data_select_offset,
             use_dataset_instruction=self.use_dataset_instruction,
             cycle_positive_docs=self.cycle_positive_docs,
+            use_text_in_document=self.use_text_in_document,
+            use_ocr_text=self.use_ocr_text,
+            prob_sample_orc_text_with_image=self.prob_sample_orc_text_with_image,
         )
 
 
