@@ -227,7 +227,36 @@ same warp-copy loops, further stressing SM issue slots. HybridEP dedicates a Red
 inside the pipeline and, cross-node, pre-reduces within the node before the RDMA hop. This is
 where HybridEP's largest steady-state kernel margin shows (+12% at DSv3 dims internode).
 
-### 5.4 Where the wins actually convert to step time / MFU
+### 5.4 Transport tiers and the "hybrid" routing
+
+Both libraries split every all-to-all across two interconnect tiers, and the benchmarks above
+exercise both tiers concurrently (the internode logs report NVL and RDMA bandwidth for the
+*same* kernel — e.g. HybridEP EP16 dispatch sustains 285.8 GB/s NVLink and 85.7 GB/s RDMA
+simultaneously within one 1366 µs kernel; DeepEP 263.0 / 79.5 respectively).
+
+| | intra-node | inter-node |
+|---|---|---|
+| DeepEP | NVLink, peer buffers mapped via CUDA IPC; **SM warps store directly into the peer's memory** (`st_na_global`, data through registers) | NVSHMEM with **GPU-initiated IBGDA** device verbs (`csrc/kernels/ibgda_device.cuh`): warps build WQEs and ring the NIC doorbell from the kernel |
+| HybridEP | NVLink, IPC (or cuMem fabric handles for MNNVL/NVL72); **TMA `cp_async_bulk` writes into the peer's buffer** (no registers) | **DOCA GPUNetIO GPU verbs**: a dedicated RDMA warp group builds WQEs and rings doorbells on-GPU; experimental NIXL/UCX alternative |
+| DeepEP v2 (ref) | NVLink, IPC/fabric | **NCCL Gin (GDAKI)** — also kernel-initiated RDMA |
+
+Note the common ground: in all three, the CPU never touches the data path — RDMA is driven
+directly from the GPU. The differentiation is *which* GPU-side verbs stack drives the NIC and
+whether the NVLink hop is executed by SM warps or by TMA.
+
+The routing topology — the "hybrid" in both names — is identical in DeepEP and HybridEP:
+a token crossing nodes is sent over RDMA **once per destination node**, to the peer GPU with
+the same local rank (rail-optimized: each GPU only talks to its same-index peers, matching
+one-NIC-per-GPU topologies and minimizing QPs), and that peer fans it out over NVLink to the
+target experts' ranks. This buys (1) deduplication — IB traffic scales with destination
+*nodes*, not destination *experts*; (2) chunk-level pipelining of the RDMA and NVLink legs;
+(3) symmetric combine, where partial expert outputs are pre-reduced within the node before the
+single RDMA hop back. Since the topology is the same, the measured differences come entirely
+from the execution engines on each leg (TMA vs warp-copy; DOCA vs NVSHMEM) and the SM budget.
+DeepEP v2 additionally offers a *direct* (point-to-point, no forwarding) mode alongside hybrid;
+v1 and HybridEP's high-throughput path is hybrid-only.
+
+### 5.5 Where the wins actually convert to step time / MFU
 
 Two independent channels:
 - **Exposed-time channel** (no comm/compute overlap — today's Automodel path): step-time gain
