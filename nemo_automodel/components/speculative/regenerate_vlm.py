@@ -81,6 +81,12 @@ class RegenerationConfig:
             slices are reproducible across shards.
         length_instruction: Sentence appended to every prompt to force a long
             answer. Empty disables the append.
+        image_max_pixels: Per-image pixel ceiling handed to the processor, or
+            ``None`` to keep its default. Set it to the same value stage-2
+            training uses: the answer is conditioned on whatever resolution the
+            target saw here, so regenerating at a higher one supervises the
+            draft against an image it never gets at training time.
+        image_min_pixels: Per-image pixel floor, or ``None`` for the default.
     """
 
     model: str
@@ -94,6 +100,8 @@ class RegenerationConfig:
     temperature: float
     shuffle_seed: int
     length_instruction: str
+    image_max_pixels: int | None = None
+    image_min_pixels: int | None = None
 
 
 def _extract_prompt(example: dict) -> tuple[str, str] | None:
@@ -213,6 +221,26 @@ def _load_target_model(model_path: str) -> torch.nn.Module:
     return model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
 
+def _apply_image_token_budget(processor, config: RegenerationConfig) -> None:
+    """Clamp the processor image resolution to what stage-2 training will use.
+
+    Args:
+        processor: The target's ``AutoProcessor``.
+        config: The active regeneration settings.
+    """
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        return
+    for attribute, value in (("max_pixels", config.image_max_pixels), ("min_pixels", config.image_min_pixels)):
+        if value is None:
+            continue
+        setattr(image_processor, attribute, int(value))
+        size = getattr(image_processor, "size", None)
+        if isinstance(size, dict) and attribute in size:
+            size[attribute] = int(value)
+        logger.info("Capped processor %s at %d", attribute, int(value))
+
+
 def _load_source_dataset(dataset_path: str, split: str):
     """Load a source corpus from either a dataset ID or a local JSON file.
 
@@ -245,6 +273,7 @@ def regenerate(config: RegenerationConfig) -> Path:
     data_path = output_dir / "data.jsonl"
 
     processor = AutoProcessor.from_pretrained(config.model)
+    _apply_image_token_budget(processor, config)
     model = _load_target_model(config.model)
 
     dataset = _load_source_dataset(config.dataset, config.split).shuffle(seed=config.shuffle_seed)
@@ -252,8 +281,17 @@ def regenerate(config: RegenerationConfig) -> Path:
 
     written = 0
     skipped = 0
+    total = len(dataset)
+    # One target forward per row over a corpus sized for draft training runs for
+    # hours. Reporting on a cadence, and flushing as we go, is what makes a
+    # stalled or empty run distinguishable from a slow one while it is still
+    # running rather than only from the final count.
+    log_every = max(1, total // 100)
     with data_path.open("w") as handle:
-        for example in dataset:
+        for index, example in enumerate(dataset):
+            if index and index % log_every == 0:
+                handle.flush()
+                logger.info("Regenerated %d/%d rows (%d written, %d skipped)", index, total, written, skipped)
             extracted = _extract_prompt(example)
             if extracted is None:
                 skipped += 1
@@ -301,6 +339,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature; 0 means greedy.")
     parser.add_argument("--shuffle-seed", type=int, default=42, help="Seed for the source-corpus shuffle.")
     parser.add_argument(
+        "--image-max-pixels",
+        type=int,
+        default=None,
+        help="Per-image pixel ceiling; match recipe_args.image_max_pixels of the stage-2 config.",
+    )
+    parser.add_argument(
+        "--image-min-pixels",
+        type=int,
+        default=None,
+        help="Per-image pixel floor; match recipe_args.image_min_pixels of the stage-2 config.",
+    )
+    parser.add_argument(
         "--length-instruction",
         default=LENGTH_INSTRUCTION,
         help="Sentence appended to every prompt to force a long answer; empty disables it.",
@@ -327,6 +377,8 @@ def main(argv: list[str] | None = None) -> int:
             temperature=args.temperature,
             shuffle_seed=args.shuffle_seed,
             length_instruction=args.length_instruction,
+            image_max_pixels=args.image_max_pixels,
+            image_min_pixels=args.image_min_pixels,
         )
     )
     return 0
