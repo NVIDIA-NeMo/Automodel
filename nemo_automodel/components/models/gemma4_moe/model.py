@@ -1457,9 +1457,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if batch.get("input_ids") is None:
             raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
         return {
-            "cp_sharder": ContextParallelSharder._from_strategy(
-                self._cp_shard_batch_aux_only,
-                contiguous_local_indices,
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=self._cp_shard_batch_aux_only,
+                local_token_global_indices=contiguous_local_indices,
             )
         }
 

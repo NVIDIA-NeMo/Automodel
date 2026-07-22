@@ -855,13 +855,13 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             contiguous_local_indices,
         )
 
-        cp_sharder = ContextParallelSharder._from_strategy(
-            partial(
+        cp_sharder = ContextParallelSharder(
+            shard_batch=partial(
                 make_dsv4_contiguous_shard_cp_batch_and_ctx,
                 pad_multiple=dsv4_cp_local_seq_multiple(self.config),
                 sync_packed_length=self.backend.dispatcher == "hybridep",
             ),
-            contiguous_local_indices,
+            local_token_global_indices=contiguous_local_indices,
         )
         return {"cp_sharder": cp_sharder}
 

@@ -51,6 +51,7 @@ dispatcher wraps them into sharders at resolution time.
 from __future__ import annotations
 
 import contextlib
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -266,26 +267,40 @@ class ContextParallelSharder:
 
     def __init__(
         self,
-        model: torch.nn.Module | None,
-        device_mesh: DeviceMesh | None,
-        batch: dict[str, Any],
+        model: torch.nn.Module | None = None,
+        device_mesh: DeviceMesh | None = None,
+        batch: dict[str, Any] | None = None,
         *,
+        shard_batch: Callable[..., tuple[Callable, dict[str, Any], "ShardLayout | None"]] | None = None,
+        local_token_global_indices: Callable[..., torch.Tensor] | None = None,
+        shard_layout: "ShardLayout | None" = None,
         padding_token_id: int = 0,
         num_chunks: int = 1,
         loss_mask: torch.Tensor | None = None,
         invoke_pre_embed: bool = True,
         extra_seq_buffers: dict[str, int] | None = None,
     ) -> None:
-        """Resolve and bind context-parallel sharding for one forward.
+        """Construct a strategy sharder or resolve one for a forward.
 
         Args:
             model: Model whose attention backend and CP preparation hook select
-                the sharding strategy, or None for the generic strategy.
+                the sharding strategy, or None for the generic strategy. Omit
+                when constructing directly from ``shard_batch``.
             device_mesh: Device mesh containing optional ``cp`` and ``tp`` axes.
-            batch: Mutable input mapping. Token tensors normally have shape
+                Omit when constructing directly from ``shard_batch``.
+            batch: Mutable input mapping required when resolving a strategy.
+                Token tensors normally have shape
                 [batch, sequence, ...]; THD source batches declare
                 ``qkv_format="thd"`` and are flattened during :meth:`shard`.
                 Model hook metadata is merged into this mapping in place.
+            shard_batch: Optional backend callback for direct strategy
+                construction. It accepts token tensors with backend-defined
+                layouts and returns the sharded batch plus its layout.
+            local_token_global_indices: Optional callback returning a tensor of
+                shape [local_tokens] with each local token's global position.
+            shard_layout: Optional captured layout for direct strategy
+                construction. Tensor fields use the layouts documented by
+                :class:`ShardLayout`.
             padding_token_id: Value used to pad ``input_ids`` on the sequence axis.
             num_chunks: Number of THD chunks created during sharding.
             loss_mask: Optional tensor of shape [batch, sequence] sharded with
@@ -293,6 +308,32 @@ class ContextParallelSharder:
             invoke_pre_embed: Whether to invoke a model-owned CP preparation hook.
             extra_seq_buffers: Additional batch keys mapped to their sequence axes.
         """
+        if shard_batch is not None:
+            has_resolution_args = (
+                model is not None
+                or device_mesh is not None
+                or batch is not None
+                or padding_token_id != 0
+                or num_chunks != 1
+                or loss_mask is not None
+                or not invoke_pre_embed
+                or extra_seq_buffers is not None
+            )
+            if has_resolution_args:
+                raise TypeError("shard_batch is mutually exclusive with model, batch, mesh, and resolution options")
+            self.shard_batch = shard_batch
+            self.local_token_global_indices = local_token_global_indices
+            self.shard_layout = shard_layout
+            self._cp_mesh = None
+            self._tp_mesh = None
+            self._loss_mask = None
+            self._padding_token_id = 0
+            return
+        if local_token_global_indices is not None or shard_layout is not None:
+            raise TypeError("local_token_global_indices and shard_layout require shard_batch")
+        if batch is None:
+            raise TypeError("batch is required when shard_batch is not provided")
+
         from nemo_automodel.components.distributed.context_parallel.utils import _prepare_cp_sharder
 
         resolved = _prepare_cp_sharder(
@@ -322,6 +363,9 @@ class ContextParallelSharder:
     ) -> "ContextParallelSharder":
         """Construct an unresolved sharder from a backend strategy.
 
+        .. deprecated:: 0.5.0
+            Use ``ContextParallelSharder(shard_batch=..., ...)`` instead.
+
         Args:
             shard_batch: Backend callback that shards token tensors along their
                 sequence axis and returns the resulting batch and layout.
@@ -333,15 +377,17 @@ class ContextParallelSharder:
         Returns:
             Unbound sharder for internal backend and model-hook composition.
         """
-        sharder = cls.__new__(cls)
-        sharder.shard_batch = shard_batch
-        sharder.local_token_global_indices = local_token_global_indices
-        sharder.shard_layout = shard_layout
-        sharder._cp_mesh = None
-        sharder._tp_mesh = None
-        sharder._loss_mask = None
-        sharder._padding_token_id = 0
-        return sharder
+        warnings.warn(
+            "ContextParallelSharder._from_strategy() is deprecated; use the constructor with "
+            "shard_batch= and local_token_global_indices= instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return cls(
+            shard_batch=shard_batch,
+            local_token_global_indices=local_token_global_indices,
+            shard_layout=shard_layout,
+        )
 
     def _bind(
         self,

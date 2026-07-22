@@ -357,14 +357,14 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         if getattr(self.backend, "attn", None) != "tilelang":
             raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
 
-        cp_sharder = ContextParallelSharder._from_strategy(
-            partial(
+        cp_sharder = ContextParallelSharder(
+            shard_batch=partial(
                 shard_glm_dsa_packed_cp_batch,
                 num_chunks=int(num_chunks),
             ),
             # Contiguous over the packed THD token axis: rank r keeps
             # tokens [r * T/cp, (r + 1) * T/cp).
-            contiguous_local_indices,
+            local_token_global_indices=contiguous_local_indices,
         )
         return {"cp_sharder": cp_sharder}
 

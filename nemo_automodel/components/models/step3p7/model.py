@@ -537,9 +537,9 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             raise ValueError("Step3p7 CP pre-embedding requires input_ids.")
         del num_chunks
         return {
-            "cp_sharder": ContextParallelSharder._from_strategy(
-                shard_batch_aux_only,
-                round_robin_local_indices,
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=shard_batch_aux_only,
+                local_token_global_indices=round_robin_local_indices,
             )
         }
 

@@ -44,7 +44,7 @@ from nemo_automodel.components.models.gemma4_moe import cp_batch as _cm
 # _make_cp_batch_and_ctx parameter; the batch itself stays pure tensors). Exercises the public
 # contiguous shard (the production entry DSV4/Gemma4 wrap) on the model-provided per-token keys.
 def _contiguous_sharder():
-    return ContextParallelSharder._from_strategy(
+    return ContextParallelSharder(
         shard_batch=partial(
             shard_batch_contiguous,
             extra_seq_keys={"per_layer_inputs": 1, "_packed_seq_ids": 1, "mm_token_type_ids": 1},
@@ -136,7 +136,7 @@ def test_make_cp_batch_and_ctx_honors_model_sharder_at_cp_size_one():
         "input_ids": torch.tensor([[1, 2, 3, 4]]),
         "labels": torch.tensor([[1, 2, 3, 4]]),
     }
-    sharder = ContextParallelSharder._from_strategy(
+    sharder = ContextParallelSharder(
         shard_batch=make_native_batch,
         local_token_global_indices=contiguous_local_indices,
     )
@@ -732,7 +732,7 @@ def test_sharder_constructor_merges_model_hook_batch_updates(monkeypatch):
             assert num_chunks == 3
             assert batch["mm_token_type_ids"].shape == (1, 4)
             return {
-                "cp_sharder": ContextParallelSharder._from_strategy(
+                "cp_sharder": ContextParallelSharder(
                     shard_batch=shard_batch_aux_only,
                     local_token_global_indices=round_robin_local_indices,
                 ),

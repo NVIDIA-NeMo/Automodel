@@ -470,7 +470,7 @@ def _resolve_cp_sharder(
                 )
             return contextlib.nullcontext, prepped, layout
 
-        return ContextParallelSharder._from_strategy(_shard_batch_magi, None)
+        return ContextParallelSharder(shard_batch=_shard_batch_magi)
 
     if is_thd:
         # The THD partition is data-dependent (cu_seqlens), so shard_batch
@@ -499,17 +499,20 @@ def _resolve_cp_sharder(
                 )
             return contextlib.nullcontext, prepped, layout
 
-        return ContextParallelSharder._from_strategy(_shard_batch_te, None)
+        return ContextParallelSharder(shard_batch=_shard_batch_te)
 
     if cp_active:
-        return ContextParallelSharder._from_strategy(
-            partial(shard_batch_load_balanced, extra_seq_buffers=extra_seq_buffers),
-            round_robin_local_indices,
+        return ContextParallelSharder(
+            shard_batch=partial(shard_batch_load_balanced, extra_seq_buffers=extra_seq_buffers),
+            local_token_global_indices=round_robin_local_indices,
         )
 
     # No CP prep applies: the identity sharder, so callers hold working token
     # verbs at every cp_size.
-    return ContextParallelSharder._from_strategy(shard_batch_identity, identity_local_indices)
+    return ContextParallelSharder(
+        shard_batch=shard_batch_identity,
+        local_token_global_indices=identity_local_indices,
+    )
 
 
 def unshard_context_parallel_tensor(

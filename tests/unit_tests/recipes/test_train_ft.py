@@ -2439,7 +2439,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
             )
 
             return {
-                "cp_sharder": ContextParallelSharder._from_strategy(
+                "cp_sharder": ContextParallelSharder(
                     shard_batch=lambda cp_mesh, tp_mesh, batch, **k: (nullcontext, batch, None),
                     local_token_global_indices=contiguous_local_indices,
                 )

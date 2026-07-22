@@ -664,9 +664,9 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         """
         del batch, num_chunks
         return {
-            "cp_sharder": ContextParallelSharder._from_strategy(
-                shard_batch_aux_only,
-                round_robin_local_indices,
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=shard_batch_aux_only,
+                local_token_global_indices=round_robin_local_indices,
             )
         }
 

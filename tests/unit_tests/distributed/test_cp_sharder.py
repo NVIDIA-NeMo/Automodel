@@ -132,7 +132,7 @@ def test_gather_token_tensor_identity_without_cp():
 # ContextParallelSharder default/override resolution
 # ---------------------------------------------------------------------------
 def test_sharder_default_shard_token_tensor_uses_indices():
-    sharder = cs.ContextParallelSharder._from_strategy(
+    sharder = cs.ContextParallelSharder(
         shard_batch=lambda *a, **k: (contextlib.nullcontext, {}, None),
         local_token_global_indices=cs.contiguous_local_indices,
     )._bind(_FakeMesh(2, 1), None)
@@ -144,8 +144,8 @@ def test_sharder_default_shard_token_tensor_uses_indices():
 def test_shard_batch_contiguous_records_shard_layout():
     """shard_batch reports original/padded lengths as ShardLayout; once installed,
     the token verbs accept caller-coordinate tensors and reject mismatched ones."""
-    sharder = cs.ContextParallelSharder._from_strategy(
-        shard_batch=None,
+    sharder = cs.ContextParallelSharder(
+        shard_batch=cs.shard_batch_identity,
         local_token_global_indices=cs.contiguous_local_indices,
     )
     mesh = _FakeMesh(2, 0)
@@ -175,8 +175,8 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
     columns and dropped input pad slots come back as fill."""
     # input row: [a, b, PAD] -> rebuilt row: [a, b, X, X] (doc re-padded to 4)
     positions = torch.tensor([[0, 1, -1]])
-    sharder = cs.ContextParallelSharder._from_strategy(
-        shard_batch=None,
+    sharder = cs.ContextParallelSharder(
+        shard_batch=cs.shard_batch_identity,
         local_token_global_indices=cs.contiguous_local_indices,
         shard_layout=cs.ShardLayout(padded_seq_len=4, input_token_stream_positions=positions),
     )
@@ -197,8 +197,8 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
 
 
 def test_gather_trim_raises_without_captured_facts():
-    sharder = cs.ContextParallelSharder._from_strategy(
-        shard_batch=None,
+    sharder = cs.ContextParallelSharder(
+        shard_batch=cs.shard_batch_identity,
         local_token_global_indices=cs.contiguous_local_indices,
     )
     sharder._bind(_FakeMesh(1), None)
@@ -209,7 +209,7 @@ def test_gather_trim_raises_without_captured_facts():
 def test_reported_indices_validate_stream_length():
     # Reported index maps flatten + cast to long, and reject a padded_seq_len
     # that does not match the partition the shard reported.
-    sharder = cs.ContextParallelSharder._from_strategy(
+    sharder = cs.ContextParallelSharder(
         shard_batch=lambda *a, **k: (contextlib.nullcontext, {}, None),
         local_token_global_indices=None,
         shard_layout=cs.ShardLayout(local_token_global_indices=torch.tensor([[1, 0]], dtype=torch.int32)),
@@ -227,7 +227,7 @@ def test_sharder_token_verbs_unavailable_for_data_dependent_layouts():
     # THD/magi layouts depend on batch content (cu_seqlens / dispatch solver),
     # so their framework sharders carry no index map and the token-tensor verbs
     # must fail loudly rather than shard the wrong slice.
-    sharder = cs.ContextParallelSharder._from_strategy(
+    sharder = cs.ContextParallelSharder(
         shard_batch=lambda *a, **k: (contextlib.nullcontext, {}, None),
         local_token_global_indices=None,
     )._bind(_FakeMesh(2, 0), None)
@@ -235,6 +235,26 @@ def test_sharder_token_verbs_unavailable_for_data_dependent_layouts():
         sharder.shard_token_tensor(torch.randn(1, 8))
     with pytest.raises(NotImplementedError, match="data-dependent"):
         sharder.gather_token_tensor(torch.randn(1, 4))
+
+
+def test_from_strategy_is_deprecated():
+    with pytest.warns(DeprecationWarning, match="use the constructor"):
+        sharder = cs.ContextParallelSharder._from_strategy(
+            cs.shard_batch_identity,
+            cs.identity_local_indices,
+        )
+
+    assert sharder.shard_batch is cs.shard_batch_identity
+
+
+def test_constructor_rejects_mixed_resolution_and_strategy_arguments():
+    with pytest.raises(TypeError, match="mutually exclusive"):
+        cs.ContextParallelSharder(
+            None,
+            _FakeMesh(1),
+            {},
+            shard_batch=cs.shard_batch_identity,
+        )
 
 
 # ---------------------------------------------------------------------------
