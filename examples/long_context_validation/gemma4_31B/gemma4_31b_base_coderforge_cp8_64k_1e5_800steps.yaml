@@ -12,31 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# CoderForge agent SFT on the BASE Gemma-4-31B (google/gemma-4-31B -> hf_gemma4_31b) — RETRAIN v2.
-#
-# WHY v2: the first base run (gemma4_31b_base_coderforge_cp8_64k_16node.yaml, lr 5e-6, 224/300 steps
-# ~0.15B tok) scored 0% on SWE-bench because it never learned to emit the gemma4 tool-call special
-# tokens (<|tool_call>=48 / <tool_call|>=49 / <|"|>=52) — it emitted the plain-text `call:name{...}`
-# approximation, which vLLM's gemma4 parser (regex over 48..49) can't structure. Root cause (verified,
-# 2026-07-09): pure UNDERFITTING, NOT freezing/tokenizer/serve —
-#   - `freeze_embeddings` is a NO-OP in this recipe path (apply_parameter_freezing never reads it);
-#     with freeze_language_model:false the embeddings + tied LM head were already TRAINABLE.
-#   - tokenizers byte-identical across base/-it; training LABELS contain 48/49/52 (rendered a real
-#     CoderForge sample: 48 x43, 49 x43, 52 x90).
-#   - in-distribution probe (probe_indist.py, job 13650661): step_224 emits <|tool_call> 0/3 even under
-#     exact training rendering -> capability gap, not prompt-format shift.
-# The -it model already had these tokens (Google instruct-tuning) so the small budget sufficed for it.
-# FIX = more budget + faster LR so a RAW base learns the new tool-call format from scratch.
-#
-# DELTAS vs v1: lr 5e-6 -> 1e-5 (install new behavior fast; the earlier 6440 grad spike at 1e-5 was
-# CLIPPED by max_norm=1.0 and never diverged), max_steps 300 -> 800 (~0.5B tok), ckpt_every 75 -> 100.
-# KEEP: clip_grad_norm 1.0 (safety net), warmup 60 (gentle ramp on a fragile base), cosine + min_lr
-# stretched over the full 800 steps, freeze_language_model:false (embeds/head trainable — the only
-# thing that matters), pure base (NO warm-start from -it, per the base-vs-it comparison).
-# LIVE GUARDRAIL: watch grad_norm over the first ~50 steps; if it is SUSTAINED hard-clipping at 1e-5
-# (effective-LR distortion), drop toward 7.5e-6 and restart — a destabilized base is worse than a slow
-# one. CONVERGENCE METRIC (not loss): per-consolidated-ckpt one-call tool smoke test (probe_indist.py
-# path B) -> the step where structured tool-calling switches on; early kill-check if not on by ~300-400.
+# CoderForge agent SFT on the BASE Gemma-4-31B (google/gemma-4-31B)
 
 recipe: FinetuneRecipeForVLM
 
@@ -46,11 +22,7 @@ step_scheduler:
   ckpt_every_steps: 100       # consolidated HF ckpt at 100/200/.../800 (smoke test + preemption safety)
   val_every_steps: 999999
   max_steps: 800              # ~0.5B tok. NOTE: to train LONGER do NOT just bump this + resume — the
-                              # DCP scheduler state reloads at min_lr (5e-7) and stays there (verified
-                              # 2026-07-10). Use the fresh-continuation recipe (loads step_799
-                              # consolidated + a NEW cosine schedule): *_cont800.yaml.
-  num_epochs: 1
-
+                              # DCP scheduler state reloads at min_lr (5e-7) and stays there
 dist_env:
   backend: nccl
   timeout_minutes: 120
@@ -62,7 +34,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: /path/to/checkpoints/hf_gemma4_31b
+  pretrained_model_name_or_path: google/gemma-4-31B
   torch_dtype: torch.bfloat16
   attn_implementation: sdpa   # dense CP requires sdpa (model-owned p2p ring); no TE attn backend
   use_liger_kernel: false
