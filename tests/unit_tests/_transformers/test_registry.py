@@ -411,3 +411,27 @@ def test_all_model_folders_registered_in_auto_map():
         f"in MODEL_ARCH_MAPPING (registry.py). Add an entry for each architecture "
         f"exported by these modules."
     )
+
+
+def test_minimax_m3_vl_config_overrides_transformers_builtin():
+    """Our MiniMaxM3VLConfig must win the AutoConfig registration even when transformers ships its own.
+
+    transformers 5.12 added a native ``minimax_m3_vl`` model_type (same class
+    names as ours). The skip-if-built-in registration then handed the native
+    config to our custom MiniMaxM3SparseForConditionalGeneration, whose vision
+    encoder reads ``config.rope_theta`` that the native vision config does not
+    carry -> AttributeError at model init. ``_CUSTOM_CONFIG_OVERRIDES_BUILTIN``
+    forces our config class for such model_types.
+    """
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
+
+    resolved = CONFIG_MAPPING["minimax_m3_vl"]
+    assert resolved is MiniMaxM3VLConfig, (
+        f"AutoConfig resolves minimax_m3_vl to {resolved.__module__}.{resolved.__name__}; "
+        "expected the nemo_automodel config class. The custom model's vision encoder "
+        "requires our config fields (e.g. rope_theta)."
+    )
+    # The concrete field the crash was about: our vision sub-config must default it.
+    assert MiniMaxM3VLConfig().vision_config.rope_theta is not None
