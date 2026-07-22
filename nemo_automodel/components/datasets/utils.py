@@ -458,7 +458,8 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     Stacks ``input_ids``, ``labels``, ``position_ids`` and converts the
     indexed ``attention_mask`` to the format required by the attention backend.
 
-    For ``flash_attention_2``: keeps the indexed 2D mask ``[B, S]``.
+    For flash attention (``flash_attention_2`` / ``flash_attention_3`` /
+    ``flash_attention_4``): keeps the indexed 2D mask ``[B, S]``.
     For ``sdpa`` / ``eager``: converts to a 4D block-causal float mask.
 
     Args:
@@ -477,7 +478,7 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
 
-    if attn_implementation == "flash_attention_2":
+    if attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
         mask_out = attention_mask
     else:
         mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
