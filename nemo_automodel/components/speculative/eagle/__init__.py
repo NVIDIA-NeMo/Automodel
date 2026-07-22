@@ -37,6 +37,19 @@ from nemo_automodel.components.speculative.eagle.msd_curriculum import (
     MSDCurriculumPhase,
     MSDDataSource,
 )
+from nemo_automodel.components.speculative.eagle.msd_decode import (
+    MSDGreedyDecoder,
+    MSDTreeDraftGenerator,
+    MSDTreeLayout,
+    MSDTreeNode,
+    MSDTreeProposal,
+    MSDVerificationResult,
+    accept_or_resample,
+    build_msd_tree_layout,
+    verify_greedy_tree,
+    verify_hf_greedy_tree,
+    verify_stochastic_chain,
+)
 from nemo_automodel.components.speculative.eagle.msd_target import HFMSDTargetModel
 from nemo_automodel.components.speculative.eagle.peagle_trainer import PEagleTrainerModule
 from nemo_automodel.components.speculative.eagle.registry import (
@@ -64,6 +77,17 @@ __all__ = [
     "MSDCurriculumConfig",
     "MSDCurriculumPhase",
     "MSDDataSource",
+    "MSDGreedyDecoder",
+    "MSDTreeDraftGenerator",
+    "MSDTreeLayout",
+    "MSDTreeNode",
+    "MSDTreeProposal",
+    "MSDVerificationResult",
+    "accept_or_resample",
+    "build_msd_tree_layout",
+    "verify_greedy_tree",
+    "verify_hf_greedy_tree",
+    "verify_stochastic_chain",
     "MultimodalEagleDraftModel",
     "HFEagle3TargetModel",
     "LlamaEagleDraftModel",
