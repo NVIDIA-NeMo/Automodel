@@ -59,6 +59,7 @@ from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa:
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG  # noqa: E402
 from nemo_automodel.components.training.step_scheduler import StepScheduler  # noqa: E402
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config  # noqa: E402
+from nemo_automodel.recipes._typed_config import RecipeConfig  # noqa: E402
 from nemo_automodel.recipes.base_recipe import BaseRecipe  # noqa: E402
 
 try:
@@ -261,7 +262,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     """
 
     def __init__(self, cfg):
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
         self._throughput_window_start: float | None = None
         self._throughput_token_window = 0.0
         self._throughput_step_window = 0
@@ -409,7 +410,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         self.rng = StatefulRNG(seed=self.global_seed, ranked=True)
 
         # -- wandb --------------------------------------------------------
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
             run = self._build_wandb()
             logging.info("Running run at %s", run.url)
