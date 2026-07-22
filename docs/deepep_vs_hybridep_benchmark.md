@@ -3,7 +3,6 @@
 **Date:** 2026-07-22
 **Author:** benchmark series run on cw-dfw-cs-001 (H100 80GB SXM, CX7 400Gb/s IB)
 **Code:** `deepseek-ai/DeepEP` — `v1.2.1` tag (DeepEP), `hybrid-ep` branch @ 17cfb81 (HybridEP, NVIDIA), `epv2-release` branch (DeepEP v2, included as secondary reference)
-**Logs:** `deepep/logs/`, reusable sbatch scripts in `deepep/slurm_*.sub`
 
 ---
 
@@ -299,19 +298,3 @@ FP8 dispatch @ 8 SMs intranode (nearly saturated — big SM-efficiency gain over
 divides by an auto-detected NIC bandwidth that returns 0 on this cluster (`EP_NIC_NAME`
 mismatch) — pass `--num-sms` explicitly.
 
----
-
-## Appendix: raw data locations
-
-| Dataset | Log |
-|---|---|
-| DeepEP intranode SM sweep (DSv3 dims) | `logs/deepep_v1_sweep.log`, `logs/deepep_v1_intranode.log` |
-| HybridEP intranode sweeps | `logs/hybridep_sm{4,8,16,24}.log` |
-| DeepEP v2 intranode | `logs/deepep_v2_ep8*.log`, `logs/deepep_v2_sm*.log` |
-| DeepEP v1 full-path (notify/CPU-sync cost) | `logs/v1_fullpath_sm24.log` |
-| Internode DSv3 dims (v1 + HybridEP) | `logs/internode_14246612_node0.out` |
-| Internode DSv3 dims (v2) | `logs/v2_internode_14247570_node0.out` |
-| Qwen dims intranode | `logs/qwen_v1_sweep.log`, `logs/qwen_hybrid_sm{8,24}.log`, `logs/qwen_v2_sm{8,24}.log` |
-| Qwen dims internode | `logs/qwen_internode_14247894_*.out`, `logs/qwen_hyb24_14248118_node0.out` |
-| Real training single node | `logs/am_step_{deepep,hybridep}.log` |
-| Real training 2 nodes | `logs/am_ep16_14250238_node0.out` |
