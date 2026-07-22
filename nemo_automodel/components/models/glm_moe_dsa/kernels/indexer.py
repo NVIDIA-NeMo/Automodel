@@ -19,6 +19,9 @@ import torch
 from .tilelang_indexer_bwd import indexer_bwd_interface
 from .tilelang_indexer_fwd import indexer_fwd_interface
 
+# 32M fp32 scores are 128 MiB; H100 torch.topk uses about 8x that as workspace here.
+_TOPK_MAX_ELEMENTS_PER_CALL = 32 * 1024 * 1024
+
 
 def pytorch_extract_topk_scores(logits, topk_indices, dim=-1):
     valid_mask = topk_indices != -1
@@ -26,6 +29,23 @@ def pytorch_extract_topk_scores(logits, topk_indices, dim=-1):
     scores = torch.gather(logits, dim=dim, index=safe_indices)
     scores = torch.where(valid_mask, scores, float("-inf"))
     return scores
+
+
+def _topk_in_row_chunks(logits: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bound temporary memory while preserving independent per-row top-k selection."""
+    if logits.ndim != 2 or logits.shape[1] == 0:
+        raise ValueError(f"top-k logits must have shape [queries, keys], got {tuple(logits.shape)}.")
+    chunk_rows = max(1, _TOPK_MAX_ELEMENTS_PER_CALL // logits.shape[1])
+    if chunk_rows >= logits.shape[0]:
+        return torch.topk(logits, topk, dim=-1)
+
+    score_chunks = []
+    index_chunks = []
+    for logits_chunk in logits.split(chunk_rows, dim=0):
+        scores, indices = torch.topk(logits_chunk, topk, dim=-1)
+        score_chunks.append(scores)
+        index_chunks.append(indices)
+    return torch.cat(score_chunks, dim=0), torch.cat(index_chunks, dim=0)
 
 
 class IndexerFunction(torch.autograd.Function):
@@ -48,7 +68,7 @@ class IndexerFunction(torch.autograd.Function):
             pad = topk - logits.shape[-1]
             if pad > 0:
                 logits = torch.nn.functional.pad(logits, (0, pad), value=float("-inf"))
-            index_score, topk_indices = torch.topk(logits, topk, dim=-1)
+            index_score, topk_indices = _topk_in_row_chunks(logits, topk)
             topk_indices = topk_indices.to(torch.int32)
             topk_indices = topk_indices.masked_fill(index_score == -torch.inf, -1)
 

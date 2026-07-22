@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import inspect
 import logging
 import sys
@@ -43,10 +44,30 @@ from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callab
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _build_pp_collate_wrapper,
+    _pop_mock_data_fingerprint,
     _should_pack_validation,
     build_model,
     compute_trust_remote_code_from_model,
 )
+
+
+def test_pop_mock_data_fingerprint_combines_and_removes_values():
+    batches = [
+        {"input_ids": torch.tensor([1]), "mock_data_fingerprint": "a" * 64},
+        {"input_ids": torch.tensor([2]), "mock_data_fingerprint": "b" * 64},
+    ]
+
+    fingerprint = _pop_mock_data_fingerprint(batches)
+
+    assert fingerprint == hashlib.sha256((("a" * 64) + ("b" * 64)).encode("ascii")).hexdigest()
+    assert all("mock_data_fingerprint" not in batch for batch in batches)
+
+
+def test_pop_mock_data_fingerprint_rejects_partial_step():
+    batches = [{"mock_data_fingerprint": "a" * 64}, {}]
+
+    with pytest.raises(ValueError, match="Every accumulated batch"):
+        _pop_mock_data_fingerprint(batches)
 
 
 def _build_loader(
@@ -1777,15 +1798,17 @@ def test_pp_autoconfig_failure_skips_masks(caplog):
     add_masks.assert_not_called()
 
 
-def test_pp_deepseek_v4_skips_masks(caplog):
-    """DeepSeek V4 computes masks internally, so PP mask precomputation is skipped."""
+@pytest.mark.parametrize("model_type", ["deepseek_v4", "glm_moe_dsa"])
+def test_pp_custom_sparse_model_skips_masks(caplog, model_type):
+    """Custom sparse models compute masks internally, so PP precomputation is skipped."""
     calls = []
     cfg_dl = ConfigNode({"collate_fn": lambda b: calls.append("base") or b, "num_workers": 0})
-    cfg_model = ConfigNode({"pretrained_model_name_or_path": "deepseek-ai/DeepSeek-V4-Pro"})
+    model_name = "zai-org/GLM-5.2" if model_type == "glm_moe_dsa" else "deepseek-ai/DeepSeek-V4-Pro"
+    cfg_model = ConfigNode({"pretrained_model_name_or_path": model_name})
     with (
         patch(
             "nemo_automodel.recipes.llm.train_ft.AutoConfig.from_pretrained",
-            return_value=MagicMock(model_type="deepseek_v4"),
+            return_value=MagicMock(model_type=model_type),
         ),
         patch("nemo_automodel.components.datasets.utils.add_causal_masks_to_batch") as add_masks,
         caplog.at_level(logging.INFO),
@@ -1795,7 +1818,7 @@ def test_pp_deepseek_v4_skips_masks(caplog):
     collate_fn(["dummy"])
     assert calls == ["base"]
     add_masks.assert_not_called()
-    assert "Skipping pipeline parallel causal mask precomputation for model_type=deepseek_v4" in caplog.text
+    assert f"Skipping pipeline parallel causal mask precomputation for model_type={model_type}" in caplog.text
 
 
 def test_pp_autoconfig_success_chains_masks():

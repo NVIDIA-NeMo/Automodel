@@ -15,6 +15,66 @@
 import torch
 
 
+def _padding_mask_from_packed_lengths(
+    seq_lens: torch.Tensor,
+    seq_lens_padded: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+    seq_lens_padding_value: int,
+) -> torch.Tensor:
+    """Build a token padding mask from packed-sequence slot metadata."""
+    if seq_lens.shape != seq_lens_padded.shape:
+        raise ValueError(
+            "seq_lens and seq_lens_padded must have identical shapes; "
+            f"got {tuple(seq_lens.shape)} and {tuple(seq_lens_padded.shape)}."
+        )
+    if seq_lens.device != seq_lens_padded.device:
+        raise ValueError("seq_lens and seq_lens_padded must be on the same device.")
+    if seq_lens.numel() % batch_size != 0:
+        raise ValueError(
+            "Packed sequence lengths with shape "
+            f"{tuple(seq_lens.shape)} cannot be reshaped for batch size {batch_size}."
+        )
+
+    real_lens = seq_lens.reshape(batch_size, -1)
+    padded_lens = seq_lens_padded.reshape(batch_size, -1)
+    real_valid = real_lens != seq_lens_padding_value
+    padded_valid = padded_lens != seq_lens_padding_value
+    valid = real_valid & padded_valid
+    lengths_are_valid = (
+        (real_valid == padded_valid)
+        & (~valid | ((real_lens >= 0) & (padded_lens >= real_lens)))
+        & ~(valid & (~valid).to(torch.int32).cumsum(dim=1).gt(0))
+    ).all()
+    padded_totals = torch.where(valid, padded_lens, 0).sum(dim=1)
+    padded_totals_are_valid = padded_totals.le(seq_len).all()
+    if not bool((lengths_are_valid & padded_totals_are_valid).item()):
+        raise ValueError(
+            "Packed lengths must be non-negative, have matching trailing sentinels, satisfy "
+            "seq_lens <= seq_lens_padded, and fit within the input sequence length."
+        )
+
+    real_lens = torch.where(valid, real_lens, 0)
+    padded_lens = torch.where(valid, padded_lens, 0)
+
+    slot_starts = padded_lens.cumsum(dim=1) - padded_lens
+    pad_starts = (slot_starts + real_lens).clamp(min=0, max=seq_len)
+    pad_ends = (slot_starts + padded_lens).clamp(min=0, max=seq_len)
+    has_padding = valid & (padded_lens > real_lens)
+
+    # Mark each [pad_start, pad_end) interval through a difference array. This
+    # avoids materializing a [batch, num_sequences, sequence] comparison tensor.
+    deltas = torch.zeros((batch_size, seq_len + 1), dtype=torch.int32, device=seq_lens.device)
+    updates = has_padding.to(torch.int32)
+    deltas.scatter_add_(1, pad_starts.to(torch.long), updates)
+    deltas.scatter_add_(1, pad_ends.to(torch.long), -updates)
+    trailing_updates = padded_totals.lt(seq_len).to(torch.int32)
+    deltas.scatter_add_(1, padded_totals.to(torch.long).unsqueeze(1), trailing_updates.unsqueeze(1))
+    deltas[:, seq_len] -= trailing_updates
+    return deltas[:, :-1].cumsum(dim=1).gt(0)
+
+
 def process_input_for_thd(
     batch: dict[str, torch.Tensor],
     seq_lens_padding_value: int = -1000,
@@ -45,9 +105,12 @@ def process_input_for_thd(
             - 'seq_lens_padded': Padded sequence lengths tensor of shape [batch_size, num_packs]
                 containing lengths including separator tokens. Values matching
                 seq_lens_padding_value indicate padding and are filtered out.
+            - 'padding_mask': Optional explicit boolean mask of shape [batch_size, seq_len].
+                When absent, padding is derived from seq_lens and seq_lens_padded.
         seq_lens_padding_value: Value used to indicate padding in seq_lens/seq_lens_padded
             tensors that should be filtered out (default: -1000)
-        padding_token_id: Token ID used for padding in input_ids to generate padding_mask (default: 0)
+        padding_token_id: Fallback token ID used to generate padding_mask only when neither
+            an explicit mask nor packed-length metadata is available (default: 0)
 
     Returns:
         Dictionary containing:
@@ -176,12 +239,31 @@ def process_input_for_thd(
         if cu_seqlens is not None and cu_seqlens.numel() > 1:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().to(dtype=torch.int32)
 
+    explicit_padding_mask = batch.get("padding_mask")
+    if explicit_padding_mask is not None:
+        if explicit_padding_mask.numel() != total_tokens:
+            raise ValueError(
+                "padding_mask must contain one value per input token; "
+                f"got shape {tuple(explicit_padding_mask.shape)} for input shape {tuple(input_ids.shape)}."
+            )
+        padding_mask_thd = explicit_padding_mask.reshape(total_tokens).bool()
+    elif seq_lens is not None and seq_lens_padded is not None:
+        padding_mask_thd = _padding_mask_from_packed_lengths(
+            seq_lens,
+            seq_lens_padded,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            seq_lens_padding_value=seq_lens_padding_value,
+        ).reshape(total_tokens)
+    else:
+        padding_mask_thd = input_ids_thd == padding_token_id
+
     result = {
         "input_ids": input_ids_thd,
         "position_ids": position_ids_thd,
         "cu_seqlens": cu_seqlens,
         "labels": labels_thd,
-        "padding_mask": (input_ids_thd == padding_token_id),
+        "padding_mask": padding_mask_thd,
     }
     # Emit cu_seqlens_padded only when it differs from cu_seqlens — its
     # presence is what flips TE's pad_between_seqs=True path in

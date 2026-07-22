@@ -111,7 +111,9 @@ diffusion_kernels = [
 # "flash-attn==2.8.1",
 cuda = [
     "causal-conv1d",
+    "flash-mla",
     "mamba-ssm",
+    "nvidia-cudnn-frontend[cutedsl]==1.25.0",
     "nv-grouped-gemm",
     # This is required to prevent ONNX errors arising from TE
     "onnxscript>=0.5.6",
@@ -229,11 +231,15 @@ dev = [
 [tool.uv]
 managed = true
 default-groups = ["build", "docs", "test"]
+# CUTLASS's base and CUDA wheels intentionally share package paths. Copying from
+# the cache keeps uv from producing a mixed Python/MLIR installation.
+link-mode = "copy"
 no-build-isolation-package = [
     "bitsandbytes",
     "causal-conv1d",
     "deep_ep",
     "flash-attn",
+    "flash_mla",
     "flash-attn-3",  # FA3: source build from Dao-AILab/flash-attention hopper/ (needs image torch)
     "mamba-ssm",
     "nv-grouped-gemm",
@@ -270,6 +276,9 @@ constraint-dependencies = [
 ]
 override-dependencies = [
     "nvidia-cublas==13.4.1.1; sys_platform == 'linux'",
+    # cuDNN frontend 1.25.0 pins 4.5.0, while ffpa-attn requires >=4.5.1;
+    # 4.5.2 matches the tested Megatron DSA dependency lock.
+    "nvidia-cutlass-dsl[cu13]==4.5.2",
     # torchx (via nemo-run) caps urllib3<1.27; override to keep the CVE pin
     "urllib3>=2.7.0",
     "thrift>=0.23.0",
@@ -278,6 +287,7 @@ prerelease = "allow"
 
 [tool.uv.sources]
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "7febc6e25660af0f54d95dd781ecdcd62265ecca" }
+flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA.git", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
 onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
@@ -320,6 +330,7 @@ explicit = true
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]
 deep_ep = [{ requirement = "torch", match-runtime = true }]
+flash_mla = [{ requirement = "torch", match-runtime = true }]
 transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 nv_grouped_gemm = ["setuptools"]
@@ -330,6 +341,12 @@ name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
 version = "v1.2.1+7febc6e"
 requires-dist = ["torch", "packaging", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "flash-mla"
+# FlashMLA derives its local version from the short git revision at build time.
+version = "1.0.0+b7643bd"
+requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "nv_grouped_gemm"

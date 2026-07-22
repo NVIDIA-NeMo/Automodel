@@ -37,6 +37,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
 )
 from nemo_automodel.components.models.glm_moe_dsa.cp import make_glm_dsa_packed_cp_batch_and_ctx
 from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA
+from nemo_automodel.components.models.glm_moe_dsa.optimized_kernels import prepare_cudnn_dsa_packed_metadata
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
@@ -227,6 +228,41 @@ class GlmMoeDsaModel(nn.Module):
 
         h = self.embed_tokens(input_ids) if self.embed_tokens is not None else input_ids
 
+        if self.backend.attn == "cudnn" and attn_kwargs.get("qkv_format") == "thd":
+            cu_seqlens = attn_kwargs.get("cu_seqlens")
+            if cu_seqlens is None:
+                raise ValueError("cuDNN DSA requires 'cu_seqlens' for packed THD input.")
+            cu_seqlens = cu_seqlens.flatten().to(device=h.device, dtype=torch.int32).contiguous()
+            query_indices = attn_kwargs.get("glm_dsa_cp_query_indices")
+            if query_indices is not None:
+                query_indices = query_indices.flatten().to(device=h.device, dtype=torch.int32).contiguous()
+            cu_seqlens_padded = attn_kwargs.get("cu_seqlens_padded")
+            if cu_seqlens_padded is not None:
+                cu_seqlens_padded = cu_seqlens_padded.flatten().to(device=h.device, dtype=torch.int32).contiguous()
+            cudnn_padding_mask = None
+            if padding_mask is not None:
+                cudnn_padding_mask = padding_mask.flatten().to(device=h.device, dtype=torch.bool).contiguous()
+            cp_size = int(attn_kwargs.get("cp_size", 1))
+            packed_metadata = prepare_cudnn_dsa_packed_metadata(
+                cu_seqlens,
+                h.shape[0] * cp_size,
+                query_indices=query_indices,
+                cu_seqlens_padded=cu_seqlens_padded,
+                padding_mask=cudnn_padding_mask,
+            )
+            attn_kwargs = dict(attn_kwargs)
+            attn_kwargs["cu_seqlens"] = cu_seqlens
+            if query_indices is not None:
+                attn_kwargs["glm_dsa_cp_query_indices"] = query_indices
+            if cu_seqlens_padded is not None:
+                attn_kwargs["cu_seqlens_padded"] = cu_seqlens_padded
+            attn_kwargs["_cudnn_dsa_packed_metadata"] = packed_metadata
+            attn_kwargs["_cudnn_dsa_topk_length"] = packed_metadata.causal_lengths.clamp_max(
+                int(self.config.index_topk)
+            ).contiguous()
+            attn_kwargs["_cudnn_dsa_all_rows_nonempty"] = packed_metadata.all_rows_nonempty
+            attn_kwargs["_cudnn_dsa_valid_row_indices"] = packed_metadata.valid_row_indices
+
         # IndexShare: thread the most recent "full" layer's top-k selection forward so the
         # following "shared" layers can reuse it. Seeded from `prev_topk_indices` (carried from
         # the previous pipeline stage); `None` on the first stage / all-"full" configs (GLM-5.1).
@@ -332,15 +368,31 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         self.lm_head = new_embeddings
 
     def should_pack_validation_with_training(self) -> bool:
-        """GLM DSA TileLang kernels require validation to use the THD packed layout."""
-        return getattr(self.backend, "attn", None) == "tilelang"
+        """Return whether validation must use the optimized packed THD layout."""
+        return getattr(self.backend, "attn", None) in ("tilelang", "cudnn")
 
     def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
-        """Attach GLM DSA's packed THD context-parallel batch sharder."""
+        """Attach GLM DSA's packed THD batch sharder.
+
+        Args:
+            input_ids: Token-ID tensor of shape ``[batch, sequence]`` before CP sharding.
+            **kwargs: Sharding options, including the non-tensor ``num_chunks`` value.
+
+        Returns:
+            Mapping containing the GLM DSA packed-CP batch callback.
+
+        Raises:
+            NotImplementedError: If the attention backend is not a GLM DSA packed backend.
+                TileLang and cuDNN both support the model-owned packed CP path.
+        """
         from functools import partial  # noqa: PLC0415
 
-        if getattr(self.backend, "attn", None) != "tilelang":
-            raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
+        attn_backend = getattr(self.backend, "attn", None)
+        if attn_backend not in ("tilelang", "cudnn"):
+            raise NotImplementedError(
+                "GLM DSA packed batch preparation requires backend.attn in {'tilelang', 'cudnn'}; "
+                f"got backend.attn={attn_backend!r}."
+            )
 
         return {
             "_cp_make_batch_fn": partial(
@@ -373,29 +425,42 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         Non-first stages additionally receive the previous "full" layer's top-k selection, and
         non-last stages emit the running selection, so a stage that begins with a "shared" layer
         has the top-k it needs (correct at any sequence length).
+
+        Args:
+            is_first: Whether this module is the first pipeline stage.
+            microbatch_size: Number of sequences in the pipeline microbatch.
+            seq_len: Sequence or packed-token length represented by the metadata.
+            dtype: Hidden-state and logits dtype.
+
+        Returns:
+            Pair of input and output metadata tuples. Optimized THD stages use hidden-state
+            tensors of shape ``[seq_len, hidden]`` and fixed-width top-k tensors of shape
+            ``[seq_len, 1, index_topk]``. Dense BSHD stages use ``[microbatch, seq_len, hidden]``
+            and ``[microbatch, seq_len, min(index_topk, seq_len)]``. Top-k carry metadata is
+            float32 because pipeline receive buffers require gradients.
         """
         hidden_size = self.config.hidden_size
         vocab_size = self.config.vocab_size
-        # TileLang's fused indexer always returns ``index_topk`` columns. Under
+        # Optimized indexers always return ``index_topk`` columns. Under TileLang
         # CP the query length is sharded (for example 4096 / cp8 = 512), while
         # K/V are gathered inside the model, so capping by the local query
         # length would under-declare the inter-stage carry shape.
         index_topk = int(self.config.index_topk)
-        topk = index_topk if self.backend.attn == "tilelang" else min(index_topk, seq_len)
+        optimized_thd = self.backend.attn in ("tilelang", "cudnn")
+        topk = index_topk if optimized_thd else min(index_topk, seq_len)
 
         def meta(shape: tuple[int, ...], dt: torch.dtype) -> torch.Tensor:
             return torch.empty(*shape, device="meta", dtype=dt)
 
         # The inter-stage tensor RANK matches the attention backend's data format, so each stage's
         # forward emits its natural tensors and no per-boundary reshape is needed:
-        #   * TileLang DSA runs in THD (packed; batch folded into the token axis) -> 2D hidden
-        #     ``[T, H]`` and top-k ``[T, 1, topk]`` (the tilelang layout). tilelang implies THD.
+        #   * TileLang/cuDNN DSA run in THD (packed; batch folded into the token axis) -> 2D hidden
+        #     ``[T, H]`` and fixed-width top-k ``[T, 1, topk]``. Both backends imply THD.
         #   * sdpa/te/eager run dense bshd -> 3D hidden ``[B, S, H]`` and top-k ``[B, S, topk]``.
         # Top-k indices cross the boundary as float32: torch.distributed.pipelining calls
         # ``requires_grad_(True)`` on recv buffers and int dtypes can't require grad; float32 holds
-        # the index values losslessly and ``forward`` casts back (int32 for tilelang, int64 dense).
-        thd = self.backend.attn == "tilelang"
-        if thd:
+        # the index values losslessly and ``forward`` casts back (int32 for optimized THD, int64 dense).
+        if optimized_thd:
             hidden_meta = meta((seq_len, hidden_size), dtype)
             topk_meta = meta((seq_len, 1, topk), torch.float32)
         else:
@@ -437,13 +502,30 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         ``(hidden_states, topk_indices)`` and the last stage returns the ``logits`` tensor.
 
         Args:
-            input_ids: Token IDs (BSHD ``[B, S]`` / THD ``[1, T]``) on the first stage, or the
-                upstream hidden state on later pipeline stages.
-            carry: Optional ``(topk_indices,)`` carried from the previous pipeline stage.
-            position_ids / attention_mask / padding_mask: Optional masks / positions.
+            input_ids: Token-ID tensor of shape ``[batch, sequence]`` (BSHD) or ``[1, tokens]``
+                (packed THD) on the first stage. On later stages, the upstream hidden-state
+                tensor has shape ``[batch, sequence, hidden]`` or ``[tokens, hidden]``.
+            carry: Optional top-k tensor carried from the previous pipeline stage. Optimized
+                THD backends use float32 ``[tokens, 1, index_topk]``; dense BSHD uses float32
+                ``[batch, sequence, min(index_topk, sequence)]``.
+            position_ids: Optional position-ID tensor of shape ``[batch, sequence]`` or
+                ``[1, tokens]`` for packed THD.
+            attention_mask: Optional key-mask tensor of shape ``[batch, sequence]`` or additive
+                mask of shape ``[batch, 1, sequence, sequence]``.
+            padding_mask: Optional padding-mask tensor of shape ``[batch, sequence]`` or
+                ``[1, tokens]`` for packed THD.
             logits_to_keep: If ``0``, project all positions; else only the last ``logits_to_keep``.
+                A tensor value contains the one-dimensional token indices to project.
             output_hidden_states: When set (single-process), carry final hidden states on the output.
-            **attn_kwargs: Additional arguments forwarded to the base model.
+            **attn_kwargs: Additional attention metadata forwarded to the base model. Packed THD
+                uses an int32 ``cu_seqlens`` tensor of shape ``[sequences + 1]`` and
+                ``qkv_format="thd"``.
+
+        Returns:
+            Single-process execution returns a causal-LM output whose logits tensor has shape
+            ``[batch, sequence, vocab]``. A non-last pipeline stage returns hidden states and
+            float32 top-k carry tensors in the layouts described above; the last stage returns
+            a logits tensor of shape ``[batch, sequence, vocab]``.
         """
         output_hidden_states = (
             output_hidden_states
@@ -459,8 +541,8 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         prev_topk_indices = None
         if carry_in is not None:
             # The carry arrives in the backend's natural top-k layout (THD: [T, 1, topk]; bshd:
-            # [B, S, topk]) as float32. tilelang SparseMLA requires int32 indices; the dense path
-            # uses int64. Only the dtype differs -- no reshape (see get_pipeline_stage_metas).
+            # [B, S, topk]) as float32. Optimized THD kernels require int32 indices; the dense
+            # path uses int64. Only the dtype differs -- no reshape (see get_pipeline_stage_metas).
             prev_topk_indices = carry_in.to(torch.int32) if is_thd else carry_in.to(torch.int64)
 
         # THD: squeeze the leading batch dim on EVERY stage. First stage ``input_ids`` is token ids
@@ -502,8 +584,8 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             # Non-last stage: emit (hidden, float32 top-k carry) to the next stage. The tensors are
             # already in the backend's natural pipeline shape (THD: [T, H] + [T, 1, topk]; bshd:
             # [B, S, H] + [B, S, topk]) per get_pipeline_stage_metas, so no reshape is needed.
-            # (THD requires packed_sequence_size >= index_topk so the tilelang top-k width matches
-            # the meta's min(index_topk, seq_len).)
+            # Optimized THD indexers always return the fixed ``index_topk`` width declared by
+            # the pipeline metadata, including when it exceeds an individual packed sequence.
             zero_from_hidden = hidden.float().sum() * 0.0  # connected to grad-bearing hidden
             carry_out = topk_indices.to(torch.float32) + zero_from_hidden  # requires grad, value unchanged
             if carry_in is not None:

@@ -355,6 +355,10 @@ class TestProcessInputForTHDWithChunks:
         assert "cu_seqlens_padded" in result
         assert torch.equal(result["cu_seqlens_padded"][0], expected_cu_padded_0)
         assert torch.equal(result["cu_seqlens_padded"][1], expected_cu_padded_1)
+        assert torch.equal(
+            result["padding_mask"][1],
+            torch.tensor([False, False, False, False, True, True, False, False, True, False, False, False]),
+        )
 
     def test_single_chunk(self):
         """Test with num_chunks=1 (no actual chunking)."""
@@ -491,12 +495,12 @@ class TestProcessInputForTHDWithChunks:
         assert result["cu_seqlens"].dtype == torch.int32
 
     def test_padding_mask_correctness(self):
-        """Test that padding_mask is correctly generated."""
+        """Test that packed metadata takes precedence over token values."""
         batch = {
             "input_ids": torch.tensor([[0, 1, 2], [3, 0, 5], [0, 0, 8], [9, 10, 11]]),
             "labels": torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]]),
             "position_ids": torch.tensor([[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2]]),
-            "seq_lens": torch.tensor([[3], [3], [3], [3]]),
+            "seq_lens": torch.tensor([[3], [2], [1], [3]]),
             "seq_lens_padded": torch.tensor([[3], [3], [3], [3]]),
         }
 
@@ -505,10 +509,74 @@ class TestProcessInputForTHDWithChunks:
         # Check padding_mask shape
         assert result["padding_mask"].shape == (2, 6)
 
-        # Verify padding mask identifies 0s as padding
-        # First chunk: [0, 1, 2, 3, 0, 5] -> mask: [T, F, F, F, T, F]
-        expected_mask_0 = torch.tensor([True, False, False, False, True, False])
+        # Token 0 is valid in the first item. Only the final slot in the second
+        # item is padding according to seq_lens/seq_lens_padded.
+        expected_mask_0 = torch.tensor([False, False, False, False, False, True])
         assert torch.equal(result["padding_mask"][0], expected_mask_0)
+
+    def test_padding_mask_handles_padding_between_packed_sequences(self):
+        batch = {
+            "input_ids": torch.tensor([[10, 154820, 154820, 11, 154820, 12]]),
+            "labels": torch.tensor([[10, -100, -100, 11, -100, 12]]),
+            "position_ids": torch.arange(6).unsqueeze(0),
+            "seq_lens": torch.tensor([[1, 1, 1]]),
+            "seq_lens_padded": torch.tensor([[3, 2, 1]]),
+        }
+
+        result = process_input_for_thd(batch, padding_token_id=154820)
+
+        assert torch.equal(
+            result["padding_mask"],
+            torch.tensor([False, True, True, False, True, False]),
+        )
+
+    def test_padding_mask_preserves_explicit_mask(self):
+        batch = {
+            "input_ids": torch.tensor([[154820, 8, 9]]),
+            "labels": torch.tensor([[1, 2, -100]]),
+            "position_ids": torch.arange(3).unsqueeze(0),
+            "seq_lens": torch.tensor([[3]]),
+            "seq_lens_padded": torch.tensor([[3]]),
+            "padding_mask": torch.tensor([[False, False, True]]),
+        }
+
+        result = process_input_for_thd(batch, padding_token_id=154820)
+
+        assert torch.equal(result["padding_mask"], torch.tensor([False, False, True]))
+
+    @pytest.mark.parametrize(
+        ("seq_lens", "seq_lens_padded"),
+        [
+            ([[2]], [[2, 1]]),
+            ([[3]], [[2]]),
+            ([[2]], [[4]]),
+            ([[1, -1000, 1]], [[1, -1000, 1]]),
+        ],
+    )
+    def test_padding_mask_rejects_invalid_packed_lengths(self, seq_lens, seq_lens_padded):
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "labels": torch.tensor([[1, 2, 3]]),
+            "position_ids": torch.arange(3).unsqueeze(0),
+            "seq_lens": torch.tensor(seq_lens),
+            "seq_lens_padded": torch.tensor(seq_lens_padded),
+        }
+
+        with pytest.raises(ValueError, match="Packed|identical shapes"):
+            process_input_for_thd(batch)
+
+    def test_padding_mask_rejects_wrong_explicit_mask_shape(self):
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "labels": torch.tensor([[1, 2, 3]]),
+            "position_ids": torch.arange(3).unsqueeze(0),
+            "seq_lens": torch.tensor([[3]]),
+            "seq_lens_padded": torch.tensor([[3]]),
+            "padding_mask": torch.tensor([[False, False]]),
+        }
+
+        with pytest.raises(ValueError, match="one value per input token"):
+            process_input_for_thd(batch)
 
     @pytest.mark.parametrize("num_chunks", [2, 4, 8])
     def test_different_chunk_sizes(self, num_chunks):

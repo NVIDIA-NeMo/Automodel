@@ -439,8 +439,9 @@ def test_make_cp_batch_for_te_basic(monkeypatch):
     cp_mesh = _DummySubMesh(size=2)
 
     # Create simple batch in BSHD format
-    # 2 sequences: [1,2,3,4] and [5,6,7,8]
-    input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+    # Token 0 is valid according to the packed lengths and must not be
+    # reinterpreted as padding after THD context-parallel sharding.
+    input_ids = torch.tensor([[0, 2, 3, 4], [5, 6, 7, 8]])
     labels = torch.tensor([[10, 20, 30, 40], [50, 60, 70, 80]])
     position_ids = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]])
     seq_lens = torch.tensor([[4], [4]])  # Both sequences have length 4
@@ -494,6 +495,7 @@ def test_make_cp_batch_for_te_basic(monkeypatch):
 
     # Verify cu_seqlens are properly formatted
     assert result["cu_seqlens"].dtype == torch.int32
+    assert not result["padding_mask"].any()
 
 
 def test_shard_thd_chunk_skips_missing_padding_mask(monkeypatch):

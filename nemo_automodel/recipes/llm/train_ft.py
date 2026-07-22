@@ -26,6 +26,7 @@ except ImportError:
     pass
 
 import gc
+import hashlib
 import inspect
 import logging
 import pathlib
@@ -168,7 +169,24 @@ def _should_pack_validation(cfg: RecipeConfig, model: nn.Module) -> bool:
 
 def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
     """Return whether the recipe should attach PP causal-mask precomputation."""
-    return getattr(model_config, "model_type", None) != "deepseek_v4"
+    model_type = getattr(model_config, "model_type", None)
+    return model_type not in {"deepseek_v4", "glm_moe_dsa"}
+
+
+def _pop_mock_data_fingerprint(batches: list[dict[str, Any]]) -> str | None:
+    """Remove mock-data fingerprints from model inputs and combine one optimizer step."""
+    fingerprints = [batch.pop("mock_data_fingerprint", None) for batch in batches]
+    present = [value is not None for value in fingerprints]
+    if any(present) and not all(present):
+        raise ValueError("Every accumulated batch must provide mock_data_fingerprint when any batch does.")
+    if not any(present):
+        return None
+    if not all(isinstance(value, str) and len(value) == 64 for value in fingerprints):
+        raise ValueError("mock_data_fingerprint values must be SHA-256 hex strings.")
+    digest = hashlib.sha256()
+    for value in fingerprints:
+        digest.update(value.encode("ascii"))
+    return digest.hexdigest()
 
 
 def _get_num_thd_chunks(pp_enabled, cfg):
@@ -1144,6 +1162,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
         """
 
+        input_fingerprint = _pop_mock_data_fingerprint(batches)
         num_label_tokens = torch.tensor(
             sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
         )
@@ -1276,20 +1295,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         reporting_loss = reporting_loss.cpu().item()
         # fix reporting_loss, tps across ranks
 
+        metrics = {
+            "loss": reporting_loss,
+            "grad_norm": grad_norm,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+            "tps": tps,
+            "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+            "mfu": mfu,
+            "num_tokens_per_step": num_tokens_in_batch,
+            "num_label_tokens": num_label_tokens,
+        }
+        if input_fingerprint is not None:
+            metrics["input_fingerprint"] = input_fingerprint
+
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
-            metrics={
-                "loss": reporting_loss,
-                "grad_norm": grad_norm,
-                "lr": self.optimizer[0].param_groups[0]["lr"],
-                "mem": torch.cuda.max_memory_allocated() / 1024**3,
-                "tps": tps,
-                "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
-                "mfu": mfu,
-                "num_tokens_per_step": num_tokens_in_batch,
-                "num_label_tokens": num_label_tokens,
-            },
+            metrics=metrics,
         )
 
     @torch.no_grad()
