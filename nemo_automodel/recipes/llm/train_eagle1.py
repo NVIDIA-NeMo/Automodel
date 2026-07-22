@@ -787,7 +787,9 @@ class TrainEagle1Recipe(BaseRecipe):
                     running_acc += metrics.accuracy.detach().item()
                     running_micro_batches += 1
                     for component_name, component_value in self._loss_components(metrics).items():
-                        running_components[component_name] = running_components.get(component_name, 0.0) + component_value
+                        running_components[component_name] = (
+                            running_components.get(component_name, 0.0) + component_value
+                        )
                     epoch_loss += metrics.loss.detach().item()
                     micro_step += 1
                     pending_micro_batches += 1
@@ -815,13 +817,23 @@ class TrainEagle1Recipe(BaseRecipe):
                                     acc=f"{avg_acc:.4f}",
                                     lr=f"{current_lr:.2e}",
                                 )
+                            # grad_norm is the pre-clip norm, so a value far above
+                            # ``max_grad_norm`` means every step is being rescaled
+                            # and the effective LR is ``lr / grad_norm``; the
+                            # per-recipe components carry the loss breakdown that
+                            # otherwise only reaches W&B.
+                            component_text = " ".join(
+                                f"{name}={value / n:.4g}" for name, value in sorted(running_components.items())
+                            )
                             logger.info(
-                                "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g",
+                                "epoch=%d step=%d loss=%.4f acc=%.4f lr=%.6g grad_norm=%.4g%s",
                                 epoch_idx,
                                 self.runtime.global_step,
                                 avg_loss,
                                 avg_acc,
                                 current_lr,
+                                float(grad_norm),
+                                f" {component_text}" if component_text else "",
                             )
                             self._wandb_log(
                                 {

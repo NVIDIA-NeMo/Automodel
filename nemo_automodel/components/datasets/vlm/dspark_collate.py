@@ -52,6 +52,7 @@ def dspark_vlm_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
     max_length: int,
+    inject_fake_image: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """Collate multimodal conversations into a DSpark-ready batch.
 
@@ -76,6 +77,14 @@ def dspark_vlm_collate_fn(
     training. The fake image's vision tokens get ``attention_mask = 0``
     (:func:`~.fake_image.mask_fake_vision_tokens_batch`) so they never
     influence the captured hidden states.
+
+    ``inject_fake_image=False`` turns that injection off, for consumers whose
+    draft reads the image positions itself. ViSpec is the case in point: it
+    locates image spans by ``input_ids == image_token_id``, which a fake image
+    satisfies, so the draft would compress the fake vision features and broadcast
+    their global vector over every following text position. Zeroing the fake
+    tokens in ``attention_mask`` does not prevent that, because the span lookup
+    never consults ``attention_mask``.
     """
     if not HAVE_QWEN_VL_UTILS:
         raise ImportError(MISSING_QWEN_VL_UTILS_MSG)
@@ -84,7 +93,7 @@ def dspark_vlm_collate_fn(
     fake_indices = []
     for i, example in enumerate(examples):
         conversation = example["conversation"]
-        if not _conversation_has_media(conversation):
+        if inject_fake_image and not _conversation_has_media(conversation):
             conversation = inject_fake_image_into_conversation(conversation)
             fake_indices.append(i)
         conversations.append(conversation)
@@ -123,6 +132,7 @@ def build_dspark_vlm_dataloader(
     num_workers: int = 0,
     distributed: bool = False,
     dp_mesh=None,
+    inject_fake_image: bool = True,
 ) -> DataLoader:
     """Build a multimodal DataLoader for DSpark training.
 
@@ -136,9 +146,18 @@ def build_dspark_vlm_dataloader(
     that applies to DSpark's non-packed, non-pipelined target-capture call
     (MiniMax M3's text decoder defaults to plain sequential position ids
     regardless of whether images are present).
+
+    ``inject_fake_image=False`` forwards to :func:`dspark_vlm_collate_fn` and
+    leaves text-only conversations text-only; see that function's docstring for
+    when to turn the injection off.
     """
     dataset = dataset_cfg.instantiate()
-    collate_fn = functools.partial(dspark_vlm_collate_fn, processor=processor, max_length=max_length)
+    collate_fn = functools.partial(
+        dspark_vlm_collate_fn,
+        processor=processor,
+        max_length=max_length,
+        inject_fake_image=inject_fake_image,
+    )
 
     sampler = None
     if distributed:

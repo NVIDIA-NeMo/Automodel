@@ -130,7 +130,15 @@ class HFVispecTargetModel:
         base_model = self.model.model
         forward_params = inspect.signature(base_model.forward).parameters
         accepted = {name: value for name, value in multimodal_inputs.items() if name in forward_params}
-        extra_kwargs = {name: False for name in ("output_attentions", "use_cache") if name in forward_params}
+        # A VLM base model declares its vision tensors explicitly but funnels the
+        # HF-generic flags through a ``**kwargs`` catch-all, so a plain
+        # ``name in forward_params`` test never matches them and the flags are
+        # silently dropped -- leaving ``use_cache`` on its config default, which
+        # allocates a full-sequence KV cache on every capture forward for nothing.
+        has_var_keyword = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in forward_params.values())
+        extra_kwargs = {
+            name: False for name in ("output_attentions", "use_cache") if name in forward_params or has_var_keyword
+        }
 
         outputs = base_model(
             input_ids=input_ids,

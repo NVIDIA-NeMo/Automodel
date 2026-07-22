@@ -360,6 +360,50 @@ class TestTargetWrapper:
         )
         assert batch.target_logits.shape == (1, 3, VOCAB)
 
+    def test_disables_use_cache_through_a_kwargs_catch_all(self):
+        """A VLM base model funnels ``use_cache`` through ``**kwargs``.
+
+        Testing membership in the declared parameters alone never matches those
+        models, so the flag would stay on its config default and allocate a
+        full-sequence KV cache on every capture forward.
+        """
+        target = _StubTarget()
+        captured = {}
+        base_forward = target.model.forward
+
+        def recording_forward(*args, **kwargs):
+            captured.update(kwargs)
+            return base_forward(*args, **kwargs)
+
+        target.model.forward = recording_forward
+        wrapper = HFVispecTargetModel(target, image_token_id=IMAGE_TOKEN_ID)
+        input_ids = torch.tensor([[1, 2, 3]])
+        wrapper.generate_batch(input_ids, torch.ones_like(input_ids), torch.ones_like(input_ids))
+
+        assert captured["use_cache"] is False
+        assert captured["output_attentions"] is False
+
+    def test_omits_flags_a_strict_signature_would_reject(self):
+        """A base model with neither the parameter nor ``**kwargs`` must not receive it."""
+
+        class _StrictBaseModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(VOCAB, HIDDEN)
+
+            def forward(self, input_ids, attention_mask, output_hidden_states=False):
+                from types import SimpleNamespace
+
+                embeds = self.embed(input_ids)
+                return SimpleNamespace(hidden_states=(embeds, embeds * 2.0))
+
+        target = _StubTarget()
+        target.model = _StrictBaseModel()
+        wrapper = HFVispecTargetModel(target, image_token_id=IMAGE_TOKEN_ID)
+        input_ids = torch.tensor([[1, 2, 3]])
+        batch = wrapper.generate_batch(input_ids, torch.ones_like(input_ids), torch.ones_like(input_ids))
+        assert batch.target_logits.shape == (1, 3, VOCAB)
+
 
 @pytest.mark.parametrize(
     "architecture",
