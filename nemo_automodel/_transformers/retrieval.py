@@ -31,18 +31,17 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICA
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel._transformers.sentence_transformer_export import (
+    _SENTENCE_TRANSFORMER_POOLING_KEYS,
+    _SentenceTransformerMetadataExporter,
+)
 from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 logger = logging.get_logger(__name__)
 
 
-_STANDARD_SENTENCE_TRANSFORMER_POOLING_TYPES = frozenset({"avg", "cls", "last"})
-_SENTENCE_TRANSFORMER_POOLING_KEYS = {
-    "avg": "pooling_mode_mean_tokens",
-    "cls": "pooling_mode_cls_token",
-    "last": "pooling_mode_lasttoken",
-}
+_STANDARD_SENTENCE_TRANSFORMER_POOLING_TYPES = frozenset(_SENTENCE_TRANSFORMER_POOLING_KEYS)
 _BI_ENCODER_DEFAULT_POOLING = "avg"
 _BI_ENCODER_DEFAULT_L2_NORMALIZE = True
 _HF_HUB_METADATA_KWARGS = {
@@ -629,7 +628,7 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
         )
         original_model_path = str(model_reference) if model_reference and os.path.isdir(str(model_reference)) else None
     if export_config is not None:
-        from nemo_automodel.components.checkpoint.addons import (
+        from nemo_automodel._transformers.sentence_transformer_export import (
             _save_generated_sentence_transformer_assets,
             _validate_sentence_transformer_export,
         )
@@ -799,6 +798,13 @@ class BiEncoderModel(nn.Module):
     def disable_sentence_transformer_export(self) -> None:
         """Disable standard export when runtime behavior cannot be represented faithfully."""
         self.sentence_transformer_export_config = None
+
+    def _get_consolidated_hf_metadata_exporter(self) -> _SentenceTransformerMetadataExporter | None:
+        """Return the retrieval-owned exporter for consolidated Hugging Face metadata."""
+        export_config = self.sentence_transformer_export_config
+        if export_config is None:
+            return None
+        return _SentenceTransformerMetadataExporter(self, export_config)
 
     def get_hf_export_config(self) -> PretrainedConfig:
         """Return a deployable Hugging Face config describing the effective bi-encoder."""

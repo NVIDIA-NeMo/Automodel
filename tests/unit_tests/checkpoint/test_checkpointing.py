@@ -28,6 +28,7 @@ import yaml
 from safetensors.torch import save_file
 from torch.nn.parallel import DistributedDataParallel
 
+from nemo_automodel._transformers.sentence_transformer_export import _SentenceTransformerMetadataExporter
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _DIFFUSERS_INDEX_FN,
     _extract_file_index_with_status,
@@ -400,6 +401,10 @@ def test_save_model_generates_sentence_transformer_metadata_from_effective_model
         document_prompt="passage: ",
     )
     model.get_hf_export_config = lambda: model.config
+    model._get_consolidated_hf_metadata_exporter = lambda: _SentenceTransformerMetadataExporter(
+        model,
+        model.sentence_transformer_export_config,
+    )
     tokenizer = MagicMock()
     tokenizer.model_max_length = 8192
     weights_path = tmp_path / "step"
