@@ -28,10 +28,11 @@ parallelizer file stays small.
 import logging
 import os
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import List
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
@@ -309,29 +310,44 @@ def _disable_dynamo_lru_cache() -> None:
         logger.debug("Could not disable dynamo LRU cache for selective AC + compile.", exc_info=True)
 
 
+@contextmanager
+def _restore_sdpa_state(sdpa: Callable, backends: list[SDPBackend]):
+    """Temporarily restore the SDPA callable and backend set captured during forward."""
+    backward_sdpa = F.scaled_dot_product_attention
+    F.scaled_dot_product_attention = sdpa
+    try:
+        with sdpa_kernel(backends):
+            yield
+    finally:
+        F.scaled_dot_product_attention = backward_sdpa
+
+
 def sdpa_backend_snapshot_context_fn() -> tuple[AbstractContextManager, AbstractContextManager]:
-    """Snapshot the ambient SDPA backend set and restore it on checkpoint recompute.
+    """Snapshot the ambient SDPA state and restore it on checkpoint recompute.
 
     A ``context_fn`` for non-reentrant ``checkpoint_wrapper``: torch's
     non-reentrant checkpoint invokes it at region entry on every checkpointed
-    forward, so the flags read here are exactly the backends the forward runs
-    under. Checkpoint recompute faults if and only if the effective SDPA
-    backend set differs between the forward and the backward-time replay (the
-    two passes then save different tensors and the wrapper's determinism check
-    raises ``CheckpointError``). Re-pinning the forward-time set during the
-    recompute therefore gives parity by construction: a no-op in clean
-    environments, and correct under ambient backend forcing (an
-    ``sdpa_kernel`` pin or module-level backend toggling) that is active at
-    forward time but does not span the recompute. Caveat: forcing toggled
-    *inside* the checkpointed region between attention calls is not captured,
-    because the snapshot is taken once at region entry.
+    forward, so the state read here is exactly what the forward runs under.
+    Both the enabled backend set and ``F.scaled_dot_product_attention`` are
+    restored during recompute. The callable matters for context parallelism:
+    a VLM vision tower temporarily suspends CP's ring-SDPA monkeypatch, and
+    checkpoint recompute occurs after that forward-only suspension has exited.
+    Replaying under the captured callable keeps bidirectional vision attention
+    local while restoring the backward-time CP dispatcher after recompute.
+
+    Re-pinning the forward-time backend set also prevents checkpoint metadata
+    mismatches when ambient backend forcing (an ``sdpa_kernel`` pin or
+    module-level backend toggling) is active at forward time but does not span
+    recompute. State toggled *inside* the checkpointed region between attention
+    calls is not captured because the snapshot is taken once at region entry.
 
     Returns:
         ``(forward_ctx, recompute_ctx)``: a no-op context for the checkpoint
-        forward, and an ``sdpa_kernel`` context restoring the captured backend
+        forward, and a context restoring the captured SDPA callable and backend
         set for the backward-time recompute.
     """
-    captured = [
+    captured_sdpa = F.scaled_dot_product_attention
+    captured_backends = [
         backend
         for enabled, backend in (
             (torch.backends.cuda.flash_sdp_enabled(), SDPBackend.FLASH_ATTENTION),
@@ -341,7 +357,7 @@ def sdpa_backend_snapshot_context_fn() -> tuple[AbstractContextManager, Abstract
         )
         if enabled
     ]
-    return nullcontext(), sdpa_kernel(captured)
+    return nullcontext(), _restore_sdpa_state(captured_sdpa, captured_backends)
 
 
 def _registered_child_name(module: nn.Module, attr: str, child: nn.Module) -> str | None:
@@ -382,7 +398,9 @@ def apply_submodule_checkpointing(
     layers: List[nn.Module],
     has_kv_sharing: bool,
     *,
-    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
+    context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = (
+        sdpa_backend_snapshot_context_fn
+    ),
 ) -> None:
     """Wrap a transformer block's sub-modules with ``checkpoint_wrapper``.
 
@@ -397,11 +415,10 @@ def apply_submodule_checkpointing(
     Args:
         layers: Transformer decoder layers to wrap (mutated in place).
         has_kv_sharing: Whether the model reuses K/V across layers via the cache.
-        context_fn: Optional factory returning ``(forward_ctx, recompute_ctx)``
-            for the attention and MLP checkpoint wrappers (e.g.
-            ``sdpa_backend_snapshot_context_fn``). Norm wrappers stay plain:
-            they dispatch no SDPA, so their recompute cannot diverge on
-            backend state.
+        context_fn: Factory returning ``(forward_ctx, recompute_ctx)`` for the
+            attention and MLP checkpoint wrappers. Defaults to restoring the
+            forward-time SDPA state; pass ``None`` to disable it. Norm wrappers
+            stay plain because they dispatch no SDPA.
     """
     wrapped_counts: dict[str, int] = {
         "mlp": 0,

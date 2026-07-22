@@ -151,10 +151,31 @@ def test_submodule_checkpointing_with_snapshot_context_reruns_recompute_under_fo
     assert block.attn._checkpoint_wrapped_module.qkv.weight.grad is not None
 
 
+def test_submodule_checkpointing_recompute_restores_forward_sdpa_callable(monkeypatch):
+    """Recompute must preserve a forward-local suspension of CP's SDPA monkeypatch."""
+    original_sdpa = F.scaled_dot_product_attention
+    block = _SdpaVisionBlock()
+    ac.apply_submodule_checkpointing([block], has_kv_sharing=False)
+
+    out = block(torch.randn(4, _D))
+
+    def cp_ring_sdpa(*args, **kwargs):
+        raise RuntimeError("bidirectional vision attention reached the CP ring dispatcher")
+
+    # Model forward has now left cp_dispatcher_suspended(), so the outer train
+    # context has restored CP's ring-SDPA monkeypatch before backward starts.
+    monkeypatch.setattr(F, "scaled_dot_product_attention", cp_ring_sdpa)
+    out.sum().backward()
+
+    assert F.scaled_dot_product_attention is cp_ring_sdpa
+    assert ac.unwrap_checkpoint_wrapper(block.attn).qkv.weight.grad is not None
+    assert original_sdpa is not cp_ring_sdpa
+
+
 def test_submodule_checkpointing_without_snapshot_context_recompute_sees_divergent_backends():
     """Without the snapshot context_fn, the recompute runs under whatever is ambient at backward time."""
     block = _SdpaVisionBlock()
-    ac.apply_submodule_checkpointing([block], has_kv_sharing=False)
+    ac.apply_submodule_checkpointing([block], has_kv_sharing=False, context_fn=None)
 
     attn = ac.unwrap_checkpoint_wrapper(block.attn)
     with sdpa_kernel([SDPBackend.MATH]):
@@ -211,7 +232,7 @@ def test_checkpointed_sdpa_replay_faults_without_snapshot_context_and_passes_wit
     # exited by backward time -> the recompute dispatches a fused backend that
     # saves different tensors -> deterministic CheckpointError.
     plain = _SdpaVisionBlock().to(device)
-    ac.apply_submodule_checkpointing([plain], has_kv_sharing=False)
+    ac.apply_submodule_checkpointing([plain], has_kv_sharing=False, context_fn=None)
     with sdpa_kernel([SDPBackend.MATH]):
         out = plain(x)
     with pytest.raises(CheckpointError):
