@@ -78,6 +78,7 @@ class HFMSDTargetModel:
         if not hasattr(model, "lm_head"):
             raise ValueError("MSD requires a Hugging Face VLM exposing its language head as `lm_head`.")
         self.image_token_id = int(image_token_id)
+        self.language_backbone = getattr(model.model, "language_model", model.model)
 
     def get_lm_head(self) -> nn.Module:
         """Return the frozen VLM language-model head used by the draft loss."""
@@ -111,7 +112,7 @@ class HFMSDTargetModel:
             sequence, hidden] or [batch, sequence, vocab] as appropriate.
         """
         capture = _InputEmbeddingCapture()
-        handle = self.model.model.register_forward_pre_hook(capture, with_kwargs=True)
+        handle = self.language_backbone.register_forward_pre_hook(capture, with_kwargs=True)
         try:
             outputs = self.model(output_hidden_states=True, return_dict=True, use_cache=False, **model_inputs)
         finally:

@@ -185,6 +185,40 @@ class _TinyVLM(nn.Module):
         return SimpleNamespace(hidden_states=(hidden_states,), logits=self.lm_head(hidden_states))
 
 
+class _TinyMultimodalBackbone(nn.Module):
+    """Minimal multimodal wrapper exposing a nested language backbone."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.language_model = _TinyLanguageBackbone()
+
+
+class _NestedTinyVLM(_TinyVLM):
+    """Tiny VLM matching models that nest the language backbone one level deeper."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = _TinyMultimodalBackbone()
+
+    def forward(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        output_hidden_states: bool,
+        return_dict: bool,
+        use_cache: bool,
+        pixel_values: torch.Tensor,
+    ) -> SimpleNamespace:
+        """Fuse a vision feature and invoke the nested language backbone."""
+        del attention_mask, output_hidden_states, return_dict, use_cache
+        embeds = self.embeddings(input_ids)
+        image_features = pixel_values.mean(dim=(1, 2, 3), keepdim=False).view(-1, 1, 1).expand(-1, 1, 4)
+        embeds = torch.where(input_ids.eq(self.config.image_token_id).unsqueeze(-1), image_features, embeds)
+        hidden_states = self.model.language_model(inputs_embeds=embeds)
+        return SimpleNamespace(hidden_states=(hidden_states,), logits=self.lm_head(hidden_states))
+
+
 def test_msd_target_captures_fused_image_embeddings_and_alignment() -> None:
     """The target wrapper preserves vision features and VLM label alignment."""
     model = _TinyVLM()
@@ -202,3 +236,22 @@ def test_msd_target_captures_fused_image_embeddings_and_alignment() -> None:
     assert torch.equal(batch.loss_mask, torch.tensor([[True, False, True]]))
     assert torch.allclose(batch.inputs_embeds[0, 0], torch.full((4,), 5.0))
     assert torch.equal(batch.target_hidden_states[:, -1], torch.zeros(1, 4))
+
+
+def test_msd_target_captures_embeddings_from_nested_language_backbone() -> None:
+    """The target wrapper supports VLMs that expose ``model.language_model``."""
+    model = _NestedTinyVLM()
+    wrapper = HFMSDTargetModel(model)
+    input_ids = torch.tensor([[1, 3, 2]])
+    batch = wrapper.generate_batch(
+        input_ids=input_ids,
+        attention_mask=torch.ones(1, 3),
+        loss_mask=torch.ones(1, 3, dtype=torch.bool),
+        model_inputs={
+            "input_ids": input_ids,
+            "attention_mask": torch.ones(1, 3),
+            "pixel_values": torch.full((1, 3, 2, 2), 5.0),
+        },
+    )
+
+    assert torch.allclose(batch.inputs_embeds[0, 0], torch.full((4,), 5.0))
