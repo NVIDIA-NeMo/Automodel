@@ -39,6 +39,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nemo_automodel.components.loss.listmle import listmle_loss
+
 
 @dataclass
 class VispecStepMetrics:
@@ -49,32 +51,6 @@ class VispecStepMetrics:
     rank_loss: torch.Tensor
     accuracy: torch.Tensor
     valid_tokens: torch.Tensor
-
-
-def listmle_loss(logits: torch.Tensor, target_probs: torch.Tensor, topk: int) -> torch.Tensor:
-    """ListMLE ranking loss over the target's top-k tokens.
-
-    Scores the draft on reproducing the target's *ordering* of its ``topk`` most
-    likely tokens: the Plackett-Luce likelihood of drawing those tokens, under
-    the draft's logits, in the target's own descending-probability order.
-
-    Args:
-        logits: Tensor of shape [tokens, vocab] -- the draft's logits at the
-            supervised positions.
-        target_probs: Tensor of shape [tokens, vocab] -- the target's
-            probabilities at the same positions.
-        topk: Number of top target tokens to rank.
-
-    Returns:
-        Scalar Tensor: the mean over ``tokens`` of the summed negative
-        log-likelihood of the target's top-k ordering.
-    """
-    _, topk_indices = torch.topk(target_probs, k=topk, dim=-1)
-    topk_logits = logits.gather(-1, topk_indices).float()
-    # log sum_{j >= i} exp(logit_j) for every rank i, computed as a reversed
-    # cumulative logsumexp so the tail sums come out in one pass.
-    log_denominator = torch.flip(torch.logcumsumexp(torch.flip(topk_logits, dims=[-1]), dim=-1), dims=[-1])
-    return -torch.mean((topk_logits - log_denominator).sum(dim=-1))
 
 
 class VispecTrainerModule(nn.Module):

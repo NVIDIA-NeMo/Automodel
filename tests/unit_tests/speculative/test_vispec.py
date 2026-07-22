@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 from transformers import LlamaConfig
 
+from nemo_automodel.components.loss.listmle import listmle_loss
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
 from nemo_automodel.components.speculative.eagle.registry import (
     resolve_vispec_draft_spec,
@@ -27,7 +28,6 @@ from nemo_automodel.components.speculative.eagle.registry import (
 from nemo_automodel.components.speculative.eagle.vispec_core import (
     VispecStepMetrics,
     VispecTrainerModule,
-    listmle_loss,
 )
 from nemo_automodel.components.speculative.eagle.vispec_draft import VispecDraftModel, VispecImageAdaptor
 from nemo_automodel.components.speculative.eagle.vispec_target import (

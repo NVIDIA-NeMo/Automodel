@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nemo_automodel.components.loss.listmle import listmle_loss
 from nemo_automodel.components.loss.soft_ce import masked_soft_cross_entropy
 
 
@@ -34,6 +35,7 @@ class EagleStepMetrics:
     token_loss: torch.Tensor
     accuracy: torch.Tensor
     valid_tokens: torch.Tensor
+    rank_loss: torch.Tensor | None = None
 
 
 class EagleTrainerModule(nn.Module):
@@ -47,6 +49,8 @@ class EagleTrainerModule(nn.Module):
         hidden_loss_weight: float = 1.0,
         token_loss_weight: float = 0.1,
         feature_noise: float = 0.0,
+        rank_loss_weight: float = 0.0,
+        rank_loss_topk: int = 10,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -56,6 +60,16 @@ class EagleTrainerModule(nn.Module):
         object.__setattr__(self, "_target_lm_head", target_lm_head)
         self.hidden_loss_weight = hidden_loss_weight
         self.token_loss_weight = token_loss_weight
+        # Optional Plackett-Luce ranking term over the target's top-k tokens.
+        # EAGLE-1/2 does not use it, so it is off by default and the objective is
+        # unchanged at 0.0. ViSpec's stage 1 does: its reference implementation
+        # computes ``v_w * vloss + p_w * (ploss + 0.1 * rloss)`` with ``v_w=1.0``
+        # and ``p_w=0.1``, so the ranking term carries an effective weight of
+        # 0.1 * 0.1 = 0.01 in the total. ``rank_loss_weight`` is that effective
+        # weight, applied directly rather than nested, so the three terms read
+        # off the config independently.
+        self.rank_loss_weight = rank_loss_weight
+        self.rank_loss_topk = rank_loss_topk
         # EAGLE feature-noise data augmentation. The original paper adds noise
         # sampled from U(-0.1, 0.1) to the target features fed to the draft during
         # training, to mitigate the error accumulation that compounds across the
@@ -141,6 +155,16 @@ class EagleTrainerModule(nn.Module):
         )
         loss = self.hidden_loss_weight * hidden_loss + self.token_loss_weight * token_loss
 
+        rank_loss = None
+        if self.rank_loss_weight > 0.0:
+            # Ranking is only defined where there is supervision; an empty
+            # selection would make topk/logcumsumexp return NaN.
+            if valid_mask.any():
+                rank_loss = listmle_loss(predicted_logits[valid_mask], target_probs[valid_mask], self.rank_loss_topk)
+            else:
+                rank_loss = predicted_logits.sum() * 0.0
+            loss = loss + self.rank_loss_weight * rank_loss
+
         target_token_ids = target_logits.argmax(dim=-1)
         predicted_token_ids = predicted_logits.argmax(dim=-1)
         correct = (predicted_token_ids == target_token_ids) & valid_mask
@@ -152,4 +176,5 @@ class EagleTrainerModule(nn.Module):
             token_loss=token_loss,
             accuracy=accuracy,
             valid_tokens=valid_tokens,
+            rank_loss=rank_loss,
         )
