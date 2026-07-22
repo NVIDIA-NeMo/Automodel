@@ -133,6 +133,13 @@ dataloader:
 clip_grad_norm:
   max_norm: 1.0
 
+# Initialize lazy CUDA runtime state before the first 128K step reaches peak
+# activation and gradient memory.
+prewarm:
+  cublas_backward: true
+  fla_gdn_autotune: true
+  comm_groups: true
+
 optimizer:
   # Empty FSDP shards from small trainable ViT parameters are filtered by the
   # shared optimizer factory before Transformer Engine sees them.
@@ -146,7 +153,9 @@ optimizer:
   master_weights: true
   master_weight_dtype: torch.float32
   store_param_remainders: true
-  exp_avg_dtype: torch.float32
+  # The first moment uses BF16 to keep the 122B DP8 layout within 80GB;
+  # retain FP32 for the master weights and numerically sensitive second moment.
+  exp_avg_dtype: torch.bfloat16
   exp_avg_sq_dtype: torch.float32
 
 lr_scheduler:

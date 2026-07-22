@@ -40,12 +40,18 @@ def test_qwen3_5_moe_122b_example_declares_scaling_contract() -> None:
     assert raw_config["packed_sequence"]["attn_implementation"] == "sdpa"
     assert raw_config["step_scheduler"]["max_steps"] == 10
 
+    assert raw_config["prewarm"] == {
+        "cublas_backward": True,
+        "fla_gdn_autotune": True,
+        "comm_groups": True,
+    }
+
     optimizer = raw_config["optimizer"]
     assert optimizer["_target_"] == "transformer_engine.pytorch.optimizers.FusedAdam"
     assert optimizer["master_weights"] is True
     assert optimizer["master_weight_dtype"] == "torch.float32"
     assert optimizer["store_param_remainders"] is True
-    assert optimizer["exp_avg_dtype"] == "torch.float32"
+    assert optimizer["exp_avg_dtype"] == "torch.bfloat16"
     assert optimizer["exp_avg_sq_dtype"] == "torch.float32"
 
     vision_policy = CpVisionShardingConfig(**raw_config["distributed"]["cp_vision_sharding"])
