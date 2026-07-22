@@ -83,6 +83,7 @@ from typing import Optional
 
 import torch
 from utils import (
+    GEMMA_ADAPTER_KEY_MAP,
     get_num_transfer_tokens,
     get_transfer_index,
     load_model_and_tokenizer,
@@ -535,7 +536,10 @@ def main():
 
     if args.adapter:
         print(f"Merging adapter: {args.adapter}")
-        model = merge_adapter(model, args.adapter)
+        # DiffusionGemma trains on the native Automodel implementation but
+        # generates through the HF class; re-parent the adapter module paths.
+        key_map = GEMMA_ADAPTER_KEY_MAP if args.sampler == "gemma" else None
+        model = merge_adapter(model, args.adapter, key_map=key_map)
 
     overrides = {}
     for key in [

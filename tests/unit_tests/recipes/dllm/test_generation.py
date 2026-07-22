@@ -176,3 +176,29 @@ def test_cli_exposes_adapter_flag(monkeypatch, capsys):
     with pytest.raises(SystemExit, match="0"):
         main()
     assert "--adapter" in capsys.readouterr().out
+
+
+def test_translate_adapter_reparents_gemma_module_paths(tmp_path):
+    pytest.importorskip("safetensors")
+    import json
+
+    from safetensors.torch import load_file, save_file
+    from utils import GEMMA_ADAPTER_KEY_MAP, translate_adapter
+
+    src = tmp_path / "adapter"
+    src.mkdir()
+    save_file(
+        {"base_model.model.model.layers.3.self_attn.q_proj.lora_A.weight": torch.zeros(2, 2)},
+        str(src / "adapter_model.safetensors"),
+    )
+    (src / "adapter_config.json").write_text(
+        json.dumps({"target_modules": ["model.layers.3.self_attn.q_proj"], "r": 2})
+    )
+
+    out = Path(translate_adapter(str(src), GEMMA_ADAPTER_KEY_MAP))
+
+    translated = load_file(str(out / "adapter_model.safetensors"))
+    assert list(translated) == ["base_model.model.model.decoder.layers.3.self_attn.q_proj.lora_A.weight"]
+    cfg = json.loads((out / "adapter_config.json").read_text())
+    assert cfg["target_modules"] == ["model.decoder.layers.3.self_attn.q_proj"]
+    assert cfg["r"] == 2  # non-key fields untouched
