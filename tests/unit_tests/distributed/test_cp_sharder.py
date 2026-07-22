@@ -47,6 +47,11 @@ class _FakeMesh:
         return None
 
 
+def _forward(cp_mesh, local_indices, result=None):
+    result = result or cs.CPShardResult(contextlib.nullcontext(), {})
+    return cs.CPForward(result, cp_mesh, local_indices)
+
+
 @pytest.fixture(autouse=True)
 def _force_no_dist(monkeypatch):
     """Pin rank resolution to the fake mesh's local rank."""
@@ -140,24 +145,21 @@ def test_gather_token_tensor_identity_without_cp():
 # CPShardStrategy default/override resolution
 # ---------------------------------------------------------------------------
 def test_sharder_default_shard_token_tensor_uses_indices():
-    tokens = cs.CPTokenLayout(
-        cp_mesh=_FakeMesh(2, 1),
-        local_token_global_indices=cs._contiguous_local_indices,
-    )
+    tokens = _forward(_FakeMesh(2, 1), cs._contiguous_local_indices)
     full = torch.randn(1, 8)
     local = tokens.shard(full, seq_dim=1)
     torch.testing.assert_close(local, full[:, 4:])
 
 
-def test_shard_batch_contiguous_records_shard_layout():
-    """shard_batch reports original/padded lengths as ShardLayout; once installed,
+def test_shard_batch_contiguous_records_layout():
+    """shard_batch reports original/padded lengths; once installed,
     the token verbs accept caller-coordinate tensors and reject mismatched ones."""
     mesh = _FakeMesh(2, 0)
     batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
     prepared = cs.shard_batch_contiguous(mesh, None, batch)  # pads 6 -> 8
-    tokens = cs.CPTokenLayout(mesh, cs._contiguous_local_indices, prepared.layout)
+    tokens = _forward(mesh, cs._contiguous_local_indices, prepared)
 
-    assert (tokens.shard_layout.original_seq_len, tokens.shard_layout.padded_seq_len) == (6, 8)
+    assert (prepared.original_seq_len, prepared.padded_seq_len) == (6, 8)
     # down: unpadded tensor auto-pads with the explicit fill, rank 0 owns [0:4]
     local = tokens.shard(torch.arange(6.0).unsqueeze(0), fill=-1.0)
     assert torch.equal(local, torch.tensor([[0.0, 1.0, 2.0, 3.0]]))
@@ -178,11 +180,13 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
     columns and dropped input pad slots come back as fill."""
     # input row: [a, b, PAD] -> rebuilt row: [a, b, X, X] (doc re-padded to 4)
     positions = torch.tensor([[0, 1, -1]])
-    tokens = cs.CPTokenLayout(
-        cp_mesh=_FakeMesh(2, 0),
-        local_token_global_indices=cs._contiguous_local_indices,
-        shard_layout=cs.ShardLayout(padded_seq_len=4, input_token_stream_positions=positions),
+    result = cs.CPShardResult(
+        contextlib.nullcontext(),
+        {},
+        padded_seq_len=4,
+        input_token_stream_positions=positions,
     )
+    tokens = _forward(_FakeMesh(2, 0), cs._contiguous_local_indices, result)
     local = tokens.shard(torch.tensor([[10.0, 20.0, 99.0]]), fill=0.0)
     assert torch.equal(local, torch.tensor([[10.0, 20.0]]))
     with pytest.raises(ValueError, match="fill"):
@@ -190,11 +194,7 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
 
     # up: gather (identity at cp<=1 here) then map back to input coordinates
     full_rows = torch.tensor([[10.0, 20.0, 7.0, 7.0]])
-    identity_tokens = cs.CPTokenLayout(
-        cp_mesh=_FakeMesh(1),
-        local_token_global_indices=cs._contiguous_local_indices,
-        shard_layout=tokens.shard_layout,
-    )
+    identity_tokens = _forward(_FakeMesh(1), cs._contiguous_local_indices, result)
     out = identity_tokens.gather(full_rows, fill=-5.0)
     assert torch.equal(out, torch.tensor([[10.0, 20.0, -5.0]]))
     with pytest.raises(ValueError, match="fill"):
@@ -202,10 +202,7 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
 
 
 def test_gather_without_captured_facts_returns_global_coordinates():
-    tokens = cs.CPTokenLayout(
-        cp_mesh=_FakeMesh(1),
-        local_token_global_indices=cs._contiguous_local_indices,
-    )
+    tokens = _forward(_FakeMesh(1), cs._contiguous_local_indices)
     tensor = torch.zeros(1, 4)
     assert tokens.gather(tensor) is tensor
 
@@ -213,17 +210,14 @@ def test_gather_without_captured_facts_returns_global_coordinates():
 def test_reported_indices_validate_stream_length():
     # Reported index maps flatten + cast to long, and reject a padded_seq_len
     # that does not match the partition the shard reported.
-    tokens = cs.CPTokenLayout(
-        cp_mesh=_FakeMesh(2, 0),
-        local_token_global_indices=None,
-        shard_layout=cs.ShardLayout(local_token_global_indices=torch.tensor([[1, 0]], dtype=torch.int32)),
+    result = cs.CPShardResult(
+        contextlib.nullcontext(),
+        {},
+        local_token_global_indices=torch.tensor([[1, 0]], dtype=torch.int32),
     )
+    tokens = _forward(_FakeMesh(2, 0), None, result)
     assert torch.equal(tokens._indices(4, torch.device("cpu")), torch.tensor([1, 0]))
-    identity_tokens = cs.CPTokenLayout(
-        cp_mesh=None,
-        local_token_global_indices=None,
-        shard_layout=tokens.shard_layout,
-    )
+    identity_tokens = _forward(None, None, result)
     assert torch.equal(identity_tokens._indices(2, torch.device("cpu")), torch.tensor([1, 0]))
     with pytest.raises(ValueError, match="does not match"):
         tokens._indices(6, torch.device("cpu"))
@@ -233,10 +227,7 @@ def test_sharder_token_verbs_unavailable_for_data_dependent_layouts():
     # THD/magi layouts depend on batch content (cu_seqlens / dispatch solver),
     # so their framework sharders carry no index map and the token-tensor verbs
     # must fail loudly rather than shard the wrong slice.
-    tokens = cs.CPTokenLayout(
-        cp_mesh=_FakeMesh(2, 0),
-        local_token_global_indices=None,
-    )
+    tokens = _forward(_FakeMesh(2, 0), None)
     with pytest.raises(RuntimeError, match="does not contain"):
         tokens.shard(torch.randn(1, 8))
     with pytest.raises(RuntimeError, match="does not contain"):
@@ -367,13 +358,13 @@ def test_shard_batch_aux_only_matches_load_balanced(monkeypatch):
 
 
 def test_shard_batch_aux_only_reports_padded_layout(monkeypatch):
-    """The returned ShardLayout carries the primary stream's target padded length."""
+    """The result carries the primary stream's target padded length."""
 
     monkeypatch.setattr(cs, "_create_context_parallel_ctx", lambda *a, **k: contextlib.nullcontext())
 
     batch = {"input_ids": torch.arange(6).view(1, 6), "labels": torch.arange(6).view(1, 6)}
-    layout = cs._shard_batch_aux_only(_FakeMesh(2, 0), None, batch).layout
-    assert (layout.original_seq_len, layout.padded_seq_len) == (6, 8)
+    prepared = cs._shard_batch_aux_only(_FakeMesh(2, 0), None, batch)
+    assert (prepared.original_seq_len, prepared.padded_seq_len) == (6, 8)
 
 
 def test_shard_batch_contiguous_extra_seq_keys():
@@ -424,7 +415,7 @@ def test_aux_only_contiguous_slice_equivalence_with_shard_batch_contiguous(cp_si
     ref_prepared = cs.shard_batch_contiguous(
         mesh, None, ref, extra_seq_keys={"vision_ids": 1}, extra_pad_values={"vision_ids": -1}
     )
-    ref_out, ref_layout = ref_prepared.batch, ref_prepared.layout
+    ref_out = ref_prepared.batch
 
     # Aux-only: primary stays full; the model slices it in forward.
     aux = make_batch()
@@ -432,7 +423,7 @@ def test_aux_only_contiguous_slice_equivalence_with_shard_batch_contiguous(cp_si
     aux_prepared = cs.shard_batch_contiguous(
         mesh, None, aux, extra_seq_keys={"vision_ids": 1}, extra_pad_values={"vision_ids": -1}, shard_primary=False
     )
-    aux_out, aux_layout = aux_prepared.batch, aux_prepared.layout
+    aux_out = aux_prepared.batch
     # Primary is left full-length + untouched by the aux-only sharder.
     assert aux_out["inputs_embeds"] is full_embeds
     assert aux_out["inputs_embeds"].shape == (1, seq, hidden)
@@ -441,11 +432,11 @@ def test_aux_only_contiguous_slice_equivalence_with_shard_batch_contiguous(cp_si
     )
 
     # Same padded layout, same primary slice, same aux slices.
-    assert (aux_layout.original_seq_len, aux_layout.padded_seq_len) == (
-        ref_layout.original_seq_len,
-        ref_layout.padded_seq_len,
+    assert (aux_prepared.original_seq_len, aux_prepared.padded_seq_len) == (
+        ref_prepared.original_seq_len,
+        ref_prepared.padded_seq_len,
     )
-    assert padded_len == ref_layout.padded_seq_len
+    assert padded_len == ref_prepared.padded_seq_len
     torch.testing.assert_close(local_primary, ref_out["inputs_embeds"])
     torch.testing.assert_close(aux_out["labels"], ref_out["labels"])
     torch.testing.assert_close(aux_out["position_ids"], ref_out["position_ids"])
@@ -465,11 +456,11 @@ def test_shard_batch_contiguous_aux_only_keeps_input_ids_full(monkeypatch):
     }
     orig_input_ids = batch["input_ids"].clone()
     prepared = cs.shard_batch_contiguous(mesh, None, batch, shard_primary=False)
-    out, layout = prepared.batch, prepared.layout
+    out = prepared.batch
     torch.testing.assert_close(out["input_ids"], orig_input_ids)  # full + untouched
     assert out["labels"].shape == (1, 4)  # rank 1 owns [4:8]
     assert out["labels"][0, -1].item() == -100  # pad tail is the ignore index
-    assert (layout.original_seq_len, layout.padded_seq_len) == (6, 8)
+    assert (prepared.original_seq_len, prepared.padded_seq_len) == (6, 8)
 
 
 def test_shard_sequence_for_cp_contiguous_is_differentiable():

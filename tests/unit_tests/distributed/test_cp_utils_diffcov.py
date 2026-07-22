@@ -195,7 +195,7 @@ def test_shard_batch_contiguous_pads_and_slices_all_keys():
         extra_seq_keys={"vision_extra": 1, "mm_token_type_ids": 1, "per_layer_inputs": 1},
         extra_pad_values={"vision_extra": 0, "mm_token_type_ids": 0, "per_layer_inputs": 0},
     )
-    out, layout = prepared.batch, prepared.layout
+    out = prepared.batch
     # rank 0 keeps the first local_seq_len=4 positions
     assert out["inputs_embeds"].shape == (1, 4, d)
     assert out["labels"].shape == (1, 4)
@@ -203,7 +203,7 @@ def test_shard_batch_contiguous_pads_and_slices_all_keys():
     assert out["padding_mask"].shape == (1, 4)
     assert out["vision_extra"].shape == (1, 4)
     assert out["loss_mask"].shape == (1, 4)
-    assert (layout.original_seq_len, layout.padded_seq_len) == (6, 8)
+    assert (prepared.original_seq_len, prepared.padded_seq_len) == (6, 8)
 
 
 def test_shard_batch_contiguous_uses_dist_rank_when_initialized():

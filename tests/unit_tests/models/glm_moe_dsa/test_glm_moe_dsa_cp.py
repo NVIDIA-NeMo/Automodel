@@ -150,11 +150,11 @@ def test_shard_glm_dsa_packed_cp_batch_reports_single_chunk_layout(monkeypatch):
         num_chunks=1,
     )
 
-    out, layout = prepared.batch, prepared.layout
+    out = prepared.batch
     assert isinstance(prepared.context, contextlib.nullcontext)
     assert out["input_ids"].tolist() == [0, 1]
-    assert layout.padded_seq_len == 6
-    assert layout.input_row_shape == (1, 6)
+    assert prepared.padded_seq_len == 6
+    assert prepared.input_row_shape == (1, 6)
 
 
 def test_make_glm_dsa_packed_cp_batch_stacks_pipeline_chunks(monkeypatch):

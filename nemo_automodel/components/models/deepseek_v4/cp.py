@@ -288,7 +288,7 @@ def _repad_dsv4_packed_batch(
 
     batch_size = primary.shape[0]
     # Per-row map from input position to rebuilt-row column (-1 = input pad
-    # slot whose token was dropped); the CPShardStrategy token verbs restore the
+    # slot whose token was dropped); the CPForward token verbs restore the
     # caller's coordinates through it.
     input_positions = torch.full((batch_size, primary.shape[1]), -1, dtype=torch.long, device=primary.device)
     rebuilt_primary = []
@@ -437,7 +437,8 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     ``pad_multiple``) and invoked by the CP dispatch. HybridEP can
     first max-reduce packed lengths so every rank contributes a uniform token count.
     Each CP rank then keeps one ``seq_start:seq_end`` slice; DSV4 attention all-gathers
-    K/V across CP ranks during forward. Returns ``(nullcontext, batch)``.
+    K/V across CP ranks during forward. Returns a ``CPShardResult`` containing
+    the prepared batch, forward context, and captured token layout.
 
     ``pad_multiple`` is the required *per-CP-rank* shard multiple (from
     ``dsv4_cp_local_seq_multiple``); the global sequence is padded so it is divisible
@@ -449,7 +450,6 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
 
     from nemo_automodel.components.distributed.context_parallel._strategy import (  # noqa: PLC0415
         CPShardResult,
-        ShardLayout,
         convert_attention_mask_to_padding_mask,
         shard_batch_contiguous,
     )
@@ -500,13 +500,13 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     if packed:
         # The repad rebuilt the rows, so no single original length exists; the
         # caller's coordinates are restored through the position map instead.
-        layout = ShardLayout(
-            padded_seq_len=prepared.layout.padded_seq_len,
+        prepared = CPShardResult(
+            prepared.context,
+            prepared.batch,
+            padded_seq_len=prepared.padded_seq_len,
             input_token_stream_positions=input_positions,
         )
-    else:
-        layout = prepared.layout
     # Hand the CP process group to the model forward (read from attn_kwargs) so
     # DSV4 attention all-gathers K/V across CP ranks. Not a tensor -> not sharded.
     prepared.batch["_dsv4_cp_group"] = cp_mesh.get_group()
-    return CPShardResult(prepared.context, prepared.batch, layout)
+    return prepared

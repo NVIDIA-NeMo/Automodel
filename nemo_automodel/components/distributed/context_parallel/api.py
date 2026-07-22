@@ -15,18 +15,15 @@
 """Public context-parallel batch sharder."""
 
 import contextlib
-from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.context_parallel._strategy import (
+    CPForward,
     CPShardResult,
     CPShardStrategy,
-    CPTokenLayout,
-    ShardLayout,
 )
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
 from nemo_automodel.components.distributed.context_parallel.utils import _prepare_thd_batch
@@ -57,53 +54,6 @@ def _is_multimodal_model(model: torch.nn.Module | None) -> bool:
         for name in ("visual", "vision_model", "vision_tower", "audio_model", "audio_tower")
     )
     return has_language_model and has_media_model
-
-
-@dataclass(frozen=True)
-class CPForward:
-    """Prepared context-parallel state for one model forward.
-
-    Attributes:
-        context: Context manager entered around the model forward.
-        batch: Prepared batch. Tensor values may have layouts such as
-            ``[batch, local_sequence]`` or packed THD ``[local_tokens]``
-            according to the selected backend. The input mapping is mutated and
-            returned by reference.
-    """
-
-    context: AbstractContextManager[None]
-    batch: dict[str, Any]
-    _tokens: CPTokenLayout = field(repr=False)
-
-    def shard(self, tensor: torch.Tensor, *, seq_dim: int = 1, fill: int | float | None = None) -> torch.Tensor:
-        """Shard an additional tensor using this forward's token layout.
-
-        Args:
-            tensor: Full tensor of shape ``[..., sequence, ...]`` with the
-                sequence axis selected by ``seq_dim``.
-            seq_dim: Sequence axis in ``tensor``.
-            fill: Value used for positions introduced by CP padding. Required
-                when the tensor has the original unpadded sequence length.
-
-        Returns:
-            Tensor with the same axis order and the sequence axis restricted to
-            this rank's local tokens.
-        """
-        return self._tokens.shard(tensor, seq_dim=seq_dim, fill=fill)
-
-    def gather(self, tensor: torch.Tensor, *, seq_dim: int = 1, fill: int | float | None = None) -> torch.Tensor:
-        """Gather a local tensor into the caller's original token coordinates.
-
-        Args:
-            tensor: Local tensor of shape ``[..., local_sequence, ...]`` with
-                the sequence axis selected by ``seq_dim``.
-            seq_dim: Sequence axis in ``tensor``.
-            fill: Value used for input positions absent from the CP layout.
-
-        Returns:
-            Tensor with the same axis order and the original global sequence axis.
-        """
-        return self._tokens.gather(tensor, seq_dim=seq_dim, fill=fill)
 
 
 class ContextParallelSharder:
@@ -197,22 +147,23 @@ class ContextParallelSharder:
                     is_thd=is_thd,
                     model=model,
                 )
-                layout = None
-                if local_indices is not None:
-                    padded = local_indices.numel() * max(self._magi.cp_size or 1, 1)
-                    original, input_rows = None, None
-                    if row_shape is not None:
-                        if padded == row_shape[0] * row_shape[1]:
-                            input_rows = row_shape
-                        elif row_shape[0] == 1 and padded >= row_shape[1]:
-                            original = row_shape[1]
-                    layout = ShardLayout(
-                        local_token_global_indices=local_indices,
-                        original_seq_len=original,
-                        padded_seq_len=padded,
-                        input_row_shape=input_rows,
-                    )
-                return CPShardResult(contextlib.nullcontext(), prepped, layout)
+                if local_indices is None:
+                    return CPShardResult(contextlib.nullcontext(), prepped)
+                padded = local_indices.numel() * max(self._magi.cp_size or 1, 1)
+                original, input_rows = None, None
+                if row_shape is not None:
+                    if padded == row_shape[0] * row_shape[1]:
+                        input_rows = row_shape
+                    elif row_shape[0] == 1 and padded >= row_shape[1]:
+                        original = row_shape[1]
+                return CPShardResult(
+                    contextlib.nullcontext(),
+                    prepped,
+                    local_token_global_indices=local_indices,
+                    original_seq_len=original,
+                    padded_seq_len=padded,
+                    input_row_shape=input_rows,
+                )
 
             return CPShardStrategy(shard_batch=shard_batch_magi, local_token_global_indices=None)
 
@@ -252,14 +203,15 @@ class ContextParallelSharder:
                     padding_token_id=padding_token_id,
                     num_chunks=num_chunks,
                 )
-                layout = None
-                if local_indices is not None:
-                    layout = ShardLayout(
-                        local_token_global_indices=local_indices,
-                        padded_seq_len=row_shape[0] * row_shape[1] if row_shape is not None else None,
-                        input_row_shape=row_shape,
-                    )
-                return CPShardResult(contextlib.nullcontext(), prepped, layout)
+                return CPShardResult(
+                    contextlib.nullcontext(),
+                    prepped,
+                    local_token_global_indices=local_indices,
+                    padded_seq_len=row_shape[0] * row_shape[1]
+                    if local_indices is not None and row_shape is not None
+                    else None,
+                    input_row_shape=row_shape if local_indices is not None else None,
+                )
 
             return CPShardStrategy(shard_batch=shard_batch_thd, local_token_global_indices=None)
 
@@ -344,9 +296,8 @@ class ContextParallelSharder:
             loss_mask=loss_mask,
             padding_token_id=padding_token_id,
         )
-        tokens = CPTokenLayout(
-            cp_mesh=cp_mesh,
-            local_token_global_indices=sharder.local_token_global_indices,
-            shard_layout=prepared.layout or ShardLayout(),
+        return CPForward(
+            _result=prepared,
+            _cp_mesh=cp_mesh,
+            _local_token_global_indices=sharder.local_token_global_indices,
         )
-        return CPForward(context=prepared.context, batch=prepared.batch, _tokens=tokens)

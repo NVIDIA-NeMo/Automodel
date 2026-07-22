@@ -21,7 +21,7 @@ import contextlib
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.distributed.context_parallel._strategy import CPShardResult, ShardLayout
+from nemo_automodel.components.distributed.context_parallel._strategy import CPShardResult
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
 
 
@@ -90,19 +90,6 @@ def _slice_thd_chunk_for_cp(
         out["cu_seqlens_padded"] = chunk["cu_seqlens_padded"].to(torch.int32).contiguous()
     out["padding_mask"] = (out["input_ids"] == padding_token_id).bool().contiguous()
     return out  # type: ignore[return-value]
-
-
-def _packed_cp_layout(batch, *, num_chunks: int) -> ShardLayout | None:
-    # The BSHD->THD flatten is a pure reshape: the pre-flatten rows are the
-    # caller's coordinate system and the stream length is rows x cols. Chunked
-    # streams (num_chunks > 1) are per-chunk token spaces and report no layout.
-    input_ids = batch.get("input_ids")
-    if num_chunks <= 1 and input_ids is not None and input_ids.dim() >= 2:
-        return ShardLayout(
-            padded_seq_len=input_ids.shape[0] * input_ids.shape[1],
-            input_row_shape=tuple(input_ids.shape[:2]),
-        )
-    return None
 
 
 def _prepare_glm_dsa_packed_cp_batch(
@@ -177,7 +164,10 @@ def shard_glm_dsa_packed_cp_batch(
     seq_lens_padding_value: int = -1000,
 ):
     """``CPShardStrategy.shard_batch`` wrapper for GLM DSA packed CP."""
-    layout = _packed_cp_layout(batch, num_chunks=num_chunks)
+    input_ids = batch.get("input_ids")
+    input_row_shape = (
+        tuple(input_ids.shape[:2]) if num_chunks <= 1 and input_ids is not None and input_ids.dim() >= 2 else None
+    )
     sharded_batch = _prepare_glm_dsa_packed_cp_batch(
         cp_mesh,
         tp_mesh,
@@ -187,4 +177,9 @@ def shard_glm_dsa_packed_cp_batch(
         num_chunks=num_chunks,
         seq_lens_padding_value=seq_lens_padding_value,
     )
-    return CPShardResult(contextlib.nullcontext(), sharded_batch, layout)
+    return CPShardResult(
+        contextlib.nullcontext(),
+        sharded_batch,
+        padded_seq_len=input_row_shape[0] * input_row_shape[1] if input_row_shape is not None else None,
+        input_row_shape=input_row_shape,
+    )

@@ -73,7 +73,7 @@ class _FakeMesh:
 def _shard(batch, *, cp_size, local_rank, **kwargs):
     mesh = _FakeMesh(cp_size, local_rank)
     prepared = make_dsv4_contiguous_shard_cp_batch_and_ctx(mesh, None, batch, **kwargs)
-    return prepared.context, prepared.batch, prepared.layout
+    return prepared.context, prepared.batch, prepared
 
 
 # --------------------------------------------------------------------------- #
