@@ -354,11 +354,13 @@ dataloader:
 The following settings control bi-encoder behavior:
 
 - `pooling`: controls how token hidden states become one embedding. Common single-vector choices are `avg`, `cls`,
-  `last`, and `weighted_avg`. The shipped hard-negative miner currently loads the bi-encoder wrapper with its default
-  `avg` pooling and does not expose a mining override. Do not use it for a model trained with a different pooling mode or
-  with `colbert` pooling, which returns token-level embeddings.
+  `last`, and `weighted_avg`. The shipped hard-negative miner does not expose a pooling override. When the checkpoint
+  contains supported Sentence Transformers metadata, the miner restores the saved pooling mode. Otherwise, loading
+  falls back to the backbone configuration or `avg`. Do not use the miner with `colbert` pooling, which returns
+  token-level embeddings.
 - `l2_normalize`: normalizes embeddings before scoring. When enabled, the recipe divides scores by `temperature`. The
-  shipped miner currently uses the bi-encoder wrapper default, `true`, and does not expose a mining override.
+  shipped miner does not expose a normalization override. It restores saved Sentence Transformers normalization
+  metadata when available and otherwise defaults to `true`.
 - `q_max_len` and `p_max_len`: set separate truncation lengths for queries and passages.
 - `query_prefix` and `passage_prefix`: add task-specific text before tokenization. Keep these aligned between training,
   hard-negative mining, and inference.
@@ -678,9 +680,12 @@ Match these mining settings to training:
 - Set `use_negatives_from_file` when you want to keep existing negatives before appending mined negatives. Deduplicate
   and audit the combined list.
 
-The miner does not accept `pooling` or `l2_normalize` settings. It uses the bi-encoder wrapper defaults of `avg`
-pooling and L2 normalization. Use this helper only when those settings match training. For other settings, use a custom
-mining workflow that loads the encoder with the required wrapper arguments.
+`pooling` and `l2_normalize` are not `mining.*` config fields. Unknown mining keys are ignored rather than applied, so do
+not pass `--mining.pooling` or `--mining.l2_normalize`. The current miner calls
+`NeMoAutoModelBiEncoder.from_pretrained` without those arguments. The loader restores pooling and normalization from
+supported Sentence Transformers checkpoint metadata when available. For checkpoints without that metadata, pooling
+falls back to the backbone configuration or `avg`, and normalization defaults to `true`. Confirm that these fallbacks
+match training before mining from a legacy or external checkpoint.
 
 Use a new, empty `cache_embeddings_dir` for every model, input, prefix, sequence length, `corpus_chunk_size`, and world
 size. The miner reuses expected shard files even when `load_embeddings_from_cache` is `false`, and it does not record
