@@ -47,7 +47,7 @@ def _thd_batch() -> dict[str, torch.Tensor | str]:
     }
 
 
-def test_build_resolves_backend_from_model_config(monkeypatch):
+def test_constructor_resolves_backend_from_model_config(monkeypatch):
     model_config = SimpleNamespace(backend=SimpleNamespace(attn="magi"))
     mesh = _DeviceMesh(cp_size=2)
     magi = SimpleNamespace(enabled=True, hf_dispatch=True)
@@ -59,7 +59,7 @@ def test_build_resolves_backend_from_model_config(monkeypatch):
         lambda config, device_mesh: calls.append((config, device_mesh)) or magi,
     )
 
-    runtime = ContextParallelSharder.build(model_config, device_mesh=mesh)
+    runtime = ContextParallelSharder(model_config, device_mesh=mesh)
 
     assert calls == [(model_config, mesh)]
     assert runtime.requires_full_logits is True

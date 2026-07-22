@@ -438,7 +438,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         if not self._should_setup_training_components():
             return
 
-        self.cp_sharder = ContextParallelSharder.build(
+        self.cp_sharder = ContextParallelSharder(
             self.cfg.model,
             device_mesh=self.device_mesh,
         )

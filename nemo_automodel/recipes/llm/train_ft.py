@@ -439,7 +439,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         if not self._should_setup_training_components():
             return
 
-        self.cp_sharder = ContextParallelSharder.build(self.cfg.model, device_mesh=self.device_mesh)
+        self.cp_sharder = ContextParallelSharder(self.cfg.model, device_mesh=self.device_mesh)
 
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()

@@ -106,7 +106,6 @@ class CPForward:
         return self._tokens.gather(tensor, seq_dim=seq_dim, fill=fill)
 
 
-@dataclass(frozen=True)
 class ContextParallelSharder:
     """Resolve CP backend state and shard batches for model forwards.
 
@@ -115,34 +114,32 @@ class ContextParallelSharder:
     data-dependent token layouts remain in each returned :class:`CPForward`.
     """
 
-    device_mesh: DeviceMesh | None = None
-    _magi: MagiState = field(default_factory=MagiState, repr=False)
+    device_mesh: DeviceMesh | None
+    _magi: MagiState
 
-    @classmethod
-    def build(
-        cls,
-        model_config: object,
+    def __init__(
+        self,
+        model_config: object | None = None,
         *,
-        device_mesh: DeviceMesh | None,
-    ) -> "ContextParallelSharder":
-        """Resolve backend intent from model config and bind CP resources.
+        device_mesh: DeviceMesh | None = None,
+        _magi: MagiState | None = None,
+    ) -> None:
+        """Resolve backend intent and bind CP resources.
 
         This runs before model construction because the Magi HF attention
         implementation must be registered before the model is instantiated.
 
         Args:
-            model_config: Model construction config containing the resolved
-                attention backend.
+            model_config: Optional model construction config containing the
+                resolved attention backend.
             device_mesh: Full runtime device mesh containing optional ``cp`` and
                 ``tp`` axes.
-
-        Returns:
-            Sharder ready to prepare batches for model forwards.
+            _magi: Pre-resolved Magi state for internal use.
         """
-        return cls(
-            device_mesh=device_mesh,
-            _magi=setup_magi(model_config, device_mesh),
-        )
+        if _magi is None:
+            _magi = setup_magi(model_config, device_mesh) if model_config is not None else MagiState()
+        self.device_mesh = device_mesh
+        self._magi = _magi
 
     @property
     def requires_full_logits(self) -> bool:
