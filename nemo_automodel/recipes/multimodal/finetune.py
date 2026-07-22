@@ -968,7 +968,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
         if self.checkpointer is not None:
-            self.checkpointer.close()
+            self._finalize_and_close_checkpointer()
 
     # ------------------------------------------------------------------
     # Logging helpers shared with FinetuneRecipeForVLM so BAGEL can keep its
