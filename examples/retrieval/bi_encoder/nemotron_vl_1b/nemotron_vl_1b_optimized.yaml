@@ -63,14 +63,17 @@ model:
   do_distributed_inbatch_negative: true
   detach_distributed_inbatch_negatives: false
 
-  # Optimized language model backend.
-  use_custom_llama_backend: true
-  use_te_fused_mlp: true
-  use_te_fused_qkv: true
+  optimization_config:
+    _target_: nemo_automodel.components.models.llama_nemotron_vl.model.LlamaNemotronVLRetrievalOptimizationConfig
 
-  # Optimized vision encoder.
-  use_te_fused_siglip_layer: true
-  disable_unused_siglip_pooling_head: true
+    # Optimized language model backend.
+    use_custom_llama_backend: true
+    use_te_fused_mlp: true
+    use_te_fused_qkv: true
+
+    # Optimized vision encoder.
+    use_te_fused_siglip_layer: true
+    disable_unused_siglip_pooling_head: true
 
 tokenizer:
   _target_: nemo_automodel.components.models.llama_nemotron_vl.processor.LlamaNemotronVLProcessor.from_pretrained

@@ -404,11 +404,6 @@ class BiEncoderModel(nn.Module):
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
         trust_remote_code: bool = False,
-        disable_unused_siglip_pooling_head: bool = False,
-        use_te_fused_siglip_layer: bool = False,
-        use_custom_llama_backend: bool = False,
-        use_te_fused_mlp: bool = False,
-        use_te_fused_qkv: bool = False,
         **hf_kwargs,
     ):
         """Build bi-encoder model from a pretrained backbone."""
@@ -416,59 +411,12 @@ class BiEncoderModel(nn.Module):
         if effective_task is None:
             raise ValueError("task must be specified when calling build()")
 
-        # Explicit model-specific optimizations are a strict contract: fail if they cannot be applied rather than
-        # silently training with a different backend. Generic Liger and SDPA patches remain best-effort fallbacks.
-        if use_te_fused_mlp and not use_custom_llama_backend:
-            raise ValueError("use_te_fused_mlp requires use_custom_llama_backend=True")
-        if use_te_fused_qkv and not use_custom_llama_backend:
-            raise ValueError("use_te_fused_qkv requires use_custom_llama_backend=True")
-
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
         freeze_config = hf_kwargs.pop("freeze_config", None)
 
         backbone = build_encoder_backbone(
             model_name_or_path, effective_task, trust_remote_code=trust_remote_code, pooling=pooling, **hf_kwargs
         )
-        if use_custom_llama_backend:
-            try:
-                from nemo_automodel.components.models.llama_nemotron_vl.model import (
-                    replace_language_model_with_custom_llama,
-                    replace_llama_mlp_with_te_fused,
-                    replace_llama_qkv_with_te_fused,
-                )
-            except Exception as exc:
-                raise RuntimeError("Custom Llama backend requested but the VL helper could not be imported") from exc
-            replaced = replace_language_model_with_custom_llama(backbone)
-            if not replaced:
-                raise RuntimeError("use_custom_llama_backend requested but the loaded backbone was not replaced")
-            if use_te_fused_mlp:
-                fused = replace_llama_mlp_with_te_fused(backbone)
-                if fused == 0:
-                    raise RuntimeError("use_te_fused_mlp requested but no custom LLaMA MLP layers were fused")
-            if use_te_fused_qkv:
-                fused = replace_llama_qkv_with_te_fused(backbone)
-                if fused == 0:
-                    raise RuntimeError("use_te_fused_qkv requested but no custom LLaMA QKV layers were fused")
-        if use_te_fused_siglip_layer or disable_unused_siglip_pooling_head:
-            try:
-                from nemo_automodel.components.models.llama_nemotron_vl.model import (
-                    disable_unused_siglip_pooling_head_grad,
-                    replace_siglip_encoder_layers_with_te_fused,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "SigLIP helper requested but the LlamaNemotronVL helpers could not be imported"
-                ) from exc
-        if use_te_fused_siglip_layer:
-            replaced = replace_siglip_encoder_layers_with_te_fused(backbone)
-            if replaced == 0:
-                raise RuntimeError("use_te_fused_siglip_layer requested but no SigLIP encoder layers were replaced")
-        if disable_unused_siglip_pooling_head:
-            disabled = disable_unused_siglip_pooling_head_grad(backbone)
-            if disabled == 0:
-                raise RuntimeError(
-                    "disable_unused_siglip_pooling_head requested but no SigLIP pooling-head parameters were disabled"
-                )
         if freeze_config is not None:
             apply_parameter_freezing(backbone, freeze_config)
 

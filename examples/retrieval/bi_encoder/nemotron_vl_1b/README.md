@@ -79,8 +79,8 @@ same model and uses the same data format as the base example, while enabling:
 
 On the reference workload, the optimized configuration reduced step time by about 15% and increased per-GPU
 throughput by about 18% compared with `nemotron_vl_1b_example.yaml`, while producing comparable loss values. The
-optimization flags are in the `model:` and `bi_encoder_optimization:` sections, so you can use the base example when
-you prefer the simplest configuration.
+model-specific switches are grouped under `model.optimization_config`, while bidirectional mask preparation is under
+`bi_encoder_optimization`. Use the base example when you prefer the simplest configuration.
 
 The configuration uses `global_batch_size: 64` and `local_batch_size: 2`. On one 8-GPU node, this means four gradient
 accumulation steps per optimizer step, so the file sets `distributed.static_graph: false`. Set the allocator option

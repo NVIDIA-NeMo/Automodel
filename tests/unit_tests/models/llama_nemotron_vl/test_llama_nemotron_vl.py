@@ -13,19 +13,23 @@
 # limitations under the License.
 
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
 from PIL import Image
 from transformers.image_utils import PILImageResampling
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 from transformers.processing_utils import ProcessorMixin
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.llama_nemotron_vl.model import (
     FusedTESiglipEncoderLayer,
@@ -34,6 +38,7 @@ from nemo_automodel.components.models.llama_nemotron_vl.model import (
     LlamaNemotronVLConfig,
     LlamaNemotronVLEncoderStateDictAdapter,
     LlamaNemotronVLModel,
+    LlamaNemotronVLRetrievalOptimizationConfig,
     OptimizedFusedTERMSNormMLP,
     OptimizedFusedTERMSNormQKV,
     OptimizedLlamaBidirectionalModel,
@@ -51,6 +56,7 @@ from nemo_automodel.components.models.llama_nemotron_vl.processor import (
 )
 
 IMG_CONTEXT_TOKEN_ID = 99
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 class FakeTokenizer:
@@ -555,6 +561,151 @@ def test_replace_language_model_with_custom_llama_builds_optimized_stack(monkeyp
 
 def test_replace_language_model_with_custom_llama_skips_non_vl_models():
     assert replace_language_model_with_custom_llama(nn.Linear(2, 2)) is False
+
+
+def test_optimized_recipe_instantiates_model_owned_optimization_config():
+    config_path = REPO_ROOT / "examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized.yaml"
+    raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    optimization_config = ConfigNode(raw_config["model"]["optimization_config"]).instantiate()
+
+    assert optimization_config == LlamaNemotronVLRetrievalOptimizationConfig(
+        use_custom_llama_backend=True,
+        use_te_fused_mlp=True,
+        use_te_fused_qkv=True,
+        use_te_fused_siglip_layer=True,
+        disable_unused_siglip_pooling_head=True,
+    )
+
+
+@pytest.mark.parametrize("flag", ["use_te_fused_mlp", "use_te_fused_qkv"])
+def test_retrieval_optimization_config_rejects_llama_fusions_without_custom_backend(flag):
+    with pytest.raises(ValueError, match=rf"{flag} requires use_custom_llama_backend=True"):
+        LlamaNemotronVLRetrievalOptimizationConfig(**{flag: True})
+
+
+def test_retrieval_optimization_config_rejects_other_models():
+    with pytest.raises(TypeError, match="Expected LlamaNemotronVLModel, got Linear"):
+        LlamaNemotronVLRetrievalOptimizationConfig().build(model=nn.Linear(2, 2))
+
+
+def test_retrieval_optimization_config_applies_full_path(monkeypatch, processor, fake_transformer_engine):
+    del fake_transformer_engine
+    import nemo_automodel.components.models.llama_nemotron_vl.model as model_module
+
+    monkeypatch.setattr(model_module.AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
+    config = LlamaNemotronVLConfig(
+        vision_config=_tiny_vision_config(),
+        llm_config=_tiny_llm_config(),
+        pooling="avg",
+        img_context_token_id=IMG_CONTEXT_TOKEN_ID,
+    )
+    model = LlamaNemotronVLModel(
+        config,
+        vision_model=SiglipVisionModel(config.vision_config),
+        language_model=LlamaBidirectionalModel(config.llm_config),
+    )
+    pooling_head = model.vision_model.head
+    optimization_config = LlamaNemotronVLRetrievalOptimizationConfig(
+        use_custom_llama_backend=True,
+        use_te_fused_mlp=True,
+        use_te_fused_qkv=True,
+        use_te_fused_siglip_layer=True,
+        disable_unused_siglip_pooling_head=True,
+    )
+
+    optimized_model = optimization_config.build(model=model)
+
+    assert optimized_model is model
+    assert isinstance(model.language_model, OptimizedLlamaBidirectionalModel)
+    assert isinstance(model.language_model.layers[0].mlp, OptimizedFusedTERMSNormMLP)
+    assert isinstance(model.language_model.layers[0].self_attn.pre_attention_qkv, OptimizedFusedTERMSNormQKV)
+    assert isinstance(model.vision_model.encoder.layers[0], FusedTESiglipEncoderLayer)
+    assert model.vision_model.use_head is False
+    assert all(not parameter.requires_grad for parameter in pooling_head.parameters())
+
+
+@pytest.mark.parametrize(
+    ("config_kwargs", "failing_helper", "bad_return", "error_match"),
+    [
+        (
+            {"use_custom_llama_backend": True},
+            "replace_language_model_with_custom_llama",
+            False,
+            "use_custom_llama_backend requested but the loaded backbone was not replaced",
+        ),
+        (
+            {"use_custom_llama_backend": True, "use_te_fused_mlp": True},
+            "replace_llama_mlp_with_te_fused",
+            0,
+            "use_te_fused_mlp requested but no custom LLaMA MLP layers were fused",
+        ),
+        (
+            {"use_custom_llama_backend": True, "use_te_fused_qkv": True},
+            "replace_llama_qkv_with_te_fused",
+            0,
+            "use_te_fused_qkv requested but no custom LLaMA QKV layers were fused",
+        ),
+        (
+            {"use_te_fused_siglip_layer": True},
+            "replace_siglip_encoder_layers_with_te_fused",
+            0,
+            "use_te_fused_siglip_layer requested but no SigLIP encoder layers were replaced",
+        ),
+        (
+            {"disable_unused_siglip_pooling_head": True},
+            "disable_unused_siglip_pooling_head_grad",
+            0,
+            "disable_unused_siglip_pooling_head requested but no SigLIP pooling-head parameters were disabled",
+        ),
+    ],
+)
+def test_retrieval_optimization_config_raises_when_requested_change_does_not_apply(
+    monkeypatch, config_kwargs, failing_helper, bad_return, error_match
+):
+    import nemo_automodel.components.models.llama_nemotron_vl.model as model_module
+
+    model = LlamaNemotronVLModel.__new__(LlamaNemotronVLModel)
+    nn.Module.__init__(model)
+    monkeypatch.setattr(model_module, "replace_language_model_with_custom_llama", lambda model: True)
+    monkeypatch.setattr(model_module, "replace_llama_mlp_with_te_fused", lambda model: 1)
+    monkeypatch.setattr(model_module, "replace_llama_qkv_with_te_fused", lambda model: 1)
+    monkeypatch.setattr(model_module, "replace_siglip_encoder_layers_with_te_fused", lambda model: 1)
+    monkeypatch.setattr(model_module, "disable_unused_siglip_pooling_head_grad", lambda model: 1)
+    monkeypatch.setattr(model_module, failing_helper, lambda model: bad_return)
+
+    with pytest.raises(RuntimeError, match=error_match):
+        LlamaNemotronVLRetrievalOptimizationConfig(**config_kwargs).build(model=model)
+
+
+def test_from_pretrained_applies_retrieval_optimization_config(monkeypatch):
+    model = LlamaNemotronVLModel.__new__(LlamaNemotronVLModel)
+    nn.Module.__init__(model)
+    calls = []
+
+    def fake_from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        calls.append((cls, pretrained_model_name_or_path, model_args, kwargs))
+        return model
+
+    def fake_build(self, *, model):
+        calls.append((self, model))
+        return model
+
+    monkeypatch.setattr(PreTrainedModel, "from_pretrained", classmethod(fake_from_pretrained))
+    monkeypatch.setattr(LlamaNemotronVLRetrievalOptimizationConfig, "build", fake_build)
+    optimization_config = LlamaNemotronVLRetrievalOptimizationConfig()
+
+    loaded_model = LlamaNemotronVLModel.from_pretrained(
+        "local-checkpoint",
+        optimization_config=optimization_config,
+        torch_dtype=torch.bfloat16,
+    )
+
+    assert loaded_model is model
+    assert calls == [
+        (LlamaNemotronVLModel, "local-checkpoint", (), {"torch_dtype": torch.bfloat16}),
+        (optimization_config, model),
+    ]
 
 
 def test_te_llama_mlp_and_qkv_replacements_use_fused_modules(fake_transformer_engine):

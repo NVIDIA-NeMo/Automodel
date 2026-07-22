@@ -538,6 +538,74 @@ def replace_language_model_with_custom_llama(
     return True
 
 
+@dataclass(frozen=True, kw_only=True)
+class LlamaNemotronVLRetrievalOptimizationConfig:
+    """Model-owned optimizations for Llama Nemotron VL retrieval training.
+
+    Attributes:
+        use_custom_llama_backend: Replace the Hugging Face Llama tower with the optimized local implementation.
+        use_te_fused_mlp: Fuse Llama RMSNorm and MLP projections with Transformer Engine.
+        use_te_fused_qkv: Fuse Llama RMSNorm and QKV projections with Transformer Engine.
+        use_te_fused_siglip_layer: Replace SigLIP encoder layers with Transformer Engine layers.
+        disable_unused_siglip_pooling_head: Disable gradients and execution for the unused SigLIP pooling head.
+    """
+
+    use_custom_llama_backend: bool = False
+    use_te_fused_mlp: bool = False
+    use_te_fused_qkv: bool = False
+    use_te_fused_siglip_layer: bool = False
+    disable_unused_siglip_pooling_head: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate dependencies between the model-specific optimizations."""
+        if self.use_te_fused_mlp and not self.use_custom_llama_backend:
+            raise ValueError("use_te_fused_mlp requires use_custom_llama_backend=True")
+        if self.use_te_fused_qkv and not self.use_custom_llama_backend:
+            raise ValueError("use_te_fused_qkv requires use_custom_llama_backend=True")
+
+    def build(self, *, model: "LlamaNemotronVLModel") -> "LlamaNemotronVLModel":
+        """Apply the requested optimizations to a loaded Llama Nemotron VL model.
+
+        Args:
+            model: Loaded model to optimize before distributed wrapping and optimizer construction.
+
+        Returns:
+            The optimized model.
+
+        Raises:
+            TypeError: If ``model`` is not a ``LlamaNemotronVLModel``.
+            RuntimeError: If a requested optimization cannot be applied.
+        """
+        if not isinstance(model, LlamaNemotronVLModel):
+            raise TypeError(f"Expected LlamaNemotronVLModel, got {type(model).__name__}")
+
+        if self.use_custom_llama_backend:
+            replaced = replace_language_model_with_custom_llama(model)
+            if not replaced:
+                raise RuntimeError("use_custom_llama_backend requested but the loaded backbone was not replaced")
+            if self.use_te_fused_mlp:
+                fused = replace_llama_mlp_with_te_fused(model)
+                if fused == 0:
+                    raise RuntimeError("use_te_fused_mlp requested but no custom LLaMA MLP layers were fused")
+            if self.use_te_fused_qkv:
+                fused = replace_llama_qkv_with_te_fused(model)
+                if fused == 0:
+                    raise RuntimeError("use_te_fused_qkv requested but no custom LLaMA QKV layers were fused")
+
+        if self.use_te_fused_siglip_layer:
+            replaced = replace_siglip_encoder_layers_with_te_fused(model)
+            if replaced == 0:
+                raise RuntimeError("use_te_fused_siglip_layer requested but no SigLIP encoder layers were replaced")
+        if self.disable_unused_siglip_pooling_head:
+            disabled = disable_unused_siglip_pooling_head_grad(model)
+            if disabled == 0:
+                raise RuntimeError(
+                    "disable_unused_siglip_pooling_head requested but no SigLIP pooling-head parameters were disabled"
+                )
+
+        return model
+
+
 # ============================================================================
 # LlamaNemotronVL Model Classes
 # ============================================================================
@@ -565,6 +633,30 @@ class LlamaNemotronVLModel(PreTrainedModel):
     _supports_flash_attn_2 = True  # transformers < 4.54
     _supports_flash_attn = True  # transformers >= 4.54
     _supports_sdpa = True
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args: Any,
+        optimization_config: Optional[LlamaNemotronVLRetrievalOptimizationConfig] = None,
+        **kwargs: Any,
+    ) -> "LlamaNemotronVLModel":
+        """Load the model and apply model-specific retrieval optimizations.
+
+        Args:
+            pretrained_model_name_or_path: Hugging Face model identifier or local checkpoint path.
+            *model_args: Positional arguments forwarded to Hugging Face model loading.
+            optimization_config: Optional typed configuration for model-specific optimizations.
+            **kwargs: Keyword arguments forwarded to Hugging Face model loading.
+
+        Returns:
+            The loaded model, with requested optimizations applied before it is returned.
+        """
+        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        if optimization_config is not None:
+            model = optimization_config.build(model=model)
+        return model
 
     def __init__(
         self,
@@ -896,6 +988,7 @@ __all__ = [
     "LlamaNemotronVLConfig",
     "LlamaNemotronVLEncoderStateDictAdapter",
     "LlamaNemotronVLModel",
+    "LlamaNemotronVLRetrievalOptimizationConfig",
     "ModelClass",
     "OptimizedFusedTERMSNormMLP",
     "OptimizedFusedTERMSNormQKV",
