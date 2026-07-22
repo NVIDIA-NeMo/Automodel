@@ -15,7 +15,7 @@
 """Setup-time context-parallel backend resolution and per-forward preparation."""
 
 import contextlib
-from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,14 +24,13 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
 from nemo_automodel.components.distributed.context_parallel.sharder import (
-    ContextFactory,
     ContextParallelismSharder,
+    CPModelPreparation,
+    CPShardResult,
     CPTokenLayout,
     ShardLayout,
-    identity_local_indices,
-    shard_batch_identity,
 )
-from nemo_automodel.components.distributed.context_parallel.utils import make_cp_batch_for_te
+from nemo_automodel.components.distributed.context_parallel.utils import _prepare_thd_batch
 
 
 def _get_submesh(device_mesh: DeviceMesh | None, dim: str) -> DeviceMesh | None:
@@ -66,8 +65,7 @@ class CPForward:
     """Prepared context-parallel state for one model forward.
 
     Attributes:
-        context: Factory for the context manager entered around the model
-            forward.
+        context: Context manager entered around the model forward.
         batch: Prepared batch. Tensor values may have layouts such as
             ``[batch, local_sequence]`` or packed THD ``[local_tokens]``
             according to the selected backend. The input mapping is mutated and
@@ -76,7 +74,7 @@ class CPForward:
             tensors and gathering local tensors produced by this forward.
     """
 
-    context: ContextFactory
+    context: AbstractContextManager[None]
     batch: dict[str, Any]
     tokens: CPTokenLayout
 
@@ -148,7 +146,7 @@ class ContextParallelRuntime:
                 *,
                 loss_mask: torch.Tensor | None = None,
                 padding_token_id: int = 0,
-            ) -> tuple[ContextFactory, dict[str, Any], ShardLayout | None]:
+            ) -> CPShardResult:
                 """Prepare a full-sequence batch with the bound Magi runtime.
 
                 Args:
@@ -162,20 +160,18 @@ class ContextParallelRuntime:
                     padding_token_id: Token ID used for Magi sequence padding.
 
                 Returns:
-                    Null context factory, Magi-prepared batch, and captured token
+                    Magi-prepared batch with a null context and captured token
                     layout.
                 """
                 del tp_mesh, loss_mask
                 input_ids = batch.get("input_ids")
                 row_shape = tuple(input_ids.shape[:2]) if input_ids is not None and input_ids.dim() >= 2 else None
-                prepped, local_indices = self._magi.make_cp_batch(
-                    cp_mesh,
+                prepped, local_indices = self._magi.prepare_batch(
                     batch,
                     padding_token_id=padding_token_id,
                     num_chunks=num_chunks,
                     is_thd=is_thd,
                     model=model,
-                    return_local_indices=True,
                 )
                 layout = None
                 if local_indices is not None:
@@ -192,7 +188,7 @@ class ContextParallelRuntime:
                         padded_seq_len=padded,
                         input_row_shape=input_rows,
                     )
-                return contextlib.nullcontext, prepped, layout
+                return CPShardResult(contextlib.nullcontext(), prepped, layout)
 
             return ContextParallelismSharder(shard_batch=shard_batch_magi, local_token_global_indices=None)
 
@@ -205,7 +201,7 @@ class ContextParallelRuntime:
                 *,
                 loss_mask: torch.Tensor | None = None,
                 padding_token_id: int = 0,
-            ) -> tuple[ContextFactory, dict[str, Any], ShardLayout | None]:
+            ) -> CPShardResult:
                 """Convert a full-sequence batch to THD and shard its token stream.
 
                 Args:
@@ -220,20 +216,17 @@ class ContextParallelRuntime:
                     padding_token_id: Token ID used for input padding.
 
                 Returns:
-                    Null context factory, packed local THD batch, and captured
+                    Packed local THD batch with a null context and captured
                     flat-stream token layout.
                 """
                 del tp_mesh, loss_mask
                 input_ids = batch.get("input_ids")
                 row_shape = tuple(input_ids.shape[:2]) if input_ids is not None and input_ids.dim() >= 2 else None
-                prepped, local_indices = make_cp_batch_for_te(
+                prepped, local_indices = _prepare_thd_batch(
                     cp_mesh,
                     batch,
                     padding_token_id=padding_token_id,
-                    qkv_format="thd",
                     num_chunks=num_chunks,
-                    seq_lens_padding_value=-1000,
-                    return_local_indices=True,
                 )
                 layout = None
                 if local_indices is not None:
@@ -242,17 +235,14 @@ class ContextParallelRuntime:
                         padded_seq_len=row_shape[0] * row_shape[1] if row_shape is not None else None,
                         input_row_shape=row_shape,
                     )
-                return contextlib.nullcontext, prepped, layout
+                return CPShardResult(contextlib.nullcontext(), prepped, layout)
 
             return ContextParallelismSharder(shard_batch=shard_batch_thd, local_token_global_indices=None)
 
         if cp_active:
             return ContextParallelismSharder.sdpa()
 
-        return ContextParallelismSharder(
-            shard_batch=shard_batch_identity,
-            local_token_global_indices=identity_local_indices,
-        )
+        return ContextParallelismSharder.identity()
 
     def prepare_forward(
         self,
@@ -284,7 +274,7 @@ class ContextParallelRuntime:
                 alongside the batch on strategies that consume it.
 
         Returns:
-            Prepared forward state with a context factory, mutated batch, and
+            Prepared forward state with a context manager, mutated batch, and
             immutable token layout bound to this batch.
 
         Raises:
@@ -313,12 +303,10 @@ class ContextParallelRuntime:
         magi_replaces_hook = self._magi.enabled and not is_multimodal
         if (cp_active or model_owns_thd) and callable(hook) and not magi_replaces_hook:
             prepared = hook(batch, num_chunks=num_chunks)
-            if not isinstance(prepared, Mapping):
-                raise TypeError("prepare_model_inputs_for_cp must return a mapping")
-            model_sharder = prepared.get("cp_sharder")
-            if not isinstance(model_sharder, ContextParallelismSharder):
-                raise TypeError("prepare_model_inputs_for_cp must return a ContextParallelismSharder as 'cp_sharder'")
-            batch.update({key: value for key, value in prepared.items() if key != "cp_sharder"})
+            if not isinstance(prepared, CPModelPreparation):
+                raise TypeError("prepare_model_inputs_for_cp must return CPModelPreparation")
+            model_sharder = prepared.sharder
+            batch.update(prepared.batch_updates)
 
         sharder = self._resolve_sharder(
             model_sharder,
@@ -327,7 +315,7 @@ class ContextParallelRuntime:
             model=model,
         )
         tp_mesh = _get_submesh(self.device_mesh, "tp")
-        context, prepared_batch, layout = sharder.shard_batch(
+        prepared = sharder.shard_batch(
             cp_mesh,
             tp_mesh,
             batch,
@@ -337,6 +325,6 @@ class ContextParallelRuntime:
         tokens = CPTokenLayout(
             cp_mesh=cp_mesh,
             local_token_global_indices=sharder.local_token_global_indices,
-            shard_layout=layout or ShardLayout(),
+            shard_layout=prepared.layout or ShardLayout(),
         )
-        return CPForward(context=context, batch=prepared_batch, tokens=tokens)
+        return CPForward(context=prepared.context, batch=prepared.batch, tokens=tokens)

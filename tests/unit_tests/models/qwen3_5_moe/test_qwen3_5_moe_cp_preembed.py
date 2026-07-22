@@ -71,27 +71,27 @@ class TestPrepareModelInputsForCP:
         positions returned for the aux shard, mm_token_type_ids consumed."""
         from nemo_automodel.components.distributed.context_parallel.sharder import (
             ContextParallelismSharder,
-            round_robin_local_indices,
-            shard_batch_aux_only,
+            _round_robin_local_indices,
+            _shard_batch_aux_only,
         )
 
         model = _build_model()
         out = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[5, 6, 7, 8]])})
 
-        assert "inputs_embeds" not in out  # embedding happens in forward now
-        sharder = out["cp_sharder"]
+        assert "inputs_embeds" not in out.batch_updates  # embedding happens in forward now
+        sharder = out.sharder
         assert isinstance(sharder, ContextParallelismSharder)
-        assert sharder.shard_batch is shard_batch_aux_only
-        assert sharder.local_token_global_indices is round_robin_local_indices
-        assert out["position_ids"].shape == (3, 1, 4)  # mRoPE [3, B, S]
-        assert out["mm_token_type_ids"] is None
+        assert sharder.shard_batch is _shard_batch_aux_only
+        assert sharder.local_token_global_indices is _round_robin_local_indices
+        assert out.batch_updates["position_ids"].shape == (3, 1, 4)  # mRoPE [3, B, S]
+        assert out.batch_updates["mm_token_type_ids"] is None
         assert model.model.rope_deltas is not None
 
     def test_input_ids_not_consumed(self):
         """input_ids stays in the batch for the forward's in-forward embed+splice."""
         model = _build_model()
         out = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[5, 6, 7, 8]])})
-        assert "input_ids" not in out
+        assert "input_ids" not in out.batch_updates
 
     def test_existing_position_ids_not_recomputed(self):
         called = {"count": 0}
@@ -105,7 +105,7 @@ class TestPrepareModelInputsForCP:
         out = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[5, 6, 7, 8]]), "position_ids": pos})
 
         assert called["count"] == 0, "get_rope_index must not run when position_ids provided"
-        assert out["position_ids"] is pos
+        assert out.batch_updates["position_ids"] is pos
 
     def test_image_grid_hws_promoted_to_thw(self):
         """image_grid_hws of shape [N, 2] is promoted to [N, 3] and written back for the forward."""
@@ -124,8 +124,8 @@ class TestPrepareModelInputsForCP:
             }
         )
         assert captured["image_grid_thw"].tolist() == [[1, 2, 2]]
-        assert out["image_grid_thw"].tolist() == [[1, 2, 2]]
-        assert out["image_grid_hws"] is None
+        assert out.batch_updates["image_grid_thw"].tolist() == [[1, 2, 2]]
+        assert out.batch_updates["image_grid_hws"] is None
 
     def test_mm_token_type_ids_synthesized_from_token_ids(self):
         """When get_rope_index accepts mm_token_type_ids, it is built from image/video token ids."""

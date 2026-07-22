@@ -496,7 +496,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         )
         train_ctx, batch = prepared_cp.context, prepared_cp.batch
         labels = batch.pop("labels")
-        with train_ctx(), torch.no_grad():
+        with train_ctx, torch.no_grad():
             if self.pp_enabled:
                 input_ids = batch.pop("input_ids")
                 batch_filtered = {
@@ -607,7 +607,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
             if is_train
             else nullcontext()
         )
-        with train_ctx(), sync_ctx:
+        with train_ctx, sync_ctx:
             # No grad for teacher forward.
             if separate_teacher_logits is None:
                 with (
@@ -717,7 +717,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
 
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
-        with train_ctx(), fp8_ctx:
+        with train_ctx, fp8_ctx:
             if separate_teacher_logits is not None:
                 self._current_teacher_logits = list(
                     torch.split(separate_teacher_logits, self.pipeline_config.pp_microbatch_size, dim=0)

@@ -326,7 +326,7 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
             torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+        with train_ctx, sync_ctx, fp8_ctx, autocast_ctx:
             # Hook for model families that need extra forward inputs derived from
             # the (clean) batch — e.g. block_diffusion builds the block-causal
             # attention masks + canvas position ids here. No-op by default.
@@ -1100,7 +1100,7 @@ class DiffusionGemmaSFTRecipe(DiffusionLMSFTRecipe):
             torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+        with train_ctx, sync_ctx, fp8_ctx, autocast_ctx:
             batch = filter_forward_kwargs(model, batch)
             out = model(**batch)
             logits = getattr(out, "logits", out)

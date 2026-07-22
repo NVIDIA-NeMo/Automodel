@@ -702,7 +702,7 @@ class DFlashStrategy(DLLMStrategy):
         fp8_ctx = recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
         train_ctx = recipe.cp_runtime.prepare_forward(None, {}).context
 
-        with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
+        with train_ctx, sync_ctx, fp8_ctx, autocast_ctx:
             draft_kwargs = dict(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,

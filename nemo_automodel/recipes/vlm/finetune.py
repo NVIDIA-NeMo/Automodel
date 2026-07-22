@@ -816,7 +816,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
                 return
 
-            with train_ctx():
+            with train_ctx:
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
                     masked_labels = labels.clone()
@@ -1101,7 +1101,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 )
                 train_ctx, batch = prepared_cp.context, prepared_cp.batch
                 labels = batch.pop("labels")
-                with train_ctx():
+                with train_ctx:
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                         out = self.model_parts[0](logits_to_keep=1, **batch)

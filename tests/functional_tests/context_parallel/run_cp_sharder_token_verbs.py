@@ -17,7 +17,7 @@
 The single-process unit suite can only exercise the identity early-returns of
 ``CPTokenLayout.gather``; this driver runs the real collectives:
 
-  - shard -> gather(trim=True) round-trips a
+  - shard -> gather round-trips a
     caller-coordinate tensor through the round-robin layout (fill/trim);
   - the gather is differentiable: backward through the gathered full-sequence
     tensor routes gradients back to each rank's own local shard, in local
@@ -35,7 +35,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 from nemo_automodel.components.distributed import ContextParallelRuntime
-from nemo_automodel.components.distributed.context_parallel.sharder import round_robin_local_indices
+from nemo_automodel.components.distributed.context_parallel import ContextParallelismSharder
 
 
 def main() -> None:
@@ -61,13 +61,13 @@ def main() -> None:
     # --- down: caller-coordinate tensor rides the same layout -------------
     full = torch.arange(float(seq_len), device=device).unsqueeze(0)
     local = tokens.shard(full, fill=-1.0)
-    indices = round_robin_local_indices(cp_mesh, padded, device=device)
+    indices = ContextParallelismSharder.sdpa().local_token_global_indices(cp_mesh, padded, device)
     expected_local = torch.where(indices < seq_len, indices.float(), torch.tensor(-1.0, device=device)).unsqueeze(0)
     assert torch.equal(local, expected_local), (rank, local.tolist(), expected_local.tolist())
 
     # --- up: differentiable gather + trim back to caller coordinates ------
     local_leaf = local.detach().clone().requires_grad_(True)
-    gathered = tokens.gather(local_leaf, trim=True)
+    gathered = tokens.gather(local_leaf)
     assert gathered.shape == (1, seq_len), gathered.shape
     # global order restored: position i holds the token with global index i
     assert torch.equal(gathered, full), (rank, gathered.tolist())

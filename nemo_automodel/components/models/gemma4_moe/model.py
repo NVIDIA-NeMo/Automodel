@@ -80,7 +80,7 @@ except (ModuleNotFoundError, ImportError, AttributeError):
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelismSharder,
-    contiguous_local_indices,
+    CPModelPreparation,
     shard_sequence_for_cp_contiguous,
 )
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
@@ -1432,7 +1432,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> dict[str, Any]:
+    ) -> CPModelPreparation:
         """Return a sharder-only CP backend; embed + splice + slice happen in forward.
 
         Sunk (Megatron-style per-microbatch) CP: the returned
@@ -1456,12 +1456,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         del num_chunks
         if batch.get("input_ids") is None:
             raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
-        return {
-            "cp_sharder": ContextParallelismSharder(
-                shard_batch=self._cp_shard_batch_aux_only,
-                local_token_global_indices=contiguous_local_indices,
-            )
-        }
+        return CPModelPreparation(ContextParallelismSharder.contiguous(self._cp_shard_batch_aux_only))
 
     def _cp_sunk_prepare_inputs(
         self,

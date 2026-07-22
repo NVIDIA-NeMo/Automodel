@@ -41,7 +41,7 @@ def main():
 
     from torch.distributed.device_mesh import init_device_mesh
 
-    from nemo_automodel.components.distributed.context_parallel.sharder import shard_batch_aux_only
+    from nemo_automodel.components.distributed.context_parallel import ContextParallelismSharder
     from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 
     mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("cp",))
@@ -54,7 +54,7 @@ def main():
         "labels": torch.randint(2, 50, (1, seqlen), device=device),
         "position_ids": torch.arange(seqlen, device=device).unsqueeze(0),
     }
-    train_ctx, _, _ = shard_batch_aux_only(cp_mesh, None, batch)
+    train_ctx = ContextParallelismSharder.sdpa_aux().shard_batch(cp_mesh, None, batch).context
 
     def vision_sdpa():
         # A vision-tower-like non-causal attention: [batch, heads, patches, dim].
@@ -63,7 +63,7 @@ def main():
         v = torch.randn_like(q)
         return F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=False)
 
-    with train_ctx():
+    with train_ctx:
         # (a) inside the ring without suspend -> the CP ring intercepts the
         #     non-causal SDPA (load-balancing rejection or seq all-gather).
         without_suspend_failed = False

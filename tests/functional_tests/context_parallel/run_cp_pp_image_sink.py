@@ -196,7 +196,7 @@ def main():
         train_ctx, batch = prepared_cp.context, prepared_cp.batch
         labels = batch.pop("labels")
         if pp_size > 1:
-            with train_ctx(), stage_vlm_media_for_pp(pp, pp.parts, batch):
+            with train_ctx, stage_vlm_media_for_pp(pp, pp.parts, batch):
                 sl = [] if has_last else None
                 mi = batch.pop("input_ids")
                 pp.update_seq_len(mi.shape[1])
@@ -207,7 +207,7 @@ def main():
                 )
             local = torch.stack(sl).mean() if has_last else torch.tensor(0.0, device=device)
         else:
-            with train_ctx():
+            with train_ctx:
                 out = model(
                     input_ids=batch["input_ids"],
                     pixel_values=batch["pixel_values"],

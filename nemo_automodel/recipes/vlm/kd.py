@@ -266,7 +266,7 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         prepared_cp = self.cp_runtime.prepare_forward(model, batch)
         train_ctx, batch = prepared_cp.context, prepared_cp.batch
         batch.pop("labels")
-        with train_ctx(), torch.no_grad():
+        with train_ctx, torch.no_grad():
             teacher_batch = filter_forward_kwargs(model, batch)
             output = model(**teacher_batch)
             logits = getattr(output, "logits", output).detach()

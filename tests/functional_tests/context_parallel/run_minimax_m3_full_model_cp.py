@@ -21,7 +21,7 @@ drives the WHOLE model exactly as recipes/vlm/finetune.py does under CP:
 
   apply_cp(model, cp_mesh)                      # sets _cp_mesh on the sparse layers
   train_ctx, batch, _ = ContextParallelRuntime.prepare_forward(None, ...) # torch context_parallel shards the seq
-  with train_ctx(): logits_local = model(**batch)
+  with train_ctx: logits_local = model(**batch)
   logits_full = context_parallel_unshard(...)   # undo the load-balanced layout
 
 then asserts the reconstructed per-token logits match the eager full-sequence logits.

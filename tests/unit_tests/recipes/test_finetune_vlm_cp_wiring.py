@@ -38,6 +38,7 @@ import torch
 
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed.context_parallel import ContextParallelismSharder, CPModelPreparation
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
@@ -52,10 +53,10 @@ class _NoOpCPRuntime:
         hook = getattr(model, "prepare_model_inputs_for_cp", None)
         if callable(hook):
             prepared = hook(batch, num_chunks=num_chunks)
-            batch.update({key: value for key, value in prepared.items() if key != "cp_sharder"})
+            batch.update(prepared.batch_updates)
         if self.seen_batch is not None:
             self.seen_batch.update(batch)
-        return SimpleNamespace(context=nullcontext, batch=batch)
+        return SimpleNamespace(context=nullcontext(), batch=batch)
 
 
 def _make_recipe_with_pp_stages(*, pp_enabled=True, has_first_stage=True, pp_microbatch_size=2):
@@ -188,7 +189,7 @@ class _SunkSpyVLM:
     def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
         # Sharder-only: nothing consumed, no inputs_embeds — input_ids stays full.
         self.calls.append({"batch": dict(batch), "num_chunks": num_chunks})
-        return {}
+        return CPModelPreparation(ContextParallelismSharder.identity())
 
     def __call__(self, **kwargs):
         raise AssertionError("CP prepare must call prepare_model_inputs_for_cp directly, not __call__")
@@ -443,12 +444,11 @@ def test_val_counts_label_tokens_inside_cp_context_after_labels_are_sharded():
     batch = {"labels": labels}
     local_labels = torch.tensor([[1, -100]])
 
-    def train_ctx():
-        return _ShardLabelsOnEnter(labels, local_labels)
+    train_ctx = _ShardLabelsOnEnter(labels, local_labels)
 
     labels = batch.pop("labels")
     pre_context_count = (labels != -100).sum().item()
-    with train_ctx():
+    with train_ctx:
         local_num_label_tokens = (labels != -100).sum().item()
 
     assert pre_context_count == 3
@@ -550,7 +550,7 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
 
         def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):  # sharder-only hook
             pre_embed_calls.append(set(batch))
-            return {}
+            return CPModelPreparation(ContextParallelismSharder.identity())
 
         def forward(self, **batch):
             return SimpleNamespace(logits=torch.zeros(1, 4, 8), hidden_states=None)

@@ -15,9 +15,8 @@
 """Context-parallel batch-sharding contract.
 
 Every CP backend is a :class:`ContextParallelismSharder`. A model that owns its CP batch
-sharding and attention transport returns one from
-``prepare_model_inputs_for_cp`` under the ``"cp_sharder"`` batch key; the
-framework constructs its own for the remaining backends (torch
+sharding and attention transport returns one in :class:`CPModelPreparation`;
+the framework constructs its own for the remaining backends (torch
 ``context_parallel`` round-robin, TE/THD, MagiAttention) so the CP runtime
 reduces to resolving a sharder and calling ``shard_batch``. This replaces the retired private batch keys
 (``_cp_make_batch_fn``, ``_cp_metadata_seq_dims``, ``_cp_metadata_pad_values``,
@@ -49,43 +48,23 @@ dispatcher wraps them into sharders at resolution time.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
-ContextFactory = Callable[[], AbstractContextManager[None]]
 
+@contextlib.contextmanager
+def _sdpa_context(cp_context: AbstractContextManager[None]):
+    """Enter the SDPA backend and context-parallel contexts for one forward."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
 
-def _get_train_context(
-    enable_loss_parallel: bool,
-    enable_compiled_autograd: bool,
-    cp_context: AbstractContextManager[None] | None = None,
-) -> ContextFactory:
-    """Build the context entered around a context-parallel forward."""
-
-    @contextlib.contextmanager
-    def context():
-        with contextlib.ExitStack() as stack:
-            if enable_loss_parallel:
-                stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
-
-            if enable_compiled_autograd:
-                stack.enter_context(torch._dynamo.utils.maybe_enable_compiled_autograd(True))
-
-            if cp_context is not None:
-                from torch.nn.attention import SDPBackend, sdpa_kernel
-
-                stack.enter_context(sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]))
-                stack.enter_context(cp_context)
-
-            yield
-
-    return context
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]), cp_context:
+        yield
 
 
 def _create_context_parallel_ctx(
@@ -130,7 +109,7 @@ def _cp_rank(cp_mesh) -> int:
     return getattr(cp_mesh, "get_local_rank", lambda: 0)()
 
 
-def contiguous_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
+def _contiguous_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
     """Global positions owned by this rank under contiguous rank-ordered sharding.
 
     Rank ``r`` owns ``[r * L, (r + 1) * L)`` with ``L = padded_seq_len // cp_size``.
@@ -152,7 +131,7 @@ def contiguous_local_indices(cp_mesh, padded_seq_len: int, device: torch.device 
     return torch.arange(start, start + local_len, device=device, dtype=torch.long)
 
 
-def identity_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
+def _identity_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
     """Global positions owned by this rank when CP is inactive: all of them.
 
     Index map of the identity sharder, so consumers run the same
@@ -162,7 +141,7 @@ def identity_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | 
     return torch.arange(padded_seq_len, device=device, dtype=torch.long)
 
 
-def shard_batch_identity(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id: int = 0):
+def _shard_batch_identity(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id: int = 0):
     """``shard_batch`` of the identity sharder: a no-op that returns a trivial shard layout.
 
     Returned by the dispatch when no CP prep applies, so callers hold working
@@ -173,10 +152,10 @@ def shard_batch_identity(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_tok
     layout = None
     if primary is not None and primary.dim() >= 2:
         layout = ShardLayout(original_seq_len=primary.shape[1], padded_seq_len=primary.shape[1])
-    return contextlib.nullcontext, batch, layout
+    return CPShardResult(contextlib.nullcontext(), batch, layout)
 
 
-def round_robin_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
+def _round_robin_local_indices(cp_mesh, padded_seq_len: int, device: torch.device | None = None) -> torch.Tensor:
     """Global positions owned by this rank under torch ``context_parallel`` load balancing.
 
     The sequence splits into ``2 * cp_size`` chunks and rank ``r`` owns chunks
@@ -204,7 +183,7 @@ def round_robin_local_indices(cp_mesh, padded_seq_len: int, device: torch.device
     return torch.cat((head, tail))
 
 
-def shard_token_tensor_by_indices(tensor: torch.Tensor, local_indices: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
+def _shard_token_tensor_by_indices(tensor: torch.Tensor, local_indices: torch.Tensor, seq_dim: int = 1) -> torch.Tensor:
     """Keep this rank's slice of a full-length token-aligned tensor.
 
     Args:
@@ -237,7 +216,7 @@ def _reorder_gathered_token_tensor(
     return full.index_select(seq_dim, torch.argsort(full_indices)).contiguous()
 
 
-def gather_token_tensor_by_indices(
+def _gather_token_tensor_by_indices(
     cp_mesh, tensor: torch.Tensor, local_indices: torch.Tensor, seq_dim: int = 1
 ) -> torch.Tensor:
     """Differentiably gather a token-aligned local shard back to the full sequence.
@@ -272,7 +251,7 @@ def gather_token_tensor_by_indices(
 class ShardLayout:
     """What a ``shard_batch`` learned about the layout it just applied.
 
-    Returned as the third element of ``shard_batch`` and bound into a
+    Returned in :class:`CPShardResult` and bound into a
     :class:`CPTokenLayout`, so token operations accept and return tensors in the
     caller's coordinates. Padding remains an internal layout detail.
 
@@ -299,7 +278,16 @@ class ShardLayout:
     input_token_stream_positions: torch.Tensor | None = None
 
 
-class ShardBatch(Protocol):
+@dataclass(frozen=True)
+class CPShardResult:
+    """Prepared batch, forward context, and token layout from a CP sharder."""
+
+    context: AbstractContextManager[None]
+    batch: dict[str, Any]
+    layout: ShardLayout | None = None
+
+
+class _ShardBatch(Protocol):
     """Callable contract implemented by context-parallel batch strategies."""
 
     def __call__(
@@ -310,11 +298,11 @@ class ShardBatch(Protocol):
         *,
         loss_mask: torch.Tensor | None = None,
         padding_token_id: int = 0,
-    ) -> tuple[ContextFactory, dict[str, Any], ShardLayout | None]:
+    ) -> CPShardResult:
         """Shard sequence-bearing tensors in ``batch`` and report their layout."""
 
 
-LocalIndexFn = Callable[[DeviceMesh | None, int, torch.device | None], torch.Tensor]
+_LocalIndexFn = Callable[[DeviceMesh | None, int, torch.device | None], torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -323,7 +311,7 @@ class ContextParallelismSharder:
 
     Attributes:
         shard_batch: ``(cp_mesh, tp_mesh, batch, *, loss_mask=None,
-            padding_token_id=0) -> (ctx_factory, batch, ShardLayout | None)``.
+            padding_token_id=0) -> CPShardResult``.
             Pads and shards the batch, installs any backend-owned attention
             transport, and reports the shard layout it computed; the dispatch
             binds it into the returned :class:`CPTokenLayout`.
@@ -334,8 +322,13 @@ class ContextParallelismSharder:
             :class:`ShardLayout`.
     """
 
-    shard_batch: ShardBatch
-    local_token_global_indices: LocalIndexFn | None
+    shard_batch: _ShardBatch
+    local_token_global_indices: _LocalIndexFn | None
+
+    @classmethod
+    def identity(cls) -> "ContextParallelismSharder":
+        """Build the no-op strategy used when context parallelism is inactive."""
+        return cls(shard_batch=_shard_batch_identity, local_token_global_indices=_identity_local_indices)
 
     @classmethod
     def sdpa(cls) -> "ContextParallelismSharder":
@@ -346,9 +339,27 @@ class ContextParallelismSharder:
             SDPA context-parallel attention implementation.
         """
         return cls(
-            shard_batch=shard_batch_load_balanced,
-            local_token_global_indices=round_robin_local_indices,
+            shard_batch=_shard_batch_load_balanced,
+            local_token_global_indices=_round_robin_local_indices,
         )
+
+    @classmethod
+    def sdpa_aux(cls) -> "ContextParallelismSharder":
+        """Build SDPA CP that shards auxiliary streams while models shard embeddings."""
+        return cls(shard_batch=_shard_batch_aux_only, local_token_global_indices=_round_robin_local_indices)
+
+    @classmethod
+    def contiguous(cls, shard_batch: _ShardBatch) -> "ContextParallelismSharder":
+        """Bind a model-owned batch preparation to contiguous token ownership."""
+        return cls(shard_batch=shard_batch, local_token_global_indices=_contiguous_local_indices)
+
+
+@dataclass(frozen=True)
+class CPModelPreparation:
+    """Model-selected CP sharder and batch values produced by its preparation hook."""
+
+    sharder: ContextParallelismSharder
+    batch_updates: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -369,7 +380,7 @@ class CPTokenLayout:
     """
 
     cp_mesh: DeviceMesh | None
-    local_token_global_indices: LocalIndexFn | None
+    local_token_global_indices: _LocalIndexFn | None
     shard_layout: ShardLayout = ShardLayout()
 
     def _indices(self, padded_seq_len: int, device: torch.device) -> torch.Tensor:
@@ -450,20 +461,19 @@ class CPTokenLayout:
                     "Pass the original-length tensor with an explicit `fill`, or pre-pad it yourself."
                 )
         indices = self._indices(tensor.shape[seq_dim], tensor.device)
-        return shard_token_tensor_by_indices(tensor, indices, seq_dim=seq_dim)
+        return _shard_token_tensor_by_indices(tensor, indices, seq_dim=seq_dim)
 
     def gather(
         self,
         tensor: torch.Tensor,
         *,
         seq_dim: int = 1,
-        trim: bool = False,
         fill: float | int | None = None,
     ) -> torch.Tensor:
         """Differentiably gather a token-aligned local shard to global order.
 
-        With ``trim=True`` the result is returned in the caller's original
-        coordinates using the shard layout: sliced back to ``original_seq_len``,
+        The result is returned in the caller's original coordinates using the
+        shard layout: sliced back to ``original_seq_len``,
         un-flattened to ``input_row_shape`` (THD), or mapped through the
         reported position map (``fill`` for input positions whose tokens were
         dropped, e.g. re-padded pack slots). Raises when no layout is present
@@ -474,20 +484,16 @@ class CPTokenLayout:
                 in the prepared CP token order. ``seq_dim`` selects its sequence
                 axis.
             seq_dim: Sequence-axis index in ``tensor``.
-            trim: Restore the caller's original unpadded coordinates.
             fill: Value used for caller positions dropped by a repositioning
                 layout.
 
         Returns:
-            Replicated full-sequence tensor in global token order, optionally
-            restored to the caller's original shape when ``trim`` is true.
+            Replicated tensor restored to the caller's original coordinates.
         """
         layout = self.shard_layout
         padded_seq_len = tensor.shape[seq_dim] * (self.cp_mesh.size() if self.cp_mesh is not None else 1)
         indices = self._indices(padded_seq_len, tensor.device)
-        full = gather_token_tensor_by_indices(self.cp_mesh, tensor, indices, seq_dim=seq_dim)
-        if not trim:
-            return full
+        full = _gather_token_tensor_by_indices(self.cp_mesh, tensor, indices, seq_dim=seq_dim)
         if layout.padded_seq_len is not None and full.shape[seq_dim] != layout.padded_seq_len:
             raise ValueError(
                 f"gathered length {full.shape[seq_dim]} on dim {seq_dim} != reported "
@@ -504,11 +510,7 @@ class CPTokenLayout:
             return full.reshape(*layout.input_row_shape, *full.shape[seq_dim + 1 :])
         if layout.original_seq_len is not None:
             return full.narrow(seq_dim, 0, layout.original_seq_len)
-        raise NotImplementedError(
-            "This CP token layout has no original coordinates to trim to; "
-            "gather with trim=False and restore the layout with the batch metadata "
-            "(padding_mask / cu_seqlens)."
-        )
+        return full
 
 
 # ---------------------------------------------------------------------------
@@ -602,8 +604,8 @@ def shard_batch_contiguous(
             then the length the model must pad its primary to before slicing.
 
     Returns:
-        ``(contextlib.nullcontext, batch, ShardLayout)`` — transport lives in the
-        model's own attention, so no CP context manager is needed.
+        Prepared batch and layout with a null context; transport lives in the
+        model's own attention.
     """
     # --- normalize: mask -> padding_mask, primary tensor, position_ids, labels
     convert_attention_mask_to_padding_mask(batch)
@@ -714,7 +716,7 @@ def shard_batch_contiguous(
         batch["loss_mask"] = loss_mask[:, seq_start:seq_end].contiguous()
 
     layout = ShardLayout(original_seq_len=seq_len, padded_seq_len=padded_seq_len)
-    return contextlib.nullcontext, batch, layout
+    return CPShardResult(contextlib.nullcontext(), batch, layout)
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +833,7 @@ def _pad_cp_buffers_to_divisor(
     return cp_buffers, new_no_restore
 
 
-def shard_batch_load_balanced(
+def _shard_batch_load_balanced(
     cp_mesh,
     tp_mesh,
     batch,
@@ -843,14 +845,13 @@ def shard_batch_load_balanced(
 
     ``ContextParallelismSharder.shard_batch`` implementation for the default framework-owned CP
     path (layout ``"round_robin"``, indices from
-    :func:`round_robin_local_indices`). Assumes an active CP mesh (size > 1).
+    :func:`_round_robin_local_indices`). Assumes an active CP mesh (size > 1).
     ``padding_token_id`` is accepted per the contract but unused: CP-pad slots
     are zero-filled, sit after every real token under the causal mask, and
     carry -100 labels.
 
     Returns:
-        ``(ctx_factory, batch, ShardLayout)`` where entering ``ctx_factory()``
-        installs the SDPA-kernel + ``context_parallel`` context for the forward.
+        Prepared batch, token layout, and SDPA context for the forward.
     """
     # Remove attention_mask from the batch so the model does not attempt to
     # build a 4D causal mask (which would have mismatched shapes with
@@ -905,12 +906,12 @@ def shard_batch_load_balanced(
     # mutate only the integer/mask buffers.
     primary_seq_tensor = cp_buffers[0]
     if primary_seq_tensor.requires_grad:
-        local_indices = round_robin_local_indices(
+        local_indices = _round_robin_local_indices(
             cp_mesh,
             primary_seq_tensor.shape[cp_seq_dims[0]],
             device=primary_seq_tensor.device,
         )
-        batch[primary_key] = shard_token_tensor_by_indices(
+        batch[primary_key] = _shard_token_tensor_by_indices(
             primary_seq_tensor,
             local_indices,
             seq_dim=cp_seq_dims[0],
@@ -926,14 +927,11 @@ def shard_batch_load_balanced(
         cp_no_restore_buffers=cp_no_restore_buffers,
         cp_rotate_method="allgather",  # TODO: expose through cfg
     )
-    # TODO(@akoumparouli): surface these in the future.
-    enable_loss_parallel: bool = False
-    enable_compiled_autograd: bool = False
     layout = ShardLayout(original_seq_len=seq_len, padded_seq_len=seq_len + (-seq_len) % cp_divisor)
-    return _get_train_context(enable_loss_parallel, enable_compiled_autograd, cp_ctx), batch, layout
+    return CPShardResult(_sdpa_context(cp_ctx), batch, layout)
 
 
-def shard_batch_aux_only(
+def _shard_batch_aux_only(
     cp_mesh,
     tp_mesh,
     batch,
@@ -943,7 +941,7 @@ def shard_batch_aux_only(
 ):
     """Round-robin CP shard of the no-grad AUXILIARY streams only.
 
-    The framework-owned peer of :func:`shard_batch_load_balanced` for models that
+    The framework-owned peer of :func:`_shard_batch_load_balanced` for models that
     embed and sequence-shard their primary stream (``input_ids`` /
     ``inputs_embeds`` and any ``pixel_*`` keys) inside their own forward
     (Megatron-style per-microbatch CP). Pads and round-robin-shards
@@ -969,8 +967,7 @@ def shard_batch_aux_only(
         padding_token_id: Accepted per the contract but unused (the primary
             stream is not sharded here).
     Returns:
-        ``(ctx_factory, batch, ShardLayout)`` where entering ``ctx_factory()``
-        installs the SDPA-kernel + ``context_parallel`` context for the forward.
+        Prepared batch, token layout, and SDPA context for the forward.
         The layout's ``padded_seq_len`` is what the model must pad its primary
         stream to before sharding.
     """
@@ -1012,7 +1009,7 @@ def shard_batch_aux_only(
         cp_rotate_method="allgather",  # TODO: expose through cfg
     )
     layout = ShardLayout(original_seq_len=seq_len, padded_seq_len=seq_len + (-seq_len) % cp_divisor)
-    return _get_train_context(False, False, cp_ctx), batch, layout
+    return CPShardResult(_sdpa_context(cp_ctx), batch, layout)
 
 
 def shard_sequence_for_cp_round_robin(
@@ -1020,8 +1017,8 @@ def shard_sequence_for_cp_round_robin(
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Pad and round-robin shard a full-length sequence tensor inside a model forward.
 
-    The in-forward peer of :func:`shard_batch_load_balanced`: a model that leaves
-    its primary stream full-length (see :func:`shard_batch_aux_only`) calls this
+    The in-forward peer of :func:`_shard_batch_load_balanced`: a model that leaves
+    its primary stream full-length (see :func:`_shard_batch_aux_only`) calls this
     on its embedded, spliced hidden states to keep this CP rank's head-tail chunk
     pair, matching the layout the ring-SDPA context and the aux streams were
     sharded to. Differentiable (``index_select``), so gradients route to the
@@ -1052,8 +1049,8 @@ def shard_sequence_for_cp_round_robin(
     if pad_len:
         tensor = _pad_tensor_seq_dim_(tensor, seq_dim, pad_len, pad_value)
     padded_seq_len = tensor.shape[seq_dim]
-    local_indices = round_robin_local_indices(cp_mesh, padded_seq_len, device=tensor.device)
-    local = shard_token_tensor_by_indices(tensor, local_indices, seq_dim=seq_dim)
+    local_indices = _round_robin_local_indices(cp_mesh, padded_seq_len, device=tensor.device)
+    local = _shard_token_tensor_by_indices(tensor, local_indices, seq_dim=seq_dim)
     return local, local_indices, padded_seq_len
 
 
@@ -1096,6 +1093,6 @@ def shard_sequence_for_cp_contiguous(
     if pad_len:
         tensor = _pad_tensor_seq_dim_(tensor, seq_dim, pad_len, pad_value)
     padded_seq_len = tensor.shape[seq_dim]
-    local_indices = contiguous_local_indices(cp_mesh, padded_seq_len, device=tensor.device)
-    local = shard_token_tensor_by_indices(tensor, local_indices, seq_dim=seq_dim)
+    local_indices = _contiguous_local_indices(cp_mesh, padded_seq_len, device=tensor.device)
+    local = _shard_token_tensor_by_indices(tensor, local_indices, seq_dim=seq_dim)
     return local, local_indices, padded_seq_len

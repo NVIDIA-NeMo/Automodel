@@ -22,7 +22,7 @@ Supported model types: qwen3_moe, deepseek_v3, nemotron_v3
 
 Supported configs:
   bshd_te   - 3D BSHD input, TE p2p CP, DualChunkSwap
-  thd_te    - 2D THD input, TE p2p CP (qwen3/deepseek use make_cp_batch_for_te;
+  thd_te    - 2D THD input, TE p2p CP (qwen3/deepseek use _prepare_thd_batch;
               nemotron_v3 uses DualChunkSwap)
   bshd_sdpa - 3D BSHD input, DTensor context_parallel(), SDPA backend
 
@@ -479,7 +479,7 @@ def run_bshd_te(model_type, config, rank, world_size, device, attn_no_cp=None, a
 def run_thd_te(model_type, config, rank, world_size, device, attn_no_cp=None, attn_with_cp=None, get_freqs_cis=None):
     """THD input with TE p2p CP.
 
-    For qwen3_moe / deepseek_v3: uses make_cp_batch_for_te + apply_cp flow.
+    For qwen3_moe / deepseek_v3: uses _prepare_thd_batch + apply_cp flow.
     For nemotron_v3: uses set_context_parallel_group + DualChunkSwap flow.
     """
     if model_type == "nemotron_v3":
@@ -513,7 +513,7 @@ def _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device, attn
         dist.broadcast(param_with_cp.data, src=0)
 
     # Create packed sequence batch
-    from nemo_automodel.components.distributed.context_parallel.utils import make_cp_batch_for_te
+    from nemo_automodel.components.distributed.context_parallel.utils import _prepare_thd_batch
 
     batch_size = 4
     seq_lens_per_batch = [[32], [40], [36], [44]]
@@ -523,10 +523,9 @@ def _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device, attn
 
     # ===== Baseline: CP=1 (no context parallelism) =====
     torch.manual_seed(42)
-    batch_no_cp = make_cp_batch_for_te(
+    batch_no_cp, _ = _prepare_thd_batch(
         cp_mesh=None,
         batch=batch,
-        qkv_format="thd",
         padding_token_id=0,
     )
 
@@ -610,10 +609,9 @@ def _run_thd_te_qwen_deepseek(model_type, config, rank, world_size, device, attn
 
     # Process batch with CP
     torch.manual_seed(42)
-    batch_with_cp = make_cp_batch_for_te(
+    batch_with_cp, _ = _prepare_thd_batch(
         cp_mesh=cp_mesh["cp"],
         batch=batch,
-        qkv_format="thd",
         padding_token_id=0,
     )
 

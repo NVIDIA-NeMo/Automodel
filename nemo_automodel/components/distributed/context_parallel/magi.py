@@ -43,14 +43,13 @@ place of eager/SDPA/flash for convergence-parity comparisons.
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.distributed.context_parallel.utils import make_cp_batch_for_te
+from nemo_automodel.components.distributed.context_parallel.utils import _prepare_thd_batch
 
 logger = logging.getLogger(__name__)
 
@@ -758,17 +757,10 @@ class MagiState:
         """
         return self.enabled and not self.custom
 
-    def prepare_llm_batch(
-        self, model, batch, *, device_mesh, is_thd, pad_id, num_chunks
-    ):  # pragma: no cover - requires GPU + magi_attention
+    def _prepare_llm_batch(self, model, batch, *, is_thd, pad_id, num_chunks):  # pragma: no cover - GPU + magi
         """Per-step batch prep for the LLM recipe (assumes ``enabled``).
 
-        Returns ``(train_ctx, batch, local_indices)``. magi does its own CP, so
-        ``train_ctx`` is always ``nullcontext`` (no torch-native DTensor CP
-        context). ``local_indices`` is the global stream position of every
-        local token on the paths that dispatch the sequence (magi's
-        ``get_position_ids``), None otherwise; the framework installs it on
-        the magi ContextParallelismSharder for the token-tensor verbs.
+        Returns the batch and global stream positions for locally owned tokens.
         """
         # cp=1 prefix-tree mask: the datasets layer cannot import this module (component
         # independence), so the collate attaches the tree structure and the spec is built
@@ -802,7 +794,7 @@ class MagiState:
         elif self.custom and self.cp_size > 1 and is_thd:
             # Custom-model CP packed path: build the *global* THD layout (no TE
             # sharding) then dispatch it with magi's own load-balancing solver.
-            batch = make_cp_batch_for_te(None, batch, qkv_format="thd", padding_token_id=pad_id, num_chunks=1)
+            batch, _ = _prepare_thd_batch(None, batch, padding_token_id=pad_id, num_chunks=1)
             batch, _ = magi_prepare_packed_cp(model, batch, self.cp_group)
             local_indices = batch["position_ids"]
         elif is_thd:
@@ -811,79 +803,63 @@ class MagiState:
             # position_ids here are per-document RoPE positions, not stream
             # indices, so no index map is exposed.
             cp_mesh = None
-            if device_mesh is not None and "cp" in (getattr(device_mesh, "mesh_dim_names", None) or ()):
-                cp_mesh = device_mesh["cp"]
-            batch = make_cp_batch_for_te(
+            if self.device_mesh is not None and "cp" in (getattr(self.device_mesh, "mesh_dim_names", None) or ()):
+                cp_mesh = self.device_mesh["cp"]
+            batch, _ = _prepare_thd_batch(
                 cp_mesh,
                 batch,
-                qkv_format="thd",
                 padding_token_id=pad_id,
                 num_chunks=num_chunks,
             )
-        return nullcontext, batch, local_indices
+        return batch, local_indices
 
-    def prepare_vlm_batch(self, model, batch):
+    def _prepare_vlm_batch(self, model, batch):
         """Per-step batch prep for the VLM recipe (assumes ``enabled``).
 
         HF VLMs stamp the cp_group on the language-backbone attention; custom VLMs
         use the factory attn_func with the active cp_group set in :func:`setup_magi`
-        (the vision tower stays on SDPA either way). Returns ``(train_ctx, batch)``.
+        (the vision tower stays on SDPA either way).
         """
         if not self.custom:
             batch, _ = magi_prepare_vlm(model, batch, self.cp_group)
-        return nullcontext, batch
+        return batch
 
-    def make_cp_batch(
+    def prepare_batch(
         self,
-        cp_mesh,
-        batch,
+        batch: dict[str, Any],
         *,
         padding_token_id: int = 0,
         num_chunks: int = 1,
         is_thd: bool = False,
-        model=None,
-        return_local_indices: bool = False,
-    ):
-        """Backend-owned per-step batch prep, shaped like ``make_cp_batch_for_te``.
+        model: torch.nn.Module | None = None,
+    ) -> tuple[dict[str, Any], torch.Tensor | None]:
+        """Prepare a batch with the bound Magi runtime.
 
-        Called by the CP dispatch at the same rung
-        as the TE path: magi manages its own CP transport, so the context is
-        implicitly ``nullcontext`` and only the prepped batch is returned.
-        Backend state and runtime resources were bound at :func:`setup_magi`;
+        Called by the CP dispatch at the same rung as the THD path. Backend
+        state and runtime resources were bound at :func:`setup_magi`;
         model capabilities select input preparation for each forward.
 
         Args:
-            cp_mesh: The context-parallel submesh. Unused — magi owns its
-                bound ``cp_group``; accepted for signature symmetry with
-                ``make_cp_batch_for_te``.
             batch: The full-sequence batch.
             padding_token_id: Pad sentinel for ``input_ids``.
             num_chunks: THD chunk count.
             is_thd: THD-packed collator is active.
             model: The model part whose attention modules receive keys/specs.
-            return_local_indices: Also return the local-token global index map
-                from the dispatch that just ran (None on paths that do not
-                dispatch, e.g. cp=1 THD conversion and multimodal models). Used
-                by the magi ContextParallelismSharder's token verbs.
-
         Returns:
-            The dispatched (magi-sharded) batch, or ``(batch, local_indices)``
-            when ``return_local_indices``.
+            The dispatched batch and its local-token global index map, when available.
         """
-        del cp_mesh
         local_indices = None
         if _is_multimodal_model(model):
-            _, batch = self.prepare_vlm_batch(model, batch)
+            batch = self._prepare_vlm_batch(model, batch)
         else:
-            _, batch, local_indices = self.prepare_llm_batch(
+            batch, local_indices = self._prepare_llm_batch(
                 model,
                 batch,
-                device_mesh=self.device_mesh,
                 is_thd=is_thd,
                 pad_id=padding_token_id,
                 num_chunks=num_chunks,
             )
-        return (batch, local_indices) if return_local_indices else batch
+        return batch, local_indices
 
 
 def _config_value(config: object, key: str, default: object = None) -> object:
@@ -901,8 +877,7 @@ def setup_magi(model_config: object, device_mesh) -> MagiState:
 
     Enabled when the model is configured with ``attn_implementation="magi"`` (HF) or
     ``backend.attn="magi"`` (custom models). Returns a :class:`MagiState`
-    (``enabled=False`` when magi is not configured). ``label`` is an optional suffix
-    for the log line (e.g. ``"VLM language backbone"``).
+    (``enabled=False`` when magi is not configured).
 
     Args:
         model_config: Model construction config containing either ``backend.attn``

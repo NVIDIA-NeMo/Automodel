@@ -66,7 +66,7 @@ def materialize_teacher_logits(
     """
     if isinstance(logits, DTensor):
         logits = logits.full_tensor()
-    logits = tokens.gather(logits, seq_dim=1, trim=True)
+    logits = tokens.gather(logits, seq_dim=1, fill=0)
     return logits.narrow(1, 0, sequence_length).detach().contiguous()
 
 

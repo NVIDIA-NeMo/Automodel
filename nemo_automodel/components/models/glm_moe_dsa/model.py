@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -42,6 +42,9 @@ from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.context_parallel.sharder import CPModelPreparation
 
 
 class Block(nn.Module):
@@ -336,7 +339,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> dict[str, Any]:
+    ) -> "CPModelPreparation":
         """Attach GLM DSA's packed THD context-parallel batch sharder.
 
         Args:
@@ -347,22 +350,19 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
             ContextParallelismSharder,
-            contiguous_local_indices,
+            CPModelPreparation,
         )
 
         if getattr(self.backend, "attn", None) != "tilelang":
             raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
 
-        cp_sharder = ContextParallelismSharder(
-            shard_batch=partial(
+        cp_sharder = ContextParallelismSharder.contiguous(
+            partial(
                 shard_glm_dsa_packed_cp_batch,
                 num_chunks=int(num_chunks),
-            ),
-            # Contiguous over the packed THD token axis: rank r keeps
-            # tokens [r * T/cp, (r + 1) * T/cp).
-            local_token_global_indices=contiguous_local_indices,
+            )
         )
-        return {"cp_sharder": cp_sharder}
+        return CPModelPreparation(cp_sharder)
 
     def _is_pipeline_parallel_stage(self) -> bool:
         """True when this module is a trimmed pipeline-parallel stage (not the whole model)."""

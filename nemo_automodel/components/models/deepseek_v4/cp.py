@@ -448,6 +448,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
     import contextlib
 
     from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
+        CPShardResult,
         ShardLayout,
         convert_attention_mask_to_padding_mask,
         shard_batch_contiguous,
@@ -462,7 +463,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
             batch["labels"] = loss_mask
         elif loss_mask is not None:
             batch["loss_mask"] = loss_mask
-        return contextlib.nullcontext, batch, None
+        return CPShardResult(contextlib.nullcontext(), batch)
 
     local_multiple = max(int(pad_multiple or 2), 2)
 
@@ -486,7 +487,7 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
             loss_mask=loss_mask,
         )
 
-    ctx, batch, layout = shard_batch_contiguous(
+    prepared = shard_batch_contiguous(
         cp_mesh,
         tp_mesh,
         batch,
@@ -500,10 +501,12 @@ def make_dsv4_contiguous_shard_cp_batch_and_ctx(
         # The repad rebuilt the rows, so no single original length exists; the
         # caller's coordinates are restored through the position map instead.
         layout = ShardLayout(
-            padded_seq_len=layout.padded_seq_len,
+            padded_seq_len=prepared.layout.padded_seq_len,
             input_token_stream_positions=input_positions,
         )
+    else:
+        layout = prepared.layout
     # Hand the CP process group to the model forward (read from attn_kwargs) so
     # DSV4 attention all-gathers K/V across CP ranks. Not a tensor -> not sharded.
-    batch["_dsv4_cp_group"] = cp_mesh.get_group()
-    return ctx, batch, layout
+    prepared.batch["_dsv4_cp_group"] = cp_mesh.get_group()
+    return CPShardResult(prepared.context, prepared.batch, layout)

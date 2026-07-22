@@ -28,8 +28,7 @@ import torch.nn as nn
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelismSharder,
-    round_robin_local_indices,
-    shard_batch_aux_only,
+    CPModelPreparation,
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.models.common import (
@@ -646,12 +645,12 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> dict[str, Any]:
+    ) -> CPModelPreparation:
         """Return a sharder-only CP backend; embed + splice + shard happen in forward.
 
         The returned :class:`ContextParallelismSharder` round-robin-shards only the
         no-grad aux streams (labels/position_ids/loss_mask/padding_mask) via
-        :func:`shard_batch_aux_only`, leaving ``input_ids`` and the multimodal inputs
+        :meth:`ContextParallelismSharder.sdpa_aux`, leaving ``input_ids`` and the multimodal inputs
         full-length; the forward then embeds + splices and calls
         :func:`shard_sequence_for_cp_round_robin` per microbatch, so embeddings and vision stay
         trainable under CP. Nothing is consumed here.
@@ -663,12 +662,7 @@ class MiniMaxM3SparseForConditionalGeneration(HFCheckpointingMixin, nn.Module, M
             num_chunks: Accepted for hook-signature parity; unused (round-robin CP).
         """
         del batch, num_chunks
-        return {
-            "cp_sharder": ContextParallelismSharder(
-                shard_batch=shard_batch_aux_only,
-                local_token_global_indices=round_robin_local_indices,
-            )
-        }
+        return CPModelPreparation(ContextParallelismSharder.sdpa_aux())
 
     def forward(
         self,

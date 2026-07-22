@@ -62,8 +62,7 @@ except ModuleNotFoundError:
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelismSharder,
-    round_robin_local_indices,
-    shard_batch_aux_only,
+    CPModelPreparation,
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
@@ -859,13 +858,13 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> dict[str, Any]:
+    ) -> CPModelPreparation:
         """Return a sharder-only CP backend plus the full-sequence mRoPE positions.
 
         Embedding and the VLM->LM multimodal scatter now run inside ``forward``
         per microbatch (see :meth:`_embed_and_splice_for_cp`), so this hook only
         computes the mRoPE ``position_ids`` on the full (unsharded) sequence via
-        ``get_rope_index`` and returns them for :func:`shard_batch_aux_only` to
+        ``get_rope_index`` and returns them for :meth:`ContextParallelismSharder.sdpa_aux` to
         round-robin-shard on the mRoPE axis, plus the
         :class:`ContextParallelismSharder`. ``input_ids`` and the media inputs are
         left in the batch for the forward; ``mm_token_type_ids`` is consumed here
@@ -921,15 +920,10 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
             position_ids, rope_deltas = self.model.get_rope_index(input_ids, **rope_kwargs)
             self.model.rope_deltas = rope_deltas
 
-        return {
-            "cp_sharder": ContextParallelismSharder(
-                shard_batch=shard_batch_aux_only,
-                local_token_global_indices=round_robin_local_indices,
-            ),
-            "position_ids": position_ids,
-            "mm_token_type_ids": None,
-            **promoted,
-        }
+        return CPModelPreparation(
+            ContextParallelismSharder.sdpa_aux(),
+            {"position_ids": position_ids, "mm_token_type_ids": None, **promoted},
+        )
 
     def _embed_and_splice_for_cp(
         self,

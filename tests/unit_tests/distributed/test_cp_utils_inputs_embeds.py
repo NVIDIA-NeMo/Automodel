@@ -77,7 +77,6 @@ def _prepare(device_mesh, batch, loss_mask=None):
 def test_xor_assertion_neither_present(monkeypatch):
     """Batch missing both input_ids AND inputs_embeds must raise AssertionError."""
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", lambda **kw: object())
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     batch = {"labels": torch.zeros(1, 4, dtype=torch.long)}  # neither present
     with pytest.raises(AssertionError, match="exactly one of"):
@@ -87,7 +86,6 @@ def test_xor_assertion_neither_present(monkeypatch):
 def test_xor_assertion_both_present(monkeypatch):
     """Batch with BOTH input_ids and inputs_embeds must raise AssertionError."""
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", lambda **kw: object())
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     batch = {
         "input_ids": torch.zeros(1, 4, dtype=torch.long),
@@ -107,7 +105,6 @@ def test_inputs_embeds_path_uses_embeds_as_primary_seq_tensor(monkeypatch):
         return object()
 
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     inputs_embeds = torch.randn(1, 8, 16)  # [B=1, S=8, H=16]
@@ -130,7 +127,6 @@ def test_inputs_embeds_with_grad_is_sharded_out_of_place(monkeypatch):
         return object()
 
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1, cp_rank=1)
     full_sequence = torch.arange(8.0, requires_grad=True)
@@ -161,7 +157,6 @@ def test_inputs_embeds_with_grad_is_sharded_out_of_place(monkeypatch):
 def test_inputs_embeds_grad_sharding_uses_cp_submesh_rank_under_hsdp(monkeypatch, root_rank, cp_rank, expected):
     """HSDP root coordinates must not affect the rank used for CP sharding."""
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", lambda **kw: object())
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyHSDPDeviceMesh(root_rank=root_rank, cp_rank=cp_rank)
     full_sequence = torch.arange(8.0, requires_grad=True)
@@ -200,7 +195,6 @@ def test_inputs_embeds_with_grad_and_cp_padding_preserves_global_token_mean(monk
             return object()
 
         monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-        monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
         embedding = torch.nn.Embedding(sequence_length, hidden_size, dtype=torch.float64)
         with torch.no_grad():
@@ -261,7 +255,6 @@ def test_input_ids_path_unchanged(monkeypatch):
         return object()
 
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     input_ids = torch.zeros(1, 8, dtype=torch.long)
@@ -279,7 +272,6 @@ def test_position_ids_synthesized_from_inputs_embeds_seq_dim(monkeypatch):
     synthesized arange must use ``inputs_embeds.shape[1]`` (the seq dim of the
     embed tensor, not its hidden dim)."""
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", lambda **kw: object())
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     inputs_embeds = torch.randn(1, 12, 32)  # B=1, S=12, H=32
@@ -297,7 +289,6 @@ def test_position_ids_synthesized_for_each_batch_row(monkeypatch):
     """Synthesized 2D position_ids must match the batch dimension so later CP
     sharding keeps positions aligned with each sample."""
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", lambda **kw: object())
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     inputs_embeds = torch.randn(3, 8, 16)
@@ -320,7 +311,6 @@ def test_singleton_position_ids_expand_to_batch_size(monkeypatch):
         return object()
 
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     inputs_embeds = torch.randn(2, 8, 16)
@@ -345,7 +335,7 @@ def test_inputs_embeds_no_op_when_cp_size_le_1():
     batch = {"inputs_embeds": inputs_embeds, "labels": torch.zeros(1, 4, dtype=torch.long)}
 
     ctx, new_batch, _ = _prepare(device_mesh, batch)
-    assert ctx is contextlib.nullcontext
+    assert isinstance(ctx, contextlib.nullcontext)
     assert new_batch is batch
     # Must NOT inject position_ids when CP is off
     assert "position_ids" not in batch
@@ -360,7 +350,6 @@ def test_inputs_embeds_path_preserves_padding_mask_in_cp_buffers(monkeypatch):
         return object()
 
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     inputs_embeds = torch.randn(1, 8, 16)
@@ -388,7 +377,6 @@ def test_padding_pads_all_buffers_to_cp_divisor_multiple(monkeypatch):
         return object()
 
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # divisor = 4
     seq_len = 6  # 6 % 4 = 2 -> pad to 8
@@ -426,7 +414,6 @@ def test_padding_labels_use_negative_100_int_buffers_use_zero(monkeypatch):
         return object()
 
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # divisor = 4
     inputs_embeds = torch.ones(1, 6, 4)
@@ -464,7 +451,6 @@ def test_padding_handles_loss_mask_and_padding_mask(monkeypatch):
         return object()
 
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # divisor = 4
     seq_len = 6
@@ -491,7 +477,6 @@ def test_padding_handles_loss_mask_and_padding_mask(monkeypatch):
 def test_additional_token_tensor_uses_prepared_layout(monkeypatch):
     """Teacher logits use the returned token layout instead of a dispatch argument."""
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", lambda **kwargs: object())
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     teacher_logits = torch.randn(1, 6, 5)
@@ -522,7 +507,6 @@ def test_padding_mask_pad_value_is_True_not_False(monkeypatch):
         return object()
 
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # divisor = 4
     seq_len = 6  # 6 % 4 = 2 -> pad to 8
@@ -552,7 +536,7 @@ def test_padding_attention_mask_pad_value_is_zero(monkeypatch):
     """If a future caller passes an ``attention_mask`` in the batch, it should
     pad with ``0`` (HF convention: 1=real, 0=pad) -- NOT with True/dtype-default.
 
-    Today ``shard_batch_load_balanced`` strips ``attention_mask`` at the top of
+    Today ``_shard_batch_load_balanced`` strips ``attention_mask`` at the top of
     the function so this case is moot, but the PAD_FILL table is the right
     place to encode the semantic in case the strip is ever revisited.
     """
@@ -577,7 +561,6 @@ def test_padding_mirrors_padding_mask_back_into_batch(monkeypatch):
         return object()
 
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # divisor = 4
     seq_len = 6  # 6 % 4 = 2 -> pad to 8
@@ -614,7 +597,6 @@ def test_padding_no_op_when_seq_already_aligned(monkeypatch):
         return object()
 
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # divisor = 4
     seq_len = 8  # 8 % 4 == 0 -> no pad
@@ -639,7 +621,6 @@ def test_padding_input_ids_path_int_padding_with_zero(monkeypatch):
         return object()
 
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)  # divisor = 4
     input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
@@ -670,7 +651,6 @@ def test_inputs_embeds_3d_position_ids_seq_dim(monkeypatch):
         return object()
 
     monkeypatch.setattr(_cs, "_create_context_parallel_ctx", _fake_create_ctx)
-    monkeypatch.setattr(_cs, "_get_train_context", lambda *a, **kw: "ctx")
 
     device_mesh = _DummyDeviceMesh(cp_size=2, tp_size=1)
     inputs_embeds = torch.randn(1, 8, 16)

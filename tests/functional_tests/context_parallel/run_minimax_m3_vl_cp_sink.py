@@ -15,7 +15,7 @@
 """GPU CP forward-equivalence for the MiniMax M3 VL in-forward pre-embed shard (L1, 2 GPUs).
 
 Exercises the sunk CP path end to end: ``ContextParallelRuntime.prepare_forward`` invokes the
-sharder-only ``prepare_model_inputs_for_cp`` hook (``shard_batch_aux_only``
+sharder-only ``prepare_model_inputs_for_cp`` hook (``_shard_batch_aux_only``
 round-robin shards labels/position_ids and installs the ring-SDPA context), and
 ``MiniMaxM3SparseForConditionalGeneration.forward`` embeds the full sequence then
 ``shard_sequence_for_cp_round_robin`` shards ``inputs_embeds`` per rank. The unsharded cp2

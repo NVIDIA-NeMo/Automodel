@@ -72,13 +72,12 @@ def test_prepare_forward_derives_thd_from_batch(monkeypatch):
         seen.update(cp_mesh=cp_mesh, batch=batch, kwargs=kwargs)
         return {"input_ids": torch.tensor([1, 2])}, torch.tensor([0, 2])
 
-    monkeypatch.setattr(cp_runtime, "make_cp_batch_for_te", fake_make_cp_batch_for_te)
+    monkeypatch.setattr(cp_runtime, "_prepare_thd_batch", fake_make_cp_batch_for_te)
     prepared = ContextParallelRuntime(device_mesh=_DeviceMesh(cp_size=2)).prepare_forward(None, _thd_batch())
 
     assert isinstance(prepared, CPForward)
-    assert seen["kwargs"]["qkv_format"] == "thd"
-    assert seen["kwargs"]["return_local_indices"] is True
-    assert prepared.context is contextlib.nullcontext
+    assert seen["kwargs"]["num_chunks"] == 1
+    assert isinstance(prepared.context, contextlib.nullcontext)
     assert torch.equal(prepared.tokens.shard(torch.arange(4.0), seq_dim=0), torch.tensor([0.0, 2.0]))
 
 
@@ -96,9 +95,9 @@ def test_prepare_forward_returns_identity_token_layout_without_cp():
     prepared = ContextParallelRuntime().prepare_forward(None, batch)
 
     assert prepared.batch is batch
-    assert prepared.context is contextlib.nullcontext
+    assert isinstance(prepared.context, contextlib.nullcontext)
     assert torch.equal(prepared.tokens.shard(tensor), tensor)
-    assert torch.equal(prepared.tokens.gather(tensor, trim=True), tensor)
+    assert torch.equal(prepared.tokens.gather(tensor), tensor)
 
 
 def test_multimodal_model_rejects_thd_with_context_parallelism():
@@ -123,7 +122,7 @@ def test_multimodal_detection_falls_back_to_model_config():
 def test_text_model_thd_does_not_depend_on_recipe_domain(monkeypatch):
     monkeypatch.setattr(
         cp_runtime,
-        "make_cp_batch_for_te",
+        "_prepare_thd_batch",
         lambda cp_mesh, batch, **kwargs: (batch, torch.tensor([0, 2])),
     )
     model = torch.nn.Module()

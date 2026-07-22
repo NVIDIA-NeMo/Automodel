@@ -181,8 +181,8 @@ def test_prepare_model_inputs_for_cp_is_sharder_only(vlm_model):
     batch (input_ids, pixel_values) is left intact for the forward to consume."""
     from nemo_automodel.components.distributed.context_parallel.sharder import (
         ContextParallelismSharder,
-        round_robin_local_indices,
-        shard_batch_aux_only,
+        _round_robin_local_indices,
+        _shard_batch_aux_only,
     )
 
     assert hasattr(vlm_model, "prepare_model_inputs_for_cp")
@@ -192,11 +192,11 @@ def test_prepare_model_inputs_for_cp_is_sharder_only(vlm_model):
     cp_batch = {"input_ids": ids, "pixel_values": pixel_values, "image_grid_thw": grid_thw}
     prepared = vlm_model.prepare_model_inputs_for_cp(cp_batch)
 
-    assert set(prepared) == {"cp_sharder"}
-    sharder = prepared["cp_sharder"]
+    assert not prepared.batch_updates
+    sharder = prepared.sharder
     assert isinstance(sharder, ContextParallelismSharder)
-    assert sharder.shard_batch is shard_batch_aux_only
-    assert sharder.local_token_global_indices is round_robin_local_indices
+    assert sharder.shard_batch is _shard_batch_aux_only
+    assert sharder.local_token_global_indices is _round_robin_local_indices
     # nothing consumed: the raw streams stay for the forward
     assert cp_batch["input_ids"] is ids and cp_batch["pixel_values"] is pixel_values
 

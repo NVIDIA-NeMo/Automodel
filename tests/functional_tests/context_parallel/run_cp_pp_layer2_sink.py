@@ -245,7 +245,7 @@ def main():
         train_ctx, batch = prepared_cp.context, prepared_cp.batch
         labels = batch.pop("labels")
         if pp_size > 1:
-            with train_ctx():
+            with train_ctx:
                 step_losses = [] if has_last else None
                 model_input = batch.pop("input_ids")
                 pp.update_seq_len(model_input.shape[1])
@@ -257,7 +257,7 @@ def main():
             # microbatches gives the batch mean, comparable to the cp2xpp1 leg.
             local = torch.stack(step_losses).mean() if has_last else torch.tensor(0.0, device=device)
         else:
-            with train_ctx():
+            with train_ctx:
                 out = model(input_ids=batch["input_ids"], position_ids=batch["position_ids"])
                 local = loss_fn(out, labels)  # full output so MTP depths are included
                 local.backward()

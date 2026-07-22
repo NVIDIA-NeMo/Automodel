@@ -120,7 +120,7 @@ def test_make_glm_dsa_packed_cp_batch_single_chunk(monkeypatch):
     monkeypatch.setattr(glm_cp.dist, "is_available", lambda: False)
     monkeypatch.setattr(glm_cp.dist, "is_initialized", lambda: False)
 
-    ctx, out = glm_cp.make_glm_dsa_packed_cp_batch_and_ctx(
+    out = glm_cp._prepare_glm_dsa_packed_cp_batch(
         _FakeMesh(size=3),
         None,
         {"input_ids": torch.arange(6).view(1, 6)},
@@ -129,7 +129,6 @@ def test_make_glm_dsa_packed_cp_batch_single_chunk(monkeypatch):
         seq_lens_padding_value=-77,
     )
 
-    assert ctx is contextlib.nullcontext
     assert captured["kwargs"]["num_chunks"] == 1
     assert captured["kwargs"]["seq_lens_padding_value"] == -77
     assert captured["kwargs"]["padding_token_id"] == 3
@@ -143,7 +142,7 @@ def test_shard_glm_dsa_packed_cp_batch_reports_single_chunk_layout(monkeypatch):
     monkeypatch.setattr(glm_cp.dist, "is_available", lambda: False)
     monkeypatch.setattr(glm_cp.dist, "is_initialized", lambda: False)
 
-    ctx, out, layout = glm_cp.shard_glm_dsa_packed_cp_batch(
+    prepared = glm_cp.shard_glm_dsa_packed_cp_batch(
         _FakeMesh(size=3),
         None,
         {"input_ids": torch.arange(6).view(1, 6)},
@@ -151,7 +150,8 @@ def test_shard_glm_dsa_packed_cp_batch_reports_single_chunk_layout(monkeypatch):
         num_chunks=1,
     )
 
-    assert ctx is contextlib.nullcontext
+    out, layout = prepared.batch, prepared.layout
+    assert isinstance(prepared.context, contextlib.nullcontext)
     assert out["input_ids"].tolist() == [0, 1]
     assert layout.padded_seq_len == 6
     assert layout.input_row_shape == (1, 6)
@@ -171,7 +171,7 @@ def test_make_glm_dsa_packed_cp_batch_stacks_pipeline_chunks(monkeypatch):
     monkeypatch.setattr(glm_cp.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(glm_cp.dist, "get_rank", lambda group: 1)
 
-    ctx, out = glm_cp.make_glm_dsa_packed_cp_batch_and_ctx(
+    out = glm_cp._prepare_glm_dsa_packed_cp_batch(
         _FakeMesh(size=2),
         None,
         {"input_ids": torch.arange(8).view(2, 4)},
@@ -179,7 +179,6 @@ def test_make_glm_dsa_packed_cp_batch_stacks_pipeline_chunks(monkeypatch):
         num_chunks=2,
     )
 
-    assert ctx is contextlib.nullcontext
     assert out["input_ids"].tolist() == [[2, 3], [12, 13]]
     assert out["labels"].tolist() == [[102, 103], [112, 113]]
     assert out["position_ids"].tolist() == [[202, 203], [212, 213]]

@@ -141,7 +141,7 @@ def _shard_batch(batch, cp_size, cp_rank, seq_len):
     mesh = _FakeCPMesh(cp_size, cp_rank)
     # Exercise the public contiguous shard directly on the 4D per_layer_inputs key
     # (the production entry the model wraps), the same slice the sunk forward applies.
-    _ctx_fn, sharded, _ = shard_batch_contiguous(
+    prepared = shard_batch_contiguous(
         mesh,
         None,
         batch,
@@ -150,7 +150,7 @@ def _shard_batch(batch, cp_size, cp_rank, seq_len):
         extra_seq_keys={"per_layer_inputs": 1},
         extra_pad_values={"per_layer_inputs": 0},
     )
-    return sharded
+    return prepared.batch
 
 
 def test_cp_batch_shards_per_layer_inputs_on_seq_dim():
@@ -246,8 +246,8 @@ def test_prepare_model_inputs_is_sharder_only_for_e_series():
     cfg.image_token_id = 99
     model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.float32)
     prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])})
-    assert set(prepared) == {"cp_sharder"}
-    assert prepared["cp_sharder"].shard_batch == model._cp_shard_batch_aux_only
+    assert not prepared.batch_updates
+    assert prepared.sharder.shard_batch == model._cp_shard_batch_aux_only
 
 
 def test_cp_sunk_prepare_inputs_slices_per_layer_inputs_on_seq_dim():

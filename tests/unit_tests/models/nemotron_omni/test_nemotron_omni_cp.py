@@ -132,8 +132,8 @@ def test_prepare_model_inputs_for_cp_is_sharder_only():
     ContextParallelismSharder; embed + splice + shard run inside forward."""
     from nemo_automodel.components.distributed.context_parallel.sharder import (
         ContextParallelismSharder,
-        round_robin_local_indices,
-        shard_batch_aux_only,
+        _round_robin_local_indices,
+        _shard_batch_aux_only,
     )
 
     model = _make_omni_stub()
@@ -141,11 +141,11 @@ def test_prepare_model_inputs_for_cp_is_sharder_only():
     batch = {"input_ids": input_ids, "pixel_values": torch.zeros(2, 3, 4, 4), "image_flags": torch.tensor([[1], [1]])}
     out = model.prepare_model_inputs_for_cp(batch)
 
-    assert set(out) == {"cp_sharder"}
-    sharder = out["cp_sharder"]
+    assert not out.batch_updates
+    sharder = out.sharder
     assert isinstance(sharder, ContextParallelismSharder)
-    assert sharder.shard_batch is shard_batch_aux_only
-    assert sharder.local_token_global_indices is round_robin_local_indices
+    assert sharder.shard_batch is _shard_batch_aux_only
+    assert sharder.local_token_global_indices is _round_robin_local_indices
     # nothing consumed: input_ids / media stay for the forward
     assert batch["input_ids"] is input_ids and "pixel_values" in batch
 
@@ -264,8 +264,8 @@ def test_prepare_model_inputs_for_cp_is_sharder_only_and_skips_lm(monkeypatch):
         }
     )
     # Sharder-only hook: returns the CP sharder, does not embed or call the LM.
-    assert isinstance(out, dict)
-    assert set(out) == {"cp_sharder"}
+    assert not out.batch_updates
+    assert not out.batch_updates
 
 
 def test_forward_inputs_embeds_skips_multimodal_scatter_block():

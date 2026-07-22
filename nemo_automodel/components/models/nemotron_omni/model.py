@@ -36,8 +36,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelismSharder,
-    round_robin_local_indices,
-    shard_batch_aux_only,
+    CPModelPreparation,
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
@@ -779,7 +778,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> dict[str, Any]:
+    ) -> CPModelPreparation:
         """Return a sharder-only CP backend; embed + splice + shard happen in forward.
 
         Embedding and the image/video/audio multimodal scatter now run inside
@@ -797,12 +796,7 @@ class NemotronOmniForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEF
             num_chunks: Accepted for hook-signature parity; unused (round-robin CP).
         """
         del batch, num_chunks
-        return {
-            "cp_sharder": ContextParallelismSharder(
-                shard_batch=shard_batch_aux_only,
-                local_token_global_indices=round_robin_local_indices,
-            )
-        }
+        return CPModelPreparation(ContextParallelismSharder.sdpa_aux())
 
     def forward(
         self,

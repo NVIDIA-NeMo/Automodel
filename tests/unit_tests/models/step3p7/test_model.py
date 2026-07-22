@@ -291,8 +291,8 @@ def test_from_pretrained_uses_step3p7_config(monkeypatch):
 def test_prepare_model_inputs_for_cp_is_sharder_only():
     from nemo_automodel.components.distributed.context_parallel.sharder import (
         ContextParallelismSharder,
-        round_robin_local_indices,
-        shard_batch_aux_only,
+        _round_robin_local_indices,
+        _shard_batch_aux_only,
     )
 
     wrapper, _ = _wrapper_with_fake_inner()
@@ -300,12 +300,12 @@ def test_prepare_model_inputs_for_cp_is_sharder_only():
 
     # sharder-only hook: no inputs_embeds (the forward embeds), input_ids kept.
     result = wrapper.prepare_model_inputs_for_cp({"input_ids": input_ids, "image_embeds": torch.randn(1, 8)})
-    assert "inputs_embeds" not in result
-    assert set(result) == {"cp_sharder"}
-    sharder = result["cp_sharder"]
+    assert "inputs_embeds" not in result.batch_updates
+    assert not result.batch_updates
+    sharder = result.sharder
     assert isinstance(sharder, ContextParallelismSharder)
-    assert sharder.shard_batch is shard_batch_aux_only
-    assert sharder.local_token_global_indices is round_robin_local_indices
+    assert sharder.shard_batch is _shard_batch_aux_only
+    assert sharder.local_token_global_indices is _round_robin_local_indices
 
 
 def test_get_pipeline_stage_metas_cp_shards_local_seq_and_mtp():

@@ -137,7 +137,7 @@ class TestMagiState:
         st = MagiState(enabled=True, custom=False, cp_group=None, cp_size=1)
         batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long), "prefix_tree": ([1, 1, 1], [[0, 1], [0, 2]])}
         with pytest.raises(NotImplementedError, match="prefix-tree attention mask is only supported"):
-            st.prepare_llm_batch(model=None, batch=batch, device_mesh=None, is_thd=False, pad_id=0, num_chunks=1)
+            st._prepare_llm_batch(model=None, batch=batch, is_thd=False, pad_id=0, num_chunks=1)
 
     def test_prepare_llm_batch_custom_prefix_tree_ok(self):
         # Custom backend (cp=1, no THD packing) accepts the prefix-tree mask: it
@@ -145,9 +145,7 @@ class TestMagiState:
         st = MagiState(enabled=True, custom=True, cp_group=None, cp_size=1)
         batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long), "prefix_tree": ([1, 1, 1], [[0, 1], [0, 2]])}
         try:
-            _, out, local_indices = st.prepare_llm_batch(
-                model=None, batch=batch, device_mesh=None, is_thd=False, pad_id=0, num_chunks=1
-            )
+            out, local_indices = st._prepare_llm_batch(model=None, batch=batch, is_thd=False, pad_id=0, num_chunks=1)
             assert "prefix_tree" not in out
             # no dispatch ran on this path -> no local-token index map
             assert local_indices is None
@@ -270,17 +268,14 @@ class TestMagiStateVlmBatch:
     def test_prepare_vlm_batch_non_custom_stamps_backbone(self):
         model = _VLM()
         st = MagiState(enabled=True, custom=False, cp_group=None, cp_size=1)
-        train_ctx, batch = st.prepare_vlm_batch(model, {"input_ids": torch.zeros(1, 4, dtype=torch.long)})
-        from contextlib import nullcontext
-
-        assert train_ctx is nullcontext
+        st._prepare_vlm_batch(model, {"input_ids": torch.zeros(1, 4, dtype=torch.long)})
         assert model.language_model.self_attn._magi_self_key is True
 
     def test_prepare_vlm_batch_custom_is_noop(self):
         # custom VLMs use the factory attn_func (active cp_group); no stamping here.
         model = _VLM()
         st = MagiState(enabled=True, custom=True)
-        _, batch = st.prepare_vlm_batch(model, {"input_ids": torch.zeros(1, 4, dtype=torch.long)})
+        st._prepare_vlm_batch(model, {"input_ids": torch.zeros(1, 4, dtype=torch.long)})
         assert not hasattr(model.language_model.self_attn, "_magi_self_key")
 
     def test_make_cp_batch_derives_multimodal_behavior_from_model(self):
@@ -288,7 +283,7 @@ class TestMagiStateVlmBatch:
         st = MagiState(enabled=True, custom=False, cp_group=None, cp_size=1)
         batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
 
-        prepared, local_indices = st.make_cp_batch(None, batch, model=model, return_local_indices=True)
+        prepared, local_indices = st.prepare_batch(batch, model=model)
 
         assert prepared is batch
         assert local_indices is None

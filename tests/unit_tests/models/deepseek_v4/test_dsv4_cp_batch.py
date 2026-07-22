@@ -72,7 +72,8 @@ class _FakeMesh:
 
 def _shard(batch, *, cp_size, local_rank, **kwargs):
     mesh = _FakeMesh(cp_size, local_rank)
-    return make_dsv4_contiguous_shard_cp_batch_and_ctx(mesh, None, batch, **kwargs)
+    prepared = make_dsv4_contiguous_shard_cp_batch_and_ctx(mesh, None, batch, **kwargs)
+    return prepared.context, prepared.batch, prepared.layout
 
 
 # --------------------------------------------------------------------------- #
@@ -154,7 +155,7 @@ def test_contiguous_shard_basic_input_ids():
     }
     ctx, out, _ = _shard(batch, cp_size=2, local_rank=1)
     # context manager factory is the nullcontext class (instantiated by the caller)
-    assert ctx is contextlib.nullcontext
+    assert isinstance(ctx, contextlib.nullcontext)
     # divisor = cp_size * max(pad_multiple or 2, 2) = 4; seq=8 already divisible -> no pad.
     # local_seq = 8 / 2 = 4; rank 1 owns [4:8].
     assert out["input_ids"].shape == (1, 4)
@@ -184,7 +185,7 @@ def test_cp_size_one_native_thd_preserves_packed_batch_without_padding():
 
     ctx, out, _ = _shard(batch, cp_size=1, local_rank=0, pad_multiple=8, padding_token_id=99)
 
-    assert ctx is contextlib.nullcontext
+    assert isinstance(ctx, contextlib.nullcontext)
     assert out["qkv_format"] == "thd"
     assert "_dsv4_cp_group" not in out
     assert "packed_seq_ids" not in out
@@ -504,10 +505,10 @@ def test_prepare_model_inputs_for_cp_returns_sharder():
     fake_self = SimpleNamespace(config=cfg, backend=SimpleNamespace(dispatcher="hybridep"))
     prepared = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, {"input_ids": torch.arange(8).view(1, 8)})
 
-    sharder = prepared["cp_sharder"]
-    from nemo_automodel.components.distributed.context_parallel.sharder import contiguous_local_indices
+    sharder = prepared.sharder
+    from nemo_automodel.components.distributed.context_parallel.sharder import _contiguous_local_indices
 
-    assert sharder.local_token_global_indices is contiguous_local_indices
+    assert sharder.local_token_global_indices is _contiguous_local_indices
     fn = sharder.shard_batch
     # the partial binds the config-derived per-rank multiple (lcm(8,128) == 128)
     assert fn.keywords["pad_multiple"] == 128
@@ -516,8 +517,7 @@ def test_prepare_model_inputs_for_cp_returns_sharder():
 
     # the bound fn shards a batch end-to-end with a real (fake-mesh) divisor.
     batch = {"input_ids": torch.arange(256).view(1, 256), "labels": torch.arange(256).view(1, 256)}
-    _, out, _ = fn(_FakeMesh(2, 0), None, batch)
-    assert out["input_ids"].shape == (1, 128)
+    assert fn(_FakeMesh(2, 0), None, batch).batch["input_ids"].shape == (1, 128)
 
 
 def test_prepare_model_inputs_for_cp_binds_shard_multiple():
@@ -526,8 +526,8 @@ def test_prepare_model_inputs_for_cp_binds_shard_multiple():
     cfg = SimpleNamespace(compress_ratios=[4])
     fake_self = SimpleNamespace(config=cfg, backend=SimpleNamespace(dispatcher="deepep"))
     out = DeepseekV4ForCausalLM.prepare_model_inputs_for_cp(fake_self, {"input_ids": torch.arange(8).view(1, 8)})
-    assert out["cp_sharder"].shard_batch.keywords["pad_multiple"] == 8
-    assert out["cp_sharder"].shard_batch.keywords["sync_packed_length"] is False
+    assert out.sharder.shard_batch.keywords["pad_multiple"] == 8
+    assert out.sharder.shard_batch.keywords["sync_packed_length"] is False
 
 
 def test_setup_cp_attention_stores_group():

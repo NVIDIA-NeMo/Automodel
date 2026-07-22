@@ -54,21 +54,21 @@ def _force_no_dist(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# contiguous_local_indices
+# _contiguous_local_indices
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("cp_size,rank", [(1, 0), (2, 0), (2, 1), (4, 2)])
 def test_contiguous_local_indices(cp_size, rank):
-    indices = cs.contiguous_local_indices(_FakeMesh(cp_size, rank), 8 * cp_size)
+    indices = cs._contiguous_local_indices(_FakeMesh(cp_size, rank), 8 * cp_size)
     assert torch.equal(indices, torch.arange(rank * 8, (rank + 1) * 8))
 
 
 def test_contiguous_local_indices_requires_divisibility():
     with pytest.raises(ValueError, match="divisible"):
-        cs.contiguous_local_indices(_FakeMesh(4, 0), 6)
+        cs._contiguous_local_indices(_FakeMesh(4, 0), 6)
 
 
 # ---------------------------------------------------------------------------
-# round_robin_local_indices (torch context_parallel load-balanced layout)
+# _round_robin_local_indices (torch context_parallel load-balanced layout)
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_round_robin_local_indices_matches_torch_chunk_pairing(cp_size):
@@ -77,26 +77,26 @@ def test_round_robin_local_indices_matches_torch_chunk_pairing(cp_size):
     chunks = torch.arange(seq).view(2 * cp_size, chunk)
     for rank in range(cp_size):
         expected = torch.cat([chunks[rank], chunks[2 * cp_size - 1 - rank]])
-        indices = cs.round_robin_local_indices(_FakeMesh(cp_size, rank), seq)
+        indices = cs._round_robin_local_indices(_FakeMesh(cp_size, rank), seq)
         assert torch.equal(indices, expected)
 
 
 def test_round_robin_local_indices_partition_the_sequence():
     cp_size, seq = 4, 24
-    all_indices = torch.cat([cs.round_robin_local_indices(_FakeMesh(cp_size, r), seq) for r in range(cp_size)])
+    all_indices = torch.cat([cs._round_robin_local_indices(_FakeMesh(cp_size, r), seq) for r in range(cp_size)])
     assert torch.equal(torch.sort(all_indices).values, torch.arange(seq))
 
 
 def test_round_robin_local_indices_requires_divisibility():
     with pytest.raises(ValueError, match="divisible"):
-        cs.round_robin_local_indices(_FakeMesh(2, 0), 6)
+        cs._round_robin_local_indices(_FakeMesh(2, 0), 6)
 
 
 def test_sdpa_sharder_is_available_from_context_parallel_api():
     sharder = ContextParallelismSharder.sdpa()
 
-    assert sharder.shard_batch is cs.shard_batch_load_balanced
-    assert sharder.local_token_global_indices is cs.round_robin_local_indices
+    assert sharder.shard_batch is cs._shard_batch_load_balanced
+    assert sharder.local_token_global_indices is cs._round_robin_local_indices
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +108,8 @@ def test_shard_then_reorder_roundtrip_contiguous(cp_size):
     full = torch.randn(2, seq)
     parts, index_parts = [], []
     for rank in range(cp_size):
-        idx = cs.contiguous_local_indices(_FakeMesh(cp_size, rank), seq)
-        parts.append(cs.shard_token_tensor_by_indices(full, idx, seq_dim=1))
+        idx = cs._contiguous_local_indices(_FakeMesh(cp_size, rank), seq)
+        parts.append(cs._shard_token_tensor_by_indices(full, idx, seq_dim=1))
         index_parts.append(idx)
     rebuilt = cs._reorder_gathered_token_tensor(parts, index_parts, seq_dim=1)
     torch.testing.assert_close(rebuilt, full)
@@ -125,15 +125,15 @@ def test_shard_then_reorder_roundtrip_round_robin():
     # torch CP load balancing: rank r takes chunks (r, 2*cp - r - 1)
     rank_indices = [torch.cat([chunks[r], chunks[2 * cp_size - r - 1]]) for r in range(cp_size)]
     full = torch.randn(1, seq, 3)
-    parts = [cs.shard_token_tensor_by_indices(full, idx, seq_dim=1) for idx in rank_indices]
+    parts = [cs._shard_token_tensor_by_indices(full, idx, seq_dim=1) for idx in rank_indices]
     rebuilt = cs._reorder_gathered_token_tensor(parts, rank_indices, seq_dim=1)
     torch.testing.assert_close(rebuilt, full)
 
 
 def test_gather_token_tensor_identity_without_cp():
     t = torch.randn(1, 6)
-    assert cs.gather_token_tensor_by_indices(_FakeMesh(1), t, torch.arange(6)) is t
-    assert cs.gather_token_tensor_by_indices(None, t, torch.arange(6)) is t
+    assert cs._gather_token_tensor_by_indices(_FakeMesh(1), t, torch.arange(6)) is t
+    assert cs._gather_token_tensor_by_indices(None, t, torch.arange(6)) is t
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +142,7 @@ def test_gather_token_tensor_identity_without_cp():
 def test_sharder_default_shard_token_tensor_uses_indices():
     tokens = cs.CPTokenLayout(
         cp_mesh=_FakeMesh(2, 1),
-        local_token_global_indices=cs.contiguous_local_indices,
+        local_token_global_indices=cs._contiguous_local_indices,
     )
     full = torch.randn(1, 8)
     local = tokens.shard(full, seq_dim=1)
@@ -154,8 +154,8 @@ def test_shard_batch_contiguous_records_shard_layout():
     the token verbs accept caller-coordinate tensors and reject mismatched ones."""
     mesh = _FakeMesh(2, 0)
     batch = {"input_ids": torch.arange(6).unsqueeze(0), "labels": torch.arange(6).unsqueeze(0)}
-    _, _, layout = cs.shard_batch_contiguous(mesh, None, batch)  # pads 6 -> 8
-    tokens = cs.CPTokenLayout(mesh, cs.contiguous_local_indices, layout)
+    prepared = cs.shard_batch_contiguous(mesh, None, batch)  # pads 6 -> 8
+    tokens = cs.CPTokenLayout(mesh, cs._contiguous_local_indices, prepared.layout)
 
     assert (tokens.shard_layout.original_seq_len, tokens.shard_layout.padded_seq_len) == (6, 8)
     # down: unpadded tensor auto-pads with the explicit fill, rank 0 owns [0:4]
@@ -169,7 +169,7 @@ def test_shard_batch_contiguous_records_shard_layout():
     # collective runs in this single-process test, so the gather stays local
     # and the guard must fire rather than mis-trim)
     with pytest.raises(ValueError, match="reported padded_seq_len 8"):
-        tokens.gather(torch.zeros(1, 4), trim=True)
+        tokens.gather(torch.zeros(1, 4))
 
 
 def test_sharder_repositioned_layout_round_trips_input_coordinates():
@@ -180,7 +180,7 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
     positions = torch.tensor([[0, 1, -1]])
     tokens = cs.CPTokenLayout(
         cp_mesh=_FakeMesh(2, 0),
-        local_token_global_indices=cs.contiguous_local_indices,
+        local_token_global_indices=cs._contiguous_local_indices,
         shard_layout=cs.ShardLayout(padded_seq_len=4, input_token_stream_positions=positions),
     )
     local = tokens.shard(torch.tensor([[10.0, 20.0, 99.0]]), fill=0.0)
@@ -192,22 +192,22 @@ def test_sharder_repositioned_layout_round_trips_input_coordinates():
     full_rows = torch.tensor([[10.0, 20.0, 7.0, 7.0]])
     identity_tokens = cs.CPTokenLayout(
         cp_mesh=_FakeMesh(1),
-        local_token_global_indices=cs.contiguous_local_indices,
+        local_token_global_indices=cs._contiguous_local_indices,
         shard_layout=tokens.shard_layout,
     )
-    out = identity_tokens.gather(full_rows, trim=True, fill=-5.0)
+    out = identity_tokens.gather(full_rows, fill=-5.0)
     assert torch.equal(out, torch.tensor([[10.0, 20.0, -5.0]]))
     with pytest.raises(ValueError, match="fill"):
-        identity_tokens.gather(full_rows, trim=True)
+        identity_tokens.gather(full_rows)
 
 
-def test_gather_trim_raises_without_captured_facts():
+def test_gather_without_captured_facts_returns_global_coordinates():
     tokens = cs.CPTokenLayout(
         cp_mesh=_FakeMesh(1),
-        local_token_global_indices=cs.contiguous_local_indices,
+        local_token_global_indices=cs._contiguous_local_indices,
     )
-    with pytest.raises(NotImplementedError, match="no original coordinates"):
-        tokens.gather(torch.zeros(1, 4), trim=True)
+    tensor = torch.zeros(1, 4)
+    assert tokens.gather(tensor) is tensor
 
 
 def test_reported_indices_validate_stream_length():
@@ -252,14 +252,15 @@ def test_shard_batch_contiguous_respects_pad_multiple():
         "input_ids": torch.arange(seq).view(1, seq),
         "labels": torch.arange(seq).view(1, seq),
     }
-    ctx, out, _ = cs.shard_batch_contiguous(
+    prepared = cs.shard_batch_contiguous(
         _FakeMesh(2, 1),
         None,
         batch,
         padding_token_id=9,
         pad_multiple=4,
     )
-    assert ctx is contextlib.nullcontext
+    out = prepared.batch
+    assert isinstance(prepared.context, contextlib.nullcontext)
     assert out["input_ids"].shape == (1, 4)
     # rank 1 slice covers the pad tail: input pad sentinel + label ignore index
     assert out["input_ids"][0, -1].item() == 9
@@ -290,11 +291,11 @@ def test_shard_sequence_for_cp_round_robin_roundtrips_across_ranks():
 
 
 def test_shard_sequence_for_cp_round_robin_matches_round_robin_layout():
-    """The kept positions are exactly this rank's round_robin_local_indices."""
+    """The kept positions are exactly this rank's _round_robin_local_indices."""
     full = torch.arange(8).view(1, 8, 1).float()
     for rank in (0, 1):
         local, idx, _ = cs.shard_sequence_for_cp_round_robin(_FakeMesh(2, rank), full.clone())
-        expected_idx = cs.round_robin_local_indices(_FakeMesh(2, rank), 8)
+        expected_idx = cs._round_robin_local_indices(_FakeMesh(2, rank), 8)
         assert torch.equal(idx, expected_idx)
         torch.testing.assert_close(local, full.index_select(1, expected_idx))
 
@@ -316,7 +317,7 @@ def test_shard_sequence_for_cp_round_robin_identity_without_cp():
 
 
 # ---------------------------------------------------------------------------
-# shard_batch_aux_only vs shard_batch_load_balanced (parity on the aux streams)
+# _shard_batch_aux_only vs _shard_batch_load_balanced (parity on the aux streams)
 # ---------------------------------------------------------------------------
 def test_shard_batch_aux_only_matches_load_balanced(monkeypatch):
     """The aux-only shard pads labels/position_ids/loss_mask identically to the
@@ -330,7 +331,6 @@ def test_shard_batch_aux_only_matches_load_balanced(monkeypatch):
         return contextlib.nullcontext()
 
     monkeypatch.setattr(cs, "_create_context_parallel_ctx", _fake_ctx)
-    monkeypatch.setattr(cs, "_get_train_context", lambda *a, **k: contextlib.nullcontext)
 
     cp_size, seq = 2, 6  # -> pad to 8
     mesh = _FakeMesh(cp_size, 0)
@@ -342,12 +342,12 @@ def test_shard_batch_aux_only_matches_load_balanced(monkeypatch):
         }
 
     batch_lb = make_batch()
-    cs.shard_batch_load_balanced(mesh, None, batch_lb, loss_mask=torch.ones(1, seq))
+    cs._shard_batch_load_balanced(mesh, None, batch_lb, loss_mask=torch.ones(1, seq))
     buffers_lb = captured["buffers"]
 
     batch_aux = make_batch()
     orig_input_ids = batch_aux["input_ids"].clone()
-    cs.shard_batch_aux_only(mesh, None, batch_aux, loss_mask=torch.ones(1, seq))
+    cs._shard_batch_aux_only(mesh, None, batch_aux, loss_mask=torch.ones(1, seq))
     buffers_aux = captured["buffers"]
 
     # aux tensors padded identically (labels -> -100 tail, position_ids -> 0 tail)
@@ -370,10 +370,9 @@ def test_shard_batch_aux_only_reports_padded_layout(monkeypatch):
     """The returned ShardLayout carries the primary stream's target padded length."""
 
     monkeypatch.setattr(cs, "_create_context_parallel_ctx", lambda *a, **k: contextlib.nullcontext())
-    monkeypatch.setattr(cs, "_get_train_context", lambda *a, **k: contextlib.nullcontext)
 
     batch = {"input_ids": torch.arange(6).view(1, 6), "labels": torch.arange(6).view(1, 6)}
-    _, _, layout = cs.shard_batch_aux_only(_FakeMesh(2, 0), None, batch)
+    layout = cs._shard_batch_aux_only(_FakeMesh(2, 0), None, batch).layout
     assert (layout.original_seq_len, layout.padded_seq_len) == (6, 8)
 
 
@@ -384,13 +383,13 @@ def test_shard_batch_contiguous_extra_seq_keys():
         "labels": torch.arange(seq).view(1, seq),
         "vision_ids": torch.arange(seq).view(1, seq),
     }
-    _, out, _ = cs.shard_batch_contiguous(
+    out = cs.shard_batch_contiguous(
         _FakeMesh(2, 0),
         None,
         batch,
         extra_seq_keys={"vision_ids": 1},
         extra_pad_values={"vision_ids": -1},
-    )
+    ).batch
     assert out["vision_ids"].shape == (1, 4)
     torch.testing.assert_close(out["vision_ids"], torch.arange(4).view(1, 4))
     # model-specific keys (e.g. _packed_seq_ids) are the owning model's business
@@ -422,16 +421,18 @@ def test_aux_only_contiguous_slice_equivalence_with_shard_batch_contiguous(cp_si
 
     # Reference: shard everything at the dispatch level.
     ref = make_batch()
-    _, ref_out, ref_layout = cs.shard_batch_contiguous(
+    ref_prepared = cs.shard_batch_contiguous(
         mesh, None, ref, extra_seq_keys={"vision_ids": 1}, extra_pad_values={"vision_ids": -1}
     )
+    ref_out, ref_layout = ref_prepared.batch, ref_prepared.layout
 
     # Aux-only: primary stays full; the model slices it in forward.
     aux = make_batch()
     full_embeds = aux["inputs_embeds"]
-    _, aux_out, aux_layout = cs.shard_batch_contiguous(
+    aux_prepared = cs.shard_batch_contiguous(
         mesh, None, aux, extra_seq_keys={"vision_ids": 1}, extra_pad_values={"vision_ids": -1}, shard_primary=False
     )
+    aux_out, aux_layout = aux_prepared.batch, aux_prepared.layout
     # Primary is left full-length + untouched by the aux-only sharder.
     assert aux_out["inputs_embeds"] is full_embeds
     assert aux_out["inputs_embeds"].shape == (1, seq, hidden)
@@ -449,7 +450,7 @@ def test_aux_only_contiguous_slice_equivalence_with_shard_batch_contiguous(cp_si
     torch.testing.assert_close(aux_out["labels"], ref_out["labels"])
     torch.testing.assert_close(aux_out["position_ids"], ref_out["position_ids"])
     torch.testing.assert_close(aux_out["vision_ids"], ref_out["vision_ids"])
-    torch.testing.assert_close(local_idx, cs.contiguous_local_indices(mesh, padded_len))
+    torch.testing.assert_close(local_idx, cs._contiguous_local_indices(mesh, padded_len))
 
 
 def test_shard_batch_contiguous_aux_only_keeps_input_ids_full(monkeypatch):
@@ -463,7 +464,8 @@ def test_shard_batch_contiguous_aux_only_keeps_input_ids_full(monkeypatch):
         "labels": torch.arange(seq).view(1, seq),
     }
     orig_input_ids = batch["input_ids"].clone()
-    _, out, layout = cs.shard_batch_contiguous(mesh, None, batch, shard_primary=False)
+    prepared = cs.shard_batch_contiguous(mesh, None, batch, shard_primary=False)
+    out, layout = prepared.batch, prepared.layout
     torch.testing.assert_close(out["input_ids"], orig_input_ids)  # full + untouched
     assert out["labels"].shape == (1, 4)  # rank 1 owns [4:8]
     assert out["labels"][0, -1].item() == -100  # pad tail is the ignore index

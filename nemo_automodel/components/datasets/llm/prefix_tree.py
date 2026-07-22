@@ -141,7 +141,7 @@ def prefix_tree_collate_fn(batch: list[dict]) -> dict:
     tokens plus the prefix-tree structure. Only ``local_batch_size == 1`` is
     supported: each group already packs many completions into one flat sequence,
     and the mask is per group. The ``prefix_tree`` entry is popped by the magi
-    backend (``MagiState.prepare_llm_batch``), which builds and activates the
+    backend (``MagiState.prepare_batch``), which builds and activates the
     ``AttnMaskSpec`` from it.
 
     Args:

@@ -393,7 +393,7 @@ def main() -> None:
             device=device,
         )
         train_ctx, batch, labels = _prepare_batch(batch, device_mesh=device_mesh, cp_size=args.cp_size)
-        with train_ctx():
+        with train_ctx:
             outputs = model(**batch)
             if step == 0:
                 _write_activation_debug(

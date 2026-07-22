@@ -21,7 +21,7 @@ import contextlib
 import torch
 import torch.distributed as dist
 
-from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
+from nemo_automodel.components.distributed.context_parallel.sharder import CPShardResult, ShardLayout
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
 
 
@@ -105,7 +105,7 @@ def _packed_cp_layout(batch, *, num_chunks: int) -> ShardLayout | None:
     return None
 
 
-def make_glm_dsa_packed_cp_batch_and_ctx(
+def _prepare_glm_dsa_packed_cp_batch(
     cp_mesh,
     tp_mesh,
     batch,
@@ -142,7 +142,7 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
             cp_rank=cp_rank,
             padding_token_id=padding_token_id,
         )
-        return contextlib.nullcontext, sliced
+        return sliced
 
     chunks = []
     for idx in range(num_chunks):
@@ -163,7 +163,7 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
             stacked[key] = torch.stack([chunk[key] for chunk in chunks])  # type: ignore[list-item]
         else:
             stacked[key] = value
-    return contextlib.nullcontext, stacked
+    return stacked
 
 
 def shard_glm_dsa_packed_cp_batch(
@@ -178,7 +178,7 @@ def shard_glm_dsa_packed_cp_batch(
 ):
     """``ContextParallelismSharder.shard_batch`` wrapper for GLM DSA packed CP."""
     layout = _packed_cp_layout(batch, num_chunks=num_chunks)
-    ctx_factory, sharded_batch = make_glm_dsa_packed_cp_batch_and_ctx(
+    sharded_batch = _prepare_glm_dsa_packed_cp_batch(
         cp_mesh,
         tp_mesh,
         batch,
@@ -187,4 +187,4 @@ def shard_glm_dsa_packed_cp_batch(
         num_chunks=num_chunks,
         seq_lens_padding_value=seq_lens_padding_value,
     )
-    return ctx_factory, sharded_batch, layout
+    return CPShardResult(contextlib.nullcontext(), sharded_batch, layout)

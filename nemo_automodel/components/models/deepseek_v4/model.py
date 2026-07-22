@@ -43,7 +43,7 @@ Compress-ratio sliding-window attention is not yet implemented.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -88,6 +88,9 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.context_parallel.sharder import CPModelPreparation
 
 
 @dataclass
@@ -839,11 +842,10 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         batch: dict[str, Any],
         *,
         num_chunks: int = 1,
-    ) -> dict[str, Any]:
+    ) -> "CPModelPreparation":
         """Model-owned context-parallel batch prep (Miles-style contiguous shard).
 
-        Returns a ``ContextParallelismSharder`` (under the ``"cp_sharder"`` batch key) so
-        the CP dispatch delegates CP sharding back to this
+        Returns a ``CPModelPreparation`` so the CP dispatch delegates sharding back to this
         model, with the config-derived per-rank shard multiple bound. DSV4
         embeds internally, so (unlike VLM models) this does not pre-embed --
         it leaves ``input_ids`` for the sharding callable.
@@ -852,18 +854,17 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
             ContextParallelismSharder,
-            contiguous_local_indices,
+            CPModelPreparation,
         )
 
-        cp_sharder = ContextParallelismSharder(
-            shard_batch=partial(
+        cp_sharder = ContextParallelismSharder.contiguous(
+            partial(
                 make_dsv4_contiguous_shard_cp_batch_and_ctx,
                 pad_multiple=dsv4_cp_local_seq_multiple(self.config),
                 sync_packed_length=self.backend.dispatcher == "hybridep",
-            ),
-            local_token_global_indices=contiguous_local_indices,
+            )
         )
-        return {"cp_sharder": cp_sharder}
+        return CPModelPreparation(cp_sharder)
 
     def forward(
         self,

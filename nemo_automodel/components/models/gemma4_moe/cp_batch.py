@@ -27,7 +27,7 @@ module owns the one Gemma4-specific piece the aux-only shard still needs: the
 builder requires (its pad-region zeros depend on the global pad tail, which the
 forward -- holding only this rank's slice -- cannot reconstruct). Gemma4's
 ``prepare_model_inputs_for_cp`` exposes it through the ``ContextParallelismSharder``
-it returns under the ``"cp_sharder"`` batch key, which the CP dispatch invokes in
+in its typed preparation result, which the CP dispatch invokes in
 place of the default load-balanced ``context_parallel`` path.
 """
 

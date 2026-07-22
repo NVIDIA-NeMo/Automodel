@@ -494,7 +494,7 @@ def test_prepare_model_inputs_is_sharder_only(monkeypatch):
         lambda ids, mask: pytest.fail("prepare_model_inputs_for_cp must not pre-embed under the sunk CP path"),
     )
     prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[1, 42, 3, 4]])})
-    assert set(prepared) == {"cp_sharder"}
+    assert not prepared.batch_updates
 
 
 def test_prepare_model_inputs_consumes_nothing(monkeypatch):
@@ -508,9 +508,9 @@ def test_prepare_model_inputs_consumes_nothing(monkeypatch):
         "mm_token_type_ids": torch.tensor([[0, 1, 0, 0]]),
     }
     prepared = model.prepare_model_inputs_for_cp(batch)
-    assert "input_ids" not in prepared and "pixel_values" not in prepared
-    assert "mm_token_type_ids" not in prepared
-    assert set(prepared) == {"cp_sharder"}
+    assert "input_ids" not in prepared.batch_updates and "pixel_values" not in prepared.batch_updates
+    assert "mm_token_type_ids" not in prepared.batch_updates
+    assert not prepared.batch_updates
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +637,7 @@ def test_prepare_model_inputs_attaches_aux_only_shard_batch_fn():
     model = Gemma4ForConditionalGeneration(_cfg(enable_moe_block=False), backend=_backend()).to(torch.bfloat16)
     prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[1, 2, 3, 4]])})
     # The model attaches its own bound aux-only sharding callable (model-owned seam).
-    assert prepared["cp_sharder"].shard_batch == model._cp_shard_batch_aux_only
+    assert prepared.sharder.shard_batch == model._cp_shard_batch_aux_only
 
 
 # ---------------------------------------------------------------------------

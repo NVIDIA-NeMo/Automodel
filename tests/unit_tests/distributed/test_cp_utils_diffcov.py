@@ -159,7 +159,7 @@ def test_shard_batch_contiguous_builds_padding_mask_from_4d_mask():
 def test_shard_batch_contiguous_labels_from_loss_mask():
     batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
     loss_mask = torch.arange(4).unsqueeze(0)
-    _, out, _ = cm.shard_batch_contiguous(_FakeMesh(size=2, rank=1), None, batch, loss_mask=loss_mask)
+    out = cm.shard_batch_contiguous(_FakeMesh(size=2, rank=1), None, batch, loss_mask=loss_mask).batch
     # promoted to labels (rank 1 slice) and NOT also carried as loss_mask
     assert torch.equal(out["labels"], torch.tensor([[2, 3]]))
     assert "loss_mask" not in out
@@ -186,7 +186,7 @@ def test_shard_batch_contiguous_pads_and_slices_all_keys():
     }
     loss_mask = torch.ones(1, seq, dtype=torch.long)
 
-    _ctx, out, layout = cm.shard_batch_contiguous(
+    prepared = cm.shard_batch_contiguous(
         _FakeMesh(size=cp_size, rank=0),
         None,
         batch,
@@ -195,6 +195,7 @@ def test_shard_batch_contiguous_pads_and_slices_all_keys():
         extra_seq_keys={"vision_extra": 1, "mm_token_type_ids": 1, "per_layer_inputs": 1},
         extra_pad_values={"vision_extra": 0, "mm_token_type_ids": 0, "per_layer_inputs": 0},
     )
+    out, layout = prepared.batch, prepared.layout
     # rank 0 keeps the first local_seq_len=4 positions
     assert out["inputs_embeds"].shape == (1, 4, d)
     assert out["labels"].shape == (1, 4)
@@ -215,7 +216,7 @@ def test_shard_batch_contiguous_uses_dist_rank_when_initialized():
         mock.patch("torch.distributed.is_initialized", return_value=True),
         mock.patch("torch.distributed.get_rank", return_value=0),
     ):
-        _ctx, out, _ = cm.shard_batch_contiguous(_FakeMesh(size=2, rank=0), None, batch)
+        out = cm.shard_batch_contiguous(_FakeMesh(size=2, rank=0), None, batch).batch
     assert out["input_ids"].shape == (1, 2)
 
 
@@ -248,8 +249,8 @@ def test_runtime_routes_thd_batch_to_te_builder():
         "seq_lens": torch.tensor([[4]]),
         "seq_lens_padded": torch.tensor([[4]]),
     }
-    with mock.patch.object(cp_runtime, "make_cp_batch_for_te", return_value=(sentinel, None)) as te:
+    with mock.patch.object(cp_runtime, "_prepare_thd_batch", return_value=(sentinel, None)) as te:
         prepared = cp_runtime.ContextParallelRuntime(device_mesh=dm).prepare_forward(None, batch)
     te.assert_called_once()
-    assert te.call_args.kwargs["return_local_indices"] is True
+    assert te.call_args.kwargs["num_chunks"] == 1
     assert prepared.batch is sentinel
