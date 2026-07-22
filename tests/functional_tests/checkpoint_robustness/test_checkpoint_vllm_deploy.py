@@ -146,6 +146,11 @@ def _resolve_args(custom_args):
     }
 
 
+def _tokenize_for_generation(tokenizer, prompt, device):
+    """Tokenize a prompt using only inputs accepted by causal LM generation."""
+    return tokenizer(prompt, return_tensors="pt", return_token_type_ids=False).to(device)
+
+
 # Extract custom args at module level before pytest processes them.
 _custom_args, _remaining_argv = _extract_custom_args(sys.argv)
 sys.argv = _remaining_argv
@@ -221,7 +226,7 @@ def test_vllm_greedy_matches_hf():
 
     hf_outputs = []
     for idx, prompt in enumerate(PROMPTS):
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        inputs = _tokenize_for_generation(tokenizer, prompt, device)
         with torch.no_grad():
             output_ids = hf_model.generate(**inputs, do_sample=False, max_new_tokens=max_new_tokens)
         generated = output_ids[0, inputs["input_ids"].shape[1] :]
