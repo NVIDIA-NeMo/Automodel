@@ -66,6 +66,62 @@ from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenP
 
 logger = logging.getLogger(__name__)
 
+# Corruption-seed constants. The multiplier is Knuth's multiplicative-hash
+# constant (spreads adjacent global indices into decorrelated seeds); the stream
+# offset (2<<42) decorrelates the corruption RNG from the block-selection
+# (1<<42) and self-conditioning (0) step-seeded generators.
+_CORRUPTION_SEED_MULT = 2654435761
+_CORRUPTION_STREAM_OFFSET = 2 << 42
+_SEED_MASK = (1 << 63) - 1
+
+
+def corruption_sample_seed(
+    base_seed: int,
+    step: int,
+    dp_rank: int,
+    dp_size: int,
+    local_batch_size: int,
+    grad_acc_steps: int,
+    microbatch_idx: int,
+    offset: int,
+) -> int:
+    """Topology-independent per-sample corruption seed.
+
+    ``StatefulDistributedSampler`` shards the shuffled stream strided (rank ``r``
+    owns ``shuffled[r::dp_size]``), so an example at ``(step, dp_rank, microbatch,
+    offset)`` sits at global shuffled position
+    ``step*gbs + dp_rank + (microbatch*local_batch_size + offset)*dp_size`` with
+    ``gbs = local_batch_size * dp_size * grad_acc_steps``. Seeding by that global
+    index makes the noise an example receives independent of parallel topology
+    (``dp_size`` / ``local_batch_size`` / grad-accum) and resume-safe (a pure
+    function of ``(step, sample)``, never the global RNG state).
+
+    Note:
+        Topology-independence assumes the shuffled ``StatefulDistributedSampler``
+        (``dataloader.group_by_length=false``). With ``group_by_length=true`` the
+        ``LengthGroupedSampler`` shards the length-sorted order, so the global-batch
+        composition itself depends on ``dp_size`` and cross-topology reproducibility
+        does not hold there. The two guarantees that do NOT depend on the sampler —
+        TP/CP peers (which share ``dp_rank``) drawing identical noise, and resume
+        reproducing the same noise — hold regardless.
+
+    Args:
+        base_seed: Run seed (``self._self_cond_base_seed``).
+        step: Optimizer step index.
+        dp_rank: Data-parallel rank (sampler convention; TP/CP peers share it).
+        dp_size: Number of data-parallel shards (sampler ``num_replicas``).
+        local_batch_size: Per-rank micro-batch size.
+        grad_acc_steps: Gradient-accumulation micro-batches per optimizer step.
+        microbatch_idx: Micro-batch index within the step.
+        offset: Sample offset within the micro-batch.
+
+    Returns:
+        A 63-bit non-negative seed for ``torch.Generator.manual_seed``.
+    """
+    gbs = local_batch_size * dp_size * grad_acc_steps
+    global_sample_idx = step * gbs + dp_rank + (microbatch_idx * local_batch_size + offset) * dp_size
+    return (base_seed + _CORRUPTION_STREAM_OFFSET + _CORRUPTION_SEED_MULT * global_sample_idx) & _SEED_MASK
+
 
 class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
     """Recipe for dLLM (diffusion LLM) supervised fine-tuning.
@@ -226,42 +282,60 @@ class DiffusionLMSFTRecipe(TrainFinetuneRecipeForNextTokenPrediction):
         Args:
             input_ids: Clean token IDs, shape [B, L].
             loss_mask: Supervised positions mask, shape [B, L].
-            microbatch_idx: Index of this microbatch within the step; folded into
-                the corruption seed so distinct microbatches get distinct noise.
+            microbatch_idx: Index of this microbatch within the step.
 
         Returns:
             Tuple of (noisy_input_ids, noise_mask, p_mask).
         """
-        # Step/dp-rank/microbatch-seeded generator so the corruption noise is a
-        # deterministic function of (step, microbatch, dp_rank) and reproduces exactly
-        # on checkpoint resume. Corruption previously drew from the GLOBAL RNG, whose
-        # state is not faithfully reinstated at the first post-resume draw, so a
-        # resumed run trained on a different noise realization (the resume loss/grad
-        # spike). Mirrors the already-resume-safe block-selection (+1<<42) and
-        # self-conditioning (+0) step-seeded generators; the distinct (+2<<42) offset
-        # decorrelates the three streams. Seeding by DP rank (not global rank) keeps
-        # the noise identical across ranks that share a batch — TP/CP peers all hold
-        # the same dp_rank and MUST corrupt identically, or the sharded forward
-        # all-reduces partial activations computed from different inputs — while
-        # distinct DP ranks (which hold distinct data) still draw distinct noise.
+        # Seed corruption PER SAMPLE by the example's global index in the shuffled
+        # data stream, so the noise a given example receives is independent of the
+        # parallel topology (dp_size / local_batch_size / grad-accum count) and of
+        # which rank happens to process it. Two consequences we rely on:
+        #   1. Topology-independence: the same run at different node counts (e.g.
+        #      1-node vs 4-node) draws identical per-sample noise, so loss curves
+        #      overlap. Seeding by (step, microbatch, dp_rank) did NOT hold this —
+        #      changing dp_size moves a sample to a different rank/microbatch and
+        #      thus a different seed. This mirrors the reference, which draws
+        #      corruption once for the whole global batch before sharding.
+        #   2. Resume-safety: the seed is a pure function of (step, sample), never
+        #      the global RNG state (whose first post-resume draw is not faithfully
+        #      reinstated — the old resume loss/grad spike).
+        #
+        # dp_rank / dp_size use the SAME convention the dataloader sampler used
+        # (_get_dp_rank()/_get_dp_group_size()), so TP/CP peers that share a data
+        # shard also share the seed and MUST corrupt identically — otherwise the
+        # sharded forward all-reduces partial activations from different inputs.
         step = int(self.step_scheduler.step)
-        rank = self._get_dp_rank(include_cp=True) if torch.distributed.is_initialized() else 0
-        seed = (
-            int(getattr(self, "_self_cond_base_seed", 42))
-            + 7919 * step
-            + int(microbatch_idx)
-            + 104729 * rank
-            + (2 << 42)
-        )
-        gen = torch.Generator(device=input_ids.device).manual_seed(seed)
-        return self.dllm_strategy.apply_corruption(
-            input_ids,
-            loss_mask,
-            self.mask_token_id,
-            eps=self.dllm_eps,
-            block_size=self.dllm_block_size,
-            half_life_ratio=self.dllm_half_life_ratio,
-            generator=gen,
+        if torch.distributed.is_initialized():
+            dp_rank = self._get_dp_rank()
+            dp_size = self._get_dp_group_size()
+        else:
+            dp_rank, dp_size = 0, 1
+        bsz = int(input_ids.size(0))
+        # bsz == configured local_batch_size under drop_last + gbs divisibility.
+        grad_acc_steps = int(getattr(self.step_scheduler, "grad_acc_steps", 1))
+        base_seed = int(getattr(self, "_self_cond_base_seed", 42))
+
+        noisy_parts, noise_parts, pmask_parts = [], [], []
+        for j in range(bsz):
+            seed = corruption_sample_seed(base_seed, step, dp_rank, dp_size, bsz, grad_acc_steps, microbatch_idx, j)
+            gen = torch.Generator(device=input_ids.device).manual_seed(seed)
+            n_j, m_j, p_j = self.dllm_strategy.apply_corruption(
+                input_ids[j : j + 1],
+                loss_mask[j : j + 1],
+                self.mask_token_id,
+                eps=self.dllm_eps,
+                block_size=self.dllm_block_size,
+                half_life_ratio=self.dllm_half_life_ratio,
+                generator=gen,
+            )
+            noisy_parts.append(n_j)
+            noise_parts.append(m_j)
+            pmask_parts.append(p_j)
+        return (
+            torch.cat(noisy_parts, dim=0),
+            torch.cat(noise_parts, dim=0),
+            torch.cat(pmask_parts, dim=0),
         )
 
     def _augment_batch_for_model(self, batch, *, clean_input_ids, loss_mask):
