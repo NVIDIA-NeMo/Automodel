@@ -22,6 +22,7 @@ import pytest
 import torch
 import torch.nn as nn
 from PIL import Image
+from transformers.models.mistral3.modeling_mistral3 import Mistral3Model
 from transformers.processing_utils import ProcessorMixin
 
 pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not available in this transformers version")
@@ -29,9 +30,9 @@ pytest.importorskip("transformers.models.ministral3", reason="Ministral3 not ava
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.retrieval import BiEncoderModel, _init_encoder_common, configure_encoder_metadata
 from nemo_automodel.components.models.ministral_bidirectional.model import (
-    Mistral3BidirectionalModel,
     Ministral3BidirectionalConfig,
     Ministral3BidirectionalModel,
+    Mistral3BidirectionalModel,
 )
 from nemo_automodel.components.models.ministral_bidirectional.processor import Mistral3BiEncoderProcessor
 
@@ -400,3 +401,46 @@ def test_mistral3_vlm_liger_patch_targets_text_tower():
         cross_entropy=False,
         fused_linear_cross_entropy=False,
     )
+
+
+def test_mistral3_vlm_runs_dummy_vision_inside_model_forward(monkeypatch):
+    events = []
+    embedding = nn.Embedding(16, 4)
+
+    class FakeVisionTower(nn.Module):
+        patch_size = 2
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+
+    model = Mistral3BidirectionalModel.__new__(Mistral3BidirectionalModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(spatial_merge_size=1)
+    model.vision_tower = FakeVisionTower()
+
+    monkeypatch.setattr(Mistral3BidirectionalModel, "get_input_embeddings", lambda self: embedding)
+
+    def get_image_features(self, pixel_values, image_sizes, return_dict):
+        events.append("vision")
+        return SimpleNamespace(pooler_output=(pixel_values.sum().reshape(1) * self.vision_tower.weight,))
+
+    monkeypatch.setattr(Mistral3BidirectionalModel, "get_image_features", get_image_features)
+
+    def parent_forward(self, **kwargs):
+        events.append("parent")
+        return kwargs
+
+    monkeypatch.setattr(Mistral3Model, "forward", parent_forward)
+
+    outputs = model(
+        input_ids=torch.tensor([[1, 2]]),
+        attention_mask=torch.ones(1, 2, dtype=torch.long),
+        run_dummy_vision=True,
+    )
+
+    assert events == ["vision", "parent"]
+    assert outputs["input_ids"] is None
+    assert outputs["inputs_embeds"].shape == (1, 2, 4)
+    outputs["inputs_embeds"].sum().backward()
+    assert model.vision_tower.weight.grad is not None
