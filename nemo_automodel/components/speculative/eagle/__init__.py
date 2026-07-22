@@ -30,6 +30,8 @@ from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerMod
 from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
+from nemo_automodel.components.speculative.eagle.msd import MSDTrainerModule, MultimodalEagleDraftModel
+from nemo_automodel.components.speculative.eagle.msd_target import HFMSDTargetModel
 from nemo_automodel.components.speculative.eagle.peagle_trainer import PEagleTrainerModule
 from nemo_automodel.components.speculative.eagle.registry import (
     EAGLE1_DRAFT_REGISTRY,
@@ -50,6 +52,9 @@ __all__ = [
     "RunnerEagle3TargetModel",
     "TargetRunner",
     "HFEagleTargetModel",
+    "HFMSDTargetModel",
+    "MSDTrainerModule",
+    "MultimodalEagleDraftModel",
     "HFEagle3TargetModel",
     "LlamaEagleDraftModel",
     "LlamaEagle3DraftModel",
