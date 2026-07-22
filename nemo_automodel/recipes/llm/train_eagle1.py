@@ -296,6 +296,21 @@ class TrainEagle1Recipe(BaseRecipe):
             )
         self.trainer_module = trainer_module
 
+        self._finalize_setup(recipe_cfg=recipe_cfg, target_path=target_path, wandb_name_prefix="eagle1_")
+
+    def _finalize_setup(self, *, recipe_cfg, target_path: str, wandb_name_prefix: str) -> None:
+        """Build the optimizer, schedule, checkpointer, and logging around a ready trainer module.
+
+        Runs once ``self.trainer_module`` / ``self.draft_model`` / the dataloaders
+        exist, so recipes that assemble those differently (e.g. ViSpec's VLM
+        target) share the rest of ``setup()`` instead of copying it.
+
+        Args:
+            recipe_cfg: The ``recipe_args`` config node.
+            target_path: Target model id or path, used for checkpoint metadata
+                and the default W&B run name.
+            wandb_name_prefix: Prefix for the default W&B run name.
+        """
         opt_cfg = self.cfg.optimizer
         self.peak_lr = float(opt_cfg.lr)
         self.optimizer = torch.optim.AdamW(
@@ -360,7 +375,7 @@ class TrainEagle1Recipe(BaseRecipe):
             self.wandb_run = init_wandb_run(
                 self.cfg.wandb.to_dict(),
                 self.cfg.to_dict(),
-                default_name="eagle1_" + str(target_path).rstrip("/").split("/")[-1],
+                default_name=wandb_name_prefix + str(target_path).rstrip("/").split("/")[-1],
             )
 
     def _build_checkpointer(self, target_path: str) -> None:
@@ -647,6 +662,50 @@ class TrainEagle1Recipe(BaseRecipe):
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
 
+    def _compute_metrics(self, batch: dict[str, torch.Tensor]):
+        """Run the frozen target and the draft over one micro-batch.
+
+        Args:
+            batch: Dataloader batch whose tensors are already on ``self.device``.
+                Carries ``input_ids`` / ``attention_mask`` / ``loss_mask``, each
+                of shape [batch, sequence], plus any packing metadata.
+
+        Returns:
+            EagleStepMetrics for this micro-batch. Subclasses that feed the draft
+            different supervision (e.g. ViSpec) override this hook.
+        """
+        target_batch = self.target_wrapper.generate_batch(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            loss_mask=batch["loss_mask"],
+            **_packing_kwargs(batch),
+        )
+        return self.trainer_module(
+            input_ids=target_batch.input_ids,
+            attention_mask=target_batch.attention_mask,
+            loss_mask=target_batch.loss_mask,
+            input_hidden_states=target_batch.input_hidden_states,
+            target_hidden_states=target_batch.target_hidden_states,
+            target_logits=target_batch.target_logits,
+            position_ids=target_batch.position_ids,
+            seq_lens=target_batch.seq_lens,
+            doc_remaining=target_batch.doc_remaining,
+        )
+
+    def _loss_components(self, metrics) -> dict[str, float]:
+        """Return the per-term losses this recipe logs alongside the total.
+
+        Args:
+            metrics: The step metrics returned by :meth:`_compute_metrics`.
+
+        Returns:
+            Mapping of log-suffix to scalar value, logged as ``train/<key>``.
+        """
+        return {
+            "hidden_loss": metrics.hidden_loss.detach().item(),
+            "token_loss": metrics.token_loss.detach().item(),
+        }
+
     def _run_eval(self):
         if self.val_dataloader is None:
             return None
@@ -657,23 +716,7 @@ class TrainEagle1Recipe(BaseRecipe):
         with torch.no_grad():
             for batch in self.val_dataloader:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-                target_batch = self.target_wrapper.generate_batch(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    loss_mask=batch["loss_mask"],
-                    **_packing_kwargs(batch),
-                )
-                metrics = self.trainer_module(
-                    input_ids=target_batch.input_ids,
-                    attention_mask=target_batch.attention_mask,
-                    loss_mask=target_batch.loss_mask,
-                    input_hidden_states=target_batch.input_hidden_states,
-                    target_hidden_states=target_batch.target_hidden_states,
-                    target_logits=target_batch.target_logits,
-                    position_ids=target_batch.position_ids,
-                    seq_lens=target_batch.seq_lens,
-                    doc_remaining=target_batch.doc_remaining,
-                )
+                metrics = self._compute_metrics(batch)
                 total_loss += metrics.loss.detach()
                 total_acc += metrics.accuracy.detach()
                 total_batches += 1
@@ -714,8 +757,8 @@ class TrainEagle1Recipe(BaseRecipe):
 
                 running_loss = 0.0
                 running_acc = 0.0
-                running_hidden_loss = 0.0
-                running_token_loss = 0.0
+                running_components: dict[str, float] = {}
+                running_micro_batches = 0
                 epoch_loss = 0.0
                 micro_step = 0
                 pending_micro_batches = 0
@@ -724,12 +767,6 @@ class TrainEagle1Recipe(BaseRecipe):
                 for batch_idx, batch in enumerate(self.train_dataloader):
                     last_batch_idx = batch_idx
                     batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-                    target_batch = self.target_wrapper.generate_batch(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        loss_mask=batch["loss_mask"],
-                        **_packing_kwargs(batch),
-                    )
                     # Skip DDP's per-micro-batch all-reduce on every micro-batch
                     # except the one an optimizer step immediately follows; that
                     # step's all-reduce covers the whole locally-accumulated window.
@@ -742,24 +779,15 @@ class TrainEagle1Recipe(BaseRecipe):
                     )
                     sync_ctx = nullcontext() if sync_grads else self.trainer_module.no_sync()
                     with sync_ctx:
-                        metrics = self.trainer_module(
-                            input_ids=target_batch.input_ids,
-                            attention_mask=target_batch.attention_mask,
-                            loss_mask=target_batch.loss_mask,
-                            input_hidden_states=target_batch.input_hidden_states,
-                            target_hidden_states=target_batch.target_hidden_states,
-                            target_logits=target_batch.target_logits,
-                            position_ids=target_batch.position_ids,
-                            seq_lens=target_batch.seq_lens,
-                            doc_remaining=target_batch.doc_remaining,
-                        )
+                        metrics = self._compute_metrics(batch)
                         loss = metrics.loss / self.grad_accumulation_steps
                         loss.backward()
 
                     running_loss += metrics.loss.detach().item()
                     running_acc += metrics.accuracy.detach().item()
-                    running_hidden_loss += metrics.hidden_loss.detach().item()
-                    running_token_loss += metrics.token_loss.detach().item()
+                    running_micro_batches += 1
+                    for component_name, component_value in self._loss_components(metrics).items():
+                        running_components[component_name] = running_components.get(component_name, 0.0) + component_value
                     epoch_loss += metrics.loss.detach().item()
                     micro_step += 1
                     pending_micro_batches += 1
@@ -777,7 +805,7 @@ class TrainEagle1Recipe(BaseRecipe):
                         self._maybe_save_step_checkpoint(epoch_idx)
 
                         if self.dist_env.is_main and self.runtime.global_step % self.log_every_steps == 0:
-                            n = self.log_every_steps
+                            n = max(1, running_micro_batches)
                             avg_loss = running_loss / n
                             avg_acc = running_acc / n
                             current_lr = self.lr_scheduler.get_last_lr()[0]
@@ -799,8 +827,7 @@ class TrainEagle1Recipe(BaseRecipe):
                                 {
                                     "train/loss": avg_loss,
                                     "train/accuracy": avg_acc,
-                                    "train/hidden_loss": running_hidden_loss / n,
-                                    "train/token_loss": running_token_loss / n,
+                                    **{f"train/{name}": value / n for name, value in running_components.items()},
                                     "train/lr": current_lr,
                                     "train/grad_norm": float(grad_norm),
                                     "train/epoch": epoch_idx,
@@ -809,8 +836,8 @@ class TrainEagle1Recipe(BaseRecipe):
                             )
                             running_loss = 0.0
                             running_acc = 0.0
-                            running_hidden_loss = 0.0
-                            running_token_loss = 0.0
+                            running_components = {}
+                            running_micro_batches = 0
 
                 # Flush the trailing partial accumulation window. When
                 # ``batches_per_epoch`` is not a multiple of ``grad_accumulation_steps``,
