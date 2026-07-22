@@ -37,7 +37,8 @@ def process_input_for_thd(
             - 'input_ids': Input tensor of shape [batch_size, seq_len] for token IDs or
                 [batch_size, seq_len, hidden_dim] for embeddings (in pipeline parallel scenarios)
             - 'labels': Labels tensor of shape [batch_size, seq_len]
-            - 'position_ids': Position IDs tensor of shape [batch_size, seq_len] (required)
+            - 'position_ids': Position IDs tensor of shape [batch_size, seq_len] for standard
+                RoPE, or [n_rope, batch_size, seq_len] for mRoPE (e.g. Qwen-VL, n_rope=3). Required.
             - 'seq_lens': Sequence lengths tensor of shape [batch_size, num_packs] containing
                 actual sequence lengths (excluding padding/separators). Values matching
                 seq_lens_padding_value indicate padding and are filtered out.
@@ -53,7 +54,9 @@ def process_input_for_thd(
             - 'input_ids': Reshaped tensor of shape [total_tokens] for 2D token IDs or
                 [total_tokens, hidden_dim] for 3D embeddings
             - 'labels': Reshaped labels tensor of shape [total_tokens]
-            - 'position_ids': Reshaped tensor of shape [total_tokens]
+            - 'position_ids': Reshaped tensor of shape [total_tokens] for 2D input, or
+                [n_rope, 1, total_tokens] for 3D mRoPE input (leading rope axis and a
+                placeholder batch axis of size 1 preserved)
             - 'cu_seqlens': Cumulative REAL sequence lengths tensor of shape [num_sequences + 1] (int32)
                 where num_sequences is the total count of non-padded sequences across the batch.
                 Built from seq_lens (the unpadded real lengths). When the trailing pack-pad is
@@ -105,7 +108,22 @@ def process_input_for_thd(
     batch_size, seq_len = input_ids.shape[0], input_ids.shape[1]
     total_tokens = batch_size * seq_len
 
-    position_ids_thd = position_ids.reshape(-1) if position_ids is not None else None
+    # position_ids may be 2D ``[batch, seq]`` (standard RoPE) or 3D
+    # ``[n_rope, batch, seq]`` (mRoPE, e.g. Qwen-VL where n_rope=3 for the
+    # temporal/height/width axes). For mRoPE, collapse the batch and seq axes
+    # into the token axis while keeping the leading rope axis and a placeholder
+    # batch axis of size 1: ``[n_rope, 1, batch*seq]``. The size-1 batch axis
+    # keeps ndim==3 so HF's mRoPE rotary embedding (which expects
+    # ``[n_rope, batch, seq]``) and the model backbone's ndim==3 position_ids
+    # branch both accept it unchanged, rather than the ndim==2 path that would
+    # wrongly re-expand a bare ``[n_rope, tokens]`` tensor. Token order
+    # (batch-major, then seq) matches ``input_ids.reshape(-1)``.
+    if position_ids is None:
+        position_ids_thd = None
+    elif position_ids.dim() == 3:
+        position_ids_thd = position_ids.reshape(position_ids.shape[0], 1, -1)
+    else:
+        position_ids_thd = position_ids.reshape(-1)
     input_ids_thd = input_ids.reshape(total_tokens, -1).squeeze(-1)
     labels_thd = labels.reshape(total_tokens, -1).squeeze(-1)
 
@@ -173,8 +191,12 @@ def process_input_for_thd(
     if max_seqlen is not None:
         result["max_seqlen"] = max_seqlen
 
+    # Pass through any field this function neither transforms nor consumes (e.g.
+    # VLM media tensors like pixel_values / image_grid_thw), tensor or not, so
+    # callers don't need to pop and restore them around the THD conversion.
+    _consumed = {"seq_lens", "seq_lens_padded"}
     for key, value in batch.items():
-        if key not in result and not isinstance(value, torch.Tensor):
+        if key not in result and key not in _consumed:
             result[key] = value
 
     return result
@@ -249,6 +271,9 @@ def split_batch_into_thd_chunks(
         >>> # result['cu_seqlens'][0]: tensor([0, 6, 12], dtype=torch.int32)
         >>> # result['cu_seqlens'][1]: tensor([0, 6, 12], dtype=torch.int32)
     """
+    # NOTE: 3D mRoPE position_ids ([n_rope, batch, seq]) are only validated for the
+    # num_chunks<=1 path (cp_size=1). The multi-chunk stacking below has not been
+    # validated for mRoPE and should not be used for VLM+CP/PP THD yet.
     if num_chunks <= 1:
         return process_input_for_thd(batch, seq_lens_padding_value, padding_token_id)
 

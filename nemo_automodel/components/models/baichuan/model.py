@@ -49,6 +49,10 @@ from transformers.utils import logging
 
 from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
@@ -475,7 +479,9 @@ class BaichuanModel(BaichuanPreTrainedModel):
 # Causal LM head
 # ---------------------------------------------------------------------------
 class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    # lm_head is a weight-normalizing NormHead, so tying it to embed_tokens is
+    # semantically wrong; all shipped Baichuan checkpoints are untied.
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -488,6 +494,7 @@ class BaichuanForCausalLM(HFCheckpointingMixin, BaichuanPreTrainedModel, Generat
 
     def __init__(self, config: BaichuanConfig, **model_kwargs):
         warn_deprecated_model_class("BaichuanForCausalLM")
+        reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.model = BaichuanModel(config)
         self.lm_head = NormHead(config.hidden_size, config.vocab_size, bias=False)

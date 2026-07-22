@@ -38,6 +38,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     load_hf_safetensors_state_dict,
     save_config,
 )
+from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import (
     build_eagle3_dataloader,
@@ -63,12 +64,7 @@ from nemo_automodel.components.speculative.regen_loop import RegenRunner, resolv
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
-from nemo_automodel.recipes.base_recipe import (
-    BaseRecipe,
-    _find_latest_checkpoint,
-    _is_checkpoint_model_config_compatible,
-    _resolve_restore_from_to_ckpt_dir,
-)
+from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
 from nemo_automodel.recipes.llm._spec_train_utils import (
     apply_draft_compile,
     apply_draft_fp8,
@@ -409,6 +405,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # ``DraftSpec``) in ``components/speculative/eagle/registry.py``;
         # no recipe change required.
         draft_spec = resolve_eagle3_draft_spec(architectures)
+        # The EAGLE-3 draft mirrors only the text decoder. For a multimodal target
+        # that config is nested under ``text_config`` (a top-level ``Gemma4Config``
+        # has no ``vocab_size`` / ``hidden_size`` / ``num_hidden_layers`` at all);
+        # text-only targets have none, so fall back to the config itself. Every
+        # draft-side dimension (vocab_size, hidden_size, heads, head_dim, rope, ...)
+        # is read from this base config.
+        _text_config = getattr(target_config, "text_config", None)
+        draft_base_config = _text_config if _text_config is not None else target_config
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(
             target_path,
@@ -441,7 +445,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.cp_mesh = None
         self.dp_mesh = None
         if self.cached_target_path is None:
-            selected_token_ids, selected_token_mask = self._setup_online_target(recipe_cfg, target_path, target_config)
+            selected_token_ids, selected_token_mask = self._setup_online_target(
+                recipe_cfg, target_path, draft_base_config
+            )
         else:
             # The cached-target path never builds a cp mesh (only the colocated
             # target does), so cp_size>1 here would silently fall back to plain DP
@@ -451,11 +457,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     "Context parallelism (cp_size>1) is not supported with a cached target; the "
                     "cached path does not build a cp mesh. Use the colocated target or set cp_size=1."
                 )
-            selected_token_ids, selected_token_mask = self._setup_cached_target(recipe_cfg, target_config)
+            selected_token_ids, selected_token_mask = self._setup_cached_target(recipe_cfg, draft_base_config)
 
-        draft_config = target_config.to_dict()
+        draft_config = draft_base_config.to_dict()
         draft_config["draft_vocab_size"] = int(selected_token_ids.numel())
-        draft_config["target_hidden_size"] = target_config.hidden_size
+        draft_config["target_hidden_size"] = draft_base_config.hidden_size
         draft_config["architectures"] = ["LlamaEagle3DraftModel"]
         # The draft owns an independent ``lm_head`` whose vocab can differ
         # from ``embed_tokens`` (vocab shrinking, ``draft_vocab_size <
@@ -492,16 +498,16 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         draft_config["parallel_drafting"] = parallel_drafting
         mask_token_id = None
         if parallel_drafting:
-            mask_token_id = self._configure_peagle_draft_config(recipe_cfg, draft_config, target_config)
+            mask_token_id = self._configure_peagle_draft_config(recipe_cfg, draft_config, draft_base_config)
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
         # to bf16 while ``nn.Linear`` defaults to fp32, and ``model.fc`` errors
         # with ``expected mat1 and mat2 to have the same dtype``.
-        # Reuse the target's concrete config class (LlamaConfig / Phi3Config / ...)
-        # so architecture-specific defaults like attention_bias and head_dim
-        # flow into the draft.
-        draft_config_obj = type(target_config).from_dict(draft_config)
+        # Reuse the base config's concrete class (LlamaConfig / Phi3Config /
+        # Gemma4TextConfig / ...) so architecture-specific defaults like
+        # attention_bias and head_dim flow into the draft.
+        draft_config_obj = type(draft_base_config).from_dict(draft_config)
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         # Seed draft embeddings from the target: directly from the live target,
         # or from the embeddings stored alongside the offline cache.
@@ -848,7 +854,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             )
         return True
 
-    def _setup_online_target(self, recipe_cfg, target_path, target_config):
+    def _setup_online_target(self, recipe_cfg, target_path, draft_base_config):
         """Live path: load the target model and build the live dataloader.
 
         Sets ``self.target_model`` / ``self.target_wrapper`` /
@@ -942,7 +948,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # mapping -- so the cache only matters for cold starts.
         selected_token_ids, selected_token_mask = load_or_build_eagle3_token_mapping(
             self.train_dataloader,
-            target_vocab_size=target_config.vocab_size,
+            target_vocab_size=draft_base_config.vocab_size,
             draft_vocab_size=recipe_cfg.get("draft_vocab_size", None),
             special_token_ids=special_token_ids,
             cache_path=recipe_cfg.get("selected_token_ids_path", None),
@@ -1115,7 +1121,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             logger.info("Capping target_prefetch_depth %d -> %d (one in-flight request per server).", depth, capped)
         return capped
 
-    def _setup_cached_target(self, recipe_cfg, target_config):
+    def _setup_cached_target(self, recipe_cfg, draft_base_config):
         """Offline path: stream a precomputed cache; no target model is loaded.
 
         Reads the cache manifest for the draft-vocab mapping and loads the stored
@@ -1128,24 +1134,24 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.target_model = None
         self.target_wrapper = None
         manifest = read_manifest(self.cached_target_path)
-        if int(manifest["target_vocab_size"]) != int(target_config.vocab_size):
+        if int(manifest["target_vocab_size"]) != int(draft_base_config.vocab_size):
             raise ValueError(
                 f"EAGLE-3 cache at {self.cached_target_path} was built for target_vocab_size="
-                f"{manifest['target_vocab_size']}, but the configured target has {target_config.vocab_size}. "
+                f"{manifest['target_vocab_size']}, but the configured target has {draft_base_config.vocab_size}. "
                 "The cache does not match this target."
             )
         # The draft's ``fc`` consumes ``target_hidden_size * 3`` aux features; a
         # cache from a different-width target would otherwise crash deep inside
         # ``fc`` with a confusing shape error.
-        expected_aux_dim = int(target_config.hidden_size) * 3
+        expected_aux_dim = int(draft_base_config.hidden_size) * 3
         if int(manifest["aux_hidden_dim"]) != expected_aux_dim:
             raise ValueError(
                 f"EAGLE-3 cache at {self.cached_target_path} has aux_hidden_dim={manifest['aux_hidden_dim']}, "
-                f"but the configured target needs {expected_aux_dim} (hidden_size {target_config.hidden_size} x 3 "
+                f"but the configured target needs {expected_aux_dim} (hidden_size {draft_base_config.hidden_size} x 3 "
                 "aux layers). The cache was built for a different target."
             )
         selected_token_ids = torch.tensor(manifest["selected_token_ids"], dtype=torch.long)
-        selected_token_mask = torch.zeros(int(target_config.vocab_size), dtype=torch.bool)
+        selected_token_mask = torch.zeros(int(draft_base_config.vocab_size), dtype=torch.bool)
         selected_token_mask[selected_token_ids] = True
         self._cached_embed_source = SimpleNamespace(weight=read_target_embeddings(self.cached_target_path))
 
@@ -1358,6 +1364,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             pp_rank=0,
             moe_mesh=None,
         )
+        self._log_checkpoint_retention_policy(self.checkpoint_config)
 
     def _module(self):
         return (
@@ -1391,30 +1398,14 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             return
         self.checkpointer.async_wait()
 
-        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
-        prev_best_pending = getattr(self, "_last_pending_best_checkpoint_info", None)
+        self._complete_pending_checkpoint()
 
         ckpt_root = self.checkpoint_config.checkpoint_dir
         path = os.path.join(str(ckpt_root), f"epoch_{epoch}_step_{step}")
         is_dist_initialized = dist.is_initialized()
         is_rank_0 = (not is_dist_initialized) or dist.get_rank() == 0
-        best_val_metric = (
-            val_loss.get(next(iter(val_loss.keys())) if len(val_loss) == 1 else best_metric_key) if val_loss else None
-        )
-
-        if prev_pending is not None:
-            if is_rank_0:
-                self._update_latest_symlink(prev_pending)
-            setattr(self, "_last_pending_checkpoint_dir", None)
-            if is_dist_initialized:
-                dist.barrier()
-
-        if prev_best_pending is not None:
-            if is_rank_0 and prev_best_pending.get("val") is not None:
-                self._update_best_symlink(prev_best_pending["path"], float(prev_best_pending["val"]))
-            setattr(self, "_last_pending_best_checkpoint_info", None)
-            if is_dist_initialized:
-                dist.barrier()
+        best_metric_name = next(iter(val_loss.keys())) if val_loss and len(val_loss) == 1 else best_metric_key
+        best_val_metric = val_loss.get(best_metric_name) if val_loss else None
 
         if is_rank_0:
             if os.path.exists(path):
@@ -1461,13 +1452,21 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
 
         if getattr(self.checkpointer.config, "is_async", False):
             setattr(self, "_last_pending_checkpoint_dir", path)
-            if best_val_metric is not None:
-                setattr(self, "_last_pending_best_checkpoint_info", {"path": path, "val": float(best_val_metric)})
+            setattr(
+                self,
+                "_last_pending_best_checkpoint_info",
+                {
+                    "path": path,
+                    "val": float(best_val_metric) if best_val_metric is not None else None,
+                    "metric_key": best_metric_name,
+                },
+            )
         else:
             if is_rank_0:
                 self._update_latest_symlink(path)
                 if best_val_metric is not None:
-                    self._update_best_symlink(path, float(best_val_metric))
+                    self._update_best_symlink(path, float(best_val_metric), best_metric_name)
+                self._prune_old_checkpoints()
             if is_dist_initialized:
                 dist.barrier()
 
@@ -1557,7 +1556,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         ckpt_root = self.checkpoint_config.checkpoint_dir
 
         if restore_from:
-            ckpt_dir = _resolve_restore_from_to_ckpt_dir(ckpt_root, restore_from)
+            ckpt_dir = resolve_restore_from_to_checkpoint_dir(ckpt_root, restore_from)
             if ckpt_dir is None:
                 if is_rank_0:
                     logger.warning("restore_from='LATEST' but no checkpoint found in %s", ckpt_root)
@@ -1565,7 +1564,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             if not os.path.isdir(ckpt_dir):
                 raise FileNotFoundError(f"Checkpoint directory does not exist: {ckpt_dir}")
         else:
-            auto = _find_latest_checkpoint(ckpt_root)
+            auto = find_latest_checkpoint(ckpt_root)
             if auto is None:
                 return
             ckpt_dir = str(auto)
@@ -1728,6 +1727,9 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         loop returns, and ``initialize_distributed`` already destroys it at
         process exit.
         """
+        if getattr(self, "checkpointer", None) is not None:
+            _best_effort("finalizing pending checkpoint", self._finalize_pending_checkpoint)
+            _best_effort("closing checkpointer", self.checkpointer.close)
         if getattr(self, "target_wrapper", None) is not None:
             _best_effort("closing target backend", self.target_wrapper.close)
         if getattr(self, "decode_eval_runner", None) is not None:
