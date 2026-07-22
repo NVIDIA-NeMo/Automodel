@@ -80,12 +80,30 @@ class VispecTrainerModule(nn.Module):
         super().__init__()
         self.draft_model = draft_model
         object.__setattr__(self, "_target_lm_head", target_lm_head)
+        object.__setattr__(self, "_cached_lm_head_weight", None)
         self.prob_loss_weight = prob_loss_weight
         self.rank_loss_weight = rank_loss_weight
         self.rank_loss_topk = rank_loss_topk
         if mtp_steps < 0:
             raise ValueError(f"mtp_steps must be >= 0, got {mtp_steps}")
         self.mtp_steps = mtp_steps
+
+    def _lm_head_weight(self) -> torch.Tensor:
+        """Return the frozen target lm_head weight as a plain local tensor.
+
+        An FSDP2-sharded target exposes a DTensor weight; the draft runs under
+        DDP with plain tensors, so it has to be gathered before ``F.linear``.
+        The target is frozen, so the gathered result is cached: resolving it
+        inside the rollout loop would repeat a full ``[vocab, hidden]``
+        all-gather once per rollout, per micro-batch.
+        """
+        weight = self._cached_lm_head_weight
+        if weight is None:
+            weight = self._target_lm_head.weight
+            if hasattr(weight, "full_tensor"):
+                weight = weight.full_tensor()
+            object.__setattr__(self, "_cached_lm_head_weight", weight)
+        return weight
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project hidden states through the frozen target ``lm_head``.
@@ -96,12 +114,7 @@ class VispecTrainerModule(nn.Module):
         Returns:
             Tensor of shape [..., vocab].
         """
-        weight = self._target_lm_head.weight
-        # An FSDP2-sharded target exposes a DTensor weight; the draft runs under
-        # DDP with plain tensors, so gather before ``F.linear``. No-op unsharded.
-        if hasattr(weight, "full_tensor"):
-            weight = weight.full_tensor()
-        return F.linear(hidden_states, weight)
+        return F.linear(hidden_states, self._lm_head_weight())
 
     def forward(
         self,
