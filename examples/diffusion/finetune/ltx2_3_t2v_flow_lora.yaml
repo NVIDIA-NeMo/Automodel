@@ -106,5 +106,6 @@ checkpoint:
   restore_from: null
 
 ci:
-  recipe_owner: pthombre
+  recipe_owner: linnanw
   time: "01:30:00"
+  nodes: 1
