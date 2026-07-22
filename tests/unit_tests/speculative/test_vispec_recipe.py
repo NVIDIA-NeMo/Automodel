@@ -32,6 +32,7 @@ from nemo_automodel.components.speculative.eagle.vispec_target import HFVispecTa
 from nemo_automodel.recipes.llm.train_vispec import (
     TrainVispecRecipe,
     TrainVispecStage1Recipe,
+    _apply_image_token_budget,
     _resolve_image_token_id,
     _seed_draft_initialization,
 )
@@ -71,6 +72,7 @@ class _StubBaseModel(nn.Module):
             An object whose ``hidden_states`` is a 2-tuple of [batch, sequence, hidden].
         """
         embeds = self.embed(input_ids)
+
         class _Output(SimpleNamespace):
             def __getitem__(self, index):
                 if index == 0:
@@ -98,9 +100,7 @@ def _recipe() -> TrainVispecRecipe:
     recipe.draft_model = VispecDraftModel(_config())
     target = _StubTarget()
     recipe.target_wrapper = HFVispecTargetModel(target, image_token_id=IMAGE_TOKEN_ID)
-    recipe.trainer_module = VispecTrainerModule(
-        recipe.draft_model, target_lm_head=target.lm_head, mtp_steps=1
-    )
+    recipe.trainer_module = VispecTrainerModule(recipe.draft_model, target_lm_head=target.lm_head, mtp_steps=1)
     return recipe
 
 
@@ -121,6 +121,26 @@ class TestImageTokenResolution:
         config = SimpleNamespace(image_token_id=None)
         with pytest.raises(ValueError, match="image token"):
             _resolve_image_token_id(config, SimpleNamespace(image_token=None))
+
+
+class TestImageTokenBudget:
+    def test_caps_both_flat_attributes_and_the_size_dict(self):
+        processor = SimpleNamespace(
+            image_processor=SimpleNamespace(max_pixels=99, min_pixels=1, size={"max_pixels": 99, "min_pixels": 1})
+        )
+        _apply_image_token_budget(processor, {"image_max_pixels": 802816, "image_min_pixels": 3136})
+        assert processor.image_processor.max_pixels == 802816
+        assert processor.image_processor.min_pixels == 3136
+        assert processor.image_processor.size == {"max_pixels": 802816, "min_pixels": 3136}
+
+    def test_unset_keys_leave_the_processor_default_alone(self):
+        processor = SimpleNamespace(image_processor=SimpleNamespace(max_pixels=99, min_pixels=1))
+        _apply_image_token_budget(processor, {})
+        assert processor.image_processor.max_pixels == 99
+        assert processor.image_processor.min_pixels == 1
+
+    def test_processor_without_an_image_processor_is_a_no_op(self):
+        _apply_image_token_budget(SimpleNamespace(), {"image_max_pixels": 802816})
 
 
 class TestDraftInitializationSeed:
@@ -156,8 +176,17 @@ class TestComputeMetrics:
 
     def test_loss_components_are_logged_under_vispec_names(self):
         recipe = _recipe()
-        metrics = SimpleNamespace(prob_loss=torch.tensor(1.5), rank_loss=torch.tensor(0.25))
-        assert recipe._loss_components(metrics) == {"prob_loss": 1.5, "rank_loss": 0.25}
+        metrics = SimpleNamespace(
+            prob_loss=torch.tensor(1.5), rank_loss=torch.tensor(0.25), valid_tokens=torch.tensor(37)
+        )
+        assert recipe._loss_components(metrics) == {"prob_loss": 1.5, "rank_loss": 0.25, "valid_tokens": 37.0}
+
+    def test_valid_tokens_is_logged_so_an_empty_loss_mask_is_visible(self):
+        recipe = _recipe()
+        metrics = SimpleNamespace(
+            prob_loss=torch.tensor(0.0), rank_loss=torch.tensor(0.0), valid_tokens=torch.tensor(0)
+        )
+        assert recipe._loss_components(metrics)["valid_tokens"] == 0.0
 
 
 class TestStage1Init:
@@ -280,8 +309,18 @@ class TestRegenerateVlm:
 
     def test_main_rejects_empty_slice(self):
         argv = [
-            "--model", "m", "--dataset", "d", "--image-root", "/i",
-            "--output-dir", "/o", "--start", "10", "--end", "10",
+            "--model",
+            "m",
+            "--dataset",
+            "d",
+            "--image-root",
+            "/i",
+            "--output-dir",
+            "/o",
+            "--start",
+            "10",
+            "--end",
+            "10",
         ]
         with pytest.raises(ValueError, match="must be greater than"):
             regenerate_vlm.main(argv)
@@ -556,7 +595,10 @@ class TestStage1Setup:
 
 
 def test_stage1_recipe_name_resolves():
-    assert resolve_recipe_name("TrainVispecStage1Recipe") == "nemo_automodel.recipes.llm.train_vispec.TrainVispecStage1Recipe"
+    assert (
+        resolve_recipe_name("TrainVispecStage1Recipe")
+        == "nemo_automodel.recipes.llm.train_vispec.TrainVispecStage1Recipe"
+    )
 
 
 def test_main_requires_a_config(monkeypatch):

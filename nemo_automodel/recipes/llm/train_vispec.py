@@ -82,6 +82,40 @@ def _resolve_image_token_id(target_config, processor) -> int:
     return int(processor.tokenizer.convert_tokens_to_ids(image_token))
 
 
+def _apply_image_token_budget(processor, recipe_cfg) -> None:
+    """Clamp the processor's image resolution so vision tokens cannot crowd out the answer.
+
+    A ViSpec batch is truncated to ``seq_length``, and the assistant turn the
+    draft is supervised on sits at the *end* of the sequence. Qwen VL processors
+    default to a per-image ``max_pixels`` large enough to emit more vision tokens
+    than the whole budget, in which case truncation removes the assistant turn
+    outright: the label scan then finds no assistant marker, ``loss_mask`` comes
+    back all zeros, and the step contributes an exactly-zero loss. Capping the
+    resolution keeps room for the answer.
+
+    Args:
+        processor: The target's ``AutoProcessor``.
+        recipe_cfg: The ``recipe_args`` config node. Reads the optional
+            ``image_max_pixels`` / ``image_min_pixels`` keys; a key left unset
+            leaves the processor's own default in place.
+    """
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        return
+    for key in ("image_max_pixels", "image_min_pixels"):
+        value = recipe_cfg.get(key, None)
+        if value is None:
+            continue
+        attribute = key.removeprefix("image_")
+        setattr(image_processor, attribute, int(value))
+        # transformers >= 5 reads the bounds off ``size`` when it is present,
+        # falling back to the flat attributes only when it is not.
+        size = getattr(image_processor, "size", None)
+        if isinstance(size, dict) and attribute in size:
+            size[attribute] = int(value)
+        logger.info("ViSpec: capped processor %s at %d", attribute, int(value))
+
+
 def _seed_draft_initialization(recipe_cfg) -> int:
     """Seed ViSpec draft initialization and training-time stochasticity.
 
@@ -131,6 +165,7 @@ class TrainVispecRecipe(TrainEagle1Recipe):
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(target_path, trust_remote_code=trust_remote_code)
         self.processor = AutoProcessor.from_pretrained(target_path, trust_remote_code=trust_remote_code)
+        _apply_image_token_budget(self.processor, recipe_cfg)
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
         self.target_model = NeMoAutoModelForImageTextToText.from_pretrained(
@@ -154,6 +189,7 @@ class TrainVispecRecipe(TrainEagle1Recipe):
             shuffle=True,
             num_workers=recipe_cfg.get("num_workers", 0),
             distributed=self.dist_env.world_size > 1,
+            inject_fake_image=False,
         )
         self.val_dataloader = None
         if self.cfg.get("val_dataset", None) is not None:
@@ -268,6 +304,11 @@ class TrainVispecRecipe(TrainEagle1Recipe):
         return {
             "prob_loss": metrics.prob_loss.detach().item(),
             "rank_loss": metrics.rank_loss.detach().item(),
+            # A micro-batch whose assistant turn was truncated away has no
+            # supervised position, and the trainer module then contributes an
+            # exactly-zero loss. Without this counter that failure is
+            # indistinguishable from a genuinely small loss.
+            "valid_tokens": float(metrics.valid_tokens.detach().item()),
         }
 
 

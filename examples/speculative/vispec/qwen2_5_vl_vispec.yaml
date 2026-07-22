@@ -45,6 +45,14 @@ recipe_args:
   # Image tokens inflate the sequence well past a text-only conversation of the
   # same turn count; 4096 matches the reference implementation's --max-len.
   seq_length: 4096
+  # Cap the vision tokens per image so the assistant turn survives truncation to
+  # seq_length. Qwen VL processors default to a max_pixels that can emit more
+  # vision tokens than the whole budget, which truncates the answer away: the
+  # label scan then finds no assistant marker, loss_mask is all zeros, and the
+  # step contributes an exactly-zero loss. 1024 * 28 * 28 is roughly 1024 vision
+  # tokens per image, a quarter of the budget. Watch train/valid_tokens: a run
+  # that logs 0 there is supervising nothing.
+  image_max_pixels: 802816
   micro_batch_size: 1
   grad_accumulation_steps: 8
   num_workers: 4
