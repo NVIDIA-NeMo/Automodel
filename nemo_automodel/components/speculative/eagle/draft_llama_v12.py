@@ -107,7 +107,7 @@ class EagleLlamaAttention(nn.Module):
 
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
         attn_weights = attn_weights + attention_mask
-        attn_probs = torch.softmax(attn_weights.float(), dim=-1).to(q.dtype)
+        attn_probs = torch.softmax(attn_weights.float(), dim=-1).to(v.dtype)
         attn_output = torch.matmul(attn_probs, v)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(attn_output)

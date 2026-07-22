@@ -78,6 +78,19 @@ def test_msd_draft_rejects_misaligned_masks() -> None:
         )
 
 
+def test_msd_draft_supports_bfloat16_inputs() -> None:
+    """The draft uses a value-compatible attention probability dtype."""
+    draft = MultimodalEagleDraftModel(_draft_config()).to(dtype=torch.bfloat16)
+    output = draft(
+        inputs_embeds=torch.randn(1, 3, 8, dtype=torch.bfloat16),
+        target_hidden_states=torch.randn(1, 3, 8, dtype=torch.bfloat16),
+        attention_mask=torch.ones(1, 3),
+        image_mask=torch.zeros(1, 3, dtype=torch.bool),
+    )
+
+    assert output.dtype == torch.bfloat16
+
+
 class _PerfectDraft(nn.Module):
     """Return the target features supplied by the test batch."""
 
