@@ -16,8 +16,9 @@
 
 ViSpec (arXiv:2509.15235) trains in two stages:
 
-1. **Stage 1 -- text only.** Plain EAGLE-1/2 training on a text corpus; use
-   ``TrainEagle2Recipe``. The resulting draft has no vision modules yet.
+1. **Stage 1 -- text only.** EAGLE-1/2 training on a text corpus, with the
+   ranking term ViSpec adds to it (``rank_loss_weight``); see
+   ``TrainVispecStage1Recipe``. The resulting draft has no vision modules yet.
 2. **Stage 2 -- vision aware.** This recipe. It loads the stage-1 draft through
    ``recipe_args.draft_init_from``, adds the image adaptor and the global-image
    projection, and trains on image+text conversations whose assistant turns were
@@ -448,6 +449,13 @@ class TrainVispecStage1Recipe(TrainEagle1Recipe):
             hidden_loss_weight=float(recipe_cfg.get("hidden_loss_weight", 1.0)),
             token_loss_weight=float(recipe_cfg.get("token_loss_weight", 0.1)),
             feature_noise=float(recipe_cfg.get("feature_noise", 0.1)),
+            # ViSpec's stage 1 is EAGLE plus a ranking term, not plain EAGLE: the
+            # reference optimizes v_w * vloss + p_w * (ploss + 0.1 * rloss) with
+            # v_w=1.0 and p_w=0.1, so ListMLE carries an effective weight of 0.01.
+            # Stage 2 then leans on that ranking ability heavily, which a stage 1
+            # trained without it never developed.
+            rank_loss_weight=float(recipe_cfg.get("rank_loss_weight", 0.01)),
+            rank_loss_topk=int(recipe_cfg.get("rank_loss_topk", 10)),
         ).to(self.device)
         if self.dist_env.world_size > 1:
             trainer_module = DistributedDataParallel(

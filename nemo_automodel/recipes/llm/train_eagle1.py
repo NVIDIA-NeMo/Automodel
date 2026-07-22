@@ -701,10 +701,15 @@ class TrainEagle1Recipe(BaseRecipe):
         Returns:
             Mapping of log-suffix to scalar value, logged as ``train/<key>``.
         """
-        return {
+        components = {
             "hidden_loss": metrics.hidden_loss.detach().item(),
             "token_loss": metrics.token_loss.detach().item(),
         }
+        # Only present when the optional ranking term is enabled, so EAGLE-1/2
+        # runs do not gain an always-zero series.
+        if getattr(metrics, "rank_loss", None) is not None:
+            components["rank_loss"] = metrics.rank_loss.detach().item()
+        return components
 
     def _run_eval(self):
         if self.val_dataloader is None:

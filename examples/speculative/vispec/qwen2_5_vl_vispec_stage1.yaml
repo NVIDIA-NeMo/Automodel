@@ -27,6 +27,13 @@ recipe_args:
   hidden_loss_weight: 1.0
   token_loss_weight: 0.1
   feature_noise: 0.1
+  # ViSpec's stage 1 is EAGLE plus a ListMLE ranking term over the target's
+  # top-k. The reference optimizes v_w * vloss + p_w * (ploss + 0.1 * rloss)
+  # with v_w=1.0 and p_w=0.1, so the ranking term carries an effective weight of
+  # 0.01. Stage 2 leans on that ranking ability heavily, so a stage 1 trained
+  # without it starts stage 2 with a much larger rank_loss to work off.
+  rank_loss_weight: 0.01
+  rank_loss_topk: 10
   freeze_embeddings: true
   target_force_hf: true
   trust_remote_code: false
