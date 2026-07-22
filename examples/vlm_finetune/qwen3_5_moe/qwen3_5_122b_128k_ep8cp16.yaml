@@ -17,10 +17,11 @@
 # activation checkpointing. The 128-rank layout is CP16 x DP8; EP8 is composed
 # over that mesh by the MoE parallelizer.
 #
-# This topology completed a 10-step, 128K validation run on mixed text, image,
-# and video data containing individual approximately 120K-token examples. The
-# public MedPix dataset below keeps this example reproducible; its 128K packs
-# are assembled from independent single-image samples.
+# The corresponding Amber campaign completed 10-step, 128K validation runs on
+# mixed text, image, and video data containing individual approximately
+# 120K-token examples. The public MedPix dataset below keeps this example
+# reproducible; its 128K packs are assembled from independent single-image
+# samples.
 #
 # Example Slurm allocation (16 nodes x 8 GPUs):
 #   srun --nodes=16 --ntasks-per-node=1 automodel \
@@ -153,9 +154,9 @@ optimizer:
   master_weights: true
   master_weight_dtype: torch.float32
   store_param_remainders: true
-  # The first moment uses BF16 to keep the 122B DP8 layout within 80GB;
-  # retain FP32 for the master weights and numerically sensitive second moment.
-  exp_avg_dtype: torch.bfloat16
+  # The validated 128-rank shape has enough headroom for conservative FP32
+  # first and second moments in addition to FP32 master weights.
+  exp_avg_dtype: torch.float32
   exp_avg_sq_dtype: torch.float32
 
 lr_scheduler:
