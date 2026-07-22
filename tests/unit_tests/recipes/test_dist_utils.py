@@ -20,6 +20,7 @@ Typed validation tests live in ``tests/unit_tests/distributed/test_mesh.py``.
 import pytest
 import torch
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.config import (
     DDPConfig,
     DistributedSetup,
@@ -30,6 +31,7 @@ from nemo_automodel.components.distributed.config import (
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
 from nemo_automodel.recipes._dist_utils import (
+    _distributed_cfg_to_dict,
     create_distributed_setup_from_config,
     parse_distributed_section,
 )
@@ -333,6 +335,19 @@ class TestActivationCheckpointingParsing:
         assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] is True
 
+    @pytest.mark.parametrize("strategy", ["fsdp2", "ddp"])
+    def test_scope_forwarded_to_strategy_config(self, strategy):
+        result = parse_distributed_section(
+            {
+                "strategy": strategy,
+                "activation_checkpointing": True,
+                "activation_checkpointing_scope": "language",
+            }
+        )
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["strategy_config"].activation_checkpointing_scope == ("language",)
+        assert result["activation_checkpointing"] is True
+
     def test_selective_parsed_for_fsdp2_when_no_ep(self):
         result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "selective", "ep_size": 1})
         # AC is kept off the strategy config and carried on the parsed value.
@@ -342,6 +357,11 @@ class TestActivationCheckpointingParsing:
     def test_full_string_normalized_to_true(self):
         result = parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "full"})
         # "full" normalizes to True and is carried on the parsed value, not the strategy config.
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["activation_checkpointing"] is True
+
+    def test_full_string_normalized_to_true_for_ddp(self):
+        result = parse_distributed_section({"strategy": "ddp", "activation_checkpointing": "full"})
         assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] is True
 
@@ -355,9 +375,10 @@ class TestActivationCheckpointingParsing:
         assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] == "selective"
 
-    def test_selective_rejected_for_non_fsdp2(self):
-        with pytest.raises(ValueError, match="FSDP2"):
-            parse_distributed_section({"strategy": "ddp", "activation_checkpointing": "selective"})
+    def test_selective_allowed_for_ddp(self):
+        result = parse_distributed_section({"strategy": "ddp", "activation_checkpointing": "selective"})
+        assert result["strategy_config"].activation_checkpointing is False
+        assert result["activation_checkpointing"] == "selective"
 
     def test_unknown_activation_checkpointing_mode_rejected(self):
         with pytest.raises(ValueError, match="activation_checkpointing"):
@@ -370,24 +391,6 @@ class TestActivationCheckpointingParsing:
         # infrastructure._with_activation_checkpointing, not here.
         assert result["strategy_config"].activation_checkpointing is False
         assert result["activation_checkpointing"] == "selective"
-
-    def test_selective_allowed_for_ep(self):
-        # Selective AC is now supported with expert parallelism via the MoE
-        # parallelizer. For EP it is kept off the strategy config and carried on
-        # the parsed value (consumed by parallelize_model -> apply_ac).
-        result = parse_distributed_section(
-            {"strategy": "fsdp2", "activation_checkpointing": "selective", "ep_size": 2, "moe": {}}
-        )
-        assert result["strategy_config"].activation_checkpointing is False
-        assert result["activation_checkpointing"] == "selective"
-
-    def test_selective_rejected_for_non_fsdp2(self):
-        with pytest.raises(ValueError, match="FSDP2"):
-            parse_distributed_section({"strategy": "ddp", "activation_checkpointing": "selective"})
-
-    def test_unknown_activation_checkpointing_mode_rejected(self):
-        with pytest.raises(ValueError, match="activation_checkpointing"):
-            parse_distributed_section({"strategy": "fsdp2", "activation_checkpointing": "sometimes"})
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +624,33 @@ class TestCreateDistributedSetupFromConfigWorldSizeAutoDetect:
         assert result.strategy_config.activation_checkpointing is False
         assert result.activation_checkpointing is True
 
+    def test_top_level_dist_env_timeout_passed_to_mesh(self, patched_mesh):
+        create_distributed_setup_from_config(
+            {
+                "distributed": {
+                    "strategy": "fsdp2",
+                    "pp_size": 2,
+                    "pipeline": {},
+                },
+                "dist_env": {"timeout_minutes": 30},
+            },
+            world_size=4,
+        )
+
+        assert patched_mesh["timeout_minutes"] == 30
+
+    def test_explicit_timeout_overrides_cfg_timeout(self, patched_mesh):
+        create_distributed_setup_from_config(
+            {
+                "distributed": {"strategy": "fsdp2"},
+                "dist_env": {"timeout_minutes": 10},
+            },
+            timeout_minutes=45,
+            world_size=4,
+        )
+
+        assert patched_mesh["timeout_minutes"] == 45
+
     @pytest.mark.parametrize("strategy", ["megatron_fsdp", "megatron-fsdp", "mfsdp"])
     def test_programmatic_megatron_fsdp_names(self, strategy, patched_mesh):
         result = create_distributed_setup_from_config(strategy=strategy, world_size=1)
@@ -647,3 +677,31 @@ class TestCreateDistributedSetupFromConfigWorldSizeAutoDetect:
 
         assert result.strategy_config.sequence_parallel is True
         assert result.strategy_config.defer_fsdp_grad_sync is False
+
+    def test_none_cfg_builds_default_fsdp2(self, patched_mesh):
+        """``cfg=None`` resolves to the default FSDP2 setup on the given world size (the
+        path dspark's ``shard_dense_target`` uses when a config omits ``distributed:``)."""
+        result = create_distributed_setup_from_config(None, world_size=4)
+
+        assert isinstance(result, DistributedSetup)
+        assert isinstance(result.strategy_config, FSDP2Config)
+        assert patched_mesh["world_size"] == 4
+
+    def test_confignode_without_distributed_block_fails_loud(self, patched_mesh):
+        """A config object lacking the ``distributed:`` block keeps its fail-loud contract:
+        a mis-nested block in a config that requires one must not silently build a default
+        FSDP2 setup. Callers with an optional block pass ``None`` instead."""
+        with pytest.raises(AttributeError):
+            create_distributed_setup_from_config(ConfigNode({}), world_size=4)
+
+    def test_confignode_with_distributed_block_is_honoured(self, patched_mesh):
+        """A present ``distributed:`` block on a ConfigNode is read from the object path."""
+        result = create_distributed_setup_from_config(ConfigNode({"distributed": {"strategy": "ddp"}}), world_size=2)
+
+        assert isinstance(result.strategy_config, DDPConfig)
+        assert patched_mesh["world_size"] == 2
+
+
+def test_distributed_cfg_to_dict_confignode_with_block_returns_block():
+    cfg = ConfigNode({"distributed": {"strategy": "fsdp2", "dp_size": 4}})
+    assert _distributed_cfg_to_dict(cfg) == {"strategy": "fsdp2", "dp_size": 4}

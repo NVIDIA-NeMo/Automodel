@@ -1,0 +1,59 @@
+# DFlash draft training with tensor parallelism on the target.
+#
+# TP shards the frozen target's linears across the "tp" device submesh so a
+# target that does not fit on one GPU can still supply hidden-state context. The
+# draft is small and stays replicated: it runs data-parallel over the "dp" axis
+# (which excludes "tp"), so every TP rank in a draft replica sees the same batch.
+# The trainer holds the target's lm_head / embed_tokens as non-registered
+# references (DDP sees only the draft) and gathers their vocab-sharded (DTensor)
+# outputs back to plain tensors. Notes:
+#   * TP requires the fsdp2 strategy and world_size > 1; tp_size must divide the
+#     number of GPUs and the target's attention head count.
+#     dp_size = world_size / (tp_size * pp_size).
+#   * The target must expose a tensor-parallel plan (Qwen3 dense does).
+#
+# Run (single node, tp_size=2 over 2 GPUs):
+#   automodel examples/speculative/dflash/qwen3_dflash_tp.yaml \
+#       --nproc-per-node 2 --distributed.tp_size=2
+
+recipe: TrainDFlashRecipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-8B
+  train_data_path: /path/to/perfectblend_qwen3-8b_regen.jsonl   # regenerate responses with the target model first
+  val_data_path: null
+  output_dir: ./outputs/dflash_qwen3_8b_tp
+  seq_length: 3072
+  micro_batch_size: 4
+  grad_accumulation_steps: 1
+  num_workers: 4
+  num_epochs: 6
+
+  # --- DFlash-specific ---
+  draft_num_hidden_layers: 5
+  block_size: 16
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  mask_token_id: 151669               # REQUIRED reserved token for non-anchor block positions
+  attention_backend: flex_attention
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+
+distributed:
+  strategy: fsdp2
+  tp_size: 2
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: false

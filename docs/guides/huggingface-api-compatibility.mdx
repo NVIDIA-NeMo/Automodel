@@ -57,7 +57,7 @@ These APIs follow familiar Hugging Face Transformers patterns for model loading,
 NeMo AutoModel introduces several optimizations and architectural changes to improve training efficiency and hardware utilization.
 
 - **Performance features**: NeMo AutoModel can automatically apply optional kernel patches and optimizations (e.g., SDPA selection, Liger kernels, DeepEP, etc.) while keeping the public model API the same.
-- **Distributed training stack**: NeMo AutoModel recipes and CLI are designed for multi-GPU and multi-node fine-tuning with PyTorch-native distributed features (FSDP2, pipeline parallelism, etc.).
+- **Distributed training stack**: NeMo AutoModel recipes and CLI are designed for multi-GPU and multi-node fine-tuning with PyTorch-native distributed features (FSDP2, pipeline parallelism, etc.). When loading models directly from Python, pass a [`DistributedSetup`](/development/distributed-setup) via `from_pretrained(..., distributed_setup=...)` to enable tensor, pipeline, context, and expert parallelism.
 - **CUDA expectation**: NeMo AutoModel `NeMoAutoModel*` wrappers are primarily optimized for NVIDIA GPU workflows and offer support for CPU workflows as well.
 
 <Info>

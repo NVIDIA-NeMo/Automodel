@@ -21,6 +21,11 @@
 
 cd /opt/Automodel
 
+# VLM recipes need qwen-vl-utils/opencv from the opt-in vlm-media extra, kept out of the image.
+case "$CONFIG_PATH" in
+    *vlm_finetune*) uv pip install ".[vlm-media]" ;;
+esac
+
 CONFIG_RESOLVER="python3 /opt/Automodel/tests/ci_tests/scripts/config_resolver.py"
 TEST_DIR="$PIPELINE_DIR/$TEST_NAME"
 mkdir -p "$TEST_DIR"
@@ -82,8 +87,15 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
     --phase checkpoint_robustness \
     --output "$TEST_DIR/robustness_config.yaml")
 
+  ROBUSTNESS_TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py"
+  case "$CONFIG_PATH" in
+    *vlm_finetune*)
+      ROBUSTNESS_TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_vlm.py"
+      ;;
+  esac
+
   ROBUSTNESS_CMD="${CMD} --tee 3 --log-dir $TEST_DIR/robustness_logs \
-    -m pytest --tb=short tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
+    -m pytest --tb=short ${ROBUSTNESS_TEST_SCRIPT} \
     --config ${RESOLVED_ROBUSTNESS_CONFIG}"
 
   echo "============================================"

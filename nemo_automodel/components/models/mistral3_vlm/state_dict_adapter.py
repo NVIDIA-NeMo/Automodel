@@ -21,7 +21,7 @@ handles **FP8 dequantization** during load/save:
   * The checkpoint's language_model Linear weights are stored as per-tensor
     FP8 with a scalar ``weight_scale_inv`` sibling (and an unused
     ``activation_scale`` sibling). The adapter pairs each weight with its
-    scale on load, dequantizes to bf16 (``w_bf16 = w_fp8.to(bf16) * scale``),
+    scale on load, dequantizes through fp32 (``w_bf16 = (w_fp8.float() * scale.float()).bfloat16()``),
     and drops the scale keys. Vision tower + multi_modal_projector + lm_head
     are BF16 on disk and pass through unchanged.
 
@@ -89,11 +89,33 @@ def _dequantize_from_fp8(
     (``transformers.integrations.finegrained_fp8.Fp8Dequantize.convert``,
     finegrained_fp8.py:867-906) is not needed here.
     """
-    return weight_fp8.to(target_dtype) * scale_inv.to(target_dtype)
+    return (weight_fp8.float() * scale_inv.float()).to(target_dtype)
 
 
 def _identity(k: str) -> str:
     return k
+
+
+_MISTRAL3P5_128B_NUM_HIDDEN_LAYERS = 88
+
+
+def _config_attr(config: Any | None, attr: str) -> Any:
+    if isinstance(config, dict):
+        return config.get(attr)
+    return getattr(config, attr, None)
+
+
+def _is_mistral3p5_128b_config(config: Any | None) -> bool:
+    text_config = _config_attr(config, "text_config")
+    return (
+        _config_attr(text_config, "model_type") == "ministral3"
+        and _config_attr(text_config, "num_hidden_layers") == _MISTRAL3P5_128B_NUM_HIDDEN_LAYERS
+    )
+
+
+def _uses_identity_vlm_layout(config: Any | None) -> bool:
+    """Return True for FP8 VLM checkpoints whose disk keys already match HF."""
+    return _is_mistral3p5_128b_config(config)
 
 
 # The runtime ``Mistral3ForConditionalGeneration`` puts body modules under
@@ -161,14 +183,19 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
         self._not_fp8_prefixes = tuple(not_fp8_prefixes)
 
     @classmethod
-    def for_vlm_full(cls) -> "Mistral3FP8StateDictAdapter":
+    def for_vlm_full(cls, config: Any | None = None) -> "Mistral3FP8StateDictAdapter":
         """Full-VLM path for Mistral3ForConditionalGeneration checkpoints.
 
-        The runtime module keeps VLM body modules under ``model.*`` but the
-        checkpoint stores text weights under ``language_model.model.*`` and
-        non-text component names at top level. The **LM head** has one extra
-        quirk: the model exposes it at the top level (``lm_head.weight``) while
-        the checkpoint nests it (``language_model.lm_head.weight``).
+        Mistral3 FP8 VLM checkpoints have two observed body-key layouts. The
+        Mistral-Medium-3.5 128B checkpoint already stores keys in the same
+        layout as HF's VLM ``state_dict()`` (``model.language_model.*`` /
+        ``model.vision_tower.*`` / ``model.multi_modal_projector.*``). Newer
+        Ministral/Devstral-style checkpoints store text weights under
+        ``language_model.model.*`` and non-text component names at top level.
+
+        The **LM head** has one extra quirk in the nested layout: the model
+        exposes it at the top level (``lm_head.weight``) while the checkpoint
+        nests it (``language_model.lm_head.weight``).
         Tied checkpoints (Ministral-3) never serialize the head, so the head
         translation is a harmless no-op there; untied checkpoints (Devstral-24B)
         rely on it to find the head during the DCP load.
@@ -183,6 +210,8 @@ class Mistral3FP8StateDictAdapter(StateDictAdapter):
             "model.multi_modal_projector",
             # "lm_head" already in _NON_QUANTIZED_SUFFIXES via suffix match.
         )
+        if _uses_identity_vlm_layout(config):
+            return cls(layout_name="vlm_full_identity", not_fp8_prefixes=not_fp8)
         return cls(
             native_to_hf=_vlm_full_native_to_hf,
             hf_to_native=_vlm_full_hf_to_native,

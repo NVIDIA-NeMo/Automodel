@@ -34,9 +34,11 @@ class TinyModel(nn.Module):
 class FakeMesh:
     """Simple stand-in for a named DeviceMesh-like object."""
 
-    def __init__(self, mapping: dict, ndim: int = 1):
+    def __init__(self, mapping: dict, ndim: int = 1, mesh_dim_names: tuple = (), flatten_mapping: dict | None = None):
         self._mapping = dict(mapping)
         self.ndim = ndim
+        self.mesh_dim_names = mesh_dim_names
+        self._flatten_mapping = flatten_mapping or {}
 
     def __getitem__(self, key):
         if key not in self._mapping:
@@ -47,14 +49,18 @@ class FakeMesh:
 class FakeSubmesh:
     """A 1-D submesh stub returned from a 2-D mesh lookup."""
 
-    def __init__(self, mapping: dict | None = None):
+    def __init__(self, mapping: dict | None = None, size: int = 1):
         self.ndim = 1
         self._mapping = mapping or {}
+        self._size = size
 
     def __getitem__(self, key):
         if key not in self._mapping:
             raise KeyError(key)
         return self._mapping[key]
+
+    def size(self):
+        return self._size
 
 
 # ---------------------------------------------------------------------------
@@ -217,13 +223,44 @@ class TestGetDionMesh:
         mesh = object()  # no ndim attribute
         assert self._call(mesh) is mesh
 
-    def test_multidim_mesh_extracts_submesh(self):
-        inner_submesh = FakeSubmesh()
-        inner_submesh.ndim = 1
-        dp_2d = FakeSubmesh({"dp_shard_cp": inner_submesh})
-        mesh = FakeMesh({("dp_replicate", "dp_shard_cp"): dp_2d}, ndim=2)
+    def test_multidim_cp1_mesh_uses_native_dp_shard(self):
+        dp_shard = FakeSubmesh(size=8)
+        mesh = FakeMesh(
+            {
+                "dp_replicate": FakeSubmesh(size=1),
+                "dp_shard": dp_shard,
+                "cp": FakeSubmesh(size=1),
+            },
+            ndim=5,
+            mesh_dim_names=("dp_replicate", "dp_shard", "cp"),
+        )
         result = self._call(mesh)
-        assert result is inner_submesh
+        assert result is dp_shard
+
+    def test_multidim_cp_mesh_uses_flattened_dp_shard_cp(self):
+        dp_shard_cp = FakeSubmesh(size=16)
+        mesh = FakeMesh(
+            {
+                "dp_replicate": FakeSubmesh(size=1),
+                "dp_shard": FakeSubmesh(size=8),
+                "cp": FakeSubmesh(size=2),
+            },
+            ndim=5,
+            mesh_dim_names=("dp_replicate", "dp_shard", "cp"),
+            flatten_mapping={"dp_shard_cp": dp_shard_cp},
+        )
+        result = self._call(mesh)
+        assert result is dp_shard_cp
+
+    def test_multidim_mesh_uses_legacy_composed_dp_mesh(self):
+        dp_mesh = FakeSubmesh()
+        mesh = FakeMesh(
+            {("dp_replicate", "dp_shard_cp"): dp_mesh},
+            ndim=2,
+            mesh_dim_names=("dp_replicate", "dp_shard_cp"),
+        )
+        result = self._call(mesh)
+        assert result is dp_mesh
 
     def test_multidim_mesh_fallback_on_key_error(self):
         mesh = FakeMesh({}, ndim=2)
@@ -307,14 +344,20 @@ class TestBuildDionOptimizer:
         _, mesh_kwargs = self._build(monkeypatch, FakeDionConfig(), mesh=mesh, mesh_kwarg=None)
         assert mesh_kwargs == {}
 
-    def test_resolves_submesh_from_multidim(self, monkeypatch):
-        """A multi-dim mesh is reduced to its 1-D dp_shard_cp submesh."""
-        inner = FakeSubmesh()
-        inner.ndim = 1
-        dp_2d = FakeSubmesh({"dp_shard_cp": inner})
-        mesh = FakeMesh({("dp_replicate", "dp_shard_cp"): dp_2d}, ndim=2)
+    def test_resolves_native_dp_shard_from_cp1_multidim(self, monkeypatch):
+        """A cp=1 multi-dim mesh is reduced to its native 1-D dp_shard submesh."""
+        dp_shard = FakeSubmesh(size=8)
+        mesh = FakeMesh(
+            {
+                "dp_replicate": FakeSubmesh(size=1),
+                "dp_shard": dp_shard,
+                "cp": FakeSubmesh(size=1),
+            },
+            ndim=5,
+            mesh_dim_names=("dp_replicate", "dp_shard", "cp"),
+        )
         _, mesh_kwargs = self._build(monkeypatch, FakeDionConfig(), mesh=mesh)
-        assert mesh_kwargs == {"distributed_mesh": inner}
+        assert mesh_kwargs == {"distributed_mesh": dp_shard}
 
     def test_none_mesh_returns_empty(self, monkeypatch):
         """device_mesh=None yields no mesh kwargs."""

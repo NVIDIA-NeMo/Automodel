@@ -168,3 +168,32 @@ def test_generate_batch_drops_hf_flags_for_custom_backbone():
     input_ids, attn, loss = _batch()
     out = target.generate_batch(input_ids, attn, loss)
     assert out.hidden_states.shape == (2, 8, 2 * _HIDDEN)
+
+
+# --- teacher-logit capture (JetSpec forward-KL distillation) ---
+
+
+def test_capture_logits_off_by_default():
+    """DFlash does not need teacher logits; the wrapper leaves them None by default."""
+    target = HFDFlashTargetModel(_FakeHFCausalLM(), target_layer_ids=[1, 3])
+    out = target.generate_batch(*_batch(batch=2, seq=8))
+    assert out.logits is None
+
+
+def test_capture_logits_returns_hf_output_logits():
+    """capture_logits=True keeps the HF output's ``.logits`` (full-vocab teacher dist)."""
+    model = _FakeHFCausalLM()
+    target = HFDFlashTargetModel(model, target_layer_ids=[1, 3], capture_logits=True)
+    input_ids, attn, loss = _batch(batch=2, seq=8)
+    out = target.generate_batch(input_ids, attn, loss)
+    assert out.logits is not None
+    assert out.logits.shape == (2, 8, _VOCAB)
+    assert torch.isfinite(out.logits).all()
+
+
+def test_capture_logits_handles_bare_tensor_return():
+    """A custom backbone that returns a bare logits tensor (no ``.logits``) is captured as-is."""
+    target = HFDFlashTargetModel(_FakeCustomCausalLM(), target_layer_ids=[0, 2], capture_logits=True)
+    out = target.generate_batch(*_batch(batch=2, seq=8))
+    assert out.logits is not None
+    assert out.logits.shape == (2, 8, _VOCAB)

@@ -14,12 +14,20 @@
 
 """Tests for mesh_utils: get_flat_mesh, get_submesh, _unflatten_compat utilities."""
 
+import datetime
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+import nemo_automodel.components.distributed.mesh_utils as mesh_utils
+from nemo_automodel.components.distributed.mesh import MeshAxisName, ParallelismSizes
 from nemo_automodel.components.distributed.mesh_utils import (
+    _create_fsdp2_device_mesh,
+    _create_moe_mesh,
+    _init_named_mesh,
+    _MeshSpec,
+    _register_flattened_axes,
     _unflatten_compat,
     get_flat_mesh,
     get_fsdp_dp_mesh,
@@ -48,6 +56,124 @@ def test_distributed_package_exports_user_entrypoints():
     assert distributed.MeshContext is MeshContext
     assert distributed.ParallelismSizes is ParallelismSizes
     assert distributed.initialize_distributed is initialize_distributed
+
+
+def test_init_named_mesh_sets_nccl_timeout_backend_override(monkeypatch):
+    captured: dict = {}
+    fake_mesh = Mock()
+
+    def fake_init_device_mesh(**kwargs):
+        captured.update(kwargs)
+        return fake_mesh
+
+    monkeypatch.setattr(mesh_utils, "init_device_mesh", fake_init_device_mesh)
+    monkeypatch.setattr(mesh_utils, "_mesh_device_type", lambda: "cuda")
+
+    result = _init_named_mesh(_MeshSpec(shape=(2,), axes=(MeshAxisName.PP,)), timeout_minutes=30)
+
+    assert result is fake_mesh
+    backend, options = captured["backend_override"][MeshAxisName.PP]
+    assert backend == "nccl"
+    assert options._timeout == datetime.timedelta(minutes=30)
+
+
+def test_init_named_mesh_omits_backend_override_for_cpu(monkeypatch):
+    captured: dict = {}
+    fake_mesh = Mock()
+
+    def fake_init_device_mesh(**kwargs):
+        captured.update(kwargs)
+        return fake_mesh
+
+    monkeypatch.setattr(mesh_utils, "init_device_mesh", fake_init_device_mesh)
+    monkeypatch.setattr(mesh_utils, "_mesh_device_type", lambda: "cpu")
+
+    _init_named_mesh(_MeshSpec(shape=(2,), axes=(MeshAxisName.PP,)), timeout_minutes=30)
+
+    assert captured["backend_override"] is None
+
+
+def test_flattened_axes_inherit_nccl_timeout():
+    flattened_mesh = Mock()
+    source_mesh = Mock()
+    source_mesh.device_type = "cuda"
+    source_mesh._flatten = Mock(return_value=flattened_mesh)
+    device_mesh = Mock()
+    device_mesh.device_type = "cuda"
+    device_mesh._flatten_mapping = {}
+    device_mesh.__getitem__ = Mock(return_value=source_mesh)
+
+    _register_flattened_axes(
+        device_mesh,
+        {MeshAxisName.DP_CP: (MeshAxisName.DP_SHARD, MeshAxisName.CP)},
+        timeout_minutes=30,
+    )
+
+    backend, options = source_mesh._flatten.call_args.kwargs["backend_override"]
+    assert backend == "nccl"
+    assert options._timeout == datetime.timedelta(minutes=30)
+    assert device_mesh._flatten_mapping[MeshAxisName.DP_CP] is flattened_mesh
+
+
+def test_flattened_axes_omit_nccl_timeout_when_unconfigured():
+    source_mesh = Mock()
+    device_mesh = Mock()
+    device_mesh.device_type = "cuda"
+    device_mesh._flatten_mapping = {}
+    device_mesh.__getitem__ = Mock(return_value=source_mesh)
+
+    _register_flattened_axes(
+        device_mesh,
+        {MeshAxisName.DP_CP: (MeshAxisName.DP_SHARD, MeshAxisName.CP)},
+    )
+
+    assert source_mesh._flatten.call_args.kwargs["backend_override"] is None
+
+
+def test_fsdp2_forwards_nccl_timeout_to_moe_mesh(monkeypatch):
+    device_mesh = Mock()
+    moe_mesh = Mock()
+    monkeypatch.setattr(mesh_utils, "_init_named_mesh", Mock(return_value=device_mesh))
+    create_moe_mesh = Mock(return_value=moe_mesh)
+    monkeypatch.setattr(mesh_utils, "_create_moe_mesh", create_moe_mesh)
+
+    result = _create_fsdp2_device_mesh(
+        ParallelismSizes(dp_size=8, ep_size=2),
+        world_size=8,
+        timeout_minutes=30,
+    )
+
+    assert result == (device_mesh, moe_mesh)
+    create_moe_mesh.assert_called_once_with(
+        device_mesh,
+        ep_shard_size=4,
+        ep_size=2,
+        pp_size=1,
+        timeout_minutes=30,
+        ranks=None,
+    )
+
+
+def test_moe_ep_groups_inherit_nccl_timeout():
+    moe_mesh = Mock()
+    flat_mesh = Mock()
+    flat_mesh.device_type = "cuda"
+    flat_mesh._unflatten = Mock(return_value=moe_mesh)
+    source_mesh = Mock()
+    source_mesh._flatten = Mock(return_value=flat_mesh)
+    device_mesh = Mock()
+    device_mesh.device_type = "cuda"
+    device_mesh.__getitem__ = Mock(return_value=source_mesh)
+
+    result = _create_moe_mesh(device_mesh, ep_shard_size=4, ep_size=32, timeout_minutes=30)
+
+    source_mesh._flatten.assert_called_once_with()
+    unflatten_override = flat_mesh._unflatten.call_args.kwargs["backend_override"]
+    for axis in (MeshAxisName.EP_SHARD, MeshAxisName.EP):
+        backend, options = unflatten_override[axis]
+        assert backend == "nccl"
+        assert options._timeout == datetime.timedelta(minutes=30)
+    assert result is moe_mesh
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +344,43 @@ class TestUnflattenCompat:
         result = _unflatten_compat(flat_mesh, 0, (2, 4), ("dp_replicate", "dp_shard_cp"))
 
         flat_mesh._unflatten.assert_called_once_with(0, (2, 4), ("dp_replicate", "dp_shard_cp"))
+        assert result is expected
+
+    def test_native_unflatten_receives_backend_override(self):
+        expected = Mock()
+        flat_mesh = Mock()
+        flat_mesh.device_type = "cuda"
+        flat_mesh._unflatten = Mock(return_value=expected)
+
+        result = _unflatten_compat(
+            flat_mesh,
+            0,
+            (4, 32),
+            ("ep_shard", "ep"),
+            timeout_minutes=30,
+        )
+
+        backend_override = flat_mesh._unflatten.call_args.kwargs["backend_override"]
+        for backend, options in backend_override.values():
+            assert backend == "nccl"
+            assert options._timeout == datetime.timedelta(minutes=30)
+        assert result is expected
+
+    def test_native_unflatten_omits_backend_override_for_cpu(self):
+        expected = Mock()
+        flat_mesh = Mock()
+        flat_mesh.device_type = "cpu"
+        flat_mesh._unflatten = Mock(return_value=expected)
+
+        result = _unflatten_compat(
+            flat_mesh,
+            0,
+            (4, 32),
+            ("ep_shard", "ep"),
+            timeout_minutes=30,
+        )
+
+        flat_mesh._unflatten.assert_called_once_with(0, (4, 32), ("ep_shard", "ep"))
         assert result is expected
 
     def test_fallback_when_unflatten_missing(self):
@@ -408,15 +571,16 @@ class TestGetFsdpDpMesh:
     # Branch 3 – dp_replicate = 1, cp > 1
     # ------------------------------------------------------------------
 
-    def test_cp_only_returns_shard_cp_tuple_slice(self):
-        """dp_replicate=1, cp>1 → device_mesh[("dp_shard","cp")]."""
+    def test_cp_only_returns_flattened_shard_cp_mesh(self):
+        """dp_replicate=1, cp>1 → device_mesh["dp_shard_cp"]."""
         mesh = self._make_mesh(self._ALL_NATIVE_DIMS, {"dp_replicate": 1, "cp": 4})
+        shard_cp_mesh = Mock()
+        mesh._get_root_mesh = Mock(return_value=mesh)
+        mesh._flatten_mapping = {"dp_shard_cp": shard_cp_mesh}
 
         result = get_fsdp_dp_mesh(mesh)
 
-        mesh.__getitem__.assert_any_call(("dp_shard", "cp"))
-        assert result._key == ("dp_shard", "cp")
-        assert result._mesh is mesh
+        assert result is shard_cp_mesh
 
     # ------------------------------------------------------------------
     # Branch 4 – dp_replicate > 1 AND cp > 1 → get_submesh fallback

@@ -14,6 +14,8 @@
 
 """Unit tests for the Mistral3 FP8 VLM state-dict adapter."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -92,7 +94,7 @@ class TestIsFp8WeightKey:
 # _dequantize_from_fp8                                                        #
 # --------------------------------------------------------------------------- #
 class TestDequantizeFromFp8:
-    """w_bf16 = w_fp8.to(bf16) * scale_inv.to(bf16)."""
+    """w_bf16 = (w_fp8.float() * scale_inv.float()).bfloat16()."""
 
     def test_per_tensor_scale_multiply(self):
         # FP8 e4m3 has limited precision; pick exact-representable values.
@@ -109,6 +111,17 @@ class TestDequantizeFromFp8:
         out = _dequantize_from_fp8(w_fp8, scale, target_dtype=torch.float32)
         assert out.dtype == torch.float32
         assert torch.allclose(out, torch.tensor([2.0, 4.0]))
+
+    def test_multiplies_in_float32_before_casting(self):
+        w_fp8 = torch.tensor([-240.0], dtype=torch.float8_e4m3fn)
+        scale = torch.tensor(1e-5, dtype=torch.float32)
+
+        out = _dequantize_from_fp8(w_fp8, scale, target_dtype=torch.bfloat16)
+
+        expected = (w_fp8.float() * scale).bfloat16()
+        low_precision = w_fp8.bfloat16() * scale.bfloat16()
+        assert torch.equal(out, expected)
+        assert not torch.equal(out, low_precision)
 
 
 # --------------------------------------------------------------------------- #
@@ -163,6 +176,29 @@ class TestForVlmFullFactory:
         assert a._hf_to_native("language_model.lm_head.weight") == "lm_head.weight"
         # Round-trips back to the model name.
         assert a._hf_to_native(a._native_to_hf("lm_head.weight")) == "lm_head.weight"
+
+    def test_mistral_medium_35_uses_identity_body_layout(self):
+        # Mistral-Medium-3.5 128B stores full-VLM keys in the same layout as
+        # HF's runtime state_dict. Remapping the body to language_model.model.*
+        # makes DCP request keys that are absent from that checkpoint.
+        cfg = SimpleNamespace(text_config=SimpleNamespace(model_type="ministral3", num_hidden_layers=88))
+        a = Mistral3FP8StateDictAdapter.for_vlm_full(cfg)
+        assert a._layout_name == "vlm_full_identity"
+        for key in (
+            "model.language_model.embed_tokens.weight",
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.vision_tower.patch_conv.weight",
+            "model.multi_modal_projector.linear_1.weight",
+            "lm_head.weight",
+        ):
+            assert a._native_to_hf(key) == key
+            assert a._hf_to_native(key) == key
+
+    def test_smaller_mistral3_configs_keep_nested_body_layout(self):
+        cfg = SimpleNamespace(text_config=SimpleNamespace(model_type="ministral3", num_hidden_layers=36))
+        a = Mistral3FP8StateDictAdapter.for_vlm_full(cfg)
+        assert a._layout_name == "vlm_full"
+        assert a._native_to_hf("model.language_model.embed_tokens.weight") == "language_model.model.embed_tokens.weight"
 
 
 # --------------------------------------------------------------------------- #
@@ -310,6 +346,16 @@ class TestToHf:
         assert "language_model.lm_head.weight_scale_inv" not in out
         # Original dtype preserved (no FP8 cast for the non-quantized head).
         assert out["language_model.lm_head.weight"].dtype == torch.bfloat16
+
+    def test_mistral_medium_35_quantization_keeps_identity_body_keys(self):
+        a = Mistral3FP8StateDictAdapter.for_vlm_full(
+            {"text_config": {"model_type": "ministral3", "num_hidden_layers": 88}}
+        )
+        w_key = "model.language_model.layers.0.self_attn.q_proj.weight"
+        out = a.to_hf({w_key: torch.zeros(2, 2, dtype=torch.bfloat16)}, quantization=True)
+        assert w_key in out
+        assert "language_model.model.layers.0.self_attn.q_proj.weight" not in out
+        assert w_key + "_scale_inv" in out
 
     def test_exclude_key_regex(self):
         a = self._adapter()

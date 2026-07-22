@@ -22,8 +22,14 @@ from .delta_lake_dataset import (  # noqa: F401
 )
 from .nanogpt_dataset import NanogptDataset  # noqa: F401
 from .neat_packing import neat_pack_dataset  # noqa: F401
-from .retrieval_collator import BiEncoderCollator, CrossEncoderCollator  # noqa: F401
+from .retrieval_collator import (  # noqa: F401
+    BiEncoderCollator,
+    CrossEncoderCollator,
+    ProcessorMethodCollator,
+    make_vision_collator_from_processor_method,
+)
 from .retrieval_dataset import make_retrieval_dataset  # noqa: F401
+from .retrieval_distill_collator import BiEncoderDistillCollator  # noqa: F401
 from .squad import make_squad_dataset  # noqa: F401
 from .xlam import make_xlam_dataset  # noqa: F401
 
@@ -34,7 +40,10 @@ __all__ = [
     "make_xlam_dataset",
     "make_agent_chat_dataset",
     "BiEncoderCollator",
+    "BiEncoderDistillCollator",
     "CrossEncoderCollator",
+    "ProcessorMethodCollator",
+    "make_vision_collator_from_processor_method",
     "ColumnMappedTextInstructionDataset",
     "ColumnMappedTextInstructionIterableDataset",
     "ChatDataset",

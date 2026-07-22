@@ -172,6 +172,18 @@ def test_default_registry_has_static_entries():
         assert arch_name in inst.model_arch_name_to_cls.keys()
 
 
+def test_llama_nemotron_vl_registry_entry_is_retrieval_model():
+    """Llama Nemotron VL should be registered as a retrieval architecture."""
+    from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING, ModelRegistry
+
+    assert MODEL_ARCH_MAPPING["LlamaNemotronVLModel"] == (
+        "nemo_automodel.components.models.llama_nemotron_vl.model",
+        "LlamaNemotronVLModel",
+        {"retrieval"},
+    )
+    assert ModelRegistry.has_retrieval_model("LlamaNemotronVLModel")
+
+
 def test_step3p7_registry_and_custom_config_registration():
     """Step3p7 VLM support is available through the lazy registry and AutoConfig."""
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
@@ -290,6 +302,43 @@ def test_custom_config_registrations_in_config_mapping():
     )
 
 
+def test_kimi_k2_config_loads_without_trust_remote_code(tmp_path):
+    """Kimi-K2 uses DeepseekV3Config and should not require remote config code."""
+    import json
+
+    from transformers import AutoConfig
+
+    import nemo_automodel._transformers.registry  # noqa: F401
+    from nemo_automodel.components.models.kimi_k2.config import KimiK2Config
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV3ForCausalLM"],
+                "auto_map": {
+                    "AutoConfig": "configuration_deepseek.DeepseekV3Config",
+                    "AutoModel": "modeling_deepseek.DeepseekV3Model",
+                    "AutoModelForCausalLM": "modeling_deepseek.DeepseekV3ForCausalLM",
+                },
+                "hidden_size": 64,
+                "model_type": "kimi_k2",
+                "num_attention_heads": 8,
+                "num_hidden_layers": 2,
+                "vocab_size": 256,
+            }
+        )
+    )
+
+    cfg = AutoConfig.from_pretrained(tmp_path, trust_remote_code=False)
+
+    from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+
+    assert isinstance(cfg, KimiK2Config)
+    assert isinstance(cfg, DeepseekV3Config)
+    assert cfg.model_type == "kimi_k2"
+    assert cfg.architectures == ["DeepseekV3ForCausalLM"]
+
+
 def test_kimi_k25_arch_alias_in_model_arch_mapping():
     """KimiK25ForConditionalGeneration (checkpoint arch) must map to KimiK25VLForConditionalGeneration."""
     from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
@@ -362,3 +411,27 @@ def test_all_model_folders_registered_in_auto_map():
         f"in MODEL_ARCH_MAPPING (registry.py). Add an entry for each architecture "
         f"exported by these modules."
     )
+
+
+def test_minimax_m3_vl_config_overrides_transformers_builtin():
+    """Our MiniMaxM3VLConfig must win the AutoConfig registration even when transformers ships its own.
+
+    transformers 5.12 added a native ``minimax_m3_vl`` model_type (same class
+    names as ours). The skip-if-built-in registration then handed the native
+    config to our custom MiniMaxM3SparseForConditionalGeneration, whose vision
+    encoder reads ``config.rope_theta`` that the native vision config does not
+    carry -> AttributeError at model init. ``_CUSTOM_CONFIG_OVERRIDES_BUILTIN``
+    forces our config class for such model_types.
+    """
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
+
+    resolved = CONFIG_MAPPING["minimax_m3_vl"]
+    assert resolved is MiniMaxM3VLConfig, (
+        f"AutoConfig resolves minimax_m3_vl to {resolved.__module__}.{resolved.__name__}; "
+        "expected the nemo_automodel config class. The custom model's vision encoder "
+        "requires our config fields (e.g. rope_theta)."
+    )
+    # The concrete field the crash was about: our vision sub-config must default it.
+    assert MiniMaxM3VLConfig().vision_config.rope_theta is not None

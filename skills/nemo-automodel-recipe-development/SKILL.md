@@ -11,6 +11,7 @@ metadata:
 ---
 
 # NeMo AutoModel Recipe Development
+<!-- NVSkills signature refresh requested for AM-519. -->
 
 ## Instructions
 

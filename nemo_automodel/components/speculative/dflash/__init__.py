@@ -24,8 +24,14 @@ from nemo_automodel.components.speculative.dflash.core import (
     DFlashStepMetrics,
     DFlashTrainerModule,
     NoValidAnchorsError,
+    compute_accept_len,
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
+)
+from nemo_automodel.components.speculative.dflash.domino_core import (
+    DominoStepMetrics,
+    DominoTrainerModule,
+    get_lambda_base,
 )
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import (
     Qwen3DFlashDraftModel,
@@ -45,6 +51,10 @@ __all__ = [
     "NoValidAnchorsError",
     "create_dflash_block_mask",
     "create_dflash_sdpa_mask",
+    "DominoTrainerModule",
+    "DominoStepMetrics",
+    "compute_accept_len",
+    "get_lambda_base",
     "Qwen3DFlashDraftModel",
     "build_target_layer_ids",
     "extract_context_feature",

@@ -68,7 +68,7 @@ Configs without this key will produce an error with guidance on which target to 
 | Knowledge distillation | `nemo_automodel.recipes.llm.kd.KnowledgeDistillationRecipeForNextTokenPrediction` |
 | Benchmarking | `nemo_automodel.recipes.llm.benchmark.BenchmarkingRecipeForNextTokenPrediction` |
 | Sequence classification | `nemo_automodel.recipes.llm.train_seq_cls.TrainFinetuneRecipeForSequenceClassification` |
-| Biencoder training | `nemo_automodel.recipes.biencoder.train_biencoder.TrainBiencoderRecipe` |
+| Bi-encoder training | `nemo_automodel.recipes.retrieval.train_bi_encoder.TrainBiEncoderRecipe` |
 
 ### Launcher Configuration Moved to YAML
 
@@ -77,10 +77,10 @@ entirely within the YAML config file rather than through CLI arguments.
 
 | Launcher | YAML section |
 |---|---|
-| Kubernetes | `k8s:` |
+| Kubernetes (via SkyPilot) | `skypilot:` with `cloud: kubernetes` |
 | NeMo Run | `nemo_run:` |
 
-If none of these sections are present, the job runs locally (interactive mode).
+If neither section is present, the job runs locally (interactive mode).
 
 ### SLURM: Script-Based Submission
 
@@ -99,21 +99,40 @@ detects the distributed environment and executes the recipe in-process.
 All cluster-specific configuration lives in the sbatch script where you can
 see and edit it directly.
 
-### Lightweight CLI-Only Install
+### CLI Install Extra
 
-A new `automodel[cli]` install extra is available for login nodes or environments
-where you only need to submit jobs (SLURM, k8s, NeMo-Run) without running
-training locally:
+The `cli` optional dependency extra adds NeMo Run. PyYAML is declared in both
+the package's base dependencies and the `cli` extra:
 
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install "nemo-automodel[cli]"
 ```
-pip install nemo-automodel[cli]
+
+Optional extras are additive, so this still installs all base dependencies,
+including PyTorch. NeMo Run is already included in the extra and does not need
+to be installed separately.
+
+### Media Dependencies Are Opt-In
+
+The FFmpeg-bearing media dependencies (OpenCV, decord, the Qwen vision utils, and
+imageio-ffmpeg) are now opt-in extras, installed neither by default nor in the
+Docker container.
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install "nemo-automodel[vlm,vlm-media]"              # VLM video / Qwen / Mistral
+uv pip install "nemo-automodel[diffusion,diffusion-media]"  # diffusion preprocessing / export
 ```
 
-This installs only `pyyaml` — no PyTorch, no CUDA dependencies. It is enough
-to submit jobs through SLURM or Kubernetes. If you also need NeMo Run, install it
-separately (`pip install nemo-run`). If you try to run a local/interactive job
-with the CLI-only install, you will get a clear error message with instructions
-to install the full package.
+Two consequences when upgrading:
+
+- `[vlm]` alone no longer trains Qwen2.5-VL, Qwen3-Omni, or Mistral VLMs — add `vlm-media`.
+- `[all]` no longer includes the media extras — add them with `uv pip install "nemo-automodel[media]"` in the activated environment.
+
+See the [Installation Guide](/get-started/installation#media-extras-video--image-decode) for details.
 
 ### CLI Module Lives Inside the Package
 

@@ -29,7 +29,9 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 10
+  # The first interleaved PP backward pass can spend more than 10 minutes in
+  # downstream compile/compute before rank 0 receives gradients.
+  timeout_minutes: 30
 
 rng:
   _target_: nemo_automodel.components.training.rng.StatefulRNG

@@ -97,17 +97,12 @@ training to fit on H100-80GB.
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
-
-```bash
-pip install nemo-automodel
-```
-
-**2. Clone the repo** to get the example recipes:
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
+uv sync --locked --all-groups --all-extras --extra vlm-media
 ```
 
 <Note>
@@ -118,7 +113,7 @@ for multi-node setup. Inference / single-node fine-tune fits in
 
 </Note>
 
-**3. Run the recipe** via Slurm (see the
+**2. Run the recipe** via Slurm (see the
 [fine-tuning guide](/recipes-e2e-examples/mistral-medium-3-5) for a
 complete launch script):
 
@@ -142,7 +137,13 @@ docker run --gpus all -it --rm \
 cd /opt/Automodel
 ```
 
-**3. Run the recipe**:
+**3. Install media dependencies** (not installed in the container by default):
+
+```bash
+uv pip install ".[vlm-media]"
+```
+
+**4. Run the recipe**:
 
 ```bash
 automodel --nproc-per-node=8 examples/vlm_finetune/mistral3p5/mistral3p5_128b_medpix.yaml
