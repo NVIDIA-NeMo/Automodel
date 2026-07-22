@@ -344,6 +344,16 @@ def sdpa_backend_snapshot_context_fn() -> tuple[AbstractContextManager, Abstract
     return nullcontext(), sdpa_kernel(captured)
 
 
+def _registered_child_name(module: nn.Module, attr: str, child: nn.Module) -> str | None:
+    """Return the registered name for a child reached through an attribute."""
+    if module._modules.get(attr) is child:
+        return attr
+    for child_name, registered_child in module._modules.items():
+        if registered_child is child:
+            return child_name
+    return None
+
+
 def _wrap_first_existing_attr(
     module: nn.Module,
     attr_names: tuple[str, ...],
@@ -351,14 +361,19 @@ def _wrap_first_existing_attr(
     skip: bool = False,
     context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
 ) -> int:
-    """Checkpoint-wrap the first matching child attr on ``module``."""
+    """Checkpoint-wrap the first matching registered child attr on ``module``."""
     if skip:
         return 0
     checkpoint_kwargs = {} if context_fn is None else {"context_fn": context_fn}
     for attr in attr_names:
         child = getattr(module, attr, None)
         if isinstance(child, nn.Module):
-            setattr(module, attr, checkpoint_wrapper(child, **checkpoint_kwargs))
+            child_name = _registered_child_name(module, attr, child)
+            if child_name is None:
+                continue
+            if hasattr(child, "_checkpoint_wrapped_module"):
+                return 0
+            setattr(module, child_name, checkpoint_wrapper(child, **checkpoint_kwargs))
             return 1
     return 0
 
