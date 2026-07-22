@@ -45,7 +45,7 @@ from nemo_automodel.components.models.mistral3_vlm.state_dict_adapter import (
 # supports_config                                                             #
 # --------------------------------------------------------------------------- #
 class TestSupportsConfig:
-    """Claim only FP8-native Mistral3 VLM configs."""
+    """Claim FP8-native and dequantized Mistral3 VLM configs."""
 
     def test_fp8_mistral3_vlm_config_supported_via_dict(self):
         cfg = SimpleNamespace(
@@ -73,9 +73,9 @@ class TestSupportsConfig:
         )
         assert Mistral3FP8VLMForConditionalGeneration.supports_config(cfg) is False
 
-    def test_no_quantization_config_rejected(self):
+    def test_no_quantization_config_supported_for_dequantized_checkpoint(self):
         cfg = SimpleNamespace(text_config=SimpleNamespace(model_type="ministral3"))
-        assert Mistral3FP8VLMForConditionalGeneration.supports_config(cfg) is False
+        assert Mistral3FP8VLMForConditionalGeneration.supports_config(cfg) is True
 
     def test_non_fp8_quantization_method_rejected(self):
         cfg = SimpleNamespace(

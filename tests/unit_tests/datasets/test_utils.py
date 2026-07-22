@@ -853,3 +853,45 @@ class TestPackedSequenceTHDCollater:
         # Sum across batch should equal total_tokens
         total_tokens = batch_size * max_len
         assert result["seq_lens_padded"].sum().item() == total_tokens
+
+
+class TestPackedSequenceTHDCollaterVlm:
+    """Tests for the packed_sequence_thd_collater_vlm adapter (VLM-recipe call convention)."""
+
+    @staticmethod
+    def _batch() -> list[dict[str, list[int]]]:
+        return [
+            {
+                "input_ids": [1, 2, 3, 4, 5],
+                "labels": [1, 2, 3, 4, 5],
+                "position_ids": [0, 1, 2, 3, 4],
+                "seq_lens": [5],
+                "seq_lens_padded": [5],
+            }
+        ]
+
+    @staticmethod
+    def _assert_same_as_direct(adapter_out: dict[str, Any], direct_out: dict[str, Any]) -> None:
+        assert adapter_out.keys() == direct_out.keys()
+        for key, value in direct_out.items():
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(adapter_out[key], value)
+            else:
+                assert adapter_out[key] == value
+
+    def test_forwards_batch_unchanged(self) -> None:
+        """(a) The adapter forwards the batch to packed_sequence_thd_collater and returns its result."""
+        batch = self._batch()
+        adapter_out = sftp.packed_sequence_thd_collater_vlm(batch)
+        direct_out = sftp.packed_sequence_thd_collater(batch)
+        self._assert_same_as_direct(adapter_out, direct_out)
+
+    def test_accepts_and_ignores_processor_and_extra_kwargs(self) -> None:
+        """(b) The adapter accepts (and ignores) processor= and extra kwargs, per the VLM build_dataloader convention."""
+        batch = self._batch()
+        # recipes/vlm/finetune.py calls the collate as (examples=..., processor=...); extra kwargs must be tolerated.
+        adapter_out = sftp.packed_sequence_thd_collater_vlm(
+            examples=batch, processor=object(), some_extra="ignored", another=123
+        )
+        direct_out = sftp.packed_sequence_thd_collater(batch)
+        self._assert_same_as_direct(adapter_out, direct_out)

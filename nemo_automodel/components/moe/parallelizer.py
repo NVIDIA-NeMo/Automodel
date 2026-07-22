@@ -36,6 +36,8 @@ from nemo_automodel.components.moe.experts import GroupedExpertsDeepEP, GroupedE
 from nemo_automodel.components.moe.layers import (
     MoE,
 )
+from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
+from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 from nemo_automodel.shared.utils import dtype_from_str
 
 logger = logging.getLogger(__name__)
@@ -132,6 +134,65 @@ def _module_weights_are_tied(left: nn.Module | None, right: nn.Module | None) ->
     left_weight = getattr(left, "weight", None)
     right_weight = getattr(right, "weight", None)
     return left_weight is not None and left_weight is right_weight
+
+
+def _resolve_moe_tp_plan(
+    model: nn.Module,
+    *,
+    sequence_parallel: bool,
+    tp_shard_plan: dict[str, ParallelStyle] | str | None,
+    tp_size: int,
+) -> dict[str, ParallelStyle]:
+    """Resolve a fail-closed TP plan for a custom MoE model.
+
+    The generic dense parallelizer has broad fallback plans. Those fallbacks
+    can accidentally match ``*.experts`` on custom MoE architectures, so the
+    MoE path only accepts an explicit plan or an architecture registration and
+    always validates routed-expert ownership before applying it.
+    """
+    if sequence_parallel:
+        raise ValueError(
+            "sequence_parallel=True is not supported by the custom MoE TP path yet; "
+            "use sequence_parallel=False so replicated router/attention activations remain correct."
+        )
+    if tp_size <= 1:
+        return {}
+
+    if tp_shard_plan is not None:
+        # Reuse the standard parser for explicit dictionaries, named plans and
+        # import paths, then apply the stricter MoE ownership validation below.
+        from nemo_automodel.components.distributed.parallelizer import _get_parallel_plan
+
+        plan = _get_parallel_plan(
+            model,
+            sequence_parallel=False,
+            tp_shard_plan=tp_shard_plan,
+            tp_size=tp_size,
+        )
+    else:
+        from nemo_automodel.components.distributed.optimized_tp_plans import (
+            PARALLELIZE_FUNCTIONS,
+            _get_class_qualname,
+        )
+
+        model_cls = type(model)
+        plan_factory = PARALLELIZE_FUNCTIONS.get(_get_class_qualname(model_cls))
+        if plan_factory is None:
+            plan_factory = PARALLELIZE_FUNCTIONS.get(model_cls.__name__)
+        if plan_factory is None:
+            raise ValueError(
+                f"No safe tensor-parallel plan is registered for custom MoE model "
+                f"'{model_cls.__name__}' at tp_size={tp_size}. Register a non-expert plan in "
+                "PARALLELIZE_FUNCTIONS or pass tp_shard_plan explicitly; routed experts must remain EP-owned."
+            )
+        try:
+            plan = plan_factory(model, False)
+        except Exception as exc:
+            raise ValueError(
+                f"The registered tensor-parallel plan for custom MoE model '{model_cls.__name__}' failed: {exc}"
+            ) from exc
+
+    return _validate_moe_tp_plan(plan, model=model)
 
 
 class ExpertParallel(ParallelStyle):
@@ -533,6 +594,7 @@ def apply_fsdp(
                 shard_placement_fn=_moe_shard_placement,
                 reshard_after_forward=experts_reshard_after_forward,
                 mp_policy=mp_policy,
+                offload_policy=offload_policy,
             )
         # If FSDP is disabled for grouped experts because the parameters are already
         # fully sharded by PP and EP, then we need to explicitly remove the parameters
@@ -623,9 +685,10 @@ def apply_fsdp(
         )
     else:
         if tied_embeddings_cross_fsdp_roots and not wrap_outer_model:
-            logger.warning(
+            raise ValueError(
                 "lm_head.weight is tied to embed_tokens.weight across the outer model boundary, but "
-                "wrap_outer_model=False prevents preserving the tie in one FSDP root."
+                "wrap_outer_model=False cannot preserve that parameter in one FSDP root. "
+                "Use wrap_outer_model=True or untie the embeddings explicitly."
             )
         fully_shard_default(_model)
 
@@ -729,12 +792,53 @@ def parallelize_model(
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
     mp_policy: MixedPrecisionPolicy | None = None,
+    offload_policy: OffloadPolicy | None = None,
+    tp_shard_plan: dict[str, ParallelStyle] | str | None = None,
+    sequence_parallel: bool = False,
+    enable_async_tensor_parallel: bool = False,
 ):
-    """Apply context, expert, activation-checkpointing, and FSDP parallelism."""
+    """Apply tensor, context, expert, activation-checkpointing, and FSDP parallelism."""
 
-    assert tp_axis_name is None or world_mesh[tp_axis_name].size() == 1, (
-        "Tensor parallelism not supported for custom MoE models"
-    )
+    tp_enabled = tp_axis_name is not None and world_mesh[tp_axis_name].size() > 1
+    if tp_enabled:
+        if enable_async_tensor_parallel:
+            raise ValueError(
+                "enable_async_tensor_parallel=True is not supported by the custom MoE TP path; "
+                "it requires sequence parallelism, which is intentionally disabled for replicated router/attention paths."
+            )
+        tp_mesh = world_mesh[tp_axis_name]
+        model_parallel_plan = _resolve_moe_tp_plan(
+            model,
+            sequence_parallel=sequence_parallel,
+            tp_shard_plan=tp_shard_plan,
+            tp_size=tp_mesh.size(),
+        )
+        # Every custom-MoE TP plan keeps the token path (attention, router)
+        # replicated across TP ranks, so each expert gradient accumulates
+        # tp_size identical contributions through the EP all-gather.
+        # get_expert_tp_replication_factor reads this marker to remove that
+        # factor in scale_grads_and_clip_grad_norm.
+        model._nemo_moe_tp_requires_replica_sync = True
+        # The replicated paths have no gradient synchronization of their own;
+        # they stay identical across TP ranks only when every rank starts from
+        # the same complete pretrained checkpoint. This marker makes
+        # apply_model_infrastructure and checkpoint loading fail closed on
+        # random/from-config initialization or partial checkpoints. It applies
+        # equally to registered and explicit custom-MoE plans.
+        model._nemo_moe_tp_requires_pretrained_weights = True
+        # PEFT is applied before distributed sharding. Translate each style so
+        # LoRA-wrapped shared-expert/lm-head modules keep the same TP semantics.
+        from nemo_automodel.components.distributed.parallel_styles import translate_to_lora
+
+        model_parallel_plan = {path: translate_to_lora(style) for path, style in model_parallel_plan.items()}
+        logger.info(
+            "Applying safe custom-MoE tensor parallelism (tp_size=%d) to %d non-expert module patterns: %s",
+            tp_mesh.size(),
+            len(model_parallel_plan),
+            ", ".join(sorted(model_parallel_plan)),
+        )
+        parallelize_module(model, tp_mesh, model_parallel_plan)
+        ensure_tied_lm_head(model)
 
     cp_enabled = cp_axis_name is not None and world_mesh[cp_axis_name].size() > 1
     if cp_enabled:
@@ -763,10 +867,16 @@ def parallelize_model(
     else:
         ep_shard_mesh = None
 
-    from nemo_automodel.components.distributed.mesh_utils import get_submesh as _get_submesh
+    from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh, get_submesh
 
-    fsdp_enabled = dp_axis_names is not None and _get_submesh(world_mesh, tuple(dp_axis_names)).size() > 1
-    fsdp_mesh = _get_submesh(world_mesh, tuple(dp_axis_names)) if fsdp_enabled else None
+    axis_names = tuple(dp_axis_names or ())
+    # HSDP combines a native replica axis with a flattened shard/CP axis.
+    # Keep their common root mesh so FSDP retains the replica process group.
+    if axis_names == ("dp_replicate", "dp_shard_cp"):
+        fsdp_mesh = get_fsdp_dp_mesh(world_mesh, *axis_names)
+    else:
+        fsdp_mesh = get_submesh(world_mesh, axis_names) if axis_names else None
+    fsdp_enabled = fsdp_mesh is not None and fsdp_mesh.size() > 1
     if fsdp_enabled:
         apply_fsdp(
             model,
@@ -775,6 +885,7 @@ def parallelize_model(
             ep_shard_enabled=ep_shard_mesh is not None and ep_shard_mesh.size() > 1,
             ep_shard_mesh=ep_shard_mesh,
             mp_policy=mp_policy,
+            offload_policy=offload_policy,
             reshard_after_forward=reshard_after_forward,
             lm_head_precision=lm_head_precision,
             wrap_outer_model=wrap_outer_model,

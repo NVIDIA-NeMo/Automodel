@@ -14,14 +14,18 @@
 
 from dataclasses import dataclass
 
+import pytest
+
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.datasets.vlm.datasets import CordV2DatasetConfig
+from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+from nemo_automodel.components.datasets.vlm.datasets import CordV2DatasetConfig, PreTokenizedDatasetWrapperConfig
 from nemo_automodel.components.datasets.vlm.loader import (
     VlmCollatorConfig,
     VlmDataloaderConfig,
     VlmProcessorConfig,
 )
 from nemo_automodel.components.datasets.vlm.mock import MockVlmDatasetConfig
+from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
 from nemo_automodel.recipes._typed_config import RecipeConfig
 
 
@@ -67,6 +71,7 @@ def test_recipe_config_separates_vlm_dataset_wrapper_and_packing_fields():
                     "pack_size": 128,
                     "packing_ratio": 0.9,
                     "collate_max_length": 128,
+                    "packing_format": "thd",
                 },
                 "dataloader": {
                     "_target_": "torchdata.stateful_dataloader.StatefulDataLoader",
@@ -84,6 +89,19 @@ def test_recipe_config_separates_vlm_dataset_wrapper_and_packing_fields():
     assert config.packing.pack_size == 128
     assert config.packing.packing_ratio == 0.9
     assert config.packing.collate_max_length == 128
+    assert config.packing.packing_format == "thd"
+
+
+def test_recipe_config_rejects_unknown_vlm_packing_format():
+    raw = ConfigNode(
+        {
+            "dataset": {"_target_": "nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset"},
+            "packed_sequence": {"pack_size": 128, "packing_format": "unknown"},
+        }
+    )
+
+    with pytest.raises(ValueError, match="Unsupported VLM packing_format"):
+        _ = RecipeConfig(raw).vlm_dataloader
 
 
 def test_recipe_config_accepts_cord_v2_sample_limit():
@@ -138,3 +156,26 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
     assert result.processor is processor
     assert batch == ["item:one", "item:two"]
     assert batch_processor is processor
+
+
+def test_vlm_dataloader_selects_thd_collater(monkeypatch):
+    processor = DummyProcessor()
+    monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
+    monkeypatch.setattr(NeatPackConfig, "build", lambda self, dataset, **kwargs: dataset)
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=lambda: processor),
+        pretokenization=PreTokenizedDatasetWrapperConfig(),
+        packing=NeatPackConfig(packing_format="thd"),
+        shuffle=False,
+    )
+
+    result = config.build(
+        pretrained_model_name_or_path="unused",
+        dp_rank=0,
+        dp_world_size=1,
+        batch_size=2,
+    )
+
+    assert result.dataloader.collate_fn.func is packed_sequence_thd_vlm_collater
+    assert result.dataloader.collate_fn.keywords == {"padding_idx": 0, "max_length": None}

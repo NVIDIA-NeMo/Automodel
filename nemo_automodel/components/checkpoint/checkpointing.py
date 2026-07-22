@@ -18,6 +18,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -44,6 +45,7 @@ from safetensors.torch import load_file, save_file
 from safetensors.torch import save as safetensors_save
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
@@ -104,6 +106,13 @@ logger = logging.getLogger(__name__)
 # `grep -n nemotron-singlegpu-lora` finds every affected site.
 
 
+def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
+    """Return the module that owns model metadata hidden by DDP."""
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
+
+
 def _normalize_dtype_mapping_to_state_dict_keys(
     fqn_to_dtype_mapping: dict[str, str], state_dict_keys: list[str], base_model_prefix: str | None = None
 ) -> dict[str, str]:
@@ -131,6 +140,7 @@ def _apply_adapter_forced_dtype_mapping(
     fqn_to_dtype_mapping: dict[str, str],
 ) -> dict[str, str]:
     """Let model adapters override original HF dtype metadata for export-only keys."""
+    model = _unwrap_ddp_model(model)
     adapter = getattr(model, "state_dict_adapter", None)
     forced_dtype_mapping = getattr(adapter, "forced_hf_dtype_mapping", None)
     if not callable(forced_dtype_mapping):
@@ -287,12 +297,31 @@ class _AsyncSaveContext:
 
 def _new_gloo_process_group(
     process_group: torch.distributed.ProcessGroup | None,
+    timeout: timedelta | None = None,
 ) -> torch.distributed.ProcessGroup:
-    """Create a Gloo group with the same membership as ``process_group``."""
+    """Create a Gloo group with the same membership as ``process_group``.
+
+    Args:
+        process_group: Source process group whose membership should be preserved.
+        timeout: Optional timeout for operations executed on the new group.
+
+    Returns:
+        The newly created Gloo process group.
+    """
     if process_group is None:
+        if timeout is not None:
+            return torch.distributed.new_group(backend="gloo", timeout=timeout)
         return torch.distributed.new_group(backend="gloo")
+    ranks = torch.distributed.get_process_group_ranks(process_group)
+    if timeout is not None:
+        return torch.distributed.new_group(
+            ranks=ranks,
+            backend="gloo",
+            timeout=timeout,
+            use_local_synchronization=True,
+        )
     return torch.distributed.new_group(
-        ranks=torch.distributed.get_process_group_ranks(process_group),
+        ranks=ranks,
         backend="gloo",
         use_local_synchronization=True,
     )
@@ -404,6 +433,7 @@ class Checkpointer:
         pp_rank: int,
         moe_mesh: Optional[DeviceMesh] = None,
         process_group: torch.distributed.ProcessGroup | None = None,
+        pp_group: Optional["torch.distributed.ProcessGroup"] = None,
     ) -> None:
         """
         Initialize the checkpointer.
@@ -415,9 +445,13 @@ class Checkpointer:
             pp_rank: Pipeline parallel rank for the current process.
             moe_mesh: Optional device mesh used for MoE when adapting state dicts.
             process_group: Process group used for distributed checkpoint collectives.
+            pp_group: Optional pipeline-parallel process group. Passed to
+                ``ModelState`` so PEFT adapters are gathered across PP stages at
+                save time (complete adapter under ``pp_size > 1``).
         """
         self.config = config
         self.moe_mesh = moe_mesh
+        self.pp_group = pp_group
         self.dp_rank = dp_rank
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
@@ -426,11 +460,25 @@ class Checkpointer:
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
         self._optim_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
+        self._consolidation_process_group = None
         if self.config.is_async:
             self._model_ctx.stager = DefaultStager()
             self._optim_ctx.stager = DefaultStager()
             self._model_ctx.process_group = _new_gloo_process_group(process_group)
             self._optim_ctx.process_group = _new_gloo_process_group(process_group)
+        elif (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group=process_group) > 1
+            and _should_write_hf_metadata(self.config)
+            and self.config.save_consolidated != SaveConsolidatedMode.FALSE
+            and not self.config.single_rank_consolidation
+        ):
+            # Every rank evaluates the same config-owned condition and must create
+            # process groups in the same order.
+            self._consolidation_process_group = _new_gloo_process_group(
+                process_group,
+                timeout=timedelta(minutes=self.config.consolidation_timeout_minutes),
+            )
 
         self._addons = []
         if _should_write_hf_metadata(self.config):
@@ -478,8 +526,11 @@ class Checkpointer:
         consolidate_on_all_ranks = (
             should_write_consolidated and not self.config.is_async and not self.config.single_rank_consolidation
         )
+        consolidation_process_group = (
+            self._consolidation_process_group if self._consolidation_process_group is not None else self.process_group
+        )
 
-        model_state = ModelState(model, self.config.is_peft)
+        model_state = ModelState(model, self.config.is_peft, pp_group=self.pp_group)
         state_dict = model_state.state_dict()
 
         # Convert to HF format if using custom model implementations.
@@ -515,7 +566,7 @@ class Checkpointer:
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
                 original_model_path=self._get_original_model_path(model_state),
                 v4_compatible=self.config.v4_compatible,
-                process_group=self.process_group,
+                process_group=consolidation_process_group,
             )
         self._maybe_write_offline_consolidation_script(model_dir)
 
@@ -528,7 +579,7 @@ class Checkpointer:
             addon.post_save(
                 consolidated_path=consolidated_dir,
                 hf_metadata_path=hf_metadata_dir,
-                process_group=self.process_group,
+                process_group=consolidation_process_group,
             )
 
         if consolidate_on_all_ranks:
@@ -540,7 +591,7 @@ class Checkpointer:
                 use_staging=self.config.staging_dir is not None,
                 staging_dir=self.config.staging_dir,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
-                process_group=self.process_group,
+                process_group=consolidation_process_group,
             )
             if self.config.diffusers_compatible:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -625,7 +676,7 @@ class Checkpointer:
 
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
         model_type = getattr(getattr(model_state.model[0], "config", None), "model_type", None)
-        has_state_dict_adapter = hasattr(model_state.model[0], "state_dict_adapter")
+        has_state_dict_adapter = hasattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter")
 
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
@@ -847,7 +898,7 @@ class Checkpointer:
         # them), so they are absent from the returned state_dict but ARE loaded. The adapter
         # tracks them (reset + populated entirely inside from_hf); count them as loaded for the
         # diff to avoid false "missing" warnings while genuinely unloaded params are still flagged.
-        _adapter = getattr(model_state.model[0], "state_dict_adapter", None)
+        _adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
         loaded_keys_for_diff |= getattr(_adapter, "view_loaded_native_keys", None) or set()
         if allow_checkpoint_key_subset:
             # Keys deliberately kept at init were already warned about above; keep
@@ -855,6 +906,17 @@ class Checkpointer:
             expected_keys_for_diff &= loaded_keys_for_diff
         key_diff = _summarize_state_dict_key_diff(expected_keys_for_diff, loaded_keys_for_diff)
         if key_diff["missing_count"] or key_diff["unexpected_count"]:
+            safe_moe_tp_requires_complete_checkpoint = any(
+                getattr(part, "_nemo_moe_tp_requires_pretrained_weights", False) for part in model_state.model
+            )
+            if safe_moe_tp_requires_complete_checkpoint:
+                raise RuntimeError(
+                    "Safe custom-MoE tensor parallelism requires a complete base checkpoint; "
+                    f"missing={key_diff['missing_count']} unexpected={key_diff['unexpected_count']} "
+                    f"(missing examples={key_diff['missing_examples']}, "
+                    f"unexpected examples={key_diff['unexpected_examples']}). Randomly initialized "
+                    "replicated parameters would differ across TP ranks."
+                )
             logging.warning(
                 "Checkpoint key mismatch for %s: missing=%d unexpected=%d "
                 "(missing examples=%s, unexpected examples=%s)",
@@ -1132,11 +1194,15 @@ class Checkpointer:
             self._model_ctx.stager.close()
         if self._optim_ctx.stager is not None:
             self._optim_ctx.stager.close()
+        consolidation_process_group = self._consolidation_process_group
+        self._consolidation_process_group = None
         if torch.distributed.is_initialized():
             for context in (self._model_ctx, self._optim_ctx):
                 if context.process_group is not None:
                     torch.distributed.destroy_process_group(context.process_group)
                     context.process_group = None
+            if consolidation_process_group is not None:
+                torch.distributed.destroy_process_group(consolidation_process_group)
 
     def _do_load(
         self,
@@ -2102,7 +2168,7 @@ def _maybe_adapt_state_dict_to_hf(
     """
     Custom models use state dict adapters to convert the state dict to the Hugging Face format.
     """
-    adapter = getattr(model_part, "state_dict_adapter", None)
+    adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
     if adapter:
         return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
@@ -2325,7 +2391,7 @@ def _maybe_adapt_state_dict_from_hf(
     """
     Custom models use state dict adapters to convert the state dict from the Hugging Face format to the native format.
     """
-    adapter = getattr(model_part, "state_dict_adapter", None)
+    adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
     if adapter:
         ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
         ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh
