@@ -301,12 +301,16 @@ def test_build_target_model_tensor_parallel_path(monkeypatch):
 
     sentinel_mesh = object()
     sentinel_dp = object()
+    # cp is unset here (tp_size=2), so the "cp" submesh is a size-1 mesh.
+    sentinel_cp = SimpleNamespace(size=lambda: 1)
     dist_setup = SimpleNamespace(mesh_context=SimpleNamespace(device_mesh=sentinel_mesh))
     monkeypatch.setattr(
         train_dflash, "NeMoAutoModelForCausalLM", SimpleNamespace(from_pretrained=_fake_from_pretrained)
     )
     monkeypatch.setattr(train_dflash, "create_distributed_setup_from_config", lambda cfg, world_size: dist_setup)
-    monkeypatch.setattr(train_dflash, "_submesh_or_none", lambda mesh, name: sentinel_dp)
+    monkeypatch.setattr(
+        train_dflash, "_submesh_or_none", lambda mesh, name: sentinel_cp if name == "cp" else sentinel_dp
+    )
 
     recipe = _bare_recipe(
         cfg={"distributed": {"tp_size": 2}},
@@ -320,6 +324,7 @@ def test_build_target_model_tensor_parallel_path(monkeypatch):
     assert recipe.dist_setup is dist_setup
     assert recipe.device_mesh is sentinel_mesh
     assert recipe.dp_mesh is sentinel_dp
+    assert recipe.cp_mesh is sentinel_cp
     assert captured["kwargs"]["distributed_setup"] is dist_setup
     assert stub.to_calls == []  # sharded in place by from_pretrained, never moved
     assert stub.requires_grad_calls == [False]

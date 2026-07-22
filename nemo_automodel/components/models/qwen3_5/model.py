@@ -42,6 +42,10 @@ from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import MTPConfig, MTPModule, roll_tensor
 from nemo_automodel.components.models.common.packing import is_indexed_packed_mask
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
@@ -589,6 +593,9 @@ class Qwen3_5Model(HFQwen3_5Model):
 class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     """Qwen3.5 dense causal LM with optional Megatron-style MTP head."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.BOTH
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -626,6 +633,7 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
         num_nextn_predict_layers: int | None = None,
         **kwargs: Any,
     ) -> None:
+        reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__()
         del kwargs
         self.config = config
@@ -667,8 +675,9 @@ class Qwen3_5ForCausalLM(HFCheckpointingMixin, nn.Module):
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
         self.lm_head = new_embeddings
 
-    def tie_weights(self) -> None:
-        self.lm_head.weight = self.model.embed_tokens.weight
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        if getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
@@ -794,6 +803,9 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     # patch_hf_model_for_pp must not replace it under PP.
     _pp_keep_self_forward: bool = True
 
+    tie_word_embeddings_support: TieSupport = TieSupport.BOTH
+    _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -831,6 +843,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         num_nextn_predict_layers: int | None = None,
         **kwargs: Any,
     ) -> None:
+        reject_unsupported_tie_word_embeddings(type(self), config)
         del kwargs
         super().__init__(config)
         self.backend = _qwen3_5_backend(backend)
@@ -859,6 +872,10 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         # final hidden states and ``lm_head`` agree.
         if self.lm_head is not None and self.lm_head.weight.dtype != dtype:
             self.lm_head = self.lm_head.to(dtype)
+        # HF post_init tied lm_head to the pre-swap embedding; the language_model
+        # swap above orphaned that alias, so re-tie to the active embedding when the
+        # config requests it (no-op otherwise).
+        self.tie_weights()
         self.mtp_config = build_mtp_config_from_hf(
             text_config,
             loss_scaling_factor=mtp_loss_scaling_factor,
@@ -871,6 +888,11 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             cast_model_to_dtype(self.mtp, dtype)
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=True)
+
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        """Tie ``lm_head`` to the active VLM text embedding when requested."""
+        if getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
     def _pop_staged_vlm_media(
         self,

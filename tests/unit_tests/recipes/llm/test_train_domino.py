@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
@@ -144,6 +145,9 @@ def test_run_trainer_step_injects_lambda_base():
         input_ids=torch.zeros(1, 4, dtype=torch.long),
         hidden_states=torch.zeros(1, 4, 8),
         loss_mask=torch.ones(1, 4),
+        position_ids=None,
+        seq_lens=None,
+        doc_remaining=None,
     )
     out = recipe._run_trainer_step(target_batch)
     # global_step 50 / (100 * 1.0) -> lambda_base 0.5.
@@ -155,19 +159,80 @@ def test_log_extra_train_metrics(caplog):
     recipe = _recipe()
     recipe._last_domino_metrics = DominoStepMetrics(
         loss=torch.tensor(1.0),
+        loss_weight=torch.tensor(8.0),
         accuracy=torch.tensor(0.5),
         valid_tokens=torch.tensor(10.0),
+        correct_tokens=torch.tensor(5.0),
+        accept_len_sum=torch.tensor(13.8),
+        valid_blocks=torch.tensor(2.0),
         final_loss=torch.tensor(0.9),
         base_loss=torch.tensor(2.3),
         base_accuracy=torch.tensor(0.4),
         accept_len=torch.tensor(6.9),
+        base_correct_tokens=torch.tensor(4.0),
         base_accept_len=torch.tensor(4.0),
+        base_accept_len_sum=torch.tensor(8.0),
         lambda_base=torch.tensor(0.5),
     )
     with caplog.at_level("INFO"):
         recipe._log_extra_train_metrics(epoch_idx=0)
     assert "domino:" in caplog.text
     assert "base_loss=2.3" in caplog.text
+
+
+def test_domino_wandb_metrics_include_head_diagnostics():
+    recipe = _recipe()
+    metrics = SimpleNamespace(
+        accept_len=torch.tensor(2.5),
+        final_loss=torch.tensor(0.9),
+        base_loss=torch.tensor(1.2),
+        base_accuracy=torch.tensor(0.4),
+        base_accept_len=torch.tensor(1.8),
+        lambda_base=torch.tensor(0.25),
+    )
+
+    values = recipe._extra_train_wandb_metrics(metrics)
+
+    assert values == {
+        "train/accept_len": 2.5,
+        "train/final_loss": pytest.approx(0.9),
+        "train/base_loss": pytest.approx(1.2),
+        "train/base_accuracy": pytest.approx(0.4),
+        "train/base_accept_len": pytest.approx(1.8),
+        "train/lambda_base": 0.25,
+    }
+
+
+def test_domino_eval_sums_keep_additive_numerators():
+    recipe = _recipe()
+    metrics = SimpleNamespace(
+        loss_weight=torch.tensor(8.0),
+        valid_tokens=torch.tensor(10.0),
+        valid_blocks=torch.tensor(2.0),
+        final_loss=torch.tensor(0.9),
+        base_loss=torch.tensor(1.2),
+        base_correct_tokens=torch.tensor(4.0),
+        base_accept_len_sum=torch.tensor(7.0),
+    )
+
+    sums = recipe._extra_eval_metric_sums(metrics)
+
+    assert sums["val_final_loss"][0].item() == pytest.approx(7.2)
+    assert sums["val_final_loss"][1].item() == 8.0
+    assert sums["val_base_loss"][0].item() == pytest.approx(9.6)
+    assert sums["val_base_accuracy"][0].item() == 4.0
+    assert sums["val_base_accept_len"][0].item() == 7.0
+    assert sums["val_base_accept_len"][1].item() == 2.0
+
+
+def test_domino_empty_eval_sums_have_stable_collective_order():
+    recipe = _recipe()
+    recipe.device = torch.device("cpu")
+
+    sums = recipe._empty_extra_eval_metric_sums()
+
+    assert list(sums) == ["val_final_loss", "val_base_loss", "val_base_accuracy", "val_base_accept_len"]
+    assert all(numerator.item() == 0.0 and denominator.item() == 0.0 for numerator, denominator in sums.values())
 
 
 def test_log_extra_train_metrics_noop_without_metrics():
@@ -197,3 +262,13 @@ def test_main_runs_setup_then_loop(monkeypatch):
     monkeypatch.setattr(TrainDominoRecipe, "run_train_validation_loop", lambda self: calls.append("loop"))
     train_domino.main("cfg.yaml")
     assert calls == ["setup", "loop"]
+
+
+def test_build_trainer_module_rejects_loss_type():
+    """The DFlash loss_type knob must fail loudly here instead of being
+    silently ignored (Domino has its own dual-logit objective)."""
+    recipe = _recipe()
+    recipe.draft_model = _domino_draft(shift_label=True)
+    recipe.mask_token_id = MASK_ID
+    with pytest.raises(ValueError, match="loss_type"):
+        recipe._build_trainer_module("sdpa", {"loss_type": "variable_prefix"})

@@ -169,6 +169,7 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         self._cp_size = cp_mesh.size() if cp_mesh is not None else 1
         if self._cp_size > 1:
             from nemo_automodel.components.distributed.cp_utils import attach_context_parallel_hooks
+            from nemo_automodel.components.speculative.target_cp import attach_cp_kv_gather_hooks
 
             attach_context_parallel_hooks(self.model)
             n_self_attn = sum(1 for name, _ in self.model.named_modules() if name.endswith("self_attn"))
@@ -178,6 +179,11 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
                     "'*self_attn' (so the causal mask is fixed under sequence sharding), but none "
                     "were found on the target model."
                 )
+            # torch's context_parallel ring does not fire for a plain HF forward (q/k/v
+            # reach SDPA as local tensors), so each rank would attend only to its own
+            # shard. Since the target is frozen, all-gather K/V and attend the local Q
+            # against the full sequence.
+            attach_cp_kv_gather_hooks(self.model, cp_mesh)
 
     def _check_captured(self, captured: dict[int, torch.Tensor]) -> None:
         if len(captured) != len(self.aux_layer_ids):
@@ -185,12 +191,26 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
                 f"Expected {len(self.aux_layer_ids)} captured aux layers but got {len(captured)}: {sorted(captured)}"
             )
 
+    def _num_hidden_layers(self) -> int:
+        """Return the target's decoder depth.
+
+        Multimodal targets (e.g. ``Gemma4ForConditionalGeneration``) carry no
+        top-level ``num_hidden_layers``; the text backbone's depth lives on
+        ``config.text_config``. Text-only targets (and the lightweight config
+        stubs used in tests) expose ``num_hidden_layers`` directly.
+        """
+        config = self.model.config
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None and getattr(text_config, "num_hidden_layers", None) is not None:
+            return text_config.num_hidden_layers
+        return config.num_hidden_layers
+
     def _default_aux_layer_ids(self) -> list[int]:
-        return default_eagle3_aux_layer_ids(self.model.config.num_hidden_layers)
+        return default_eagle3_aux_layer_ids(self._num_hidden_layers())
 
     def _validate_aux_layer_ids(self, aux_layer_ids: Sequence[int]) -> list[int]:
         """Validate aux-layer selection before any forward hooks are registered."""
-        return validate_eagle3_aux_layer_ids(aux_layer_ids, self.model.config.num_hidden_layers)
+        return validate_eagle3_aux_layer_ids(aux_layer_ids, self._num_hidden_layers())
 
     def _get_transformer_layers(self) -> list[nn.Module]:
         """Return decoder layers as an ordered list indexable by integer.
@@ -202,11 +222,21 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         ``register_forward_hook`` calls.
         """
         # Common HF causal-LM layouts:
-        #   model.model.layers              (Llama, Qwen, Mistral, Gemma, Phi, ...)
-        #   model.layers                    (some VLM text backbones exposed directly)
-        #   model.transformer.h             (GPT2 / Falcon-style)
+        #   model.model.layers                     (Llama, Qwen, Mistral, Gemma, Phi, ...)
+        #   model.model.language_model.layers      (multimodal wrappers: Gemma4ForConditionalGeneration)
+        #   model.language_model.layers            (some VLM text backbones nested one level up)
+        #   model.layers                           (some VLM text backbones exposed directly)
+        #   model.transformer.h                    (GPT2 / Falcon-style)
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             container = self.model.model.layers
+        elif (
+            hasattr(self.model, "model")
+            and hasattr(self.model.model, "language_model")
+            and hasattr(self.model.model.language_model, "layers")
+        ):
+            container = self.model.model.language_model.layers
+        elif hasattr(self.model, "language_model") and hasattr(self.model.language_model, "layers"):
+            container = self.model.language_model.layers
         elif hasattr(self.model, "layers"):
             container = self.model.layers
         elif hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
@@ -308,32 +338,17 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
                 # Packing (which needs the 4D block-causal mask) is gated off
                 # upstream, so attention_mask is None and the self_attn hooks force
                 # is_causal.
-                from nemo_automodel.components.distributed.cp_utils import gather_cp_seq, make_target_cp_ctx
+                from nemo_automodel.components.speculative.target_cp import run_target_cp_forward_and_gather
 
-                if "position_ids" not in forward_params:
-                    raise ValueError(
-                        "Context parallelism requires the target model's forward to accept `position_ids`."
-                    )
-                cp_ctx, cp_input_ids, cp_position_ids, orig_len = make_target_cp_ctx(
-                    self.cp_mesh, input_ids, position_ids
-                )
-                cp_extra = {k: v for k, v in extra_kwargs.items() if k != "position_ids"}
-                with cp_ctx:
-                    outputs = self.model(
-                        input_ids=cp_input_ids,
-                        attention_mask=None,
-                        position_ids=cp_position_ids,
-                        **cp_extra,
-                    )
+                def _collect(outputs):
                     raw_logits = outputs.logits if hasattr(outputs, "logits") else outputs
                     self._check_captured(captured)
-                    # Gather inside the CP context, before the hooks are removed.
-                    gathered = gather_cp_seq(
-                        self.cp_mesh,
-                        [captured[layer_id] for layer_id in self.aux_layer_ids] + [raw_logits],
-                        seq_dim=1,
-                        orig_len=orig_len,
-                    )
+                    return [captured[layer_id] for layer_id in self.aux_layer_ids] + [raw_logits]
+
+                cp_extra = {k: v for k, v in extra_kwargs.items() if k != "position_ids"}
+                _outputs, gathered = run_target_cp_forward_and_gather(
+                    self.cp_mesh, self.model, input_ids, cp_extra, _collect, position_ids=position_ids
+                )
                 aux_hidden_states = torch.cat(gathered[:-1], dim=-1)
                 target_logits = gathered[-1]
             else:

@@ -34,12 +34,30 @@ from nemo_automodel.components.speculative.dspark.loss import compute_dspark_los
 
 @dataclass
 class DSparkStepMetrics:
-    """Per-step training outputs for the DSpark draft (loss + its three terms)."""
+    """Per-step training outputs for the DSpark draft.
+
+    Beyond the loss and its three terms, this carries the acceptance diagnostics as
+    unreduced ``(num, den)`` sums so the recipe can reduce both across the log
+    window and the DP group and form the exact global ratio once: acceptance rate
+    (the ``[block_size]`` per-position ``accept_rate@k`` sums, whose totals also
+    give the aggregate ``accept_rate``), ``tau`` (expected accepted block length),
+    and the confidence-head calibration error/bias against the measured acceptance
+    rate. A denominator is zero when the diagnostic was not computed (e.g. no
+    confidence head, or no teacher signal), which the recipe uses to skip logging.
+    """
 
     loss: torch.Tensor
     ce_loss: torch.Tensor
     l1_loss: torch.Tensor
     confidence_loss: torch.Tensor
+    accept_rate_per_pos_num: torch.Tensor
+    accept_rate_per_pos_den: torch.Tensor
+    tau_num: torch.Tensor
+    tau_den: torch.Tensor
+    confidence_abs_error_num: torch.Tensor
+    confidence_bias_num: torch.Tensor
+    confidence_cumprod_bias_num: torch.Tensor
+    confidence_diag_den: torch.Tensor
 
 
 class DSparkTrainerModule(nn.Module):
@@ -67,13 +85,32 @@ class DSparkTrainerModule(nn.Module):
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        doc_remaining: Optional[torch.Tensor] = None,
     ) -> DSparkStepMetrics:
-        """Run the draft on the target supervision and compute the DSpark loss."""
+        """Run the draft on the target supervision and compute the DSpark loss.
+
+        ``position_ids`` / ``seq_lens`` / ``doc_remaining`` (all ``None`` off the
+        packing path) are forwarded to the draft, which keeps each anchor block
+        inside one document (block-causal context, per-document positions, and
+        document-truncated supervision).
+        """
+        # Only the Qwen3 draft accepts the packing kwargs (the other registered
+        # drafts keep the original signature), and packing is gated to the Qwen3
+        # draft at recipe setup. Pass the packing metadata only when packing is
+        # active so the unpacked path stays signature-compatible with every draft.
+        packing_kwargs = (
+            {"position_ids": position_ids, "seq_lens": seq_lens, "doc_remaining": doc_remaining}
+            if seq_lens is not None
+            else {}
+        )
         outputs = self.draft_model(
             input_ids=input_ids,
             target_hidden_states=target_hidden_states,
             loss_mask=loss_mask,
             target_last_hidden_states=target_last_hidden_states,
+            **packing_kwargs,
         )
         loss, terms = compute_dspark_loss(
             outputs=outputs,
@@ -88,6 +125,14 @@ class DSparkTrainerModule(nn.Module):
             ce_loss=terms["ce_loss"],
             l1_loss=terms["l1_loss"],
             confidence_loss=terms["confidence_loss"],
+            accept_rate_per_pos_num=terms["accept_rate_per_pos_num"],
+            accept_rate_per_pos_den=terms["accept_rate_per_pos_den"],
+            tau_num=terms["tau_num"],
+            tau_den=terms["tau_den"],
+            confidence_abs_error_num=terms["confidence_abs_error_num"],
+            confidence_bias_num=terms["confidence_bias_num"],
+            confidence_cumprod_bias_num=terms["confidence_cumprod_bias_num"],
+            confidence_diag_den=terms["confidence_diag_den"],
         )
 
 

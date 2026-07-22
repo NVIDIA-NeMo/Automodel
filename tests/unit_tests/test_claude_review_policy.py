@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from pathlib import Path
 
 import pytest
@@ -38,7 +39,12 @@ def test_review_workflow_keeps_main_caller_wiring():
     assert "if" not in job
     assert "concurrency" not in job
     assert job["with"]["model"] == "${{ vars.CLAUDE_MODEL }}"
-    assert job["uses"] == "NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@v1.7.0"
+    # Pin the callee repo and path exactly, but let the ref move between release
+    # tags and full commit SHAs: the template is repinned routinely, and an exact
+    # ref match breaks this test on every bump (e.g. the v1.8.2/v1.8.3 repins).
+    uses_path, _, uses_ref = job["uses"].partition("@")
+    assert uses_path == "NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml"
+    assert re.fullmatch(r"v\d+\.\d+\.\d+|[0-9a-f]{40}", uses_ref)
 
 
 @pytest.mark.parametrize(

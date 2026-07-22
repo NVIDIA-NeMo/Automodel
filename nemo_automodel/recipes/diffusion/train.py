@@ -29,7 +29,7 @@ from huggingface_hub.constants import HF_HUB_CACHE
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
-from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
@@ -985,10 +985,14 @@ class TrainDiffusionRecipe(BaseRecipe):
             model_cache_dir=model_cache_dir if model_cache_dir is not None else HF_HUB_CACHE,
             model_repo_id=self.model_id,
             save_consolidated=checkpoint_cfg.get("save_consolidated", False),
+            consolidation_timeout_minutes=checkpoint_cfg.get("consolidation_timeout_minutes", 30),
             is_peft=self.peft_cfg is not None,
             model_state_dict_keys=model_state_dict_keys,
+            is_async=checkpoint_cfg.get("is_async", False),
             diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
+            max_recent_checkpoints=checkpoint_cfg.get("max_recent_checkpoints", None),
         )
+        self._log_checkpoint_retention_policy(self.checkpoint_config)
         self.restore_from = checkpoint_cfg.get("restore_from", None)
         self.checkpointer = self.checkpoint_config.build(
             dp_rank=self._get_dp_rank(include_cp=True),
@@ -997,15 +1001,16 @@ class TrainDiffusionRecipe(BaseRecipe):
             moe_mesh=None,
         )
 
-        dataloader_cfg = self.cfg.get("data.dataloader")
-        if not hasattr(dataloader_cfg, "instantiate"):
-            raise RuntimeError("data.dataloader must be a config node with instantiate()")
-
-        self.dataloader, self.sampler = dataloader_cfg.instantiate(
+        dataloader_config = self.cfg.diffusion_dataloader
+        if dataloader_config is None:
+            raise ValueError("Diffusion training requires a data.dataloader config")
+        dataloader_build = dataloader_config.build(
             dp_rank=self._get_dp_rank(),
             dp_world_size=self._get_dp_group_size(),
             batch_size=self.cfg.get("step_scheduler.local_batch_size"),
         )
+        self.dataloader = dataloader_build.dataloader
+        self.sampler = dataloader_build.sampler
 
         self.raw_steps_per_epoch = len(self.dataloader)
         if self.raw_steps_per_epoch == 0:
@@ -1272,6 +1277,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             if wandb.run is not None:
                 wandb.finish()
 
+        self._finalize_and_close_checkpointer()
         logging.info("[INFO] Training complete!")
 
     def _get_dp_rank(self, include_cp: bool = False) -> int:
