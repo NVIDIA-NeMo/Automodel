@@ -684,6 +684,11 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         cur_pos_neg_image_batch.append(cur_pos_neg_image)
 
         if use_dataset_instruction:
+            if cur_corpus_id not in corpus_dict:
+                raise ValueError(
+                    "use_dataset_instruction=True requires corpus metadata, but no metadata was found for "
+                    f"corpus_id={cur_corpus_id!r}. Set use_dataset_instruction=False for pure inline sources."
+                )
             query_instruction_batch.append(corpus_dict[cur_corpus_id].query_instruction)
             passage_instruction_batch.append(corpus_dict[cur_corpus_id].passage_instruction)
         else:

@@ -1026,6 +1026,25 @@ def test_retrieval_dataset_config_builds_inline_jsonl_for_both_model_types(tmp_p
     assert cross_batch["num_labels"] == [1, 1]
 
 
+def test_retrieval_dataset_config_rejects_instructions_without_corpus_metadata(tmp_path):
+    """Pure inline records cannot resolve dataset instructions without corpus metadata."""
+    f = tmp_path / "inline.jsonl"
+    f.write_text(json.dumps({"query": "Q", "pos_doc": "P", "neg_doc": ["N"]}))
+
+    dataset = rd.RetrievalDatasetConfig(
+        data_dir_list=str(f),
+        data_type="train",
+        n_passages=2,
+        use_dataset_instruction=True,
+    ).build()
+
+    with pytest.raises(
+        ValueError,
+        match=r"use_dataset_instruction=True requires corpus metadata.*Set use_dataset_instruction=False",
+    ):
+        dataset[0]
+
+
 def test__load_json_or_jsonl_json_and_jsonl_error_paths(tmp_path):
     # JSON (list)
     f_json = tmp_path / "data.json"
