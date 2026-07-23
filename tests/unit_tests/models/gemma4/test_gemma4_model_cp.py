@@ -222,54 +222,67 @@ def test_init_derives_pad_token_id_from_eos_list():
 
 
 # ---------------------------------------------------------------------------
-# prepare_model_inputs_for_cp / prepare_inputs_embeds_for_cp
+# prepare_model_inputs_for_cp
 # ---------------------------------------------------------------------------
 def test_prepare_model_inputs_requires_input_ids():
     model = Gemma4ForConditionalGeneration(_cfg(), backend=_backend())
     with pytest.raises(ValueError, match="requires input_ids"):
-        model.prepare_model_inputs_for_cp(input_ids=None)
-
-
-def test_prepare_inputs_embeds_for_cp_delegates():
-    cfg = _cfg()
-    cfg.image_token_id = 42
-    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
-    ids = torch.tensor([[1, 42, 3, 4]])
-    # prepare_inputs_embeds_for_cp returns just the inputs_embeds tensor
-    embeds = model.prepare_inputs_embeds_for_cp(input_ids=ids)
-    expected = model.prepare_model_inputs_for_cp(input_ids=ids)["inputs_embeds"]
-    assert isinstance(embeds, torch.Tensor)
-    assert embeds.shape == expected.shape
-
-
-def test_forward_pre_embed_only_routes_to_prepare(monkeypatch):
-    cfg = _cfg()
-    cfg.image_token_id = 42
-    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
-    sentinel = {"inputs_embeds": torch.zeros(1)}
-    monkeypatch.setattr(model, "prepare_model_inputs_for_cp", lambda **kw: sentinel)
-    out = model(input_ids=torch.tensor([[1, 2, 3]]), _pre_embed_only=True)
-    assert out is sentinel
+        model.prepare_model_inputs_for_cp({"input_ids": None})
 
 
 # ---------------------------------------------------------------------------
-# forward: MoE CP with pixel_values is rejected
+# forward: MoE CP embeds + splices pixels in-forward (sunk pre-embed)
 # ---------------------------------------------------------------------------
-def test_forward_moe_cp_pixel_values_raises():
-    model = Gemma4ForConditionalGeneration(_cfg(), backend=_backend()).to(torch.bfloat16)
+def test_forward_moe_cp_pixel_values_are_spliced_in_forward():
+    """Sunk CP: pixels are no longer rejected; the forward embeds + splices them
+    per microbatch (cp_mesh is None here -> the contiguous slice is the identity)."""
+    cfg = _cfg()
+    cfg.image_token_id = 2
+    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
     model._cp_enabled = True
-    with pytest.raises(NotImplementedError, match="pixel_values requires"):
-        model(input_ids=torch.tensor([[1, 2, 3, 4]]), pixel_values=torch.randn(1, 3, 8, 8))
+    feat = torch.zeros(2, cfg.text_config.hidden_size, dtype=torch.bfloat16)
+    captured = {}
+
+    def fake_lm(*args, **kwargs):
+        captured["inputs_embeds"] = kwargs.get("inputs_embeds")
+        return SimpleNamespace(last_hidden_state=torch.zeros(1, 4, cfg.text_config.hidden_size, dtype=torch.bfloat16))
+
+    with (
+        mock.patch.object(model.model, "get_image_features", return_value=SimpleNamespace(pooler_output=feat)),
+        mock.patch.object(model.model.language_model, "forward", side_effect=fake_lm),
+    ):
+        out = model(input_ids=torch.tensor([[1, 2, 3, 2]]), pixel_values=torch.randn(2, 3, 8, 8))
+    # No NotImplementedError; embeds were spliced and threaded to the backend.
+    assert captured["inputs_embeds"] is not None
+    assert captured["inputs_embeds"].shape == (1, 4, cfg.text_config.hidden_size)
+    assert out.logits.shape == (1, 4, cfg.text_config.vocab_size)
 
 
 # ---------------------------------------------------------------------------
 # forward: dense CP branches
 # ---------------------------------------------------------------------------
-def test_forward_dense_cp_pixel_values_raises():
-    model = Gemma4ForConditionalGeneration(_cfg(enable_moe_block=False), backend=_backend()).to(torch.bfloat16)
+def test_forward_dense_cp_pixel_values_are_spliced_in_forward():
+    """Sunk CP dense path: pixels embed + splice in-forward instead of raising."""
+    cfg = _cfg(enable_moe_block=False)
+    cfg.image_token_id = 2
+    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
     model._cp_enabled = True
-    with pytest.raises(NotImplementedError, match="pixel_values requires"):
-        model(input_ids=torch.tensor([[1, 2, 3, 4]]), pixel_values=torch.randn(1, 3, 8, 8))
+    feat = torch.zeros(2, cfg.text_config.hidden_size, dtype=torch.bfloat16)
+    hidden = torch.randn(1, 4, cfg.text_config.hidden_size, dtype=torch.bfloat16)
+    captured = {}
+
+    def fake_lm(*args, **kwargs):
+        captured["inputs_embeds"] = kwargs.get("inputs_embeds")
+        return SimpleNamespace(last_hidden_state=hidden, past_key_values=None, hidden_states=None, attentions=None)
+
+    with (
+        mock.patch.object(model.model, "get_image_features", return_value=SimpleNamespace(pooler_output=feat)),
+        mock.patch.object(model.model.language_model, "forward", side_effect=fake_lm),
+    ):
+        out = model(input_ids=torch.tensor([[1, 2, 3, 2]]), pixel_values=torch.randn(2, 3, 8, 8))
+    assert captured["inputs_embeds"] is not None
+    assert captured["inputs_embeds"].shape == (1, 4, cfg.text_config.hidden_size)
+    assert out.logits.shape == (1, 4, cfg.text_config.vocab_size)
 
 
 def test_forward_dense_cp_requires_inputs():
@@ -468,14 +481,36 @@ def test_prepare_per_layer_inputs_returns_per_layer_tensor():
     assert out.shape == (1, 4, 8)
 
 
-def test_prepare_model_inputs_threads_per_layer_inputs(monkeypatch):
+def test_prepare_model_inputs_is_sharder_only(monkeypatch):
+    """Sunk CP: the hook returns ONLY a sharder and computes/consumes nothing.
+    per_layer_inputs is built + sliced in the forward, not pre-embedded here."""
     cfg = _cfg()
     cfg.image_token_id = 42
     model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
-    monkeypatch.setattr(model, "_prepare_per_layer_inputs_for_cp", lambda ids, mask: torch.zeros(1, 4, 8))
-    prepared = model.prepare_model_inputs_for_cp(input_ids=torch.tensor([[1, 42, 3, 4]]))
-    assert "per_layer_inputs" in prepared
-    assert prepared["per_layer_inputs"].shape == (1, 4, 8)
+    # Any per-layer-input compute in the hook would fail this spy; it must not run.
+    monkeypatch.setattr(
+        model,
+        "_prepare_per_layer_inputs_for_cp",
+        lambda ids, mask: pytest.fail("prepare_model_inputs_for_cp must not pre-embed under the sunk CP path"),
+    )
+    prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[1, 42, 3, 4]])})
+    assert set(prepared) == {"cp_sharder"}
+
+
+def test_prepare_model_inputs_consumes_nothing(monkeypatch):
+    """The sharder-only hook leaves input_ids / pixel_values / mm_token_type_ids
+    full-length for the forward: nothing is returned as a consumed (None) marker."""
+    cfg = _cfg()
+    cfg.image_token_id = 42
+    model = Gemma4ForConditionalGeneration(cfg, backend=_backend()).to(torch.bfloat16)
+    batch = {
+        "input_ids": torch.tensor([[1, 42, 3, 4]]),
+        "mm_token_type_ids": torch.tensor([[0, 1, 0, 0]]),
+    }
+    prepared = model.prepare_model_inputs_for_cp(batch)
+    assert "input_ids" not in prepared and "pixel_values" not in prepared
+    assert "mm_token_type_ids" not in prepared
+    assert set(prepared) == {"cp_sharder"}
 
 
 # ---------------------------------------------------------------------------
@@ -567,9 +602,10 @@ def test_setup_cp_attention_idempotent():
 
 
 # ---------------------------------------------------------------------------
-# _cp_shard_batch: installs the ring (idempotent) then delegates to the sharder
+# _cp_shard_batch_aux_only: installs the ring (idempotent), records cp_mesh,
+# then delegates to the aux-only sharder
 # ---------------------------------------------------------------------------
-def test_cp_shard_batch_installs_ring_then_delegates(monkeypatch):
+def test_cp_shard_batch_aux_only_installs_ring_records_mesh_then_delegates(monkeypatch):
     model = Gemma4ForConditionalGeneration(_cfg(enable_moe_block=False), backend=_backend())
     installed = {"mesh": None}
     monkeypatch.setattr(model, "setup_cp_attention", lambda mesh: installed.__setitem__("mesh", mesh))
@@ -577,30 +613,31 @@ def test_cp_shard_batch_installs_ring_then_delegates(monkeypatch):
     sentinel = ("ctx", {"sharded": True})
     seen = {}
 
-    def fake_shard(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+    def fake_shard(cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0, **kwargs):
         seen.update(
             cp_mesh=cp_mesh, tp_mesh=tp_mesh, batch=batch, loss_mask=loss_mask, padding_token_id=padding_token_id
         )
         return sentinel
 
     monkeypatch.setattr(
-        "nemo_automodel.components.models.gemma4_moe.model.make_contiguous_shard_cp_batch_and_ctx",
+        "nemo_automodel.components.models.gemma4_moe.model.make_contiguous_aux_only_shard_cp_batch_and_ctx",
         fake_shard,
     )
 
     cp_mesh, tp_mesh, batch = object(), object(), {"input_ids": torch.tensor([[1, 2]])}
-    out = model._cp_shard_batch(cp_mesh, tp_mesh, batch, loss_mask="lm", padding_token_id=7)
+    out = model._cp_shard_batch_aux_only(cp_mesh, tp_mesh, batch, loss_mask="lm", padding_token_id=7)
     assert out is sentinel
     assert installed["mesh"] is cp_mesh  # ring installed with the CP submesh
+    assert model.cp_mesh is cp_mesh  # recorded for the forward's in-forward slice
     assert seen["cp_mesh"] is cp_mesh and seen["tp_mesh"] is tp_mesh
     assert seen["loss_mask"] == "lm" and seen["padding_token_id"] == 7
 
 
-def test_prepare_model_inputs_attaches_cp_shard_batch_fn():
+def test_prepare_model_inputs_attaches_aux_only_shard_batch_fn():
     model = Gemma4ForConditionalGeneration(_cfg(enable_moe_block=False), backend=_backend()).to(torch.bfloat16)
-    prepared = model.prepare_model_inputs_for_cp(input_ids=torch.tensor([[1, 2, 3, 4]]))
-    # The model attaches its own bound batch-sharding callable (model-owned install seam).
-    assert prepared["_cp_make_batch_fn"] == model._cp_shard_batch
+    prepared = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[1, 2, 3, 4]])})
+    # The model attaches its own bound aux-only sharding callable (model-owned seam).
+    assert prepared["cp_sharder"].shard_batch == model._cp_shard_batch_aux_only
 
 
 # ---------------------------------------------------------------------------
