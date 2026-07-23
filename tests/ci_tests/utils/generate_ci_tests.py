@@ -309,23 +309,7 @@ def generate_pipeline(automodel_dir: str, scope: str, test_folder: str) -> Dict[
     exempt_models = set(config_override.get("exempt_models") or [])
     exempt_configs = set(config_override.get("exempt_configs") or [])
 
-    # Pin the template include to the pipeline's own commit (not a bare local include).
-    # A dynamic child pipeline built from an artifact resolves a bare local `include:`
-    # against the project's DEFAULT branch, so unmerged nemo-ci template changes (a new
-    # stage or `.<x>_test` template on a branch) would be invisible and pipeline creation
-    # would fail. `include:` variable expansion is unavailable for such downstream
-    # pipelines ($CI_* expand to ""), so resolve the ref here at generation time -- this
-    # job runs in the nemo-ci pipeline where CI_COMMIT_SHA/CI_PROJECT_PATH are real env
-    # vars -- and bake the literal values in. Reproducible on main, testable on a branch
-    # pre-merge; falls back to a bare local include if the env vars are absent.
-    template_file = "automodel/automodel_ci_template.yml"
-    template_project = os.environ.get("CI_PROJECT_PATH", "")
-    template_ref = os.environ.get("CI_COMMIT_SHA", "")
-    if template_project and template_ref:
-        template_include: Any = {"project": template_project, "ref": template_ref, "file": template_file}
-    else:
-        template_include = template_file
-    pipeline: Dict[str, Any] = {"include": [template_include]}
+    pipeline: Dict[str, Any] = {"include": ["automodel/automodel_ci_template.yml"]}
     job_name_suffix = os.environ.get("AUTOMODEL_CI_JOB_NAME_SUFFIX", "")
 
     for config in yml_configs:
