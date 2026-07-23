@@ -37,3 +37,5 @@ the contributor-facing skills.
 | `linting-and-formatting` | ruff rules, type hints, docstrings, copyright headers, code review checklist |
 | `parity-testing` | Verify numerical correctness against references |
 | `testing` | Unit and functional test layout, tier semantics (L0/L1/L2), adding tests |
+| `job-log-debugging` | Locate and diagnose running or finished AutoModel job logs |
+

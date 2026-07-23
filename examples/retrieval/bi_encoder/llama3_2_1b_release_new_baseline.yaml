@@ -1,0 +1,181 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# To run this recipe, please use the following command:
+# python examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/llama3_2_1b_release_new_baseline.yaml
+# Or with torchrun for multi-GPU:
+# torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/llama3_2_1b_release_new_baseline.yaml
+
+
+recipe: TrainBiEncoderRecipe
+
+seed: 42
+
+temperature: 0.02
+
+step_scheduler:
+  global_batch_size: 128
+  local_batch_size: 4
+  ckpt_every_steps: 10000
+  val_every_steps: 1000
+  log_remote_every_steps: 10
+  num_epochs: 1
+  max_steps: null
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  trust_remote_code: true
+  pooling: avg
+  l2_normalize: true
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  torch_dtype: bfloat16
+  attn_implementation: eager
+
+tokenizer:
+  _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  add_eos_token: false
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    model_type: bi_encoder
+    data_dir_list:
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_ar_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_bn_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_en_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_es_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_fa_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_fi_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_fr_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_hi_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_id_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_ja_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_ko_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_ru_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_sw_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_te_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_th_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/rosmulski/filtering_repo/datasets/miracl_filtered/miracl_zh_unrolled_8B_ragas2_scores_1_2.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mldr_en_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/hotpotqa_remined_querymask_qwen3_8B_0_95_perc_20260523.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/nq_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/squad_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/stackexchange_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/hover_remined_querymask_qwen3_8B_0_95_perc_20260523.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/combined_synthinstrshortlong_remined_querymask_qwen3_8B_0_95_perc_20260523.json
+    data_type: train
+    n_passages: 5
+    seed: 42
+    do_shuffle: true
+    max_train_samples: null
+    use_dataset_instruction: false
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
+    q_max_len: 512
+    p_max_len: 512
+    query_prefix: "query:"
+    passage_prefix: "passage:"
+    padding: true
+    pad_to_multiple_of: 8
+    use_dataset_instruction: false
+  shuffle: true
+  num_workers: 8
+  drop_last: true
+  pin_memory: true
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  dataset:
+    _target_: nemo_automodel.components.datasets.llm.make_retrieval_dataset
+    data_dir_list:
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/TextQA_train/miracl_train_en_llama3_1b_4m_512len_eval.json
+    model_type: bi_encoder
+    data_type: eval
+    n_passages: 5
+    seed: 42
+    do_shuffle: false
+    use_dataset_instruction: false
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.llm.BiEncoderCollator
+    q_max_len: 512
+    p_max_len: 512
+    query_prefix: "query:"
+    passage_prefix: "passage:"
+    padding: true
+    pad_to_multiple_of: 8
+    use_dataset_instruction: false
+  shuffle: false
+  num_workers: 8
+  drop_last: false
+  pin_memory: true
+
+# LoRA/PEFT configuration
+# Uncomment and configure for LoRA/PEFT
+# peft:
+#   _target_: nemo_automodel.components._peft.lora.PeftConfig
+#   target_modules:
+#     - q_proj
+#     - k_proj
+#     - v_proj
+#     - o_proj
+#     - gate_proj
+#     - up_proj
+#     - down_proj
+#   exclude_modules: []
+#   match_all_linear: True
+#   dim: 16
+#   alpha: 32
+#   use_triton: true
+
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  lr: 5.0e-6
+  betas:
+    - 0.9
+    - 0.999
+  eps: 1.0e-8
+  weight_decay: 0.01
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+
+lr_scheduler:
+  lr_warmup_steps: 100
+  lr_decay_style: linear
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /lustre/fs12/portfolios/llmservice/projects/llmservice_nlp_retro/users/ybabakhin/model_checkpoints/baseline_release_v3
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+wandb:
+  project: rteb-text-embedding
+  entity: nvidia-merlin
+  name: baseline_release_v3

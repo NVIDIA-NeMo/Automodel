@@ -131,7 +131,7 @@ def validate_args(args, add_args):
     # ToDo: How to check that train_scripts and eval_scripts are executable (chmod -R 777) 
 
 def draco(
-    account: str = "datascience_nemo_retriever",
+    account: str = "nemotron_retriever_dev",
     container_image: str = "/lustre/fsw/portfolios/datascience/projects/datascience_rapids_research/retriever_models_research/03_sqsh/nvidia-nemo-automodel-26.04.00.sqsh",
     partition: str = None,
     nodes: int=1,
@@ -141,6 +141,7 @@ def draco(
     dependency_type: str = "afterok",
     job_name_prefix: str = "",
     master_port: int = 29500,
+    comment: str | None = None,
 ) -> run.Config[run.Executor]:
     """
     Create a Slurm executor configuration for the DRACO cluster.
@@ -165,15 +166,16 @@ def draco(
     env_vars["MASTER_ADDR"] = "$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)"
     env_vars["MASTER_PORT"] = str(master_port)
     
-    job_dir = f"/lustre/fsw/portfolios/llmservice/users/{username}/jobs"
+    job_dir = f"/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/{username}/jobs"
     ssh_tunnel = run.SSHTunnel(
-        host="draco-oci-login-01.draco-oci-iad.nvidia.com",
+        host="draco-oci-login-02.draco-oci-iad.nvidia.com",
         user=username,
         job_dir=job_dir,
     )
     slurm_executor = run.SlurmExecutor(
         account=account,
         partition=partition,
+        comment=comment,
         nodes=nodes,
         container_image=container_image,
         gpus_per_node=gpus_per_node,
@@ -190,6 +192,10 @@ def draco(
         # but the first job will be killed after 4 hours
         dependency_type=dependency_type,
         # avoid git commit every time and everything
-        packager = run.GitArchivePackager(include_untracked=True, include_uncommitted=True)
+        packager = run.GitArchivePackager(
+            include_untracked=True,
+            include_uncommitted=True,
+            symlink_from_remote_dir=os.getenv("NEMO_RUN_REMOTE_CODE_SYMLINK"),
+        )
     )
     return slurm_executor

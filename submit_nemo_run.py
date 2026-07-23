@@ -31,6 +31,12 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+IDLE_REAPER_COMMENT = (
+    '{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"237","reason":"other",'
+    '"description":"Draco cluster is in the broken state and kills false positive IDLE jobs. '
+    'These runs are critical for the release. MARSSUP-6917"}}'
+)
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -60,6 +66,12 @@ def get_args():
         type=str,
         help='Path to the checkpoint directory, if not provided, the checkpoint directory will be set later',
         default=None
+    )
+    parser.add_argument(
+        '--account',
+        type=str,
+        help='Slurm account to use for the job',
+        default='nemotron_retriever_dev',
     )
     parser.add_argument(
         '--partition',
@@ -256,24 +268,28 @@ def main():
         eval_executor = run.LocalExecutor()
     else:
         train_executor = draco(
+            account=args.account,
             container_image = args.container_image,
             partition = args.partition,
             nodes = int(args.num_nodes),        
             dependency_type="afterany",
             job_name_prefix=experiment_id,
             gpus_per_node=0 if args.partition == "cpu" else 8,
+            # comment=IDLE_REAPER_COMMENT,
         )
         eval_executor = draco(
+            account=args.account,
             container_image = args.container_image,
             partition = args.partition,
             nodes = 1,
             job_name_prefix='e_' + experiment_id,
+            # comment=IDLE_REAPER_COMMENT,
         )
     
     
     if args.checkpoint_directory is None:
         if isinstance(train_executor, run.SlurmExecutor):
-            checkpoints_directory = f"/lustre/fsw/portfolios/llmservice/users/{username}/model_checkpoints"
+            checkpoints_directory = f"/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/{username}/model_checkpoints"
         else:
             checkpoints_directory = "/model_checkpoints"
     else:
@@ -324,8 +340,8 @@ def main():
                 )
 
             if args.eval_datasets is not None and len(args.eval_datasets) > 0:
-                eval_commands = []
                 for eval_dataset in args.eval_datasets:
+                    eval_commands = []
                     if eval_dataset not in eval_datasets.keys():
                         eval_datasets[eval_dataset] = [(eval_dataset, "")]
                     for (dataset_list, extra_eval_args) in eval_datasets[eval_dataset]:
@@ -341,16 +357,16 @@ def main():
                         eval_args += " --dataset " + dataset_list + extra_eval_args
                         eval_commands.append(f"{args.eval_script} {eval_args}")
 
-                combined_eval_inline = "\n".join(eval_commands)
-                script = run.Script(inline=combined_eval_inline)
-                logger.info("Combined Evaluation Script")
-                logger.info(script)
-                eval_job_name = exp.add(
-                    script,
-                    name="eval",
-                    executor=eval_executor,
-                    dependencies=[train_job_name] if train_job_name else None
-                )
+                    combined_eval_inline = "\n".join(eval_commands)
+                    script = run.Script(inline=combined_eval_inline)
+                    logger.info("Evaluation Script for %s", eval_dataset)
+                    logger.info(script)
+                    exp.add(
+                        script,
+                        name=f"eval_{eval_dataset}",
+                        executor=eval_executor,
+                        dependencies=[train_job_name] if train_job_name else None
+                    )
 
             # Launches the experiment Slurm tasks 
             if args.run_local:
