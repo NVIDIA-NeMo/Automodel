@@ -78,6 +78,11 @@ except (ModuleNotFoundError, ImportError, AttributeError):
     CausalLMOutputWithPast = _make_missing("CausalLMOutputWithPast")
 
 from nemo_automodel._transformers.model_capabilities import ModelCapabilities
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    contiguous_local_indices,
+    shard_sequence_for_cp_contiguous,
+)
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -91,7 +96,7 @@ from nemo_automodel.components.moe.router_replay import RouterReplay, replay_sel
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
-from .cp_batch import make_contiguous_shard_cp_batch_and_ctx
+from .cp_batch import make_contiguous_aux_only_shard_cp_batch_and_ctx
 
 
 class _Gemma4KVShareHolder:
@@ -877,6 +882,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     # nn.Module.to rounds floating buffers; cast_model_to_dtype restores keep-fp32
     # modules afterwards (see llama/rope_utils.py).
     _keep_in_fp32_modules = ["rotary_emb"]
+    # CP submesh, recorded by _cp_shard_batch_aux_only the first time the dispatch
+    # hands the model the CP submesh; None means the forward embeds/shards nothing
+    # for CP.
+    cp_mesh = None
     """Gemma4 VL conditional generation model with NeMo MoE backend.
 
     When the checkpoint has ``enable_moe_block=True`` in its text config,
@@ -919,11 +928,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             # CP supported; TP/PP/EP off. Two features beyond plain-dense 31B were
             # exercised:
             #   * per-layer inputs (``hidden_size_per_layer_input``): under CP,
-            #     computed on the full sequence in ``prepare_model_inputs_for_cp``
-            #     and sharded contiguously on the seq dim alongside
-            #     ``inputs_embeds`` (the 4D ``per_layer_inputs`` tensor is a known
-            #     key in cp_batch); the HF dense forward applies the token-local
-            #     projection per shard (verified bit-identical to non-CP prep).
+            #     built per microbatch on the full sequence inside the forward
+            #     (``_cp_sunk_prepare_inputs``) and contiguously sliced on the seq
+            #     dim alongside ``inputs_embeds`` (the 4D ``per_layer_inputs``
+            #     tensor slices on dim 1); the HF dense forward applies the
+            #     token-local projection per shard (bit-identical to non-CP prep).
             #   * KV-sharing: when the KV cache is active each shared layer reads
             #     its source layer's CP-local sharded K/V from
             #     ``DynamicCache.shared_layers`` and rotates it through the same
@@ -978,8 +987,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         the ring on every self-attn module (each was given a per-module
         ``setup_cp_attention`` by ``attach_gemma4_cp_ring_attention`` at
         construction). Invoked from Gemma4's own batch-sharding callable
-        (``_cp_shard_batch``) the first time the recipe hands it the CP submesh, so
-        the install is fully model-owned -- no framework dispatch is required.
+        (``_cp_shard_batch_aux_only``) the first time the recipe hands it the CP
+        submesh, so the install is fully model-owned -- no framework dispatch is
+        required.
         """
         if getattr(self, "_cp_enabled", False):
             return
@@ -991,18 +1001,27 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             if callable(module_setup):
                 module_setup(cp_mesh)
 
-    def _cp_shard_batch(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
-        """Gemma4-owned CP batch sharder that also self-installs the ring.
+    def _cp_shard_batch_aux_only(self, cp_mesh, tp_mesh, batch, *, loss_mask=None, padding_token_id=0):
+        """Gemma4-owned aux-only CP batch sharder that also self-installs the ring.
 
-        Attached to the batch as ``_cp_make_batch_fn`` by
-        ``prepare_model_inputs_for_cp``. ``cp_utils.make_cp_batch_and_ctx`` calls it
-        with the CP submesh, which is the one place Gemma4 receives ``cp_mesh`` on a
-        model-owned path -- so install the ring here (idempotent) before sharding,
-        rather than depending on the framework to call ``setup_cp_attention``.
+        Exposed as ``ContextParallelSharder.shard_batch`` by the sharder-only
+        ``prepare_model_inputs_for_cp``. The CP dispatch calls it with the CP
+        submesh, which is the one place Gemma4 reliably receives ``cp_mesh`` on a
+        model-owned path (dense variants are not guaranteed to run the MoE
+        ``apply_cp``) -- so install the ring here (idempotent) and record
+        ``cp_mesh`` for the forward, which embeds, splices vision and keeps this
+        rank's contiguous slice per microbatch. Only the no-grad aux streams (and
+        the synthesized ``_packed_seq_ids``) are sharded here; ``input_ids`` /
+        ``pixel_values`` / ``mm_token_type_ids`` stay full for the forward.
         """
         self.setup_cp_attention(cp_mesh)
-        return make_contiguous_shard_cp_batch_and_ctx(
-            cp_mesh, tp_mesh, batch, loss_mask=loss_mask, padding_token_id=padding_token_id
+        self.cp_mesh = cp_mesh
+        return make_contiguous_aux_only_shard_cp_batch_and_ctx(
+            cp_mesh,
+            tp_mesh,
+            batch,
+            loss_mask=loss_mask,
+            padding_token_id=padding_token_id,
         )
 
     def __init__(
@@ -1142,19 +1161,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         pixel_values: torch.Tensor | None = None,
         image_position_ids: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
-        _pre_embed_only: bool = False,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_hidden_states: Optional[bool] = None,
         **kwargs: Any,
     ):
-        if _pre_embed_only:
-            return self.prepare_model_inputs_for_cp(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                image_position_ids=image_position_ids,
-                mm_token_type_ids=mm_token_type_ids,
-            )
-
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -1178,15 +1188,25 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if not getattr(text_config, "enable_moe_block", False):
             per_layer_inputs = kwargs.pop("per_layer_inputs", None)
             if cp_enabled:
-                if pixel_values is not None:
-                    raise NotImplementedError(
-                        "Context parallelism with Gemma4 pixel_values requires pre-computed inputs_embeds. "
-                        "Call prepare_model_inputs_for_cp before CP sharding and pass inputs_embeds instead."
-                    )
-                if input_ids is not None and inputs_embeds is None:
-                    inputs_embeds = self.model.get_input_embeddings()(input_ids)
-                if inputs_embeds is None:
+                if input_ids is None and inputs_embeds is None:
                     raise ValueError("Gemma4 CP dense forward requires either input_ids or inputs_embeds.")
+
+                # Sunk CP: embed + vision splice + per-layer inputs, then keep this
+                # rank's contiguous slice, per microbatch (see _cp_sunk_prepare_inputs).
+                # inputs_embeds is only pre-supplied on the legacy pre-embedded path,
+                # kept as a fallback; the sharder-only hook leaves input_ids full.
+                vision_group_ids_local = kwargs.get("_gemma4_vision_group_ids")
+                if inputs_embeds is None:
+                    prepared = self._cp_sunk_prepare_inputs(
+                        input_ids=input_ids,
+                        pixel_values=pixel_values,
+                        image_position_ids=image_position_ids,
+                        mm_token_type_ids=mm_token_type_ids,
+                    )
+                    inputs_embeds = prepared["inputs_embeds"]
+                    per_layer_inputs = prepared["per_layer_inputs"]
+                    mm_token_type_ids = prepared["mm_token_type_ids"]
+                    vision_group_ids_local = prepared["_gemma4_vision_group_ids"]
 
                 use_cache = kwargs.pop("use_cache", None)
                 past_key_values = kwargs.pop("past_key_values", None)
@@ -1206,11 +1226,13 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 # kwargs). Stash the CP-sharded metadata on each ring-hooked attention
                 # module so the ring builds the vision-bidirectional / packed masks
                 # rather than a plain causal mask (which corrupts multimodal attention).
+                # mm_token_type_ids / _gemma4_vision_group_ids are the forward-sliced
+                # streams; _packed_seq_ids and padding_mask ride the aux-only sharder.
                 cp_meta = {
                     "mm_token_type_ids": mm_token_type_ids,
                     "padding_mask": padding_mask,
                     "_packed_seq_ids": kwargs.get("_packed_seq_ids"),
-                    "_gemma4_vision_group_ids": kwargs.get("_gemma4_vision_group_ids"),
+                    "_gemma4_vision_group_ids": vision_group_ids_local,
                 }
                 # Left set (not cleared) so the activation-checkpoint recompute in
                 # backward sees the same metadata; each CP forward overwrites it.
@@ -1299,31 +1321,44 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             )
 
         # --- MoE forward path ---
-        if input_ids is not None and inputs_embeds is None:
-            inputs_embeds = self.model.get_input_embeddings()(input_ids)
+        if cp_enabled:
+            # Sunk CP: embed + vision splice + slice this rank's contiguous shard
+            # per microbatch. _packed_seq_ids / padding_mask ride the aux-only
+            # sharder (already sliced, in kwargs); mm_token_type_ids and
+            # _gemma4_vision_group_ids are sliced here and threaded to the ring
+            # through the MoE backend -> decoder-layer -> self_attn kwargs.
+            prepared = self._cp_sunk_prepare_inputs(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_position_ids=image_position_ids,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+            inputs_embeds = prepared["inputs_embeds"]
+            mm_token_type_ids = prepared["mm_token_type_ids"]
+            kwargs["_gemma4_vision_group_ids"] = prepared["_gemma4_vision_group_ids"]
+            pixel_values = None  # spliced into inputs_embeds; not re-processed downstream
+        else:
+            if input_ids is not None and inputs_embeds is None:
+                inputs_embeds = self.model.get_input_embeddings()(input_ids)
 
-        # Handle vision tokens
-        if pixel_values is not None:
-            if cp_enabled:
-                raise NotImplementedError(
-                    "Context parallelism with Gemma4 pixel_values requires pre-computed inputs_embeds. "
-                    "Call prepare_model_inputs_for_cp before CP sharding and pass inputs_embeds instead."
-                )
+            # Handle vision tokens
+            if pixel_values is not None:
+                image_features = self.model.get_image_features(
+                    pixel_values, image_position_ids=image_position_ids, return_dict=True
+                ).pooler_output
+                image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
 
-            image_features = self.model.get_image_features(
-                pixel_values, image_position_ids=image_position_ids, return_dict=True
-            ).pooler_output
-            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+                if mm_token_type_ids is not None:
+                    special_image_mask = mm_token_type_ids == 1
+                elif input_ids is not None:
+                    special_image_mask = input_ids == self.config.image_token_id
+                else:
+                    special_image_mask = torch.zeros(
+                        inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device
+                    )
 
-            if mm_token_type_ids is not None:
-                special_image_mask = mm_token_type_ids == 1
-            elif input_ids is not None:
-                special_image_mask = input_ids == self.config.image_token_id
-            else:
-                special_image_mask = torch.zeros(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
-
-            image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+                image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
 
         outputs = self.model.language_model(
             input_ids=None,
@@ -1394,58 +1429,106 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
     def prepare_model_inputs_for_cp(
         self,
-        input_ids: torch.Tensor,
-        pixel_values: torch.Tensor | None = None,
-        image_position_ids: torch.Tensor | None = None,
-        mm_token_type_ids: torch.Tensor | None = None,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
     ) -> dict[str, Any]:
-        """Prepare Gemma4 embeddings on the full sequence before CP sharding."""
-        if input_ids is None:
-            raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
+        """Return a sharder-only CP backend; embed + splice + slice happen in forward.
 
+        Sunk (Megatron-style per-microbatch) CP: the returned
+        :class:`ContextParallelSharder` contiguously shards only the no-grad
+        aux streams (labels/position_ids/loss_mask/padding_mask + the synthesized
+        ``_packed_seq_ids`` document map) via
+        :func:`make_contiguous_aux_only_shard_cp_batch_and_ctx` and leaves
+        ``input_ids`` / ``pixel_values`` / ``mm_token_type_ids`` full-length. The
+        forward (:meth:`_cp_sunk_prepare_inputs`) then embeds, splices vision,
+        builds ``per_layer_inputs`` and the ``mm_token_type_ids`` /
+        ``_gemma4_vision_group_ids`` ring metadata on the full sequence and keeps
+        this rank's contiguous slice, so the embeddings and vision tower are
+        trainable under CP and the PP×CP shared pre-embed graph no longer exists.
+        Nothing is consumed here. Defining this method is the opt-in signal the
+        recipe checks (``hasattr(model, "prepare_model_inputs_for_cp")``).
+
+        Args:
+            batch: The full-sequence batch; left intact (nothing consumed).
+            num_chunks: Accepted for hook-signature parity; unused (contiguous CP).
+        """
+        del num_chunks
+        if batch.get("input_ids") is None:
+            raise ValueError("prepare_model_inputs_for_cp requires input_ids.")
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=self._cp_shard_batch_aux_only,
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
+
+    def _cp_sunk_prepare_inputs(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor | None,
+        image_position_ids: torch.Tensor | None,
+        mm_token_type_ids: torch.Tensor | None,
+    ) -> dict[str, Any]:
+        """Sunk CP: embed + vision splice + per-layer inputs on the FULL sequence,
+        then keep this rank's contiguous slice (differentiable).
+
+        Runs the same embed / vision-splice / per-layer-input math as the non-CP
+        forward on the full microbatch sequence, then contiguously slices every
+        grad-carrying or per-token stream onto the layout the aux-only sharder
+        applied to labels/position_ids/padding_mask/``_packed_seq_ids``. The
+        ``_gemma4_vision_group_ids`` cumsum runs over the full sequence before the
+        slice, and ``mm_token_type_ids`` defaults to the image mask -- both
+        mirroring the previous dispatch-level pre-embed exactly, so the flex-ring
+        mask inputs reach the ring identical to before; only the shard call-site
+        moved into the forward.
+
+        Returns:
+            ``inputs_embeds`` and ``per_layer_inputs`` (this rank's contiguous
+            slice; ``per_layer_inputs`` is None when the variant has none) plus the
+            sliced ``mm_token_type_ids`` / ``_gemma4_vision_group_ids`` ring
+            metadata.
+        """
+        cp_mesh = self.cp_mesh
         special_image_mask = self._get_special_image_mask(input_ids, mm_token_type_ids)
         llm_input_ids = input_ids.masked_fill(special_image_mask, self._get_text_pad_token_id())
         inputs_embeds = self.model.get_input_embeddings()(llm_input_ids)
-        prepared_inputs: dict[str, Any] = {
-            "inputs_embeds": inputs_embeds,
-            "mm_token_type_ids": mm_token_type_ids
-            if mm_token_type_ids is not None
-            else special_image_mask.to(torch.long),
-            "_cp_make_batch_fn": self._cp_shard_batch,
-            "_gemma4_vision_group_ids": gemma4_vision_group_ids(
-                mm_token_type_ids if mm_token_type_ids is not None else special_image_mask.to(torch.long)
-            ),
-            "_cp_metadata_seq_dims": {"_gemma4_vision_group_ids": 1},
-            "_cp_metadata_pad_values": {"_gemma4_vision_group_ids": -1},
-        }
-
         per_layer_inputs = self._prepare_per_layer_inputs_for_cp(input_ids, special_image_mask)
-        if per_layer_inputs is not None:
-            prepared_inputs["per_layer_inputs"] = per_layer_inputs
-
         if pixel_values is not None:
             image_features = self.model.get_image_features(
                 pixel_values, image_position_ids=image_position_ids, return_dict=True
             ).pooler_output
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-            prepared_inputs["inputs_embeds"] = inputs_embeds.masked_scatter(image_mask, image_features)
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
 
-        return prepared_inputs
+        # Full flex-ring mask metadata. mm_token_type_ids defaults to the image
+        # mask (mirrors the previous pre-embed); vision_group_ids is a cumsum over
+        # the FULL sequence, so it must be built here before the slice.
+        mm_full = mm_token_type_ids if mm_token_type_ids is not None else special_image_mask.to(torch.long)
+        vision_group_ids_full = gemma4_vision_group_ids(mm_full)
 
-    def prepare_inputs_embeds_for_cp(
-        self,
-        input_ids: torch.Tensor,
-        pixel_values: torch.Tensor | None = None,
-        image_position_ids: torch.Tensor | None = None,
-        mm_token_type_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.prepare_model_inputs_for_cp(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_position_ids=image_position_ids,
-            mm_token_type_ids=mm_token_type_ids,
-        )["inputs_embeds"]
+        # Keep this rank's contiguous slice of every grad-carrying / per-token
+        # stream, on the same layout the aux-only sharder used (pad sentinels match
+        # the dispatch-level contiguous shard: mm_token_type_ids -> 0, vision group
+        # ids -> -1, embeds / per-layer inputs -> 0).
+        inputs_embeds = shard_sequence_for_cp_contiguous(cp_mesh, inputs_embeds, seq_dim=1)[0]
+        if per_layer_inputs is not None:
+            per_layer_inputs = shard_sequence_for_cp_contiguous(cp_mesh, per_layer_inputs, seq_dim=1)[0]
+        mm_local = shard_sequence_for_cp_contiguous(cp_mesh, mm_full, seq_dim=1, pad_value=0)[0]
+        vision_group_local, _, _ = shard_sequence_for_cp_contiguous(
+            cp_mesh,
+            vision_group_ids_full,
+            seq_dim=1,
+            pad_value=-1,
+        )
+        return {
+            "inputs_embeds": inputs_embeds,
+            "per_layer_inputs": per_layer_inputs,
+            "mm_token_type_ids": mm_local,
+            "_gemma4_vision_group_ids": vision_group_local,
+        }
 
     @torch.no_grad()
     def initialize_weights(

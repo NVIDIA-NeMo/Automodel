@@ -55,14 +55,12 @@ class _StudentVLM(nn.Module):
     def get_input_embeddings(self):
         return self.embedding
 
-    def prepare_model_inputs_for_cp(self, **kwargs):
-        return {"inputs_embeds": self.embedding(kwargs["input_ids"])}
+    def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
+        # Sharder-only CP hook: consumes nothing (the forward embeds + shards).
+        self.pre_embed_calls.append(dict(batch))
+        return {}
 
-    def forward(self, _pre_embed_only: bool = False, input_ids=None, inputs_embeds=None, **kwargs):
-        if _pre_embed_only:
-            self.pre_embed_calls.append(dict(kwargs, input_ids=input_ids))
-            return self.prepare_model_inputs_for_cp(input_ids=input_ids, **kwargs)
-
+    def forward(self, input_ids=None, inputs_embeds=None, **kwargs):
         self.forward_calls.append({"input_ids": input_ids, "inputs_embeds": inputs_embeds, **kwargs})
         if inputs_embeds is None:
             inputs_embeds = self.embedding(input_ids)
@@ -160,14 +158,24 @@ def test_vlm_kd_uses_tp_kd_loss_path(monkeypatch, trivial_pg):
     assert torch.isfinite(loss_buffer[0])
 
 
-def test_vlm_kd_cp_prepare_feeds_student_inputs_embeds_to_cp_and_teacher(monkeypatch):
+def test_vlm_kd_cp_prepare_shards_input_ids_and_teacher_embeds_them(monkeypatch):
     make_cp_calls = []
 
-    def fake_make_cp_batch_and_ctx(device_mesh, batch):
-        make_cp_calls.append((device_mesh, dict(batch)))
+    def fake_shard(sharder, batch):
+        """Capture the unsharded model-input mapping at the public CP seam.
+
+        Args:
+            sharder: Sharder configured with the recipe's device mesh.
+            batch: Mutable model-input mapping whose tensors have global batch
+                and sequence extents.
+
+        Returns:
+            The null context factory and the same input mapping.
+        """
+        make_cp_calls.append((sharder, dict(batch)))
         return nullcontext, batch
 
-    monkeypatch.setattr(vlm_kd, "make_cp_batch_and_ctx", fake_make_cp_batch_and_ctx)
+    monkeypatch.setattr(vlm_kd.ContextParallelSharder, "shard", fake_shard)
 
     student = _StudentVLM(hidden_size=8)
     teacher = _TeacherVLM(hidden_size=8)
@@ -188,123 +196,14 @@ def test_vlm_kd_cp_prepare_feeds_student_inputs_embeds_to_cp_and_teacher(monkeyp
         is_train=False,
     )
 
+    # Sunk student: the sharder-only hook consumes nothing, so input_ids (not
+    # inputs_embeds) flows to CP; the teacher embeds those input_ids itself.
     assert len(student.pre_embed_calls) == 1
     assert len(make_cp_calls) == 1
     cp_batch = make_cp_calls[0][1]
-    assert "inputs_embeds" in cp_batch
-    assert "input_ids" not in cp_batch
-    assert "pixel_values" not in cp_batch
+    assert "input_ids" in cp_batch
+    assert "inputs_embeds" not in cp_batch
     assert "labels" in cp_batch
-    assert teacher.forward_calls[0]["inputs_embeds"] is cp_batch["inputs_embeds"]
-    assert teacher.forward_calls[0]["input_ids"] is None
+    assert teacher.forward_calls[0]["input_ids"] is not None
+    assert teacher.forward_calls[0]["inputs_embeds"] is None
     assert torch.isfinite(loss_buffer[0])
-
-
-def test_vlm_kd_cp_rejects_teacher_student_hidden_size_mismatch(monkeypatch):
-    monkeypatch.setattr(vlm_kd, "make_cp_batch_and_ctx", lambda *args, **kwargs: pytest.fail("CP sharding skipped"))
-
-    student = _StudentVLM(hidden_size=8)
-    teacher = _TeacherVLM(hidden_size=12)
-    recipe = _make_recipe(
-        student=student,
-        teacher=teacher,
-        kd_loss_fn=KDLoss(),
-        device_mesh=_DeviceMesh(cp_size=2),
-    )
-
-    with pytest.raises(ValueError, match="teacher and student input embedding hidden sizes must match"):
-        recipe._forward_backward_step(
-            0,
-            _batch(),
-            loss_buffer=[],
-            num_label_tokens=3,
-            num_batches=1,
-            is_train=False,
-        )
-
-
-class _WeightOnlyEmbedding(nn.Module):
-    """Embedding-like module exposing only ``weight`` (no ``embedding_dim``)."""
-
-    def __init__(self, num_embeddings: int, hidden: int):
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(num_embeddings, hidden))
-
-
-class _ModelWithWeightOnlyEmbedding(nn.Module):
-    def __init__(self, hidden: int):
-        super().__init__()
-        self._emb = _WeightOnlyEmbedding(5, hidden)
-
-    def get_input_embeddings(self):
-        return self._emb
-
-
-class _ModelWithDegenerateEmbedding(nn.Module):
-    """Embedding lookup returns something with no usable shape info."""
-
-    def __init__(self):
-        super().__init__()
-
-    def get_input_embeddings(self):
-        # No embedding_dim and weight is 1-D, so both inner checks fail.
-        emb = nn.Module()
-        emb.weight = nn.Parameter(torch.empty(4))
-        return emb
-
-
-class _ModelWithTextConfig(nn.Module):
-    def __init__(self, text_hidden: int, outer_hidden: int | None = None):
-        super().__init__()
-        self.config = SimpleNamespace(
-            text_config=SimpleNamespace(hidden_size=text_hidden),
-            hidden_size=outer_hidden,
-        )
-
-
-class _ModelWithOuterConfigOnly(nn.Module):
-    def __init__(self, outer_hidden: int):
-        super().__init__()
-        # No text_config attribute at all.
-        self.config = SimpleNamespace(hidden_size=outer_hidden)
-
-
-class _ModelWithNoEmbeddingOrConfig(nn.Module):
-    pass
-
-
-def test_get_model_input_embedding_dim_uses_embedding_dim_when_available():
-    model = _StudentVLM(hidden_size=17)
-    assert vlm_kd._get_model_input_embedding_dim(model) == 17
-
-
-def test_get_model_input_embedding_dim_falls_back_to_weight_shape():
-    model = _ModelWithWeightOnlyEmbedding(hidden=13)
-    assert vlm_kd._get_model_input_embedding_dim(model) == 13
-
-
-def test_get_model_input_embedding_dim_prefers_text_config_hidden_size():
-    model = _ModelWithDegenerateEmbedding()
-    model.config = SimpleNamespace(
-        text_config=SimpleNamespace(hidden_size=21),
-        hidden_size=999,
-    )
-    assert vlm_kd._get_model_input_embedding_dim(model) == 21
-
-
-def test_get_model_input_embedding_dim_uses_outer_config_when_no_text_config():
-    model = _ModelWithOuterConfigOnly(outer_hidden=19)
-    assert vlm_kd._get_model_input_embedding_dim(model) == 19
-
-
-def test_get_model_input_embedding_dim_returns_none_when_unknown():
-    model = _ModelWithNoEmbeddingOrConfig()
-    assert vlm_kd._get_model_input_embedding_dim(model) is None
-
-
-def test_validate_cp_pre_embed_skips_when_teacher_hidden_size_unknown(monkeypatch):
-    monkeypatch.setattr(vlm_kd, "_get_model_input_embedding_dim", lambda model: None)
-    inputs_embeds = torch.zeros(1, 4, 8)
-    teacher = _ModelWithNoEmbeddingOrConfig()
-    # Should be a no-op (no exception) when teacher hidden size cannot be inferred.
-    assert vlm_kd._validate_cp_pre_embed_teacher_compatibility(inputs_embeds, teacher) is None
