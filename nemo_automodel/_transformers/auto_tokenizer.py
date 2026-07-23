@@ -13,7 +13,11 @@
 # limitations under the License.
 
 import logging
-from typing import Callable, Optional, Type, Union
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Literal, Optional, Type, Union
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +72,51 @@ class NeMoAutoTokenizer:
 
     # Make registry accessible at class level
     _registry = None
+
+    @dataclass(frozen=True, kw_only=True)
+    class Config:
+        """Declarative configuration for :class:`NeMoAutoTokenizer`."""
+
+        pretrained_model_name_or_path: str
+        trust_remote_code: bool = False
+        force_default: bool = False
+        force_hf: bool = False
+        add_eos_token: bool | None = None
+        padding_side: Literal["left", "right"] | None = None
+
+        def build(self) -> "PreTrainedTokenizerBase":
+            """Build the configured tokenizer without mutating config state."""
+            if self.add_eos_token is not None and self.padding_side is not None:
+                return NeMoAutoTokenizer.from_pretrained(
+                    pretrained_model_name_or_path=self.pretrained_model_name_or_path,
+                    trust_remote_code=self.trust_remote_code,
+                    force_default=self.force_default,
+                    force_hf=self.force_hf,
+                    add_eos_token=self.add_eos_token,
+                    padding_side=self.padding_side,
+                )
+            if self.add_eos_token is not None:
+                return NeMoAutoTokenizer.from_pretrained(
+                    pretrained_model_name_or_path=self.pretrained_model_name_or_path,
+                    trust_remote_code=self.trust_remote_code,
+                    force_default=self.force_default,
+                    force_hf=self.force_hf,
+                    add_eos_token=self.add_eos_token,
+                )
+            if self.padding_side is not None:
+                return NeMoAutoTokenizer.from_pretrained(
+                    pretrained_model_name_or_path=self.pretrained_model_name_or_path,
+                    trust_remote_code=self.trust_remote_code,
+                    force_default=self.force_default,
+                    force_hf=self.force_hf,
+                    padding_side=self.padding_side,
+                )
+            return NeMoAutoTokenizer.from_pretrained(
+                pretrained_model_name_or_path=self.pretrained_model_name_or_path,
+                trust_remote_code=self.trust_remote_code,
+                force_default=self.force_default,
+                force_hf=self.force_hf,
+            )
 
     @classmethod
     def register(cls, model_type: str, tokenizer_cls: Union[Type, Callable]) -> None:

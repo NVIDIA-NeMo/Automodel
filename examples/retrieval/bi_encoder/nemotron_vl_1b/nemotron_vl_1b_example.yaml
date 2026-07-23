@@ -47,7 +47,7 @@ model:
   detach_distributed_inbatch_negatives: false
 
 tokenizer:
-  _target_: nemo_automodel.components.models.llama_nemotron_vl.processor.LlamaNemotronVLProcessor.from_pretrained
+  _target_: nemo_automodel.components.models.llama_nemotron_vl.processor.LlamaNemotronVLProcessor.Config
   pretrained_model_name_or_path: nvidia/llama-nemotron-embed-vl-1b-v2
   q_max_length: 512
   p_max_length: 4096

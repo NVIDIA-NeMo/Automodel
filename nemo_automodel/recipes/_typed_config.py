@@ -203,10 +203,13 @@ class RecipeConfig:
         return build_optimizer_config(factory, kwargs)
 
     @cached_property
-    def tokenizer(self) -> "TokenizerConfig":
-        """Resolve the recipe's tokenizer or processor factory configuration."""
+    def tokenizer(self) -> "TokenizerConfig | None":
+        """Resolve the recipe's implementation-owned tokenizer or processor config."""
+        from transformers import AutoProcessor as TransformersAutoProcessor
+        from transformers import AutoTokenizer as TransformersAutoTokenizer
+
+        from nemo_automodel._transformers.auto_processor import AutoProcessor
         from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
-        from nemo_automodel._transformers.tokenizer_config import TokenizerConfig
 
         dataset_node = self._raw.get("dataset", None)
         dataset_has_tokenizer = dataset_node is not None and "tokenizer" in _as_dict(dataset_node)
@@ -221,26 +224,39 @@ class RecipeConfig:
         else:
             model_name = _model_name_from_cfg(self._raw.get("model", None))
             if model_name is None:
-                return TokenizerConfig()
-            return TokenizerConfig(
-                factory=NeMoAutoTokenizer.from_pretrained,
-                kwargs={
-                    "pretrained_model_name_or_path": model_name,
-                    "trust_remote_code": _trust_remote_code_from_model(self._raw.get("model", None)),
-                },
+                return None
+            return NeMoAutoTokenizer.Config(
+                pretrained_model_name_or_path=model_name,
+                trust_remote_code=_trust_remote_code_from_model(self._raw.get("model", None)),
             )
 
         if node is None:
-            return TokenizerConfig()
+            return None
 
         kwargs = _as_dict(node)
         target = kwargs.pop("_target_", None)
-        factory = NeMoAutoTokenizer.from_pretrained if target is None else target
-        if not callable(factory):
-            raise TypeError(f"Tokenizer _target_ must resolve to a callable, got {factory!r}")
         if inject_model_trust:
             kwargs.setdefault("trust_remote_code", _trust_remote_code_from_model(self._raw.get("model", None)))
-        return TokenizerConfig(factory=factory, kwargs=kwargs)
+
+        if target is None or target == NeMoAutoTokenizer.from_pretrained:
+            return NeMoAutoTokenizer.Config(**kwargs)
+        if target == TransformersAutoTokenizer.from_pretrained:
+            kwargs["force_hf"] = True
+            return NeMoAutoTokenizer.Config(**kwargs)
+        if target == TransformersAutoProcessor.from_pretrained:
+            return AutoProcessor.Config(**kwargs)
+
+        owner = getattr(target, "__self__", None)
+        config_cls = getattr(owner, "Config", None)
+        if isinstance(config_cls, type):
+            return config_cls(**kwargs)
+        if isinstance(target, type) and callable(getattr(target, "build", None)):
+            return target(**kwargs)
+        raise TypeError(
+            "Tokenizer _target_ must be NeMoAutoTokenizer.from_pretrained, "
+            "transformers.AutoTokenizer.from_pretrained, transformers.AutoProcessor.from_pretrained, "
+            "or a component whose class exposes a nested Config"
+        )
 
     @cached_property
     def dataloader(self) -> "DataloaderConfig" | None:

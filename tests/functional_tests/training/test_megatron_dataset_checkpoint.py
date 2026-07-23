@@ -75,7 +75,10 @@ def test_megatron_dataset_checkpointing():
     # Megatron datasets require a tokenizer; the recipe supplies it via runtime (build(tokenizer=...)),
     # so build it here the same way (from the dataset/model config) instead of relying on the default.
     recipe_config = RecipeConfig(cfg)
-    tokenizer = recipe_config.tokenizer.build()
+    tokenizer_config = recipe_config.tokenizer
+    if tokenizer_config is None:
+        raise ValueError("Megatron dataset checkpoint test requires a tokenizer config")
+    tokenizer = tokenizer_config.build()
     dataset = recipe_config.dataloader.build(
         dp_rank=dp_rank, dp_world_size=dp_world_size, pp_enabled=False, tokenizer=tokenizer
     )

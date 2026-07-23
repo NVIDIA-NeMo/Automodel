@@ -488,7 +488,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     f"      attn: te"
                 )
 
-        self.tokenizer = self.cfg.tokenizer.build()
+        tokenizer_config = self.cfg.tokenizer
+        self.tokenizer = tokenizer_config.build() if tokenizer_config is not None else None
         input_pipeline = self.cfg.llm_inputs.build(
             model=self.model_parts[0],
             tokenizer=self.tokenizer,

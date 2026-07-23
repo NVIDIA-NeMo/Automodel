@@ -284,9 +284,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
             logger=logger,
         )
 
-        self.tokenizer = self.cfg.tokenizer.build()
-        if self.tokenizer is None:
+        tokenizer_config = self.cfg.tokenizer
+        if tokenizer_config is None:
             raise ValueError("Retrieval training requires a tokenizer or processor config")
+        self.tokenizer = tokenizer_config.build()
         tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
