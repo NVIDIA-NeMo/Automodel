@@ -32,7 +32,7 @@ import pathlib
 import time
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import mlflow
 import torch
@@ -40,10 +40,10 @@ import torch.nn as nn
 import wandb
 from huggingface_hub import constants as hf_constants
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-from transformers import AutoConfig
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+from nemo_automodel._transformers.capabilities import ModelSupports
 from nemo_automodel._transformers.infrastructure import (
     apply_model_infrastructure,
     instantiate_infrastructure,
@@ -51,7 +51,7 @@ from nemo_automodel._transformers.infrastructure import (
 from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
-from nemo_automodel.components.datasets.loader import DataloaderConfig
+from nemo_automodel.components.datasets.loader import CollateFn, DataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
@@ -88,7 +88,6 @@ from nemo_automodel.components.utils.compile_utils import (
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import (
     _supports_logits_to_keep,
-    _supports_seq_lens,
     filter_forward_kwargs,
     resolve_trust_remote_code,
 )
@@ -118,6 +117,12 @@ def _get_model_name(cfg_model):
         return None
 
 
+def _supports_sequence_packing(model: nn.Module) -> bool:
+    """Return whether the live model accepts the packed-sequence input contract."""
+    supports = getattr(model, "supports_sequence_packing", None)
+    return bool(supports) if supports is not None else ModelSupports(model).supports_sequence_packing
+
+
 def _should_pack_validation(
     training_dataloader: DataloaderConfig | None,
     validation_dataloader: DataloaderConfig,
@@ -145,9 +150,12 @@ def _should_pack_validation(
     )
 
 
-def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
-    """Return whether the recipe should attach PP causal-mask precomputation."""
-    return getattr(model_config, "model_type", None) != "deepseek_v4"
+def _requires_pp_thd_microbatch_override(config: RecipeConfig) -> bool:
+    """Return whether TE+THD pipeline batches require the single-microbatch layout."""
+    from nemo_automodel.components.models.common.packing import get_attn_implementation
+
+    dataloader = config.dataloader
+    return dataloader is not None and get_attn_implementation(config.model) == "te" and dataloader.emits_thd
 
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
@@ -343,49 +351,37 @@ def _build_tokenizer(cfg_model, cfg_ds):
     return kwargs, tokenizer
 
 
-def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
-    """Return a collate-fn wrapper that precomputes pipeline-parallel causal masks, or ``None``.
-
-    ``None`` when PP is disabled, the model config can't be loaded, or the model
-    computes masks internally (e.g. ``deepseek_v4``).  Passed to
-    :meth:`DataloaderConfig.build` as ``collate_wrapper``.
-    """
+def _build_pp_collate_wrapper(model: nn.Module, pp_enabled: bool) -> Callable[[CollateFn], CollateFn] | None:
+    """Return a PP causal-mask wrapper derived from the live model, or ``None``."""
     if not pp_enabled:
         return None
-    try:
-        hf_model_config = AutoConfig.from_pretrained(
-            _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
-        )
-    except Exception:
+
+    model_config = getattr(model, "config", None)
+    if model_config is None:
         logger.warning(
-            "Failed to load model config for causal mask precomputation. "
+            "The live model has no config for causal-mask precomputation. "
             "Pipeline parallel mask precomputation will be skipped."
         )
         return None
-    if not _should_precompute_pp_causal_masks(hf_model_config):
-        logger.info(
-            "Skipping pipeline parallel causal mask precomputation for model_type=%s.",
-            getattr(hf_model_config, "model_type", None),
-        )
+    if getattr(model_config, "model_type", None) == "deepseek_v4":
+        logger.info("Skipping pipeline parallel causal mask precomputation for model_type=deepseek_v4.")
         return None
 
     from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
 
-    def wrapper(base_collate_fn):
-        def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
-            """Collate examples and attach pipeline-parallel causal masks.
+    def wrapper(base_collate_fn: CollateFn) -> CollateFn:
+        def chained_collate_fn(batch: list[object]) -> object:
+            """Collate examples and attach causal masks over the resulting token axis.
 
             Args:
-                batch: Raw examples accepted by ``base_fn``. Standard token-list fields have per-example shape
-                    ``[S_i]`` and pre-batched tensor fields have shape ``[B_i, ...]``, where ``S_i`` is an
-                    example sequence length and ``B_i`` is a source batch size.
+                batch: Raw examples accepted by ``base_collate_fn``. Token-list fields have per-example
+                    shape ``[S_i]`` and pre-batched tensor fields have shape ``[B_i, ...]``.
 
             Returns:
-                Collated mapping whose standard token tensors have shape ``[B, S]``, where ``B`` is local batch
-                size and ``S`` is padded sequence length, plus ``causal_mask_mapping`` entries covering the
-                same ``S`` token axis. Other tensor fields preserve the base collator's documented layout.
+                Collated mapping with token tensors shaped ``[B, S]`` and a ``causal_mask_mapping`` over
+                the same ``S`` token axis. Other fields preserve the base collator's documented layout.
             """
-            return add_causal_masks_to_batch(base_fn(batch), model_config=config)
+            return add_causal_masks_to_batch(base_collate_fn(batch), model_config=model_config)
 
         return chained_collate_fn
 
@@ -508,12 +504,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
 
             # THD override logic
-            if (
-                self.mesh_context.cp_size > 1
-                and self.cfg.get("model.backend.attn", self.cfg.get("model.attn_implementation", None)) == "te"
-                and self.cfg.dataloader is not None
-                and self.cfg.dataloader.emits_thd
-            ):
+            if self.mesh_context.cp_size > 1 and _requires_pp_thd_microbatch_override(self.cfg):
                 pp_microbatch_size = 1
                 pp_batch_size = pp_batch_size // self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
                 logging.info(
@@ -646,22 +637,23 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     f"      attn: te"
                 )
 
-        # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
-        # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
+        # Tokenizer + model-derived values are runtime concerns: pass them explicitly to each
+        # component-owned DataloaderConfig.build().
         _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
-        attn_implementation = None
-        if (
-            self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
-            and self.cfg.get("packed_sequence.packing_strategy", "thd") == "neat"
-        ):
-            from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+        train_dataloader_config = self.cfg.dataloader
+        if train_dataloader_config is None:
+            raise ValueError("An LLM recipe requires a dataset configuration")
 
-            attn_implementation = get_attn_implementation(self.cfg.model)
+        from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+
+        attn_implementation = get_attn_implementation(self.cfg.model)
+        if train_dataloader_config.packing is not None and train_dataloader_config.packing.requires_model_configuration:
             configure_packing(attn_implementation=attn_implementation)
-        collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
 
-        def materialize_loader(config):
-            process_group = getattr(self.mesh_context, "process_group", None)
+        collate_wrapper = _build_pp_collate_wrapper(self.model_parts[0], self.pp_enabled)
+        process_group = getattr(self.mesh_context, "process_group", None)
+
+        def materialize(config: DataloaderConfig):
             build_context = (
                 nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode(group=process_group)
             )
@@ -672,20 +664,24 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     dp_rank=self._get_dp_rank(),
                     dp_world_size=self._get_dp_group_size(),
                     pp_enabled=self.pp_enabled,
-                    supports_seq_lens=_supports_seq_lens(self.model_parts[0]),
+                    supports_seq_lens=_supports_sequence_packing(self.model_parts[0]),
                     cp_size=self.cfg.get("distributed.cp_size", 1),
                     attn_implementation=attn_implementation,
                     collate_wrapper=collate_wrapper,
                 )
 
-        self.dataloader = materialize_loader(self.cfg.dataloader)
+        self.dataloader = materialize(train_dataloader_config)
         self.val_dataloaders = {
-            name: materialize_loader(
-                dl_config
-                if _should_pack_validation(self.cfg.dataloader, dl_config, self.model_parts[0])
-                else replace(dl_config, packing=None)
+            name: materialize(
+                config
+                if _should_pack_validation(
+                    train_dataloader_config,
+                    config,
+                    self.model_parts[0],
+                )
+                else replace(config, packing=None)
             )
-            for name, dl_config in self.cfg.validation_dataloaders.items()
+            for name, config in self.cfg.validation_dataloaders.items()
         }
         # Optional tool-call accuracy evaluator for agent SFT runs.
         # Presence of the ``tool_call_eval`` block enables it; absence skips it.
