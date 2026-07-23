@@ -185,10 +185,10 @@ lr_scheduler:
   lr_warmup_steps: 1
 
 # wandb:
-#   project: yuhez_workspace
-#   entity: Nemo-automodel
-#   name: qwen3-5-122b-128k-ep8cp32-train-vit
-#   dir: logs/qwen3-5-122b-128k-ep8cp32/wandb  # pragma: allowlist secret
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_name>
+#   dir: <your_wandb_save_dir>
 
 ci:
   recipe_owner: yuhez
