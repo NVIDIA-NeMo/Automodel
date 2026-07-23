@@ -23,6 +23,7 @@ from nemo_automodel.components.datasets.vlm.loader import (
     VlmCollatorConfig,
     VlmDataloaderConfig,
     VlmProcessorConfig,
+    VlmVideoProcessorConfig,
 )
 from nemo_automodel.components.datasets.vlm.mock import MockVlmDatasetConfig
 from nemo_automodel.components.datasets.vlm.neat_packing_vlm import NeatPackConfig
@@ -156,6 +157,83 @@ def test_vlm_dataloader_builds_processor_and_dataset_inside_context_then_iterate
     assert result.processor is processor
     assert batch == ["item:one", "item:two"]
     assert batch_processor is processor
+
+
+def test_vlm_processor_builds_independently_configured_video_processor():
+    video_processor = object()
+    calls = []
+
+    def build_video_processor(*, pretrained_model_name_or_path, size, fps, max_frames):
+        calls.append(("video", pretrained_model_name_or_path, size, fps, max_frames))
+        return video_processor
+
+    def build_processor(*, model_id, video_processor):
+        calls.append(("processor", model_id, video_processor))
+        return DummyProcessor()
+
+    config = VlmProcessorConfig(
+        factory=build_processor,
+        kwargs={"model_id": "outer-model"},
+        video_processor=VlmVideoProcessorConfig(
+            factory=build_video_processor,
+            kwargs={
+                "size": {"shortest_edge": 1024, "longest_edge": 524288},
+                "fps": 2,
+                "max_frames": 8,
+            },
+        ),
+    )
+
+    result = config.build(pretrained_model_name_or_path="runtime-model")
+
+    assert isinstance(result, DummyProcessor)
+    assert calls == [
+        ("video", "runtime-model", {"shortest_edge": 1024, "longest_edge": 524288}, 2, 8),
+        ("processor", "outer-model", video_processor),
+    ]
+
+
+def test_recipe_config_resolves_nested_vlm_video_processor():
+    def build_video_processor(**kwargs):
+        return kwargs
+
+    def build_processor(**kwargs):
+        return kwargs
+
+    config = RecipeConfig(
+        ConfigNode(
+            {
+                "processor": {
+                    "_target_": build_processor,
+                    "pretrained_model_name_or_path": "outer-model",
+                    "video_processor": {
+                        "_target_": build_video_processor,
+                        "size": {"shortest_edge": 1024, "longest_edge": 524288},
+                        "fps": 2,
+                        "max_frames": 8,
+                    },
+                },
+                "dataset": {
+                    "_target_": "nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset",
+                    "num_samples": 1,
+                },
+                "dataloader": {
+                    "_target_": "torchdata.stateful_dataloader.StatefulDataLoader",
+                    "num_workers": 0,
+                },
+            }
+        )
+    ).vlm_dataloader.processor_config
+
+    assert config.factory is build_processor
+    assert config.kwargs == {"pretrained_model_name_or_path": "outer-model"}
+    assert config.video_processor is not None
+    assert config.video_processor.factory is build_video_processor
+    assert config.video_processor.kwargs == {
+        "size": {"shortest_edge": 1024, "longest_edge": 524288},
+        "fps": 2,
+        "max_frames": 8,
+    }
 
 
 def test_vlm_dataloader_selects_thd_collater(monkeypatch):
