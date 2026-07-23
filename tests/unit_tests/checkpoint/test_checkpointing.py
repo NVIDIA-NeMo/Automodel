@@ -1653,10 +1653,14 @@ class TestInitializeModelWeights:
             Checkpointer.initialize_model_weights(model, torch.device("cpu"))
             mock_logging.warning.assert_called_once()
 
-    def test_skips_for_nemotron_v2(self):
-        """NemotronHForCausalLM v2 (no n_routed_experts) should skip init."""
+    def test_skips_for_nemotron_v2_hf_remote_code(self):
+        """HF remote-code dense NemotronH (has .backbone, no n_routed_experts) skips init.
+
+        Its _init_weights uses DTensor-unsafe ops, so the loaded weights are left as-is.
+        """
         model = self._make_meta_model()
         model.config = SimpleNamespace(architectures=["NemotronHForCausalLM"])
+        model.backbone = torch.nn.Module()  # marks the HF remote-code path
         model._is_hf_initialized = True
         model.initialize_weights = MagicMock()
 
@@ -1664,6 +1668,20 @@ class TestInitializeModelWeights:
 
         model.initialize_weights.assert_not_called()
         assert model._is_hf_initialized is True
+
+    def test_does_not_skip_for_custom_dense_nemotron(self):
+        """Custom dense NemotronH (no .backbone, no n_routed_experts) runs its own init.
+
+        Regression guard for #2004: the custom dense path uses model.model with its own
+        initialize_weights, so unlike the HF remote-code path it must NOT be skipped.
+        """
+        model = self._make_meta_model()
+        model.config = SimpleNamespace(architectures=["NemotronHForCausalLM"])
+        model.initialize_weights = MagicMock()
+
+        Checkpointer.initialize_model_weights(model, torch.device("cpu"))
+
+        model.initialize_weights.assert_called_once()
 
     def test_does_not_skip_for_nemotron_v3_moe(self):
         """NemotronHForCausalLM v3 (with n_routed_experts) should NOT be skipped."""
