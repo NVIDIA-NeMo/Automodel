@@ -769,7 +769,7 @@ def test_apply_model_infrastructure_configures_dense_thd_te_and_bshd_sdpa_cp():
             pretrained_model_name_or_path="",
         )
 
-    attach_te.assert_called_once_with(model, cp_mesh)
+    attach_te.assert_called_once_with(model, cp_mesh, None)
     attach_sdpa.assert_called_once_with(model)
 
 

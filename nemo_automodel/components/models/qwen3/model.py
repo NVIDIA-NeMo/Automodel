@@ -75,6 +75,7 @@ class Qwen3Attention(HFQwen3Attention):
                 num_v_channels=self.head_dim,
                 softmax_scale=self.scaling,
                 num_gqa_groups=config.num_key_value_heads,
+                attention_dropout=config.attention_dropout,
             )
 
     def forward(
@@ -143,7 +144,7 @@ class Qwen3Attention(HFQwen3Attention):
                 position_embeddings[1],
             )
 
-        window_size = (-1, 0) if self.sliding_window is None else (self.sliding_window, 0)
+        window_size = (-1, 0) if self.sliding_window is None else (self.sliding_window - 1, 0)
         query_states, key_states, value_states, te_kwargs = preprocess_args_and_kwargs_for_attn(
             query_states,
             key_states,
@@ -285,6 +286,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
+                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }

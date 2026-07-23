@@ -33,9 +33,10 @@ MODEL_KINDS = ("llama", "qwen2", "qwen3")
 class _ReferencePackedAttention(nn.Module):
     """CPU reference for TE's causal variable-length THD attention."""
 
-    def __init__(self, scale: float) -> None:
+    def __init__(self, scale: float, attention_dropout: float) -> None:
         super().__init__()
         self.scale = scale
+        self.attention_dropout = attention_dropout
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs) -> torch.Tensor:
         """Attend independently within each packed document.
@@ -51,16 +52,29 @@ class _ReferencePackedAttention(nn.Module):
             Packed output ``[T, Hq, D]`` in the same document order.
         """
         cu_seqlens = kwargs["cu_seqlens_q"].tolist()
+        left_window, right_window = kwargs.get("window_size", (-1, 0))
         outputs = []
         for start, end in zip(cu_seqlens, cu_seqlens[1:]):
             q_doc = query[start:end].transpose(0, 1).unsqueeze(0)
             k_doc = key[start:end].transpose(0, 1).unsqueeze(0)
             v_doc = value[start:end].transpose(0, 1).unsqueeze(0)
+            attention_mask = None
+            is_causal = True
+            if left_window >= 0:
+                positions = torch.arange(end - start)
+                query_positions = positions[:, None]
+                key_positions = positions[None, :]
+                attention_mask = (key_positions >= query_positions - left_window) & (
+                    key_positions <= query_positions + right_window
+                )
+                is_causal = False
             output = F.scaled_dot_product_attention(
                 q_doc,
                 k_doc,
                 v_doc,
-                is_causal=True,
+                attn_mask=attention_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=is_causal,
                 enable_gqa=True,
                 scale=self.scale,
             )
@@ -69,11 +83,17 @@ class _ReferencePackedAttention(nn.Module):
 
 
 def _reference_te_factory(**kwargs):
-    attention = _ReferencePackedAttention(kwargs["softmax_scale"])
+    attention = _ReferencePackedAttention(kwargs["softmax_scale"], kwargs["attention_dropout"])
     return attention, attention.__call__
 
 
-def _build_model(model_kind: str, monkeypatch: pytest.MonkeyPatch) -> nn.Module:
+def _build_model(
+    model_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    attention_dropout: float = 0.0,
+    sliding_window: int | None = None,
+) -> nn.Module:
     if model_kind == "llama":
         module = importlib.import_module("nemo_automodel.components.models.llama.model")
         model_cls = module.LlamaForCausalLM
@@ -85,7 +105,7 @@ def _build_model(model_kind: str, monkeypatch: pytest.MonkeyPatch) -> nn.Module:
             num_attention_heads=4,
             num_key_value_heads=2,
             max_position_embeddings=32,
-            attention_dropout=0.0,
+            attention_dropout=attention_dropout,
             tie_word_embeddings=False,
         )
     elif model_kind == "qwen2":
@@ -99,7 +119,7 @@ def _build_model(model_kind: str, monkeypatch: pytest.MonkeyPatch) -> nn.Module:
             num_attention_heads=4,
             num_key_value_heads=2,
             max_position_embeddings=32,
-            attention_dropout=0.0,
+            attention_dropout=attention_dropout,
             tie_word_embeddings=False,
         )
     else:
@@ -114,9 +134,15 @@ def _build_model(model_kind: str, monkeypatch: pytest.MonkeyPatch) -> nn.Module:
             num_key_value_heads=2,
             head_dim=4,
             max_position_embeddings=32,
-            attention_dropout=0.0,
+            attention_dropout=attention_dropout,
             tie_word_embeddings=False,
         )
+
+    if sliding_window is not None:
+        if not hasattr(config, "sliding_window") or not hasattr(config, "layer_types"):
+            raise ValueError(f"{model_kind} config does not support sliding attention.")
+        config.sliding_window = sliding_window
+        config.layer_types = ["sliding_attention"] * config.num_hidden_layers
 
     monkeypatch.setattr(module, "initialize_attn_module_and_func", _reference_te_factory)
     config._attn_implementation = "sdpa"
@@ -207,3 +233,37 @@ def test_packed_thd_rejects_non_te_attention(model_kind, monkeypatch):
             cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32),
             max_seqlen=2,
         )
+
+
+@pytest.mark.parametrize("model_kind", MODEL_KINDS)
+def test_te_attention_preserves_configured_dropout(model_kind, monkeypatch):
+    """The THD backend must receive the model's nonzero attention dropout."""
+    model = _build_model(model_kind, monkeypatch, attention_dropout=0.25)
+
+    assert model.model.layers[0].self_attn.attn_module.attention_dropout == 0.25
+
+
+@pytest.mark.parametrize("model_kind", ("qwen2", "qwen3"))
+def test_packed_sliding_attention_matches_huggingface_window(model_kind, monkeypatch):
+    """Packed THD must use the same inclusive token count as HF sliding attention."""
+    torch.manual_seed(1234)
+    reference_model = _build_model(model_kind, monkeypatch, sliding_window=3).eval()
+    packed_model = _build_model(model_kind, monkeypatch, sliding_window=3).eval()
+    packed_model.load_state_dict(reference_model.state_dict())
+
+    input_ids = torch.tensor([1, 2, 3, 4, 5, 6])
+    position_ids = torch.arange(input_ids.shape[0])
+    reference_logits = reference_model(
+        input_ids.unsqueeze(0),
+        position_ids=position_ids.unsqueeze(0),
+        use_cache=False,
+    ).logits
+    packed_logits = packed_model(
+        input_ids,
+        position_ids=position_ids,
+        qkv_format="thd",
+        cu_seqlens=torch.tensor([0, input_ids.shape[0]], dtype=torch.int32),
+        max_seqlen=input_ids.shape[0],
+    ).logits
+
+    torch.testing.assert_close(packed_logits, reference_logits, atol=1e-6, rtol=1e-6)

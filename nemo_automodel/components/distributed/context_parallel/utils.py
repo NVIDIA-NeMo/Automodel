@@ -187,13 +187,20 @@ def attach_context_parallel_hooks(model: torch.nn.Module):
             module.register_forward_pre_hook(_self_attn_pre_forward_hook, with_kwargs=True, prepend=True)
 
 
-def attach_te_context_parallel(model: torch.nn.Module, cp_mesh: DeviceMesh) -> int:
-    """Configure Transformer Engine attention modules for context parallelism.
+def attach_te_context_parallel(
+    model: torch.nn.Module,
+    cp_mesh: DeviceMesh,
+    tp_mesh: DeviceMesh | None = None,
+) -> int:
+    """Configure Transformer Engine attention modules for context and tensor parallelism.
 
     Args:
         model: Model or pipeline stage containing ``self_attn`` modules.
         cp_mesh: One-dimensional context-parallel device mesh. Every configured
             attention module communicates over this mesh; no tensor is mutated.
+        tp_mesh: Optional one-dimensional tensor-parallel device mesh. When its
+            size is greater than one, Q/K/V use per-rank head shards and every
+            attention module is configured with the corresponding process group.
 
     Returns:
         Number of Transformer Engine attention modules configured.
@@ -207,6 +214,8 @@ def attach_te_context_parallel(model: torch.nn.Module, cp_mesh: DeviceMesh) -> i
     cp_group = cp_mesh.get_group()
     cp_ranks = torch.distributed.get_process_group_ranks(cp_group)
     cp_stream = torch.cuda.Stream()
+    tp_size = tp_mesh.size() if tp_mesh is not None else 1
+    tp_group = tp_mesh.get_group() if tp_size > 1 else None
     configured = 0
     for name, module in model.named_modules():
         if not name.endswith("self_attn"):
@@ -214,6 +223,16 @@ def attach_te_context_parallel(model: torch.nn.Module, cp_mesh: DeviceMesh) -> i
         attn_module = getattr(module, "attn_module", None)
         if not isinstance(attn_module, dot_product_attention_cls):
             continue
+        if tp_size > 1:
+            if attn_module.num_attention_heads % tp_size != 0 or attn_module.num_gqa_groups % tp_size != 0:
+                raise ValueError(
+                    "Transformer Engine attention head counts must be divisible by tensor-parallel size: "
+                    f"num_attention_heads={attn_module.num_attention_heads}, "
+                    f"num_gqa_groups={attn_module.num_gqa_groups}, tp_size={tp_size}."
+                )
+            attn_module.tp_size = tp_size
+            attn_module.num_gqa_groups_per_partition = attn_module.num_gqa_groups // tp_size
+            attn_module.set_tensor_parallel_group(tp_group)
         cp_comm_type = "all_gather" if getattr(module, "sliding_window", None) is not None else "p2p"
         attn_module.set_context_parallel_group(
             cp_group,

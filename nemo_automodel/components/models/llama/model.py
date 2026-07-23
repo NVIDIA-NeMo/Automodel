@@ -121,6 +121,7 @@ class LlamaAttention(nn.Module):
                 num_v_channels=self.head_dim,
                 softmax_scale=self.scaling,
                 num_gqa_groups=config.num_key_value_heads,
+                attention_dropout=config.attention_dropout,
             )
 
     def forward(
@@ -457,6 +458,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 config=self.config,
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
+                cache_position=cache_position,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
             )

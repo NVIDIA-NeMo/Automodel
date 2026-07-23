@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import contextlib
 from functools import partial
-from typing import Any
 from unittest import mock
 
 import pytest
@@ -455,9 +454,17 @@ def test_attach_te_context_parallel_configures_full_and_sliding_attention(monkey
     class _FakeDotProductAttention:
         def __init__(self):
             self.calls = []
+            self.tp_calls = []
+            self.num_attention_heads = 8
+            self.num_gqa_groups = 4
+            self.tp_size = 1
+            self.num_gqa_groups_per_partition = 4
 
         def set_context_parallel_group(self, group, ranks, stream, *, cp_comm_type):
             self.calls.append((group, ranks, stream, cp_comm_type))
+
+        def set_tensor_parallel_group(self, group):
+            self.tp_calls.append(group)
 
     class _Attention(torch.nn.Module):
         def __init__(self, sliding_window):
@@ -475,6 +482,10 @@ def test_attach_te_context_parallel_configures_full_and_sliding_attention(monkey
     stream = object()
     cp_mesh = mock.MagicMock()
     cp_mesh.get_group.return_value = group
+    tp_group = object()
+    tp_mesh = mock.MagicMock()
+    tp_mesh.size.return_value = 2
+    tp_mesh.get_group.return_value = tp_group
 
     monkeypatch.setattr(
         "nemo_automodel.shared.import_utils.safe_import_from",
@@ -483,11 +494,15 @@ def test_attach_te_context_parallel_configures_full_and_sliding_attention(monkey
     monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _group: [0, 1])
     monkeypatch.setattr(torch.cuda, "Stream", lambda: stream)
 
-    configured = _cu.attach_te_context_parallel(model, cp_mesh)
+    configured = _cu.attach_te_context_parallel(model, cp_mesh, tp_mesh)
 
     assert configured == 2
     assert model[0].self_attn.attn_module.calls == [(group, [0, 1], stream, "p2p")]
     assert model[1].self_attn.attn_module.calls == [(group, [0, 1], stream, "all_gather")]
+    for block in model:
+        assert block.self_attn.attn_module.tp_calls == [tp_group]
+        assert block.self_attn.attn_module.tp_size == 2
+        assert block.self_attn.attn_module.num_gqa_groups_per_partition == 2
 
 
 # ============================================================================

@@ -107,6 +107,7 @@ class Qwen2Attention(nn.Module):
                 num_v_channels=self.head_dim,
                 softmax_scale=self.scaling,
                 num_gqa_groups=config.num_key_value_heads,
+                attention_dropout=config.attention_dropout,
             )
 
     def forward(
@@ -178,7 +179,7 @@ class Qwen2Attention(nn.Module):
             attn_module = getattr(self, "attn_module", None)
             if attn_module is None:
                 raise ValueError("Packed THD attention requires backend.attn='te'.")
-            window_size = (-1, 0) if self.sliding_window is None else (self.sliding_window, 0)
+            window_size = (-1, 0) if self.sliding_window is None else (self.sliding_window - 1, 0)
             query_states, key_states, value_states, te_kwargs = preprocess_args_and_kwargs_for_attn(
                 query_states,
                 key_states,
@@ -431,6 +432,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
+                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }

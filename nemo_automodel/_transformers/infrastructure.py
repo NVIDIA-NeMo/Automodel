@@ -770,7 +770,8 @@ def apply_model_infrastructure(
         uses_te_attention = _uses_te_attention(model)
         if uses_te_attention:
             cp_mesh = mesh.device_mesh["cp"]
-            configured = sum(attach_te_context_parallel(mp, cp_mesh) for mp in model_parts)
+            tp_mesh = mesh.device_mesh["tp"] if mesh.tp_size > 1 else None
+            configured = sum(attach_te_context_parallel(mp, cp_mesh, tp_mesh) for mp in model_parts)
             if configured == 0:
                 raise ValueError(
                     "Context parallelism selected Transformer Engine attention, but no "
