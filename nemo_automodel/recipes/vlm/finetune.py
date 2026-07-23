@@ -357,6 +357,7 @@ def build_dataloader(
             get_rope_index=get_rope_index,
             packing_attn_implementation=packing_attn_implementation,
             pp_n_microbatches=pp_n_microbatches,
+            cp_size=cp_size,
         )
     return result.dataloader, result.processor
 
@@ -624,6 +625,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 get_rope_index=get_rope_index,
                 packing_attn_implementation=packing_attn_implementation,
                 pp_n_microbatches=pp_n_microbatches,
+                cp_size=self.mesh_context.cp_size,
             )
         self.dataloader = dataloader_build.dataloader
         self.processor = dataloader_build.processor
@@ -641,6 +643,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
                     dataset_build_context=validation_build_context,
                     get_rope_index=get_rope_index,
+                    cp_size=self.mesh_context.cp_size,
                 )
             self.val_dataloader = validation_build.dataloader
 

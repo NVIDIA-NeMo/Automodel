@@ -17,7 +17,10 @@ from dataclasses import dataclass
 import pytest
 
 from nemo_automodel.components.config.loader import ConfigNode
-from nemo_automodel.components.datasets.vlm.collate_fns import packed_sequence_thd_vlm_collater
+from nemo_automodel.components.datasets.vlm.collate_fns import (
+    neat_packed_vlm_collater,
+    packed_sequence_thd_vlm_collater,
+)
 from nemo_automodel.components.datasets.vlm.datasets import CordV2DatasetConfig, PreTokenizedDatasetWrapperConfig
 from nemo_automodel.components.datasets.vlm.loader import (
     VlmCollatorConfig,
@@ -257,3 +260,29 @@ def test_vlm_dataloader_selects_thd_collater(monkeypatch):
 
     assert result.dataloader.collate_fn.func is packed_sequence_thd_vlm_collater
     assert result.dataloader.collate_fn.keywords == {"padding_idx": 0, "max_length": None}
+
+
+def test_vlm_dataloader_skips_dense_neat_packing_mask_under_cp(monkeypatch):
+    processor = DummyProcessor()
+    monkeypatch.setattr(PreTokenizedDatasetWrapperConfig, "build", lambda self, dataset, processor: dataset)
+    monkeypatch.setattr(NeatPackConfig, "build", lambda self, dataset, **kwargs: dataset)
+    config = VlmDataloaderConfig(
+        dataset_config=StaticDatasetConfig([]),
+        processor_config=VlmProcessorConfig(factory=lambda: processor),
+        pretokenization=PreTokenizedDatasetWrapperConfig(),
+        packing=NeatPackConfig(),
+        shuffle=False,
+    )
+
+    result = config.build(
+        pretrained_model_name_or_path="unused",
+        dp_rank=0,
+        dp_world_size=1,
+        batch_size=2,
+        packing_attn_implementation="sdpa",
+        cp_size=32,
+    )
+
+    assert result.dataloader.collate_fn.func is neat_packed_vlm_collater
+    assert result.dataloader.collate_fn.keywords["attn_implementation"] == "sdpa"
+    assert result.dataloader.collate_fn.keywords["materialize_4d_mask"] is False

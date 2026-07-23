@@ -236,6 +236,7 @@ class VlmDataloaderConfig:
         get_rope_index: Callable[..., object] | None = None,
         packing_attn_implementation: str | None = None,
         pp_n_microbatches: int | None = None,
+        cp_size: int = 1,
     ) -> VlmDataloaderBuild:
         """Build the processor, dataset wrappers, sampler, collator, and dataloader.
 
@@ -248,6 +249,8 @@ class VlmDataloaderConfig:
             get_rope_index: Optional model callback used to create packed multimodal position IDs.
             packing_attn_implementation: Resolved attention backend for packed-mask construction.
             pp_n_microbatches: Optional pipeline microbatch count used to pre-chunk media tensors.
+            cp_size: Runtime context-parallel world size. Neat-packed CP uses
+                compact document IDs instead of a dense quadratic attention mask.
 
         Returns:
             Named result containing the stateful dataloader and runtime processor.
@@ -285,11 +288,19 @@ class VlmDataloaderConfig:
                     max_length=self.packing.collate_max_length,
                 )
             else:
+                materialize_4d_mask = cp_size <= 1
+                if not materialize_4d_mask:
+                    logger.info(
+                        "Skipping the dense packed VLM attention mask at cp_size=%d; "
+                        "the CP path rebuilds it from compact document IDs",
+                        cp_size,
+                    )
                 collate_fn = partial(
                     neat_packed_vlm_collater,
                     padding_idx=padding_idx,
                     max_length=self.packing.collate_max_length,
                     attn_implementation=packing_attn_implementation,
+                    materialize_4d_mask=materialize_4d_mask,
                 )
         elif self.collator is not None:
             collate_fn = self.collator.build(processor=processor)
