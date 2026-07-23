@@ -409,6 +409,10 @@ def instantiate_infrastructure(
                 "enable_async_tensor_parallel",
                 bool(model_wrapper.enable_async_tensor_parallel),
             )
+            moe_kwargs.setdefault(
+                "frozen_multimodal_sharding",
+                model_wrapper.frozen_multimodal_sharding,
+            )
         parallelize_fn = partial(
             parallelize_model,
             activation_checkpointing=activation_checkpointing,
