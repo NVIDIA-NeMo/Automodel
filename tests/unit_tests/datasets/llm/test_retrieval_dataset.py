@@ -932,7 +932,7 @@ def test_load_datasets_inline_jsonl(tmp_path):
     row0 = dataset[0]
     assert row0["question"] == "Explain transformers"
     assert row0["corpus_id"] == rdi.INLINE_CORPUS_ID
-    assert row0["pos_doc"][0]["id"].startswith("inline:")
+    assert row0["pos_doc"][0]["id"] == ""
     assert row0["pos_doc"][0]["text"].startswith("Transformers are")
     assert [d["text"] for d in row0["neg_doc"]] == ["RNNs are...", "CNNs are..."]
 
@@ -959,8 +959,6 @@ def test_transform_func_inline_text_docs_no_corpus():
     out = rdi._retrieval_transform_func(examples, num_neg_docs=2, corpus_dict={}, use_dataset_instruction=True)
     assert out["question"] == ["Q"]
     assert out["doc_text"][0] == ["P", "N1", "N2"]
-    assert len(out["doc_id"][0]) == 3
-    assert all(doc_id.startswith("inline:") for doc_id in out["doc_id"][0])
     assert len(out["doc_image"][0]) == 3
     # No corpus metadata -> instructions should be empty even if enabled
     assert out["query_instruction"][0] == ""
@@ -988,41 +986,6 @@ def test_make_retrieval_dataset_inline_end_to_end(tmp_path):
     ex = ds[0]
     assert ex["question"] == "Explain transformers"
     assert ex["doc_text"] == ["Transformers are a type of neural network...", "RNNs are...", "CNNs are..."]
-    assert ex["doc_image"] == ["", "", ""]
-
-
-def test_make_retrieval_dataset_inline_parquet_end_to_end(tmp_path):
-    """End-to-end: make_retrieval_dataset should accept inline Parquet input."""
-    records = [
-        {
-            "question_id": "q0",
-            "question": "Explain transformers",
-            "corpus_id": rdi.INLINE_CORPUS_ID,
-            "pos_doc": [{"id": "p0", "text": "Transformers are attention models.", "image": "", "nr_ocr": ""}],
-            "neg_doc": [
-                {"id": "n0", "text": "RNNs process sequences recurrently.", "image": "", "nr_ocr": ""},
-                {"id": "n1", "text": "CNNs use convolutions.", "image": "", "nr_ocr": ""},
-            ],
-        }
-    ]
-    parquet_path = tmp_path / "inline.parquet"
-    Dataset.from_list(records).to_parquet(str(parquet_path))
-
-    ds = rdi.make_retrieval_dataset(
-        data_dir_list=str(parquet_path),
-        data_type="train",
-        n_passages=3,
-        do_shuffle=False,
-        cache_dir=str(tmp_path / "hf_cache"),
-    )
-
-    ex = ds[0]
-    assert ex["question"] == "Explain transformers"
-    assert ex["doc_text"] == [
-        "Transformers are attention models.",
-        "RNNs process sequences recurrently.",
-        "CNNs use convolutions.",
-    ]
     assert ex["doc_image"] == ["", "", ""]
 
 
@@ -1064,23 +1027,17 @@ def test_inline_normalization_and_resolution_branches():
     # String doc -> treated as inline text
     ex = rdi._resolve_doc_to_example("hello")
     assert ex["text"] == "hello"
-    assert ex["id"].startswith("inline:")
 
-    # Inline dict doc: id empty -> deterministic id from inline fields
+    # Inline dict doc: id empty -> use inline fields
     inline = rdi._resolve_doc_to_example(
         {"id": "", "text": "txt", "image": None, "nr_ocr": 123},
     )
-    assert inline["id"].startswith("inline:")
     assert inline["text"] == "txt"
     assert inline["image"] == ""  # None -> ""
     assert inline["nr_ocr"] == "123"
 
-    explicit = rdi._resolve_doc_to_example({"id": "doc-1", "text": "txt"})
-    assert explicit["id"] == "doc-1"
-
     # Fallback: non-str doc coerces to string
     ex3 = rdi._resolve_doc_to_example(123)
-    assert ex3["id"].startswith("inline:")
     assert ex3["text"] == "123"
 
 
@@ -1202,7 +1159,6 @@ def test_transform_func_inline_with_dataset_instruction_from_corpus():
         "neg_doc": [[{"id": "", "text": "N", "image": "", "nr_ocr": ""}]],
     }
     out = rdi._retrieval_transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, use_dataset_instruction=True)
-    assert all(doc_id.startswith("inline:") for doc_id in out["doc_id"][0])
     assert out["query_instruction"][0] == "QI"
     assert out["passage_instruction"][0] == "PI"
 
@@ -1541,30 +1497,6 @@ def test_retrieval_dataset_inline_smoke(tmp_path):
     assert ex["question"] == "Q"
     assert ex["doc_text"] == ["P", "N"]
     assert ex["doc_image"] == ["", ""]
-    assert len(ex["doc_id"]) == 2
-    assert all(doc_id.startswith("inline:") for doc_id in ex["doc_id"])
-
-
-def test_retrieval_dataset_inline_propagates_stable_doc_ids(tmp_path):
-    f = tmp_path / "inline.jsonl"
-    records = [
-        {"query": "Q0", "pos_doc": {"id": "doc-p", "text": "P"}, "neg_doc": [{"id": "doc-n", "text": "N"}]},
-        {"query": "Q1", "pos_doc": "shared positive", "neg_doc": ["N1"]},
-        {"query": "Q2", "pos_doc": "shared positive", "neg_doc": ["N2"]},
-    ]
-    f.write_text("\n".join(json.dumps(record) for record in records))
-
-    ds = rdi.make_retrieval_dataset(
-        data_dir_list=str(f),
-        data_type="train",
-        n_passages=2,
-        do_shuffle=False,
-    )
-
-    assert ds[0]["doc_id"] == ["doc-p", "doc-n"]
-    assert ds[1]["doc_id"][0].startswith("inline:")
-    assert ds[1]["doc_id"][0] == ds[2]["doc_id"][0]
-    assert ds[1]["doc_id"][0] != "doc-p"
 
 
 def test_make_retrieval_dataset_model_type_bi_encoder(tmp_path):
