@@ -125,7 +125,8 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self.model_parts = [model]
         self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
 
-        self.tokenizer = self.cfg.tokenizer.build()
+        tokenizer_config = self.cfg.tokenizer
+        self.tokenizer = tokenizer_config.build() if tokenizer_config is not None else None
 
         def materialize_loader(config):
             build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()

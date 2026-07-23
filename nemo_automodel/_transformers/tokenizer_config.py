@@ -12,41 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Typed tokenizer and processor construction."""
+"""Typed tokenizer and processor construction contracts."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from typing import Protocol
 
 from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
 TokenizerLike = PreTrainedTokenizerBase | ProcessorMixin
-TokenizerFactory = Callable[..., TokenizerLike]
 
 
-@dataclass(frozen=True)
-class TokenizerConfig:
-    """Declarative tokenizer or processor factory configuration.
+class TokenizerConfig(Protocol):
+    """Construction contract implemented by tokenizer and processor configs."""
 
-    ``factory=None`` represents an explicitly disabled tokenizer. Factory
-    keyword arguments are copied at build time so the serializable config is
-    never mutated or used to cache the runtime object.
-    """
-
-    factory: TokenizerFactory | None = None
-    kwargs: Mapping[str, object] = field(default_factory=dict)
-
-    def build(self) -> TokenizerLike | None:
+    def build(self) -> TokenizerLike:
         """Build the configured tokenizer or processor.
 
         Returns:
-            A tokenizer or multimodal processor, or ``None`` when construction
-            is disabled.
+            A tokenizer or multimodal processor.
         """
-        if self.factory is None:
-            return None
-        return self.factory(**dict(self.kwargs))
 
 
-__all__ = ["TokenizerConfig", "TokenizerFactory", "TokenizerLike"]
+__all__ = ["TokenizerConfig", "TokenizerLike"]

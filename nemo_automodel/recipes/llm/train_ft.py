@@ -591,7 +591,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Model-derived values are runtime concerns: pass them explicitly to each
         # component-owned DataloaderConfig.build().
-        self.tokenizer = self.cfg.tokenizer.build()
+        tokenizer_config = self.cfg.tokenizer
+        self.tokenizer = tokenizer_config.build() if tokenizer_config is not None else None
         train_dataloader_config = self.cfg.dataloader
         if train_dataloader_config is None:
             raise ValueError("An LLM recipe requires a dataset configuration")

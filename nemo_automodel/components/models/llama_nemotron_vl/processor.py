@@ -293,6 +293,28 @@ class LlamaNemotronVLProcessor(ProcessorMixin):
     attributes = ["tokenizer"]
     tokenizer_class = "AutoTokenizer"
 
+    @dataclasses.dataclass(frozen=True, kw_only=True)
+    class Config:
+        """Declarative configuration for :class:`LlamaNemotronVLProcessor`."""
+
+        pretrained_model_name_or_path: str
+        q_max_length: int | None = None
+        p_max_length: int | None = None
+        query_prefix: str = "query:"
+        passage_prefix: str = "passage:"
+        max_input_tiles: int = 6
+
+        def build(self) -> "LlamaNemotronVLProcessor":
+            """Build the configured processor without mutating config state."""
+            return LlamaNemotronVLProcessor.from_pretrained(
+                pretrained_model_name_or_path=self.pretrained_model_name_or_path,
+                q_max_length=self.q_max_length,
+                p_max_length=self.p_max_length,
+                query_prefix=self.query_prefix,
+                passage_prefix=self.passage_prefix,
+                max_input_tiles=self.max_input_tiles,
+            )
+
     def __init__(
         self,
         tokenizer: Any,
