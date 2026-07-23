@@ -21,7 +21,7 @@ import yaml
 from nemo_automodel.components.distributed.cp_vision_shard import CpVisionShardingConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-CONFIG_PATH = REPO_ROOT / "examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp16.yaml"
+CONFIG_PATH = REPO_ROOT / "examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml"
 
 
 def test_qwen3_5_moe_122b_example_declares_scaling_contract() -> None:
@@ -32,12 +32,13 @@ def test_qwen3_5_moe_122b_example_declares_scaling_contract() -> None:
     assert raw_config["model"]["attn_implementation"] == "sdpa"
     assert raw_config["model"]["text_config"]["output_hidden_states"] is True
     assert raw_config["model"]["text_config"]["mtp_expert_hf_layout"] == "split"
-    assert raw_config["distributed"]["cp_size"] == 16
+    assert raw_config["distributed"]["cp_size"] == 32
     assert raw_config["distributed"]["ep_size"] == 8
     assert raw_config["distributed"]["activation_checkpointing"] is True
     assert raw_config["freeze_config"]["freeze_vision_tower"] is False
     assert raw_config["packed_sequence"]["pack_size"] == 131072
     assert raw_config["packed_sequence"]["attn_implementation"] == "sdpa"
+    assert raw_config["step_scheduler"]["global_batch_size"] == 4
     assert raw_config["step_scheduler"]["max_steps"] == 10
 
     video_processor = raw_config["processor"]["video_processor"]
