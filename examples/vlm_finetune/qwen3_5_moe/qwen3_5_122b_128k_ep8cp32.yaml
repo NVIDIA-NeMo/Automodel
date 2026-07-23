@@ -194,3 +194,4 @@ ci:
   recipe_owner: yuhez
   time: "01:00:00"
   nodes: 16
+  max_steps: 10
