@@ -1006,15 +1006,11 @@ def test_retrieval_dataset_config_builds_inline_jsonl_for_both_model_types(tmp_p
         data_dir_list=str(f),
         data_type="train",
         n_passages=2,
-        use_dataset_instruction=True,
         cycle_positive_docs=True,
     ).build()
 
     assert hasattr(dataset, "set_epoch")
     assert dataset[0]["doc_text"] == ["P1", "N"]
-    assert dataset[0]["query_instruction"] == ""
-    assert dataset[0]["passage_instruction"] == ""
-
     dataset.set_epoch(1)
     assert dataset[0]["doc_text"] == ["P2", "N"]
 
@@ -1023,7 +1019,6 @@ def test_retrieval_dataset_config_builds_inline_jsonl_for_both_model_types(tmp_p
         model_type="cross_encoder",
         data_type="train",
         n_passages=2,
-        use_dataset_instruction=True,
     ).build()
     cross_batch = cross_dataset[[0]]
     assert cross_batch["question"] == ["Q", "Q"]
