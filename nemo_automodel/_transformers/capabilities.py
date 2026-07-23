@@ -191,6 +191,7 @@ class ModelSupports:
             "cp",
             "ep",
             "sequence_packing",
+            "cp_vision_sharding",
             "gradient_checkpointing",
             "generate",
         )
@@ -293,6 +294,15 @@ class ModelSupports:
         except AttributeError:
             return False
         return capabilities.supports_thd
+
+    @property
+    def supports_cp_vision_sharding(self) -> bool:
+        """Model owns a verified frame-level vision-sharding integration."""
+        try:
+            capabilities = query_capabilities(self._model)
+        except AttributeError:
+            return False
+        return capabilities.supports_cp_vision_sharding
 
     @property
     def supports_generate(self) -> bool:

@@ -29,7 +29,7 @@ import logging
 import pathlib
 import time
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 import mlflow
 import torch
@@ -50,7 +50,11 @@ from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
-from nemo_automodel.components.distributed.cp_vision_shard import reset_cp_vision_group, set_cp_vision_group
+from nemo_automodel.components.distributed.cp_vision_shard import (
+    CpVisionShardingConfig,
+    reset_cp_vision_group,
+    set_cp_vision_group,
+)
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
@@ -99,6 +103,31 @@ except (ImportError, FileNotFoundError, OSError):
 # ---------------------------
 #  Stateless helper functions
 # ---------------------------
+
+
+class _CpVisionShardingCapability(Protocol):
+    """Model capability required by the VLM vision-sharding recipe policy."""
+
+    @property
+    def supports_cp_vision_sharding(self) -> bool:
+        """Whether the model owns a verified CP vision-sharding integration."""
+        ...
+
+
+def _validate_cp_vision_sharding_support(
+    model: _CpVisionShardingCapability,
+    config: CpVisionShardingConfig,
+) -> None:
+    """Reject enabled vision sharding when the model has no production integration."""
+    if not config.enabled or model.supports_cp_vision_sharding:
+        return
+
+    model_name = type(model).__name__
+    raise ValueError(
+        "distributed.cp_vision_sharding.enabled=true requires a model-owned frame-level "
+        f"vision-sharding integration, but {model_name} declares supports_cp_vision_sharding=False. "
+        "Disable the policy with distributed.cp_vision_sharding.enabled=false or use a supported model."
+    )
 
 
 def _get_model_name(cfg_model):
@@ -526,6 +555,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
             distributed_setup=self.distributed_setup,
             cfg_quantization=self.cfg.get("quantization", None),
         )
+        capability_model = model.parts[0] if isinstance(model, AutoPipeline) else model
+        _validate_cp_vision_sharding_support(capability_model, self.cp_vision_sharding)
         apply_te_patches()
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)

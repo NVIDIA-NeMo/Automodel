@@ -59,6 +59,7 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         supports_pp: bool = False
         supports_ep: bool = False
         supports_thd: bool = False
+        supports_cp_vision_sharding: bool = True
 
     def __init__(self, config: Qwen3VLConfig) -> None:
         """Construct the Hugging Face-compatible dense Qwen3-VL model.

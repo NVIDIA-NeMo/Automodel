@@ -142,6 +142,36 @@ def test_recipe_config_accepts_explicit_auto_cost_alpha():
     assert cfg.cp_vision_sharding.cost_alpha == "auto"
 
 
+class _UnsupportedVisionModel:
+    supports_cp_vision_sharding = False
+
+
+class _SupportedVisionModel:
+    supports_cp_vision_sharding = True
+
+
+def test_cp_vision_sharding_rejects_model_without_capability():
+    policy = CpVisionShardingConfig(enabled=True)
+
+    with pytest.raises(
+        ValueError,
+        match=r"_UnsupportedVisionModel declares supports_cp_vision_sharding=False",
+    ):
+        vlm_finetune._validate_cp_vision_sharding_support(_UnsupportedVisionModel(), policy)
+
+
+def test_cp_vision_sharding_accepts_model_with_capability():
+    policy = CpVisionShardingConfig(enabled=True)
+
+    vlm_finetune._validate_cp_vision_sharding_support(_SupportedVisionModel(), policy)
+
+
+def test_disabled_cp_vision_sharding_accepts_model_without_capability():
+    policy = CpVisionShardingConfig(enabled=False)
+
+    vlm_finetune._validate_cp_vision_sharding_support(_UnsupportedVisionModel(), policy)
+
+
 def test_cp_vision_sharding_context_resets_published_group_after_failure(monkeypatch):
     """The recipe must restore vision-shard state when the model forward raises."""
     recipe = object.__new__(FinetuneRecipeForVLM)

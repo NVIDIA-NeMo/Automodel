@@ -114,6 +114,20 @@ class _GlmMoeDsaLike(nn.Module):
         return input_ids
 
 
+@dataclass(frozen=True)
+class _VisionShardingCapabilities:
+    supports_tp: bool = False
+    supports_cp: bool = True
+    supports_pp: bool = False
+    supports_ep: bool = False
+    supports_thd: bool = False
+    supports_cp_vision_sharding: bool = True
+
+
+class _VisionShardingModel(nn.Module):
+    ModelCapabilities = _VisionShardingCapabilities
+
+
 def _mesh(tp=1, pp=1, cp=1, ep=1):
     return SimpleNamespace(tp_size=tp, pp_size=pp, cp_size=cp, ep_size=ep)
 
@@ -228,6 +242,22 @@ class TestModelSupportsTHD:
         _attach(model)
         assert model.supports.supports_thd is False
         assert model.supports_thd is False
+
+
+class TestModelSupportsCpVisionSharding:
+    def test_verified_model_capability_is_exposed(self):
+        model = _VisionShardingModel()
+        _attach(model)
+
+        assert model.supports.supports_cp_vision_sharding is True
+        assert model.supports_cp_vision_sharding is True
+
+    def test_undeclared_capability_defaults_false(self):
+        model = _Bare()
+        _attach(model)
+
+        assert model.supports.supports_cp_vision_sharding is False
+        assert model.supports_cp_vision_sharding is False
 
 
 class TestModelSupportsPP:

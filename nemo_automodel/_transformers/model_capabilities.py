@@ -55,6 +55,8 @@ class ModelCapabilities:
         supports_pp: Pipeline parallelism.
         supports_ep: Expert parallelism (MoE).
         supports_thd: THD packed-sequence inputs.
+        supports_cp_vision_sharding: Frame-level vision-tower sharding over
+            context-parallel ranks.
     """
 
     supports_tp: bool = False
@@ -62,6 +64,7 @@ class ModelCapabilities:
     supports_pp: bool = False
     supports_ep: bool = False
     supports_thd: bool = False
+    supports_cp_vision_sharding: bool = False
 
 
 def _to_canonical(caps_obj) -> ModelCapabilities:
@@ -79,6 +82,7 @@ def _to_canonical(caps_obj) -> ModelCapabilities:
         supports_pp=bool(caps_obj.supports_pp),
         supports_ep=bool(caps_obj.supports_ep),
         supports_thd=bool(caps_obj.supports_thd),
+        supports_cp_vision_sharding=bool(getattr(caps_obj, "supports_cp_vision_sharding", False)),
     )
 
 

@@ -827,6 +827,8 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = False
+        supports_thd: bool = False
+        supports_cp_vision_sharding: bool = True
 
     @classmethod
     def from_config(
