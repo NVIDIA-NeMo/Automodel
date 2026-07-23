@@ -382,8 +382,6 @@ class BaseRecipe:
             if hasattr(opt, "synchronize_for_checkpoint"):
                 opt.synchronize_for_checkpoint()
         self.checkpointer.save_optimizer(optimizer, model, path, scheduler)
-        if self.checkpointer.config.wait_for_staging:
-            self.checkpointer.maybe_wait_for_staging()
         save_config(config.raw_config, path)
         if is_dist_initialized:
             _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
@@ -412,6 +410,12 @@ class BaseRecipe:
                 self._prune_old_checkpoints()
             if is_dist_initialized:
                 _dist_barrier(getattr(getattr(self, "mesh_context", None), "process_group", None))
+
+        # Staging holds the source buffers until it completes, so drain it before
+        # reclaiming memory below. Waiting here (rather than right after the save)
+        # overlaps staging with the config write, barrier, and symlink update.
+        if self.checkpointer.config.wait_for_staging:
+            self.checkpointer.maybe_wait_for_staging()
 
         # Release NCCL workspace and DCP gather scratch back to the allocator.
         # Without this, the next training step's backward sees a fragmented
