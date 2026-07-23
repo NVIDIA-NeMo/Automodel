@@ -107,7 +107,8 @@ def test_maybe_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
     assert list(dst_root.rglob("*.py")) == []
 
 
-def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effective_model(tmp_path):
+@pytest.mark.parametrize("use_ddp", [False, True])
+def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effective_model(tmp_path, use_ddp):
     source_dir = tmp_path / "source"
     metadata_dir = tmp_path / "model" / ".hf_metadata"
     consolidated_dir = tmp_path / "model" / "consolidated"
@@ -160,12 +161,10 @@ def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effe
     ddp_model = object.__new__(DistributedDataParallel)
     nn.Module.__init__(ddp_model)
     ddp_model.module = model
-    compiled_model = nn.Module()
-    compiled_model._orig_mod = ddp_model
 
     addon = ConsolidatedHFAddon()
     addon.pre_save(
-        model_state=SimpleNamespace(model=[compiled_model]),
+        model_state=SimpleNamespace(model=[ddp_model if use_ddp else model]),
         hf_metadata_dir=str(metadata_dir),
         tokenizer=tokenizer,
         fqn_to_file_index_mapping={"w": 1},
