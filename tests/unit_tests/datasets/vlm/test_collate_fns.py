@@ -3091,7 +3091,7 @@ class TestNeatPackedVlmCollaterAttnImpl:
     def test_single_sequence_omits_packed_seq_ids(self):
         """A single (unpacked) sequence carries no ``_packed_seq_ids``; the all-gather
         CP path synthesizes the trivial one-document map downstream (see
-        ``cp_utils._synthesize_single_document_seq_ids``)."""
+        ``context_parallel.utils._synthesize_single_document_seq_ids``)."""
         from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
         batch = [self._make_packed_sample(4, 0)]

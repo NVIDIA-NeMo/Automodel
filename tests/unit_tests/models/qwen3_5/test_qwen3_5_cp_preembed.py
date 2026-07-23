@@ -69,21 +69,36 @@ class TestPrepareModelInputsForCP:
     def test_requires_input_ids(self):
         model = _build_model()
         with pytest.raises(ValueError, match="requires input_ids"):
-            model.prepare_model_inputs_for_cp(input_ids=None)
+            model.prepare_model_inputs_for_cp({"input_ids": None})
 
-    def test_text_only_builds_embeds_and_positions(self):
+    def test_returns_sharder_and_positions_only(self):
+        """Sharder-only hook: no inputs_embeds (the forward embeds), full mRoPE
+        positions returned for the aux shard, mm_token_type_ids consumed."""
+        from nemo_automodel.components.distributed.context_parallel.sharder import (
+            ContextParallelSharder,
+            round_robin_local_indices,
+            shard_batch_aux_only,
+        )
+
         model = _build_model()
-        input_ids = torch.tensor([[5, 6, 7, 8]])
+        out = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[5, 6, 7, 8]])})
 
-        out = model.prepare_model_inputs_for_cp(input_ids=input_ids)
-
-        # CP linear-attn recovers token order internally; only embeds + positions here.
-        assert set(out) == {"inputs_embeds", "position_ids"}
-        assert out["inputs_embeds"].shape == (1, 4, 4)
-        # position_ids came from get_rope_index (mRoPE [3, B, S]).
+        assert "inputs_embeds" not in out  # embedding happens in forward now
+        sharder = out["cp_sharder"]
+        assert isinstance(sharder, ContextParallelSharder)
+        assert sharder.shard_batch is shard_batch_aux_only
+        assert sharder.local_token_global_indices is round_robin_local_indices
+        # position_ids came from get_rope_index (mRoPE [3, B, S]); aux shard slices it.
         assert out["position_ids"].shape == (3, 1, 4)
-        # rope_deltas stashed back onto the inner model.
+        # mm_token_type_ids is consumed by get_rope_index -> returned as a None marker.
+        assert out["mm_token_type_ids"] is None
         assert model.model.rope_deltas is not None
+
+    def test_input_ids_and_media_not_consumed(self):
+        """input_ids stays in the batch for the forward's in-forward embed+splice."""
+        model = _build_model()
+        out = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[5, 6, 7, 8]])})
+        assert "input_ids" not in out  # not returned as a None marker -> stays in batch
 
     def test_existing_position_ids_not_recomputed(self):
         called = {"count": 0}
@@ -94,13 +109,14 @@ class TestPrepareModelInputsForCP:
 
         model = _build_model(rope_index=_rope)
         pos = torch.arange(4).view(1, 4)
-        out = model.prepare_model_inputs_for_cp(input_ids=torch.tensor([[5, 6, 7, 8]]), position_ids=pos)
+        out = model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[5, 6, 7, 8]]), "position_ids": pos})
 
         assert called["count"] == 0, "get_rope_index must not run when position_ids provided"
         assert out["position_ids"] is pos
 
     def test_image_grid_hws_promoted_to_thw(self):
-        """image_grid_hws of shape [N, 2] is promoted to [N, 3] by prepending a temporal=1 column."""
+        """image_grid_hws of shape [N, 2] is promoted to [N, 3] for get_rope_index and
+        written back to the batch (so the forward's embed path reads the T/H/W grid)."""
         captured = {}
 
         def _rope(input_ids, **kwargs):
@@ -109,11 +125,16 @@ class TestPrepareModelInputsForCP:
 
         model = _build_model(rope_index=_rope)
         image_grid_hws = torch.tensor([[2, 2]])  # [N, 2]
-        model.prepare_model_inputs_for_cp(
-            input_ids=torch.tensor([[5, 6, 7, 8]]),
-            image_grid_hws=image_grid_hws,
+        out = model.prepare_model_inputs_for_cp(
+            {
+                "input_ids": torch.tensor([[5, 6, 7, 8]]),
+                "image_grid_hws": image_grid_hws,
+            }
         )
         assert captured["image_grid_thw"].tolist() == [[1, 2, 2]]
+        # promoted grid is returned for the forward; the raw hws key is dropped.
+        assert out["image_grid_thw"].tolist() == [[1, 2, 2]]
+        assert out["image_grid_hws"] is None
 
     def test_image_grid_hws_already_thw_passes_through(self):
         """image_grid_hws already shaped [N, 3] is used as-is (no temporal column prepended)."""
@@ -126,8 +147,10 @@ class TestPrepareModelInputsForCP:
         model = _build_model(rope_index=_rope)
         image_grid_hws = torch.tensor([[1, 2, 2]])  # [N, 3]
         model.prepare_model_inputs_for_cp(
-            input_ids=torch.tensor([[5, 6, 7, 8]]),
-            image_grid_hws=image_grid_hws,
+            {
+                "input_ids": torch.tensor([[5, 6, 7, 8]]),
+                "image_grid_hws": image_grid_hws,
+            }
         )
         assert captured["image_grid_thw"].tolist() == [[1, 2, 2]]
 
@@ -140,7 +163,7 @@ class TestPrepareModelInputsForCP:
             return torch.zeros(3, 1, input_ids.shape[1]), torch.zeros(1, 1)
 
         model = _build_model(rope_index=_rope, image_token_id=6, video_token_id=8)
-        model.prepare_model_inputs_for_cp(input_ids=torch.tensor([[5, 6, 7, 8]]))
+        model.prepare_model_inputs_for_cp({"input_ids": torch.tensor([[5, 6, 7, 8]])})
 
         # token 6 -> image (1), token 8 -> video (2), others 0.
         assert captured["mm_token_type_ids"].tolist() == [[0, 1, 0, 2]]
@@ -181,6 +204,10 @@ class TestPopStagedVlmMedia:
         assert pixel_values is pixel_values_in
         assert image_grid_thw is image_grid_in
 
+
+class TestEmbedAndSpliceForCP:
+    """The in-forward embed + vision splice (moved out of the CP hook)."""
+
     def test_image_features_scattered_into_embeds(self):
         """pixel_values path: image features replace image-token embeddings via masked_scatter."""
         model = _build_model(image_token_id=99)
@@ -192,8 +219,8 @@ class TestPopStagedVlmMedia:
         )
 
         feat = torch.full((1, 4), 8.0)  # one image token, hidden=4
-        model.model.get_image_features = (
-            lambda pixel_values, image_grid_thw=None, return_dict=True: types.SimpleNamespace(pooler_output=[feat])
+        model.model.get_image_features = lambda pixel_values, image_grid_thw=None, return_dict=True: (
+            types.SimpleNamespace(pooler_output=[feat])
         )
 
         def _mask(input_ids, *, inputs_embeds=None, image_features=None, video_features=None):
@@ -203,15 +230,13 @@ class TestPopStagedVlmMedia:
         model.model.get_placeholder_mask = _mask
 
         ids = torch.tensor([[5, 99, 7]])
-        # Pass position_ids so the rope path (covered elsewhere) is skipped here.
-        out = model.prepare_model_inputs_for_cp(
-            input_ids=ids,
+        emb = model._embed_and_splice_for_cp(
+            ids,
             pixel_values=torch.zeros(1, 3, 2, 2),
+            pixel_values_videos=None,
             image_grid_thw=torch.tensor([[1, 2, 2]]),
-            position_ids=torch.zeros(3, 1, 3, dtype=torch.long),
+            video_grid_thw=None,
         )
-
-        emb = out["inputs_embeds"]
         assert torch.allclose(emb[0, 1], torch.full((4,), 8.0))  # image token overwritten
         assert torch.allclose(emb[0, 0], torch.full((4,), 5.0))  # text token untouched
         assert moved["dev"] is not None  # visual.rotary_pos_emb.to(...) ran
@@ -221,10 +246,8 @@ class TestPopStagedVlmMedia:
         model = _build_model(video_token_id=88)
 
         feat = torch.full((1, 4), 3.0)  # one video token, hidden=4
-        model.model.get_video_features = (
-            lambda pixel_values_videos, video_grid_thw=None, return_dict=True: types.SimpleNamespace(
-                pooler_output=[feat]
-            )
+        model.model.get_video_features = lambda pixel_values_videos, video_grid_thw=None, return_dict=True: (
+            types.SimpleNamespace(pooler_output=[feat])
         )
 
         def _mask(input_ids, *, inputs_embeds=None, image_features=None, video_features=None):
@@ -234,47 +257,15 @@ class TestPopStagedVlmMedia:
         model.model.get_placeholder_mask = _mask
 
         ids = torch.tensor([[5, 88, 7]])
-        out = model.prepare_model_inputs_for_cp(
-            input_ids=ids,
+        emb = model._embed_and_splice_for_cp(
+            ids,
+            pixel_values=None,
             pixel_values_videos=torch.zeros(1, 3, 2, 2),
+            image_grid_thw=None,
             video_grid_thw=torch.tensor([[1, 2, 2]]),
-            position_ids=torch.zeros(3, 1, 3, dtype=torch.long),
         )
-
-        emb = out["inputs_embeds"]
         assert torch.allclose(emb[0, 1], torch.full((4,), 3.0))  # video token overwritten
         assert torch.allclose(emb[0, 2], torch.full((4,), 7.0))  # text token untouched
-
-
-class TestForwardPreEmbedDispatch:
-    def test_pre_embed_only_dispatches_to_prepare(self):
-        model = _build_model()
-        sentinel = {"inputs_embeds": torch.zeros(1, 4, 4)}
-
-        captured = {}
-
-        def _fake_prepare(*, input_ids, attention_mask=None, position_ids=None, pixel_values=None, **kwargs):
-            captured["input_ids"] = input_ids
-            captured["pixel_values"] = pixel_values
-            captured["kwargs"] = kwargs
-            return sentinel
-
-        model.prepare_model_inputs_for_cp = _fake_prepare
-
-        input_ids = torch.tensor([[5, 6, 7, 8]])
-        pixel_values = torch.randn(4, 8)
-        # image_grid_hws is not a named forward param, so it rides in **kwargs.
-        out = model.forward(
-            input_ids=input_ids,
-            _pre_embed_only=True,
-            pixel_values=pixel_values,
-            image_grid_hws=torch.tensor([[2, 2]]),
-        )
-
-        assert out is sentinel
-        assert torch.equal(captured["input_ids"], input_ids)
-        assert captured["pixel_values"] is pixel_values
-        assert "image_grid_hws" in captured["kwargs"]
 
 
 class TestQwen3_5ModelForward:
@@ -330,3 +321,42 @@ class TestQwen3_5ModelForward:
         assert out is sentinel
         assert captured["input_ids"] is None
         assert captured["inputs_embeds"] is hidden_states
+
+
+class _FakeCPMesh:
+    def __init__(self, size: int):
+        self._size = size
+
+    def size(self) -> int:
+        return self._size
+
+
+class TestPipelineStageMetas:
+    """get_pipeline_stage_metas: CP shards stage outputs; cp=1 stays symmetric."""
+
+    def _model(self, *, cp_size, lm_head):
+        model = Qwen3_5ForConditionalGeneration.__new__(Qwen3_5ForConditionalGeneration)
+        nn.Module.__init__(model)
+        model.config = types.SimpleNamespace(text_config=types.SimpleNamespace(hidden_size=8, vocab_size=32))
+        model.lm_head = nn.Linear(8, 32, bias=False) if lm_head else None
+        model.cp_mesh = _FakeCPMesh(cp_size) if cp_size > 1 else None
+        return model
+
+    def test_cp_shards_stage_outputs(self):
+        model = self._model(cp_size=2, lm_head=True)
+        ins, outs = model.get_pipeline_stage_metas(is_first=True, microbatch_size=1, seq_len=6, dtype=torch.float32)
+        # first stage consumes the FULL token ids; output is the local shard (pad 6->8, //2 = 4)
+        assert ins[0].shape == (1, 6) and ins[0].dtype == torch.long
+        assert outs[0].shape == (1, 4, 32)  # last stage (lm_head) -> vocab
+
+    def test_cp_middle_stage_local_hidden(self):
+        model = self._model(cp_size=2, lm_head=False)
+        ins, outs = model.get_pipeline_stage_metas(is_first=False, microbatch_size=1, seq_len=6, dtype=torch.float32)
+        assert ins[0].shape == (1, 4, 8)  # local hidden in
+        assert outs[0].shape == (1, 4, 8)  # local hidden out (no lm_head)
+
+    def test_cp1_symmetric_matches_default(self):
+        model = self._model(cp_size=1, lm_head=True)
+        ins, outs = model.get_pipeline_stage_metas(is_first=True, microbatch_size=2, seq_len=5, dtype=torch.float32)
+        assert ins[0].shape == (2, 5) and ins[0].dtype == torch.long
+        assert outs[0].shape == (2, 5, 32)  # full length, no CP shard

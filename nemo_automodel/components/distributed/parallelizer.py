@@ -510,7 +510,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
             for layer in layers:
                 if hasattr(layer, "block_type") and layer.block_type == "mamba":
-                    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+                    from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
                     mixer = layer.mixer
                     mixer.cp = MambaContextParallel(
@@ -674,6 +674,11 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
             for _, mod in model.named_modules():
                 if isinstance(mod, CPAwareGatedDeltaNet):
                     mod._cp_mesh = cp_mesh
+            # Hand the CP submesh to the model so a forward that embeds and
+            # sequence-shards its own primary stream (Megatron-style per-microbatch
+            # CP; see shard_sequence_for_cp_round_robin / shard_batch_aux_only) can build this
+            # rank's round-robin shard.
+            model.cp_mesh = cp_mesh
 
         return result
 
