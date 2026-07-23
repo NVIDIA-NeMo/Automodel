@@ -49,13 +49,16 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import (
     _has_dtensor_params,
     cast_model_to_dtype,
@@ -621,6 +624,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     # ``DeepseekV4PreTrainedModel._keep_in_fp32_modules_strict`` (lines 890-900
     # of modular_deepseek_v4.py) plus the existing ``e_score_correction_bias``
     # entry that is specific to KAutomodel's shared Gate buffer.
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = [
         "attn_hc.fn",
         "attn_hc.base",
@@ -687,7 +691,7 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         mtp_loss_scaling_factor = kwargs.pop("mtp_loss_scaling_factor", 0.1)
@@ -830,27 +834,40 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             embeds.append(self.model.embed_tokens(cur_input_ids))
         return tuple(embeds)
 
-    def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
         """Model-owned context-parallel batch prep (Miles-style contiguous shard).
 
-        Returns the ``_cp_make_batch_fn`` callable that
-        ``cp_utils.make_cp_batch_and_ctx`` uses to delegate CP sharding back to
-        this model, with the config-derived per-rank shard multiple bound. DSV4
-        embeds internally, so this leaves ``input_ids`` for the sharding callable.
+        Returns a ``ContextParallelSharder`` (under the ``"cp_sharder"`` batch key) so
+        the CP dispatch delegates CP sharding back to this
+        model, with the config-derived per-rank shard multiple bound. DSV4
+        embeds internally, so (unlike VLM models) this does not pre-embed --
+        it leaves ``input_ids`` for the sharding callable.
         """
         from functools import partial  # noqa: PLC0415
 
-        return {
-            "_cp_make_batch_fn": partial(
+        from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
+            ContextParallelSharder,
+            contiguous_local_indices,
+        )
+
+        cp_sharder = ContextParallelSharder(
+            shard_batch=partial(
                 make_dsv4_contiguous_shard_cp_batch_and_ctx,
                 pad_multiple=dsv4_cp_local_seq_multiple(self.config),
                 sync_packed_length=self.backend.dispatcher == "hybridep",
             ),
-        }
+            local_token_global_indices=contiguous_local_indices,
+        )
+        return {"cp_sharder": cp_sharder}
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         *mtp_embed_inputs: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -859,12 +876,6 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         output_hidden_states: Optional[bool] = None,
         **attn_kwargs: Any,
     ) -> "DeepseekV4CausalLMOutput" | tuple[torch.Tensor, ...] | torch.Tensor:
-        # Model-owned context-parallel input prep. The recipe routes the batch
-        # through ``__call__(_pre_embed_only=True)`` before CP sharding so the model
-        # can attach its own ``_cp_make_batch_fn`` (see ``prepare_model_inputs_for_cp``).
-        if attn_kwargs.pop("_pre_embed_only", False):
-            return self.prepare_model_inputs_for_cp(input_ids=input_ids)
-
         if output_hidden_states is None:
             output_hidden_states = getattr(getattr(self, "config", None), "output_hidden_states", False)
 
