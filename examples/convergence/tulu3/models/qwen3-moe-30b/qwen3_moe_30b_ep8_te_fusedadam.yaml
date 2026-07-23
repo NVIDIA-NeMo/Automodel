@@ -110,6 +110,13 @@ optimizer:
   exp_avg_dtype: torch.bfloat16
   exp_avg_sq_dtype: torch.bfloat16
 
+wandb:
+  enable: false
+  entity: Nemo-automodel
+  project: automodel_convergence_runs
+  name: qwen3_moe_30b_ep8_te_fusedadam
+  dir: /tmp/wandb
+
 # ── Weekly Tulu-3 convergence CI (train 1000 steps -> IFEval -> threshold gate) ──
 # Passes iff |CI IFEval prompt_level_strict_acc - baseline| < k * stderr. The SFT
 # model is evaluated WITH --thinking (its training mode); without it the empty

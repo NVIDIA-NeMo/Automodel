@@ -102,10 +102,10 @@ freeze_config:
   freeze_language_model: false
 
 wandb:
-  enable: true
-  project: convergence
-  entity: nvidia
-  name: gemma4_31b_tulu3_packed2k_cp1_gbs32_4node_lr5e-6
+  enable: false
+  entity: Nemo-automodel
+  project: automodel_convergence_runs
+  name: gemma4_31b_tulu3_packed2k_cp1_gbs32_4node
   dir: /tmp/wandb
 
 # ── Weekly Tulu-3 convergence CI (train 1000 steps -> IFEval -> threshold gate) ──

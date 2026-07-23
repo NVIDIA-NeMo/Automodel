@@ -45,13 +45,10 @@ RESOLVED_FINETUNE_CONFIG=$($CONFIG_RESOLVER \
   --output "$TEST_DIR/finetune_config.yaml")
 
 export WANDB_API_KEY="${WANDB_AUTOMODEL_API_KEY}"
-# Disable wandb in CI. The recipes log to `wandb.entity: nvidia`, but the CI token
-# (WANDB_AUTOMODEL_API_KEY) has no models-write access to that org, so wandb.init()
-# raises CommError on rank0 during recipe.setup() and strands the other ranks at the
-# checkpoint-consolidation gloo barrier (30-min c10d store timeout). The convergence
-# gate is downstream IFEval, not wandb; the recipe's wandb config stays intact for
-# manual runs. Set WANDB_MODE=online + a CI-writable entity later to capture curves.
-export WANDB_MODE=disabled
+# Enable wandb for the convergence runs. The recipes ship `wandb.enable: false` (required
+# by the example-yaml linter), so flip it on here via the `--wandb.enable true` CLI
+# override on the training command below. Entity/project/name/dir come from each recipe's
+# wandb block (nemo_automodel / automodel_convergence_runs).
 
 # Entry script by recipe type. Convergence recipes live under examples/convergence/
 # (mixed LLM/VLM), so the path-based heuristic templates use does not apply -- pick the
@@ -79,7 +76,7 @@ echo "============================================"
 echo "[convergence] Training ${TEST_NAME}..."
 echo "============================================"
 TRAIN_START=$SECONDS
-eval "${CMD} ${TEST_SCRIPT_PATH} --config ${RESOLVED_FINETUNE_CONFIG} ${FINETUNE_ARGS:-}"
+eval "${CMD} ${TEST_SCRIPT_PATH} --config ${RESOLVED_FINETUNE_CONFIG} --wandb.enable true ${FINETUNE_ARGS:-}"
 TRAIN_EXIT_CODE=$?
 echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"train\",\"seconds\":$((SECONDS - TRAIN_START))}" >> "$TEST_DIR/timing.jsonl"
 if [[ "$TRAIN_EXIT_CODE" -ne 0 ]]; then

@@ -113,6 +113,13 @@ moe_metrics:
   enabled: true
   mode: brief
 
+wandb:
+  enable: false
+  entity: Nemo-automodel
+  project: automodel_convergence_runs
+  name: moonlight_16b_ep8_te_fusedadam
+  dir: /tmp/wandb
+
 # ── Weekly Tulu-3 convergence CI (train 1000 steps -> IFEval -> threshold gate) ──
 # convergence_tests_launcher.sh reads downstream_eval and passes iff
 # |CI IFEval prompt_level_strict_acc - baseline| < k * stderr. baseline/stderr are
