@@ -155,6 +155,7 @@ class ConsolidatedHFAddon:
         model_part = model_state.model[0]  # ModelState already converts to list if needed
         original_model_path = kwargs["original_model_path"]
         generated_metadata_path = kwargs.get("generated_metadata_path", original_model_path)
+        process_group = kwargs.get("process_group")
 
         export_model = unwrap_model(model_part)
         get_metadata_exporter = getattr(export_model, "_get_consolidated_hf_metadata_exporter", None)
@@ -168,7 +169,7 @@ class ConsolidatedHFAddon:
             )
 
         # Perform save operations on rank 0
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        if _is_group_rank_0(process_group):
             if metadata_exporter is not None:
                 metadata_exporter.save(
                     metadata_reference_path=generated_metadata_path,
@@ -251,6 +252,7 @@ class PeftAddon:
         peft_config = kwargs["peft_config"]
         original_model_path = kwargs["original_model_path"]
         generated_metadata_path = kwargs.get("generated_metadata_path", original_model_path)
+        process_group = kwargs.get("process_group")
         v4_compatible = kwargs.get("v4_compatible", False)
         process_group = kwargs.get("process_group")
         hf_peft_config = _get_hf_peft_config(peft_config, model_state, v4_compatible=v4_compatible)
