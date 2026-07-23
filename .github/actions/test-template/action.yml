@@ -102,6 +102,50 @@ runs:
         bash retry_job.sh
         echo "::endgroup::"
 
+    - name: Validate CUDA runtime compatibility
+      shell: bash -e -u -o pipefail {0}
+      if: ${{ inputs.cpu-only == 'false' }}
+      run: |
+        echo "::group::Validate CUDA runtime compatibility"
+        docker exec nemo_container_${{ github.run_id }} bash -c '
+          set -e
+
+          . /opt/venv/env.sh
+
+          echo "nvidia-smi:"
+          nvidia-smi || true
+
+          python - <<'"'"'PY'"'"'
+        import torch
+
+        print(f"torch={torch.__version__}")
+        print(f"torch.version.cuda={torch.version.cuda}")
+        print(f"cuda_available_probe={torch.cuda.is_available()}")
+
+        try:
+            torch.cuda.init()
+            device_count = torch.cuda.device_count()
+            print(f"cuda_device_count={device_count}")
+            if device_count < 1:
+                raise RuntimeError("no CUDA devices are visible")
+            for idx in range(device_count):
+                name = torch.cuda.get_device_name(idx)
+                capability = torch.cuda.get_device_capability(idx)
+                print(f"cuda_device_{idx}={name}, capability={capability}")
+            torch.empty(1, device="cuda")
+        except Exception as exc:
+            print(
+                "::error title=CUDA runtime incompatible::"
+                "CUDA failed to initialize inside the test container. "
+                "This usually means the host NVIDIA driver is too old for "
+                "the CUDA runtime in the CI image; rerun on an updated GPU runner. "
+                f"error={type(exc).__name__}: {exc}"
+            )
+            raise
+        PY
+        '
+        echo "::endgroup::"
+
     - name: Create run-script
       id: create
       shell: bash
