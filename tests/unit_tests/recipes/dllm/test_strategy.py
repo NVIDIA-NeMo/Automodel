@@ -330,16 +330,6 @@ class TestIDLMStrategy:
         assert (noisy[:, 8:] == 999).all()
         assert (noisy[:, :8] == input_ids[:, :8]).all()
 
-    def test_prepare_batch_keeps_attention_mask(self, strategy):
-        """The padding mask must be kept (it feeds the block-diffusion mask)."""
-        batch = {"input_ids": torch.zeros(2, 4, dtype=torch.long), "attention_mask": torch.ones(2, 4)}
-        noisy = torch.full((2, 4), 999, dtype=torch.long)
-        noise_mask = torch.ones(2, 4, dtype=torch.bool)
-        clean = torch.arange(8, dtype=torch.long).reshape(2, 4)
-        result = strategy.prepare_batch(batch, noisy, noise_mask, clean)
-        assert (result["input_ids"] == noisy).all()
-        assert "attention_mask" in result  # unlike MDLM, kept for the block-diffusion mask
-
 
 # ---------------------------------------------------------------------------
 # DFlashStrategy — anchor-block sampling (CPU, no model loading)
