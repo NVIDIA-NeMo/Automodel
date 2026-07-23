@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -22,9 +21,6 @@ import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
-from nemo_automodel._transformers.sentence_transformer_export import (
-    _SentenceTransformerMetadataExporter,
-)
 from nemo_automodel.components.checkpoint.addons import (
     ConsolidatedHFAddon,
     _extract_target_modules,
@@ -108,143 +104,48 @@ def test_maybe_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
 
 
 @pytest.mark.parametrize("use_ddp", [False, True])
-def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effective_model(tmp_path, use_ddp):
-    source_dir = tmp_path / "source"
-    metadata_dir = tmp_path / "model" / ".hf_metadata"
-    consolidated_dir = tmp_path / "model" / "consolidated"
-    source_files = {
-        ".gitattributes": "git attributes",
-        "1_Pooling/config.json": '{"pooling_mode_mean_tokens": true}',
-        "2_Dense/config.json": '{"in_features": 2048, "out_features": 1024}',
-        "2_Dense/model.safetensors": "stale module weights",
-        "LICENSE": "license",
-        "LICENSE.md": "markdown license",
-        "NOTICE": "notice",
-        "NOTICE.md": "markdown notice",
-        "README.md": "model card",
-        "config.json": '{"architectures": ["SourceModel"], "pooling": "avg"}',
-        "config_sentence_transformers.json": (
-            '{"prompts": {"query": "old query: ", "document": "old passage: "}, "similarity_fn_name": "cosine"}'
-        ),
-        "custom_module.py": "class CustomModule: pass",
-        "model.safetensors": "old weights",
-        "modules.json": '[{"idx": 0, "path": "2_Dense", "type": "stale.Dense"}]',
-        "sentence_bert_config.json": '{"max_seq_length": 8192, "do_lower_case": false}',
-    }
-    for relative_path, content in source_files.items():
-        _write(str(source_dir / relative_path), content)
-    metadata_dir.mkdir(parents=True)
-    consolidated_dir.mkdir(parents=True)
-
-    class DeployConfig:
-        hidden_size = 2048
-        max_position_embeddings = 32768
-
-        def to_json_string(self, use_diff=False):
-            del use_diff
-            return '{"architectures": ["DeployableModel"], "pooling": "cls"}'
-
+def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(tmp_path, use_ddp):
+    metadata_dir = tmp_path / "metadata"
+    metadata_dir.mkdir()
+    exporter = SimpleNamespace(validate=MagicMock(), save=MagicMock())
     model = nn.Module()
-    model.config = DeployConfig()
-    model.pooling = "cls"
-    model.l2_normalize = False
-    model.sentence_transformer_export_config = SimpleNamespace(
-        query_prompt="search: ",
-        document_prompt="index: ",
-    )
-    model.get_hf_export_config = lambda: model.config
-    model._get_consolidated_hf_metadata_exporter = lambda: _SentenceTransformerMetadataExporter(
-        model,
-        model.sentence_transformer_export_config,
-    )
+    model._get_consolidated_hf_metadata_exporter = lambda: exporter
+    wrapped_model = object.__new__(DistributedDataParallel)
+    nn.Module.__init__(wrapped_model)
+    wrapped_model.module = model
     tokenizer = MagicMock()
-    ddp_model = object.__new__(DistributedDataParallel)
-    nn.Module.__init__(ddp_model)
-    ddp_model.module = model
 
-    addon = ConsolidatedHFAddon()
-    addon.pre_save(
-        model_state=SimpleNamespace(model=[ddp_model if use_ddp else model]),
+    ConsolidatedHFAddon().pre_save(
+        model_state=SimpleNamespace(model=[wrapped_model if use_ddp else model]),
         hf_metadata_dir=str(metadata_dir),
         tokenizer=tokenizer,
         fqn_to_file_index_mapping={"w": 1},
-        fqn_to_dtype_mapping={"w": "BF16"},
-        original_model_path=str(source_dir),
+        fqn_to_dtype_mapping=None,
+        original_model_path="/source",
         v4_compatible=True,
     )
 
-    (consolidated_dir / "model.safetensors").write_text("new weights")
-    (consolidated_dir / "model.safetensors.index.json").write_text('{"weight_map": {"w": "model.safetensors"}}')
-    addon.post_save(
-        consolidated_path=str(consolidated_dir),
-        hf_metadata_path=str(metadata_dir),
+    exporter.validate.assert_called_once_with(tokenizer=tokenizer, original_model_path="/source")
+    exporter.save.assert_called_once_with(
+        hf_metadata_dir=str(metadata_dir),
+        tokenizer=tokenizer,
+        original_model_path="/source",
     )
 
-    actual_manifest = {
-        path.relative_to(consolidated_dir).as_posix() for path in consolidated_dir.rglob("*") if path.is_file()
-    }
-    assert actual_manifest == {
-        ".gitattributes",
-        "1_Pooling/config.json",
-        "LICENSE",
-        "LICENSE.md",
-        "NOTICE",
-        "NOTICE.md",
-        "config.json",
-        "config_sentence_transformers.json",
-        "model.safetensors",
-        "model.safetensors.index.json",
-        "modules.json",
-        "sentence_bert_config.json",
-    }
-    assert json.loads((consolidated_dir / "config.json").read_text()) == {
-        "architectures": ["DeployableModel"],
-        "pooling": "cls",
-    }
-    assert not (consolidated_dir / "config.v5.json").exists()
-    assert json.loads((consolidated_dir / "modules.json").read_text()) == [
-        {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
-        {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
-    ]
-    pooling_config = json.loads((consolidated_dir / "1_Pooling" / "config.json").read_text())
-    assert pooling_config["pooling_mode_cls_token"] is True
-    assert pooling_config["pooling_mode_mean_tokens"] is False
-    assert pooling_config["include_prompt"] is True
-    assert pooling_config["word_embedding_dimension"] == 2048
-    assert json.loads((consolidated_dir / "config_sentence_transformers.json").read_text()) == {
-        "prompts": {"query": "search: ", "document": "index: "},
-        "default_prompt_name": None,
-        "similarity_fn_name": "dot",
-    }
-    assert json.loads((consolidated_dir / "sentence_bert_config.json").read_text()) == {
-        "max_seq_length": 8192,
-        "do_lower_case": False,
-    }
-    assert (consolidated_dir / "model.safetensors").read_text() == "new weights"
-    assert not (consolidated_dir / "2_Dense").exists()
-    assert not (consolidated_dir / "custom_module.py").exists()
-    tokenizer.save_pretrained.assert_called_once_with(str(metadata_dir))
 
-
-def test_consolidated_hf_addon_validates_sentence_transformer_export_on_nonzero_rank(tmp_path):
+def test_consolidated_hf_addon_validates_model_exporter_on_nonzero_rank(tmp_path):
+    exporter = SimpleNamespace(
+        validate=MagicMock(side_effect=ValueError("invalid export")),
+        save=MagicMock(),
+    )
     model = nn.Module()
-    model.pooling = "weighted_avg"
-    model.l2_normalize = False
-    model.config = SimpleNamespace(hidden_size=8, max_position_embeddings=512)
-    model.sentence_transformer_export_config = SimpleNamespace(
-        query_prompt="",
-        document_prompt="",
-    )
-    model._get_consolidated_hf_metadata_exporter = lambda: _SentenceTransformerMetadataExporter(
-        model,
-        model.sentence_transformer_export_config,
-    )
+    model._get_consolidated_hf_metadata_exporter = lambda: exporter
 
     with (
         patch("torch.distributed.is_initialized", return_value=True),
         patch("torch.distributed.get_rank", return_value=1),
-        patch("torch.distributed.barrier") as mock_barrier,
-        pytest.raises(ValueError, match="cannot be represented"),
+        patch("torch.distributed.barrier") as barrier,
+        pytest.raises(ValueError, match="invalid export"),
     ):
         ConsolidatedHFAddon().pre_save(
             model_state=SimpleNamespace(model=[model]),
@@ -256,74 +157,8 @@ def test_consolidated_hf_addon_validates_sentence_transformer_export_on_nonzero_
             v4_compatible=False,
         )
 
-    mock_barrier.assert_not_called()
-
-
-def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(tmp_path):
-    metadata_dir = tmp_path / "metadata"
-    metadata_dir.mkdir()
-    exporter = SimpleNamespace(validate=MagicMock(), save=MagicMock())
-    model = nn.Module()
-    model._get_consolidated_hf_metadata_exporter = lambda: exporter
-    tokenizer = MagicMock()
-
-    ConsolidatedHFAddon().pre_save(
-        model_state=SimpleNamespace(model=[model]),
-        hf_metadata_dir=str(metadata_dir),
-        tokenizer=tokenizer,
-        fqn_to_file_index_mapping={"w": 1},
-        fqn_to_dtype_mapping=None,
-        original_model_path="/source",
-        generated_metadata_path="/generated",
-        v4_compatible=True,
-    )
-
-    exporter.validate.assert_called_once_with(
-        tokenizer=tokenizer,
-        original_model_path="/source",
-    )
-    exporter.save.assert_called_once_with(
-        metadata_reference_path="/generated",
-        hf_metadata_dir=str(metadata_dir),
-        tokenizer=tokenizer,
-        original_model_path="/source",
-    )
-
-
-def test_consolidated_hf_addon_keeps_generated_metadata_path_for_other_models(tmp_path):
-    source_dir = tmp_path / "source"
-    generated_metadata_dir = tmp_path / "generated"
-    metadata_dir = tmp_path / "model" / ".hf_metadata"
-    _write(str(source_dir / "config.json"), '{"architectures": ["SourceModel"]}')
-    _write(str(source_dir / "LICENSE"), "source license")
-    _write(str(generated_metadata_dir / "modeling_custom.py"), "class CustomModel: pass")
-    metadata_dir.mkdir(parents=True)
-
-    class GeneratedConfig:
-        def to_json_string(self, use_diff=False):
-            del use_diff
-            return '{"architectures": ["GeneratedModel"]}'
-
-    model = nn.Module()
-    model.config = GeneratedConfig()
-    tokenizer = MagicMock()
-
-    ConsolidatedHFAddon().pre_save(
-        model_state=SimpleNamespace(model=[model]),
-        hf_metadata_dir=str(metadata_dir),
-        tokenizer=tokenizer,
-        fqn_to_file_index_mapping={"w": 1},
-        fqn_to_dtype_mapping=None,
-        original_model_path=str(source_dir),
-        generated_metadata_path=str(generated_metadata_dir),
-        v4_compatible=False,
-    )
-
-    assert (metadata_dir / "config.json").read_text() == '{"architectures": ["GeneratedModel"]}'
-    assert (metadata_dir / "modeling_custom.py").exists()
-    assert not (metadata_dir / "LICENSE").exists()
-    assert not (metadata_dir / "modules.json").exists()
-    tokenizer.save_pretrained.assert_called_once_with(str(metadata_dir))
+    exporter.save.assert_not_called()
+    barrier.assert_not_called()
 
 
 def test_model_state_keeps_lm_head_when_storage_not_shared():

@@ -124,7 +124,6 @@ class _ConsolidatedHFMetadataExporter(Protocol):
     def save(
         self,
         *,
-        metadata_reference_path: str | None,
         hf_metadata_dir: str,
         tokenizer: object,
         original_model_path: str | None,
@@ -152,7 +151,6 @@ class ConsolidatedHFAddon:
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
             fqn_to_dtype_mapping (dict[str, str] | None): Original HF safetensors dtype map.
             original_model_path (str | None): Authoritative source checkpoint snapshot.
-            generated_metadata_path (str | None): Existing model/code reference for generated metadata fallback.
         """
         model_state = kwargs["model_state"]
         hf_metadata_dir = kwargs["hf_metadata_dir"]
@@ -161,7 +159,6 @@ class ConsolidatedHFAddon:
         tokenizer = kwargs.get("tokenizer", None)
         model_part = model_state.model[0]  # ModelState already converts to list if needed
         original_model_path = kwargs["original_model_path"]
-        generated_metadata_path = kwargs.get("generated_metadata_path", original_model_path)
         process_group = kwargs.get("process_group")
 
         export_model = _unwrap_ddp_model(model_part)
@@ -179,7 +176,6 @@ class ConsolidatedHFAddon:
         if _is_group_rank_0(process_group):
             if metadata_exporter is not None:
                 metadata_exporter.save(
-                    metadata_reference_path=generated_metadata_path,
                     hf_metadata_dir=hf_metadata_dir,
                     tokenizer=tokenizer,
                     original_model_path=original_model_path,
@@ -187,7 +183,7 @@ class ConsolidatedHFAddon:
             else:
                 _save_generated_hf_assets(
                     model_part,
-                    generated_metadata_path,
+                    original_model_path,
                     hf_metadata_dir,
                     tokenizer,
                     v4_compatible=kwargs.get("v4_compatible", False),
@@ -258,7 +254,6 @@ class PeftAddon:
         model_state = kwargs["model_state"]
         peft_config = kwargs["peft_config"]
         original_model_path = kwargs["original_model_path"]
-        generated_metadata_path = kwargs.get("generated_metadata_path", original_model_path)
         v4_compatible = kwargs.get("v4_compatible", False)
         process_group = kwargs.get("process_group")
         hf_peft_config = _get_hf_peft_config(peft_config, model_state, v4_compatible=v4_compatible)
@@ -266,7 +261,7 @@ class PeftAddon:
         if _is_group_rank_0(process_group):
             # if the HF model has custom model code, we need to save it as part of the checkpoint
             model_part = model_state.model[0] if model_state is not None else None
-            _maybe_save_custom_model_code(generated_metadata_path, model_path, model_part=model_part)
+            _maybe_save_custom_model_code(original_model_path, model_path, model_part=model_part)
             # save the tokenizer
             if tokenizer is not None:
                 tokenizer.save_pretrained(model_path)

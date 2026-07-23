@@ -299,15 +299,6 @@ def _cache_hub_source_legal_assets(model_name_or_path: str, config, hf_kwargs: d
         return None
 
 
-def _clone_pretrained_config(config: PretrainedConfig) -> PretrainedConfig:
-    """Clone a config while retaining private source-revision metadata."""
-    cloned_config = config.__class__.from_dict(config.to_dict())
-    commit_hash = getattr(config, "_commit_hash", None)
-    if commit_hash is not None:
-        cloned_config._commit_hash = commit_hash
-    return cloned_config
-
-
 def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedModel:
     """Extract a nested submodel from a loaded model using a dotted attribute path."""
     extracted_model = model

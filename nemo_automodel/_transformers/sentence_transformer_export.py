@@ -267,14 +267,18 @@ class _SentenceTransformerMetadataExporter:
         self.model_part = model_part
         self.export_config = export_config
 
+    def _source_model_path(self, fallback: str | None) -> str | None:
+        """Prefer the retrieval model source snapshot over generic checkpoint lookup."""
+        source_model_path = getattr(self.model_part, "source_model_path", None)
+        return str(source_model_path) if source_model_path is not None else fallback
+
     def validate(self, *, tokenizer, original_model_path: str | None) -> None:
         """Validate export inputs on every distributed rank before filesystem writes."""
-        _validate_sentence_transformer_export(self.model_part, tokenizer, original_model_path)
+        _validate_sentence_transformer_export(self.model_part, tokenizer, self._source_model_path(original_model_path))
 
     def save(
         self,
         *,
-        metadata_reference_path: str | None,
         hf_metadata_dir: str,
         tokenizer,
         original_model_path: str | None,
@@ -283,9 +287,10 @@ class _SentenceTransformerMetadataExporter:
         from nemo_automodel.components.checkpoint.addons import _save_generated_hf_assets
 
         deploy_config = self.model_part.get_hf_export_config()
+        source_model_path = self._source_model_path(original_model_path)
         _save_generated_hf_assets(
             self.model_part,
-            metadata_reference_path,
+            source_model_path,
             hf_metadata_dir,
             tokenizer,
             v4_compatible=False,
@@ -295,7 +300,7 @@ class _SentenceTransformerMetadataExporter:
         _save_generated_sentence_transformer_assets(
             self.model_part,
             self.export_config,
-            original_model_path,
+            source_model_path,
             hf_metadata_dir,
             tokenizer,
         )
