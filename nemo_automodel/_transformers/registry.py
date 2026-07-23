@@ -21,6 +21,7 @@ from functools import lru_cache
 from typing import Dict, Tuple, Type, Union
 
 import torch.nn as nn
+from transformers.configuration_utils import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -319,7 +320,7 @@ _CUSTOM_CONFIG_OVERRIDES_BUILTIN = {
 }
 
 
-def resolve_custom_config_cls(model_type: str):
+def resolve_custom_config_cls(model_type: str) -> Type[PretrainedConfig] | None:
     """Resolve Automodel's preferred config class for ``model_type`` if one applies."""
     if model_type not in _CUSTOM_CONFIG_REGISTRATIONS:
         return None
