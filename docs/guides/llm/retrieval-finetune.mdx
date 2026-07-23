@@ -175,8 +175,8 @@ The standard bi-encoder and cross-encoder recipes need at least one negative can
 reranking supervision, unless you add a custom strategy such as qrels-aware in-batch negatives.
 </Warning>
 
-For quick custom experiments, inline JSONL is the simplest format. Use the inline dataset factory for these files, and
-switch to corpus ID-based JSON before hard-negative mining or full-corpus evaluation:
+For quick custom experiments, inline JSONL is the simplest format. `RetrievalDatasetConfig` selects the inline loading
+path from the `.jsonl` extension. Switch to corpus ID-based JSON before hard-negative mining or full-corpus evaluation:
 
 ```json
 {"query":"What does NVLink do?","pos_doc":"NVLink is a high-bandwidth GPU interconnect.","neg_doc":["CUDA is a programming model.","Tensor Cores accelerate matrix math."]}
@@ -190,8 +190,8 @@ row uses only the first positive. Otherwise, in-batch negatives and mined hard n
 relevant passage as a negative. The detailed source schemas and conversion rules are in
 [Retrieval Dataset](/datasets/retrieval-dataset).
 
-For larger corpora, use the corpus ID-based JSON format from the dataset guide. Use
-`nemo_automodel.components.datasets.llm.make_retrieval_dataset` for corpus ID-based JSON and for `hf://` sources that
+For larger corpora, use the corpus ID-based JSON format from the dataset guide. The same
+`nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig` also loads `hf://` sources that
 already follow the AutoModel retrieval schema, such as:
 
 ```yaml
@@ -201,10 +201,10 @@ data_dir_list:
 ```
 
 `n_passages` controls the size of each query group. For example, `n_passages: 5` means one positive and four negatives.
-Corpus-backed JSON and `hf://` sources use `pos_doc[0]` by default. Set `cycle_positive_docs: true` to rotate the
-supervised positive across epochs when a row has multiple positives. Inline JSONL always uses the first positive.
-Negatives are taken from `neg_doc` in order. If a record has fewer negatives than requested, they are repeated
-cyclically to fill the group. Treat repetition as a fallback for shape compatibility. Prefer enough distinct negatives.
+All supported sources use `pos_doc[0]` by default. Set `cycle_positive_docs: true` to rotate the supervised positive
+across epochs when a record has multiple positives. Negatives are taken from `neg_doc` in order. If a record has fewer
+negatives than requested, they are repeated cyclically to fill the group. Treat repetition as a fallback for shape
+compatibility. Prefer enough distinct negatives.
 
 The training recipe does not load a separate qrels file. Materialize qrels into retrieval records before fine-tuning.
 For mining, keep every known positive for the query in `pos_doc` so the miner can exclude those IDs. It does not read an
@@ -468,9 +468,8 @@ Hugging Face data on each node or use a shared cache, and budget CPU RAM and loc
 ## Add Validation
 
 Both examples include commented `validation_dataset` and `validation_dataloader` blocks. Enable them when you have a
-held-out retrieval file. Use the same dataset family as the validation source: `RetrievalDatasetConfig` for `hf://` or
-corpus ID-based JSON, and `InlineRetrievalDatasetConfig` only for inline JSONL. This corpus-backed example mirrors the
-shipped configs:
+held-out retrieval file. Use `RetrievalDatasetConfig` for every supported source; it selects the loading path from the
+source URI and file extension. This corpus-backed example mirrors the shipped configs:
 
 ```yaml
 validation_dataset:

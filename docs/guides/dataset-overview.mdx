@@ -238,10 +238,8 @@ See the [Function Calling guide](/recipes-e2e-examples/function-calling) for an 
 For a small reasoning-style chat SFT starting point, see [qwen2_5_0p5b_instruct_fineproofs_chat.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/qwen/qwen2_5_0p5b_instruct_fineproofs_chat.yaml).
 
 ### Retrieval Fine-Tuning
-- Factory for corpus ID JSON and `hf://` AutoModel-schema sources:
-  `nemo_automodel.components.datasets.llm.make_retrieval_dataset`
-- Factory for inline JSONL:
-  `nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset`
+- Dataset config for corpus ID JSON, `hf://` AutoModel-schema sources, and inline JSONL:
+  `nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig`
 - Collators: `nemo_automodel.components.datasets.llm.BiEncoderCollator` or
   `nemo_automodel.components.datasets.llm.CrossEncoderCollator`
 - Use case: bi-encoder embedding fine-tuning with contrastive query and passage groups, or cross-encoder reranking over
@@ -255,7 +253,7 @@ The following example configures an inline JSONL bi-encoder dataset:
 
 ```yaml
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.InlineRetrievalDatasetConfig
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
   model_type: bi_encoder
   data_dir_list:
     - /abs/path/to/train.jsonl

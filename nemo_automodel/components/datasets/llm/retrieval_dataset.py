@@ -648,7 +648,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         cur_corpus_id = corpus_ids[idx_doc]
         for doc in docs:
             if isinstance(doc, dict) and "text" in doc:
-                # Inline-text records (.jsonl/.tsv/.csv) keep document content
+                # Inline-text records keep document content
                 # directly in pos_doc / neg_doc.
                 cur_doc = {
                     "text": "" if doc.get("text") is None else str(doc.get("text", "")),
@@ -683,7 +683,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         cur_pos_neg_text_batch.append(cur_pos_neg_text)
         cur_pos_neg_image_batch.append(cur_pos_neg_image)
 
-        if use_dataset_instruction:
+        if use_dataset_instruction and cur_corpus_id in corpus_dict:
             query_instruction_batch.append(corpus_dict[cur_corpus_id].query_instruction)
             passage_instruction_batch.append(corpus_dict[cur_corpus_id].passage_instruction)
         else:
@@ -781,15 +781,15 @@ def make_retrieval_dataset(
     """
     Load and return dataset in retrieval format for encoder training.
 
-    Entries in *data_dir_list* can be local JSON file paths **or** ``hf://`` URIs
-    pointing to a HuggingFace dataset repository (e.g.
+    Entries in *data_dir_list* can be local corpus JSON or inline JSONL file paths or ``hf://`` URIs
+    pointing to a Hugging Face dataset repository (for example,
     ``hf://nvidia/embed-nemotron-dataset-v1/SciFact``). A source can also be
     provided as ``{"path": path_or_uri, "num_samples": N}`` to sample a fixed
     subset once while loading. Uses ``set_transform()`` for lazy evaluation —
     tokenization is handled by the collator.
 
     Args:
-        data_dir_list: Path(s) to JSON file(s), ``hf://`` URIs, or dictionary entries with path and
+        data_dir_list: Path(s) to corpus JSON or inline JSONL files, ``hf://`` URIs, or dictionary entries with path and
             num_samples.
         model_type: "bi_encoder" (default) or "cross_encoder"
         data_type: Type of data ("train" or "eval")
@@ -922,7 +922,7 @@ class RetrievalDatasetConfig:
     """Construction-time configuration for the retrieval dataset."""
 
     data_dir_list: list[DataEntry] | DataEntry | None = None
-    """Path(s) to JSON file(s), ``hf://`` URIs, or dict entries with path and num_samples."""
+    """Path(s) to corpus JSON or inline JSONL files, ``hf://`` URIs, or dict entries with path and num_samples."""
     model_type: str = "bi_encoder"
     """``bi_encoder`` or ``cross_encoder``."""
     data_type: str = "train"

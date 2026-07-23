@@ -13,8 +13,8 @@ This dataset is used by the retrieval recipes in `examples/retrieval/bi_encoder/
 
 ## Raw Records and Runtime Schemas
 
-The dataset factory `nemo_automodel.components.datasets.llm.make_retrieval_dataset` returns a Hugging Face
-`datasets.Dataset`. At runtime it transforms each raw record into the training-time schema:
+The public config `nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig` builds a Hugging
+Face `datasets.Dataset`. At runtime, it transforms each raw record into the training-time schema:
 
 - `question`: query string
 - `doc_text`: list of document texts in the order `[positive, negative_1, negative_2, ...]`
@@ -28,22 +28,17 @@ The cross-encoder recipe consumes the same raw retrieval records, but sets `mode
 transform flattens each query with its positive and negative passages, and `CrossEncoderCollator` serializes each
 query-passage pair for reranking.
 
-Each transformed training example uses exactly one positive passage. Corpus-backed JSON and `hf://` sources use the
-first item in `pos_doc` by default. Set `cycle_positive_docs: true` to rotate through multiple positives by epoch.
-Inline JSONL currently always uses the first positive. For multi-positive data, choose a canonical positive, enable
-cycling where supported, expand the record into one example per positive, or add a multi-positive loss/masking strategy.
-If expanded rows for the same query can share a batch, keep distributed in-batch negatives disabled unless you also
-prevent sibling positives from becoming negatives through qrels-aware sampling or masking. Keep the full set of known
-positives in your qrels or corpus metadata for evaluation and false-negative filtering, even when each transformed
-example uses one positive.
+Each transformed training example uses exactly one positive passage. `RetrievalDatasetConfig` uses the first item in
+`pos_doc` by default. Set `cycle_positive_docs: true` to rotate through multiple positives by epoch for any supported
+source. For guidance about expanding multi-positive data and preventing sibling positives from becoming negatives,
+refer to [Convert Qrels and Multi-Positive Data](#convert-qrels-and-multi-positive-data).
 
 ## Supported Input Formats
 
-NeMo AutoModel supports **two** input schemas across three source types. They use different dataset factories:
-
-- Use `nemo_automodel.components.datasets.llm.make_retrieval_dataset` for corpus ID-based JSON and `hf://` sources.
-- Use `nemo_automodel.components.datasets.llm.retrieval_dataset_inline.make_retrieval_dataset` for inline JSONL where
-  document text is stored directly in each record.
+NeMo AutoModel supports **two** input schemas across three source types. Configure all supported sources with
+`nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig`. It selects corpus-backed JSON,
+`hf://`, or inline JSONL loading from the source URI and file extension. Name inline files with the `.jsonl` extension.
+An inline `.json` file is treated as corpus-backed data and is not detected automatically.
 
 The following table compares the three supported source types:
 
@@ -53,21 +48,23 @@ The following table compares the three supported source types:
 | `hf://` AutoModel schema | `question` | `pos_doc`, a companion Hugging Face corpus split, and `neg_doc` before training with `n_passages > 1` | Shared datasets that already use the AutoModel retrieval schema |
 | Inline JSONL | `query` or `question` | Inline text in `pos_doc` and `neg_doc` | Small custom text datasets |
 
-Separate query relevance judgment files, commonly called qrels, are not consumed directly by the training dataset
-factory. Convert qrels-style data into retrieval records before training:
+### Convert Qrels and Multi-Positive Data
+
+The training dataset does not consume query relevance judgments (qrels) as a separate input. Convert
+qrels-style data into retrieval records before training:
 
 1. Put every passage in a corpus split with stable `id` and `text` values.
-2. For each query, write one or more training records with `question_id`, `question`, `corpus_id`, `pos_doc`, and
-   `neg_doc`. Use unique `question_id` values within each mining file. Hard-negative mining writes results back by ID.
-3. Put the canonical positive first in `pos_doc`. For corpus-backed JSON and `hf://` sources, you can also set
-   `cycle_positive_docs: true` to rotate through positives by epoch. Expand multi-positive queries into multiple records
-   if every positive must become a supervised positive in the same epoch.
-4. For hard-negative mining, include all known positive document IDs for that query in the row's `pos_doc`. The miner
-   excludes only IDs present in the input row, not an external qrels file.
-5. If you expand one query into multiple positive rows, keep those sibling-positive rows out of the same in-batch-negative
-   training batch or use qrels-aware masking.
-6. Preserve the complete qrels separately for full-corpus evaluation and audit mined negatives against them before
-   reusing the output for training.
+2. For each query, write one or more records with `question_id`, `question`, `corpus_id`, `pos_doc`, and `neg_doc`. Use
+   unique `question_id` values within each mining file because hard-negative mining writes results back by ID.
+3. Put the canonical positive first in `pos_doc`. Set `cycle_positive_docs: true` to rotate through all positives by
+   epoch, or expand the query into multiple records if every positive must be supervised in the same epoch.
+4. For hard-negative mining, include every known positive document ID for the query in `pos_doc`. The miner excludes
+   only IDs in the input record, not an external qrels file.
+5. If you expand a query into multiple records, keep sibling-positive records out of the same in-batch-negative training
+   batch or use known-positive masking.
+
+Preserve the complete qrels separately for offline full-corpus retrieval evaluation and use them to audit mined negatives
+before reusing the output for training.
 
 ### Corpus ID-Based JSON
 
@@ -176,7 +173,8 @@ The following behavior applies to inline records:
 
 ## Configure the Dataset and Collator in YAML
 
-Use `RetrievalDatasetConfig` with the bi-encoder collator for corpus ID-based JSON or Hugging Face `hf://` sources:
+Use `RetrievalDatasetConfig` with the appropriate collator for every supported source. The following corpus-backed
+example also works with an `hf://` source:
 
 ```yaml
 dataset:
@@ -186,7 +184,6 @@ dataset:
     - /abs/path/to/train.json    # or hf://nvidia/embed-nemotron-dataset-v1/FEVER
   data_type: train
   n_passages: 5                 # 1 positive + 4 negatives
-  do_shuffle: true
   use_dataset_instruction: false
 
 dataloader:
@@ -200,21 +197,19 @@ dataloader:
     pad_to_multiple_of: 8
 ```
 
-For corpus ID JSON and `hf://` sources, `do_shuffle: true` shuffles rows only when `max_train_samples` is set before
-subsampling. Training order is controlled by the dataloader or distributed sampler. For inline JSONL, `do_shuffle: true`
-shuffles the loaded rows directly.
+For all supported source types, `do_shuffle: true` shuffles rows only when `max_train_samples` is set, before
+subsampling. Otherwise, the dataloader or distributed sampler controls training order.
 
-Use `InlineRetrievalDatasetConfig` for inline JSONL:
+For inline JSONL, keep the same public config and change the source path:
 
 ```yaml
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.InlineRetrievalDatasetConfig
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
   model_type: bi_encoder
   data_dir_list:
     - /abs/path/to/train.jsonl
   data_type: train
   n_passages: 5                 # 1 positive + 4 negatives
-  do_shuffle: true
 
 dataloader:
   collate_fn:
@@ -231,13 +226,12 @@ For cross-encoder training, keep the same dataset config, set `model_type: cross
 
 ```yaml
 dataset:
-  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_inline.InlineRetrievalDatasetConfig
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
   model_type: cross_encoder
   data_dir_list:
     - /abs/path/to/train.jsonl
   data_type: train
   n_passages: 5
-  do_shuffle: true
 
 dataloader:
   collate_fn:
