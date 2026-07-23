@@ -144,3 +144,85 @@ def test_signals_received_aggregates(monkeypatch):
 
     handler = sutils.DistributedSignalHandler()
     assert handler.signals_received() == expected
+
+
+# ---------------------------------------------------------------------------
+# resolve_signal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec, expected",
+    [
+        ("SIGTERM", signal.SIGTERM),
+        ("sigterm", signal.SIGTERM),
+        ("USR1", signal.SIGUSR1),
+        ("usr2", signal.SIGUSR2),
+        (int(signal.SIGTERM), signal.SIGTERM),
+        (signal.SIGTERM, signal.SIGTERM),
+    ],
+)
+def test_resolve_signal_valid(spec, expected):
+    """resolve_signal accepts names (with/without SIG prefix), ints and Signals members."""
+    assert sutils.resolve_signal(spec) is expected
+
+
+def test_resolve_signal_invalid_name():
+    with pytest.raises(ValueError, match="Unknown signal name"):
+        sutils.resolve_signal("SIGDOESNOTEXIST")
+
+
+def test_resolve_signal_invalid_number():
+    with pytest.raises(ValueError, match="Invalid signal number"):
+        sutils.resolve_signal(10**6)
+
+
+def test_resolve_signal_invalid_type():
+    with pytest.raises(TypeError):
+        sutils.resolve_signal(3.14)
+
+
+# ----------------------------------------------------------------------------
+# DistributedSignalHandler: multiple signals
+# ---------------------------------------------------------------------------
+
+
+def test_signal_handler_multiple_signals_install_and_restore():
+    """
+    A handler configured with several signals must install a handler for each
+    and restore all originals on exit. Receiving any one of the signals must
+    set the flag.
+    """
+    sigs = [signal.SIGUSR1, signal.SIGUSR2]
+    originals = {s: signal.getsignal(s) for s in sigs}
+
+    with sutils.DistributedSignalHandler(sig=sigs) as h:
+        for s in sigs:
+            assert signal.getsignal(s) is not originals[s]
+        signal.getsignal(signal.SIGUSR2)(signal.SIGUSR2, None)
+        assert h._signal_received is True
+
+    for s in sigs:
+        assert signal.getsignal(s) is originals[s]
+
+
+def test_signal_handler_string_signal_real_delivery():
+    """
+    End-to-end: configure by string name, deliver a real signal with os.kill,
+    and verify signals_received reports it (single-process fallback path).
+    """
+    import os
+
+    original = signal.getsignal(signal.SIGUSR1)
+    with sutils.DistributedSignalHandler(sig="SIGUSR1") as h:
+        assert h.signals_received() == [False]
+        os.kill(os.getpid(), signal.SIGUSR1)
+        assert h.signals_received() == [True]
+    assert signal.getsignal(signal.SIGUSR1) is original
+
+
+def test_signal_handler_rejects_duplicates_and_empty():
+    with pytest.raises(ValueError, match="Duplicate"):
+        sutils.DistributedSignalHandler(sig=[signal.SIGUSR1, "USR1"])
+    with pytest.raises(ValueError, match="At least one"):
+        sutils.DistributedSignalHandler(sig=[])
