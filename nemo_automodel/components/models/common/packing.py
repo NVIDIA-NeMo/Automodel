@@ -269,6 +269,8 @@ def _patch_preprocess_mask_arguments_for_packing() -> None:
 # Model modules whose ``create_causal_mask`` must be patched for neat packing.
 # TODO: perhaps its for ALL models.
 _PACKING_PATCH_MODULES = [
+    "transformers.models.llama.modeling_llama",
+    "transformers.models.qwen3.modeling_qwen3",
     "transformers.models.qwen2.modeling_qwen2",
     "transformers.models.qwen2_5_vl.modeling_qwen2_5_vl",
     "transformers.models.qwen2_vl.modeling_qwen2_vl",

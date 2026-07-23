@@ -41,6 +41,12 @@ model:
   trust_remote_code: true
   force_hf: true
 
+# Repair checkpoint input rows whose near-zero norm can produce extreme gradients
+# when those token IDs first occur during continued pretraining.
+embedding_row_repair:
+  min_norm: 1.0e-4
+  max_rows: 256
+
 compile:
   enabled: false
   mode: "default" # Options: "default", "reduce-overhead", "max-autotune"
