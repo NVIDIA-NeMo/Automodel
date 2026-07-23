@@ -209,8 +209,11 @@ def _install_torch_and_layers_stubs(monkeypatch):
     utils_checkpoint_stub.CheckpointPolicy = CheckpointPolicy
     utils_checkpoint_stub.create_selective_checkpoint_contexts = create_selective_checkpoint_contexts
 
-    # ops.aten.mm.default sentinel
-    aten = types.SimpleNamespace(mm=types.SimpleNamespace(default=object()))
+    # Router ops used by the targeted activation-checkpointing policy.
+    aten = types.SimpleNamespace(
+        mm=types.SimpleNamespace(default=object()),
+        topk=types.SimpleNamespace(default=object()),
+    )
     torch_stub.ops = types.SimpleNamespace(aten=aten)
 
     # dtype and device classes for type annotations
@@ -220,8 +223,12 @@ def _install_torch_and_layers_stubs(monkeypatch):
     class device:
         pass
 
+    class Tensor:
+        pass
+
     torch_stub.dtype = dtype
     torch_stub.device = device
+    torch_stub.Tensor = Tensor
 
     # common dtypes referenced by code
     torch_stub.bfloat16 = object()
@@ -293,7 +300,11 @@ def _import_parallelizer_with_stubs(monkeypatch):
 
     _install_torch_and_layers_stubs(monkeypatch)
 
-    # Stub the pipelining module and hf_utils
+    # Stub the distributed package, config normalization, pipelining module, and hf_utils.
+    distributed_stub = types.ModuleType("nemo_automodel.components.distributed")
+    distributed_stub.__path__ = []
+    config_stub = types.ModuleType("nemo_automodel.components.distributed.config")
+    config_stub.normalize_activation_checkpointing_scope = lambda scope: (scope,) if isinstance(scope, str) else tuple(scope)
     pipelining_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining")
     hf_utils_stub = types.ModuleType("nemo_automodel.components.distributed.pipelining.hf_utils")
 
@@ -306,6 +317,8 @@ def _import_parallelizer_with_stubs(monkeypatch):
     hf_utils_stub.get_text_module = get_text_module
     pipelining_stub.hf_utils = hf_utils_stub
 
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed", distributed_stub)
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.config", config_stub)
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.pipelining", pipelining_stub)
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.pipelining.hf_utils", hf_utils_stub)
 
@@ -543,7 +556,7 @@ def test_apply_ac_warns_when_router_is_recomputed(monkeypatch):
     assert logger_mock.warning.call_count == 1
     assert "ignore_router_for_ac" in logger_mock.warning.call_args[0][0]
 
-    # ignore_router=True (the default) saves the router output -> no warning.
+    # ignore_router=True (the default) saves the router projection and top-k outputs -> no warning.
     logger_mock.reset_mock()
     P.apply_ac(DummyModel([DummyBlock()]), ignore_router=True, hidden_size=7168, num_experts=256)
     logger_mock.warning.assert_not_called()
@@ -575,7 +588,7 @@ def test_apply_ac_uses_generic_wrapper_even_when_block_local_checkpointing_is_av
     assert model.layers.registered["0"] is wrapped
 
 
-def test_apply_ac_custom_policy_respects_hidden_and_expert_dims(monkeypatch):
+def test_apply_ac_custom_policy_saves_router_projection_and_topk(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
 
     captured_policy = None
@@ -608,10 +621,12 @@ def test_apply_ac_custom_policy_respects_hidden_and_expert_dims(monkeypatch):
 
     policy = captured_policy
     must_save = policy(None, torch_stub.ops.aten.mm.default, object(), rhs_match)
+    must_save_topk = policy(None, torch_stub.ops.aten.topk.default, object(), 2)
     prefer_recompute_shape = policy(None, torch_stub.ops.aten.mm.default, object(), rhs_mismatch)
     prefer_recompute_func = policy(None, object(), object(), rhs_match)
 
     assert must_save == P.CheckpointPolicy.MUST_SAVE
+    assert must_save_topk == P.CheckpointPolicy.MUST_SAVE
     assert prefer_recompute_shape == P.CheckpointPolicy.PREFER_RECOMPUTE
     assert prefer_recompute_func == P.CheckpointPolicy.PREFER_RECOMPUTE
 
