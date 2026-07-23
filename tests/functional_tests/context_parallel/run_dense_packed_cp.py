@@ -30,7 +30,10 @@ from torch.distributed.device_mesh import init_device_mesh
 from transformer_engine.pytorch import DotProductAttention
 from transformers import LlamaConfig, Qwen2Config, Qwen3Config
 
-from nemo_automodel.components.distributed.cp_utils import attach_te_context_parallel, make_cp_batch_for_te
+from nemo_automodel.components.distributed.context_parallel.utils import (
+    attach_te_context_parallel,
+    make_cp_batch_for_te,
+)
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM
 from nemo_automodel.components.models.qwen2.model import Qwen2ForCausalLM

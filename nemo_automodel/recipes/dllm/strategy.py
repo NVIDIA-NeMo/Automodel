@@ -42,7 +42,7 @@ from nemo_automodel.components.datasets.dllm.corruption import (
     corrupt_uniform,
     corrupt_uniform_random,
 )
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loss.dllm_loss import (
     BlockDiffusionCrossEntropyLoss,
@@ -701,7 +701,8 @@ class DFlashStrategy(DLLMStrategy):
             torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )
         fp8_ctx = recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
-        train_ctx, _ = make_cp_batch_and_ctx(recipe.device_mesh, {})
+        cp_sharder = ContextParallelSharder(None, recipe.device_mesh, {})
+        train_ctx, _ = cp_sharder.shard({})
 
         with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
             draft_kwargs = dict(

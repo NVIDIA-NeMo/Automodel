@@ -25,7 +25,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
 from nemo_automodel.components.distributed.config import DDPConfig, DistributedSetup
-from nemo_automodel.components.distributed.cp_utils import unshard_context_parallel_tensor
+from nemo_automodel.components.distributed.context_parallel.utils import unshard_context_parallel_tensor
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, parse_distributed_section
 
 if TYPE_CHECKING:
