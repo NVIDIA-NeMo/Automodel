@@ -45,6 +45,13 @@ RESOLVED_FINETUNE_CONFIG=$($CONFIG_RESOLVER \
   --output "$TEST_DIR/finetune_config.yaml")
 
 export WANDB_API_KEY="${WANDB_AUTOMODEL_API_KEY}"
+# Disable wandb in CI. The recipes log to `wandb.entity: nvidia`, but the CI token
+# (WANDB_AUTOMODEL_API_KEY) has no models-write access to that org, so wandb.init()
+# raises CommError on rank0 during recipe.setup() and strands the other ranks at the
+# checkpoint-consolidation gloo barrier (30-min c10d store timeout). The convergence
+# gate is downstream IFEval, not wandb; the recipe's wandb config stays intact for
+# manual runs. Set WANDB_MODE=online + a CI-writable entity later to capture curves.
+export WANDB_MODE=disabled
 
 # Entry script by recipe type. Convergence recipes live under examples/convergence/
 # (mixed LLM/VLM), so the path-based heuristic templates use does not apply -- pick the
