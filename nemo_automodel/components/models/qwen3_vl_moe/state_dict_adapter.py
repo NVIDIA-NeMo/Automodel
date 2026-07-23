@@ -127,6 +127,8 @@ class Qwen3VLMoeStateDictAdapter(StateDictAdapter):
 
             if key.startswith("model."):
                 state_dict[key] = value
+            elif key.startswith("lm_head."):
+                state_dict[key] = value
             else:
                 state_dict[f"{model_prefix}{key}"] = value
 

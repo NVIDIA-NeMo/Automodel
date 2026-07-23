@@ -22,10 +22,9 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-# FlexAttention mask type. For each mask type, we initialize it at most once per
-# batch. To record what it is initialized, FLEX_ATTN_MASK_T is used as the key to
-# track the initialized mask.
-FLEX_ATTN_MASK_T = tuple[str, int | None] | tuple[int, int, int]
+# Cache masks by window, tensor geometry, and device so a BlockMask is reused only
+# for compatible attention inputs.
+FLEX_ATTN_MASK_T = tuple[int, int, int, int, int, torch.device]
 
 
 # Adapted from https://github.com/pytorch/torchtitan/pull/1559
@@ -51,12 +50,8 @@ class FlexAttention(torch.nn.Module):
     # We registered flex_attention related attributes as class variables as we
     # need to amortize the cost of compilation.
     flex_attn: ClassVar[Callable[..., Any]] = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs")
-    mask_key: FLEX_ATTN_MASK_T
-    # Attention mask type to the created BlockMask.
-    # This allows us to keep track the created block masks for each
-    # new batch. We will use this to update the block mask when a
-    # new batch is created. This also allows user to create different
-    # block masks for different layers.
+    # Cache key to the created BlockMask. Matching layers can share a mask,
+    # while different tensor geometries and devices receive distinct masks.
     block_masks: ClassVar[dict[FLEX_ATTN_MASK_T, BlockMask]] = {}
 
     def forward(
@@ -69,18 +64,26 @@ class FlexAttention(torch.nn.Module):
         sliding_window: int = 0,
         enable_gqa: bool = False,
     ) -> torch.Tensor:
-        if sink_weights is None:
-            block_mask = FlexAttention.block_masks[self.mask_key]
-            result: torch.Tensor = FlexAttention.flex_attn(
-                q, k, v, block_mask=block_mask, scale=scale, enable_gqa=enable_gqa
-            )
-            return result
+        """Apply FlexAttention with a cached causal or sliding-window mask.
 
-        B, H_q, S_q, D = q.shape
-        _, H_kv, S_kv, _ = k.shape
+        Args:
+            q: Query tensor with shape ``[B, Hq, Sq, Dqk]``, where ``B`` is the batch size, ``Hq`` is the
+                number of query heads, ``Sq`` is the query sequence length, and ``Dqk`` is the query/key head size.
+            k: Key tensor with shape ``[B, Hkv, Skv, Dqk]``, where ``Hkv`` is the number of key/value heads and
+                ``Skv`` is the key/value sequence length.
+            v: Value tensor with shape ``[B, Hkv, Skv, Dv]``, where ``Dv`` is the value head size.
+            scale: Optional scale applied to the query-key scores when ``sink_weights`` is not set.
+            sink_weights: Optional attention-sink weights with shape ``[Hq]``.
+            sliding_window: Number of causal tokens available to each query. ``0`` uses the full causal history.
+            enable_gqa: Whether to enable grouped-query attention when ``Hq`` differs from ``Hkv``.
 
-        # regular (no-sink) mask + no extra KV col
-        mask_key = (sliding_window, S_q, S_kv)
+        Returns:
+            Attention output with shape ``[B, Hq, Sq, Dv]`` on the same device and with the same dtype as ``q``.
+        """
+        batch_size, num_q_heads, q_len, _ = q.shape
+        kv_len = k.shape[2]
+
+        mask_key = (sliding_window, batch_size, num_q_heads, q_len, kv_len, q.device)
         if mask_key not in FlexAttention.block_masks:
             if sliding_window is not None and sliding_window > 0:
                 mask_mod = FlexAttention._get_sliding_window_mask_mod(sliding_window)
@@ -88,10 +91,10 @@ class FlexAttention(torch.nn.Module):
                 mask_mod = FlexAttention._get_causal_mask_mod()
             block_mask = create_block_mask(
                 mask_mod,
-                B,
-                H_q,
-                S_q,
-                S_kv,
+                batch_size,
+                num_q_heads,
+                q_len,
+                kv_len,
                 _compile=False,  # NOTE: _compile=True leads to hangs during sampling, so setting it to False for now
                 device=q.device,
             )
@@ -99,14 +102,25 @@ class FlexAttention(torch.nn.Module):
 
         block_mask = FlexAttention.block_masks[mask_key]
 
+        if sink_weights is None:
+            result: torch.Tensor = FlexAttention.flex_attn(
+                q, k, v, block_mask=block_mask, scale=scale, enable_gqa=enable_gqa
+            )
+            return result
+
         # run fast flex_attn and return LSE
-        out, lse = FlexAttention.flex_attn(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa, return_lse=True)
+        out, lse = FlexAttention.flex_attn(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            enable_gqa=enable_gqa,
+            return_lse=True,
+        )
 
         # rescale by sigma(lse - w[h]) and broadcast over D
-        if sink_weights is not None:
-            w = sink_weights  # [H]
-            attn_scale = torch.sigmoid(lse - w.view(1, -1, 1)).unsqueeze(-1)  # [B,H,S,1]
-            out = out * attn_scale
+        attn_scale = torch.sigmoid(lse - sink_weights.view(1, -1, 1)).unsqueeze(-1)  # [B,H,S,1]
+        out = out * attn_scale
 
         out_tensor: torch.Tensor = out.to(q.dtype)
         return out_tensor

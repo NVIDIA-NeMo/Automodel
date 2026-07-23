@@ -302,3 +302,119 @@ def test_forward_unpacks_vision_features_from_named_output(rotary_cls, thinker_c
 
     mock_gif.assert_called_once()
     assert logits.shape == (batch, seq_len, vocab_size)
+
+
+@patch.object(HFQwen3OmniMoeThinkerForConditionalGeneration, "__init__", new=_stub_hf_init)
+@patch("nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
+def test_forward_unpacks_audio_features_from_named_output(
+    rotary_cls, thinker_config, backend_config, moe_config, device
+):
+    """``get_audio_features`` returns ``BaseModelOutputWithPooling`` in transformers 5.5.0
+    (carrying ``last_hidden_state``), not a bare tensor. ``forward`` must extract
+    ``.last_hidden_state`` before ``.to(device, dtype)``; passing the named output
+    straight to ``.to`` raises ``AttributeError`` and silently breaks ASR training.
+
+    This regression test asserts the audio branch handles the named output exactly
+    the way the image/video branches do.
+    """
+    from transformers.modeling_outputs import BaseModelOutputWithPooling
+
+    rotary_cls.return_value = MagicMock(side_effect=lambda x, y: (torch.zeros_like(x), torch.zeros_like(x)))
+    model = Qwen3OmniMoeThinkerForConditionalGeneration(
+        thinker_config, moe_config=moe_config, backend=backend_config
+    ).to(device)
+    model.config = thinker_config
+
+    hidden_size = thinker_config.text_config.hidden_size
+    vocab_size = thinker_config.text_config.vocab_size
+    batch, seq_len = 1, 6
+    num_audio_tokens = 2  # how many "<|audio_pad|>" slots inputs_embeds has.
+
+    # Place audio embeddings in the first two positions of the sequence via the
+    # audio_mask returned by get_placeholder_mask.
+    audio_mask = torch.zeros(batch, seq_len, 1, dtype=torch.bool, device=device)
+    audio_mask[0, :num_audio_tokens, 0] = True
+
+    fake_audio_features = torch.randn(num_audio_tokens, hidden_size, device=device)
+    fake_audio_output = BaseModelOutputWithPooling(
+        last_hidden_state=fake_audio_features,
+        pooler_output=None,
+        hidden_states=None,
+        attentions=None,
+    )
+
+    hidden = torch.randn(
+        batch, seq_len, hidden_size, device=device, dtype=model.lm_head.weight.dtype
+    )
+    input_ids = torch.randint(0, vocab_size, (batch, seq_len), device=device)
+    input_features = torch.randn(batch, 128, 10, device=device)
+    feature_attention_mask = torch.ones(batch, 10, dtype=torch.long, device=device)
+
+    with (
+        patch.object(model.model, "forward", return_value=hidden),
+        patch.object(model, "get_audio_features", return_value=fake_audio_output) as mock_gaf,
+        patch.object(
+            model,
+            "get_placeholder_mask",
+            return_value=(
+                torch.zeros(batch, seq_len, 1, dtype=torch.bool, device=device),
+                torch.zeros(batch, seq_len, 1, dtype=torch.bool, device=device),
+                audio_mask,
+            ),
+        ),
+    ):
+        logits = model(
+            input_ids=input_ids,
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
+        )
+
+    mock_gaf.assert_called_once()
+    # Must not raise AttributeError on BaseModelOutputWithPooling.to(...); shape OK.
+    assert logits.shape == (batch, seq_len, vocab_size)
+
+
+@patch.object(HFQwen3OmniMoeThinkerForConditionalGeneration, "__init__", new=_stub_hf_init)
+@patch("nemo_automodel.components.models.qwen3_omni_moe.model.Qwen3OmniMoeThinkerTextRotaryEmbedding")
+def test_forward_audio_features_tensor_fallback(
+    rotary_cls, thinker_config, backend_config, moe_config, device
+):
+    """If a future ``get_audio_features`` override returns a bare tensor (no
+    ``last_hidden_state`` attribute), the audio branch must still work via the
+    ``hasattr(..., 'last_hidden_state')`` guard."""
+    rotary_cls.return_value = MagicMock(side_effect=lambda x, y: (torch.zeros_like(x), torch.zeros_like(x)))
+    model = Qwen3OmniMoeThinkerForConditionalGeneration(
+        thinker_config, moe_config=moe_config, backend=backend_config
+    ).to(device)
+    model.config = thinker_config
+
+    hidden_size = thinker_config.text_config.hidden_size
+    vocab_size = thinker_config.text_config.vocab_size
+    batch, seq_len = 1, 4
+    num_audio_tokens = 2
+
+    audio_mask = torch.zeros(batch, seq_len, 1, dtype=torch.bool, device=device)
+    audio_mask[0, :num_audio_tokens, 0] = True
+    bare_tensor_audio = torch.randn(num_audio_tokens, hidden_size, device=device)
+    hidden = torch.randn(batch, seq_len, hidden_size, device=device, dtype=model.lm_head.weight.dtype)
+    input_ids = torch.randint(0, vocab_size, (batch, seq_len), device=device)
+
+    with (
+        patch.object(model.model, "forward", return_value=hidden),
+        patch.object(model, "get_audio_features", return_value=bare_tensor_audio),
+        patch.object(
+            model,
+            "get_placeholder_mask",
+            return_value=(
+                torch.zeros(batch, seq_len, 1, dtype=torch.bool, device=device),
+                torch.zeros(batch, seq_len, 1, dtype=torch.bool, device=device),
+                audio_mask,
+            ),
+        ),
+    ):
+        logits = model(
+            input_ids=input_ids,
+            input_features=torch.randn(batch, 128, 10, device=device),
+            feature_attention_mask=torch.ones(batch, 10, dtype=torch.long, device=device),
+        )
+    assert logits.shape == (batch, seq_len, vocab_size)

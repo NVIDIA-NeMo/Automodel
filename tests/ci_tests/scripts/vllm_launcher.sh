@@ -19,9 +19,12 @@
 set -xeuo pipefail
 
 export PYTHONPATH=${PYTHONPATH:-}:$(pwd)
-export CUDA_VISIBLE_DEVICES="0"
 
 cd /opt/Automodel
+
+# Expose ci.vllm_deploy_gpus GPUs (default 1) so large models can tensor-parallel.
+# Set after cd so the relative $CONFIG_PATH resolves under /opt/Automodel.
+export CUDA_VISIBLE_DEVICES="$(python3 -c "import yaml; cfg = yaml.safe_load(open('$CONFIG_PATH')) or {}; n = int((cfg.get('ci') or {}).get('vllm_deploy_gpus', 1) or 1); print(','.join(map(str, range(n))))" 2>/dev/null || echo 0)"
 
 TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_vllm_deploy.py"
 FINETUNE_TEST_NAME="${TEST_NAME%_vllm_deploy}"

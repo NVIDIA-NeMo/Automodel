@@ -5,12 +5,12 @@ pyproject.toml @nvidia-nemo/automation
 uv.lock @nvidia-nemo/automation
 tests/ci_tests @nvidia-nemo/automation
 
-docs @akoumpa @jgerh @adil-a @HuiyingLi @hemildesai @pthombre @athitten @zyzhou5
-nemo_automodel @akoumpa @HuiyingLi @adil-a @hemildesai @ZhiyuLi-Nvidia @pthombre @athitten @zyzhou5
-examples @akoumpa @HuiyingLi @adil-a @hemildesai @ZhiyuLi-Nvidia @pthombre @athitten @zyzhou5
-README.md @akoumpa @HuiyingLi @snowmanwwg
+docs @jgerh @NVIDIA-NeMo/core-am
+nemo_automodel @NVIDIA-NeMo/core-am
+examples @NVIDIA-NeMo/core-am
+README.md @akoumpa @HuiyingLi @athitten @snowmanwwg
 
-nemo_automodel/components/datasets/llm/retrieval_*.py @akoumpa @adil-a @HuiyingLi @hemildesai @NVIDIA-NeMo/automodel_retriever_maintainers
-nemo_automodel/_transformers/retrieval.py @akoumpa @adil-a @HuiyingLi @hemildesai @NVIDIA-NeMo/automodel_retriever_maintainers
-nemo_automodel/recipes/retrieval/ @akoumpa @adil-a @HuiyingLi @hemildesai @NVIDIA-NeMo/automodel_retriever_maintainers
-examples/retrieval/ @akoumpa @adil-a @HuiyingLi @hemildesai @NVIDIA-NeMo/automodel_retriever_maintainers
+nemo_automodel/components/datasets/llm/retrieval_*.py @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
+nemo_automodel/_transformers/retrieval.py @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
+nemo_automodel/recipes/retrieval/ @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers
+examples/retrieval/ @NVIDIA-NeMo/core-am @NVIDIA-NeMo/automodel_retriever_maintainers

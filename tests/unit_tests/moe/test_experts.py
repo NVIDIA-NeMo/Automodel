@@ -746,8 +746,12 @@ class TestGroupedExpertsDeepEP:
         mock_mesh.get_local_rank.return_value = 0
         mock_mesh.get_group.return_value = Mock()
 
-        # Patch the MoEFlexTokenDispatcher to avoid the TPxEP assertion
-        with patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher") as mock_dispatcher:
+        # Patch the MoEFlexTokenDispatcher to avoid the TPxEP assertion and the
+        # DeepEP buffer allocation, which requires the optional runtime.
+        with (
+            patch("nemo_automodel.components.moe.experts.MoEFlexTokenDispatcher") as mock_dispatcher,
+            patch.object(experts, "_init_deepep_buffer") as mock_init_buffer,
+        ):
             mock_dispatcher.return_value = Mock()
 
             experts.init_token_dispatcher(mock_mesh)
@@ -755,6 +759,7 @@ class TestGroupedExpertsDeepEP:
             assert hasattr(experts, "token_dispatcher")
             assert experts.ep_size == 2
             assert experts.ep_rank == 0
+            mock_init_buffer.assert_called_once_with(mock_mesh.get_group.return_value)
 
     def test_grouped_experts_deepep_apply_bias_no_bias(self, moe_config):
         """Test _apply_bias method with no bias."""
@@ -800,15 +805,29 @@ class TestGroupedExpertsDeepEP:
 
     def test_grouped_experts_deepep_init_with_hybridep_backend(self, moe_config):
         """Test GroupedExpertsDeepEP initialization with hybridep backend."""
-        experts = GroupedExpertsDeepEP(moe_config, dispatcher_backend="hybridep", dispatcher_num_sms=24)
+        experts = GroupedExpertsDeepEP(
+            moe_config,
+            dispatcher_backend="hybridep",
+            dispatcher_num_sms=24,
+            dispatcher_share_token_dispatcher=False,
+            dispatcher_async_dispatch=True,
+        )
 
         assert experts.dispatcher_backend == "hybridep"
         assert experts.dispatcher_num_sms == 24
+        assert experts.dispatcher_share_token_dispatcher is False
+        assert experts.dispatcher_async_dispatch is True
         assert experts.config == moe_config
 
     def test_grouped_experts_deepep_token_dispatcher_init_hybridep(self, moe_config):
         """Test init_token_dispatcher passes hybridep config to TokenDispatcherConfig."""
-        experts = GroupedExpertsDeepEP(moe_config, dispatcher_backend="hybridep", dispatcher_num_sms=24)
+        experts = GroupedExpertsDeepEP(
+            moe_config,
+            dispatcher_backend="hybridep",
+            dispatcher_num_sms=24,
+            dispatcher_share_token_dispatcher=False,
+            dispatcher_async_dispatch=True,
+        )
 
         mock_mesh = Mock()
         mock_mesh.size.return_value = 2
@@ -828,6 +847,8 @@ class TestGroupedExpertsDeepEP:
             assert config_arg.moe_flex_dispatcher_backend == "hybridep"
             assert config_arg.moe_hybridep_num_sms == 24
             assert config_arg.moe_deepep_num_sms == 24
+            assert config_arg.moe_share_token_dispatcher is False
+            assert config_arg.moe_deepep_async_dispatch is True
 
 
 class TestNonGatedActivations:
@@ -1789,6 +1810,46 @@ class TestGroupedExpertsTE:
             # After init_token_dispatcher, out_features should still be moe_inter_dim (not 2*)
             assert experts.gate_up_linear.out_features == config.moe_inter_dim
             assert experts.gate_up_linear.num_gemms == config.n_routed_experts // 2
+
+    def test_grouped_experts_te_zero_routed_tokens_grads_all_local_experts(self, te_moe_config):
+        """All local expert params must get (zero) grads when no tokens are routed locally.
+
+        Grouped GEMM produces explicit zero gradients for every local expert.
+        The zero-token fallback must do the same: a parameter left with
+        ``grad=None`` skips momentum decay, decoupled weight decay, and its
+        optimizer step, so its optimizer state silently diverges from ranks
+        that did receive tokens.
+        """
+        from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        experts = GroupedExpertsTE(te_moe_config)
+        self._materialize_weights(experts, device)
+
+        num_tokens = 4
+        x = torch.randn(num_tokens, te_moe_config.dim, dtype=te_moe_config.dtype, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, te_moe_config.n_activated_experts, device=device)
+        indices = torch.zeros(num_tokens, te_moe_config.n_activated_experts, dtype=torch.long, device=device)
+
+        # Simulate an EP step where the dispatcher hands this rank zero tokens.
+        empty_hidden = torch.zeros(0, te_moe_config.dim, dtype=te_moe_config.dtype, device=device)
+        empty_probs = torch.zeros(0, dtype=te_moe_config.dtype, device=device)
+        zero_splits = [0] * te_moe_config.n_routed_experts
+        dispatcher = Mock()
+        dispatcher.token_permutation2 = Mock(return_value=(empty_hidden, zero_splits, empty_probs))
+        dispatcher.token_unpermutation = Mock(side_effect=lambda output: output)
+        experts.token_dispatcher = dispatcher
+        experts.ep_size = 1
+
+        y = experts(x, token_mask, weights, indices)
+        y.sum().backward()
+
+        params = list(experts.gate_up_linear.parameters()) + list(experts.down_linear.parameters())
+        assert len(params) == 2 * te_moe_config.n_routed_experts
+        for param in params:
+            assert param.grad is not None, "expert parameter received no gradient in the zero-token fallback"
+            assert torch.count_nonzero(param.grad) == 0
 
 
 class TestPermuteTokensForGroupedMM:

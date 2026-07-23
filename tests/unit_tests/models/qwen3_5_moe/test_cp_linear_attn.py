@@ -15,7 +15,8 @@
 """Unit tests for CPAwareGatedDeltaNet (cp_linear_attn.py).
 
 Tests cover:
-  - _extract_local_positions: various tensor shapes and fallback behavior
+  - _extract_local_seq_index: various tensor shapes and fallback behavior
+  - _build_dual_chunk_local_positions: DualChunkSwap layout derivation
   - _undo_attention_load_balancing / _redo_attention_load_balancing: correctness
   - _AllGatherConcatFn: forward in a single-rank mock scenario
   - CPAwareGatedDeltaNet.forward: fast path delegation when CP is disabled
@@ -114,46 +115,70 @@ def _patch_dist_for_cp(rank=0, world_size=2):
 
 
 # ============================================================================
-# _extract_local_positions
+# _extract_local_seq_index
 # ============================================================================
 
 
-class TestExtractLocalPositions:
+class TestExtractLocalSeqIndex:
     def test_1d_seq_index(self, module, device):
         seq_index = torch.tensor([3, 1, 0, 2], device=device)
-        result = module._extract_local_positions(position_ids=None, seq_index=seq_index, seq_len=4)
+        result = module._extract_local_seq_index(seq_index, seq_len=4)
         assert result is not None
         assert torch.equal(result, seq_index.long())
 
-    def test_2d_position_ids(self, module, device):
-        position_ids = torch.tensor([[0, 1, 2, 3]], device=device)
-        result = module._extract_local_positions(position_ids=position_ids, seq_index=None, seq_len=4)
+    def test_2d_seq_index_takes_first_row(self, module, device):
+        seq_index = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], device=device)
+        result = module._extract_local_seq_index(seq_index, seq_len=4)
         assert result is not None
-        assert torch.equal(result, position_ids[0].long())
+        assert torch.equal(result, seq_index[0].long())
 
-    def test_3d_mrope_position_ids(self, module, device):
-        # 3D mRoPE: [1, num_axes, seq_len]
-        position_ids = torch.arange(4, device=device).unsqueeze(0).unsqueeze(0).expand(1, 3, 4)
-        result = module._extract_local_positions(position_ids=position_ids, seq_index=None, seq_len=4)
-        assert result is not None
-        assert result.shape == (4,)
+    def test_casts_to_long(self, module, device):
+        seq_index = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+        result = module._extract_local_seq_index(seq_index, seq_len=4)
+        assert result.dtype == torch.long
 
     @pytest.mark.parametrize(
-        "position_ids, seq_index, seq_len",
+        "seq_index, seq_len",
         [
-            (None, None, 4),  # both None
-            (None, torch.tensor([0, 1, 2]), 4),  # length mismatch
-            (torch.arange(4).reshape(1, 1, 1, 4), None, 4),  # 4D tensor skipped
+            (None, 4),  # None -> None (falls back to DualChunkSwap derivation)
+            (torch.tensor([0, 1, 2]), 4),  # length mismatch
+            (torch.arange(4).reshape(1, 1, 4), 4),  # 3D tensor skipped
         ],
-        ids=["both_none", "length_mismatch", "4d_skipped"],
+        ids=["none", "length_mismatch", "3d_skipped"],
     )
-    def test_returns_none_for_invalid_inputs(self, module, device, position_ids, seq_index, seq_len):
-        if position_ids is not None:
-            position_ids = position_ids.to(device)
+    def test_returns_none_for_invalid_inputs(self, module, device, seq_index, seq_len):
         if seq_index is not None:
             seq_index = seq_index.to(device)
-        result = module._extract_local_positions(position_ids=position_ids, seq_index=seq_index, seq_len=seq_len)
+        result = module._extract_local_seq_index(seq_index, seq_len=seq_len)
         assert result is None
+
+
+# ============================================================================
+# _build_dual_chunk_local_positions
+# ============================================================================
+
+
+class TestBuildDualChunkLocalPositions:
+    def test_rank0_of_2_takes_first_and_last_chunks(self, module, device):
+        # cp_size=2 -> 4 chunks indexed 0..3 across ranks. rank 0 owns chunk 0
+        # (first) and chunk 2*2-1-0=3 (last); seq_len=4 -> chunk_len=2.
+        result = module._build_dual_chunk_local_positions(seq_len=4, cp_size=2, cp_rank=0, device=device)
+        assert result.tolist() == [0, 1, 6, 7]
+
+    def test_rank1_of_2_takes_inner_chunks(self, module, device):
+        # rank 1 owns chunk 1 and chunk 2*2-1-1=2.
+        result = module._build_dual_chunk_local_positions(seq_len=4, cp_size=2, cp_rank=1, device=device)
+        assert result.tolist() == [2, 3, 4, 5]
+
+    def test_result_dtype_and_device(self, module, device):
+        result = module._build_dual_chunk_local_positions(seq_len=8, cp_size=4, cp_rank=2, device=device)
+        assert result.dtype == torch.long
+        assert result.device.type == device.type
+        assert result.shape == (8,)
+
+    def test_raises_on_odd_seq_len(self, module, device):
+        with pytest.raises(RuntimeError, match="even local sequence length"):
+            module._build_dual_chunk_local_positions(seq_len=5, cp_size=2, cp_rank=0, device=device)
 
 
 # ============================================================================

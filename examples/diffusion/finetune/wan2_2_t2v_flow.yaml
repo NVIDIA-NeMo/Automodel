@@ -1,0 +1,105 @@
+seed: 42
+
+wandb:
+  enable: false
+  project: wan-t2v-flow-matching
+  mode: online
+  # Stage name is auto-appended (e.g. wan2_2_t2v_fm_high_noise) when model.stage is set.
+  name: wan2_2_t2v_fm
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  pretrained_model_name_or_path: Wan-AI/Wan2.2-T2V-A14B-Diffusers
+  mode: finetune
+  # Two-stage finetuning knob. Required for Wan2.2-T2V-A14B.
+  # "high_noise" trains pipe.transformer on sigma in [boundary_ratio, 1.0].
+  # "low_noise"  trains pipe.transformer_2 on sigma in [0.0, boundary_ratio].
+  # Run twice (once per stage) with different checkpoint dirs to fully finetune.
+  stage: high_noise
+  # Optional override; if unset the recipe reads boundary_ratio from the
+  # pipeline config (Wan2.2-T2V-A14B ships with 0.875).
+  boundary_ratio: 0.875
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  num_epochs: 100
+  log_every: 2
+  save_checkpoint_every_epoch: false
+
+data:
+  dataloader:
+    _target_: nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader
+    # Point this at the cache produced by tools/diffusion/processors/wan.py --variant wan22
+    cache_dir: PATH_TO_YOUR_WAN22_DATA
+    model_type: wan
+    base_resolution: [512, 512]
+    dynamic_batch_size: false
+    shuffle: true
+    drop_last: false
+    num_workers: 2
+
+optim:
+  learning_rate: 5e-6
+  optimizer:
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    foreach: true
+
+performance:
+  check_loss: false
+  grad_clip_foreach: true
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 0
+  min_lr: 1e-6
+
+# Flow matching V2 configuration. sigma_min/sigma_max are derived from
+# model.stage + boundary_ratio at runtime; any values set here are ignored.
+flow_matching:
+  adapter_type: "simple"
+  adapter_kwargs: {}
+  timestep_sampling: "uniform"
+  logit_mean: 0.0
+  logit_std: 1.0
+  flow_shift: 3.0
+  mix_uniform_ratio: 0.1
+  num_train_timesteps: 1000
+  i2v_prob: 0.3
+  use_loss_weighting: true
+  log_interval: 100
+  summary_log_interval: 10
+
+fsdp:
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  # 14B transformer needs aggressive sharding; bump dp_size beyond Wan2.1's default.
+  dp_size: 8
+  defer_fsdp_grad_sync: true
+  enable_fsdp2_prefetch: true
+  fsdp2_backward_prefetch_depth: 2
+  fsdp2_forward_prefetch_depth: 1
+  # Explicitly required for the 14B model to fit at bf16.
+  activation_checkpointing: true
+
+checkpoint:
+  enabled: true
+  # Use a different checkpoint_dir per stage so the two stages stay distinct
+  # (e.g. .../wan22_high/ and .../wan22_low/). Both are then consumed by
+  # examples/diffusion/generate/configs/generate_wan22.yaml.
+  checkpoint_dir: PATH_TO_YOUR_CKPT_DIR
+  model_save_format: safetensors
+  save_consolidated: true
+  diffusers_compatible: true
+  restore_from: null
+
+ci:
+  recipe_owner: linnanw
+  time: "00:30:00"

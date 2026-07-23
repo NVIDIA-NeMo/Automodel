@@ -22,7 +22,7 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.gpt_oss.model import Block, GptOssForCausalLM, GptOssModel
 from nemo_automodel.components.moe.config import MoEConfig
-from nemo_automodel.components.moe.layers import MLP, MoE
+from nemo_automodel.components.moe.layers import MoE
 
 
 @pytest.fixture
@@ -194,43 +194,6 @@ class TestBlock:
             else:
                 padding_mask = kwargs.get("padding_mask")
             assert padding_mask is not None
-
-    def test_mlp_handling_regular_mlp(self, gpt_config, backend_config, device):
-        """Test _mlp method with regular MLP."""
-        # Create a config that would result in regular MLP
-        moe_config = MoEConfig(
-            dim=128,
-            inter_dim=256,
-            moe_inter_dim=256,
-            n_routed_experts=0,
-            n_shared_experts=1,
-            n_activated_experts=1,
-            n_expert_groups=1,
-            n_limited_groups=1,
-            train_gate=True,
-            gate_bias_update_factor=0,
-            score_func="softmax",
-            route_scale=1.0,
-            aux_loss_coeff=0.01,
-            norm_topk_prob=False,
-            expert_bias=True,
-            router_bias=True,
-            expert_activation="quick_geglu",
-            activation_alpha=1.702,
-            activation_limit=7.0,
-        )
-
-        block = Block(0, gpt_config, moe_config, backend_config)
-
-        # Manually replace with regular MLP for testing
-        block.mlp = MLP(dim=128, inter_dim=256, backend="torch")
-        block = block.to(device)
-
-        x = torch.randn(2, 8, 128, dtype=torch.bfloat16, device=device)
-        output = block._mlp(x, padding_mask=None)
-
-        assert output.shape == x.shape
-        assert output.device == device
 
     def test_init_weights(self, gpt_config, moe_config, backend_config, device):
         """Test Block weight initialization."""
@@ -433,7 +396,7 @@ class TestGptOssForCausalLM:
                 batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
             )
 
-            output = model(input_ids)
+            output = model(input_ids).logits
 
             assert output.shape == (batch_size, seq_len, gpt_config.vocab_size)
             assert output.device == device
@@ -466,11 +429,13 @@ class TestGptOssForCausalLM:
                 position_ids=position_ids,
                 qkv_format="thd",
                 cu_seqlens=cu_seqlens,
+                output_hidden_states=True,
             )
 
             # Logits must be 3D [1, T, V] after unsqueeze
-            assert output.ndim == 3
-            assert output.shape == (1, total_tokens, gpt_config.vocab_size)
+            assert output.logits.ndim == 3
+            assert output.logits.shape == (1, total_tokens, gpt_config.vocab_size)
+            assert output.hidden_states.shape == (1, total_tokens, gpt_config.hidden_size)
 
             # Verify backbone received squeezed 1D input_ids
             call_args = mock_model.call_args
@@ -491,7 +456,7 @@ class TestGptOssForCausalLM:
                 batch_size, seq_len, gpt_config.hidden_size, dtype=torch.bfloat16, device=device
             )
 
-            output = model(input_ids)
+            output = model(input_ids).logits
 
             # Standard 3D output [B, S, V] without unsqueeze
             assert output.ndim == 3

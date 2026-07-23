@@ -14,7 +14,6 @@
 
 """Unit tests for ``HYV3Config``."""
 
-import pytest
 from transformers import PretrainedConfig
 
 from nemo_automodel.components.models.hy_v3.config import HYV3Config

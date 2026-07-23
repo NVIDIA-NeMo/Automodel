@@ -1,0 +1,74 @@
+recipe: TrainEagle3Recipe
+
+# EAGLE-3 fp8 draft-training convergence smoke (SM89+ hardware only).
+#
+# This is the SHRUNK config the fp8 convergence smoke harness materializes
+# twice -- once as-is (real fp8, `fp8.emulate: false`) and once with
+# `fp8.enabled: false` for the bf16 baseline -- to validate that the fp8 draft
+# GEMMs actually train and that the fp8 loss trajectory tracks bf16 on real
+# fp8-capable silicon (H100 / Ada, compute capability >= 8.9). See
+# tests/functional_tests/speculative/run_eagle3_fp8_convergence_smoke.sh.
+#
+# It is intentionally tiny (few dozen samples, seq 1024, a handful of steps) so
+# a single H100 reaches a step in a couple of minutes. It is a numerics /
+# convergence gate, NOT an accuracy run.
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-8B
+  draft_attn_implementation: flash_attention_2
+  # The harness overwrites train_data_path / output_dir at run time.
+  train_data_path: /path/to/train.jsonl
+  val_data_path: null
+  train_split: null
+  val_split: null
+  output_dir: ./outputs/eagle3_qwen3_8b_fp8_smoke
+  seq_length: 1024
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 0
+  num_epochs: 1
+  ttt_steps: 4
+  draft_vocab_size: 32000
+  freeze_embeddings: true
+  trust_remote_code: false
+  # Same seed on both variants so the data order is identical and the fp8-vs-bf16
+  # loss comparison is apples to apples.
+  shuffle_seed: 42
+  log_every_steps: 1
+  max_grad_norm: 1.0
+  packed_sequence_size: 1024
+
+# Torchao fp8 draft training (same surface as the SFT recipes' `fp8:` block).
+# `emulate: false` forces the REAL hardware fp8 GEMM path -- the whole point of
+# this smoke -- so it requires SM89+ (H100/Ada). On pre-Hopper GPUs torchao
+# falls back / errors; run the bf16 baseline there instead, the fp8 variant is
+# only meaningful on fp8-capable silicon.
+fp8:
+  enabled: true
+  recipe_name: tensorwise
+  filter_fqns: ["lm_head"]
+  emulate: false
+
+# torch.compile of the draft. Strongly recommended together with `fp8:`: the
+# Float8Linear cast/scale ops only pay off once inductor fuses them into the
+# GEMM prologue, and eager-mode fp8 is typically SLOWER than bf16.
+compile:
+  enabled: true
+  mode: default
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+# No intermediate checkpoints: a convergence smoke only needs the logged
+# per-step loss. The end-of-run checkpoint is still written.
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/eagle3_qwen3_8b_fp8_smoke/checkpoints
+  model_save_format: safetensors
+  save_consolidated: false

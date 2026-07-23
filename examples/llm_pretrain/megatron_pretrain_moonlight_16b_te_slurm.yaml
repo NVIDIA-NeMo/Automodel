@@ -15,14 +15,16 @@
 
 
 # To run this recipe:
-#   automodel examples/llm_pretrain/megatron_pretrain_moonlight_16b_te_slurm.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
+#   cp slurm.sub my_cluster.sub
+#   # In my_cluster.sub, set CONFIG to this file and request 1 node x 8 GPUs.
+#   sbatch my_cluster.sub
+# This config uses dp_size=8 and ep_size=8, so the configured world size is 8 GPUs.
 
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 
 step_scheduler:
   global_batch_size: 512
-  local_batch_size: 4
+  local_batch_size: 2
   ckpt_every_steps: 500
   val_every_steps: 100  # will run every x number of gradient steps
   num_epochs: 1
@@ -39,6 +41,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  torch_dtype: float32
   config:
     _target_: transformers.AutoConfig.from_pretrained
     pretrained_model_name_or_path: moonshotai/Moonlight-16B-A3B
@@ -47,7 +50,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: false
 
 distributed:
   strategy: fsdp2

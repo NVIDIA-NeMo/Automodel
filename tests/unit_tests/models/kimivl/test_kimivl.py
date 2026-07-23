@@ -14,10 +14,10 @@
 
 """Unit tests for KimiVL model components."""
 
-import torch
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
 from nemo_automodel.components.models.kimivl.model import (
@@ -254,8 +254,9 @@ class TestVisionTowerComponents:
 
     def test_moonvit_mlp_forward(self):
         """Test MoonVitMLP forward pass."""
-        from nemo_automodel.components.models.kimivl.model import MoonVitMLP
         import torch.nn.functional as F
+
+        from nemo_automodel.components.models.kimivl.model import MoonVitMLP
 
         dims = [64, 128, 64]
         mlp = MoonVitMLP(dims, activation=F.gelu)
@@ -414,6 +415,7 @@ class TestKimiVLModel:
     def test_kimivl_model_forward_signature(self):
         """Test KimiVLModel.forward has expected signature."""
         import inspect
+
         from nemo_automodel.components.models.kimivl.model import KimiVLModel
 
         sig = inspect.signature(KimiVLModel.forward)
@@ -747,7 +749,6 @@ class TestKimiVLRegistration:
 
     def test_registration_executed_on_import(self):
         """Test that registration happens when module is imported."""
-        from transformers import AutoConfig
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
         # After importing kimivl.model, kimi_vl should be registered
@@ -839,8 +840,9 @@ class TestMoonVitEncoderLayer:
     @pytest.fixture
     def encoder_layer(self):
         """Create a small encoder layer for testing."""
-        from nemo_automodel.components.models.kimivl.model import MoonVitEncoderLayer
         import torch.nn.functional as F
+
+        from nemo_automodel.components.models.kimivl.model import MoonVitEncoderLayer
 
         return MoonVitEncoderLayer(
             num_heads=4,
@@ -1065,6 +1067,7 @@ class TestKimiVLLanguageModelBackend:
     def test_backend_forward_signature(self):
         """Test forward signature has expected parameters."""
         import inspect
+
         from nemo_automodel.components.models.kimivl.model import KimiVLLanguageModelBackend
 
         sig = inspect.signature(KimiVLLanguageModelBackend.forward)
@@ -1100,7 +1103,6 @@ class TestKimiVLModelMergeFeatures:
 
     def test_merge_replaces_media_tokens(self):
         """Test _merge_with_image_features replaces media tokens."""
-        from nemo_automodel.components.models.kimivl.model import KimiVLModel
 
         # Simulate the merge logic
         batch_size, seq_len, embed_dim = 1, 8, 64
@@ -1167,7 +1169,6 @@ class TestKimiVLModelForward:
 
     def test_forward_raises_with_both_inputs(self):
         """Test forward raises when both input_ids and inputs_embeds provided."""
-        from nemo_automodel.components.models.kimivl.model import KimiVLModel
 
         # Test the validation condition directly
         input_ids = torch.randint(0, 100, (1, 8))
@@ -1235,16 +1236,17 @@ class TestKimiVLForConditionalGenerationInit:
 
     def test_has_model_attribute(self):
         """Test class has model attribute defined."""
-        from nemo_automodel.components.models.kimivl.model import KimiVLForConditionalGeneration
-
         # Check __init__ signature mentions model
         import inspect
+
+        from nemo_automodel.components.models.kimivl.model import KimiVLForConditionalGeneration
         source = inspect.getsource(KimiVLForConditionalGeneration.__init__)
         assert "self.model" in source
 
     def test_has_vocab_size_attribute(self):
         """Test vocab_size is set from config."""
         import inspect
+
         from nemo_automodel.components.models.kimivl.model import KimiVLForConditionalGeneration
 
         source = inspect.getsource(KimiVLForConditionalGeneration.__init__)
@@ -1253,6 +1255,7 @@ class TestKimiVLForConditionalGenerationInit:
     def test_has_state_dict_adapter_conditional(self):
         """Test state_dict_adapter is created conditionally."""
         import inspect
+
         from nemo_automodel.components.models.kimivl.model import KimiVLForConditionalGeneration
 
         source = inspect.getsource(KimiVLForConditionalGeneration.__init__)

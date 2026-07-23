@@ -28,6 +28,7 @@ import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.mtp import MTPConfig
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
 from nemo_automodel.components.models.deepseek_v4 import model as dsv4_model_module
@@ -118,6 +119,96 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
 
 
 class TestDeepseekV4ModelSmoke:
+    def test_dsv4_hca_param_sync_group_uses_only_1d_mesh(self):
+        named_hca_group = object()
+        unnamed_hca_group = object()
+        shape_only_hca_group = object()
+
+        class NamedOneDimMesh:
+            mesh_dim_names = ("dp",)
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return named_hca_group
+
+        class UnnamedOneDimMesh:
+            mesh_dim_names = None
+            ndim = 1
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return unnamed_hca_group
+
+        class UnnamedTwoDimMesh:
+            mesh_dim_names = None
+            ndim = 2
+
+        class ShapeOnlyOneDimMesh:
+            shape = (2,)
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return shape_only_hca_group
+
+        class TwoDimMesh:
+            mesh_dim_names = ("dp", "tp")
+
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(None) is None
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(UnnamedOneDimMesh()) is unnamed_hca_group
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(UnnamedTwoDimMesh()) is None
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(ShapeOnlyOneDimMesh()) is shape_only_hca_group
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(TwoDimMesh()) is None
+        assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(NamedOneDimMesh()) is named_hca_group
+
+    def test_dsv4_fsdp_attaches_hca_group_before_all_fp32_fast_path(self, monkeypatch):
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[128])
+        model = _make_model(cfg)
+        block = model.model.layers["0"]
+        calls = []
+
+        def fake_fully_shard(module, **kwargs):
+            calls.append((module, kwargs))
+            return module
+
+        monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+
+        hca_group = object()
+
+        class FakeMesh:
+            ndim = 1
+            mesh_dim_names = None
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return hca_group
+
+        input_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.bfloat16,
+        )
+
+        dsv4_fsdp.fully_shard_deepseek_v4(
+            block,
+            mesh=FakeMesh(),
+            mp_policy=input_policy,
+            offload_policy=object(),
+        )
+
+        assert block.self_attn.compressor._hca_param_sync_group is hca_group
+        assert len(calls) == 1
+        assert calls[0][0] is block
+        assert calls[0][1]["mp_policy"].param_dtype == torch.float32
+        assert calls[0][1]["mp_policy"].reduce_dtype == torch.float32
+
     def test_dsv4_fsdp_wraps_fp32_islands_without_ignored_trainable_tensors(self, monkeypatch):
         cfg = _tiny_config(
             num_hidden_layers=1,
@@ -152,6 +243,17 @@ class TestDeepseekV4ModelSmoke:
 
         monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
 
+        hca_group = object()
+
+        class FakeMesh:
+            mesh_dim_names = ("dp",)
+
+            def size(self):
+                return 2
+
+            def get_group(self):
+                return hca_group
+
         input_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
@@ -161,12 +263,13 @@ class TestDeepseekV4ModelSmoke:
 
         dsv4_fsdp.fully_shard_deepseek_v4(
             block,
-            mesh=object(),
+            mesh=FakeMesh(),
             mp_policy=input_policy,
             offload_policy=object(),
             ignored_params=ignored_expert_params,
         )
 
+        assert block.self_attn.compressor._hca_param_sync_group is hca_group
         calls_by_name = {name: kwargs for name, kwargs in calls}
         expected_fp32_modules = {
             "attn_hc",
@@ -187,6 +290,12 @@ class TestDeepseekV4ModelSmoke:
         parent_ignored = calls_by_name["<block>"]["ignored_params"]
         assert ignored_expert_params.issubset(parent_ignored)
         assert len(parent_ignored) == len(ignored_expert_params)
+
+    def test_dsv4_fp32_holder_preserves_explicit_no_reshard(self):
+        holder_type = type("DeepseekV4FP32Parameter", (torch.nn.Module,), {})
+        kwargs = {"reshard_after_forward": False, "mesh": object()}
+
+        assert dsv4_fsdp._fp32_module_fsdp_kwargs(holder_type(), kwargs) is kwargs
 
     def test_reference_fp32_parameters_constructed_before_cast(self):
         cfg = _tiny_config(
@@ -311,6 +420,53 @@ class TestDeepseekV4ModelSmoke:
 
         model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.bfloat16)
 
+    def test_initialize_weights_initializes_all_hyper_connection_parameters(self):
+        cfg = _tiny_config(
+            num_hidden_layers=1,
+            num_hash_layers=0,
+            compress_ratios=[0],
+            num_nextn_predict_layers=1,
+        )
+        model = DeepseekV4ForCausalLM(
+            cfg,
+            backend=BackendConfig(
+                attn="sdpa",
+                linear="torch",
+                rms_norm="torch",
+                rope_fusion=False,
+                enable_hf_state_dict_adapter=False,
+                dispatcher="torch",
+                experts="torch_mm",
+            ),
+        )
+        block = model.model.layers["0"]
+        assert model.mtp is not None
+        mtp_block = model.mtp.layers[0]
+        hyper_modules = (block.attn_hc, block.ffn_hc, mtp_block.attn_hc, mtp_block.ffn_hc)
+        hyper_heads = (model.model.hc_head, mtp_block.hc_head)
+        with torch.no_grad():
+            for module in hyper_modules:
+                module.fn.fill_(float("nan"))
+                module.base.fill_(float("nan"))
+                module.scale.fill_(float("nan"))
+            for head in hyper_heads:
+                head.hc_fn.fill_(float("nan"))
+                head.hc_base.fill_(float("nan"))
+                head.hc_scale.fill_(float("nan"))
+
+        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+
+        for module in hyper_modules:
+            assert torch.isfinite(module.fn).all()
+            assert torch.count_nonzero(module.fn) > 0
+            torch.testing.assert_close(module.base, torch.zeros_like(module.base))
+            torch.testing.assert_close(module.scale, torch.ones_like(module.scale))
+        for head in hyper_heads:
+            assert torch.isfinite(head.hc_fn).all()
+            assert torch.count_nonzero(head.hc_fn) > 0
+            torch.testing.assert_close(head.hc_base, torch.zeros_like(head.hc_base))
+            torch.testing.assert_close(head.hc_scale, torch.ones_like(head.hc_scale))
+
     def test_hash_gate_tid2eid_uses_deepep_runtime_int64_dtype(self):
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=1, compress_ratios=[0])
         model = DeepseekV4ForCausalLM(
@@ -335,22 +491,51 @@ class TestDeepseekV4ModelSmoke:
         _, indices, _ = gate(torch.zeros(3, cfg.hidden_size), torch.ones(3, dtype=torch.bool))
         assert indices.dtype == torch.long
 
+    def test_initialize_weights_builds_valid_hash_routes(self):
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=1, compress_ratios=[0])
+        model = DeepseekV4ForCausalLM(
+            cfg,
+            backend=BackendConfig(
+                attn="sdpa",
+                linear="torch",
+                rms_norm="torch",
+                rope_fusion=False,
+                enable_hf_state_dict_adapter=False,
+                dispatcher="torch",
+                experts="torch_mm",
+            ),
+        )
+        gate = model.model.layers["0"].mlp.gate
+        with torch.no_grad():
+            gate.weight.fill_(float("nan"))
+            gate.tid2eid.zero_()
+
+        model.initialize_weights(buffer_device=torch.device("cpu"), dtype=torch.float32)
+
+        assert torch.isfinite(gate.weight).all()
+        assert torch.count_nonzero(gate.weight) > 0
+        sorted_routes = gate.tid2eid.sort(dim=-1).values
+        assert torch.all(sorted_routes[:, 1:] != sorted_routes[:, :-1])
+        expert_load = torch.bincount(gate.tid2eid.flatten(), minlength=gate.n_experts)
+        assert expert_load.max() - expert_load.min() <= 1
+
     def test_hc_comb_transpose_used_at_attn_and_mlp_sites(self):
-        """Both HC expand sites mix residual streams as ``comb.T @ x``."""
+        """Both HC expand sites mix residual streams as ``comb.T @ x``.
+
+        The fake HC modules intentionally expose only ``forward`` so this also
+        guards against bypassing module hooks via direct ``compute_weights`` calls.
+        """
 
         class _FixedHC(torch.nn.Module):
             def __init__(self, comb):
                 super().__init__()
                 self.register_buffer("comb", comb)
 
-            def compute_weights(self, hidden_streams):
+            def forward(self, hidden_streams):
                 bsz, seq, hc_mult = hidden_streams.shape[:3]
                 pre = torch.zeros(bsz, seq, hc_mult, dtype=torch.float32, device=hidden_streams.device)
                 post = torch.zeros_like(pre)
                 return pre, post, self.comb.expand(bsz, seq, -1, -1)
-
-            def forward(self, hidden_streams):
-                return self.compute_weights(hidden_streams)
 
         class _ZeroAttention(torch.nn.Module):
             def forward(self, hidden_states, **kwargs):
@@ -398,6 +583,78 @@ class TestDeepseekV4ModelSmoke:
         torch.testing.assert_close(actual, expected)
         assert not torch.allclose(expected, wrong_orientation)
 
+    def test_thd_pp_intermediate_hidden_state_keeps_shape(self):
+        """Packed-sequence PP stages must not add a fake batch dim to hidden states."""
+
+        class _HiddenStage(torch.nn.Module):
+            def forward(self, input_ids, **kwargs):
+                del input_ids, kwargs
+                return torch.zeros(1, 8, 4, 16)
+
+        model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.model = _HiddenStage()
+        model.lm_head = None
+        model.mtp = None
+        model.mtp_config = MTPConfig()
+
+        out = model(torch.ones(1, 8, dtype=torch.long), qkv_format="thd")
+
+        assert out.shape == (1, 8, 4, 16)
+
+    def test_thd_first_stage_keeps_batch_axis(self):
+        """DSV4 packed sequence uses seq_lens masks while preserving [1, T] inputs."""
+        cfg = _tiny_config(num_hidden_layers=0, compress_ratios=[])
+        model = _make_model(cfg)
+
+        input_ids = torch.ones(1, 8, dtype=torch.long)
+        position_ids = torch.arange(8, dtype=torch.long).unsqueeze(0)
+        seq_lens = torch.tensor([[8]], dtype=torch.long)
+
+        with torch.no_grad():
+            out = model(
+                input_ids,
+                position_ids=position_ids,
+                qkv_format="thd",
+                seq_lens=seq_lens,
+                seq_lens_padded=seq_lens,
+            )
+
+        assert out.logits.shape == (1, 8, cfg.vocab_size)
+
+    def test_thd_cp_normalizes_packed_ids_and_derives_padding_mask(self, monkeypatch):
+        cfg = _tiny_config(num_hidden_layers=0, compress_ratios=[])
+        model = _make_model(cfg)
+        cp_group = object()
+        captured = {}
+
+        monkeypatch.setattr(dsv4_model_module, "dsv4_cp_enabled", lambda group: group is cp_group)
+
+        def fake_packed_cp_mask(**kwargs):
+            captured.update(kwargs)
+            seq_len = kwargs["position_ids"].shape[-1]
+            return torch.zeros(1, 1, seq_len, seq_len, dtype=kwargs["dtype"], device=kwargs["device"])
+
+        monkeypatch.setattr(dsv4_model_module, "build_dsv4_cp_packed_causal_padding_mask", fake_packed_cp_mask)
+
+        input_ids = torch.ones(1, 4, dtype=torch.long)
+        attention_mask = torch.tensor([[1, 1, 1, 0]])
+        with torch.no_grad():
+            out = model(
+                input_ids,
+                attention_mask=attention_mask,
+                qkv_format="thd",
+                seq_lens_padded=torch.tensor([[4]]),
+                packed_seq_ids=torch.ones(4, dtype=torch.int32),
+                _dsv4_cp_group=cp_group,
+            )
+
+        assert out.logits.shape == (1, 4, cfg.vocab_size)
+        assert captured["packed_seq_ids"].dtype == torch.long
+        assert captured["packed_seq_ids"].shape == (1, 4)
+        torch.testing.assert_close(captured["padding_mask"], torch.tensor([[False, False, False, True]]))
+        assert captured["cp_group"] is cp_group
+
     @_REQUIRES_CUDA
     def test_forward_shape(self):
         """Forward pass produces logits of the right shape."""
@@ -407,7 +664,8 @@ class TestDeepseekV4ModelSmoke:
         bsz, seq = 2, 8
         input_ids = torch.randint(0, cfg.vocab_size, (bsz, seq))
         with torch.no_grad():
-            logits = model(input_ids)
+            # forward returns DeepseekV4CausalLMOutput; pull .logits.
+            logits = model(input_ids).logits
 
         assert logits.shape == (bsz, seq, cfg.vocab_size), f"unexpected shape {logits.shape}"
         assert not logits.isnan().any(), "logits contain NaN"
@@ -424,7 +682,7 @@ class TestDeepseekV4ModelSmoke:
         input_ids = torch.randint(0, cfg.vocab_size, (bsz, seq))
         labels = torch.randint(0, cfg.vocab_size, (bsz, seq))
 
-        logits = model(input_ids)
+        logits = model(input_ids).logits
         loss = torch.nn.functional.cross_entropy(logits.view(-1, cfg.vocab_size), labels.view(-1))
         loss.backward()
 
@@ -514,7 +772,7 @@ class TestDeepseekV4ModelSmoke:
             for seq in [1, 4, 16, 32]:
                 input_ids = torch.randint(0, cfg.vocab_size, (1, seq))
                 with torch.no_grad():
-                    logits = model(input_ids)
+                    logits = model(input_ids).logits
                 assert logits.shape == (1, seq, cfg.vocab_size)
 
 

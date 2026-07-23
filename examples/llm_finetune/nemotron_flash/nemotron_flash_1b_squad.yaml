@@ -23,6 +23,7 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
+  max_steps: 100
   ckpt_every_steps: 1000
   val_every_steps: 10  # will run every x number of gradient steps
   num_epochs: 1
@@ -103,9 +104,16 @@ lr_scheduler:
 ci:
   vllm_deploy: true
   recipe_owner: akoumpa
-  time: "00:15:00"
+  time: "00:20:00"
   checkpoint_robustness:
+    # Tied control for source-load parity: Nemotron-Flash-1B is the tied
+    # list-form-tied-keys remote-code model (the #1817 case), so this run
+    # proves the force-HF load path still ties when the config requests it —
+    # the mirror of the untied Nemotron-Nano-9B-v2 coverage.
+    check_source_load_parity: true
     hf_kl_threshold: 5e-3
+    source_load_kl_threshold: 5e-3
+    source_load_cosine_threshold: 0.9995
     tokenizer_name: nvidia/Nemotron-Flash-1B
     trust_remote_code: true
     # FIXME(akoumpa): pragmatic relaxation, not a verified fix. The measured

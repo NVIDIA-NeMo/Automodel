@@ -23,7 +23,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.training.rng import ScopedRNG
-from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe
+from nemo_automodel.recipes.retrieval.train_bi_encoder import TrainBiEncoderRecipe, _get_autocast_ctx
 
 
 @torch.no_grad()
@@ -96,7 +96,7 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
         labels = batch.pop("labels")
 
         model = self.model_parts[0]
-        train_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
+        train_ctx = _get_autocast_ctx(self.distributed_config)
         sync_ctx = (
             get_sync_ctx(
                 model,
@@ -131,9 +131,7 @@ class TrainCrossEncoderRecipe(TrainBiEncoderRecipe):
             all_labels = []
 
             model = self.model_parts[0]
-            autocast_ctx = (
-                torch.amp.autocast("cuda", dtype=torch.bfloat16) if torch.cuda.is_available() else nullcontext()
-            )
+            autocast_ctx = _get_autocast_ctx(self.distributed_config)
 
             with torch.no_grad():
                 for batch in val_dataloader:

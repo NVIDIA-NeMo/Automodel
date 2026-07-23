@@ -1,0 +1,53 @@
+recipe: TrainEagle3Recipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+# FSDP2 sharding for the target. Qwen3-30B-A3B is ~60GB in bf16, which
+# does not fit on a single 80GB GPU once the draft, activations, and
+# optimizer state are added. ``ep_size: 8`` splits the 128 experts across
+# 8 ranks (16 experts per rank), and ``dp_size`` defaults to
+# ``world_size // ep_size`` -- each DP rank holds 1/dp_size of the
+# non-expert target weights, gathered per layer and immediately reshared
+# in the forward pass. ``activation_checkpointing: true`` keeps memory
+# headroom for the TTT-unrolled draft forwards on top of the target
+# forward. EP8 was validated end-to-end on an 8xH100 node.
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  pp_size: 1
+  cp_size: 1
+  ep_size: 8
+  activation_checkpointing: true
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-30B-A3B
+  train_data_path: /path/to/train.jsonl
+  val_data_path: null
+  train_split: null
+  val_split: null
+  output_dir: ./outputs/eagle3_qwen3_moe_mvp
+  seq_length: 1024
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 0
+  num_epochs: 1
+  ttt_steps: 4
+  draft_vocab_size: 8192
+  freeze_embeddings: true
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+
+optimizer:
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/eagle3_qwen3_moe_mvp/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true

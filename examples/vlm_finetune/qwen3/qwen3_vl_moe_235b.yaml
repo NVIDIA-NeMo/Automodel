@@ -46,7 +46,8 @@ model:
     linear: te
     rms_norm: torch_fp32
     rope_fusion: false
-    enable_deepep: true
+    experts: gmm
+    dispatcher: hybridep
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -56,7 +57,7 @@ checkpoint:
   enabled: false
   checkpoint_dir: /tmp/checkpoints/
   model_save_format: safetensors
-  save_consolidated: true
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2

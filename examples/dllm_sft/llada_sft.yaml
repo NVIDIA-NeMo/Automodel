@@ -29,6 +29,7 @@ dist_env:
 seed: 42
 
 wandb:
+  enable: false
   project: dllm-baseline
   name: am-llada-tulu3_run
 
@@ -96,3 +97,10 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   group_by_length: true
+
+# Included in the dllm_sft nightly CI scope (tests/ci_tests/configs/dllm_sft).
+# Cold-cache budget: 8B download + tulu-3 + train + consolidate + reload +
+# generate; tune once cache-warm timings are known.
+ci:
+  recipe_owner: zyzhou5
+  time: "01:30:00"

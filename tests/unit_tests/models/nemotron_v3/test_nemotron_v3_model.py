@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.moe.config import MoEConfig
 
 skip_if_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU operations")
@@ -97,7 +98,7 @@ class TestNemotronV3Model:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -328,7 +329,7 @@ class TestNemotronHForCausalLM:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -516,6 +517,29 @@ class TestNemotronHForCausalLM:
         model = NemotronHForCausalLM(config, backend=backend)
 
         assert hasattr(model, "state_dict_adapter")
+
+    def test_mamba_decay_params_stay_fp32_after_bf16_cast(self, config, backend):
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM
+
+        config.layers_block_type = ["mamba", "attention"]
+        model = NemotronHForCausalLM(config, backend=backend)
+        expected = {}
+        for name, param in model.named_parameters():
+            if name.endswith(("A_log", "dt_bias", "D")):
+                values = torch.linspace(0.00123, 0.00456, param.numel(), dtype=torch.float32).reshape_as(param)
+                param.data.copy_(values)
+                expected[name] = values
+
+        assert expected, "Nemotron V3 Mamba layers should create decay parameters"
+        assert all("._fp32_params." in name for name in expected)
+
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        params = dict(model.named_parameters())
+        for name, values in expected.items():
+            assert params[name].dtype == torch.float32
+            torch.testing.assert_close(params[name], values)
+        assert model.lm_head.weight.dtype == torch.bfloat16
 
     def test_model_class_export(self):
         """Test that ModelClass is exported correctly."""
@@ -762,7 +786,7 @@ class TestNemotronV3KVCache:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -960,7 +984,7 @@ class TestNemotronV3MambaCacheGPU:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=False,
             enable_hf_state_dict_adapter=False,
         )
@@ -1118,7 +1142,7 @@ class TestNemotronV3ModelWithMoE:
             linear="torch",
             attn="sdpa",
             rms_norm="torch",
-            enable_deepep=False,
+            dispatcher="torch",
             fake_balanced_gate=True,  # Use fake balanced gate for deterministic testing
             enable_hf_state_dict_adapter=False,
         )
@@ -1133,6 +1157,43 @@ class TestNemotronV3ModelWithMoE:
         assert model.layers["0"].block_type == "moe"
         assert hasattr(model.layers["0"].mixer, "experts")
         assert hasattr(model.layers["0"].mixer, "shared_experts")
+
+    def test_e_score_correction_bias_stays_fp32_after_dtype_cast(self, config, backend):
+        """Nemotron v3 router correction bias must stay fp32 under bf16 storage casts."""
+        from nemo_automodel.components.models.common.utils import cast_model_to_dtype
+        from nemo_automodel.components.models.nemotron_v3.model import NemotronHForCausalLM, NemotronV3Model
+
+        backend = BackendConfig(
+            linear=backend.linear,
+            attn=backend.attn,
+            rms_norm=backend.rms_norm,
+            dispatcher="torch",
+            fake_balanced_gate=False,
+            enable_hf_state_dict_adapter=False,
+        )
+        base_model = NemotronV3Model(config, backend=backend)
+        original_bias = torch.tensor([1.001, -2.003, 0.3333, 17.125], dtype=torch.float32)
+        base_model.layers["0"].mixer.gate.e_score_correction_bias.copy_(original_bias)
+        cast_model_to_dtype(base_model, torch.bfloat16)
+
+        base_gate = base_model.layers["0"].mixer.gate
+        assert base_model.embed_tokens.weight.dtype == torch.bfloat16
+        assert base_model.layers["0"].mixer.experts.gate_and_up_projs.dtype == torch.bfloat16
+        assert base_gate.e_score_correction_bias.dtype == torch.float32
+        assert torch.equal(base_gate.e_score_correction_bias, original_bias)
+
+        model = NemotronHForCausalLM(config, backend=backend)
+        model.model.layers["0"].mixer.gate.e_score_correction_bias.copy_(original_bias)
+        cast_model_to_dtype(model, torch.bfloat16)
+
+        gate = model.model.layers["0"].mixer.gate
+        state_dict = model.state_dict()
+        assert model.model.embed_tokens.weight.dtype == torch.bfloat16
+        assert model.model.layers["0"].mixer.experts.gate_and_up_projs.dtype == torch.bfloat16
+        assert gate.e_score_correction_bias.dtype == torch.float32
+        assert torch.equal(gate.e_score_correction_bias, original_bias)
+        assert state_dict["model.layers.0.mixer.gate.e_score_correction_bias"].dtype == torch.float32
+        assert torch.equal(state_dict["model.layers.0.mixer.gate.e_score_correction_bias"], original_bias)
 
     @skip_if_no_gpu
     def test_moe_model_forward(self, config, backend):

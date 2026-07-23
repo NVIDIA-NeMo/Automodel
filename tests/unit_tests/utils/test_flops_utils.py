@@ -232,6 +232,23 @@ def test_flops_formulas_with_precomputed_values(name, func, cfg_factory, kwargs,
     assert actual == expected, f"{name}: expected {expected}, got {actual}"
 
 
+def test_gpt_oss_flops_uses_head_dim_from_hf_config():
+    config = SimpleNamespace(
+        num_hidden_layers=1,
+        hidden_size=24,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_experts_per_tok=2,
+        intermediate_size=16,
+        vocab_size=32,
+        head_dim=8,
+    )
+
+    assert not hasattr(config, "kv_channels")
+    assert config.head_dim != config.hidden_size // config.num_attention_heads
+    assert int(flops_utils.gpt_oss_flops(config, gbs=1, seq_len=8)) == 271872
+
+
 @pytest.mark.parametrize(
     "tflops, world_size, time_seconds, reference_mfu, expected_mfu",
     [

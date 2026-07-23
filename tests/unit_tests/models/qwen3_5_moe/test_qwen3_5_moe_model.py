@@ -129,7 +129,7 @@ def backend_config():
         linear="torch",
         attn="sdpa",
         rms_norm="torch",
-        enable_deepep=False,
+        dispatcher="torch",
         fake_balanced_gate=False,
         enable_hf_state_dict_adapter=False,
     )
@@ -186,7 +186,9 @@ class TestQwen3_5MoeBlock:
         assert hasattr(block, "input_layernorm")
         assert hasattr(block, "post_attention_layernorm")
 
-    def test_linear_attention_block_has_native_gated_delta_net(self, text_config_with_linear, moe_config, backend_config):
+    def test_linear_attention_block_has_native_gated_delta_net(
+        self, text_config_with_linear, moe_config, backend_config
+    ):
         """Layer 1 is linear_attention — should use HF Qwen3_5MoeGatedDeltaNet."""
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDeltaNet
 
@@ -211,7 +213,9 @@ class TestQwen3_5MoeBlock:
         mock_attn.assert_called_once()
         mock_mlp.assert_called_once()
 
-    def test_init_weights_linear_attention_initializes_projections(self, text_config_with_linear, moe_config, backend_config):
+    def test_init_weights_linear_attention_initializes_projections(
+        self, text_config_with_linear, moe_config, backend_config
+    ):
         block = Qwen3_5MoeBlock(1, text_config_with_linear, moe_config, backend_config)
 
         with (
@@ -227,7 +231,9 @@ class TestQwen3_5MoeBlock:
         assert mock_trunc.call_count == 5
         mock_norm_reset.assert_called_once()
 
-    def test_init_weights_linear_attention_norm_without_reset_parameters(self, text_config_with_linear, moe_config, backend_config):
+    def test_init_weights_linear_attention_norm_without_reset_parameters(
+        self, text_config_with_linear, moe_config, backend_config
+    ):
         """Fallback path when norm (e.g. HF Qwen3_5MoeRMSNormGated) lacks reset_parameters."""
         block = Qwen3_5MoeBlock(1, text_config_with_linear, moe_config, backend_config)
 
@@ -421,7 +427,11 @@ class TestQwen3_5MoeModel:
         assert core.embed_tokens is core.language_model.embed_tokens
         assert core.norm is core.language_model.norm
 
-    def test_forward_uses_embed_tokens_when_inputs_embeds_not_provided(self, vl_config, backend_config, moe_config, device):
+    def test_forward_text_only_forwards_input_ids_to_language_model(
+        self, vl_config, backend_config, moe_config, device
+    ):
+        """Text-only path passes integer input_ids straight to the backend language
+        model (which embeds internally), rather than pre-embedding here."""
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
         core = model.model
 
@@ -430,15 +440,16 @@ class TestQwen3_5MoeModel:
 
         with patch.object(core.language_model, "forward") as mock_lang_forward:
             mock_output = MagicMock()
-            mock_output.last_hidden_state = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device)
+            mock_output.last_hidden_state = torch.randn(
+                batch, seq_len, vl_config.text_config.hidden_size, device=device
+            )
             mock_lang_forward.return_value = mock_output
 
             core.forward(input_ids=input_ids)
 
         call_kwargs = mock_lang_forward.call_args.kwargs
-        assert call_kwargs["input_ids"] is None
-        assert call_kwargs["inputs_embeds"] is not None
-        assert call_kwargs["inputs_embeds"].shape == (batch, seq_len, vl_config.text_config.hidden_size)
+        assert call_kwargs["input_ids"] is input_ids
+        assert call_kwargs["inputs_embeds"] is None
 
     def test_forward_accepts_float_input_ids_as_inputs_embeds(self, vl_config, backend_config, moe_config, device):
         """Float tensor input_ids are treated as inputs_embeds (pipeline-parallel support)."""
@@ -446,14 +457,18 @@ class TestQwen3_5MoeModel:
         core = model.model
 
         batch, seq_len = 2, 3
-        float_input = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=torch.bfloat16)
+        float_input = torch.randn(
+            batch, seq_len, vl_config.text_config.hidden_size, device=device, dtype=torch.bfloat16
+        )
 
         with (
             patch.object(core, "get_input_embeddings", return_value=None),
             patch.object(core.language_model, "forward") as mock_lang_forward,
         ):
             mock_output = MagicMock()
-            mock_output.last_hidden_state = torch.randn(batch, seq_len, vl_config.text_config.hidden_size, device=device)
+            mock_output.last_hidden_state = torch.randn(
+                batch, seq_len, vl_config.text_config.hidden_size, device=device
+            )
             mock_lang_forward.return_value = mock_output
 
             core.forward(input_ids=float_input)
@@ -462,15 +477,13 @@ class TestQwen3_5MoeModel:
         assert call_kwargs["input_ids"] is None
         torch.testing.assert_close(call_kwargs["inputs_embeds"], float_input)
 
-    def test_forward_raises_when_no_embeds_and_no_embed_tokens(self, vl_config, backend_config, moe_config, device):
+    def test_forward_raises_when_no_input_ids_and_no_inputs_embeds(self, vl_config, backend_config, moe_config, device):
+        """Text-only path requires at least one of input_ids / inputs_embeds."""
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
         core = model.model
 
-        input_ids = torch.randint(0, vl_config.text_config.vocab_size, (2, 3), device=device)
-
-        with patch.object(core, "get_input_embeddings", return_value=None):
-            with pytest.raises(ValueError, match="inputs_embeds must be provided"):
-                core.forward(input_ids=input_ids)
+        with pytest.raises(ValueError, match="Either input_ids or inputs_embeds"):
+            core.forward()
 
 
 # ---------------------------------------------------------------------------
@@ -480,9 +493,14 @@ class TestQwen3_5MoeForConditionalGeneration:
     def test_initialization_configures_backend_components(self, vl_config, backend_config, moe_config):
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
 
-        assert model.backend is backend_config
+        assert model.backend is not backend_config
+        assert model.backend.attn == backend_config.attn
+        assert model.backend.linear == backend_config.linear
+        assert model.backend.rms_norm == backend_config.rms_norm
+        assert model.backend.rope_fusion is False
         assert isinstance(model.model, Qwen3_5MoeModel)
         assert isinstance(model.model.language_model, Qwen3_5MoeTextModelBackend)
+        assert model.model.language_model.backend is model.backend
         assert model.model.moe_config is model.model.language_model.moe_config
 
         vision_model = getattr(model.model, "visual")
@@ -513,8 +531,9 @@ class TestQwen3_5MoeForConditionalGeneration:
             )
             mock_model_forward.return_value = mock_output
 
-            logits = model.forward(input_ids=input_ids)
+            out = model.forward(input_ids=input_ids)
 
+        logits = out.logits
         assert logits.shape == (batch, seq_len, vl_config.text_config.vocab_size)
         mock_model_forward.assert_called_once()
 
@@ -533,7 +552,7 @@ class TestQwen3_5MoeForConditionalGeneration:
 
             result = model.forward(input_ids=input_ids)
 
-        torch.testing.assert_close(result, hidden_states)
+        torch.testing.assert_close(result.logits, hidden_states)
 
     def test_forward_retrieves_pixel_values_from_stored_chunks(self, vl_config, backend_config, moe_config, device):
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config).to(device)
@@ -605,7 +624,7 @@ class TestQwen3_5MoeForConditionalGeneration:
                 qkv_format="thd",
             )
 
-        assert result.shape == (batch, seq_len, vl_config.text_config.vocab_size)
+        assert result.logits.shape == (batch, seq_len, vl_config.text_config.vocab_size)
         squeeze_args = mock_squeeze.call_args[0]
         assert squeeze_args[0] is input_ids
         assert squeeze_args[1] is position_ids
@@ -637,8 +656,12 @@ class TestQwen3_5MoeForConditionalGeneration:
 # from_pretrained / ModelClass export tests
 # ---------------------------------------------------------------------------
 class TestQwen3_5MoeFromPretrainedAndModelClass:
-    def test_from_pretrained_classmethod(self):
-        cfg = Qwen3_5MoeConfig()
+    def test_from_pretrained_classmethod(self, vl_config):
+        # Use the tiny `vl_config` fixture instead of the default ``Qwen3_5MoeConfig()``,
+        # which describes the full ~30B model (40 layers, 256 experts, 248K vocab) and
+        # takes minutes to materialize on GPU. The classmethod's delegation behaviour is
+        # identical regardless of model size.
+        cfg = vl_config
         cfg.text_config.pad_token_id = 0
 
         with (
@@ -696,7 +719,9 @@ class TestQwen3_5MoeModelVLPath:
         assert kw["pixel_values"] is pixel_values
         assert kw["input_ids"] is None
         assert kw["inputs_embeds"] is not None
-        assert result is mock_output
+        # model.model (base) delegates the VL path to HF super().forward(), which returns the
+        # multimodal hidden states; lm_head/logits live on the outer ForConditionalGeneration.
+        assert result.last_hidden_state.shape == (batch, seq_len, vl_config.text_config.hidden_size)
 
 
 # ---------------------------------------------------------------------------
@@ -838,7 +863,9 @@ class TestConditionalGenerationPPVLMChunkEdgeCases:
 # TextModelBackend.forward — inputs_embeds provided directly
 # ---------------------------------------------------------------------------
 class TestTextModelBackendInputsEmbedsPath:
-    def test_forward_uses_provided_inputs_embeds_skipping_embed_tokens(self, text_config, backend_config, moe_config, device):
+    def test_forward_uses_provided_inputs_embeds_skipping_embed_tokens(
+        self, text_config, backend_config, moe_config, device
+    ):
         """When inputs_embeds is provided, embed_tokens should not be called."""
         model = Qwen3_5MoeTextModelBackend(text_config, backend=backend_config, moe_config=moe_config).to(device)
 
@@ -930,7 +957,9 @@ class TestTextModelBackendPaddingMaskDerivation:
 # initialize_weights — TypeError fallback (init_weights without buffer_device)
 # ---------------------------------------------------------------------------
 class TestInitializeWeightsTypeErrorFallback:
-    def test_initialize_weights_retries_without_buffer_device_on_type_error(self, vl_config, backend_config, moe_config):
+    def test_initialize_weights_retries_without_buffer_device_on_type_error(
+        self, vl_config, backend_config, moe_config
+    ):
         """When init_weights(buffer_device=...) raises TypeError, it retries without args."""
         model = Qwen3_5MoeForConditionalGeneration(vl_config, backend=backend_config, moe_config=moe_config)
 
@@ -989,12 +1018,14 @@ class TestDefaultBackendCreation:
 class TestFromConfigDirect:
     def test_from_config_creates_model_directly(self, vl_config, moe_config, backend_config):
         """from_config should create a model without going through from_pretrained."""
-        model = Qwen3_5MoeForConditionalGeneration.from_config(
-            vl_config, moe_config=moe_config, backend=backend_config
-        )
+        model = Qwen3_5MoeForConditionalGeneration.from_config(vl_config, moe_config=moe_config, backend=backend_config)
 
         assert isinstance(model, Qwen3_5MoeForConditionalGeneration)
-        assert model.backend is backend_config
+        assert model.backend is not backend_config
+        assert model.backend.attn == backend_config.attn
+        assert model.backend.linear == backend_config.linear
+        assert model.backend.rms_norm == backend_config.rms_norm
+        assert model.backend.rope_fusion is False
 
 
 # ---------------------------------------------------------------------------

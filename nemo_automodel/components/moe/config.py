@@ -12,29 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MoE parallelizer configuration."""
+"""MoE model configuration."""
 
-from dataclasses import dataclass, fields
-from typing import Any, Dict, Literal, Optional, Union
+from dataclasses import dataclass
+from typing import Literal, Optional
 
 import torch
-from torch.distributed.fsdp._fully_shard import MixedPrecisionPolicy
 
 from nemo_automodel.shared.utils import dtype_from_str
-
-
-@dataclass
-class MoEParallelizerConfig:
-    """Configuration for MoE model parallelization (EP + FSDP settings)."""
-
-    ignore_router_for_ac: bool = False
-    reshard_after_forward: bool = False
-    lm_head_precision: Optional[Union[str, torch.dtype]] = None
-    wrap_outer_model: bool = True
-    mp_policy: Optional[MixedPrecisionPolicy] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
 @dataclass(kw_only=True)
@@ -57,7 +42,7 @@ class MoEConfig:
     norm_topk_prob: bool
     router_bias: bool = False
     expert_bias: bool = False
-    expert_activation: Literal["swiglu", "quick_geglu", "geglu", "relu2"] = "swiglu"
+    expert_activation: Literal["swiglu", "swigluoai", "quick_geglu", "geglu", "relu2"] = "swiglu"
     activation_alpha: float = 1.702
     activation_limit: float = 7.0
     # When > 0, ``expert_activation="swiglu"`` dispatches to a clamped FP32
@@ -72,6 +57,10 @@ class MoEConfig:
     shared_expert_activation: str = "swiglu"  # Activation for shared experts ("swiglu" or "relu2")
     force_e_score_correction_bias: bool = False  # Force creation of e_score_correction_bias buffer
     moe_latent_size: int | None = None
+    # Rollout Routing Replay (R3): when True, each gate records/replays its top-k
+    # expert selection so RL training reuses the rollout's routing decisions. See
+    # nemo_automodel.components.moe.router_replay.
+    enable_routing_replay: bool = False
 
     @property
     def expert_dim(self) -> int:

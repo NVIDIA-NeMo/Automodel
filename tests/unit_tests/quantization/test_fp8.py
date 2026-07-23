@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch.nn as nn
-from unittest.mock import patch
 
 from nemo_automodel.components.quantization.fp8 import (
     FP8Config,
-    apply_fp8_to_model,
-    verify_fp8_conversion,
     _module_filter_fn,
+    apply_fp8_to_model,
     build_fp8_config,
     create_fp8_config_from_dict,
+    verify_fp8_conversion,
 )
 
 

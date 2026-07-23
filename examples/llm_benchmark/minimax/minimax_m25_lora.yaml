@@ -30,7 +30,7 @@ benchmark:
   nsys_start: -1
   nsys_end: -1
   nsys_ranks: []
-  num_nodes: 4
+  num_nodes: 8
 
 step_scheduler:
   gc_every_steps: 10
@@ -45,10 +45,18 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 1
+  pp_size: 2
   ep_size: 32
   sequence_parallel: false
   activation_checkpointing: true
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+    layers_per_stage: 2
   moe:
     reshard_after_forward: false
     wrap_outer_model: false
@@ -69,8 +77,8 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: gmm
-    dispatcher: deepep
+    experts: torch_mm
+    dispatcher: hybridep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
@@ -78,8 +86,8 @@ model:
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules: ["*"]
-  dim: 32
-  alpha: 32
+  dim: 64
+  alpha: 64
   dropout: 0.0
   moe_rank_scaling: true
 
@@ -108,5 +116,5 @@ optimizer:
   weight_decay: 0
 
 ci:
-  time: "00:20:00"
-  nodes: 4
+  time: "00:45:00"
+  nodes: 8

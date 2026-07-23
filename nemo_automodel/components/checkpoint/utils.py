@@ -12,13 +12,89 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 from transformers.modeling_utils import _get_resolved_checkpoint_files, load_state_dict
+
+from nemo_automodel.shared.tied_weights import (
+    ensure_tied_lm_head as ensure_tied_lm_head,
+)
+from nemo_automodel.shared.tied_weights import (
+    get_input_embeddings_weight_and_name,
+    get_lm_head_weight_and_name,
+    is_tied_word_embeddings,
+)
+from nemo_automodel.shared.tied_weights import (
+    has_local_tied_lm_head as has_local_tied_lm_head,
+)
+
+
+def get_rank_safe() -> int:
+    """Return the current distributed rank, defaulting to 0 when not initialized."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return int(os.environ.get("RANK", "0"))
+
+
+def get_world_size_safe() -> int:
+    """Return the current distributed world size, defaulting to 1 when not initialized."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def is_rank_0() -> bool:
+    """Return True on the main rank."""
+    return get_rank_safe() == 0
+
+
+def estimate_tensor_bytes(tensor: torch.Tensor) -> int:
+    """Estimate logical bytes in a tensor without materializing it."""
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+def estimate_state_dict_bytes(state_dict: dict[str, torch.Tensor]) -> int | None:
+    """Estimate logical bytes in a state dict without materializing tensors."""
+    total = 0
+    try:
+        for tensor in state_dict.values():
+            total += estimate_tensor_bytes(tensor)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    return total
+
+
+def get_safetensors_index_total_size(index_path: str | None) -> int | None:
+    """Return the total checkpoint size recorded in a Hugging Face safetensors index."""
+    if index_path is None:
+        return None
+    index_file = Path(index_path)
+    if index_file.is_dir():
+        index_file = index_file / "model.safetensors.index.json"
+    try:
+        with open(index_file) as f:
+            index = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    total_size = index.get("metadata", {}).get("total_size")
+    return total_size if isinstance(total_size, int) else None
+
+
+def format_bytes(num_bytes: int) -> str:
+    """Format bytes as a human-readable GiB value."""
+    return f"{num_bytes / 1024**3:.1f} GiB"
+
+
+def format_output_file_count(count: int) -> str:
+    """Format the output shard count for user-facing log messages."""
+    return f"{count} output {'file' if count == 1 else 'files'}"
 
 
 def resolve_trust_remote_code(pretrained_model_name_or_path):
@@ -35,84 +111,6 @@ def resolve_trust_remote_code(pretrained_model_name_or_path):
         return False
     # pretrained_model_name_or_path can be something like nvidia/NVIDIA-Nemotron-Nano-9B-v2
     return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
-
-
-def is_tied_word_embeddings(model: nn.Module) -> bool:
-    """
-    Check if the model's word embeddings are tied.
-
-    Args:
-        model (nn.Module): The model to check.
-
-    Returns:
-        bool: True if the model's word embeddings are tied, False otherwise.
-    """
-    non_tied_lm_head_models = {
-        "Qwen3OmniMoeThinkerForConditionalGeneration",  # complicated config structure
-    }
-    model_class_name = type(model).__name__
-    for m in non_tied_lm_head_models:
-        if m in model_class_name:
-            return False
-    config = getattr(model, "config", None)
-    text_config = getattr(config, "get_text_config", lambda: None)()
-    return bool(getattr(text_config, "tie_word_embeddings", getattr(config, "tie_word_embeddings", False)))
-
-
-def _normalize_param_name(name: str) -> str:
-    """Strip wrapper-specific prefixes from a parameter name."""
-    return name.replace("_orig_mod.", "")
-
-
-def get_lm_head_weight_and_name(model: nn.Module) -> tuple[torch.Tensor | None, str | None]:
-    """Return the first ``lm_head.weight`` parameter found on a model.
-
-    Args:
-        model: Model to inspect.
-
-    Returns:
-        Tuple of the parameter tensor and its normalized FQN, or ``(None, None)``
-        when the model has no LM head weight.
-    """
-    for name, param in model.named_parameters(remove_duplicate=False):
-        normalized_name = _normalize_param_name(name)
-        if "lm_head" in normalized_name and normalized_name.endswith(".weight"):
-            return param, normalized_name
-    return None, None
-
-
-def get_input_embeddings_weight_and_name(model: nn.Module) -> tuple[torch.Tensor | None, str | None]:
-    """Return the input embedding weight and normalized name if present.
-
-    Args:
-        model: Model to inspect.
-
-    Returns:
-        Tuple of the embedding weight tensor and its normalized FQN, or
-        ``(None, None)`` when the current model partition does not own the input
-        embedding.
-    """
-    get_input_embeddings = getattr(model, "get_input_embeddings", None)
-    if callable(get_input_embeddings):
-        try:
-            input_embeddings = get_input_embeddings()
-        except Exception:
-            input_embeddings = None
-        if input_embeddings is not None and hasattr(input_embeddings, "weight"):
-            for name, param in model.named_parameters(remove_duplicate=False):
-                if param is input_embeddings.weight:
-                    return param, _normalize_param_name(name)
-
-    candidate_suffixes = (
-        "embed_tokens.weight",
-        "language_model.embed_tokens.weight",
-        "model.language_model.embed_tokens.weight",
-    )
-    for name, param in model.named_parameters(remove_duplicate=False):
-        normalized_name = _normalize_param_name(name)
-        if normalized_name.endswith(candidate_suffixes):
-            return param, normalized_name
-    return None, None
 
 
 def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | None = None) -> list[str]:
@@ -167,38 +165,6 @@ def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | No
         seen_source_names.add(source_name)
         deduped_source_names.append(source_name)
     return deduped_source_names
-
-
-def has_local_tied_lm_head(model: nn.Module) -> bool:
-    """Return whether the current model partition can locally satisfy a tied LM head.
-
-    This is intentionally stricter than ``is_tied_word_embeddings()``: pipeline
-    stages often keep the config flag set to ``True`` even though ``lm_head`` and
-    ``embed_tokens`` live on different partitions and therefore cannot be
-    reconstructed from each other locally.
-
-    Note: we purposefully do NOT check ``lm_head.weight is embed_tokens.weight``.
-    After FSDP/TP sharding both are wrapped into separate ``DTensor``s and the
-    ``is``-identity is broken, but HF's ``tie_weights()`` can still relink them
-    locally on load. The only case we actually need to distinguish is "is the
-    embedding source present on this partition at all?", which answers "can we
-    safely omit ``lm_head.weight`` during save and rematerialize on load?".
-
-    Args:
-        model: Model or pipeline stage to inspect.
-
-    Returns:
-        ``True`` when the model is configured with tied word embeddings AND
-        both the local ``lm_head`` and the input embedding live on this
-        partition. ``False`` when the config isn't tied, or when the local
-        partition is missing one of the two (typical for PP non-last / non-first
-        stages).
-    """
-    if not is_tied_word_embeddings(model):
-        return False
-    lm_head_weight, _ = get_lm_head_weight_and_name(model)
-    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
-    return lm_head_weight is not None and input_embeddings_weight is not None
 
 
 def materialize_missing_tied_lm_head(

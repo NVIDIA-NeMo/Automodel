@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import random
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from datasets import Dataset, Features, Sequence, Value
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 
 def make_vocab(vocab_size: int = 100):
@@ -95,6 +102,39 @@ def build_packed_dataset(
         }
     )
     return Dataset.from_list(examples[:num_blocks], features=features)
+
+
+@dataclass
+class MockPackedDatasetConfig:
+    """Construction-time configuration for the mock packed dataset (tokenizer is a build arg)."""
+
+    num_blocks: int = 10
+    """Number of packed blocks to generate."""
+    block_size: int = 128
+    """Token length of each packed block."""
+    mean_len: float = 20.0
+    """Mean sentence length (Gaussian)."""
+    std_len: float = 6.0
+    """Standard deviation of sentence length (Gaussian)."""
+    vocab_size: int = 100
+    """Vocabulary size for the synthetic tokens."""
+    max_sentence_len: int = 64
+    """Maximum sentence length."""
+    seed: int = 0
+    """Seed for the random generator."""
+
+    def build(self, *, tokenizer: "PreTrainedTokenizerBase | None" = None) -> Dataset:
+        """Build the mock packed :class:`~datasets.Dataset` from this :class:`MockPackedDatasetConfig`."""
+        return build_packed_dataset(
+            num_blocks=self.num_blocks,
+            block_size=self.block_size,
+            mean_len=self.mean_len,
+            std_len=self.std_len,
+            vocab_size=self.vocab_size,
+            max_sentence_len=self.max_sentence_len,
+            seed=self.seed,
+            tokenizer=tokenizer,
+        )
 
 
 if __name__ == "__main__":

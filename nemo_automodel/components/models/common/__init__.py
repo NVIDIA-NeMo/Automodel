@@ -19,6 +19,7 @@ from nemo_automodel.components.models.common.utils import (
     HAVE_DEEP_EP,
     HAVE_TE,
     BackendConfig,
+    compute_lm_head_logits,
     get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,
@@ -34,4 +35,6 @@ __all__ = [
     "get_rope_config",
     "initialize_rms_norm_module",
     "initialize_linear_module",
+    # lm_head projection
+    "compute_lm_head_logits",
 ]

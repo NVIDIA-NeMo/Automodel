@@ -255,7 +255,16 @@ def load_module_from_file(file_path: str | Path) -> types.ModuleType:
         raise ImportError(f"Cannot create module spec for {p}")
 
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Register the module in sys.modules *before* executing it. The dataclass
+    # machinery (and other tools that inspect annotations) looks the module up
+    # via sys.modules[cls.__module__]; if the module is absent this raises an
+    # AttributeError when the module uses `from __future__ import annotations`.
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
 
     return module
 

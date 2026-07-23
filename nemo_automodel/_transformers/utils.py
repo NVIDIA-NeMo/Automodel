@@ -13,12 +13,81 @@
 # limitations under the License.
 
 import logging
+from collections import deque
+from collections.abc import Callable
 from typing import Any, Optional
 
 import torch
+import torch.nn as nn
 from transformers import AutoConfig
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_get_rope_index(model: nn.Module) -> Optional[Callable]:
+    """Locate a model's mRoPE position-id builder.
+
+    Transformers does not keep ``get_rope_index`` at a fixed depth, and a plain
+    ``getattr`` on the top-level module therefore finds nothing for most
+    layouts, which silently degrades packed multimodal training to 1D positions.
+    Three layouts exist as of transformers 5.8, so the search widens gradually:
+
+    1. The model itself, after unwrapping the ``module`` that DDP and
+       MegatronFSDP add without proxying attribute reads. Qwen2.5-Omni defines
+       ``get_rope_index`` on its top-level ``*ForConditionalGeneration``.
+    2. HuggingFace's ``base_model`` property, which resolves to
+       ``getattr(model, model.base_model_prefix, model)``. Qwen2-VL, Qwen2.5-VL,
+       Qwen3-VL, Qwen3-VL-MoE and GLM-4V put it on that inner ``*Model``.
+    3. Any remaining submodule, breadth-first so the shallowest match wins.
+       Qwen3-Omni reaches neither of the above: it owns no ``get_rope_index``,
+       and its ``base_model_prefix`` of ``model`` resolves back to itself
+       because the builder lives on the ``thinker`` submodule.
+
+    Breadth-first order matters because a model may hold several distinct
+    builders. Qwen3-Omni carries one on ``thinker`` and a different one on
+    ``talker``; both sit one level down, so the traversal must be deterministic
+    rather than depend on how a search happens to recurse. The sweep tracks
+    visited modules like ``nn.Module.named_modules`` does, since a module graph
+    may share a submodule across paths or contain an outright cycle.
+
+    Args:
+        model: The (possibly wrapped) model to search. Accepts any object; no
+            tensor inputs. Objects without the ``nn.Module`` child API, such as
+            the stage wrappers a pipeline-parallel run holds, are searched by
+            attribute only and never swept.
+
+    Returns:
+        The ``get_rope_index`` callable, or ``None`` when the model does not
+        expose one (i.e. it is not an mRoPE model).
+    """
+    model = getattr(model, "module", model)
+    get_rope_index = getattr(model, "get_rope_index", None)
+    if get_rope_index is not None:
+        return get_rope_index
+
+    get_rope_index = getattr(getattr(model, "base_model", None), "get_rope_index", None)
+    if get_rope_index is not None:
+        return get_rope_index
+
+    # Pipeline stages reach this as bare wrappers rather than nn.Modules, so the
+    # sweep is only available when the object actually carries the module API.
+    named_children = getattr(model, "named_children", None)
+    if named_children is None:
+        return None
+
+    seen = {id(model)}
+    queue = deque(named_children())
+    while queue:
+        name, submodule = queue.popleft()
+        if id(submodule) in seen:
+            continue
+        seen.add(id(submodule))
+        get_rope_index = getattr(submodule, "get_rope_index", None)
+        if get_rope_index is not None:
+            logger.debug("Resolved get_rope_index from submodule %r of %s", name, type(model).__name__)
+            return get_rope_index
+        queue.extend((f"{name}.{child_name}", child) for child_name, child in submodule.named_children())
+    return None
 
 
 def _should_load_before_shard(

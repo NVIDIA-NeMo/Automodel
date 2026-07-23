@@ -1,0 +1,117 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
+# Local CP parity run for the DENSE Qwen3.6-27B VLM on MedPix-VQA (real images)
+# at 2k sequence length (2 nodes / 16 GPUs). Pair with qwen3_6_27b_medpix_cp2_2k_2node_100steps.yaml; the
+# two configs differ ONLY in cp_size, so the per-step global batch (and thus the
+# loss curve) must match within numerical tolerance.
+# Run:
+#   automodel finetune -c examples/vlm_finetune/qwen3_5/qwen3_6_27b_medpix_cp1_2k_2node_100steps.yaml --nproc-per-node 8
+
+recipe: FinetuneRecipeForVLM
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  log_remote_every_steps: 1
+  gc_every_steps: 5
+  num_epochs: 1
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.6-27B
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch
+    rope_fusion: false
+  attn_implementation: sdpa
+  torch_dtype: bfloat16
+  # MTP disabled: its extra full-vocab projection at 2k OOMs the forward pass
+  # on 2 nodes (activation does not shard across DP). Irrelevant to CP parity.
+  num_nextn_predict_layers: 0
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.6-27B
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/qwen3_6_27b_medpix_cp1_2k_2node_100steps/
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  tp_size: 4
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  mp_policy:
+    _target_: torch.distributed.fsdp.MixedPrecisionPolicy
+    param_dtype: bfloat16
+    reduce_dtype: bfloat16
+    output_dtype: bfloat16
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  # FusedLinearCrossEntropy: no materialized [seq,248320] logits. cp2 carries
+  # CP all-gather overhead that OOMs MaskedCE's 2.37 GiB logits at step 2;
+  # the fused path removes that tensor so both cp1 and cp2 fit at 2k.
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 1
+  drop_last: true
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
+    max_length: 2048
+
+optimizer:
+  # torch AdamW: shards optimizer states over the FSDP2 DTensor mesh (/16).
+  # TE FusedAdam was tried but OOMs in initialize_state -- it allocates
+  # exp_avg/exp_avg_sq unsharded (TP-local /4, not FSDP /16).
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 5.0e-6
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: constant
+
+wandb:
+  enable: false
+  project: huiyingl_workspace
+  entity: Nemo-automodel
+  name: qwen3_6_27b_medpix_cp1_2k_2node_100steps
+  group: qwen3_6_27b_medpix_dense_cp_parity_2k_2node_100steps
+  tags: [qwen3.6-27b, medpix, dense, cp1, 2k, 2node, parity]
+  dir: logs/qwen3_6_27b_medpix_cp1_2k_2node_100steps/wandb

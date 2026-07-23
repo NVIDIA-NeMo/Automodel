@@ -99,3 +99,14 @@ optimizer:
 
 ci:
   recipe_owner: HuiyingLi
+  time: "00:25:00"
+  checkpoint_robustness:
+    check_source_load_parity: true
+    hf_kl_threshold: 5e-3
+    source_load_kl_threshold: 5e-3
+    source_load_cosine_threshold: 0.9995
+    tokenizer_name: mistralai/Mistral-Nemo-Base-2407
+    hf_device_map_auto: true
+    no_check_resume: true
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500

@@ -1,0 +1,150 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# FULL supervised fine-tune of Nemotron-3-Ultra-550B-A55B across 32 x H100 nodes
+# (256 GPUs, PP=4, EP=64).
+# Mirrors nemotron_ultra_v3_hellaswag_peft.yaml but trains ALL parameters (no `peft:` block),
+# scaled up for the full-FT memory footprint (32 nodes, PP=4, EP=64, activation checkpointing, full
+# Adam optimizer state). Real router (fake_balanced_gate=false), HybridEP dispatch,
+# and the repeated MTP head are kept.
+#
+# To run on a 32-node Slurm allocation, drive torchrun from an srun step:
+#
+#   MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+#   srun --ntasks-per-node=1 --nodes=32 bash -c '
+#     torchrun --nnodes=32 --nproc-per-node=8 \
+#       --rdzv-backend=c10d --rdzv-endpoint="$MASTER_ADDR":29500 \
+#       --node-rank=$SLURM_NODEID \
+#       examples/llm_finetune/finetune.py \
+#       -c examples/llm_finetune/nemotron/nemotron_ultra_v3_squad.yaml'
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  num_epochs: 1
+  max_steps: 17
+  global_batch_size: 256  # local_batch_size(4) * dp_size(64) -> no grad accumulation.
+  local_batch_size: 4
+  ckpt_every_steps: 50
+  val_every_steps: 50
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16
+  # MTP head predicts the next 2 tokens. mtp_use_repeated_layer reuses ONE physical MTP
+  # layer across both depths (weight-tied), so the param count matches a 1-depth MTP. The
+  # block-type pattern auto-resolves from Ultra's mtp_layers_block_type: ["attention", "moe"].
+  num_nextn_predict_layers: 2
+  mtp_use_repeated_layer: true
+  mtp_loss_scaling_factor: 0.1
+  output_hidden_states: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    experts: gmm
+    dispatcher: hybridep
+    enable_fsdp_optimizations: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/ultra_full_sft/
+  model_save_format: safetensors
+  save_consolidated: final
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 4
+  ep_size: 64
+  activation_checkpointing: true
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 14  # 108 layers / 8 virtual stages = 2 virtual stages per PP rank.
+    round_virtual_stages_to_pp_multiple: down
+    scale_grads_in_schedule: false
+    patch_inner_model: false
+    patch_causal_lm_model: false
+
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: train
+
+packed_sequence:
+  packed_sequence_size: 4096
+  packing_strategy: thd
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.squad.make_squad_dataset
+  dataset_name: rajpurkar/squad
+  split: validation
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+  shuffle: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  lr: 5.0e-6
+  weight_decay: 0.1
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 10
+  min_lr: 1.0e-6
+
+ci:
+  # pp_size(4) * ep_size(64) = 256 GPUs => 32 nodes (8 H100/node).
+  recipe_owner: adil-a
+  nodes: 32
+  time: "00:30:00"
+  max_steps: 17
+  env_vars:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "8"
+    NUM_OF_STAGES_G2S_COMBINE_API: "4"
+
+# wandb:
+#   project: my-project
+#   entity: my-entity
+#   name: ultra-full-sft

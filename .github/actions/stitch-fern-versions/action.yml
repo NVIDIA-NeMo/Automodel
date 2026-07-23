@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Restores frozen backward-version page trees into the working copy so the Fern
+# build sees every version train, even though only the nightly tree (top-level
+# docs/) is kept on main. Each archived version's pages/ tree lives on a separate
+# git ref (a long-lived archive branch by default, or a docs/v* tag for an
+# immutable snapshot) and is restored into docs/fern/versions/<vdir>/pages.
+#
+# Fern has no native cross-ref version sourcing: `fern generate --docs` reads the
+# single local working tree, so the archived pages must physically exist before
+# `fern check` / `fern generate` runs. This action provides that materialization.
+#
+# The archive ref is treated as an opaque git ref, so a branch and a tag flow
+# through the same code path -- only the registry value differs.
+
+name: Stitch archived Fern version pages
+description: Restore frozen pages/ trees from an archive branch or docs/v* tag into docs/fern/versions/<vdir>/pages.
+
+inputs:
+  archived-versions:
+    description: >-
+      Newline-separated list of "<version-dir>=<git-ref>" pairs. <version-dir> is
+      the directory under docs/fern/versions/ (e.g. "v0.4"); <git-ref> is the
+      branch or tag holding that version's frozen pages (e.g. "docs-archive" or
+      "docs/v0.4.0"). The `latest` train is an alias of an existing pages tree and
+      needs no entry.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Restore archived version pages
+      shell: bash
+      env:
+        ARCHIVED_VERSIONS: ${{ inputs.archived-versions }}
+      run: |
+        set -euo pipefail
+        while IFS='=' read -r vdir ref; do
+          vdir="$(echo "${vdir}" | xargs)"   # trim surrounding whitespace
+          ref="$(echo "${ref}" | xargs)"
+          [ -z "${vdir}" ] && continue
+          subtree="docs/fern/versions/${vdir}/pages"
+          echo "::group::Stitch ${vdir} from ${ref}"
+          # Shallow-fetch the ref. Works for a branch or a tag alike and does not
+          # need a full-history (fetch-depth: 0) checkout. actions/checkout has
+          # already configured the authenticated 'origin' remote, so fetching the
+          # base repo's own ref needs no extra secret.
+          git fetch --depth=1 origin "${ref}" --quiet
+          # Hard-fail if the ref or the subtree is missing -- a silent miss would
+          # otherwise drop the version from the published site (publish is a full
+          # snapshot, not incremental).
+          if [ -z "$(git ls-tree -r --name-only FETCH_HEAD -- "${subtree}")" ]; then
+            echo "::error::archive ref '${ref}' does not contain '${subtree}'"
+            exit 1
+          fi
+          # Restore ONLY the frozen pages subtree from the ref. docs.yml and the
+          # nav YAMLs always come from the live checkout, never the archive ref,
+          # so editorial changes on the current branch always win and the frozen
+          # prose can never drift into the wrong train.
+          git restore --source=FETCH_HEAD --worktree --no-overlay -- "${subtree}"
+          echo "  restored $(git ls-tree -r --name-only FETCH_HEAD -- "${subtree}" | wc -l | xargs) files into ${subtree}"
+          echo "::endgroup::"
+        done <<< "${ARCHIVED_VERSIONS}"

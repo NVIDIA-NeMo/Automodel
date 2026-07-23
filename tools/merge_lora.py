@@ -262,7 +262,20 @@ def merge_lora(
 
     if save_tokenizer:
         try:
-            tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=trust_remote_code)
+            # Prefer NeMoAutoTokenizer: on transformers>=5 a plain
+            # AutoTokenizer.save_pretrained re-serializes the tokenizer and
+            # mutates tokenizer_config.json (e.g. extra_special_tokens
+            # becomes a list, added_tokens_decoder / additional_special_tokens
+            # / chat_template are dropped, stray backend / is_local keys
+            # are added), which downstream tools such as vLLM reject. NeMoAutoTokenizer
+            # restores the original config faithfully on save. Fall back to the plain
+            # HF tokenizer if Automodel is unavailable.
+            try:
+                from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+
+                tokenizer = NeMoAutoTokenizer.from_pretrained(base_model, trust_remote_code=trust_remote_code)
+            except Exception:
+                tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=trust_remote_code)
             tokenizer.save_pretrained(output_dir)
             logger.info("Tokenizer saved to %s", output_dir)
         except Exception as e:

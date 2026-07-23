@@ -92,6 +92,7 @@ def test_batchify_adds_batch_dimension() -> None:
     assert out.ndim == 2
     assert torch.equal(out, torch.tensor([[1, 2, 3]]))
 
+
 def test_batchify_adds_batch_dimension_default_tensor_cls() -> None:
     """`batchify` must insert dim-0 in-place when given a 1-D tensor."""
     vec = [1, 2, 3]
@@ -150,7 +151,7 @@ def test_default_collater_shapes() -> None:
             "___PAD_TOKEN_IDS___": {
                 "input_ids": 0,
                 "labels": -100,
-            }
+            },
         },
         {
             "input_ids": [3],
@@ -160,7 +161,7 @@ def test_default_collater_shapes() -> None:
             "___PAD_TOKEN_IDS___": {
                 "input_ids": 0,
                 "labels": -100,
-            }
+            },
         },
     ]
 
@@ -178,7 +179,7 @@ def test_default_collater_shapes() -> None:
     # Verify returned values
     attention_mask = torch.tensor([[1, 1], [1, 0]])
     input_ids = torch.tensor([[1, 2], [3, 0]])
-    labels = torch.tensor([[ 101,  102], [ 103, -100]])
+    labels = torch.tensor([[101, 102], [103, -100]])
     loss_mask = torch.tensor([[1, 1], [1, 0]])
 
     assert torch.equal(collated["attention_mask"], attention_mask)
@@ -199,6 +200,56 @@ def test_default_collater_shapes() -> None:
     # # Sanity on dtype
     # for tensor in collated.values():
     #     assert tensor.dtype == torch.long
+
+
+def test_default_collater_padding_mask_prefers_attention_mask() -> None:
+    """padding_mask must follow attention_mask, not input_ids == pad_token value.
+
+    Regression test: when pad_token_id collides with a content token value (e.g.
+    pad_token_id == eos_token_id), keying padding off the input_ids *value* flags real
+    tokens as padding, which masks them out of the MoE experts -> near-random outputs on
+    chat data. The collater must instead derive padding_mask from the real attention_mask.
+    """
+    # pad_token value 1 also appears as a real content token: the trailing eos of row 0
+    # and the leading token of row 1. Neither is padding.
+    raw_batch = [
+        {
+            "input_ids": [5, 6, 1],
+            "attention_mask": [1, 1, 1],
+            "labels": [5, 6, 1],
+            "___PAD_TOKEN_IDS___": {"input_ids": 1, "labels": -100},
+        },
+        {
+            "input_ids": [1, 7],
+            "attention_mask": [1, 1],
+            "labels": [1, 7],
+            "___PAD_TOKEN_IDS___": {"input_ids": 1, "labels": -100},
+        },
+    ]
+
+    collated = sftp.default_collater(raw_batch)
+
+    # Row 1 is padded 2->3 with pad_token 1; only that trailing slot is real padding.
+    expected = torch.tensor([[False, False, False], [False, False, True]])
+    assert torch.equal(collated["padding_mask"], expected)
+
+    # The buggy value-based mask would flag every input_ids == 1 (the real eos/leading tokens).
+    value_based = collated["input_ids"] == 1
+    assert not torch.equal(collated["padding_mask"], value_based)
+
+
+def test_default_collater_padding_mask_fallback_without_attention_mask() -> None:
+    """Without an attention_mask, padding_mask falls back to input_ids == pad_token."""
+    raw_batch = [
+        {"input_ids": [5, 6, 7], "___PAD_TOKEN_IDS___": {"input_ids": 0}},
+        {"input_ids": [5, 6], "___PAD_TOKEN_IDS___": {"input_ids": 0}},
+    ]
+
+    collated = sftp.default_collater(raw_batch)
+
+    assert "attention_mask" not in collated
+    expected = torch.tensor([[False, False, False], [False, False, True]])
+    assert torch.equal(collated["padding_mask"], expected)
 
 
 def test_tokenize_function_strips_special_tokens(dummy_tokenizer: DummyTokenizer) -> None:
@@ -304,6 +355,7 @@ def test_full_process_pipeline(dummy_tokenizer: DummyTokenizer) -> None:
     first_len = len(processed[0]["input_ids"])
     assert all(len(r["input_ids"]) == first_len for r in processed)
 
+
 @pytest.mark.parametrize(
     "lst,value,expected",
     [
@@ -320,6 +372,7 @@ def test_full_process_pipeline(dummy_tokenizer: DummyTokenizer) -> None:
 )
 def test_find_last_non_pad_token(lst, value, expected):
     assert sftp.find_last_non_pad_token(lst, value) == expected
+
 
 @pytest.mark.parametrize(
     "val,expected",

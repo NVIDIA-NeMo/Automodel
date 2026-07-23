@@ -35,6 +35,8 @@ from nemo_automodel.components.distributed.parallelizer import (
     NemotronHParallelizationStrategy,
     ParallelizationStrategy,
     WanParallelizationStrategy,
+    _extract_model_layers,
+    _nemotronh_decoder_blocks,
     fsdp2_strategy_parallelize,
     get_parallelization_strategy,
 )
@@ -104,6 +106,55 @@ class MockNemotronHModel(nn.Module):
         return x
 
 
+class MockNemotronV3Model(nn.Module):
+    """Mock of the native Nemotron-V3 model: decoder blocks live in ``model.model.layers``
+    as a ``ModuleDict`` (keyed "0".."N-1") and there is no ``backbone`` attribute."""
+
+    def __init__(self, num_layers=4):
+        super().__init__()
+
+        class MockInner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleDict()
+                for i in range(num_layers):
+                    layer = nn.Module()
+                    setattr(layer, "block_type", "mlp" if i % 2 == 0 else "attention")
+                    self.layers[str(i)] = layer
+
+        self.model = MockInner()
+        self.__class__.__name__ = "NemotronHForCausalLM"
+
+    def forward(self, x):
+        return x
+
+
+class TestNemotronHLayoutResolution:
+    """Both classes named ``NemotronHForCausalLM`` must resolve their decoder blocks
+    without an AttributeError (AM-448): the HF model exposes ``backbone.layers``
+    (``ModuleList``) and the native Nemotron-V3 model exposes ``model.layers``
+    (``ModuleDict``)."""
+
+    def test_helper_hf_backbone_modulelist(self):
+        container, blocks = _nemotronh_decoder_blocks(MockNemotronHModel())
+        assert isinstance(container, nn.ModuleList)
+        assert len(blocks) == 2
+
+    def test_helper_native_model_moduledict(self):
+        container, blocks = _nemotronh_decoder_blocks(MockNemotronV3Model(num_layers=4))
+        assert isinstance(container, nn.ModuleDict)
+        assert len(blocks) == 4  # ordered values of the ModuleDict
+
+    def test_extract_model_layers_native_has_no_backbone(self):
+        # Regression for AM-448: the registry still lists "backbone.layers", but the native
+        # model has no `backbone`; _reduce_attrs must skip it and resolve "model.layers"
+        # instead of raising.
+        assert len(_extract_model_layers(MockNemotronV3Model(num_layers=4))) == 4
+
+    def test_extract_model_layers_hf_backbone(self):
+        assert len(_extract_model_layers(MockNemotronHModel())) == 2
+
+
 @pytest.fixture
 def mock_device_mesh():
     """Create a mock device mesh for testing."""
@@ -152,10 +203,17 @@ def mock_distributed_env(monkeypatch):
         "nemo_automodel.components.distributed.parallelizer.parallelize_module", parallelize_module_mock, raising=False
     )
 
-    # Mock checkpoint wrapper
+    # Mock checkpoint wrapper. Sub-module/whole-block wrapping now lives in
+    # activation_checkpointing.py and calls that module's checkpoint_wrapper, so
+    # patch it there too.
     checkpoint_wrapper_mock = MagicMock(side_effect=lambda x: x)
     monkeypatch.setattr(
         "nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper", checkpoint_wrapper_mock, raising=False
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.components.distributed.activation_checkpointing.checkpoint_wrapper",
+        checkpoint_wrapper_mock,
+        raising=False,
     )
 
     # Mock apply_fsdp2_sharding_recursively
@@ -166,10 +224,12 @@ def mock_distributed_env(monkeypatch):
         raising=False,
     )
 
-    # Mock _extract_model_layers
-    extract_layers_mock = MagicMock(return_value=[])
+    # Mock grouped layer extraction, which is used for both sharding and AC scope filtering.
+    extract_layer_groups_mock = MagicMock(return_value={"language": []})
     monkeypatch.setattr(
-        "nemo_automodel.components.distributed.parallelizer._extract_model_layers", extract_layers_mock, raising=False
+        "nemo_automodel.components.distributed.parallelizer._extract_model_layer_groups",
+        extract_layer_groups_mock,
+        raising=False,
     )
 
     # Mock _get_parallel_plan
@@ -189,7 +249,7 @@ def mock_distributed_env(monkeypatch):
         "parallelize_module": parallelize_module_mock,
         "checkpoint_wrapper": checkpoint_wrapper_mock,
         "apply_fsdp": apply_fsdp_mock,
-        "extract_layers": extract_layers_mock,
+        "extract_layer_groups": extract_layer_groups_mock,
         "get_plan": get_plan_mock,
         "validate_tp": validate_tp_mock,
     }
@@ -242,6 +302,7 @@ class TestDefaultParallelizationStrategy:
             "offload_policy",
             "sequence_parallel",
             "activation_checkpointing",
+            "activation_checkpointing_scope",
             "tp_shard_plan",
             "dp_replicate_mesh_name",
             "dp_shard_cp_mesh_name",
@@ -268,7 +329,7 @@ class TestDefaultParallelizationStrategy:
         assert result is model  # Should return the same model
 
         # Verify key functions were called
-        mock_distributed_env["extract_layers"].assert_called_once_with(model)
+        mock_distributed_env["extract_layer_groups"].assert_called_once_with(model)
         mock_distributed_env["apply_fsdp"].assert_called_once()
         mock_distributed_env["fully_shard"].assert_called()
 
@@ -296,12 +357,12 @@ class TestDefaultParallelizationStrategy:
         mesh, dp_replicate_mesh, dp_shard_mesh, tp_mesh = mock_device_mesh
 
         # Mock layers with all the attributes that get checkpointed
-        mock_layer = MagicMock()
+        mock_layer = nn.Module()
         mock_layer.mlp = nn.Linear(10, 10)
-        mock_layer.self_attn = MagicMock()
-        mock_layer.input_layernorm = MagicMock()
-        mock_layer.post_attention_layernorm = MagicMock()
-        mock_distributed_env["extract_layers"].return_value = [mock_layer]
+        mock_layer.self_attn = nn.Linear(10, 10)
+        mock_layer.input_layernorm = nn.Linear(10, 10)
+        mock_layer.post_attention_layernorm = nn.Linear(10, 10)
+        mock_distributed_env["extract_layer_groups"].return_value = {"language": [mock_layer]}
 
         model = MockModel()
 
@@ -319,6 +380,8 @@ class TestDefaultParallelizationStrategy:
         expected_calls = [
             call(mock_layer.mlp),
             call(mock_layer.self_attn),
+            call(mock_layer.input_layernorm),
+            call(mock_layer.post_attention_layernorm),
         ]
         checkpoint_wrapper_mock.assert_has_calls(expected_calls, any_order=False)
 
@@ -351,6 +414,29 @@ class TestDefaultParallelizationStrategy:
             call(("custom_dp_replicate", "custom_dp_shard")),
         ]
         mesh.__getitem__.assert_has_calls(expected_calls, any_order=True)
+
+    def test_explicit_reshard_true_warns_with_pipeline_parallelism(
+        self, strategy, mock_device_mesh, mock_distributed_env, monkeypatch, caplog
+    ):
+        """Explicit layer resharding overrides the PP default and should warn."""
+        mesh, _, _, _ = mock_device_mesh
+        pp_mesh = MagicMock()
+        pp_mesh.size.return_value = 2
+        dp_mesh = MagicMock()
+        dp_mesh.mesh_dim_names = ("pp",)
+        dp_mesh.__getitem__.side_effect = lambda key: {"pp": pp_mesh}[key]
+        monkeypatch.setattr(parallelizer_mod, "get_fsdp_dp_mesh", lambda *args, **kwargs: dp_mesh)
+
+        with caplog.at_level(logging.WARNING, logger=parallelizer_mod.__name__):
+            strategy.parallelize(
+                model=MockModel(),
+                device_mesh=mesh,
+                sequence_parallel=False,
+                activation_checkpointing=False,
+                reshard_after_forward=True,
+            )
+
+        assert "reshard_after_forward=True overrides the pipeline-parallel default" in caplog.text
 
 
 class TestNemotronHParallelizationStrategy:
@@ -455,6 +541,31 @@ class TestNemotronHParallelizationStrategy:
         # Should call fully_shard for each layer and the root model regardless of TP size
         expected_fully_shard_calls = len(nemotron_model.backbone.layers) + 1  # +1 for root
         assert fully_shard_by_dtype.call_count + fully_shard.call_count == expected_fully_shard_calls
+
+    @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    def test_threads_reshard_after_forward_to_layer_sharding(
+        self,
+        fully_shard_by_dtype,
+        fully_shard,
+        strategy,
+        mock_device_mesh,
+        nemotron_model,
+    ):
+        """Nemotron layers must honor explicit FSDP reshard overrides."""
+        mesh, _, _, _ = mock_device_mesh
+        fully_shard.side_effect = lambda model, **kwargs: model
+        fully_shard_by_dtype.side_effect = lambda model, **kwargs: model
+
+        strategy.parallelize(
+            model=nemotron_model,
+            device_mesh=mesh,
+            activation_checkpointing=False,
+            reshard_after_forward=True,
+        )
+
+        for call_args in fully_shard_by_dtype.call_args_list:
+            assert call_args.kwargs["reshard_after_forward"] is True
 
     @patch("nemo_automodel.components.distributed.parallelizer.checkpoint_wrapper")
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
@@ -779,7 +890,7 @@ class TestFsdp2StrategyParallelizeIntegration:
 
         assert result is model
         # Verify that default strategy functions were called
-        mock_distributed_env["extract_layers"].assert_called_once_with(model)
+        mock_distributed_env["extract_layer_groups"].assert_called_once_with(model)
 
     @patch("nemo_automodel.components.distributed.parallelizer.parallelize_module")
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
@@ -841,6 +952,7 @@ class TestFsdp2StrategyParallelizeIntegration:
             "offload_policy",
             "sequence_parallel",
             "activation_checkpointing",
+            "activation_checkpointing_scope",
             "tp_shard_plan",
             "dp_replicate_mesh_name",
             "dp_shard_cp_mesh_name",

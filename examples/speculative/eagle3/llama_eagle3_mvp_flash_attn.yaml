@@ -17,10 +17,9 @@ recipe_args:
   #     {"role": "assistant", "content": "Paris."}
   #   ]}
   #
-  # If a dataset ships the conversations under a different key (e.g.
-  # PerfectBlend uses ``conversations``), rename the column locally
-  # before pointing the recipe at it. See the inline one-liner in
-  # ``llama_eagle3_perfectblend.yaml``.
+  # ShareGPT-style datasets (e.g. PerfectBlend) that ship turns under a
+  # ``conversations`` column of ``{from, value}`` entries are auto-converted to
+  # the ``messages`` schema -- no manual column rename needed.
   train_data_path: /path/to/train.jsonl
   val_data_path: null
   train_split: null

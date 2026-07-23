@@ -34,6 +34,7 @@ from nemo_automodel.components.models.common import (
     initialize_linear_module,
 )
 from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
 class GptOssAttention(nn.Module):
@@ -47,17 +48,19 @@ class GptOssAttention(nn.Module):
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
 
+        dtype = get_dtype(getattr(config, "torch_dtype", None), torch.bfloat16)
+
         self.q_proj = initialize_linear_module(
-            backend.linear, self.hidden_size, self.num_attention_heads * self.head_dim, bias=True
+            backend.linear, self.hidden_size, self.num_attention_heads * self.head_dim, bias=True, dtype=dtype
         )
         self.k_proj = initialize_linear_module(
-            backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+            backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, dtype=dtype
         )
         self.v_proj = initialize_linear_module(
-            backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+            backend.linear, self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True, dtype=dtype
         )
         self.o_proj = initialize_linear_module(
-            backend.linear, self.num_attention_heads * self.head_dim, self.hidden_size, bias=True
+            backend.linear, self.num_attention_heads * self.head_dim, self.hidden_size, bias=True, dtype=dtype
         )
 
         self.softmax_scale = self.head_dim**-0.5

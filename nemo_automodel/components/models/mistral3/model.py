@@ -38,6 +38,11 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple, logging
 
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
+from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 
 logger = logging.get_logger(__name__)
 
@@ -478,7 +483,6 @@ class Ministral3Model(Ministral3PreTrainedModel):
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
@@ -505,11 +509,24 @@ class Ministral3Model(Ministral3PreTrainedModel):
 
 
 class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, GenerationMixin):
+    # No checkpoint served through this arch is tied (config default is untied);
+    # the 3B's text_config tie flag reaches the VLM class, not this one.
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = True
+        supports_cp: bool = False
+        supports_pp: bool = True
+        supports_ep: bool = False
+
     def __init__(self, config: Ministral3Config):
+        reject_unsupported_tie_word_embeddings(type(self), config)
         super().__init__(config)
         self.model = Ministral3Model(config)
         self.vocab_size = config.vocab_size
@@ -540,8 +557,15 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        output_hidden_states: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else getattr(self.config, "output_hidden_states", False)
+        )
+
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -554,13 +578,7 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
         )
 
         hidden_states = outputs.last_hidden_state
-        # DTensor compatibility: when logits_to_keep=0, slice(0, None) would select all
-        # elements but DTensor cannot handle the resulting aten.alias op. Skip slicing.
-        if isinstance(logits_to_keep, int) and logits_to_keep == 0:
-            logits = self.lm_head(hidden_states)
-        else:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep).logits
 
         loss = None
         if labels is not None:
@@ -570,7 +588,9 @@ class Ministral3ForCausalLM(HFCheckpointingMixin, Ministral3PreTrainedModel, Gen
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
+            # Surface the FINAL hidden states (the input to lm_head) so the
+            # train_ft recipe can route through FusedLinearCrossEntropy (cut-CE).
+            hidden_states=(hidden_states if output_hidden_states else None),
             attentions=outputs.attentions,
         )
 

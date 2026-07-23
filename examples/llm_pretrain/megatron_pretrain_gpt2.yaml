@@ -32,10 +32,7 @@ dist_env:
   backend: nccl
   timeout_minutes: 1
 
-rng:
-  _target_: nemo_automodel.components.training.rng.StatefulRNG
-  seed: 1111
-  ranked: true
+seed: 1111
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
@@ -47,7 +44,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: checkpoints/
   model_save_format: torch_save # torch_save or safetensors
-  save_consolidated: false # saves the model in a consolidated safetensors format. Requires model_save_format to be safetensors.
+  save_consolidated: false
 
 distributed:
   strategy: fsdp2
@@ -94,10 +91,16 @@ validation_dataloader:
   dataloader_type: "single"
 
 optimizer:
-  _target_: torch.optim.AdamW
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
   betas: [0.9, 0.95]
   lr: 0.0006
   weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
 
 lr_scheduler:
   lr_decay_style: cosine
@@ -109,4 +112,4 @@ lr_scheduler:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
-#   save_dir: <your_wandb_save_dir>
+#   dir: <your_wandb_save_dir>

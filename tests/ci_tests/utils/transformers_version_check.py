@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 from typing import Optional
 
-import argparse
 import requests
 import tomllib
 from packaging.version import Version

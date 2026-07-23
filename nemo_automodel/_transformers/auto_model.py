@@ -27,6 +27,7 @@ Heavy-lifting helpers live in sibling modules:
 import gc
 import inspect
 import logging
+import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -38,26 +39,24 @@ from nemo_automodel.shared.torch_patches import apply_torch_patches
 apply_torch_patches()
 from huggingface_hub import constants as hf_constants  # noqa: E402
 from transformers import (  # noqa: E402
+    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForMultimodalLM,
     AutoModelForSequenceClassification,
     AutoModelForTextToWaveform,
+    AutoModelForTokenClassification,
     PreTrainedModel,
 )
 from transformers.initialization import no_init_weights  # noqa: E402
 from transformers.models.auto.auto_factory import _BaseAutoModelClass  # noqa: E402
 from transformers.utils import ContextManagers  # noqa: E402
 
-from nemo_automodel.components.distributed.config import (  # noqa: E402
-    DistributedConfig,
-)
+from nemo_automodel.components.distributed.config import DistributedSetup  # noqa: E402
 from nemo_automodel.components.distributed.ddp import DDPManager  # noqa: E402
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe  # noqa: E402
 from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager  # noqa: E402
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline  # noqa: E402, F401
-from nemo_automodel.components.distributed.pipelining.config import PipelineConfig  # noqa: E402
-from nemo_automodel.components.moe.config import MoEParallelizerConfig  # noqa: E402
 from nemo_automodel.components.quantization.qat import QATConfig  # noqa: E402
 from nemo_automodel.components.utils.model_utils import (  # noqa: E402
     init_empty_weights,
@@ -98,6 +97,7 @@ from nemo_automodel._transformers.model_init import (
     no_hf_meta_device,
     resolve_sdpa_method,
 )
+from nemo_automodel.components.models.common.tie_word_embeddings import reject_tie_word_embeddings_flip
 
 if not hasattr(_gen_utils, "NEED_SETUP_CACHE_CLASSES_MAPPING"):
     from transformers.cache_utils import StaticCache
@@ -110,6 +110,40 @@ logger = logging.getLogger(__name__)
 _MAX_BUILD_RETRIES = 5
 
 _remote_code_compat_applied = False
+_DISTRIBUTED_SETUP_ONLY_KWARGS = {
+    "moe_mesh",
+    "distributed_config",
+    "pipeline_config",
+    "moe_config",
+    "activation_checkpointing",
+    "tp_plan",
+}
+
+
+def _reject_separate_distributed_kwargs(kwargs: dict) -> None:
+    provided = sorted(_DISTRIBUTED_SETUP_ONLY_KWARGS & set(kwargs))
+    if provided:
+        raise TypeError(
+            "Distributed settings must be passed with distributed_setup; "
+            f"separate distributed kwargs are not accepted: {provided}"
+        )
+
+
+def _resolve_distributed_setup(
+    *,
+    distributed_setup: Optional[DistributedSetup],
+    device_mesh: Optional["DeviceMesh"] = None,
+) -> DistributedSetup:
+    """Return a setup, upcasting raw mesh inputs into topology-only setup."""
+    if distributed_setup is not None:
+        if device_mesh is not None:
+            raise ValueError("Pass either distributed_setup or device_mesh, not both")
+        return distributed_setup
+
+    if isinstance(device_mesh, MeshContext):
+        raise TypeError("device_mesh expects a DeviceMesh; pass DistributedSetup for MeshContext or MoE topology")
+
+    return DistributedSetup(mesh_context=MeshContext.from_meshes(device_mesh))
 
 
 def _patch_remote_code_compat():
@@ -162,6 +196,53 @@ def _patch_remote_code_compat():
     _remote_code_compat_applied = True
 
 
+_AUTO_CONFIG_HUB_KWARG_KEYS = (
+    "revision",
+    "subfolder",
+    "token",
+    "use_auth_token",
+    "cache_dir",
+    "local_files_only",
+    "code_revision",
+)
+
+
+def _alias_remote_auto_map_for_target(args, kwargs, target_key):
+    """Return a config with ``auto_map[target_key]`` aliased from ``auto_map[AutoModel]``.
+
+    When a trust-remote-code model card ships ``auto_map`` with only an
+    ``AutoModel`` entry (and no ``target_key`` such as
+    ``AutoModelForCausalLM``), HF's auto resolution fails. For models that
+    are otherwise causal LMs this helper copies the existing ``AutoModel``
+    class reference into ``target_key`` so resolution succeeds on retry.
+
+    Returns the patched ``PretrainedConfig`` if patching applied, else
+    ``None``.
+    """
+    if not kwargs.get("trust_remote_code"):
+        return None
+    config = kwargs.get("config")
+    if config is None:
+        if not args:
+            return None
+        pretrained_path = args[0]
+        hub_kwargs = {k: kwargs[k] for k in _AUTO_CONFIG_HUB_KWARG_KEYS if k in kwargs}
+        try:
+            config = AutoConfig.from_pretrained(
+                pretrained_path,
+                trust_remote_code=True,
+                **hub_kwargs,
+            )
+        except Exception:
+            return None
+    auto_map = getattr(config, "auto_map", None)
+    if not auto_map or target_key in auto_map or "AutoModel" not in auto_map:
+        return None
+    config.auto_map = dict(auto_map)
+    config.auto_map[target_key] = auto_map["AutoModel"]
+    return config
+
+
 def _maybe_dequantize_fp8_for_peft(hf_native_quant_cfg, peft_config, pretrained_path):
     """Set ``dequantize=True`` on FP8 quantization configs when PEFT is requested.
 
@@ -173,6 +254,42 @@ def _maybe_dequantize_fp8_for_peft(hf_native_quant_cfg, peft_config, pretrained_
             logger.info("FP8 model with PEFT: setting dequantize=True for compatibility")
             return True
     return False
+
+
+def _maybe_reject_tie_word_embeddings_flip(pretrained_model_name_or_path, hf_config, kwargs):
+    """Reject a from_pretrained request that flips tie_word_embeddings from the checkpoint.
+
+    Re-reads the checkpoint's raw config (no user value-overrides) and compares its
+    controlling tie flag to the requested ``hf_config`` via
+    :func:`reject_tie_word_embeddings_flip`. Conservative by design: path-like sources
+    are normalized with :func:`os.fspath`, non-path sources are skipped, and it silently
+    returns if the raw config cannot be re-read, so it never blocks a load except on a
+    genuine flip.
+
+    Args:
+        pretrained_model_name_or_path: The from_pretrained source (``str`` and
+            ``os.PathLike`` are checked; anything else is skipped).
+        hf_config: The resolved config with user overrides applied (the requested value).
+        kwargs: The from_pretrained kwargs (hub-locating keys are reused for the raw load).
+    """
+    if isinstance(pretrained_model_name_or_path, os.PathLike):
+        pretrained_model_name_or_path = os.fspath(pretrained_model_name_or_path)
+    if not isinstance(pretrained_model_name_or_path, str):
+        # Non-path source (e.g. bytes fspath or preloaded object): nothing to re-read.
+        return
+    hub_kwargs = {k: kwargs[k] for k in _AUTO_CONFIG_HUB_KWARG_KEYS if k in kwargs}
+    try:
+        raw_config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=kwargs.get("trust_remote_code", resolve_trust_remote_code(pretrained_model_name_or_path)),
+            **hub_kwargs,
+        )
+    except Exception:
+        # Cannot re-read the raw config (offline / custom loader); do not block the load.
+        return
+    architectures = getattr(hf_config, "architectures", None) or []
+    model_class_name = architectures[0] if architectures else type(hf_config).__name__
+    reject_tie_word_embeddings_flip(raw_config, hf_config, model_class_name)
 
 
 class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
@@ -213,6 +330,26 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 )
                 _patch_remote_code_compat()
                 model = super().from_pretrained(*args, **kwargs)
+            else:
+                raise
+        except ValueError as e:
+            # Some trust-remote-code model cards ship config.json with only
+            # auto_map["AutoModel"] and omit the AutoModelForCausalLM (etc.)
+            # entry, which makes HF's resolution fail. If the model is
+            # otherwise a causal LM, alias the existing AutoModel mapping to
+            # the requested target key and retry.
+            target_key = cls.__name__
+            if "Unrecognized configuration class" in str(e) and target_key in str(e):
+                patched = _alias_remote_auto_map_for_target(args, kwargs, target_key)
+                if patched is not None:
+                    logger.warning(
+                        "Model config.json missing auto_map[%s]; aliasing from auto_map[AutoModel] and retrying.",
+                        target_key,
+                    )
+                    kwargs = dict(kwargs, config=patched)
+                    model = super().from_pretrained(*args, **kwargs)
+                else:
+                    raise
             else:
                 raise
         except OSError:
@@ -322,6 +459,14 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             logger.info("attn_implementation='te' requested: using 'sdpa' for model init and will inject TE post-init.")
             attn_implementation = "sdpa"
 
+        # FFPA backend setup (validate + register) lives in ffpa_attention; run it
+        # before _apply_preload_overrides, which would otherwise rewrite ffpa → sdpa/
+        # flash_attention_2 for HF models.
+        if attn_implementation == "ffpa":
+            from nemo_automodel.components.attention.ffpa_attention import setup_ffpa_backend
+
+            setup_ffpa_backend(mesh.cp_size, has_packed_sequence)
+
         if is_hf_model:
             attn_implementation, use_liger_kernel = _apply_preload_overrides(
                 mesh.tp_size,
@@ -377,6 +522,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
 
         model = None  # Ensure 'model' is always bound for the except handler
         is_custom_model = None
+        process_group = getattr(mesh, "process_group", None)
         try:
             with init_ctx:
                 is_custom_model, model = _init_model(
@@ -387,6 +533,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     quantization_config,
                     force_hf,
                     *model_args,
+                    _process_group=process_group,
                     **kwargs,
                 )
         except (NotImplementedError, RuntimeError) as e:
@@ -416,6 +563,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                         quantization_config,
                         force_hf,
                         *model_args,
+                        _process_group=process_group,
                         **kwargs,
                     )
             else:
@@ -441,7 +589,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             return _retry(use_liger_kernel=False)
 
         try:
-            if use_sdpa_patching and not is_custom_model:
+            if use_sdpa_patching and (not is_custom_model or sdpa_method is not None):
                 model = _patch_attention(model, sdpa_method)  # noqa: F821
         except Exception:
             logger.warning("Retrying without SDPA patching.")
@@ -455,7 +603,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             else getattr(pretrained_model_name_or_path_or_config, "name_or_path", "")
         )
 
-        if is_hf_model:
+        if is_hf_model and attn_implementation != "magi":
             _verify_sdpa_support(model, mesh.cp_size)
 
         # HF from_pretrained on a real device loads (and potentially quantizes) weights
@@ -503,14 +651,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
+        distributed_setup: Optional[DistributedSetup] = None,
         device_mesh: Optional["DeviceMesh"] = None,
-        moe_mesh: Optional["DeviceMesh"] = None,
-        tp_plan: Optional[dict] = None,
-        distributed_config: Optional[DistributedConfig] = None,
-        pipeline_config: Optional[PipelineConfig] = None,
         qat_config: Optional[QATConfig] = None,
-        moe_config: Optional[MoEParallelizerConfig] = None,
-        activation_checkpointing: bool = False,
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
@@ -552,23 +695,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 will be applied to the model.
             force_hf (bool, default=False): If `True`, force the use of HF model implementation.
                 If `False`, the model will be loaded using the custom model implementation if available.
-            device_mesh (DeviceMesh | None, optional): Pre-created device mesh for
-                distributed training. Parallelism sizes (tp, pp, cp, ep) are inferred
-                from this. Default: None.
-            moe_mesh (DeviceMesh | None, optional): FSDP2-only. Device mesh for expert
-                parallelism. ep_size is inferred from this. Default: None.
-            tp_plan (dict | None, optional): Custom tensor parallel plan. If provided,
-                overrides the tp_plan on distributed_config. Default: None.
-            distributed_config (FSDP2Config | MegatronFSDPConfig | DDPConfig | None, optional):
-                Strategy-specific distributed training configuration. Default: None.
-            pipeline_config (PipelineConfig | None, optional): Pipeline parallelism
-                configuration including loss_fn. Default: None.
+            distributed_setup (DistributedSetup | None, optional): Resolved distributed
+                topology and policy object. Default: None.
+            device_mesh (DeviceMesh | None, optional): Pre-created Hugging Face-style
+                device mesh. NeMo wraps it in a topology-only ``DistributedSetup``
+                internally. Use ``distributed_setup`` when passing NeMo-specific
+                policies such as strategy, pipeline, MoE, or activation checkpointing.
+                Default: None.
             qat_config (QATConfig | None, optional): Quantization-Aware Training
                 configuration. Default: None.
-            moe_config (MoEParallelizerConfig | None, optional): MoE parallelizer
-                configuration. Default: None.
-            activation_checkpointing (bool, default=False): Enable activation checkpointing
-                for transformer blocks to reduce memory usage. Default: False.
             peft_config (dict | None, optional): PEFT/LoRA configuration dictionary.
                 If provided, LoRA adapters will be applied to the model. Default: None.
             fp8_config (FP8Config | None, optional): FP8 quantization configuration.
@@ -583,16 +718,22 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             transformers.PreTrainedModel: The loaded (and possibly patched)
             model instance with all infrastructure applied.
         """
-        if tp_plan is not None and distributed_config is not None:
-            distributed_config.tp_plan = tp_plan
-
-        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+        _reject_separate_distributed_kwargs(kwargs)
+        setup = _resolve_distributed_setup(
+            distributed_setup=distributed_setup,
+            device_mesh=device_mesh,
+        )
+        mesh = setup.mesh_context
+        distributed_config = setup.strategy_config
+        pipeline_config = setup.pipeline_config
+        moe_parallel_config = setup.moe_parallel_config
+        activation_checkpointing = setup.activation_checkpointing
 
         model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
             distributed_config=distributed_config,
             pipeline_config=pipeline_config,
             qat_config=qat_config,
-            moe_config=moe_config,
+            moe_parallel_config=moe_parallel_config,
             activation_checkpointing=activation_checkpointing,
             device=torch.device("cuda", torch.cuda.current_device()),
             mesh=mesh,
@@ -610,7 +751,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 raise
         is_hf_model = get_is_hf_model(hf_config, force_hf)
 
-        sdpa_method = resolve_sdpa_method(sdpa_method, device_mesh, activation_checkpointing)
+        # Layer 2: reject loading a checkpoint with tie_word_embeddings flipped from the
+        # value it was saved with (the class-level TieSupport policy cannot catch this).
+        _maybe_reject_tie_word_embeddings_flip(pretrained_model_name_or_path, hf_config, kwargs)
+
+        sdpa_method = resolve_sdpa_method(sdpa_method, mesh.device_mesh, activation_checkpointing)
 
         return cls._build_model(
             pretrained_model_name_or_path,
@@ -648,14 +793,9 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION,
         quantization_config=None,
         force_hf: bool = False,
+        distributed_setup: Optional[DistributedSetup] = None,
         device_mesh: Optional["DeviceMesh"] = None,
-        moe_mesh: Optional["DeviceMesh"] = None,
-        tp_plan: Optional[dict] = None,
-        distributed_config: Optional[DistributedConfig] = None,
-        pipeline_config: Optional[PipelineConfig] = None,
         qat_config: Optional[QATConfig] = None,
-        moe_config: Optional[MoEParallelizerConfig] = None,
-        activation_checkpointing: bool = False,
         peft_config: Optional[dict] = None,
         fp8_config: Optional["FP8Config"] = None,
         compile_config: Optional["CompileConfig"] = None,
@@ -675,10 +815,16 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
             torch_dtype (str | torch.dtype, default="auto"):
                 Data type for model parameters. If "auto", defaults to ``torch.bfloat16``.
         """
-        if tp_plan is not None and distributed_config is not None:
-            distributed_config.tp_plan = tp_plan
-
-        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+        _reject_separate_distributed_kwargs(kwargs)
+        setup = _resolve_distributed_setup(
+            distributed_setup=distributed_setup,
+            device_mesh=device_mesh,
+        )
+        mesh = setup.mesh_context
+        distributed_config = setup.strategy_config
+        pipeline_config = setup.pipeline_config
+        moe_parallel_config = setup.moe_parallel_config
+        activation_checkpointing = setup.activation_checkpointing
 
         # Only instantiate infrastructure when distributed_config is provided
         model_wrapper = autopipeline = parallelize_fn = qat_quantizer = None
@@ -688,7 +834,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 distributed_config=distributed_config,
                 pipeline_config=pipeline_config,
                 qat_config=qat_config,
-                moe_config=moe_config,
+                moe_parallel_config=moe_parallel_config,
                 activation_checkpointing=activation_checkpointing,
                 device=torch.device("cuda", torch.cuda.current_device()),
                 mesh=mesh,
@@ -714,7 +860,7 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
         _consume_config_overrides(config, kwargs)
         is_hf_model = get_is_hf_model(config, force_hf)
 
-        sdpa_method = resolve_sdpa_method(sdpa_method, device_mesh, activation_checkpointing)
+        sdpa_method = resolve_sdpa_method(sdpa_method, mesh.device_mesh, activation_checkpointing)
 
         return cls._build_model(
             config,
@@ -754,8 +900,6 @@ class NeMoAutoModelForCausalLM(_BaseNeMoAutoModelClass, AutoModelForCausalLM):
     functional model.
 
 
-    TODO(@akoumpa): extend this beyond liger_kernel.
-
     Notes:
     -----
     - No changes are made to the model's public API; forward signatures,
@@ -783,8 +927,6 @@ class NeMoAutoModelForImageTextToText(_BaseNeMoAutoModelClass, AutoModelForImage
     retried once with ``use_liger_kernel=False`` so that users still obtain a
     functional model.
 
-
-    @akoumpa: currently only supporting liger_kernel for demonstration purposes.
 
     Notes:
     -----
@@ -839,6 +981,33 @@ class NeMoAutoModelForSequenceClassification(_BaseNeMoAutoModelClass, AutoModelF
     pass
 
 
+class NeMoAutoModelForTokenClassification(_BaseNeMoAutoModelClass, AutoModelForTokenClassification):
+    """Drop-in replacement for ``transformers.AutoModelForTokenClassification`` with custom-kernels.
+
+    The class only overrides ``from_pretrained`` and ``from_config`` to add the
+    optional ``use_liger_kernel`` flag.  If the flag is ``True`` (default) and
+    the Liger kernel is available, the model's attention layers are
+    monkey-patched in place.  If patching fails for any reason, the call is
+    retried once with ``use_liger_kernel=False`` so that users still obtain a
+    functional model.
+
+    Notes:
+    -----
+    - No changes are made to the model's public API; forward signatures,
+      generation utilities, and weight shapes remain identical.
+    - Only decoder-style (causal) architectures are currently supported by the
+      Liger patch.  Unsupported models will silently fall back.
+
+    Examples:
+    --------
+    >>> model = NeMoAutoModelForTokenClassification.from_pretrained("dbmdz/bert-large-cased-finetuned-conll03-english") # try Liger
+    >>> model = NeMoAutoModelForTokenClassification.from_pretrained(
+    ...     "dbmdz/bert-large-cased-finetuned-conll03-english", use_liger_kernel=False)   # skip Liger
+    """
+
+    pass
+
+
 class NeMoAutoModelForTextToWaveform(_BaseNeMoAutoModelClass, AutoModelForTextToWaveform):
     """Drop-in replacement for ``transformers.AutoModelForTextToWaveform`` with custom-kernels.
 
@@ -887,11 +1056,8 @@ class _NeMoAutoModelForRetrievalBase:
         use_sdpa_patching: bool = True,
         sdpa_method: Optional[List[SDPBackend]] = None,
         torch_dtype="auto",
+        distributed_setup: Optional[DistributedSetup] = None,
         device_mesh: Optional["DeviceMesh"] = None,
-        moe_mesh: Optional["DeviceMesh"] = None,
-        tp_plan: Optional[dict] = None,
-        distributed_config: Optional[DistributedConfig] = None,
-        moe_config: Optional[MoEParallelizerConfig] = None,
         compile_config: Optional["CompileConfig"] = None,
         peft_config: Optional[dict] = None,
         **kwargs,
@@ -912,11 +1078,9 @@ class _NeMoAutoModelForRetrievalBase:
             use_sdpa_patching: Whether to apply SDPA patching.
             sdpa_method: SDPA backend methods to use.
             torch_dtype: Data type passed to the underlying model initialization.
-            device_mesh: Pre-created device mesh for distributed training.
-            moe_mesh: Device mesh for expert parallelism (FSDP2 only).
-            tp_plan: Custom tensor parallel plan; overrides distributed_config.tp_plan.
-            distributed_config: Strategy-specific distributed training configuration.
-            moe_config: MoE parallelizer configuration.
+            distributed_setup: Resolved distributed topology and policy object.
+            device_mesh: Pre-created Hugging Face-style device mesh. NeMo wraps it
+                in a topology-only ``DistributedSetup`` internally.
             compile_config: Configuration for torch.compile.
             peft_config: PEFT/LoRA configuration dictionary.
             **kwargs: Additional arguments passed to the encoder's ``build()`` method.
@@ -927,9 +1091,15 @@ class _NeMoAutoModelForRetrievalBase:
         Notes:
             If kernel patching fails, the method retries with adjusted parameters.
         """
+        _reject_separate_distributed_kwargs(kwargs)
         from nemo_automodel._transformers import retrieval as _enc_mod
 
         encoder_cls = getattr(_enc_mod, cls._ENCODER_CLS_NAME)
+
+        if attn_implementation == "ffpa":
+            from nemo_automodel.components.attention.ffpa_attention import register_ffpa_attention
+
+            register_ffpa_attention()
 
         logger.info(f"Loading {cls.__name__} from {pretrained_model_name_or_path}")
 
@@ -941,11 +1111,8 @@ class _NeMoAutoModelForRetrievalBase:
                 use_sdpa_patching=override.get("use_sdpa_patching", use_sdpa_patching),
                 sdpa_method=sdpa_method,
                 torch_dtype=torch_dtype,
+                distributed_setup=distributed_setup,
                 device_mesh=device_mesh,
-                moe_mesh=moe_mesh,
-                tp_plan=tp_plan,
-                distributed_config=distributed_config,
-                moe_config=moe_config,
                 compile_config=compile_config,
                 peft_config=peft_config,
                 **kwargs,
@@ -956,16 +1123,21 @@ class _NeMoAutoModelForRetrievalBase:
         build_kwargs.pop("cp_size", None)
         build_kwargs.pop("has_packed_sequence", None)
 
-        if tp_plan is not None and distributed_config is not None:
-            distributed_config.tp_plan = tp_plan
-
-        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+        setup = _resolve_distributed_setup(
+            distributed_setup=distributed_setup,
+            device_mesh=device_mesh,
+        )
+        mesh = setup.mesh_context
+        distributed_config = setup.strategy_config
+        moe_parallel_config = setup.moe_parallel_config
+        activation_checkpointing = setup.activation_checkpointing
 
         model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
             distributed_config=distributed_config,
             pipeline_config=None,
             qat_config=None,
-            moe_config=moe_config,
+            moe_parallel_config=moe_parallel_config,
+            activation_checkpointing=activation_checkpointing,
             device=torch.device("cuda", torch.cuda.current_device()),
             mesh=mesh,
         )
@@ -1034,7 +1206,7 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
     ...     "meta-llama/Llama-3.2-1B",
     ...     pooling="cls",
     ...     l2_normalize=False,
-    ...     distributed_config=FSDP2Config(),
+    ...     distributed_setup=distributed_setup,
     ... )
     """
 
@@ -1046,6 +1218,9 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         pretrained_model_name_or_path: str,
         pooling: str = "avg",
         l2_normalize: bool = True,
+        do_distributed_inbatch_negative: bool = False,
+        detach_distributed_inbatch_negatives: bool = True,
+        output_embedding_quantization: Optional[str] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Load a bi-encoder model with infrastructure.
@@ -1057,6 +1232,12 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             pretrained_model_name_or_path: Path to pretrained model or model identifier.
             pooling: Pooling strategy (``'avg'``, ``'cls'``, ``'last'``, etc.).
             l2_normalize: Whether to L2-normalize embeddings.
+            do_distributed_inbatch_negative: Whether to gather passages across ranks for distributed in-batch
+                negatives during training.
+            detach_distributed_inbatch_negatives: Whether to detach remote passage embeddings in distributed
+                in-batch-negative losses. Set to false for full cross-rank gradient flow.
+            output_embedding_quantization: Optional quantization-aware training mode applied to emitted embeddings
+                after pooling and before L2 normalization. Currently supports ``None`` or ``"int8"``.
             **kwargs: Forwarded to ``_NeMoAutoModelForRetrievalBase.from_pretrained``.
 
         Returns:
@@ -1066,6 +1247,9 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             pretrained_model_name_or_path,
             pooling=pooling,
             l2_normalize=l2_normalize,
+            do_distributed_inbatch_negative=do_distributed_inbatch_negative,
+            detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
+            output_embedding_quantization=output_embedding_quantization,
             **kwargs,
         )
 
@@ -1081,7 +1265,7 @@ class NeMoAutoModelCrossEncoder(_NeMoAutoModelForRetrievalBase):
     >>> model = NeMoAutoModelCrossEncoder.from_pretrained("meta-llama/Llama-3.2-1B")
     >>> model = NeMoAutoModelCrossEncoder.from_pretrained(
     ...     "meta-llama/Llama-3.2-1B",
-    ...     distributed_config=FSDP2Config(),
+    ...     distributed_setup=distributed_setup,
     ... )
     """
 

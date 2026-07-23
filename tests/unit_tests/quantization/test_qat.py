@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import sys
+import types
 
 import pytest
 import torch
 import torch.nn as nn
-import types
-import importlib
-import sys
 
 import nemo_automodel.components.quantization.qat as qat
 

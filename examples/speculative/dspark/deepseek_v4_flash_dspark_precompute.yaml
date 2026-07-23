@@ -1,0 +1,81 @@
+# Distributed DSpark offline precompute for a DeepSeek-V4-Flash target.
+#
+# This is PHASE 1 of the two-phase offline flow for a target too large to fit on a
+# single node. It loads the full DeepSeek-V4-Flash target frozen through the SAME
+# expert-parallel + FSDP2 distributed path as online training (the 256 routed experts
+# shard across ranks, FP8/FP4 base weights dequantize on load), runs it once over the
+# dataset, and writes the DSpark cache (per-layer + final target hidden states, plus
+# the target embed_tokens / lm_head) to `recipe_args.cache_output_dir`.
+#
+# PHASE 2 is normal DSpark draft training that streams this cache with NO live target:
+# point `deepseek_v4_flash_dspark.yaml`'s `recipe_args.cached_target_path` at the same
+# directory (and drop its `distributed.ep_size` back to a single-node mesh, since the
+# heavy target is no longer loaded during training).
+#
+# ---------------------------------------------------------------------------
+# HARDWARE: same as online V4 training -- AT LEAST 2 nodes (16 x 80GB), because the
+# target itself must fit. ep_size MUST divide n_routed_experts (256) and equal
+# world_size (nnodes * 8): ep_size=16 -> ~32 GiB/rank experts (2 nodes); ep_size=32
+# -> ~16 GiB/rank (4 nodes). Expert parallelism is data-parallel-compatible, so each
+# rank forwards its OWN contiguous slice of the dataset and writes its own global
+# shards straight into the shared cache_output_dir (no post-hoc merge).
+# ---------------------------------------------------------------------------
+#
+# LAUNCH (4 nodes, ep_size=32). Run the SAME command on every node, varying only
+# --node-rank; node 0 is the rendezvous master:
+#   torchrun --nnodes=4 --node-rank=0 --nproc_per_node=8 \
+#     --master-addr=<NODE0_IP> --master-port=29500 \
+#     -m nemo_automodel.recipes.llm.precompute_dspark_dist \
+#     -c examples/speculative/dspark/deepseek_v4_flash_dspark_precompute.yaml
+#
+# To sanity-check the whole path on ONE node in minutes, set
+# recipe_args.target_num_hidden_layers to a small value (e.g. 4) so the target fits,
+# and target_layer_ids to layers that exist in the reduced stack (e.g. [1, 2, 3]).
+# A cache produced against a reduced target is a validation aid only, not usable.
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1                 # keep PP off: the target wrapper hooks a single (non-pipelined) model
+  ep_size: 32                # = world_size (4 nodes x 8). Must divide n_routed_experts (256)
+  activation_checkpointing: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+recipe_args:
+  target_model_name_or_path: deepseek-ai/DeepSeek-V4-Flash
+  train_data_path: /path/to/open-perfectblend-direct-clean
+  train_split: "train[4096:]"
+  seq_length: 4096
+  micro_batch_size: 1
+  num_workers: 2
+  shuffle_seed: 42
+  trust_remote_code: false
+
+  # --- offline cache output (PHASE 2 reads this as cached_target_path) ---
+  cache_output_dir: ./outputs/dspark_v4_flash_cache
+  cache_dtype: bf16          # bf16 | fp16 | fp32 (cache float precision for the hidden states)
+  cache_shard_size: 256      # samples per shard; must be a multiple of micro_batch_size
+
+  # --- captured target features (must match PHASE-2 training) ---
+  target_layer_ids: [40, 41, 42]   # 3 late feature layers of the full 43-layer V4 target
+  draft_num_hidden_layers: 2       # only used to derive default target_layer_ids when unset
+
+  # --- REQUIRED chat template (V4-Flash tokenizer ships none) ---
+  chat_template: |-
+    {{ bos_token }}{% for message in messages %}{% if message['role'] == 'system' %}{{ message['content'] }}{% elif message['role'] == 'user' %}{{ '<｜User｜>' + message['content'] }}{% elif message['role'] == 'assistant' %}{{ '<｜Assistant｜></think>' }}{% generation %}{{ message['content'] }}{{ eos_token }}{% endgeneration %}{% else %}{{ raise_exception('Unsupported role: ' + message['role']) }}{% endif %}{% endfor %}{% if add_generation_prompt is defined and add_generation_prompt and (messages|length == 0 or messages[-1]['role'] != 'assistant') %}{{ '<｜Assistant｜></think>' }}{% endif %}
+
+  # --- frozen DeepSeek V4 target backend (mirrors the online V4 DSpark backend) ---
+  target_attn_backend: eager       # reliable everywhere; switch to `tilelang` for speed if your build supports it
+  target_dispatcher: hybridep      # MoE token dispatcher for the sharded experts (needs DeepEP)
+  target_experts: torch_mm         # grouped-expert GEMM backend
+  target_enable_fsdp_optimizations: true
+
+  # mask_reasoning_content: true   # exclude <think>...</think> traces from loss (non-thinking data)
+  # target_num_hidden_layers: 4    # single-node validation only (see header); set target_layer_ids to match

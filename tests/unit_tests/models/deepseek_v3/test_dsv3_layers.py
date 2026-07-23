@@ -12,17 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, patch
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from nemo_automodel.components.models.deepseek_v3.layers import (
-    preprocess_args_and_kwargs_for_attn,
-    postprocess_output_for_attn,
-    MLA,
-)
 from nemo_automodel.components.models.common import BackendConfig
+from nemo_automodel.components.models.deepseek_v3.layers import (
+    MLA,
+    postprocess_output_for_attn,
+    preprocess_args_and_kwargs_for_attn,
+)
 
 # Skip Transformer Engine tests by default unless explicitly enabled
 TE_AVAILABLE = False

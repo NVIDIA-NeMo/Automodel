@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import types
-
 from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn as nn
@@ -76,6 +75,7 @@ class FakePPMesh:
 
 class FakeDeviceMesh:
     """Mock DeviceMesh that behaves like the real DeviceMesh but without distributed setup."""
+
     def __init__(self, device_type="cpu", mesh=None, mesh_dim_names=None, pp_size=2, local_rank=0):
         self.device_type = device_type
         self.mesh = mesh or [[0, 1]]
@@ -98,6 +98,7 @@ class FakeDeviceMesh:
 
 class FakeWorldMesh(dict):
     """Mock for DeviceMesh that behaves like a dict."""
+
     pass
 
 
@@ -179,7 +180,9 @@ class TestAutoPipelineValidation:
         world_mesh = FakeDeviceMesh()
 
         # Test missing schedule validation
-        with pytest.raises(ValueError, match="Either pipeline_parallel_schedule or pipeline_parallel_schedule_csv must be provided"):
+        with pytest.raises(
+            ValueError, match="Either pipeline_parallel_schedule or pipeline_parallel_schedule_csv must be provided"
+        ):
             AutoPipeline(
                 world_mesh=world_mesh,
                 pp_axis_name="pp",
@@ -221,6 +224,7 @@ class TestAutoPipelineValidation:
 # -----------------------------
 # Core build/materialize/step tests
 # -----------------------------
+
 
 class TestAutoPipelineBuildAndStep:
     """Test AutoPipeline build, materialize, and step functionality."""
@@ -408,6 +412,7 @@ class TestAutoPipelineErrorHandling:
         with pytest.raises(RuntimeError, match="Autopipeline not built"):
             _ = ap.parts
 
+
 class TestAutoPipelineProperties:
     """Test AutoPipeline properties and state management."""
 
@@ -580,6 +585,7 @@ class TestAutoPipelineDebugUtilities:
 
         # Test log_debug_summary
         import logging
+
         with caplog.at_level(logging.INFO):
             ap.log_debug_summary()
 
@@ -591,7 +597,7 @@ class TestAutoPipelineDebugUtilities:
         # Create a simple module with known parameter count
         module = nn.Sequential(
             nn.Linear(10, 5, bias=True),  # 10*5 + 5 = 55 params
-            nn.Linear(5, 1, bias=False)   # 5*1 = 5 params
+            nn.Linear(5, 1, bias=False),  # 5*1 = 5 params
         )
 
         # Total params: 60
@@ -699,8 +705,8 @@ class TestAutoPipelineDebugUtilities:
 
         # Create stages with is_first and is_last attributes to trigger line 268 coverage
         for i, stage in enumerate(ap._info.stages):
-            stage.is_first = (i == 0)
-            stage.is_last = (i == len(ap._info.stages) - 1)
+            stage.is_first = i == 0
+            stage.is_last = i == len(ap._info.stages) - 1
 
         # Test pretty_print_stages with module limit to trigger line 275-276
         pretty_print = ap.pretty_print_stages(max_modules_per_stage=1)
@@ -807,24 +813,34 @@ class TestAutoPipelineUpdateSeqLen:
 
         model = DummyQwenForCausalLM(num_layers=4)
         module_fqns = generate_hf_model_fqn_per_model_part(
-            num_stages=2, num_layers=4, include_embeddings=True,
-            include_lm_head=True, include_rotary_emb=True, fqn_prefix="model.",
+            num_stages=2,
+            num_layers=4,
+            include_embeddings=True,
+            include_lm_head=True,
+            include_rotary_emb=True,
+            fqn_prefix="model.",
         )
         world_mesh = FakeWorldMesh()
         world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
 
         ap = AutoPipeline(
-            world_mesh=world_mesh, pp_axis_name="pp", pp_schedule="1f1b",
-            pp_microbatch_size=1, pp_batch_size=2,
-            module_fqns_per_model_part=module_fqns, device=torch.device("cpu"),
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            module_fqns_per_model_part=module_fqns,
+            device=torch.device("cpu"),
         )
         ap.build(model, loss_fn=lambda x, y: torch.tensor(0.0))
 
         # Patch reset_pp_stage_shapes to track calls (mock to avoid needing real config)
         call_count = [0]
         import nemo_automodel.components.distributed.pipelining.autopipeline as ap_mod
+
         def counting_reset(*args, **kwargs):
             call_count[0] += 1
+
         monkeypatch.setattr(ap_mod, "reset_pp_stage_shapes", counting_reset)
 
         # First call should trigger reset
@@ -842,32 +858,44 @@ class TestAutoPipelineUpdateSeqLen:
 
         model = DummyQwenForCausalLM(num_layers=4)
         module_fqns = generate_hf_model_fqn_per_model_part(
-            num_stages=2, num_layers=4, include_embeddings=True,
-            include_lm_head=True, include_rotary_emb=True, fqn_prefix="model.",
+            num_stages=2,
+            num_layers=4,
+            include_embeddings=True,
+            include_lm_head=True,
+            include_rotary_emb=True,
+            fqn_prefix="model.",
         )
         world_mesh = FakeWorldMesh()
         world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
 
         ap = AutoPipeline(
-            world_mesh=world_mesh, pp_axis_name="pp", pp_schedule="1f1b",
-            pp_microbatch_size=2, pp_batch_size=4,
-            module_fqns_per_model_part=module_fqns, device=torch.device("cpu"),
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=2,
+            pp_batch_size=4,
+            module_fqns_per_model_part=module_fqns,
+            device=torch.device("cpu"),
         )
         ap.build(model, loss_fn=lambda x, y: torch.tensor(0.0))
 
         # Track the call args
         import nemo_automodel.components.distributed.pipelining.autopipeline as ap_mod
+
         captured_args = []
-        def mock_reset(schedule, stages, model_config, microbatch_size, seq_len):
-            captured_args.append((schedule, stages, model_config, microbatch_size, seq_len))
+
+        def mock_reset(schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype=None):
+            captured_args.append((schedule, stages, model_config, microbatch_size, seq_len, tensor_dtype))
+
         monkeypatch.setattr(ap_mod, "reset_pp_stage_shapes", mock_reset)
 
         ap.update_seq_len(256)
 
         assert len(captured_args) == 1
-        _, _, _, mb_size, sl = captured_args[0]
+        _, _, _, mb_size, sl, tensor_dtype = captured_args[0]
         assert mb_size == 2  # pp_microbatch_size
         assert sl == 256
+        assert tensor_dtype is ap.dtype
 
     def test_update_seq_len_tracks_current(self, monkeypatch):
         """update_seq_len should track current seq_len and reset on change."""
@@ -875,23 +903,34 @@ class TestAutoPipelineUpdateSeqLen:
 
         model = DummyQwenForCausalLM(num_layers=4)
         module_fqns = generate_hf_model_fqn_per_model_part(
-            num_stages=2, num_layers=4, include_embeddings=True,
-            include_lm_head=True, include_rotary_emb=True, fqn_prefix="model.",
+            num_stages=2,
+            num_layers=4,
+            include_embeddings=True,
+            include_lm_head=True,
+            include_rotary_emb=True,
+            fqn_prefix="model.",
         )
         world_mesh = FakeWorldMesh()
         world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
 
         ap = AutoPipeline(
-            world_mesh=world_mesh, pp_axis_name="pp", pp_schedule="1f1b",
-            pp_microbatch_size=1, pp_batch_size=2,
-            module_fqns_per_model_part=module_fqns, device=torch.device("cpu"),
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            module_fqns_per_model_part=module_fqns,
+            device=torch.device("cpu"),
         )
         ap.build(model, loss_fn=lambda x, y: torch.tensor(0.0))
 
         import nemo_automodel.components.distributed.pipelining.autopipeline as ap_mod
+
         call_count = [0]
+
         def mock_reset(*a, **kw):
             call_count[0] += 1
+
         monkeypatch.setattr(ap_mod, "reset_pp_stage_shapes", mock_reset)
 
         ap.update_seq_len(100)
@@ -913,16 +952,24 @@ class TestAutoPipelineUpdateSeqLen:
 
         model = DummyQwenForCausalLM(num_layers=4)
         module_fqns = generate_hf_model_fqn_per_model_part(
-            num_stages=2, num_layers=4, include_embeddings=True,
-            include_lm_head=True, include_rotary_emb=True, fqn_prefix="model.",
+            num_stages=2,
+            num_layers=4,
+            include_embeddings=True,
+            include_lm_head=True,
+            include_rotary_emb=True,
+            fqn_prefix="model.",
         )
         world_mesh = FakeWorldMesh()
         world_mesh["pp"] = FakePPMesh(size=2, local_rank=0)
 
         ap = AutoPipeline(
-            world_mesh=world_mesh, pp_axis_name="pp", pp_schedule="1f1b",
-            pp_microbatch_size=1, pp_batch_size=2,
-            module_fqns_per_model_part=module_fqns, device=torch.device("cpu"),
+            world_mesh=world_mesh,
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            module_fqns_per_model_part=module_fqns,
+            device=torch.device("cpu"),
         )
 
         assert ap._model_config is None

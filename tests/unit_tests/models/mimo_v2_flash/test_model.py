@@ -299,6 +299,18 @@ class TestMiMoV2FlashForCausalLM:
         # gate weight is no longer kept in fp32 (Pattern A uses gate_precision instead).
         assert "mlp.gate.weight" not in MiMoV2FlashForCausalLM._keep_in_fp32_modules_strict
 
+    def test_customize_pipeline_stage_modules_keeps_swa_rotary(self, tiny_config, backend_config):
+        model = MiMoV2FlashForCausalLM(tiny_config, backend=backend_config)
+        stages = [
+            ["model.embed_tokens", "model.layers.0", "model.rotary_emb"],
+            ["model.layers.1", "model.norm", "lm_head", "model.rotary_emb"],
+        ]
+
+        out = model.customize_pipeline_stage_modules(stages, layers_prefix="model.", text_model=model.model)
+
+        for stage_modules in out:
+            assert "model.swa_rotary_emb" in stage_modules
+
 
 # ---------------------------------------------------------------------------
 # Forward-pass smoke tests (CPU)
@@ -317,7 +329,7 @@ class TestForwardShapes:
         batch, seq = 1, 4
         input_ids = torch.randint(0, tiny_config.vocab_size, (batch, seq))
         with torch.no_grad():
-            logits = model(input_ids)
+            logits = model(input_ids).logits
         assert logits.shape == (batch, seq, tiny_config.vocab_size)
 
     def test_forward_with_explicit_position_ids(self, tiny_config, backend_config):
@@ -326,7 +338,7 @@ class TestForwardShapes:
         input_ids = torch.randint(0, tiny_config.vocab_size, (batch, seq))
         position_ids = torch.arange(seq).unsqueeze(0)
         with torch.no_grad():
-            logits = model(input_ids, position_ids=position_ids)
+            logits = model(input_ids, position_ids=position_ids).logits
         assert logits.shape == (batch, seq, tiny_config.vocab_size)
 
     def test_forward_logits_to_keep_int(self, tiny_config, backend_config):
@@ -334,7 +346,7 @@ class TestForwardShapes:
         batch, seq = 1, 6
         input_ids = torch.randint(0, tiny_config.vocab_size, (batch, seq))
         with torch.no_grad():
-            logits = model(input_ids, logits_to_keep=2)
+            logits = model(input_ids, logits_to_keep=2).logits
         assert logits.shape == (batch, 2, tiny_config.vocab_size)
 
 

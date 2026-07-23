@@ -25,10 +25,8 @@ Usage:
 
 import argparse
 import json
-import math
 import os
 import sys
-import traceback
 
 # Make sure the project root is on sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -37,7 +35,6 @@ from nemo_automodel.components.datasets.vlm.datasets import (
     _convert_sharegpt_to_conversation,
     _load_json_or_jsonl,
 )
-from nemo_automodel.components.datasets.vlm.utils import _resolve_lmdb_image
 
 
 def load_first_n_lines(file_path, n):
@@ -201,7 +198,7 @@ def main():
     print("-" * 80)
     print(f"\nTotal: {total}  Passed: {passed}  Failed: {failed}")
     if failed_names:
-        print(f"\nFailed datasets:")
+        print("\nFailed datasets:")
         for name in failed_names:
             print(f"  - {name}")
         sys.exit(1)

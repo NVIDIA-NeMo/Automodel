@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import importlib.util
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -1328,6 +1328,22 @@ class TestMoE:
         assert moe.experts.dispatcher_backend == "hybridep"
         assert moe.experts.dispatcher_num_sms == backend_config.dispatcher_num_sms
 
+    def test_moe_forwards_dispatcher_config_to_experts(self, moe_config, backend_config):
+        """MoE should pass BackendConfig dispatcher knobs to flex dispatcher experts."""
+        backend_config.experts = "torch_mm"
+        backend_config.dispatcher = "deepep"
+        backend_config.dispatcher_num_sms = 12
+        backend_config.dispatcher_share_token_dispatcher = False
+        backend_config.dispatcher_async_dispatch = True
+        with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
+            moe = MoE(moe_config, backend_config)
+
+        assert isinstance(moe.experts, GroupedExpertsDeepEP)
+        assert moe.experts.dispatcher_backend == "deepep"
+        assert moe.experts.dispatcher_num_sms == 12
+        assert moe.experts.dispatcher_share_token_dispatcher is False
+        assert moe.experts.dispatcher_async_dispatch is True
+
     def test_moe_init_with_shared_experts(self, moe_config, backend_config):
         """Test MoE initialization with shared experts."""
         moe_config.n_shared_experts = 2
@@ -1401,27 +1417,11 @@ class TestMoE:
             mock_experts.return_value = torch.randn(batch_size * seq_len, moe_config.dim, device=device)
             mock_shared.return_value = torch.randn(batch_size * seq_len, moe_config.dim, device=device)
 
-            # Patch at the module level to avoid CUDA stream issues on CPU
-            with (
-                patch("torch.cuda.Stream") as mock_stream_class,
-                patch("torch.cuda.current_stream") as mock_current_stream,
-                patch("torch.cuda.stream") as mock_stream_context,
-            ):
-                mock_stream = Mock()
-                mock_stream.wait_stream = Mock()
-                mock_stream_class.return_value = mock_stream
-                mock_current_stream.return_value = Mock()
+            # Shared experts run inline on the main stream (no side-stream overlap).
+            output = moe(x)
 
-                # Create a context manager that just yields
-                mock_context = Mock()
-                mock_context.__enter__ = Mock(return_value=None)
-                mock_context.__exit__ = Mock(return_value=None)
-                mock_stream_context.return_value = mock_context
-
-                output = moe(x)
-
-                assert output.shape == x.shape
-                assert output.device == device
+            assert output.shape == x.shape
+            assert output.device == device
 
     def test_moe_forward_with_padding_mask(self, moe_config, backend_config, device):
         """Test MoE forward pass with padding mask."""
