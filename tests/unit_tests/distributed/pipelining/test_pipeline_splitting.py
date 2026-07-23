@@ -157,9 +157,7 @@ class TestModelSplittingBasics:
             # layers should be ModuleDict with only indices assigned to this global stage
             assert isinstance(part.model.layers, nn.ModuleDict)
             expected_layer_indices = sorted(
-                int(name.split(".")[-1])
-                for name in module_fqns[global_stage_idx]
-                if name.startswith("model.layers.")
+                int(name.split(".")[-1]) for name in module_fqns[global_stage_idx] if name.startswith("model.layers.")
             )
             assert sorted(map(int, part.model.layers.keys())) == expected_layer_indices
 
@@ -272,6 +270,7 @@ class TestModelSplittingBasics:
         # The layers should be a subset of total layers (since we're only looking at rank 0)
         assert total_layers_assigned <= num_layers
 
+
 class TestHFModelSplitting:
     """Test model splitting with HF models (end-to-end tests from original file)."""
 
@@ -341,9 +340,7 @@ class TestHFModelSplitting:
         for part, global_stage_idx in zip(model_parts, local_stage_indices):
             assert isinstance(part.model.layers, nn.ModuleDict)
             expected_layer_indices = sorted(
-                int(name.split(".")[-1])
-                for name in module_fqns[global_stage_idx]
-                if name.startswith("model.layers.")
+                int(name.split(".")[-1]) for name in module_fqns[global_stage_idx] if name.startswith("model.layers.")
             )
             assert sorted(map(int, part.model.layers.keys())) == expected_layer_indices
 

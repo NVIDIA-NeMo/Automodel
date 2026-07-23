@@ -19,6 +19,7 @@ import random
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
 
 from datasets import Dataset, concatenate_datasets, load_dataset
@@ -102,6 +103,7 @@ class WikiSSNQDataset(AbstractDataset):
     def get_document_by_id(self, id):
         example = deepcopy(EXAMPLE_TEMPLATE)
         doc = self.data[self.docid2idx[id]]
+        example["text"] = doc["text"]
         example["image"] = doc["image"]
         if "nr_ocr" in doc:
             example["nr_ocr"] = doc["nr_ocr"]
@@ -574,7 +576,14 @@ def _load_hf_sources(hf_entries: List[Tuple[Optional[int], str]], seed: int = 42
     return Dataset.from_list(hf_data), corpus_dict
 
 
-def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False, epoch: int = 0):
+def _transform_func(
+    examples,
+    num_neg_docs,
+    corpus_dict,
+    use_dataset_instruction: bool = False,
+    epoch: int = 0,
+    use_text_in_document: bool = False,
+):
     """
     Transform function to convert from raw format to training format.
 
@@ -584,6 +593,7 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         corpus_dict: Dictionary mapping corpus_id to corpus objects
         use_dataset_instruction: Whether to use instruction from dataset's metadata
         epoch: Current epoch for cycling through positive documents
+        use_text_in_document: Whether image documents should also include their text
     """
     # Handle both batched and single examples
     is_batched = isinstance(examples["question"], list)
@@ -631,7 +641,9 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
             cur_pos_neg_doc += [negatives[n_id] for n_id in cur_neg_ids]
 
         cur_pos_neg_doc_batch.append(cur_pos_neg_doc)
-        cur_pos_neg_doc_id_batch.append([d["id"] for d in cur_pos_neg_doc])
+        cur_pos_neg_doc_id_batch.append(
+            [d["id"] if isinstance(d, dict) and "id" in d else str(d) for d in cur_pos_neg_doc]
+        )
 
     # Extract text and images from corpus
     cur_pos_neg_text_batch = []
@@ -643,20 +655,28 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
         cur_pos_neg_text = []
         cur_pos_neg_image = []
         cur_corpus_id = corpus_ids[idx_doc]
-        if cur_corpus_id not in corpus_dict:
-            raise ValueError(
-                f"Unknown corpus_id '{cur_corpus_id}' in retrieval example. "
-                f"Available corpus ids: {sorted(corpus_dict.keys())}"
-            )
-
         for doc in docs:
-            cur_id = doc["id"]
-            cur_doc = corpus_dict[cur_corpus_id].get_document_by_id(cur_id)
+            if isinstance(doc, dict) and "text" in doc:
+                # Inline-text records (.jsonl/.tsv/.csv) keep document content
+                # directly in pos_doc / neg_doc.
+                cur_doc = {
+                    "text": "" if doc.get("text") is None else str(doc.get("text", "")),
+                    "image": doc.get("image", ""),
+                    "nr_ocr": "" if doc.get("nr_ocr") is None else str(doc.get("nr_ocr", "")),
+                }
+            else:
+                if cur_corpus_id not in corpus_dict:
+                    raise ValueError(
+                        f"Unknown corpus_id '{cur_corpus_id}' in retrieval example. "
+                        f"Available corpus ids: {sorted(corpus_dict.keys())}"
+                    )
+                cur_id = doc["id"] if isinstance(doc, dict) else str(doc)
+                cur_doc = corpus_dict[cur_corpus_id].get_document_by_id(cur_id)
 
             # Extract text
             if cur_doc["text"] != "" and not cur_doc["image"]:
                 text = cur_doc["text"]
-            elif cur_doc["image"]:
+            elif use_text_in_document and cur_doc["image"]:
                 text = " " + cur_doc["text"] if cur_doc["text"] else ""
                 text = text.strip()
             else:
@@ -696,14 +716,26 @@ def _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction
 
 
 def _cross_encoder_transform_func(
-    examples, num_neg_docs, corpus_dict, use_dataset_instruction: bool = False, epoch: int = 0
+    examples,
+    num_neg_docs,
+    corpus_dict,
+    use_dataset_instruction: bool = False,
+    epoch: int = 0,
+    use_text_in_document: bool = False,
 ):
     """
     Transform function to convert from raw format to cross-encoder training format.
     """
     from nemo_automodel.components.datasets.llm.retrieval_dataset_inline import flatten_bi_encoder_to_cross_encoder
 
-    data = _transform_func(examples, num_neg_docs, corpus_dict, use_dataset_instruction, epoch=epoch)
+    data = _transform_func(
+        examples,
+        num_neg_docs,
+        corpus_dict,
+        use_dataset_instruction,
+        epoch=epoch,
+        use_text_in_document=use_text_in_document,
+    )
     return flatten_bi_encoder_to_cross_encoder(data)
 
 
@@ -721,6 +753,7 @@ class RetrievalTransform:
         use_dataset_instruction: bool = False,
         model_type: str = "bi_encoder",
         cycle_positive_docs: bool = False,
+        use_text_in_document: bool = False,
     ):
         if model_type not in _VALID_MODEL_TYPES:
             raise ValueError(f"model_type must be one of {_VALID_MODEL_TYPES}, got {model_type!r}")
@@ -729,6 +762,7 @@ class RetrievalTransform:
         self.use_dataset_instruction = use_dataset_instruction
         self.model_type = model_type
         self.cycle_positive_docs = cycle_positive_docs
+        self.use_text_in_document = use_text_in_document
         self.epoch = 0
 
     def __call__(self, examples):
@@ -740,6 +774,7 @@ class RetrievalTransform:
                 corpus_dict=self.corpus_dict,
                 use_dataset_instruction=self.use_dataset_instruction,
                 epoch=epoch,
+                use_text_in_document=self.use_text_in_document,
             )
         return _transform_func(
             examples,
@@ -747,6 +782,7 @@ class RetrievalTransform:
             corpus_dict=self.corpus_dict,
             use_dataset_instruction=self.use_dataset_instruction,
             epoch=epoch,
+            use_text_in_document=self.use_text_in_document,
         )
 
     def set_epoch(self, epoch: int):
@@ -766,6 +802,7 @@ def make_retrieval_dataset(
     train_data_select_offset: int = 0,
     use_dataset_instruction: bool = False,
     cycle_positive_docs: bool = False,
+    use_text_in_document: bool = False,
 ):
     """
     Load and return dataset in retrieval format for encoder training.
@@ -794,6 +831,7 @@ def make_retrieval_dataset(
         cycle_positive_docs: Whether training should cycle through positive documents across epochs.
             Defaults to ``False`` (always use the first positive document). Set to ``True`` only
             when a query has multiple positive documents and you want to rotate through them by epoch.
+        use_text_in_document: Whether image documents should also include their text.
 
     Returns:
         A HuggingFace Dataset where each example is a dict with keys:
@@ -835,14 +873,36 @@ def make_retrieval_dataset(
         corpus_dict.update(hf_corpus)
 
     if local_entries:
-        local_dataset, local_corpus = load_datasets(local_entries, concatenate=True, seed=seed)
-        datasets_list.append(local_dataset)
-        for cid, cinfo in local_corpus.items():
-            if cid in corpus_dict and corpus_dict[cid].path != cinfo.path:
-                raise ValueError(
-                    f"Duplicate corpus_id '{cid}' with different paths: {corpus_dict[cid].path} vs {cinfo.path}"
-                )
-            corpus_dict[cid] = cinfo
+        corpus_local_entries: list[tuple[Optional[int], str]] = []
+        inline_local_entries: list[tuple[Optional[int], str]] = []
+        for num_samples, local_path in local_entries:
+            suffix = Path(local_path).suffix.lower()
+            if suffix in {".jsonl", ".tsv", ".csv"}:
+                inline_local_entries.append((num_samples, local_path))
+            else:
+                corpus_local_entries.append((num_samples, local_path))
+
+        if corpus_local_entries:
+            local_dataset, local_corpus = load_datasets(corpus_local_entries, concatenate=True, seed=seed)
+            datasets_list.append(local_dataset)
+            for cid, cinfo in local_corpus.items():
+                if cid in corpus_dict and corpus_dict[cid].path != cinfo.path:
+                    raise ValueError(
+                        f"Duplicate corpus_id '{cid}' with different paths: {corpus_dict[cid].path} vs {cinfo.path}"
+                    )
+                corpus_dict[cid] = cinfo
+
+        if inline_local_entries:
+            from nemo_automodel.components.datasets.llm import retrieval_dataset_inline
+
+            inline_rows: list[dict] = []
+            for num_samples, local_path in inline_local_entries:
+                inline_dataset, _ = retrieval_dataset_inline.load_datasets(local_path, concatenate=True)
+                sampled_rows = _sample_data_items(inline_dataset.to_list(), num_samples, local_path, seed)
+                inline_rows.extend(sampled_rows)
+
+            if inline_rows:
+                datasets_list.append(Dataset.from_list(inline_rows))
 
     dataset = concatenate_datasets(datasets_list) if len(datasets_list) > 1 else datasets_list[0]
 
@@ -858,7 +918,12 @@ def make_retrieval_dataset(
 
         negative_size = n_passages - 1
         transform = RetrievalTransform(
-            negative_size, corpus_dict, use_dataset_instruction, model_type, cycle_positive_docs
+            negative_size,
+            corpus_dict,
+            use_dataset_instruction,
+            model_type,
+            cycle_positive_docs,
+            use_text_in_document,
         )
         dataset.set_transform(transform)
         if cycle_positive_docs:
@@ -872,7 +937,12 @@ def make_retrieval_dataset(
         if eval_negative_size is None:
             eval_negative_size = n_passages - 1
         transform = RetrievalTransform(
-            eval_negative_size, corpus_dict, use_dataset_instruction, model_type, cycle_positive_docs
+            eval_negative_size,
+            corpus_dict,
+            use_dataset_instruction,
+            model_type,
+            cycle_positive_docs,
+            use_text_in_document,
         )
         dataset.set_transform(transform)
 
@@ -882,6 +952,53 @@ def make_retrieval_dataset(
     logging.info(f"Created {data_type} dataset with {len(dataset)} examples")
 
     return dataset
+
+
+@dataclass
+class RetrievalDatasetConfig:
+    """Construction-time configuration for the retrieval dataset."""
+
+    data_dir_list: list[DataEntry] | DataEntry | None = None
+    """Path(s) to JSON file(s), ``hf://`` URIs, or dict entries with path and num_samples."""
+    model_type: str = "bi_encoder"
+    """``bi_encoder`` or ``cross_encoder``."""
+    data_type: str = "train"
+    """Type of data (``train`` or ``eval``)."""
+    n_passages: int = 5
+    """Number of passages (1 positive + n-1 negatives)."""
+    eval_negative_size: int | None = None
+    """Number of negative documents for evaluation."""
+    seed: int = 42
+    """Random seed for shuffling / sampling."""
+    do_shuffle: bool = False
+    """Shuffle dataset rows before subset selection (only when ``max_train_samples`` is set)."""
+    max_train_samples: int | None = None
+    """Maximum number of training samples to use."""
+    train_data_select_offset: int = 0
+    """Offset for selecting training samples."""
+    use_dataset_instruction: bool = False
+    """Whether to use the instruction from the dataset's metadata."""
+    cycle_positive_docs: bool = False
+    """Whether to rotate through multiple positive documents by epoch during training."""
+    use_text_in_document: bool = False
+    """Whether image documents should also include their text."""
+
+    def build(self) -> Dataset:
+        """Build the retrieval :class:`~datasets.Dataset` from this :class:`RetrievalDatasetConfig`."""
+        return make_retrieval_dataset(
+            data_dir_list=self.data_dir_list,
+            model_type=self.model_type,
+            data_type=self.data_type,
+            n_passages=self.n_passages,
+            eval_negative_size=self.eval_negative_size,
+            seed=self.seed,
+            do_shuffle=self.do_shuffle,
+            max_train_samples=self.max_train_samples,
+            train_data_select_offset=self.train_data_select_offset,
+            use_dataset_instruction=self.use_dataset_instruction,
+            cycle_positive_docs=self.cycle_positive_docs,
+            use_text_in_document=self.use_text_in_document,
+        )
 
 
 if __name__ == "__main__":

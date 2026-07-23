@@ -443,6 +443,20 @@ blocks) instead.
 | `peft` | Optional, EAGLE-3 only; LoRA draft adaptation (`PeftConfig`). See "LoRA draft adaptation". |
 | `wandb` | Optional; `project`, `entity`, `name`. |
 
+### DFlash-family validation metrics
+
+When `recipe_args.val_data_path` is set, DFlash, Domino, and JetSpec report
+globally reduced `val_loss`, token-weighted `val_accuracy`, and block-weighted
+`val_accept_len`. Domino also reports final-head and base-head loss, base
+accuracy, and base acceptance length. The reductions sum raw token and block
+statistics across ranks before division, so uneven valid-token counts do not
+bias the result.
+
+Adding a top-level `wandb:` block uploads these values as `val/loss`,
+`val/accuracy`, `val/accept_len`, and the corresponding Domino base-head keys.
+Training logs include `train/loss`, `train/accuracy`, `train/accept_len`, and
+the method-specific Domino diagnostics.
+
 ### `recipe_args` common to all methods
 
 `target_model_name_or_path`, `train_data_path`, `val_data_path`, `train_split`,

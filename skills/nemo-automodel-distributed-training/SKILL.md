@@ -528,7 +528,7 @@ components/distributed/pipelining/hf_utils.py      -- HF model validation for PP
 Context parallelism:
 
 ```
-components/distributed/cp_utils.py
+components/distributed/context_parallel/utils.py
     make_cp_batch_and_ctx()            -- creates CP context manager + shards batch
     create_context_parallel_ctx()      -- wraps torch.distributed.tensor.experimental.context_parallel
     attach_context_parallel_hooks()    -- strips attention_mask, sets is_causal=True

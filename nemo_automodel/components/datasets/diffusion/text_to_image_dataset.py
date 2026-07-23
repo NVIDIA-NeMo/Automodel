@@ -12,12 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
 
 import torch
 
 from .base_dataset import BaseMultiresolutionDataset
+
+
+@dataclass
+class TextToImageDatasetConfig:
+    """Construction-time configuration for :class:`TextToImageDataset`."""
+
+    cache_dir: str
+    """Directory containing preprocessed cache."""
+    train_text_encoder: bool = False
+    """If True, returns tokens instead of embeddings."""
+
+    def build(self) -> "TextToImageDataset":
+        """Build a :class:`TextToImageDataset` from this :class:`TextToImageDatasetConfig`."""
+        return TextToImageDataset(
+            cache_dir=self.cache_dir,
+            train_text_encoder=self.train_text_encoder,
+        )
 
 
 class TextToImageDataset(BaseMultiresolutionDataset):

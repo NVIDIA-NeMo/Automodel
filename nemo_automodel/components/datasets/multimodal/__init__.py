@@ -26,6 +26,7 @@ from .collate_fns import SimpleCustomBatch, bagel_packed_collate_fn, collate_wra
 from .datasets import (
     DATASET_REGISTRY,
     DEFAULT_DATASET_INFO,
+    BagelDatasetConfig,
     SftJSONLIterableDataset,
     T2IIterableDataset,
     UnifiedEditIterableDataset,
@@ -50,6 +51,7 @@ from .video import FrameSampler
 __all__ = [
     "DATASET_REGISTRY",
     "DEFAULT_DATASET_INFO",
+    "BagelDatasetConfig",
     "DataConfig",
     "DistributedIterableDataset",
     "FrameSampler",

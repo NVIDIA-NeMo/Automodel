@@ -19,10 +19,50 @@ tensors with the correct shapes for WAN 2.1 training, allowing functional
 tests to run without requiring real data.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
+
+from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderBuild
+
+
+@dataclass
+class MockWanDatasetConfig:
+    """Construction-time configuration for :class:`MockWanDataset`."""
+
+    length: int = 1024
+    """Number of samples in the dataset."""
+    num_channels: int = 16
+    """Number of latent channels."""
+    num_frame_latents: int = 16
+    """Number of temporal latent frames."""
+    spatial_h: int = 30
+    """Height of spatial latents."""
+    spatial_w: int = 52
+    """Width of spatial latents."""
+    text_seq_len: int = 77
+    """Length of text sequence."""
+    text_embed_dim: int = 4096
+    """Dimension of text embeddings."""
+    device: str = "cpu"
+    """Device to place tensors on."""
+
+    def build(self) -> "MockWanDataset":
+        """Build a :class:`MockWanDataset` from this :class:`MockWanDatasetConfig`."""
+        return MockWanDataset(
+            length=self.length,
+            num_channels=self.num_channels,
+            num_frame_latents=self.num_frame_latents,
+            spatial_h=self.spatial_h,
+            spatial_w=self.spatial_w,
+            text_seq_len=self.text_seq_len,
+            text_embed_dim=self.text_embed_dim,
+            device=self.device,
+        )
 
 
 class MockWanDataset(Dataset):
@@ -120,6 +160,54 @@ def mock_collate_fn(batch):
     }
 
 
+@dataclass
+class MockWanDataloaderConfig:
+    """Construction-time configuration for a mock WAN dataloader."""
+
+    num_workers: int = 0
+    device: str = "cpu"
+    length: int = 1024
+    num_channels: int = 16
+    num_frame_latents: int = 16
+    spatial_h: int = 30
+    spatial_w: int = 52
+    text_seq_len: int = 77
+    text_embed_dim: int = 4096
+    shuffle: bool = True
+
+    def build(self, *, dp_rank: int, dp_world_size: int, batch_size: int) -> DiffusionDataloaderBuild:
+        """Build the configured mock dataset, sampler, and dataloader."""
+        dataset = MockWanDatasetConfig(
+            length=self.length,
+            num_channels=self.num_channels,
+            num_frame_latents=self.num_frame_latents,
+            spatial_h=self.spatial_h,
+            spatial_w=self.spatial_w,
+            text_seq_len=self.text_seq_len,
+            text_embed_dim=self.text_embed_dim,
+            device=self.device,
+        ).build()
+        sampler = None
+        if dp_world_size > 1:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=dp_world_size,
+                rank=dp_rank,
+                shuffle=self.shuffle,
+                drop_last=False,
+            )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=sampler is None and self.shuffle,
+            sampler=sampler,
+            num_workers=self.num_workers,
+            collate_fn=mock_collate_fn,
+            pin_memory=self.device == "cpu",
+        )
+        return DiffusionDataloaderBuild(dataloader=dataloader, sampler=sampler)
+
+
 def build_mock_dataloader(
     *,
     dp_rank: int = 0,
@@ -159,7 +247,9 @@ def build_mock_dataloader(
     Returns:
         Tuple of (DataLoader, DistributedSampler or None).
     """
-    dataset = MockWanDataset(
+    result = MockWanDataloaderConfig(
+        num_workers=num_workers,
+        device=device,
         length=length,
         num_channels=num_channels,
         num_frame_latents=num_frame_latents,
@@ -167,28 +257,10 @@ def build_mock_dataloader(
         spatial_w=spatial_w,
         text_seq_len=text_seq_len,
         text_embed_dim=text_embed_dim,
-        device=device,
-    )
-
-    sampler = None
-    if dp_world_size > 1:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=dp_world_size,
-            rank=dp_rank,
-            shuffle=shuffle,
-            drop_last=False,
-        )
-
-    use_pin_memory = device == "cpu"
-    dataloader = DataLoader(
-        dataset,
+        shuffle=shuffle,
+    ).build(
         batch_size=batch_size,
-        shuffle=(sampler is None and shuffle),
-        sampler=sampler,
-        num_workers=num_workers,
-        collate_fn=mock_collate_fn,
-        pin_memory=use_pin_memory,
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
     )
-
-    return dataloader, sampler
+    return result.dataloader, result.sampler
