@@ -36,6 +36,7 @@ Qwen3.5-VL is Alibaba Cloud's next-generation vision language model series, incl
 | [qwen3_5_9b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_9b.yaml) | MedPix-VQA | SFT — Qwen3.5-VL 9B on MedPix |
 | [qwen3_5_moe_medpix.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_moe_medpix.yaml) | MedPix-VQA | SFT — Qwen3.5-MoE on MedPix |
 | [qwen3_5_35b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_35b.yaml) | MedPix-VQA | SFT — Qwen3.5 35B on MedPix |
+| [qwen3_5_122b_128k_ep8cp16.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp16.yaml) | MedPix-VQA | SFT — Qwen3.5-MoE 122B with EP8, CP16, 128K packing, and a trainable vision tower |
 | [qwen3_6_27b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_6_27b.yaml) | MedPix-VQA | SFT — Qwen3.6-27B on MedPix |
 | [qwen3_6_35b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_6_35b.yaml) | MedPix-VQA | SFT — Qwen3.6 35B-A3B on MedPix |
 
@@ -89,6 +90,10 @@ See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Gui
 ## Fine-Tuning
 
 See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
+
+Dense Qwen3.5 and Qwen3.5-MoE support context-parallel vision sharding. The
+Qwen3.5-MoE path composes expert and context parallelism with packed sequences; see the
+[Context-Parallel Vision Sharding guide](/development/cp-vision-sharding).
 
 ## Hugging Face Model Cards
 
