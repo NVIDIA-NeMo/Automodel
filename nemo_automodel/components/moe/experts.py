@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from contextlib import nullcontext
 from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -959,6 +960,17 @@ class GroupedExpertsTE(nn.Module):
         self.dispatcher_async_dispatch = dispatcher_async_dispatch
         self.cuda_graph_moe_enabled = backend is not None and "moe" in getattr(backend, "cuda_graph_modules", [])
         self.cuda_graph_moe_capacity_factor = backend.cuda_graph_moe_capacity_factor if backend is not None else None
+        self.cuda_graph_moe_paged_stash = bool(
+            backend is not None and getattr(backend, "cuda_graph_moe_paged_stash", False)
+        )
+        if self.cuda_graph_moe_paged_stash:
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            get_paged_stash_manager().configure(
+                enabled=True,
+                page_size=backend.cuda_graph_moe_paged_stash_page_size,
+                buffer_size_factor=backend.cuda_graph_moe_paged_stash_buffer_size_factor,
+            )
 
         # Gated (SwiGLU, Quick-GEGLU): out_features = moe_inter_dim * 2
         # Non-gated (ReLU²): out_features = moe_inter_dim
@@ -1482,9 +1494,30 @@ class GroupedExpertsTE(nn.Module):
         """
         permuted_probs = permuted_probs.unsqueeze(-1)
         splits = [tokens_per_local_expert] * self.num_local_experts
-        output1 = self.gate_up_linear(hidden_states, splits)
-        output1 = self.expert_activation(output1, permuted_probs)
-        output2 = self.down_linear(output1, splits)
+        if self.cuda_graph_moe_paged_stash:
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            stash_group = get_paged_stash_manager().group(
+                name="te_grouped_mlp",
+                max_num_tokens=hidden_states.shape[0],
+                live_token_mask=permuted_probs.squeeze(-1).ne(0),
+            )
+        else:
+            stash_group = nullcontext()
+
+        if self.cuda_graph_moe_paged_stash:
+            hidden_states = stash_group.start(hidden_states)
+        with stash_group:
+            output1 = self.gate_up_linear(hidden_states, splits)
+            if self.cuda_graph_moe_paged_stash:
+                output1 = stash_group.mark_activation(output1)
+            output1 = self.expert_activation(output1, permuted_probs)
+            if self.cuda_graph_moe_paged_stash:
+                output1 = stash_group.mark_activation(output1)
+            output2 = self.down_linear(output1, splits)
+        if self.cuda_graph_moe_paged_stash:
+            del output1
+            output2 = stash_group.commit(output2)
         if self.expert_bias:
             down_bias = self._get_stacked_bias(self.down_linear)
             if down_bias is not None:

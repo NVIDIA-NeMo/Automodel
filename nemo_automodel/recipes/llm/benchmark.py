@@ -341,21 +341,24 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             # Time the iteration
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
             with self.timers(iter_timer, log_level=1):
-                # Gradient accumulation loop
                 num_label_tokens = 0
                 loss_buffer = []
-                prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+                # Materialize the exact retry inputs before snapshotting model
+                # RNG. A dataloader with num_workers=0 may consume the global
+                # Python/NumPy/Torch streams while producing each batch.
+                iteration_batches = [next(dataloader_iter) for _ in range(ga_steps)]
+                for batch in iteration_batches:
+                    num_label_tokens += (batch["labels"] != -100).sum().item()
 
-                for ga_step_idx in range(ga_steps):
+                prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+                paged_stash_rng_state = self._snapshot_paged_stash_rng_state()
+
+                # Gradient accumulation loop
+                for ga_step_idx, batch in enumerate(iteration_batches):
                     if ga_step_idx == ga_steps - 1:
                         prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
-                    # Get batch from dataloader
-                    batch = next(dataloader_iter)
                     torch.cuda.nvtx.range_push(f"iteration_{i}_ga_step_{ga_step_idx}")
-
-                    # Accumulate label tokens locally
-                    num_label_tokens += (batch["labels"] != -100).sum().item()
 
                     with self.timers(f"forward_backward_{ga_step_idx}", log_level=2):
                         self._forward_backward_step(
@@ -371,6 +374,13 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
                     if ga_step_idx == 0:
                         prepare_after_first_microbatch()
+
+                loss_buffer = self._rerun_after_paged_stash_overflow(
+                    iteration_batches,
+                    num_label_tokens=None,
+                    loss_buffer=loss_buffer,
+                    rng_state=paged_stash_rng_state,
+                )
 
                 # Optimizer step
                 with self.timers("optimizer", log_level=2):
