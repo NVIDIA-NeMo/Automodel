@@ -348,7 +348,8 @@ class IDLMStrategy(DLLMStrategy):
             torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_dtype is not None else nullcontext()
         )
         fp8_ctx = recipe.te_fp8.maybe_te_autocast() if recipe.te_fp8 is not None else nullcontext()
-        train_ctx, _ = make_cp_batch_and_ctx(recipe.device_mesh, {})
+        cp_sharder = ContextParallelSharder(None, recipe.device_mesh, {})
+        train_ctx, _ = cp_sharder.shard({})
 
         L = noisy_input_ids.size(1)
         concat_input_ids = torch.cat([noisy_input_ids, clean_input_ids], dim=1)
