@@ -59,7 +59,6 @@ dataset:
   data_type: train
   n_passages: 5
   seed: 42
-  do_shuffle: true
 
 dataloader:
   collate_fn:
@@ -80,9 +79,6 @@ dataloader:
 #   data_type: eval
 #   n_passages: 5
 #   seed: 42
-#   do_shuffle: false
-#   max_train_samples: 1000
-#   train_data_select_offset: 0
 #
 # validation_dataloader:
 #   collate_fn:
@@ -110,7 +106,7 @@ dataloader:
 #     - up_proj
 #     - down_proj
 #   exclude_modules: []
-#   match_all_linear: True
+#   match_all_linear: false
 #   dim: 16
 #   alpha: 32
 #   use_triton: true
