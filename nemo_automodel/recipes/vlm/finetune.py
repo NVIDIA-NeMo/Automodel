@@ -313,7 +313,7 @@ def build_dataloader(
         model_attn_implementation=get_attn_implementation(cfg_model),
         cp_size=cp_size,
     )
-    if config.packing is not None:
+    if config.packing is not None and config.packing.packing_format != "thd":
         configure_packing(attn_implementation=packing_attn_implementation)
 
     with ScopedRNG(seed=seed, ranked=True):
@@ -514,8 +514,6 @@ class FinetuneRecipeForVLM(BaseRecipe):
             logging.info("Disabling rope_fusion because cp_size=%d > 1", self.mesh_context.cp_size)
             self.cfg.model.backend.rope_fusion = False
 
-        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
-
         model = build_model(
             self.cfg.model,
             self.cfg.get("freeze_config", None),
@@ -578,7 +576,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             model_attn_implementation=get_attn_implementation(self.cfg.model),
             cp_size=self.mesh_context.cp_size,
         )
-        if dataloader_config.packing is not None:
+        if dataloader_config.packing is not None and dataloader_config.packing.packing_format != "thd":
             configure_packing(attn_implementation=packing_attn_implementation)
         process_group = getattr(self.mesh_context, "process_group", None)
         dataset_build_context = FirstRankPerNode(group=process_group)
@@ -697,7 +695,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
 
-        self.checkpointer.close()
+        self._finalize_and_close_checkpointer()
 
         # Mark the MLflow run KILLED if training exited via SIGTERM.
         if self.step_scheduler.sigterm_flag:
@@ -812,6 +810,20 @@ class FinetuneRecipeForVLM(BaseRecipe):
             train_ctx, batch = self.magi.prepare_vlm_batch(
                 self.model_parts[0], batch
             )  # pragma: no cover - requires GPU + magi_attention
+        elif batch.get("qkv_format", None) == "thd":
+            # THD packed VLM inputs use TE sequence metadata even without context parallelism.
+            if self.mesh_context.cp_size > 1:
+                raise NotImplementedError(
+                    "THD packing (packing_format='thd') for VLM currently supports cp_size=1 only; "
+                    "context-parallel THD for mRoPE VLMs is not yet implemented."
+                )
+            padding_id = getattr(getattr(self.processor, "tokenizer", None), "pad_token_id", 0) or 0
+            train_ctx, batch = make_cp_batch_and_ctx(
+                self.device_mesh,
+                batch,
+                use_te=True,
+                padding_token_id=padding_id,
+            )
         else:
             train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
         labels = batch.pop("labels")

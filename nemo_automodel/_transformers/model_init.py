@@ -930,9 +930,13 @@ def __init_model(
             kwargs = _filter_kwargs_for_init(model_cls, kwargs)
             # Coerce plain-dict backend (e.g. from CLI --model.backend.attn sdpa) to BackendConfig
             if "backend" in kwargs and isinstance(kwargs["backend"], dict):
-                from nemo_automodel.components.models.common.utils import BackendConfig
+                backend_config_resolver = getattr(model_cls, "backend_config_resolver", None)
+                if backend_config_resolver is not None:
+                    kwargs["backend"] = backend_config_resolver(kwargs["backend"])
+                else:
+                    from nemo_automodel.components.models.common.utils import BackendConfig
 
-                kwargs["backend"] = BackendConfig(**kwargs["backend"])
+                    kwargs["backend"] = BackendConfig(**kwargs["backend"])
             with local_torch_dtype(torch_dtype, model_cls.__name__):
                 return True, model_cls(hf_config, *model_args, **kwargs)
 

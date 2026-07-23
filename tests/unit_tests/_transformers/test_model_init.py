@@ -356,7 +356,7 @@ class TestBackendDictCoercion:
         config.name_or_path = "fake/model"
         return config
 
-    def _run_init_model(self, mock_resolve_cls, **extra_kwargs):
+    def _run_init_model(self, mock_resolve_cls, backend_config_resolver=None, **extra_kwargs):
         """Helper to call _init_model with a fake model class and capture kwargs."""
         captured_kwargs = {}
 
@@ -365,6 +365,8 @@ class TestBackendDictCoercion:
             return MagicMock()
 
         fake_model_cls.__module__ = "nemo_automodel.components.models.fake"
+        if backend_config_resolver is not None:
+            fake_model_cls.backend_config_resolver = backend_config_resolver
         mock_resolve_cls.return_value = fake_model_cls
 
         _init_model(
@@ -390,6 +392,24 @@ class TestBackendDictCoercion:
         # Unspecified fields should get their environment-dependent defaults
         assert captured["backend"].rms_norm == defaults.rms_norm
         assert captured["backend"].linear == defaults.linear
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_model_specific_backend_resolver_takes_precedence(self, mock_resolve_cls, _mock_download):
+        """Custom models may merge partial mappings onto model-specific stable defaults."""
+        resolved_backend = object()
+
+        def _resolve_backend(backend):
+            assert backend == {"rms_norm": "te"}
+            return resolved_backend
+
+        captured = self._run_init_model(
+            mock_resolve_cls,
+            backend_config_resolver=_resolve_backend,
+            backend={"rms_norm": "te"},
+        )
+
+        assert captured["backend"] is resolved_backend
 
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")

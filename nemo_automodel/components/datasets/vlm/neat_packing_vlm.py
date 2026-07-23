@@ -35,7 +35,7 @@ import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Literal
 
 import torch
 import torch.utils.data
@@ -606,6 +606,12 @@ class NeatPackConfig:
     """Optional maximum padded length used by the packed collator."""
     attn_implementation: str | None = None
     """Optional packed-mask backend override used only with context parallelism."""
+    packing_format: Literal["neat", "thd"] = "neat"
+    """Packed collator format. ``thd`` emits Transformer Engine sequence metadata."""
+
+    def __post_init__(self) -> None:
+        if self.packing_format not in ("neat", "thd"):
+            raise ValueError(f"Unsupported VLM packing_format {self.packing_format!r}; expected 'neat' or 'thd'")
 
     def build(
         self,
