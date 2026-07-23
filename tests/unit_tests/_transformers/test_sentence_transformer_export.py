@@ -14,9 +14,11 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
+from nemo_automodel._transformers import sentence_transformer_export
 from nemo_automodel._transformers.sentence_transformer_export import (
     _resolve_sentence_transformer_max_seq_length,
     _save_generated_sentence_transformer_assets,
@@ -252,3 +254,122 @@ def test_generated_sentence_transformer_assets_require_tokenizer(tmp_path):
             hf_metadata_dir=str(tmp_path),
             tokenizer=None,
         )
+
+
+def test_cached_source_model_path_uses_exact_loaded_revision(tmp_path, monkeypatch):
+    local_root = tmp_path / "local"
+    (local_root / "encoder").mkdir(parents=True)
+    assert sentence_transformer_export._resolve_cached_source_model_path(
+        str(local_root), SimpleNamespace(), {"subfolder": "encoder"}
+    ) == str(local_root / "encoder")
+    assert sentence_transformer_export._resolve_cached_source_repository_path(
+        str(local_root), str(local_root / "encoder"), {"subfolder": "encoder"}
+    ) == str(local_root)
+
+    cached_config = tmp_path / "snapshot" / "encoder" / "config.json"
+    cached_config.parent.mkdir(parents=True)
+    cached_config.write_text("{}")
+    cache_lookup = MagicMock(return_value=str(cached_config))
+    monkeypatch.setattr(sentence_transformer_export, "try_to_load_from_cache", cache_lookup)
+
+    result = sentence_transformer_export._resolve_cached_source_model_path(
+        "org/model",
+        SimpleNamespace(_commit_hash="exact-commit"),
+        {"cache_dir": "/cache", "revision": "branch", "subfolder": "encoder"},
+    )
+
+    assert result == str(cached_config.parent)
+    assert sentence_transformer_export._resolve_cached_source_repository_path(
+        "org/model", result, {"subfolder": "encoder"}
+    ) == str(tmp_path / "snapshot")
+    cache_lookup.assert_called_once_with(
+        "org/model",
+        "encoder/config.json",
+        cache_dir="/cache",
+        revision="exact-commit",
+    )
+
+
+def test_cache_hub_source_legal_assets_uses_exact_loaded_revision(monkeypatch):
+    snapshot_download = MagicMock(return_value="/cache/snapshot")
+    monkeypatch.setattr(sentence_transformer_export, "snapshot_download", snapshot_download)
+
+    result = sentence_transformer_export._cache_hub_source_legal_assets(
+        "org/model",
+        SimpleNamespace(_commit_hash="exact-commit"),
+        {
+            "cache_dir": "/cache",
+            "revision": "branch",
+            "use_auth_token": "token",
+            "local_files_only": True,
+        },
+    )
+
+    assert result == "/cache/snapshot"
+    snapshot_download.assert_called_once_with(
+        repo_id="org/model",
+        allow_patterns=sentence_transformer_export._SOURCE_LEGAL_ASSET_PATTERNS,
+        cache_dir="/cache",
+        local_files_only=True,
+        revision="exact-commit",
+        token="token",
+    )
+
+
+def test_sentence_transformer_source_with_unsupported_module_is_rejected(tmp_path):
+    (tmp_path / "1_Pooling").mkdir()
+    (tmp_path / "modules.json").write_text(
+        json.dumps(
+            [
+                {"idx": 0, "path": "", "type": "sentence_transformers.models.Transformer"},
+                {"idx": 1, "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+                {"idx": 2, "path": "2_Dense", "type": "sentence_transformers.models.Dense"},
+            ]
+        )
+    )
+    (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps({"pooling_mode_mean_tokens": True}))
+
+    with pytest.raises(ValueError, match="exact supported module stack"):
+        sentence_transformer_export._load_sentence_transformer_wrapper_options(str(tmp_path), {})
+
+
+def test_sentence_transformer_source_excluding_prompts_is_rejected(tmp_path):
+    (tmp_path / "1_Pooling").mkdir()
+    (tmp_path / "modules.json").write_text(
+        json.dumps(
+            [
+                {"idx": 0, "path": "", "type": "sentence_transformers.models.Transformer"},
+                {"idx": 1, "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+            ]
+        )
+    )
+    (tmp_path / "1_Pooling" / "config.json").write_text(
+        json.dumps({"pooling_mode_mean_tokens": True, "include_prompt": False})
+    )
+
+    with pytest.raises(ValueError, match="include_prompt=False"):
+        sentence_transformer_export._load_sentence_transformer_wrapper_options(str(tmp_path), {})
+
+
+def test_sentence_transformer_source_lowercasing_is_rejected(tmp_path):
+    (tmp_path / "1_Pooling").mkdir()
+    (tmp_path / "modules.json").write_text(
+        json.dumps(
+            [
+                {"idx": 0, "path": "", "type": "sentence_transformers.models.Transformer"},
+                {"idx": 1, "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+            ]
+        )
+    )
+    (tmp_path / "1_Pooling" / "config.json").write_text(json.dumps({"pooling_mode_mean_tokens": True}))
+    (tmp_path / "sentence_bert_config.json").write_text(json.dumps({"do_lower_case": True}))
+
+    with pytest.raises(ValueError, match="do_lower_case=True"):
+        sentence_transformer_export._load_sentence_transformer_wrapper_options(str(tmp_path), {})
+
+
+def test_sentence_transformer_metadata_load_fails_closed_on_unexpected_hub_error(monkeypatch):
+    monkeypatch.setattr(sentence_transformer_export, "hf_hub_download", MagicMock(side_effect=OSError("offline")))
+
+    with pytest.raises(RuntimeError, match="Unable to load Sentence Transformers metadata modules.json"):
+        sentence_transformer_export._load_sentence_transformer_json("org/model", "modules.json", {})

@@ -15,25 +15,27 @@
 """Encoder models for bi-encoder and cross-encoder tasks."""
 
 import inspect
-import json
 import os
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from huggingface_hub import hf_hub_download, snapshot_download, try_to_load_from_cache
-from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
 from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PretrainedConfig, PreTrainedModel
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel._transformers.sentence_transformer_export import (
-    _SENTENCE_TRANSFORMER_POOLING_KEYS,
+    SentenceTransformerExportConfig,
+    SentenceTransformerWrapperOptions,
+    _cache_hub_source_legal_assets,
+    _load_sentence_transformer_wrapper_options,
+    _resolve_cached_source_model_path,
+    _resolve_cached_source_repository_path,
     _SentenceTransformerMetadataExporter,
+    _supports_standard_sentence_transformer_export,
 )
 from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
@@ -41,25 +43,8 @@ from nemo_automodel.components.models.common.bidirectional import EncoderStateDi
 logger = logging.get_logger(__name__)
 
 
-_STANDARD_SENTENCE_TRANSFORMER_POOLING_TYPES = frozenset(_SENTENCE_TRANSFORMER_POOLING_KEYS)
 _BI_ENCODER_DEFAULT_POOLING = "avg"
 _BI_ENCODER_DEFAULT_L2_NORMALIZE = True
-_HF_HUB_METADATA_KWARGS = {
-    "cache_dir",
-    "force_download",
-    "local_files_only",
-    "revision",
-    "token",
-}
-_SOURCE_LEGAL_ASSET_PATTERNS = (
-    ".gitattributes",
-    "LICENSE*",
-    "license*",
-    "NOTICE*",
-    "notice*",
-    "*NOTICE*",
-    "*notice*",
-)
 _EXPORT_ONLY_BI_ENCODER_KWARGS = {
     "query_prompt",
     "document_prompt",
@@ -67,156 +52,6 @@ _EXPORT_ONLY_BI_ENCODER_KWARGS = {
     "similarity_fn_name",
     "do_lower_case",
 }
-
-
-@dataclass
-class SentenceTransformerExportConfig:
-    """Effective Sentence Transformers semantics written with a bi-encoder checkpoint.
-
-    Attributes:
-        query_prompt: Exact prompt prepended to queries, or None when no prompt is configured yet.
-        document_prompt: Exact prompt prepended to documents, or None when no prompt is configured yet.
-    """
-
-    query_prompt: str | None = None
-    document_prompt: str | None = None
-
-
-@dataclass(frozen=True)
-class SentenceTransformerWrapperOptions:
-    """Bi-encoder wrapper behavior represented by standard Sentence Transformers modules."""
-
-    pooling: str
-    l2_normalize: bool
-    query_prompt: str | None = None
-    document_prompt: str | None = None
-
-
-def _load_sentence_transformer_json(
-    model_name_or_path: str,
-    filename: str,
-    hf_kwargs: dict,
-) -> object | None:
-    """Load a standard Sentence Transformers JSON asset from a local path or the Hub."""
-    subfolder = hf_kwargs.get("subfolder")
-    if os.path.isdir(model_name_or_path):
-        root = os.path.join(model_name_or_path, subfolder) if subfolder else model_name_or_path
-        asset_path = os.path.join(root, filename)
-        if not os.path.isfile(asset_path):
-            return None
-    else:
-        download_kwargs = {key: hf_kwargs[key] for key in _HF_HUB_METADATA_KWARGS if key in hf_kwargs}
-        if "token" not in download_kwargs and "use_auth_token" in hf_kwargs:
-            download_kwargs["token"] = hf_kwargs["use_auth_token"]
-        try:
-            asset_path = hf_hub_download(
-                repo_id=model_name_or_path,
-                filename=filename,
-                subfolder=subfolder,
-                **download_kwargs,
-            )
-        except EntryNotFoundError:
-            return None
-        except LocalEntryNotFoundError as exc:
-            raise RuntimeError(
-                f"Could not establish whether Sentence Transformers metadata {filename} exists locally."
-            ) from exc
-        except Exception as exc:
-            raise RuntimeError(f"Unable to load Sentence Transformers metadata {filename}.") from exc
-
-    with open(asset_path) as f:
-        return json.load(f)
-
-
-def _load_sentence_transformer_wrapper_options(
-    model_name_or_path: str,
-    hf_kwargs: dict,
-) -> SentenceTransformerWrapperOptions | None:
-    """Restore pooling and normalization from the standard Sentence Transformers module stack."""
-    modules = _load_sentence_transformer_json(model_name_or_path, "modules.json", hf_kwargs)
-    if modules is None:
-        return None
-    if not isinstance(modules, list):
-        raise ValueError("Sentence Transformers modules.json must contain a list of modules.")
-
-    transformer_type = "sentence_transformers.models.Transformer"
-    pooling_type = "sentence_transformers.models.Pooling"
-    normalize_type = "sentence_transformers.models.Normalize"
-    module_types = [module.get("type") if isinstance(module, dict) else None for module in modules]
-    if module_types not in ([transformer_type, pooling_type], [transformer_type, pooling_type, normalize_type]):
-        raise ValueError(
-            "Sentence Transformers metadata must use the exact supported module stack: "
-            "Transformer, Pooling, and optional Normalize."
-        )
-    if modules[0].get("path") != "":
-        raise ValueError("Sentence Transformers Transformer metadata must reference the checkpoint root.")
-
-    sentence_bert_config = _load_sentence_transformer_json(
-        model_name_or_path,
-        "sentence_bert_config.json",
-        hf_kwargs,
-    )
-    if isinstance(sentence_bert_config, dict) and sentence_bert_config.get("do_lower_case"):
-        raise ValueError(
-            "Sentence Transformers checkpoints with do_lower_case=True are unsupported because "
-            "the NeMo inference path does not lowercase text."
-        )
-
-    pooling_path = modules[1].get("path")
-    if not isinstance(pooling_path, str) or not pooling_path:
-        raise ValueError("Sentence Transformers Pooling metadata must reference a module path.")
-    pooling_config = _load_sentence_transformer_json(
-        model_name_or_path,
-        os.path.join(pooling_path, "config.json"),
-        hf_kwargs,
-    )
-    if not isinstance(pooling_config, dict):
-        raise ValueError("Sentence Transformers Pooling config.json is missing or invalid.")
-    if pooling_config.get("include_prompt", True) is False:
-        raise ValueError(
-            "Sentence Transformers checkpoints with include_prompt=False are unsupported because "
-            "the NeMo pooling path includes prompt tokens."
-        )
-
-    active_pooling_keys = {
-        key for key, value in pooling_config.items() if key.startswith("pooling_mode_") and bool(value)
-    }
-    matching_pooling = [
-        pooling
-        for pooling, metadata_key in _SENTENCE_TRANSFORMER_POOLING_KEYS.items()
-        if metadata_key in active_pooling_keys
-    ]
-    if len(active_pooling_keys) != 1 or len(matching_pooling) != 1:
-        raise ValueError(
-            "Sentence Transformers pooling metadata cannot be represented by a single NeMo avg, cls, or last mode."
-        )
-
-    sentence_transformer_config = _load_sentence_transformer_json(
-        model_name_or_path,
-        "config_sentence_transformers.json",
-        hf_kwargs,
-    )
-    query_prompt = None
-    document_prompt = None
-    if sentence_transformer_config is not None:
-        if not isinstance(sentence_transformer_config, dict):
-            raise ValueError("Sentence Transformers config_sentence_transformers.json is invalid.")
-        prompts = sentence_transformer_config.get("prompts", {})
-        if not isinstance(prompts, dict):
-            raise ValueError("Sentence Transformers prompts metadata must contain a mapping.")
-        query_prompt = prompts.get("query")
-        document_prompt = prompts.get("document")
-        if query_prompt is not None and not isinstance(query_prompt, str):
-            raise ValueError("Sentence Transformers query prompt must be a string.")
-        if document_prompt is not None and not isinstance(document_prompt, str):
-            raise ValueError("Sentence Transformers document prompt must be a string.")
-
-    return SentenceTransformerWrapperOptions(
-        pooling=matching_pooling[0],
-        l2_normalize=len(modules) == 3,
-        query_prompt=query_prompt,
-        document_prompt=document_prompt,
-    )
 
 
 def _resolve_bi_encoder_options(
@@ -234,69 +69,6 @@ def _resolve_bi_encoder_options(
     if l2_normalize is None:
         l2_normalize = saved_options.l2_normalize if saved_options is not None else _BI_ENCODER_DEFAULT_L2_NORMALIZE
     return pooling, l2_normalize
-
-
-def _resolve_cached_source_model_path(model_name_or_path: str, config, hf_kwargs: dict) -> str | None:
-    """Resolve the already-downloaded source snapshot without network access."""
-    subfolder = hf_kwargs.get("subfolder")
-    if os.path.isdir(model_name_or_path):
-        source_path = os.path.join(model_name_or_path, subfolder) if subfolder else model_name_or_path
-        return source_path if os.path.isdir(source_path) else None
-    filename = os.path.join(subfolder, "config.json") if subfolder else "config.json"
-    cached_config = try_to_load_from_cache(
-        model_name_or_path,
-        filename,
-        cache_dir=hf_kwargs.get("cache_dir"),
-        revision=getattr(config, "_commit_hash", None) or hf_kwargs.get("revision"),
-    )
-    if isinstance(cached_config, str) and os.path.isfile(cached_config):
-        return os.path.dirname(cached_config)
-    return None
-
-
-def _resolve_cached_source_repository_path(
-    model_name_or_path: str,
-    source_model_path: str | None,
-    hf_kwargs: dict,
-) -> str | None:
-    """Resolve the repository or snapshot root for a model loaded from a subfolder."""
-    if source_model_path is None:
-        return None
-    subfolder = hf_kwargs.get("subfolder")
-    if not subfolder:
-        return source_model_path
-    if os.path.isdir(model_name_or_path):
-        return model_name_or_path
-
-    repository_path = source_model_path
-    for part in os.path.normpath(subfolder).split(os.sep):
-        if part not in ("", "."):
-            repository_path = os.path.dirname(repository_path)
-    return repository_path
-
-
-def _cache_hub_source_legal_assets(model_name_or_path: str, config, hf_kwargs: dict) -> str | None:
-    """Cache source legal assets while the Hub-backed model is being loaded."""
-    if os.path.isdir(model_name_or_path):
-        return None
-
-    download_kwargs = {
-        key: hf_kwargs[key] for key in ("cache_dir", "force_download", "local_files_only", "token") if key in hf_kwargs
-    }
-    if "token" not in download_kwargs and "use_auth_token" in hf_kwargs:
-        download_kwargs["token"] = hf_kwargs["use_auth_token"]
-    revision = getattr(config, "_commit_hash", None) or hf_kwargs.get("revision")
-    if revision is not None:
-        download_kwargs["revision"] = revision
-    try:
-        return snapshot_download(
-            repo_id=model_name_or_path,
-            allow_patterns=_SOURCE_LEGAL_ASSET_PATTERNS,
-            **download_kwargs,
-        )
-    except Exception as exc:
-        logger.warning("Unable to cache source legal assets for %s: %s", model_name_or_path, exc)
-        return None
 
 
 def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedModel:
@@ -589,20 +361,6 @@ def build_encoder_backbone(
             model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs
         )
     return AutoModel.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
-
-
-def _supports_standard_sentence_transformer_export(model: nn.Module, pooling: str) -> bool:
-    """Return whether a backbone can be represented by the standard text module stack."""
-    config = getattr(model, "config", None)
-    hidden_size = getattr(config, "hidden_size", None)
-    return (
-        pooling in _STANDARD_SENTENCE_TRANSFORMER_POOLING_TYPES
-        and getattr(model, "main_input_name", "input_ids") == "input_ids"
-        and isinstance(config, PretrainedConfig)
-        and not bool(getattr(config, "is_composition", False))
-        and isinstance(hidden_size, int)
-        and hidden_size > 0
-    )
 
 
 def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> None:
