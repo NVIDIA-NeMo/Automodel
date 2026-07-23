@@ -23,6 +23,12 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    round_robin_local_indices,
+    shard_batch_aux_only,
+    shard_sequence_for_cp_round_robin,
+)
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.mtp import roll_tensor
@@ -322,6 +328,9 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
 
     _pp_keep_self_forward: bool = True
     mtp_outputs_are_logits = True
+    # CP submesh, installed by the MoE parallelizer's apply_cp when context
+    # parallelism is active; None means the forward embeds and shards nothing for CP.
+    cp_mesh = None
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -447,8 +456,18 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         seq_len: int,
         dtype: torch.dtype,
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        hidden_shape = (microbatch_size, seq_len, self.config.text_config.hidden_size)
-        vocab_shape = (microbatch_size, seq_len, self.config.text_config.vocab_size)
+        # Under context parallelism the first stage embeds the full sequence and
+        # shards it in forward, so every stage output and later-stage input (incl.
+        # the propagated MTP hidden states) carries the LOCAL (padded-to-2*cp then
+        # //cp) sequence length while the first-stage token-id input stays full.
+        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+        local_seq_len = seq_len
+        if cp_size > 1:
+            padded_seq_len = seq_len + (-seq_len) % (2 * cp_size)
+            local_seq_len = padded_seq_len // cp_size
+
+        hidden_shape = (microbatch_size, local_seq_len, self.config.text_config.hidden_size)
+        vocab_shape = (microbatch_size, local_seq_len, self.config.text_config.vocab_size)
         mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
 
         def meta(shape: tuple[int, ...]) -> torch.Tensor:
@@ -494,23 +513,35 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
 
     def prepare_model_inputs_for_cp(
         self,
-        input_ids: torch.Tensor,
+        batch: dict[str, Any],
         *,
-        pixel_values: torch.Tensor | None = None,
-        patch_pixel_values: torch.Tensor | None = None,
-        num_patches: torch.Tensor | list[int] | tuple[int, ...] | None = None,
-        image_embeds: torch.Tensor | None = None,
-        **_: Any,
-    ) -> dict[str, torch.Tensor]:
-        """Merge vision features into token embeddings before CP sequence sharding."""
-        multimodal_embeddings = self.model.get_multimodal_embeddings(
-            pixel_values=pixel_values,
-            patch_pixel_values=patch_pixel_values,
-            num_patches=num_patches,
-            image_embeds=image_embeds,
-        )
-        inputs_embeds = self.model.prepare_inputs_embeds(input_ids, multimodal_embeddings)
-        return {"inputs_embeds": inputs_embeds}
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Return a sharder-only CP backend; embed + splice + shard happen in forward.
+
+        Embedding and the vision multimodal scatter now run inside ``forward``
+        per microbatch (see the CP branch that calls ``get_multimodal_embeddings``
+        + ``prepare_inputs_embeds`` + :func:`shard_sequence_for_cp_round_robin`). The returned
+        :class:`ContextParallelSharder` round-robin-shards only the no-grad aux
+        streams (labels/position_ids/loss_mask/padding_mask) and leaves
+        ``input_ids`` and the media inputs full-length for the forward. Step3.7
+        uses plain 1-D positions, so no ``position_ids`` are computed here (the
+        aux shard injects and slices them).
+
+        Args:
+            batch: The full-sequence batch (with ``input_ids`` ``[batch,
+                sequence]``); left intact.
+            num_chunks: Accepted for hook-signature parity; unused (round-robin CP).
+        """
+        if batch.get("input_ids") is None:
+            raise ValueError("Step3p7 CP pre-embedding requires input_ids.")
+        del num_chunks
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=shard_batch_aux_only,
+                local_token_global_indices=round_robin_local_indices,
+            )
+        }
 
     def forward(
         self,
@@ -530,11 +561,6 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
             if output_hidden_states is not None
             else getattr(self.config.text_config, "output_hidden_states", False)
         )
-
-        if kwargs.pop("_pre_embed_only", False):
-            if input_ids is None:
-                raise ValueError("Step3p7 CP pre-embedding requires input_ids.")
-            return self.prepare_model_inputs_for_cp(input_ids=input_ids, **kwargs)
 
         is_pp_stage = self._is_pipeline_parallel_stage()
         pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
@@ -602,6 +628,42 @@ class Step3p7ForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSy
         # padding_causal + sliding-window path diverges from the CP path.
         if self.backend.attn == "te" and attention_mask is not None:
             attention_mask = None
+
+        # Context-parallel: embed + vision-splice the full sequence, then keep this
+        # rank's round-robin chunk pair (aux streams aligned by shard_batch_aux_only).
+        # Downstream (MTP source embeds, decoder, lm_head) sees what the old
+        # dispatch-level pre-embed produced, and stays differentiable.
+        cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+        if (
+            cp_size > 1
+            and inputs_embeds is None
+            and input_ids is not None
+            and input_ids.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            and getattr(self.model.language_model, "embed_tokens", None) is not None
+        ):
+            if is_pp_stage and self.lm_head is None and kwargs.get("pixel_values") is not None:
+                raise NotImplementedError(
+                    "Step3p7 does not support image microbatch chunking under combined pipeline + "
+                    "context parallelism; use a text-only batch for cp>1 and pp>1."
+                )
+            multimodal_embeddings = self.model.get_multimodal_embeddings(
+                pixel_values=kwargs.get("pixel_values", None),
+                patch_pixel_values=kwargs.get("patch_pixel_values", None),
+                num_patches=kwargs.get("num_patches", None),
+                image_embeds=kwargs.get("image_embeds", None),
+            )
+            inputs_embeds = self.model.prepare_inputs_embeds(input_ids, multimodal_embeddings)
+            inputs_embeds, _, _ = shard_sequence_for_cp_round_robin(self.cp_mesh, inputs_embeds, seq_dim=1)
+            input_ids = None
+            # Media consumed into inputs_embeds; drop so self.model does not re-splice.
+            for media_key in (
+                "pixel_values",
+                "patch_pixel_values",
+                "num_patches",
+                "image_embeds",
+                "patch_newline_mask",
+            ):
+                kwargs.pop(media_key, None)
 
         need_mtp_source_embeds = (use_mtp or (pp_mtp_enabled and self.lm_head is None)) and not mtp_embed_inputs
         if need_mtp_source_embeds and inputs_embeds is None and input_ids is not None:
