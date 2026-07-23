@@ -59,9 +59,8 @@ class LocalFeatureStore(FeatureStore):
             of zero flaps the producer on every step.
 
     Thread safety: every public method holds a single :class:`threading.Lock`,
-    so concurrent puts and gets from the same Python process are safe. Async
-    / cross-process safety is the queue's responsibility and is out of scope
-    for PR 1.
+    so concurrent puts and gets from the same Python process are safe.
+    Cross-process coordination is the queue's responsibility.
     """
 
     def __init__(
@@ -138,10 +137,9 @@ class LocalFeatureStore(FeatureStore):
 
     @property
     def store_uri(self) -> str:
-        # Stable URI the queue's lease / ack protocols can match on. PR 3's
-        # SharedDirFeatureStore will return a different scheme ("file://"),
-        # so the queue can refuse to lease a ref whose URI does not match
-        # its bound store.
+        # Stable URI the queue's lease / ack protocols can match on.
+        # SharedDirFeatureStore uses a ``file://`` scheme instead so a
+        # consumer bound to one backend cannot materialize a foreign ref.
         return f"mem://local-{id(self):x}"
 
     # --- public API ---------------------------------------------------------
@@ -359,9 +357,8 @@ class LocalFeatureStore(FeatureStore):
             )
 
     def gc(self) -> int:
-        # Local store has no transient I/O; gc is a no-op for now, but the
-        # method exists so the queue can call it unconditionally and PR 4's
-        # NCCL store can override with real cleanup of failed-release handles.
+        # No transient I/O to sweep in-process; the queue may still call
+        # this unconditionally and file/NCCL backends can override it.
         with self._lock:
             return 0
 
@@ -380,6 +377,12 @@ class LocalFeatureStore(FeatureStore):
         with self._lock:
             if self._closed:
                 return
+            outstanding = sum(count for count in self._handle_refs.values() if count > 0)
+            if outstanding:
+                raise RuntimeError(
+                    f"LocalFeatureStore.close() called with {outstanding} outstanding handle(s); "
+                    f"release all StoreHandles before closing"
+                )
             self._closed = True
             self._storage.clear()
             self._handle_refs.clear()

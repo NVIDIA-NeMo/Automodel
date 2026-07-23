@@ -14,7 +14,7 @@
 
 """Tensor-free control-plane contracts for the speculative-training stream.
 
-Per the train-inference disaggregation RFC (issue #3062), every produced sample
+Per the train-inference disaggregation RFC, every produced sample
 is split into a tensor-free reference (this module) and the actual supervision
 tensors, which live in a pluggable :mod:`store`. References hop between the
 target-side producer and the draft-side consumer over queues, HTTP, and
@@ -73,8 +73,8 @@ def _algorithm_required_features(algo: FeatureAlgorithm) -> frozenset[str]:
     """Required feature-name set per algorithm (RFC "Feature schema per algorithm").
 
     Mirrors the "Required feature keys" column of the RFC's schema table.
-    PR 2 widens this into a typed registry that also validates per-key
-    dtypes / shapes; PR 1 only checks that the producer named the right set.
+    Algorithm-specific schema modules (for example :mod:`eagle3`) add per-key
+    dtype and shape validation on top of this name set.
     """
     if algo is FeatureAlgorithm.EAGLE3:
         return frozenset({"aux_hidden_states", "input_ids", "attention_mask", "loss_mask"})
@@ -138,8 +138,9 @@ class SampleRef:
             makes; the store object itself is discovered through the URI at
             materialization time, not stored on the ref.
         feature_keys: Named features this sample contributes, mapped to
-            per-store keys (e.g. filenames for ``SharedDirFeatureStore`` in
-            PR 3, dict keys for :class:`LocalFeatureStore`).
+            per-store keys (for example filenames for
+            :class:`~nemo_automodel.components.speculative.streaming.stores.shared_dir.SharedDirFeatureStore`
+            or dict keys for :class:`LocalFeatureStore`).
         feature_specs: Per-feature :class:`FeatureSpec` so the consumer can
             allocate the receive buffer before calling :meth:`FeatureStore.get`.
         algorithm: Which draft family produced this sample; the consumer
@@ -155,11 +156,11 @@ class SampleRef:
             :attr:`StoreHealth.resident_bytes` for watermark hysteresis.
         target_model_version: Monotonically increasing identifier of the
             target-model weights that produced this sample. Used to reject
-            refs from a stale target (relevant once train-with-decode /
-            weight resync lands in PR 4).
+            refs from a stale target once train-with-decode weight resync
+            is wired through the recipe.
         draft_weight_version: Same idea for the draft model's weights, so a
             consumer can refuse to train against a ref produced before its
-            own weight snapshot. Starts at ``"0"``; PR 4 wires the resync.
+            own weight snapshot. Starts at ``"0"`` until resync is implemented.
     """
 
     sample_id: str
@@ -251,7 +252,7 @@ def assert_no_tensors(obj: Any, *, path: str = "ref") -> None:
     any depth raises :class:`ValueError`.
 
     The check is structural, not nominal: a third-party tensor type that
-    quacks like one is rejected. PR 2's registry / schema validators layer on
+    quacks like one is rejected. Per-algorithm schema validators layer on
     top of this primitive guard, not instead of it.
     """
     if obj is None or isinstance(obj, _PRIMITIVE_TYPES):
@@ -276,9 +277,6 @@ def assert_no_tensors(obj: Any, *, path: str = "ref") -> None:
         _reject_tensor(obj, path)
     if _is_numpy_array(obj):
         _reject_tensor(obj, path)
-    # Anything else is treated as opaque metadata. PR 2 may add a "frozen"
-    # class allowlist if / when producers start carrying more objects on the
-    # control plane (e.g. config fragments).
     logger.debug("assert_no_tensors accepted opaque object of type %s at %s", type(obj).__name__, path)
 
 

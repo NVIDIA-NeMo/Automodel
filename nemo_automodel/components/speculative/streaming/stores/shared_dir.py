@@ -24,12 +24,12 @@ partial write.
 The store is the rendezvous for a multi-process run:
 
 - Each process owns its own :class:`SharedDirFeatureStore` instance
-  pointing at the same shared directory. Per-process file ownership
-  (tracked in ``self._owned_files``) is what lets ``release`` delete
-  safely -- a process only deletes files it put.
+  pointing at the same shared directory. Producers write files; consumers
+  in other processes materialize them by ``sample_id`` without needing a
+  process-local ownership record.
 - The shared directory is the cross-process rendezvous; cross-rank
-  routing of which rank reads which sample_id is PR 4's DP resharding
-  work and is out of scope here.
+  routing of which rank reads which ``sample_id`` is left to distributed
+  resharding layers above this store.
 - Distributed parallelism (FSDP / CP / EP) lives in the trainer's
   forward / backward; this store is rank-local state plus a shared
   filesystem.
@@ -123,18 +123,13 @@ class SharedDirFeatureStore(FeatureStore):
         os.makedirs(directory, exist_ok=True)
         self._lock = threading.Lock()
         # Files this store instance put, keyed by sample_id. Tracks
-        # ownership so ``release`` only unlinks files we wrote -- a
-        # store cannot accidentally remove a file another process put.
+        # ownership so ``close`` only unlinks files we wrote.
         self._owned_files: dict[str, int] = {}
         # Track per-file handle refcount so concurrent get() calls on
         # the same sample each get their own tensors and the file
         # deletes only after the last release -- mirrors
         # ``LocalFeatureStore``'s consume-once semantics.
         self._handle_refs: dict[str, int] = {}
-        # ``_resident_bytes`` is a cached counter; ``health`` is the
-        # ints-only snapshot the queue reads. Maintained on put/release
-        # to keep ``health`` cheap.
-        self._resident_bytes = 0
         self._closed = False
 
     @property
@@ -148,6 +143,26 @@ class SharedDirFeatureStore(FeatureStore):
                 f"sample_id {sample_id!r} contains characters that would escape the store directory; refusing to write"
             )
         return os.path.join(self._directory, f"{sample_id}.safetensors")
+
+    def _directory_residency(self) -> tuple[int, int]:
+        """Return ``(sample_count, resident_bytes)`` from on-disk sample files."""
+        sample_count = 0
+        resident_bytes = 0
+        try:
+            names = os.listdir(self._directory)
+        except OSError:
+            return 0, 0
+        for name in names:
+            if not name.endswith(".safetensors") or name.startswith(".tmp."):
+                continue
+            path = os.path.join(self._directory, name)
+            try:
+                if os.path.isfile(path):
+                    resident_bytes += os.path.getsize(path)
+                    sample_count += 1
+            except OSError:
+                continue
+        return sample_count, resident_bytes
 
     def _atomic_write(self, path: str, tensors: Mapping[str, torch.Tensor]) -> int:
         # Atomic write: serialize to a tmp file in the same directory,
@@ -196,28 +211,28 @@ class SharedDirFeatureStore(FeatureStore):
         with self._lock:
             if self._closed:
                 raise RuntimeError("SharedDirFeatureStore is closed; no further puts accepted")
-            if sample_id in self._owned_files:
+            if sample_id in self._owned_files or os.path.isfile(path):
                 raise ValueError(f"sample_id already present in store: {sample_id}")
-            if self._max_samples is not None and len(self._owned_files) >= self._max_samples:
+            sample_count, resident_bytes = self._directory_residency()
+            if self._max_samples is not None and sample_count >= self._max_samples:
                 raise MemoryError(
-                    f"SharedDirFeatureStore at sample-count cap ({len(self._owned_files)}/{self._max_samples}); "
+                    f"SharedDirFeatureStore at sample-count cap ({sample_count}/{self._max_samples}); "
                     f"refusing put for sample_id={sample_id}"
                 )
             bytes_in = sum(_tensor_bytes(t) for t in tensors.values())
-            if self._max_bytes is not None and self._resident_bytes + bytes_in > self._max_bytes:
+            if self._max_bytes is not None and resident_bytes + bytes_in > self._max_bytes:
                 raise MemoryError(
-                    f"SharedDirFeatureStore at byte cap ({self._resident_bytes + bytes_in} > "
+                    f"SharedDirFeatureStore at byte cap ({resident_bytes + bytes_in} > "
                     f"{self._max_bytes}); refusing put for sample_id={sample_id}"
                 )
             bytes_written = self._atomic_write(path, tensors)
             self._owned_files[sample_id] = bytes_written
             self._handle_refs[sample_id] = 0
-            self._resident_bytes += bytes_written
             logger.debug(
                 "SharedDirFeatureStore put sample_id=%s bytes=%d resident=%d",
                 sample_id,
                 bytes_written,
-                self._resident_bytes,
+                resident_bytes + bytes_written,
             )
 
         feature_specs: dict[str, FeatureSpec] = {
@@ -253,10 +268,10 @@ class SharedDirFeatureStore(FeatureStore):
         with self._lock:
             if self._closed:
                 raise RuntimeError("SharedDirFeatureStore is closed; no further gets accepted")
-            if ref.sample_id not in self._owned_files:
-                raise KeyError(
-                    f"sample_id {ref.sample_id!r} is not present in this SharedDirFeatureStore (released or never put)"
-                )
+        if not os.path.isfile(path):
+            raise KeyError(
+                f"sample_id {ref.sample_id!r} is not present in this SharedDirFeatureStore (released or never put)"
+            )
         # Read outside the lock: the file is owned by this store and
         # is not mutated after the atomic put-write, so concurrent
         # reads of the same file are safe. Holding the lock across the
@@ -279,7 +294,7 @@ class SharedDirFeatureStore(FeatureStore):
                 tensor = tensor.clone()
             out[name] = tensor
         with self._lock:
-            self._handle_refs[ref.sample_id] += 1
+            self._handle_refs[ref.sample_id] = self._handle_refs.get(ref.sample_id, 0) + 1
             handle = StoreHandle(store=self, sample_id=ref.sample_id, ref=ref)
             logger.debug(
                 "SharedDirFeatureStore get sample_id=%s device=%s handles=%d",
@@ -304,51 +319,55 @@ class SharedDirFeatureStore(FeatureStore):
                 return
             count -= 1
             if count == 0:
-                # Last outstanding handle -- unlink the file and drop
-                # the ownership record. Best-effort: a missing file
-                # (e.g. cleaned up externally) is not an error.
-                bytes_in = self._owned_files.pop(handle.sample_id, 0)
-                self._handle_refs.pop(handle.sample_id, None)
                 path = self._path_for(handle.sample_id)
+                self._owned_files.pop(handle.sample_id, None)
+                self._handle_refs.pop(handle.sample_id, None)
                 try:
                     os.unlink(path)
                 except FileNotFoundError:
                     pass
                 except OSError:
                     logger.exception("SharedDirFeatureStore unlink failed for %s; ignoring", path)
-                self._resident_bytes -= bytes_in
             else:
                 self._handle_refs[handle.sample_id] = count
+            _, resident_bytes = self._directory_residency()
             logger.debug(
                 "SharedDirFeatureStore release sample_id=%s remaining_handles=%d resident=%d",
                 handle.sample_id,
                 count,
-                self._resident_bytes,
+                resident_bytes,
             )
 
     def gc(self) -> int:
-        # The local release path already unlinks files when their last
-        # handle is dropped, so the in-process case has nothing to do.
-        # A future PR (PR 4's multi-process controller) could use this
-        # hook to reclaim files put by crashed processes -- that is
-        # out of scope here.
+        # Release already unlinks files when the last handle drops; a
+        # controller could override this to reclaim files from crashed producers.
         return 0
 
     def health(self) -> StoreHealth:
+        sample_count, resident_bytes = self._directory_residency()
         with self._lock:
+            if self._closed:
+                sample_count = 0
+                resident_bytes = 0
             capacity = self._max_bytes if self._max_bytes is not None else 0
             return StoreHealth(
-                resident_bytes=self._resident_bytes,
+                resident_bytes=resident_bytes,
                 capacity_bytes=capacity,
-                sample_count=len(self._owned_files),
-                high_watermark_hit=(self._high_watermark is not None and self._resident_bytes >= self._high_watermark),
-                low_watermark_hit=(self._low_watermark is not None and self._resident_bytes <= self._low_watermark),
+                sample_count=sample_count,
+                high_watermark_hit=(self._high_watermark is not None and resident_bytes >= self._high_watermark),
+                low_watermark_hit=(self._low_watermark is not None and resident_bytes <= self._low_watermark),
             )
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
+            outstanding = sum(count for count in self._handle_refs.values() if count > 0)
+            if outstanding:
+                raise RuntimeError(
+                    f"SharedDirFeatureStore.close() called with {outstanding} outstanding handle(s); "
+                    f"release all StoreHandles before closing"
+                )
             self._closed = True
             # Delete every file this store instance still owns. A
             # crashed process leaks its files into the directory;
@@ -364,7 +383,6 @@ class SharedDirFeatureStore(FeatureStore):
                     logger.exception("SharedDirFeatureStore close unlink failed for %s; ignoring", path)
             self._owned_files.clear()
             self._handle_refs.clear()
-            self._resident_bytes = 0
 
 
 __all__ = ["SharedDirFeatureStore"]

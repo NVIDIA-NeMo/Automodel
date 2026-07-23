@@ -26,8 +26,8 @@ The pipeline's contract under test:
    shutdown.
 4. An exception in the prompt source (or the producer) is captured
    and re-raised on ``stop``, so the trainer sees it.
-5. A concurrent loader can iterate the queue while the pipeline
-   runs, which is the trainer-side overlap PR 3 unlocks.
+5. A concurrent loader can iterate the queue while the pipeline runs,
+   overlapping target forward with draft-side consumption.
 """
 
 from __future__ import annotations
@@ -50,10 +50,11 @@ from nemo_automodel.components.speculative.streaming import (
 from nemo_automodel.components.speculative.streaming.async_pipeline import AsyncFeaturePipeline
 from nemo_automodel.components.speculative.streaming.loader import FeatureDataLoader
 from nemo_automodel.components.speculative.streaming.producer import FeatureProducer
+from nemo_automodel.components.speculative.streaming.stores.shared_dir import SharedDirFeatureStore
 
 
 class _FakeHFCausalLM(nn.Module):
-    """Tiny HF causal-LM stand-in -- matches the PR 2 fixtures."""
+    """Tiny HF causal-LM stand-in shared with the producer/loader tests."""
 
     def __init__(self, num_layers: int = 4, hidden: int = 16, vocab: int = 32) -> None:
         super().__init__()
@@ -246,6 +247,59 @@ def test_async_pipeline_propagates_producer_error(target, store, queue) -> None:
 
 
 # --- 5. backpressure interacts correctly -----------------------------------
+
+
+def test_async_pipeline_stop_unblocks_backpressured_producer(producer, queue) -> None:
+    """``stop`` closes the queue so a blocked ``put_blocks_until_below`` exits."""
+    small_store = LocalFeatureStore(
+        max_samples=8,
+        max_bytes=256 * 1024,
+        high_watermark_bytes=4 * 1024,
+        low_watermark_bytes=1024,
+    )
+    small_queue = SampleRefQueue(small_store)
+    small_producer = FeatureProducer(producer._target, small_store, run_id="r1")
+    for _ in range(3):
+        small_producer.produce(
+            input_ids=torch.randint(0, 32, (2, 8)),
+            attention_mask=torch.ones(2, 8, dtype=torch.long),
+            loss_mask=torch.ones(2, 8, dtype=torch.long),
+        )
+    assert small_store.health().high_watermark_hit
+
+    pipe = AsyncFeaturePipeline(small_producer, small_queue, _prompts(1), poll_interval=0.01)
+    pipe.start()
+    time.sleep(0.1)
+    assert pipe._thread is not None and pipe._thread.is_alive()
+    pipe.stop(join_timeout=2.0)
+    assert small_queue.is_closed
+
+
+def test_async_pipeline_with_shared_dir_store(tmp_path) -> None:
+    directory = str(tmp_path / "store")
+    store = SharedDirFeatureStore(
+        directory,
+        max_samples=8,
+        max_bytes=4 * 1024 * 1024,
+        high_watermark_bytes=3 * 1024 * 1024,
+        low_watermark_bytes=1 * 1024 * 1024,
+    )
+    queue = SampleRefQueue(store)
+    target = HFEagle3TargetModel(_FakeHFCausalLM(num_layers=4), aux_layer_ids=[0, 1, 3])
+    producer = FeatureProducer(target, store, run_id="r1")
+    with AsyncFeaturePipeline(producer, queue, _prompts(2), poll_interval=0.01) as pipe:
+        loader = FeatureDataLoader(queue, store)
+        pulled = 0
+        deadline = time.monotonic() + 3.0
+        while pulled < 2 and time.monotonic() < deadline:
+            try:
+                batch = next(iter(loader))
+                assert batch.logits is not None
+                pulled += 1
+            except StopIteration:
+                time.sleep(0.01)
+        pipe.join(timeout=2.0)
+    assert pulled == 2
 
 
 def test_async_pipeline_backpressure_pauses_when_store_overflows(producer, queue) -> None:

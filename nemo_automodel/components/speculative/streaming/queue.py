@@ -25,9 +25,8 @@ may retry).
 
 A lease that is never ACK'd or FAIL'd within :attr:`Lease.visibility_timeout`
 is considered orphaned and is reclaimed by
-:meth:`SampleRefQueue.reclaim_expired`. That reclaim is what makes the queue
-safe to drive against a producer that may crash mid-flight (RFC §"Phased plan"
-PR 4's "visibility-timeout redelivery").
+:meth:`SampleRefQueue.reclaim_expired`. That reclaim makes the queue
+safe to drive against a producer that may crash mid-flight.
 
 Backpressure is driven by the bound :class:`FeatureStore`'s
 :meth:`FeatureStore.health` (ints only -- the queue never touches tensors in
@@ -88,7 +87,7 @@ class Lease:
         visibility_timeout: The :class:`VisibilityTimeout` that produced
             this lease, kept here so the consumer can introspect it.
         redelivery_count: Number of times this ref has been leased and
-            re-leased (PR 4 uses it for retry telemetry). Starts at 0.
+            re-leased (used for retry telemetry). Starts at 0.
     """
 
     ref: SampleRef
@@ -200,6 +199,12 @@ class SampleRefQueue:
             return health.resident_bytes <= self._low_bytes
         return health.low_watermark_hit
 
+    def _gc_store(self) -> None:
+        try:
+            self._store.gc()
+        except Exception:
+            logger.exception("store.gc failed; continuing")
+
     # --- produce side -------------------------------------------------------
 
     def put(self, ref: SampleRef) -> None:
@@ -217,8 +222,15 @@ class SampleRefQueue:
             self._pending.append(ref)
             self._sample_counters.setdefault(ref.sample_id, 0)
             logger.debug("SampleRefQueue put sample_id=%s pending=%d", ref.sample_id, len(self._pending))
+            self._gc_store()
 
-    def put_blocks_until_below(self, ref: SampleRef, *, poll_interval: float = 0.05) -> None:
+    def put_blocks_until_below(
+        self,
+        ref: SampleRef,
+        *,
+        poll_interval: float = 0.05,
+        abort_when: Callable[[], bool] | None = None,
+    ) -> None:
         """Enqueue ``ref``, blocking the producer while the store is over its high watermark.
 
         The producer is paused when :meth:`_should_pause` returns ``True``
@@ -234,14 +246,20 @@ class SampleRefQueue:
             poll_interval: Seconds between backpressure checks when paused.
                 Defaults to 50ms -- well below typical step times, well above
                 the cost of a Python-level :meth:`FeatureStore.health` call.
+            abort_when: Optional callable checked on each loop iteration.
+                When it returns ``True``, the put aborts with
+                :class:`RuntimeError` so a shutdown signal can unblock a
+                producer waiting on backpressure without closing the queue
+                first.
 
         Raises:
             RuntimeError: if the queue is closed while the producer is
-                blocked, so a producer does not silently swallow a
-                shutdown signal.
+                blocked, or if ``abort_when`` returns ``True``.
         """
         while True:
             with self._put_cv:
+                if abort_when is not None and abort_when():
+                    raise RuntimeError("SampleRefQueue put aborted during shutdown")
                 if self._closed:
                     raise RuntimeError("SampleRefQueue is closed while put was waiting on backpressure")
                 health = self._store.health()
@@ -313,6 +331,7 @@ class SampleRefQueue:
         with self._put_cv:
             if self._closed and not self._pending and not self._outstanding:
                 return None
+            self._gc_store()
             if not self._pending:
                 self._put_cv.wait(timeout=poll_interval)
                 if not self._pending:
@@ -356,6 +375,7 @@ class SampleRefQueue:
             # Wake up a producer that might have been waiting for the
             # store to drain below the high watermark.
             self._put_cv.notify_all()
+            self._gc_store()
 
     def fail(self, lease: Lease) -> None:
         """Return a leased ref to the pending queue, without dropping its tensors.
@@ -378,6 +398,7 @@ class SampleRefQueue:
             # ahead of samples still waiting their first try.
             self._pending.append(active.ref)
             self._put_cv.notify_all()
+            self._gc_store()
 
     # --- background reclaim -------------------------------------------------
 
@@ -403,6 +424,7 @@ class SampleRefQueue:
                 self._outstanding.pop(sample_id, None)
             if reclaimed:
                 self._put_cv.notify_all()
+                self._gc_store()
         if reclaimed:
             logger.warning("SampleRefQueue reclaimed %d expired leases: %s", len(reclaimed), reclaimed[:8])
         return len(reclaimed)
@@ -431,7 +453,3 @@ class SampleRefQueue:
 
 
 __all__ = ["Lease", "SampleRefQueue", "VisibilityTimeout"]
-
-
-# Note: when PR 4 adds a ``completion_future`` field to ``Lease`` it should
-# import ``field`` from ``dataclasses`` and add it to the dataclass.

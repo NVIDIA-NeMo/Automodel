@@ -16,12 +16,12 @@
 
 The :class:`FeatureStore` ABC abstracts where the supervision tensors actually
 live -- an in-process dict for build/test, a POSIX shared mount for
-multi-node/colocated, or NCCL for GPU-to-GPU in later PRs. The
+multi-node/colocated, or NCCL for GPU-to-GPU transfers. The
 :class:`SampleRefQueue` reads the store's :meth:`FeatureStore.health` to
 decide whether to back off.
 
-The contract is deliberately small (5 methods + 1 property) so PR 2 and
-later have an obvious surface to extend:
+The contract is deliberately small (5 methods + 1 property) so producers,
+consumers, and alternate backends share one obvious surface to extend:
 
 - :meth:`put` -- produce-side: stash tensors for a sample.
 - :meth:`get`  -- consume-side: materialize them; returns a :class:`StoreHandle`
@@ -67,9 +67,9 @@ class StoreHealth:
         resident_bytes: Bytes currently held in the store across un-acked
             samples. Compared against ``capacity_bytes`` for the high/low
             watermark hysteresis.
-        capacity_bytes: Configured hard cap from
-            :class:`~nemo_automodel.components.speculative.streaming.stores.local.LocalFeatureStore`
-            (PR 3's shared-dir / PR 4's NCCL store report the analogous cap).
+        capacity_bytes: Configured hard cap from the bound store backend
+            (for example :class:`~nemo_automodel.components.speculative.streaming.stores.local.LocalFeatureStore`
+            or :class:`~nemo_automodel.components.speculative.streaming.stores.shared_dir.SharedDirFeatureStore`).
         sample_count: Number of un-acked samples currently held. Used for
             the second cap (sample count) the RFC §"Open questions" Q2 keeps
             alongside the byte backstop.

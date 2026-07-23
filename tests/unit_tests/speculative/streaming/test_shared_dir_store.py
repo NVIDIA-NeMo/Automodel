@@ -236,6 +236,29 @@ def test_shared_dir_store_gc_is_a_noop_for_in_process(store) -> None:
 # --- 6. atomic write -------------------------------------------------------
 
 
+def test_shared_dir_store_cross_process_get_and_release(tmp_path) -> None:
+    """A consumer process can materialize files put by a producer process."""
+    directory = str(tmp_path / "store")
+    producer = SharedDirFeatureStore(directory, max_samples=4, max_bytes=4 * 1024 * 1024)
+    consumer = SharedDirFeatureStore(directory, max_samples=4, max_bytes=4 * 1024 * 1024)
+    ref = _put(producer, "s1", n_floats=128)
+
+    out, handle = consumer.get(ref)
+    assert torch.equal(out["input_ids"], _eagle3_features(128)["input_ids"])
+    consumer.release(handle)
+    assert not (tmp_path / "store" / "s1.safetensors").exists()
+
+
+def test_shared_dir_store_health_scans_directory(tmp_path) -> None:
+    directory = str(tmp_path / "store")
+    producer = SharedDirFeatureStore(directory, max_samples=4, max_bytes=4 * 1024 * 1024)
+    consumer = SharedDirFeatureStore(directory, max_samples=4, max_bytes=4 * 1024 * 1024)
+    _put(producer, "s1", n_floats=128)
+    health = consumer.health()
+    assert health.sample_count == 1
+    assert health.resident_bytes > 0
+
+
 def test_shared_dir_store_atomic_write_leaves_no_partial_files(tmp_path) -> None:
     store = SharedDirFeatureStore(str(tmp_path / "store"), max_samples=4, max_bytes=1024 * 1024)
     _put(store, "s1", n_floats=64)

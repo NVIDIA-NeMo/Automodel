@@ -18,19 +18,17 @@
 :class:`SampleRefQueue` and runs the target forward in a background
 thread, pushing every produced :class:`SampleRef` onto the queue
 through :meth:`SampleRefQueue.put_blocks_until_below` so the queue's
-HWM/LWM hysteresis (PR 1's fix) governs the producer's pacing.
+HWM/LWM hysteresis governs the producer's pacing.
 
-The trainer-side code is unchanged from PR 2:
-``FeatureDataLoader`` iterates the queue; the trainer consumes
-``Eagle3TargetBatch`` instances. The only difference is that the queue
-is now filled by a background thread rather than by the trainer's
+The trainer-side :class:`~nemo_automodel.components.speculative.streaming.loader.FeatureDataLoader`
+iterates the queue; the trainer consumes ``Eagle3TargetBatch`` instances.
+The queue is filled by a background thread rather than by the trainer's
 main thread, so target-side forward and draft-side backward overlap.
 
-Distributed-training note (per the Automodel principle): the pipeline
-is per-rank. Each rank owns its own :class:`FeatureProducer`,
-:class:`SampleRefQueue`, and :class:`FeatureStore`; FSDP / CP / EP
-happen inside the trainer's forward / backward. Cross-rank
-coordination (DP resharding) is PR 4.
+Distributed-training note: the pipeline is per-rank. Each rank owns its own
+:class:`FeatureProducer`, :class:`SampleRefQueue`, and :class:`FeatureStore`;
+FSDP / CP / EP happen inside the trainer's forward / backward. Cross-rank
+sample routing is handled above this layer.
 """
 
 from __future__ import annotations
@@ -65,12 +63,12 @@ class AsyncFeaturePipeline:
     """Run a :class:`FeatureProducer` in a background thread, draining a prompt source.
 
     Args:
-        producer: The :class:`FeatureProducer` (PR 2) to invoke on each
-            prompt. It carries the wrapped target backend, the store,
-            and the per-call metadata.
+        producer: The :class:`FeatureProducer` to invoke on each prompt.
+            It carries the wrapped target backend, the store, and the
+            per-call metadata.
         queue: The :class:`SampleRefQueue` to push the resulting
             :class:`SampleRef` onto. The queue's HWM/LWM hysteresis
-            (PR 1's fix) paces the producer against the consumer.
+            paces the producer against the consumer.
         prompt_source: A :class:`PromptSource` -- either a zero-arg
             callable or an :class:`Iterator`. The callable is invoked
             from the background thread; it must be thread-safe (e.g.
@@ -131,13 +129,16 @@ class AsyncFeaturePipeline:
         # only when the iterator yields the full 3-tuple.
         if isinstance(value, tuple) and len(value) == 3:
             return value
+        if isinstance(value, tuple) and len(value) == 6:
+            return value
         if isinstance(value, torch.Tensor):
             attn = torch.ones_like(value, dtype=torch.long)
             loss = torch.ones_like(value, dtype=torch.long)
             return value, attn, loss
         raise TypeError(
-            f"prompt iterator must yield (input_ids, attention_mask, loss_mask) or a single "
-            f"Tensor; got {type(value).__name__}"
+            f"prompt iterator must yield (input_ids, attention_mask, loss_mask) or a six-tuple "
+            f"with packing metadata (position_ids, seq_lens, doc_remaining), or a single "
+            f"Tensor; got {type(value).__name__} of length {len(value) if isinstance(value, tuple) else 'n/a'}"
         )
 
     def start(self) -> None:
@@ -202,19 +203,37 @@ class AsyncFeaturePipeline:
                     if self._stop_event.wait(timeout=self._poll_interval):
                         break
                     continue
-                input_ids, attention_mask, loss_mask = prompt
+                packing_kwargs = {}
+                if isinstance(prompt, tuple) and len(prompt) == 6:
+                    input_ids, attention_mask, loss_mask, position_ids, seq_lens, doc_remaining = prompt
+                    packing_kwargs = {
+                        "position_ids": position_ids,
+                        "seq_lens": seq_lens,
+                        "doc_remaining": doc_remaining,
+                    }
+                else:
+                    input_ids, attention_mask, loss_mask = prompt
                 ref = self._producer.produce(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     loss_mask=loss_mask,
+                    **packing_kwargs,
                 )
                 # put_blocks_until_below honors the queue's HWM/LWM
                 # hysteresis; a fast producer here naturally blocks
                 # when the store is at high watermark.
-                self._queue.put_blocks_until_below(
-                    ref,
-                    poll_interval=self._poll_interval,
-                )
+                try:
+                    self._queue.put_blocks_until_below(
+                        ref,
+                        poll_interval=self._poll_interval,
+                        abort_when=self._stop_event.is_set,
+                    )
+                except RuntimeError as e:
+                    if self._stop_event.is_set() and (
+                        "aborted during shutdown" in str(e) or "closed while put was waiting" in str(e)
+                    ):
+                        break
+                    raise
         except BaseException as e:  # noqa: BLE001 -- capture then re-raise from stop()
             logger.exception("AsyncFeaturePipeline background thread failed")
             self._error = e

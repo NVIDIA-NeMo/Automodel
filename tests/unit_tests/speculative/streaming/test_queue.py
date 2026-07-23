@@ -27,8 +27,8 @@ its guarantees are:
 5. :meth:`close` drains the queue (subsequent acquires return ``None``).
 
 These tests run CPU-only and exercise the API directly rather than through
-the trainer. PR 2's :class:`FeatureDataLoader` consumer integration is the
-end-to-end coverage for the recipe-side path.
+the trainer. :class:`FeatureDataLoader` integration tests cover the
+recipe-side path end-to-end.
 """
 
 from __future__ import annotations

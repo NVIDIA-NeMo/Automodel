@@ -37,6 +37,7 @@ from nemo_automodel.components.speculative.streaming.eagle3 import (
     EAGLE3_CORE_FEATURES,
     EAGLE3_DRAFT_VOCAB_SUPERVISION,
     EAGLE3_LOGITS_SUPERVISION,
+    EAGLE3_SCHEMA_VERSION,
     EAGLE3_SUPERVISION_ENCODINGS,
     eagle3_logits_feature_specs,
     eagle3_logits_tensors,
@@ -104,6 +105,30 @@ def _ref(
 # --- 1. Tensor-dict packing + insertion order -----------------------------
 
 
+def test_eagle3_logits_tensors_includes_packing_metadata_when_provided() -> None:
+    aux = torch.zeros(2, 8, 96)
+    ids = torch.zeros(2, 8, dtype=torch.long)
+    mask = torch.ones(2, 8, dtype=torch.long)
+    loss = torch.ones(2, 8, dtype=torch.long)
+    logits = torch.zeros(2, 8, 32)
+    position_ids = torch.arange(8, dtype=torch.long).unsqueeze(0).expand(2, -1)
+    seq_lens = torch.tensor([[4, 4], [8, 0]], dtype=torch.long)
+    doc_remaining = torch.ones(2, 8, dtype=torch.long)
+    out = eagle3_logits_tensors(
+        aux_hidden_states=aux,
+        input_ids=ids,
+        attention_mask=mask,
+        loss_mask=loss,
+        logits=logits,
+        position_ids=position_ids,
+        seq_lens=seq_lens,
+        doc_remaining=doc_remaining,
+    )
+    assert set(out) == set(EAGLE3_SUPERVISION_ENCODINGS) | {"position_ids", "seq_lens", "doc_remaining"}
+    specs = eagle3_logits_feature_specs(aux, ids, mask, loss, logits, position_ids, seq_lens, doc_remaining)
+    assert specs["seq_lens"].shape == (2, 2)
+
+
 def test_eagle3_logits_tensors_packs_documented_key_set() -> None:
     aux = torch.zeros(2, 8, 96)
     ids = torch.zeros(2, 8, dtype=torch.long)
@@ -147,6 +172,25 @@ def test_validate_accepts_draft_vocab_supervision() -> None:
 def test_validate_rejects_non_eagle3_algorithm() -> None:
     ref = _ref(algorithm=FeatureAlgorithm.DFLASH)
     with pytest.raises(ValueError, match=r"must be .*EAGLE3.* for an EAGLE-3 consumer"):
+        validate_eagle3_ref(ref)
+
+
+def test_validate_rejects_wrong_schema_version() -> None:
+    ref = _ref(include_logits=True)
+    object.__setattr__(ref, "schema_version", 0)
+    with pytest.raises(ValueError, match=f"schema_version must be {EAGLE3_SCHEMA_VERSION}"):
+        validate_eagle3_ref(ref)
+
+
+def test_validate_rejects_partial_packing_features() -> None:
+    ref = _ref(include_logits=True)
+    object.__setattr__(
+        ref,
+        "feature_specs",
+        {**ref.feature_specs, "seq_lens": FeatureSpec(shape=(2, 2), dtype=torch.long)},
+    )
+    object.__setattr__(ref, "feature_keys", {**ref.feature_keys, "seq_lens": "s/seq_lens"})
+    with pytest.raises(ValueError, match="position_ids, seq_lens, and doc_remaining together"):
         validate_eagle3_ref(ref)
 
 

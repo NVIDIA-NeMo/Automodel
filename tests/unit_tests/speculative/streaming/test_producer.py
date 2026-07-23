@@ -59,7 +59,7 @@ class _FakeHFCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def forward(self, input_ids, attention_mask=None, **kwargs):
+    def forward(self, input_ids, attention_mask=None, position_ids=None, **kwargs):
         h = self.embed_tokens(input_ids)
         for layer in self.layers:
             h = layer(h)
@@ -85,6 +85,32 @@ def _inputs(*, batch: int = 2, seq: int = 8) -> tuple[torch.Tensor, torch.Tensor
 
 
 # --- 1. Round-trip via the wrapped backend --------------------------------
+
+
+def test_producer_round_trips_packing_metadata(target, store) -> None:
+    producer = FeatureProducer(target, store, run_id="r1")
+    input_ids = torch.randint(0, 32, (2, 8))
+    attn = torch.ones(2, 8, dtype=torch.long)
+    loss = torch.ones(2, 8, dtype=torch.long)
+    position_ids = torch.arange(8, dtype=torch.long).unsqueeze(0).expand(2, -1)
+    seq_lens = torch.tensor([[4, 4], [8, 0]], dtype=torch.long)
+    doc_remaining = torch.ones(2, 8, dtype=torch.long)
+    ref = producer.produce(
+        input_ids=input_ids,
+        attention_mask=attn,
+        loss_mask=loss,
+        position_ids=position_ids,
+        seq_lens=seq_lens,
+        doc_remaining=doc_remaining,
+    )
+    assert "position_ids" in ref.feature_specs
+    assert "seq_lens" in ref.feature_specs
+    assert "doc_remaining" in ref.feature_specs
+    tensors, handle = store.get(ref)
+    assert torch.equal(tensors["position_ids"], position_ids)
+    assert torch.equal(tensors["seq_lens"], seq_lens)
+    assert torch.equal(tensors["doc_remaining"], doc_remaining)
+    store.release(handle)
 
 
 def test_producer_passes_input_through_to_wrapped_backend(target, store) -> None:

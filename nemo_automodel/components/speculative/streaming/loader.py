@@ -35,7 +35,10 @@ import logging
 import torch
 
 from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
-from nemo_automodel.components.speculative.streaming.eagle3 import validate_eagle3_ref
+from nemo_automodel.components.speculative.streaming.eagle3 import (
+    EAGLE3_PACKING_FEATURES,
+    validate_eagle3_ref,
+)
 from nemo_automodel.components.speculative.streaming.queue import Lease, SampleRefQueue
 from nemo_automodel.components.speculative.streaming.store import FeatureStore, StoreHandle
 
@@ -170,6 +173,10 @@ def _materialize_batch(algorithm, tensors: dict[str, torch.Tensor]) -> Eagle3Tar
     new branch here.
     """
     if algorithm.value == "eagle3":
+        if "seq_lens" in tensors:
+            missing = [name for name in EAGLE3_PACKING_FEATURES if name not in tensors]
+            if missing:
+                raise ValueError(f"FeatureDataLoader (EAGLE-3) received partial packing metadata; missing {missing}")
         logits = tensors.get("logits")
         if logits is not None:
             return Eagle3TargetBatch(
@@ -178,6 +185,9 @@ def _materialize_batch(algorithm, tensors: dict[str, torch.Tensor]) -> Eagle3Tar
                 attention_mask=tensors["attention_mask"],
                 loss_mask=tensors["loss_mask"],
                 logits=logits,
+                position_ids=tensors.get("position_ids"),
+                seq_lens=tensors.get("seq_lens"),
+                doc_remaining=tensors.get("doc_remaining"),
             )
         target_probs = tensors.get("target_probs")
         position_mask = tensors.get("position_mask")
@@ -189,6 +199,9 @@ def _materialize_batch(algorithm, tensors: dict[str, torch.Tensor]) -> Eagle3Tar
                 loss_mask=tensors["loss_mask"],
                 target_probs=target_probs,
                 position_mask=position_mask,
+                position_ids=tensors.get("position_ids"),
+                seq_lens=tensors.get("seq_lens"),
+                doc_remaining=tensors.get("doc_remaining"),
             )
         raise ValueError(
             f"FeatureDataLoader (EAGLE-3) received a ref with no supervision encoding; feature keys={sorted(tensors)}"

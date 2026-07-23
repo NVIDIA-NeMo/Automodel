@@ -39,8 +39,10 @@ import torch.nn as nn
 
 from nemo_automodel.components.speculative.eagle.target import Eagle3TargetBatch
 from nemo_automodel.components.speculative.streaming.eagle3 import (
+    EAGLE3_SCHEMA_VERSION,
     eagle3_logits_feature_specs,
     eagle3_logits_tensors,
+    validate_eagle3_packing_inputs,
 )
 from nemo_automodel.components.speculative.streaming.refs import (
     FeatureAlgorithm,
@@ -83,9 +85,6 @@ class FeatureProducer:
             :class:`SampleRef`.
         algorithm: Forced :class:`FeatureAlgorithm`; defaults to picking
             by the backend's runtime type.
-        schema_version: Bumped when the producer's feature set / tensor
-            layout for ``algorithm`` changes incompatibly. The consumer
-            treats it as a hard gate.
         target_model_version: Monotonically increasing identifier of the
             target-model weights; surfaced on each :class:`SampleRef`.
         draft_weight_version: Same idea for the draft model's weights.
@@ -106,7 +105,6 @@ class FeatureProducer:
         *,
         run_id: str,
         algorithm: FeatureAlgorithm | None = None,
-        schema_version: int = 1,
         target_model_version: str = "0",
         draft_weight_version: str = "0",
         sample_id_factory: Callable[[int], str] | None = None,
@@ -117,7 +115,6 @@ class FeatureProducer:
         self._store = store
         self._run_id = run_id
         self._algorithm = algorithm if algorithm is not None else _resolve_algorithm(target_backend)
-        self._schema_version = schema_version
         self._target_model_version = target_model_version
         self._draft_weight_version = draft_weight_version
         self._sample_id_factory = sample_id_factory or self._default_sample_id
@@ -183,6 +180,11 @@ class FeatureProducer:
                 wait for the store to drain through the queue's
                 backpressure path (``put_blocks_until_below``).
         """
+        validate_eagle3_packing_inputs(
+            position_ids=position_ids,
+            seq_lens=seq_lens,
+            doc_remaining=doc_remaining,
+        )
         batch: Eagle3TargetBatch = self._target.generate_batch(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -204,6 +206,9 @@ class FeatureProducer:
             attention_mask=batch.attention_mask,
             loss_mask=batch.loss_mask,
             logits=logits,
+            position_ids=batch.position_ids,
+            seq_lens=batch.seq_lens,
+            doc_remaining=batch.doc_remaining,
         )
         feature_specs = eagle3_logits_feature_specs(
             batch.aux_hidden_states,
@@ -211,6 +216,9 @@ class FeatureProducer:
             batch.attention_mask,
             batch.loss_mask,
             logits,
+            batch.position_ids,
+            batch.seq_lens,
+            batch.doc_remaining,
         )
         self._sample_seq += 1
         sample_id = self._sample_id_factory(self._sample_seq)
@@ -220,7 +228,7 @@ class FeatureProducer:
             tensors,
             run_id=self._run_id,
             algorithm=self._algorithm,
-            schema_version=self._schema_version,
+            schema_version=EAGLE3_SCHEMA_VERSION,
             target_model_version=self._target_model_version,
             draft_weight_version=self._draft_weight_version,
             num_tokens=num_tokens,

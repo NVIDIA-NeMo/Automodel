@@ -14,9 +14,8 @@
 
 """Unit tests for :class:`LocalFeatureStore`.
 
-The store is the build-and-test surface for PR 1; everything in
-``tests/unit_tests/speculative/streaming/test_local_store.py`` runs CPU-only
-and covers the contract pieces of
+The store is the in-process reference backend for the streaming data plane;
+everything in this module runs CPU-only and covers the contract pieces of
 :class:`~nemo_automodel.components.speculative.streaming.store.FeatureStore`:
 
 1. Put + get + release round-trip; get returns detached copies so the
@@ -252,6 +251,16 @@ def test_local_store_health_reports_resident_bytes_and_watermarks() -> None:
 
 
 # --- 5. lifecycle ---------------------------------------------------------
+
+
+def test_local_store_close_rejects_outstanding_handles() -> None:
+    store = LocalFeatureStore(max_samples=4, max_bytes=1024 * 1024)
+    ref = _put(store, "s1", n_bytes=64)
+    _, handle = store.get(ref)
+    with pytest.raises(RuntimeError, match="outstanding handle"):
+        store.close()
+    store.release(handle)
+    store.close()
 
 
 def test_local_store_close_drops_state_and_rejects_subsequent_put() -> None:

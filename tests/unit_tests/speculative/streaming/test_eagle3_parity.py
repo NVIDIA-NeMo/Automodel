@@ -14,14 +14,10 @@
 
 """Numerical parity between the streaming producer/loader and the colocated path.
 
-This is the contract that PR 2 of issue #3062 is gated on: feeding the
-same input to ``HFEagle3TargetModel.generate_batch`` (the existing
-colocated path) and to ``FeatureProducer.produce`` +
-``FeatureDataLoader.__next__`` (the streaming path) must yield a
-bit-identical :class:`Eagle3TargetBatch`. The check covers every
-supervision-relevant field so a producer-side transformation (a dropout
-toggle, a dtype cast, a transpose, a stray ``clone``) trips here
-instead of silently degrading a downstream draft.
+This is the parity contract for the streaming path: feeding the
+same input to ``HFEagle3TargetModel.generate_batch`` (the colocated path)
+and to ``FeatureProducer.produce`` + ``FeatureDataLoader.__next__`` must
+yield a bit-identical :class:`Eagle3TargetBatch`.
 """
 
 from __future__ import annotations
@@ -53,7 +49,7 @@ class _FakeHFCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def forward(self, input_ids, attention_mask=None, **kwargs):
+    def forward(self, input_ids, attention_mask=None, position_ids=None, **kwargs):
         h = self.embed_tokens(input_ids)
         for layer in self.layers:
             h = layer(h)
@@ -98,6 +94,46 @@ def test_streaming_path_matches_colocated_path(colocated, streaming_inputs) -> N
     assert torch.equal(baseline.logits, streamed.logits)
     assert streamed.target_probs is None
     assert streamed.position_mask is None
+
+
+def test_streaming_path_matches_colocated_path_with_packing(colocated) -> None:
+    """Packing metadata must round-trip through the streaming path like ``train_eagle3``."""
+    input_ids = torch.randint(0, 32, (2, 8))
+    attention_mask = torch.ones(2, 8, dtype=torch.long)
+    loss_mask = torch.ones(2, 8, dtype=torch.long)
+    position_ids = torch.arange(8, dtype=torch.long).unsqueeze(0).expand(2, -1)
+    seq_lens = torch.tensor([[4, 4], [8, 0]], dtype=torch.long)
+    doc_remaining = torch.ones(2, 8, dtype=torch.long)
+
+    baseline = colocated.generate_batch(
+        input_ids,
+        attention_mask,
+        loss_mask,
+        position_ids=position_ids,
+        seq_lens=seq_lens,
+        doc_remaining=doc_remaining,
+    )
+
+    store = LocalFeatureStore(max_samples=8, max_bytes=4 * 1024 * 1024)
+    queue = SampleRefQueue(store)
+    producer = FeatureProducer(colocated, store, run_id="parity-packed")
+    ref = producer.produce(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+        position_ids=position_ids,
+        seq_lens=seq_lens,
+        doc_remaining=doc_remaining,
+    )
+    queue.put(ref)
+    streamed = next(iter(FeatureDataLoader(queue, store)))
+
+    assert torch.equal(baseline.aux_hidden_states, streamed.aux_hidden_states)
+    assert torch.equal(baseline.logits, streamed.logits)
+    assert baseline.seq_lens is not None and streamed.seq_lens is not None
+    assert torch.equal(baseline.position_ids, streamed.position_ids)
+    assert torch.equal(baseline.seq_lens, streamed.seq_lens)
+    assert torch.equal(baseline.doc_remaining, streamed.doc_remaining)
 
 
 def test_streaming_path_over_multiple_inputs_matches_colocated(colocated) -> None:

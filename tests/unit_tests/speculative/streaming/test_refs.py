@@ -25,9 +25,8 @@ Three contracts are under test here:
    rejects torch tensors, numpy arrays, and duck-typed tensor-likes
    anywhere in the structure, and accepts the empty case.
 
-These tests are CPU-only (no GPU required) and are the contract surface
-PR 2 + PR 4 will validate against; the RFC's "PR 1: data-plane contracts
-and local store" requires contract coverage as the landing gate.
+These tests are CPU-only (no GPU required) and cover the control-plane
+contract surface that producers and consumers must honor.
 """
 
 from __future__ import annotations

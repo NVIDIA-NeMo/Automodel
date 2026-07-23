@@ -81,20 +81,42 @@ def backend() -> HFEagle3TargetModel:
     return HFEagle3TargetModel(_FakeHFCausalLM(num_layers=4), aux_layer_ids=[0, 1, 3])
 
 
-def _produce_one(target, store, *, sample_id="s1") -> SampleRef:
+def _produce_one(
+    target,
+    store,
+    *,
+    sample_id="s1",
+    position_ids=None,
+    seq_lens=None,
+    doc_remaining=None,
+) -> SampleRef:
     input_ids = torch.randint(0, 32, (2, 8))
     attn = torch.ones(2, 8, dtype=torch.long)
     loss = torch.ones(2, 8, dtype=torch.long)
-    batch: Eagle3TargetBatch = target.generate_batch(input_ids, attn, loss)
+    batch: Eagle3TargetBatch = target.generate_batch(
+        input_ids,
+        attn,
+        loss,
+        position_ids=position_ids,
+        seq_lens=seq_lens,
+        doc_remaining=doc_remaining,
+    )
+    tensors = {
+        "aux_hidden_states": batch.aux_hidden_states,
+        "input_ids": batch.input_ids,
+        "attention_mask": batch.attention_mask,
+        "loss_mask": batch.loss_mask,
+        "logits": batch.logits,
+    }
+    if position_ids is not None:
+        tensors["position_ids"] = position_ids
+    if seq_lens is not None:
+        tensors["seq_lens"] = seq_lens
+    if doc_remaining is not None:
+        tensors["doc_remaining"] = doc_remaining
     return store.put(
         sample_id,
-        {
-            "aux_hidden_states": batch.aux_hidden_states,
-            "input_ids": batch.input_ids,
-            "attention_mask": batch.attention_mask,
-            "loss_mask": batch.loss_mask,
-            "logits": batch.logits,
-        },
+        tensors,
         run_id="r1",
         algorithm=FeatureAlgorithm.EAGLE3,
         schema_version=1,
@@ -105,6 +127,42 @@ def _produce_one(target, store, *, sample_id="s1") -> SampleRef:
 
 
 # --- 1. lease + materialize -------------------------------------------------
+
+
+def test_loader_round_trips_packing_metadata(queue, store, backend) -> None:
+    position_ids = torch.arange(8, dtype=torch.long).unsqueeze(0).expand(2, -1)
+    seq_lens = torch.tensor([[4, 4], [8, 0]], dtype=torch.long)
+    doc_remaining = torch.ones(2, 8, dtype=torch.long)
+    input_ids = torch.randint(0, 32, (2, 8))
+    attn = torch.ones(2, 8, dtype=torch.long)
+    loss = torch.ones(2, 8, dtype=torch.long)
+    batch: Eagle3TargetBatch = backend.generate_batch(input_ids, attn, loss)
+    ref = store.put(
+        "packed",
+        {
+            "aux_hidden_states": batch.aux_hidden_states,
+            "input_ids": batch.input_ids,
+            "attention_mask": batch.attention_mask,
+            "loss_mask": batch.loss_mask,
+            "logits": batch.logits,
+            "position_ids": position_ids,
+            "seq_lens": seq_lens,
+            "doc_remaining": doc_remaining,
+        },
+        run_id="r1",
+        algorithm=FeatureAlgorithm.EAGLE3,
+        schema_version=1,
+        target_model_version="0",
+        draft_weight_version="0",
+        num_tokens=16,
+    )
+    queue.put(ref)
+    loader = FeatureDataLoader(queue, store)
+    batch = next(iter(loader))
+    assert batch.seq_lens is not None
+    assert torch.equal(batch.position_ids, position_ids)
+    assert torch.equal(batch.seq_lens, seq_lens)
+    assert torch.equal(batch.doc_remaining, doc_remaining)
 
 
 def test_loader_yields_eagle3_target_batch_with_expected_fields(queue, store, backend) -> None:

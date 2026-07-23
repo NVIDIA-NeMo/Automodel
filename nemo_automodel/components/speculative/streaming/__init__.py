@@ -14,8 +14,7 @@
 
 """Tensor-free control-plane contracts for the speculative-training stream.
 
-The streaming pipeline (per the EAGLE-3 / DFlash / DSpark train-inference
-disaggregation RFC, issue #3062 PR 1) splits every transferred sample into a
+The streaming pipeline splits every transferred sample into a
 :mod:`refs` (control-plane, no tensors) and a :mod:`store` (data-plane, holds
 the supervision tensors). The queue carries refs only; tensors live in the
 store and are referenced by :class:`nemo_automodel.components.speculative.streaming.refs.SampleRef.feature_keys`.
@@ -30,7 +29,7 @@ This package owns:
 - :class:`~nemo_automodel.components.speculative.streaming.store.FeatureStore`
   -- the pluggable data-plane transport (local dict, shared POSIX mount, NCCL,
   ...); :class:`~nemo_automodel.components.speculative.streaming.stores.local.LocalFeatureStore`
-  -- the in-process implementation land-tested by PR 1.
+  is the in-process reference implementation.
 - :class:`~nemo_automodel.components.speculative.streaming.queue.SampleRefQueue`
   -- the metadata-only lease/ack/fail queue between producers and consumers
   with visibility-timeout reclaim and watermark-based backpressure.
@@ -40,6 +39,8 @@ from nemo_automodel.components.speculative.streaming.async_pipeline import (
     AsyncFeaturePipeline,
     PromptSource,
 )
+from nemo_automodel.components.speculative.streaming.loader import FeatureDataLoader
+from nemo_automodel.components.speculative.streaming.producer import FeatureProducer
 from nemo_automodel.components.speculative.streaming.queue import (
     Lease,
     SampleRefQueue,
@@ -62,6 +63,8 @@ from nemo_automodel.components.speculative.streaming.stores.shared_dir import Sh
 __all__ = [
     "AsyncFeaturePipeline",
     "FeatureAlgorithm",
+    "FeatureDataLoader",
+    "FeatureProducer",
     "FeatureSpec",
     "FeatureStore",
     "Lease",
