@@ -145,7 +145,7 @@ class TestGetAttnImplementation:
 
 
 class TestConfigurePacking:
-    @pytest.mark.parametrize("attn_implementation", ["sdpa", "flash_attention_3"])
+    @pytest.mark.parametrize("attn_implementation", ["sdpa", "eager"])
     def test_noop_for_unsupported_backends(self, attn_implementation, monkeypatch):
         """configure_packing should not install FA2 shims for unsupported backends."""
         patch_preprocess = MagicMock()
@@ -158,8 +158,9 @@ class TestConfigurePacking:
 
         patch_preprocess.assert_not_called()
 
-    def test_patches_flash_attention_utils(self):
-        """configure_packing should patch _get_unpad_data for flash_attention_2."""
+    @pytest.mark.parametrize("attn_implementation", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
+    def test_patches_flash_attention_utils(self, attn_implementation):
+        """configure_packing should patch _get_unpad_data for every flash-attention variant."""
         import transformers.masking_utils as masking_utils
         import transformers.modeling_flash_attention_utils as fa_utils
 
@@ -167,7 +168,7 @@ class TestConfigurePacking:
         original_preprocess = masking_utils._preprocess_mask_arguments
         original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
         try:
-            configure_packing("flash_attention_2")
+            configure_packing(attn_implementation)
             assert fa_utils._get_unpad_data is get_unpad_data
         finally:
             fa_utils._get_unpad_data = original
