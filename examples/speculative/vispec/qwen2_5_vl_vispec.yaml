@@ -43,7 +43,7 @@ recipe_args:
   # Point at stage 1's consolidated export DIRECTORY. The checkpointer names the
   # export by shard (model-00001-of-0000N.safetensors), so there is no fixed file
   # name to reference, and the marker symlink is LATEST, not latest.
-  draft_init_from: /data/runs/vispec_qwen2_5_vl_stage1/checkpoints/LATEST/model/consolidated
+  draft_init_from: /data/runs/vispec_qwen2_5_vl_stage1/checkpoints/LATEST/model/consolidated  # pragma: allowlist secret
   output_dir: /data/runs/vispec_qwen2_5_vl_stage2
   # Image tokens inflate the sequence well past a text-only conversation of the
   # same turn count; 4096 matches the reference implementation's --max-len.
