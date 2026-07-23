@@ -1783,7 +1783,7 @@ dependencies = [
     { name = "nvidia-cutlass-dsl" },
     { name = "packaging" },
     { name = "quack-kernels", version = "0.5.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
-    { name = "quack-kernels", version = "0.6.1", source = { git = "https://github.com/akoumpa/quack.git?rev=6dbcedd9caba0e32a5ea87555a8d527ad2ab98e7#6dbcedd9caba0e32a5ea87555a8d527ad2ab98e7" }, marker = "sys_platform == 'linux'" },
+    { name = "quack-kernels", version = "0.6.1", source = { git = "https://github.com/akoumpa/quack.git?rev=add2869739a745fd004da20fb3985e0753d03d35#add2869739a745fd004da20fb3985e0753d03d35" }, marker = "sys_platform == 'linux'" },
     { name = "ray" },
     { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.10.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
@@ -3911,7 +3911,7 @@ dependencies = [
     { name = "mlflow" },
     { name = "pybind11" },
     { name = "pyyaml" },
-    { name = "quack-kernels", version = "0.6.1", source = { git = "https://github.com/akoumpa/quack.git?rev=6dbcedd9caba0e32a5ea87555a8d527ad2ab98e7#6dbcedd9caba0e32a5ea87555a8d527ad2ab98e7" }, marker = "sys_platform == 'linux'" },
+    { name = "quack-kernels", version = "0.6.1", source = { git = "https://github.com/akoumpa/quack.git?rev=add2869739a745fd004da20fb3985e0753d03d35#add2869739a745fd004da20fb3985e0753d03d35" }, marker = "sys_platform == 'linux'" },
     { name = "tiktoken" },
     { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.10.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin' and sys_platform != 'linux'" },
@@ -4155,7 +4155,7 @@ requires-dist = [
     { name = "pybind11" },
     { name = "pyyaml" },
     { name = "pyyaml", marker = "extra == 'cli'" },
-    { name = "quack-kernels", marker = "sys_platform == 'linux'", git = "https://github.com/akoumpa/quack.git?rev=6dbcedd9caba0e32a5ea87555a8d527ad2ab98e7" },
+    { name = "quack-kernels", marker = "sys_platform == 'linux'", git = "https://github.com/akoumpa/quack.git?rev=add2869739a745fd004da20fb3985e0753d03d35" },
     { name = "qwen-omni-utils", marker = "extra == 'vlm-media'" },
     { name = "qwen-vl-utils", marker = "extra == 'vlm-media'" },
     { name = "sentencepiece", marker = "extra == 'extra'" },
@@ -6219,7 +6219,7 @@ wheels = [
 [[package]]
 name = "quack-kernels"
 version = "0.6.1"
-source = { git = "https://github.com/akoumpa/quack.git?rev=6dbcedd9caba0e32a5ea87555a8d527ad2ab98e7#6dbcedd9caba0e32a5ea87555a8d527ad2ab98e7" }
+source = { git = "https://github.com/akoumpa/quack.git?rev=add2869739a745fd004da20fb3985e0753d03d35#add2869739a745fd004da20fb3985e0753d03d35" }
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.13.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
