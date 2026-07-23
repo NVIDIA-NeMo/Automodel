@@ -3439,7 +3439,7 @@ wheels = [
 [[package]]
 name = "megatron-fsdp"
 version = "0.5.0"
-source = { git = "https://github.com/yuhezhang-ai/Megatron-LM.git?subdirectory=megatron%2Fcore%2Fdistributed%2Ffsdp%2Fsrc&rev=920e1d247ed0b3b79cb9eb941c3af087869b1b43#920e1d247ed0b3b79cb9eb941c3af087869b1b43" }
+source = { git = "https://github.com/yuhezhang-ai/Megatron-LM.git?subdirectory=megatron%2Fcore%2Fdistributed%2Ffsdp%2Fsrc&rev=455389c480af6b3acdca74c7830c68b3274eb083#455389c480af6b3acdca74c7830c68b3274eb083" }
 dependencies = [
     { name = "einops" },
     { name = "packaging" },
@@ -4116,7 +4116,7 @@ requires-dist = [
     { name = "imageio-ffmpeg", marker = "extra == 'diffusion-media'" },
     { name = "kernels", marker = "extra == 'diffusion-kernels'" },
     { name = "mamba-ssm", marker = "extra == 'cuda'" },
-    { name = "megatron-fsdp", git = "https://github.com/yuhezhang-ai/Megatron-LM.git?subdirectory=megatron%2Fcore%2Fdistributed%2Ffsdp%2Fsrc&rev=920e1d247ed0b3b79cb9eb941c3af087869b1b43" },
+    { name = "megatron-fsdp", git = "https://github.com/yuhezhang-ai/Megatron-LM.git?subdirectory=megatron%2Fcore%2Fdistributed%2Ffsdp%2Fsrc&rev=455389c480af6b3acdca74c7830c68b3274eb083" },
     { name = "mistral-common", marker = "extra == 'vlm'", specifier = ">=1.11.0" },
     { name = "mistral-common", extras = ["audio", "hf-hub", "sentencepiece"] },
     { name = "mlflow" },
