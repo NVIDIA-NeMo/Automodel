@@ -391,7 +391,27 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
             # Match the training-loop lifecycle: record one complete eager
             # optimizer step, then capture outside the measured iteration.
             if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
+                stash_manager = None
+                if self._partial_cuda_graph_paged_stash_enabled:
+                    from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+                    stash_manager = get_paged_stash_manager()
+                    stash_manager.prepare()
+                    logger.info("Partial MoE paged stash prepared: %s", stash_manager.diagnostics())
                 self.partial_cuda_graph_manager.capture()
+                if stash_manager is not None:
+                    overflow_ranks = self._paged_stash_overflow_rank_count(stash_manager)
+                    if overflow_ranks:
+                        self.partial_cuda_graph_manager.close()
+                        self.partial_cuda_graph_manager = None
+                        stash_manager.close()
+                        self._partial_cuda_graph_paged_stash_enabled = False
+                        self._partial_cuda_graph_capture_pending = False
+                        raise RuntimeError(
+                            "MoE paged stash capacity overflowed during CUDA graph capture on "
+                            f"{overflow_ranks} ranks; partial CUDA graphs were disabled"
+                        )
+                    stash_manager.finish_iteration()
                 self._partial_cuda_graph_capture_pending = False
 
             # Synchronize num_label_tokens across DP ranks
@@ -619,6 +639,12 @@ def main(config_path=None):
         if recipe.partial_cuda_graph_manager is not None:
             recipe.partial_cuda_graph_manager.close()
             recipe.partial_cuda_graph_manager = None
+        recipe._partial_cuda_graph_capture_pending = False
+        if recipe._partial_cuda_graph_paged_stash_enabled:
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            get_paged_stash_manager().close()
+            recipe._partial_cuda_graph_paged_stash_enabled = False
 
 
 if __name__ == "__main__":

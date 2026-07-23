@@ -460,7 +460,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.partial_cuda_graph_manager = None
         self._partial_cuda_graph_capture_pending = False
         self._partial_cuda_graph_paged_stash_enabled = False
-        self._partial_cuda_graph_paged_stash_reruns = 0
 
     # ------------------ build phase ------------------
     def _create_distributed_setup(self) -> DistributedSetup:
@@ -960,7 +959,27 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     # eager optimizer step has completed. This leaves no
                     # pending checkpoint recomputation or GA backward work.
                     if self.partial_cuda_graph_manager is not None and self._partial_cuda_graph_capture_pending:
+                        stash_manager = None
+                        if self._partial_cuda_graph_paged_stash_enabled:
+                            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+                            stash_manager = get_paged_stash_manager()
+                            stash_manager.prepare()
+                            logger.info("Partial MoE paged stash prepared: %s", stash_manager.diagnostics())
                         self.partial_cuda_graph_manager.capture()
+                        if stash_manager is not None:
+                            overflow_ranks = self._paged_stash_overflow_rank_count(stash_manager)
+                            if overflow_ranks:
+                                self.partial_cuda_graph_manager.close()
+                                self.partial_cuda_graph_manager = None
+                                stash_manager.close()
+                                self._partial_cuda_graph_paged_stash_enabled = False
+                                self._partial_cuda_graph_capture_pending = False
+                                raise RuntimeError(
+                                    "MoE paged stash capacity overflowed during CUDA graph capture on "
+                                    f"{overflow_ranks} ranks; partial CUDA graphs were disabled"
+                                )
+                            stash_manager.finish_iteration()
                         self._partial_cuda_graph_capture_pending = False
                     # Collect MoE load balance metrics (all ranks participate in all-reduce)
                     self._collect_moe_load_balance()
@@ -1016,6 +1035,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             self.partial_cuda_graph_manager.close()
             self.partial_cuda_graph_manager = None
         self._partial_cuda_graph_capture_pending = False
+        if self._partial_cuda_graph_paged_stash_enabled:
+            from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
+
+            get_paged_stash_manager().close()
+            self._partial_cuda_graph_paged_stash_enabled = False
 
     # ------------------ helpers ------------------
     def _forward_backward_step(
@@ -1199,7 +1223,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             Python, NumPy, PyTorch, and CUDA RNG state when paged stash is active, or ``None`` when no retry can
             occur.
         """
-        if not getattr(self, "_partial_cuda_graph_paged_stash_enabled", False):
+        if not self._partial_cuda_graph_paged_stash_enabled:
             return None
 
         from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
@@ -1245,7 +1269,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         Returns:
             ``loss_buffer`` when no rank overflowed, otherwise losses from a full eager retry of the same batches.
         """
-        if not getattr(self, "_partial_cuda_graph_paged_stash_enabled", False):
+        if not self._partial_cuda_graph_paged_stash_enabled:
             return loss_buffer
 
         from nemo_automodel.components.moe.paged_stash import get_paged_stash_manager
@@ -1265,11 +1289,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "overflow on %d ranks",
             overflow_ranks,
         )
-        self._partial_cuda_graph_paged_stash_reruns += 1
-
         # Graphs reference the page buffers, so destroy them before disabling
         # the stash. No clipping or optimizer action has happened yet.
-        self._close_partial_cuda_graphs()
+        if self.partial_cuda_graph_manager is not None:
+            self.partial_cuda_graph_manager.close()
+            self.partial_cuda_graph_manager = None
+        self._partial_cuda_graph_capture_pending = False
+        stash_manager.close()
+        self._partial_cuda_graph_paged_stash_enabled = False
         for optimizer in self.optimizer:
             optimizer.zero_grad()
         self.rng.load_state_dict(rng_state)
