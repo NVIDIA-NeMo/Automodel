@@ -1305,6 +1305,42 @@ class TestMoE:
         assert isinstance(moe.gate, Gate)
         assert isinstance(moe.experts, GroupedExperts)
 
+    def test_ep1_fixed_te_experts_are_kept_under_multi_rank_fsdp(self, moe_config):
+        backend = BackendConfig(
+            experts="te",
+            dispatcher="torch",
+            cuda_graph_modules=["moe"],
+            cuda_graph_moe_capacity_factor=1.0,
+        )
+        fixed_te_experts = torch.nn.Identity()
+        with patch(
+            "nemo_automodel.components.moe.layers.GroupedExpertsTE",
+            return_value=fixed_te_experts,
+        ) as grouped_experts_te:
+            with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=2):
+                moe = MoE(moe_config, backend)
+
+        assert moe.experts is fixed_te_experts
+        grouped_experts_te.assert_called_once()
+
+    def test_ep1_hybridep_moe_graph_keeps_local_te_experts(self, moe_config):
+        backend = BackendConfig(
+            experts="te",
+            dispatcher="hybridep",
+            cuda_graph_modules=["moe"],
+            cuda_graph_moe_capacity_factor=1.0,
+        )
+        fixed_te_experts = torch.nn.Identity()
+        with patch(
+            "nemo_automodel.components.moe.layers.GroupedExpertsTE",
+            return_value=fixed_te_experts,
+        ) as grouped_experts_te:
+            with patch("nemo_automodel.components.moe.layers.get_world_size_safe", return_value=1):
+                moe = MoE(moe_config, backend)
+
+        assert moe.experts is fixed_te_experts
+        grouped_experts_te.assert_called_once()
+
     @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
     def test_moe_init_with_deepep_multi_device(self, moe_config, backend_config):
         """DeepEP dispatcher enabled and world size > 1 should use GroupedExpertsTE."""

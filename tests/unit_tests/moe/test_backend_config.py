@@ -101,6 +101,100 @@ class TestBackendConfigExpertsDispatcherValidation:
         assert config.experts == "torch_mm"
         assert config.dispatcher == "deepep"
 
+    def test_local_te_experts_are_valid_for_full_moe_graph(self):
+        config = BackendConfig(
+            experts="te",
+            dispatcher="torch",
+            cuda_graph_modules=["moe"],
+            cuda_graph_moe_capacity_factor=1.25,
+        )
+
+        assert config.experts == "te"
+        assert config.dispatcher == "torch"
+
+    def test_hybridep_te_experts_are_valid_for_full_moe_graph(self):
+        config = BackendConfig(
+            experts="te",
+            dispatcher="hybridep",
+            cuda_graph_modules=["moe"],
+            cuda_graph_moe_capacity_factor=1.25,
+        )
+
+        assert config.experts == "te"
+        assert config.dispatcher == "hybridep"
+
+    def test_combined_attention_and_moe_graphs_are_valid(self):
+        config = BackendConfig(
+            attn="te",
+            linear="torch",
+            rms_norm="torch",
+            rope_fusion=False,
+            experts="te",
+            dispatcher="torch",
+            cuda_graph_modules=["attn", "moe"],
+            cuda_graph_moe_capacity_factor=1.0,
+        )
+
+        assert config.cuda_graph_modules == ["attn", "moe"]
+
+    def test_full_moe_graph_rejects_legacy_deepep(self):
+        with pytest.raises(ValueError, match="requires dispatcher='torch' or 'hybridep'"):
+            BackendConfig(
+                experts="te",
+                dispatcher="deepep",
+                cuda_graph_modules=["moe"],
+                cuda_graph_moe_capacity_factor=1.0,
+            )
+
+    def test_full_moe_graph_requires_capacity(self):
+        with pytest.raises(ValueError, match="requires cuda_graph_moe_capacity_factor"):
+            BackendConfig(experts="te", dispatcher="torch", cuda_graph_modules=["moe"])
+
+    def test_capacity_factor_requires_full_moe_graph(self):
+        with pytest.raises(ValueError, match="requires 'moe' in cuda_graph_modules"):
+            BackendConfig(
+                experts="te",
+                dispatcher="torch",
+                cuda_graph_moe_capacity_factor=1.0,
+            )
+
+    def test_full_moe_graph_requires_te_experts(self):
+        with pytest.raises(ValueError, match="requires experts='te'"):
+            BackendConfig(
+                experts="torch_mm",
+                dispatcher="torch",
+                cuda_graph_modules=["moe"],
+                cuda_graph_moe_capacity_factor=1.0,
+            )
+
+    def test_full_moe_graph_rejects_split_moe_scopes(self):
+        with pytest.raises(ValueError, match="cannot be combined"):
+            BackendConfig(
+                experts="te",
+                dispatcher="hybridep",
+                cuda_graph_modules=["moe", "moe_router"],
+                cuda_graph_moe_capacity_factor=1.0,
+            )
+
+    def test_full_moe_graph_capacity_must_be_positive(self):
+        with pytest.raises(ValueError, match="must be positive"):
+            BackendConfig(
+                experts="te",
+                dispatcher="torch",
+                cuda_graph_modules=["moe"],
+                cuda_graph_moe_capacity_factor=0.0,
+            )
+
+    @pytest.mark.parametrize("capacity_factor", [float("nan"), float("inf"), -float("inf")])
+    def test_full_moe_graph_capacity_must_be_finite(self, capacity_factor):
+        with pytest.raises(ValueError, match="positive and finite"):
+            BackendConfig(
+                experts="te",
+                dispatcher="torch",
+                cuda_graph_modules=["moe"],
+                cuda_graph_moe_capacity_factor=capacity_factor,
+            )
+
 
 class TestBackendConfigFakeGateNoise:
     """Test BackendConfig fake_gate_noise field."""

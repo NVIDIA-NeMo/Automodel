@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Scoped partial CUDA graphs for fixed-shape attention and MoE preprocessing.
+"""Scoped partial CUDA graphs for fixed-shape attention and MoE execution.
 
-Attention, the parameterless router core, and HybridEP metadata preprocessing
-may be captured. Dynamic dispatch, expert compute, and combine remain eager.
+Attention, fixed-capacity post-router MoE execution, the parameterless router
+core, and HybridEP metadata preprocessing may be captured.
 """
 
 from __future__ import annotations
@@ -81,9 +81,9 @@ def _named_buffer_storage(target: nn.Module) -> tuple[tuple[Any, ...], ...]:
         try:
             data_ptr = buffer.data_ptr()
         except (RuntimeError, TypeError) as error:
-            raise RuntimeError(f"whole-attention buffer {name!r} has no stable local storage") from error
+            raise RuntimeError(f"CUDA graph buffer {name!r} has no stable local storage") from error
         if buffer.numel() > 0 and data_ptr == 0:
-            raise RuntimeError(f"whole-attention buffer {name!r} has no stable local storage")
+            raise RuntimeError(f"CUDA graph buffer {name!r} has no stable local storage")
         signatures.append((name, id(buffer), data_ptr, _tensor_metadata(buffer)))
     return tuple(signatures)
 
@@ -94,8 +94,8 @@ def _require_local_parameter_storage(name: str, parameter: nn.Parameter) -> None
         data_ptr = parameter.data_ptr()
     except (RuntimeError, TypeError) as error:
         raise RuntimeError(
-            "Whole-attention CUDA graph capture requires materialized parameters with stable local storage; "
-            f"{name!r} is not materialized. Nested FSDP attention ownership is not supported."
+            "Parameterized CUDA graph capture requires materialized parameters with stable local storage; "
+            f"{name!r} is not materialized. Nested FSDP ownership is not supported."
         ) from error
     if parameter.numel() > 0 and data_ptr == 0:
         raise RuntimeError(
@@ -295,10 +295,10 @@ class _ExplicitParameterCallAdapter(nn.Module):
 
         named_parameters = tuple(target.named_parameters())
         if not named_parameters:
-            raise RuntimeError("Whole-attention CUDA graph target has no parameters")
+            raise RuntimeError("Parameterized CUDA graph target has no parameters")
         all_parameter_names = tuple(name for name, _parameter in target.named_parameters(remove_duplicate=False))
         if len(all_parameter_names) != len(named_parameters):
-            raise RuntimeError("Whole-attention CUDA graphs do not support tied or aliased parameters")
+            raise RuntimeError("Parameterized CUDA graphs do not support tied or aliased parameters")
         self.parameter_names = tuple(name for name, _parameter in named_parameters)
         self.parameter_metadata = tuple(_tensor_metadata(parameter) for _name, parameter in named_parameters)
         self.buffer_storage = _named_buffer_storage(target)
@@ -306,7 +306,7 @@ class _ExplicitParameterCallAdapter(nn.Module):
         for name, parameter in named_parameters:
             if not isinstance(parameter, nn.Parameter):
                 raise RuntimeError(
-                    "Whole-attention CUDA graph capture requires materialized nn.Parameter values; "
+                    "Parameterized CUDA graph capture requires materialized nn.Parameter values; "
                     f"{name!r} is {type(parameter).__name__}"
                 )
             _require_local_parameter_storage(name, parameter)
@@ -341,26 +341,25 @@ class _ExplicitParameterCallAdapter(nn.Module):
         parameter_names = tuple(name for name, _parameter in named_parameters)
         if parameter_names != self.parameter_names:
             raise RuntimeError(
-                f"whole-attention parameter names changed: expected {self.parameter_names}, got {parameter_names}"
+                f"CUDA graph parameter names changed: expected {self.parameter_names}, got {parameter_names}"
             )
         for index, (name, parameter) in enumerate(named_parameters):
             if not isinstance(parameter, nn.Parameter):
                 raise RuntimeError(
-                    "whole-attention parameters are not materialized for replay: "
-                    f"{name!r} is {type(parameter).__name__}"
+                    f"CUDA graph parameters are not materialized for replay: {name!r} is {type(parameter).__name__}"
                 )
             _require_local_parameter_storage(name, parameter)
             actual_metadata = _tensor_metadata(parameter)
             expected_metadata = self.parameter_metadata[index]
             if actual_metadata != expected_metadata:
                 raise RuntimeError(
-                    f"whole-attention parameter metadata changed for {name!r}: "
+                    f"CUDA graph parameter metadata changed for {name!r}: "
                     f"expected {expected_metadata}, got {actual_metadata}"
                 )
         buffer_storage = _named_buffer_storage(self.target)
         if buffer_storage != self.buffer_storage:
             raise RuntimeError(
-                f"whole-attention buffer storage changed: expected {self.buffer_storage}, got {buffer_storage}"
+                f"CUDA graph buffer storage changed: expected {self.buffer_storage}, got {buffer_storage}"
             )
         return dynamic_inputs + tuple(parameter for _name, parameter in named_parameters)
 
@@ -524,9 +523,9 @@ class _PartialGraphEntry:
             for name, parameter in self.target.named_parameters():
                 if not isinstance(parameter, nn.Parameter):
                     raise RuntimeError(
-                        "Whole-attention CUDA graph capture requires the selected FSDP owner to materialize "
+                        "Parameterized CUDA graph capture requires the selected FSDP owner to materialize "
                         f"every target parameter; {name!r} remains {type(parameter).__name__}. "
-                        "Nested FSDP attention ownership is not supported."
+                        "Nested FSDP ownership is not supported."
                     )
                 _require_local_parameter_storage(name, parameter)
 
@@ -718,6 +717,14 @@ def _find_moe_preprocess(block: _DiscoveredBlock) -> nn.Module | None:
     return None
 
 
+def _find_moe_execution(block: _DiscoveredBlock) -> nn.Module | None:
+    """Find the dispatch, TE GroupedLinear, and combine boundary after routing."""
+    experts = getattr(block.moe, "experts", None)
+    return (
+        experts if isinstance(experts, nn.Module) and getattr(experts, "_supports_full_moe_cuda_graph", False) else None
+    )
+
+
 def _require_parameterless_target(module_name: str, block: _DiscoveredBlock, target: nn.Module) -> None:
     """Reject graph boundaries that own parameters managed outside the graph."""
     if any(True for _ in target.parameters()):
@@ -790,6 +797,29 @@ def _build_moe_preprocess_entry(
     return _PartialGraphEntry(name=f"{block.name}.moe_preprocess", target=target)
 
 
+def _build_moe_execution_entry(
+    block: _DiscoveredBlock,
+    target: nn.Module,
+    _activation_checkpointing: bool,
+) -> _PartialGraphEntry:
+    """Build one fixed-capacity post-router MoE graph entry."""
+    from torch.distributed.fsdp import FSDPModule
+
+    if isinstance(target, FSDPModule):
+        raise RuntimeError(
+            "Full MoE CUDA graphs do not support nested FSDP expert sharding (ep_shard > 1); "
+            "the expert parameters must be owned by the transformer block"
+        )
+    capture_owner = block.capture_owner if isinstance(block.capture_owner, FSDPModule) else None
+    return _PartialGraphEntry(
+        name=f"{block.name}.moe",
+        target=target,
+        explicit_parameters=True,
+        capture_owner=capture_owner,
+        retain_graph_in_backward=True,
+    )
+
+
 @dataclass(frozen=True)
 class _GraphModuleSpec:
     """Discovery and entry-construction contract for one user-facing graph module."""
@@ -801,6 +831,7 @@ class _GraphModuleSpec:
 _GRAPH_MODULE_SPECS = {
     "attn": _GraphModuleSpec(_find_attention, _build_whole_attention_entry),
     "te_dpa": _GraphModuleSpec(_find_te_dpa, _build_te_dpa_entry),
+    "moe": _GraphModuleSpec(_find_moe_execution, _build_moe_execution_entry),
     "moe_router": _GraphModuleSpec(_find_moe_router, _build_moe_router_entry),
     "moe_preprocess": _GraphModuleSpec(_find_moe_preprocess, _build_moe_preprocess_entry),
 }
@@ -899,6 +930,8 @@ class PartialCudaGraphManager:
                     "Whole-attention CUDA graphs do not support activation checkpointing; "
                     "use te_dpa or disable activation checkpointing"
                 )
+            if any("moe" in part.backend.cuda_graph_modules for part in enabled_parts):
+                raise RuntimeError("Full MoE CUDA graphs do not support activation checkpointing")
             if any(
                 "moe_router" in part.backend.cuda_graph_modules or "moe_preprocess" in part.backend.cuda_graph_modules
                 for part in enabled_parts

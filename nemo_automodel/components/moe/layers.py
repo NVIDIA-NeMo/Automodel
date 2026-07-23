@@ -664,7 +664,24 @@ class MoE(nn.Module):
         else:
             self.gate = Gate(config, gate_precision=backend.gate_precision)
             self.gate.use_routing_core = "moe_router" in backend.cuda_graph_modules
-        if backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and get_world_size_safe() == 1:
+        world_size = get_world_size_safe()
+        local_fixed_te_moe = (
+            backend.experts == "te"
+            and "moe" in backend.cuda_graph_modules
+            and (backend.dispatcher == "torch" or (backend.dispatcher == "hybridep" and world_size == 1))
+        )
+        if local_fixed_te_moe:
+            # EP=1 fixed-capacity execution uses local TE experts even when the
+            # surrounding transformer block is sharded over a data-parallel FSDP2 mesh.
+            self.experts = GroupedExpertsTE(
+                config,
+                backend=backend,
+                dispatcher_backend=backend.dispatcher,
+                dispatcher_num_sms=backend.dispatcher_num_sms,
+                dispatcher_share_token_dispatcher=backend.dispatcher_share_token_dispatcher,
+                dispatcher_async_dispatch=backend.dispatcher_async_dispatch,
+            )
+        elif backend.dispatcher in ("deepep", "hybridep", "uccl_ep") and world_size == 1:
             warnings.warn(
                 f"'{backend.dispatcher}' dispatcher is enabled in config, but world size is 1. "
                 "Expert parallelism requires multiple GPUs. Falling back to standard GroupedExperts.",

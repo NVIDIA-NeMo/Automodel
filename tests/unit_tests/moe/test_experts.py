@@ -27,6 +27,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.experts import (
     GroupedExperts,
     GroupedExpertsDeepEP,
+    GroupedExpertsTE,
     _apply_bias,
     _permute_tokens_for_grouped_mm,
     _torch_mm_experts_fwd,
@@ -1036,6 +1037,117 @@ class TestNonGatedActivations:
             swiglu_config.dim,
             swiglu_config.moe_inter_dim * 2,
         )
+
+
+class TestGroupedExpertsTECudaGraphMetadata:
+    def _make_experts(self, config, capacity_factor=1.0):
+        experts = GroupedExpertsTE.__new__(GroupedExpertsTE)
+        torch.nn.Module.__init__(experts)
+        experts.config = config
+        experts.cuda_graph_moe_capacity_factor = capacity_factor
+        return experts
+
+    class _FakeGroupedLinear(torch.nn.Module):
+        def __init__(self, biases=None):
+            super().__init__()
+            self.use_bias = biases is not None
+            self.num_gemms = len(biases) if biases is not None else 0
+            if biases is not None:
+                for index, bias in enumerate(biases):
+                    self.register_parameter(f"bias{index}", torch.nn.Parameter(bias.clone()))
+
+        def forward(self, hidden_states, splits):
+            chunks = torch.split(hidden_states, splits)
+            outputs = []
+            for index, chunk in enumerate(chunks):
+                if self.use_bias:
+                    outputs.append(chunk + getattr(self, f"bias{index}"))
+                else:
+                    outputs.append(chunk)
+            return torch.cat(outputs)
+
+    def test_capacity_is_derived_from_fixed_input_shape(self, moe_config):
+        experts = self._make_experts(moe_config, capacity_factor=1.25)
+
+        assert experts._cuda_graph_source_expert_capacity(16) == 5
+
+    def test_capacity_rejects_more_slots_than_source_tokens(self, moe_config):
+        experts = self._make_experts(moe_config, capacity_factor=5.0)
+
+        with pytest.raises(RuntimeError, match="must be in"):
+            experts._cuda_graph_source_expert_capacity(2)
+
+    def test_local_metadata_masks_padding_and_preserves_weight_gradients(self, moe_config):
+        experts = self._make_experts(moe_config)
+        token_mask = torch.tensor([True, False, True])
+        indices = torch.tensor([[0, 2], [1, 3], [2, 4]])
+        weights = torch.tensor([[0.6, 0.4], [0.7, 0.3], [0.8, 0.2]], requires_grad=True)
+
+        routing_map, routing_probs = experts._local_drop_and_pad_metadata(token_mask, weights, indices, capacity=3)
+
+        assert routing_map.nonzero().tolist() == [[0, 0], [0, 2], [2, 2], [2, 4]]
+        torch.testing.assert_close(routing_probs.sum(), torch.tensor(2.0))
+        routing_probs.sum().backward()
+        torch.testing.assert_close(
+            weights.grad,
+            torch.tensor([[1.0, 1.0], [0.0, 0.0], [1.0, 1.0]]),
+        )
+
+    def test_local_metadata_keeps_highest_probability_assignments(self, moe_config):
+        experts = self._make_experts(moe_config)
+        token_mask = torch.ones(4, dtype=torch.bool)
+        indices = torch.zeros((4, 1), dtype=torch.long)
+        weights = torch.tensor([[0.1], [0.9], [0.8], [0.2]], requires_grad=True)
+
+        routing_map, routing_probs = experts._local_drop_and_pad_metadata(
+            token_mask,
+            weights,
+            indices,
+            capacity=2,
+        )
+
+        assert routing_map[:, 0].tolist() == [False, True, True, False]
+        torch.testing.assert_close(routing_probs[:, 0], torch.tensor([0.0, 0.9, 0.8, 0.0]))
+        routing_probs.sum().backward()
+        torch.testing.assert_close(weights.grad, torch.tensor([[0.0], [1.0], [1.0], [0.0]]))
+
+    def test_fixed_capacity_down_bias_is_weighted_without_split_tensor(self, moe_config):
+        experts = self._make_experts(moe_config)
+        experts.num_local_experts = 2
+        experts.expert_bias = True
+        experts.gate_up_linear = self._FakeGroupedLinear()
+        experts.down_linear = self._FakeGroupedLinear(
+            biases=[
+                torch.tensor([10.0, 20.0]),
+                torch.tensor([30.0, 40.0]),
+            ]
+        )
+        experts.expert_activation = lambda output, _probs: output
+        hidden_states = torch.tensor(
+            [
+                [1.0, 2.0],
+                [3.0, 4.0],
+                [5.0, 6.0],
+                [7.0, 8.0],
+            ]
+        )
+        permuted_probs = torch.tensor([0.25, 0.5, 0.75, 1.0])
+
+        output = experts._forward_fixed_capacity_te_experts(
+            hidden_states,
+            permuted_probs,
+            tokens_per_local_expert=2,
+        )
+
+        expected = torch.tensor(
+            [
+                [3.5, 7.0],
+                [8.0, 14.0],
+                [27.5, 36.0],
+                [37.0, 48.0],
+            ]
+        )
+        torch.testing.assert_close(output, expected)
 
 
 @pytest.mark.skipif(SKIP_TE_TESTS, reason="TransformerEngine and CUDA required")
