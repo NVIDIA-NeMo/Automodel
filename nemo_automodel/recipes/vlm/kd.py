@@ -52,7 +52,7 @@ from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.distributed.config import DistributedSetup
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
@@ -68,7 +68,7 @@ from nemo_automodel.components.training.utils import (
     prepare_for_grad_accumulation,
     scale_grads_and_clip_grad_norm,
 )
-from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS, filter_forward_kwargs
+from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.recipes.kd_utils import (
     RUN_TEACHER,
     STOP_TEACHER,
@@ -149,44 +149,6 @@ def _verify_tokenizer_compatibility(student_cfg, teacher_cfg, trust_remote_code=
     if student_tokenizer.pad_token != teacher_tokenizer.pad_token:
         raise ValueError("Student and teacher tokenizers have different pad tokens")
     del student_tokenizer, teacher_tokenizer
-
-
-def _get_model_input_embedding_dim(model: torch.nn.Module) -> int | None:
-    """Return the model input embedding width when it can be inferred."""
-    get_input_embeddings = getattr(model, "get_input_embeddings", None)
-    if callable(get_input_embeddings):
-        embeddings = get_input_embeddings()
-        if embeddings is not None:
-            embedding_dim = getattr(embeddings, "embedding_dim", None)
-            if embedding_dim is not None:
-                return int(embedding_dim)
-            weight = getattr(embeddings, "weight", None)
-            if isinstance(weight, torch.Tensor) and weight.ndim >= 2:
-                return int(weight.shape[-1])
-
-    config = getattr(model, "config", None)
-    text_config = getattr(config, "text_config", None)
-    for cfg in (text_config, config):
-        hidden_size = getattr(cfg, "hidden_size", None)
-        if hidden_size is not None:
-            return int(hidden_size)
-    return None
-
-
-def _validate_cp_pre_embed_teacher_compatibility(inputs_embeds: torch.Tensor, teacher_model: torch.nn.Module) -> None:
-    """Reject CP pre-embed when the teacher cannot consume the student's embedding width."""
-    teacher_hidden_size = _get_model_input_embedding_dim(teacher_model)
-    if teacher_hidden_size is None:
-        return
-
-    student_hidden_size = int(inputs_embeds.shape[-1])
-    if student_hidden_size != teacher_hidden_size:
-        raise ValueError(
-            "VLM KD with context parallelism pre-embeds multimodal inputs with the student model before CP "
-            "sharding, so teacher and student input embedding hidden sizes must match. "
-            f"Got student inputs_embeds hidden size {student_hidden_size} and teacher input embedding hidden "
-            f"size {teacher_hidden_size}."
-        )
 
 
 class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
@@ -309,18 +271,10 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         batch = self.kd_mesh_bridge.move_to_device(batch)
         sequence_length = batch["labels"].shape[1]
         model = self.teacher_model
-        cp_active = (
-            self.device_mesh is not None
-            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
-            and self.device_mesh["cp"].size() > 1
-        )
-        if cp_active and hasattr(model, "prepare_model_inputs_for_cp"):
-            mm_kwargs = {key: batch[key] for key in VLM_INPUT_KEYS if batch.get(key) is not None}
-            prepared = model(_pre_embed_only=True, **mm_kwargs)
-            for key in VLM_INPUT_KEYS:
-                batch.pop(key, None)
-            batch.update(prepared)
-        train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        # Single CP dispatch: invokes the teacher's pre-embed hook (when CP is
+        # active and the model has one) and shards the batch.
+        cp_sharder = ContextParallelSharder(model, self.device_mesh, batch)
+        train_ctx, batch = cp_sharder.shard(batch)
         batch.pop("labels")
         with train_ctx(), torch.no_grad():
             teacher_batch = filter_forward_kwargs(model, batch)
@@ -383,31 +337,15 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
         if separate_teacher_logits is not None:
             batch["teacher_logits"] = separate_teacher_logits
 
-        _model = self.model_parts[0]
-        _cp_active = (
-            self.device_mesh is not None
-            and "cp" in getattr(self.device_mesh, "mesh_dim_names", ())
-            and self.device_mesh["cp"].size() > 1
-            and not self.pp_enabled
+        # Separate-mesh teacher logits ride the batch through CP sharding.
+        cp_sharder = ContextParallelSharder(
+            self.model_parts[0],
+            self.device_mesh,
+            batch,
+            invoke_pre_embed=not self.pp_enabled,
+            extra_seq_buffers={"teacher_logits": 1} if separate_teacher_logits is not None else None,
         )
-        if _cp_active and hasattr(_model, "prepare_model_inputs_for_cp"):
-            mm_kwargs = {k: batch[k] for k in VLM_INPUT_KEYS if batch.get(k) is not None}
-            with torch.no_grad():
-                prepared = _model(_pre_embed_only=True, **mm_kwargs)
-            if "inputs_embeds" in prepared and not getattr(self, "separate_meshes", False):
-                _validate_cp_pre_embed_teacher_compatibility(prepared["inputs_embeds"], self.teacher_model)
-            for k in VLM_INPUT_KEYS:
-                batch.pop(k, None)
-            batch.update(prepared)
-
-        if separate_teacher_logits is not None:
-            train_ctx, batch = make_cp_batch_and_ctx(
-                self.device_mesh,
-                batch,
-                extra_seq_buffers={"teacher_logits": 1},
-            )
-        else:
-            train_ctx, batch = make_cp_batch_and_ctx(self.device_mesh, batch)
+        train_ctx, batch = cp_sharder.shard(batch)
         separate_teacher_logits = batch.pop("teacher_logits", None)
         labels = batch.pop("labels")
 
