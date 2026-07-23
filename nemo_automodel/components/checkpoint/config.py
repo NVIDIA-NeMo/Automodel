@@ -106,6 +106,7 @@ class CheckpointingConfig:
         None  # copy of the model state dict keys before any parallelization. Kept for BW compatibility.
     )
     is_async: bool = False
+    wait_for_staging: bool = False  # block on async staging before freeing memory; no effect unless is_async
     cpu_offload: bool = False  # If True, move DCP model and optimizer state dict tensors to CPU before saving.
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
