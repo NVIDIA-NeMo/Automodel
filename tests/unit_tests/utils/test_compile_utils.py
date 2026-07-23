@@ -242,7 +242,7 @@ class TestPatchPrepareFA2FromPositionIds:
     def test_patch_general_exception(self):
         """Test handling of general exception during patching."""
         # Create a mock that raises an exception when accessed
-        with patch("transformers.modeling_flash_attention_utils", new=None) as mock_fa_utils:
+        with patch("transformers.modeling_flash_attention_utils", new=None):
             result = patch_prepare_fa2_from_position_ids()
             assert result is False
 

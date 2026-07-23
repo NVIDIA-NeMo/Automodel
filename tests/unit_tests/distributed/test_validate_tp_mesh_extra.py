@@ -64,12 +64,14 @@ def _install_fake_gemma3(monkeypatch):
 
     modeling.Gemma3ForConditionalGeneration = _StubGemma3
 
+
 def _make_tp_mesh(size: int):
     """Create a ``MagicMock`` that mimics the minimal DeviceMesh interface."""
 
     mesh = MagicMock()
     mesh.size.return_value = size
     return mesh
+
 
 def test_validate_tp_mesh_import_error(monkeypatch):
     """Function should no-op (not raise) when Gemma3 import fails.
@@ -101,10 +103,13 @@ def test_validate_tp_mesh_import_error(monkeypatch):
     validate_tp_mesh(dummy_model, tp_mesh)  # Should silently return
 
 
-@pytest.mark.parametrize("num_heads,tp_size,should_raise", [
-    (8, 4, False),  # divisible
-    (10, 4, True),  # not divisible
-])
+@pytest.mark.parametrize(
+    "num_heads,tp_size,should_raise",
+    [
+        (8, 4, False),  # divisible
+        (10, 4, True),  # not divisible
+    ],
+)
 def test_validate_tp_mesh_basic_divisibility(monkeypatch, num_heads, tp_size, should_raise):
     """Smoke-test divisibility logic with a minimal config object.
 
