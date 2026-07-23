@@ -43,6 +43,7 @@ from nemo_automodel.components.attention.utils import (
 )
 from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.llama.rope_utils import (
     Qwen2RotaryEmbedding,
@@ -333,6 +334,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMixin):
     """Dense Qwen3 causal LM with packed THD context parallelism."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -370,6 +372,10 @@ class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMix
 
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
         self.lm_head = new_embeddings
+
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        if getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     @can_return_tuple
     def forward(
