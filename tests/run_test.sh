@@ -20,28 +20,16 @@ CPU=false
 TEST_DIR="tests/"
 TEST_NAME=""
 ADDITIONAL_ARGS=""
-SHARD_ID=""
-NUM_SHARDS=""
 
 for i in "$@"; do
     case $i in
         --UNIT_TEST=?*) UNIT_TEST="${i#*=}";;
         --CPU=?*) CPU="${i#*=}";;
         --TEST_NAME=?*) TEST_NAME="${i#*=}";;
-        --SHARD_ID=?*) SHARD_ID="${i#*=}";;
-        --NUM_SHARDS=?*) NUM_SHARDS="${i#*=}";;
         *) ;;
     esac
     shift
 done
-
-# Optionally split the collected tests into shards via pytest-shard so a single
-# suite can be spread across several parallel CI runners. Only takes effect when
-# both a shard index and a shard count (>1) are provided.
-SHARD_ARGS=""
-if [[ -n "$NUM_SHARDS" && "$NUM_SHARDS" -gt 1 && -n "$SHARD_ID" ]]; then
-    SHARD_ARGS="--shard-id=$SHARD_ID --num-shards=$NUM_SHARDS"
-fi
 
 if [[ "$CPU" == "false" ]]; then
     export CUDA_VISIBLE_DEVICES="0,1"
@@ -72,6 +60,5 @@ coverage run \
     -o log_cli=true \
     -o log_cli_level=INFO \
     -vs -m "not pleasefixme" --tb=short -rA \
-    $SHARD_ARGS \
     $ADDITIONAL_ARGS
 coverage combine -q

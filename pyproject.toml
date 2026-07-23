@@ -219,7 +219,7 @@ linting = [
     "import-linter~=2.4",
     "ty>=0.0.20",
 ]
-test = ["coverage", "pytest", "pytest-shard", "peft>=0.18.1", "ruamel.yaml", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
+test = ["coverage", "pytest", "peft>=0.18.1", "ruamel.yaml", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 dev = [
     "cut-cross-entropy",
     "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
