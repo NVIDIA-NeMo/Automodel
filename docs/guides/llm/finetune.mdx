@@ -274,8 +274,7 @@ gradient accumulation steps = global_batch_size / (local_batch_size × DP size)
 With the values above, a single DP rank accumulates 8 micro-batches; 8 DP ranks require no accumulation. `global_batch_size` must be divisible by `local_batch_size × DP size`.
 
 <Note>
-Most example recipes use bf16 training by default for memory and throughput. If you are running long fine-tuning, especially full-parameter SFT, and you require a higher-precision optimizer state, configure it explicitly instead of assuming it from the mixed-precision compute policy. See the [Mixed-Precision Training Guide](/development/mixed-precision-training) for the recommended Transformer Engine (TE) and torch AdamW patterns.
-
+Most example recipes run forward/backward in bf16 for memory and throughput. For **full-parameter SFT with a `torch.optim` optimizer** (such as `torch.optim.AdamW`), AutoModel now uses an effective `float32` model-construction dtype when you leave `model.torch_dtype` unset, so the parameters act as an fp32 master copy and the Adam state stays full precision. This default does not apply to PEFT/LoRA, TE FusedAdam, or an explicit `model.torch_dtype`. See the [mixed-precision training guide](/development/mixed-precision-training) for the recommended TE and torch AdamW patterns and how to opt out.
 </Note>
 
 ### Full Config YAML

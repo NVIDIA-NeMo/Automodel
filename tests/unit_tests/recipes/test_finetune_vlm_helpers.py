@@ -217,6 +217,37 @@ def test_build_model_passes_freeze_config():
     assert captured_kwargs["freeze_config"] == {"freeze_language_model": False, "freeze_vision_tower": True}
 
 
+def test_build_model_passes_runtime_torch_dtype_without_mutating_config():
+    """The effective storage dtype is a runtime override, not a declarative config edit."""
+    from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForImageTextToText.from_pretrained
+            self.torch_dtype = "auto"
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+    build_model(
+        cfg_model=cfg_model,
+        cfg_freeze=None,
+        cfg_peft=None,
+        seed=123,
+        model_torch_dtype="float32",
+    )
+
+    assert cfg_model.torch_dtype == "auto"
+    assert captured_kwargs["torch_dtype"] == "float32"
+
+
 def test_build_model_passes_distributed_setup():
     """Distributed policy is passed through the single setup object."""
     from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
@@ -2780,7 +2811,12 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", lambda *a, **k: dummy_model)
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
-        property(lambda self: SimpleNamespace(build=lambda *a, **k: [dummy_opt])),
+        property(
+            lambda self: SimpleNamespace(
+                build=lambda *a, **k: [dummy_opt],
+                uses_model_params_as_master_weights=lambda: False,
+            )
+        ),
     )
     loader_config = SimpleNamespace(
         packing=None,
@@ -2903,9 +2939,16 @@ def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
     assert cfg.model.backend.rope_fusion is True
 
 
-def test_vlm_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
+def test_vlm_setup_passes_fp32_storage_override_without_mutating_config(monkeypatch):
     cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True, optimizer_target="torch.optim.AdamW")
     _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    captured_model_kwargs = {}
+
+    def build_model_stub(*args, **kwargs):
+        captured_model_kwargs.update(kwargs)
+        return DummyModel()
+
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_model", build_model_stub)
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
     optimizer_config = build_optimizer_config("torch.optim.AdamW", {"lr": 0.01})
     monkeypatch.setattr(optimizer_config, "build", lambda *a, **k: [dummy_opt])
@@ -2917,7 +2960,8 @@ def test_vlm_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
     trainer = FinetuneRecipeForVLM(cfg)
     trainer.setup()
 
-    assert not hasattr(cfg.model, "torch_dtype")
+    assert cfg.model.get("torch_dtype", None) is None
+    assert captured_model_kwargs["model_torch_dtype"] == "float32"
 
 
 def test_vlm_rope_fusion_stays_false_when_already_disabled(monkeypatch):

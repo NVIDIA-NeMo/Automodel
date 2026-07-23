@@ -34,7 +34,10 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sy
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
+from nemo_automodel.components.optim.precision_warnings import (
+    resolve_storage_dtype,
+    warn_if_torch_adam_with_bf16_params,
+)
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.components.utils.compile_utils import build_compile_config
@@ -255,7 +258,14 @@ class TrainBiEncoderRecipe(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
 
-        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
+        optimizer_config = self.cfg.optimizer
+        model_torch_dtype = resolve_storage_dtype(
+            self.cfg.model.get("torch_dtype", None),
+            uses_model_params_as_master_weights=optimizer_config.uses_model_params_as_master_weights(),
+            is_peft=self.peft_config is not None,
+            context="retrieval",
+            logger=logger,
+        )
 
         checkpoint_config = self.cfg.checkpoint
 
@@ -274,6 +284,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             kwargs = _get_model_instantiate_kwargs(self.cfg, self.distributed_setup, self.peft_config)
+            if model_torch_dtype is not None:
+                kwargs["torch_dtype"] = model_torch_dtype
             model = self.cfg.model.instantiate(
                 **kwargs,
             )
@@ -282,7 +294,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.pp = None
 
         param_groups = self._build_optimizer_param_groups()
-        optimizer = self.cfg.optimizer.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
+        optimizer = optimizer_config.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
         self.optimizer = [optimizer]
         warn_if_torch_adam_with_bf16_params(
             optimizer=self.optimizer,

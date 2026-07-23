@@ -54,7 +54,9 @@ _RECIPE_CASES = (
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,parent_cls", _RECIPE_CASES)
-def test_kd_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch, recipe_module, recipe_cls, parent_cls):
+def test_kd_setup_delegates_dtype_resolution_without_mutating_config(
+    monkeypatch, recipe_module, recipe_cls, parent_cls
+):
     class SetupStopped(Exception):
         pass
 
@@ -67,6 +69,7 @@ def test_kd_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch, recipe_m
     )
 
     def stop_parent_setup(self):
+        assert self.cfg.model.get("torch_dtype", None) is None
         raise SetupStopped
 
     monkeypatch.setattr(recipe_module, "_verify_tokenizer_compatibility", lambda *args, **kwargs: None)
@@ -78,7 +81,7 @@ def test_kd_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch, recipe_m
     with pytest.raises(SetupStopped):
         recipe.setup()
 
-    assert cfg.model.torch_dtype == "float32"
+    assert cfg.model.get("torch_dtype", None) is None
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)

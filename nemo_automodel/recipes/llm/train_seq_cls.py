@@ -30,6 +30,7 @@ from nemo_automodel.components.distributed.utils import FirstRankPerNode
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.optim.precision_warnings import resolve_storage_dtype
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
@@ -106,7 +107,14 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
-        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
+        optimizer_config = self.cfg.optimizer
+        model_torch_dtype = resolve_storage_dtype(
+            self.cfg.model.get("torch_dtype", None),
+            uses_model_params_as_master_weights=optimizer_config.uses_model_params_as_master_weights(),
+            is_peft=self.peft_config is not None,
+            context="llm-seq-cls",
+            logger=logger,
+        )
         model = build_model(
             cfg_model=self.cfg.model,
             cfg_peft=self.peft_config,
@@ -116,9 +124,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             cfg_quantization=self.cfg.get("quantization", None),
             distributed_setup=self.distributed_setup,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
+            model_torch_dtype=model_torch_dtype,
         )
-        optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
-        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        optimizer = optimizer_config.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
+        allow_megatron_fsdp_sharding = getattr(optimizer_config, "supports_megatron_fsdp_sharding", True)
         self.optimizer = shard_optimizers_for_megatron_fsdp(
             model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )

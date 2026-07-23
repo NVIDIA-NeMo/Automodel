@@ -871,6 +871,36 @@ def test_force_hf_true_disables_meta_init(monkeypatch):
     assert optimizer is not None
 
 
+def test_build_model_passes_runtime_torch_dtype_without_mutating_config():
+    """The effective storage dtype is a runtime override, not a declarative config edit."""
+    from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+
+    captured_kwargs = {}
+
+    class CapturingModelConfig:
+        def __init__(self):
+            self._target_ = NeMoAutoModelForCausalLM.from_pretrained
+            self.torch_dtype = "auto"
+
+        def instantiate(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return DummyModel()
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    cfg_model = CapturingModelConfig()
+    build_model(
+        cfg_model=cfg_model,
+        cfg_peft=None,
+        seed=123,
+        model_torch_dtype="float32",
+    )
+
+    assert cfg_model.torch_dtype == "auto"
+    assert captured_kwargs["torch_dtype"] == "float32"
+
+
 # -----------------
 # NVTX flag tests
 # -----------------
@@ -948,7 +978,12 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
-        property(lambda self: SimpleNamespace(build=lambda *a, **k: [dummy_opt])),
+        property(
+            lambda self: SimpleNamespace(
+                build=lambda *a, **k: [dummy_opt],
+                uses_model_params_as_master_weights=lambda: False,
+            )
+        ),
     )
 
     # Data-related stubs: short-circuit the RecipeConfig dataloader resolution + build.
@@ -1080,10 +1115,17 @@ def test_nvtx_false_skips_patching(monkeypatch):
     assert patch_calls == []
 
 
-def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
+def test_setup_passes_fp32_storage_override_without_mutating_config(monkeypatch):
     cfg = _minimal_cfg_with_nvtx(nvtx_value=False, optimizer_target="torch.optim.AdamW")
 
     _patch_setup_minimals(monkeypatch, lambda *a, **k: None)
+    captured_model_kwargs = {}
+
+    def build_model_stub(*args, **kwargs):
+        captured_model_kwargs.update(kwargs)
+        return DummyModel()
+
+    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", build_model_stub)
     dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda: None)
     optimizer_config = build_optimizer_config("torch.optim.AdamW", {"lr": 0.01})
     monkeypatch.setattr(optimizer_config, "build", lambda *a, **k: [dummy_opt])
@@ -1095,7 +1137,8 @@ def test_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     trainer.setup()
 
-    assert not hasattr(cfg.model, "torch_dtype")
+    assert cfg.model.get("torch_dtype", None) is None
+    assert captured_model_kwargs["model_torch_dtype"] == "float32"
 
 
 def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
@@ -1128,7 +1171,12 @@ def test_nvtx_true_pipeline_patches_all_parts(monkeypatch):
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.build_model", _build_model_stub)
     monkeypatch.setattr(
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
-        property(lambda self: SimpleNamespace(build=_build_optimizer_stub)),
+        property(
+            lambda self: SimpleNamespace(
+                build=_build_optimizer_stub,
+                uses_model_params_as_master_weights=lambda: False,
+            )
+        ),
     )
 
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
