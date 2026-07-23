@@ -38,6 +38,7 @@ echo "$@"
 # /opt/venv/bin/python -m pip install --upgrade peft
 # /opt/venv/bin/python -m pip install transformers==5.5.0
 export TRITON_CACHE_DIR="/lustre/fsw/portfolios/llmservice/users/$SLURM_JOB_USER/triton_cache"
+export RTEB_PRIVATE_LOCAL_DATA_DIR="${RTEB_PRIVATE_LOCAL_DATA_DIR:-/lustre/fsw/portfolios/llmservice/users/ybabakhin/git/codex/mteb/data/rteb_private_local}"
 
 # Dynamically detect number of available GPUs
 NUM_GPUS=$(nvidia-smi -L | wc -l)

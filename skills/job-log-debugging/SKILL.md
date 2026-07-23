@@ -32,6 +32,14 @@ Use `LOGDIR` from `list_jobs -d` when present. For all-user searches, only use
 Default job roots for this workspace:
 
 ```bash
+/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/$USER/jobs
+/lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/ybabakhin/jobs
+```
+
+Prefer the `nemotron_retriever_dev` roots above. For older runs, fall back to
+legacy roots only after the new location has no match:
+
+```bash
 /lustre/fsw/portfolios/llmservice/users/$USER/jobs
 /lustre/fsw/portfolios/llmservice/users/ybabakhin/jobs
 ```
@@ -39,8 +47,8 @@ Default job roots for this workspace:
 Use bounded `find` searches by exact run name first:
 
 ```bash
-find /lustre/fsw/portfolios/llmservice/users/$USER/jobs -maxdepth 4 -type d -name '*<run-name>*' -print
-find /lustre/fsw/portfolios/llmservice/users/$USER/jobs -maxdepth 4 -type f -name '*<run-name>*' -print
+find /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/$USER/jobs -maxdepth 4 -type d -name '*<run-name>*' -print
+find /lustre/fsw/portfolios/nemotron/projects/nemotron_retriever_dev/users/$USER/jobs -maxdepth 4 -type f -name '*<run-name>*' -print
 ```
 
 If no exact match is found, search with stable fragments such as the model

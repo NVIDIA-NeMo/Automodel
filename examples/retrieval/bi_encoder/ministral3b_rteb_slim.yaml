@@ -168,6 +168,15 @@ dataloader:
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_multihiertt_iter2_iter3_ultra_nvfp4_sdg_filtered_kept_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_multihiertt_iter2_iter3_ultra_nvfp4_sdg_filtered_kept_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_multihiertt_iter2_iter3_ultra_nvfp4_sdg_filtered_kept_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/legal_summarization_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/apps_retrieval_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/apps_retrieval_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_weak_case_sdg_20260710.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/ds1000_retrieval_weak_case_sdg_20260711.json
     data_type: train
     n_passages: 5
     seed: 42

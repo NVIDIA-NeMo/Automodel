@@ -47,7 +47,7 @@ model:
   use_liger_kernel: false
   use_sdpa_patching: false
   torch_dtype: bfloat16
-  attn_implementation: eager
+  attn_implementation: flash_attention_2
 
 tokenizer:
   _target_: transformers.AutoTokenizer.from_pretrained
@@ -125,6 +125,30 @@ dataloader:
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/chatdoctor_eval_like_qwen235b_noisy_2400_20260525_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/financebench_fresh_20260522_110925_autoresearch_iter_006_financebenchretrieval_alt_model_sdg_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/curev1_autoresearch_20260523_iter_006_curev1_eval_like_seed_sdg_qwen3_8B_0_95_perc.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_deu_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_eng_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_fra_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_ita_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_por_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_spa_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_deu_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_eng_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_fra_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_ita_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_por_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_spa_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_eng_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_fra_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_spa_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_deu_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_ita_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_por_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_eng_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_fra_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_spa_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_deu_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_ita_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_por_10k_qwen3_8B_0_95_perc_positives_unrolled.json
     data_type: train
     n_passages: 5
     seed: 42
@@ -233,7 +257,128 @@ wandb:
   entity: nvidia-merlin
   name: ministral3_3b_bidirectional
 
+# FinePDF x2 + unrolled
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_deu_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_eng_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_fra_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_ita_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_por_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_spa_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_deu_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_eng_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_fra_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_ita_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_por_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_spa_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_eng_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_fra_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_spa_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_deu_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_ita_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_por_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_eng_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_fra_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_spa_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_deu_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_ita_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_por_10k_qwen3_8B_0_95_perc_positives_unrolled.json
+
+# FinePDF x2 + filtered + unrolled
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_deu_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_eng_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_fra_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_ita_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_por_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_spa_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_deu_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_eng_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_fra_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_ita_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_por_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_spa_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_deu_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_eng_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_fra_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_ita_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_por_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_spa_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_deu_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_eng_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_fra_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_ita_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_por_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_spa_10k_qwen3_8B_0_95_perc_gptoss20b_filtered_positives_unrolled.json
+
+# Multilingual FinePDF x2 filtered
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_deu_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_eng_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_fra_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_ita_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_por_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_spa_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_deu_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_eng_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_fra_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_ita_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_por_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_spa_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_deu_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_eng_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_fra_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_ita_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_por_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_spa_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_deu_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_eng_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_fra_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_ita_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_por_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_spa_10k_qwen3_8B_0_95_perc_gptoss20b_filtered.json
+
+# Multi-lingual FinePDF x2 diverse
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_eng_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_fra_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_spa_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_deu_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_ita_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_eng_query_por_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_eng_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_fra_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_spa_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_deu_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_ita_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_diverse_20260606_doc_fra_query_por_10k_qwen3_8B_0_95_perc.json
+
+# Multi-lingual FinePDF
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_deu_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_eng_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_fra_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_ita_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_por_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_spa_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_deu_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_eng_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_fra_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_ita_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_por_10k_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_fra_query_spa_10k_qwen3_8B_0_95_perc.json
+
+# 0-shot
+      # - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/finqa_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/coir_apps_qwen3_8B_0_95_perc.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/wikisql_sql_retrieval_qwen3_8B_0_95_perc.json
+
+#       /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/wikisqlretrieval_table_sql_qwen_next_3200_20260527_qwen3_8B_0_95_perc.json
+# /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/wikisqlretrieval_operator_contrast_qwen_next_3200_20260527_qwen3_8B_0_95_perc.json
+# /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/wikisqlretrieval_table_sql_nemotron_2400_20260527_qwen3_8B_0_95_perc.json
+# /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/wikisqlretrieval_long_schema_qwen_next_4800_20260527_qwen3_8B_0_95_perc.json
+
 # FinePDF Qwen-like
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_eng_random5_first20_persona_vidore_qwenline_2qperdoc_50k_20260604_qwen3_8B_0_95_perc_unrolled.json
+      # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_eng_random5_first20_persona_vidore_qwenline_2qperdoc_50k_20260604_qwen3_8B_0_95_perc_unrolled_gptoss20b_filtered.json
+
+# /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_eng_random5_first20_persona_vidore_qwenline_50k_20260603_qwen3_8B_0_95_perc_unrolled.json -- too many same docs
+# /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_eng_random5_first20_persona_vidore_qwenline_50k_20260603_qwen3_8B_0_95_perc_unrolled_gptoss20b_filtered.json -- filtered
       # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_eng_random5_first20_persona_50k_20260603_qwen3_8B_0_95_perc_unrolled.json
       # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_eng_random5_first20_persona_50k_first5corpus_20260603_qwen3_8B_0_95_perc_unrolled.json
       # - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_eng_random5_first20_persona_50k_20260603_qwen3_8B_0_85_perc_unrolled.json
