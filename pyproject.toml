@@ -122,6 +122,11 @@ cuda = [
     "tile-kernels==1.0.0",
     # tilelang 0.1.11 does not cap its TVM ffi dependency, but 0.1.12 is
     # incompatible with its bundled TVM. Keep pip installs on the known-good ffi.
+    # NOTE: flash-attn-4 (attn_implementation="flash_attention_4") requires
+    # apache-tvm-ffi>=0.1.12,<0.2 -- mutually exclusive with this pin until
+    # tilelang ships a release built against ffi 0.1.12. The container installs
+    # FA4 only when built with INSTALL_FA4=true (docker/Dockerfile), which
+    # upgrades ffi and disables the tilelang backend in that image.
     "apache-tvm-ffi<=0.1.11",
 ]
 cuda_source = [
@@ -229,6 +234,7 @@ no-build-isolation-package = [
     "causal-conv1d",
     "deep_ep",
     "flash-attn",
+    "flash-attn-3",  # FA3: source build from Dao-AILab/flash-attention hopper/ (needs image torch)
     "mamba-ssm",
     "nv-grouped-gemm",
     "transformer-engine",
