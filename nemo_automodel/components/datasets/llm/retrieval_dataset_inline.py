@@ -12,44 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
 import json
 import logging
 import os
 from dataclasses import dataclass
-from glob import glob
-from pathlib import Path
 from typing import Any, Dict, List, Union
 
-from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk
+from datasets import Dataset, concatenate_datasets
 
 INLINE_CORPUS_ID = "__inline__"
-
-
-def _is_hf_dataset_dir(path: str) -> bool:
-    """Return whether *path* looks like a dataset saved by ``Dataset.save_to_disk``."""
-    path_obj = Path(path)
-    return path_obj.is_dir() and (path_obj / "dataset_info.json").is_file() and (path_obj / "state.json").is_file()
-
-
-def _expand_parquet_files(path: str) -> list[str]:
-    """Return Parquet files represented by a file, directory, or glob path."""
-    path_obj = Path(path)
-    if path_obj.is_file() and path_obj.suffix == ".parquet":
-        return [str(path_obj)]
-    if path_obj.is_dir():
-        return sorted(str(p) for p in path_obj.glob("*.parquet"))
-    if any(token in path for token in ("*", "?", "[")):
-        return sorted(p for p in glob(path) if p.endswith(".parquet"))
-    return []
-
-
-def _load_inline_parquet(path: str, cache_dir: str | None = None) -> Dataset:
-    """Load inline retrieval records from Parquet shards."""
-    parquet_files = _expand_parquet_files(path)
-    if not parquet_files:
-        raise ValueError(f"No Parquet files found for inline retrieval dataset path: {path}")
-    return load_dataset("parquet", data_files=parquet_files, split="train", cache_dir=cache_dir)
 
 
 def _load_json_or_jsonl(path: str) -> Union[dict, list]:
@@ -82,82 +53,59 @@ def _coerce_to_list(value: Any) -> list:
     return [value]
 
 
-def _stable_inline_doc_id(text: str, image: Any = "", nr_ocr: str = "") -> str:
-    """Create a deterministic id for inline docs that do not provide one."""
-    image_key = image if isinstance(image, str) else ""
-    payload = json.dumps(
-        {"text": text, "image": image_key, "nr_ocr": nr_ocr},
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    return f"inline:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
-
-
 def _normalize_inline_doc(doc: Any) -> Dict[str, Any]:
     """Normalize an inline doc (text/image provided) into a canonical dict shape."""
     if isinstance(doc, dict):
         if "text" not in doc:
             raise ValueError(f"Inline doc dict must include 'text'. Got keys: {sorted(list(doc.keys()))}")
-        doc_id = doc.get("id", "")
         text = doc.get("text", "")
         image = doc.get("image", "")
         nr_ocr = doc.get("nr_ocr", "")
     else:
-        doc_id = ""
         text = doc if isinstance(doc, str) else str(doc)
         image = ""
         nr_ocr = ""
-    text = "" if text is None else str(text)
-    nr_ocr = "" if nr_ocr is None else str(nr_ocr)
-    image = "" if image is None else image
     return {
-        "id": str(doc_id) if doc_id else _stable_inline_doc_id(text, image, nr_ocr),
-        "text": text,
-        "image": image,
-        "nr_ocr": nr_ocr,
+        "id": "",
+        "text": "" if text is None else str(text),
+        "image": "" if image is None else image,
+        "nr_ocr": "" if nr_ocr is None else str(nr_ocr),
     }
 
 
 def _resolve_doc_to_example(doc: Any) -> dict:
     """
-    Resolve a doc reference into an example dict with keys: id, text, image, nr_ocr.
+    Resolve a doc reference into an example dict with keys: text, image, nr_ocr.
 
     Supported doc forms:
     - `str`: interpreted as inline document text
     - `dict`: must include `text` (optionally `image`, `nr_ocr`)
     """
-    example = {"id": "", "text": "", "image": "", "nr_ocr": ""}
+    example = {"text": "", "image": "", "nr_ocr": ""}
     if isinstance(doc, dict):
         if "text" not in doc:
             raise ValueError(f"Inline doc dict must include 'text'. Got keys: {sorted(list(doc.keys()))}")
 
-        if "id" in doc and doc["id"] is not None:
-            example["id"] = str(doc["id"])
         if "text" in doc and doc["text"] is not None:
             example["text"] = str(doc["text"])
         if "image" in doc and doc["image"] is not None:
             example["image"] = doc["image"]
         if "nr_ocr" in doc and doc["nr_ocr"] is not None:
             example["nr_ocr"] = str(doc["nr_ocr"])
-        if not example["id"]:
-            example["id"] = _stable_inline_doc_id(example["text"], example["image"], example["nr_ocr"])
         return example
 
     if isinstance(doc, str):
         example["text"] = doc
-        example["id"] = _stable_inline_doc_id(example["text"])
         return example
 
     # Fallback: coerce to string text
     example["text"] = str(doc)
-    example["id"] = _stable_inline_doc_id(example["text"])
     return example
 
 
-def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True, cache_dir: str | None = None):
+def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True):
     """
-    Load retrieval datasets from JSON/JSONL, Parquet, or saved HuggingFace datasets.
+    Load retrieval datasets from JSON/JSONL files.
 
     Copied from nemo-retriever-research/src/data/datasets.py
 
@@ -168,18 +116,6 @@ def load_datasets(data_dir_list: Union[List[str], str], concatenate: bool = True
         data_dir_list = [data_dir_list]
     datasets = []
     for data_dir in data_dir_list:
-        if _is_hf_dataset_dir(data_dir):
-            loaded_dataset = load_from_disk(data_dir)
-            if isinstance(loaded_dataset, dict):
-                loaded_dataset = loaded_dataset["train"]
-            datasets.append(loaded_dataset)
-            continue
-
-        parquet_files = _expand_parquet_files(data_dir)
-        if parquet_files:
-            datasets.append(_load_inline_parquet(data_dir, cache_dir=cache_dir))
-            continue
-
         train_data = _load_json_or_jsonl(data_dir)
 
         # Corpus-id based format is intentionally not supported in this "inline" loader.
@@ -298,19 +234,16 @@ def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_i
     # Extract text and images from corpus
     cur_pos_neg_text_batch = []
     cur_pos_neg_image_batch = []
-    cur_pos_neg_doc_id_batch = []
     query_instruction_batch = []
     passage_instruction_batch = []
 
     for idx_doc, docs in enumerate(cur_pos_neg_doc_batch):
         cur_pos_neg_text = []
         cur_pos_neg_image = []
-        cur_pos_neg_doc_id = []
         cur_corpus_id = corpus_ids[idx_doc]
 
         for doc in docs:
             cur_doc = _resolve_doc_to_example(doc)
-            cur_pos_neg_doc_id.append(cur_doc["id"])
 
             # Extract text
             if cur_doc["text"] != "" and not cur_doc["image"]:
@@ -330,7 +263,6 @@ def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_i
 
         cur_pos_neg_text_batch.append(cur_pos_neg_text)
         cur_pos_neg_image_batch.append(cur_pos_neg_image)
-        cur_pos_neg_doc_id_batch.append(cur_pos_neg_doc_id)
 
         if use_dataset_instruction and cur_corpus_id in corpus_dict:
             query_instruction_batch.append(corpus_dict[cur_corpus_id].query_instruction)
@@ -343,7 +275,6 @@ def _retrieval_transform_func(examples, num_neg_docs, corpus_dict, use_dataset_i
         "question": questions,
         "doc_text": cur_pos_neg_text_batch,
         "doc_image": cur_pos_neg_image_batch,
-        "doc_id": cur_pos_neg_doc_id_batch,
         "query_instruction": query_instruction_batch,
         "passage_instruction": passage_instruction_batch,
     }
@@ -432,7 +363,6 @@ def make_retrieval_dataset(
     max_train_samples: int = None,
     train_data_select_offset: int = 0,
     use_dataset_instruction: bool = False,
-    cache_dir: str | None = None,
 ):
     """
     Load and return dataset in retrieval format for encoder training.
@@ -450,7 +380,6 @@ def make_retrieval_dataset(
         do_shuffle: Whether to shuffle the dataset
         max_train_samples: Maximum number of training samples to use
         train_data_select_offset: Offset for selecting training samples
-        cache_dir: Optional HuggingFace datasets cache directory for Parquet loading
 
     Returns:
         A HuggingFace Dataset where each example is a dict with keys:
@@ -470,7 +399,7 @@ def make_retrieval_dataset(
     logging.info(f"Loading data from {data_dir_list if isinstance(data_dir_list, str) else len(data_dir_list)} file(s)")
 
     # Load datasets from JSON files
-    dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True, cache_dir=cache_dir)
+    dataset, corpus_dict = load_datasets(data_dir_list, concatenate=True)
 
     logging.info(f"Loaded dataset with {len(dataset)} examples")
 
