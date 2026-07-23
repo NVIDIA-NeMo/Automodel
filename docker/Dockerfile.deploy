@@ -17,8 +17,11 @@ FROM ${VLLM_IMAGE} AS deploy
 
 # Build mamba-ssm and causal-conv1d from source against the container's torch
 ENV MAMBA_FORCE_BUILD=TRUE CAUSAL_CONV1D_FORCE_BUILD=TRUE
-RUN pip install --no-build-isolation --no-binary=mamba-ssm,causal-conv1d \
-    mamba-ssm causal-conv1d
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    PIP_NO_CACHE_DIR=off pip install \
+        --no-build-isolation \
+        --no-binary=mamba-ssm,causal-conv1d \
+        mamba-ssm causal-conv1d
 
 # Test dependencies
 RUN --mount=type=bind,source=tests/ci_tests/requirements_deploy.txt,target=/tmp/requirements_deploy.txt \

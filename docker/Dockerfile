@@ -167,6 +167,8 @@ COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
 ARG UV_SYNC_ARGS="--locked"
+# Preserve locally built wheels for source-only CUDA packages such as flash-attn,
+# causal-conv1d, mamba-ssm, and nv-grouped-gemm across BuildKit builds.
 RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
     if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
