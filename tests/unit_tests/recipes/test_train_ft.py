@@ -39,9 +39,11 @@ from nemo_automodel.components.loss.mtp import PipelineCausalLMLoss
 from nemo_automodel.components.models.deepseek_v4.cp import dsv4_cp_local_seq_multiple
 from nemo_automodel.components.optim.optimizer import build_optimizer_config
 from nemo_automodel.recipes._typed_config import RecipeConfig, _as_dict, _callable_and_kwargs
-from nemo_automodel.recipes.llm.config import LlmInputConfig
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
+    _build_pp_collate_wrapper,
+    _should_pack_validation,
+    _supports_sequence_packing,
     build_model,
     compute_trust_remote_code_from_model,
 )
@@ -80,18 +82,19 @@ def _build_loader(
             },
         }
     )
-    input_config = RecipeConfig(raw).llm_inputs
+    config = RecipeConfig(raw).dataloader
+    assert config is not None
     runtime_model = model if model is not None else nn.Module()
-    with patch("nemo_automodel.recipes.llm.config.ScopedRNG", return_value=nullcontext()):
-        pipeline = input_config.build(
-            model=runtime_model,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            pp_enabled=pp_enabled,
-            cp_size=cp_size,
-            tokenizer=None,
-        )
-    return pipeline.train, None
+    loader = config.build(
+        dp_rank=dp_rank,
+        dp_world_size=dp_world_size,
+        pp_enabled=pp_enabled,
+        cp_size=cp_size,
+        tokenizer=None,
+        supports_seq_lens=_supports_sequence_packing(runtime_model),
+        collate_wrapper=_build_pp_collate_wrapper(runtime_model, pp_enabled),
+    )
+    return loader, None
 
 
 def build_optimizer(model, cfg_opt, distributed_config, device_mesh):
@@ -322,43 +325,26 @@ def test_validation_dataloaders_skip_packing_without_pack_size():
     assert RecipeConfig(cfg).validation_dataloaders["default"].packing is None
 
 
-def _build_validation_input(config: LlmInputConfig, model: nn.Module) -> DataloaderConfig:
-    """Build an LLM input config with loader construction replaced by its input config."""
-    with (
-        patch("nemo_automodel.recipes.llm.config.FirstRankPerNode", return_value=nullcontext()),
-        patch("nemo_automodel.recipes.llm.config.ScopedRNG", return_value=nullcontext()),
-        patch.object(DataloaderConfig, "build", autospec=True, side_effect=lambda loader, **kwargs: loader),
-    ):
-        return config.build(
-            model=model,
-            tokenizer=None,
-            dp_rank=0,
-            dp_world_size=1,
-        ).validation["default"]
-
-
 @pytest.mark.parametrize("attn", ["magi", "te", "sdpa"])
-def test_llm_input_config_packs_validation_for_explicit_thd_collater(attn):
+def test_packs_validation_for_explicit_thd_collater(attn):
     from nemo_automodel.components.datasets.loader import ThdPackingConfig
     from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
     packing = ThdPackingConfig(packed_sequence_size=1024)
     train = DataloaderConfig(dataset_config=MagicMock(), packing=packing)
     validation = DataloaderConfig(dataset_config=MagicMock(), packing=packing, collate_fn=packed_sequence_thd_collater)
-    config = LlmInputConfig(train=train, validation={"default": validation}, attn_implementation=attn)
 
-    assert _build_validation_input(config, nn.Module()).packing is packing
+    assert _should_pack_validation(train, validation, nn.Module(), attn) is True
 
 
-def test_llm_input_config_does_not_pack_validation_without_training_packing():
+def test_does_not_pack_validation_without_training_packing():
     train = DataloaderConfig(dataset_config=MagicMock())
     validation = DataloaderConfig(dataset_config=MagicMock())
-    config = LlmInputConfig(train=train, validation={"default": validation})
 
-    assert _build_validation_input(config, nn.Module()).packing is None
+    assert _should_pack_validation(train, validation, nn.Module(), "sdpa") is False
 
 
-def test_llm_input_config_packs_validation_when_model_requires_training_layout():
+def test_packs_validation_when_model_requires_training_layout():
     from nemo_automodel.components.datasets.loader import ThdPackingConfig
     from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
@@ -370,60 +356,25 @@ def test_llm_input_config_packs_validation_when_model_requires_training_layout()
         def should_pack_validation_with_training(self):
             return True
 
-    config = LlmInputConfig(train=train, validation={"default": validation})
-    assert _build_validation_input(config, ModelRequiresPackedValidation()).packing is packing
+    assert _should_pack_validation(train, validation, ModelRequiresPackedValidation(), "sdpa") is True
 
 
 @pytest.mark.parametrize("attn", ["magi", "te"])
-def test_llm_input_config_packs_validation_for_backend_training_layout(attn):
+def test_packs_validation_for_backend_training_layout(attn):
     from nemo_automodel.components.datasets.loader import ThdPackingConfig
     from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
 
     packing = ThdPackingConfig(packed_sequence_size=1024)
     train = DataloaderConfig(dataset_config=MagicMock(), packing=packing, collate_fn=packed_sequence_thd_collater)
     validation = DataloaderConfig(dataset_config=MagicMock(), packing=packing)
-    config = LlmInputConfig(train=train, validation={"default": validation}, attn_implementation=attn)
 
-    assert _build_validation_input(config, nn.Module()).packing is packing
+    assert _should_pack_validation(train, validation, nn.Module(), attn) is True
 
 
-def test_llm_input_config_configures_model_for_neat_packing():
+def test_neat_packing_declares_model_configuration_requirement():
     from nemo_automodel.components.datasets.loader import NeatPackingConfig
 
-    train = DataloaderConfig(dataset_config=MagicMock(), packing=NeatPackingConfig(packed_sequence_size=1024))
-    config = LlmInputConfig(train=train, validation={}, attn_implementation="flash_attention_2")
-
-    with (
-        patch("nemo_automodel.recipes.llm.config.FirstRankPerNode", return_value=nullcontext()),
-        patch("nemo_automodel.recipes.llm.config.ScopedRNG", return_value=nullcontext()),
-        patch.object(DataloaderConfig, "build", autospec=True, side_effect=lambda loader, **kwargs: loader),
-        patch("nemo_automodel.components.models.common.packing.configure_packing") as configure_packing,
-    ):
-        pipeline = config.build(model=nn.Module(), tokenizer=None, dp_rank=0, dp_world_size=1)
-
-    assert pipeline.train is train
-    configure_packing.assert_called_once_with(attn_implementation="flash_attention_2")
-
-
-def test_llm_input_config_uses_model_local_process_group_for_dataset_build():
-    train = DataloaderConfig(dataset_config=MagicMock())
-    config = LlmInputConfig(train=train, validation={})
-    process_group = MagicMock()
-
-    with (
-        patch("nemo_automodel.recipes.llm.config.FirstRankPerNode", return_value=nullcontext()) as first_rank,
-        patch("nemo_automodel.recipes.llm.config.ScopedRNG", return_value=nullcontext()),
-        patch.object(DataloaderConfig, "build", autospec=True, side_effect=lambda loader, **kwargs: loader),
-    ):
-        config.build(
-            model=nn.Module(),
-            tokenizer=None,
-            dp_rank=0,
-            dp_world_size=1,
-            dataset_build_process_group=process_group,
-        )
-
-    first_rank.assert_called_once_with(group=process_group)
+    assert NeatPackingConfig(packed_sequence_size=1024).requires_model_configuration is True
 
 
 class DummyLinear(nn.Module):
@@ -975,18 +926,21 @@ def _patch_setup_minimals(monkeypatch, patch_fn):
         property(lambda self: SimpleNamespace(build=lambda *a, **k: [dummy_opt])),
     )
 
-    # Data-related stub: short-circuit the complete typed LLM input build.
+    # Data-related stubs: short-circuit typed dataloader resolution and construction.
     monkeypatch.setattr(
         RecipeConfig,
-        "llm_inputs",
+        "dataloader",
         property(
             lambda self: SimpleNamespace(
-                build=lambda **k: SimpleNamespace(train="dl", validation={}),
-                requires_pp_thd_microbatch_override=False,
+                build=lambda **k: "dl",
+                dataset_builds_on_all_ranks=False,
+                seed=42,
                 uses_thd_collater=False,
+                packing=None,
             )
         ),
     )
+    monkeypatch.setattr(RecipeConfig, "validation_dataloaders", property(lambda self: {}))
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft._build_tokenizer", lambda cfg_model, cfg_ds: ({}, None))
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
@@ -1321,7 +1275,7 @@ def _create_minimal_recipe_for_pp_test(monkeypatch, pp_info):
 
     # Create the recipe without calling setup
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    recipe.cfg.__dict__["llm_inputs"] = SimpleNamespace(uses_thd_collater=False)
+    recipe.cfg.__dict__["dataloader"] = SimpleNamespace(uses_thd_collater=False)
 
     # Mock out attributes needed for _forward_backward_step
     # Use object.__setattr__ to bypass the state tracking
@@ -2046,7 +2000,7 @@ class TestRunTrainOptimStepSetsMoEScale:
         )
         monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
         recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-        recipe.cfg.__dict__["llm_inputs"] = SimpleNamespace(uses_thd_collater=False)
+        recipe.cfg.__dict__["dataloader"] = SimpleNamespace(uses_thd_collater=False)
 
         object.__setattr__(recipe, "dist_env", SimpleNamespace(device=torch.device("cpu"), rank=0, is_main=True))
         object.__setattr__(recipe, "device_mesh", None)
@@ -2440,7 +2394,7 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
     )
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.setup_logging", lambda: None)
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    recipe.cfg.__dict__["llm_inputs"] = SimpleNamespace(uses_thd_collater=uses_thd)
+    recipe.cfg.__dict__["dataloader"] = SimpleNamespace(uses_thd_collater=uses_thd)
 
     class _CPModel(nn.Module):
         def __init__(self):

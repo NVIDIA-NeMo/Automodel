@@ -78,6 +78,7 @@ from nemo_automodel.recipes.kd_utils import (
 from nemo_automodel.recipes.llm.train_ft import (
     TrainFinetuneRecipeForNextTokenPrediction,
     _get_num_thd_chunks,
+    _requires_pp_thd_microbatch_override,
     build_model,
 )
 
@@ -708,7 +709,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         if separate_teacher_logits is not None:
             batch["teacher_logits"] = separate_teacher_logits
         cp_kwargs = {
-            "use_te": self.cfg.llm_inputs.requires_pp_thd_microbatch_override,
+            "use_te": _requires_pp_thd_microbatch_override(self.cfg),
             "padding_token_id": self.tokenizer.pad_token_id if self.tokenizer else 0,
             "num_chunks": _get_num_thd_chunks(True, self.cfg),
         }

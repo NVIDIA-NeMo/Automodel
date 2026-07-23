@@ -59,7 +59,6 @@ if TYPE_CHECKING:
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
-    from nemo_automodel.recipes.llm.config import LlmInputConfig
     from nemo_automodel.components.training.prewarm import PrewarmConfig
 
 # Keys present in the YAML ``step_scheduler:`` block that are runtime args passed
@@ -323,21 +322,6 @@ class RecipeConfig:
                 continue
             dataset_nodes[_name(key)] = node
         return {name: self._resolve_dataloader(node, val_dl_node) for name, node in dataset_nodes.items()}
-
-    @cached_property
-    def llm_inputs(self) -> "LlmInputConfig":
-        """Resolve the complete typed LLM input-pipeline configuration."""
-        from nemo_automodel.components.models.common.packing import get_attn_implementation
-        from nemo_automodel.recipes.llm.config import LlmInputConfig
-
-        train = self.dataloader
-        if train is None:
-            raise ValueError("An LLM recipe requires a dataset configuration")
-        return LlmInputConfig(
-            train=train,
-            validation=self.validation_dataloaders,
-            attn_implementation=get_attn_implementation(self._raw.get("model", None)),
-        )
 
     @staticmethod
     def _resolve_vlm_processor(node: Any) -> "VlmProcessorConfig":
