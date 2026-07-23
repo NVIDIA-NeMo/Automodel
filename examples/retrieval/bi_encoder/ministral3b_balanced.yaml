@@ -87,7 +87,6 @@ dataloader:
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/pubmedqa_pqa_labeled_train_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/medquad_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/datascience/projects/datascience_nemo_retriever/users/jiaruic/data/rteb/jaquad_qwen3_8B_0_95_perc.json
-      TODO: ADD CODE
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_deu_10k_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_eng_10k_qwen3_8B_0_95_perc.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/finepdf_vidore_multilingual_20260605_doc_eng_query_fra_10k_qwen3_8B_0_95_perc.json
@@ -104,7 +103,6 @@ dataloader:
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mlqa_de_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mlqa_es_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
       - /lustre/fsw/portfolios/llmservice/users/ybabakhin/data/rteb/mlqa_hi_remined_origcorpus_qwen3_8B_0_95_perc_20260523.json
-
     data_type: train
     n_passages: 5
     seed: 42
