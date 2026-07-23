@@ -53,16 +53,11 @@ model:
   mtp_loss_scaling_factor: 0.1
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
-    rms_norm: torch_fp32
-    linear: torch
-
-# torch.compile configuration
-compile:
-  enabled: false
-  mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
-  fullgraph: false
-  dynamic: true  # Set to false for better performance with fixed shapes
-  backend: null  # Use default backend (inductor)
+    attn: te
+    linear: te
+    rms_norm: te
+    experts: gmm
+    dispatcher: hybridep
 
 checkpoint:
   enabled: true
@@ -82,7 +77,7 @@ distributed:
   dp_size: none
   tp_size: 1
   cp_size: 1
-  ep_size: 4
+  ep_size: 8
 
   sequence_parallel: false
 
