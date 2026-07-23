@@ -53,9 +53,9 @@ from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.loader import CollateFn, DataloaderConfig
 from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
-from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
+from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
-from nemo_automodel.components.distributed.magi_attn_utils import MagiState, setup_magi
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
@@ -124,21 +124,30 @@ def _supports_sequence_packing(model: nn.Module) -> bool:
 
 
 def _should_pack_validation(
-    train: DataloaderConfig,
-    validation: DataloaderConfig,
+    training_dataloader: DataloaderConfig | None,
+    validation_dataloader: DataloaderConfig,
     model: nn.Module,
-    attn_implementation: str,
 ) -> bool:
     """Return whether validation must use the configured training packer."""
-    if train.packing is None:
+    if validation_dataloader.packing is None:
         return False
-    if validation.uses_thd_collater:
+    if replace(validation_dataloader, packing=None).emits_thd:
         return True
-
-    model_policy = getattr(model, "should_pack_validation_with_training", None)
-    model_requires_training_layout = callable(model_policy) and bool(model_policy())
-    backend_requires_training_layout = attn_implementation in {"magi", "te"}
-    return (model_requires_training_layout or backend_requires_training_layout) and train.uses_thd_collater
+    if training_dataloader is None or not training_dataloader.emits_thd:
+        return False
+    model_requires_packing = bool(
+        callable(getattr(model, "should_pack_validation_with_training", None))
+        and model.should_pack_validation_with_training()
+    )
+    model_config = getattr(model, "config", None)
+    attention_backend = getattr(getattr(model, "backend", None), "attn", None) or getattr(
+        model_config, "_attn_implementation", None
+    )
+    return (
+        attention_backend in ("te", "magi")
+        or bool(getattr(model, "_te_attention_injected", False))
+        or model_requires_packing
+    )
 
 
 def _requires_pp_thd_microbatch_override(config: RecipeConfig) -> bool:
@@ -146,13 +155,7 @@ def _requires_pp_thd_microbatch_override(config: RecipeConfig) -> bool:
     from nemo_automodel.components.models.common.packing import get_attn_implementation
 
     dataloader = config.dataloader
-    return dataloader is not None and get_attn_implementation(config.model) == "te" and dataloader.uses_thd_collater
-
-
-def _get_num_thd_chunks(pp_enabled, cfg):
-    if pp_enabled:
-        return cfg.get("step_scheduler.local_batch_size", 1) // cfg.get("distributed.pipeline.pp_microbatch_size", 1)
-    return 1
+    return dataloader is not None and get_attn_implementation(config.model) == "te" and dataloader.emits_thd
 
 
 def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
@@ -549,14 +552,13 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             pp_rank=self._get_pp_rank(),
             moe_mesh=self.moe_mesh,
             process_group=getattr(self.mesh_context, "process_group", None),
+            pp_group=self._get_pp_group(),
         )
 
         # Disable fused RoPE when context parallelism is enabled (cp > 1)
         if self.mesh_context.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
             logging.info("Disabling rope_fusion because cp_size=%d > 1", self.mesh_context.cp_size)
             self.cfg.model.backend.rope_fusion = False
-
-        # fp32 master-weight default planned to be enabled in follow-up PR (resolve_storage_dtype).
 
         model = build_model(
             self.cfg.model,
@@ -570,6 +572,12 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             cfg_qat=self.cfg.get("qat", None),
             sdpa_method=self.cfg.get("sdpa_method", None),
         )
+        self.embedding_row_repair_report = None
+        embedding_row_repair = self.cfg.embedding_row_repair
+        if embedding_row_repair is not None and embedding_row_repair.enabled:
+            if isinstance(model, AutoPipeline):
+                raise ValueError("embedding_row_repair is not currently supported with pipeline parallelism")
+            self.embedding_row_repair_report = embedding_row_repair.apply(model)
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
         self.optimizer = shard_optimizers_for_megatron_fsdp(
@@ -670,7 +678,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     train_dataloader_config,
                     config,
                     self.model_parts[0],
-                    attn_implementation,
                 )
                 else replace(config, packing=None)
             )
@@ -917,7 +924,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         for v in self.metric_logger_valid.values():
             v.close()
 
-        self.checkpointer.close()
+        self._finalize_and_close_checkpointer()
 
         # Mark the MLflow run KILLED if training exited via SIGTERM.
         if self.step_scheduler.sigterm_flag:
@@ -943,45 +950,14 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             )
             for k, v in batch.items()
         }
-        _thd_collater = self.cfg.dataloader.uses_thd_collater
-        # Gate THD/cu_seqlens processing on the dataset being THD-packed, not on TE
-        # attention being present on this rank: both TE attention and mamba need
-        # cu_seqlens, and gating on attention would drop PP stages with no attention
-        # layers (mamba+moe only) and leave cu_seqlens unbuilt downstream.
-        _use_te_value = _thd_collater
-        _num_chunks_value = _get_num_thd_chunks(self.pp_enabled, self.cfg)
-        cp_size = getattr(getattr(self, "dist_setup", None), "cp_size", self.cfg.get("distributed.cp_size", 1))
-        if self.magi.enabled:
-            train_ctx, batch = self.magi.prepare_llm_batch(  # pragma: no cover - requires GPU + magi_attention
-                self.model_parts[0] if hasattr(self, "model_parts") else None,
-                batch,
-                device_mesh=self.device_mesh,
-                is_thd=_thd_collater,
-                pad_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-                num_chunks=_num_chunks_value,
-            )
-        else:
-            # Model-owned context parallelism: if the model exposes a CP input-prep
-            # hook, let it attach its own batch-sharding callable (``_cp_make_batch_fn``)
-            # before make_cp_batch_and_ctx shards the batch, instead of the default
-            # load-balanced context_parallel path.
-            _model_cp = self.model_parts[0] if hasattr(self, "model_parts") else None
-            model_owns_thd = _thd_collater and bool(getattr(_model_cp, "supports_thd", False))
-            if (
-                (cp_size > 1 or model_owns_thd)
-                and _model_cp is not None
-                and hasattr(_model_cp, "prepare_model_inputs_for_cp")
-            ):
-                batch.update(
-                    _model_cp.prepare_model_inputs_for_cp(input_ids=batch["input_ids"], num_chunks=_num_chunks_value)
-                )
-            train_ctx, batch = make_cp_batch_and_ctx(
-                self.device_mesh,
-                batch,
-                use_te=_use_te_value,
-                padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
-                num_chunks=_num_chunks_value,
-            )
+        cp_sharder = ContextParallelSharder(
+            self.model_parts[0] if hasattr(self, "model_parts") else None,
+            self.device_mesh,
+            batch,
+            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
+            num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1,
+        )
+        train_ctx, batch = cp_sharder.shard(batch)
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 

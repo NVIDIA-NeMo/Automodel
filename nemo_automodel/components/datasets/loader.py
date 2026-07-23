@@ -593,6 +593,13 @@ class DataloaderConfig:
         return isinstance(self.dataset_config, AllRanksDatasetConfig)
 
     @property
+    def emits_thd(self) -> bool:
+        """Whether this configuration produces THD-formatted batches."""
+        from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+        return isinstance(self.packing, ThdPackingConfig) or self.collate_fn is packed_sequence_thd_collater
+
+    @property
     def uses_thd_collater(self) -> bool:
         """Whether this loader explicitly selects the THD collater."""
         from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater

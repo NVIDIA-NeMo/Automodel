@@ -319,12 +319,31 @@ def wrap_vlm_collate_for_pp(
     return wrapper
 
 
+def _will_run_forward_metadata_inference(pp: Any) -> bool:
+    """Return whether the next schedule step will probe stage 0 with a real forward."""
+    schedule = getattr(pp.info, "schedule", None)
+    stages = getattr(pp.info, "stages", None)
+    if schedule is None or not stages:
+        return False
+
+    first_stage = next((stage for stage in stages if getattr(stage, "is_first", False)), None)
+    if first_stage is None or hasattr(first_stage, "_configure_outputs_meta"):
+        return False
+
+    if hasattr(schedule, "_stage_forward_initialized"):
+        return not schedule._stage_forward_initialized
+    if hasattr(schedule, "_stages_forward_initialized"):
+        return not schedule._stages_forward_initialized
+    return False
+
+
 @contextmanager
 def stage_vlm_media_for_pp(pp: Any, model_parts: list[torch.nn.Module], batch: MutableMapping[str, Any]):
     """Attach dataloader-prepared VLM media chunks to PP stage 0 for one schedule call."""
     pp_media = batch.pop(VLM_PP_MEDIA_KEY, None)
     stage0_model = model_parts[0] if pp_media and getattr(pp.info, "has_first_stage", False) else None
     staged = False
+    metadata_forward_hook = None
 
     if stage0_model is not None:
         if "pixel_values" in pp_media:
@@ -340,10 +359,19 @@ def stage_vlm_media_for_pp(pp: Any, model_parts: list[torch.nn.Module], batch: M
             staged = True
         if staged:
             stage0_model._vlm_chunk_idx = 0
+            if _will_run_forward_metadata_inference(pp):
+
+                def reset_media_cursor_after_metadata_forward(_module, _args, _output):
+                    stage0_model._vlm_chunk_idx = 0
+                    metadata_forward_hook.remove()
+
+                metadata_forward_hook = stage0_model.register_forward_hook(reset_media_cursor_after_metadata_forward)
 
     try:
         yield
     finally:
+        if metadata_forward_hook is not None:
+            metadata_forward_hook.remove()
         if staged and stage0_model is not None:
             stage0_model._vlm_pixel_values_chunks = None
             stage0_model._vlm_image_grid_hws_chunks = None
