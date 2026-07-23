@@ -2865,14 +2865,19 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_pp_rank", lambda self: 0)
 
 
-def _minimal_vlm_cfg(cp_size: int, rope_fusion: bool, prewarm: dict[str, bool] | None = None) -> ConfigNode:
+def _minimal_vlm_cfg(
+    cp_size: int,
+    rope_fusion: bool,
+    prewarm: dict[str, bool] | None = None,
+    optimizer_target: str | None = None,
+) -> ConfigNode:
     cfg = {
         "model": {"backend": {"rope_fusion": rope_fusion}},
         "dataloader": {},
         "dataset": {"path_or_dataset": "dummy"},
         "validation_dataloader": {},
         "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
-        "optimizer": {},
+        "optimizer": {"_target_": optimizer_target} if optimizer_target is not None else {},
         "loss_fn": {},
         "checkpoint": {"best_metric_key": "default"},
         "distributed": {"cp_size": cp_size},
@@ -2924,6 +2929,23 @@ def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
     trainer.setup()
 
     assert cfg.model.backend.rope_fusion is True
+
+
+def test_vlm_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True, optimizer_target="torch.optim.AdamW")
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
+    optimizer_config = build_optimizer_config("torch.optim.AdamW", {"lr": 0.01})
+    monkeypatch.setattr(optimizer_config, "build", lambda *a, **k: [dummy_opt])
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: optimizer_config),
+    )
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert not hasattr(cfg.model, "torch_dtype")
 
 
 def test_vlm_rope_fusion_stays_false_when_already_disabled(monkeypatch):
