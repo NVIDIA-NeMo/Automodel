@@ -17,10 +17,9 @@
 Covers:
   - ``prepare_model_inputs_for_cp`` returns a dict containing ``inputs_embeds``
     with the expected shape and image/video/sound token positions filled.
-  - ``prepare_inputs_embeds_for_cp`` is a thin Tensor-returning wrapper.
-  - ``forward(_pre_embed_only=True)`` delegates to ``prepare_model_inputs_for_cp``
-    without entering the LLM body (so FSDP2 forward pre-hooks fire on
-    ``__call__`` while the LLM forward is skipped).
+  - ``prepare_model_inputs_for_cp`` is a sharder-only hook: it returns the CP
+    sharder without entering the LLM body (embed / vision splice / shard happen
+    in the model's own forward).
   - ``forward(inputs_embeds=...)`` skips the multimodal scatter block.
 
 The model is constructed via ``object.__new__`` + minimal stub submodules so we
@@ -31,9 +30,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from nemo_automodel.components.models.nemotron_omni.model import (
     NemotronOmniForConditionalGeneration,
@@ -61,9 +60,16 @@ class _StubLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self._embed = _StubEmbedding()
+        self.captured: dict = {}
 
     def get_input_embeddings(self):
         return self._embed
+
+    def forward(self, **kwargs):
+        # Capture the (post-embed, post-splice, post-CP-shard) inputs_embeds the
+        # wrapper forward hands the LM so tests can assert on it.
+        self.captured = kwargs
+        return SimpleNamespace(logits=kwargs.get("inputs_embeds"), hidden_states=None)
 
 
 def _make_omni_stub(*, with_sound_encoder: bool = True):
@@ -107,184 +113,159 @@ def _make_omni_stub(*, with_sound_encoder: bool = True):
 # -----------------------------------------------------------------------------
 
 
-def test_prepare_model_inputs_for_cp_returns_dict():
+class _FakeCPMesh:
+    def __init__(self, size: int):
+        self._size = size
+
+    def size(self) -> int:
+        return self._size
+
+
+def _forward_embeds(model, **forward_kwargs):
+    """Run the wrapper forward and return the inputs_embeds it handed the LM."""
+    model(**forward_kwargs)
+    return model.language_model.captured["inputs_embeds"]
+
+
+def test_prepare_model_inputs_for_cp_is_sharder_only():
+    """The CP hook is sharder-only: it consumes nothing and returns a
+    ContextParallelSharder; embed + splice + shard run inside forward."""
+    from nemo_automodel.components.distributed.context_parallel.sharder import (
+        ContextParallelSharder,
+        round_robin_local_indices,
+        shard_batch_aux_only,
+    )
+
     model = _make_omni_stub()
-    input_ids = torch.tensor([[1, 2, 3, 4]])
-    out = model.prepare_model_inputs_for_cp(input_ids=input_ids)
-    assert isinstance(out, dict)
-    assert "inputs_embeds" in out
-    assert out["inputs_embeds"].shape == (1, 4, HIDDEN)
+    input_ids = torch.tensor([[1, IMG_TOKEN_ID, IMG_TOKEN_ID, 4]])
+    batch = {"input_ids": input_ids, "pixel_values": torch.zeros(2, 3, 4, 4), "image_flags": torch.tensor([[1], [1]])}
+    out = model.prepare_model_inputs_for_cp(batch)
+
+    assert set(out) == {"cp_sharder"}
+    sharder = out["cp_sharder"]
+    assert isinstance(sharder, ContextParallelSharder)
+    assert sharder.shard_batch is shard_batch_aux_only
+    assert sharder.local_token_global_indices is round_robin_local_indices
+    # nothing consumed: input_ids / media stay for the forward
+    assert batch["input_ids"] is input_ids and "pixel_values" in batch
 
 
-def test_prepare_model_inputs_for_cp_text_only_returns_pure_embeds():
+def test_forward_text_only_embeds():
     """No multimodal inputs -> embeds are just embed_tokens(input_ids)."""
     model = _make_omni_stub()
     input_ids = torch.tensor([[5, 6, 7]])
-    out = model.prepare_model_inputs_for_cp(input_ids=input_ids)["inputs_embeds"]
+    out = _forward_embeds(model, input_ids=input_ids)
     expected = model.language_model.get_input_embeddings()(input_ids)
     assert torch.equal(out, expected)
 
 
-def test_prepare_model_inputs_for_cp_image_scatter_at_placeholder_positions():
+def test_forward_image_scatter_at_placeholder_positions():
     """Image positions in input_ids must receive the vit feature value (9.0)."""
     model = _make_omni_stub()
     input_ids = torch.tensor([[1, IMG_TOKEN_ID, IMG_TOKEN_ID, 4]])
-    pixel_values = torch.zeros(2, 3, 4, 4)  # 2 tiles
-    image_flags = torch.tensor([[1], [1]])
-    out = model.prepare_model_inputs_for_cp(
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        image_flags=image_flags,
-    )["inputs_embeds"]
+    out = _forward_embeds(
+        model, input_ids=input_ids, pixel_values=torch.zeros(2, 3, 4, 4), image_flags=torch.tensor([[1], [1]])
+    )
     assert out.shape == (1, 4, HIDDEN)
-    # Positions 1 and 2 are image tokens => value 9.0
     assert torch.allclose(out[0, 1], torch.full((HIDDEN,), 9.0))
     assert torch.allclose(out[0, 2], torch.full((HIDDEN,), 9.0))
-    # Positions 0 and 3 are text tokens => preserved from embed lookup
     expected_pos0 = (torch.tensor([1.0]) + 1.0) / 100.0
     expected_pos3 = (torch.tensor([4.0]) + 1.0) / 100.0
     assert torch.allclose(out[0, 0], expected_pos0.expand(HIDDEN))
     assert torch.allclose(out[0, 3], expected_pos3.expand(HIDDEN))
 
 
-def test_prepare_model_inputs_for_cp_dynamic_res_takes_priority_over_static():
-    """When imgs_sizes is provided, the dynamic-res branch (extract_feature_dynamic)
-    handles vision; the static path (extract_feature) is skipped."""
+def test_forward_dynamic_res_takes_priority_over_static():
+    """When imgs_sizes is provided, the dynamic-res branch handles vision."""
     model = _make_omni_stub()
-    input_ids = torch.tensor([[1, IMG_TOKEN_ID, 3]])
-    pixel_values = torch.zeros(1, 3, 8, 8)
-    imgs_sizes = torch.tensor([[8, 8]])
-    out = model.prepare_model_inputs_for_cp(
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        imgs_sizes=imgs_sizes,
-    )["inputs_embeds"]
+    out = _forward_embeds(
+        model,
+        input_ids=torch.tensor([[1, IMG_TOKEN_ID, 3]]),
+        pixel_values=torch.zeros(1, 3, 8, 8),
+        imgs_sizes=torch.tensor([[8, 8]]),
+    )
     # extract_feature_dynamic stub returns 7.0; extract_feature returns 9.0
     assert torch.allclose(out[0, 1], torch.full((HIDDEN,), 7.0))
 
 
-def test_prepare_model_inputs_for_cp_video_scatter_at_img_token_positions():
-    """Video features scatter at the same img_context_token_id positions
-    (image and video are mutually exclusive on Nemotron-Omni)."""
+def test_forward_video_scatter_at_img_token_positions():
+    """Video features scatter at the img_context_token_id positions."""
     model = _make_omni_stub()
-    input_ids = torch.tensor([[1, IMG_TOKEN_ID, IMG_TOKEN_ID, 4]])
-    pixel_values_videos = torch.zeros(2, 3, 4, 4)
-    out = model.prepare_model_inputs_for_cp(
-        input_ids=input_ids,
-        pixel_values_videos=pixel_values_videos,
-    )["inputs_embeds"]
+    out = _forward_embeds(
+        model,
+        input_ids=torch.tensor([[1, IMG_TOKEN_ID, IMG_TOKEN_ID, 4]]),
+        pixel_values_videos=torch.zeros(2, 3, 4, 4),
+    )
     assert torch.allclose(out[0, 1], torch.full((HIDDEN,), 5.0))
     assert torch.allclose(out[0, 2], torch.full((HIDDEN,), 5.0))
 
 
-def test_prepare_model_inputs_for_cp_sound_scatter_at_sound_token():
+def test_forward_sound_scatter_at_sound_token():
     model = _make_omni_stub()
-    input_ids = torch.tensor([[SOUND_TOKEN_ID, 2, SOUND_TOKEN_ID]])
-    sound_features = torch.zeros(2, 4, 16)  # 2 sound chunks
-    sound_attention_mask = torch.ones(2, 4)
-    out = model.prepare_model_inputs_for_cp(
-        input_ids=input_ids,
-        sound_features=sound_features,
-        sound_attention_mask=sound_attention_mask,
-    )["inputs_embeds"]
+    out = _forward_embeds(
+        model,
+        input_ids=torch.tensor([[SOUND_TOKEN_ID, 2, SOUND_TOKEN_ID]]),
+        sound_features=torch.zeros(2, 4, 16),
+        sound_attention_mask=torch.ones(2, 4),
+    )
     assert torch.allclose(out[0, 0], torch.full((HIDDEN,), 3.0))
     assert torch.allclose(out[0, 2], torch.full((HIDDEN,), 3.0))
     expected_pos1 = (torch.tensor([2.0]) + 1.0) / 100.0
     assert torch.allclose(out[0, 1], expected_pos1.expand(HIDDEN))
 
 
-def test_prepare_model_inputs_for_cp_sound_skipped_when_no_sound_encoder():
-    """If model.sound_encoder is None (sound disabled), sound branch must be a no-op."""
+def test_forward_sound_skipped_when_no_sound_encoder():
+    """If model.sound_encoder is None (sound disabled), the sound branch is a no-op."""
     model = _make_omni_stub(with_sound_encoder=False)
     input_ids = torch.tensor([[SOUND_TOKEN_ID, 2, SOUND_TOKEN_ID]])
-    sound_features = torch.zeros(2, 4, 16)
-    out = model.prepare_model_inputs_for_cp(
-        input_ids=input_ids,
-        sound_features=sound_features,
-    )["inputs_embeds"]
-    # Should equal pure embed lookup (sound positions unchanged)
+    out = _forward_embeds(model, input_ids=input_ids, sound_features=torch.zeros(2, 4, 16))
     expected = model.language_model.get_input_embeddings()(input_ids)
     assert torch.equal(out, expected)
 
 
-# -----------------------------------------------------------------------------
-# prepare_inputs_embeds_for_cp (thin wrapper)
-# -----------------------------------------------------------------------------
-
-
-def test_prepare_inputs_embeds_for_cp_returns_tensor_not_dict():
-    """Thin wrapper: returns ``Tensor`` (just inputs_embeds), not a dict."""
+def test_forward_cp_shards_embedded_sequence():
+    """With a CP mesh installed, forward embeds+splices the full sequence then
+    keeps this rank's round-robin chunk pair, so the LM sees the local shard."""
+    sdpa_before = F.scaled_dot_product_attention
     model = _make_omni_stub()
-    input_ids = torch.tensor([[1, 2, 3]])
-    out = model.prepare_inputs_embeds_for_cp(input_ids=input_ids)
-    assert isinstance(out, torch.Tensor)
-    assert out.shape == (1, 3, HIDDEN)
-
-
-def test_prepare_inputs_embeds_for_cp_matches_prepare_model_inputs_for_cp():
-    """Wrapper output equals ``prepare_model_inputs_for_cp(...)["inputs_embeds"]``."""
-    model = _make_omni_stub()
-    input_ids = torch.tensor([[1, IMG_TOKEN_ID, 3]])
-    pixel_values = torch.zeros(1, 3, 4, 4)
-    image_flags = torch.tensor([[1]])
-    a = model.prepare_inputs_embeds_for_cp(
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        image_flags=image_flags,
+    model.cp_mesh = _FakeCPMesh(2)
+    input_ids = torch.tensor([[1, IMG_TOKEN_ID, IMG_TOKEN_ID, 4, 5, 6, 7, 8]])  # len 8 == multiple of 2*cp
+    out = _forward_embeds(
+        model, input_ids=input_ids, pixel_values=torch.zeros(2, 3, 4, 4), image_flags=torch.tensor([[1], [1]])
     )
-    b = model.prepare_model_inputs_for_cp(
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        image_flags=image_flags,
-    )["inputs_embeds"]
-    assert torch.equal(a, b)
+    assert out.shape == (1, 4, HIDDEN)  # 8 // cp_size(2) = 4 local tokens
+    assert F.scaled_dot_product_attention is sdpa_before
 
 
 # -----------------------------------------------------------------------------
-# forward(_pre_embed_only=True)
 # -----------------------------------------------------------------------------
 
 
-def test_forward_pre_embed_only_returns_dict_from_prepare_model_inputs_for_cp(monkeypatch):
-    """forward(_pre_embed_only=True) must early-return prepare_model_inputs_for_cp's dict
-    WITHOUT entering the LLM forward."""
+# -----------------------------------------------------------------------------
+# prepare_model_inputs_for_cp (sharder-only hook)
+# -----------------------------------------------------------------------------
+
+
+def test_prepare_model_inputs_for_cp_is_sharder_only_and_skips_lm(monkeypatch):
+    """The sharder-only CP hook returns just the CP sharder and never touches the
+    LLM body (embed / vision splice / shard happen in the model's own forward)."""
     model = _make_omni_stub()
 
-    # Sentinel: if the LLM body is invoked, language_model.__call__ would be hit.
-    # We assert it is NOT by mocking it to raise.
     def _llm_must_not_run(*args, **kwargs):
-        raise AssertionError("language_model should NOT be called under _pre_embed_only=True")
+        raise AssertionError("language_model should NOT be called by the CP hook")
 
-    model.language_model.forward = _llm_must_not_run  # would also catch __call__
+    model.language_model.forward = _llm_must_not_run
 
-    out = model.forward(
-        input_ids=torch.tensor([[1, IMG_TOKEN_ID, 3]]),
-        pixel_values=torch.zeros(1, 3, 4, 4),
-        image_flags=torch.tensor([[1]]),
-        _pre_embed_only=True,
+    out = model.prepare_model_inputs_for_cp(
+        {
+            "input_ids": torch.tensor([[1, IMG_TOKEN_ID, 3]]),
+            "pixel_values": torch.zeros(1, 3, 4, 4),
+            "image_flags": torch.tensor([[1]]),
+        }
     )
+    # Sharder-only hook: returns the CP sharder, does not embed or call the LM.
     assert isinstance(out, dict)
-    assert "inputs_embeds" in out
-    assert out["inputs_embeds"].shape == (1, 3, HIDDEN)
-
-
-def test_forward_pre_embed_only_default_false_does_not_short_circuit(monkeypatch):
-    """Default ``_pre_embed_only=False`` must NOT take the early-return path."""
-    model = _make_omni_stub()
-
-    # Prove the early branch isn't triggered by patching prepare_model_inputs_for_cp
-    # to a sentinel and asserting it's NOT what gets returned. (The full forward
-    # would hit the LLM, which we mock to raise — so we expect AssertionError.)
-    def _llm_raises(*args, **kwargs):
-        raise AssertionError("LM was reached past the multimodal block")
-
-    model.language_model.forward = _llm_raises
-
-    with pytest.raises(AssertionError, match="LM was reached"):
-        model.forward(
-            input_ids=torch.tensor([[1, 2, 3]]),
-            # _pre_embed_only defaults to False
-        )
+    assert set(out) == {"cp_sharder"}
 
 
 def test_forward_inputs_embeds_skips_multimodal_scatter_block():
@@ -308,7 +289,7 @@ def test_forward_inputs_embeds_skips_multimodal_scatter_block():
     model.language_model.__call__ = _fake_llm  # nn.Module.__call__ wraps forward
 
     pre_built = torch.randn(1, 3, HIDDEN)
-    out = model.forward(
+    model.forward(
         inputs_embeds=pre_built,
         pixel_values=torch.zeros(1, 3, 4, 4),  # provided but should be IGNORED
         image_flags=torch.tensor([[1]]),

@@ -23,8 +23,10 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 import yaml
 from safetensors.torch import save_file
+from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _DIFFUSERS_INDEX_FN,
@@ -55,7 +57,11 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     is_cloud_path,
     save_config,
 )
-from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, _get_lm_head_weight_and_name
+from nemo_automodel.components.checkpoint.stateful_wrappers import (
+    ModelState,
+    OptimizerState,
+    _get_lm_head_weight_and_name,
+)
 from nemo_automodel.components.checkpoint.utils import (
     has_local_tied_lm_head,
     materialize_missing_tied_lm_head,
@@ -782,6 +788,39 @@ def test_model_state_refreshes_tied_lm_head_before_dropping_key():
     assert "model.embed_tokens.weight" in saved_state_dict
 
 
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_model_state_passes_cpu_offload_to_dcp(cpu_offload):
+    model = torch.nn.Linear(2, 2)
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_model_state_dict",
+        return_value={"weight": model.weight},
+    ) as get_state_dict:
+        ModelState(model, cpu_offload=cpu_offload).state_dict()
+
+    options = get_state_dict.call_args.kwargs["options"]
+    if cpu_offload:
+        assert options.cpu_offload is True
+    else:
+        assert options is None
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_optimizer_state_passes_cpu_offload_to_dcp(cpu_offload):
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.Adam(model.parameters())
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_optimizer_state_dict",
+        return_value={},
+    ) as get_state_dict:
+        OptimizerState(model, optimizer, cpu_offload=cpu_offload).state_dict()
+
+    options = get_state_dict.call_args.kwargs["options"]
+    assert options.cpu_offload is cpu_offload
+    assert options.flatten_optimizer_state_dict is True
+
+
 def test_materialize_missing_tied_lm_head_uses_embedding_tensor_from_checkpoint():
     model = _PipelineLastStageLikeModel()
     embed_weight = torch.full_like(model.lm_head.weight, 3.0)
@@ -1083,6 +1122,49 @@ class TestModelHasDtensors:
         """If all parameters are regular tensors, returns False."""
         model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
         assert _model_has_dtensors(model) is False
+
+
+# =============================================================================
+# Tests for load_model: DDP-wrapped state dict adapters
+# =============================================================================
+
+
+def test_load_model_uses_state_dict_adapter_from_ddp_module(tmp_path):
+    """A DDP-wrapped encoder restores HF-format checkpoint keys through its adapter."""
+    from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Linear(2, 2, bias=False)
+            self.state_dict_adapter = EncoderStateDictAdapter()
+
+    encoder = Encoder()
+    # DDP's checkpoint traversal only depends on the registered ``module`` child;
+    # bypass process-group setup so this key-conversion regression stays a CPU unit test.
+    ddp_model = object.__new__(DistributedDataParallel)
+    torch.nn.Module.__init__(ddp_model)
+    ddp_model.module = encoder
+
+    model_path = tmp_path / "model"
+    checkpoint_weight = torch.full_like(encoder.model.weight, 7.0)
+    dcp.save({"weight": checkpoint_weight}, checkpoint_id=str(model_path))
+
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+        is_peft=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+
+    checkpointer.load_model(ddp_model, model_path=str(model_path))
+
+    torch.testing.assert_close(encoder.model.weight, checkpoint_weight)
 
 
 # =============================================================================
