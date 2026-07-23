@@ -167,10 +167,11 @@ COPY docker/common/update_pyproject_pytorch.sh /opt/Automodel/docker/common/
 ARG BASE_IMAGE=cuda
 ARG AUTOMODEL_INSTALL=all
 ARG UV_SYNC_ARGS="--locked"
-RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
+RUN --mount=type=cache,target=/opt/uv_cache,sharing=locked \
+    if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
-    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS --no-cache
+    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS
 
 # MXFP8 MoE training (experts="torch_mm_mxfp8"): the NGC PyTorch base does not bundle
 # torchao and uv-pytorch.toml gates it off (sys_platform=='never'), so `uv sync` skips
