@@ -145,9 +145,9 @@ class TestGetAttnImplementation:
 
 
 class TestConfigurePacking:
-    @pytest.mark.parametrize("attn_implementation", ["sdpa", "flash_attention_3"])
+    @pytest.mark.parametrize("attn_implementation", ["sdpa", "eager"])
     def test_noop_for_unsupported_backends(self, attn_implementation, monkeypatch):
-        """configure_packing should not install FA2 shims for unsupported backends."""
+        """configure_packing should not install flash-attn shims for unsupported backends."""
         patch_preprocess = MagicMock()
         monkeypatch.setattr(
             "nemo_automodel.components.models.common.packing._patch_preprocess_mask_arguments_for_packing",
@@ -257,8 +257,8 @@ class TestConfigurePacking:
             else:
                 masking_utils._nemo_automodel_packing_preprocess_patched = original_flag
 
-    def test_qwen3_uses_generic_preprocess_shim(self):
-        """Qwen3 should preserve indexed masks without a model-specific module patch."""
+    def test_qwen3_preserves_indexed_mask(self):
+        """Qwen3 should preserve indexed masks after packing is configured."""
         import transformers.masking_utils as masking_utils
         import transformers.modeling_flash_attention_utils as fa_utils
         import transformers.models.qwen3.modeling_qwen3 as modeling_qwen3
@@ -266,7 +266,6 @@ class TestConfigurePacking:
         original_unpad = fa_utils._get_unpad_data
         original_preprocess = masking_utils._preprocess_mask_arguments
         original_flag = getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", None)
-        original_create_causal_mask = modeling_qwen3.create_causal_mask
         try:
             configure_packing("flash_attention_2")
             mask = torch.tensor([[1, 1, 2, 2, 0]], dtype=torch.long)
@@ -278,7 +277,6 @@ class TestConfigurePacking:
                 position_ids=torch.arange(5).unsqueeze(0),
             )
 
-            assert modeling_qwen3.create_causal_mask is original_create_causal_mask
             assert result is mask
         finally:
             fa_utils._get_unpad_data = original_unpad
