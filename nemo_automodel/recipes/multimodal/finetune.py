@@ -50,6 +50,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.loggers.log_utils import setup_logging  # noqa: E402
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger  # noqa: E402
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages  # noqa: E402
+from nemo_automodel.components.models.bagel.configuration import resolve_bagel_backend  # noqa: E402
 from nemo_automodel.components.models.bagel.hf_backbone_loader import (  # noqa: E402
     build_bagel_from_hf_backbones,
     initialize_bagel_non_backbone_weights,
@@ -295,6 +296,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
     ):
         """Build BAGEL from HF backbones and apply the configured infrastructure."""
         logger.info("Building BAGEL from HF backbones (artifact_source=%s, stage=%d)", artifact_path, stage)
+        backend_cfg = resolve_bagel_backend(self.cfg.get("model.backend", None))
         with ScopedRNG(seed=rank_seed, ranked=False):
             model = build_bagel_from_hf_backbones(
                 model_cfg=self.cfg.model,
@@ -302,6 +304,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
                 vae_config=self.cfg.get("model.vae_config", None),
                 meta_init=True,
                 load_backbone_weights=False,
+                backend=backend_cfg,
             )
             if freeze_before_infrastructure:
                 model.eval()
@@ -965,7 +968,7 @@ class FinetuneRecipeForMultimodal(BaseRecipe):
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
         if self.checkpointer is not None:
-            self.checkpointer.close()
+            self._finalize_and_close_checkpointer()
 
     # ------------------------------------------------------------------
     # Logging helpers shared with FinetuneRecipeForVLM so BAGEL can keep its

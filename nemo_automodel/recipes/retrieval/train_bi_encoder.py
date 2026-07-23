@@ -401,7 +401,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
-        self.checkpointer.close()
+        self._finalize_and_close_checkpointer()
 
     def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
         """Forward and backward pass for a single micro-batch."""

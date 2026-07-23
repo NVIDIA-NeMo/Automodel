@@ -263,12 +263,15 @@ def test_transform_func_image_conversion():
         "c": DummyCorpus({"p": {"text": "t", "image": img, "nr_ocr": ""}}),
     }
     examples = {"question": ["Q"], "corpus_id": ["c"], "pos_doc": [[{"id": "p"}]], "neg_doc": [[{"id": "p"}]]}
-    out = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
+    out = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict, use_text_in_document=True)
     # conversion called
     assert isinstance(out["doc_image"][0][0], DummyImage)
     assert img.convert_called_with == "RGB"
     # text is preserved (trim logic without leading spaces result)
     assert out["doc_text"][0][0] == "t"
+
+    out_without_text = rd._transform_func(examples, num_neg_docs=1, corpus_dict=corpus_dict)
+    assert out_without_text["doc_text"][0][0] == ""
 
 
 def _make_train_file(tmp_path, corpus_dir, data_len=1, corpus_id="corpusA"):
@@ -397,12 +400,14 @@ def test_wikissnq_dataset_uses_docid_ids(monkeypatch):
             [
                 {
                     "docid": "doc-b",
+                    "text": "text-b",
                     "image": "image-b",
                     "nr_ocr": "ocr-b",
                     "complex_ocr": "complex-b",
                 },
                 {
                     "docid": "doc-a",
+                    "text": "text-a",
                     "image": "image-a",
                     "nr_ocr": "ocr-a",
                     "complex_ocr": "complex-a",
@@ -416,7 +421,7 @@ def test_wikissnq_dataset_uses_docid_ids(monkeypatch):
     assert corpus.path == "wikissnq-path"
     assert corpus.get_all_ids() == ["doc-a", "doc-b"]
     assert corpus.get_document_by_id("doc-a") == {
-        "text": "",
+        "text": "text-a",
         "image": "image-a",
         "nr_ocr": "ocr-a",
         "complex_ocr": "complex-a",
