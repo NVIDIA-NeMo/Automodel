@@ -155,7 +155,7 @@ matches the workflow you need:
 | Data path | Use when | Notes |
 |-----------|----------|-------|
 | `hf://` AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires an AutoModel-style HF subset with a companion corpus split. |
-| Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record. The loader derives identifiers from document values, but they are not stable corpus IDs. |
+| Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record. Pure inline records do not provide document IDs for same-document masking. |
 | Corpus ID-based JSON | You need hard-negative mining, reusable corpora, or same-document masking | Records reference document IDs in a local corpus that can be loaded by Hugging Face `datasets`. |
 
 The key field requirements differ by source:
@@ -360,9 +360,9 @@ The following settings control bi-encoder behavior:
   additional negatives. Enable it with `model.do_distributed_inbatch_negative: true` or the CLI override
   `--model.do_distributed_inbatch_negative true`. Today it all-gathers over the default process group, so use it only
   for data-parallel FSDP2 retrieval runs (`tp_size: 1`, `cp_size: 1`). Reliable same-document masking requires stable
-  `doc_id` fields from corpus-backed or custom datasets. Inline JSONL derives identifiers from document values, so it can
-  mask exact duplicate inline records but does not provide stable corpus document identity. The collator hashes raw
-  document IDs across the full batch, so make IDs globally unique when a run combines multiple corpora. For
+  `doc_id` fields from corpus-backed or custom datasets. Pure inline JSONL produces empty IDs, and the collator omits
+  same-document masking if any document ID in the batch is missing or incomplete. The collator hashes raw document IDs
+  across the full batch, so make IDs globally unique when a run combines multiple corpora. For
   multi-positive queries expanded into separate rows, keep distributed in-batch negatives disabled unless your sampler
   or masking prevents sibling positives from becoming negatives.
 

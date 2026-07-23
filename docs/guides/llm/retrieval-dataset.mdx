@@ -20,8 +20,8 @@ Face `datasets.Dataset`. At runtime, it transforms each raw record into the trai
 - `doc_text`: list of document texts in the order `[positive, negative_1, negative_2, ...]`
 - `doc_image`: list of images (or empty strings), aligned with `doc_text`
 - `doc_id`: list of document identifiers aligned with `doc_text`. Corpus-backed and `hf://` sources preserve document
-  IDs. Inline JSONL derives identifiers from document values instead of stable corpus identity, so use a corpus-backed
-  source when reliable same-document masking is required.
+  IDs. Pure inline JSONL produces empty IDs, so use a corpus-backed source or custom preprocessing when reliable
+  same-document masking is required.
 - `query_instruction` / `passage_instruction`: optional, used when `use_dataset_instruction: true` and the corpus
   provides instructions through metadata
 
