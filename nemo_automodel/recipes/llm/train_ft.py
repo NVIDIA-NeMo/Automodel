@@ -450,7 +450,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         self.partial_cuda_graph_manager = None
         self._partial_cuda_graph_capture_pending = False
         self._partial_cuda_graph_paged_stash_enabled = False
-        self._partial_cuda_graph_paged_stash_reruns = 0
 
     # ------------------ build phase ------------------
     def _create_distributed_setup(self) -> DistributedSetup:
@@ -1314,8 +1313,6 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "overflow on %d ranks",
             overflow_ranks,
         )
-        self._partial_cuda_graph_paged_stash_reruns += 1
-
         # Graphs reference the page buffers, so destroy them before disabling
         # the stash. No clipping or optimizer action has happened yet.
         self._close_partial_cuda_graphs()

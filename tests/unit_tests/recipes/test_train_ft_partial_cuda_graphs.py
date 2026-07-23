@@ -156,7 +156,6 @@ def test_paged_stash_overflow_closes_graph_discards_gradients_and_reruns(monkeyp
     recipe.partial_cuda_graph_manager = SimpleNamespace(close=lambda: events.append("graph-close"))
     recipe._partial_cuda_graph_capture_pending = False
     recipe._partial_cuda_graph_paged_stash_enabled = True
-    recipe._partial_cuda_graph_paged_stash_reruns = 0
     recipe.optimizer = [SimpleNamespace(zero_grad=lambda: events.append("zero-grad"))]
     recipe.rng = SimpleNamespace(load_state_dict=lambda state: events.append(("restore-rng", state)))
     recipe._run_forward_backward_batches = lambda batches, num_label_tokens: (
@@ -178,7 +177,6 @@ def test_paged_stash_overflow_closes_graph_discards_gradients_and_reruns(monkeyp
         ("rerun", ["same-batch"], 7),
     ]
     assert result[0].item() == 2.0
-    assert recipe._partial_cuda_graph_paged_stash_reruns == 1
     assert recipe.partial_cuda_graph_manager is None
 
 
@@ -209,7 +207,6 @@ def test_overflow_retry_reproduces_python_numpy_and_torch_rng(monkeypatch):
     recipe.partial_cuda_graph_manager = SimpleNamespace(close=lambda: None)
     recipe._partial_cuda_graph_capture_pending = False
     recipe._partial_cuda_graph_paged_stash_enabled = True
-    recipe._partial_cuda_graph_paged_stash_reruns = 0
     recipe.optimizer = [SimpleNamespace(zero_grad=lambda: None)]
     recipe.rng = StatefulRNG(seed=1234)
 

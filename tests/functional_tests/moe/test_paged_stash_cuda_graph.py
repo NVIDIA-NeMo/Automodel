@@ -219,7 +219,6 @@ def _asymmetric_overflow_worker(rank: int, world_size: int, init_method: str) ->
     recipe.partial_cuda_graph_manager = SimpleNamespace(close=lambda: events.append("graph-close"))
     recipe._partial_cuda_graph_capture_pending = False
     recipe._partial_cuda_graph_paged_stash_enabled = True
-    recipe._partial_cuda_graph_paged_stash_reruns = 0
     recipe.optimizer = [SimpleNamespace(zero_grad=lambda: events.append("zero-grad"))]
     stateful_rng = StatefulRNG(seed=1234 + rank)
     rng_state = stateful_rng.state_dict()
@@ -248,7 +247,6 @@ def _asymmetric_overflow_worker(rank: int, world_size: int, init_method: str) ->
             rng_state=rng_state,
         )
         assert result[0].item() == 2.0
-        assert recipe._partial_cuda_graph_paged_stash_reruns == 1
         assert events[:3] == ["graph-close", "stash-close", "zero-grad"]
         assert events[3][0] == "restore-rng"
         assert events[3][1] is rng_state
