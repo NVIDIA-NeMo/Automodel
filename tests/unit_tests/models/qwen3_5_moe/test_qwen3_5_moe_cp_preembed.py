@@ -62,6 +62,12 @@ def _build_model(*, rope_index=None, image_token_id=None, video_token_id=None, a
     return model
 
 
+def test_declares_cp_vision_sharding_support():
+    capabilities = Qwen3_5MoeForConditionalGeneration.ModelCapabilities()
+
+    assert capabilities.supports_cp_vision_sharding is True
+
+
 class TestPrepareModelInputsForCP:
     def test_requires_input_ids(self):
         model = _build_model()
