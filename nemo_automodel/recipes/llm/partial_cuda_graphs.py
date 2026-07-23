@@ -23,6 +23,7 @@ from __future__ import annotations
 import enum
 import logging
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,6 +36,66 @@ from nemo_automodel.shared.import_utils import safe_import_from, safe_import_te
 logger = logging.getLogger(__name__)
 
 _Canonicalizer = Callable[[tuple[Any, ...], dict[str, Any]], tuple[tuple[Any, ...], dict[str, Any]]]
+
+
+@dataclass(frozen=True)
+class _CudaMemoryState:
+    """CUDA allocator usage split between normal and graph-private pools."""
+
+    normal_allocated: int
+    normal_reserved: int
+    private_allocated: int
+    private_reserved: int
+
+
+def _cuda_memory_state() -> _CudaMemoryState | None:
+    """Read allocator state without making CUDA a module-import requirement."""
+    if not torch.cuda.is_available():
+        return None
+
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    private_allocated = 0
+    private_reserved = 0
+    for segment in torch.cuda.memory_snapshot():
+        pool_id = segment.get("segment_pool_id")
+        if pool_id is None or pool_id == (0, 0) or pool_id == [0, 0]:
+            continue
+        private_allocated += int(segment.get("allocated_size", 0))
+        private_reserved += int(segment.get("total_size", 0))
+    return _CudaMemoryState(
+        normal_allocated=max(0, allocated - private_allocated),
+        normal_reserved=max(0, reserved - private_reserved),
+        private_allocated=private_allocated,
+        private_reserved=private_reserved,
+    )
+
+
+def _format_memory_state(state: _CudaMemoryState | None) -> str:
+    """Format allocator bytes as a stable one-line diagnostic."""
+    if state is None:
+        return "unavailable"
+    mib = 1024 * 1024
+    return (
+        f"normal_allocated={state.normal_allocated / mib:.2f}MiB "
+        f"normal_reserved={state.normal_reserved / mib:.2f}MiB "
+        f"private_allocated={state.private_allocated / mib:.2f}MiB "
+        f"private_reserved={state.private_reserved / mib:.2f}MiB"
+    )
+
+
+def _tensor_bytes(tensors: Sequence[torch.Tensor]) -> int:
+    """Return storage bytes for a tensor surface, counting aliases once."""
+    seen: set[tuple[torch.device, int]] = set()
+    total = 0
+    for tensor in tensors:
+        storage = tensor.untyped_storage()
+        storage_key = (tensor.device, storage.data_ptr())
+        if storage_key in seen:
+            continue
+        seen.add(storage_key)
+        total += storage.nbytes()
+    return total
 
 
 def _get_make_graphed_callables() -> Callable[..., Any]:
@@ -310,10 +371,17 @@ class _ExplicitParameterCallAdapter(nn.Module):
                     f"{name!r} is {type(parameter).__name__}"
                 )
             _require_local_parameter_storage(name, parameter)
-            clone = parameter.detach().clone(memory_format=torch.preserve_format)
-            clone.requires_grad_(parameter.requires_grad)
-            capture_parameters.append(clone)
+            # Always use a fresh leaf, even when the target is not FSDP-owned.
+            # Persistent model Parameters may already own AccumulateGrad nodes
+            # created on the eager stream; capturing those nodes can make TE's
+            # backward graph depend on the wrong stream. TE directly uses this
+            # clone as its static input, so this is one staging allocation rather
+            # than a clone followed by a second TE-owned parameter copy.
+            capture_parameter = parameter.detach().clone(memory_format=torch.preserve_format)
+            capture_parameter.requires_grad_(parameter.requires_grad)
+            capture_parameters.append(capture_parameter)
         self.capture_parameters = tuple(capture_parameters)
+        self.cloned_parameter_bytes = _tensor_bytes(self.capture_parameters)
 
     def parameters(self, recurse: bool = True) -> Iterator[nn.Parameter]:
         """Hide the registered target parameters from TE module-parameter discovery."""
@@ -393,6 +461,7 @@ class _PartialGraphEntry:
         name: str,
         target: nn.Module,
         canonicalizer: _Canonicalizer | None = None,
+        pool_group: str | None = None,
         capture_input_variants: int = 1,
         explicit_parameters: bool = False,
         capture_owner: nn.Module | None = None,
@@ -402,6 +471,7 @@ class _PartialGraphEntry:
         self.name = name
         self.target = target
         self.canonicalizer = canonicalizer
+        self.pool_group = pool_group or name
         if capture_input_variants <= 0:
             raise ValueError("capture_input_variants must be positive")
         self.capture_input_variants = capture_input_variants
@@ -414,6 +484,7 @@ class _PartialGraphEntry:
         self.captured_call: _CapturedCall | None = None
         self._captured_call_variants: list[_CapturedCall] = []
         self._adapters: tuple[nn.Module, ...] = ()
+        self._replay_forward: Callable[..., Any] | None = None
 
         # Runtime statistics.
         self.capture_count = 0
@@ -484,6 +555,7 @@ class _PartialGraphEntry:
             del reset
 
         self._adapters = ()
+        self._replay_forward = None
         self.captured_call = None
         self._captured_call_variants.clear()
         self._captured_training = None
@@ -537,7 +609,12 @@ class _PartialGraphEntry:
             finally:
                 self._capture_owner_unsharded = False
 
-    def install(self, graphed_adapter: nn.Module | Sequence[nn.Module]) -> None:
+    def install(
+        self,
+        graphed_adapter: nn.Module | Sequence[nn.Module],
+        *,
+        allow_eager_fallback: bool = True,
+    ) -> None:
         """Install validated graph replay around the original target forward."""
         if self._closed:
             raise RuntimeError(f"Partial CUDA graph entry {self.name!r} is closed")
@@ -596,13 +673,35 @@ class _PartialGraphEntry:
                     self._logged_replay = True
                 return adapters[variant_index](*tensors)
 
+            if not allow_eager_fallback:
+                raise RuntimeError(
+                    f"Partial CUDA graph pooled entry {self.name!r} cannot fall back independently: {reason}"
+                )
+
             self.fallback_count += 1
             if not self._logged_fallback:
                 logger.warning("Partial CUDA graph eager fallback for %s: %s", self.name, reason)
                 self._logged_fallback = True
             return self.original_forward(*args, **kwargs)
 
-        self.target.forward = dispatch
+        self._replay_forward = dispatch
+        self.target.forward = self._replay_forward
+
+    def suspend_replay(self) -> None:
+        """Route this entry through its original eager forward without destroying graphs."""
+        if self._closed:
+            raise RuntimeError(f"Partial CUDA graph entry {self.name!r} is closed")
+        if self._adapters:
+            self.target.forward = self.original_forward
+
+    def resume_replay(self) -> None:
+        """Restore graph dispatch after a manager-wide eager region."""
+        if self._closed:
+            raise RuntimeError(f"Partial CUDA graph entry {self.name!r} is closed")
+        if self._adapters:
+            if self._replay_forward is None:
+                raise RuntimeError(f"Partial CUDA graph entry {self.name!r} has no replay forward")
+            self.target.forward = self._replay_forward
 
 
 def _canonicalize_bf16_fused_attention(
@@ -743,6 +842,7 @@ def _build_whole_attention_entry(
     return _PartialGraphEntry(
         name=f"{block.name}.attention",
         target=target,
+        pool_group="attn",
         capture_input_variants=1,
         # PyTorch parameters are explicit inputs even without FSDP. Letting TE
         # discover them as static module state can keep AccumulateGrad nodes on
@@ -765,6 +865,7 @@ def _build_te_dpa_entry(
     return _PartialGraphEntry(
         name=f"{block.name}.fused_attention",
         target=target,
+        pool_group="te_dpa",
         canonicalizer=_canonicalize_bf16_fused_attention,
         # Reentrant checkpointing invokes attention once under no-grad and once
         # under grad-enabled recompute. Each contract needs its own TE graph
@@ -784,7 +885,7 @@ def _build_moe_router_entry(
     if getattr(gate, "router_replay", None) is not None or getattr(gate, "e_score_correction_bias", None) is not None:
         raise RuntimeError("Partial MoE router graphs require routing replay and score-correction bias to be disabled")
     _require_parameterless_target("moe_router", block, target)
-    return _PartialGraphEntry(name=f"{block.name}.moe_router", target=target)
+    return _PartialGraphEntry(name=f"{block.name}.moe_router", target=target, pool_group="moe_router")
 
 
 def _build_moe_preprocess_entry(
@@ -794,7 +895,7 @@ def _build_moe_preprocess_entry(
 ) -> _PartialGraphEntry:
     """Build one fused HybridEP metadata-preprocessing graph entry."""
     _require_parameterless_target("moe_preprocess", block, target)
-    return _PartialGraphEntry(name=f"{block.name}.moe_preprocess", target=target)
+    return _PartialGraphEntry(name=f"{block.name}.moe_preprocess", target=target, pool_group="moe_preprocess")
 
 
 def _build_moe_execution_entry(
@@ -814,6 +915,7 @@ def _build_moe_execution_entry(
     return _PartialGraphEntry(
         name=f"{block.name}.moe",
         target=target,
+        pool_group="moe",
         explicit_parameters=True,
         capture_owner=capture_owner,
         retain_graph_in_backward=True,
@@ -904,6 +1006,7 @@ class PartialCudaGraphManager:
         self.entries = entries
         self._captured = False
         self._closed = False
+        self._eager_execution_depth = 0
 
     @classmethod
     def from_model_parts(
@@ -919,10 +1022,21 @@ class PartialCudaGraphManager:
         ]
         if not enabled_parts:
             return None
-        if pipeline_parallel or len(model_parts) != 1:
+        # Pipeline schedules can run multiple microbatches through the same local
+        # stage before the earlier microbatch has completed backward. The current
+        # partial graph contract owns one static input/output surface per target,
+        # and #2943 additionally shares graph-private pools across layers in a
+        # scope. That combination has not been validated against PP or virtual PP
+        # chunk interleaving, so reject it before any target installs graph hooks.
+        if pipeline_parallel:
             raise RuntimeError(
-                "Partial CUDA graphs require one non-pipeline model root; pipeline stages and virtual "
-                "pipeline chunks can overwrite static graph buffers with in-flight microbatches"
+                "Partial CUDA graphs do not support pipeline parallelism yet; PP schedules can interleave "
+                "microbatches and overwrite static CUDA graph buffers before backward consumes them"
+            )
+        if len(model_parts) != 1:
+            raise RuntimeError(
+                "Partial CUDA graphs require one local model part; virtual pipeline chunks can interleave "
+                "microbatches and overwrite static CUDA graph buffers before backward consumes them"
             )
         if activation_checkpointing:
             if any("attn" in part.backend.cuda_graph_modules for part in enabled_parts):
@@ -986,6 +1100,30 @@ class PartialCudaGraphManager:
         for entry in self.entries:
             entry.start_recording()
 
+    @contextmanager
+    def eager_execution(self) -> Iterator[None]:
+        """Temporarily disable every graph entry as one pooled execution unit.
+
+        Pooled entries cannot fall back independently because doing so would
+        violate the shared private-pool execution order. Validation changes
+        module training mode and runs forward without backward, so the entire
+        manager must execute eagerly for that region.
+        """
+        if self._closed:
+            raise RuntimeError("Partial CUDA graph manager is closed")
+        outermost = self._eager_execution_depth == 0
+        if outermost:
+            for entry in self.entries:
+                entry.suspend_replay()
+        self._eager_execution_depth += 1
+        try:
+            yield
+        finally:
+            self._eager_execution_depth -= 1
+            if outermost and not self._closed:
+                for entry in self.entries:
+                    entry.resume_replay()
+
     def capture(self) -> None:
         """Batch-capture all observed targets in real forward order."""
         if self._closed:
@@ -1002,46 +1140,116 @@ class PartialCudaGraphManager:
                 f"missing samples for {missing_entries}"
             )
 
-        staged_entries: list[tuple[_PartialGraphEntry, tuple[nn.Module, ...]]] = []
+        staged_groups: dict[tuple[str, bool], list[tuple[_PartialGraphEntry, nn.Module, tuple[torch.Tensor, ...]]]] = {}
+        variant_entries = []
+        for entry in self.entries:
+            captured_calls = entry.captured_calls()
+            entry_before = _cuda_memory_state()
+            staged_adapters = []
+            try:
+                entry.prepare_for_capture()
+                for captured_call in captured_calls:
+                    adapter = entry.build_adapter(captured_call)
+                    capture_inputs = entry.capture_inputs(adapter, captured_call)
+                    staged_adapters.append((adapter, capture_inputs))
+            finally:
+                entry.finish_capture()
+
+            entry_after = _cuda_memory_state()
+            cloned_parameter_bytes = sum(
+                adapter.cloned_parameter_bytes
+                for adapter, _capture_inputs in staged_adapters
+                if isinstance(adapter, _ExplicitParameterCallAdapter)
+            )
+            logger.info(
+                "Partial CUDA graph memory (entry staged): name=%s calls=%d static_input_bytes=%d "
+                "cloned_parameter_bytes=%d before=[%s] after=[%s]",
+                entry.name,
+                len(staged_adapters),
+                sum(_tensor_bytes(capture_inputs) for _adapter, capture_inputs in staged_adapters),
+                cloned_parameter_bytes,
+                _format_memory_state(entry_before),
+                _format_memory_state(entry_after),
+            )
+            if len(staged_adapters) == 1:
+                adapter, capture_inputs = staged_adapters[0]
+                group_key = (entry.pool_group, entry.retain_graph_in_backward)
+                staged_groups.setdefault(group_key, []).append((entry, adapter, capture_inputs))
+            else:
+                variant_entries.append((entry, staged_adapters))
+
         uninstalled_adapters: list[nn.Module] = []
+
+        def capture_group(
+            staged_group: Sequence[tuple[_PartialGraphEntry, nn.Module, tuple[torch.Tensor, ...]]],
+        ) -> tuple[nn.Module, ...]:
+            if not staged_group:
+                return ()
+            group_before = _cuda_memory_state()
+            modules = tuple(adapter for _entry, adapter, _capture_inputs in staged_group)
+            sample_args = tuple(capture_inputs for _entry, _adapter, capture_inputs in staged_group)
+            graph_kwargs: dict[str, Any] = {
+                # TE runs callable-local forward/backward warmups, separate from training-loop warmup steps.
+                "num_warmup_iters": 3,
+                # This disables TE FP8/FP4 quantization, not CUDA graph capture.
+                "enabled": tuple(False for _ in modules),
+            }
+            if staged_group[0][0].retain_graph_in_backward:
+                graph_kwargs["retain_graph_in_backward"] = True
+            names = tuple(entry.name for entry, _adapter, _capture_inputs in staged_group)
+            try:
+                result = _get_make_graphed_callables()(
+                    modules=modules,
+                    sample_args=sample_args,
+                    **graph_kwargs,
+                )
+            except Exception as error:
+                raise RuntimeError(f"Partial CUDA graph capture failed for shared-pool entries {names}") from error
+            if not isinstance(result, tuple):
+                result = (result,)
+            # Track returned graphs before validating the result shape so even a
+            # malformed TE return is reset by the surrounding transaction.
+            uninstalled_adapters.extend(result)
+            if len(result) != len(staged_group) or not all(isinstance(adapter, nn.Module) for adapter in result):
+                raise RuntimeError(
+                    "Transformer Engine must return one nn.Module graph for every partial target; "
+                    f"got {result!r} for {len(staged_group)} targets"
+                )
+            group_after = _cuda_memory_state()
+            logger.info(
+                "Partial CUDA graph memory (shared capture): entries=%d names=%s before=[%s] after=[%s]",
+                len(staged_group),
+                names,
+                _format_memory_state(group_before),
+                _format_memory_state(group_after),
+            )
+            return result
+
+        captured_groups: list[
+            tuple[
+                Sequence[tuple[_PartialGraphEntry, nn.Module, tuple[torch.Tensor, ...]]],
+                tuple[nn.Module, ...],
+            ]
+        ] = []
+        captured_variants: list[tuple[_PartialGraphEntry, tuple[nn.Module, ...]]] = []
         try:
-            for entry in self.entries:
+            # Each scope is captured in one TE invocation. TE captures forwards
+            # in model order and backwards in reverse order, so every layer in
+            # that scope can safely share one private pool.
+            for staged_group in staged_groups.values():
+                captured_groups.append((staged_group, capture_group(staged_group)))
+
+            # Multiple contracts for one physical target are alternatives rather
+            # than a fixed execution sequence, so they must not share a pool.
+            for entry, staged_adapters in variant_entries:
                 graphed_adapters = []
-                try:
-                    entry.prepare_for_capture()
-                    for captured_call in entry.captured_calls():
-                        adapter = entry.build_adapter(captured_call)
-                        graph_kwargs = {
-                            # TE runs callable-local forward/backward warmups, separate from training-loop warmup steps.
-                            "num_warmup_iters": 3,
-                            # This disables TE FP8/FP4 quantization, not CUDA graph capture.
-                            "enabled": (False,),
-                        }
-                        if entry.retain_graph_in_backward:
-                            graph_kwargs["retain_graph_in_backward"] = True
-                        try:
-                            result = _get_make_graphed_callables()(
-                                modules=(adapter,),
-                                sample_args=(entry.capture_inputs(adapter, captured_call),),
-                                **graph_kwargs,
-                            )
-                        except Exception as error:
-                            raise RuntimeError(f"Partial CUDA graph capture failed for {entry.name}") from error
-                        if not isinstance(result, tuple):
-                            result = (result,)
-                        uninstalled_adapters.extend(result)
-                        if len(result) != 1 or not isinstance(result[0], nn.Module):
-                            raise RuntimeError(
-                                "Transformer Engine must return one nn.Module graph for partial target "
-                                f"{entry.name!r}; got {result!r}"
-                            )
-                        graphed_adapters.append(result[0])
-                finally:
-                    entry.finish_capture()
-                staged_entries.append((entry, tuple(graphed_adapters)))
+                for adapter, capture_inputs in staged_adapters:
+                    graphed_adapters.extend(capture_group([(entry, adapter, capture_inputs)]))
+                captured_variants.append((entry, tuple(graphed_adapters)))
         except Exception:
-            # Installation starts only after every target succeeds, so resetting
-            # the staged adapters restores a fully eager model on any failure.
+            # No graph has been installed yet. Release every successfully
+            # captured TE graph so a later group failure cannot leak a private
+            # pool while all user-visible forwards remain eager.
             for graphed_adapter in uninstalled_adapters:
                 reset = getattr(graphed_adapter, "reset", None)
                 if callable(reset):
@@ -1051,7 +1259,11 @@ class PartialCudaGraphManager:
                         logger.exception("Failed to reset an uninstalled partial CUDA graph after capture failure")
             raise
 
-        for entry, graphed_adapters in staged_entries:
+        for staged_group, grouped_results in captured_groups:
+            pooled = len(staged_group) > 1
+            for (entry, _adapter, _capture_inputs), graphed_adapter in zip(staged_group, grouped_results):
+                entry.install(graphed_adapter, allow_eager_fallback=not pooled)
+        for entry, graphed_adapters in captured_variants:
             entry.install(graphed_adapters)
 
         self._captured = True
