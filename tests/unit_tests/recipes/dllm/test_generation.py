@@ -229,3 +229,70 @@ def test_nemotron_infill_is_rejected_before_loading(monkeypatch, capsys):
         main()
 
     assert "--infill is not supported by the Nemotron generation path" in capsys.readouterr().err
+
+
+class _TinyProj(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = torch.nn.Linear(4, 4, bias=False)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+def test_merge_adapter_matches_manual_lora_math(tmp_path):
+    peft = pytest.importorskip("peft")
+    from utils import merge_adapter
+
+    torch.manual_seed(0)
+    model = _TinyProj()
+    base_weight = model.proj.weight.detach().clone()
+
+    lora_config = peft.LoraConfig(r=2, lora_alpha=4, target_modules=["proj"], init_lora_weights=False)
+    peft_model = peft.get_peft_model(model, lora_config)
+    lora_layer = peft_model.base_model.model.proj
+    lora_a = lora_layer.lora_A["default"].weight.detach().clone()
+    lora_b = lora_layer.lora_B["default"].weight.detach().clone()
+    peft_model.save_pretrained(tmp_path)  # adapter_config.json + adapter_model.safetensors
+
+    fresh = _TinyProj()
+    with torch.no_grad():
+        fresh.proj.weight.copy_(base_weight)
+    merged = merge_adapter(fresh, str(tmp_path))
+
+    expected = base_weight + (4 / 2) * (lora_b @ lora_a)  # W + (alpha/r) * B @ A
+    assert torch.allclose(merged.proj.weight, expected, atol=1e-5)
+    assert not isinstance(merged, peft.PeftModel), "adapters must be merged and the PEFT wrapper dropped"
+
+
+def test_cli_exposes_adapter_flag(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["generate.py", "--help"])
+    with pytest.raises(SystemExit, match="0"):
+        main()
+    assert "--adapter" in capsys.readouterr().out
+
+
+def test_translate_adapter_reparents_gemma_module_paths(tmp_path):
+    pytest.importorskip("safetensors")
+    import json
+
+    from safetensors.torch import load_file, save_file
+    from utils import GEMMA_ADAPTER_KEY_MAP, translate_adapter
+
+    src = tmp_path / "adapter"
+    src.mkdir()
+    save_file(
+        {"base_model.model.model.layers.3.self_attn.q_proj.lora_A.weight": torch.zeros(2, 2)},
+        str(src / "adapter_model.safetensors"),
+    )
+    (src / "adapter_config.json").write_text(
+        json.dumps({"target_modules": ["model.layers.3.self_attn.q_proj"], "r": 2})
+    )
+
+    out = Path(translate_adapter(str(src), GEMMA_ADAPTER_KEY_MAP))
+
+    translated = load_file(str(out / "adapter_model.safetensors"))
+    assert list(translated) == ["base_model.model.model.decoder.layers.3.self_attn.q_proj.lora_A.weight"]
+    cfg = json.loads((out / "adapter_config.json").read_text())
+    assert cfg["target_modules"] == ["model.decoder.layers.3.self_attn.q_proj"]
+    assert cfg["r"] == 2  # non-key fields untouched
