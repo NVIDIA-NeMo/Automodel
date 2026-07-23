@@ -40,6 +40,14 @@ def test_qwen3_5_moe_122b_example_declares_scaling_contract() -> None:
     assert raw_config["packed_sequence"]["attn_implementation"] == "sdpa"
     assert raw_config["step_scheduler"]["max_steps"] == 10
 
+    video_processor = raw_config["processor"]["video_processor"]
+    assert video_processor["size"] == {
+        "shortest_edge": 1024,
+        "longest_edge": 524288,
+    }
+    assert video_processor["fps"] == 2
+    assert video_processor["max_frames"] == 8
+
     assert raw_config["prewarm"] == {
         "cublas_backward": True,
         "fla_gdn_autotune": True,

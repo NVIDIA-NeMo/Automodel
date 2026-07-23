@@ -56,6 +56,29 @@ class RankedVlmDatasetConfig(Protocol):
 
 
 @dataclass(frozen=True)
+class VlmVideoProcessorConfig:
+    """Declarative video-processor factory and keyword arguments."""
+
+    factory: Callable[..., object]
+    """Configured video-processor factory."""
+    kwargs: dict[str, object] = field(default_factory=dict)
+    """Declarative keyword arguments for the configured factory."""
+
+    def build(self, *, pretrained_model_name_or_path: str) -> object:
+        """Build the configured video processor.
+
+        Args:
+            pretrained_model_name_or_path: Runtime model identifier used when the nested config does not override it.
+
+        Returns:
+            Video-processor instance accepted by the parent processor factory.
+        """
+        kwargs = dict(self.kwargs)
+        kwargs.setdefault("pretrained_model_name_or_path", pretrained_model_name_or_path)
+        return self.factory(**kwargs)
+
+
+@dataclass(frozen=True)
 class VlmProcessorConfig:
     """Declarative processor factory and keyword arguments."""
 
@@ -63,6 +86,8 @@ class VlmProcessorConfig:
     """Configured processor factory; ``None`` selects ``AutoProcessor.from_pretrained``."""
     kwargs: dict[str, object] = field(default_factory=dict)
     """Declarative keyword arguments for the configured processor factory."""
+    video_processor: VlmVideoProcessorConfig | None = None
+    """Optional independently configured video processor."""
 
     def build(self, *, pretrained_model_name_or_path: str) -> ProcessorMixin | None:
         """Build the configured processor.
@@ -73,11 +98,17 @@ class VlmProcessorConfig:
         Returns:
             Processor instance, or ``None`` when the model has no compatible AutoProcessor.
         """
+        kwargs = dict(self.kwargs)
+        if self.video_processor is not None:
+            kwargs["video_processor"] = self.video_processor.build(
+                pretrained_model_name_or_path=pretrained_model_name_or_path
+            )
+
         if self.factory is not None:
-            return self.factory(**self.kwargs)
+            return self.factory(**kwargs)
 
         try:
-            return AutoProcessor.from_pretrained(pretrained_model_name_or_path, **self.kwargs)
+            return AutoProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
         except Exception as exc:
             message = str(exc)
             if "num_hidden_layers" in message and ("layer_types" in message or "layer types" in message):
@@ -85,7 +116,7 @@ class VlmProcessorConfig:
 
                 relax_layer_types_validator()
                 try:
-                    return AutoProcessor.from_pretrained(pretrained_model_name_or_path, **self.kwargs)
+                    return AutoProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
                 except Exception as retry_exc:
                     logger.warning(
                         "AutoProcessor not available for %s after relaxing layer-type validation: %s",
