@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import types
 from contextlib import nullcontext
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -30,6 +31,10 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 
 import nemo_automodel.components.models.qwen3_vl.model as qwen3_vl_model_module
 from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
+from nemo_automodel.components.distributed.parallelizer import (
+    DefaultParallelizationStrategy,
+    get_parallelization_strategy,
+)
 from nemo_automodel.components.models.qwen3_vl.model import Qwen3VLForConditionalGeneration
 
 
@@ -96,6 +101,29 @@ def _bare_model() -> Qwen3VLForConditionalGeneration:
     model.model.get_placeholder_mask = _placeholder_mask
     model.model.compute_3d_position_ids = _positions
     return model
+
+
+def test_parallelization_strategy_installs_cp_mesh(monkeypatch):
+    """The production strategy gives the model-owned CP forward its CP submesh."""
+    model = _bare_model()
+    cp_mesh = MagicMock()
+    cp_mesh.size.return_value = 2
+    device_mesh = MagicMock()
+    device_mesh.mesh_dim_names = ("dp_shard", "cp", "tp")
+    device_mesh.__getitem__.side_effect = lambda name: {"cp": cp_mesh}[name]
+
+    monkeypatch.setattr(
+        DefaultParallelizationStrategy,
+        "parallelize",
+        lambda _self, parallel_model, _device_mesh, **_kwargs: parallel_model,
+    )
+
+    strategy = get_parallelization_strategy(model)
+    result = strategy.parallelize(model, device_mesh)
+
+    assert type(strategy).__name__ == "Qwen3VLParallelizationStrategy"
+    assert result is model
+    assert model.cp_mesh is cp_mesh
 
 
 def _tiny_config(*, tie_word_embeddings: bool = False) -> Qwen3VLConfig:

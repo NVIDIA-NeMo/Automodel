@@ -106,6 +106,9 @@ then compare step time and peak memory on a representative image or video worklo
 
 ## Limitations
 
+- This setting is a frame-level work-sharing policy over the existing CP group, not
+  a topology declaration for the encoder. It does not assign separate TP, CP, or PP
+  meshes to vision, audio, and language submodules.
 - The final visual embeddings are gathered on every CP rank before the language sequence is
   sharded. The larger intermediate vision activations are distributed, but the final
   embeddings remain replicated.
