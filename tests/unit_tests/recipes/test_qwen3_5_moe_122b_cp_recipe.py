@@ -51,7 +51,7 @@ def test_qwen3_5_moe_122b_example_declares_scaling_contract() -> None:
     assert optimizer["master_weights"] is True
     assert optimizer["master_weight_dtype"] == "torch.float32"
     assert optimizer["store_param_remainders"] is True
-    assert optimizer["exp_avg_dtype"] == "torch.bfloat16"
+    assert optimizer["exp_avg_dtype"] == "torch.float32"
     assert optimizer["exp_avg_sq_dtype"] == "torch.float32"
 
     vision_policy = CpVisionShardingConfig(**raw_config["distributed"]["cp_vision_sharding"])
