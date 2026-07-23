@@ -20,7 +20,6 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -28,11 +27,15 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     freqs_cis_from_position_ids,
     precompute_freqs_cis,
 )
-from nemo_automodel.components.models.glm_moe_dsa.cp import make_glm_dsa_packed_cp_batch_and_ctx
+from nemo_automodel.components.models.glm_moe_dsa.cp import shard_glm_dsa_packed_cp_batch
 from nemo_automodel.components.models.glm_moe_dsa.layers import GlmMoeDsaMLA
 from nemo_automodel.components.models.glm_moe_dsa.state_dict_adapter import GlmMoeDsaStateDictAdapter
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -257,6 +260,8 @@ class GlmMoeDsaModel(nn.Module):
 
 
 class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     @dataclass(frozen=True)
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
@@ -296,7 +301,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     ):
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         self.backend = backend or BackendConfig()
         moe_overrides = kwargs.pop("moe_overrides", None)
         self.model = GlmMoeDsaModel(
@@ -330,19 +335,38 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
         """GLM DSA TileLang kernels require validation to use the THD packed layout."""
         return getattr(self.backend, "attn", None) == "tilelang"
 
-    def prepare_model_inputs_for_cp(self, input_ids: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
-        """Attach GLM DSA's packed THD context-parallel batch sharder."""
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Attach GLM DSA's packed THD context-parallel batch sharder.
+
+        Args:
+            batch: The batch dict.
+            num_chunks: Number of chunks for load-balanced CP sharding.
+        """
         from functools import partial  # noqa: PLC0415
+
+        from nemo_automodel.components.distributed.context_parallel.sharder import (  # noqa: PLC0415
+            ContextParallelSharder,
+            contiguous_local_indices,
+        )
 
         if getattr(self.backend, "attn", None) != "tilelang":
             raise NotImplementedError("GLM DSA context parallelism is implemented only for backend.attn='tilelang'.")
 
-        return {
-            "_cp_make_batch_fn": partial(
-                make_glm_dsa_packed_cp_batch_and_ctx,
-                num_chunks=int(kwargs.get("num_chunks", 1)),
+        cp_sharder = ContextParallelSharder(
+            shard_batch=partial(
+                shard_glm_dsa_packed_cp_batch,
+                num_chunks=int(num_chunks),
             ),
-        }
+            # Contiguous over the packed THD token axis: rank r keeps
+            # tokens [r * T/cp, (r + 1) * T/cp).
+            local_token_global_indices=contiguous_local_indices,
+        )
+        return {"cp_sharder": cp_sharder}
 
     def _is_pipeline_parallel_stage(self) -> bool:
         """True when this module is a trimmed pipeline-parallel stage (not the whole model)."""
@@ -412,7 +436,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         *carry: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -440,6 +464,7 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             output_hidden_states: When set (single-process), carry final hidden states on the output.
             **attn_kwargs: Additional arguments forwarded to the base model.
         """
+
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None

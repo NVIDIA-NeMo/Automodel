@@ -27,6 +27,7 @@ from nemo_automodel.components.models.gemma4_moe.model import (
     Gemma4MoEModel,
     Gemma4MoETextModelBackend,
     _build_packed_gemma4_causal_mask_mapping,
+    _build_unpacked_gemma4_causal_mask_mapping,
     _derive_padding_mask,
 )
 from nemo_automodel.components.moe.config import MoEConfig
@@ -506,6 +507,59 @@ class TestPackedGemma4MaskMapping:
         assert not sliding_allowed[0, 0, 5, 1]
         assert not sliding_allowed[0, 0, 7, 7]
 
+    def test_unpacked_mask_uses_legacy_mapping_when_available(self, monkeypatch):
+        from transformers.models.gemma4 import modeling_gemma4
+
+        expected = {"full_attention": object(), "sliding_attention": object()}
+        legacy_mapping = MagicMock(return_value=expected)
+        monkeypatch.setattr(modeling_gemma4, "create_causal_mask_mapping", legacy_mapping, raising=False)
+        inputs_embeds = torch.zeros(1, 4, 8)
+        mm_token_type_ids = torch.zeros(1, 4, dtype=torch.long)
+
+        actual = _build_unpacked_gemma4_causal_mask_mapping(
+            MagicMock(),
+            inputs_embeds,
+            None,
+            None,
+            None,
+            mm_token_type_ids,
+            None,
+            is_training=False,
+        )
+
+        assert actual is expected
+        assert legacy_mapping.call_args.kwargs["mm_token_type_ids"] is mm_token_type_ids
+
+    def test_unpacked_mask_uses_block_ids_when_legacy_mapping_is_unavailable(self, monkeypatch):
+        from transformers import masking_utils
+        from transformers.models.gemma4 import modeling_gemma4
+
+        full_mask = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+        sliding_mask = torch.zeros(1, 1, 4, 4, dtype=torch.bool)
+        create_full = MagicMock(return_value=full_mask)
+        create_sliding = MagicMock(return_value=sliding_mask)
+        monkeypatch.setattr(modeling_gemma4, "create_causal_mask_mapping", None, raising=False)
+        monkeypatch.setattr(masking_utils, "create_causal_mask", create_full)
+        monkeypatch.setattr(masking_utils, "create_sliding_window_causal_mask", create_sliding)
+        inputs_embeds = torch.zeros(1, 4, 8)
+        mm_token_type_ids = torch.tensor([[0, 1, 1, 0]])
+
+        actual = _build_unpacked_gemma4_causal_mask_mapping(
+            MagicMock(),
+            inputs_embeds,
+            None,
+            None,
+            None,
+            mm_token_type_ids,
+            None,
+            is_training=False,
+        )
+
+        assert actual == {"full_attention": full_mask, "sliding_attention": sliding_mask}
+        expected_block_ids = torch.tensor([[-1, 0, 0, -1]])
+        torch.testing.assert_close(create_full.call_args.kwargs["block_sequence_ids"], expected_block_ids)
+        torch.testing.assert_close(create_sliding.call_args.kwargs["block_sequence_ids"], expected_block_ids)
+
 
 # ---------------------------------------------------------------------------
 # Gemma4ForConditionalGeneration tests
@@ -630,7 +684,10 @@ class TestGemma4ForConditionalGeneration:
             torch.arange(seq, device=device),
         )
 
-    def test_prepare_model_inputs_for_cp_merges_image_features(self, gemma4_config, backend_config, device):
+    def test_cp_sunk_prepare_inputs_merges_image_features(self, gemma4_config, backend_config, device):
+        # Sunk CP: the forward (not the hook) embeds + splices vision per microbatch.
+        # cp_mesh is None here, so the contiguous slice is the identity and the full
+        # spliced sequence is returned -- the splice math is unchanged.
         gemma4_config.image_token_id = 42
         model = Gemma4ForConditionalGeneration(gemma4_config, backend=backend_config)
         model = model.to(device).to(torch.bfloat16)
@@ -646,7 +703,12 @@ class TestGemma4ForConditionalGeneration:
             "get_image_features",
             return_value=MagicMock(pooler_output=image_features),
         ):
-            prepared = model.prepare_model_inputs_for_cp(input_ids=input_ids, pixel_values=pixel_values)
+            prepared = model._cp_sunk_prepare_inputs(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_position_ids=None,
+                mm_token_type_ids=None,
+            )
 
         torch.testing.assert_close(prepared["inputs_embeds"][:, 0, :], base_embeds[:, 0, :])
         torch.testing.assert_close(prepared["inputs_embeds"][:, 1, :], image_features)

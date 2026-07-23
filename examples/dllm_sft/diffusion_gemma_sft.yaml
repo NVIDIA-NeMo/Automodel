@@ -135,3 +135,8 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
+
+ci:
+  recipe_owner: zyzhou5
+  time: "02:00:00"
+  nodes: 1
