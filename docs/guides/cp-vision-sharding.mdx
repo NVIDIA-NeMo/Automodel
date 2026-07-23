@@ -1,121 +1,32 @@
 ---
 title: "Context-Parallel Vision Sharding"
-description: "Distribute the VLM vision tower across context-parallel ranks at frame granularity, removing the per-rank replicated ViT forward."
+description: "Reduce duplicated vision-tower work by distributing image and video frames across context-parallel ranks."
 ---
 
 ## Overview
 
-Vision-language models must run the vision tower (ViT) before sharding the language
-sequence across context-parallel (CP) ranks. The model embeds all images and videos,
-scatters the vision features into `inputs_embeds`, and then keeps the local sequence shard.
-This work runs inside the model forward, with the CP ring dispatcher temporarily suspended
-because vision attention is non-causal.
+Context parallelism (CP) splits a model's language sequence across multiple GPUs. In a
+vision-language model, however, the vision tower normally processes every image and video
+on every CP rank before the language sequence is split. This repeats the same vision
+computation on each rank.
 
-Without vision sharding, the `visual(...)` call runs on the full, unsharded set
-of images on every CP rank. With `cp_size=N`, the vision tower performs N times the necessary
-compute and holds `O(all-images)` vision activations on each rank.
+Context-parallel vision sharding distributes independent image and video frames across the
+CP group. Each rank processes only its assigned frames, and the resulting visual embeddings
+are gathered in their original order before the existing language-sequence shard. This
+reduces duplicated vision-tower computation while preserving the model's input ordering and
+gradients.
 
-`nemo_automodel.components.distributed.cp_vision_shard` removes this redundancy by
-partitioning the visual input across the CP group at **frame granularity**, running the
-vision tower on each rank's slice only, and all-gathering the per-frame embeddings back in
-order. The downstream scatter into `inputs_embeds` and the sequence shard consume
-numerically equivalent (`allclose`) embeddings through the unchanged code path.
+The built-in integration supports the following model families:
 
-## Design
-
-### Vision Frames Are Independent
-
-Qwen3.5- and Qwen3-VL-style vision towers have no cross-frame coupling:
-
-- Attention is per frame. `cu_seqlens` is built from `grid_thw`, so each frame's `h*w`
-  patches attend only within that frame.
-- The rotary and learned position embeddings are spatial only and repeat identically for
-  each frame. Temporal reasoning happens later in the LLM through mRoPE.
-- The patch embedding is per temporal patch.
-
-With all CP ranks holding identical fully sharded data parallel (FSDP) all-gathered vision
-weights, the following relationships apply:
-
-```text
-visual((t,h,w)) == visual(t × (1,h,w))
-visual(all_frames) == concat_r visual(frames_of_rank_r)
-```
-
-These relationships hold within numerical precision (`allclose`). Every `(t,h,w)` entry
-expands into `t` per-frame units. The frames are partitioned contiguously across the CP group,
-each rank runs `visual` on its slice, and a
-differentiable all-gather reassembles the embeddings in the original order. Sharding at frame
-granularity instead of by whole entry allows a single large video, or a pack with fewer
-videos than ranks, to be sharded across ranks and provides finer-grained balancing. Images
-have `t == 1`, which means that each image is one unit.
-
-### Flow for Each CP Rank `r`
-
-The following flow shows how each CP rank processes the vision input:
-
-```text
-embed_multimodal:
-  vision_output = maybe_distribute_visual(self.visual, pixel_values, grid_thw)
-    ├─ disabled / no CP group / cp_size<=1 / no media / below min tokens → self.visual(full)   [replicate]
-    └─ else:
-         frames = expand each (t,h,w) -> t units of h*w patches       [images: 1 unit each]
-         if num_frame_units < world:                                  [pad path]
-             pad with (world - num_frame_units) minimal (1,sms,sms) zero dummy frames
-             cuts = one frame unit per rank                           [every rank runs ONE frame]
-         else:
-             cuts = contiguous, attention-cost-balanced partition of FRAMES, >=1 frame/rank
-         local  = self.visual(pixel_rows[r], coalesce(frames_of_rank_r))
-         full   = all-gather(local) over the CP group, reassembled in frame order
-         full   = full[:real_token_count]                             # drop the dummy tail (pad path)
-  # unchanged from here: masked_scatter into inputs_embeds, sequence shard
-```
-
-The following table describes the primary design concerns and their resolutions:
-
-| Concern | Resolution |
+| Model | Support |
 |---|---|
-| Load Balance | A contiguous partition of per-frame units is balanced by `p*(p+alpha)`, where `p` is the per-frame attention sequence size (`h*w`), with at least one frame per rank. The quadratic term captures per-frame attention. `alpha*p` adds a model-scaled proxy for the linear per-patch work, such as QKV and MLP projections, that pure `p**2` ignores. As a result, packs that mix large image frames with many small video frames no longer place most small frames on a few ranks. By default, `alpha = 3 * vision_hidden_size` is discovered from the model (Qwen `visual.config.hidden_size`, nested `vision_config`, Nemotron `vit_hidden_size`, and RADIO `embed_dim`, without class-name checks). Unknown towers fall back to `alpha=0`, which uses the legacy pure-quadratic calculation. The contiguous partition allows the gathered blocks to concatenate in their original frame order without reshuffling. The partition is deterministic, so every rank computes the same cuts. |
-| Differentiable All-Gather | Per-rank `[max_tokens, H]` blocks are padded to the global maximum and all-gathered. The forward pass uses all-gather and concatenation, and the backward pass uses reduce-scatter SUM. The blocks are then sliced back to their actual token counts. |
-| Gradient Parity | Every rank reassembles the full embeddings, then keeps only its sequence shard. A frame computed by rank `c` lands in shard-owner rank `s`. Reduce-scatter SUM routes the gradient from `s` back to `c` and sums gradients when a frame spans shards. The total vision-parameter gradient is numerically equivalent (`allclose`) to the replicated baseline gradient. |
-| FSDP Without Deadlock | The distribute, pad, or replicate choice is a pure function of `(num_frame_units, world, enabled)` and is therefore identical on all ranks. Every rank makes exactly one `visual` call and the same number of vision-shard collectives. When there are fewer frame units than ranks, the operation pads the input with minimal dummy frames, one unit per rank, so every rank receives work. The dummy embeddings are sliced off before the loss and contribute exactly zero gradient. The all-gather inside `maybe_distribute_visual` is the synchronization boundary. Do not add an extra post-visual CP barrier. |
-| Small Workloads | Batches with a visual token count below `distributed.cp_vision_sharding.min_tokens` (default `2048`) use the replicated path. These batches have little memory pressure but would still incur the all-gather synchronization cost. |
+| Dense Qwen3.5 | Supported |
+| Dense Qwen3-VL | Supported, including DeepStack features |
+| Qwen3-VL-MoE | Not yet supported |
 
-`maybe_distribute_visual` also all-gathers an optional `deepstack_features` list for
-Qwen3-VL-style towers. `last_hidden_state` intentionally remains the local shard because
-`embed_multimodal` reads only `pooler_output` and `deepstack_features`.
+## Configure Vision Sharding
 
-### Choose a Sharding Scope for a Frozen or Trainable Vision Tower
-
-The caller declares the scope of the process group that it publishes by using
-`set_cp_vision_group(group, config=..., spans_only_cp=...)`, and the function enforces the
-declaration. On every rank, `maybe_distribute_visual` raises a `ValueError` before any
-collective when the vision tower has trainable parameters but the published group is not
-declared CP-only (`spans_only_cp=False`).
-
-The supported sharding group depends on whether the vision tower is frozen or trainable:
-
-| Vision Tower | Helper-Supported Sharding Group | Why |
-|---|---|---|
-| Frozen | Full CP × TP rank set (`spans_only_cp=False`) | Frame independence and replicated weights make the forward pass numerically equivalent (`allclose`) for any rank group with identical weights. Because `requires_grad=False`, no backward pass runs through the gather, so there is no gradient risk. |
-| Trainable | CP group only (`spans_only_cp=True`, the default) | The vision tower is replicated, not tensor parallel, across TP ranks. Gathering frames across CP × TP would cause the all-gather reduce-scatter SUM backward pass to accumulate the vision gradient `tp` times. Each TP-replicated sequence shard propagates its gradient into the single rank that computed the frame. TP ranks therefore compute the ViT redundantly, and `maybe_distribute_visual` raises an error if a trainable tower is published with `spans_only_cp=False`. |
-| Pure TP (`cp_size == 1`) | Not enabled | Without CP, there is no CP group to publish. Either no group is set, or the published group has size `1`. `maybe_distribute_visual` falls back to the replicated path whenever the group size is less than or equal to `1`. |
-
-Extending the trainable case to CP × TP would require gathering over CP × TP while reducing
-gradients over CP only, or scaling by `1/tp`, and adding a gradient-parity test. Until then,
-the CP-only group is correct by construction.
-
-The built-in dense Qwen3.5 and Qwen3-VL integrations publish the CP-only group for both
-frozen and trainable towers. The helper supports a wider frozen-tower group, but a
-caller must publish that group explicitly. The recipe does not derive or publish CP × TP.
-
-## Usage
-
-The helper activates when a process group is published around the VLM model forward.
-The built-in dense Qwen3.5 and Qwen3-VL callers publish their CP group. Qwen3-VL's
-in-forward path additionally shards its sequence-aligned visual mask and ragged DeepStack
-features in the same head-tail order as `inputs_embeds`. Custom integrations may
-publish a wider CP × TP group for a frozen tower by declaring `spans_only_cp=False` (see
-[sharding scope](#choose-a-sharding-scope-for-a-frozen-or-trainable-vision-tower)):
+Enable context parallelism and vision sharding under `distributed`:
 
 ```yaml
 distributed:
@@ -123,111 +34,83 @@ distributed:
   cp_vision_sharding:
     enabled: true
     min_tokens: 2048
-    cost_alpha: auto  # infers 3 * vision_hidden_size
+    cost_alpha: auto
 ```
 
-The policy is disabled by default, so existing CP recipes retain replicated vision behavior.
-Enable it explicitly in the recipe. For an A/B baseline, use the recorded CLI override
-`--distributed.cp_vision_sharding.enabled false` rather than an environment variable.
+Vision sharding is disabled by default. A CP size greater than 1 and a supported model are
+required for the sharded path.
 
-Runnable CP size 2 examples are available for
-[dense Qwen3-VL](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_shard.yaml)
-and
-[dense Qwen3.5](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml).
+The following example recipes are available:
 
-Programmatic callers pass the same typed policy while publishing the runtime-only process
-group:
+- [Dense Qwen3-VL 8B with CP2 and vision sharding](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_shard.yaml)
+- [Dense Qwen3.5 4B with CP2 and vision sharding](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml)
 
-```python
-from nemo_automodel.components.distributed import cp_vision_shard
+For example, run the Qwen3-VL recipe on eight GPUs:
 
-config = cp_vision_shard.CpVisionShardingConfig(enabled=True)
-# Trainable vision tower: publish the CP-only group (spans_only_cp defaults to True).
-token = cp_vision_shard.set_cp_vision_group(cp_group, config=config)
-# Frozen vision tower only: a wider CP x TP group can be published instead.
-# token = cp_vision_shard.set_cp_vision_group(cp_tp_group, config=config, spans_only_cp=False)
-try:
-    # Model forward; the multimodal path routes self.visual(...) through
-    # cp_vision_shard.maybe_distribute_visual(self.visual, pixel_values, grid_thw)
-    ...
-finally:
-    cp_vision_shard.reset_cp_vision_group(token)
+```bash
+uv run automodel --nproc-per-node=8 \
+  examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_shard.yaml
 ```
 
-The following configuration fields control CP vision sharding:
+### Configuration Fields
 
-| Field | Default | Effect |
+| Field | Default | Description |
 |---|---|---|
-| `distributed.cp_vision_sharding.enabled` | `false` | Enables CP vision sharding. `false` preserves the replicated ViT path. |
-| `distributed.cp_vision_sharding.min_tokens` | `2048` | Sets the visual token threshold below which the replicated path is used. |
-| `distributed.cp_vision_sharding.cost_alpha` | `auto` | Sets the linear term `alpha` in the `p*(p+alpha)` partition cost. `auto` discovers `3 * vision_hidden_size` from the model. `null` remains a backward-compatible alias. A nonnegative integer is an exact override. A value of `0` restores the legacy pure-quadratic `p**2` partition. This field affects partitioning only. The forward pass and gradients are identical for any cuts. |
+| `enabled` | `false` | Enables vision sharding across the CP group. |
+| `min_tokens` | `2048` | Uses the replicated path when the batch has fewer visual tokens than this threshold. Set it to `0` to always exercise vision sharding. |
+| `cost_alpha` | `auto` | Controls how frame cost is estimated for load balancing. `auto` uses the vision hidden size and is the recommended setting. A nonnegative integer overrides the inferred value; `0` uses a purely quadratic attention-cost estimate. |
 
-## Validation
+## How It Works
 
-Validation includes the following tests and runs:
+Qwen3.5- and Qwen3-VL-style vision towers process each frame independently. Vision
+sharding uses this property to:
 
-- Unit tests (`tests/unit_tests/distributed/test_cp_vision_shard.py`, CPU only) validate
-  `visual(full) == concat_r visual(slice_r)` for the forward pass and vision-parameter
-  gradient at world sizes 2–4. They also validate partition balance, coverage, and order.
-  Other tests cover variable-token all-gather forward and backward passes and end-to-end
-  `maybe_distribute_visual` behavior. The end-to-end tests include DeepStack, video entries,
-  a single video split across ranks at frame granularity, every fallback (including `None`
-  media inputs), the trainable-tower sharding-scope guard, and the pad path through the
-  production code. The pad-path test asserts `sum_r grad_r == replicate grad`. It also
-  verifies that every padded dummy rank contributes exactly zero gradient.
-- Qwen3.5 composition tests
-  (`tests/unit_tests/distributed/test_cp_vision_shard_qwen3_5.py`, CPU only) verify that the
-  small `Qwen3_5VisionModel` produces the same pooled output for a replicated forward pass
-  and concatenated contiguous frame slices, including the single-video frame-split case.
-- Qwen3-VL composition and model tests
-  (`tests/unit_tests/distributed/test_cp_vision_shard_qwen3_vl.py` and
-  `tests/unit_tests/models/qwen3_vl/test_qwen3_vl_cp_preembed.py`, CPU only) verify that the
-  Qwen3-VL tower preserves both pooled and DeepStack outputs across image-entry and
-  single-video frame partitions. The production model preserves non-CP Hugging Face parity,
-  uses one mixed image and video vision forward, and shards DeepStack tensors with gradient
-  coverage in the same token order as the CP sequence.
-- Real-collective tests (`tests/unit_tests/distributed/test_cp_vision_shard_gloo.py`,
-  two-rank Gloo on CPU) validate the `maybe_distribute_visual` forward and backward passes
-  through the `all_gather` and `reduce_scatter(SUM)` collectives. Each rank propagates
-  gradients from its sequence shard, and the group-summed vision-parameter gradients must
-  equal the single-process replicated reference. The tests cover the balanced-partition
-  path with DeepStack and the dummy-pad path, where the padded rank receives exactly zero
-  gradient. A Qwen3.5 tower test also validates forward parity through the production
-  collective path.
-- GPU smoke validation uses the CP size 2 example configurations with frozen vision towers.
-  The [Qwen3-VL-8B replicated run](https://wandb.ai/Nemo-automodel/yuhez_workspace/runs/gbc52yjo)
-  and [sharded run](https://wandb.ai/Nemo-automodel/yuhez_workspace/runs/c4pioop7)
-  completed six matching-label optimizer steps. Their maximum absolute loss difference was
-  0.0058, mean absolute loss difference was 0.00225, and observed throughput for steps 1
-  through 5 was 4.3% higher for the sharded run. Peak allocated memory was 41.70 GiB in
-  both runs. A [Qwen3.5-4B sharded run](https://wandb.ai/Nemo-automodel/yuhez_workspace/runs/ln6bttgk)
-  completed the same integration smoke path. These short runs validate correctness and
-  execution, not benchmark-level throughput or memory improvements.
+1. Expand each image or video into individual frame units.
+2. Divide contiguous frames across CP ranks using an estimated per-frame compute cost.
+3. Run the vision tower once on each rank's local frames.
+4. Gather the visual embeddings in the original frame order.
+5. Continue through the model's existing multimodal embedding and CP sequence-sharding
+   path.
 
-Because memory savings depend on activation checkpointing, a checkpointed vision tower
-retains only block-boundary activations. The primary benefit is reduced compute. Activation
-checkpointing runs the vision forward pass twice, and sharding divides both passes by
-approximately `cp_size`.
+The partitioner accounts for both attention cost and linear per-patch work. This helps
+balance batches that mix large images with many smaller video frames. Keeping each rank's
+frames contiguous allows the gathered outputs to be concatenated without reordering.
+
+The gather operation supports autograd, so a trainable vision tower receives the same
+gradient contributions as the replicated path. Built-in integrations shard across the CP
+dimension only, even when tensor parallelism is also enabled. This avoids over-counting
+gradients for vision-tower weights that are replicated across TP ranks.
+
+If a batch contains fewer frames than CP ranks, the implementation adds minimal dummy
+frames so every rank participates in the vision forward and collectives. The corresponding
+embeddings are discarded and contribute no gradient.
+
+## Check Your Workload
+
+The benefit depends on the amount and shape of visual input, the CP size, activation
+checkpointing, and communication between ranks. Small visual workloads can spend more time
+gathering embeddings than they save in vision computation, which is why `min_tokens`
+defaults to `2048`.
+
+Compare a sharded run with the replicated baseline by disabling the policy from the command
+line:
+
+```bash
+uv run automodel --nproc-per-node=8 \
+  examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_shard.yaml \
+  --distributed.cp_vision_sharding.enabled false
+```
+
+Use the same seed, batch, and topology for both runs. Confirm that training remains stable,
+then compare step time and peak memory on a representative image or video workload.
 
 ## Limitations
 
-<Note>
-The built-in dense Qwen3.5 and Qwen3-VL callers shard within the CP group only, whether the
-tower is frozen or trainable. This scope is gradient-correct. The lower-level helper permits
-a wider CP × TP group only for a frozen tower, but the current recipe does not publish that
-wider group.
-
-</Note>
-
-The following limitations apply:
-
-- Memory savings are modest under activation checkpointing. Retained vision activations
-  are already small when the tower is checkpointed. The throughput improvement is the
-  larger and more consistent benefit.
-- Gathered embeddings are complete on every rank. The final per-frame embeddings are small
-  compared to the ViT's internal activations, but they are reconstructed in full before the
-  existing sequence shard. Sharding these embeddings is a separate, more invasive effort.
-- Model wiring is required outside dense Qwen3.5 and dense Qwen3-VL. The helper is
-  model-agnostic, but each additional VLM family's `embed_multimodal` function must route
-  its `visual(...)` call through `maybe_distribute_visual`. The recipe must also publish the
-  CP group around the model forward pass.
+- The final visual embeddings are gathered on every CP rank before the language sequence is
+  sharded. The larger intermediate vision activations are distributed, but the final
+  embeddings remain replicated.
+- Activation checkpointing already reduces retained vision activations, so vision sharding
+  can improve computation more noticeably than peak memory.
+- Additional VLM families require model-specific integration before they can use this
+  policy.
+- CP vision sharding has no effect when `cp_size` is `1`.

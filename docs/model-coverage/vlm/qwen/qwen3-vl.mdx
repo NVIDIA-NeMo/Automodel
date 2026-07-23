@@ -94,11 +94,10 @@ See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Gui
 
 See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
-Dense `Qwen3VLForConditionalGeneration` supports context parallelism with
-DeepStack-aware, in-forward multimodal sharding. To distribute the vision tower across
-the CP group as well, enable the `distributed.cp_vision_sharding` policy; see the
-[Context-Parallel Vision Sharding guide](/development/cp-vision-sharding).
-The Qwen3-VL-MoE implementation does not yet expose this CP path.
+Dense Qwen3-VL supports context parallelism. To distribute the vision tower across the CP
+group, enable `distributed.cp_vision_sharding`; see the
+[Context-Parallel Vision Sharding guide](/development/cp-vision-sharding). Qwen3-VL-MoE
+does not yet support this path.
 
 ## Hugging Face Model Cards
 
