@@ -404,3 +404,27 @@ class TestNeatPackedCollater:
         assert result["attention_mask"].shape == (1, 1, 4, 4)
         assert result["attention_mask"].dtype == torch.bool
         assert result["_packed_seq_ids"].tolist() == [[1, 1, 2, 2]]
+
+
+class TestNeatPackedCollaterFlashVersions:
+    """The indexed 2D mask must be kept for every flash-attention version (4D only for sdpa/eager)."""
+
+    def _batch(self):
+        return [
+            {
+                "input_ids": [1, 2, 3, 4],
+                "labels": [10, 20, 30, 40],
+                "position_ids": [0, 1, 0, 1],
+                "attention_mask": [1, 1, 2, 2],
+            }
+        ]
+
+    @pytest.mark.parametrize("impl", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
+    def test_flash_versions_keep_indexed_2d_mask(self, impl):
+        out = neat_packed_collater(self._batch(), attn_implementation=impl)
+        assert out["attention_mask"].dim() == 2
+        assert out["attention_mask"].tolist() == [[1, 1, 2, 2]]
+
+    def test_sdpa_gets_4d_mask(self):
+        out = neat_packed_collater(self._batch(), attn_implementation="sdpa")
+        assert out["attention_mask"].dim() == 4
