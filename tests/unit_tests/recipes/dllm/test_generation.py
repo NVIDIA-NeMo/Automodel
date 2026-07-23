@@ -191,6 +191,33 @@ def test_multi_block_sampling_unmasks_every_scheduled_position():
     assert (out[0, 2:] == 7).all(), "every generated position should hold the denoiser's prediction"
 
 
+def test_ragged_prompts_decode_nonempty_when_eos_active():
+    """Unequal-length prompts + a real eos_id: sample()'s batched EOS-stop and block
+    windows assume every row has the longest prompt, so a ragged batch strands the
+    shorter rows. The CLI dispatch guards this by decoding one prompt at a time (B=1)
+    when an eos_token_id is set — verify that path fully decodes each prompt."""
+    mask_id = 9
+    prompts = [[1, 2, 3, 4], [1]]  # unequal lengths
+    sampler = LLaDASampler(
+        _FakeDenoiser(),
+        mask_id=mask_id,
+        eos_id=0,
+        steps=4,
+        max_new_tokens=8,
+        block_size=4,
+        temperature=0.0,
+        use_kv_cache=False,
+        eos_token_id=0,  # real EOS activates the ragged-batch-prone stop path
+    )
+
+    # Mirror the CLI B=1 guard: decode each prompt on its own.
+    outputs = [sampler.sample([p]) for p in prompts]
+    for prompt, out in zip(prompts, outputs):
+        gen = out[0, len(prompt) :]
+        assert gen.numel() > 0, "empty generation"
+        assert (gen == mask_id).sum().item() == 0, "residual masks: prompt not fully decoded"
+
+
 def test_nemotron_infill_is_rejected_before_loading(monkeypatch, capsys):
     monkeypatch.setattr(
         sys,

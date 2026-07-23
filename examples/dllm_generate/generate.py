@@ -612,8 +612,22 @@ def main():
         else:
             # LLaDA path: LLaDA checkpoints don't ship a built-in ``generate``
             # method, so fall back to the standalone ``DLLMSampler`` here.
-            outputs = sampler.sample(inputs)
-            sequences = trim_response(tokenizer, outputs.tolist(), inputs)
+            #
+            # ``sample()``'s batched EOS-stop and block windows assume every row has
+            # the longest prompt (the canvas is one rectangle sized to
+            # ``max_prompt_len``). With unequal-length prompts that strands the
+            # shorter rows: their tail EOS-fill reads as an early stop, one row
+            # finishing halts refinement for the whole batch, and their block
+            # windows are anchored past the real prompt. When an ``eos_token_id`` is
+            # active, decode one prompt at a time (B=1) so shorter prompts still
+            # complete. Inert for the current LLaDA preset (``eos_token_id=None``);
+            # guards the EOS-stop path once a preset sets it (e.g. I-DLM).
+            if len(inputs) > 1 and sampler.default_config.eos_token_id is not None:
+                outputs = [sampler.sample([inp]) for inp in inputs]
+                sequences = [trim_response(tokenizer, o.tolist(), [inp])[0] for o, inp in zip(outputs, inputs)]
+            else:
+                outputs = sampler.sample(inputs)
+                sequences = trim_response(tokenizer, outputs.tolist(), inputs)
         for i, (prompt, response) in enumerate(zip(args.prompt, sequences)):
             print(f"\n{'─' * 80}\n[Prompt {i}] {prompt}\n{'─' * 80}")
             print(response.strip() or "<empty>")
