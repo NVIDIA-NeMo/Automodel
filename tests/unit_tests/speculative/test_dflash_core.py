@@ -82,6 +82,9 @@ def test_forward_returns_finite_loss_and_grads_flow_to_draft():
     assert torch.isfinite(out.loss) and out.loss.item() > 0
     assert 0.0 <= out.accuracy.item() <= 1.0
     assert out.valid_tokens.item() > 0
+    assert out.loss_weight.item() > 0
+    torch.testing.assert_close(out.accuracy, out.correct_tokens / out.valid_tokens)
+    torch.testing.assert_close(out.accept_len, out.accept_len_sum / out.valid_blocks)
     out.loss.backward()
     grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
     assert grad > 0
@@ -215,6 +218,9 @@ def test_variable_prefix_forward_finite_loss_and_grads():
     assert torch.isfinite(out.loss) and out.loss.item() > 0
     assert 0.0 <= out.accuracy.item() <= 1.0
     assert out.valid_tokens.item() > 0
+    assert out.loss_weight.item() > 0
+    torch.testing.assert_close(out.accuracy, out.correct_tokens / out.valid_tokens)
+    torch.testing.assert_close(out.accept_len, out.accept_len_sum / out.valid_blocks)
     out.loss.backward()
     grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
     assert grad > 0
@@ -293,9 +299,8 @@ def test_variable_prefix_loss_matches_naive_reference():
     expected_valid = supervised.sum()
     torch.testing.assert_close(out.valid_tokens, expected_valid)
     expected_correct = ((logits.argmax(-1) == target_ids).float() * supervised).sum()
-    # The raw counts are what recipes SUM-reduce across ranks to get a global accuracy.
-    torch.testing.assert_close(out.correct, expected_correct)
-    torch.testing.assert_close(out.accuracy, expected_correct / (expected_valid + 1e-6))
+    torch.testing.assert_close(out.accuracy, expected_correct / expected_valid)
+    torch.testing.assert_close(out.correct_tokens, expected_correct)
 
 
 def test_variable_prefix_loss_uniform_weights_without_gamma():
