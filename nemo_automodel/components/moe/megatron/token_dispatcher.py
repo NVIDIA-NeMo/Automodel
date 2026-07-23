@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import List, Literal, Optional, Tuple
 
 import torch
+from torch import nn
 
 from .fused_a2a import (
     fused_combine,
@@ -319,6 +320,38 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
 
+class _HybridEPMetadataProcessor(nn.Module):
+    """Fixed-shape conversion from top-k metadata to HybridEP metadata."""
+
+    def __init__(self, *, num_experts: int, permute_fusion: bool):
+        super().__init__()
+        self.num_experts = num_experts
+        self.permute_fusion = permute_fusion
+
+    def forward(self, token_indices: torch.Tensor, token_probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert compact top-k indices and probabilities to multihot tensors."""
+        if self.permute_fusion:
+            return fused_indices_to_multihot(token_indices, token_probs, self.num_experts)
+
+        batch_size = token_indices.shape[0]
+        routing_map = torch.zeros(
+            (batch_size, self.num_experts),
+            dtype=torch.bool,
+            device=token_indices.device,
+        )
+        multihot_probs = torch.zeros(
+            (batch_size, self.num_experts),
+            dtype=torch.float,
+            device=token_indices.device,
+        )
+        mask = token_indices != -1
+        valid_indices = token_indices[mask]
+        row_indices = torch.arange(batch_size, device=token_indices.device).repeat_interleave(mask.sum(dim=1))
+        routing_map[row_indices, valid_indices] = True
+        multihot_probs[row_indices, valid_indices] = token_probs[mask]
+        return routing_map, multihot_probs
+
+
 class _HybridEPManager(_DispatchManager):
     """
     A manager class to handle fused all-to-all communication processes for MoE models using
@@ -536,6 +569,7 @@ class MoEFlexTokenDispatcher:
 
         self.num_local_experts = num_local_experts
         self.local_expert_indices = local_expert_indices
+        self.hybridep_metadata_processor: Optional[_HybridEPMetadataProcessor] = None
         assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
 
         backend = self.config.moe_flex_dispatcher_backend
@@ -611,6 +645,10 @@ class MoEFlexTokenDispatcher:
                     permute_fusion=self.config.moe_permute_fusion,
                     moe_hybridep_num_sms=self.config.moe_hybridep_num_sms,
                 )
+            self.hybridep_metadata_processor = _HybridEPMetadataProcessor(
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                permute_fusion=self.config.moe_permute_fusion,
+            )
         else:
             raise ValueError(
                 f"Invalid backend: {backend}. Please set moe_flex_dispatcher_backend='deepep', 'hybridep', or 'uccl_ep'"
@@ -647,7 +685,10 @@ class MoEFlexTokenDispatcher:
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         if isinstance(self._comm_manager, _HybridEPManager):
-            self._comm_manager.setup_metadata_from_indices(token_indices, token_probs)
+            assert self.hybridep_metadata_processor is not None
+            routing_map, multihot_probs = self.hybridep_metadata_processor(token_indices, token_probs)
+            self._comm_manager.routing_map = routing_map
+            self._comm_manager.token_probs = multihot_probs
         else:
             self._comm_manager.token_probs = token_probs
             self._comm_manager.token_indices = token_indices

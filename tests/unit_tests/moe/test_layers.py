@@ -509,6 +509,26 @@ class TestFakeBalancedGateNoise:
 class TestGate:
     """Test Gate (router) module."""
 
+    def test_parameterless_routing_core_matches_eager_path(self, moe_config, device):
+        gate = Gate(moe_config).to(device)
+        gate.eval()
+        torch.nn.init.normal_(gate.weight)
+        gate.bias_update_factor = 0.0
+        gate.aux_loss_coeff = 0.0
+        inputs = torch.randn(4, moe_config.dim, device=device)
+        token_mask = torch.ones(4, dtype=torch.bool, device=device)
+
+        eager = gate(inputs, token_mask, None)
+        gate.use_routing_core = True
+        scoped = gate(inputs, token_mask, None)
+
+        assert not tuple(gate.routing_core.parameters())
+        for eager_value, scoped_value in zip(eager, scoped):
+            if eager_value is None:
+                assert scoped_value is None
+            else:
+                torch.testing.assert_close(eager_value, scoped_value)
+
     def test_gate_init_basic(self, moe_config):
         """Test Gate initialization with basic config."""
         gate = Gate(moe_config)

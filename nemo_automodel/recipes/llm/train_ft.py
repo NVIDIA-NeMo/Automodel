@@ -417,6 +417,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 wrapper is idempotent.
         """
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
+        # Partial graphs are opt-in through model.backend. Discovery happens
+        # after checkpoint restore, and capture is deferred until one complete
+        # eager optimizer step has supplied representative runtime inputs.
+        self.partial_cuda_graph_manager = None
+        self._partial_cuda_graph_capture_pending = False
 
     # ------------------ build phase ------------------
     def _create_distributed_setup(self) -> DistributedSetup:
@@ -758,10 +763,46 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
         # Optionally resume
         self.load_checkpoint(restore_from)
+
+        # Install lightweight call recorders only after model/optimizer state is
+        # final. The manager owns all feature eligibility checks (including PP
+        # and activation-checkpointing restrictions).
+        self._setup_partial_cuda_graphs()
         torch.cuda.empty_cache()
 
         # Log step scheduler details
         self._log_step_scheduler_details(self.step_scheduler)
+
+    def _setup_partial_cuda_graphs(self) -> None:
+        """Discover opt-in graph targets and arm first-step eager recording."""
+        from nemo_automodel.recipes.llm.partial_cuda_graphs import PartialCudaGraphManager
+
+        self.partial_cuda_graph_manager = PartialCudaGraphManager.from_model_parts(
+            self.model_parts,
+            activation_checkpointing=bool(self.activation_checkpointing),
+            pipeline_parallel=bool(self.pp_enabled),
+        )
+        self._partial_cuda_graph_capture_pending = self.partial_cuda_graph_manager is not None
+
+    def _capture_partial_cuda_graphs_after_eager_step(self) -> None:
+        """Capture once, after a complete eager forward/backward/optimizer step."""
+        # Some recipe subclasses and focused tests construct an instance via
+        # ``__new__``. Missing state is equivalent to the opt-in being disabled.
+        if not getattr(self, "_partial_cuda_graph_capture_pending", False):
+            return
+        assert self.partial_cuda_graph_manager is not None
+        self.partial_cuda_graph_manager.capture()
+        self._partial_cuda_graph_capture_pending = False
+
+    def _close_partial_cuda_graphs(self) -> None:
+        """Destroy partial graphs before model or distributed state is torn down."""
+        manager = getattr(self, "partial_cuda_graph_manager", None)
+        if manager is None:
+            self._partial_cuda_graph_capture_pending = False
+            return
+        manager.close()
+        self.partial_cuda_graph_manager = None
+        self._partial_cuda_graph_capture_pending = False
 
     def _collect_moe_load_balance(self):
         """Collect MoE load balance metrics with DP all-reduce.
@@ -894,6 +935,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     # If QAT delayed fake-quant is configured, enable after threshold
                     self._enable_qat_if_delayed(self.step_scheduler.step)
                     train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    # Capture outside the microbatch loop and only after the
+                    # eager optimizer step has completed. This leaves no
+                    # pending checkpoint recomputation or GA backward work.
+                    self._capture_partial_cuda_graphs_after_eager_step()
                     # Collect MoE load balance metrics (all ranks participate in all-reduce)
                     self._collect_moe_load_balance()
                     # log
@@ -921,8 +966,11 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         )
                     self._maybe_collect_garbage()
         finally:
-            if pbar is not None:
-                pbar.close()
+            try:
+                self._close_partial_cuda_graphs()
+            finally:
+                if pbar is not None:
+                    pbar.close()
         # Close JSONL loggers after training loop completes
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
@@ -1496,8 +1544,11 @@ def main(config_path=None):
         config_path = pathlib.Path(__file__).parent.resolve() / "llama_3_2_1b_hellaswag.yaml"
     cfg = parse_args_and_load_config(config_path)
     trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
-    trainer.setup()
-    trainer.run_train_validation_loop()
+    try:
+        trainer.setup()
+        trainer.run_train_validation_loop()
+    finally:
+        trainer._close_partial_cuda_graphs()
 
 
 if __name__ == "__main__":
