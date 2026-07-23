@@ -305,13 +305,12 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
-    config_load_kwargs = dict(hf_kwargs)
     config = loaded_config
     if config is None:
         config = AutoConfig.from_pretrained(
             model_name_or_path,
             trust_remote_code=trust_remote_code,
-            **config_load_kwargs,
+            **hf_kwargs,
         )
     model_type = getattr(config, "model_type", "")
 
@@ -505,25 +504,10 @@ class BiEncoderModel(nn.Module):
 
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
-        config_load_kwargs = {
-            key: hf_kwargs[key]
-            for key in (
-                "cache_dir",
-                "code_revision",
-                "force_download",
-                "local_files_only",
-                "proxies",
-                "revision",
-                "subfolder",
-                "token",
-                "use_auth_token",
-            )
-            if key in hf_kwargs
-        }
         config = AutoConfig.from_pretrained(
             model_name_or_path,
             trust_remote_code=trust_remote_code,
-            **config_load_kwargs,
+            **hf_kwargs,
         )
         metadata_kwargs = dict(hf_kwargs)
         commit_hash = getattr(config, "_commit_hash", None)

@@ -421,6 +421,50 @@ def test_ministral_embedding_preserves_hf_config_overrides(tmp_path):
     assert backbone.config.output_attentions is True
 
 
+def test_bi_encoder_build_forwards_native_hf_kwargs_to_config_and_backbone(monkeypatch):
+    """The preliminary config load retains native HuggingFace loader behavior."""
+    from nemo_automodel._transformers import retrieval
+
+    config = PretrainedConfig()
+    config.model_type = "test"
+    backbone = MagicMock(spec=nn.Module)
+    backbone.config = config
+    backbone.main_input_name = "pixel_values"
+    backbone.forward = MagicMock()
+    auto_config_from_pretrained = MagicMock(return_value=config)
+    build_encoder_backbone = MagicMock(return_value=backbone)
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
+    monkeypatch.setattr(retrieval, "build_encoder_backbone", build_encoder_backbone)
+    monkeypatch.setattr(retrieval, "_load_sentence_transformer_wrapper_options", MagicMock(return_value=None))
+    monkeypatch.setattr(retrieval, "_resolve_cached_source_model_path", MagicMock(return_value=None))
+
+    retrieval.BiEncoderModel.build(
+        "org/model",
+        task="embedding",
+        revision="revision-a",
+        output_attentions=True,
+        device_map="cpu",
+    )
+
+    auto_config_from_pretrained.assert_called_once_with(
+        "org/model",
+        trust_remote_code=False,
+        revision="revision-a",
+        output_attentions=True,
+        device_map="cpu",
+    )
+    build_encoder_backbone.assert_called_once_with(
+        "org/model",
+        "embedding",
+        trust_remote_code=False,
+        pooling="avg",
+        loaded_config=config,
+        revision="revision-a",
+        output_attentions=True,
+        device_map="cpu",
+    )
+
+
 @pytest.mark.parametrize("pooling", ["weighted_avg", "colbert", "multi_vector"])
 def test_bi_encoder_skips_standard_export_for_unrepresentable_pooling(pooling, tmp_path):
     from nemo_automodel._transformers import retrieval
