@@ -361,7 +361,7 @@ jobs:
             buildkit-uv-${{ runner.os }}-${{ steps.platform.outputs.cache-key }}-
 
       - name: Inject uv cache into BuildKit
-        uses: reproducible-containers/buildkit-cache-dance@v3.4.0
+        uses: reproducible-containers/buildkit-cache-dance@5b81f4d29dc8397a7d341dba3aeecc7ec54d6361 # v3.3.0
         with:
           builder: ${{ steps.setup-buildx.outputs.name }}
           cache-map: |
