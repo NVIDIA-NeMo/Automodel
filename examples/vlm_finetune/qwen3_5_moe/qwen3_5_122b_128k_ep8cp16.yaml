@@ -17,11 +17,10 @@
 # activation checkpointing. The 128-rank layout is CP16 x DP8; EP8 is composed
 # over that mesh by the MoE parallelizer.
 #
-# The corresponding Amber campaign completed 10-step, 128K validation runs on
-# mixed text, image, and video data containing individual approximately
-# 120K-token examples. The public MedPix dataset below keeps this example
-# reproducible; its 128K packs are assembled from independent single-image
-# samples.
+# This topology completed a 100-step validation run on mixed text, image, and
+# video data containing individual examples of approximately 120K tokens. The
+# public MedPix dataset below keeps this example reproducible; its 128K packs
+# are assembled from independent single-image samples.
 #
 # Example Slurm allocation (16 nodes x 8 GPUs):
 #   srun --nodes=16 --ntasks-per-node=1 automodel \
