@@ -24,8 +24,9 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     seen: set[int] = set()
     while id(model) not in seen:
         seen.add(id(model))
-        wrapped_model = getattr(model, "module", None)
-        if not isinstance(wrapped_model, torch.nn.Module):
+        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            wrapped_model = model.module
+        else:
             wrapped_model = getattr(model, "_orig_mod", None)
         if not isinstance(wrapped_model, torch.nn.Module) or wrapped_model is model:
             break

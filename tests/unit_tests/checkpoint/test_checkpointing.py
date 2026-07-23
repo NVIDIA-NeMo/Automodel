@@ -71,6 +71,14 @@ from nemo_automodel.components.checkpoint.utils import (
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 from nemo_automodel.shared.utils import unwrap_model
 
+
+def _make_ddp_wrapper(module: torch.nn.Module) -> DistributedDataParallel:
+    wrapper = object.__new__(DistributedDataParallel)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.module = module
+    return wrapper
+
+
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
 LOCAL_PATH_MODEL = "/ckpts/step-100/model"
@@ -248,8 +256,7 @@ def test_original_model_path_uses_configured_repo_exact_cached_revision_and_cach
     inner_model.config = SimpleNamespace(name_or_path="wrong/repo", _commit_hash="source-commit")
     compiled_model = torch.nn.Module()
     compiled_model._orig_mod = inner_model
-    distributed_model = torch.nn.Module()
-    distributed_model.module = compiled_model
+    distributed_model = _make_ddp_wrapper(compiled_model)
     model_state = SimpleNamespace(model=[distributed_model])
 
     with patch("huggingface_hub.snapshot_download") as mock_download:
@@ -298,8 +305,7 @@ def test_original_model_path_uses_unwrapped_model_name_when_repo_is_not_configur
     inner_model = torch.nn.Module()
     inner_model.name_or_path = str(source_dir)
     inner_model.config = SimpleNamespace()
-    distributed_model = torch.nn.Module()
-    distributed_model.module = inner_model
+    distributed_model = _make_ddp_wrapper(inner_model)
     compiled_model = torch.nn.Module()
     compiled_model._orig_mod = distributed_model
     model_state = SimpleNamespace(model=[compiled_model])
@@ -323,8 +329,7 @@ def test_encoder_state_dict_adapter_is_used_through_ddp_and_compile_wrappers():
     inner_model.state_dict_adapter = EncoderStateDictAdapter()
     compiled_model = torch.nn.Module()
     compiled_model._orig_mod = inner_model
-    wrapped_model = torch.nn.Module()
-    wrapped_model.module = compiled_model
+    wrapped_model = _make_ddp_wrapper(compiled_model)
     value = torch.ones(2)
 
     exported = _maybe_adapt_state_dict_to_hf(
@@ -340,6 +345,13 @@ def test_unwrap_model_ignores_non_module_wrapper_attributes():
     model = torch.nn.Module()
     model.module = object()
     model._orig_mod = object()
+
+    assert unwrap_model(model) is model
+
+
+def test_unwrap_model_preserves_regular_module_child():
+    model = torch.nn.Module()
+    model.module = torch.nn.Linear(2, 2)
 
     assert unwrap_model(model) is model
 

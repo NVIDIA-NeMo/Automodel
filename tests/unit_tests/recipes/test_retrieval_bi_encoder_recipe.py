@@ -17,6 +17,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
+from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.recipes.retrieval import train_bi_encoder
@@ -37,9 +38,9 @@ class _RetrieverAttrs(torch.nn.Module):
     detach_distributed_inbatch_negatives = False
 
 
-class _DDPLikeWrapper(torch.nn.Module):
+class _DDPWrapper(DistributedDataParallel):
     def __init__(self, module: torch.nn.Module):
-        super().__init__()
+        torch.nn.Module.__init__(self)
         self.module = module
 
 
@@ -54,9 +55,9 @@ class _DictLikeConfig(SimpleNamespace):
         return getattr(self, key, default)
 
 
-def test_retrieval_attrs_unwrap_ddp_like_wrapper():
+def test_retrieval_attrs_unwrap_ddp_wrapper():
     inner = _RetrieverAttrs()
-    wrapped = _DDPLikeWrapper(inner)
+    wrapped = _DDPWrapper(inner)
 
     attr_model = unwrap_model(wrapped)
 
@@ -90,7 +91,7 @@ def test_configure_sentence_transformer_export_binds_exact_static_collator_promp
         use_dataset_instruction=False,
     )
 
-    wrapped = _CompiledLikeWrapper(_DDPLikeWrapper(_Model()))
+    wrapped = _CompiledLikeWrapper(_DDPWrapper(_Model()))
     _configure_sentence_transformer_export(wrapped, collator)
 
     assert captured == {"query_prompt": "query: ", "document_prompt": "passage: "}

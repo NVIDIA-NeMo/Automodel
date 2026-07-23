@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel._transformers.sentence_transformer_export import (
     _SentenceTransformerMetadataExporter,
@@ -156,7 +157,8 @@ def test_consolidated_hf_addon_generates_sentence_transformer_metadata_from_effe
         model.sentence_transformer_export_config,
     )
     tokenizer = MagicMock()
-    ddp_model = nn.Module()
+    ddp_model = object.__new__(DistributedDataParallel)
+    nn.Module.__init__(ddp_model)
     ddp_model.module = model
     compiled_model = nn.Module()
     compiled_model._orig_mod = ddp_model
