@@ -304,3 +304,37 @@ def process_text_batch(
         )
 
     return batch
+
+
+def set_image_pixel_bounds(processor, *, max_pixels: int | None = None, min_pixels: int | None = None) -> None:
+    """Clamp a VLM processor's per-image resolution.
+
+    A draft-training batch is truncated to ``seq_length`` and the assistant turn
+    the draft is supervised on sits at the *end* of the sequence. Qwen VL
+    processors default to a per-image ``max_pixels`` large enough to emit more
+    vision tokens than the whole budget, in which case truncation removes the
+    assistant turn outright, the label scan finds no assistant marker, and the
+    resulting ``loss_mask`` is all zeros.
+
+    Answer regeneration must apply the same bounds as training: the answer is
+    conditioned on whatever resolution the target saw, so regenerating at a
+    higher one supervises the draft against an image it never gets.
+
+    Args:
+        processor: A HuggingFace processor; a no-op when it has no image processor.
+        max_pixels: Per-image pixel ceiling, or None to keep the default.
+        min_pixels: Per-image pixel floor, or None to keep the default.
+    """
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        return
+    for attribute, value in (("max_pixels", max_pixels), ("min_pixels", min_pixels)):
+        if value is None:
+            continue
+        setattr(image_processor, attribute, int(value))
+        # transformers >= 5 reads the bounds off ``size`` when it is present,
+        # falling back to the flat attributes only when it is not.
+        size = getattr(image_processor, "size", None)
+        if isinstance(size, dict) and attribute in size:
+            size[attribute] = int(value)
+        logger.info("Capped processor %s at %d", attribute, int(value))

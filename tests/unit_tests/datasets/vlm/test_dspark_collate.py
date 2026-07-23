@@ -162,6 +162,28 @@ def test_dspark_vlm_collate_fn_injects_fake_image_into_text_only_conversation(
     assert any(item.get("type") == "image" for item in user_content)
 
 
+def test_dspark_vlm_collate_fn_can_opt_out_of_fake_image_injection(collate_mod, fake_qwen_utils, monkeypatch):
+    """ViSpec locates image spans by token id, so a fake image is real to its draft.
+
+    The draft would compress the placeholder's vision features and broadcast
+    their global vector over every following text position, which zeroing the
+    fake tokens in ``attention_mask`` does not prevent.
+    """
+    monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
+    monkeypatch.setattr(
+        collate_mod, "build_labels_from_template", lambda *a, **k: torch.zeros(1, 4, dtype=torch.long), raising=True
+    )
+
+    processor = _DummyProcessor()
+    collate_mod.dspark_vlm_collate_fn(
+        [{"conversation": TEXT_ONLY_CONVERSATION}], processor, max_length=4, inject_fake_image=False
+    )
+
+    sent_conversation = processor.captured_conv_list[0]
+    user_content = sent_conversation[0]["content"]
+    assert not any(item.get("type") == "image" for item in user_content)
+
+
 def test_dspark_vlm_collate_fn_does_not_double_inject_when_image_present(collate_mod, fake_qwen_utils, monkeypatch):
     monkeypatch.setattr(collate_mod, "HAVE_QWEN_VL_UTILS", True, raising=True)
     monkeypatch.setattr(
