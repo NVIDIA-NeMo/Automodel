@@ -16,6 +16,8 @@ import pytest
 import torch
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.datasets.diffusion.collate_fns import TextToImageDataloaderConfig
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.diffusion.train import (
     _build_optimizer,
     _resolve_model_dtypes,
@@ -144,3 +146,41 @@ def test_validate_precision_configuration_allows_matching_dtype_for_ddp_or_peft(
         ddp_cfg={"world_size": 1},
         peft_cfg=object(),
     )
+
+
+def test_recipe_config_resolves_diffusion_builder_target_to_typed_config():
+    config = RecipeConfig(
+        ConfigNode(
+            {
+                "data": {
+                    "dataloader": {
+                        "_target_": (
+                            "nemo_automodel.components.datasets.diffusion."
+                            "build_text_to_image_multiresolution_dataloader"
+                        ),
+                        "cache_dir": "/tmp/cache",
+                        "base_resolution": [512, 512],
+                        "num_workers": 0,
+                    }
+                }
+            }
+        )
+    ).diffusion_dataloader
+
+    assert isinstance(config, TextToImageDataloaderConfig)
+    assert config.cache_dir == "/tmp/cache"
+    assert config.base_resolution == (512, 512)
+    assert config.num_workers == 0
+
+
+def test_recipe_config_rejects_unknown_diffusion_dataloader_field():
+    raw = ConfigNode(
+        {
+            "_target_": "nemo_automodel.components.datasets.diffusion.build_video_multiresolution_dataloader",
+            "cache_dir": "/tmp/cache",
+            "num_workerz": 2,
+        }
+    )
+
+    with pytest.raises(TypeError, match="num_workerz"):
+        RecipeConfig.resolve_diffusion_dataloader(raw)

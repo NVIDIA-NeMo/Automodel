@@ -71,6 +71,7 @@ from nemo_automodel.components.distributed.config import (
     normalize_activation_checkpointing_scope,
 )
 from nemo_automodel.components.distributed.mesh_utils import get_fsdp_dp_mesh
+from nemo_automodel.shared.tied_weights import ensure_tied_lm_head
 
 
 def _is_transformers_v5_or_higher() -> bool:
@@ -344,6 +345,11 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         category=UserWarning,
                     )
                     parallelize_module(model, tp_mesh, model_parallel_plan)
+                # TP styles replace module weights with DTensors independently.
+                # Restore an architectural embedding/head alias before FSDP
+                # records ownership; re-tying after FSDP can leave two roots
+                # that disagree about the shared parameter.
+                ensure_tied_lm_head(model)
                 if _attention_is_head_sharded(model_parallel_plan):
                     _update_attention_head_counts_for_tp(model, tp_mesh.size())
 
@@ -504,7 +510,7 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
 
             for layer in layers:
                 if hasattr(layer, "block_type") and layer.block_type == "mamba":
-                    from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+                    from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
                     mixer = layer.mixer
                     mixer.cp = MambaContextParallel(
@@ -668,6 +674,11 @@ class Qwen3_5ParallelizationStrategy(DefaultParallelizationStrategy):
             for _, mod in model.named_modules():
                 if isinstance(mod, CPAwareGatedDeltaNet):
                     mod._cp_mesh = cp_mesh
+            # Hand the CP submesh to the model so a forward that embeds and
+            # sequence-shards its own primary stream (Megatron-style per-microbatch
+            # CP; see shard_sequence_for_cp_round_robin / shard_batch_aux_only) can build this
+            # rank's round-robin shard.
+            model.cp_mesh = cp_mesh
 
         return result
 
@@ -1934,6 +1945,18 @@ def _should_use_hf_native_gradient_checkpointing(
     )
 
 
+def _uses_custom_moe_modules(model: nn.Module) -> bool:
+    """Return whether ``model`` contains Automodel's grouped custom-MoE layer."""
+    iter_modules = getattr(model, "modules", None)
+    if not callable(iter_modules):
+        return False
+    try:
+        from nemo_automodel.components.moe.layers import MoE
+    except ImportError:
+        return False
+    return any(isinstance(module, MoE) for module in iter_modules())
+
+
 def _get_parallel_plan(
     model: nn.Module,
     sequence_parallel: bool = False,
@@ -2125,6 +2148,15 @@ def _get_parallel_plan(
         for k in ("lm_head", "language_model.lm_head"):
             if model_parallel_plan.pop(k, None) is not None:
                 logger.info("Nemotron-Flash: excluding %s from TP plan to keep lm_head.weight replicated.", k)
+
+    # EP=1 uses this generic FSDP2 path rather than the dedicated MoE
+    # parallelizer. Apply the same routed-expert ownership validation here so
+    # an explicit/wildcard TP plan cannot silently shard expert or router
+    # modules merely because expert parallelism is disabled.
+    if tp_size > 1 and _uses_custom_moe_modules(model):
+        from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
+
+        model_parallel_plan = _validate_moe_tp_plan(model_parallel_plan, model=model)
 
     return model_parallel_plan
 
