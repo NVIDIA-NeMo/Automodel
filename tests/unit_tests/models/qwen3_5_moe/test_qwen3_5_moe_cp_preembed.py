@@ -1,13 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU-only tests for Qwen3.5-MoE CP pre-embedding (PR #2432).
+"""CPU-only tests for Qwen3.5-MoE model-owned context parallelism.
 
-``prepare_model_inputs_for_cp`` builds full-sequence multimodal embeddings and
-mRoPE positions *before* context-parallel sharding, plus a dense ``seq_index``
-the linear-attention layers need. Instantiating the full VL model is expensive,
-so we build a barebones instance via ``__new__`` and stub the heavy submodules
-(visual encoder, rope-index helper, embedding table).
+``prepare_model_inputs_for_cp`` selects a sharder and computes full-sequence
+mRoPE positions without touching weights. Embedding, multimodal splicing, and
+the primary sequence shard happen inside ``forward``. Instantiating the full VL
+model is expensive, so these tests build a barebones instance via ``__new__``
+and stub the heavy submodules.
 """
 
 from __future__ import annotations
