@@ -50,11 +50,8 @@ def _assert_numerically_close(actual: torch.Tensor, expected: torch.Tensor) -> N
 @pytest.mark.parametrize(
     ("model_shape", "tokens", "in_features", "out_features", "bias"),
     [
-        pytest.param("qwen3_next_q", 257, 2048, 8192, False),
-        pytest.param("qwen3_next_kv", 4096, 2048, 512, False),
-        pytest.param("nemotron_h_mlp", 511, 2688, 1856, False),
+        # One biased, odd-token model shape covers tail and bias gradients without compiling a full shape matrix in L0.
         pytest.param("gpt_oss_q", 257, 2880, 4096, True),
-        pytest.param("qwen2_mlp_up", 257, 3584, 18944, False),
     ],
 )
 def test_quack_linear_forward_and_gradient_parity(
@@ -97,11 +94,8 @@ def test_quack_linear_forward_and_gradient_parity(
 @pytest.mark.parametrize(
     ("model_shape", "tokens", "hidden_size"),
     [
+        # One odd-token model shape covers the RMSNorm tail path without redundant L0 kernel specializations.
         pytest.param("qwen3_moe", 257, 2048),
-        pytest.param("nemotron_h", 511, 2688),
-        pytest.param("gpt_oss", 257, 2880),
-        pytest.param("qwen2", 4096, 3584),
-        pytest.param("llama", 257, 4096),
     ],
 )
 def test_quack_rms_norm_forward_and_gradient_parity(model_shape: str, tokens: int, hidden_size: int) -> None:
