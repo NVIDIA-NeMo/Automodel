@@ -338,3 +338,32 @@ class TestConfigurePacking:
             else:
                 masking_utils._nemo_automodel_packing_preprocess_patched = original_flag
             del sys.modules[fake_mod_name]
+
+
+class TestConfigurePackingFA3FA4:
+    """FA3/FA4 use the same transformers varlen wrapper as FA2 and must be patched alike."""
+
+    @pytest.mark.parametrize("impl", ["flash_attention_3", "flash_attention_4"])
+    def test_patches_flash_attention_utils(self, impl):
+        import transformers.modeling_flash_attention_utils as fa_utils
+
+        original = fa_utils._get_unpad_data
+        try:
+            configure_packing(impl)
+            assert fa_utils._get_unpad_data is get_unpad_data
+        finally:
+            fa_utils._get_unpad_data = original
+
+    @pytest.mark.parametrize("impl", ["flash_attention_3", "flash_attention_4"])
+    def test_passthrough_mask_for_fa3_fa4_config(self, impl):
+        """_passthrough_create_causal_mask must pass the 2D mask through for any FA version."""
+        config = SimpleNamespace(_attn_implementation=impl)
+        mask = torch.tensor([[1, 1, 0]])
+        out = _passthrough_create_causal_mask(config=config, attention_mask=mask)
+        assert out is mask
+
+    def test_llama_and_qwen3_in_patch_modules(self):
+        from nemo_automodel.components.models.common.packing import _PACKING_PATCH_MODULES
+
+        assert "transformers.models.llama.modeling_llama" in _PACKING_PATCH_MODULES
+        assert "transformers.models.qwen3.modeling_qwen3" in _PACKING_PATCH_MODULES
