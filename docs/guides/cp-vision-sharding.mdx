@@ -5,13 +5,13 @@ description: "Distribute the VLM vision tower across context-parallel ranks at f
 
 ## Overview
 
-Vision-language models run the vision tower (ViT) in a pre-embed step outside the
-context-parallel (CP) attention context. The model embeds all images and videos, scatters the
-vision features into `inputs_embeds`, and then shards the sequence across CP ranks.
-Vision attention is non-causal and incompatible with CP ring attention, so this step cannot
-reuse the sequence shard.
+Vision-language models must run the vision tower (ViT) before sharding the language
+sequence across context-parallel (CP) ranks. The model embeds all images and videos,
+scatters the vision features into `inputs_embeds`, and then keeps the local sequence shard.
+This work runs inside the model forward, with the CP ring dispatcher temporarily suspended
+because vision attention is non-causal.
 
-Without vision sharding, the pre-embed `visual(...)` call runs on the full, unsharded set
+Without vision sharding, the `visual(...)` call runs on the full, unsharded set
 of images on every CP rank. With `cp_size=N`, the vision tower performs N times the necessary
 compute and holds `O(all-images)` vision activations on each rank.
 
@@ -110,10 +110,10 @@ caller must publish that group explicitly. The recipe does not derive or publish
 
 ## Usage
 
-The helper activates when a process group is published around the VLM pre-embed forward.
+The helper activates when a process group is published around the VLM model forward.
 The built-in dense Qwen3.5 and Qwen3-VL callers publish their CP group. Qwen3-VL's
-model-owned batch hook additionally shards its sequence-aligned visual mask and ragged
-DeepStack features in the same head-tail order as `inputs_embeds`. Custom integrations may
+in-forward path additionally shards its sequence-aligned visual mask and ragged DeepStack
+features in the same head-tail order as `inputs_embeds`. Custom integrations may
 publish a wider CP × TP group for a frozen tower by declaring `spans_only_cp=False` (see
 [sharding scope](#choose-a-sharding-scope-for-a-frozen-or-trainable-vision-tower)):
 
@@ -147,7 +147,7 @@ token = cp_vision_shard.set_cp_vision_group(cp_group, config=config)
 # Frozen vision tower only: a wider CP x TP group can be published instead.
 # token = cp_vision_shard.set_cp_vision_group(cp_tp_group, config=config, spans_only_cp=False)
 try:
-    # pre-embed forward; embed_multimodal routes self.visual(...) through
+    # Model forward; the multimodal path routes self.visual(...) through
     # cp_vision_shard.maybe_distribute_visual(self.visual, pixel_values, grid_thw)
     ...
 finally:
@@ -230,4 +230,4 @@ The following limitations apply:
 - Model wiring is required outside dense Qwen3.5 and dense Qwen3-VL. The helper is
   model-agnostic, but each additional VLM family's `embed_multimodal` function must route
   its `visual(...)` call through `maybe_distribute_visual`. The recipe must also publish the
-  CP group around the pre-embed forward pass.
+  CP group around the model forward pass.

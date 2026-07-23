@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for dense Qwen3-VL context-parallel pre-embedding."""
+"""CPU tests for dense Qwen3-VL context-parallel multimodal sharding."""
 
 from __future__ import annotations
 
 import types
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -27,9 +28,8 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalGeneration,
 )
 
-import nemo_automodel.components.models.qwen3_vl.cp_batch as cp_batch_module
 import nemo_automodel.components.models.qwen3_vl.model as qwen3_vl_model_module
-from nemo_automodel.components.models.qwen3_vl.cp_batch import make_qwen3_vl_cp_batch
+from nemo_automodel.components.distributed.context_parallel.sharder import ContextParallelSharder
 from nemo_automodel.components.models.qwen3_vl.model import Qwen3VLForConditionalGeneration
 
 
@@ -149,8 +149,8 @@ def test_non_cp_text_forward_matches_hugging_face() -> None:
     torch.testing.assert_close(actual_logits, expected_logits, atol=1e-6, rtol=1e-6)
 
 
-def test_real_vision_preembed_and_deepstack_forward_match_hugging_face() -> None:
-    """The complete image pre-embed and DeepStack branch preserve HF logits."""
+def test_real_vision_forward_matches_hugging_face() -> None:
+    """The complete image and DeepStack branch preserves HF logits outside CP."""
     torch.manual_seed(11)
     config = _tiny_config()
     reference = HFQwen3VLForConditionalGeneration(config).eval()
@@ -171,14 +171,12 @@ def test_real_vision_preembed_and_deepstack_forward_match_hugging_face() -> None
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
         ).logits
-        prepared = actual.prepare_model_inputs_for_cp(
+        actual_logits = actual(
             input_ids=input_ids,
             position_ids=position_ids,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
-        )
-        prepared.pop("_cp_make_batch_fn")
-        actual_logits = actual(**prepared).logits
+        ).logits
 
     torch.testing.assert_close(actual_logits, expected_logits, atol=1e-5, rtol=1e-5)
 
@@ -189,7 +187,7 @@ def test_tied_config_aliases_lm_head_and_text_embedding() -> None:
     assert model.lm_head.weight is model.model.language_model.embed_tokens.weight
 
 
-def test_mixed_image_video_preembed_uses_one_visual_forward(monkeypatch) -> None:
+def test_mixed_image_video_embed_uses_one_visual_forward(monkeypatch) -> None:
     """Mixed media is encoded once and returns sequence-ordered DeepStack inputs."""
     model = _bare_model()
     calls = []
@@ -215,10 +213,10 @@ def test_mixed_image_video_preembed_uses_one_visual_forward(monkeypatch) -> None
 
     monkeypatch.setattr(qwen3_vl_model_module, "maybe_distribute_visual", _visual)
     input_ids = torch.tensor([[5, 91, 91, 7, 92, 92]])
-    out = model.prepare_model_inputs_for_cp(
-        input_ids=input_ids,
-        attention_mask=torch.ones_like(input_ids),
-        mm_token_type_ids=torch.tensor([[0, 1, 1, 0, 2, 2]]),
+    inputs_embeds = model.get_input_embeddings()(input_ids)
+    inputs_embeds, visual_pos_masks, deepstack_visual_embeds = model._prepare_visual_inputs_for_cp(
+        input_ids,
+        inputs_embeds,
         pixel_values=torch.randn(8, 6),
         pixel_values_videos=torch.randn(8, 6),
         image_grid_thw=torch.tensor([[1, 2, 4]]),
@@ -228,22 +226,45 @@ def test_mixed_image_video_preembed_uses_one_visual_forward(monkeypatch) -> None
     assert len(calls) == 1
     assert calls[0][1].shape == (16, 6)
     assert calls[0][2].tolist() == [[1, 2, 4], [1, 2, 4]]
-    assert out["visual_pos_masks"].tolist() == [[False, True, True, False, True, True]]
-    torch.testing.assert_close(out["inputs_embeds"][0, 1:3], torch.arange(8).view(2, 4).float())
-    torch.testing.assert_close(out["inputs_embeds"][0, 4:6], torch.arange(8, 16).view(2, 4).float())
-    torch.testing.assert_close(out["_deepstack_visual_embeds"][0], torch.arange(16).view(4, 4).float() + 100)
-    assert out["_cp_make_batch_fn"] is make_qwen3_vl_cp_batch
-    assert out["position_ids"].shape == (3, 1, 6)
+    assert visual_pos_masks.tolist() == [[False, True, True, False, True, True]]
+    torch.testing.assert_close(inputs_embeds[0, 1:3], torch.arange(8).view(2, 4).float())
+    torch.testing.assert_close(inputs_embeds[0, 4:6], torch.arange(8, 16).view(2, 4).float())
+    torch.testing.assert_close(deepstack_visual_embeds[0], torch.arange(16).view(4, 4).float() + 100)
 
 
-def test_preembed_requires_media_grid_pairs() -> None:
+def test_visual_embed_requires_media_grid_pairs() -> None:
     """Incomplete patch/grid inputs fail before entering the vision tower."""
     model = _bare_model()
+    input_ids = torch.tensor([[1, 2]])
     with pytest.raises(ValueError, match="provided together"):
-        model.prepare_model_inputs_for_cp(
-            input_ids=torch.tensor([[1, 2]]),
+        model._prepare_visual_inputs_for_cp(
+            input_ids,
+            model.get_input_embeddings()(input_ids),
             pixel_values=torch.randn(4, 6),
+            pixel_values_videos=None,
+            image_grid_thw=None,
+            video_grid_thw=None,
         )
+
+
+def test_cp_hook_is_sharder_only_and_consumes_position_metadata() -> None:
+    """The merged CP contract must not embed or run the vision tower in the hook."""
+    model = _bare_model()
+    input_ids = torch.tensor([[5, 91, 91, 7]])
+    model.get_input_embeddings = lambda: (_ for _ in ()).throw(AssertionError("hook touched embedding weights"))
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "image_grid_thw": torch.tensor([[1, 2, 4]]),
+        "mm_token_type_ids": torch.tensor([[0, 1, 1, 0]]),
+    }
+
+    prepared = model.prepare_model_inputs_for_cp(batch)
+
+    assert isinstance(prepared["cp_sharder"], ContextParallelSharder)
+    assert prepared["position_ids"].shape == (3, 1, 4)
+    assert prepared["mm_token_type_ids"] is None
+    assert "inputs_embeds" not in prepared
 
 
 class _FakeCpMesh:
@@ -261,25 +282,9 @@ class _FakeCpMesh:
         return self.rank
 
 
-def test_cp_batch_shards_deepstack_in_token_order_with_gradients(monkeypatch) -> None:
+def test_cp_forward_shard_keeps_deepstack_token_order_and_gradients() -> None:
     """Both CP ranks together select every DeepStack row exactly once with autograd."""
-    captured = []
-
-    def _capture(_mesh, batch, **_kwargs):
-        """Capture the already transformed batch instead of invoking CP collectives.
-
-        Args:
-            _mesh: Unused context-parallel mesh.
-            batch: Batch containing sequence and DeepStack tensors.
-            **_kwargs: Unused shared-sharder options.
-
-        Returns:
-            A placeholder context plus the unchanged batch mapping.
-        """
-        captured.append(batch)
-        return types.SimpleNamespace(), batch
-
-    monkeypatch.setattr(cp_batch_module, "make_cp_batch_and_ctx", _capture)
+    model = _bare_model()
     deepstack = torch.tensor([[10.0], [20.0], [30.0]], requires_grad=True)
     losses = []
     expected_masks = [
@@ -289,39 +294,35 @@ def test_cp_batch_shards_deepstack_in_token_order_with_gradients(monkeypatch) ->
     expected_values = [[10.0], [20.0, 30.0]]
 
     for rank in range(2):
-        batch = {
-            "inputs_embeds": torch.zeros(1, 5, 2, requires_grad=True),
-            "labels": torch.zeros(1, 5, dtype=torch.long),
-            "position_ids": torch.arange(5).view(1, 5),
-            "visual_pos_masks": torch.tensor([[True, False, True, False, True]]),
-            "_deepstack_visual_embeds": [deepstack],
-        }
-        _, local_batch = make_qwen3_vl_cp_batch(_FakeCpMesh(rank), None, batch)
-        assert local_batch["visual_pos_masks"].tolist() == expected_masks[rank]
-        assert local_batch["_deepstack_visual_embeds"][0].flatten().tolist() == expected_values[rank]
-        losses.append(local_batch["_deepstack_visual_embeds"][0].sum())
+        model.cp_mesh = _FakeCpMesh(rank)
+        _, local_mask, local_deepstack = model._shard_multimodal_inputs_for_cp(
+            torch.zeros(1, 5, 2, requires_grad=True),
+            torch.tensor([[True, False, True, False, True]]),
+            [deepstack],
+        )
+        assert local_mask.tolist() == expected_masks[rank]
+        assert local_deepstack[0].flatten().tolist() == expected_values[rank]
+        losses.append(local_deepstack[0].sum())
 
     sum(losses).backward()
     torch.testing.assert_close(deepstack.grad, torch.ones_like(deepstack))
-    assert len(captured) == 2
 
 
-def test_cp_batch_rejects_a_visual_mask_that_does_not_match_the_sequence(monkeypatch) -> None:
+def test_cp_forward_shard_rejects_visual_mask_sequence_mismatch() -> None:
     """Mismatched mask and embedding sequence extents fail before shared CP setup."""
-    monkeypatch.setattr(cp_batch_module, "make_cp_batch_and_ctx", lambda *_args, **_kwargs: None)
-    batch = {
-        "inputs_embeds": torch.zeros(1, 5, 2),
-        "labels": torch.zeros(1, 5, dtype=torch.long),
-        "visual_pos_masks": torch.zeros(1, 4, dtype=torch.bool),
-        "_deepstack_visual_embeds": [],
-    }
+    model = _bare_model()
+    model.cp_mesh = _FakeCpMesh(0)
 
     with pytest.raises(ValueError, match="must match inputs_embeds"):
-        make_qwen3_vl_cp_batch(_FakeCpMesh(0), None, batch)
+        model._shard_multimodal_inputs_for_cp(
+            torch.zeros(1, 5, 2),
+            torch.zeros(1, 4, dtype=torch.bool),
+            [],
+        )
 
 
-def test_cp_forward_passes_local_deepstack_to_language_model() -> None:
-    """The post-shard branch bypasses vision and injects local DeepStack features."""
+def test_cp_forward_builds_and_passes_local_deepstack_to_language_model(monkeypatch) -> None:
+    """The in-forward path injects the matching local DeepStack features."""
     model = _bare_model()
     captured = {}
 
@@ -352,14 +353,18 @@ def test_cp_forward_passes_local_deepstack_to_language_model() -> None:
     inputs_embeds = torch.randn(1, 4, 4)
     visual_mask = torch.tensor([[True, False, True, False]])
     deepstack = [torch.randn(2, 4)]
+    model.cp_mesh = _FakeCpMesh(0)
+    monkeypatch.setattr(qwen3_vl_model_module, "cp_dispatcher_suspended", lambda _mesh: nullcontext())
+    model._prepare_visual_inputs_for_cp = lambda *_args, **_kwargs: (
+        inputs_embeds,
+        visual_mask,
+        deepstack,
+    )
     out = model.forward(
-        inputs_embeds=inputs_embeds,
-        position_ids=torch.arange(4).view(1, 4),
-        _qwen3_vl_cp_preembedded=True,
-        visual_pos_masks=visual_mask,
-        _deepstack_visual_embeds=deepstack,
+        input_ids=torch.tensor([[1, 2, 3, 4]]),
+        position_ids=torch.tensor([[0, 3]]),
     )
 
-    assert captured["visual_pos_masks"] is visual_mask
-    assert captured["deepstack_visual_embeds"] is deepstack
-    assert out.logits.shape == (1, 4, 8)
+    assert captured["visual_pos_masks"].tolist() == [[True, False]]
+    torch.testing.assert_close(captured["deepstack_visual_embeds"][0], deepstack[0][:1])
+    assert out.logits.shape == (1, 2, 8)

@@ -14,9 +14,10 @@
 
 """Frame-level context-parallel vision-tower sharding.
 
-Under context parallelism (CP) the VLM pre-embed step (``embed_multimodal`` ->
-``self.visual(...)``) runs the ENTIRE vision tower on the full, un-sharded set of
-images on EVERY CP rank.  With ``cp_size=N`` that is N x redundant compute and
+Under context parallelism (CP), a VLM must encode media and splice the resulting
+features before it shards the language sequence. Without vision sharding,
+``self.visual(...)`` runs the ENTIRE vision tower on the full, un-sharded set of
+images on EVERY CP rank. With ``cp_size=N`` that is N x redundant compute and
 O(all-images) vision activations per rank.
 
 Qwen3-VL-style vision towers attend per IMAGE/FRAME ("entry"): the forward builds
@@ -129,13 +130,13 @@ CpVisionGroupToken = _GroupScope | None
 
 class _GroupHolder:
     """Plain get/set/reset holder for the sharding-group scope active during the
-    VLM pre-embed step.  Set by the VLM CP recipe around the pre-embed forward and
-    read by ``maybe_distribute_visual``.
+    VLM forward. Set by the VLM CP recipe around the model forward and read
+    synchronously by ``maybe_distribute_visual`` before the vision tower runs.
 
-    A plain attribute (not a ``ContextVar``) is sufficient: the vision pre-embed
-    runs synchronously in the main thread OUTSIDE activation checkpointing, so
-    there is no cross-thread AC-recompute read.  Training steps are sequential,
-    so a single slot with token-based restore is safe.
+    A plain attribute (not a ``ContextVar``) is sufficient: activation-checkpoint
+    recompute re-enters vision submodules after frame selection, not this helper,
+    so there is no cross-thread recompute read. Training steps are sequential,
+    and token-based restore handles nested callers.
     """
 
     def __init__(self):
@@ -153,7 +154,7 @@ class _GroupHolder:
         self._value = token
 
 
-# Holds the published sharding-group scope (or ``None``) for the current pre-embed call.
+# Holds the published sharding-group scope (or ``None``) for the current model forward.
 _CP_VISION_GROUP = _GroupHolder()
 
 
@@ -237,7 +238,7 @@ def set_cp_vision_group(
     config: CpVisionShardingConfig,
     spans_only_cp: bool = True,
 ) -> CpVisionGroupToken:
-    """Install the sharding process group for the next pre-embed forward.
+    """Install the sharding process group for the current model forward.
 
     Args:
         group: Process group to shard vision frames across, or ``None`` to disable
@@ -265,10 +266,10 @@ def reset_cp_vision_group(token: CpVisionGroupToken) -> None:
 
 
 def cp_vision_sharding_active() -> bool:
-    """Return whether the current pre-embed call has an active CP shard group.
+    """Return whether the current model forward has an active CP shard group.
 
     This intentionally shares :func:`maybe_distribute_visual`'s typed policy.
-    Model-specific pre-embed implementations can use it to leave their ordinary
+    Model-specific multimodal implementations can use it to leave their ordinary
     (replicated / CP-off) multimodal forward completely untouched.
     """
     scope = _CP_VISION_GROUP.get()

@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dense Qwen3-VL integration with context-parallel multimodal pre-embedding."""
+"""Dense Qwen3-VL integration with in-forward context-parallel multimodal sharding."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from typing import Any
 
 import torch
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
@@ -28,6 +28,13 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalGeneration,
 )
 
+from nemo_automodel.components.distributed.context_parallel.sharder import (
+    ContextParallelSharder,
+    round_robin_local_indices,
+    shard_batch_aux_only,
+    shard_sequence_for_cp_round_robin,
+)
+from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
 from nemo_automodel.components.distributed.cp_vision_shard import maybe_distribute_visual
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -35,22 +42,9 @@ from nemo_automodel.components.models.common.tie_word_embeddings import (
     reject_unsupported_tie_word_embeddings,
 )
 
-from .cp_batch import make_qwen3_vl_cp_batch
-
-
-class _Qwen3VLCpInputs(TypedDict, total=False):
-    """Internal batch fields produced by Qwen3-VL's CP pre-embed."""
-
-    inputs_embeds: torch.Tensor
-    position_ids: torch.Tensor
-    visual_pos_masks: torch.Tensor
-    _deepstack_visual_embeds: list[torch.Tensor]
-    _cp_make_batch_fn: Any
-    _qwen3_vl_cp_preembedded: bool
-
 
 class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditionalGeneration):
-    """Dense Qwen3-VL with a DeepStack-aware context-parallel pre-embed path."""
+    """Dense Qwen3-VL with a DeepStack-aware context-parallel forward path."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
@@ -204,77 +198,125 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
 
     def prepare_model_inputs_for_cp(
         self,
-        input_ids: torch.Tensor | None,
+        batch: dict[str, Any],
         *,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.Tensor | None = None,
-        image_grid_thw: torch.Tensor | None = None,
-        video_grid_thw: torch.Tensor | None = None,
-        mm_token_type_ids: torch.Tensor | None = None,
-        **_kwargs: Any,
-    ) -> _Qwen3VLCpInputs:
-        """Build full-sequence Qwen3-VL multimodal inputs before CP sharding.
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Return Qwen3-VL's aux-only sharder and full-sequence mRoPE positions.
+
+        Embedding, vision encoding, DeepStack construction, and differentiable
+        sequence sharding run inside :meth:`forward` per microbatch. This hook
+        only computes metadata and selects the round-robin CP strategy, so it
+        does not touch model weights or create an autograd graph shared across
+        microbatches.
 
         Args:
-            input_ids: Token ids of shape ``[batch, sequence]``.
-            attention_mask: Optional padding mask of shape ``[batch, sequence]``.
-            position_ids: Optional precomputed mRoPE positions of shape
-                ``[position_channels, batch, sequence]``.
-            pixel_values: Optional image patch rows of shape
-                ``[image_patch_rows, patch_dim]``.
-            pixel_values_videos: Optional video patch rows of shape
-                ``[video_patch_rows, patch_dim]``.
-            image_grid_thw: Optional image grids of shape ``[num_images, 3]``.
-            video_grid_thw: Optional video grids of shape ``[num_videos, 3]``.
-            mm_token_type_ids: Optional modality ids of shape ``[batch, sequence]``.
-            **_kwargs: Additional upstream-compatible inputs ignored by this pre-embed path.
+            batch: Full-sequence input mapping. ``input_ids`` has shape
+                ``[batch, sequence]``; optional grid metadata has shape
+                ``[num_media, 3]``.
+            num_chunks: Accepted for the common model-hook contract; unused by
+                the round-robin Qwen3-VL strategy.
 
         Returns:
-            Mapping containing ``inputs_embeds`` of shape ``[batch, sequence,
-            hidden]`` and, when available, ``position_ids`` of shape
-            ``[position_channels, batch, sequence]``. Media batches also carry
-            ``visual_pos_masks`` of shape ``[batch, sequence]`` and one DeepStack
-            tensor of shape ``[visual_tokens, hidden]`` per injection layer.
+            Mapping containing a :class:`ContextParallelSharder`, optional
+            full-sequence mRoPE ``position_ids``, and a ``None`` replacement for
+            ``mm_token_type_ids`` after that metadata has been consumed.
 
         Raises:
-            ValueError: If ``input_ids`` is missing or media/grid pairs are incomplete.
+            ValueError: If ``input_ids`` is missing or multimodal position
+                metadata is incomplete.
         """
+        del num_chunks
+        input_ids = batch.get("input_ids")
         if input_ids is None:
-            raise ValueError("Qwen3-VL CP pre-embedding requires input_ids")
+            raise ValueError("Qwen3-VL context parallelism requires input_ids")
 
-        inputs_embeds = self.get_input_embeddings()(input_ids)
-        inputs_embeds, visual_pos_masks, deepstack_visual_embeds = self._prepare_visual_inputs_for_cp(
-            input_ids,
-            inputs_embeds,
-            pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-        )
-
+        position_ids = batch.get("position_ids")
         if position_ids is None:
             position_ids = self.model.compute_3d_position_ids(
                 input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                attention_mask=attention_mask,
-                mm_token_type_ids=mm_token_type_ids,
+                inputs_embeds=None,
+                image_grid_thw=batch.get("image_grid_thw"),
+                video_grid_thw=batch.get("video_grid_thw"),
+                attention_mask=batch.get("attention_mask"),
+                mm_token_type_ids=batch.get("mm_token_type_ids"),
             )
 
-        prepared: _Qwen3VLCpInputs = {
-            "inputs_embeds": inputs_embeds,
-            "_qwen3_vl_cp_preembedded": True,
+        prepared: dict[str, Any] = {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=shard_batch_aux_only,
+                local_token_global_indices=round_robin_local_indices,
+            ),
+            "mm_token_type_ids": None,
         }
         if position_ids is not None:
             prepared["position_ids"] = position_ids
-        if visual_pos_masks is not None:
-            prepared["visual_pos_masks"] = visual_pos_masks
-            prepared["_deepstack_visual_embeds"] = deepstack_visual_embeds or []
-            prepared["_cp_make_batch_fn"] = make_qwen3_vl_cp_batch
         return prepared
+
+    def _shard_multimodal_inputs_for_cp(
+        self,
+        inputs_embeds: torch.Tensor,
+        visual_pos_masks: torch.Tensor | None,
+        deepstack_visual_embeds: list[torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor] | None]:
+        """Shard token embeddings and ragged DeepStack inputs in matching order.
+
+        Args:
+            inputs_embeds: Full-sequence embeddings ``[batch, sequence, hidden]``.
+            visual_pos_masks: Optional full-sequence visual mask
+                ``[batch, sequence]``.
+            deepstack_visual_embeds: Optional tensors shaped
+                ``[visual_tokens, hidden]``, one per DeepStack injection layer.
+
+        Returns:
+            Local embeddings ``[batch, local_sequence, hidden]``, the matching
+            local visual mask, and local ragged DeepStack tensors.
+
+        Raises:
+            TypeError: If ``visual_pos_masks`` is not boolean.
+            ValueError: If mask and DeepStack shapes are inconsistent.
+        """
+        cp_mesh = getattr(self, "cp_mesh", None)
+        local_inputs, _, _ = shard_sequence_for_cp_round_robin(cp_mesh, inputs_embeds, seq_dim=1)
+        if visual_pos_masks is None:
+            return local_inputs, None, None
+        if visual_pos_masks.dtype != torch.bool:
+            raise TypeError("Qwen3-VL visual_pos_masks must be a boolean tensor")
+        if visual_pos_masks.shape != inputs_embeds.shape[:2]:
+            raise ValueError(
+                "Qwen3-VL visual_pos_masks must match inputs_embeds on batch and sequence axes, got "
+                f"{tuple(visual_pos_masks.shape)} and {tuple(inputs_embeds.shape[:2])}"
+            )
+
+        deepstack_visual_embeds = deepstack_visual_embeds or []
+        num_visual_tokens = int(visual_pos_masks.sum().item())
+        sequence_aligned: list[torch.Tensor] = []
+        for layer_idx, embeds in enumerate(deepstack_visual_embeds):
+            if embeds.ndim != 2:
+                raise ValueError(
+                    f"Qwen3-VL DeepStack tensor {layer_idx} must have shape "
+                    f"[visual_tokens, hidden], got {tuple(embeds.shape)}"
+                )
+            if embeds.shape[0] != num_visual_tokens:
+                raise ValueError(
+                    f"Qwen3-VL DeepStack tensor {layer_idx} has {embeds.shape[0]} visual tokens "
+                    f"but visual_pos_masks selects {num_visual_tokens}"
+                )
+            aligned = embeds.new_zeros(*visual_pos_masks.shape, embeds.shape[-1])
+            aligned[visual_pos_masks] = embeds
+            sequence_aligned.append(aligned)
+
+        local_mask, _, _ = shard_sequence_for_cp_round_robin(
+            cp_mesh,
+            visual_pos_masks,
+            seq_dim=1,
+            pad_value=False,
+        )
+        local_deepstack = []
+        for aligned in sequence_aligned:
+            local_aligned, _, _ = shard_sequence_for_cp_round_robin(cp_mesh, aligned, seq_dim=1)
+            local_deepstack.append(local_aligned[local_mask])
+        return local_inputs, local_mask, local_deepstack
 
     def forward(
         self,
@@ -293,8 +335,8 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Any,
-    ) -> tuple | Qwen3VLCausalLMOutputWithPast | _Qwen3VLCpInputs:
-        """Run Qwen3-VL, including the internal CP pre-embed and local DeepStack path.
+    ) -> tuple | Qwen3VLCausalLMOutputWithPast:
+        """Run Qwen3-VL, including its in-forward CP multimodal path.
 
         Named tensor arguments preserve the Hugging Face
         ``Qwen3VLForConditionalGeneration.forward`` layouts. The internal CP path
@@ -302,21 +344,9 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         ``visual_pos_masks`` of shape ``[batch, local_sequence]``, and DeepStack
         tensors of shape ``[local_visual_tokens, hidden]``.
         """
-        if kwargs.pop("_pre_embed_only", False):
-            return self.prepare_model_inputs_for_cp(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                mm_token_type_ids=mm_token_type_ids,
-                **kwargs,
-            )
-
-        cp_preembedded = bool(kwargs.pop("_qwen3_vl_cp_preembedded", False))
-        if not cp_preembedded:
+        cp_mesh = getattr(self, "cp_mesh", None)
+        cp_size = cp_mesh.size() if cp_mesh is not None else 1
+        if cp_size <= 1:
             return super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -335,8 +365,31 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
                 **kwargs,
             )
 
-        visual_pos_masks = kwargs.pop("visual_pos_masks", None)
-        deepstack_visual_embeds = kwargs.pop("_deepstack_visual_embeds", None)
+        if input_ids is None:
+            if inputs_embeds is None:
+                raise ValueError("Qwen3-VL context parallelism requires input_ids or inputs_embeds")
+            if pixel_values is not None or pixel_values_videos is not None:
+                raise ValueError("Qwen3-VL media inputs under context parallelism require input_ids")
+            visual_pos_masks = None
+            deepstack_visual_embeds = None
+        else:
+            if inputs_embeds is None:
+                inputs_embeds = self.get_input_embeddings()(input_ids)
+            with cp_dispatcher_suspended(cp_mesh):
+                inputs_embeds, visual_pos_masks, deepstack_visual_embeds = self._prepare_visual_inputs_for_cp(
+                    input_ids,
+                    inputs_embeds,
+                    pixel_values=pixel_values,
+                    pixel_values_videos=pixel_values_videos,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                )
+
+        inputs_embeds, visual_pos_masks, deepstack_visual_embeds = self._shard_multimodal_inputs_for_cp(
+            inputs_embeds,
+            visual_pos_masks,
+            deepstack_visual_embeds,
+        )
         text_outputs = self.model.language_model(
             input_ids=None,
             attention_mask=attention_mask,

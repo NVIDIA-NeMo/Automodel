@@ -39,7 +39,6 @@ import torch
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.cp_vision_shard import CpVisionShardingConfig
-from nemo_automodel.components.utils.model_utils import VLM_INPUT_KEYS
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
@@ -285,6 +284,7 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     recipe = object.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.device_mesh = _FakeCPMesh()
+    recipe.cp_vision_sharding = CpVisionShardingConfig(enabled=True)
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.model_parts = [model]
     recipe.pp_enabled = True

@@ -989,7 +989,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         *,
         is_video: bool,
     ) -> torch.Tensor:
-        """Encode one modality's patches into flat, entry-ordered visual tokens for CP pre-embed.
+        """Encode one modality's patches into flat, entry-ordered visual tokens under CP.
 
         Under context parallelism the vision tower otherwise runs redundantly on the full,
         un-sharded patch set on every CP rank. When the CP vision-shard group is published
