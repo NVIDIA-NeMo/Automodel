@@ -58,10 +58,7 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
     get_fqn_to_dtype_mapping,
     get_fqn_to_file_index_mapping,
 )
-from nemo_automodel.components.checkpoint.addons import (
-    ConsolidatedHFAddon,
-    PeftAddon,
-)
+from nemo_automodel.components.checkpoint.addons import ConsolidatedHFAddon, PeftAddon
 from nemo_automodel.components.checkpoint.conversion_mapping import (
     get_combined_key_mapping,
     requires_tensor_merging,
@@ -459,8 +456,6 @@ class Checkpointer:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.process_group = process_group
-        self._original_model_path_resolved = False
-        self._original_model_path: str | None = None
 
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
@@ -541,8 +536,6 @@ class Checkpointer:
             cpu_offload=self.config.cpu_offload,
             pp_group=self.pp_group,
         )
-        original_model_path = self._get_original_model_path(model_state)
-        generated_metadata_path = self._get_generated_metadata_path(model_state, original_model_path)
         state_dict = model_state.state_dict()
 
         # Convert to HF format if using custom model implementations.
@@ -576,8 +569,7 @@ class Checkpointer:
                 peft_config=peft_config,
                 fqn_to_file_index_mapping=fqn_to_file_index_mapping,
                 fqn_to_dtype_mapping=fqn_to_dtype_mapping,
-                original_model_path=original_model_path,
-                generated_metadata_path=generated_metadata_path,
+                original_model_path=self._get_original_model_path(model_state),
                 v4_compatible=self.config.v4_compatible,
                 process_group=consolidation_process_group,
             )
@@ -1407,22 +1399,26 @@ fi
         """
         if not _should_write_hf_metadata(self.config):
             return None
-        model = _unwrap_ddp_model(model_state.model[0])
+        model = model_state.model[0]
         # we first need to find the FQN -> .safetensors mapping
-        reference_path = self._get_original_model_path(model_state)
+        reference_path = _get_hf_safetensors_reference_path(
+            self.config.model_cache_dir,
+            self.config.model_repo_id,
+        )
         if reference_path:
             # HF VLM models may contain a special checkpoint mapping attribute
             fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(
                 reference_path, getattr(model, "_checkpoint_conversion_mapping", None)
             )
-            config = getattr(model, "config", None)
+            model_part = model_state.model[0]
+            config = getattr(model_part, "config", None)
             model_type = getattr(config, "model_type", None)
             pre_shard_hf_state_dict_keys = (
                 getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
             )
             if pre_shard_hf_state_dict_keys is None:
                 pre_shard_hf_state_dict_keys = list(state_dict.keys())
-            if model_type and requires_tensor_merging(model_type) and not hasattr(model, "state_dict_adapter"):
+            if model_type and requires_tensor_merging(model_type) and not hasattr(model_part, "state_dict_adapter"):
                 # in this case, Transformers performed weight conversion so we will save the converted format in the checkpoint
                 num_shards = max(fqn_to_file_index_mapping.values()) if fqn_to_file_index_mapping else 1
                 fqn_to_file_index_mapping = _equally_divide_layers(num_shards, pre_shard_hf_state_dict_keys)
@@ -1496,11 +1492,14 @@ fi
         if not _should_write_hf_metadata(self.config):
             return None
 
-        reference_path = self._get_original_model_path(model_state)
+        reference_path = _get_hf_safetensors_reference_path(
+            self.config.model_cache_dir,
+            self.config.model_repo_id,
+        )
         if not reference_path:
             return None
 
-        model = _unwrap_ddp_model(model_state.model[0])
+        model = model_state.model[0]
         dtype_mapping = get_fqn_to_dtype_mapping(reference_path, getattr(model, "_checkpoint_conversion_mapping", None))
         if not dtype_mapping:
             return None
@@ -1597,74 +1596,29 @@ fi
         return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
     def _get_original_model_path(self, model_state: ModelState) -> str | None:
-        """Resolve and cache the authoritative source checkpoint directory without network access."""
-        if self._original_model_path_resolved:
-            return self._original_model_path
-
-        self._original_model_path_resolved = True
-        model_part = _unwrap_ddp_model(model_state.model[0])
-        model_config = getattr(model_part, "config", None)
-        source_model_path = getattr(model_part, "source_model_path", None)
-        if source_model_path and os.path.isdir(str(source_model_path)):
-            self._original_model_path = str(source_model_path)
-            return self._original_model_path
-
-        model_repo_id = (
-            self.config.model_repo_id
-            or getattr(model_part, "name_or_path", None)
-            or getattr(model_config, "name_or_path", None)
-        )
-        if not model_repo_id:
+        """
+        Get the path to the original model from the Hugging Face checkpoint.
+        """
+        if not hasattr(model_state.model[0], "name_or_path") and not hasattr(
+            getattr(model_state.model[0], "config", None), "name_or_path"
+        ):
             return None
 
-        model_repo_id = str(model_repo_id)
-        if os.path.isdir(model_repo_id):
-            self._original_model_path = model_repo_id
-            return self._original_model_path
-
-        cache_dir = getattr(self.config, "original_model_root_dir", None) or self.config.model_cache_dir or HF_HUB_CACHE
-        revision = getattr(model_config, "_commit_hash", None)
-        if revision:
-            exact_cached_path = (
-                Path(cache_dir) / f"models--{model_repo_id.replace('/', '--')}" / "snapshots" / str(revision)
-            )
-            if exact_cached_path.is_dir():
-                self._original_model_path = str(exact_cached_path)
-                return self._original_model_path
-            logger.warning(
-                "Unable to resolve source checkpoint %s at revision %s from cache %s; "
-                "falling back to generated Hugging Face metadata.",
-                model_repo_id,
-                revision,
-                cache_dir,
-            )
+        pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path", None) or getattr(
+            getattr(model_state.model[0], "config", None), "name_or_path", None
+        )
+        # Randomly initialized HF models often have an empty `name_or_path`. In that case,
+        # there is no "original" HF snapshot to reference for metadata.
+        if not pretrained_model_name_or_path:
             return None
 
-        try:
-            self._original_model_path = _get_hf_safetensors_reference_path(cache_dir, model_repo_id)
-        except (FileNotFoundError, ValueError) as exc:
-            logger.warning(
-                "Unable to resolve source checkpoint %s from cache %s; "
-                "falling back to generated Hugging Face metadata. Error: %s",
-                model_repo_id,
-                cache_dir,
-                exc,
-            )
-        return self._original_model_path
+        if os.path.isdir(pretrained_model_name_or_path):
+            return pretrained_model_name_or_path
 
-    def _get_generated_metadata_path(
-        self,
-        model_state: ModelState,
-        original_model_path: str | None,
-    ) -> str | None:
-        """Return the existing model/code reference used by the generated-metadata path."""
-        model_part = _unwrap_ddp_model(model_state.model[0])
-        model_reference = getattr(model_part, "name_or_path", None) or getattr(
-            getattr(model_part, "config", None), "name_or_path", None
-        )
-        if model_reference and os.path.isdir(str(model_reference)):
-            return str(model_reference)
-        return original_model_path
+        # `original_model_root_dir` exists on the config but may be None. In that case,
+        # fall back to the standard HF hub cache root.
+        cache_dir = getattr(self.config, "original_model_root_dir", None) or HF_HUB_CACHE
+        return _get_hf_safetensors_reference_path(cache_dir, pretrained_model_name_or_path)
 
 
 def _get_hf_safetensors_reference_path(cache_dir: str | Path | None, repo_id: str | None) -> str | None:
