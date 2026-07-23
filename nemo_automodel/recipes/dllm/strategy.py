@@ -262,11 +262,9 @@ class IDLMStrategy(DLLMStrategy):
 
     def __init__(self):
         self.block_size = 1
-        self.use_regular_causal = True
 
     def create_loss_fn(self, dllm_cfg: dict) -> nn.Module:
         self.block_size = int(dllm_cfg.get("block_length", 1))
-        self.use_regular_causal = bool(dllm_cfg.get("use_regular_causal", True))
         return IDLMLoss(
             clean_loss_weight=float(dllm_cfg.get("clean_loss_weight", 0.2)),
             auto_balance=bool(dllm_cfg.get("auto_balance_clean_loss", False)),
@@ -299,6 +297,14 @@ class IDLMStrategy(DLLMStrategy):
         return corrupt_all_masked(input_ids, loss_mask, mask_token_id)
 
     def prepare_batch(self, batch, noisy_input_ids, noise_mask, clean_input_ids):
+        """Required by the abstract interface but unused on the I-DLM path.
+
+        :meth:`forward_backward` is overridden and builds the ``[x_t | x_0]``
+        concat itself from the ``pre_step`` sidecars, so the recipe never routes
+        an I-DLM batch through here. Kept (and kept correct) only to satisfy
+        :class:`DLLMStrategy`; assigning the noisy ids matches what the base
+        MDLM path would do if a future edit re-enabled that route.
+        """
         batch["input_ids"] = noisy_input_ids
         return batch
 
@@ -349,14 +355,10 @@ class IDLMStrategy(DLLMStrategy):
         pos = torch.arange(L, device=device)
         concat_position_ids = torch.cat([pos, pos]).unsqueeze(0).expand(concat_input_ids.size(0), -1)
         if getattr(getattr(model, "config", None), "_attn_implementation", None) == "flex_attention":
-            block_mask = create_idlm_block_mask(
-                L, self.block_size, attn, device=device, use_regular_causal=self.use_regular_causal
-            )
+            block_mask = create_idlm_block_mask(L, self.block_size, attn, device=device)
         else:
             mask_dtype = autocast_dtype if autocast_dtype is not None else torch.float32
-            block_mask = create_idlm_sdpa_mask(
-                L, self.block_size, attn, device=device, dtype=mask_dtype, use_regular_causal=self.use_regular_causal
-            )
+            block_mask = create_idlm_sdpa_mask(L, self.block_size, attn, device=device, dtype=mask_dtype)
 
         with train_ctx(), sync_ctx, fp8_ctx, autocast_ctx:
             out = model(

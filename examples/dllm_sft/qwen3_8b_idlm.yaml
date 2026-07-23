@@ -95,7 +95,6 @@ dllm:
   block_length: 1
   clean_loss_weight: 0.2
   auto_balance_clean_loss: false
-  eps: 0.001
   supervise_padding: false
 
 loss_fn:

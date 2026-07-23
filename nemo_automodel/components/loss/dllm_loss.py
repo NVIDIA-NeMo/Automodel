@@ -656,6 +656,17 @@ class IDLMLoss(nn.Module):
         # Logit shift: logits[:, i] predicts target[:, i+1]. Both copies supervise
         # the response tokens. _compute_per_token_nll materialises a vocab-sharded
         # DTensor via full_tensor() if needed.
+        #
+        # Support note (deliberate, differs from the reference by one position):
+        # gating on ``answer_mask[:, 1:]`` supervises every position whose NEXT
+        # token is a response token, so the loss covers exactly the response
+        # tokens — including the FIRST one, predicted from the last prompt
+        # position. The official repo instead keeps only masked positions
+        # (``logits_to_keep``), which never includes that clean prompt position,
+        # so it skips the first response token and scores one position past the
+        # answer. Supervising it matters here: at inference the first generated
+        # token comes from exactly that hidden state, so leaving it untrained
+        # would rely on the base AR behaviour surviving finetuning.
         shift_target = target_ids[:, 1:]
         supervise = answer_mask[:, 1:].bool() & valid_mask[:, 1:].bool()
         weight = supervise.to(torch.float32)

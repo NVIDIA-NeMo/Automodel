@@ -42,9 +42,11 @@ def create_idlm_sdpa_mask(
     *,
     device: torch.device,
     dtype: torch.dtype,
-    use_regular_causal: bool = True,
 ) -> torch.Tensor:
     """Build the dense additive ``[x_t | x_0]`` block-diffusion mask for SDPA.
+
+    The ``x_0`` region is always strict token-causal, matching the paper (§3.1)
+    and every released I-DLM checkpoint.
 
     Args:
         seq_len:  Length ``L`` of one copy (the concatenated length is ``2L``).
@@ -53,7 +55,6 @@ def create_idlm_sdpa_mask(
             (1 = real token); padded keys are blocked in both copies.
         device:   torch device.
         dtype:    dtype for the additive mask (typically the model dtype).
-        use_regular_causal: Strict token-causal ``x_0`` region (paper default).
 
     Returns:
         ``[B, 1, 2L, 2L]`` float tensor: ``0`` at attended positions, ``-inf``
@@ -70,10 +71,7 @@ def create_idlm_sdpa_mask(
 
     m_bd = (block_q == block_kv) & (~x0_q) & (~x0_kv) & (q_idx >= kv_idx)
     m_obc = (block_q > block_kv) & x0_kv & (~x0_q)
-    if use_regular_causal:
-        m_bc = (q_idx >= kv_idx) & x0_q & x0_kv
-    else:
-        m_bc = (block_q >= block_kv) & x0_q & x0_kv
+    m_bc = (q_idx >= kv_idx) & x0_q & x0_kv
 
     key_valid = torch.cat([valid_mask.bool(), valid_mask.bool()], dim=1).view(valid_mask.size(0), 1, 1, two_l)
     bool_mask = (m_bd | m_obc | m_bc) & key_valid
@@ -89,7 +87,6 @@ def create_idlm_block_mask(
     valid_mask: torch.Tensor,
     *,
     device: torch.device,
-    use_regular_causal: bool = True,
     use_compile: bool = True,
 ) -> "BlockMask":
     """Build a sparse FlexAttention :class:`BlockMask` for I-DLM training.
@@ -104,7 +101,6 @@ def create_idlm_block_mask(
         block_size: Diffusion block size.
         valid_mask: Padding-validity mask over one copy, shape ``[B, L]``.
         device:   torch device.
-        use_regular_causal: Strict token-causal ``x_0`` region (paper default).
         use_compile: Reuse a cached ``torch.compile``'d ``create_block_mask``.
 
     Returns:
@@ -121,10 +117,7 @@ def create_idlm_block_mask(
         block_kv = torch.where(x0_kv, (kv_idx - seq_len) // block_size, kv_idx // block_size)
         m_bd = (block_q == block_kv) & (~x0_q) & (~x0_kv) & (q_idx >= kv_idx)
         m_obc = (block_q > block_kv) & x0_kv & (~x0_q)
-        if use_regular_causal:
-            m_bc = (q_idx >= kv_idx) & x0_q & x0_kv
-        else:
-            m_bc = (block_q >= block_kv) & x0_q & x0_kv
+        m_bc = (q_idx >= kv_idx) & x0_q & x0_kv
         return (m_bd | m_obc | m_bc) & key_valid[b, kv_idx]
 
     builder = _get_compiled_create_block_mask() if use_compile else create_block_mask

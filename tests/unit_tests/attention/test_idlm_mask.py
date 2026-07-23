@@ -22,7 +22,7 @@ import torch
 from nemo_automodel.components.attention.idlm_mask import create_idlm_block_mask, create_idlm_sdpa_mask
 
 
-def _reference_idlm_mask(seq_len, block_size, valid_mask, use_regular_causal=True):
+def _reference_idlm_mask(seq_len, block_size, valid_mask):
     """Element-level reference for block_diff_mask over the [x_t | x_0] concat.
 
     Mirrors the official ``block_diff_mask`` (paper Appendix E):
@@ -43,10 +43,7 @@ def _reference_idlm_mask(seq_len, block_size, valid_mask, use_regular_causal=Tru
                 bkv = (k - seq_len) // block_size if x0_kv else k // block_size
                 m_bd = (bq == bkv) and (not x0_q) and (not x0_kv) and (q >= k)
                 m_obc = (bq > bkv) and x0_kv and (not x0_q)
-                if use_regular_causal:
-                    m_bc = (q >= k) and x0_q and x0_kv
-                else:
-                    m_bc = (bq >= bkv) and x0_q and x0_kv
+                m_bc = (q >= k) and x0_q and x0_kv
                 key_ok = bool(valid_mask[b, k % seq_len])
                 mask[b, 0, q, k] = (m_bd or m_obc or m_bc) and key_ok
     return mask

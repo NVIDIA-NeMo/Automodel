@@ -283,6 +283,8 @@ class DLLMSampler:
                     x[:, block_slice] = cur
                 else:
                     mask_idx = x == self.mask_id
+                    # No-op unless logit_shift != 0 (I-DLM); LLaDA/Nemotron presets
+                    # keep logit_shift = 0 and read the logit at the filled position.
                     logits = self._apply_logit_shift(self.model(x, attention_mask=attention_mask).logits)
                     x0, transfer_idx = get_transfer_index(
                         logits,
@@ -377,6 +379,7 @@ class DLLMSampler:
             transfer_schedule = get_num_transfer_tokens(block_mask, steps_per_block)
             for s in range(transfer_schedule.size(1)):
                 mask_full = x == self.mask_id
+                # No-op unless logit_shift != 0 (I-DLM); see `sample` above.
                 logits = self._apply_logit_shift(self.model(x, attention_mask=attention_mask).logits)
                 x0, transfer_index = get_transfer_index(
                     logits,
