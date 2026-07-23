@@ -21,6 +21,7 @@ import contextlib
 import torch
 import torch.distributed as dist
 
+from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
 from nemo_automodel.components.distributed.thd_utils import split_batch_into_thd_chunks
 
 
@@ -91,6 +92,19 @@ def _slice_thd_chunk_for_cp(
     return out  # type: ignore[return-value]
 
 
+def _packed_cp_layout(batch, *, num_chunks: int) -> ShardLayout | None:
+    # The BSHD->THD flatten is a pure reshape: the pre-flatten rows are the
+    # caller's coordinate system and the stream length is rows x cols. Chunked
+    # streams (num_chunks > 1) are per-chunk token spaces and report no layout.
+    input_ids = batch.get("input_ids")
+    if num_chunks <= 1 and input_ids is not None and input_ids.dim() >= 2:
+        return ShardLayout(
+            padded_seq_len=input_ids.shape[0] * input_ids.shape[1],
+            input_row_shape=tuple(input_ids.shape[:2]),
+        )
+    return None
+
+
 def make_glm_dsa_packed_cp_batch_and_ctx(
     cp_mesh,
     tp_mesh,
@@ -121,13 +135,14 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
     cp_rank = dist.get_rank(group=cp_group) if dist.is_available() and dist.is_initialized() else 0
 
     if num_chunks <= 1:
-        return contextlib.nullcontext, _slice_thd_chunk_for_cp(
+        sliced = _slice_thd_chunk_for_cp(
             thd_batch,
             cp_group=cp_group,
             cp_size=cp_size,
             cp_rank=cp_rank,
             padding_token_id=padding_token_id,
         )
+        return contextlib.nullcontext, sliced
 
     chunks = []
     for idx in range(num_chunks):
@@ -149,3 +164,27 @@ def make_glm_dsa_packed_cp_batch_and_ctx(
         else:
             stacked[key] = value
     return contextlib.nullcontext, stacked
+
+
+def shard_glm_dsa_packed_cp_batch(
+    cp_mesh,
+    tp_mesh,
+    batch,
+    *,
+    loss_mask=None,
+    padding_token_id: int = 0,
+    num_chunks: int = 1,
+    seq_lens_padding_value: int = -1000,
+):
+    """``ContextParallelSharder.shard_batch`` wrapper for GLM DSA packed CP."""
+    layout = _packed_cp_layout(batch, num_chunks=num_chunks)
+    ctx_factory, sharded_batch = make_glm_dsa_packed_cp_batch_and_ctx(
+        cp_mesh,
+        tp_mesh,
+        batch,
+        loss_mask=loss_mask,
+        padding_token_id=padding_token_id,
+        num_chunks=num_chunks,
+        seq_lens_padding_value=seq_lens_padding_value,
+    )
+    return ctx_factory, sharded_batch, layout
