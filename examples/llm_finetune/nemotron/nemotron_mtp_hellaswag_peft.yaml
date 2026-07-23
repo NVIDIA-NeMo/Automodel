@@ -57,7 +57,7 @@ model:
     linear: te
     rms_norm: te
     experts: gmm
-    dispatcher: hybridep
+    dispatcher: deepep
 
 checkpoint:
   enabled: true
