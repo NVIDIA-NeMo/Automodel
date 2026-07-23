@@ -1746,6 +1746,53 @@ class TestNeMoAutoModelForMultimodalLM:
         assert "NeMoAutoModelForMultimodalLM" in pkg.__all__
 
 
+class TestNeMoAutoModelForSeq2SeqLM:
+    """Tests for the NeMoAutoModelForSeq2SeqLM class and its exports (issue #630)."""
+
+    def test_class_exists_and_inherits_correctly(self):
+        from transformers import AutoModelForSeq2SeqLM
+
+        from nemo_automodel._transformers.auto_model import NeMoAutoModelForSeq2SeqLM, _BaseNeMoAutoModelClass
+
+        assert issubclass(NeMoAutoModelForSeq2SeqLM, _BaseNeMoAutoModelClass)
+        assert issubclass(NeMoAutoModelForSeq2SeqLM, AutoModelForSeq2SeqLM)
+
+    def test_has_from_pretrained_and_from_config(self):
+        from nemo_automodel._transformers.auto_model import NeMoAutoModelForSeq2SeqLM
+
+        assert callable(NeMoAutoModelForSeq2SeqLM.from_pretrained)
+        assert callable(NeMoAutoModelForSeq2SeqLM.from_config)
+
+    def test_lazy_export_from_transformers_subpackage(self):
+        from nemo_automodel._transformers import NeMoAutoModelForSeq2SeqLM
+
+        assert NeMoAutoModelForSeq2SeqLM is not None
+
+    def test_lazy_export_from_top_level_package(self):
+        from nemo_automodel import NeMoAutoModelForSeq2SeqLM
+
+        assert NeMoAutoModelForSeq2SeqLM is not None
+
+    def test_top_level_dir_includes_seq2seq(self):
+        import nemo_automodel
+
+        assert "NeMoAutoModelForSeq2SeqLM" in dir(nemo_automodel)
+
+    def test_transformers_subpackage_all_includes_seq2seq(self):
+        import nemo_automodel._transformers as pkg
+
+        assert "NeMoAutoModelForSeq2SeqLM" in pkg.__all__
+
+    def test_model_mapping_resolves_t5_and_bart(self):
+        from transformers import BartConfig, T5Config
+
+        from nemo_automodel._transformers.auto_model import NeMoAutoModelForSeq2SeqLM
+
+        mapping = NeMoAutoModelForSeq2SeqLM._model_mapping
+        assert mapping[T5Config].__name__ == "T5ForConditionalGeneration"
+        assert mapping[BartConfig].__name__ == "BartForConditionalGeneration"
+
+
 class TestFilterMetaDeviceFromInitContext:
     def test_removes_meta_device(self):
         contexts = [torch.device("meta"), torch.float32]
