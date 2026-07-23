@@ -91,6 +91,20 @@ See the [Installation Guide](/get-started/installation) and [VLM Fine-Tuning Gui
 
 See the [VLM Fine-Tuning Guide](/recipes-e2e-examples/gemma-3-3n).
 
+### Validated Large-Model, Long-Context Scale
+
+The Qwen3.5-MoE VLM training path has been validated at both
+**397-billion-parameter model scale** and **128K context length**.
+Qwen3.5-397B-A17B completed a 10-step end-to-end training run on 256 H100 GPUs
+with FSDP2, CP64, EP64, packed sequences, full activation checkpointing, and a
+trainable vision tower. The workload mixed text, image, and video data and
+included genuine examples of approximately 120K tokens.
+
+The run maintained finite, decreasing loss, validating the training mechanics
+for this combined large-model and long-context regime. It is not a model
+convergence result. A public 397B recipe is not currently included; use the
+122B EP8/CP16 recipe as the closest published reference.
+
 Dense Qwen3.5 and Qwen3.5-MoE support context-parallel vision sharding. The
 Qwen3.5-MoE path composes expert and context parallelism with packed sequences; see the
 [Context-Parallel Vision Sharding guide](/development/cp-vision-sharding).
