@@ -107,12 +107,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         )
 
         self.peft_config = self.cfg.instantiate_path("peft")
-        # Default storage dtype to fp32 for full-parameter torch.optim training so the
-        # parameters serve as the fp32 master copy (no-op for PEFT / TE FusedAdam /
-        # explicit model.torch_dtype). Must run before build_model.
-        resolve_storage_dtype(
-            self.cfg.get("model"),
-            self.cfg.get("optimizer"),
+        optimizer_config = self.cfg.optimizer
+        model_torch_dtype = resolve_storage_dtype(
+            self.cfg.model.get("torch_dtype", None),
+            uses_model_params_as_master_weights=optimizer_config.uses_model_params_as_master_weights(),
             is_peft=self.peft_config is not None,
             context="llm-seq-cls",
             logger=logger,
@@ -126,9 +124,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             cfg_quantization=self.cfg.get("quantization", None),
             distributed_setup=self.distributed_setup,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
+            model_torch_dtype=model_torch_dtype,
         )
-        optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
-        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        optimizer = optimizer_config.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
+        allow_megatron_fsdp_sharding = getattr(optimizer_config, "supports_megatron_fsdp_sharding", True)
         self.optimizer = shard_optimizers_for_megatron_fsdp(
             model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )

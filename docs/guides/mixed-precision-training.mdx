@@ -116,7 +116,7 @@ This is usually negligible. When bringing up a new model, fp32 storage (Pattern 
 
 ## Default Behavior
 
-You usually do not have to configure Pattern B by hand. When you run **full-parameter** training (not PEFT/LoRA) with a `torch.optim` optimizer (such as `torch.optim.Adam` or `torch.optim.AdamW`) and leave `model.torch_dtype` unset (or `auto`), NeMo AutoModel automatically resolves it to `float32` — applying **Pattern B** for you: the resident sharded parameters act as the fp32 master copy, the AdamW EMA buffers stay fp32, and forward/backward still run in bf16 through FSDP2 mixed precision.
+You usually do not have to configure Pattern B by hand. When you run **full-parameter** training (not PEFT/LoRA) with a `torch.optim` optimizer (such as `torch.optim.Adam` or `torch.optim.AdamW`) and leave `model.torch_dtype` unset (or `auto`), NeMo AutoModel resolves the effective model-construction dtype to `float32` — applying **Pattern B** for you: the resident sharded parameters act as the fp32 master copy, the AdamW EMA buffers stay fp32, and forward/backward still run in bf16 through FSDP2 mixed precision.
 
 The auto-default never overrides an explicit choice. It is a no-op when:
 

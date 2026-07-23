@@ -121,8 +121,13 @@ def build_model(
     cfg_compile=None,
     distributed_setup: DistributedSetup | None = None,
     cfg_quantization=None,
+    model_torch_dtype: str | torch.dtype | None = None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model for VLM.
+
+    Args:
+        model_torch_dtype: Effective storage dtype passed to model construction
+            without changing the declarative model config.
 
     Returns:
         The instantiated model and optimizer.
@@ -146,6 +151,8 @@ def build_model(
             from nemo_automodel.components.quantization.qlora import create_bnb_config
 
             kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
+        if model_torch_dtype is not None:
+            kwargs["torch_dtype"] = model_torch_dtype
 
         if _is_recipe_target(cfg_model.get("_target_", None)):
             model = cfg_model.instantiate(**kwargs)
@@ -515,12 +522,10 @@ class FinetuneRecipeForVLM(BaseRecipe):
             logging.info("Disabling rope_fusion because cp_size=%d > 1", self.mesh_context.cp_size)
             self.cfg.model.backend.rope_fusion = False
 
-        # Default storage dtype to fp32 for full-parameter torch.optim training so the
-        # parameters serve as the fp32 master copy (no-op for PEFT / TE FusedAdam /
-        # explicit model.torch_dtype). Must run before build_model.
-        resolve_storage_dtype(
-            self.cfg.get("model"),
-            self.cfg.get("optimizer"),
+        optimizer_config = self.cfg.optimizer
+        model_torch_dtype = resolve_storage_dtype(
+            self.cfg.model.get("torch_dtype", None),
+            uses_model_params_as_master_weights=optimizer_config.uses_model_params_as_master_weights(),
             is_peft=self.peft_config is not None,
             context="vlm",
             logger=logger,
@@ -535,10 +540,11 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_compile=self.cfg.get("compile", None),
             distributed_setup=self.distributed_setup,
             cfg_quantization=self.cfg.get("quantization", None),
+            model_torch_dtype=model_torch_dtype,
         )
         apply_te_patches()
-        optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
-        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        optimizer = optimizer_config.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
+        allow_megatron_fsdp_sharding = getattr(optimizer_config, "supports_megatron_fsdp_sharding", True)
         self.optimizer = shard_optimizers_for_megatron_fsdp(
             model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )

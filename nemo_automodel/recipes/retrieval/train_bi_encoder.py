@@ -258,12 +258,10 @@ class TrainBiEncoderRecipe(BaseRecipe):
         if self.cfg.get("peft", None) is not None:
             self.peft_config = self.cfg.peft.instantiate()
 
-        # Default storage dtype to fp32 for full-parameter torch.optim training so the
-        # parameters serve as the fp32 master copy (no-op for PEFT / TE FusedAdam /
-        # explicit model.torch_dtype). Must run before the model is instantiated.
-        resolve_storage_dtype(
-            self.cfg.get("model"),
-            self.cfg.get("optimizer"),
+        optimizer_config = self.cfg.optimizer
+        model_torch_dtype = resolve_storage_dtype(
+            self.cfg.model.get("torch_dtype", None),
+            uses_model_params_as_master_weights=optimizer_config.uses_model_params_as_master_weights(),
             is_peft=self.peft_config is not None,
             context="retrieval",
             logger=logger,
@@ -286,6 +284,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         with ScopedRNG(seed=self.cfg.get("seed", 42), ranked=True):
             kwargs = _get_model_instantiate_kwargs(self.cfg, self.distributed_setup, self.peft_config)
+            if model_torch_dtype is not None:
+                kwargs["torch_dtype"] = model_torch_dtype
             model = self.cfg.model.instantiate(
                 **kwargs,
             )
@@ -294,7 +294,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.pp = None
 
         param_groups = self._build_optimizer_param_groups()
-        optimizer = self.cfg.optimizer.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
+        optimizer = optimizer_config.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
         self.optimizer = [optimizer]
         warn_if_torch_adam_with_bf16_params(
             optimizer=self.optimizer,

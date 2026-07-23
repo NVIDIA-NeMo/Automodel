@@ -192,6 +192,7 @@ class OptimizerConfig:
     # Whether this optimizer can be sharded for Megatron-FSDP. The recipe layer
     # reads this to decide whether to shard the built optimizers.
     supports_megatron_fsdp_sharding: ClassVar[bool] = True
+    _uses_model_params_as_master_weights: ClassVar[bool] = False
 
     # Per-group LR/WD overrides matched by parameter name. Empty = single group
     # (unchanged behavior). Honored by the standard torch optimizers (typed configs
@@ -202,6 +203,10 @@ class OptimizerConfig:
     def __post_init__(self) -> None:
         # YAML delivers overrides as plain dicts; coerce them to the typed form.
         self.param_group_overrides = _coerce_param_group_overrides(self.param_group_overrides)
+
+    def uses_model_params_as_master_weights(self) -> bool:
+        """Return whether the optimizer updates resident model parameters without a separate master copy."""
+        return self._uses_model_params_as_master_weights
 
     def build(
         self,
@@ -257,6 +262,8 @@ class OptimizerConfig:
 class AdamConfig(OptimizerConfig):
     """``torch.optim.Adam``."""
 
+    _uses_model_params_as_master_weights: ClassVar[bool] = True
+
     lr: float = 1e-4
     weight_decay: float = 0.01
     betas: tuple[float, float] = (0.9, 0.999)
@@ -274,6 +281,8 @@ class AdamConfig(OptimizerConfig):
 @dataclass
 class AdamWConfig(OptimizerConfig):
     """``torch.optim.AdamW``."""
+
+    _uses_model_params_as_master_weights: ClassVar[bool] = True
 
     lr: float = 1e-4
     weight_decay: float = 0.01
@@ -490,6 +499,11 @@ class OptimizerFromFactoryConfig(OptimizerConfig):
 
     factory: Callable[..., torch.optim.Optimizer] | None = None
     kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def uses_model_params_as_master_weights(self) -> bool:
+        """Return whether the wrapped factory is a built-in ``torch.optim`` optimizer."""
+        module = getattr(self.factory, "__module__", "") or ""
+        return module == "torch.optim" or module.startswith("torch.optim.")
 
     def build(
         self,

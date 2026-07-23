@@ -182,6 +182,7 @@ def build_model(
     unfreeze_modules: list[str] | None = None,
     sdpa_method: list[str] | None = None,
     device_mesh=None,
+    model_torch_dtype: str | torch.dtype | None = None,
 ) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
     """Build and initialize a model.
 
@@ -200,6 +201,8 @@ def build_model(
             ``["flash_attention", "efficient_attention"]``), or ``None`` to
             auto-select based on CP / activation checkpointing.
         device_mesh: Pre-created device mesh forwarded when ``distributed_setup`` is not provided.
+        model_torch_dtype: Effective storage dtype passed to model construction
+            without changing the declarative model config.
     """
     with ScopedRNG(seed=seed, ranked=True):
         kwargs = {
@@ -233,6 +236,8 @@ def build_model(
             from nemo_automodel.components.quantization.qlora import create_bnb_config
 
             kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
+        if model_torch_dtype is not None:
+            kwargs["torch_dtype"] = model_torch_dtype
 
         is_nemo_auto_model = cfg_model.get("_target_", None) in (
             NeMoAutoModelForCausalLM.from_config,
@@ -254,7 +259,10 @@ def build_model(
             # We must convert config objects into runtime objects (model_wrapper,
             # autopipeline, parallelize_fn, etc.) via instantiate_infrastructure,
             # exactly as from_pretrained/from_config do internally.
-            model = cfg_model.instantiate()
+            if model_torch_dtype is None:
+                model = cfg_model.instantiate()
+            else:
+                model = cfg_model.instantiate(torch_dtype=model_torch_dtype)
 
             setup = distributed_setup or DistributedSetup(mesh_context=MeshContext())
             mesh = setup.mesh_context
@@ -570,12 +578,10 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             logging.info("Disabling rope_fusion because cp_size=%d > 1", self.mesh_context.cp_size)
             self.cfg.model.backend.rope_fusion = False
 
-        # Default storage dtype to fp32 for full-parameter torch.optim training so the
-        # parameters serve as the fp32 master copy (no-op for PEFT / TE FusedAdam /
-        # explicit model.torch_dtype). Must run before build_model.
-        resolve_storage_dtype(
-            self.cfg.get("model"),
-            self.cfg.get("optimizer"),
+        optimizer_config = self.cfg.optimizer
+        model_torch_dtype = resolve_storage_dtype(
+            self.cfg.model.get("torch_dtype", None),
+            uses_model_params_as_master_weights=optimizer_config.uses_model_params_as_master_weights(),
             is_peft=self.peft_config is not None,
             context="llm",
             logger=logger,
@@ -592,6 +598,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             distributed_setup=self.distributed_setup,
             cfg_qat=self.cfg.get("qat", None),
             sdpa_method=self.cfg.get("sdpa_method", None),
+            model_torch_dtype=model_torch_dtype,
         )
         self.embedding_row_repair_report = None
         embedding_row_repair = self.cfg.embedding_row_repair
@@ -599,8 +606,8 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             if isinstance(model, AutoPipeline):
                 raise ValueError("embedding_row_repair is not currently supported with pipeline parallelism")
             self.embedding_row_repair_report = embedding_row_repair.apply(model)
-        optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
-        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        optimizer = optimizer_config.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
+        allow_megatron_fsdp_sharding = getattr(optimizer_config, "supports_megatron_fsdp_sharding", True)
         self.optimizer = shard_optimizers_for_megatron_fsdp(
             model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
         )

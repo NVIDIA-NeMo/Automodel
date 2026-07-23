@@ -351,7 +351,8 @@ def _patch_pp_setup_minimals(monkeypatch, *, cp_size, stage0, dataloader_calls):
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
         property(
             lambda self: SimpleNamespace(
-                build=lambda *args, **kwargs: [SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None)]
+                build=lambda *args, **kwargs: [SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None)],
+                uses_model_params_as_master_weights=lambda: False,
             )
         ),
     )
