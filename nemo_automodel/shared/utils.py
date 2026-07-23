@@ -14,26 +14,6 @@
 import torch
 
 
-def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    """Return the underlying model beneath supported training wrappers.
-
-    DDP exposes its wrapped model as ``module`` while ``torch.compile`` uses
-    ``_orig_mod``. Training can nest those wrappers in either order, so callers
-    that inspect model capabilities must unwrap recursively.
-    """
-    seen: set[int] = set()
-    while id(model) not in seen:
-        seen.add(id(model))
-        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-            wrapped_model = model.module
-        else:
-            wrapped_model = getattr(model, "_orig_mod", None)
-        if not isinstance(wrapped_model, torch.nn.Module) or wrapped_model is model:
-            break
-        model = wrapped_model
-    return model
-
-
 def dtype_from_str(val, default=torch.bfloat16):
     """
     Translate a str val of a dtype into the corresponding torch.dtype

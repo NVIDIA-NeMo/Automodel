@@ -17,7 +17,6 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
-from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.recipes.retrieval import train_bi_encoder
@@ -26,9 +25,9 @@ from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     _configure_sentence_transformer_export,
     _get_autocast_ctx,
     _get_model_instantiate_kwargs,
+    _unwrap_model_for_attrs,
     _uses_multi_vector_scoring,
 )
-from nemo_automodel.shared.utils import unwrap_model
 
 
 class _RetrieverAttrs(torch.nn.Module):
@@ -38,16 +37,10 @@ class _RetrieverAttrs(torch.nn.Module):
     detach_distributed_inbatch_negatives = False
 
 
-class _DDPWrapper(DistributedDataParallel):
-    def __init__(self, module: torch.nn.Module):
-        torch.nn.Module.__init__(self)
-        self.module = module
-
-
-class _CompiledLikeWrapper(torch.nn.Module):
+class _DDPLikeWrapper(torch.nn.Module):
     def __init__(self, module: torch.nn.Module):
         super().__init__()
-        self._orig_mod = module
+        self.module = module
 
 
 class _DictLikeConfig(SimpleNamespace):
@@ -55,11 +48,11 @@ class _DictLikeConfig(SimpleNamespace):
         return getattr(self, key, default)
 
 
-def test_retrieval_attrs_unwrap_ddp_wrapper():
+def test_retrieval_attrs_unwrap_ddp_like_wrapper():
     inner = _RetrieverAttrs()
-    wrapped = _DDPWrapper(inner)
+    wrapped = _DDPLikeWrapper(inner)
 
-    attr_model = unwrap_model(wrapped)
+    attr_model = _unwrap_model_for_attrs(wrapped)
 
     assert attr_model is inner
     assert attr_model.l2_normalize is True
@@ -71,7 +64,7 @@ def test_retrieval_attrs_unwrap_ddp_wrapper():
 def test_retrieval_attrs_accept_unwrapped_model():
     inner = _RetrieverAttrs()
 
-    assert unwrap_model(inner) is inner
+    assert _unwrap_model_for_attrs(inner) is inner
     assert _uses_multi_vector_scoring(inner) is True
 
 
@@ -91,7 +84,7 @@ def test_configure_sentence_transformer_export_binds_exact_static_collator_promp
         use_dataset_instruction=False,
     )
 
-    wrapped = _CompiledLikeWrapper(_DDPWrapper(_Model()))
+    wrapped = _DDPLikeWrapper(_Model())
     _configure_sentence_transformer_export(wrapped, collator)
 
     assert captured == {"query_prompt": "query: ", "document_prompt": "passage: "}

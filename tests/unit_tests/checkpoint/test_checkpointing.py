@@ -69,7 +69,6 @@ from nemo_automodel.components.checkpoint.utils import (
     materialize_missing_tied_lm_head,
 )
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
-from nemo_automodel.shared.utils import unwrap_model
 
 
 def _make_ddp_wrapper(module: torch.nn.Module) -> DistributedDataParallel:
@@ -77,7 +76,6 @@ def _make_ddp_wrapper(module: torch.nn.Module) -> DistributedDataParallel:
     torch.nn.Module.__init__(wrapper)
     wrapper.module = module
     return wrapper
-
 
 CLOUD_PATH_MODEL = "msc://bucket/step-100/model"
 CLOUD_PATH_OPTIM = "msc://bucket/step-100/optim"
@@ -254,9 +252,7 @@ def test_original_model_path_uses_configured_repo_exact_cached_revision_and_cach
     inner_model = torch.nn.Module()
     inner_model.name_or_path = str(local_model_code)
     inner_model.config = SimpleNamespace(name_or_path="wrong/repo", _commit_hash="source-commit")
-    compiled_model = torch.nn.Module()
-    compiled_model._orig_mod = inner_model
-    distributed_model = _make_ddp_wrapper(compiled_model)
+    distributed_model = _make_ddp_wrapper(inner_model)
     model_state = SimpleNamespace(model=[distributed_model])
 
     with patch("huggingface_hub.snapshot_download") as mock_download:
@@ -306,9 +302,7 @@ def test_original_model_path_uses_unwrapped_model_name_when_repo_is_not_configur
     inner_model.name_or_path = str(source_dir)
     inner_model.config = SimpleNamespace()
     distributed_model = _make_ddp_wrapper(inner_model)
-    compiled_model = torch.nn.Module()
-    compiled_model._orig_mod = distributed_model
-    model_state = SimpleNamespace(model=[compiled_model])
+    model_state = SimpleNamespace(model=[distributed_model])
 
     assert checkpointer._get_original_model_path(model_state) == str(source_dir)
 
@@ -324,36 +318,19 @@ def test_original_model_path_prefers_actual_load_root_for_exact_revision(tmp_pat
     assert checkpointer._get_original_model_path(model_state) == str(exact_snapshot)
 
 
-def test_encoder_state_dict_adapter_is_used_through_ddp_and_compile_wrappers():
+def test_encoder_state_dict_adapter_is_used_through_ddp_wrapper():
     inner_model = torch.nn.Module()
     inner_model.state_dict_adapter = EncoderStateDictAdapter()
-    compiled_model = torch.nn.Module()
-    compiled_model._orig_mod = inner_model
-    wrapped_model = _make_ddp_wrapper(compiled_model)
+    wrapped_model = _make_ddp_wrapper(inner_model)
     value = torch.ones(2)
 
     exported = _maybe_adapt_state_dict_to_hf(
-        unwrap_model(wrapped_model),
+        wrapped_model,
         {"model.layers.0.weight": value},
     )
 
     assert set(exported) == {"layers.0.weight"}
     assert exported["layers.0.weight"] is value
-
-
-def test_unwrap_model_ignores_non_module_wrapper_attributes():
-    model = torch.nn.Module()
-    model.module = object()
-    model._orig_mod = object()
-
-    assert unwrap_model(model) is model
-
-
-def test_unwrap_model_preserves_regular_module_child():
-    model = torch.nn.Module()
-    model.module = torch.nn.Linear(2, 2)
-
-    assert unwrap_model(model) is model
 
 
 def test_generated_metadata_path_preserves_local_custom_model_code_reference(tmp_path):

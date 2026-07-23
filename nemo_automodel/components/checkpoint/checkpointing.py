@@ -45,6 +45,7 @@ from safetensors.torch import load_file, save_file
 from safetensors.torch import save as safetensors_save
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
@@ -78,7 +79,6 @@ from nemo_automodel.components.checkpoint.utils import (
     is_rank_0,
     materialize_missing_tied_lm_head,
 )
-from nemo_automodel.shared.utils import unwrap_model
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -109,6 +109,13 @@ logger = logging.getLogger(__name__)
 # `grep -n nemotron-singlegpu-lora` finds every affected site.
 
 
+def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
+    """Return the module that owns model metadata hidden by DDP."""
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
+
+
 def _normalize_dtype_mapping_to_state_dict_keys(
     fqn_to_dtype_mapping: dict[str, str], state_dict_keys: list[str], base_model_prefix: str | None = None
 ) -> dict[str, str]:
@@ -136,7 +143,7 @@ def _apply_adapter_forced_dtype_mapping(
     fqn_to_dtype_mapping: dict[str, str],
 ) -> dict[str, str]:
     """Let model adapters override original HF dtype metadata for export-only keys."""
-    model = unwrap_model(model)
+    model = _unwrap_ddp_model(model)
     adapter = getattr(model, "state_dict_adapter", None)
     forced_dtype_mapping = getattr(adapter, "forced_hf_dtype_mapping", None)
     if not callable(forced_dtype_mapping):
@@ -540,7 +547,7 @@ class Checkpointer:
 
         # Convert to HF format if using custom model implementations.
         state_dict = _maybe_adapt_state_dict_to_hf(
-            unwrap_model(model_state.model[0]),
+            model_state.model[0],
             state_dict,
             quantization=False,
             device_mesh=self.moe_mesh,
@@ -687,7 +694,7 @@ class Checkpointer:
 
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
         model_type = getattr(getattr(model_state.model[0], "config", None), "model_type", None)
-        has_state_dict_adapter = hasattr(unwrap_model(model_state.model[0]), "state_dict_adapter")
+        has_state_dict_adapter = hasattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter")
 
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
@@ -909,7 +916,7 @@ class Checkpointer:
         # them), so they are absent from the returned state_dict but ARE loaded. The adapter
         # tracks them (reset + populated entirely inside from_hf); count them as loaded for the
         # diff to avoid false "missing" warnings while genuinely unloaded params are still flagged.
-        _adapter = getattr(unwrap_model(model_state.model[0]), "state_dict_adapter", None)
+        _adapter = getattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter", None)
         loaded_keys_for_diff |= getattr(_adapter, "view_loaded_native_keys", None) or set()
         if allow_checkpoint_key_subset:
             # Keys deliberately kept at init were already warned about above; keep
@@ -1400,7 +1407,7 @@ fi
         """
         if not _should_write_hf_metadata(self.config):
             return None
-        model = unwrap_model(model_state.model[0])
+        model = _unwrap_ddp_model(model_state.model[0])
         # we first need to find the FQN -> .safetensors mapping
         reference_path = self._get_original_model_path(model_state)
         if reference_path:
@@ -1493,7 +1500,7 @@ fi
         if not reference_path:
             return None
 
-        model = unwrap_model(model_state.model[0])
+        model = _unwrap_ddp_model(model_state.model[0])
         dtype_mapping = get_fqn_to_dtype_mapping(reference_path, getattr(model, "_checkpoint_conversion_mapping", None))
         if not dtype_mapping:
             return None
@@ -1595,7 +1602,7 @@ fi
             return self._original_model_path
 
         self._original_model_path_resolved = True
-        model_part = unwrap_model(model_state.model[0])
+        model_part = _unwrap_ddp_model(model_state.model[0])
         model_config = getattr(model_part, "config", None)
         source_model_path = getattr(model_part, "source_model_path", None)
         if source_model_path and os.path.isdir(str(source_model_path)):
@@ -1651,7 +1658,7 @@ fi
         original_model_path: str | None,
     ) -> str | None:
         """Return the existing model/code reference used by the generated-metadata path."""
-        model_part = unwrap_model(model_state.model[0])
+        model_part = _unwrap_ddp_model(model_state.model[0])
         model_reference = getattr(model_part, "name_or_path", None) or getattr(
             getattr(model_part, "config", None), "name_or_path", None
         )
@@ -2230,7 +2237,7 @@ def _maybe_adapt_state_dict_to_hf(
     """
     Custom models use state dict adapters to convert the state dict to the Hugging Face format.
     """
-    adapter = getattr(unwrap_model(model_part), "state_dict_adapter", None)
+    adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
     if adapter:
         return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
@@ -2453,7 +2460,7 @@ def _maybe_adapt_state_dict_from_hf(
     """
     Custom models use state dict adapters to convert the state dict from the Hugging Face format to the native format.
     """
-    adapter = getattr(unwrap_model(model_part), "state_dict_adapter", None)
+    adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
     if adapter:
         ep_mesh_dims = [dim for dim in moe_mesh.mesh_dim_names if dim != "pp"] if moe_mesh is not None else []
         ep_mesh = moe_mesh[tuple(ep_mesh_dims)] if ep_mesh_dims else moe_mesh

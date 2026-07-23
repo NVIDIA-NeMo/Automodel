@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint._backports.hf_utils import (
     FQN_TO_DTYPE_MAPPING_FILENAME,
@@ -27,7 +28,6 @@ from nemo_automodel.components.checkpoint._backports.hf_utils import (
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState
 from nemo_automodel.components.moe.state_dict_mixin import MoESplitExpertsStateDictMixin
-from nemo_automodel.shared.utils import unwrap_model
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -41,6 +41,13 @@ def _is_group_rank_0(process_group: "ProcessGroup | None") -> bool:
 def _group_barrier(process_group: "ProcessGroup | None") -> None:
     if torch.distributed.is_initialized():
         torch.distributed.barrier(group=process_group)
+
+
+def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
+    """Return the module that owns export metadata hidden by DDP."""
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
 
 
 def _save_generated_hf_assets(
@@ -157,7 +164,7 @@ class ConsolidatedHFAddon:
         generated_metadata_path = kwargs.get("generated_metadata_path", original_model_path)
         process_group = kwargs.get("process_group")
 
-        export_model = unwrap_model(model_part)
+        export_model = _unwrap_ddp_model(model_part)
         get_metadata_exporter = getattr(export_model, "_get_consolidated_hf_metadata_exporter", None)
         metadata_exporter: _ConsolidatedHFMetadataExporter | None = (
             get_metadata_exporter() if callable(get_metadata_exporter) else None
@@ -252,7 +259,6 @@ class PeftAddon:
         peft_config = kwargs["peft_config"]
         original_model_path = kwargs["original_model_path"]
         generated_metadata_path = kwargs.get("generated_metadata_path", original_model_path)
-        process_group = kwargs.get("process_group")
         v4_compatible = kwargs.get("v4_compatible", False)
         process_group = kwargs.get("process_group")
         hf_peft_config = _get_hf_peft_config(peft_config, model_state, v4_compatible=v4_compatible)
