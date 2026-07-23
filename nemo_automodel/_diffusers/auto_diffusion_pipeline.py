@@ -479,7 +479,18 @@ def _apply_parallelization(
     pipe,
     parallel_scheme: Optional[Dict[str, Dict[str, Any]]],
 ) -> Dict[str, ParallelManager]:
-    """Apply FSDP2/DDP parallelization to pipeline components."""
+    """Apply FSDP2/DDP parallelization to pipeline components.
+
+    Each parallelized component is stamped with ``_pre_shard_hf_state_dict_keys``:
+    its state-dict keys captured just before sharding (after LoRA injection, QKV
+    fusion, and TransformerEngine swaps, which all run earlier in
+    ``from_pretrained``/``from_config``). The checkpointer reads this attribute to
+    reconstruct the consolidated safetensors key set — the same contract
+    ``_transformers/infrastructure.py`` provides for LLM/VLM models. For DDP the
+    attribute is set on the inner ``.module``, matching the LLM path: the wrapper's
+    state-dict keys gain a ``module.`` prefix, and DDP delegates attribute access
+    to the inner module.
+    """
     created_managers: Dict[str, ParallelManager] = {}
     if parallel_scheme is None:
         return created_managers
@@ -494,9 +505,15 @@ def _apply_parallelization(
         logger.info("[INFO] Applying parallelization to %s", comp_name)
         manager = _create_parallel_manager(manager_args)
         created_managers[comp_name] = manager
+        pre_shard_hf_state_dict_keys = list(comp_module.state_dict().keys())
         parallel_module = manager.parallelize(comp_module)
         if hasattr(manager, "maybe_compile"):
             manager.maybe_compile(parallel_module)
+        if isinstance(manager, DDPManager):
+            inner_module = getattr(parallel_module, "module", parallel_module)
+            setattr(inner_module, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
+        else:
+            setattr(parallel_module, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
         setattr(pipe, comp_name, parallel_module)
 
     return created_managers

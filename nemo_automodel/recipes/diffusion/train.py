@@ -742,8 +742,9 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         # Typed checkpoint config from the YAML ``checkpoint:`` block; model-derived
         # fields (model_repo_id, model_cache_dir, is_peft) are filled by RecipeConfig.
-        # The state-dict keys are runtime data (the model must exist first), so they
-        # are passed to build() rather than stored on the config.
+        # The checkpointer discovers the pre-shard state-dict keys via the
+        # `_pre_shard_hf_state_dict_keys` attribute stamped on the transformer in
+        # `_apply_parallelization` (_diffusers/auto_diffusion_pipeline.py).
         self.checkpoint_config = self.cfg.checkpoint
         self.restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.checkpointer = self.checkpoint_config.build(
@@ -751,7 +752,6 @@ class TrainDiffusionRecipe(BaseRecipe):
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
             moe_mesh=None,
-            model_state_dict_keys=list(self.model.state_dict().keys()),
         )
 
         dataloader_config = self.cfg.diffusion_dataloader

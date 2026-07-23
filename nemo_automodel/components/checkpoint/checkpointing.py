@@ -425,8 +425,6 @@ class Checkpointer:
         moe_mesh: Optional[DeviceMesh] = None,
         process_group: torch.distributed.ProcessGroup | None = None,
         pp_group: Optional["torch.distributed.ProcessGroup"] = None,
-        *,
-        model_state_dict_keys: list[str] | None = None,
     ) -> None:
         """
         Initialize the checkpointer.
@@ -441,12 +439,6 @@ class Checkpointer:
             pp_group: Optional pipeline-parallel process group. Passed to
                 ``ModelState`` so PEFT adapters are gathered across PP stages at
                 save time (complete adapter under ``pp_size > 1``).
-            model_state_dict_keys: Model state-dict keys captured before any
-                parallelization, for models that do not set
-                ``_pre_shard_hf_state_dict_keys`` (e.g. diffusion transformers).
-                Runtime data, so it is passed here rather than stored on the
-                config; takes precedence over the legacy
-                ``config.model_state_dict_keys`` field.
         """
         self.config = config
         self.moe_mesh = moe_mesh
@@ -455,7 +447,6 @@ class Checkpointer:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.process_group = process_group
-        self._model_state_dict_keys = model_state_dict_keys
 
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
@@ -1404,9 +1395,7 @@ fi
             config = getattr(model_part, "config", None)
             model_type = getattr(config, "model_type", None)
             pre_shard_hf_state_dict_keys = (
-                getattr(model, "_pre_shard_hf_state_dict_keys", None)
-                or self._model_state_dict_keys
-                or self.config.model_state_dict_keys
+                getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
             )
             if pre_shard_hf_state_dict_keys is None:
                 pre_shard_hf_state_dict_keys = list(state_dict.keys())
@@ -1418,7 +1407,9 @@ fi
                 # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
                 # however, HF initializes buffers with persistent=False, so we need to make sure these
                 # buffer keys are not saved during checkpointing
-                # The `_pre_shard_hf_state_dict_keys` attribute is set in the `apply_model_infrastructure` in auto_model.py
+                # The `_pre_shard_hf_state_dict_keys` attribute is set during parallelization: in
+                # `apply_model_infrastructure` (_transformers/infrastructure.py) for LLM/VLM models and in
+                # `_apply_parallelization` (_diffusers/auto_diffusion_pipeline.py) for diffusion pipelines.
                 keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(pre_shard_hf_state_dict_keys))
                 # Only drop lm_head from the save map when it is actually an alias
                 # of the embedding (e.g. single-rank tied case). PP last stages have
@@ -1430,7 +1421,7 @@ fi
         else:
             pre_shard_hf_state_dict_keys = getattr(model, "_pre_shard_hf_state_dict_keys", None)
             if pre_shard_hf_state_dict_keys is None:
-                pre_shard_hf_state_dict_keys = self._model_state_dict_keys or self.config.model_state_dict_keys
+                pre_shard_hf_state_dict_keys = self.config.model_state_dict_keys
             fallback_keys = pre_shard_hf_state_dict_keys or list(state_dict.keys())
             fqn_to_file_index_mapping = _divide_keys_by_size(
                 fallback_keys,

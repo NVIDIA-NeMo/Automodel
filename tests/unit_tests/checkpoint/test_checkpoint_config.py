@@ -208,8 +208,8 @@ def test_async_checkpointing_gate_uses_semantic_versioning(monkeypatch, version,
     assert cfg.is_async is expected
 
 
-class TestBuildModelStateDictKeys:
-    """CheckpointingConfig.build forwards runtime model_state_dict_keys to the Checkpointer."""
+class TestBuild:
+    """CheckpointingConfig.build constructs a Checkpointer and forwards runtime arguments."""
 
     def _build(self, **build_kwargs):
         cfg = CheckpointingConfig(
@@ -222,21 +222,15 @@ class TestBuildModelStateDictKeys:
         )
         return cfg.build(dp_rank=0, tp_rank=0, pp_rank=0, **build_kwargs)
 
-    def test_runtime_keys_take_precedence_over_legacy_config_field(self):
-        checkpointer = self._build(model_state_dict_keys=["transformer.w1", "transformer.w2"])
-
-        assert checkpointer._model_state_dict_keys == ["transformer.w1", "transformer.w2"]
-        assert checkpointer.config.model_state_dict_keys is None
-
-    def test_build_forwards_pp_group_and_runtime_keys(self):
-        pp_group = object()
-
-        checkpointer = self._build(pp_group=pp_group, model_state_dict_keys=["transformer.w1"])
-
-        assert checkpointer.pp_group is pp_group
-        assert checkpointer._model_state_dict_keys == ["transformer.w1"]
-
-    def test_build_defaults_to_no_runtime_keys(self):
+    def test_build_constructs_checkpointer_with_config_and_ranks(self):
         checkpointer = self._build()
 
-        assert checkpointer._model_state_dict_keys is None
+        assert checkpointer.config.model_repo_id == "org/model"
+        assert (checkpointer.dp_rank, checkpointer.tp_rank, checkpointer.pp_rank) == (0, 0, 0)
+
+    def test_build_forwards_pp_group(self):
+        pp_group = object()
+
+        checkpointer = self._build(pp_group=pp_group)
+
+        assert checkpointer.pp_group is pp_group

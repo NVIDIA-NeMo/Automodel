@@ -192,8 +192,6 @@ class CheckpointingConfig:
         moe_mesh: DeviceMesh | None = None,
         process_group: ProcessGroup | None = None,
         pp_group: ProcessGroup | None = None,
-        *,
-        model_state_dict_keys: list[str] | None = None,
     ) -> Checkpointer:
         """Build the :class:`Checkpointer` engine for this config.
 
@@ -210,12 +208,6 @@ class CheckpointingConfig:
             pp_group: Optional pipeline-parallel process group. Threaded to the
                 PEFT save path so adapter weights are gathered across PP stages
                 (required for complete adapters when ``pp_size > 1``).
-            model_state_dict_keys: Model state-dict keys captured before any
-                parallelization, for models that do not set
-                ``_pre_shard_hf_state_dict_keys``. Runtime data (the model must
-                be built first), so it is a build argument rather than a config
-                field; takes precedence over the legacy
-                ``model_state_dict_keys`` config field.
 
         Returns:
             Configured :class:`Checkpointer`.
@@ -230,7 +222,6 @@ class CheckpointingConfig:
             moe_mesh=moe_mesh,
             process_group=process_group,
             pp_group=pp_group,
-            model_state_dict_keys=model_state_dict_keys,
         )
 
 
