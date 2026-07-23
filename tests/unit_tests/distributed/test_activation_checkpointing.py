@@ -205,6 +205,36 @@ def test_submodule_checkpointing_wraps_linear_attn_mixer():
     assert ac.unwrap_checkpoint_wrapper(block.linear_attn) is inner
 
 
+def test_submodule_checkpointing_preserves_canonical_state_dict_keys_for_property_aliases():
+    class Mixer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._fp32_params = nn.Module()
+            self._fp32_params.A_log = nn.Parameter(torch.ones(2))
+
+    class AliasLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mixer = Mixer()
+
+        @property
+        def mlp(self):
+            return self.mixer
+
+        @property
+        def self_attn(self):
+            return self.mixer
+
+    layer = AliasLayer()
+
+    ac.apply_submodule_checkpointing([layer], has_kv_sharing=False)
+
+    assert isinstance(layer.mixer, CheckpointWrapper)
+    assert isinstance(ac.unwrap_checkpoint_wrapper(layer.mixer), Mixer)
+    assert [name for name, _ in layer.named_children()] == ["mixer"]
+    assert list(layer.state_dict()) == ["mixer._fp32_params.A_log"]
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="Backend-set divergence across checkpoint recompute requires fused CUDA SDPA backends",
