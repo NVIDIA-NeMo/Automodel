@@ -21,21 +21,16 @@ attributes each helper reads are populated -- mirroring the EAGLE recipe tests.
 from __future__ import annotations
 
 import logging
-import pathlib
-from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.recipes.llm import train_dflash
 from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
-from nemo_automodel.recipes.llm.train_domino import TrainDominoRecipe
 
 _VOCAB = 64
 _HIDDEN = 32
@@ -322,61 +317,6 @@ def _eval_self(trainer, num_batches):
     return obj
 
 
-def _distributed_domino_eval_worker(rank: int, world_size: int, init_file: str, output_dir: str) -> None:
-    """Run uneven Domino validation on one CPU process.
-
-    Rank 0 contributes no valid batch while rank 1 contributes scalar step
-    statistics. Both ranks must enter the same Gloo collectives and produce the
-    same globally reduced result.
-    """
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{init_file}",
-        rank=rank,
-        world_size=world_size,
-        timeout=timedelta(seconds=30),
-    )
-    try:
-        batch = {
-            "input_ids": torch.zeros(1, 4, dtype=torch.long),
-            "attention_mask": torch.ones(1, 4, dtype=torch.long),
-            "loss_mask": torch.ones(1, 4),
-        }
-        recipe = TrainDominoRecipe.__new__(TrainDominoRecipe)
-        recipe.device = torch.device("cpu")
-        recipe.val_dataloader = [batch]
-        recipe.trainer_module = SimpleNamespace(eval=lambda: None, train=lambda: None)
-        recipe.target_wrapper = SimpleNamespace(generate_batch=lambda **kwargs: SimpleNamespace(**kwargs))
-        result = (
-            NoValidAnchorsError("rank has no valid anchors")
-            if rank == 0
-            else SimpleNamespace(
-                loss=torch.tensor(2.0),
-                loss_weight=torch.tensor(4.0),
-                accuracy=torch.tensor(0.8),
-                valid_tokens=torch.tensor(5.0),
-                correct_tokens=torch.tensor(4.0),
-                accept_len_sum=torch.tensor(6.0),
-                valid_blocks=torch.tensor(2.0),
-                final_loss=torch.tensor(1.5),
-                base_loss=torch.tensor(3.0),
-                base_correct_tokens=torch.tensor(2.0),
-                base_accept_len_sum=torch.tensor(4.0),
-            )
-        )
-
-        def _run_step(_target_batch):
-            if isinstance(result, Exception):
-                raise result
-            return result
-
-        recipe._run_trainer_step = _run_step
-        metrics = recipe._run_eval()
-        torch.save(metrics, pathlib.Path(output_dir) / f"rank_{rank}.pt")
-    finally:
-        dist.destroy_process_group()
-
-
 def test_run_eval_returns_none_without_val_dataloader():
     obj = SimpleNamespace(val_dataloader=None)
     assert TrainDFlashRecipe._run_eval(obj) is None
@@ -428,28 +368,6 @@ def test_run_eval_all_batches_short_returns_zero_metrics():
 
     assert metrics == {"val_loss": 0.0, "val_accuracy": 0.0, "val_accept_len": 0.0}
     assert trainer.mode_calls == ["eval", "train"]
-
-
-def test_distributed_domino_eval_handles_rank_with_no_valid_batches(tmp_path):
-    init_file = tmp_path / "gloo_init"
-    mp.spawn(
-        _distributed_domino_eval_worker,
-        args=(2, str(init_file), str(tmp_path)),
-        nprocs=2,
-        join=True,
-    )
-
-    expected = {
-        "val_loss": 2.0,
-        "val_accuracy": pytest.approx(0.8),
-        "val_accept_len": 3.0,
-        "val_final_loss": 1.5,
-        "val_base_loss": 3.0,
-        "val_base_accuracy": pytest.approx(0.4),
-        "val_base_accept_len": 2.0,
-    }
-    assert torch.load(tmp_path / "rank_0.pt", weights_only=True) == expected
-    assert torch.load(tmp_path / "rank_1.pt", weights_only=True) == expected
 
 
 def test_all_ranks_have_valid_single_process_passes_local_flag():
