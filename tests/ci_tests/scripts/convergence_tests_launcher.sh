@@ -106,6 +106,10 @@ fi
 echo "[convergence] Setting up lm-evaluation-harness..."
 export HOME=/root
 export PATH="/root/.local/bin:$PATH"
+# Allow Hub access for eval: lm-eval fetches the IFEval dataset (google/IFEval), which the CI's
+# HF cache does not pre-warm, so the default offline mode raises OfflineModeIsEnabled.
+export HF_HUB_OFFLINE=0
+export HF_DATASETS_OFFLINE=0
 command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
 bash examples/convergence/tulu3/eval/setup_lm_eval.sh /opt/lm-evaluation-harness
 uv pip uninstall --python /opt/lm-evaluation-harness/.venv/bin/python torchcodec || true

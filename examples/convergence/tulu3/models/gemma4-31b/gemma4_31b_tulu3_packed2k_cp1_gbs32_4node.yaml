@@ -116,16 +116,12 @@ wandb:
 # Passes iff |CI IFEval prompt_level_strict_acc - baseline| < k * stderr. baseline/stderr
 # measured (see README.md). `tokenizer: checkpoint` -> eval uses the trained checkpoint's
 # tokenizer (it carries the chat_template.jinja).
-# allow_failure while the gemma4 path is validated end to end. google/gemma-4-31B (base) ships
-# no chat template; it is now supplied via dataset.chat_template (applied to the processor by the
-# VLM loader) instead of being staged on the model dir. Keep allow_failure until a green run
-# confirms train + eval (tokenizer: checkpoint carries the template) + gate, then flip to blocking
-# like moonlight/qwen.
+# google/gemma-4-31B (base) ships no chat template; it is supplied via dataset.chat_template
+# (applied to the processor by the VLM loader), so no manual staging onto the model dir is needed.
 ci:
   recipe_owner: athitten
   nodes: 4
   time: "02:00:00"                     # full 1000-step train (4 nodes) + IFEval
-  allow_failure: true
   convergence:
     step_scheduler.max_steps: 1000
   downstream_eval:

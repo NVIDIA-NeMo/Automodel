@@ -106,10 +106,7 @@ instruction-level aggregation).
 This recipe's `ci.downstream_eval` block registers it in the weekly convergence flow
 (`tests/ci_tests/configs/convergence/convergence_recipes.yml`): train 1000 steps → IFEval → **pass iff
 `|prompt_level_strict_acc − 0.5287| < 2·0.0215`** (band `[0.486, 0.572]`). The base ships no chat
-template; the recipe supplies the `-it` template via `dataset.chat_template`. Kept `allow_failure`
-until a green run verifies train + eval (`tokenizer: checkpoint` carries the template) + gate, then
-flip to blocking like moonlight/qwen.
-
+template; the recipe supplies the `-it` template via `dataset.chat_template`.
 ## Gotchas
 
 - **Base ships no chat template** → the recipe supplies the `-it` template via
