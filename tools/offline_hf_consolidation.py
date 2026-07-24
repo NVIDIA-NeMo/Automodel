@@ -158,7 +158,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional dtype for floating-point tensors in the consolidated checkpoint. "
             "Supported aliases include bf16, bfloat16, fp16, float16, fp32, and float32. "
-            "Integer tensors keep their original dtype."
+            "Tensors marked as intrinsically fp32 by model export metadata remain fp32; "
+            "FP8 and non-floating tensors keep their original dtype."
         ),
     )
     return parser.parse_args()

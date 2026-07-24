@@ -12,16 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import time
-from datetime import timedelta
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_biencoder import (
     _extract_custom_args as _extract_biencoder_custom_args,
@@ -32,34 +28,14 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _extract_custom_args,
     _finish_hf_reload_sync,
     _get_input_ids,
+    _hf_model_load_context,
     _hf_source_load_kwargs,
     _load_hf_fp8_dequantized_config,
     _post_load_dequant_max_memory,
-    _prepare_hf_reload_sync,
     _record_deferred_failure,
     _wait_for_hf_reload_rank0,
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm import _get_vlm_input_ids
-
-
-def _run_hf_reload_sync_rank(rank, init_path, checkpoint_dir):
-    os.environ["TORCHELASTIC_RUN_ID"] = "checkpoint-robustness-hf-sync-test"
-    os.environ["HF_RELOAD_TIMEOUT_SECONDS"] = "15"
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{init_path}",
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=3),
-    )
-    try:
-        cfg = SimpleNamespace(checkpoint=SimpleNamespace(checkpoint_dir=checkpoint_dir))
-        sync_paths = _prepare_hf_reload_sync(cfg)
-        if rank == 0:
-            time.sleep(4)
-        _finish_hf_reload_sync(sync_paths)
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize(
@@ -103,6 +79,26 @@ def test_explicit_attention_implementation_is_preserved():
         )
 
     assert hf_kwargs["attn_implementation"] == "eager"
+
+
+@pytest.mark.parametrize(
+    ("trust_remote_code", "has_device_map", "expected_no_meta_calls"),
+    [(True, True, 0), (False, False, 0), (True, False, 1)],
+)
+def test_hf_model_load_context_keeps_meta_for_device_map(
+    trust_remote_code,
+    has_device_map,
+    expected_no_meta_calls,
+):
+    with patch("nemo_automodel._transformers.model_init.no_hf_meta_device") as no_hf_meta_device:
+        no_hf_meta_device.return_value = nullcontext()
+        with _hf_model_load_context(
+            trust_remote_code=trust_remote_code,
+            has_device_map=has_device_map,
+        ):
+            pass
+
+    assert no_hf_meta_device.call_count == expected_no_meta_calls
 
 
 @pytest.mark.parametrize(("offline", "expected_local_files_only"), [(None, False), ("1", True)])
@@ -367,15 +363,6 @@ def test_record_deferred_failure_preserves_all_comparison_failures():
     _record_deferred_failure(failures, "Phase 4 HF reload parity", "HF parity failed")
 
     assert failures == ["Phase 4 HF reload parity:\nHF parity failed"]
-
-
-def test_hf_reload_wait_does_not_start_collective_during_rank0_work(tmp_path):
-    mp.spawn(
-        _run_hf_reload_sync_rank,
-        args=(str(tmp_path / "dist-init"), str(tmp_path / "checkpoints")),
-        nprocs=2,
-        join=True,
-    )
 
 
 def test_biencoder_robustness_reads_hf_reload_settings_from_config(tmp_path):

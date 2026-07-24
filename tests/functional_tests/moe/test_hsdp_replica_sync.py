@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Numerical regression test for MoE HSDP replica gradient synchronization.
+"""Scheduled numerical regression test for MoE HSDP replica gradient synchronization.
 
 Four Gloo ranks form a logical ``dp_replicate=2 x dp_shard=2`` mesh while
 ``ep_size=2`` keeps the MoE parallelization path active. Rank-specific inputs

@@ -57,7 +57,11 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     is_cloud_path,
     save_config,
 )
-from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, _get_lm_head_weight_and_name
+from nemo_automodel.components.checkpoint.stateful_wrappers import (
+    ModelState,
+    OptimizerState,
+    _get_lm_head_weight_and_name,
+)
 from nemo_automodel.components.checkpoint.utils import (
     has_local_tied_lm_head,
     materialize_missing_tied_lm_head,
@@ -621,6 +625,45 @@ def test_original_dtype_mapping_applies_adapter_forced_dtypes(tmp_path):
     }
 
 
+def test_original_dtype_mapping_applies_adapter_forced_dtypes_without_hf_reference(tmp_path):
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="safetensors",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="",
+        save_consolidated=False,
+        is_peft=False,
+    )
+
+    class Adapter:
+        def forced_hf_dtype_mapping(self, state_dict):
+            assert set(state_dict) == {
+                "backbone.layers.0.mixer.A_log",
+                "backbone.layers.0.mixer.in_proj.weight",
+            }
+            return {
+                "backbone.layers.0.mixer.A_log": "F32",
+                "absent.weight": "F32",
+            }
+
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+    model_state = SimpleNamespace(model=[SimpleNamespace(state_dict_adapter=Adapter())])
+    state_dict = {
+        "backbone.layers.0.mixer.A_log": torch.ones(1, dtype=torch.float32),
+        "backbone.layers.0.mixer.in_proj.weight": torch.ones(1, dtype=torch.float32),
+    }
+
+    with patch(
+        "nemo_automodel.components.checkpoint.checkpointing._get_hf_safetensors_reference_path",
+        return_value=None,
+    ):
+        dtype_mapping = checkpointer._maybe_build_original_dtype_mapping(model_state, state_dict)
+
+    assert dtype_mapping == {"backbone.layers.0.mixer.A_log": "F32"}
+
+
 def test_summarize_state_dict_key_diff_reports_missing_and_unexpected():
     summary = _summarize_state_dict_key_diff(
         {"a.weight", "b.bias", "c.weight"},
@@ -782,6 +825,39 @@ def test_model_state_refreshes_tied_lm_head_before_dropping_key():
     assert model_state.has_local_tied_lm_head is True
     assert "lm_head.weight" not in saved_state_dict
     assert "model.embed_tokens.weight" in saved_state_dict
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_model_state_passes_cpu_offload_to_dcp(cpu_offload):
+    model = torch.nn.Linear(2, 2)
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_model_state_dict",
+        return_value={"weight": model.weight},
+    ) as get_state_dict:
+        ModelState(model, cpu_offload=cpu_offload).state_dict()
+
+    options = get_state_dict.call_args.kwargs["options"]
+    if cpu_offload:
+        assert options.cpu_offload is True
+    else:
+        assert options is None
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_optimizer_state_passes_cpu_offload_to_dcp(cpu_offload):
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.Adam(model.parameters())
+
+    with patch(
+        "nemo_automodel.components.checkpoint.stateful_wrappers.get_optimizer_state_dict",
+        return_value={},
+    ) as get_state_dict:
+        OptimizerState(model, optimizer, cpu_offload=cpu_offload).state_dict()
+
+    options = get_state_dict.call_args.kwargs["options"]
+    assert options.cpu_offload is cpu_offload
+    assert options.flatten_optimizer_state_dict is True
 
 
 def test_materialize_missing_tied_lm_head_uses_embedding_tensor_from_checkpoint():

@@ -488,6 +488,25 @@ def packed_sequence_thd_collater(batch):
     }
 
 
+def packed_sequence_thd_collater_vlm(examples, processor=None, **kwargs):
+    """THD collater adapter for the VLM recipe's ``(examples, processor)`` call convention.
+
+    ``recipes/vlm/finetune.py:build_dataloader`` invokes the configured collate as
+    ``collate_cfg.instantiate(examples=examples, processor=processor)``, whereas
+    :func:`packed_sequence_thd_collater` takes only ``batch``. This thin adapter accepts
+    (and ignores) ``processor`` and any extra kwargs so pre-tokenized ``ChatDataset``
+    samples can use THD / context-parallel batching inside the VLM recipe.
+
+    Args:
+        examples: Batch of samples, forwarded to :func:`packed_sequence_thd_collater`.
+        processor: Unused; accepted only for VLM-recipe call-convention compatibility.
+
+    Returns:
+        dict: THD-format batch (see :func:`packed_sequence_thd_collater`).
+    """
+    return packed_sequence_thd_collater(examples)
+
+
 def _indexed_mask_to_4d_block_causal(attention_mask: torch.Tensor) -> torch.Tensor:
     """Convert an indexed attention mask to a 4D block-causal mask.
 
@@ -527,7 +546,8 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     Stacks ``input_ids``, ``labels``, ``position_ids`` and converts the
     indexed ``attention_mask`` to the format required by the attention backend.
 
-    For ``flash_attention_2``: keeps the indexed 2D mask ``[B, S]``.
+    For flash attention (``flash_attention_2`` / ``flash_attention_3`` /
+    ``flash_attention_4``): keeps the indexed 2D mask ``[B, S]``.
     For ``sdpa`` / ``eager``: converts to a 4D block-causal float mask.
 
     Args:
@@ -546,7 +566,7 @@ def neat_packed_collater(batch: list[dict], attn_implementation: str = "sdpa") -
     position_ids = batchify(torch.stack([torch.as_tensor(x["position_ids"]) for x in batch]))
     attention_mask = batchify(torch.stack([torch.as_tensor(x["attention_mask"]) for x in batch]))
 
-    if attn_implementation == "flash_attention_2":
+    if attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
         mask_out = attention_mask
     else:
         mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
