@@ -22,6 +22,7 @@ import torch
 from nemo_automodel.components.loss.dllm_loss import (
     BlockDiffusionCrossEntropyLoss,
     DFlashDecayLoss,
+    IDLMLoss,
     MDLMCrossEntropyLoss,
 )
 from nemo_automodel.recipes.dllm.strategy import (
@@ -29,6 +30,7 @@ from nemo_automodel.recipes.dllm.strategy import (
     BlockDiffusionStrategy,
     DFlashStrategy,
     HybridStrategy,
+    IDLMStrategy,
     MDLMStrategy,
     _build_target_layer_ids,
     get_dllm_strategy,
@@ -267,6 +269,66 @@ class TestHybridStrategy:
         assert result["skip_loss"] is True
         assert "attention_mask" not in result
         assert "use_cache" not in result
+
+
+# ---------------------------------------------------------------------------
+# IDLMStrategy tests
+# ---------------------------------------------------------------------------
+
+
+class TestIDLMStrategy:
+    @pytest.fixture
+    def strategy(self):
+        return IDLMStrategy()
+
+    def test_resolves_from_registry(self):
+        assert isinstance(get_dllm_strategy("idlm"), IDLMStrategy)
+
+    def test_create_loss_fn_reads_clean_weight(self, strategy):
+        assert strategy.create_loss_fn({"clean_loss_weight": 0.3}).clean_loss_weight == 0.3
+        assert strategy.create_loss_fn({}).clean_loss_weight == 0.2  # paper default
+        assert isinstance(strategy.create_loss_fn({}), IDLMLoss)
+        assert strategy.create_loss_fn({"auto_balance_clean_loss": True}).auto_balance is True
+
+    def test_create_loss_fn_captures_block_length(self, strategy):
+        strategy.create_loss_fn({"block_length": 3})
+        assert strategy.block_size == 3
+        strategy.create_loss_fn({})
+        assert strategy.block_size == 1  # b1 default
+
+    def test_setup_extra_validates_mask_token_id(self, strategy):
+        recipe = types.SimpleNamespace(
+            distributed_config=types.SimpleNamespace(cp_size=1),
+            model_parts=[
+                types.SimpleNamespace(config=types.SimpleNamespace(_attn_implementation="sdpa", vocab_size=1000))
+            ],
+            mask_token_id=None,
+        )
+        with pytest.raises(ValueError, match="mask_token_id"):
+            strategy.setup_extra(recipe)
+        recipe.mask_token_id = 1000  # == vocab_size, out of range
+        with pytest.raises(ValueError, match="outside the model vocab"):
+            strategy.setup_extra(recipe)
+        recipe.mask_token_id = 999
+        strategy.setup_extra(recipe)
+
+    def test_apply_corruption_masks_all_supervised(self, strategy):
+        input_ids = torch.randint(0, 100, (2, 16))
+        loss_mask = torch.zeros(2, 16, dtype=torch.long)
+        loss_mask[:, 8:] = 1  # supervised region = response
+        noisy, noise_mask, _ = strategy.apply_corruption(
+            input_ids,
+            loss_mask,
+            mask_token_id=999,
+            eps=0.0,
+            block_size=None,
+            half_life_ratio=None,
+            generator=torch.Generator(),  # accepted (recipe passes it) though corruption is deterministic
+        )
+        # All-masked: every supervised position masked, prompt untouched.
+        assert torch.equal(noise_mask, loss_mask.bool())
+        assert (noisy[:, 8:] == 999).all()
+        assert (noisy[:, :8] == input_ids[:, :8]).all()
 
 
 # ---------------------------------------------------------------------------
