@@ -114,15 +114,9 @@ class Block(nn.Module):
         )
         x = x + attn_out
 
-        mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
+        mlp_out = self.mlp(self.post_attention_layernorm(x), padding_mask=padding_mask)
         x = x + mlp_out
         return x
-
-    def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
-            return self.mlp(x)
-        assert isinstance(self.mlp, MoE)
-        return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device) -> None:
         for norm in (self.input_layernorm, self.post_attention_layernorm):
@@ -259,8 +253,7 @@ class BailingMoeV2Model(nn.Module):
         """No-op for SFT; published Ling checkpoints freeze the expert_bias buffer."""
         with torch.no_grad():
             for _, block in self.layers.named_children():
-                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
-                    block.mlp.gate.update_bias()
+                block.mlp.update_gate_bias()
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -444,8 +437,7 @@ class BailingMoeV2ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin)
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for _, block in self.model.layers.named_children():
-                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
-                    block.mlp.gate.update_bias()
+                block.mlp.update_gate_bias()
 
     @torch.no_grad()
     def initialize_weights(

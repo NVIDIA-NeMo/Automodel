@@ -106,20 +106,18 @@ class Block(nn.Module):
             )
         x = x + attn_out
 
-        mlp_out = self._mlp(x=self.post_attention_layernorm(x), padding_mask=padding_mask)
-        x = x + mlp_out
-        return x
-
-    def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
+        mlp_input = self.post_attention_layernorm(x)
         # ``self.mlp`` may be wrapped by activation checkpointing (submodule-level
         # AC), so inspect the underlying module to pick the dense (no padding_mask)
         # vs MoE (padding_mask) call signature, but invoke the wrapped module.
         mlp = unwrap_checkpoint_wrapper(self.mlp)
         if isinstance(mlp, MLP):
-            return self.mlp(x)
+            mlp_out = self.mlp(mlp_input)
         else:
             assert isinstance(mlp, MoE)
-            return self.mlp(x, padding_mask)
+            mlp_out = self.mlp(mlp_input, padding_mask)
+        x = x + mlp_out
+        return x
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):

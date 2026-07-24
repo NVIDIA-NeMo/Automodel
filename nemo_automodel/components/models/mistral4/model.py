@@ -44,7 +44,6 @@ from nemo_automodel.components.models.mistral4.state_dict_adapter import (
 )
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
-from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -281,8 +280,7 @@ class Mistral4Model(nn.Module):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for _, block in self.layers.named_children():
-                if isinstance(block.mlp, MoE):
-                    block.mlp.gate.update_bias()
+                block.mlp.update_gate_bias()
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -425,8 +423,7 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for _, block in self.model.layers.named_children():
-                if isinstance(block.mlp, MoE):
-                    block.mlp.gate.update_bias()
+                block.mlp.update_gate_bias()
 
     @torch.no_grad()
     def initialize_weights(
@@ -865,8 +862,7 @@ if _HF_MISTRAL3_AVAILABLE:
         def update_moe_gate_bias(self) -> None:
             with torch.no_grad():
                 for _, block in self.model.language_model.layers.named_children():
-                    if isinstance(block.mlp, MoE):
-                        block.mlp.gate.update_bias()
+                    block.mlp.update_gate_bias()
 
         @torch.no_grad()
         def initialize_weights(

@@ -97,16 +97,20 @@ class MLP(nn.Module):
             linear_impl=backend, in_features=inter_dim, out_features=dim, bias=bias, dtype=dtype
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the MLP layer.
+    def forward(self, x: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Run the dense feed-forward layer.
 
         Args:
-            x (torch.Tensor): Input tensor.
+            x: Tensor of shape [..., hidden].
+            padding_mask: Optional boolean tensor marking padded tokens. Dense
+                MLPs do not route tokens, so the mask is intentionally ignored;
+                accepting it keeps the feed-forward call contract shared with
+                :class:`MoE`.
 
         Returns:
-            torch.Tensor: Output tensor after MLP computation.
+            Tensor of shape [..., hidden].
         """
+        del padding_mask
         if not self.is_gated:
             return self.down_proj(F.relu(self.up_proj(x)).pow(2))
         if self.swiglu_limit > 0.0:
@@ -121,6 +125,14 @@ class MLP(nn.Module):
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
         self.apply(init_weights_fn)
+
+    def update_gate_bias(self) -> None:
+        """Keep the shared feed-forward gate-update contract as a dense no-op."""
+        return None
+
+    def reset_gate_correction_bias(self, buffer_device: torch.device) -> None:
+        """Keep the shared feed-forward initialization contract as a dense no-op."""
+        del buffer_device
 
 
 class FakeBalancedGate(nn.Module):
@@ -759,6 +771,19 @@ class MoE(nn.Module):
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
         self.apply(init_weights_fn)
+
+    def update_gate_bias(self) -> None:
+        """Update the router correction bias when bias-based balancing is enabled."""
+        if self.gate.bias_update_factor > 0:
+            self.gate.update_bias()
+
+    def reset_gate_correction_bias(self, buffer_device: torch.device) -> None:
+        """Reset the router correction bias in fp32 on the initialization device."""
+        self.gate.e_score_correction_bias = torch.zeros(
+            self.gate.n_experts,
+            dtype=torch.float32,
+            device=buffer_device,
+        )
 
 
 def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):

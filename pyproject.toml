@@ -215,7 +215,9 @@ docs = [
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
 linting = [
+    "diff-cover~=9.2.0",
     "pre-commit>=4.2.0",
+    "pylint~=4.0",
     "ruff~=0.9.0",
     "import-linter~=2.4",
     "ty>=0.0.20",
