@@ -60,7 +60,7 @@ apply_qwen3_omni_config_patch()
 
 import nemo_automodel.components.checkpoint.utils as checkpoint_utils
 import nemo_automodel.components.distributed.utils as dist_utils
-from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel._transformers.registry import ModelRegistry, resolve_custom_config_cls
 from nemo_automodel.components.distributed.init_utils import get_local_world_size_preinit, get_world_size_safe
 from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     has_gated_delta_net_fp32_checkpoint_contract,
@@ -246,6 +246,31 @@ def _resolve_custom_model_cls_for_config(config):
     return ModelRegistry.resolve_custom_model_cls(arch_name, config)
 
 
+def _load_registered_custom_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
+    """Load a config through Automodel's registry before falling back to HF AutoConfig."""
+    config_kwargs = kwargs.copy()
+    config_kwargs["_from_auto"] = True
+    config_kwargs["name_or_path"] = pretrained_model_name_or_path
+    config_kwargs.pop("code_revision", None)
+
+    try:
+        config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **config_kwargs)
+    except Exception:
+        logger.debug("Could not pre-read config for %s", pretrained_model_name_or_path, exc_info=True)
+        return None
+
+    model_type = config_dict.get("model_type")
+    if not isinstance(model_type, str):
+        return None
+
+    config_cls = resolve_custom_config_cls(model_type)
+    if config_cls is None:
+        return None
+
+    unused_kwargs.setdefault("attn_implementation", attn_implementation)
+    return config_cls.from_dict(config_dict, **unused_kwargs)
+
+
 def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
     """
     Get the HF config for the model.
@@ -271,6 +296,8 @@ def get_hf_config(pretrained_model_name_or_path, attn_implementation, **kwargs):
         # with incomplete dicts, losing all other fields. These nested overrides are
         # instead handled by _consume_config_overrides which deep-merges them.
         nested_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if isinstance(kwargs[k], dict)}  # noqa: F841
+        hf_config = _load_registered_custom_config(pretrained_model_name_or_path, attn_implementation, **kwargs)
+    if hf_config is None:
         try:
             hf_config = AutoConfig.from_pretrained(
                 pretrained_model_name_or_path,
