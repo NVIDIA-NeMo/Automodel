@@ -557,6 +557,7 @@ _LLAMA_TASKS = {
 }
 _MISTRAL3_BIDIREC_TASKS = {
     "embedding": "Mistral3BidirectionalModel",
+    "score": "Mistral3VLBidirectionalForSequenceClassification",
 }
 _MINISTRAL3_BIDIREC_TASKS = {
     "embedding": "Ministral3BidirectionalModel",

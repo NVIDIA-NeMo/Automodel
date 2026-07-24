@@ -1917,6 +1917,10 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
 
 def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
     """Extract transformer layers grouped by model role."""
+    layer_group_root = getattr(model, "_nemo_layer_group_root", None)
+    if isinstance(layer_group_root, nn.Module) and layer_group_root is not model:
+        return _extract_model_layer_groups(layer_group_root)
+
     model_cls = type(model)
     if model_cls.__name__ in {"BiEncoderModel", "CrossEncoderModel", "FSDPBiEncoderModel"}:
         inner_model = getattr(model, "model", None)

@@ -14,14 +14,20 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from transformers import AutoConfig, AutoModel
+import torch.nn as nn
+from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification
+from transformers import initialization as init
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_bidirectional_mask
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.models.ministral3.configuration_ministral3 import Ministral3Config
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Model
 from transformers.models.mistral3.configuration_mistral3 import Mistral3Config
-from transformers.models.mistral3.modeling_mistral3 import Mistral3Model, Mistral3MultiModalProjector
+from transformers.models.mistral3.modeling_mistral3 import (
+    Mistral3Model,
+    Mistral3MultiModalProjector,
+    Mistral3PreTrainedModel,
+)
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
@@ -153,15 +159,22 @@ class Mistral3BidirectionalConfig(Mistral3Config):
             else:
                 self.text_config.pooling = value
 
-    def __init__(self, **kwargs):
+    def __init__(self, pooling: str = "avg", temperature: float = 1.0, **kwargs) -> None:
         super().__init__(**kwargs)
-        self.pooling = kwargs.get("pooling", "avg")
+        self.pooling = pooling
+        self.temperature = temperature
 
     def __post_init__(self, **kwargs):
         if self.text_config is not None:
             if isinstance(self.text_config, dict):
                 self.text_config = Ministral3BidirectionalConfig(**self.text_config)
         super().__post_init__(**kwargs)
+
+    def to_dict(self):
+        config_dict = super().to_dict()
+        config_dict.pop("_pooling", None)
+        config_dict["pooling"] = self.pooling
+        return config_dict
 
 
 class Mistral3BidirectionalModel(Mistral3Model):
@@ -192,7 +205,7 @@ class Mistral3BidirectionalModel(Mistral3Model):
             )
 
         config_dict = self.config.to_dict()
-        config_dict["pooling"] = config_dict.pop("_pooling", "avg")
+        config_dict["pooling"] = config_dict.pop("_pooling", config_dict.get("pooling", "avg"))
         config_dict.pop("model_type", None)
         config_dict.pop("auto_map", None)
         config_dict.pop("task_instructions", None)
@@ -346,8 +359,176 @@ class Mistral3BidirectionalModel(Mistral3Model):
         )
 
 
+def pool(
+    last_hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    pool_type: str,
+) -> torch.Tensor:
+    """Pool token hidden states into one representation per input sequence.
+
+    Args:
+        last_hidden_states: Tensor of shape [batch, sequence, hidden].
+        attention_mask: Tensor of shape [batch, sequence].
+        pool_type: Pooling strategy. Supported values are ``"avg"``, ``"cls"``,
+            and ``"last"``.
+
+    Returns:
+        Tensor of shape [batch, hidden].
+    """
+    masked_hidden_states = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
+
+    if pool_type == "avg":
+        return masked_hidden_states.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
+    if pool_type == "cls":
+        return masked_hidden_states[:, 0]
+    if pool_type == "last":
+        if attention_mask[:, -1].all():
+            return masked_hidden_states[:, -1]
+        sequence_lengths = attention_mask.sum(dim=1) - 1
+        batch_indices = torch.arange(masked_hidden_states.shape[0], device=masked_hidden_states.device)
+        return masked_hidden_states[batch_indices, sequence_lengths]
+    raise ValueError(f"Unsupported pooling strategy: {pool_type!r}. Expected 'avg', 'cls', or 'last'.")
+
+
+class Mistral3VLBidirectionalForSequenceClassification(Mistral3PreTrainedModel):
+    """Bidirectional Mistral3 VLM with a sequence-scoring head."""
+
+    config_class = Mistral3BidirectionalConfig
+    base_model_prefix = "model"
+
+    @dataclass(frozen=True)
+    class ModelCapabilities:
+        """Declared parallelism capabilities for this model class."""
+
+        supports_tp: bool = False
+        supports_cp: bool = False
+        supports_pp: bool = False
+        supports_ep: bool = False
+
+    def __init__(self, config: Mistral3BidirectionalConfig) -> None:
+        """Initialize the full vision-language cross-encoder.
+
+        Args:
+            config: Mistral3 vision-language configuration.
+        """
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.model = Mistral3BidirectionalModel(config)
+        self.score = nn.Linear(config.text_config.hidden_size, self.num_labels, bias=False)
+        self.post_init()
+
+    def _nemo_apply_liger_kernel(self, liger_kernel_transformers) -> None:
+        """Apply compatible Liger kernels to the nested Mistral text tower."""
+        self.model._nemo_apply_liger_kernel(liger_kernel_transformers)
+
+    @property
+    def _nemo_layer_group_root(self) -> nn.Module:
+        """Return the VLM body that owns the language and vision transformer blocks."""
+        return self.model
+
+    @torch.no_grad()
+    def _init_weights(self, module: nn.Module) -> None:
+        """Initialize the scoring head in its configured dtype.
+
+        Args:
+            module: Module whose parameters are initialized in place.
+        """
+        if module is self.score:
+            std = getattr(self.config.text_config, "initializer_range", 0.02) or 0.02
+            init.normal_(module.weight, mean=0.0, std=std)
+            return
+        super()._init_weights(module)
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        image_sizes: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        run_dummy_vision: bool | None = None,
+        **kwargs,
+    ) -> SequenceClassifierOutputWithPast | tuple[torch.Tensor, ...]:
+        """Score each multimodal question-document sequence.
+
+        Args:
+            input_ids: Tensor of shape [batch, sequence] containing text and image
+                placeholder token IDs.
+            pixel_values: Tensor of shape [images, channels, height, width].
+            image_sizes: Tensor of shape [images, 2] containing image height and
+                width before padding.
+            attention_mask: Tensor of shape [batch, sequence].
+            position_ids: Tensor of shape [batch, sequence].
+            past_key_values: Optional transformer key/value cache.
+            inputs_embeds: Tensor of shape [batch, sequence, hidden].
+            labels: Tensor of shape [query_batch] containing the relevant
+                candidate index for each query. Accepted for compatibility but
+                intentionally unused because the recipe computes the grouped
+                cross-entropy loss.
+            use_cache: Whether to return updated key/value cache state.
+            output_attentions: Whether to return attention tensors.
+            output_hidden_states: Whether to return intermediate hidden states.
+            return_dict: Whether to return a structured model output.
+            run_dummy_vision: Whether text-only training batches should run the
+                zero-weighted dummy vision path for distributed gradient coverage.
+            **kwargs: Additional arguments forwarded to ``Mistral3BidirectionalModel``.
+
+        Returns:
+            A sequence-classifier output whose ``logits`` tensor has shape
+            [batch, num_labels], or the equivalent tuple when ``return_dict`` is
+            false.
+        """
+        if attention_mask is None:
+            raise ValueError("attention_mask is required for sequence pooling.")
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        outputs = self.model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            run_dummy_vision=run_dummy_vision,
+            **kwargs,
+        )
+        pooled_hidden_states = pool(
+            last_hidden_states=outputs[0],
+            attention_mask=attention_mask,
+            pool_type=self.config.pooling,
+        )
+        logits = self.score(pooled_hidden_states) / self.config.temperature
+
+        if not return_dict:
+            return (logits,) + outputs[1:]
+
+        return SequenceClassifierOutputWithPast(
+            loss=None,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
 # Export for ModelRegistry auto-discovery
-ModelClass = [Ministral3BidirectionalModel, Mistral3BidirectionalModel]
+ModelClass = [
+    Ministral3BidirectionalModel,
+    Mistral3BidirectionalModel,
+    Mistral3VLBidirectionalForSequenceClassification,
+]
 
 
 def _register_with_hf_auto_classes() -> None:
@@ -373,6 +554,13 @@ def _register_with_hf_auto_classes() -> None:
         AutoModel.register(Mistral3BidirectionalConfig, Mistral3BidirectionalModel)
     except ValueError:
         pass  # Already registered
+    try:
+        AutoModelForSequenceClassification.register(
+            Mistral3BidirectionalConfig,
+            Mistral3VLBidirectionalForSequenceClassification,
+        )
+    except ValueError:
+        pass  # Already registered
 
 
 _register_with_hf_auto_classes()
@@ -381,5 +569,7 @@ __all__ = [
     "Ministral3BidirectionalModel",
     "Ministral3BidirectionalConfig",
     "Mistral3BidirectionalModel",
+    "Mistral3BidirectionalConfig",
+    "Mistral3VLBidirectionalForSequenceClassification",
     "ModelClass",
 ]
