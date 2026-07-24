@@ -221,3 +221,31 @@ def test_async_checkpointing_gate_uses_semantic_versioning(monkeypatch, version,
     cfg = CheckpointingConfig(is_async=True, save_consolidated=False)
 
     assert cfg.is_async is expected
+
+
+class TestBuild:
+    """CheckpointingConfig.build constructs a Checkpointer and forwards runtime arguments."""
+
+    def _build(self, **build_kwargs):
+        cfg = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir="/tmp/ckpt",
+            model_save_format="safetensors",
+            model_cache_dir="/tmp/cache",
+            model_repo_id="org/model",
+            save_consolidated=False,
+        )
+        return cfg.build(dp_rank=0, tp_rank=0, pp_rank=0, **build_kwargs)
+
+    def test_build_constructs_checkpointer_with_config_and_ranks(self):
+        checkpointer = self._build()
+
+        assert checkpointer.config.model_repo_id == "org/model"
+        assert (checkpointer.dp_rank, checkpointer.tp_rank, checkpointer.pp_rank) == (0, 0, 0)
+
+    def test_build_forwards_pp_group(self):
+        pp_group = object()
+
+        checkpointer = self._build(pp_group=pp_group)
+
+        assert checkpointer.pp_group is pp_group

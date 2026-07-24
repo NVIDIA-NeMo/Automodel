@@ -1426,7 +1426,9 @@ fi
                 # some HF models like Moonlight-16B have non-persistent buffers in the base checkpoint
                 # however, HF initializes buffers with persistent=False, so we need to make sure these
                 # buffer keys are not saved during checkpointing
-                # The `_pre_shard_hf_state_dict_keys` attribute is set in the `apply_model_infrastructure` in auto_model.py
+                # The `_pre_shard_hf_state_dict_keys` attribute is set during parallelization: in
+                # `apply_model_infrastructure` (_transformers/infrastructure.py) for LLM/VLM models and in
+                # `_apply_parallelization` (_diffusers/auto_diffusion_pipeline.py) for diffusion pipelines.
                 keys_to_remove = list(set(fqn_to_file_index_mapping.keys()) - set(pre_shard_hf_state_dict_keys))
                 # Only drop lm_head from the save map when it is actually an alias
                 # of the embedding (e.g. single-rank tied case). PP last stages have
