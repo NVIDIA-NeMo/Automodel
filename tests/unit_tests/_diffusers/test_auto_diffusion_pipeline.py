@@ -595,6 +595,59 @@ def test_apply_parallelization_skips_components_not_in_scheme():
     assert pipe.text_encoder is text_encoder
 
 
+def test_apply_parallelization_stamps_pre_shard_keys_on_parallelized_module():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import _apply_parallelization
+
+    unet = DummyModule()
+    expected_keys = list(unet.state_dict().keys())
+    new_unet = DummyModule()
+    pipe = DummyPipeline({"unet": unet})
+
+    mock_manager = Mock()
+    mock_manager.parallelize.return_value = new_unet
+
+    with (
+        patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
+        patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mock_manager),
+        patch(f"{MODULE_PATH}._init_parallelizer"),
+    ):
+        _apply_parallelization(pipe, {"unet": {"_manager_type": "fsdp2"}})
+
+    # The checkpointer reads this attribute off the parallelized module to
+    # reconstruct the consolidated safetensors key set.
+    assert pipe.unet._pre_shard_hf_state_dict_keys == expected_keys
+
+
+def test_apply_parallelization_stamps_pre_shard_keys_on_inner_module_for_ddp():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import DDPManager, _apply_parallelization
+
+    class DDPLikeWrapper(torch.nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+    unet = DummyModule()
+    expected_keys = list(unet.state_dict().keys())
+    wrapper = DDPLikeWrapper(unet)
+    pipe = DummyPipeline({"unet": unet})
+
+    mock_manager = Mock(spec=DDPManager)
+    mock_manager.parallelize.return_value = wrapper
+
+    with (
+        patch(f"{MODULE_PATH}.torch.distributed.is_initialized", return_value=True),
+        patch(f"{MODULE_PATH}._create_parallel_manager", return_value=mock_manager),
+        patch(f"{MODULE_PATH}._init_parallelizer"),
+    ):
+        _apply_parallelization(pipe, {"unet": {"_manager_type": "ddp"}})
+
+    # For DDP the attribute must land on the inner module (the wrapper's
+    # state-dict keys gain a "module." prefix), matching the LLM path in
+    # _transformers/infrastructure.py.
+    assert wrapper.module._pre_shard_hf_state_dict_keys == expected_keys
+    assert "_pre_shard_hf_state_dict_keys" not in wrapper.__dict__
+
+
 # =============================================================================
 # from_pretrained tests
 # =============================================================================

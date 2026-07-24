@@ -37,13 +37,13 @@ peft:
     - "*.to_qkv_mlp_proj"
     - "*.single_transformer_blocks.*.attn.to_out"
 
-optim:
-  learning_rate: 1e-4
-  optimizer:
-    weight_decay: 1e-4
-    betas: [0.9, 0.999]
-    foreach: false
-    fused: true
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-4
+  weight_decay: 1e-4
+  betas: [0.9, 0.999]
+  foreach: false
+  fused: true
 
 performance:
   check_loss: false
@@ -100,7 +100,7 @@ step_scheduler:
   local_batch_size: 1
   global_batch_size: 4
   ckpt_every_steps: 500
-  log_every: 10
+  log_remote_every_steps: 10
   # max_steps: null  # Set to limit training to a specific number of steps
   save_checkpoint_every_epoch: false
 

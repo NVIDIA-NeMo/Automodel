@@ -504,6 +504,10 @@ def apply_ac(
     def selective_checkpointing_context_fn():
         return create_selective_checkpoint_contexts(_custom_policy)
 
+    from nemo_automodel.components.distributed.activation_checkpointing import ensure_profiler_ops_sac_ignored
+
+    ensure_profiler_ops_sac_ignored()
+
     # Weight-tied (use_repeated_layer) MTP head blocks must NOT be activation
     # checkpointed: the single physical block is recomputed once per MTP depth in
     # backward, and FSDP2 cannot re-unshard the *shared* EP-sharded experts param
