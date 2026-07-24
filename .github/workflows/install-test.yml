@@ -135,7 +135,7 @@ jobs:
 
           export PATH="./bin/:$PATH"
 
-          uv sync --link-mode copy --locked --all-groups --extra all
+          uv sync --link-mode copy --locked --all-groups --no-group magi --extra all
 
           uv pip install --no-deps -e .
 
@@ -335,7 +335,7 @@ jobs:
 
           uv sync --link-mode copy --locked --only-group build
 
-          uv sync --link-mode copy --locked --all-groups
+          uv sync --link-mode copy --locked --all-groups --no-group magi
 
           uv pip install --no-deps -e .
 

@@ -226,6 +226,9 @@ dev = [
     "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'",
 ]
+magi = [
+    "magi_attention",
+]
 
 [tool.uv]
 managed = true
@@ -236,6 +239,7 @@ no-build-isolation-package = [
     "deep_ep",
     "flash-attn",
     "flash-attn-3",  # FA3: source build from Dao-AILab/flash-attention hopper/ (needs image torch)
+    "magi_attention",
     "mamba-ssm",
     "nv-grouped-gemm",
     "transformer-engine",
@@ -281,6 +285,7 @@ prerelease = "allow"
 megatron-fsdp = { git = "https://github.com/yuhezhang-ai/Megatron-LM.git", rev = "455389c480af6b3acdca74c7830c68b3274eb083", subdirectory = "megatron/core/distributed/fsdp/src" }
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "7febc6e25660af0f54d95dd781ecdcd62265ecca" }
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
+magi_attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
 onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
 torch = [
@@ -322,6 +327,13 @@ explicit = true
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]
 deep_ep = [{ requirement = "torch", match-runtime = true }]
+magi_attention = [
+    "cmake",
+    "ninja",
+    "packaging",
+    "versioningit",
+    "wheel",
+]
 transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 nv_grouped_gemm = ["setuptools"]
@@ -332,6 +344,11 @@ name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
 version = "v1.2.1+7febc6e"
 requires-dist = ["torch", "packaging", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "magi_attention"
+version = "1.1.1"
+requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "nv_grouped_gemm"

@@ -170,7 +170,7 @@ ARG UV_SYNC_ARGS="--locked"
 RUN if [ "$BASE_IMAGE" = "pytorch" ]; then \
         bash docker/common/update_pyproject_pytorch.sh /opt/Automodel; \
     fi && \
-    uv sync --extra $AUTOMODEL_INSTALL --all-groups $UV_SYNC_ARGS --no-cache
+    uv sync --extra $AUTOMODEL_INSTALL --all-groups --no-group magi $UV_SYNC_ARGS --no-cache
 
 # MXFP8 MoE training (experts="torch_mm_mxfp8"): the NGC PyTorch base does not bundle
 # torchao and uv-pytorch.toml gates it off (sys_platform=='never'), so `uv sync` skips

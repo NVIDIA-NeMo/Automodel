@@ -89,6 +89,10 @@ version = "1.2.1+7febc6e"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[manifest.dependency-metadata]]
+name = "magi-attention"
+version = "1.1.1"
+
+[[manifest.dependency-metadata]]
 name = "nv-grouped-gemm"
 version = "1.1.4.post8"
 requires-dist = ["torch", "packaging", "ninja", "setuptools"]
@@ -3215,6 +3219,11 @@ wheels = [
 ]
 
 [[package]]
+name = "magi-attention"
+version = "1.1.1"
+source = { git = "https://github.com/SandAI-org/MagiAttention.git?rev=d7ea8afd44c790b65fab68a04a6a0fdd5adbf182#d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
+
+[[package]]
 name = "mako"
 version = "1.3.12"
 source = { registry = "https://pypi.org/simple" }
@@ -4087,6 +4096,9 @@ linting = [
     { name = "ruff" },
     { name = "ty" },
 ]
+magi = [
+    { name = "magi-attention" },
+]
 test = [
     { name = "coverage" },
     { name = "onnxruntime-gpu", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
@@ -4203,6 +4215,7 @@ linting = [
     { name = "ruff", specifier = "~=0.9.0" },
     { name = "ty", specifier = ">=0.0.20" },
 ]
+magi = [{ name = "magi-attention", git = "https://github.com/SandAI-org/MagiAttention.git?rev=d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }]
 test = [
     { name = "coverage" },
     { name = "onnxruntime-gpu", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", index = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-13/pypi/simple/" },
