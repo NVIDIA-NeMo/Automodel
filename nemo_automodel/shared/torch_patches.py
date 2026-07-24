@@ -28,6 +28,39 @@ _logger = logging.getLogger(__name__)
 _TORCH_PATCHES_APPLIED = False
 
 
+def patch_fsdp_accumulated_grad_guard() -> None:
+    """Guard FSDP2 post-backward against params that were never unsharded.
+
+    PyTorch FSDP2 creates ``_unsharded_param`` lazily from an FSDP unit's
+    forward pre-hook. If a separately wrapped unit is skipped by the batch
+    (for example a vision tower on text-only data), deferred post-backward can
+    dereference that missing field. Missing lazy state means there is no
+    unsharded grad to upcast, so the exact missing-field case can return early.
+    """
+    try:
+        from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+    except Exception:
+        return
+
+    orig = FSDPParam.to_accumulated_grad_if_needed
+    if getattr(orig, "_nemo_automodel_guarded", False):
+        return
+
+    def guarded(self):
+        try:
+            return orig(self)
+        except AttributeError as exc:
+            if "_unsharded_param" not in str(exc) or hasattr(self, "_unsharded_param"):
+                raise
+            return None
+
+    setattr(guarded, "_nemo_automodel_guarded", True)
+    # Preserve the previous Gemma4 marker name for callers/tests that only need
+    # idempotency and do not care which entry point installed the patch.
+    setattr(guarded, "_gemma4_guarded", True)
+    FSDPParam.to_accumulated_grad_if_needed = guarded
+
+
 def apply_torch_patches() -> None:
     """
     Apply small, version/packaging-specific torch monkey patches.

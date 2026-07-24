@@ -5,6 +5,25 @@ position: 6
 ---
 ## 0.5.0
 
+### Frozen Multimodal FSDP2 Modules Default to Root Sharding
+
+Fully frozen vision/audio towers and multimodal projectors now default to the `root` FSDP2 policy. Previously, dense
+frozen vision towers commonly used per-layer FSDP units. Root ownership keeps the collective sequence aligned when
+some ranks execute a modality branch and other ranks skip it, but it can increase peak unshard memory.
+
+To retain the previous dense vision topology, opt in explicitly:
+
+```yaml
+distributed:
+  strategy: fsdp2
+  frozen_multimodal_sharding: per_layer
+```
+
+`per_layer` requires every rank in the FSDP group to execute or skip the frozen multimodal units the same number of
+times and in the same order on every microbatch. Use `replicate` instead to avoid those collectives while keeping a
+full copy of the frozen parameters on every rank. See [YAML Configuration](/development/configuration) for all three
+policies and the `wrap_outer_model` constraint.
+
 ### FSDP2 Default `reduce_dtype` Is Now `float32`
 
 The default [`MixedPrecisionPolicy`](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html) built by `FSDP2Config` now uses `reduce_dtype=torch.float32` instead of `torch.bfloat16`. Forward/backward compute still uses `param_dtype=torch.bfloat16`, but gradient reduction now accumulates in fp32 to reduce communication-rounding error at larger data-parallel world sizes.

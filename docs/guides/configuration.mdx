@@ -100,6 +100,24 @@ Rows with a non-finite L2 norm or a norm at or below `min_norm` are replaced wit
 
 This option is intended for diagnosed checkpoint defects where rare token IDs produce extreme input-embedding gradients. It is disabled when the section is absent and is not currently supported with pipeline parallelism.
 
+### Frozen Multimodal FSDP Policy
+
+FSDP2 uses the correctness-first `root` policy for fully frozen vision/audio towers and multimodal projectors:
+
+```yaml
+distributed:
+  strategy: fsdp2
+  frozen_multimodal_sharding: root
+```
+
+The supported policies are:
+
+- `root` (default): the always-run outer FSDP root owns frozen multimodal parameters. This keeps collective ordering aligned when some ranks execute a modality branch and others skip it.
+- `per_layer`: layers inside the frozen multimodal module get their normal FSDP units. This can reduce peak unshard memory, but it is an expert option: every rank in the FSDP group must execute or skip those units the same number of times and in the same order on every microbatch.
+- `replicate`: frozen multimodal parameters are excluded from FSDP and copied on every rank. This removes their collectives at the cost of higher per-rank parameter memory.
+
+This setting does not change modules that contain any trainable parameters. For nested MoE/VLM models, `root` requires `distributed.moe.wrap_outer_model: true` when a fully frozen multimodal module is outside the inner text-model FSDP root. Use `per_layer` or `replicate` if the outer model must remain unwrapped.
+
 ## Interpolate Environment Variables in YAML
 
 NeMo AutoModel supports env var interpolation inside YAML **string values**.

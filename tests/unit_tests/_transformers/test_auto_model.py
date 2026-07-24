@@ -33,7 +33,7 @@ from nemo_automodel._transformers.auto_model import (
     _patch_remote_code_compat,
     _resolve_distributed_setup,
 )
-from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision
+from nemo_automodel._transformers.infrastructure import _apply_peft_and_lower_precision, instantiate_infrastructure
 from nemo_automodel._transformers.model_init import (
     _filter_kwargs_for_init,
     _filter_meta_device_from_init_context,
@@ -120,6 +120,21 @@ class TestResolveMeshContext:
         assert isinstance(setup.mesh_context, MeshContext)
         assert setup.strategy_config is None
         assert setup.activation_checkpointing is False
+
+    def test_infrastructure_forwards_frozen_multimodal_sharding_to_moe_parallelizer(self):
+        device_mesh = _FakeMesh({MeshAxisName.DP_SHARD: 2, MeshAxisName.CP: 1, MeshAxisName.TP: 1})
+        moe_mesh = _FakeMesh({MeshAxisName.EP: 2, MeshAxisName.EP_SHARD: 2})
+        mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
+
+        _, _, parallelize_fn, _ = instantiate_infrastructure(
+            distributed_config=FSDP2Config(frozen_multimodal_sharding="replicate"),
+            moe_parallel_config=MoEParallelizerConfig(),
+            activation_checkpointing=False,
+            mesh=mesh,
+        )
+
+        assert parallelize_fn is not None
+        assert parallelize_fn.keywords["frozen_multimodal_sharding"] == "replicate"
 
 
 class TestFromPretrainedDeviceMesh:

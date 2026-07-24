@@ -83,6 +83,8 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
+  # Every rank receives text-only batches, so the frozen vision tower is skipped uniformly.
+  frozen_multimodal_sharding: per_layer
   dp_size: none
   # Joint drafter is TP/PP-unsafe (the drafter cross-attends the base's shared KV);
   # keep tp_size/cp_size/pp_size at 1 and shard the 31B base with FSDP2 instead.
