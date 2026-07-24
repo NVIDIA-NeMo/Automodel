@@ -10,11 +10,12 @@ vision-language model, however, the vision tower normally processes every image 
 on every CP rank before the language sequence is split. This repeats the same vision
 computation on each rank.
 
-Context-parallel vision sharding distributes independent image and video frames across the
-CP group. Each rank processes only its assigned frames, and the resulting visual embeddings
-are gathered in their original order before the existing language-sequence shard. This
-reduces duplicated vision-tower computation while preserving the model's input ordering and
-gradients.
+Context-parallel vision sharding does not apply context-parallel attention inside the vision
+tower. Instead, it distributes independent image and video frames over the existing CP ranks.
+Each rank processes only its assigned frames, the resulting visual embeddings are gathered in
+their original order, and ordinary sequence CP then shards the assembled multimodal sequence.
+This reduces duplicated vision-tower computation while preserving the model's input ordering
+and gradients.
 
 The built-in integration supports the following model families:
 
