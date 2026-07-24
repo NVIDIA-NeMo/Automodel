@@ -5,7 +5,7 @@ position: 17
 ---
 ## Introduction
 
-Diffusion language models (dLLMs) generate text by iteratively denoising masked tokens, rather than generating one token at a time left-to-right like autoregressive (AR) models. Starting from a sequence of `[MASK]` tokens, the model progressively unmasks the most confident positions over multiple denoising steps until the full response is revealed.
+Diffusion language models (dLLMs) generate text by iteratively denoising masked tokens rather than generating one token at a time from left to right, as autoregressive (AR) models do. Starting from a sequence of `[MASK]` tokens, the model progressively unmasks the most confident positions over multiple denoising steps until the full response is revealed.
 
 This approach enables **parallel token generation** and **bidirectional attention**, which gives the model more context for each prediction compared to AR models.
 
