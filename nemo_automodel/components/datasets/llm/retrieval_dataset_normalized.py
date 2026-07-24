@@ -187,7 +187,7 @@ def _load_corpus_dict(bundle_root: Path, metadata: dict[str, Any]) -> dict[str, 
         corpus_dataset = _load_arrow_shards(corpus_paths)
         corpus_metadata = dict(corpus_meta.get("metadata", {}))
         corpus_metadata.setdefault("corpus_id", corpus_id)
-        corpus_path = str(corpus_paths[0].parent) if corpus_paths else str(bundle_root)
+        corpus_path = str(corpus_paths[0].parent)
         corpus_dict[corpus_id] = CorpusInfo(
             corpus_metadata,
             NormalizedArrowCorpusDataset(corpus_dataset, path=corpus_path),
@@ -198,7 +198,6 @@ def _load_corpus_dict(bundle_root: Path, metadata: dict[str, Any]) -> dict[str, 
 
 
 def _merge_corpus_dicts(corpus_dicts: Sequence[dict[str, CorpusInfo]]) -> dict[str, CorpusInfo]:
-    datasets = _import_datasets()
     merged: dict[str, CorpusInfo] = {}
     for corpus_dict in corpus_dicts:
         for corpus_id, corpus_info in corpus_dict.items():
@@ -231,6 +230,7 @@ def _merge_corpus_dicts(corpus_dicts: Sequence[dict[str, CorpusInfo]]) -> dict[s
             unique_indices = [idx for doc_id, idx in corpus_info.corpus.docid2idx.items() if doc_id not in existing_ids]
             combined_dataset = existing.corpus.data
             if unique_indices:
+                datasets = _import_datasets()
                 combined_dataset = datasets.concatenate_datasets(
                     [existing.corpus.data, corpus_info.corpus.data.select(unique_indices)]
                 )
