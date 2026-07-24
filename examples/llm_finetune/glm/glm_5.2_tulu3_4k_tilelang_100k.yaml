@@ -108,3 +108,9 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
+
+ci:
+  # pp4 with ep64 requires 256 ranks.
+  recipe_owner: huiyingl
+  nodes: 32
+  time: "01:00:00"
