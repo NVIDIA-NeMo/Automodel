@@ -77,7 +77,7 @@ One benign quirk is that the `flash` backend's backward operation on the CP path
 
 Both issues should be reported/fixed upstream; once they land, `cp_ring_degree` can be re-enabled here for ring or hybrid ring×Ulysses layouts (useful when CP spans nodes and all-to-all bandwidth is the constraint).
 
-## Current limitations
+## Current Limitations
 
 - **Ulysses only** (see above); `cp_size` must divide the attention head count.
 - **HunyuanVideo** lacks a `_cp_plan` in diffusers 0.39. A custom plan can be passed once authored (`enable_parallelism(cp_plan=...)`), or contributed upstream.
