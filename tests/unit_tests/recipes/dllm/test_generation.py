@@ -220,6 +220,39 @@ def test_ragged_prompts_decode_nonempty_when_eos_active():
         assert (gen == mask_id).sum().item() == 0, "residual masks: prompt not fully decoded"
 
 
+def test_infill_fills_every_masked_position_per_block_window():
+    """infill() carries the same block-window restriction as sample(): the
+    candidate set is clamped to the current block before top-k, so out-of-window
+    masks cannot steal a block's transfer slots. With block_size < sequence
+    length and the confidence-increasing _FakeDenoiser (future positions look
+    most confident), a naive full-sequence selection would strand near masks —
+    the fix must fill every scheduled mask while leaving supplied tokens intact.
+    """
+    mask_id = 9
+    sampler = LLaDASampler(
+        _FakeDenoiser(),
+        mask_id=mask_id,
+        eos_id=0,
+        steps=4,
+        max_new_tokens=8,
+        block_size=4,  # 8-token sequence -> 2 blocks
+        temperature=0.0,
+        use_kv_cache=False,
+        eos_token_id=None,
+    )
+    # Masks scattered across BOTH blocks; positions 0/3/7 carry real tokens.
+    seq = [1, mask_id, mask_id, 2, mask_id, mask_id, mask_id, 3]
+
+    out = sampler.infill([seq])
+
+    assert (out == mask_id).sum().item() == 0, "residual masks: block-window restriction failed in infill"
+    # Supplied (non-mask) tokens are preserved; filled masks hold the prediction 7.
+    assert out[0, 0].item() == 1 and out[0, 3].item() == 2 and out[0, 7].item() == 3
+    assert (out[0, torch.tensor([1, 2, 4, 5, 6])] == 7).all(), (
+        "masked positions not filled with the denoiser prediction"
+    )
+
+
 def test_nemotron_infill_is_rejected_before_loading(monkeypatch, capsys):
     monkeypatch.setattr(
         sys,
