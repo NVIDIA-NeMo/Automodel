@@ -420,6 +420,13 @@ def test_resolve_dtype_cast_accepts_aliases_and_none():
 @pytest.mark.run_only_on("CPU")
 def test_every_rank_consolidation_uses_supplied_group_for_barrier():
     process_group = MagicMock()
+    call_order = []
+
+    def _record_barrier(*args, **kwargs):
+        call_order.append("barrier")
+
+    def _record_index_write(*args, **kwargs):
+        call_order.append("index")
 
     with (
         patch(
@@ -438,13 +445,17 @@ def test_every_rank_consolidation_uses_supplied_group_for_barrier():
             "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.get_world_size",
             return_value=2,
         ) as get_world_size,
-        patch("nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.barrier") as barrier,
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.barrier",
+            side_effect=_record_barrier,
+        ) as barrier,
         patch(
             "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors._consolidate_safetensors_files"
         ),
         patch(
             "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors."
-            "_write_overall_metadata_file_from_shards"
+            "_write_overall_metadata_file_from_shards",
+            side_effect=_record_index_write,
         ),
     ):
         consolidate_safetensors_files_on_every_rank(
@@ -457,6 +468,7 @@ def test_every_rank_consolidation_uses_supplied_group_for_barrier():
     get_rank.assert_called_once_with(group=process_group)
     get_world_size.assert_called_once_with(group=process_group)
     barrier.assert_called_once_with(group=process_group)
+    assert call_order == ["barrier", "index"]
 
 
 # =============================================================================
