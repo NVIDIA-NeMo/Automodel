@@ -20,6 +20,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 
+from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -110,7 +111,15 @@ class Block(nn.Module):
         return x
 
     def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        return self.mlp(x, padding_mask=padding_mask)
+        # ``self.mlp`` may be wrapped by activation checkpointing (submodule-level
+        # AC), so inspect the underlying module to pick the dense (no padding_mask)
+        # vs MoE (padding_mask) call signature, but invoke the wrapped module.
+        mlp = unwrap_checkpoint_wrapper(self.mlp)
+        if isinstance(mlp, MLP):
+            return self.mlp(x)
+        else:
+            assert isinstance(mlp, MoE)
+            return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
