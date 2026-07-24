@@ -161,6 +161,8 @@ dflash:
   num_blocks_per_sample: 512                    # Paper default (Appendix A.1)
   attention_backend: flex_attention             # required for N > ~64; sdpa OOMs
   overlap_anchors: true                         # paper samples anchors independently
+  loss_type: dflash                             # dflash | dpace | dpace-cumulative-confidence-only | dpace-continuation-value-only
+  dpace_alpha: 0.5                              # smoothing alpha for the D-PACE variants
 ```
 
 The following table describes the key configuration fields for DFlash fine-tuning.
@@ -173,6 +175,14 @@ The following table describes the key configuration fields for DFlash fine-tunin
 | `dflash.num_blocks_per_sample` | Number of anchor blocks processed per sequence per step (paper default: 512, Appendix A.1) |
 | `dflash.attention_backend` | `flex_attention` (sparse, scales to 512 anchors) or `sdpa` (dense, OOMs above ~64). Default `sdpa` for backward compat — set to `flex_attention` for production runs |
 | `dflash.overlap_anchors` | `true` (paper, independent sampling) or `false` (non-overlapping stars-and-bars, caps at `seq_len // block_size`) |
+| `dflash.loss_type` | `dflash` (decay-weighted CE, default) or a D-PACE variant: `dpace`, `dpace-cumulative-confidence-only`, `dpace-continuation-value-only` (detached confidence-aware weights) |
+| `dflash.dpace_alpha` | Smoothing α in `[0, 1]` for the D-PACE confidence products; ignored when `loss_type: dflash` |
+
+<Note>
+The `dpace*` variants implement D-PACE (Dynamic Position-Aware Cross-Entropy),
+which reweights each position by detached cumulative draft confidence; see
+[arXiv:2605.18810](https://arxiv.org/abs/2605.18810).
+</Note>
 
 #### DFlash Training Metrics
 
@@ -180,8 +190,8 @@ In addition to the shared metrics (such as `loss`, `grad_norm`, `lr`, `mem`, `tp
 
 | Metric | Meaning | Where |
 |--------|---------|-------|
-| `draft_acc` | Overall fraction of valid block positions where `argmax(draft_logits) == target_token` | Console line + wandb / mlflow / comet + file logger |
-| `draft_acc_k{k}` | Same fraction restricted to block offset `k` (`k = 1..block_size-1`) — the acceptance-length curve | wandb / mlflow / comet + file logger (one panel per offset); intentionally omitted from the console line to keep it readable |
+| `draft_acc` | Overall fraction of valid block positions where `argmax(draft_logits) == target_token` | Console line and wandb / mlflow / comet and file logger |
+| `draft_acc_k{k}` | Same fraction restricted to block offset `k` (`k = 1..block_size-1`), the acceptance-length curve | wandb / mlflow / comet and file logger (one panel per offset); intentionally omitted from the console line to keep it readable |
 
 Both metrics are computed from the logits already produced by the chunked linear cross-entropy path, without an additional model forward pass. They are reduced across data parallel and context parallel ranks using per-rank raw `(correct, count)` sums that are summed with an all-reduce operation and then divided after reduction. This process ensures that the values are correct across arbitrary per-rank token distributions under any of the distributed modes of AutoModel.
 
@@ -214,6 +224,7 @@ The use of `--temperature 0.8` (compared to the EAGLE-oriented default value of 
 You can then point the recipe configuration `dataset.path_or_dataset_id` to the regenerated Parquet shards in the `/data/dflash-train-regen` directory instead of using the raw Hugging Face dataset.
 
 ## Fine-Tune the Model
+Run the following commands to launch fine-tuning for each supported model family.
 
 ### Fine-Tune LLaDA2
 

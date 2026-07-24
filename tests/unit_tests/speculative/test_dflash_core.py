@@ -31,7 +31,7 @@ BLOCK_SIZE = 4
 MASK_ID = VOCAB - 1
 
 
-def _build_trainer(num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa"):
+def _build_trainer(num_anchors=8, loss_decay_gamma=None, loss_type="dflash", dpace_alpha=0.5, attention_backend="sdpa"):
     cfg = Qwen3Config(
         vocab_size=VOCAB,
         hidden_size=HIDDEN,
@@ -61,6 +61,8 @@ def _build_trainer(num_anchors=8, loss_decay_gamma=None, attention_backend="sdpa
         attention_backend=attention_backend,
         num_anchors=num_anchors,
         loss_decay_gamma=loss_decay_gamma,
+        loss_type=loss_type,
+        dpace_alpha=dpace_alpha,
     )
 
 
@@ -83,6 +85,17 @@ def test_forward_returns_finite_loss_and_grads_flow_to_draft():
     assert out.loss_weight.item() > 0
     torch.testing.assert_close(out.accuracy, out.correct_tokens / out.valid_tokens)
     torch.testing.assert_close(out.accept_len, out.accept_len_sum / out.valid_blocks)
+    out.loss.backward()
+    grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
+    assert grad > 0
+
+
+def test_forward_supports_dpace_loss_and_grads_flow_to_draft():
+    trainer = _build_trainer(loss_type="dpace", dpace_alpha=0.4)
+    input_ids, hidden, loss_mask = _inputs()
+    out = trainer(input_ids=input_ids, hidden_states=hidden, loss_mask=loss_mask)
+    assert isinstance(out, DFlashStepMetrics)
+    assert torch.isfinite(out.loss) and out.loss.item() > 0
     out.loss.backward()
     grad = sum(p.grad.abs().sum().item() for p in trainer.draft_model.parameters() if p.grad is not None)
     assert grad > 0
