@@ -139,7 +139,7 @@ The following table describes the key configuration fields for dLLM fine-tuning.
 | `dllm.auto_balance_clean_loss` | Replaces `α` with `(CE_noisy/CE_clean).detach()` (paper Equation 2, b3 stage). I-DLM mode only |
 | `dataset.unshifted` | Must be `true` for dLLM. Disables the autoregressive input and target shift |
 
-### DFlash Configuration
+### Configure DFlash
 
 DFlash trains a small draft model to predict tokens conditioned on a frozen causal target language model.
 Only the weights of the draft model are updated. The target language model is loaded once and remains frozen.
