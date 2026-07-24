@@ -474,6 +474,15 @@ class IDLMSampler(DLLMSampler):
       block, confident masked positions are accepted in parallel via the
       ``threshold`` rule, the diffusion parallelism over the AR baseline.
 
+    Checkpoint compatibility: the full-forward decode relies on the model
+    attending *causally* to an all-ones attention mask. This holds for an
+    Automodel I-DLM checkpoint (a plain ``Qwen3ForCausalLM``, causal by default),
+    so it decodes directly. It does NOT hold for the released HF reference
+    checkpoint (``yifanyu/I-DLM-8B``): its custom ``modeling_sdar.py`` treats an
+    all-ones mask as *bidirectional* and decodes garbage. To run those reference
+    weights, load them into a stock ``Qwen3ForCausalLM`` (their state-dict keys
+    match exactly) or pass an explicit causal mask.
+
     The production engine is SGLang's ``IDLMBlockN`` (``--dllm-algorithm
     IDLMBlockN``): each forward emits one clean AR anchor plus N-1 speculative
     tokens that the next forward verifies left-to-right (``r = p/q``; greedy
