@@ -178,8 +178,8 @@ def test_extract_submodel_llama_embedding_from_local_vlm_converts_to_supported_b
     assert outputs.last_hidden_state.shape == (2, 8, backbone.config.hidden_size)
 
 
-def test_ministral_embedding_forwards_hf_kwargs_to_config_and_model(monkeypatch):
-    """Ministral config and weights receive the same native loader options."""
+def test_ministral_embedding_forwards_supported_hf_kwargs_to_config_and_model(monkeypatch):
+    """Ministral config and weights receive the same supported native loader options."""
     from nemo_automodel._transformers import retrieval
 
     config = MagicMock()
@@ -195,7 +195,6 @@ def test_ministral_embedding_forwards_hf_kwargs_to_config_and_model(monkeypatch)
         task="embedding",
         trust_remote_code=True,
         revision="revision-a",
-        use_auth_token="legacy-token",
         subfolder="encoder",
         token="token",
         cache_dir="/cache",
@@ -212,7 +211,6 @@ def test_ministral_embedding_forwards_hf_kwargs_to_config_and_model(monkeypatch)
         token="token",
         cache_dir="/cache",
         local_files_only=True,
-        use_auth_token="legacy-token",
         torch_dtype=torch.bfloat16,
     )
     auto_model_from_pretrained.assert_called_once_with(
@@ -224,7 +222,6 @@ def test_ministral_embedding_forwards_hf_kwargs_to_config_and_model(monkeypatch)
         cache_dir="/cache",
         local_files_only=True,
         torch_dtype=torch.bfloat16,
-        use_auth_token="legacy-token",
     )
 
 
