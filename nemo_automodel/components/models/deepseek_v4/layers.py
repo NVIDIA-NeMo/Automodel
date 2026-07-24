@@ -315,10 +315,12 @@ class DeepseekV4TrainCache:
         self.indexer_state: list[dict] = []
 
     def _branch_state(self, state_key: str, layer_idx: int) -> dict:
-        store = getattr(self, state_key, None)
-        if store is None:
-            store = []
-            setattr(self, state_key, store)
+        if state_key == "compressor_state":
+            store = self.compressor_state
+        elif state_key == "indexer_state":
+            store = self.indexer_state
+        else:
+            raise ValueError(f"Unsupported DeepSeek V4 cache branch: {state_key}")
         while len(store) <= layer_idx:
             store.append({"buffer_kv": None, "buffer_gate": None, "pooled": None})
         return store[layer_idx]
