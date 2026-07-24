@@ -130,6 +130,10 @@ class MLP(nn.Module):
         """Keep the shared feed-forward gate-update contract as a dense no-op."""
         return None
 
+    def reset_gate_correction_bias(self, buffer_device: torch.device) -> None:
+        """Keep the shared feed-forward initialization contract as a dense no-op."""
+        del buffer_device
+
 
 class FakeBalancedGate(nn.Module):
     """
@@ -772,6 +776,14 @@ class MoE(nn.Module):
         """Update the router correction bias when bias-based balancing is enabled."""
         if self.gate.bias_update_factor > 0:
             self.gate.update_bias()
+
+    def reset_gate_correction_bias(self, buffer_device: torch.device) -> None:
+        """Reset the router correction bias in fp32 on the initialization device."""
+        self.gate.e_score_correction_bias = torch.zeros(
+            self.gate.n_experts,
+            dtype=torch.float32,
+            device=buffer_device,
+        )
 
 
 def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):

@@ -145,6 +145,12 @@ class TestMLP:
 
         assert mlp.update_gate_bias() is None
 
+    def test_reset_gate_correction_bias_is_no_op(self):
+        """Dense MLP accepts the shared correction-bias initialization contract."""
+        mlp = MLP(8, 16, backend="torch")
+
+        assert mlp.reset_gate_correction_bias(torch.device("cpu")) is None
+
     def test_mlp_init_weights(self, device):
         """Test MLP weight initialization."""
         mlp = MLP(64, 128, backend="torch")
@@ -1291,6 +1297,20 @@ class TestMoE:
             moe.update_gate_bias()
 
         update_bias.assert_called_once_with()
+
+    def test_reset_gate_correction_bias_uses_gate_shape_and_fp32(self, moe_config, backend_config):
+        """Correction-bias initialization is owned by the MoE feed-forward layer."""
+        moe = MoE(moe_config, backend_config)
+
+        moe.reset_gate_correction_bias(torch.device("cpu"))
+
+        assert moe.gate.e_score_correction_bias.shape == (moe_config.n_routed_experts,)
+        assert moe.gate.e_score_correction_bias.dtype == torch.float32
+        assert moe.gate.e_score_correction_bias.device.type == "cpu"
+        torch.testing.assert_close(
+            moe.gate.e_score_correction_bias,
+            torch.zeros(moe_config.n_routed_experts, dtype=torch.float32),
+        )
 
     def test_moe_init_with_fake_balanced_gate(self, moe_config, backend_config):
         """Test MoE initialization with fake balanced gate."""

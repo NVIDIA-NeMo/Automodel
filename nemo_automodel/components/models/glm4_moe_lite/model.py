@@ -361,10 +361,7 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         cast_model_to_dtype(self, dtype)
         for layer in self.model.layers.values():
-            if isinstance(layer.mlp, MoE):
-                layer.mlp.gate.e_score_correction_bias = torch.zeros(
-                    (self.config.n_routed_experts), dtype=torch.float32
-                ).to(buffer_device)
+            layer.mlp.reset_gate_correction_bias(buffer_device)
 
 
 ModelClass = Glm4MoeLiteForCausalLM
