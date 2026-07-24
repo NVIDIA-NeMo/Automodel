@@ -20,13 +20,16 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import torch.nn as nn
-from transformers import AutoModel, Mistral3Config
+from transformers import AutoModel, Ministral3Config, Mistral3Config
+from transformers.models.ministral3.modeling_ministral3 import (
+    Ministral3ForSequenceClassification,
+    Ministral3Model,
+)
 
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalForSequenceClassification,
     LlamaBidirectionalModel,
 )
-from nemo_automodel.components.models.ministral_bidirectional.model import Ministral3BidirectionalModel
 
 
 def test_llama_nemotron_vl_supported_backbone_for_embedding():
@@ -71,6 +74,28 @@ def _save_tiny_vlm(tmp_path, text_model_type: str):
     model.save_pretrained(model_dir)
     language_state_dict = {key: tensor.detach().clone() for key, tensor in model.language_model.state_dict().items()}
     return model_dir, language_state_dict
+
+
+def _save_tiny_ministral_text_model(tmp_path):
+    """Save a tiny stock Ministral text checkpoint and return its weights."""
+    config = Ministral3Config(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        max_position_embeddings=64,
+        sliding_window=4,
+        attention_dropout=0.0,
+    )
+    config._attn_implementation = "sdpa"
+    model = Ministral3Model(config)
+    model_dir = tmp_path / "ministral3_text"
+    model.save_pretrained(model_dir)
+    state_dict = {key: tensor.detach().clone() for key, tensor in model.state_dict().items()}
+    return model_dir, state_dict
 
 
 def _assert_state_dict_equal(expected: dict[str, torch.Tensor], actual: dict[str, torch.Tensor]) -> None:
@@ -153,8 +178,168 @@ def test_extract_submodel_llama_embedding_from_local_vlm_converts_to_supported_b
     assert outputs.last_hidden_state.shape == (2, 8, backbone.config.hidden_size)
 
 
+def test_ministral_embedding_forwards_supported_hf_kwargs_to_config_and_model(monkeypatch):
+    """Ministral config and weights receive the same supported native loader options."""
+    from nemo_automodel._transformers import retrieval
+
+    config = MagicMock()
+    config.model_type = "ministral3"
+    backbone = MagicMock()
+    auto_config_from_pretrained = MagicMock(return_value=config)
+    auto_model_from_pretrained = MagicMock(return_value=backbone)
+    monkeypatch.setattr(retrieval.AutoConfig, "from_pretrained", auto_config_from_pretrained)
+    monkeypatch.setattr(retrieval.AutoModel, "from_pretrained", auto_model_from_pretrained)
+
+    result = retrieval.build_encoder_backbone(
+        model_name_or_path="org/model",
+        task="embedding",
+        trust_remote_code=True,
+        revision="revision-a",
+        subfolder="encoder",
+        token="token",
+        cache_dir="/cache",
+        local_files_only=True,
+        torch_dtype=torch.bfloat16,
+    )
+
+    assert result is backbone
+    auto_config_from_pretrained.assert_called_once_with(
+        "org/model",
+        trust_remote_code=True,
+        revision="revision-a",
+        subfolder="encoder",
+        token="token",
+        cache_dir="/cache",
+        local_files_only=True,
+        torch_dtype=torch.bfloat16,
+    )
+    auto_model_from_pretrained.assert_called_once_with(
+        "org/model",
+        trust_remote_code=True,
+        revision="revision-a",
+        subfolder="encoder",
+        token="token",
+        cache_dir="/cache",
+        local_files_only=True,
+        torch_dtype=torch.bfloat16,
+    )
+
+
+def test_standard_ministral_score_uses_sequence_classification_model(tmp_path):
+    """Standard Ministral score checkpoints retain the HuggingFace reranker path."""
+    from nemo_automodel._transformers import retrieval
+
+    model_dir, source_state_dict = _save_tiny_ministral_text_model(tmp_path)
+
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="score",
+        num_labels=1,
+    )
+
+    assert type(backbone) is Ministral3ForSequenceClassification
+    assert backbone.config.model_type == "ministral3"
+    assert backbone.config.num_labels == 1
+    _assert_state_dict_equal(source_state_dict, backbone.model.state_dict())
+
+    input_ids = torch.randint(0, backbone.config.vocab_size, (2, 4))
+    attention_mask = torch.ones_like(input_ids)
+    backbone.eval()
+    with torch.no_grad():
+        outputs = backbone(input_ids=input_ids, attention_mask=attention_mask)
+    assert outputs.logits.shape == (2, 1)
+
+
+def test_ministral_embedding_preserves_hf_config_overrides(tmp_path):
+    """Valid HuggingFace config overrides retain native loader behavior."""
+    from nemo_automodel._transformers import retrieval
+
+    model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
+
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="embedding",
+        output_attentions=True,
+    )
+
+    assert backbone.config.output_attentions is True
+
+
+def test_ministral_embedding_uses_stock_bidirectional_model(tmp_path):
+    """Standard Ministral checkpoints use and save the stock non-causal model."""
+    from nemo_automodel._transformers import retrieval
+
+    model_dir, source_state_dict = _save_tiny_ministral_text_model(tmp_path)
+
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="embedding",
+        pooling="avg",
+    )
+
+    assert type(backbone) is Ministral3Model
+    assert backbone.config.model_type == "ministral3"
+    assert backbone.config.is_causal is False
+    assert backbone.config.pooling == "avg"
+    assert backbone.config.sliding_window == 4
+    assert backbone.config._attn_implementation == "sdpa"
+    _assert_state_dict_equal(source_state_dict, backbone.state_dict())
+
+    input_ids = torch.randint(0, backbone.config.vocab_size, (1, 4))
+    attention_mask = torch.ones_like(input_ids)
+    modified_input_ids = input_ids.clone()
+    modified_input_ids[0, -1] = (modified_input_ids[0, -1] + 1) % backbone.config.vocab_size
+    backbone.eval()
+    with torch.no_grad():
+        original_output = backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        modified_output = backbone(input_ids=modified_input_ids, attention_mask=attention_mask).last_hidden_state
+    assert not torch.allclose(original_output[0, 0], modified_output[0, 0])
+
+    save_dir = tmp_path / "saved_stock_ministral"
+    backbone.save_pretrained(save_dir)
+
+    assert not list(save_dir.glob("*.py"))
+    reloaded = AutoModel.from_pretrained(save_dir)
+    assert type(reloaded) is Ministral3Model
+    assert reloaded.config.model_type == "ministral3"
+    assert reloaded.config.is_causal is False
+    assert getattr(reloaded.config, "auto_map", None) is None
+    _assert_state_dict_equal(source_state_dict, reloaded.state_dict())
+
+
+def test_ministral_embedding_uses_bidirectional_flash_attention(tmp_path, monkeypatch):
+    """Stock Ministral selects non-causal attention at the FlashAttention kernel boundary."""
+    from transformers.integrations import flash_attention
+
+    from nemo_automodel._transformers import retrieval
+
+    model_dir, _ = _save_tiny_ministral_text_model(tmp_path)
+    backbone = retrieval.build_encoder_backbone(
+        model_name_or_path=str(model_dir),
+        task="embedding",
+        pooling="avg",
+    )
+    assert backbone.config.is_causal is False
+    backbone.config._attn_implementation = "flash_attention_2"
+    assert all(layer.self_attn.is_causal is True for layer in backbone.layers)
+
+    kernel_calls = []
+
+    def record_flash_attention(query, key, value, attention_mask, **kwargs):
+        kernel_calls.append({"is_causal": kwargs.get("is_causal"), "attention_mask": attention_mask})
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(flash_attention, "_flash_attention_forward", record_flash_attention)
+
+    input_ids = torch.randint(0, backbone.config.vocab_size, (1, 4))
+    backbone(input_ids=input_ids, attention_mask=torch.ones_like(input_ids))
+
+    assert len(kernel_calls) == backbone.config.num_hidden_layers
+    assert all(call == {"is_causal": False, "attention_mask": None} for call in kernel_calls)
+
+
 def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_supported_backbone(tmp_path):
-    """The real Ministral3 VLM text backbone path becomes the Ministral bi-encoder."""
+    """A Ministral3 VLM text backbone becomes a stock non-causal Ministral model."""
     from nemo_automodel._transformers import retrieval
 
     model_dir, language_state_dict = _save_tiny_vlm(tmp_path, "ministral3")
@@ -163,10 +348,13 @@ def test_extract_submodel_ministral_embedding_from_local_vlm_converts_to_support
         model_name_or_path=str(model_dir),
         task="embedding",
         extract_submodel="language_model",
+        pooling="avg",
     )
 
-    assert isinstance(backbone, Ministral3BidirectionalModel)
-    assert backbone.config.model_type == "ministral3_bidirec"
+    assert type(backbone) is Ministral3Model
+    assert backbone.config.model_type == "ministral3"
+    assert backbone.config.is_causal is False
+    assert backbone.config.pooling == "avg"
     _assert_state_dict_equal(language_state_dict, backbone.state_dict())
 
     input_ids = torch.randint(0, backbone.config.vocab_size, (2, 8))
