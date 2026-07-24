@@ -1,0 +1,96 @@
+---
+title: "Context Parallelism for Diffusion Models"
+description: "Train diffusion transformers on long video/image token sequences by sharding the sequence across GPUs with diffusers context parallelism (Ulysses attention)"
+position: 17
+---
+
+## Overview
+
+Video diffusion transformers operate on very long token sequences — a Wan 2.1 clip at 480p with 81 frames patchifies to tens of thousands of tokens, and activation memory grows linearly (attention compute quadratically) with that length. Context parallelism (CP) shards the *sequence dimension* across GPUs so each rank holds and computes only `1/cp_size` of the tokens, while attention exchanges the missing context through collectives.
+
+NeMo AutoModel integrates the context-parallel API that Hugging Face Diffusers added for its transformer models (`ContextParallelConfig`), using the diffusers ≥ 0.39 capability to pass a **pre-instantiated device mesh**. This means CP reuses the `cp` axis of the FSDP2 device mesh that AutoModel already builds — one process-group topology shared by FSDP2 sharding, gradient reduction, and CP attention, instead of diffusers initializing a second world mesh.
+
+Enable it with a single knob in any FSDP2 diffusion recipe:
+
+```yaml
+fsdp:
+  dp_size: 4
+  cp_size: 2   # dp * tp * cp * pp must equal world size
+```
+
+## How the integration works
+
+1. **Mesh bridge.** Diffusers requires a mesh with dimensions named `("ring", "ulysses")`. `create_ring_ulysses_mesh()` (in `nemo_automodel/components/distributed/mesh_utils.py`) reshapes the 1D `cp` axis of the FSDP2 root mesh into that 2D layout — the same unflatten machinery used for the expert-parallel mesh.
+2. **Hook registration before sharding.** `NeMoAutoDiffusionPipeline` calls `transformer.enable_parallelism(config=ContextParallelConfig(ulysses_degree=cp_size, mesh=...))` *before* `fully_shard`, mirroring the LoRA ordering. Diffusers registers forward hooks driven by the model's `_cp_plan`: inputs are split on the sequence dimension at the model boundary, attention runs as Ulysses (all-to-all over heads), and the output is all-gathered at the final projection so every rank returns the full-sequence prediction.
+3. **Data and RNG alignment.** The dataloader already shards by data-parallel rank with CP excluded, so CP peers receive identical batches. Because the flow-matching step samples noise, timesteps, and CFG dropout *per rank*, the recipe re-seeds RNG by data rank when `cp_size > 1` — all CP peers draw identical noise while DP ranks stay decorrelated. Without this, CP peers silently train against different targets.
+4. **Gradient scale correction.** Each CP rank computes the full-sequence loss on the gathered output, so its backward pass produces a *partial* gradient (the contribution flowing through its sequence chunk); the partials **sum** to the true gradient. FSDP2 then *mean*-reduces over the flattened `dp_shard_cp` mesh, which would make gradients exactly `cp_size×` too small. The recipe therefore scales the backward loss by `cp_size`, turning that reduction into a sum over CP peers and a mean over DP ranks. This was verified numerically: without scaling, gradients are low by exactly 2.0000× (cp=2) and 4.02× (cp=4); with scaling, fp32 gradients match a single-GPU baseline to 2.3e-5.
+
+### Configuration reference
+
+| Key | Default | Meaning |
+|---|---|---|
+| `fsdp.cp_size` | `1` | Number of GPUs the token sequence is sharded across. |
+| `fsdp.cp_ulysses_degree` | `cp_size` | Size of the Ulysses (all-to-all) attention dimension. |
+| `fsdp.cp_ring_degree` | `1` | Ring-attention dimension. Values > 1 are **rejected** for training — see the upstream issues below. |
+
+Constraints:
+
+- The post-patchify sequence length must be divisible by `cp_size` (e.g. Wan 2.1 with patch size (1, 2, 2): `frames × height/16 × width/16` latent tokens).
+- The attention backend must support CP. Verified working for CP *training*: the default `native` SDPA backend, `flash` (flash-attn 2), and `_native_flash` / `_native_cudnn` (via AutoModel's interim patches, see below). If you set `model.attention_backend`, diffusers validates CP support when CP is enabled. `sage` is advertised as CP-capable by diffusers but has no backward op at all (inference only).
+- Attention head count must be divisible by the Ulysses degree.
+- The model must define a diffusers `_cp_plan`. In diffusers 0.39 this covers Flux, Flux.2, Qwen-Image, Wan, LTX/LTX-2, ChronoEdit, and Helios; **HunyuanVideo has no plan yet** and CP is rejected with a clear error.
+- CP requires the `fsdp2` strategy (not DDP).
+
+## Validation
+
+All runs on 8×H100, Wan2.1-T2V-1.3B, real training recipe end-to-end (synthetic latent cache, `shuffle: false`, seed 42, fp32 params / bf16 compute).
+
+**Loss parity, dp=2/cp=1 (2 GPUs) vs dp=2/cp=2 (4 GPUs).** Same data per DP rank, so losses and gradient norms must match step-for-step:
+
+| Step | Loss (cp=1) | Loss (cp=2) | Grad norm (cp=1) | Grad norm (cp=2) |
+|---|---|---|---|---|
+| 0 | 6.711974 | 6.711974 | 22.047 | 22.047 |
+| 1 | 7.608454 | 7.607918 | 23.922 | 23.918 |
+| 4 | 6.528771 | 6.529164 | 3.876 | 3.879 |
+| 8 | 7.426730 | 7.427078 | 6.130 | 6.131 |
+
+Step 0 matches exactly (proving the RNG synchronization); later steps drift ≤ 1e-4 relative, consistent with bf16 reduction-order noise compounding through optimizer steps. The same held for cp=4 and for gradient accumulation (2 microbatches per step).
+
+**Memory and long-sequence payoff.** Peak per-GPU memory at sequence length 1,024: 13.3 GB (cp=1) → 6.7 GB (cp=2) → 3.6 GB (cp=4). At sequence length 16,384 (long video), dp=8/cp=1 peaks at **54.9 GB/GPU** while dp=2/cp=4 peaks at **16.3 GB/GPU** — a 3.4× reduction that converts directly into headroom for longer clips, higher resolution, or larger models.
+
+<Note>
+At short sequence lengths CP adds communication overhead without a memory need (0.22s vs 0.26s per step in the small parity run). Use CP when activations, not parameters, are the bottleneck — long videos and high resolutions.
+</Note>
+
+## Known upstream diffusers issues
+
+Three bugs in diffusers (≤ 0.39, `models/attention_dispatch.py`) restrict training to **Ulysses attention**, on either the `native` SDPA backend or the `flash` (flash-attn 2) backend — both verified gradient-correct. The bugs affect the backward pass only, so they are invisible in diffusers' inference-oriented usage:
+
+1. **Ring attention backward reuses stale key/value chunks.** `TemplatedRingAttention.backward` all-gathers the KV chunks and rotates them through local Python variables each ring iteration — but it invokes `ctx.backward_op(ctx, grad_out)`, and every backward op reads Q/K/V from `ctx.saved_tensors`, which were saved once during forward at ring iteration 0 (`_save_ctx=i == 0`) with only the *local* KV chunk. The rotated chunks never reach the backward computation, so gradient contributions from remote KV are computed against the wrong tensors. How this surfaces depends on the backend: with `_native_flash` it crashes on a shape mismatch, but with `flash` (flash-attn 2) **it runs without any error and silently corrupts gradients** — in a controlled test the forward loss matched the baseline to 4e-4 while per-parameter gradient-norm ratios scattered from 0.46× to 2.01× with no consistent scale factor. A training run would look healthy while learning from wrong gradients. This is why AutoModel hard-rejects `cp_ring_degree > 1` rather than warning.
+2. **`_native_flash` backward double-transposes K/V.** `_native_flash_attention_forward_op` transposes query, key, and value to `[batch, heads, seq, dim]` *before* saving them to `ctx`, but `_native_flash_attention_backward_op` transposes key and value again (leaving query alone) before calling `aten::_scaled_dot_product_flash_attention_backward`. Key/value arrive as `[batch, seq, heads, dim]` while query is `[batch, heads, seq, dim]`, and the kernel fails with `Number of heads in key/value must divide number of heads in query` (the sequence length lands in the heads slot). This breaks the `_native_flash` backend whenever the templated CP path drives the backward. Note this does **not** mean flash kernels are unavailable: the `flash` backend (flash-attn 2 package) keeps a consistent `[batch, seq, heads, dim]` layout in its forward/backward ops and trains correctly under Ulysses CP, and the `native` SDPA backend dispatches to fused flash/cuDNN kernels internally. **AutoModel ships an interim fix** for this bug (`nemo_automodel/_diffusers/diffusers_patches.py`), applied automatically when CP is enabled: it replaces the backward op with a layout-correct version, feature-detected against the buggy source so it becomes a no-op once the upstream fix lands. With the patch, `_native_flash` passes the same gradient-parity check as `flash` and `native`.
+
+3. **`_native_cudnn` is doubly broken — and corrupts silently.** Its backward re-transposes key/value exactly like `_native_flash` (bug 2), but instead of raising, cuDNN accepts the mismatched shapes as a degenerate GQA case. Additionally, `_cudnn_attention_forward_op` calls the kernel with `compute_log_sumexp=return_lse` — which is `False` during training — and saves the resulting `lse=None` to the autograd context, so the backward kernel computes garbage even with the transpose fixed. In an op-level gradient-parity test (Ulysses 2, bf16), the forward matched the fp32 reference to 4e-3 while gradients came back NaN/garbage. AutoModel's interim patch covers both defects (`apply_cudnn_attention_patch`, applied automatically alongside the `_native_flash` patch when CP is enabled); with it, `_native_cudnn` passes the same gradient-parity check as the other backends.
+
+A related limitation (by design, not a bug): ring attention requires the attention backend to return log-sum-exp (`return_lse=True`) for merging partial results across ring steps, which the `native` SDPA backend cannot do — so even after the bugs above are fixed upstream, ring will require a flash-class backend.
+
+One benign quirk is that the `flash` backend's backward operation on the CP path advances the CUDA RNG (Philox) state on every call, even with dropout 0. The `native`, `_native_flash`, and `_native_cudnn` backends do not. Training remains correct because every CP peer executes the same call sequence, so peers stay RNG-synchronized, and the step-0 gradient norm matches the `cp_size = 1` baseline exactly. However, the noise and timestep draws from step 1 onward differ from any non-flash run, so per-step loss curves are comparable only to a baseline that uses the same backend.
+
+These issues should be reported and fixed upstream. After the fixes are available, `cp_ring_degree` can be re-enabled for ring or hybrid ring and Ulysses layouts. These layouts are useful when CP spans nodes and all-to-all bandwidth is the constraint.
+
+## Current Limitations
+
+- **Ulysses only.** `cp_size` must divide the attention head count.
+- **HunyuanVideo** lacks a `_cp_plan` in Diffusers version 0.39. After you create a custom plan, you can pass it through `enable_parallelism(cp_plan=...)` or contribute it upstream.
+- The following interactions are not yet validated: CP and LoRA, CP and Transformer Engine linear/FP8, CP and activation checkpointing, and CP and `fuse_qkv_projections`.
+
+## Example
+
+To fine-tune Wan 2.1 on eight GPUs with sequence sharding across two GPUs, run the following command:
+
+```bash
+torchrun --nproc-per-node 8 examples/diffusion/finetune/finetune.py \
+    --config examples/diffusion/finetune/wan2_1_t2v_flow.yaml \
+    --fsdp.dp_size 4 --fsdp.cp_size 2
+```
+
+See [Diffusion Model Fine-Tuning](/recipes-e2e-examples/diffusion-fine-tuning) for the full recipe walkthrough.

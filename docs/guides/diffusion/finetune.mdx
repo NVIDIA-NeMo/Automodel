@@ -5,9 +5,9 @@ position: 16
 ---
 ## Introduction
 
-Diffusion models generate images and videos by learning to reverse a noise process — starting from random noise and iteratively refining it into coherent visual output guided by a text prompt. Pretrained diffusion models (like [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) for images or [Wan 2.1](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) for video) produce impressive general-purpose results, but they know nothing about your particular visual domain, style, or subject matter. Fine-tuning bridges that gap — you adapt the model on your own data so it produces outputs that match your requirements, without the cost of training from scratch.
+Diffusion models generate images and videos by learning to reverse a noise process. They start from random noise and iteratively refine it into coherent visual output guided by a text prompt. Pretrained diffusion models, such as [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) for images or [Wan 2.1](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) for video, produce impressive general-purpose results. However, they do not contain information about your particular visual domain, style, or subject matter. Fine-tuning bridges that gap by adapting the model to your data so that it produces outputs that match your requirements, without the cost of training from scratch.
 
-Under the hood, NeMo AutoModel uses [flow matching](https://arxiv.org/abs/2210.02747), a modern generative framework that learns to transform noise into data by regressing a velocity field along straight interpolation paths. It integrates with [Hugging Face Diffusers](https://huggingface.co/docs/diffusers) to provide distributed fine-tuning for text-to-image and text-to-video models. This guide walks you through the process end-to-end — from installation through training and inference — using [Wan 2.1 T2V 1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) as a running example.
+NeMo AutoModel uses [flow matching](https://arxiv.org/abs/2210.02747), a modern generative framework that learns to transform noise into data by regressing a velocity field along straight interpolation paths. It integrates with [Hugging Face Diffusers](https://huggingface.co/docs/diffusers) to provide distributed fine-tuning for text-to-image and text-to-video models. This guide walks you through the process from installation through training and inference, using [Wan 2.1 T2V 1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers) as a running example.
 
 ### Workflow Overview
 
@@ -23,11 +23,11 @@ Under the hood, NeMo AutoModel uses [flow matching](https://arxiv.org/abs/2210.0
 | Step | Section | What You Do |
 |------|---------|-------------|
 | **1. Install** | [Install NeMo AutoModel](#install-nemo-automodel) | Install the package with uv or Docker |
-| **2. Prepare Data** | [Prepare Your Dataset](#prepare-your-dataset) | Encode raw images/videos into `.meta` latent files |
+| **2. Prepare Data** | [Prepare Your Dataset](#prepare-your-dataset) | Encode raw images and videos into `.meta` latent files |
 | **3. Configure** | [Configure Your Training Recipe](#configure-your-training-recipe) | Write a YAML config specifying model, data, and training settings |
 | **4. Train** | [Fine-Tune the Model](#fine-tune-the-model) | Launch training with `torchrun` on a single node |
 | **4b. Multi-Node** | [Multi-Node Training](#multi-node-training) | Scale training across multiple nodes |
-| **5. Generate** | [Generation / Inference](#generation--inference) | Run inference using the fine-tuned checkpoint |
+| **5. Generate** | [Generation and Inference](#generation-and-inference) | Run inference using the fine-tuned checkpoint |
 
 For model-specific configuration (FLUX.1-dev, HunyuanVideo), see [Model-Specific Notes](#model-specific-notes).
 
@@ -45,7 +45,7 @@ All models use FSDP2 for distributed training and flow matching for loss computa
 ## Install NeMo AutoModel
 
 Diffusion fine-tuning needs the `diffusion` extra plus `diffusion-media` (OpenCV
-for image/video preprocessing and imageio-ffmpeg for T2V export):
+Diffusion fine-tuning requires the `diffusion` extra and `diffusion-media` (OpenCV for image and video preprocessing and imageio-ffmpeg for T2V export):
 
 ```bash
 uv venv

@@ -376,6 +376,9 @@ navigation:
       - page: "Wan2.1-T2V Fine-Tuning"
         path: ../../guides/diffusion/finetune.mdx
         slug: diffusion-fine-tuning
+      - page: "Context Parallelism for Diffusion Models"
+        path: ../../guides/diffusion/context-parallel.mdx
+        slug: diffusion-context-parallel
       - page: "Fine-Tuning DiffusionGemma"
         path: ../../guides/dllm/diffusiongemma.mdx
         slug: diffusiongemma
