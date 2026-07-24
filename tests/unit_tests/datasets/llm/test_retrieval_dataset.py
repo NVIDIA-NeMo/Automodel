@@ -994,6 +994,62 @@ def test_make_retrieval_dataset_inline_end_to_end(tmp_path):
     assert ex["doc_image"] == ["", "", ""]
 
 
+def test_retrieval_dataset_config_builds_inline_jsonl_for_both_model_types(tmp_path):
+    """The public retrieval config should route inline JSONL without corpus metadata."""
+    f = tmp_path / "inline.jsonl"
+    f.write_text(
+        json.dumps(
+            {
+                "query": "Q",
+                "pos_doc": ["P1", "P2"],
+                "neg_doc": ["N"],
+            }
+        )
+    )
+
+    dataset = rd.RetrievalDatasetConfig(
+        data_dir_list=str(f),
+        data_type="train",
+        n_passages=2,
+        cycle_positive_docs=True,
+    ).build()
+
+    assert hasattr(dataset, "set_epoch")
+    assert dataset[0]["doc_text"] == ["P1", "N"]
+    dataset.set_epoch(1)
+    assert dataset[0]["doc_text"] == ["P2", "N"]
+
+    cross_dataset = rd.RetrievalDatasetConfig(
+        data_dir_list=str(f),
+        model_type="cross_encoder",
+        data_type="train",
+        n_passages=2,
+    ).build()
+    cross_batch = cross_dataset[[0]]
+    assert cross_batch["question"] == ["Q", "Q"]
+    assert cross_batch["doc_text"] == ["P1", "N"]
+    assert cross_batch["num_labels"] == [1, 1]
+
+
+def test_retrieval_dataset_config_rejects_instructions_without_corpus_metadata(tmp_path):
+    """Pure inline records cannot resolve dataset instructions without corpus metadata."""
+    f = tmp_path / "inline.jsonl"
+    f.write_text(json.dumps({"query": "Q", "pos_doc": "P", "neg_doc": ["N"]}))
+
+    dataset = rd.RetrievalDatasetConfig(
+        data_dir_list=str(f),
+        data_type="train",
+        n_passages=2,
+        use_dataset_instruction=True,
+    ).build()
+
+    with pytest.raises(
+        ValueError,
+        match=r"use_dataset_instruction=True requires corpus metadata.*Set use_dataset_instruction=False",
+    ):
+        dataset[0]
+
+
 def test__load_json_or_jsonl_json_and_jsonl_error_paths(tmp_path):
     # JSON (list)
     f_json = tmp_path / "data.json"
