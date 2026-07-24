@@ -2,8 +2,8 @@
 title: "Troubleshooting Models and First Runs"
 description: "Diagnose model-loading failures and checkpoint-specific training instability."
 ---
-Sometimes a model listed on the Hugging Face Hub may not work with NeMo AutoModel.
-If you encounter any such model, please open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with the model ID and any stack trace you see.
+A model listed on the Hugging Face Hub might not work with NeMo AutoModel.
+If you encounter such a model, open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) with the model ID and any stack trace you see.
 
 ## Common Issues
 
@@ -12,15 +12,18 @@ If you encounter any such model, please open a [GitHub issue](https://github.com
 | Model has explicitly disabled training in its definition code | — | Request support via a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues). We can add the model through our custom registry. |
 | Model requires a newer `transformers` version | `The checkpoint you are trying to load has model type deepseek_v32 but Transformers does not recognize this architecture.` | Upgrade `transformers` (and NeMo AutoModel if needed), or open a GitHub issue. |
 | Model upper-bounds `transformers`, requiring an older version | — | Open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues). |
-| Unsupported checkpoint format | `OSError: meta-llama/Llama-2-70b does not appear to have a file named pytorch_model.bin, model.safetensors, ...` | Open a GitHub issue or request the model publisher to share a SafeTensors checkpoint. |
+| Model has explicitly disabled training in its definition code | Not provided | Request support through a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues). Support can be added through the custom registry |
+| Model requires a newer `transformers` version | `The checkpoint you are trying to load has model type deepseek_v32 but Transformers does not recognize this architecture.` | Upgrade `transformers` (and NeMo AutoModel if needed), or open a GitHub issue |
+| Model upper-bounds `transformers`, requiring an older version | Not provided | Open a [GitHub issue](https://github.com/NVIDIA-NeMo/Automodel/issues) |
+| Unsupported checkpoint format | `OSError: meta-llama/Llama-2-70b does not appear to have a file named pytorch_model.bin, model.safetensors, ...` | Open a GitHub issue or request that the model publisher share a SafeTensors checkpoint |
 
 These cases typically stem from upstream packaging or dependency constraints. You would encounter the same issues when using `transformers` directly, as AutoModel mirrors the familiar load and fine-tune semantics.
 
 ## Steps to Try
 
 1. **Upgrade NeMo AutoModel** to a release that supports the required `transformers` version. See [Install NeMo AutoModel](/get-started/installation).
-2. **Enable remote code** — if the model uses custom code, set `trust_remote_code: true` in your `model:` config. See [Hugging Face API Compatibility](/get-started/hf-compatibility).
-3. **Open a GitHub issue** with the model ID and error so we can prioritize support or add a registry-backed implementation.
+2. **Enable remote code** if the model uses custom code by setting `trust_remote_code: true` in your `model:` config. See [Hugging Face API Compatibility](/get-started/hf-compatibility).
+3. **Open a GitHub issue** with the model ID and error so that the team can prioritize support or add a registry-backed implementation.
 
 ## Repair Damaged Input-Embedding Rows
 
@@ -30,6 +33,7 @@ Gradient clipping does not repair the checkpoint. A very large but finite global
 
 <Warning>
 Use embedding-row repair only for a diagnosed checkpoint defect. It does not correct NaNs caused by invalid data, an unstable loss, an unsuitable precision mode, optimizer state, or another model operation.
+
 </Warning>
 
 ### Why Rare Tokens Expose the Problem Late
@@ -44,11 +48,11 @@ An isolated input-embedding defect is likely when several of these observations 
 
 - The same architecture and data train from random initialization, but training from a particular checkpoint fails.
 - The checkpoint fails in more than one training framework.
-- Failure occurs when a rare token ID first appears; full-vocabulary mock data reproduces it much earlier than real data.
+- Failure occurs when a rare token ID first appears. Full-vocabulary mock data reproduces it much earlier than real data.
 - Most input-embedding rows have similar norms, while a small set is zero, non-finite, or separated from the healthy distribution by several orders of magnitude.
 - The corresponding output rows in `lm_head` are finite and have healthy norms.
 
-Inspect the checkpoint and choose `min_norm` from the observed gap between damaged and healthy rows. There is no model-independent threshold. The [Nemotron Nano 4B example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_4b_squad.yaml) uses `1.0e-4` for its diagnosed checkpoint; the component default is `1.0e-6`.
+Inspect the checkpoint and choose `min_norm` from the observed gap between damaged and healthy rows. There is no model-independent threshold. The [Nemotron Nano 4B example](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/nemotron/nemotron_nano_4b_squad.yaml) uses `1.0e-4` for its diagnosed checkpoint. The component default is `1.0e-6`.
 
 ### Enable the Repair
 
@@ -66,7 +70,7 @@ The section is optional and repair is disabled when it is absent. When the secti
 - `min_norm` is an inclusive L2-norm threshold. Rows with non-finite norms or norms less than or equal to this value are considered damaged.
 - `max_rows` is a safety bound, not an expected repair count. Setup stops before changing weights when more rows are damaged.
 
-During setup, the LLM training and fine-tuning recipe:
+During setup, the LLM training and fine-tuning recipe performs these steps:
 
 1. Scans the input embedding after checkpoint loading and model sharding, but before optimizer construction.
 2. Collects and logs the damaged global token IDs.
@@ -78,6 +82,7 @@ The operation supports regular tensors and DTensors with replicated or sharded v
 
 <Info>
 Repair changes the in-memory model and is included in checkpoints saved by the training run. It does not modify the source checkpoint.
+
 </Info>
 
 ### Interpret Setup Results
@@ -92,7 +97,7 @@ Setup fails instead of guessing when:
 - A corresponding output row is also damaged.
 - Pipeline parallelism is enabled.
 
-Do not increase `max_rows` merely to bypass the safety error. First verify the checkpoint source, model configuration, tokenizer vocabulary, and input/output embedding shapes. Broad damage usually indicates a mismatched or corrupted checkpoint rather than isolated bad rows.
+Do not increase `max_rows` merely to bypass the safety error. First verify the checkpoint source, model configuration, tokenizer vocabulary, and input and output embedding shapes. Broad damage usually indicates a mismatched or corrupted checkpoint rather than isolated bad rows.
 
 ### Verify Training
 
