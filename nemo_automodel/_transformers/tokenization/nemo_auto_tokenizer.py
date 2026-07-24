@@ -352,7 +352,15 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
     """
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *args, add_bos_token=True, add_eos_token=True, **kwargs):
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path,
+        *args,
+        add_bos_token=True,
+        add_eos_token=True,
+        force_tokenizers_backend: bool = False,
+        **kwargs,
+    ):
         """
         Load the HF tokenizer class via AutoTokenizer and (optionally) wrap it to add BOS/EOS.
 
@@ -360,9 +368,16 @@ class NeMoAutoTokenizerWithBosEosEnforced(AutoTokenizer):
             pretrained_model_name_or_path: Model identifier or path
             add_bos_token: Whether to add BOS token (default: True)
             add_eos_token: Whether to add EOS token (default: True)
+            force_tokenizers_backend: Whether to load tokenizer.json directly instead of using AutoTokenizer dispatch.
         """
+        tokenizer_loader = super().from_pretrained
+        if force_tokenizers_backend:
+            from transformers import TokenizersBackend
+
+            tokenizer_loader = TokenizersBackend.from_pretrained
+
         try:
-            tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+            tokenizer = tokenizer_loader(pretrained_model_name_or_path, *args, **kwargs)
         except (ValueError, StrictDataclassClassValidationError) as e:
             err = str(e)
             if "num_hidden_layers" in err and ("layer_types" in err or "layer types" in err):
