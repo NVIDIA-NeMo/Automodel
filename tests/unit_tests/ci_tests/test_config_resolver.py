@@ -384,6 +384,21 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
     assert "tokenizer_name" not in resolved
 
 
+@pytest.mark.parametrize(
+    "recipe_path",
+    [
+        "examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_tulu_magicoder_mix.yaml",
+        "examples/vlm_finetune/gemma4_joint_drafter/gemma4_31b_joint_drafter_tulu_magicoder_mix.yaml",
+    ],
+)
+def test_rank_uniform_text_only_vlm_recipes_opt_into_per_layer(recipe_path):
+    """Text-only recipes may retain the faster legacy sharding when every rank skips the frozen tower."""
+    resolved = yaml.load((REPO_ROOT / recipe_path).read_text())
+
+    assert resolved["freeze_config"]["freeze_vision_tower"] is True
+    assert resolved["distributed"]["frozen_multimodal_sharding"] == "per_layer"
+
+
 def test_end_to_end_dry_run_does_not_write(tmp_path, synthetic_recipe):
     out = tmp_path / "should_not_exist.yaml"
     env = {"PIPELINE_DIR": str(tmp_path), "TEST_NAME": "t1"}
