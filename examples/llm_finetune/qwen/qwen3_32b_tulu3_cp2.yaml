@@ -1,0 +1,162 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# To run this recipe:
+#   automodel examples/llm_finetune/qwen/qwen3_32b_tulu3_cp2.yaml --nproc-per-node 8
+# Adjust --nproc-per-node to the number of GPUs available on your machine.
+# Sized for 8 x 80GB (H100/A100) with FSDP2 full sharding + activation checkpointing.
+#
+# Qwen3-32B (dense) SFT on Tulu-3 with FSDP2 and context parallelism (cp_size=2).
+# Qwen3-32B has no custom NeMo model class, so this loads the stock HuggingFace
+# `Qwen3ForCausalLM` directly through NeMoAutoModelForCausalLM. Context parallelism
+# shards each sequence on the sequence dimension across the CP group; attention runs
+# through the SDPA/flash path, which is the CP-compatible path for a stock HF model.
+#
+# Fixed sequence length = 2048 (unpacked). Tulu-3 conversations are mostly short
+# (median ~255 tokens, 99.6% <= 2048), so to give context parallelism a real, uniform
+# sequence to shard we PIN every sample to exactly 2048 tokens:
+#   * dataset: truncation=true + seq_length=2048 caps the ~0.4% long tail at 2048
+#   * collater: pad_seq_len_divisible=2048 rounds each (<=2048) batch up to 2048
+# 2048 is divisible by 2*cp_size (=4), so cp2 shards it evenly to 1024 tokens/rank.
+# Padding is masked (labels=-100), so the fixed length is transparent to the loss.
+#
+# This is the cp2 arm of a cp1-vs-cp2 validation. It is IDENTICAL to
+# qwen3_32b_tulu3.yaml except cp_size=2 and local_batch_size=2. CP halves the
+# data-parallel width (dp_size 8 -> 4), so local_batch_size is doubled (1 -> 2) to
+# hold the global batch and gradient-accumulation window fixed. With shuffle=false
+# both runs consume identical data per optimizer step, so the cp1 and cp2 loss curves
+# must overlap -- that overlap is the CP-correctness check.
+#
+# Loss is FusedLinearCrossEntropy (fuses lm_head + CE and consumes the final hidden
+# state) to avoid the full [batch, seq, vocab] fp32 logit upcast that OOMs
+# MaskedCrossEntropy on 32B; it requires output_hidden_states=true on the model.
+#
+# Batch math (global_batch_size held fixed at 64):
+#   cp1: cp_size=1 -> dp_size=8, local_batch_size=1 -> grad_accum = 64/(1*8) = 8
+#   cp2: cp_size=2 -> dp_size=4, local_batch_size=2 -> grad_accum = 64/(2*4) = 8
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 2  # doubled vs cp1 because CP halves dp_size (8 -> 4)
+  ckpt_every_steps: 1000
+  val_every_steps: 100  # will run every x number of gradient steps
+  max_steps: 100
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3-32B
+  output_hidden_states: true  # FusedLinearCrossEntropy needs the final hidden state, not full logits
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: checkpoints/
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 2  # context parallelism: shard each sequence across 2 ranks
+  pp_size: 1
+
+  sequence_parallel: false
+  activation_checkpointing: true
+  # Reduce-scatter grads every micro-batch. The FSDP2 default (defer=true) accumulates
+  # the full UNSHARDED 32B gradient (~64 GiB bf16) across grad-accum steps and OOMs on
+  # 8x80GB; deferring off keeps only the ~8 GiB sharded grad. Numerically identical.
+  defer_fsdp_grad_sync: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  seq_length: 2048
+  truncation: true  # cap the ~0.4% of samples longer than 2048; the rest are unchanged
+  padding: do_not_pad  # dataset stays unpadded; the collater pads to the fixed 2048
+  # SFT supervises only assistant tokens, but the stock Qwen3 template can't produce that loss mask
+  # (it rewrites earlier turns); this override adds {% generation %} blocks so the tokenizer emits it.
+  # Needed for multi-turn chat datasets like Tulu-3.
+  chat_template: examples/llm_finetune/qwen/qwen3_tulu3_chat_template.jinja
+
+# Packing stays off: Qwen3-32B (dense) has no custom NeMo model class, so it loads
+# directly as the stock HF Qwen3ForCausalLM. With CP>1 the only usable attention is
+# SDPA: CP is implemented by intercepting F.scaled_dot_product_attention (torch's
+# context_parallel ring / all-gather), and HF's flash_attention_2 bypasses SDPA and
+# calls the flash-attn kernels directly, so the CP all-gather never fires (each rank
+# would attend only to its local shard). But packing + CP>1 over SDPA is not supported
+# (rejected in _apply_preload_overrides: "Packed sequence is only supported with CP
+# size 1"), because SDPA has no cu_seqlens/varlen interface and CP over varlen-packed
+# sequences isn't implemented. Supporting packing under CP for Qwen3-32B would require
+# a custom NeMo model class with a cu_seqlens-aware backend (TE or magi) that owns its
+# packed-CP routing (as the qwen3_moe TE/magi recipes do). We don't have that here, so
+# we get long (>=1k) sequences via a fixed seq_length + padding instead of packing.
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 2048  # pins every batch to a fixed 2048-token sequence (all samples are <= 2048)
+  shuffle: false  # deterministic order so cp1 vs cp2 curves are directly comparable
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: "train[:128]"
+  seq_length: 2048
+  truncation: true
+  chat_template: examples/llm_finetune/qwen/qwen3_tulu3_chat_template.jinja
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.default_collater
+    pad_seq_len_divisible: 2048
+
+optimizer:
+  _target_: torch.optim.Adam
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0
+
+# Uncomment and configure for W&B logging
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: athitten
+  time: "00:40:00"
+  nodes: 1
+  nproc_per_node: 8
