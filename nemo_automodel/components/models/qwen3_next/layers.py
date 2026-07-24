@@ -71,7 +71,7 @@ def _install_ssm_gate(mod: nn.Module, fp32_dtype: torch.dtype = torch.float32) -
         param = mod._parameters.pop(pname)
         if param.dtype != fp32_dtype:
             param.data = param.data.to(fp32_dtype)
-        setattr(gate, pname, param)
+        gate.register_parameter(pname, param)
     mod.add_module("_fp32_params", gate)
     return gate
 
