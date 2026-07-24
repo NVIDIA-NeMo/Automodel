@@ -20,23 +20,31 @@ EAGLE TTT depth offsets (``arange + step_idx``), packed sequences, context
 parallelism -- silently receive the wrong rotary phase.
 """
 
+import logging
 from unittest.mock import patch
 
 import pytest
 import torch
 from transformers import LlamaConfig
 
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.llama.rope_utils import LlamaRotaryEmbedding
 
 
-def _build_rope(*, head_dim: int = 8, heads: int = 4, max_pos: int = 128) -> LlamaRotaryEmbedding:
+def _build_rope(
+    *,
+    head_dim: int = 8,
+    heads: int = 4,
+    max_pos: int = 128,
+    rope_fusion: bool = False,
+) -> LlamaRotaryEmbedding:
     config = LlamaConfig(
         hidden_size=head_dim * heads,
         num_attention_heads=heads,
         num_key_value_heads=heads,
         max_position_embeddings=max_pos,
     )
-    return LlamaRotaryEmbedding(config)
+    return LlamaRotaryEmbedding(config, rope_fusion=rope_fusion)
 
 
 def test_rope_arange_is_per_position_and_unchanged():
@@ -88,6 +96,32 @@ def test_rope_gathers_non_contiguous_positions():
         cos_p, sin_p = rope(x, torch.tensor([[p]]))
         torch.testing.assert_close(cos[0, i], cos_p[0, 0])
         torch.testing.assert_close(sin[0, i], sin_p[0, 0])
+
+
+def test_quack_backend_disables_fusion_and_gathers_non_contiguous_positions(caplog):
+    """QuACK must not inherit the CUDA/TE fused-RoPE default.
+
+    Passing ``rope_fusion=True`` reproduces the default on CUDA builds with
+    Transformer Engine. QuACK must override it so arbitrary position IDs select
+    their absolute rotary phases instead of a contiguous ``[0, seq_len)`` slice.
+    """
+    with caplog.at_level(logging.WARNING):
+        backend = BackendConfig(rope="quack", rope_fusion=True)
+
+    assert backend.rope_fusion is False
+    assert "rope='quack' is incompatible with rope_fusion=True" in caplog.text
+
+    rope = _build_rope(rope_fusion=backend.rope_fusion)
+    x = torch.zeros(1, 1, 8)
+    positions = torch.tensor([[0, 5, 2, 9]])
+    cos, sin = rope(x, positions)
+    contiguous_cos, _ = rope(x, torch.arange(positions.shape[-1]).unsqueeze(0))
+
+    assert not torch.equal(cos, contiguous_cos)
+    for sequence_index, position in enumerate(positions[0]):
+        cos_at_position, sin_at_position = rope(x, position.reshape(1, 1))
+        torch.testing.assert_close(cos[0, sequence_index], cos_at_position[0, 0])
+        torch.testing.assert_close(sin[0, sequence_index], sin_at_position[0, 0])
 
 
 def test_rope_position_exceeding_seq_len_grows_cache():
