@@ -69,8 +69,8 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_sequence_for_cp_contiguous,
     shard_sequence_for_cp_round_robin,
 )
-from nemo_automodel.components.distributed.cp_vision_shard import (
-    cp_vision_sharding_active,
+from nemo_automodel.components.distributed.cp_vision_frame_shard import (
+    cp_vision_frame_sharding_active,
     maybe_distribute_visual,
 )
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
@@ -775,7 +775,7 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
         supports_pp: bool = True
         supports_ep: bool = True
         supports_thd: bool = False
-        supports_cp_vision_sharding: bool = True
+        supports_cp_vision_frame_sharding: bool = True
 
     @classmethod
     def from_config(
@@ -927,11 +927,11 @@ class Qwen3_5MoeForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5MoeForCo
 
         Returns:
             Flat merged-token embeddings of shape ``[visual_tokens, hidden]``
-            in original entry order. When CP vision sharding is active, each
+            in original entry order. When CP vision frame sharding is active, each
             rank computes a frame partition and the differentiable gather
             reconstructs this replicated output.
         """
-        if cp_vision_sharding_active():
+        if cp_vision_frame_sharding_active():
             return maybe_distribute_visual(
                 self.model.visual, pixel_values.type(self.model.visual.dtype), grid_thw
             ).pooler_output

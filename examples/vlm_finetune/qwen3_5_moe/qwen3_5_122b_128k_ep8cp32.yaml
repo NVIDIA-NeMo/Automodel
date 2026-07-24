@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Qwen3.5-122B-A10B long-context VLM scaling probe: 128K neat packing,
-# EP=8, CP=32, trainable vision tower, frame-level vision sharding, and full
+# EP=8, CP=32, trainable vision tower, CP vision frame sharding, and full
 # activation checkpointing. The 128-rank layout is CP32 x DP4; EP8 is composed
 # over that mesh by the MoE parallelizer.
 #
@@ -116,7 +116,7 @@ distributed:
   sequence_parallel: false
   activation_checkpointing: true
   defer_fsdp_grad_sync: false
-  cp_vision_sharding:
+  cp_vision_frame_sharding:
     enabled: true
     min_tokens: 0
     cost_alpha: auto

@@ -62,10 +62,10 @@ def _build_model(*, rope_index=None, image_token_id=None, video_token_id=None, a
     return model
 
 
-def test_declares_cp_vision_sharding_support():
+def test_declares_cp_vision_frame_sharding_support():
     capabilities = Qwen3_5MoeForConditionalGeneration.ModelCapabilities()
 
-    assert capabilities.supports_cp_vision_sharding is True
+    assert capabilities.supports_cp_vision_frame_sharding is True
 
 
 class TestPrepareModelInputsForCP:
@@ -246,7 +246,7 @@ class TestEmbedAndSpliceForCP:
             calls.append((visual, pixel_values, grid_thw))
             return types.SimpleNamespace(pooler_output=feat)
 
-        monkeypatch.setattr(model_module, "cp_vision_sharding_active", lambda: True)
+        monkeypatch.setattr(model_module, "cp_vision_frame_sharding_active", lambda: True)
         monkeypatch.setattr(model_module, "maybe_distribute_visual", _distribute)
 
         grid = torch.tensor([[1, 2, 2]])

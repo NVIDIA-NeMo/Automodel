@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from nemo_automodel.components.distributed.cp_vision_shard import CpVisionShardingConfig
+from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = REPO_ROOT / "examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml"
@@ -63,5 +63,5 @@ def test_qwen3_5_moe_122b_example_declares_scaling_contract() -> None:
     assert optimizer["exp_avg_dtype"] == "torch.float32"
     assert optimizer["exp_avg_sq_dtype"] == "torch.float32"
 
-    vision_policy = CpVisionShardingConfig(**raw_config["distributed"]["cp_vision_sharding"])
-    assert vision_policy == CpVisionShardingConfig(enabled=True, min_tokens=0, cost_alpha="auto")
+    vision_policy = CpVisionFrameShardingConfig(**raw_config["distributed"]["cp_vision_frame_sharding"])
+    assert vision_policy == CpVisionFrameShardingConfig(enabled=True, min_tokens=0, cost_alpha="auto")
