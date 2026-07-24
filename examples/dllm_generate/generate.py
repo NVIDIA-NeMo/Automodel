@@ -43,6 +43,14 @@ Nemotron-Labs-Diffusion generation::
         --prompt "What is 2+2?" \
         --sampler nemotron
 
+Generate from a LoRA (PEFT) checkpoint — any sampler::
+
+    python examples/dllm_generate/generate.py \
+        --checkpoint <base model id or SFT checkpoint> \
+        --adapter <lora checkpoint dir> \
+        --prompt "Explain what a neural network is." \
+        --sampler llada
+
 Override preset defaults::
 
     python examples/dllm_generate/generate.py \
@@ -75,9 +83,11 @@ from typing import Optional
 
 import torch
 from utils import (
+    GEMMA_ADAPTER_KEY_MAP,
     get_num_transfer_tokens,
     get_transfer_index,
     load_model_and_tokenizer,
+    merge_adapter,
     resolve_checkpoint,
     trim_response,
 )
@@ -501,6 +511,11 @@ def main():
     )
     parser.add_argument("--raw", action="store_true", help="No chat template")
     parser.add_argument("--infill", action="store_true", help="Infilling mode")
+    parser.add_argument(
+        "--adapter",
+        default=None,
+        help="Path to a PEFT (LoRA) adapter checkpoint dir; merged into the base --checkpoint model before generation",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -518,6 +533,13 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
 
     model, tokenizer, mask_id, eos_id = load_model_and_tokenizer(checkpoint_path, sampler_name=args.sampler)
+
+    if args.adapter:
+        print(f"Merging adapter: {args.adapter}")
+        # DiffusionGemma trains on the native Automodel implementation but
+        # generates through the HF class; re-parent the adapter module paths.
+        key_map = GEMMA_ADAPTER_KEY_MAP if args.sampler == "gemma" else None
+        model = merge_adapter(model, args.adapter, key_map=key_map)
 
     overrides = {}
     for key in [

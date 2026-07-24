@@ -21,6 +21,7 @@ from functools import lru_cache
 from typing import Dict, Tuple, Type, Union
 
 import torch.nn as nn
+from transformers.configuration_utils import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +291,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
+    "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
     "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
@@ -318,17 +320,36 @@ _CUSTOM_CONFIG_OVERRIDES_BUILTIN = {
 }
 
 
+def resolve_custom_config_cls(model_type: str) -> Type[PretrainedConfig] | None:
+    """Resolve Automodel's preferred config class for ``model_type`` if one applies."""
+    if model_type not in _CUSTOM_CONFIG_REGISTRATIONS:
+        return None
+
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    is_builtin = model_type in CONFIG_MAPPING
+    if is_builtin and model_type not in _CUSTOM_CONFIG_OVERRIDES_BUILTIN:
+        return None
+
+    module_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS[model_type]
+    try:
+        mod = importlib.import_module(module_path)
+        return getattr(mod, cls_name)
+    except Exception:
+        logger.debug("Failed to resolve custom config for model_type=%s", model_type, exc_info=True)
+        return None
+
+
 def _register_custom_configs() -> None:
     from transformers import AutoConfig
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    for model_type, (module_path, cls_name) in _CUSTOM_CONFIG_REGISTRATIONS.items():
+    for model_type in _CUSTOM_CONFIG_REGISTRATIONS:
         is_builtin = model_type in CONFIG_MAPPING
-        if is_builtin and model_type not in _CUSTOM_CONFIG_OVERRIDES_BUILTIN:
+        cfg_cls = resolve_custom_config_cls(model_type)
+        if cfg_cls is None:
             continue
         try:
-            mod = importlib.import_module(module_path)
-            cfg_cls = getattr(mod, cls_name)
             AutoConfig.register(model_type, cfg_cls, exist_ok=is_builtin)
         except Exception:
             logger.debug("Failed to register config for model_type=%s", model_type, exc_info=True)

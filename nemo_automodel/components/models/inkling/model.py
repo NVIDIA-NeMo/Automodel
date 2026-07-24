@@ -29,6 +29,21 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
+
+from .configuration import InklingConfig
+
+_INKLING_HF_UNAVAILABLE_MSG = (
+    "The Inkling model requires a transformers build that provides "
+    "transformers.models.inkling and transformers.masking_utils.create_recurrent_attention_mask "
+    "(transformers >= 5.14)."
+)
+
+
+def _make_missing(name: str):
+    return UnavailableMeta(name, (), {"_msg": _INKLING_HF_UNAVAILABLE_MSG})
+
+
 try:
     from transformers.cache_utils import DynamicCache
     from transformers.masking_utils import (
@@ -37,22 +52,27 @@ try:
         create_sliding_window_causal_mask,
     )
     from transformers.modeling_outputs import BaseModelOutputWithPast
-    from transformers.models.inkling.configuration_inkling import InklingConfig
+    from transformers.models.inkling.configuration_inkling import InklingConfig as HFInklingConfig
     from transformers.models.inkling.modeling_inkling import (
         InklingForConditionalGeneration as HFInklingForConditionalGeneration,
     )
     from transformers.models.inkling.modeling_inkling import InklingMLP as HFInklingMLP
     from transformers.models.inkling.modeling_inkling import InklingMoE as HFInklingMoE
     from transformers.models.inkling.modeling_inkling import InklingTextModel as HFInklingTextModel
-except ImportError as exc:  # transformers < 5.14 ships neither symbol set
-    from nemo_automodel.shared.import_utils import UnavailableError
 
-    raise UnavailableError(
-        "The Inkling model requires a transformers build that provides "
-        "transformers.models.inkling and "
-        "transformers.masking_utils.create_recurrent_attention_mask "
-        "(transformers >= 5.14)."
-    ) from exc
+    InklingConfig = HFInklingConfig
+    _INKLING_HF_AVAILABLE = True
+except ImportError:  # transformers < 5.14 ships neither symbol set
+    DynamicCache = _make_missing("DynamicCache")
+    BaseModelOutputWithPast = _make_missing("BaseModelOutputWithPast")
+    HFInklingForConditionalGeneration = _make_missing("HFInklingForConditionalGeneration")
+    HFInklingMLP = _make_missing("HFInklingMLP")
+    HFInklingMoE = _make_missing("HFInklingMoE")
+    HFInklingTextModel = _make_missing("HFInklingTextModel")
+    create_causal_mask = _make_missing("create_causal_mask")
+    create_recurrent_attention_mask = _make_missing("create_recurrent_attention_mask")
+    create_sliding_window_causal_mask = _make_missing("create_sliding_window_causal_mask")
+    _INKLING_HF_AVAILABLE = False
 
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
@@ -65,8 +85,15 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
-from .layers import InklingDenseMLP, InklingMoE, InklingShortConvolution, build_inkling_moe_config
 from .state_dict_adapter import InklingStateDictAdapter
+
+if _INKLING_HF_AVAILABLE:
+    from .layers import InklingDenseMLP, InklingMoE, InklingShortConvolution, build_inkling_moe_config
+else:
+    InklingDenseMLP = _make_missing("InklingDenseMLP")
+    InklingMoE = _make_missing("InklingMoE")
+    InklingShortConvolution = _make_missing("InklingShortConvolution")
+    build_inkling_moe_config = _make_missing("build_inkling_moe_config")
 
 
 class InklingTextModel(HFInklingTextModel):
@@ -137,6 +164,7 @@ class InklingTextModel(HFInklingTextModel):
 class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditionalGeneration, MoEFSDPSyncMixin):
     """Inkling VLM with expert-parallel MoE feed-forwards."""
 
+    _msg = _INKLING_HF_UNAVAILABLE_MSG
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
 
     # The adapter covers every checkpoint tensor. Avoid initializing the 975B
@@ -177,6 +205,8 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
         *model_args,
         **kwargs,
     ) -> "InklingForConditionalGeneration":
+        if not _INKLING_HF_AVAILABLE:
+            raise UnavailableError(_INKLING_HF_UNAVAILABLE_MSG)
         config = InklingConfig.from_pretrained(pretrained_model_name_or_path)
         return cls.from_config(config, *model_args, **kwargs)
 
@@ -187,6 +217,8 @@ class InklingForConditionalGeneration(HFCheckpointingMixin, HFInklingForConditio
         backend: BackendConfig | None = None,
         **kwargs,
     ) -> None:
+        if not _INKLING_HF_AVAILABLE:
+            raise UnavailableError(_INKLING_HF_UNAVAILABLE_MSG)
         reject_unsupported_tie_word_embeddings(type(self), config)
         backend = backend or BackendConfig()
 

@@ -233,6 +233,14 @@ class BackendConfig:
     compile_attn: bool = False
 
     def __post_init__(self):
+        # QuACK consumes position-gathered cosine/sine tables. TE's fused RoPE path
+        # instead assumes contiguous [0, seq_len) positions, so combining the two
+        # silently produces incorrect phases for packed, offset, or per-example
+        # position IDs.
+        if self.rope == "quack" and self.rope_fusion:
+            logger.warning("rope='quack' is incompatible with rope_fusion=True; disabling rope_fusion.")
+            self.rope_fusion = False
+
         # TEMPORARY: force TE fused RoPE off globally. The fused kernel computes cos/sin
         # in fp32 in-kernel while HF/vLLM rotate with bf16 tables, breaking logprob parity
         # in some models. See #3027. This is the one chokepoint every BackendConfig passes

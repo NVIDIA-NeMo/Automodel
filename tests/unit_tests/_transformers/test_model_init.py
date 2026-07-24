@@ -530,6 +530,60 @@ class TestGetHfConfigNestedKwargs:
         assert "config" not in call_kwargs
 
 
+class TestGetHfConfigCustomRegistry:
+    """get_hf_config should prefer Automodel's config registry over Transformers AutoConfig."""
+
+    def test_registered_custom_config_is_loaded_before_auto_config(self):
+        from transformers import PretrainedConfig
+
+        class RegistryConfig(PretrainedConfig):
+            model_type = "am_future"
+
+            def __init__(self, hidden_size=0, **kwargs):
+                self.hidden_size = hidden_size
+                super().__init__(**kwargs)
+
+        with (
+            patch(
+                "nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict",
+                return_value=(
+                    {"model_type": "am_future", "hidden_size": 123, "architectures": ["FutureForCausalLM"]},
+                    {"output_hidden_states": True},
+                ),
+            ),
+            patch(
+                "nemo_automodel._transformers.model_init.resolve_custom_config_cls",
+                return_value=RegistryConfig,
+            ) as mock_resolve,
+            patch("nemo_automodel._transformers.model_init.AutoConfig.from_pretrained") as mock_auto_config,
+        ):
+            result = get_hf_config("org/future-model", "sdpa", output_hidden_states=True)
+
+        assert isinstance(result, RegistryConfig)
+        assert result.hidden_size == 123
+        assert result.output_hidden_states is True
+        mock_resolve.assert_called_once_with("am_future")
+        mock_auto_config.assert_not_called()
+
+    def test_unknown_custom_config_falls_back_to_auto_config(self):
+        fallback_config = MagicMock()
+        with (
+            patch(
+                "nemo_automodel._transformers.model_init.PretrainedConfig.get_config_dict",
+                return_value=({"model_type": "not_registered"}, {}),
+            ),
+            patch("nemo_automodel._transformers.model_init.resolve_custom_config_cls", return_value=None),
+            patch(
+                "nemo_automodel._transformers.model_init.AutoConfig.from_pretrained",
+                return_value=fallback_config,
+            ) as mock_auto_config,
+        ):
+            result = get_hf_config("org/native-model", "flash_attention_2")
+
+        assert result is fallback_config
+        mock_auto_config.assert_called_once()
+
+
 class TestDictConfigOverrideKeepsCustomPath:
     """NVBugs 6259955 Defect 2: --model.config.* overrides must not flip dispatch off the
     custom model path, and the dict ``config`` must not reach the model constructor."""
