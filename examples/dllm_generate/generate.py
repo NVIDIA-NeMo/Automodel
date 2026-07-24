@@ -19,6 +19,8 @@ Provides ``DLLMSampler`` (core logic) with preset subclasses:
 - ``LLaDASampler``: no-cache, full-forward defaults.
 - ``LLaDA2Sampler``: built-in block-refinement generation defaults.
 - ``NemotronLabsDLLMSampler``: KV-cache block-diffusion defaults.
+- ``DiffusionGemmaSampler``: built-in HF diffusion-sampler defaults
+  (entropy-bounded denoising with adaptive stopping).
 
 Usage
 -----
@@ -50,6 +52,13 @@ Generate from a LoRA (PEFT) checkpoint — any sampler::
         --adapter <lora checkpoint dir> \
         --prompt "Explain what a neural network is." \
         --sampler llada
+
+DiffusionGemma generation::
+
+    python examples/dllm_generate/generate.py \
+        --checkpoint <path> \
+        --prompt "Explain what a neural network is." \
+        --sampler gemma
 
 Override preset defaults::
 
@@ -430,10 +439,29 @@ class NemotronLabsDLLMSampler(DLLMSampler):
     )
 
 
+class DiffusionGemmaSampler(DLLMSampler):
+    """Config-preset holder for DiffusionGemma generation.
+
+    DiffusionGemma ships its own diffusion sampler inside ``transformers``
+    (entropy-bounded denoising with adaptive stopping over canvas blocks), so
+    the CLI in ``main`` routes generation through ``model.generate(...)`` via
+    :func:`generate_gemma`. The inherited mask-based ``sample`` method is
+    unused on this path; only ``max_new_tokens`` and ``steps`` (mapped to the
+    sampler's ``max_denoising_steps``) are forwarded — the remaining sampler
+    hyperparameters keep their upstream defaults.
+    """
+
+    default_config = SamplerConfig(
+        steps=48,  # transformers DiffusionGemmaGenerationConfig.max_denoising_steps default
+        max_new_tokens=256,  # transformers DiffusionGemmaGenerationConfig default
+    )
+
+
 SAMPLERS = {
     "llada": LLaDASampler,
     "llada2": LLaDA2Sampler,
     "nemotron": NemotronLabsDLLMSampler,
+    "gemma": DiffusionGemmaSampler,
 }
 
 
@@ -467,6 +495,35 @@ def generate_llada2(model, tokenizer, inputs, config: SamplerConfig, mask_id: in
             mask_id=mask_id,
         )
         sequences.append(tokenizer.decode(generated[0], skip_special_tokens=True))
+    return sequences
+
+
+@torch.no_grad()
+def generate_gemma(model, tokenizer, inputs, config: SamplerConfig, eos_id: int) -> list[str]:
+    """Generate one DiffusionGemma response per prompt with the model's built-in sampler.
+
+    DiffusionGemma's ``generate`` (shipped with ``transformers``) performs
+    entropy-bounded denoising with adaptive stopping over canvas blocks.
+    Returned sequences include the prompt (with post-EOS positions padded),
+    so only the tail is decoded.
+    """
+    if eos_id is None:
+        raise ValueError("DiffusionGemma generation requires a tokenizer EOS token ID")
+
+    pad_id = tokenizer.pad_token_id if getattr(tokenizer, "pad_token_id", None) is not None else eos_id
+    device = getattr(model, "device", None) or next(model.parameters()).device
+    sequences = []
+    for prompt_ids in inputs:
+        prompt_tensor = torch.as_tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+        out = model.generate(
+            input_ids=prompt_tensor,
+            max_new_tokens=config.max_new_tokens,
+            max_denoising_steps=config.steps,
+            eos_token_id=eos_id,
+            pad_token_id=pad_id,
+        )
+        generated = out.sequences[0, prompt_tensor.shape[1] :]
+        sequences.append(tokenizer.decode(generated, skip_special_tokens=True))
     return sequences
 
 
@@ -530,6 +587,8 @@ def main():
         parser.error("--infill is not supported by the LLaDA2 generation path")
     if args.infill and args.sampler == "nemotron":
         parser.error("--infill is not supported by the Nemotron generation path (the tokenizer has no mask token)")
+    if args.infill and args.sampler == "gemma":
+        parser.error("--infill is not supported by the DiffusionGemma generation path")
 
     try:
         checkpoint_path = resolve_checkpoint(args.checkpoint)
@@ -631,6 +690,10 @@ def main():
             # ``generate`` implementation. It returns generated-only IDs and
             # currently supports one prompt per call.
             sequences = generate_llada2(model, tokenizer, inputs, sampler.default_config, mask_id, eos_id)
+        elif args.sampler == "gemma":
+            # DiffusionGemma ships its own diffusion sampler in ``transformers``
+            # (entropy-bounded denoising with adaptive stopping); route through it.
+            sequences = generate_gemma(model, tokenizer, inputs, sampler.default_config, eos_id)
         else:
             # LLaDA path: LLaDA checkpoints don't ship a built-in ``generate``
             # method, so fall back to the standalone ``DLLMSampler`` here.
