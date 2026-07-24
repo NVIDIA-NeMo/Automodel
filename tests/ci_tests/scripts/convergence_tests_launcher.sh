@@ -60,6 +60,22 @@ else
   TEST_SCRIPT_PATH="examples/llm_finetune/finetune.py"
 fi
 
+# --- Prefilter (LLM recipes only) ---
+# The LLM recipes (moonlight/qwen) train on raw allenai/tulu-3-sft-mixture with
+# truncation: false; over-length samples spike memory on the large-vocab MoEs and OOM.
+# Hence prefilter to seq_length first: resolve (or
+# build once) the filtered cache and point both dataset paths at it. gemma4 (VLM) packs
+# with drop_long_samples and is skipped.
+if [ "$RECIPE_KIND" != "FinetuneRecipeForVLM" ]; then
+  CACHED_DATASET=$(python3 /opt/Automodel/tests/ci_tests/scripts/convergence_prefilter.py \
+    --config "${RESOLVED_FINETUNE_CONFIG}")
+  if [ -z "${CACHED_DATASET}" ]; then
+    echo "[convergence] prefilter failed to resolve a cache path"; exit 1
+  fi
+  echo "[convergence] prefiltered dataset: ${CACHED_DATASET}"
+  FINETUNE_ARGS="--dataset.path_or_dataset_id ${CACHED_DATASET} --validation_dataset.path_or_dataset_id ${CACHED_DATASET} ${FINETUNE_ARGS:-}"
+fi
+
 # --- Executor ---
 NPROC_PER_NODE=${CONFIG_NPROC_PER_NODE:-$NPROC_PER_NODE}
 CMD="torchrun --nproc-per-node=${NPROC_PER_NODE} \

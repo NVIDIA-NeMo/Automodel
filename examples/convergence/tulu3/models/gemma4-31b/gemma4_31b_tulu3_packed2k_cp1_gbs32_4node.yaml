@@ -60,6 +60,10 @@ dataset:
   path_or_dataset: allenai/tulu-3-sft-mixture
   split: train
   truncate: false
+  # google/gemma-4-31B (base) ships no chat template; make_tulu3_dataset formats via the
+  # processor's tokenizer, so supply the -it template here. The VLM loader pops this key and
+  # applies it to processor.chat_template (no manual moving the chat template onto the model dir needed).
+  chat_template: examples/convergence/tulu3/models/gemma4-31b/chat_template.jinja
 
 # 2k sequence packing (multiple conversations per sample); the gemma4 hook injects
 # the thinking prefix and the packer masks it out of the loss.
@@ -112,9 +116,11 @@ wandb:
 # Passes iff |CI IFEval prompt_level_strict_acc - baseline| < k * stderr. baseline/stderr
 # measured (see README.md). `tokenizer: checkpoint` -> eval uses the trained checkpoint's
 # tokenizer (it carries the chat_template.jinja).
-# allow_failure until CI wires the gemma4 prerequisite: google/gemma-4-31B (base) ships NO
-# chat template, so `make_tulu3_dataset` (train) and eval both need the -it chat_template.jinja
-# staged onto the model dir first. Flip to blocking once the CI env stages it.
+# allow_failure while the gemma4 path is validated end to end. google/gemma-4-31B (base) ships
+# no chat template; it is now supplied via dataset.chat_template (applied to the processor by the
+# VLM loader) instead of being staged on the model dir. Keep allow_failure until a green run
+# confirms train + eval (tokenizer: checkpoint carries the template) + gate, then flip to blocking
+# like moonlight/qwen.
 ci:
   recipe_owner: athitten
   nodes: 4

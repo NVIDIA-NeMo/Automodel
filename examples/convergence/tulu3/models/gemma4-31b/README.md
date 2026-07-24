@@ -49,8 +49,9 @@ that exceed 2k. So there is no meta-JSON / prefilter / cache step to run.
 [`slurm.sub`](../../../../../slurm.sub) — point it at `examples/vlm_finetune/finetune.py -c <this
 config>` with a 4-node `torchrun` rendezvous.
 
-Prereq: the base ships no chat template — stage the `-it` `chat_template.jinja` onto the model dir
-first (needed by `make_tulu3_dataset`). Runs 1000 steps, `save_consolidated: final`.
+The base ships no chat template — the recipe supplies the `-it` template via
+`dataset.chat_template` (the VLM loader applies it to the processor), so no manual staging onto the
+model dir is needed. Runs 1000 steps, `save_consolidated: final`.
 
 ## Evaluate
 
@@ -104,13 +105,14 @@ instruction-level aggregation).
 
 This recipe's `ci.downstream_eval` block registers it in the weekly convergence flow
 (`tests/ci_tests/configs/convergence/convergence_recipes.yml`): train 1000 steps → IFEval → **pass iff
-`|prompt_level_strict_acc − 0.5287| < 2·0.0215`** (band `[0.486, 0.572]`). Marked `allow_failure`
-until the CI env stages the `-it` `chat_template.jinja` onto the base (the base ships none, needed by
-both `make_tulu3_dataset` and eval).
+`|prompt_level_strict_acc − 0.5287| < 2·0.0215`** (band `[0.486, 0.572]`). The base ships no chat
+template; the recipe supplies the `-it` template via `dataset.chat_template`. Kept `allow_failure`
+until a green run verifies train + eval (`tokenizer: checkpoint` carries the template) + gate, then
+flip to blocking like moonlight/qwen.
 
 ## Gotchas
 
-- **Base ships no chat template** → stage the `-it` `chat_template.jinja` onto the model dir before
-  train/eval.
+- **Base ships no chat template** → the recipe supplies the `-it` template via
+  `dataset.chat_template` (the VLM loader applies it to the processor); no manual staging needed.
 - **Eval flashinfer/cutlass drift** → `setup_lm_eval.sh` pins `nvidia-cutlass-dsl==4.5.0` (flashinfer
   0.6.13's `>=4.5.0` is too loose; 4.5.2 breaks the CuTeDSL MLIR API).
