@@ -445,7 +445,11 @@ class Gate(nn.Module):
             if self._cumulative_expert_load is None:
                 self._cumulative_expert_load = expert_load.detach()
             else:
-                self._cumulative_expert_load += expert_load.detach()
+                # Out-of-place add: under activation checkpointing this gate forward is
+                # recomputed in backward, and an in-place op on non-checkpointed module
+                # state trips torch's guard ("aten.add_.Tensor ... not found in storage").
+                # The bias update uses sign(avg - load), so the recompute double-count is a no-op.
+                self._cumulative_expert_load = self._cumulative_expert_load + expert_load.detach()
 
         aux_loss = None
         if self.aux_loss_coeff > 0 and self.training:

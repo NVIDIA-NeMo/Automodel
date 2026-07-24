@@ -109,3 +109,32 @@ optimizer:
   store_param_remainders: true
   exp_avg_dtype: torch.bfloat16
   exp_avg_sq_dtype: torch.bfloat16
+
+wandb:
+  enable: false
+  entity: Nemo-automodel
+  project: automodel_convergence_runs
+  name: qwen3_moe_30b_ep8_te_fusedadam
+  dir: /tmp/wandb
+
+# ── Weekly Tulu-3 convergence CI (train 1000 steps -> IFEval -> threshold gate) ──
+# Passes iff |CI IFEval prompt_level_strict_acc - baseline| < k * stderr. The SFT
+# model is evaluated WITH --thinking (its training mode); without it the empty
+# <think> prefill sends the model OOD and IFEval collapses. baseline/stderr measured.
+ci:
+  recipe_owner: athitten
+  nodes: 1
+  time: "02:00:00"                     # full 1000-step train + IFEval
+  convergence:
+    step_scheduler.max_steps: 1000     # phases.convergence abbreviates to 200; restore full run
+  downstream_eval:
+    tasks: ifeval
+    tokenizer: Qwen/Qwen3-30B-A3B
+    tp_size: 1
+    dp_size: 1
+    thinking: true
+    extra_model_args: "think_end_token=</think>,max_model_len=8192"
+    metric: prompt_level_strict_acc
+    baseline: 0.5767
+    stderr: 0.0213
+    k: 2

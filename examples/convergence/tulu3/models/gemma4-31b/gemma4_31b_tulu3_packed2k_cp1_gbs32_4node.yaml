@@ -1,0 +1,136 @@
+# Gemma 4 31B (dense, base) text-only SFT on Tulu-3 — PACKED 2k, GBS=32 on 4 nodes.
+#
+# Packed variant of the gbs32 sweep: pack to 2k, cp1 -> dp32 (4x8 GPUs) -> GBS=32
+# (local 1, grad_acc 1). Same large batch as the unpacked gbs32 run, but with
+# 2k sequence packing (multiple conversations per sample) instead of one
+# conversation/sample. FusedAdam fp32-master, lr 1e-5 cosine, 1000 steps.
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  # dp32 (world 32 / cp1 / tp1) * local 1 => grad_acc 1 => effective gbs=32.
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 999999
+  max_steps: 1000
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: google/gemma-4-31B
+  torch_dtype: torch.bfloat16
+  attn_implementation: sdpa
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  text_config:
+    use_cache: false
+
+processor:
+  padding_side: right
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints_convergence/gemma4_31b_tulu3_packed2k_cp1_gbs32_4node_lr5e6/
+  model_save_format: safetensors
+  save_consolidated: final
+
+distributed:
+  strategy: fsdp2
+  dp_size: none          # auto = world/(cp*tp) = 32 (4 nodes) -> gbs=32
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_tulu3_dataset
+  path_or_dataset: allenai/tulu-3-sft-mixture
+  split: train
+  truncate: false
+  # google/gemma-4-31B (base) ships no chat template; make_tulu3_dataset formats via the
+  # processor's tokenizer, so supply the -it template here. The VLM loader pops this key and
+  # applies it to processor.chat_template (no manual moving the chat template onto the model dir needed).
+  chat_template: examples/convergence/tulu3/models/gemma4-31b/chat_template.jinja
+
+# 2k sequence packing (multiple conversations per sample); the gemma4 hook injects
+# the thinking prefix and the packer masks it out of the loss.
+packed_sequence:
+  pretokenize: true
+  max_length: 2048
+  pack_size: 2048
+  collate_max_length: 2048
+  packing_ratio: 0.9
+  drop_long_samples: true
+  post_tokenize_hook_fn: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_inject_thinking_prefix
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+
+# fp32-master TE FusedAdam
+optimizer:
+  _target_: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 5e-6
+  weight_decay: 0.0
+  master_weights: true
+  store_param_remainders: true
+  exp_avg_dtype: torch.bfloat16
+  exp_avg_sq_dtype: torch.bfloat16
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 100
+  min_lr: 1.0e-6
+
+freeze_config:
+  freeze_embeddings: true
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+wandb:
+  enable: false
+  entity: Nemo-automodel
+  project: automodel_convergence_runs
+  name: gemma4_31b_tulu3_packed2k_cp1_gbs32_4node
+  dir: /tmp/wandb
+
+# ── Weekly Tulu-3 convergence CI (train 1000 steps -> IFEval -> threshold gate) ──
+# Passes iff |CI IFEval prompt_level_strict_acc - baseline| < k * stderr. baseline/stderr
+# measured (see README.md). `tokenizer: checkpoint` -> eval uses the trained checkpoint's
+# tokenizer (it carries the chat_template.jinja).
+# google/gemma-4-31B (base) ships no chat template; it is supplied via dataset.chat_template
+# (applied to the processor by the VLM loader), so no manual staging onto the model dir is needed.
+ci:
+  recipe_owner: athitten
+  nodes: 4
+  time: "02:00:00"                     # full 1000-step train (4 nodes) + IFEval
+  convergence:
+    step_scheduler.max_steps: 1000
+  downstream_eval:
+    tasks: ifeval
+    tokenizer: checkpoint
+    tp_size: 2
+    dp_size: 1
+    extra_model_args: "max_model_len=8192"
+    metric: prompt_level_strict_acc
+    baseline: 0.5287
+    stderr: 0.0215
+    k: 2
