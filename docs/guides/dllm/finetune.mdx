@@ -242,10 +242,10 @@ model:
 
 dllm:
   mode: idlm
-  mask_token_id: 151669          # reserved Qwen3 special token used as the mask
-  block_length: 1                # diffusion block size (paper curriculum 1 -> 2 -> 3)
-  clean_loss_weight: 0.2         # fixed alpha on CE_clean
-  auto_balance_clean_loss: false # set true for the auto-balanced alpha (Eq. 2, b3 stage)
+  mask_token_id: 151669          # Reserved Qwen3 special token used as the mask
+  block_length: 1                # Diffusion block size (paper curriculum 1 -> 2 -> 3)
+  clean_loss_weight: 0.2         # Fixed alpha on CE_clean
+  auto_balance_clean_loss: false # Set true for the auto-balanced alpha (Eq. 2, b3 stage)
 
 dataset:
   unshifted: true
