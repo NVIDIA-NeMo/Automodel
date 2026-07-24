@@ -144,9 +144,7 @@ class DeepseekV4Block(nn.Module):
         # tid2eid lookup table instead of the score-based generic Gate.
         # Swap after MoE construction so the rest of MoE (experts, shared
         # experts, etc.) keeps its standard layout.
-        self.is_hash_routing_layer = (
-            layer_idx < int(getattr(config, "num_hash_layers", 0) or 0) and not backend.fake_balanced_gate
-        )
+        self.is_hash_routing_layer = layer_idx < config.num_hash_layers and not backend.fake_balanced_gate
         if self.is_hash_routing_layer:
             self.mlp.gate = DeepseekV4HashGate(config, moe_config)
         self.input_layernorm = initialize_rms_norm_module(
