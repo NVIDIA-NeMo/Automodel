@@ -40,7 +40,11 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
+from nemo_automodel.shared.import_utils import get_torch_version
+
 logger = logging.getLogger(__name__)
+
+_TORCH_PROFILER_SAC_IGNORE_MIN_VERSION = (2, 13)
 
 
 def unwrap_checkpoint_wrapper(module: nn.Module) -> nn.Module:
@@ -253,8 +257,43 @@ def _maybe_trace_selective_ac_decision(func, decision, is_alternating: bool, *, 
     logger.info("[selective-ac] %s -> %s", key, verdict)
 
 
+def ensure_profiler_ops_sac_ignored() -> None:
+    """Keep ``torch.ops.profiler`` record-function ops out of SAC's op replay.
+
+    torch 2.13's FSDP2 runs its pre/post-forward hooks under
+    ``torch.autograd.profiler.record_function``, which emits dispatchable
+    ``torch.ops.profiler._record_function_*`` ops. When an FSDP module boundary
+    sits inside a selective-activation-checkpointed region (e.g. MoE experts
+    sharded separately inside a checkpointed decoder block), those hooks fire a
+    different number of times during the backward recompute than during the
+    forward. SAC replays the forward op stream by per-op invocation index, so
+    the extra profiler op shifts the stream and training fails with
+    ``profiler._record_function_enter_new.default invocation index N
+    encountered during backward but not found in storage``.
+
+    Range ops carry no tensors SAC could cache or restore; adding them to
+    ``SAC_IGNORED_OPS`` only removes them from the replay accounting (they
+    still execute). No-op before torch 2.13 and on torch builds without
+    ``SAC_IGNORED_OPS`` or the profiler op namespace.
+    """
+    if get_torch_version().release < _TORCH_PROFILER_SAC_IGNORE_MIN_VERSION:
+        return
+
+    sac_ignored = getattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", None)
+    profiler_ops = getattr(torch.ops, "profiler", None)
+    if sac_ignored is None or profiler_ops is None:
+        return
+    for packet_name in ("_record_function_enter", "_record_function_enter_new", "_record_function_exit"):
+        packet = getattr(profiler_ops, packet_name, None)
+        if packet is None:
+            continue
+        for overload_name in packet.overloads():
+            sac_ignored.add(getattr(packet, overload_name))
+
+
 def make_selective_checkpoint_context_fn():
     """Build a TorchTitan-style selective activation checkpointing context."""
+    ensure_profiler_ops_sac_ignored()
 
     def selective_checkpointing_context_fn():
         # Count matmuls separately for the forward and recompute passes. torch
