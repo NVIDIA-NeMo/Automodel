@@ -22,7 +22,18 @@ import torch
 
 from .base_dataset import BaseMultiresolutionDataset
 
-VIDEO_OPTIONAL_FIELDS = ("text_mask", "text_embeddings_2", "text_mask_2", "image_embeds")
+VIDEO_OPTIONAL_FIELDS = (
+    "text_mask",
+    "text_embeddings_2",
+    "text_mask_2",
+    "image_embeds",
+    # LTX-2 dual-stream cache keys: audio latents [1, 8, L, 16] and the
+    # audio-stream text conditioning [1, T, D_a]. L is constant across a
+    # dataset preprocessed with a fixed num_frames, so torch.cat collation
+    # in collate_optional_video_fields stays valid.
+    "audio_latents",
+    "audio_text_embeddings",
+)
 
 
 def load_optional_video_fields(data: dict, device: str = "cpu") -> dict:

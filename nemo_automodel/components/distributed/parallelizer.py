@@ -890,6 +890,18 @@ class HunyuanParallelizationStrategy(ParallelizationStrategy):
         )
 
 
+class LTX2ParallelizationStrategy(HunyuanParallelizationStrategy):
+    """Parallelization strategy for the LTX-2 video+audio transformer.
+
+    ``LTX2VideoTransformer3DModel`` exposes its layers as ``transformer_blocks``
+    but names the attention/FFN submodules ``attn1``/``attn2``/``ff``, which the
+    Default strategy's submodule-level activation checkpointing does not
+    recognize — leaving attention and MLP activations un-checkpointed and OOM-ing
+    on the long combined video+audio token sequence. Wrapping each whole block
+    (as the HunyuanVideo strategy does) restores the expected memory profile.
+    """
+
+
 # Strategy registry mapping model class names to parallelization strategies
 PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "NemotronHForCausalLM": NemotronHParallelizationStrategy(),
@@ -898,6 +910,7 @@ PARALLELIZATION_STRATEGIES: Dict[str, ParallelizationStrategy] = {
     "Qwen3_5ForCausalLM": Qwen3_5ParallelizationStrategy(),
     "WanTransformer3DModel": WanParallelizationStrategy(),
     "HunyuanVideo15Transformer3DModel": HunyuanParallelizationStrategy(),
+    "LTX2VideoTransformer3DModel": LTX2ParallelizationStrategy(),
 }
 
 # Default strategy instance

@@ -3992,6 +3992,7 @@ diffusion-kernels = [
     { name = "torchvision", version = "0.25.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
 ]
 diffusion-media = [
+    { name = "av" },
     { name = "imageio-ffmpeg" },
     { name = "opencv-python-headless" },
 ]
@@ -4011,6 +4012,7 @@ fla = [
 ]
 media = [
     { name = "albumentations" },
+    { name = "av" },
     { name = "decord", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "imageio-ffmpeg" },
     { name = "opencv-python-headless" },
@@ -4100,6 +4102,7 @@ test = [
 requires-dist = [
     { name = "albumentations", marker = "extra == 'vlm-media'" },
     { name = "apache-tvm-ffi", marker = "extra == 'cuda'", specifier = "<=0.1.11" },
+    { name = "av", marker = "extra == 'diffusion-media'" },
     { name = "backoff", marker = "extra == 'vlm'" },
     { name = "bitsandbytes", marker = "extra == 'cuda-source'" },
     { name = "boto3", marker = "extra == 's3'", specifier = ">=1.34" },
