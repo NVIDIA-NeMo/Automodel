@@ -1438,7 +1438,13 @@ class TestActivationCheckpointingKVSharing:
             lambda mesh, *a, **kw: MagicMock(),
         )
 
-    def _run_parallelize(self, model, activation_checkpointing=True, activation_checkpointing_scope="all"):
+    def _run_parallelize(
+        self,
+        model,
+        activation_checkpointing=True,
+        activation_checkpointing_scope="all",
+        enable_compile=False,
+    ):
         """Invoke the strategy under test and return the model."""
         from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
@@ -1452,6 +1458,7 @@ class TestActivationCheckpointingKVSharing:
             device_mesh=mesh,
             activation_checkpointing=activation_checkpointing,
             activation_checkpointing_scope=activation_checkpointing_scope,
+            enable_compile=enable_compile,
         )
 
     # ------------------------------------------------------------------ #
@@ -1520,6 +1527,24 @@ class TestActivationCheckpointingKVSharing:
             assert isinstance(layer.self_attn, self._Wrapped), (
                 "self_attn should be checkpoint-wrapped for standard models"
             )
+
+    def test_linear_attn_wrapped_with_compile(self):
+        """Compile-compatible checkpointing wraps hybrid blocks' ``linear_attn`` mixers."""
+
+        class _LinearAttentionLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear_attn = nn.Linear(16, 16)
+                self.mlp = nn.Linear(16, 16)
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.model.layers = nn.ModuleList([_LinearAttentionLayer() for _ in range(2)])
+
+        self._run_parallelize(model, enable_compile=True)
+
+        for layer in model.model.layers:
+            assert isinstance(layer.linear_attn, self._Wrapped)
+            assert isinstance(layer.mlp, self._Wrapped)
 
     def test_mlp_always_wrapped(self):
         """MLP is checkpoint-wrapped regardless of KV sharing."""
