@@ -40,7 +40,11 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
+from nemo_automodel.shared.import_utils import get_torch_version
+
 logger = logging.getLogger(__name__)
+
+_TORCH_PROFILER_SAC_IGNORE_MIN_VERSION = (2, 13)
 
 
 def unwrap_checkpoint_wrapper(module: nn.Module) -> nn.Module:
@@ -269,9 +273,12 @@ def ensure_profiler_ops_sac_ignored() -> None:
 
     Range ops carry no tensors SAC could cache or restore; adding them to
     ``SAC_IGNORED_OPS`` only removes them from the replay accounting (they
-    still execute). No-op on torch builds without ``SAC_IGNORED_OPS`` or the
-    profiler op namespace.
+    still execute). No-op before torch 2.13 and on torch builds without
+    ``SAC_IGNORED_OPS`` or the profiler op namespace.
     """
+    if get_torch_version().release < _TORCH_PROFILER_SAC_IGNORE_MIN_VERSION:
+        return
+
     sac_ignored = getattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", None)
     profiler_ops = getattr(torch.ops, "profiler", None)
     if sac_ignored is None or profiler_ops is None:

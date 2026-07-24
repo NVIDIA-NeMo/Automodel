@@ -20,6 +20,7 @@ import copy
 import pytest
 import torch
 import torch.nn.functional as F
+from packaging.version import Version
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper, checkpoint_wrapper
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -341,7 +342,39 @@ def _sac_context_factory():
     return lambda: create_selective_checkpoint_contexts(policy)
 
 
-def test_sac_replay_tolerates_recompute_only_record_function():
+def test_profiler_ops_sac_ignore_skips_before_torch_2_13(monkeypatch):
+    sac_ignored = set()
+    monkeypatch.setattr(ac, "get_torch_version", lambda: Version("2.12.0"))
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored, raising=False)
+
+    ac.ensure_profiler_ops_sac_ignored()
+
+    assert sac_ignored == set()
+
+
+def test_profiler_ops_sac_ignore_includes_torch_2_13_alpha(monkeypatch):
+    op = object()
+    packet = type("FakePacket", (), {"default": op, "overloads": lambda self: ("default",)})()
+    profiler_ops = type(
+        "FakeProfilerOps",
+        (),
+        {
+            "_record_function_enter": packet,
+            "_record_function_enter_new": packet,
+            "_record_function_exit": packet,
+        },
+    )()
+    sac_ignored = set()
+    monkeypatch.setattr(ac, "get_torch_version", lambda: Version("2.13.0a0+8145d630e8"))
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored, raising=False)
+    monkeypatch.setattr(torch.ops, "profiler", profiler_ops, raising=False)
+
+    ac.ensure_profiler_ops_sac_ignored()
+
+    assert sac_ignored == {op}
+
+
+def test_sac_replay_tolerates_recompute_only_record_function(monkeypatch):
     """A profiler range entered only during backward recompute must not desync SAC replay.
 
     torch 2.13's FSDP2 runs its hooks under ``record_function``; with an FSDP
@@ -354,6 +387,7 @@ def test_sac_replay_tolerates_recompute_only_record_function():
     if not hasattr(torch.utils.checkpoint, "SAC_IGNORED_OPS"):
         pytest.skip("torch build without SAC_IGNORED_OPS")
 
+    monkeypatch.setattr(ac, "get_torch_version", lambda: Version("2.13.0a0+8145d630e8"))
     ac.ensure_profiler_ops_sac_ignored()
     assert torch.ops.profiler._record_function_enter_new.default in torch.utils.checkpoint.SAC_IGNORED_OPS
 
