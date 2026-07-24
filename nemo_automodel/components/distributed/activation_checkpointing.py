@@ -40,7 +40,11 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
 
+from nemo_automodel.shared.import_utils import get_torch_version
+
 logger = logging.getLogger(__name__)
+
+_TORCH_PROFILER_SAC_IGNORE_MIN_VERSION = (2, 13)
 
 
 def unwrap_checkpoint_wrapper(module: nn.Module) -> nn.Module:
@@ -253,8 +257,43 @@ def _maybe_trace_selective_ac_decision(func, decision, is_alternating: bool, *, 
     logger.info("[selective-ac] %s -> %s", key, verdict)
 
 
+def ensure_profiler_ops_sac_ignored() -> None:
+    """Keep ``torch.ops.profiler`` record-function ops out of SAC's op replay.
+
+    torch 2.13's FSDP2 runs its pre/post-forward hooks under
+    ``torch.autograd.profiler.record_function``, which emits dispatchable
+    ``torch.ops.profiler._record_function_*`` ops. When an FSDP module boundary
+    sits inside a selective-activation-checkpointed region (e.g. MoE experts
+    sharded separately inside a checkpointed decoder block), those hooks fire a
+    different number of times during the backward recompute than during the
+    forward. SAC replays the forward op stream by per-op invocation index, so
+    the extra profiler op shifts the stream and training fails with
+    ``profiler._record_function_enter_new.default invocation index N
+    encountered during backward but not found in storage``.
+
+    Range ops carry no tensors SAC could cache or restore; adding them to
+    ``SAC_IGNORED_OPS`` only removes them from the replay accounting (they
+    still execute). No-op before torch 2.13 and on torch builds without
+    ``SAC_IGNORED_OPS`` or the profiler op namespace.
+    """
+    if get_torch_version().release < _TORCH_PROFILER_SAC_IGNORE_MIN_VERSION:
+        return
+
+    sac_ignored = getattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", None)
+    profiler_ops = getattr(torch.ops, "profiler", None)
+    if sac_ignored is None or profiler_ops is None:
+        return
+    for packet_name in ("_record_function_enter", "_record_function_enter_new", "_record_function_exit"):
+        packet = getattr(profiler_ops, packet_name, None)
+        if packet is None:
+            continue
+        for overload_name in packet.overloads():
+            sac_ignored.add(getattr(packet, overload_name))
+
+
 def make_selective_checkpoint_context_fn():
     """Build a TorchTitan-style selective activation checkpointing context."""
+    ensure_profiler_ops_sac_ignored()
 
     def selective_checkpointing_context_fn():
         # Count matmuls separately for the forward and recompute passes. torch
@@ -344,6 +383,16 @@ def sdpa_backend_snapshot_context_fn() -> tuple[AbstractContextManager, Abstract
     return nullcontext(), sdpa_kernel(captured)
 
 
+def _registered_child_name(module: nn.Module, attr: str, child: nn.Module) -> str | None:
+    """Return the registered name for a child reached through an attribute."""
+    if module._modules.get(attr) is child:
+        return attr
+    for child_name, registered_child in module._modules.items():
+        if registered_child is child:
+            return child_name
+    return None
+
+
 def _wrap_first_existing_attr(
     module: nn.Module,
     attr_names: tuple[str, ...],
@@ -351,14 +400,19 @@ def _wrap_first_existing_attr(
     skip: bool = False,
     context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
 ) -> int:
-    """Checkpoint-wrap the first matching child attr on ``module``."""
+    """Checkpoint-wrap the first matching registered child attr on ``module``."""
     if skip:
         return 0
     checkpoint_kwargs = {} if context_fn is None else {"context_fn": context_fn}
     for attr in attr_names:
         child = getattr(module, attr, None)
         if isinstance(child, nn.Module):
-            setattr(module, attr, checkpoint_wrapper(child, **checkpoint_kwargs))
+            child_name = _registered_child_name(module, attr, child)
+            if child_name is None:
+                continue
+            if hasattr(child, "_checkpoint_wrapped_module"):
+                return 0
+            setattr(module, child_name, checkpoint_wrapper(child, **checkpoint_kwargs))
             return 1
     return 0
 

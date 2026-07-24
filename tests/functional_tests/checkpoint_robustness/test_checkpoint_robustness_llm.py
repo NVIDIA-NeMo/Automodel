@@ -32,6 +32,7 @@ import sys
 import time
 import traceback
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 
 import datasets
@@ -363,6 +364,23 @@ def _hf_source_load_kwargs(
     return hf_kwargs
 
 
+def _hf_model_load_context(*, trust_remote_code: bool, has_device_map: bool) -> AbstractContextManager[None]:
+    """Return the model-initialization context for a vanilla Hugging Face load.
+
+    Hugging Face device-map dispatch relies on meta initialization to preserve
+    non-persistent buffers such as Llama RoPE frequencies. Disabling that path
+    before a device-mapped load can replace those buffers with uninitialized storage.
+    The real-device fallback is therefore limited to remote-code loads whose
+    placement is not already owned by ``device_map``.
+    """
+    if not trust_remote_code or has_device_map:
+        return nullcontext()
+
+    from nemo_automodel._transformers.model_init import no_hf_meta_device
+
+    return no_hf_meta_device()
+
+
 def _lm_head_embedding_aliased(model) -> bool | None:
     """Return lm_head/input-embedding aliasing when real local storage is inspectable."""
     # FSDP2/TP wrappers may expose distinct local storages for logically tied
@@ -609,8 +627,6 @@ def _prepare_source_load_reference_rank0(
     hf_source_post_load_dequantize: bool,
 ) -> tuple[torch.Tensor, bool | None, bool | None]:
     """Rank-0 implementation of vanilla HF source-load reference capture."""
-    from contextlib import nullcontext
-
     from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 
     apply_cache_compatibility_patches()
@@ -653,15 +669,13 @@ def _prepare_source_load_reference_rank0(
         if fp8_config is not None:
             hf_kwargs["config"] = fp8_config
 
-    try:
-        from nemo_automodel._transformers.model_init import no_hf_meta_device
-
-        no_meta = no_hf_meta_device() if trust_remote_code else nullcontext()
-    except ImportError:
-        no_meta = nullcontext()
+    model_load_context = _hf_model_load_context(
+        trust_remote_code=trust_remote_code,
+        has_device_map="device_map" in hf_kwargs,
+    )
 
     print(f"\n[Phase 0] Source-load reference: vanilla HF for {original_pretrained_path}")
-    with no_meta:
+    with model_load_context:
         if "device_map" in hf_kwargs:
             hf_model = hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
         else:
@@ -1221,21 +1235,6 @@ def run_checkpoint_robustness(
         if _rank0():
             print("[Phase 4] Skipped (ci.checkpoint_robustness.skip_hf_reload=true).")
     elif _rank0():
-        from contextlib import nullcontext
-
-        # Nemotron-Flash's custom ``LlamaRotaryEmbedding.__init__`` does
-        # ``torch.arange(...).to(device)`` which blows up under transformers 5.x's
-        # unconditional ``torch.device("meta")`` init context. Wrap HF loads in
-        # ``no_hf_meta_device`` so the model is built on a real device; we rely on
-        # this only for trust_remote_code models since standard HF models init
-        # correctly under meta.
-        try:
-            from nemo_automodel._transformers.model_init import no_hf_meta_device
-
-            _no_meta = no_hf_meta_device() if trust_remote_code else nullcontext()
-        except ImportError:
-            _no_meta = nullcontext()
-
         hf_kwargs = dict(
             torch_dtype=torch.bfloat16,
             trust_remote_code=trust_remote_code,
@@ -1267,16 +1266,20 @@ def run_checkpoint_robustness(
         # rank-0-only stall trips the NCCL watchdog while the other ranks idle at
         # the post-phase ``_barrier()`` below (the failure mode this test hit on
         # large models). ``device_map`` places weights on the GPU directly (~12s).
-        # trust_remote_code models need the ``_no_meta`` real-device init, which is
-        # incompatible with device_map's meta dispatch, and the auto/quantized
-        # paths set ``device_map`` themselves -- so restrict this to standard-HF loads.
+        # Remote-code models without device-map placement need real-device init;
+        # standard-HF loads can be placed directly through a fixed device map.
         if "device_map" not in hf_kwargs and not trust_remote_code and original_quantization_config is None:
             hf_kwargs["device_map"] = {"": device}
+
+        model_load_context = _hf_model_load_context(
+            trust_remote_code=trust_remote_code,
+            has_device_map="device_map" in hf_kwargs,
+        )
 
         if is_peft:
             from peft import PeftModel
 
-            with _no_meta:
+            with model_load_context:
                 if "device_map" in hf_kwargs:
                     base_model = hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
                 else:
@@ -1323,7 +1326,7 @@ def run_checkpoint_robustness(
             del peft_model, base_model
         else:
             _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
-            with _no_meta:
+            with model_load_context:
                 if "device_map" in hf_kwargs:
                     hf_model = hf_model_cls.from_pretrained(str(consolidated_dir), **hf_kwargs)
                 else:

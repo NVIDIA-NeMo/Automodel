@@ -53,7 +53,11 @@ from nemo_automodel.components.distributed.config import (
 from nemo_automodel.components.distributed.ddp import DDPManager
 from nemo_automodel.components.distributed.fsdp2 import FSDP2Manager
 from nemo_automodel.components.distributed.init_utils import get_world_size_safe
-from nemo_automodel.components.distributed.megatron_fsdp import MegatronFSDPManager
+from nemo_automodel.components.distributed.megatron_fsdp import (
+    MegatronFSDPManager,
+    restore_distributed_param_attrs,
+    snapshot_distributed_param_attrs,
+)
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.config import PipelineConfig
@@ -621,12 +625,18 @@ def apply_model_infrastructure(
 
     # Apply pipeline parallelism if configured. This is the outermost parallelization.
     # Note: AutoPipeline takes care of applying PP + EP + FSDP. _shard_ep_fsdp will take care of applying EP + FSDP if no PP.
+    mfsdp_param_attrs = None
     if autopipeline is not None:
         model = _shard_pp(autopipeline, model, loss_fn, parallelize_fn)
         for part in model.parts:
             setattr(part, "_pre_shard_hf_state_dict_keys", pre_shard_hf_state_dict_keys)
     else:
         model = _shard_ep_fsdp(model, model_wrapper, parallelize_fn, mesh)
+        # Megatron-FSDP stamps load-bearing per-parameter state (owning-model back-ref,
+        # tied-weight ``_is_shared`` marker, ``orig_param`` and friends) during wrapping.
+        # The lm-head re-tie and post-wrap checkpoint reload below rebuild Parameter
+        # objects and drop that state; snapshot it now and re-apply it afterwards.
+        mfsdp_param_attrs = snapshot_distributed_param_attrs(model)
         _ensure_tied_lm_heads(model)
         if compile_config is not None and not isinstance(model_wrapper, FSDP2Manager):
             model = compile_model(model, compile_config)
@@ -748,7 +758,7 @@ def apply_model_infrastructure(
     # is not excluded by the _uses_te_attention check, so gate on ep_size: only
     # dense (non-MoE) models need this pass.
     if mesh.cp_size > 1 and mesh.ep_size <= 1 and not _uses_te_attention(model):
-        from nemo_automodel.components.distributed.cp_utils import (
+        from nemo_automodel.components.distributed.context_parallel.utils import (
             attach_context_parallel_hooks,
             attach_cp_sdpa_hooks,
         )
@@ -774,6 +784,11 @@ def apply_model_infrastructure(
     if compute_dtype is not None:
         for mp in model.parts if hasattr(model, "parts") else [model]:
             cast_frozen_modules_to_compute_dtype(mp, compute_dtype)
+
+    # Re-apply the Megatron-FSDP per-parameter state dropped by the lm-head re-tie and
+    # post-wrap checkpoint reload, so the deferred optimizer registration and first
+    # backward see the same distributed-parameter attributes the combined entry point does.
+    restore_distributed_param_attrs(model, mfsdp_param_attrs)
 
     model = _apply_runtime_compatibility_fixes(model)
     return model

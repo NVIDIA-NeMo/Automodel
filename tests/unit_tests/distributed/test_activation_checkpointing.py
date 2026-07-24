@@ -20,6 +20,7 @@ import copy
 import pytest
 import torch
 import torch.nn.functional as F
+from packaging.version import Version
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper, checkpoint_wrapper
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -168,6 +169,36 @@ def test_submodule_checkpointing_without_snapshot_context_recompute_sees_diverge
     assert attn.backend_states[1] != _MATH_ONLY
 
 
+def test_submodule_checkpointing_preserves_canonical_state_dict_keys_for_property_aliases():
+    class Mixer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._fp32_params = nn.Module()
+            self._fp32_params.A_log = nn.Parameter(torch.ones(2))
+
+    class AliasLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mixer = Mixer()
+
+        @property
+        def mlp(self):
+            return self.mixer
+
+        @property
+        def self_attn(self):
+            return self.mixer
+
+    layer = AliasLayer()
+
+    ac.apply_submodule_checkpointing([layer], has_kv_sharing=False)
+
+    assert isinstance(layer.mixer, CheckpointWrapper)
+    assert isinstance(ac.unwrap_checkpoint_wrapper(layer.mixer), Mixer)
+    assert [name for name, _ in layer.named_children()] == ["mixer"]
+    assert list(layer.state_dict()) == ["mixer._fp32_params.A_log"]
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="Backend-set divergence across checkpoint recompute requires fused CUDA SDPA backends",
@@ -300,3 +331,79 @@ def test_detect_kv_sharing_leaves_cache_enabled_for_kv_shared_models():
     assert has_kv_sharing is True
     assert model.config.use_cache is True
     assert model.config.text_config.use_cache is True
+
+
+def _sac_context_factory():
+    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+
+    def policy(ctx, func, *args, **kwargs):
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    return lambda: create_selective_checkpoint_contexts(policy)
+
+
+def test_profiler_ops_sac_ignore_skips_before_torch_2_13(monkeypatch):
+    sac_ignored = set()
+    monkeypatch.setattr(ac, "get_torch_version", lambda: Version("2.12.0"))
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored, raising=False)
+
+    ac.ensure_profiler_ops_sac_ignored()
+
+    assert sac_ignored == set()
+
+
+def test_profiler_ops_sac_ignore_includes_torch_2_13_alpha(monkeypatch):
+    op = object()
+    packet = type("FakePacket", (), {"default": op, "overloads": lambda self: ("default",)})()
+    profiler_ops = type(
+        "FakeProfilerOps",
+        (),
+        {
+            "_record_function_enter": packet,
+            "_record_function_enter_new": packet,
+            "_record_function_exit": packet,
+        },
+    )()
+    sac_ignored = set()
+    monkeypatch.setattr(ac, "get_torch_version", lambda: Version("2.13.0a0+8145d630e8"))
+    monkeypatch.setattr(torch.utils.checkpoint, "SAC_IGNORED_OPS", sac_ignored, raising=False)
+    monkeypatch.setattr(torch.ops, "profiler", profiler_ops, raising=False)
+
+    ac.ensure_profiler_ops_sac_ignored()
+
+    assert sac_ignored == {op}
+
+
+def test_sac_replay_tolerates_recompute_only_record_function(monkeypatch):
+    """A profiler range entered only during backward recompute must not desync SAC replay.
+
+    torch 2.13's FSDP2 runs its hooks under ``record_function``; with an FSDP
+    boundary inside a SAC region the range ops fire a different number of times
+    in the recompute than in the forward, which shifts SAC's per-op replay
+    index and raises ``... encountered during backward but not found in
+    storage``. ``ensure_profiler_ops_sac_ignored`` keeps profiler ops out of
+    the replay accounting.
+    """
+    if not hasattr(torch.utils.checkpoint, "SAC_IGNORED_OPS"):
+        pytest.skip("torch build without SAC_IGNORED_OPS")
+
+    monkeypatch.setattr(ac, "get_torch_version", lambda: Version("2.13.0a0+8145d630e8"))
+    ac.ensure_profiler_ops_sac_ignored()
+    assert torch.ops.profiler._record_function_enter_new.default in torch.utils.checkpoint.SAC_IGNORED_OPS
+
+    linear = nn.Linear(4, 4)
+    calls = {"n": 0}
+
+    def fn(x):
+        calls["n"] += 1
+        if calls["n"] > 1:  # backward-time recompute takes a different hook path
+            with torch.autograd.profiler.record_function("recompute-only-range"):
+                return linear(x)
+        return linear(x)
+
+    x = torch.randn(2, 4, requires_grad=True)
+    out = torch.utils.checkpoint.checkpoint(fn, x, use_reentrant=False, context_fn=_sac_context_factory())
+    out.sum().backward()
+
+    assert calls["n"] == 2
+    assert x.grad is not None

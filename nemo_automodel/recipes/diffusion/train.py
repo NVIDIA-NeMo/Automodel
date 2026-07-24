@@ -14,31 +14,23 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import os
 import time
 from contextlib import nullcontext
-from math import ceil
 from typing import Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
 import wandb
-from huggingface_hub.constants import HF_HUB_CACHE
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
-from nemo_automodel.components.checkpoint.checkpointing import CheckpointingConfig
-from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.optim.precision_warnings import warn_if_torch_adam_with_bf16_params
-from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.rng import StatefulRNG
-from nemo_automodel.components.training.step_scheduler import StepScheduler
 from nemo_automodel.components.training.utils import (
     clip_grad_norm,
     prepare_after_first_microbatch,
@@ -51,23 +43,37 @@ from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str
 
-_OPTIMIZER_DEFAULT_TARGET = "torch.optim.AdamW"
-_TORCH_DTYPE_ALIASES = {
-    "float32": torch.float32,
-    "fp32": torch.float32,
-    "bfloat16": torch.bfloat16,
-    "bf16": torch.bfloat16,
-    "float16": torch.float16,
-    "fp16": torch.float16,
+# Removed diffusion-only YAML keys and their standard replacements. The diffusion
+# recipe now shares the LLM/VLM ``optimizer:`` / ``clip_grad_norm:`` /
+# ``step_scheduler:`` schema; configs still using the old keys fail fast with the
+# mapping below instead of being silently misread.
+_REMOVED_KEY_MIGRATIONS = {
+    "optim.learning_rate": "optimizer.lr",
+    "optim.optimizer": "optimizer (with an explicit _target_, e.g. torch.optim.AdamW)",
+    "optim.clip_grad": "clip_grad_norm.max_norm",
+    "step_scheduler.log_every": "step_scheduler.log_remote_every_steps",
 }
 
 
-def _resolve_optimizer_dtype_strings(optimizer_cfg: Any) -> None:
-    """Resolve dtype strings in optimizer config objects in place."""
-    for attr in ("master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype"):
-        val = getattr(optimizer_cfg, attr, None)
-        if isinstance(val, str):
-            setattr(optimizer_cfg, attr, dtype_from_str(val))
+def _reject_removed_diffusion_keys(cfg: Any) -> None:
+    """Raise with old->new key mapping when a removed diffusion YAML key is present.
+
+    Args:
+        cfg: Raw recipe config (``ConfigNode`` or ``RecipeConfig``) as loaded from YAML.
+
+    Raises:
+        ValueError: If any key from ``_REMOVED_KEY_MIGRATIONS`` is present.
+    """
+    found = [key for key in _REMOVED_KEY_MIGRATIONS if cfg.get(key, None) is not None]
+    if cfg.get("optim", None) is not None:
+        found = sorted(set(found) | {"optim.learning_rate"})
+    if found:
+        mapping = "; ".join(f"'{key}' -> '{_REMOVED_KEY_MIGRATIONS[key]}'" for key in found)
+        raise ValueError(
+            f"Config uses removed diffusion-only keys: {mapping}. "
+            "The diffusion recipe now uses the same optimizer/clip_grad_norm/step_scheduler "
+            "YAML schema as the LLM/VLM recipes; see examples/diffusion/**/*.yaml."
+        )
 
 
 def _resolve_model_dtypes(cfg: Any) -> tuple[torch.dtype, torch.dtype]:
@@ -103,79 +109,6 @@ def _validate_precision_configuration(
         "Split storage/compute dtypes require FSDP full-parameter training, where FSDP can cast gathered "
         "parameters to the compute dtype."
     )
-
-
-def _build_optimizer(
-    trainable_params: list[torch.nn.Parameter],
-    optimizer_cfg: Any,
-    learning_rate: float,
-    is_peft: bool = False,
-) -> torch.optim.Optimizer:
-    """Build optimizer from config, falling back to AdamW for legacy configs."""
-    optimizer_cfg = optimizer_cfg or {}
-    if isinstance(optimizer_cfg, dict) and "_target_" in optimizer_cfg:
-        optimizer_cfg = ConfigNode(optimizer_cfg)
-
-    if hasattr(optimizer_cfg, "_target_"):
-        _resolve_optimizer_dtype_strings(optimizer_cfg)
-        optimizer_target = optimizer_cfg._target_
-        optimizer_target_name = _get_optimizer_target_name(optimizer_target)
-        optimizer_cls = _resolve_optimizer_class(optimizer_target)
-        optimizer_dict = optimizer_cfg.to_dict() if hasattr(optimizer_cfg, "to_dict") else dict(optimizer_cfg)
-
-        optimizer_kwargs = {"lr": learning_rate}
-        for key, value in optimizer_dict.items():
-            if key in {"_target_", "lr", "learning_rate"}:
-                continue
-            if value is not None:
-                optimizer_kwargs[key] = _normalize_optimizer_value(value)
-
-        if (
-            optimizer_cls is torch.optim.AdamW
-            and optimizer_kwargs.get("foreach", False)
-            and optimizer_kwargs.get("fused", False)
-        ):
-            raise ValueError("torch.optim.AdamW does not support foreach=True and fused=True at the same time")
-        optimizer_kwargs = _filter_optimizer_kwargs(optimizer_target_name, optimizer_cls, optimizer_kwargs)
-        optimizer = optimizer_cls(trainable_params, **optimizer_kwargs)
-        logging.info("[INFO] Optimizer target: %s", optimizer_target_name)
-        logging.info("[INFO] Optimizer config: %s", optimizer_kwargs)
-        warn_if_torch_adam_with_bf16_params(
-            optimizer=optimizer,
-            parameters=trainable_params,
-            is_peft=is_peft,
-            context="diffusion",
-            logger=logging.getLogger(__name__),
-        )
-        return optimizer
-
-    optimizer_dict = optimizer_cfg.to_dict() if hasattr(optimizer_cfg, "to_dict") else dict(optimizer_cfg)
-    weight_decay = optimizer_dict.get("weight_decay", 0.01)
-    betas = tuple(optimizer_dict.get("betas", (0.9, 0.999)))
-    adamw_kwargs = {
-        "lr": learning_rate,
-        "weight_decay": weight_decay,
-        "betas": betas,
-        "eps": optimizer_dict.get("eps", 1e-8),
-        "amsgrad": optimizer_dict.get("amsgrad", False),
-    }
-    for key in ("foreach", "fused", "capturable", "maximize"):
-        value = optimizer_dict.get(key, None)
-        if value is not None:
-            adamw_kwargs[key] = value
-    if adamw_kwargs.get("foreach", False) and adamw_kwargs.get("fused", False):
-        raise ValueError("torch.optim.AdamW does not support foreach=True and fused=True at the same time")
-    optimizer = torch.optim.AdamW(trainable_params, **adamw_kwargs)
-
-    logging.info("[INFO] Optimizer config: %s", adamw_kwargs)
-    warn_if_torch_adam_with_bf16_params(
-        optimizer=optimizer,
-        parameters=trainable_params,
-        is_peft=is_peft,
-        context="diffusion",
-        logger=logging.getLogger(__name__),
-    )
-    return optimizer
 
 
 def _get_diffusion_microbatch_size(batch: Dict[str, Any]) -> int:
@@ -295,78 +228,6 @@ def _build_diffusion_parallel_manager_args(
     }
 
 
-def _normalize_optimizer_value(value: Any) -> Any:
-    """Convert CLI-friendly optimizer scalar values into Python objects."""
-    if isinstance(value, str):
-        normalized = value.removeprefix("torch.").lower()
-        return _TORCH_DTYPE_ALIASES.get(normalized, value)
-    return value
-
-
-def _get_optimizer_target_name(target: Any) -> str:
-    """Return a stable display name for an optimizer target."""
-    if isinstance(target, str):
-        return target
-    module_name = getattr(target, "__module__", None)
-    qualname = getattr(target, "__qualname__", None)
-    if module_name and qualname:
-        return f"{module_name}.{qualname}"
-    return repr(target)
-
-
-def _resolve_optimizer_class(target: Any) -> Any:
-    """Resolve an optimizer class from a fully qualified `_target_` string."""
-    if not isinstance(target, str):
-        if callable(target):
-            return target
-        raise ValueError(f"Optimizer target must be a fully qualified import path or callable, got {target!r}.")
-
-    if target == _OPTIMIZER_DEFAULT_TARGET:
-        return torch.optim.AdamW
-
-    module_name, _, symbol_name = target.rpartition(".")
-    if not module_name or not symbol_name:
-        raise ValueError(
-            f"Optimizer target must be a fully qualified import path, got {target!r}. "
-            f"Example: {_OPTIMIZER_DEFAULT_TARGET!r}."
-        )
-
-    available, optimizer_cls = safe_import_from(
-        module_name,
-        symbol_name,
-        msg=f"Optimizer target {target!r} could not be imported",
-    )
-    if not available:
-        raise ImportError(f"Optimizer target {target!r} could not be imported")
-    return optimizer_cls
-
-
-def _filter_optimizer_kwargs(target: str, optimizer_cls: Any, optimizer_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Drop kwargs unsupported by an opt-in optimizer target."""
-    try:
-        signature = inspect.signature(optimizer_cls)
-    except (TypeError, ValueError):
-        logging.info("[INFO] Could not inspect optimizer target %s; passing all optimizer kwargs", target)
-        return optimizer_kwargs
-
-    parameters = signature.parameters
-    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
-        return optimizer_kwargs
-
-    accepted = {
-        name
-        for name, parameter in parameters.items()
-        if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-    }
-    accepted.discard("params")
-
-    filtered_kwargs = {key: value for key, value in optimizer_kwargs.items() if key in accepted}
-    ignored_kwargs = sorted(set(optimizer_kwargs) - set(filtered_kwargs))
-    if ignored_kwargs:
-        logging.info("[INFO] Optimizer target %s does not accept kwargs %s; ignoring them", target, ignored_kwargs)
-    return filtered_kwargs
-
-
 def _build_transformer_engine_fp8_recipe(
     recipe_name: str,
     *,
@@ -422,11 +283,10 @@ def _resolve_transformer_engine_autocast() -> Any:
     return te_autocast
 
 
-def build_model_and_optimizer(
+def build_diffusion_pipeline(
     *,
     model_id: str,
     finetune_mode: bool,
-    learning_rate: float,
     device: torch.device,
     dtype: torch.dtype,
     compute_dtype: Optional[torch.dtype] = None,
@@ -434,7 +294,6 @@ def build_model_and_optimizer(
     fsdp_cfg: Optional[Dict[str, Any]] = None,
     ddp_cfg: Optional[Dict[str, Any]] = None,
     attention_backend: Optional[str] = None,
-    optimizer_cfg: Optional[Dict[str, Any]] = None,
     transformer_engine_linear: bool = False,
     transformer_engine_fp8_safe_only: bool = False,
     fuse_qkv_projections: bool = False,
@@ -443,13 +302,16 @@ def build_model_and_optimizer(
     peft_cfg=None,
     model_type=None,
     active_transformer: Optional[str] = None,
-) -> tuple[NeMoAutoDiffusionPipeline, torch.optim.Optimizer, Any]:
-    """Build the diffusion model, parallel scheme, and optimizer.
+) -> tuple[NeMoAutoDiffusionPipeline, Any]:
+    """Build the sharded diffusion pipeline (model + parallel scheme).
+
+    The optimizer is built separately by the recipe via
+    ``OptimizerConfig.build(...)`` on the returned pipeline's transformer, so
+    that parameters are collected after FSDP2 wrapping.
 
     Args:
         model_id: Pretrained model name or path.
         finetune_mode: Whether to load for finetuning (True) or pretraining (False).
-        learning_rate: Learning rate for optimizer.
         device: Target device.
         dtype: Model parameter storage dtype.
         compute_dtype: Forward/FSDP compute dtype. Defaults to dtype when unset.
@@ -457,7 +319,6 @@ def build_model_and_optimizer(
         fsdp_cfg: FSDP configuration dict. Mutually exclusive with ddp_cfg.
         ddp_cfg: DDP configuration dict. Mutually exclusive with fsdp_cfg.
         attention_backend: Optional attention backend override.
-        optimizer_cfg: Optional optimizer configuration.
         transformer_engine_linear: Whether to replace transformer torch.nn.Linear modules with Transformer Engine Linear.
         transformer_engine_fp8_safe_only: Whether to skip TE conversion for known FP8-incompatible modules.
         fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer before FSDP.
@@ -476,7 +337,7 @@ def build_model_and_optimizer(
             before device placement so only one transformer lives on GPU.
 
     Returns:
-        Tuple of (pipeline, optimizer, device_mesh or None).
+        Tuple of (pipeline, device_mesh or None).
 
     Raises:
         ValueError: If both fsdp_cfg and ddp_cfg are provided.
@@ -561,28 +422,23 @@ def build_model_and_optimizer(
         transformer_module_for_attrs.set_attention_backend(attention_backend)
 
     if lora_enabled:
-        # Collect lora_params AFTER FSDP2 wrapping from the live wrapped module.
-        # Pre-FSDP2 refs (pipe._lora_params) are stale after fully_shard() —
-        # FSDP2 replaces parameter storage, so AdamW with stale refs never commits
-        # updates to the actual sharded parameters. Mirrors the LLM pattern in
-        # nemo_automodel/recipes/llm/train_ft.py line 313.
-        trainable_params = [p for n, p in transformer_module.named_parameters() if "lora_" in n and p.requires_grad]
-        if not trainable_params:
+        # LoRA params must be collected AFTER FSDP2 wrapping from the live wrapped
+        # module. Pre-FSDP2 refs (pipe._lora_params) are stale after fully_shard() —
+        # FSDP2 replaces parameter storage, so an optimizer holding stale refs never
+        # commits updates to the actual sharded parameters. The recipe builds the
+        # optimizer from this returned pipeline for exactly that reason; this check
+        # only produces a diffusion-specific error message early.
+        lora_params = [p for n, p in transformer_module.named_parameters() if "lora_" in n and p.requires_grad]
+        if not lora_params:
             raise RuntimeError(
                 "peft_cfg is set but no LoRA params found. "
                 "Check that peft.target_modules match module names in the transformer."
             )
         logging.info(
-            "[LoRA] Optimizer: %d param tensors, %s elements",
-            len(trainable_params),
-            f"{sum(p.numel() for p in trainable_params):,}",
+            "[LoRA] Trainable: %d param tensors, %s elements",
+            len(lora_params),
+            f"{sum(p.numel() for p in lora_params):,}",
         )
-    else:
-        trainable_params = [p for p in transformer_module.parameters() if p.requires_grad]
-        if not trainable_params:
-            raise RuntimeError("No trainable parameters found in transformer module!")
-
-    optimizer = _build_optimizer(trainable_params, optimizer_cfg, learning_rate, is_peft=lora_enabled)
 
     trainable_count = sum(1 for p in transformer_module.parameters() if p.requires_grad)
     frozen_count = sum(1 for p in transformer_module.parameters() if not p.requires_grad)
@@ -593,111 +449,16 @@ def build_model_and_optimizer(
         memory_reserved = torch.cuda.memory_reserved(device) / 1024**3
         logging.info(f"[INFO] GPU memory: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
 
-    logging.info("[INFO] NeMoAutoDiffusion setup complete (pipeline + optimizer)")
+    logging.info("[INFO] NeMoAutoDiffusion pipeline setup complete")
 
-    return pipe, optimizer, getattr(fsdp2_manager, "device_mesh", None)
-
-
-def build_lr_scheduler(
-    cfg,
-    optimizer: torch.optim.Optimizer,
-    total_steps: int,
-) -> Optional[OptimizerParamScheduler]:
-    """Build the learning rate scheduler.
-
-    Args:
-        cfg: Configuration for the OptimizerParamScheduler from YAML. If None, no scheduler
-            is created and constant LR is used. Supports:
-            - lr_decay_style: constant, linear, cosine, inverse-square-root, WSD
-            - lr_warmup_steps: Number of warmup steps (or fraction < 1 for percentage)
-            - min_lr: Minimum LR after decay
-            - init_lr: Initial LR for warmup (defaults to 10% of max_lr if warmup enabled)
-            - wd_incr_style: constant, linear, cosine (for weight decay scheduling)
-            - wsd_decay_steps: WSD-specific decay steps
-            - lr_wsd_decay_style: WSD-specific decay style (cosine, linear, exponential, minus_sqrt)
-        optimizer: The optimizer to be scheduled.
-        total_steps: Total number of optimizer steps for the training run.
-
-    Returns:
-        OptimizerParamScheduler instance, or None if cfg is None.
-    """
-    if cfg is None:
-        return None
-
-    user_cfg = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg)
-
-    base_lr = optimizer.param_groups[0]["lr"]
-    base_wd = optimizer.param_groups[0].get("weight_decay", 0.0)
-
-    # Compute defaults from runtime values
-    default_cfg: Dict[str, Any] = {
-        "optimizer": optimizer,
-        "lr_warmup_steps": min(1000, total_steps // 10),
-        "lr_decay_steps": total_steps,
-        "lr_decay_style": "cosine",
-        "init_lr": base_lr * 0.1,
-        "max_lr": base_lr,
-        "min_lr": base_lr * 0.01,
-        "start_wd": base_wd,
-        "end_wd": base_wd,
-        "wd_incr_steps": total_steps,
-        "wd_incr_style": "constant",
-    }
-
-    # Handle warmup as fraction before merging
-    if "lr_warmup_steps" in user_cfg:
-        warmup = user_cfg["lr_warmup_steps"]
-        if isinstance(warmup, float) and 0 < warmup < 1:
-            user_cfg["lr_warmup_steps"] = int(warmup * total_steps)
-
-    # WSD defaults if user specifies WSD style
-    if user_cfg.get("lr_decay_style") == "WSD":
-        default_cfg["wsd_decay_steps"] = max(1, total_steps // 10)
-        default_cfg["lr_wsd_decay_style"] = "cosine"
-
-    # User config overrides defaults
-    default_cfg.update(user_cfg)
-
-    # If user disabled warmup, set init_lr = max_lr
-    if default_cfg["lr_warmup_steps"] == 0:
-        default_cfg["init_lr"] = default_cfg["max_lr"]
-
-    # Ensure warmup < decay steps
-    if default_cfg["lr_warmup_steps"] >= default_cfg["lr_decay_steps"]:
-        default_cfg["lr_warmup_steps"] = max(0, default_cfg["lr_decay_steps"] - 1)
-
-    logging.info(
-        f"[INFO] LR Scheduler: style={default_cfg['lr_decay_style']}, "
-        f"warmup={default_cfg['lr_warmup_steps']}, total={default_cfg['lr_decay_steps']}, "
-        f"max_lr={default_cfg['max_lr']}, min_lr={default_cfg['min_lr']}"
-    )
-
-    return OptimizerParamScheduler(
-        optimizer=default_cfg["optimizer"],
-        init_lr=default_cfg["init_lr"],
-        max_lr=default_cfg["max_lr"],
-        min_lr=default_cfg["min_lr"],
-        lr_warmup_steps=default_cfg["lr_warmup_steps"],
-        lr_decay_steps=default_cfg["lr_decay_steps"],
-        lr_decay_style=default_cfg["lr_decay_style"],
-        start_wd=default_cfg["start_wd"],
-        end_wd=default_cfg["end_wd"],
-        wd_incr_steps=default_cfg["wd_incr_steps"],
-        wd_incr_style=default_cfg["wd_incr_style"],
-        wsd_decay_steps=default_cfg.get("wsd_decay_steps"),
-        lr_wsd_decay_style=default_cfg.get("lr_wsd_decay_style"),
-    )
-
-
-def is_main_process():
-    """Return whether the current process should perform rank-zero work."""
-    return (not dist.is_initialized()) or dist.get_rank() == 0
+    return pipe, getattr(fsdp2_manager, "device_mesh", None)
 
 
 class TrainDiffusionRecipe(BaseRecipe):
     """Training recipe for diffusion models."""
 
     def __init__(self, cfg):
+        _reject_removed_diffusion_keys(cfg)
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     def setup(self):
@@ -746,8 +507,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             self.transformer_engine_linear = True
         if self.compact_fused_qkv_projections and not self.fuse_qkv_projections:
             raise ValueError("model.compact_fused_qkv_projections=true requires model.fuse_qkv_projections=true")
-        self.learning_rate = self.cfg.get("optim.learning_rate", 5e-6)
-        self.clip_grad_max_norm = float(self.cfg.get("optim.clip_grad", 1.0))
+        self.clip_grad_max_norm = float(self.cfg.get("clip_grad_norm.max_norm", 1.0))
         self.model_dtype, self.compute_dtype = _resolve_model_dtypes(self.cfg)
         performance_cfg = self.cfg.get("performance", {}) or {}
         self.check_loss = bool(performance_cfg.get("check_loss", False))
@@ -781,7 +541,6 @@ class TrainDiffusionRecipe(BaseRecipe):
             f"[INFO] Total GPUs: {self.world_size}, GPUs per node: {self.local_world_size}, Num nodes: {self.num_nodes}"
         )
         logging.info(f"[INFO] Node rank: {self.node_rank}, Local rank: {self.local_rank}")
-        logging.info(f"[INFO] Learning rate: {self.learning_rate}")
         logging.info("[INFO] Transformer Engine Linear: %s", self.transformer_engine_linear)
         logging.info(
             "[INFO] Transformer Engine FP8: %s (recipe=%s, amax_history_len=%s, amax_compute_algo=%s)",
@@ -899,17 +658,15 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info(f"[INFO] LoRA: {lora_status}")
 
-        (self.pipe, self.optimizer, self.device_mesh) = build_model_and_optimizer(
+        self.pipe, self.device_mesh = build_diffusion_pipeline(
             model_id=self.model_id,
             finetune_mode=self.cfg.get("model.mode", "finetune").lower() == "finetune",
-            learning_rate=self.learning_rate,
             device=self.device,
             dtype=self.model_dtype,
             compute_dtype=self.compute_dtype,
             cpu_offload=self.cpu_offload,
             fsdp_cfg=fsdp_cfg,
             ddp_cfg=ddp_cfg,
-            optimizer_cfg=self.cfg.get("optim.optimizer", {}),
             transformer_engine_linear=self.transformer_engine_linear,
             transformer_engine_fp8_safe_only=self.transformer_engine_fp8,
             fuse_qkv_projections=self.fuse_qkv_projections,
@@ -932,6 +689,18 @@ class TrainDiffusionRecipe(BaseRecipe):
             logging.info("[INFO] Enabled Hunyuan flash-varlen 2D mask optimization")
 
         self.peft_config = getattr(self.pipe, "_peft_config", None)
+
+        # Optimizer params are collected here, after FSDP2 wrapping inside
+        # build_diffusion_pipeline — pre-shard parameter refs would be stale.
+        # ``OptimizerConfig.build`` filters on ``requires_grad``; diffusion freezes
+        # base weights before this point, so with LoRA the trainable set is the LoRA set.
+        if self.cfg.optimizer is None:
+            raise ValueError(
+                "optimizer config is required in YAML, e.g.\noptimizer:\n  _target_: torch.optim.AdamW\n  lr: 5e-6"
+            )
+        self.optimizer = self.cfg.optimizer.build(
+            self.model, device_mesh=self.device_mesh, is_peft=self.peft_cfg is not None
+        )
 
         # Resolve sigma range for two-stage finetuning now that the pipeline
         # is loaded and we can read its boundary_ratio config.
@@ -964,33 +733,20 @@ class TrainDiffusionRecipe(BaseRecipe):
                 self.boundary_ratio,
             )
 
-        checkpoint_cfg = self.cfg.get("checkpoint", None)
-
-        self.num_epochs = self.cfg.get("step_scheduler.num_epochs")
-        self.log_every = self.cfg.get("step_scheduler.log_every", 5)
-
-        # Strictly require checkpoint config from YAML (no fallback)
-        if checkpoint_cfg is None:
+        # Strictly require checkpoint config from YAML — ``RecipeConfig.checkpoint``
+        # would otherwise silently fall back to component defaults.
+        if self.cfg.get("checkpoint", None) is None:
             raise ValueError(
                 "checkpoint config is required in YAML (enabled, checkpoint_dir, model_save_format, save_consolidated)"
             )
 
-        # Build BaseRecipe-style checkpointing configuration (DCP/TORCH_SAVE) from YAML
-        model_state_dict_keys = list(self.model.state_dict().keys())
-        model_cache_dir = self.cfg.get("model.cache_dir", None)
-        self.checkpoint_config = CheckpointingConfig(
-            enabled=checkpoint_cfg.get("enabled"),
-            checkpoint_dir=checkpoint_cfg.get("checkpoint_dir"),
-            model_save_format=checkpoint_cfg.get("model_save_format"),
-            model_cache_dir=model_cache_dir if model_cache_dir is not None else HF_HUB_CACHE,
-            model_repo_id=self.model_id,
-            save_consolidated=checkpoint_cfg.get("save_consolidated", False),
-            consolidation_timeout_minutes=checkpoint_cfg.get("consolidation_timeout_minutes", 30),
-            is_peft=self.peft_cfg is not None,
-            model_state_dict_keys=model_state_dict_keys,
-            diffusers_compatible=checkpoint_cfg.get("diffusers_compatible", False),
-        )
-        self.restore_from = checkpoint_cfg.get("restore_from", None)
+        # Typed checkpoint config from the YAML ``checkpoint:`` block; model-derived
+        # fields (model_repo_id, model_cache_dir, is_peft) are filled by RecipeConfig.
+        # The checkpointer discovers the pre-shard state-dict keys via the
+        # `_pre_shard_hf_state_dict_keys` attribute stamped on the transformer in
+        # `_apply_parallelization` (_diffusers/auto_diffusion_pipeline.py).
+        self.checkpoint_config = self.cfg.checkpoint
+        self.restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.checkpointer = self.checkpoint_config.build(
             dp_rank=self._get_dp_rank(include_cp=True),
             tp_rank=self._get_tp_rank(),
@@ -1009,11 +765,11 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.dataloader = dataloader_build.dataloader
         self.sampler = dataloader_build.sampler
 
-        self.raw_steps_per_epoch = len(self.dataloader)
-        if self.raw_steps_per_epoch == 0:
+        if len(self.dataloader) == 0:
             raise RuntimeError("Training dataloader is empty; cannot proceed with training")
 
         # Derive DP size consistent with model parallel config
+        # (manual until the distributed section is standardized; DistributedSetup owns this math)
         if ddp_cfg is not None:
             # DDP uses pure data parallelism across all ranks
             self.dp_size = self.world_size
@@ -1028,44 +784,21 @@ class TrainDiffusionRecipe(BaseRecipe):
             if self.dp_size is None:
                 self.dp_size = max(1, self.world_size // denom)
 
-        # Infer local micro-batch size from dataloader if available
+        # Local micro-batch and global effective batch sizes, used for loop logging
         self.local_batch_size = self.cfg.get("step_scheduler.local_batch_size")
-        # Desired global effective batch size across all DP ranks and nodes
         self.global_batch_size = self.cfg.get("step_scheduler.global_batch_size")
-        # Steps per epoch after gradient accumulation
-        grad_acc_steps = max(1, self.global_batch_size // max(1, self.local_batch_size * self.dp_size))
-        self.steps_per_epoch = ceil(self.raw_steps_per_epoch / grad_acc_steps)
 
-        # Calculate total optimizer steps for LR scheduler
-        total_steps = self.num_epochs * self.steps_per_epoch
-        max_steps = self.cfg.get("step_scheduler.max_steps", None)
-        if max_steps is not None:
-            total_steps = min(total_steps, max_steps)
-
-        # Build LR scheduler (returns None if lr_scheduler not in config)
-        # Wrap in list for compatibility with checkpointing (OptimizerState expects list)
-        lr_scheduler = build_lr_scheduler(
-            self.cfg.get("lr_scheduler", None),
-            self.optimizer,
-            total_steps,
+        self.step_scheduler = self.cfg.step_scheduler.build(
+            self.dataloader,
+            int(self.dp_size),
+            self.cfg.get("step_scheduler.local_batch_size"),
         )
-        self.lr_scheduler = [lr_scheduler] if lr_scheduler is not None else None
+        self.num_epochs = self.step_scheduler.num_epochs
 
-        self.global_step = 0
-        self.start_epoch = 0
-        # Initialize StepScheduler for gradient accumulation and step/epoch bookkeeping
-        self.step_scheduler = StepScheduler(
-            global_batch_size=self.cfg.get("step_scheduler.global_batch_size"),
-            local_batch_size=self.cfg.get("step_scheduler.local_batch_size"),
-            dp_size=int(self.dp_size),
-            ckpt_every_steps=self.cfg.get("step_scheduler.ckpt_every_steps"),
-            save_checkpoint_every_epoch=self.cfg.get("step_scheduler.save_checkpoint_every_epoch", False),
-            dataloader=self.dataloader,
-            val_every_steps=None,
-            start_step=int(self.global_step),
-            start_epoch=int(self.start_epoch),
-            num_epochs=int(self.num_epochs),
-            max_steps=max_steps,
+        self.lr_scheduler = (
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            if self.cfg.lr_scheduler is not None
+            else None
         )
 
         self.load_checkpoint(self.restore_from)
@@ -1093,7 +826,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
         logging.info(f"[INFO] Flow Matching Pipeline V2 initialized with {self.adapter_type} adapter")
 
-        if is_main_process():
+        if self.dist_env.is_main:
             os.makedirs(self.checkpoint_config.checkpoint_dir, exist_ok=True)
 
         if dist.is_initialized():
@@ -1128,7 +861,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                 self.sampler.set_epoch(epoch)
 
             # Optionally wrap dataloader with tqdm for rank-0
-            if is_main_process():
+            if self.dist_env.is_main:
                 from tqdm import tqdm
 
                 self.step_scheduler.dataloader = tqdm(self.dataloader, desc=f"Epoch {epoch + 1}/{self.num_epochs}")
@@ -1139,7 +872,8 @@ class TrainDiffusionRecipe(BaseRecipe):
             num_steps = 0
 
             for batch_group in self.step_scheduler:
-                self.optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.optimizer:
+                    optimizer.zero_grad(set_to_none=True)
 
                 micro_losses = []
                 prepare_for_grad_accumulation([self.model], pp_enabled=False)
@@ -1189,7 +923,8 @@ class TrainDiffusionRecipe(BaseRecipe):
                             )
                             break
 
-                self.optimizer.step()
+                for optimizer in self.optimizer:
+                    optimizer.step()
                 if self.lr_scheduler is not None:
                     self.lr_scheduler[0].step(1)
 
@@ -1200,7 +935,8 @@ class TrainDiffusionRecipe(BaseRecipe):
                 num_steps += 1
                 global_step = int(self.step_scheduler.step)
 
-                should_log = self.log_every and self.log_every > 0 and global_step % self.log_every == 0
+                log_every = self.step_scheduler.log_remote_every_steps
+                should_log = log_every and log_every > 0 and global_step % log_every == 0
                 if should_log:
                     elapsed_seconds, perf_window_end_time = self._elapsed_seconds_since(perf_window_start_time)
                     perf_window_global_samples = self._count_global_samples(perf_window_local_samples)
@@ -1215,12 +951,12 @@ class TrainDiffusionRecipe(BaseRecipe):
                     perf_window_steps = 0
                     perf_window_local_samples = 0
 
-                if should_log and is_main_process():
+                if should_log and self.dist_env.is_main:
                     avg_loss = epoch_loss / num_steps
                     log_dict = {
                         "train_loss": group_loss_mean,
                         "train_avg_loss": avg_loss,
-                        "lr": self.optimizer.param_groups[0]["lr"],
+                        "lr": self.optimizer[0].param_groups[0]["lr"],
                         "grad_norm": grad_norm,
                         "epoch": epoch,
                         "global_step": global_step,
@@ -1236,7 +972,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                         epoch,
                         group_loss_mean,
                         avg_loss,
-                        self.optimizer.param_groups[0]["lr"],
+                        self.optimizer[0].param_groups[0]["lr"],
                         grad_norm,
                         throughput_metrics["step_time"],
                         throughput_metrics["samples_per_sec"],
@@ -1250,7 +986,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                             {
                                 "loss": f"{group_loss_mean:.4f}",
                                 "avg": f"{(avg_loss):.4f}",
-                                "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                                "lr": f"{self.optimizer[0].param_groups[0]['lr']:.2e}",
                                 "gn": f"{grad_norm:.2f}",
                                 "s/s": f"{throughput_metrics['samples_per_sec']:.1f}",
                                 "s/s/gpu": f"{throughput_metrics['samples_per_sec_per_gpu']:.2f}",
@@ -1266,14 +1002,15 @@ class TrainDiffusionRecipe(BaseRecipe):
             avg_loss = epoch_loss / num_steps
             logging.info(f"[INFO] Epoch {epoch + 1} complete. avg_loss={avg_loss:.6f}")
 
-            if is_main_process() and wandb.run is not None:
+            if self.dist_env.is_main and wandb.run is not None:
                 wandb.log({"epoch/avg_loss": avg_loss, "epoch/num": epoch + 1}, step=global_step)
 
-        if is_main_process():
+        if self.dist_env.is_main:
             logging.info(f"[INFO] Saved final checkpoint at step {global_step}")
             if wandb.run is not None:
                 wandb.finish()
 
+        self._finalize_and_close_checkpointer()
         logging.info("[INFO] Training complete!")
 
     def _get_dp_rank(self, include_cp: bool = False) -> int:
