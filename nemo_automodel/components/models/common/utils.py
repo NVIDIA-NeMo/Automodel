@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.kernels.config import HubKernelConfig
 from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -158,9 +159,11 @@ class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", "flex", "eager", or "tilelang").
-            For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
-            indexer, and Sinkhorn kernels together.
+        attn: Attention backend ("te", "sdpa", "flex", "eager", "hub", or "tilelang").
+            ``hub`` uses kernels-community flash attention in native MLA/GQA
+            factories (see ``hub_kernels.attn_repo``). For HF-model paths prefer
+            ``attn_implementation="kernels-community/flash-attn2"`` or
+            ``use_kernels=True`` instead of sprinkling Hub backends on every field.
         linear: Linear layer backend ("torch", "te", or "quack").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently
@@ -195,9 +198,14 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
+        hub_kernels: Optional Hub kernel settings for native attention repo
+            selection. Layer replacements should use ``use_kernels=True`` on
+            ``NeMoAutoModel`` rather than duplicating Hub loading in linear/rms_norm.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    attn: Literal["te", "sdpa", "flex", "eager", "hub", "tilelang"] = (
+        "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    )
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
     rope: Literal["torch", "quack"] = "torch"
@@ -231,6 +239,7 @@ class BackendConfig:
     # fullgraph can't trace), so it requires attn="sdpa", linear="torch", rms_norm="torch",
     # rope_fusion=False. Default False.
     compile_attn: bool = False
+    hub_kernels: HubKernelConfig | None = None
 
     def __post_init__(self):
         # QuACK consumes position-gathered cosine/sine tables. TE's fused RoPE path
@@ -252,6 +261,9 @@ class BackendConfig:
         # Normalize te_fp8: dict -> TEFp8Config, None stays None
         if isinstance(self.te_fp8, dict):
             self.te_fp8 = TEFp8Config(**self.te_fp8)
+
+        if isinstance(self.hub_kernels, dict):
+            self.hub_kernels = HubKernelConfig(**self.hub_kernels)
 
         if isinstance(self.gate_precision, str):
             self.gate_precision = dtype_from_str(self.gate_precision, default=None)

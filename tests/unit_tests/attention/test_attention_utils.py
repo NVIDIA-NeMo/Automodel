@@ -108,6 +108,30 @@ class TestInitializeAttnModuleAndFunc:
                 softmax_scale=0.125,
             )
 
+    def test_hub_attention_calls_flash_attn_func(self, monkeypatch):
+        """Hub backend wraps get_flash_attn_func with BHSD layout."""
+        def fake_flash(q, k, v, **kwargs):
+            assert q.shape[1] == 4  # seq dim in BSHD after transpose
+            return torch.ones_like(q)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.kernels.hub.get_flash_attn_func",
+            lambda **kwargs: fake_flash,
+        )
+        _, attn_func = initialize_attn_module_and_func(
+            attn_impl="hub",
+            num_attention_heads=8,
+            num_qk_channels=64,
+            num_v_channels=64,
+            softmax_scale=0.125,
+        )
+        q = torch.randn(1, 8, 4, 64)
+        k = torch.randn(1, 8, 4, 64)
+        v = torch.randn(1, 8, 4, 64)
+        out = attn_func(q, k, v)
+        assert out.shape == q.shape
+        assert torch.all(out == 1)
+
     def test_sdpa_late_binding_picks_up_monkey_patch(self):
         """Test that SDPA attn_func uses late-bound lookup of F.scaled_dot_product_attention.
 

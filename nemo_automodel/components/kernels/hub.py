@@ -28,10 +28,16 @@ from __future__ import annotations
 import functools
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+import torch.nn as nn
 
 from nemo_automodel.shared.import_utils import safe_import, safe_import_from
+
+if TYPE_CHECKING:
+    from nemo_automodel.components.kernels.config import HubKernelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +151,88 @@ def has_flash_attn_available(*, attn_implementation: str | None = None) -> bool:
     if HAS_COMPILED_FA:
         return True
     return _hub_flash_attn_module(attn_implementation) is not None
+
+
+def resolve_attn_implementation(
+    attn_implementation: str,
+    *,
+    hub_kernels: HubKernelConfig | None = None,
+) -> str:
+    """Resolve ``attn_implementation`` aliases and ``BackendConfig.hub_kernels`` overrides."""
+    if hub_kernels is not None and hub_kernels.attn_repo:
+        return hub_kernels.attn_repo
+    if attn_implementation == "hub":
+        return HUB_FLASH_ATTN2
+    return attn_implementation
+
+
+def extract_hub_kernels_config(kwargs: dict[str, Any]) -> HubKernelConfig | None:
+    """Read ``hub_kernels`` from a ``backend`` entry in model init kwargs."""
+    backend = kwargs.get("backend")
+    if backend is None:
+        return None
+    hub_kernels = getattr(backend, "hub_kernels", None)
+    if hub_kernels is None and isinstance(backend, dict):
+        hub_kernels = backend.get("hub_kernels")
+    if hub_kernels is None:
+        return None
+    if isinstance(hub_kernels, dict):
+        from nemo_automodel.components.kernels.config import HubKernelConfig
+
+        return HubKernelConfig(**hub_kernels)
+    return hub_kernels
+
+
+def get_flash_attn_func(*, attn_implementation: str | None = None) -> Callable[..., Any] | None:
+    """Return ``flash_attn_func`` from pip or the Hub."""
+    _, compiled_func = safe_import_from("flash_attn", "flash_attn_func")
+    if compiled_func is not None:
+        return compiled_func
+
+    hub_mod = _hub_flash_attn_module(attn_implementation)
+    if hub_mod is None:
+        return None
+    flash_func = getattr(hub_mod, "flash_attn_func", None)
+    if flash_func is None:
+        logger.debug("Hub flash-attn module %r has no flash_attn_func", hub_mod)
+    return flash_func
+
+
+def apply_hub_kernels_to_model(
+    model: nn.Module,
+    *,
+    kernel_config: Any | None = None,
+    allow_all_kernels: bool = False,
+) -> nn.Module:
+    """Apply Transformers ``kernelize`` to an already-built custom model."""
+    try:
+        from transformers.integrations.hub_kernels import (
+            allow_all_hub_kernels,
+            is_kernels_available,
+            kernelize,
+        )
+    except ImportError:
+        logger.warning("use_kernels=True but transformers hub_kernels integration is unavailable")
+        return model
+
+    if not is_kernels_available():
+        logger.warning("use_kernels=True but the kernels package is not installed")
+        return model
+
+    if not isinstance(model, nn.Module):
+        logger.warning("Skipping Hub kernelize for non-nn.Module model: %s", type(model))
+        return model
+
+    if kernel_config is not None and hasattr(model, "set_use_kernels"):
+        model.set_use_kernels(True, kernel_config)
+    elif kernel_config is not None and hasattr(model, "config"):
+        model.config.kernel_config = kernel_config
+
+    ctx = allow_all_hub_kernels() if allow_all_kernels else nullcontext()
+    with ctx:
+        kernelize(model)
+    logger.info("Applied Hub kernels via transformers.kernelize")
+    return model
 
 
 def get_flash_attn_varlen_func(*, attn_implementation: str | None = None) -> Callable[..., Any] | None:

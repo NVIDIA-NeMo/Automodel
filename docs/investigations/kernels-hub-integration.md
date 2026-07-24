@@ -60,7 +60,31 @@ A thin spike module wraps the upstream API without replacing existing call sites
 - `nemo_automodel/components/kernels/hub.py` — `get_hub_kernel()`, `has_hub_kernel()`, `get_flash_attn_varlen_func()`, `has_flash_attn_available()`
 - Unit tests: `tests/unit_tests/components/kernels/test_hub.py`
 
-Phase 2 will migrate direct `flash_attn` imports (blockdiag CP, KimiVL, BAGEL) to `get_flash_attn_varlen_func()`.
+Phase 2 migrated blockdiag CP varlen to `get_flash_attn_varlen_func()`. Remaining direct-import sites: KimiVL, BAGEL, EAGLE ring attention.
+
+---
+
+## Design: Why Not Copy the QuACK Backend Pattern?
+
+QuACK integration adds `"quack"` to **every** `BackendConfig` field (`linear`, `rms_norm`, `rope`) and wires factory branches in `utils.py` plus `_apply_backend_module_overrides` in `model_init.py`. That pattern fits **pip-installed optional deps** where NeMo owns native model construction.
+
+Hub kernels are different:
+
+| Concern | QuACK-style `"kernels"` on each field | Lean integration (implemented) |
+|---|---|---|
+| HF-model RMSNorm/MLP/Linear | Duplicate Hub loading in NeMo factories | `use_kernels=True` → Transformers `kernelize` |
+| HF flash attention | Custom factory branch | `attn_implementation="kernels-community/flash-attn2"` (Transformers dispatch) |
+| Native MLA attention | N/A in QuACK | `backend.attn: hub` + `initialize_attn_module_and_func` |
+| Liger conflict | Separate pip path | `use_kernels=True` disables `_patch_liger_kernel` |
+| Config surface | Sprawl across 5+ backend fields | `use_kernels`, `kernel_config`, optional `HubKernelConfig` |
+
+**Rule of thumb:** use Transformers passthrough for anything `hub_kernels.kernelize` already replaces; use NeMo helpers only where Transformers does not run (blockdiag varlen, native MLA `attn: hub`).
+
+Example recipe: `examples/llm_benchmark/qwen/qwen2_5_7b_hub_kernels.yaml`
+
+Optional extra: `uv sync --extra hub_kernels`
+
+---
 
 Transformers 5.x extends this with:
 

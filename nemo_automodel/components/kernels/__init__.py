@@ -14,6 +14,7 @@
 
 """Hub-backed kernel loading via the Hugging Face ``kernels`` library."""
 
+from nemo_automodel.components.kernels.config import HubKernelConfig
 from nemo_automodel.components.kernels.hub import (
     HUB_ACTIVATION,
     HUB_CAUSAL_CONV1D,
@@ -26,11 +27,15 @@ from nemo_automodel.components.kernels.hub import (
     HUB_MEGABLOCKS,
     HUB_ROTARY,
     RECOMMENDED_LOCK_REPOS,
+    apply_hub_kernels_to_model,
+    extract_hub_kernels_config,
+    get_flash_attn_func,
     get_flash_attn_varlen_func,
     get_hub_kernel,
     has_flash_attn_available,
     has_hub_kernel,
     is_hub_attn_implementation,
+    resolve_attn_implementation,
 )
 
 __all__ = [
@@ -44,10 +49,15 @@ __all__ = [
     "HUB_MAMBA_SSM",
     "HUB_MEGABLOCKS",
     "HUB_ROTARY",
+    "HubKernelConfig",
     "RECOMMENDED_LOCK_REPOS",
+    "apply_hub_kernels_to_model",
+    "extract_hub_kernels_config",
+    "get_flash_attn_func",
     "get_flash_attn_varlen_func",
     "get_hub_kernel",
     "has_flash_attn_available",
     "has_hub_kernel",
     "is_hub_attn_implementation",
+    "resolve_attn_implementation",
 ]
