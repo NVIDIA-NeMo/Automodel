@@ -132,7 +132,7 @@ class TestBlock:
 
         with (
             patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+            patch.object(block.mlp, "forward", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
             out = block(x, freqs_cis=freqs_cis)
 
@@ -150,7 +150,7 @@ class TestBlock:
 
         with (
             patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+            patch.object(block.mlp, "forward", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask)
 
@@ -172,7 +172,7 @@ class TestBlock:
 
         with (
             patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)),
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+            patch.object(block.mlp, "forward", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask, padding_mask=padding_mask)
 
@@ -180,21 +180,21 @@ class TestBlock:
         received_padding_mask = kwargs.get("padding_mask")
         torch.testing.assert_close(received_padding_mask, padding_mask)
 
-    def test_mlp_wrapper_handles_mlp_instance(self, glm_config, backend_config):
+    def test_mlp_handles_mlp_instance(self, glm_config, backend_config):
         block = Block(layer_idx=0, config=glm_config, moe_config=magic_moe_config(glm_config), backend=backend_config)
         x = torch.randn(2, 4, glm_config.hidden_size).to(torch.bfloat16)
 
-        out = block._mlp(x, padding_mask=None)
+        out = block.mlp(x, padding_mask=None)
 
         assert out.shape == x.shape
 
-    def test_mlp_wrapper_handles_moe_instance(self, glm_config, backend_config):
+    def test_mlp_handles_moe_instance(self, glm_config, backend_config):
         block = Block(layer_idx=2, config=glm_config, moe_config=magic_moe_config(glm_config), backend=backend_config)
         x = torch.randn(2, 4, glm_config.hidden_size).to(torch.bfloat16)
         padding_mask = torch.zeros(2, 4, dtype=torch.bool)
 
         with patch.object(block.mlp, "forward", return_value=torch.zeros_like(x)) as mock_moe:
-            out = block._mlp(x, padding_mask=padding_mask)
+            out = block.mlp(x, padding_mask=padding_mask)
 
         mock_moe.assert_called_once_with(x, padding_mask=padding_mask)
         assert out.shape == x.shape

@@ -160,7 +160,7 @@ class TestBlock:
 
         with (
             patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+            patch.object(block.mlp, "forward", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
             out = block(x, freqs_cis=freqs_cis)
 
@@ -178,7 +178,7 @@ class TestBlock:
 
         with (
             patch.object(block.self_attn, "forward", return_value=torch.zeros_like(x)) as mock_attn,
-            patch.object(block, "_mlp", return_value=torch.zeros_like(x)) as mock_mlp,
+            patch.object(block.mlp, "forward", return_value=torch.zeros_like(x)) as mock_mlp,
         ):
             block(x, freqs_cis=freqs_cis, attention_mask=attention_mask)
 
@@ -188,12 +188,12 @@ class TestBlock:
         assert padding_mask is not None
         torch.testing.assert_close(padding_mask, attention_mask.logical_not())
 
-    def test_mlp_wrapper_handles_mlp_instance(self, config, moe_config, backend_config):
+    def test_mlp_handles_mlp_instance(self, config, moe_config, backend_config):
         block = Block(layer_idx=0, config=config, moe_config=moe_config, backend=backend_config)
         # Layer 0 uses MLP
         x = torch.randn(2, 4, config.hidden_size).to(torch.bfloat16)
 
-        out = block._mlp(x, padding_mask=None)
+        out = block.mlp(x, padding_mask=None)
 
         assert out.shape == x.shape
 
