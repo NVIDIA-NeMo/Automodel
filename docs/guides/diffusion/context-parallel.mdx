@@ -79,9 +79,9 @@ Both issues should be reported/fixed upstream; once they land, `cp_ring_degree` 
 
 ## Current Limitations
 
-- **Ulysses only** (see above); `cp_size` must divide the attention head count.
-- **HunyuanVideo** lacks a `_cp_plan` in diffusers 0.39. A custom plan can be passed once authored (`enable_parallelism(cp_plan=...)`), or contributed upstream.
-- Interactions not yet validated: CP + LoRA, CP + Transformer Engine linear/FP8, CP + activation checkpointing, CP + `fuse_qkv_projections`.
+- **Ulysses only.** `cp_size` must divide the attention head count.
+- **HunyuanVideo** lacks a `_cp_plan` in Diffusers version 0.39. After you create a custom plan, you can pass it through `enable_parallelism(cp_plan=...)` or contribute it upstream.
+- The following interactions are not yet validated: CP and LoRA, CP and Transformer Engine linear/FP8, CP and activation checkpointing, and CP and `fuse_qkv_projections`.
 
 ## Example
 
