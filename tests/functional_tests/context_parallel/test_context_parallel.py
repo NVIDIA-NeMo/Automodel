@@ -18,6 +18,9 @@ These tests validate that attention layers produce identical forward outputs
 and gradients when using different context parallel sizes with packed sequences.
 """
 
+import pytest
+import torch
+
 from tests.utils.test_utils import run_test_script
 
 TEST_FOLDER = "context_parallel"
@@ -30,6 +33,7 @@ CP_QWEN3_5_MOE_LINEAR_ATTN_TEST_FILENAME = "L2_CP_Qwen3_5MoE_LinearAttn_Test.sh"
 CP_DENSE_PACKED_TEST_FILENAME = "L2_CP_Dense_Packed_Test.sh"
 TP_DENSE_PACKED_TEST_FILENAME = "L2_TP_Dense_Packed_Test.sh"
 TP_CP_DENSE_PACKED_TEST_FILENAME = "L2_TP_CP_Dense_Packed_Test.sh"
+TP_CP_DENSE_PACKED_REQUIRED_GPUS = 4
 
 
 class TestContextParallelAttention:
@@ -67,6 +71,10 @@ class TestContextParallelAttention:
         """Test packed THD parity for dense Llama, Qwen2, and Qwen3 with TP=2 and CP=1."""
         run_test_script(TEST_FOLDER, TP_DENSE_PACKED_TEST_FILENAME)
 
+    @pytest.mark.skipif(
+        torch.cuda.device_count() < TP_CP_DENSE_PACKED_REQUIRED_GPUS,
+        reason="requires 4 GPUs for TP=2 x CP=2; remove once context_parallel CI runs on a 4-GPU runner",
+    )
     def test_tp_cp_dense_packed(self):
         """Test packed THD parity for dense Llama, Qwen2, and Qwen3 with TP=2 and CP=2."""
         run_test_script(TEST_FOLDER, TP_CP_DENSE_PACKED_TEST_FILENAME)
