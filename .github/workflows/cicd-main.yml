@@ -51,6 +51,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
@@ -65,7 +67,7 @@ jobs:
           sudo rm -rf /usr/local/.ghcup || true
           sudo rm -rf /usr/local/lib/node_modules || true
           pip cache purge || true
-      - name: Install ruff
+      - name: Install linting dependencies
         env:
           UV_PROJECT_ENVIRONMENT: ./venv
         run: |
@@ -81,6 +83,16 @@ jobs:
           uv run --active ruff --version
           uv run --active ruff check --verbose .
           uv run --active ruff format --check --verbose .
+      - name: Reject new dynamic attribute access
+        run: |
+          source ./venv/bin/activate
+          uv run --active diff-quality \
+            --violations=pylint \
+            --compare-branch=origin/main \
+            --fail-under=100 \
+            --include "nemo_automodel/components/models/**" \
+            --include "nemo_automodel/components/distributed/**" \
+            --options="--load-plugins=pylint.extensions.bad_builtin --disable=all --enable=bad-builtin --bad-functions=getattr,setattr"
 
   import_linting:
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
