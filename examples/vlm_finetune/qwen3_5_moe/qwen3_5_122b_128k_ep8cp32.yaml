@@ -1,0 +1,197 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Qwen3.5-122B-A10B long-context VLM scaling probe: 128K neat packing,
+# EP=8, CP=32, trainable vision tower, CP vision frame sharding, and full
+# activation checkpointing. The 128-rank layout is CP32 x DP4; EP8 is composed
+# over that mesh by the MoE parallelizer.
+#
+# A nearby CP16 x DP8 topology completed an internal 100-step validation on a
+# realistic mixture of text, image, and video data, including individual
+# long-context examples of approximately 120K tokens. To keep this public
+# example reproducible, the configuration below instead uses the small public
+# MedPix dataset. Its 128K packs combine many independent single-image samples,
+# making this a vision-heavy topology and correctness smoke rather than a
+# representative throughput benchmark. For real long-text or bounded-video
+# workloads, use the smallest CP degree that fits.
+#
+# The 128K limit includes both language and visual tokens, but equal token
+# counts do not imply equal step cost: vision-tower work makes image-heavy
+# packs more expensive than text-heavy packs. The first step also includes
+# compilation and autotuning, so compare steady-state steps for throughput.
+#
+# Example Slurm allocation (16 nodes x 8 GPUs):
+#   srun --nodes=16 --ntasks-per-node=1 automodel \
+#     examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml \
+#     --nnodes 16 --nproc-per-node 8
+
+recipe: FinetuneRecipeForVLM
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 4
+  local_batch_size: 1
+  ckpt_every_steps: 100000
+  val_every_steps: 100000
+  save_checkpoint_every_epoch: false
+  num_epochs: 10
+  gc_every_steps: 20
+  # Keep the published scaling example bounded. Longer validation runs can
+  # override this through --step_scheduler.max_steps.
+  max_steps: 10
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+  deterministic: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.5-122B-A10B
+  attn_implementation: sdpa
+  torch_dtype: torch.bfloat16
+  text_config:
+    # FusedLinearCrossEntropy consumes the decoder hidden states directly.
+    output_hidden_states: true
+    # Qwen3.5 stores MTP expert projections as per-expert tensors in HF checkpoints.
+    mtp_expert_hf_layout: split
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: hybridep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: Qwen/Qwen3.5-122B-A10B
+  min_pixels: 65536
+  # Vision CP assigns complete images or frames to ranks; it does not spatially
+  # split one image. Tune this approximately 4 MP cap for task detail and
+  # per-image vision-tower memory.
+  max_pixels: 4194304
+  video_processor:
+    _target_: transformers.models.qwen3_vl.video_processing_qwen3_vl.Qwen3VLVideoProcessor.from_pretrained
+    # Qwen bounds video resize by the total sampled volume T x H x W, not
+    # by a per-frame spatial edge. This short-video setting allows at most
+    # eight sampled frames and about 256 x 256 pixels per frame at that cap.
+    size:
+      shortest_edge: 1024
+      longest_edge: 524288
+    fps: 2
+    max_frames: 8
+
+checkpoint:
+  enabled: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 32
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  defer_fsdp_grad_sync: false
+  cp_vision_frame_sharding:
+    enabled: true
+    min_tokens: 0
+    cost_alpha: auto
+
+freeze_config:
+  freeze_embeddings: false
+  freeze_vision_tower: false
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.linear_ce.FusedLinearCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
+  path_or_dataset: mmoukouba/MedPix-VQA
+  split: train
+
+packed_sequence:
+  pretokenize: true
+  max_length: 131072
+  pack_size: 131072
+  collate_max_length: 131072
+  packing_ratio: 0.95
+  drop_long_samples: true
+  balance_media_tokens: true
+  max_packs: 128
+  attn_implementation: sdpa
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: false
+  drop_last: true
+
+clip_grad_norm:
+  max_norm: 1.0
+
+# Initialize lazy CUDA runtime state before the first 128K step reaches peak
+# activation and gradient memory.
+prewarm:
+  cublas_backward: true
+  fla_gdn_autotune: true
+  comm_groups: true
+
+optimizer:
+  # Empty FSDP shards from small trainable ViT parameters are filtered by the
+  # shared optimizer factory before Transformer Engine sees them.
+  _target_: transformer_engine.pytorch.optimizers.FusedAdam
+  lr: 1.0e-5
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  adam_w_mode: true
+  bias_correction: true
+  master_weights: true
+  master_weight_dtype: torch.float32
+  store_param_remainders: true
+  # The validated 128-rank shape has enough headroom for conservative FP32
+  # first and second moments in addition to FP32 master weights.
+  exp_avg_dtype: torch.float32
+  exp_avg_sq_dtype: torch.float32
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 1
+
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_name>
+#   dir: <your_wandb_save_dir>
+
+ci:
+  recipe_owner: yuhez
+  time: "01:00:00"
+  nodes: 16
+  max_steps: 10

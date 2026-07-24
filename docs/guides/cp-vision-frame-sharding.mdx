@@ -23,6 +23,7 @@ feature. The built-in integration currently supports the following model familie
 | Model | Support |
 |---|---|
 | Dense Qwen3.5 | Supported |
+| Qwen3.5-MoE | Supported |
 | Dense Qwen3-VL | Supported, including DeepStack features |
 | Qwen3-VL-MoE | Not yet supported |
 
@@ -46,6 +47,7 @@ The following example recipes are available:
 
 - [Dense Qwen3-VL 8B with CP2 and vision frame sharding](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml)
 - [Dense Qwen3.5 4B with CP2 and vision frame sharding](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_frame_shard.yaml)
+- [Qwen3.5-MoE 122B with EP8, CP32, and 128K packing](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5_moe/qwen3_5_122b_128k_ep8cp32.yaml)
 
 For example, run the Qwen3-VL recipe on eight GPUs:
 

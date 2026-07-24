@@ -1472,6 +1472,7 @@ def neat_packed_vlm_collater(
     padding_idx: int = 0,
     max_length: int | None = None,
     attn_implementation: str = "sdpa",
+    materialize_4d_mask: bool = True,
 ) -> dict:
     """Collater for neat-packed VLM sequences.
 
@@ -1497,6 +1498,11 @@ def neat_packed_vlm_collater(
             and ensures uniform tensor shapes across steps.
         attn_implementation: Attention backend (``"flash_attention_2"``,
             ``"sdpa"``, or ``"eager"``).
+        materialize_4d_mask: Whether SDPA/eager packing should expand the
+            indexed ``[B, S]`` document map into a dense
+            ``[B, 1, S, S]`` block-causal mask. Context-parallel VLM paths
+            rebuild their local mask from ``_packed_seq_ids`` and set this to
+            False to avoid the quadratic allocation.
 
     Returns:
         Dict with batched tensors ready for model forward.
@@ -1535,9 +1541,10 @@ def neat_packed_vlm_collater(
 
     mm_token_type_ids = torch.stack([_pad_1d(_get_mm_token_type_ids(x), 0, max_len) for x in batch])
 
-    if use_flash:
-        # Keep indexed [B, S] mask for flash_attn_varlen_func.
-        # The patched _get_unpad_data will extract per-document cu_seqlens.
+    if use_flash or not materialize_4d_mask:
+        # Keep the compact indexed [B, S] document map. FlashAttention derives
+        # cu_seqlens from it; block-diagonal CP rebuilds its local mask from the
+        # identical _packed_seq_ids emitted below.
         attention_mask_out = attention_mask
     else:
         from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
@@ -1572,7 +1579,8 @@ def neat_packed_vlm_collater(
     # boundaries (e.g. SqrtCrossEntropy).  The indexed mask [B, S] uses
     # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
     # ``attention_mask_out`` is already converted to 4D, so keep a copy.
-    if attention_mask.max() > 1:
+    has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
+    if has_multiple_docs or not materialize_4d_mask:
         result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)

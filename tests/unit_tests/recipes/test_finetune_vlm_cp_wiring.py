@@ -546,6 +546,7 @@ def test_setup_always_stages_pp_media_under_pp(
     trainer.setup()
 
     assert dataloader_calls[0]["pp_n_microbatches"] == expected_pp_n_microbatches
+    assert dataloader_calls[0]["cp_size"] == cp_size
 
 
 # -----------------------------------------------------------------------------
