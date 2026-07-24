@@ -765,6 +765,12 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
     model._cp_enabled = True
     _model._cp_enabled = True
 
+    # Hand the CP submesh to the model so a forward that embeds and
+    # sequence-shards its own primary stream (Megatron-style per-microbatch CP;
+    # see shard_sequence_for_cp_round_robin / shard_batch_aux_only) can build this rank's
+    # round-robin shard. Set on the top-level model the recipe calls.
+    model.cp_mesh = cp_mesh
+
     # Route each attention block's CP setup by capability:
     #   * TE DotProductAttention -> TE's own context-parallel group;
     #   * a module exposing setup_cp_attention (e.g. Gemma4's p2p ring or MiniMax
@@ -796,7 +802,7 @@ def apply_cp(model: torch.nn.Module, cp_mesh: DeviceMesh, cp_comm_type: str = "p
                     type(attn_module).__name__ if attn_module is not None else type(self_attn).__name__,
                 )
         elif layer_type == "mamba":
-            from nemo_automodel.components.distributed.mamba_cp import MambaContextParallel
+            from nemo_automodel.components.distributed.context_parallel.mamba import MambaContextParallel
 
             mixer = block.self_attn  # NemotronV3Block.self_attn aliases mixer
             mixer.cp = MambaContextParallel(
