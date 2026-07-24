@@ -271,6 +271,55 @@ def test_consolidate_cast_dtype_does_not_cast_fp8_tensors(tmp_path):
 
 
 @pytest.mark.run_only_on("CPU")
+def test_consolidate_cast_dtype_preserves_mapped_fp32_tensors(tmp_path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    tensors = {
+        "protected_fp32_weight": torch.arange(4, dtype=torch.float32),
+        "ordinary_weight": torch.arange(4, dtype=torch.float32),
+        "ordinary_with_original_dtype": torch.arange(4, dtype=torch.float32),
+    }
+    dcp_metadata = {name: {"saved_offsets": [0 for _ in tensor.shape]} for name, tensor in tensors.items()}
+    save_file(
+        tensors,
+        input_dir / "model-00001-of-00001.safetensors",
+        metadata={CUSTOM_METADATA_KEY: json.dumps(dcp_metadata)},
+    )
+
+    consolidate_safetensors_files(
+        input_dir=str(input_dir),
+        output_dir=str(output_dir),
+        fqn_to_index_mapping={name: 1 for name in tensors},
+        cast_dtype=torch.float16,
+        fqn_to_dtype_mapping={
+            "protected_fp32_weight": "F32",
+            "ordinary_with_original_dtype": "BF16",
+        },
+    )
+
+    output_tensors = load_file(output_dir / "model-00001-of-00001.safetensors")
+    assert output_tensors["protected_fp32_weight"].dtype is torch.float32
+    assert output_tensors["ordinary_weight"].dtype is torch.float16
+    assert output_tensors["ordinary_with_original_dtype"].dtype is torch.float16
+    torch.testing.assert_close(output_tensors["protected_fp32_weight"], tensors["protected_fp32_weight"])
+    torch.testing.assert_close(output_tensors["ordinary_weight"], tensors["ordinary_weight"].to(torch.float16))
+    torch.testing.assert_close(
+        output_tensors["ordinary_with_original_dtype"], tensors["ordinary_with_original_dtype"].to(torch.float16)
+    )
+
+    with open(output_dir / "model.safetensors.index.json", "r") as f:
+        index = json.load(f)
+    expected_total_size = (
+        tensors["protected_fp32_weight"].numel() * 4
+        + (tensors["ordinary_weight"].numel() + tensors["ordinary_with_original_dtype"].numel()) * 2
+    )
+    assert index["metadata"]["total_size"] == expected_total_size
+
+
+@pytest.mark.run_only_on("CPU")
 def test_consolidate_preserves_original_hf_float_dtypes_when_available(tmp_path):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
