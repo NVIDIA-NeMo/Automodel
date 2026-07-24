@@ -250,10 +250,7 @@ class Ernie4_5MoeBlock(nn.Module):
         )
         x = x + attn_out
         mlp_in = self.post_attention_layernorm(x)
-        if isinstance(self.mlp, MoE):
-            x = x + self.mlp(mlp_in, padding_mask)
-        else:
-            x = x + self.mlp(mlp_in)
+        x = x + self.mlp(mlp_in, padding_mask=padding_mask)
         return x
 
 

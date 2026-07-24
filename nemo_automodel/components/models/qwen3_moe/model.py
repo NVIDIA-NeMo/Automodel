@@ -20,7 +20,6 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import (
     BackendConfig,
     get_rope_config,
@@ -96,13 +95,7 @@ class Block(nn.Module):
         return x
 
     def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        # Activation checkpointing wraps the MLP, so inspect the inner module
-        # to select the call signature while still invoking the wrapper.
-        mlp = unwrap_checkpoint_wrapper(self.mlp)
-        if isinstance(mlp, MLP):
-            return self.mlp(x)
-        assert isinstance(mlp, MoE)
-        return self.mlp(x, padding_mask)
+        return self.mlp(x, padding_mask=padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):

@@ -196,7 +196,7 @@ class TestBlock:
         with patch.object(block.mlp, "forward", return_value=torch.zeros_like(x)) as mock_moe:
             out = block._mlp(x, padding_mask=padding_mask)
 
-        mock_moe.assert_called_once_with(x, padding_mask)
+        mock_moe.assert_called_once_with(x, padding_mask=padding_mask)
         assert out.shape == x.shape
 
     def test_init_weights_resets_sublayers(self, glm_config, backend_config):

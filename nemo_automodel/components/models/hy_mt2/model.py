@@ -122,10 +122,7 @@ class Block(nn.Module):
         return x
 
     def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
-            return self.mlp(x)
-        assert isinstance(self.mlp, MoE)
-        return self.mlp(x, padding_mask)
+        return self.mlp(x, padding_mask=padding_mask)
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.input_layernorm, self.post_attention_layernorm):

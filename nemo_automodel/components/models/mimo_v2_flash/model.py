@@ -371,10 +371,7 @@ class MiMoV2FlashBlock(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if isinstance(self.mlp, MoE):
-            hidden_states = self.mlp(hidden_states, padding_mask)
-        else:
-            hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, padding_mask=padding_mask)
         return residual + hidden_states
 
     def init_weights(self, buffer_device: torch.device) -> None:

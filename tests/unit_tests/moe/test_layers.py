@@ -131,6 +131,14 @@ class TestMLP:
 
         torch.testing.assert_close(output, expected, rtol=1e-4, atol=1e-4)
 
+    def test_mlp_ignores_padding_mask(self, device):
+        """Dense MLP accepts the shared feed-forward mask contract without changing its output."""
+        mlp = MLP(8, 16, backend="torch").to(device)
+        x = torch.randn(2, 4, 8, dtype=torch.bfloat16, device=device)
+        padding_mask = torch.tensor([[False, False, True, True], [False, True, True, True]], device=device)
+
+        torch.testing.assert_close(mlp(x, padding_mask=padding_mask), mlp(x))
+
     def test_mlp_init_weights(self, device):
         """Test MLP weight initialization."""
         mlp = MLP(64, 128, backend="torch")

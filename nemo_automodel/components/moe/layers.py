@@ -97,16 +97,20 @@ class MLP(nn.Module):
             linear_impl=backend, in_features=inter_dim, out_features=dim, bias=bias, dtype=dtype
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the MLP layer.
+    def forward(self, x: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Run the dense feed-forward layer.
 
         Args:
-            x (torch.Tensor): Input tensor.
+            x: Tensor of shape [..., hidden].
+            padding_mask: Optional boolean tensor marking padded tokens. Dense
+                MLPs do not route tokens, so the mask is intentionally ignored;
+                accepting it keeps the feed-forward call contract shared with
+                :class:`MoE`.
 
         Returns:
-            torch.Tensor: Output tensor after MLP computation.
+            Tensor of shape [..., hidden].
         """
+        del padding_mask
         if not self.is_gated:
             return self.down_proj(F.relu(self.up_proj(x)).pow(2))
         if self.swiglu_limit > 0.0:
