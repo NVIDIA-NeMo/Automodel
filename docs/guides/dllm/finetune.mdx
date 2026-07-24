@@ -251,7 +251,7 @@ dataset:
   unshifted: true
 ```
 
-The mask is built for `sdpa`/`eager` (dense additive) or `flex_attention` (sparse
+The mask is built for `sdpa` or `eager` (dense additive) or `flex_attention` (sparse
 `BlockMask`, preferred at scale). FlashAttention-2 is unsupported (it ignores
 arbitrary masks), as is context parallelism. The paper trains a `block_length`
 1→2→3 curriculum (one epoch each); run the stages as successive fine-tunes,
