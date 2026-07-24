@@ -1,0 +1,166 @@
+# LoRA fine-tuning recipe for GLM-5.2 using the TileLang MLA attention backend.
+# 16 nodes: tp=1, cp=1, pp=1, ep=128 => 128 GPUs (8 H100/node).
+#
+# Checkpoint locations can be overridden via environment variables:
+#   GLM52_CHECKPOINT_DIR (default: checkpoints/), GLM52_RESTORE_FROM (optional).
+#
+# To run this recipe:
+#   automodel examples/llm_finetune/glm/glm_5.2_lora.yaml --nproc-per-node 8
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 42
+longalign: false
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 25
+  val_every_steps: 5
+  gc_every_steps: 25
+  num_epochs: 1
+  save_checkpoint_every_epoch: true
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 128
+  sequence_parallel: false
+  activation_checkpointing: true
+  reshard_after_forward: false
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: false
+    ignore_router_for_ac: true
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 240
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: ${oc.env:GLM52_MODEL_PATH,zai-org/GLM-5.2}
+  trust_remote_code: true
+  config:
+    head_dim: 64
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: tilelang
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm
+    experts_storage: fp8
+    dispatcher: hybridep
+    gate_precision: float32
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  target_modules:
+    - "*.self_attn.q_a_proj"
+    - "*.self_attn.q_b_proj"
+    - "*.self_attn.kv_a_proj_with_mqa"
+    - "*.self_attn.kv_b_proj"
+    - "*.self_attn.o_proj"
+    - "*.mlp.gate_proj"
+    - "*.mlp.up_proj"
+    - "*.mlp.down_proj"
+    - "*.mlp.shared_experts.gate_proj"
+    - "*.mlp.shared_experts.up_proj"
+    - "*.mlp.shared_experts.down_proj"
+    - "*.mlp.experts"
+  dim: 32
+  alpha: 64
+  dropout: 0.0
+  use_memory_efficient_lora: true
+  use_triton: false
+
+checkpoint:
+  enabled: false
+  dequantize_base_checkpoint: true
+
+clip_grad_norm:
+  max_norm: 1.0
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.chunked_ce.ChunkedCrossEntropy
+  chunk_len: 512
+  compile: true
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[:100000]
+  shuffle_seed: 42
+  truncation: false
+  seq_length: 200704
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: zai-org/GLM-5.2
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train[100000:100064]
+  shuffle_seed: 42
+  truncation: false
+  seq_length: 200704
+  padding: false
+  tokenizer:
+    _target_: transformers.AutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: zai-org/GLM-5.2
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+    pad_seq_len_divisible: 4096
+  shuffle: true
+  drop_last: false
+  num_workers: 0
+  pin_memory: false
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn:
+    _target_: nemo_automodel.components.datasets.utils.packed_sequence_thd_collater
+    pad_seq_len_divisible: 4096
+  shuffle: false
+  drop_last: false
+  num_workers: 0
+  pin_memory: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+    - 0.9
+    - 0.95
+  eps: 1.0e-8
+  lr: 1.0e-4
+  weight_decay: 0
+
+lr_scheduler:
+  lr_warmup_steps: 0
+  lr_decay_style: constant
+  min_lr: 2.0e-5
+
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: <your_wandb_exp_name>
+#   dir: <your_wandb_save_dir>
+
+ci:
+  # cp_size(1) with ep_size(128) => 128 GPUs => 16 nodes (8 H100/node).
+  recipe_owner: shahafwa
+  nodes: 16
+  time: "00:20:00"

@@ -207,16 +207,21 @@ def test_recipe_archs_have_doc_coverage():
         )
 
 
-def test_yaml_recipe_scan_finds_model_ids():
+@pytest.fixture(scope="module")
+def recipe_model_ids() -> set[str]:
+    """Collect recipe model IDs once for the filesystem-only checks."""
+    return _collect_recipe_model_ids(_repo_root() / "examples")
+
+
+def test_yaml_recipe_scan_finds_model_ids(recipe_model_ids: set[str]):
     """Sanity-check the YAML scanner: examples/ must yield at least a few HF
     model IDs. Protects against regressions in the scanner itself (e.g., a
     YAML structure change that silently makes ``_collect_recipe_model_ids``
     return nothing).
     """
-    root = _repo_root()
-    model_ids = _collect_recipe_model_ids(root / "examples")
-    assert len(model_ids) >= 10, (
-        f"YAML scanner found only {len(model_ids)} model IDs in examples/ — expected many more. Scanner may be broken."
+    assert len(recipe_model_ids) >= 10, (
+        f"YAML scanner found only {len(recipe_model_ids)} model IDs in examples/ — expected many more. "
+        "Scanner may be broken."
     )
 
 
@@ -245,7 +250,7 @@ def _expected_doc_slug(hf_org: str) -> str:
     return _HF_ORG_TO_DOC_SLUG.get(hf_org, hf_org.lower())
 
 
-def test_recipe_model_ids_live_under_publishing_org_dir():
+def test_recipe_model_ids_live_under_publishing_org_dir(recipe_model_ids: set[str]):
     """When a recipe's HF model ID is documented in ``docs/model-coverage/``,
     the hosting ``.mdx`` file must live under the HF publisher's org
     subdirectory (``docs/model-coverage/<modality>/<org_slug>/<model>.mdx``).
@@ -268,8 +273,7 @@ def test_recipe_model_ids_live_under_publishing_org_dir():
     docs_dir = root / "docs" / "model-coverage"
     assert docs_dir.is_dir()
 
-    model_ids = _collect_recipe_model_ids(root / "examples")
-    assert model_ids, "YAML scanner returned no HF model IDs"
+    assert recipe_model_ids, "YAML scanner returned no HF model IDs"
 
     # Only consider model-card files at depth <modality>/<org>/<name>.mdx.
     # Navigation pages (top-level ``latest-models.mdx``, per-modality
@@ -281,7 +285,7 @@ def test_recipe_model_ids_live_under_publishing_org_dir():
         md_texts.append((md, md.read_text(encoding="utf-8")))
 
     offenders: list[tuple[str, str, str]] = []
-    for mid in sorted(model_ids):
+    for mid in sorted(recipe_model_ids):
         hf_org = mid.split("/", 1)[0]
         if hf_org in _IGNORED_HF_ORGS:
             continue

@@ -698,11 +698,11 @@ def test_apply_model_infrastructure_attaches_cp_hooks_for_non_te(monkeypatch):
         patch(f"{_INFRA_MODULE}._uses_te_attention", return_value=False),
         patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
         patch(
-            "nemo_automodel.components.distributed.cp_utils.attach_context_parallel_hooks",
+            "nemo_automodel.components.distributed.context_parallel.utils.attach_context_parallel_hooks",
             side_effect=lambda mp: attached.__setitem__("ctx", attached["ctx"] + 1),
         ),
         patch(
-            "nemo_automodel.components.distributed.cp_utils.attach_cp_sdpa_hooks",
+            "nemo_automodel.components.distributed.context_parallel.utils.attach_cp_sdpa_hooks",
             side_effect=lambda mp, cp_mesh: attached.__setitem__("attn", attached["attn"] + 1),
         ),
     ):

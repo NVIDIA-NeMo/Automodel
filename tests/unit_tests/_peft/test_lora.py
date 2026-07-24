@@ -301,6 +301,75 @@ def test_linear_lora_memory_efficient_matches_legacy_module_forward_and_backward
     assert torch.allclose(efficient.lora_B.weight.grad, legacy.lora_B.weight.grad)
 
 
+def test_materialized_effective_weight_matches_linear_lora_forward_and_backward():
+    """The effective dense weight must preserve ordinary LoRA outputs and gradients."""
+    torch.manual_seed(1234)
+    base = nn.Linear(7, 5, bias=True, dtype=torch.float32)
+    direct = LinearLoRA(base, dim=3, alpha=6, use_memory_efficient_lora=False)
+    materialized = LinearLoRA(base, dim=3, alpha=6, use_memory_efficient_lora=False)
+    with torch.no_grad():
+        direct.lora_A.weight.normal_()
+        direct.lora_B.weight.normal_()
+        materialized.lora_A.weight.copy_(direct.lora_A.weight)
+        materialized.lora_B.weight.copy_(direct.lora_B.weight)
+
+    x_direct = torch.randn(2, 4, 7, requires_grad=True)
+    x_materialized = x_direct.detach().clone().requires_grad_(True)
+    direct_out = direct(x_direct)
+    materialized_out = F.linear(
+        x_materialized,
+        materialized.materialize_effective_weight(),
+        materialized.bias,
+    )
+    output_grad = torch.randn_like(direct_out)
+    direct_out.backward(output_grad)
+    materialized_out.backward(output_grad)
+
+    torch.testing.assert_close(materialized_out, direct_out)
+    torch.testing.assert_close(x_materialized.grad, x_direct.grad)
+    torch.testing.assert_close(materialized.lora_A.weight.grad, direct.lora_A.weight.grad)
+    torch.testing.assert_close(materialized.lora_B.weight.grad, direct.lora_B.weight.grad)
+
+
+def test_materialized_effective_weight_allows_inactive_dropout():
+    """Evaluation-time dropout must reduce to the same deterministic effective weight."""
+    torch.manual_seed(1234)
+    lora = LinearLoRA(nn.Linear(7, 5, bias=False), dim=3, alpha=6, dropout=0.5)
+    with torch.no_grad():
+        lora.lora_A.weight.normal_()
+        lora.lora_B.weight.normal_()
+    lora.eval()
+    x = torch.randn(2, 7)
+
+    torch.testing.assert_close(F.linear(x, lora.materialize_effective_weight()), lora(x))
+
+
+def test_materialized_effective_weight_rejects_active_dropout():
+    """Training dropout cannot be represented by one deterministic dense weight."""
+    lora = LinearLoRA(nn.Linear(7, 5, bias=False), dim=3, alpha=6, dropout=0.5)
+    lora.train()
+
+    with pytest.raises(RuntimeError, match="active LoRA training dropout"):
+        lora.materialize_effective_weight()
+
+
+def test_materialized_effective_weight_rejects_dora():
+    """DoRA has magnitude normalization that the ordinary LoRA formula omits."""
+    dora = LinearLoRA(nn.Linear(7, 5, bias=False), dim=3, alpha=6, use_dora=True)
+
+    with pytest.raises(NotImplementedError, match="does not support DoRA"):
+        dora.materialize_effective_weight()
+
+
+def test_materialized_effective_weight_rejects_quantized_layout():
+    """Quantized base weights must not silently use the ordinary dense formula."""
+    lora = LinearLoRA(nn.Linear(7, 5, bias=False), dim=3, alpha=6)
+    lora.quant_state = object()
+
+    with pytest.raises(NotImplementedError, match="quantized linear implementations"):
+        lora.materialize_effective_weight()
+
+
 def test_lora_layers_are_trainable():
     """Ensures that LoRA layers are trainable while base weights remain frozen."""
     base = nn.Linear(16, 16)
