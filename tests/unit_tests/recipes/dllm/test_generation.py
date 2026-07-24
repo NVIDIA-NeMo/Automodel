@@ -29,6 +29,7 @@ from generate import (  # noqa: E402
     SAMPLERS,
     DiffusionGemmaSampler,
     LLaDA2Sampler,
+    LLaDASampler,
     encode_generation_prompts,
     generate_gemma,
     generate_llada2,
@@ -144,6 +145,92 @@ def test_llada2_infill_is_rejected_before_loading(monkeypatch, capsys):
         main()
 
     assert "--infill is not supported by the LLaDA2 generation path" in capsys.readouterr().err
+
+
+class _FakeDenoiser(torch.nn.Module):
+    """Rigged denoiser: always predicts token 7, with confidence strictly
+    increasing by position. Under multi-block decoding, the highest-confidence
+    masked positions therefore always sit in FUTURE blocks — the exact setup
+    where selecting over the full sequence (instead of the current block)
+    wastes transfer slots and strands mask tokens."""
+
+    def __init__(self, vocab_size: int = 16):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+        self.vocab_size = vocab_size
+
+    def forward(self, x, attention_mask=None):
+        B, L = x.shape
+        logits = torch.zeros(B, L, self.vocab_size)
+        logits[:, :, 7] = 5.0 + 0.1 * torch.arange(L, dtype=torch.float32).unsqueeze(0)
+        return types.SimpleNamespace(logits=logits)
+
+
+def test_multi_block_sampling_unmasks_every_scheduled_position():
+    """Regression: with block_size < max_new_tokens, out-of-window positions
+    must not win top-k transfer slots — every block's schedule must fully
+    unmask its own window, leaving zero mask tokens in the output."""
+    mask_id = 9
+    sampler = LLaDASampler(
+        _FakeDenoiser(),
+        mask_id=mask_id,
+        # A real EOS id (any int distinct from mask_id=9 and the denoiser's
+        # prediction 7): sample() fills the canvas with eos_id, so None would
+        # break torch.full. 0 keeps the assertions strict — a stranded position
+        # would read back as 0, not 7.
+        eos_id=0,
+        steps=4,
+        max_new_tokens=8,
+        block_size=4,
+        temperature=0.0,
+        use_kv_cache=False,
+        eos_token_id=None,
+    )
+
+    out = sampler.sample([[1, 2]])
+
+    assert (out == mask_id).sum().item() == 0, "residual mask tokens: block schedules were underfilled"
+    assert (out[0, 2:] == 7).all(), "every generated position should hold the denoiser's prediction"
+
+
+def test_ragged_prompts_decode_nonempty_when_eos_active():
+    """Unequal-length prompts + a real eos_id: sample()'s batched EOS-stop and block
+    windows assume every row has the longest prompt, so a ragged batch strands the
+    shorter rows. The CLI dispatch guards this by decoding one prompt at a time (B=1)
+    when an eos_token_id is set — verify that path fully decodes each prompt."""
+    mask_id = 9
+    prompts = [[1, 2, 3, 4], [1]]  # unequal lengths
+    sampler = LLaDASampler(
+        _FakeDenoiser(),
+        mask_id=mask_id,
+        eos_id=0,
+        steps=4,
+        max_new_tokens=8,
+        block_size=4,
+        temperature=0.0,
+        use_kv_cache=False,
+        eos_token_id=0,  # real EOS activates the ragged-batch-prone stop path
+    )
+
+    # Mirror the CLI B=1 guard: decode each prompt on its own.
+    outputs = [sampler.sample([p]) for p in prompts]
+    for prompt, out in zip(prompts, outputs):
+        gen = out[0, len(prompt) :]
+        assert gen.numel() > 0, "empty generation"
+        assert (gen == mask_id).sum().item() == 0, "residual masks: prompt not fully decoded"
+
+
+def test_nemotron_infill_is_rejected_before_loading(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["generate.py", "--checkpoint", "unused", "--prompt", "hello", "--sampler", "nemotron", "--infill"],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        main()
+
+    assert "--infill is not supported by the Nemotron generation path" in capsys.readouterr().err
 
 
 class _FakeGemma(torch.nn.Module):

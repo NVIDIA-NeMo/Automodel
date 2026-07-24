@@ -105,8 +105,10 @@ class TestMDLMStrategy:
             "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
             "loss_mask": torch.tensor([[1, 0, 1], [0, 1, 1]]),
         }
+        seen_microbatch_indices = []
 
-        def apply_corruption(input_ids, loss_mask):
+        def apply_corruption(input_ids, loss_mask, microbatch_idx=0):
+            seen_microbatch_indices.append(microbatch_idx)
             return input_ids + 100, loss_mask.bool(), torch.full(input_ids.shape, 0.5)
 
         recipe = types.SimpleNamespace(_apply_corruption=apply_corruption)
@@ -118,6 +120,24 @@ class TestMDLMStrategy:
         assert torch.equal(batch["_noisy_input_ids"], torch.tensor([[101, 102, 103], [104, 105, 106]]))
         assert torch.equal(batch["_noise_mask"], batch["loss_mask"].bool())
         assert torch.equal(batch["_clean_input_ids"], torch.tensor([[1, 2, 3], [4, 5, 6]]))
+        # pre_step threads the grad-accum microbatch index into the corruption
+        # seed so every microbatch draws distinct, resume-reproducible noise.
+        assert seen_microbatch_indices == [0]
+
+    def test_pre_step_passes_distinct_microbatch_indices(self, strategy):
+        batches = [
+            {"input_ids": torch.tensor([[1, 2]]), "loss_mask": torch.tensor([[1, 1]])},
+            {"input_ids": torch.tensor([[3, 4]]), "loss_mask": torch.tensor([[1, 1]])},
+        ]
+        seen_microbatch_indices = []
+
+        def apply_corruption(input_ids, loss_mask, microbatch_idx=0):
+            seen_microbatch_indices.append(microbatch_idx)
+            return input_ids, loss_mask.bool(), torch.ones_like(input_ids, dtype=torch.float32)
+
+        recipe = types.SimpleNamespace(_apply_corruption=apply_corruption)
+        strategy.pre_step(recipe, batches)
+        assert seen_microbatch_indices == [0, 1]
 
     def test_forward_backward_delegates_to_recipe_step(self, strategy):
         calls = []

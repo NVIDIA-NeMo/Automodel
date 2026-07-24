@@ -47,14 +47,16 @@ RECIPE_NAME=$(basename "$CONFIG_PATH" .yaml)
 # ============================================
 # Map recipe -> generation sampler
 # ============================================
-# examples/dllm_generate/generate.py ships only two sampler presets:
-#   - llada    : pure MDLM, full-forward no-cache (LLaDA family)
+# examples/dllm_generate/generate.py sampler presets:
+#   - llada    : pure MDLM, full-forward no-cache (LLaDA)
+#   - llada2   : model's built-in block-refinement generate (LLaDA2)
 #   - nemotron : block-diffusion KV-cache via model.generate (Nemotron-Labs)
-# Recipes with no preset (dflash / diffusion_gemma) run TRAIN-ONLY: the generate
-# stage is skipped rather than guessed.
+# Recipes with no preset (dflash) run TRAIN-ONLY: the generate stage is
+# skipped rather than guessed.
 SAMPLER=""
 case "$RECIPE_NAME" in
-    llada_sft|llada2_sft)        SAMPLER="llada" ;;
+    llada_sft)                   SAMPLER="llada" ;;
+    llada2_sft)                  SAMPLER="llada2" ;;
     nemotron_labs_diffusion_sft) SAMPLER="nemotron" ;;
     *)                           SAMPLER="" ;;
 esac
