@@ -144,8 +144,10 @@ class DeepseekV4Block(nn.Module):
         # tid2eid lookup table instead of the score-based generic Gate.
         # Swap after MoE construction so the rest of MoE (experts, shared
         # experts, etc.) keeps its standard layout.
-        self.is_hash_routing_layer = layer_idx < int(getattr(config, "num_hash_layers", 0) or 0)
-        if self.is_hash_routing_layer and not backend.fake_balanced_gate:
+        self.is_hash_routing_layer = (
+            layer_idx < int(getattr(config, "num_hash_layers", 0) or 0) and not backend.fake_balanced_gate
+        )
+        if self.is_hash_routing_layer:
             self.mlp.gate = DeepseekV4HashGate(config, moe_config)
         self.input_layernorm = initialize_rms_norm_module(
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
@@ -218,7 +220,7 @@ class DeepseekV4Block(nn.Module):
 
         # Hash-routing layers need the current batch's input_ids to do the
         # tid2eid lookup; stash it on the gate just before the MoE call.
-        if self.is_hash_routing_layer and isinstance(self.mlp.gate, DeepseekV4HashGate):
+        if self.is_hash_routing_layer:
             self.mlp.gate.set_input_ids(input_ids)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
         dtype = x.dtype
@@ -229,7 +231,7 @@ class DeepseekV4Block(nn.Module):
         self.post_attention_layernorm.reset_parameters()
         self.self_attn.init_weights(buffer_device, init_std=init_std)
         self.mlp.init_weights(buffer_device, init_std=init_std)
-        if isinstance(self.mlp.gate, DeepseekV4HashGate):
+        if self.is_hash_routing_layer:
             self.mlp.gate.init_weights(init_std=init_std)
         self.attn_hc.init_weights(init_std)
         self.ffn_hc.init_weights(init_std)

@@ -34,6 +34,7 @@ from nemo_automodel.components.models.deepseek_v4 import fsdp as dsv4_fsdp
 from nemo_automodel.components.models.deepseek_v4 import model as dsv4_model_module
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.components.models.deepseek_v4.model import DeepseekV4ForCausalLM
+from nemo_automodel.components.moe.layers import FakeBalancedGate
 
 # ``MoE.forward`` (in ``nemo_automodel/components/moe/layers.py``)
 # unconditionally creates a ``torch.cuda.Stream()`` when the model has a
@@ -490,6 +491,26 @@ class TestDeepseekV4ModelSmoke:
         gate.set_input_ids(torch.tensor([[1, 2, 3]]))
         _, indices, _ = gate(torch.zeros(3, cfg.hidden_size), torch.ones(3, dtype=torch.bool))
         assert indices.dtype == torch.long
+
+    def test_fake_balanced_gate_disables_hash_routing(self):
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=1, compress_ratios=[0])
+        model = DeepseekV4ForCausalLM(
+            cfg,
+            backend=BackendConfig(
+                attn="sdpa",
+                linear="torch",
+                rms_norm="torch",
+                rope_fusion=False,
+                enable_hf_state_dict_adapter=False,
+                dispatcher="torch",
+                experts="torch_mm",
+                fake_balanced_gate=True,
+            ),
+        )
+        block = model.model.layers["0"]
+
+        assert block.is_hash_routing_layer is False
+        assert isinstance(block.mlp.gate, FakeBalancedGate)
 
     def test_initialize_weights_builds_valid_hash_routes(self):
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=1, compress_ratios=[0])
