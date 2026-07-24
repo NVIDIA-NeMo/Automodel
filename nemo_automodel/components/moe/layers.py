@@ -126,6 +126,10 @@ class MLP(nn.Module):
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
         self.apply(init_weights_fn)
 
+    def update_gate_bias(self) -> None:
+        """Keep the shared feed-forward gate-update contract as a dense no-op."""
+        return None
+
 
 class FakeBalancedGate(nn.Module):
     """
@@ -763,6 +767,11 @@ class MoE(nn.Module):
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         init_weights_fn = partial(_init_weights, buffer_device=buffer_device, init_std=init_std)
         self.apply(init_weights_fn)
+
+    def update_gate_bias(self) -> None:
+        """Update the router correction bias when bias-based balancing is enabled."""
+        if self.gate.bias_update_factor > 0:
+            self.gate.update_bias()
 
 
 def _init_weights(module, buffer_device: torch.device, init_std: float = 0.02):

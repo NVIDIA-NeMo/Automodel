@@ -139,6 +139,12 @@ class TestMLP:
 
         torch.testing.assert_close(mlp(x, padding_mask=padding_mask), mlp(x))
 
+    def test_update_gate_bias_is_no_op(self):
+        """Dense MLP accepts the shared gate-update contract as a no-op."""
+        mlp = MLP(8, 16, backend="torch")
+
+        assert mlp.update_gate_bias() is None
+
     def test_mlp_init_weights(self, device):
         """Test MLP weight initialization."""
         mlp = MLP(64, 128, backend="torch")
@@ -1265,6 +1271,26 @@ class TestGate:
 
 class TestMoE:
     """Test MoE (Mixture of Experts) module."""
+
+    def test_update_gate_bias_skips_disabled_gate(self, moe_config, backend_config):
+        """Gate updates remain disabled when the configured update factor is zero."""
+        moe_config.gate_bias_update_factor = 0.0
+        moe = MoE(moe_config, backend_config)
+
+        with patch.object(moe.gate, "update_bias") as update_bias:
+            moe.update_gate_bias()
+
+        update_bias.assert_not_called()
+
+    def test_update_gate_bias_delegates_to_enabled_gate(self, moe_config, backend_config):
+        """Gate updates delegate when bias-based load balancing is enabled."""
+        moe_config.gate_bias_update_factor = 1e-3
+        moe = MoE(moe_config, backend_config)
+
+        with patch.object(moe.gate, "update_bias") as update_bias:
+            moe.update_gate_bias()
+
+        update_bias.assert_called_once_with()
 
     def test_moe_init_with_fake_balanced_gate(self, moe_config, backend_config):
         """Test MoE initialization with fake balanced gate."""

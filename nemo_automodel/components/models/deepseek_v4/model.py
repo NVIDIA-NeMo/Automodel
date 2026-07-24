@@ -600,8 +600,7 @@ class DeepseekV4Model(nn.Module):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for block in self.layers.values():
-                if isinstance(block.mlp, MoE):
-                    block.mlp.gate.update_bias()
+                block.mlp.update_gate_bias()
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
