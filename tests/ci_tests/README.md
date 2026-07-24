@@ -59,6 +59,7 @@ ci:
   env_vars:                       # Optional. Environment variables forwarded to the job
     REQUIRE_FINITE_METRICS: "true" # Fail when no step metrics are logged or loss/grad_norm is non-finite
   vllm_deploy: true               # Optional. Enable vLLM deployment test
+  vllm_deploy_time: "00:30:00"    # Optional. Override the vLLM deploy SLURM wall time (defaults to 00:10:00)
   checkpoint_robustness:          # Optional. Enable robustness testing
     hf_kl_threshold: 1e-3
     tokenizer_name: org/model
@@ -119,6 +120,7 @@ worst token, while the stricter mean threshold prevents broad drift; Phase 0 als
 
 1. Add `vllm_deploy: true` under `ci:`
 2. Robustness must also be enabled (vLLM test loads from the robustness checkpoint)
+3. For large models that need more than 10 minutes to load, set `vllm_deploy_time`
 
 ### Add a New Test Folder
 
