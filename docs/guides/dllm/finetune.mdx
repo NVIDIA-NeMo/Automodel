@@ -292,7 +292,7 @@ torchrun --nproc-per-node=8 \
 
 ## Run Inference
 
-The generation script ([`generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_generate/generate.py)) supports chat and raw generation. Select the sampler that matches the trained family by using the `--sampler {llada,llada2,nemotron}` argument. Infilling is also available for LLaDA and Nemotron, but the LLaDA2 generation path does not support it.
+The generation script ([`generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_generate/generate.py)) supports chat and raw generation. Select the sampler that matches the trained family using the `--sampler {llada,llada2,nemotron}` argument. Infilling is also available for LLaDA and Nemotron, but the LLaDA2 generation path does not support it.
 
 The `--checkpoint` argument accepts several path types, such as a path to a `consolidated/` directory, a step directory (for example, `.../epoch_0_step_499`), or the top-level checkpoint directory. The script automatically follows the path to `LATEST/model/consolidated/`.
 
