@@ -201,6 +201,57 @@ RUN git clone --depth 1 --branch v0.17.0 --recurse-submodules --shallow-submodul
         pip install --no-cache-dir --no-build-isolation /tmp/torchao && \
     rm -rf /tmp/torchao
 
+# ---- FlashAttention-3 (Hopper-only) + FlashAttention-4 (Hopper + Blackwell) ----
+# Installed AFTER uv sync (same reason as torchao: not resolvable by uv), and
+# with `pip` -- NOT `uv pip` -- like the torchao stage above: uv resolves against
+# the venv only and would reinstall torch from PyPI over the base image's torch
+# (FA3's sdist declares a torch dependency; pip sees the system-site torch and
+# leaves it alone; --no-deps additionally guards FA3). Verification uses dist
+# metadata because transformers' is_flash_attn_*_available() requires a visible
+# GPU, which docker builds do not have.
+# FA3 kernels are SM90a-locked (Hopper ISA; they do NOT run on SM100) -- Blackwell
+# is served by FA4, whose CuTe-DSL kernels JIT-compile per-arch at runtime
+# (Sm90 and Sm100 kernel classes ship in the package; no build-time arch work).
+# FA4 must be co-located with flash-attn's `flash_attn` package: it installs the
+# `flash_attn.cute` subpackage, which FA2's __init__.py shadows if the two live in
+# different site-packages prefixes (the PYTORCH_IMAGE base puts flash-attn in
+# /usr/local dist-packages while uv installs to /opt/venv).
+# INSTALL_FA4 defaults to false: flash-attn-4 requires apache-tvm-ffi>=0.1.12,
+# which conflicts with the tilelang-pinned apache-tvm-ffi<=0.1.11 (pyproject cuda
+# extra) -- enabling FA4 disables backend.attn="tilelang" until tilelang ships a
+# release built against ffi 0.1.12.
+ARG FLASH_ATTN_REF=002cce0a1
+ARG INSTALL_FA3=true
+ARG INSTALL_FA4=false
+# TARGETARCH is provided by buildx. FA3 is skipped on arm64 automatically: the
+# arm64 image targets GB200 (Blackwell), where the SM90a-only FA3 kernels are
+# dead weight, and CI cross-builds arm64 under QEMU where the ~25 min nvcc
+# compile is impractical.
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm64" ]; then INSTALL_FA3=false; fi && \
+    if [ "$INSTALL_FA3" = "true" ] || [ "$INSTALL_FA4" = "true" ]; then \
+        git clone --filter=blob:none https://github.com/Dao-AILab/flash-attention.git /tmp/fa && \
+        cd /tmp/fa && git checkout ${FLASH_ATTN_REF} && \
+        git submodule update --init csrc/cutlass; \
+    fi && \
+    if [ "$INSTALL_FA3" = "true" ]; then \
+        cd /tmp/fa/hopper && \
+        FLASH_ATTENTION_DISABLE_SM80=TRUE MAX_JOBS=$(nproc) NVCC_THREADS=2 \
+        pip install --no-cache-dir --no-build-isolation --no-deps . && \
+        python -c "import importlib.metadata as m; print('flash-attn-3', m.version('flash-attn-3'))"; \
+    fi && \
+    if [ "$INSTALL_FA4" = "true" ]; then \
+        pip install --no-cache-dir /tmp/fa/flash_attn/cute "nvidia-cutlass-dsl[cu13]==4.6.0.dev0" && \
+        FA2_DIR=$(python -c "import flash_attn, os; print(os.path.dirname(flash_attn.__file__))") && \
+        VENV_CUTE=/opt/venv/lib/python3.12/site-packages/flash_attn/cute && \
+        { [ -e "$FA2_DIR/cute" ] || ln -s "$VENV_CUTE" "$FA2_DIR/cute"; } && \
+        python -c "import importlib.metadata as m; print('flash-attn-4', m.version('flash-attn-4'))"; \
+    fi && \
+    rm -rf /tmp/fa
+
+# Persistent disk cache for FA4's CuTe-DSL JIT (amortizes kernel compiles across restarts)
+ENV FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1
+
 COPY . /opt/Automodel
 
 # Re-apply PyTorch overrides after full COPY (which overwrites the modified pyproject.toml/uv.lock)

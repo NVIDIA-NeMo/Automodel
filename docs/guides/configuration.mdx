@@ -86,6 +86,20 @@ Adding GPUs helps only when it sufficiently reduces the relevant per-rank tensor
 
 </Info>
 
+## Repair Near-Zero Input Embeddings
+
+The LLM training/fine-tuning recipe can repair a small number of damaged input-embedding rows after loading the base checkpoint and before creating the optimizer:
+
+```yaml
+embedding_row_repair:
+  min_norm: 1.0e-4
+  max_rows: 256
+```
+
+Rows with a non-finite L2 norm or a norm at or below `min_norm` are replaced with the corresponding output-embedding direction, scaled to the RMS norm of healthy input rows. Setup logs the affected token IDs. `max_rows` is a safety limit: setup aborts instead of rewriting a broadly damaged or mismatched checkpoint.
+
+This option is intended for diagnosed checkpoint defects where rare token IDs produce extreme input-embedding gradients. It is disabled when the section is absent and is not currently supported with pipeline parallelism.
+
 ## Interpolate Environment Variables in YAML
 
 NeMo AutoModel supports env var interpolation inside YAML **string values**.

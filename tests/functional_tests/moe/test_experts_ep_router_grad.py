@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-rank CPU regression tests for router-weight gradients through the EP all-gather.
+"""Scheduled two-rank CPU regression for router gradients through the EP all-gather.
 
 ``GroupedExperts.forward`` all-gathers the per-token routing probabilities across
 the expert-parallel group before dispatching tokens to local experts. Routing

@@ -41,3 +41,23 @@ def test_bagel_auto_model_path_uses_distributed_setup_kwarg():
         }
         & keywords
     )
+
+
+def test_bagel_finalizes_pending_checkpoint_before_closing_checkpointer():
+    """Async BAGEL checkpoints must be published before the checkpointer closes."""
+    from types import SimpleNamespace
+
+    from nemo_automodel.recipes.multimodal.finetune import FinetuneRecipeForMultimodal
+
+    events = []
+    recipe = FinetuneRecipeForMultimodal.__new__(FinetuneRecipeForMultimodal)
+    recipe.model = SimpleNamespace(train=lambda: events.append("train"))
+    recipe.step_scheduler = SimpleNamespace(epochs=[])
+    recipe.metric_logger_train = SimpleNamespace(close=lambda: events.append("train_logger_close"))
+    recipe.metric_logger_valid = SimpleNamespace(close=lambda: events.append("valid_logger_close"))
+    recipe.checkpointer = SimpleNamespace(close=lambda: events.append("checkpointer_close"))
+    recipe._finalize_pending_checkpoint = lambda: events.append("finalize")
+
+    FinetuneRecipeForMultimodal.run_train_validation_loop(recipe)
+
+    assert events == ["train", "train_logger_close", "valid_logger_close", "finalize", "checkpointer_close"]

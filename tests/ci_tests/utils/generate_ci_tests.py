@@ -134,6 +134,8 @@ def _compute_base_stage(test_folder: str, config: Path, has_robustness: bool) ->
     """Pick the GitLab CI stage for a base recipe job."""
     if "benchmark" in test_folder:
         return "performance"
+    if test_folder == "llm_pretrain":
+        return "pretrain"
     if "benchmark" in config.stem:
         return "benchmark"
     if test_folder.startswith("diffusion"):

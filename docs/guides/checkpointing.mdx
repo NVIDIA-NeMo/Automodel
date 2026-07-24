@@ -1,11 +1,11 @@
 ---
-title: "Checkpointing in NeMo Automodel"
+title: "Checkpointing in NeMo AutoModel"
 description: ""
 position: 1
 ---
 ## Introduction
 
-During machine-learning experiments, the model-training routine regularly saves checkpoints. A checkpoint is a complete snapshot of a run that includes model weights, optimizer states, and other metadata required to resume training exactly where it left off. Writing these snapshots at regular intervals lets you recover quickly from crashes or pauses without losing progress.
+During machine learning experiments, the model training routine regularly saves checkpoints. A checkpoint is a complete snapshot of a run that includes model weights, optimizer states, and other metadata required to resume training exactly where it left off. Writing these snapshots at regular intervals lets you recover quickly from crashes or pauses without losing progress.
 
 NeMo AutoModel checkpoints capture the complete state of a distributed training run across multiple GPUs or nodes. This reduces memory overhead, improves GPU utilization, and allows training to be resumed with a different parallelism strategy.
 
@@ -15,7 +15,7 @@ NeMo AutoModel writes checkpoints in two formats: [Hugging Face Safetensors](htt
 
 - **Sharded Checkpoints**: During distributed training with parameter sharing, each GPU holds a subset (or "shard") of the full state, such as model weights and optimizer states. When checkpointing, each GPU writes its own shard independently without reconstructing the full model state.
 
-We provide an overview of the different types of available checkpoint formats in the table below.
+The following table provides an overview of the available checkpoint formats.
 
 Task | Model domain  | DCP (sharded) | Safetensors (sharded) | Safetensors (consolidated) |
 -----|----------------------|:-----------:|:-------------------:|:------------------------:|
@@ -23,7 +23,7 @@ SFT  | LLM                  | ✅          | ✅                   | ✅        
 SFT  | VLM                  | ✅          | ✅                   | ✅                      |
 PEFT | LLM / VLM            | 🚧          | 🚧                   | ✅                      | 
 
-Changing between output formats can be done seamlessly through the recipe's `yaml` configuration file:
+Change output formats through the recipe's YAML configuration file:
 ```yaml
 checkpoint:
     ...
@@ -33,12 +33,14 @@ checkpoint:
     consolidation_timeout_minutes: 30 # Timeout for inline consolidated-export synchronization.
     ...
 ```
-> **Note:** `save_consolidated` accepts:
-> - `final` (recommended): keep intermediate checkpoints sharded and export consolidated HF weights only for the final checkpoint.
-> - `false`: save sharded checkpoints only. Run the generated `model/consolidate.sh` helper later if you need HF weights.
-> - `every` (or legacy `true`): export consolidated HF weights during every checkpoint save. Use this only when every checkpoint must be immediately loadable by HF tools.
->
-> AutoModel writes a `model/consolidate.sh` helper next to safetensors model shards. Use this helper to create a Hugging Face-compatible `model/consolidated/` directory after training for `save_consolidated: false` checkpoints, or for earlier checkpoints when using `save_consolidated: final`. Creating consolidated Hugging Face weights requires `model_save_format: safetensors`.
+
+`save_consolidated` accepts the following values:
+
+- `final` (recommended): Keep intermediate checkpoints sharded and export consolidated Hugging Face weights only for the final checkpoint.
+- `false`: Save sharded checkpoints only. Run the generated `model/consolidate.sh` helper later if you need Hugging Face weights.
+- `every` (or legacy `true`): Export consolidated Hugging Face weights during every checkpoint save. Use this only when every checkpoint must be immediately loadable by Hugging Face tools.
+
+AutoModel writes a `model/consolidate.sh` helper next to Safetensors model shards. Use this helper to create a Hugging Face-compatible `model/consolidated/` directory after training for `save_consolidated: false` checkpoints, or for earlier checkpoints when using `save_consolidated: final`. Creating consolidated Hugging Face weights requires `model_save_format: safetensors`.
 
 Inline consolidated export synchronizes ranks through a dedicated Gloo process group. `consolidation_timeout_minutes` controls that synchronization independently of `dist_env.timeout_minutes`, which continues to control training collectives. The default is 30 minutes.
 
@@ -52,19 +54,45 @@ The optimizer states are _always_ saved in DCP (`.distcp` extension) format.
 NeMo AutoModel automatically creates symbolic links in the checkpoint directory to provide convenient access to important checkpoints:
 
 - **LATEST**: Points to the most recently saved checkpoint. This is useful for resuming training from the last saved state.
-- **LOWEST_VAL**: Points to the checkpoint with the lowest validation score/loss. This provides easy access to the best-performing checkpoint based on validation metrics, making it ideal for model evaluation or deployment.
+- **LOWEST_VAL**: Points to the checkpoint with the lowest validation score or loss. This provides easy access to the best-performing checkpoint based on validation metrics, making it ideal for model evaluation or deployment.
 
 These symbolic links eliminate the need to manually track checkpoint names or search through directories to find the best model. When validation is enabled in your training run, both links are automatically maintained and updated as training progresses.
 
+## Checkpoint Retention
+
+By default, NeMo AutoModel keeps all intermediate checkpoints. To limit disk usage when checkpoints are saved frequently, configure a bounded recent-checkpoint window:
+
+```yaml
+checkpoint:
+  max_recent_checkpoints: 2
+```
+
+`max_recent_checkpoints` sets the number of checkpoint directories in the recent window, ordered by step. It is not a hard limit on the total number of checkpoint directories.
+
+Checkpoint-root pointers protect their targets in addition to the recent window. These pointers include `LATEST`, `LOWEST_VAL`, other top-level symbolic links, and `.txt` fallback pointer files. This behavior supports reliable resumption from the latest checkpoint and preserves explicitly referenced checkpoints, such as the best validation checkpoint.
+
+For example, set `max_recent_checkpoints: 2` to retain the two most recent checkpoints. If `LOWEST_VAL` points to an older checkpoint, NeMo AutoModel also retains the `LOWEST_VAL` target.
+
+Bounded retention supports only local file system checkpoint directories. If `checkpoint.checkpoint_dir` uses `msc://` storage, leave `max_recent_checkpoints` unset. Setting it raises `ValueError`.
+
+Bounded retention removes only standard `epoch_<E>_step_<S>` checkpoint directories. It does not remove recipe-specific exports, such as retrieval distillation `step_<S>` directories.
+
+Leave the value unset, or set it to `null`, to keep all intermediate checkpoints:
+
+```yaml
+checkpoint:
+  max_recent_checkpoints: null
+```
+
 ## Safetensors
-To ensure seamless integration with the Hugging Face ecosystem, NeMo AutoModel saves checkpoints in the [Safetensors](https://github.com/safetensors/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (PyTorch .bin), natively supported by Hugging Face Transformers, offering both safety and performance advantages over Python pickle-based approaches.
+To ensure seamless integration with the Hugging Face ecosystem, NeMo AutoModel saves checkpoints in the [Safetensors](https://github.com/safetensors/safetensors) format. Safetensors is a memory-safe, zero-copy alternative to Python's pickle (PyTorch .bin). Hugging Face Transformers supports Safetensors natively, and Safetensors offers safety and performance advantages over Python pickle-based approaches.
 
 ### Key Benefits
 - **Native Hugging Face Compatibility**: Checkpoints can be loaded directly into Hugging Face-compatible tools, including vLLM, SGLang, and others.
 - **Memory Safety and Speed**: The Safetensors format prohibits saving serialized Python code, ensuring memory safety, and supports zero-copy loading for improved performance.
 - **Optional Consolidation**: Sharded checkpoints can be merged into a standard Hugging Face model format for easier downstream use.
 
-**Most importantly**, this format offers the added advantage of optionally consolidating multiple shards into a complete Hugging Face format model.
+This format also supports optional consolidation of multiple shards into a complete Hugging Face format model.
 
 ### Example
 
@@ -77,12 +105,13 @@ automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 ```
 
 <Note>
-In the above command we used the [`llama3_2_1b_squad.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/492add84a2b9d495946fe211c28973cd00051f3e/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) config as a running example, adjust as necessary to your case.
-More config examples can be found in our [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
+
+The preceding command uses the [`llama3_2_1b_squad.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/492add84a2b9d495946fe211c28973cd00051f3e/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml) configuration file as a running example. Adjust it for your use case.
+More configuration examples are available in the [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
 
 </Note>
 
-If you're running on a single GPU, you can run:
+If you are running on a single GPU, run the following command:
 ```bash
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --step_scheduler.ckpt_every_steps 20 \
@@ -97,7 +126,7 @@ After running for a few seconds, the standard output should be:
 ...
 ```
 
-The `checkpoints/` should have the following contents:
+The `checkpoints/` directory should have the following contents:
 ```
 checkpoints/
 ├── LATEST -> epoch_0_step_20
@@ -135,7 +164,7 @@ NPROC_PER_NODE=16 NUM_THREADS=5 bash checkpoints/epoch_0_step_20/model/consolida
 sbatch --cpus-per-task=80 --wrap='NPROC_PER_NODE=16 NUM_THREADS=5 bash /path/to/checkpoints/epoch_0_step_20/model/consolidate.sh'
 ```
 
-By default, consolidated export uses the original Hugging Face safetensors headers when they are available. Ordinary floating-point tensors are restored to their original per-tensor HF dtype, such as BF16, FP16, or FP32, even if the saved sharded checkpoint uses a different floating dtype. If the run started from config-only weights or the original HF metadata is unavailable, export keeps the saved checkpoint dtype. If an original quantized or packed tensor was saved as a floating-point tensor, export leaves it as float and emits a warning.
+By default, consolidated export uses the original Hugging Face Safetensors headers when they are available. Ordinary floating-point tensors are restored to their original per-tensor Hugging Face dtype, such as BF16, FP16, or FP32, even if the saved sharded checkpoint uses a different floating dtype. If the run started from configuration-only weights or the original Hugging Face metadata is unavailable, export keeps the saved checkpoint dtype. If an original quantized or packed tensor was saved as a floating-point tensor, export leaves it as float and emits a warning.
 
 You can request an explicit floating-point dtype cast during offline export:
 
@@ -145,7 +174,7 @@ CAST_DTYPE=bf16 bash checkpoints/epoch_0_step_20/model/consolidate.sh
 
 Use `CAST_DTYPE` when the consolidated Hugging Face bundle should override the default per-tensor dtype behavior, such as `CAST_DTYPE=bf16` to export ordinary floating-point tensors as BF16 for serving. Supported values include `bf16`, `fp16`, `fp32`, and `fp64`. Only ordinary floating-point tensors with a different source dtype are cast; tensors already in the cast dtype, FP8 tensors, and non-floating tensors are left unchanged.
 
-The helper writes `checkpoints/epoch_0_step_20/model/consolidated/`. We can load and run that consolidated checkpoint using the Hugging Face Transformers API directly:
+The helper writes `checkpoints/epoch_0_step_20/model/consolidated/`. Load and run that consolidated checkpoint directly with the Hugging Face Transformers API:
 ```python
 import torch
 from transformers import pipeline
@@ -166,25 +195,25 @@ print(pipe("The key to life is"))
 Although this example uses the Hugging Face Transformers API, the `consolidated/` checkpoint is compatible with any Hugging Face-compatible tool, such as vLLM, SGLang, and others.
 
 ## PEFT
-When training with Parameter-Efficient Fine-Tuning (PEFT) techniques, only a small subset of model weights are updated — the rest of the model remains frozen. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
+When training with Parameter-Efficient Fine-Tuning (PEFT) techniques, only a small subset of model weights are updated, and the rest of the model remains frozen. This dramatically reduces the size of the checkpoint, often to just a few megabytes.
 
 PEFT checkpoints save adapter files directly under `model/` and do not generate or need `model/consolidate.sh`.
 
 ### Why Consolidated Adapter Checkpoints?
 Because the PEFT state is so lightweight, sharded checkpointing adds unnecessary overhead. Instead, NeMo AutoModel automatically saves a compact Hugging Face-compatible adapter checkpoint when using PEFT. This makes it:
 
-- easier to manage and share (just the adapters),
-- compatible with Hugging Face Transformers out of the box,
-- ideal for deployment and downstream evaluation.
+- Easier to manage and share (just the adapters).
+- Compatible with Hugging Face Transformers out of the box.
+- Ideal for deployment and downstream evaluation.
 
-### Example: PEFT Fine-Tuning on Two GPUs
+### Run PEFT Fine-Tuning on Two GPUs
 
-To fine-tune a model using PEFT and save a Hugging Face–ready checkpoint:
+To fine-tune a model using PEFT and save a Hugging Face-compatible checkpoint:
 ```bash
 automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_hellaswag_peft.yaml --step_scheduler.ckpt_every_steps 20 --checkpoint.model_save_format safetensors
 ```
 
-After training, you'll get a compact Safetensors adapter checkpoint that can be loaded directly with Hugging Face tools:
+After training, the run produces a compact Safetensors adapter checkpoint that can be loaded directly with Hugging Face tools:
 
 ```
 checkpoints/
@@ -214,7 +243,7 @@ checkpoints/
 └── validation.jsonl
 ```
 
-The example below showcases the direct compatibility of NeMo AutoModel with Hugging Face and PEFT:
+The following example shows the direct compatibility of NeMo AutoModel with Hugging Face and PEFT:
 ```python
 from peft import AutoPeftModelForCausalLM
 from transformers import AutoTokenizer
@@ -234,9 +263,9 @@ print(tokenizer.batch_decode(outputs.detach().cpu().numpy(), skip_special_tokens
 ```
 
 ## PyTorch DCP
-NeMo AutoModel also offers native PyTorch DCP checkpointing support (`.distcp` extension). Similar to Safetensors, it also provides the same features of load-time resharding and parallel saving.
+NeMo AutoModel also offers native PyTorch DCP checkpointing support (`.distcp` extension). Similar to Safetensors, it provides load-time resharding and parallel saving.
 
-As a simple example, we can run the following command to launch the training recipe on two GPUs.
+As a simple example, run the following command to launch the training recipe on two GPUs.
 ```bash
 automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --step_scheduler.ckpt_every_steps 20 \
@@ -246,7 +275,7 @@ automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 > Saving checkpoint to checkpoints/epoch_0_step_20
 ...
 ```
-After 20 steps, the following checkpoint will be saved:
+After 20 steps, AutoModel saves the following checkpoint:
 
 ```
 checkpoints/
@@ -280,7 +309,7 @@ automodel --nproc-per-node=2 examples/llm_finetune/llama3_2/llama3_2_1b_squad.ya
 
 ## Save Checkpoints When Using Docker
 
-When training inside a Docker container (see [Installation Guide](/get-started/installation)), any files written to the container's filesystem are lost when the container exits (especially with `--rm`). To keep your checkpoints, you must **bind-mount a host directory** to the checkpoint path before starting the container:
+When training inside a Docker container (refer to the [Installation Guide](/get-started/installation)), any files written to the container's filesystem are lost when the container exits, especially with `--rm`. To keep your checkpoints, **bind-mount a host directory** to the checkpoint path before starting the container:
 
 ```bash
 docker run --gpus all -it --rm \
@@ -295,7 +324,7 @@ checkpoint:
   checkpoint_dir: /mnt/shared/my_checkpoints
 ```
 ```bash
-# Or via CLI override:
+# Or with a CLI override:
 automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
     --checkpoint.checkpoint_dir /mnt/shared/my_checkpoints
 ```
@@ -303,7 +332,8 @@ automodel examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml \
 When using a custom path, make sure the corresponding host directory is mounted into the container with `-v`.
 
 <Tip>
-Mount additional host directories for datasets and the Hugging Face model cache to avoid re-downloading large models across container restarts. See the [Installation Guide](/get-started/installation) for a complete `docker run` example with all recommended mounts.
+
+Mount additional host directories for datasets and the Hugging Face model cache to avoid downloading large models again across container restarts. Refer to the [Installation Guide](/get-started/installation) for a complete `docker run` example with all recommended mounts.
 
 </Tip>
 
@@ -318,10 +348,102 @@ NeMo AutoModel can write checkpoints asynchronously to reduce training stalls ca
   ```
 - **Enable** (CLI): add `--checkpoint.is_async True` to your run command.
 - **Requirements**: PyTorch ≥ 2.9.0. If an older version is detected, async mode is automatically disabled.
-- **Behavior**: At most one checkpoint uploads at a time; the next save waits for the previous upload to finish. The `LATEST` symlink is updated after the async save completes (may be deferred until the next save call). During PEFT, adapter model files are written synchronously on rank 0; optimizer states can still use async.
+- **Behavior**: At most one checkpoint is written at a time. The next save waits for the previous write to finish.
+- **Publication**: The `LATEST` symbolic link is updated after the asynchronous save completes. For intermediate checkpoints, publication can be deferred until the next save call. Before shutting down, each recipe waits for the final asynchronous checkpoint and publishes `LATEST` before closing the checkpointer.
+- **PEFT**: Adapter model files are written synchronously on rank 0; optimizer states can still be written asynchronously.
 
-## Advanced Usage: Save Additional States
-You can also save additional states in NeMo AutoModel. By default, we also automatically checkpoint the `dataloader`, `rng`, and `step_scheduler` states which are necessary to resume training accurately. In full, a Safetensors consolidated checkpoint will look like this:
+## Preemption Checkpointing
+
+On shared clusters, jobs can be preempted or reach their wall-time limits
+before training finishes. NeMo AutoModel can catch an operating-system signal
+sent ahead of the shutdown, save a checkpoint at the next step boundary, and
+exit gracefully. This lets training resume from the moment of preemption
+instead of the last periodic checkpoint.
+
+```yaml
+step_scheduler:
+  ...
+  preemption_signal: SIGUSR1   # default: SIGTERM
+```
+
+`preemption_signal` accepts:
+
+- A signal name as a string, case-insensitive, with or without the `SIG`
+  prefix (`"SIGUSR1"`, `"usr1"`, and `"SIGTERM"` are all valid).
+- A signal number, such as `15`.
+- A list of preceding options to watch multiple signals at once, for example
+  `["SIGUSR1", "SIGTERM"]`.
+- `null` to disable preemption handling entirely.
+
+By default, `SIGTERM` is watched, so runs already checkpoint on a polite
+termination request without any configuration.
+
+### How It Works
+
+When any rank receives the configured signal, the signal handler records it
+locally. The flags are then gathered across ranks at the next step boundary,
+so every rank observes the preemption at the same step. All ranks write
+a checkpoint together and shut down cleanly. This means it is sufficient
+for the signal to reach a single rank, for example, only the workers on one
+node.
+
+Since the checkpoint is written at a step boundary, the delay between signal
+delivery and the checkpoint is at most one training step. Set the signal lead
+time to cover one step plus the time to write a checkpoint for your model
+size and storage backend.
+
+If the signal arrives while the final steps of a run are completing, the run
+finishes normally and writes its regular final checkpoint, so no separate
+preemption checkpoint is made.
+
+### Slurm Usage
+
+The reference `slurm.sub` submission script demonstrates the full setup. Slurm
+delivers the warning signal to the batch script through the `--signal` directive:
+
+```bash
+#SBATCH --signal=B:USR1@300   # send USR1 to the batch script 300s before the time limit
+```
+
+The `B:` prefix is required: it delivers the signal to the batch script only.
+The batch script then forwards `SIGUSR1` to the local training worker
+processes. The workers must be signaled directly rather than `srun` or
+`torchrun`, because `torchrun` terminates on an unhandled `USR1`, taking the
+job down before a checkpoint can be written. Forwarding to the workers on the
+batch node alone is sufficient because the all-gather propagates the flag to every
+rank on every node.
+
+To test preemption behavior without waiting for a time limit, deliver the
+signal manually to a running job's batch script:
+
+```bash
+scancel --batch --signal=USR1 <jobid>
+```
+
+<Note>
+
+`--signal=B:USR1@<sec>` guarantees the warning before a *wall-time* termination. Whether the same warning is delivered on a *scheduler preemption*, such as a higher-priority job taking the nodes, depends on the cluster's Slurm configuration (`GraceTime` on the partition and `PreemptParameters=send_user_signal`). Ask your cluster administrator if preemption-triggered signals are required.
+
+</Note>
+
+### Resume Training After Preemption
+
+A preemption checkpoint is a regular checkpoint: the `LATEST` symbolic link is
+updated to point to it. Resubmitting the same job resumes from the preempted
+step with model, optimizer, and scheduler state intact.
+
+<Note>
+
+Signals that arrive before training starts (during model loading or dataloader
+construction) cannot trigger a checkpoint, since the signal handler is
+installed when the step scheduler is created and there is no training state to
+save at that point.
+
+</Note>
+
+## Save Additional States
+
+You can also save additional states in NeMo AutoModel. By default, AutoModel automatically checkpoints the `dataloader`, `rng`, and `step_scheduler` states that are necessary to resume training accurately. A complete Safetensors consolidated checkpoint looks like this:
 
 ```
 checkpoints/
@@ -355,9 +477,9 @@ checkpoints/
 └── validation.jsonl
 ```
 
-If you want to define a new state to be checkpointed in the recipe, the easiest way is to create a new attribute in the recipe class (defined using `self.` inside the recipe). Just make sure that the new attribute uses both the `load_state_dict` and `state_dict` methods.
+To define a new state to be checkpointed in the recipe, create a new attribute in the recipe class (defined using `self.` inside the recipe). Ensure that the new attribute uses both the `load_state_dict` and `state_dict` methods.
 
-Here is an example of what it might look like:
+The following example shows how to define the state:
 
 ```python
 

@@ -210,6 +210,45 @@ def test_step3p7_registry_and_custom_config_registration():
     assert CONFIG_MAPPING["step3p7"].__name__ == "Step3p7Config"
 
 
+def test_resolve_custom_config_cls_uses_registry_for_non_builtin(monkeypatch):
+    from nemo_automodel._transformers import registry as reg
+
+    class FakeConfig:
+        pass
+
+    fake_module = types.SimpleNamespace(FakeConfig=FakeConfig)
+    monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "am_future", ("fake.config_module", "FakeConfig"))
+    monkeypatch.setattr(
+        reg.importlib, "import_module", lambda name: fake_module if name == "fake.config_module" else None
+    )
+
+    assert reg.resolve_custom_config_cls("am_future") is FakeConfig
+
+
+def test_resolve_custom_config_cls_defers_to_transformers_builtin(monkeypatch):
+    from nemo_automodel._transformers import registry as reg
+
+    monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "bert", ("fake.config_module", "FakeConfig"))
+
+    assert reg.resolve_custom_config_cls("bert") is None
+
+
+def test_resolve_custom_config_cls_can_override_transformers_builtin(monkeypatch):
+    from nemo_automodel._transformers import registry as reg
+
+    class FakeConfig:
+        pass
+
+    fake_module = types.SimpleNamespace(FakeConfig=FakeConfig)
+    monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "bert", ("fake.config_module", "FakeConfig"))
+    monkeypatch.setattr(reg, "_CUSTOM_CONFIG_OVERRIDES_BUILTIN", {"bert"})
+    monkeypatch.setattr(
+        reg.importlib, "import_module", lambda name: fake_module if name == "fake.config_module" else None
+    )
+
+    assert reg.resolve_custom_config_cls("bert") is FakeConfig
+
+
 def test_resolve_custom_model_cls_found():
     """resolve_custom_model_cls returns the class when it exists and has no supports_config."""
     from nemo_automodel._transformers import registry as reg

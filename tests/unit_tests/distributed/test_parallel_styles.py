@@ -90,7 +90,7 @@ class TestDistributeParam:
         original_param = module.weight.clone()
         original_requires_grad = module.weight.requires_grad
 
-        with patch('nemo_automodel.components.distributed.parallel_styles.distribute_tensor') as mock_distribute:
+        with patch("nemo_automodel.components.distributed.parallel_styles.distribute_tensor") as mock_distribute:
             # Mock distribute_tensor to return a tensor-like object
             mock_dtensor = torch.randn_like(original_param)
             mock_distribute.return_value = mock_dtensor
@@ -102,7 +102,7 @@ class TestDistributeParam:
             call_args = mock_distribute.call_args
             assert torch.allclose(call_args[0][0], original_param)
             assert call_args[0][1] == mock_device_mesh
-            assert call_args[1]['src_data_rank'] == 0
+            assert call_args[1]["src_data_rank"] == 0
 
             # Verify the parameter was updated
             assert isinstance(module.weight, nn.Parameter)
@@ -112,7 +112,7 @@ class TestDistributeParam:
         module = nn.Linear(10, 20)
         module.weight.requires_grad = True
 
-        with patch('nemo_automodel.components.distributed.parallel_styles.distribute_tensor') as mock_distribute:
+        with patch("nemo_automodel.components.distributed.parallel_styles.distribute_tensor") as mock_distribute:
             mock_dtensor = torch.randn_like(module.weight)
             mock_distribute.return_value = mock_dtensor
 
@@ -126,7 +126,7 @@ class TestDistributeParam:
         module = nn.Linear(10, 20)
         module.weight.requires_grad = False
 
-        with patch('nemo_automodel.components.distributed.parallel_styles.distribute_tensor') as mock_distribute:
+        with patch("nemo_automodel.components.distributed.parallel_styles.distribute_tensor") as mock_distribute:
             mock_dtensor = torch.randn_like(module.weight)
             mock_distribute.return_value = mock_dtensor
 
@@ -139,7 +139,7 @@ class TestDistributeParam:
         """Test distributing bias parameter."""
         module = nn.Linear(10, 20)
 
-        with patch('nemo_automodel.components.distributed.parallel_styles.distribute_tensor') as mock_distribute:
+        with patch("nemo_automodel.components.distributed.parallel_styles.distribute_tensor") as mock_distribute:
             mock_dtensor = torch.randn_like(module.bias)
             mock_distribute.return_value = mock_dtensor
 
@@ -165,7 +165,7 @@ class TestColwiseParallelLora:
         colwise_lora = ColwiseParallelLora()
         colwise_lora.src_data_rank = 0
 
-        with patch('nemo_automodel.components.distributed.parallel_styles._distribute_param') as mock_dist:
+        with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param") as mock_dist:
             colwise_lora._partition_linear_fn("test_linear", mock_lora_linear_module, mock_device_mesh)
 
             # Should be called for weight, bias, lora_A.weight, and lora_B.weight
@@ -182,7 +182,7 @@ class TestColwiseParallelLora:
         colwise_lora = ColwiseParallelLora()
         colwise_lora.src_data_rank = 0
 
-        with patch('nemo_automodel.components.distributed.parallel_styles._distribute_param') as mock_dist:
+        with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param") as mock_dist:
             colwise_lora._partition_linear_fn("test_linear", mock_linear_module, mock_device_mesh)
 
             # Should be called for weight and bias only
@@ -194,7 +194,7 @@ class TestColwiseParallelLora:
         colwise_lora.src_data_rank = 0
 
         # Access the internal method through partition_linear_fn
-        with patch('nemo_automodel.components.distributed.parallel_styles._distribute_param') as mock_dist:
+        with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param") as mock_dist:
             mock_device_mesh = MagicMock()
             colwise_lora._partition_linear_fn("test", mock_lora_linear_module, mock_device_mesh)
 
@@ -208,7 +208,7 @@ class TestColwiseParallelLora:
         colwise_lora = ColwiseParallelLora()
         colwise_lora.src_data_rank = 0
 
-        with patch('nemo_automodel.components.distributed.parallel_styles._distribute_param') as mock_dist:
+        with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param") as mock_dist:
             mock_device_mesh = MagicMock()
             colwise_lora._partition_linear_fn("test", mock_lora_linear_module, mock_device_mesh)
 
@@ -222,7 +222,7 @@ class TestColwiseParallelLora:
         colwise_lora = ColwiseParallelLora()
         colwise_lora.src_data_rank = 0
 
-        with patch('nemo_automodel.components.distributed.parallel_styles._distribute_param') as mock_dist:
+        with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param") as mock_dist:
             colwise_lora._partition_embedding_fn("test_embedding", mock_embedding_module, mock_device_mesh)
 
             # Should be called once for embedding weight
@@ -246,7 +246,7 @@ class TestRowwiseParallelLora:
         rowwise_lora = RowwiseParallelLora()
         rowwise_lora.src_data_rank = 0
 
-        with patch('nemo_automodel.components.distributed.parallel_styles._distribute_param') as mock_dist:
+        with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param") as mock_dist:
             rowwise_lora._partition_linear_fn("test_linear", mock_lora_linear_module, mock_device_mesh)
 
             # Should be called for weight, bias, lora_A.weight, and lora_B.weight
@@ -273,7 +273,7 @@ class TestRowwiseParallelLora:
         rowwise_lora = RowwiseParallelLora()
         rowwise_lora.src_data_rank = 0
 
-        with patch('nemo_automodel.components.distributed.parallel_styles._distribute_param') as mock_dist:
+        with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param") as mock_dist:
             rowwise_lora._partition_linear_fn("test_linear", mock_linear_module, mock_device_mesh)
 
             # Should be called for weight and bias only
@@ -285,7 +285,7 @@ class TestRowwiseParallelLora:
         rowwise_lora = RowwiseParallelLora()
         rowwise_lora.src_data_rank = 0
 
-        with patch('nemo_automodel.components.distributed.parallel_styles._distribute_param') as mock_dist:
+        with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param") as mock_dist:
             rowwise_lora._partition_linear_fn("test_linear", module, mock_device_mesh)
 
             # Should only be called for weight
@@ -297,7 +297,7 @@ class TestRowwiseParallelLora:
         rowwise_lora = RowwiseParallelLora()
         rowwise_lora.src_data_rank = 0
 
-        with patch('nemo_automodel.components.distributed.parallel_styles._distribute_param') as mock_dist:
+        with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param") as mock_dist:
             rowwise_lora._partition_embedding_fn("test_embedding", mock_embedding_module, mock_device_mesh)
 
             # Should be called once for embedding weight
@@ -320,7 +320,7 @@ class TestSequenceParallelLora:
         """Test replicating a simple module."""
         seq_lora = SequenceParallelLora()
 
-        with patch('nemo_automodel.components.distributed.parallel_styles.DTensor') as mock_dtensor:
+        with patch("nemo_automodel.components.distributed.parallel_styles.DTensor") as mock_dtensor:
             # Setup mock DTensor.from_local to return actual tensors
             def mock_from_local(tensor, mesh, placements, run_check=False):
                 # Return a tensor with the same shape as input
@@ -351,7 +351,7 @@ class TestSequenceParallelLora:
         mock_linear_module.weight.requires_grad = True
         mock_linear_module.bias.requires_grad = False
 
-        with patch('nemo_automodel.components.distributed.parallel_styles.DTensor') as mock_dtensor:
+        with patch("nemo_automodel.components.distributed.parallel_styles.DTensor") as mock_dtensor:
             # Setup mock DTensor.from_local to return actual tensors
             def mock_from_local(tensor, mesh, placements, run_check=False):
                 return torch.randn_like(tensor)
@@ -417,7 +417,7 @@ class TestTranslateToLora:
         result = translate_to_lora(plan)
 
         # Check that attributes are preserved
-        assert hasattr(result, 'custom_attr')
+        assert hasattr(result, "custom_attr")
         assert result.custom_attr == "test_value"
         assert result.src_data_rank == 5
 
@@ -458,7 +458,7 @@ class TestIntegration:
         rowwise.src_data_rank = 0
 
         # Both should be able to partition the same module
-        with patch('nemo_automodel.components.distributed.parallel_styles._distribute_param'):
+        with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param"):
             colwise._partition_linear_fn("test", mock_lora_linear_module, mock_device_mesh)
             rowwise._partition_linear_fn("test", mock_lora_linear_module, mock_device_mesh)
 
@@ -482,5 +482,5 @@ class TestIntegration:
         colwise.src_data_rank = 0
 
         # Should not raise an error
-        with patch('nemo_automodel.components.distributed.parallel_styles._distribute_param'):
+        with patch("nemo_automodel.components.distributed.parallel_styles._distribute_param"):
             colwise._partition_linear_fn("test", mock_linear_module, mock_device_mesh)

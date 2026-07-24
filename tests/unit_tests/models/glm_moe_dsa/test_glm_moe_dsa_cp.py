@@ -138,6 +138,25 @@ def test_make_glm_dsa_packed_cp_batch_single_chunk(monkeypatch):
     assert out["cp_rank"] == 0
 
 
+def test_shard_glm_dsa_packed_cp_batch_reports_single_chunk_layout(monkeypatch):
+    monkeypatch.setattr(glm_cp, "split_batch_into_thd_chunks", lambda *args, **kwargs: _thd_chunk())
+    monkeypatch.setattr(glm_cp.dist, "is_available", lambda: False)
+    monkeypatch.setattr(glm_cp.dist, "is_initialized", lambda: False)
+
+    ctx, out, layout = glm_cp.shard_glm_dsa_packed_cp_batch(
+        _FakeMesh(size=3),
+        None,
+        {"input_ids": torch.arange(6).view(1, 6)},
+        padding_token_id=3,
+        num_chunks=1,
+    )
+
+    assert ctx is contextlib.nullcontext
+    assert out["input_ids"].tolist() == [0, 1]
+    assert layout.padded_seq_len == 6
+    assert layout.input_row_shape == (1, 6)
+
+
 def test_make_glm_dsa_packed_cp_batch_stacks_pipeline_chunks(monkeypatch):
     thd_batch = {
         "input_ids": torch.tensor([[0, 1, 2, 3], [10, 11, 12, 13]]),

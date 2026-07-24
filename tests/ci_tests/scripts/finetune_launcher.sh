@@ -62,6 +62,12 @@ FINETUNE_START=$SECONDS
 eval $RUN_CMD
 FINETUNE_EXIT_CODE=$?
 
+if [[ "$FINETUNE_EXIT_CODE" -eq 0 && "${REQUIRE_FINITE_METRICS:-false}" == "true" ]]; then
+  python3 /opt/Automodel/tests/ci_tests/scripts/assert_finite_train_metrics.py \
+    --log "$PIPELINE_DIR/${TEST_NAME}_slurm_${SLURM_JOB_ID}.out" \
+    || FINETUNE_EXIT_CODE=$?
+fi
+
 FINETUNE_ELAPSED=$((SECONDS - FINETUNE_START))
 echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"finetune\",\"seconds\":${FINETUNE_ELAPSED}}" >> $TEST_DIR/timing.jsonl
 echo "[timing] Finetune completed in ${FINETUNE_ELAPSED}s"
