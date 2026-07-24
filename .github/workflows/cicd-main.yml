@@ -83,7 +83,7 @@ jobs:
           uv run --active ruff --version
           uv run --active ruff check --verbose .
           uv run --active ruff format --check --verbose .
-      - name: Reject new dynamic attribute access
+      - name: Reject new runtime introspection
         run: |
           source ./venv/bin/activate
           uv run --active diff-quality \
@@ -92,7 +92,7 @@ jobs:
             --fail-under=100 \
             --include "nemo_automodel/components/models/**" \
             --include "nemo_automodel/components/distributed/**" \
-            --options="--load-plugins=pylint.extensions.bad_builtin --disable=all --enable=bad-builtin --bad-functions=getattr,setattr"
+            --options="--load-plugins=pylint.extensions.bad_builtin --disable=all --enable=bad-builtin --bad-functions=getattr,setattr,isinstance"
 
   import_linting:
     runs-on: ${{ vars.LINT_AND_INSTALL_TEST_RUNNER || 'ubuntu-latest' }}
