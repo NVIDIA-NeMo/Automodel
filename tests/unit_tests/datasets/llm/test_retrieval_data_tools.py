@@ -570,11 +570,12 @@ def test_prepare_normalized_vl_retrieval_data_writes_portable_arrow_bundle(tmp_p
     assert source_metadata["corpora"][0]["num_docs"] == 3
 
     with caplog.at_level("INFO", logger=nd.__name__):
-        dataset = nd.make_normalized_retrieval_dataset(
+        dataset = nd.NormalizedRetrievalDatasetConfig(
             data_dir_list=str(output_dir),
             n_passages=2,
             use_dataset_instruction=True,
-        )
+            use_text_in_document=True,
+        ).build()
 
     assert len(dataset) == 2
     assert f"path={output_dir}" in caplog.text

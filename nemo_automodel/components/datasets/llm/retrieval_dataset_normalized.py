@@ -298,6 +298,7 @@ def _build_transform(
     eval_negative_size: int | None,
     use_dataset_instruction: bool,
     cycle_positive_docs: bool,
+    use_text_in_document: bool,
 ):
     negative_size = n_passages - 1 if data_type == "train" else eval_negative_size
     if negative_size is None:
@@ -308,6 +309,7 @@ def _build_transform(
         use_dataset_instruction=use_dataset_instruction,
         model_type=model_type,
         cycle_positive_docs=cycle_positive_docs,
+        use_text_in_document=use_text_in_document,
     )
     return transform
 
@@ -324,6 +326,7 @@ def make_normalized_retrieval_dataset(
     train_data_select_offset: int = 0,
     use_dataset_instruction: bool = False,
     cycle_positive_docs: bool = False,
+    use_text_in_document: bool = False,
     data_dir_list: NormalizedDataPath | None = None,
 ) -> Any:
     """Build a normalized portable retrieval dataset from local Arrow bundles.
@@ -340,6 +343,7 @@ def make_normalized_retrieval_dataset(
         train_data_select_offset: Starting row for the training sample cap.
         use_dataset_instruction: Whether to attach corpus query and passage instructions.
         cycle_positive_docs: Whether to cycle through positive documents by epoch.
+        use_text_in_document: Whether image documents should also include their text.
         data_dir_list: Legacy alias for ``data_path`` used by existing retrieval configs.
 
     Returns:
@@ -390,6 +394,7 @@ def make_normalized_retrieval_dataset(
         eval_negative_size=eval_negative_size,
         use_dataset_instruction=use_dataset_instruction,
         cycle_positive_docs=cycle_positive_docs,
+        use_text_in_document=use_text_in_document,
     )
     dataset.set_transform(transform)
     if cycle_positive_docs:
@@ -413,6 +418,7 @@ class NormalizedRetrievalDatasetConfig:
     train_data_select_offset: int = 0
     use_dataset_instruction: bool = False
     cycle_positive_docs: bool = False
+    use_text_in_document: bool = False
     data_dir_list: NormalizedDataPath | None = None
 
     def build(self) -> Any:
@@ -429,5 +435,6 @@ class NormalizedRetrievalDatasetConfig:
             train_data_select_offset=self.train_data_select_offset,
             use_dataset_instruction=self.use_dataset_instruction,
             cycle_positive_docs=self.cycle_positive_docs,
+            use_text_in_document=self.use_text_in_document,
             data_dir_list=self.data_dir_list,
         )
