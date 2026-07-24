@@ -580,3 +580,32 @@ class TestIndexShare:
         assert captured["prev_dtype"] == torch.int64  # carry-in cast float32 -> int64 before model
         assert isinstance(out, tuple) and len(out) == 2
         assert out[1].dtype == torch.float32  # carry-out emitted as float32
+
+
+class TestUpdateMoeGateBias:
+    def test_updates_every_local_moe_gate_via_outer_model(self, config, backend_config):
+        """Outer hook delegates to the inner model and updates each sparse layer's gate once."""
+        model = GlmMoeDsaForCausalLM(config, backend=backend_config)
+        moe_layers = [layer for layer in model.model.layers.values() if isinstance(layer.mlp, MoE)]
+        assert len(moe_layers) == 2  # config has 2 sparse + 2 dense layers
+
+        mocks = [patch.object(layer.mlp.gate, "update_bias").start() for layer in moe_layers]
+        try:
+            model.update_moe_gate_bias()
+        finally:
+            patch.stopall()
+        for mock in mocks:
+            mock.assert_called_once_with()
+
+    @pytest.mark.parametrize("kwargs", [{"moe_overrides": {"gate_bias_update_factor": 0.0}}, {}])
+    def test_no_update_when_bias_update_disabled(self, config, backend_config, kwargs):
+        """factor=0 overrides and FakeBalancedGate (factor 0.0) must not call update_bias."""
+        if not kwargs:
+            backend_config.fake_balanced_gate = True
+        model = GlmMoeDsaForCausalLM(config, backend=backend_config, **kwargs)
+        for layer in model.model.layers.values():
+            if isinstance(layer.mlp, MoE):
+                assert layer.mlp.gate.bias_update_factor == 0.0
+                with patch.object(layer.mlp.gate, "update_bias") as mock:
+                    model.update_moe_gate_bias()
+                    mock.assert_not_called()

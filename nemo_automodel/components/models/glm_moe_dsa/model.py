@@ -258,6 +258,13 @@ class GlmMoeDsaModel(nn.Module):
             if layer is not None:
                 layer.init_weights(buffer_device=buffer_device)
 
+    def update_moe_gate_bias(self) -> None:
+        """Update the noaux router correction bias of each local MoE layer; dense layers and disabled gates are skipped."""
+        with torch.no_grad():
+            for block in self.layers.values():
+                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
+                    block.mlp.gate.update_bias()
+
 
 class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
@@ -330,6 +337,10 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def update_moe_gate_bias(self) -> None:
+        """Delegate the noaux router correction-bias update to the inner model."""
+        self.model.update_moe_gate_bias()
 
     def should_pack_validation_with_training(self) -> bool:
         """GLM DSA TileLang kernels require validation to use the THD packed layout."""
