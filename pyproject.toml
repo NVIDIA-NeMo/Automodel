@@ -138,10 +138,6 @@ ffpa = ["ffpa-attn>=0.1.19", "nvidia-cutlass-dsl>=4.5.1,<4.6"]
 fla = [
     "flash-linear-attention>=0.4.2",
 ]
-magi = [
-    "magi_attention @ git+https://github.com/SandAI-org/MagiAttention.git@d7ea8afd44c790b65fab68a04a6a0fdd5adbf182",
-    "versioningit",
-]
 delta-databricks = [
     "deltalake>=1.0.0",  # For Delta Lake metadata
     "databricks-sql-connector>=3.0.0",  # For Unity Catalog streaming access
@@ -193,7 +189,6 @@ all = [
     "nemo_automodel[diffusion]",
     "nemo_automodel[extra]",
     "nemo_automodel[fla]",
-    "nemo_automodel[magi]",
     "nemo_automodel[s3]",
     "nemo_automodel[vlm]",
 ]
@@ -227,6 +222,7 @@ linting = [
 test = ["coverage", "pytest", "pytest-shard", "peft>=0.18.1", "ruamel.yaml", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 dev = [
     "cut-cross-entropy",
+    "magi_attention",
     "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'",
 ]
@@ -285,6 +281,7 @@ prerelease = "allow"
 [tool.uv.sources]
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "7febc6e25660af0f54d95dd781ecdcd62265ecca" }
 cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git", rev = "87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" }
+magi_attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" }
 onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
 torch = [

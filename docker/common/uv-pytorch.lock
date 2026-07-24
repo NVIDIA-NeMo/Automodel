@@ -3958,7 +3958,6 @@ all = [
     { name = "flash-linear-attention" },
     { name = "ftfy" },
     { name = "imageio" },
-    { name = "magi-attention" },
     { name = "mamba-ssm" },
     { name = "mistral-common" },
     { name = "nemo-run" },
@@ -3979,7 +3978,6 @@ all = [
     { name = "timm" },
     { name = "torchvision", marker = "sys_platform == 'never'" },
     { name = "transformer-engine", marker = "sys_platform == 'never'" },
-    { name = "versioningit" },
 ]
 cli = [
     { name = "nemo-run" },
@@ -4032,10 +4030,6 @@ ffpa = [
 ]
 fla = [
     { name = "flash-linear-attention" },
-]
-magi = [
-    { name = "magi-attention" },
-    { name = "versioningit" },
 ]
 media = [
     { name = "albumentations" },
@@ -4094,6 +4088,7 @@ dev = [
     { name = "cut-cross-entropy" },
     { name = "dion", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+    { name = "magi-attention" },
 ]
 docs = [
     { name = "myst-parser" },
@@ -4144,7 +4139,6 @@ requires-dist = [
     { name = "imageio", marker = "extra == 'diffusion'" },
     { name = "imageio-ffmpeg", marker = "extra == 'diffusion-media'" },
     { name = "kernels", marker = "extra == 'diffusion-kernels'" },
-    { name = "magi-attention", marker = "extra == 'magi'", git = "https://github.com/SandAI-org/MagiAttention.git?rev=d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" },
     { name = "mamba-ssm", marker = "extra == 'cuda'" },
     { name = "megatron-fsdp", specifier = ">=0.2.3" },
     { name = "mistral-common", marker = "extra == 'vlm'", specifier = ">=1.11.0" },
@@ -4161,7 +4155,6 @@ requires-dist = [
     { name = "nemo-automodel", extras = ["extra"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["fla"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["fla"], marker = "extra == 'moe'" },
-    { name = "nemo-automodel", extras = ["magi"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["s3"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["vlm-media"], marker = "extra == 'media'" },
@@ -4197,10 +4190,9 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cu130" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'cuda'", specifier = ">=2.14.1" },
     { name = "transformers", specifier = "==5.12.1" },
-    { name = "versioningit", marker = "extra == 'magi'" },
     { name = "wandb", specifier = ">=0.28.0" },
 ]
-provides-extras = ["diffusion", "diffusion-kernels", "cuda", "cuda-source", "extra", "fa", "ffpa", "fla", "magi", "delta-databricks", "moe", "vlm", "cli", "s3", "msc", "vlm-media", "diffusion-media", "media", "all"]
+provides-extras = ["diffusion", "diffusion-kernels", "cuda", "cuda-source", "extra", "fa", "ffpa", "fla", "delta-databricks", "moe", "vlm", "cli", "s3", "msc", "vlm-media", "diffusion-media", "media", "all"]
 
 [package.metadata.requires-dev]
 build = [
@@ -4215,6 +4207,7 @@ dev = [
     { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" },
     { name = "dion", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/microsoft/dion.git" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/linkedin/Liger-Kernel.git?rev=1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" },
+    { name = "magi-attention", git = "https://github.com/SandAI-org/MagiAttention.git?rev=d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" },
 ]
 docs = [
     { name = "myst-parser" },
@@ -7983,19 +7976,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/cb/ce/f06b84e2697fef4688ca63bdb2fdf113ca0a3be33f94488f2cadb690b0cf/uvicorn-0.38.0.tar.gz", hash = "sha256:fd97093bdd120a2609fc0d3afe931d4d4ad688b6e75f0f929fde1bc36fe0e91d", size = 80605, upload-time = "2025-10-18T13:46:44.63Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ee/d9/d88e73ca598f4f6ff671fb5fde8a32925c2e08a637303a1d12883c7305fa/uvicorn-0.38.0-py3-none-any.whl", hash = "sha256:48c0afd214ceb59340075b4a052ea1ee91c16fbc2a9b1469cca0e54566977b02", size = 68109, upload-time = "2025-10-18T13:46:42.958Z" },
-]
-
-[[package]]
-name = "versioningit"
-version = "3.3.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "packaging" },
-    { name = "tomli", marker = "python_full_version < '3.11'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/89/f4/bc578cc80989c572231a36cc03cc097091176fa3fb8b4e2af1deb4370eb7/versioningit-3.3.0.tar.gz", hash = "sha256:b91ad7d73e73d21220e69540f20213f2b729a1f9b35c04e9e137eaf28d2214da", size = 220280, upload-time = "2025-06-27T20:13:23.368Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1c/59/964ecb8008722d27d8a835baea81f56a91cea8e097b3be992bc6ccde6367/versioningit-3.3.0-py3-none-any.whl", hash = "sha256:23b1db3c4756cded9bd6b0ddec6643c261e3d0c471707da3e0b230b81ce53e4b", size = 38439, upload-time = "2025-06-27T20:13:21.927Z" },
 ]
 
 [[package]]
