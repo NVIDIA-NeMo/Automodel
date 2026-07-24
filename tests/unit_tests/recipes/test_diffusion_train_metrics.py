@@ -481,7 +481,9 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
     assert calls["transformer_engine_fp8_safe_only"] is True
     assert calls["fuse_qkv_projections"] is True
     assert calls["compact_fused_qkv_projections"] is True
-    assert pipe.transformer.attention_backend == "flash"
+    # attention_backend is forwarded to from_pretrained, which applies it via
+    # set_attention_backend before sharding (required for context parallelism).
+    assert calls["attention_backend"] == "flash"
     assert built_pipe is pipe
     assert device_mesh == "mesh"
 
@@ -633,6 +635,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     recipe.local_batch_size = 2
     recipe.num_nodes = 1
     recipe.dp_size = 1
+    recipe.cp_size = 1
     recipe.world_size = 1
     recipe.num_epochs = 1
     recipe.sampler = SimpleNamespace(set_epoch=MagicMock())
