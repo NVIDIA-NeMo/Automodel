@@ -37,7 +37,7 @@ def test_resolve_offline_uses_cache_only(monkeypatch):
 
     # Offline: no cold-cache download, single cache-only resolution.
     assert resolved == "/cache/snapshot"
-    mock_sd.assert_called_once_with("some/repo-id", local_files_only=True)
+    mock_sd.assert_called_once_with("some/repo-id", revision=None, local_files_only=True)
 
 
 def test_resolve_online_downloads_then_resolves_locally(monkeypatch):
@@ -51,7 +51,20 @@ def test_resolve_online_downloads_then_resolves_locally(monkeypatch):
     # Online: fetch once (cold cache), then resolve the local dir without revalidation.
     assert mock_sd.call_count == 2
     assert mock_sd.call_args_list[0].args == ("some/repo-id",)
-    assert mock_sd.call_args_list[1].kwargs == {"local_files_only": True}
+    assert mock_sd.call_args_list[0].kwargs == {"revision": None}
+    assert mock_sd.call_args_list[1].kwargs == {"revision": None, "local_files_only": True}
+
+
+def test_resolve_forwards_pinned_revision(monkeypatch):
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.setattr(_hf_cache, "HF_HUB_AVAILABLE", True)
+
+    with patch(f"{MODULE}.snapshot_download", return_value="/cache/pinned-snapshot") as mock_sd:
+        resolved = resolve_diffusion_model_dir("some/repo-id", revision="abc123")
+
+    assert resolved == "/cache/pinned-snapshot"
+    assert mock_sd.call_args_list[0].kwargs == {"revision": "abc123"}
+    assert mock_sd.call_args_list[1].kwargs == {"revision": "abc123", "local_files_only": True}
 
 
 def test_resolve_passthrough_when_hub_unavailable(monkeypatch):

@@ -102,9 +102,7 @@ class CheckpointingConfig:
     model_repo_id: str | None = None
     save_consolidated: bool | str | SaveConsolidatedMode = "final"
     is_peft: bool = False
-    model_state_dict_keys: list[str] | None = (
-        None  # copy of the model state dict keys before any parallelization. Kept for BW compatibility.
-    )
+    model_state_dict_keys: list[str] | None = None  # Legacy serialized field. Prefer the runtime-only build() argument.
     is_async: bool = False
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
@@ -192,6 +190,7 @@ class CheckpointingConfig:
         moe_mesh: DeviceMesh | None = None,
         process_group: ProcessGroup | None = None,
         pp_group: ProcessGroup | None = None,
+        model_state_dict_keys: list[str] | None = None,
     ) -> Checkpointer:
         """Build the :class:`Checkpointer` engine for this config.
 
@@ -208,6 +207,11 @@ class CheckpointingConfig:
             pp_group: Optional pipeline-parallel process group. Threaded to the
                 PEFT save path so adapter weights are gathered across PP stages
                 (required for complete adapters when ``pp_size > 1``).
+            model_state_dict_keys: Runtime snapshot of model state-dict keys
+                captured before parallelization. The list contains names only,
+                not tensor values, and is copied into the checkpointer without
+                mutating this serializable config. When omitted, the legacy
+                config field is used for backward compatibility.
 
         Returns:
             Configured :class:`Checkpointer`.
@@ -222,6 +226,7 @@ class CheckpointingConfig:
             moe_mesh=moe_mesh,
             process_group=process_group,
             pp_group=pp_group,
+            model_state_dict_keys=model_state_dict_keys,
         )
 
 

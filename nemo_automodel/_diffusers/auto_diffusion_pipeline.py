@@ -456,6 +456,7 @@ def _create_parallel_manager(manager_args: Dict[str, Any]) -> ParallelManager:
                 enable_fsdp2_prefetch=args.get("enable_fsdp2_prefetch", False),
                 fsdp2_backward_prefetch_depth=args.get("fsdp2_backward_prefetch_depth", 2),
                 fsdp2_forward_prefetch_depth=args.get("fsdp2_forward_prefetch_depth", 1),
+                reshard_after_forward=args.get("reshard_after_forward", None),
                 activation_checkpointing=args.get("activation_checkpointing", False),
             ),
             parallelism_sizes=parallelism,
@@ -566,6 +567,7 @@ class NeMoAutoDiffusionPipeline:
         transformer_engine_fp8_safe_only: bool = False,
         fuse_qkv_projections: bool = False,
         compact_fused_qkv_projections: bool = False,
+        revision: str | None = None,
         **kwargs,
     ) -> Tuple[DiffusionPipeline, Dict[str, ParallelManager]]:
         """
@@ -599,6 +601,7 @@ class NeMoAutoDiffusionPipeline:
             transformer_engine_fp8_safe_only: Whether to skip TE Linear conversion for known FP8-incompatible modules.
             fuse_qkv_projections: Whether to call Diffusers QKV projection fusion on the transformer.
             compact_fused_qkv_projections: Whether to remove original projection modules after QKV fusion.
+            revision: Optional immutable Hugging Face Hub revision for the model snapshot.
             **kwargs: Additional arguments passed to DiffusionPipeline.from_pretrained
 
         Returns:
@@ -614,7 +617,7 @@ class NeMoAutoDiffusionPipeline:
 
         # Resolve to a local snapshot dir so a warm HF cache is not re-validated
         # (and potentially re-downloaded) over the network on every run.
-        model_dir = resolve_diffusion_model_dir(pretrained_model_name_or_path)
+        model_dir = resolve_diffusion_model_dir(pretrained_model_name_or_path, revision=revision)
 
         # Use DiffusionPipeline.from_pretrained for auto-detection
         pipe: DiffusionPipeline = DiffusionPipeline.from_pretrained(

@@ -20,7 +20,7 @@ recipe body only ever sees typed component configs and calls
 ``self.cfg.<section>.build(...)`` directly.
 
 Known sections are exposed as cached, typed attributes that own a ``build()``:
-``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm`` map to
+``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``flow_matching``/``prewarm`` map to
 component config dataclasses; the ``optimizer`` and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable, Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from nemo_automodel.components.datasets.loader import DataloaderConfig
     from nemo_automodel.components.datasets.multimodal.loader import BagelDataloaderConfig
     from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig, VlmProcessorConfig
+    from nemo_automodel.components.flow_matching.config import FlowMatchingConfig
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
@@ -128,7 +129,7 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
 class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
-    ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
+    ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``flow_matching``, ``optimizer``,
     ``loss_fn`` and ``checkpoint`` are exposed as typed objects that own a
     ``.build(...)`` (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
@@ -167,6 +168,27 @@ class RecipeConfig:
     def lr_scheduler(self) -> LRSchedulerConfig | None:
         node = self._raw.get("lr_scheduler", None)
         return LRSchedulerConfig(**_section_kwargs(node)) if node else None
+
+    @cached_property
+    def flow_matching(self) -> "FlowMatchingConfig":
+        """Typed flow-matching pipeline and adapter configuration."""
+        from nemo_automodel.components.flow_matching.config import (
+            FlowMatchingAdapterConfig,
+            FlowMatchingConfig,
+        )
+
+        node = self._raw.get("flow_matching", None)
+        if node is None:
+            return FlowMatchingConfig()
+
+        kwargs = _section_kwargs(node)
+        adapter_node = kwargs.pop("adapter", None)
+        if adapter_node is not None:
+            target, adapter_kwargs = _callable_and_kwargs(adapter_node)
+            kwargs["adapter"] = FlowMatchingAdapterConfig(target=target, kwargs=adapter_kwargs)
+        if "adapter_kwargs" in kwargs:
+            kwargs["adapter_kwargs"] = _as_dict(kwargs["adapter_kwargs"])
+        return FlowMatchingConfig(**kwargs)
 
     @cached_property
     def optimizer(self) -> "OptimizerConfig" | None:
@@ -543,7 +565,25 @@ class RecipeConfig:
     def diffusion_dataloader(self) -> "DiffusionDataloaderConfig" | None:
         """Typed diffusion dataloader config resolved from ``data.dataloader``."""
         node = self._raw.get("data.dataloader", None)
-        return self.resolve_diffusion_dataloader(node) if node is not None else None
+        if node is None:
+            return None
+        config = self.resolve_diffusion_dataloader(node)
+
+        from nemo_automodel.components.datasets.diffusion.image_edit_dataset import ImageEditDataloaderConfig
+
+        if isinstance(config, ImageEditDataloaderConfig):
+            model_name = self._raw.get("model.pretrained_model_name_or_path", None)
+            model_revision = self._raw.get("model.revision", None)
+            if config.expected_model_name not in (None, model_name):
+                raise ValueError("data.dataloader.expected_model_name must match model.pretrained_model_name_or_path")
+            if config.expected_model_revision not in (None, model_revision):
+                raise ValueError("data.dataloader.expected_model_revision must match model.revision")
+            config = replace(
+                config,
+                expected_model_name=model_name,
+                expected_model_revision=model_revision,
+            )
+        return config
 
     @cached_property
     def bagel_dataloader(self) -> "BagelDataloaderConfig" | None:

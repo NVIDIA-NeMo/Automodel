@@ -19,6 +19,8 @@ Unit tests for FlowMatchingPipeline and related components:
 - Factory functions (create_adapter, create_pipeline)
 """
 
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
@@ -33,6 +35,7 @@ from nemo_automodel.components.flow_matching.pipeline import (
     create_adapter,
     create_pipeline,
 )
+from nemo_automodel.components.training.rng import StatefulRNG
 
 # =============================================================================
 # Fixtures
@@ -53,6 +56,67 @@ class MockModel(nn.Module):
         # Add small scaled version of input to maintain gradient connection
         output = output + hidden_states * 0.0
         return (output,)
+
+
+class _ScalarFlowModel(nn.Module):
+    """Tiny deterministic model whose parameters affect every latent element."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(0.25))
+        self.bias = nn.Parameter(torch.tensor(-0.1))
+        self.last_timesteps: torch.Tensor | None = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        attention_kwargs: dict[str, float] | None = None,
+        return_dict: bool = False,
+    ) -> tuple[torch.Tensor]:
+        """Apply a learned scalar affine transform to noisy latents.
+
+        Args:
+            hidden_states: Tensor of shape [batch, channels, height, width]
+                containing noisy image latents.
+            timestep: Tensor of shape [batch] containing diffusion timesteps.
+            encoder_hidden_states: Tensor of shape [batch, sequence, hidden]
+                containing text conditioning; unused by this tiny model.
+            attention_kwargs: Optional non-tensor attention settings; unused.
+            return_dict: Whether to return a mapping; unused because the adapter
+                requests a tuple.
+
+        Returns:
+            Tuple containing a tensor of shape [batch, channels, height, width].
+        """
+        del encoder_hidden_states, attention_kwargs, return_dict
+        self.last_timesteps = timestep.detach().clone()
+        return (hidden_states * self.scale + self.bias,)
+
+
+class _RecordingSimpleAdapter(SimpleAdapter):
+    """Simple adapter that records the exact velocity target used for loss."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_target: torch.Tensor | None = None
+
+    def compute_loss(self, model_pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Record and compute elementwise flow-matching loss.
+
+        Args:
+            model_pred: Tensor of shape [batch, channels, height, width]
+                containing predicted velocity.
+            target: Tensor of shape [batch, channels, height, width] containing
+                the sampled velocity target.
+
+        Returns:
+            Float32 tensor of shape [batch, channels, height, width] containing
+            per-element squared error.
+        """
+        self.last_target = target.detach().clone()
+        return super().compute_loss(model_pred, target)
 
 
 @pytest.fixture
@@ -270,6 +334,62 @@ class TestTimestepSampling:
         assert method == "lognorm"
         assert sigma.shape == (batch_size,)
         assert (sigma >= 0).all() and (sigma <= 1).all()
+
+    def test_beta_sampling_is_deterministic_without_global_rng_mutation(self, simple_adapter):
+        """Beta sampling uses only the explicit recipe generator."""
+        global_state = torch.get_rng_state().clone()
+        generator_a = torch.Generator(device="cpu").manual_seed(1234)
+        generator_b = torch.Generator(device="cpu").manual_seed(1234)
+        pipeline_a = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            timestep_sampling="beta",
+            beta_alpha=2.5,
+            beta_beta=1.5,
+            generator=generator_a,
+        )
+        pipeline_b = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            timestep_sampling="beta",
+            beta_alpha=2.5,
+            beta_beta=1.5,
+            generator=generator_b,
+        )
+
+        sigma_a, timesteps_a, method = pipeline_a.sample_timesteps(128, torch.device("cpu"))
+        sigma_b, timesteps_b, _ = pipeline_b.sample_timesteps(128, torch.device("cpu"))
+
+        assert method == "beta"
+        assert torch.equal(sigma_a, sigma_b)
+        assert torch.equal(timesteps_a, timesteps_b)
+        assert (sigma_a >= 0).all() and (sigma_a <= 1).all()
+        assert torch.equal(torch.get_rng_state(), global_state)
+
+    def test_beta_sampling_matches_configured_distribution_moments(self, simple_adapter):
+        """A large sample matches the configured Beta mean and variance."""
+        alpha = 2.5
+        beta = 1.5
+        pipeline = FlowMatchingPipeline(
+            model_adapter=simple_adapter,
+            timestep_sampling="beta",
+            beta_alpha=alpha,
+            beta_beta=beta,
+            generator=torch.Generator(device="cpu").manual_seed(2026),
+        )
+
+        sigma, _, method = pipeline.sample_timesteps(100_000, torch.device("cpu"))
+
+        expected_mean = alpha / (alpha + beta)
+        expected_variance = alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1.0))
+        assert method == "beta"
+        assert sigma.mean().item() == pytest.approx(expected_mean, abs=0.004)
+        assert sigma.var(unbiased=True).item() == pytest.approx(expected_variance, abs=0.002)
+
+    def test_beta_sampling_requires_recipe_generator(self, simple_adapter):
+        """Beta sampling cannot silently consume the global generator."""
+        pipeline = FlowMatchingPipeline(model_adapter=simple_adapter, timestep_sampling="beta")
+
+        with pytest.raises(ValueError, match="recipe-owned torch.Generator"):
+            pipeline.sample_timesteps(2, torch.device("cpu"))
 
     def test_mix_sampling_strategy(self, simple_adapter):
         """Test mixed uniform sampling ratio."""
@@ -730,6 +850,138 @@ class TestFullTrainingStep:
         assert not torch.isnan(average_weighted_loss)
         assert loss_mask is None
         assert metrics == {}
+
+    def test_step_preserves_cached_cpu_token_metrics_on_hot_path(self, simple_adapter, mock_model, sample_batch):
+        """Cached token counts remain available without scalar tensor reads."""
+        sample_batch["metadata"] = {
+            "batch_size": 2,
+            "target_token_count": 32,
+            "context_token_count": 48,
+            "text_token_count": 12,
+            "total_token_count": 92,
+        }
+        pipeline = FlowMatchingPipeline(model_adapter=simple_adapter, timestep_sampling="uniform")
+
+        _, _, _, metrics = pipeline.step(
+            mock_model,
+            sample_batch,
+            torch.device("cpu"),
+            torch.float32,
+            collect_metrics=False,
+        )
+
+        assert metrics == {
+            "perf/batch_size": 2,
+            "perf/target_token_count": 32,
+            "perf/context_token_count": 48,
+            "perf/text_token_count": 12,
+            "perf/total_token_count": 92,
+        }
+
+    def test_beta_training_step_is_identical_after_rng_and_optimizer_resume(self):
+        """Split-run resume preserves beta sigma, noise, loss, and parameter updates."""
+        image_latents = torch.tensor(
+            [
+                [[[0.25, -0.5], [0.75, 0.125]]],
+                [[[-0.25, 0.5], [-0.75, -0.125]]],
+            ],
+            dtype=torch.float32,
+        )
+        batch = {
+            "image_latents": image_latents,
+            "text_embeddings": torch.zeros(2, 1, 1),
+            "data_type": "image",
+        }
+
+        def build_training_state(seed: int):
+            """Build a deterministic CPU model, optimizer, RNG, and flow pipeline."""
+            model = _ScalarFlowModel()
+            optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, weight_decay=0.0)
+            rng = StatefulRNG(seed=seed)
+            adapter = _RecordingSimpleAdapter()
+            pipeline = FlowMatchingPipeline(
+                model_adapter=adapter,
+                timestep_sampling="beta",
+                beta_alpha=2.5,
+                beta_beta=1.5,
+                use_loss_weighting=False,
+                device=torch.device("cpu"),
+                generator=rng.generator("cpu"),
+            )
+            return model, optimizer, rng, adapter, pipeline
+
+        def run_steps(
+            model: _ScalarFlowModel,
+            optimizer: torch.optim.Optimizer,
+            adapter: _RecordingSimpleAdapter,
+            pipeline: FlowMatchingPipeline,
+            count: int,
+        ) -> list[dict[str, torch.Tensor]]:
+            """Run CPU optimizer steps and capture exact stochastic outcomes.
+
+            Returns:
+                Per-step mappings containing ``sigma`` tensors of shape [batch],
+                ``noise`` tensors of shape [batch, channels, height, width], a
+                scalar ``loss`` tensor, and ``parameters`` tensors of shape [2].
+            """
+            records: list[dict[str, torch.Tensor]] = []
+            for _ in range(count):
+                optimizer.zero_grad(set_to_none=True)
+                _, average_loss, _, _ = pipeline.step(
+                    model=model,
+                    batch=batch,
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                    collect_metrics=False,
+                    check_loss=False,
+                )
+                average_loss.backward()
+                if model.last_timesteps is None or adapter.last_target is None:
+                    raise AssertionError("Flow step did not expose its sampled timestep and velocity target")
+                sigma = model.last_timesteps / pipeline.num_train_timesteps
+                noise = adapter.last_target + image_latents
+                optimizer.step()
+                records.append(
+                    {
+                        "sigma": sigma.clone(),
+                        "noise": noise.clone(),
+                        "loss": average_loss.detach().clone(),
+                        "parameters": torch.stack((model.scale.detach(), model.bias.detach())).clone(),
+                    }
+                )
+            return records
+
+        uninterrupted_model, uninterrupted_optimizer, _, uninterrupted_adapter, uninterrupted_pipeline = (
+            build_training_state(1234)
+        )
+        uninterrupted_records = run_steps(
+            uninterrupted_model,
+            uninterrupted_optimizer,
+            uninterrupted_adapter,
+            uninterrupted_pipeline,
+            4,
+        )
+
+        split_model, split_optimizer, split_rng, split_adapter, split_pipeline = build_training_state(1234)
+        split_records = run_steps(split_model, split_optimizer, split_adapter, split_pipeline, 2)
+        checkpoint = {
+            "model": copy.deepcopy(split_model.state_dict()),
+            "optimizer": copy.deepcopy(split_optimizer.state_dict()),
+            "rng": copy.deepcopy(split_rng.state_dict()),
+        }
+
+        resumed_model, resumed_optimizer, resumed_rng, resumed_adapter, resumed_pipeline = build_training_state(9999)
+        resumed_model.load_state_dict(checkpoint["model"])
+        resumed_optimizer.load_state_dict(checkpoint["optimizer"])
+        # ``build_training_state`` materializes the generator before this load,
+        # matching the diffusion recipe's setup order.
+        resumed_rng.load_state_dict(checkpoint["rng"])
+        resumed_records = run_steps(resumed_model, resumed_optimizer, resumed_adapter, resumed_pipeline, 2)
+
+        for expected, actual in zip(uninterrupted_records, split_records + resumed_records, strict=True):
+            assert actual.keys() == expected.keys()
+            for name in expected:
+                torch.testing.assert_close(actual[name], expected[name], atol=0.0, rtol=0.0)
 
 
 class TestFactoryFunctions:

@@ -15,14 +15,23 @@
 
 import json
 import logging
+import re
 import shutil
 import urllib.request
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from nemo_automodel.shared.import_utils import safe_import
+
 logger = logging.getLogger(__name__)
+
+HF_HUB_AVAILABLE, huggingface_hub = safe_import(
+    "huggingface_hub",
+    msg="Hugging Face dataset materialization requires huggingface_hub",
+)
 
 IMAGE_COLUMN_CANDIDATES = ("image", "jpg", "jpeg", "png", "webp")
 VIDEO_COLUMN_CANDIDATES = ("video", "mp4", "file", "video_path", "path")
@@ -30,17 +39,49 @@ CAPTION_COLUMN_CANDIDATES = ("caption", "text", "prompt", "description")
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+IMAGE_EDIT_MEDIA_ROLES = {"target", "context", "condition"}
+_HF_COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+@dataclass(frozen=True)
+class HFDatasetMediaMapping:
+    """Map an image-edit media role to a Hugging Face dataset column.
+
+    Attributes:
+        role: Generic image-edit role: ``target``, ``context``, or ``condition``.
+        column: Hugging Face dataset column containing image media.
+    """
+
+    role: str
+    column: str
 
 
 @dataclass(frozen=True)
 class HFDatasetExport:
-    """Summary of a materialized Hugging Face dataset split."""
+    """Summary of a materialized Hugging Face dataset split.
+
+    Attributes:
+        media_dir: Root directory containing the materialized media.
+        total_items: Number of exported dataset rows.
+        media_column: Dataset column used for the primary media.
+        caption_column: Dataset column used for captions, when available.
+        caption_file: Generated caption metadata path for image exports.
+        media_mappings: Ordered image-edit role-to-column mappings.
+        manifest_file: Generated generic image-edit manifest path.
+        dataset_revision: Effective dataset revision. Image-edit exports use
+            the immutable Hugging Face commit SHA returned by the Hub.
+        dataset_config_name: Dataset config selected by ``load_dataset``.
+    """
 
     media_dir: Path
     total_items: int
     media_column: str
     caption_column: str | None
     caption_file: Path | None = None
+    media_mappings: tuple[HFDatasetMediaMapping, ...] = ()
+    manifest_file: Path | None = None
+    dataset_revision: str | None = None
+    dataset_config_name: str | None = None
 
 
 def materialize_hf_dataset(
@@ -50,7 +91,9 @@ def materialize_hf_dataset(
     media_type: str,
     split: str = "train",
     config_name: str | None = None,
+    revision: str | None = None,
     media_column: str | None = None,
+    media_mappings: Sequence[HFDatasetMediaMapping] | None = None,
     caption_column: str | None = None,
     caption_field: str = "caption",
     max_items: int | None = None,
@@ -60,19 +103,25 @@ def materialize_hf_dataset(
 ) -> HFDatasetExport:
     """Download a Hugging Face split and export media plus captions locally.
 
-    The diffusion preprocessors operate on local image/video paths. This helper
-    adapts Hugging Face rows to that shape while preserving the existing
-    processor, bucketing, multiprocessing, and cache-writing paths.
+    The diffusion preprocessors operate on local media paths. This helper adapts
+    Hugging Face rows to that shape while preserving the existing image/video
+    exports and providing a generic manifest for image-edit preprocessors.
 
     Args:
         dataset_name: Hugging Face dataset ID or local dataset path accepted by
             ``datasets.load_dataset``.
         output_dir: Directory where media files and caption metadata are written.
-        media_type: Either ``"image"`` or ``"video"``.
+        media_type: ``"image"``, ``"video"``, or ``"image-edit"``.
         split: Dataset split to load.
         config_name: Optional dataset config/subset name.
+        revision: Optional dataset revision. Image-edit exports resolve this
+            ref through the Hub and load the resulting immutable commit SHA.
         media_column: Optional source media column. If omitted, common names are
-            inferred from features or the first row.
+            inferred from features or the first row. This legacy option cannot
+            be combined with ``media_mappings``.
+        media_mappings: Ordered image-edit role-to-column mappings. Image-edit
+            exports require one target and at least one context. Context and
+            condition roles may be repeated.
         caption_column: Optional source caption column. If omitted, common text
             column names are inferred from features or the first row.
         caption_field: Caption key to write in generated metadata.
@@ -88,29 +137,56 @@ def materialize_hf_dataset(
         ValueError: If columns cannot be resolved or media cells use an
             unsupported shape.
     """
-    if media_type not in {"image", "video"}:
-        raise ValueError(f"media_type must be 'image' or 'video', got {media_type!r}")
+    if media_type not in {"image", "video", "image-edit"}:
+        raise ValueError(f"media_type must be 'image', 'video', or 'image-edit', got {media_type!r}")
+    if media_column is not None and media_mappings:
+        raise ValueError("--dataset_media_column cannot be combined with --dataset_media_mapping")
+    if media_type == "image-edit":
+        resolved_mappings = _validate_media_mappings(media_mappings)
+        if Path(dataset_name).exists():
+            raise ValueError(
+                "media_type='image-edit' requires a Hugging Face Hub dataset ID so provenance can be resolved "
+                "to an immutable commit SHA; local dataset paths are not supported"
+            )
+    elif media_mappings:
+        raise ValueError("media_mappings are only supported for media_type='image-edit'")
+    else:
+        resolved_mappings = ()
 
     output_path = Path(output_dir)
     has_exported_samples = output_path.exists() and (
-        (output_path / "hf_internvl.json").exists() or any(output_path.glob("hf_sample_*"))
+        (output_path / "hf_internvl.json").exists()
+        or (output_path / "hf_image_edit_manifest.jsonl").exists()
+        or any(output_path.glob("hf_sample_*"))
+        or any((output_path / "media").glob("hf_sample_*"))
     )
     if has_exported_samples:
         raise ValueError("HF materialization directory is not empty; choose a new directory")
+
+    resolved_revision = revision
+    if media_type == "image-edit":
+        resolved_revision = _resolve_hf_dataset_revision(dataset_name, revision)
 
     dataset = _load_hf_dataset(
         dataset_name,
         split=split,
         config_name=config_name,
+        revision=resolved_revision,
         streaming=streaming,
         trust_remote_code=trust_remote_code,
     )
+    resolved_config_name = _resolve_dataset_config_name(dataset, config_name)
 
     available = _available_columns_from_dataset(dataset)
     if available:
-        media_column = _resolve_media_column(available, media_type, media_column)
+        if media_type == "image-edit":
+            _validate_mapping_columns(available, resolved_mappings)
+            dataset = _maybe_cast_mapped_images_decode_false(dataset, resolved_mappings)
+            media_column = _target_media_column(resolved_mappings)
+        else:
+            media_column = _resolve_media_column(available, media_type, media_column)
+            dataset = _maybe_cast_decode_false(dataset, media_type, media_column)
         caption_column = _resolve_caption_column(available, caption_column)
-        dataset = _maybe_cast_decode_false(dataset, media_type, media_column)
         row_iter = iter(dataset)
         try:
             first_row = next(row_iter)
@@ -124,9 +200,14 @@ def materialize_hf_dataset(
             raise ValueError(f"Dataset {dataset_name!r} split {split!r} is empty") from exc
 
         available = set(first_row.keys())
-        media_column = _resolve_media_column(available, media_type, media_column)
+        if media_type == "image-edit":
+            _validate_mapping_columns(available, resolved_mappings)
+            dataset = _maybe_cast_mapped_images_decode_false(dataset, resolved_mappings)
+            media_column = _target_media_column(resolved_mappings)
+        else:
+            media_column = _resolve_media_column(available, media_type, media_column)
+            dataset = _maybe_cast_decode_false(dataset, media_type, media_column)
         caption_column = _resolve_caption_column(available, caption_column)
-        dataset = _maybe_cast_decode_false(dataset, media_type, media_column)
 
         # Re-create the iterator after an optional cast so rows reflect decode=False.
         row_iter = iter(dataset)
@@ -138,27 +219,46 @@ def materialize_hf_dataset(
     output_path.mkdir(parents=True, exist_ok=True)
 
     caption_file = output_path / "hf_internvl.json" if media_type == "image" else None
+    manifest_file = output_path / "hf_image_edit_manifest.jsonl" if media_type == "image-edit" else None
     if caption_file is not None:
         caption_file.write_text("", encoding="utf-8")
+    if manifest_file is not None:
+        manifest_file.write_text("", encoding="utf-8")
 
     total_items = 0
     for index, row in enumerate(_chain_first(first_row, row_iter)):
         if max_items is not None and index >= max_items:
             break
 
-        media_value = row[media_column]
         caption = _get_caption(row, caption_column, fallback=f"hf sample {index:08d}")
 
         if media_type == "image":
+            media_value = row[media_column]
             file_name = f"hf_sample_{index:08d}{_media_suffix(media_value, default='.png', allowed=IMAGE_EXTENSIONS)}"
             media_path = output_path / file_name
             _write_image(media_value, media_path, download_timeout)
             _append_jsonl_caption(caption_file, file_name, caption, caption_field)
-        else:
+        elif media_type == "video":
+            media_value = row[media_column]
             suffix = _media_suffix(media_value, default=".mp4", allowed=VIDEO_EXTENSIONS)
             media_path = output_path / f"hf_sample_{index:08d}{suffix}"
             _write_binary_or_path(media_value, media_path, download_timeout)
             _write_sidecar_caption(media_path.with_suffix(".json"), caption, caption_field)
+        else:
+            _append_image_edit_manifest_row(
+                manifest_file,
+                row=row,
+                index=index,
+                prompt=caption,
+                mappings=resolved_mappings,
+                output_dir=output_path,
+                dataset_name=dataset_name,
+                dataset_revision=resolved_revision,
+                dataset_config_name=resolved_config_name,
+                dataset_split=split,
+                caption_column=caption_column,
+                download_timeout=download_timeout,
+            )
 
         total_items += 1
 
@@ -168,7 +268,50 @@ def materialize_hf_dataset(
         media_column=media_column,
         caption_column=caption_column,
         caption_file=caption_file,
+        media_mappings=resolved_mappings,
+        manifest_file=manifest_file,
+        dataset_revision=resolved_revision,
+        dataset_config_name=resolved_config_name,
     )
+
+
+def _resolve_hf_dataset_revision(dataset_name: str, revision: str | None) -> str | None:
+    """Resolve a remote Hugging Face dataset ref to an immutable commit SHA.
+
+    Local dataset paths retain their caller-provided revision because they do
+    not have a Hugging Face repository commit to resolve.
+    """
+    if Path(dataset_name).exists():
+        return revision
+    if revision is not None and _HF_COMMIT_SHA_PATTERN.fullmatch(revision):
+        return revision.lower()
+    if not HF_HUB_AVAILABLE:
+        raise ImportError("Remote image-edit dataset provenance requires huggingface_hub")
+
+    dataset_info = huggingface_hub.HfApi().dataset_info(repo_id=dataset_name, revision=revision)
+    resolved_revision = dataset_info.sha
+    if not isinstance(resolved_revision, str) or not _HF_COMMIT_SHA_PATTERN.fullmatch(resolved_revision):
+        raise ValueError(
+            f"Hugging Face resolved dataset {dataset_name!r} revision {revision!r} to invalid commit SHA "
+            f"{resolved_revision!r}"
+        )
+    return resolved_revision.lower()
+
+
+def _resolve_dataset_config_name(dataset: object, requested_config_name: str | None) -> str | None:
+    """Return the config name selected by ``datasets.load_dataset``."""
+    dataset_info = getattr(dataset, "info", None)
+    resolved_config_name = getattr(dataset_info, "config_name", None)
+    if resolved_config_name is None:
+        return requested_config_name
+    if not isinstance(resolved_config_name, str) or not resolved_config_name:
+        raise ValueError(f"Loaded Hugging Face dataset has invalid config name {resolved_config_name!r}")
+    if requested_config_name is not None and resolved_config_name != requested_config_name:
+        raise ValueError(
+            f"Requested Hugging Face dataset config {requested_config_name!r}, but load_dataset selected "
+            f"{resolved_config_name!r}"
+        )
+    return resolved_config_name
 
 
 def _load_hf_dataset(
@@ -176,6 +319,7 @@ def _load_hf_dataset(
     *,
     split: str,
     config_name: str | None,
+    revision: str | None,
     streaming: bool,
     trust_remote_code: bool | None,
 ):
@@ -185,6 +329,8 @@ def _load_hf_dataset(
     kwargs: dict[str, Any] = {"split": split, "streaming": streaming}
     if config_name is not None:
         kwargs["name"] = config_name
+    if revision is not None:
+        kwargs["revision"] = revision
     if trust_remote_code is not None:
         kwargs["trust_remote_code"] = trust_remote_code
 
@@ -195,6 +341,176 @@ def _chain_first(first_row: dict[str, Any], rows):
     """Yield a consumed first row followed by the remaining iterator."""
     yield first_row
     yield from rows
+
+
+def _validate_media_mappings(
+    media_mappings: Sequence[HFDatasetMediaMapping] | None,
+) -> tuple[HFDatasetMediaMapping, ...]:
+    """Validate and freeze ordered image-edit media mappings."""
+    mappings = tuple(media_mappings or ())
+    if not mappings:
+        raise ValueError("media_type='image-edit' requires media_mappings")
+
+    invalid_roles = sorted({mapping.role for mapping in mappings} - IMAGE_EDIT_MEDIA_ROLES)
+    if invalid_roles:
+        raise ValueError(
+            f"Unsupported image-edit media role(s): {', '.join(invalid_roles)}. "
+            f"Expected roles: {', '.join(sorted(IMAGE_EDIT_MEDIA_ROLES))}"
+        )
+
+    empty_columns = [mapping.role for mapping in mappings if not mapping.column]
+    if empty_columns:
+        raise ValueError(f"Image-edit media columns cannot be empty for roles: {', '.join(empty_columns)}")
+
+    target_count = sum(mapping.role == "target" for mapping in mappings)
+    if target_count != 1:
+        raise ValueError(f"Image-edit media mappings require exactly one target, got {target_count}")
+    if not any(mapping.role == "context" for mapping in mappings):
+        raise ValueError("Image-edit media mappings require at least one context")
+
+    duplicate_mappings = sorted(
+        {mapping for mapping in mappings if sum(candidate == mapping for candidate in mappings) > 1},
+        key=lambda mapping: (mapping.role, mapping.column),
+    )
+    if duplicate_mappings:
+        formatted = ", ".join(f"{mapping.role}={mapping.column}" for mapping in duplicate_mappings)
+        raise ValueError(f"Duplicate image-edit media mapping(s): {formatted}")
+
+    return mappings
+
+
+def _validate_mapping_columns(available: set[str], mappings: tuple[HFDatasetMediaMapping, ...]) -> None:
+    """Validate that all image-edit mapping columns exist in a dataset row."""
+    missing = sorted({mapping.column for mapping in mappings} - available)
+    if missing:
+        raise ValueError(f"Image-edit media column(s) not found: {missing}. Available columns: {sorted(available)}")
+
+
+def _target_media_column(mappings: tuple[HFDatasetMediaMapping, ...]) -> str:
+    """Return the single validated target media column."""
+    return next(mapping.column for mapping in mappings if mapping.role == "target")
+
+
+def _maybe_cast_mapped_images_decode_false(dataset, mappings: tuple[HFDatasetMediaMapping, ...]):
+    """Prefer path/bytes cells for every unique mapped image column."""
+    for column in dict.fromkeys(mapping.column for mapping in mappings):
+        dataset = _maybe_cast_decode_false(dataset, "image", column)
+    return dataset
+
+
+def _append_image_edit_manifest_row(
+    manifest_file: Path,
+    *,
+    row: dict[str, Any],
+    index: int,
+    prompt: str,
+    mappings: tuple[HFDatasetMediaMapping, ...],
+    output_dir: Path,
+    dataset_name: str,
+    dataset_revision: str | None,
+    dataset_config_name: str | None,
+    dataset_split: str,
+    caption_column: str | None,
+    download_timeout: int,
+) -> None:
+    """Materialize one image-edit row and append its generic manifest entry."""
+    files_by_column: dict[str, str] = {}
+    for media_index, column in enumerate(dict.fromkeys(mapping.column for mapping in mappings)):
+        media_value = row[column]
+        suffix = _media_suffix(media_value, default=".png", allowed=IMAGE_EXTENSIONS)
+        file_name = f"media/hf_sample_{index:08d}_{media_index:02d}{suffix}"
+        _write_image(media_value, output_dir / file_name, download_timeout)
+        files_by_column[column] = file_name
+
+    media = [{"role": mapping.role, "file_name": files_by_column[mapping.column]} for mapping in mappings]
+    mapped_columns = set(files_by_column)
+    row_metadata = {}
+    for metadata_index, (column, value) in enumerate(row.items()):
+        if column in mapped_columns or column == caption_column:
+            continue
+        row_metadata[column] = _serialize_metadata_value(
+            value,
+            output_dir=output_dir,
+            index=index,
+            metadata_index=metadata_index,
+            column=column,
+            download_timeout=download_timeout,
+        )
+
+    manifest_row = {
+        "id": f"{dataset_split}:{index:08d}",
+        "prompt": prompt,
+        "media": media,
+        "metadata": {
+            "dataset_name": dataset_name,
+            "dataset_revision": dataset_revision,
+            "dataset_config_name": dataset_config_name,
+            "dataset_split": dataset_split,
+            "row_index": index,
+            "row": row_metadata,
+        },
+    }
+    with manifest_file.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(manifest_row) + "\n")
+
+
+def _serialize_metadata_value(
+    value: Any,
+    *,
+    output_dir: Path,
+    index: int,
+    metadata_index: int,
+    column: str,
+    download_timeout: int,
+) -> Any:
+    """Convert row metadata to JSON values, materializing image objects by relative path."""
+    from PIL import Image
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Image.Image):
+        file_name = f"metadata/hf_sample_{index:08d}_{metadata_index:02d}_{_safe_name(column)}.png"
+        _write_image(value, output_dir / file_name, download_timeout)
+        return {"media_type": "image", "file_name": file_name}
+    if isinstance(value, dict):
+        return {
+            str(key): _serialize_metadata_value(
+                item,
+                output_dir=output_dir,
+                index=index,
+                metadata_index=metadata_index,
+                column=column,
+                download_timeout=download_timeout,
+            )
+            for key, item in value.items()
+            if key != "bytes"
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _serialize_metadata_value(
+                item,
+                output_dir=output_dir,
+                index=index,
+                metadata_index=metadata_index,
+                column=column,
+                download_timeout=download_timeout,
+            )
+            for item in value
+        ]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    return str(value)
+
+
+def _safe_name(value: str) -> str:
+    """Return a path-safe, readable fragment for generated metadata files."""
+    safe = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in value)
+    return safe or "metadata"
 
 
 def _resolve_media_column(available: set[str], media_type: str, requested: str | None) -> str:
@@ -289,6 +605,8 @@ def _write_sidecar_caption(caption_file: Path, caption: str, caption_field: str)
 def _write_image(media_value: Any, output_path: Path, download_timeout: int) -> None:
     """Write an image-like HF cell to disk."""
     from PIL import Image
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if isinstance(media_value, Image.Image):
         media_value.convert("RGB").save(output_path)

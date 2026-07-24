@@ -1,95 +1,171 @@
 ---
 title: "Qwen-Image"
-description: ""
+description: "Train Qwen-Image text-to-image and Qwen-Image-Edit-2511 image-editing models."
 ---
-[Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is Alibaba Cloud's text-to-image diffusion transformer. NeMo AutoModel supports Qwen-Image training via its flow-matching pipeline with a dedicated `qwen_image` adapter, enabling FSDP2 parallelization, multiresolution bucketed dataloading and LoRA-style fine-tuning.
+
+[Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is Alibaba Cloud's flow-matching image model. NeMo AutoModel supports Qwen-Image text-to-image training and cached, full-parameter training of [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511).
 
 <Info>
 
 | | |
 |---|---|
-| **Task** | Text-to-Image |
-| **Architecture** | DiT (Flow Matching) |
+| **Tasks** | Text-to-Image, instruction-based image editing |
+| **Architecture** | Diffusion Transformer (Flow Matching) |
 | **HF Org** | [Qwen](https://huggingface.co/Qwen) |
 
 </Info>
 
 ## Available Models
 
-- **Qwen-Image**
+| Model | HF ID | Training scope |
+|---|---|---|
+| Qwen-Image | [`Qwen/Qwen-Image`](https://huggingface.co/Qwen/Qwen-Image) | Text-to-image training and fine-tuning |
+| Qwen-Image-Edit-2511 | [`Qwen/Qwen-Image-Edit-2511`](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Cached, full-parameter, single-node training |
 
-## Task
+Qwen-Image-Edit-2511 support is intentionally limited to cached target/context latents and cached Qwen2.5-VL prompt conditioning. Raw-image online encoding, LoRA, inference onboarding, older Qwen image-edit checkpoints, and multinode tuning are not supported by this recipe.
 
-- Text-to-Image (T2I)
-
-## Example HF Models
-
-| Model | HF ID |
-|---|---|
-| Qwen-Image | [`Qwen/Qwen-Image`](https://huggingface.co/Qwen/Qwen-Image) |
-
-## Example Recipes
+## Recipes
 
 | Recipe | Description |
 |---|---|
-| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) | Fine-tune — Qwen-Image with flow matching |
-| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/qwen_image_t2i_flow.yaml) | Pretrain — Qwen-Image with flow matching |
+| [qwen_image_edit_2511_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml) | Eight-GPU BF16 FSDP2 baseline for full-parameter Qwen-Image-Edit-2511 training |
+| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/finetune/qwen_image_t2i_flow.yaml) | Fine-tune Qwen-Image with flow matching |
+| [qwen_image_t2i_flow.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/pretrain/qwen_image_t2i_flow.yaml) | Pretrain Qwen-Image with flow matching |
 
-## Try with NeMo AutoModel
+## Prepare MagicBrush
 
-**1. Clone and install from source** ([full instructions](/get-started/installation)):
+The validation protocol uses [`osunlp/MagicBrush`](https://huggingface.co/datasets/osunlp/MagicBrush), an instruction-based editing dataset released under CC-BY-4.0. It contains 8,807 training examples and 528 development examples. The commands pin MagicBrush revision `1d8d4629150d18ca50afab66391866f2085be989` and Qwen-Image-Edit-2511 revision `6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9`.
+
+The generic exporter maps dataset columns to ordered editing roles. Mapping `source_img` to both `context` and `condition` writes the image only once while retaining both role entries. The dataset's mask is retained in source-manifest metadata for future masked-edit adapters.
+
+Create the 64-example correctness cache with aspect-ratio-preserving processing limited to approximately 1024² total pixels:
 
 ```bash
-git clone https://github.com/NVIDIA-NeMo/Automodel.git
-cd Automodel
-uv sync --locked --all-groups --all-extras --extra diffusion-media
+uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
+  --dataset_name osunlp/MagicBrush \
+  --dataset_revision 1d8d4629150d18ca50afab66391866f2085be989 \
+  --dataset_split dev \
+  --dataset_streaming \
+  --dataset_media_mapping target=target_img \
+  --dataset_media_mapping context=source_img \
+  --dataset_media_mapping condition=source_img \
+  --dataset_caption_column instruction \
+  --max_items 64 \
+  --max_pixels 1048576 \
+  --max_sequence_length 512 \
+  --processor_target nemo_automodel.components.models.qwen_image_edit.preprocessing.QwenImageEditCacheEncoder \
+  --model_name Qwen/Qwen-Image-Edit-2511 \
+  --model_revision 6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9 \
+  --num_gpus 8 \
+  --verify \
+  --output_dir /cache/magicbrush-qwen-edit-correctness
 ```
 
-**2. Run the recipe** from inside the repo:
+Create the 1,024-example fixed-square performance cache by replacing the split, limit, resolution, and output arguments:
+
+```bash
+uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
+  --dataset_name osunlp/MagicBrush \
+  --dataset_revision 1d8d4629150d18ca50afab66391866f2085be989 \
+  --dataset_split train \
+  --dataset_streaming \
+  --dataset_media_mapping target=target_img \
+  --dataset_media_mapping context=source_img \
+  --dataset_media_mapping condition=source_img \
+  --dataset_caption_column instruction \
+  --max_items 1024 \
+  --resolution_preset 1024p \
+  --max_sequence_length 512 \
+  --processor_target nemo_automodel.components.models.qwen_image_edit.preprocessing.QwenImageEditCacheEncoder \
+  --model_name Qwen/Qwen-Image-Edit-2511 \
+  --model_revision 6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9 \
+  --num_gpus 8 \
+  --verify \
+  --output_dir /cache/magicbrush-qwen-edit-performance
+```
+
+The performance preset resizes both source and target to 1024×1024. If that shape cannot complete without an out-of-memory error, use the 768p preset for every compared run and record the fallback.
+
+## Cache Contract
+
+Each versioned cache sample contains:
+
+- `target_latent`: `[channels, height, width]`
+- `context_latents`: an ordered list of `[channels, context_height, context_width]` tensors
+- `prompt_embeddings`: `[sequence, hidden]`
+- `prompt_attention_mask`: `[sequence]`
+- `conditioning_tensors`: optional explicitly named tensors
+- `metadata`: original IDs, source revision, tensor shapes, token lengths, and the compound target/context bucket signature
+
+The top-level `metadata.json` records the cache format version, source dataset ID, resolved dataset revision and config, split, row limit, resolved model revision, and preprocessing settings. Batches contain only compatible target and ordered-context shapes. Their CPU metadata includes target, context, text, and total token counts, so throughput logging does not inspect accelerator tensors.
+
+## Train
+
+Set `data.dataloader.cache_dir` and `checkpoint.checkpoint_dir` in the recipe, then launch one FSDP2 rank per H100:
 
 ```bash
 uv run torchrun --nproc-per-node=8 \
   examples/diffusion/finetune/finetune.py \
-  -c examples/diffusion/finetune/qwen_image_t2i_flow.yaml
+  -c examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml
 ```
 
-<Accordion title="Run with Docker">
-**1. Pull the container** and mount a checkpoint directory:
+The baseline uses BF16 parameters and compute, whole Qwen transformer-block activation checkpointing, beta timestep sampling from the recipe's checkpointed rank-local generator, and the distributed checkpoint manager. Consolidated model checkpoints retain the upstream Diffusers transformer state-dict representation. Set `checkpoint.restore_from: LATEST` to resume the optimizer, scheduler, dataloader, sampler, step, and RNG state.
+
+### Checkpoint-resume smoke test
+
+Use the 64-example correctness cache and a new checkpoint path. The first launch saves after 10 completed optimizer steps:
 
 ```bash
-docker run --gpus all -it --rm \
-  --shm-size=8g \
-  -v $(pwd)/checkpoints:/opt/Automodel/checkpoints \
-  nvcr.io/nvidia/nemo-automodel:26.06.00
-```
+export QWEN_EDIT_CACHE=/cache/magicbrush-qwen-edit-correctness
+export QWEN_EDIT_CKPT=/checkpoints/qwen-edit-resume-smoke
+test ! -e "${QWEN_EDIT_CKPT}" || { echo "Choose a new QWEN_EDIT_CKPT path"; exit 1; }
 
-**2.** Navigate to the AutoModel directory (where the recipes are):
-
-```bash
-cd /opt/Automodel
-```
-
-**3. Install media dependencies** (not installed in the container by default):
-
-```bash
-uv pip install ".[diffusion-media]"
-```
-
-**4. Run the recipe**:
-
-```bash
-torchrun --nproc-per-node=8 \
+uv run torchrun --nproc-per-node=8 \
   examples/diffusion/finetune/finetune.py \
-  -c examples/diffusion/finetune/qwen_image_t2i_flow.yaml
+  -c examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml \
+  --data.dataloader.cache_dir "${QWEN_EDIT_CACHE}" \
+  --checkpoint.checkpoint_dir "${QWEN_EDIT_CKPT}" \
+  --checkpoint.save_consolidated false \
+  --step_scheduler.max_steps 10 \
+  --step_scheduler.ckpt_every_steps 10 \
+  --step_scheduler.log_remote_every_steps 1 \
+  --performance.check_loss true \
+  --performance.throughput_warmup_steps 0
 ```
-</Accordion>
+
+Resume the same run and continue to 20 completed optimizer steps:
+
+```bash
+uv run torchrun --nproc-per-node=8 \
+  examples/diffusion/finetune/finetune.py \
+  -c examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml \
+  --data.dataloader.cache_dir "${QWEN_EDIT_CACHE}" \
+  --checkpoint.checkpoint_dir "${QWEN_EDIT_CKPT}" \
+  --checkpoint.restore_from LATEST \
+  --checkpoint.save_consolidated false \
+  --step_scheduler.max_steps 20 \
+  --step_scheduler.ckpt_every_steps 10 \
+  --step_scheduler.log_remote_every_steps 1 \
+  --performance.check_loss true \
+  --performance.throughput_warmup_steps 0
+```
+
+The smoke test passes when the first launch writes the step-10 checkpoint, the second launch restores it and reaches step 20, and every reported loss and gradient norm is finite.
+
+## H100 Benchmark Protocol
+
+Use the fixed performance cache for 20 warm-up steps and 100 timed optimization steps, repeated three times. The recipe's `performance.throughput_warmup_steps: 20` excludes warm-up work and logging overhead from the 100-step window. Dataloader wait uses the CPU wall clock; CUDA events measure forward, backward, gradient clipping, and optimizer phases. Set `step_scheduler.max_steps: 120` for a benchmark-only run. Report the median samples/second, target and total latent tokens/second, step time, peak allocated and reserved memory, and phase times.
+
+The `diffusion.forward`, `diffusion.backward_and_communication`, `diffusion.grad_clip`, and `diffusion.optimizer` PyTorch Profiler ranges identify phase boundaries. Because FSDP communication overlaps backward execution, use the NCCL events in a profiler trace to report communication time separately; the scalar `backward_time` includes that overlap.
+
+Sweep one setting at a time: supported attention backends, `torch.compile`, whole-block versus selective activation checkpointing, FSDP reshard-after-forward, forward/backward prefetch, reduce-scatter dtype, and supported QKV fusion, Transformer Engine, or FP8 paths. Keep only configurations with finite loss and gradients, checkpoint-resume correctness, and loss/gradient parity.
+
+## Install
+
+From a source checkout, install the diffusion media dependencies:
+
+```bash
+uv sync --locked --all-groups --extra all --extra diffusion-media
+```
 
 See the [Installation Guide](/get-started/installation) and [Diffusion Training and Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
-
-## Fine-Tuning
-
-See the [Diffusion Training and Fine-Tuning Guide](/recipes-e2e-examples/diffusion-fine-tuning).
-
-## Hugging Face Model Cards
-
-- [Qwen/Qwen-Image](https://huggingface.co/Qwen/Qwen-Image)

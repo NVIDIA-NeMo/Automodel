@@ -13,14 +13,17 @@
 # limitations under the License.
 
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 import torch.nn as nn
+import yaml
 
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.diffusion import train as diffusion_train
 from nemo_automodel.recipes.diffusion.train import (
     TrainDiffusionRecipe,
@@ -28,6 +31,7 @@ from nemo_automodel.recipes.diffusion.train import (
     _calculate_throughput_metrics,
     _count_local_batch_group_samples,
     _get_diffusion_microbatch_size,
+    _PhaseTimer,
     build_model_and_optimizer,
 )
 
@@ -58,6 +62,53 @@ def test_count_local_batch_group_samples_sums_microbatches():
     ]
 
     assert _count_local_batch_group_samples(batch_group) == 5
+
+
+def test_count_global_token_metrics_keeps_integer_cache_counts(monkeypatch):
+    recipe = object.__new__(TrainDiffusionRecipe)
+    recipe.device = torch.device("cpu")
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+
+    assert recipe._count_global_token_metrics(target=10, context=20, text=5, total=35) == {
+        "target": 10,
+        "context": 20,
+        "text": 5,
+        "total": 35,
+    }
+
+
+def test_phase_timer_accumulates_cpu_phases_without_device_sync(monkeypatch):
+    """CPU timing is deterministic and remains disabled unless configured."""
+    perf_counter = MagicMock(side_effect=[1.0, 1.25, 2.0, 2.5])
+    monkeypatch.setattr(diffusion_train.time, "perf_counter", perf_counter)
+    timer = _PhaseTimer(enabled=True, device=torch.device("cpu"))
+
+    started = timer.start()
+    timer.stop("forward", started)
+    started = timer.start()
+    timer.stop("forward", started)
+
+    assert timer.elapsed_seconds() == {"forward": pytest.approx(0.75)}
+    timer.reset()
+    assert timer.elapsed_seconds() == {}
+
+
+def test_max_global_timing_metrics_uses_world_max_and_preserves_phase_names(monkeypatch):
+    recipe = object.__new__(TrainDiffusionRecipe)
+    recipe.device = torch.device("cpu")
+    all_reduce = MagicMock()
+
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(diffusion_train.dist, "get_backend", lambda: "gloo")
+    monkeypatch.setattr(diffusion_train.dist, "all_reduce", all_reduce)
+
+    assert recipe._max_global_timing_metrics({"forward": 1.5, "dataloader_wait": 0.25}) == {
+        "dataloader_wait": pytest.approx(0.25),
+        "forward": pytest.approx(1.5),
+    }
+    all_reduce.assert_called_once()
+    assert all_reduce.call_args.args[0].tolist() == [0.25, 1.5]
+    assert all_reduce.call_args.kwargs == {"op": diffusion_train.dist.ReduceOp.MAX, "group": None}
 
 
 def test_calculate_throughput_metrics_uses_measured_counts():
@@ -329,7 +380,11 @@ def _patch_lightweight_diffusion_recipe_setup(monkeypatch):
         diffusion_train, "initialize_distributed", lambda *args, **kwargs: SimpleNamespace(is_main=False)
     )
     monkeypatch.setattr(diffusion_train, "setup_logging", lambda: None)
-    monkeypatch.setattr(diffusion_train, "StatefulRNG", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        diffusion_train,
+        "StatefulRNG",
+        lambda *args, **kwargs: SimpleNamespace(generator=lambda device: torch.Generator(device=device)),
+    )
     monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
 
@@ -403,7 +458,7 @@ def test_diffusion_recipe_enables_hunyuan_flash_varlen_mask_optimization_before_
     enable_optimization.assert_called_once_with()
 
 
-def test_diffusion_recipe_forwards_consolidation_timeout(monkeypatch):
+def test_diffusion_recipe_uses_typed_checkpoint_config_and_runtime_model_keys(monkeypatch):
     class StopAfterCheckpointConfig(Exception):
         pass
 
@@ -415,11 +470,17 @@ def test_diffusion_recipe_forwards_consolidation_timeout(monkeypatch):
         MagicMock(return_value=(model, object(), None)),
     )
 
+    from nemo_automodel.components.checkpoint.config import CheckpointingConfig
     from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
 
     monkeypatch.setattr(hunyuan_module, "enable_hunyuan_flash_varlen_mask_optimization", MagicMock(return_value=True))
-    checkpoint_config = MagicMock(side_effect=StopAfterCheckpointConfig)
-    monkeypatch.setattr(diffusion_train, "CheckpointingConfig", checkpoint_config)
+    build_calls = []
+
+    def stop_after_checkpoint_config(self, **kwargs):
+        build_calls.append((self, kwargs))
+        raise StopAfterCheckpointConfig
+
+    monkeypatch.setattr(CheckpointingConfig, "build", stop_after_checkpoint_config)
     recipe = TrainDiffusionRecipe(
         _minimal_diffusion_recipe_cfg(
             checkpoint={
@@ -428,6 +489,10 @@ def test_diffusion_recipe_forwards_consolidation_timeout(monkeypatch):
                 "model_save_format": "safetensors",
                 "save_consolidated": "final",
                 "consolidation_timeout_minutes": 45,
+                "staging_dir": "/tmp/checkpoint-staging",
+                "single_rank_consolidation": True,
+                "diffusers_compatible": True,
+                "best_metric_key": "validation_loss",
             }
         )
     )
@@ -435,7 +500,14 @@ def test_diffusion_recipe_forwards_consolidation_timeout(monkeypatch):
     with pytest.raises(StopAfterCheckpointConfig):
         recipe.setup()
 
-    assert checkpoint_config.call_args.kwargs["consolidation_timeout_minutes"] == 45
+    assert len(build_calls) == 1
+    checkpoint_config, runtime_kwargs = build_calls[0]
+    assert checkpoint_config.consolidation_timeout_minutes == 45
+    assert checkpoint_config.staging_dir == "/tmp/checkpoint-staging"
+    assert checkpoint_config.single_rank_consolidation is True
+    assert checkpoint_config.diffusers_compatible is True
+    assert checkpoint_config.best_metric_key == "validation_loss"
+    assert runtime_kwargs["model_state_dict_keys"] == ["weight", "bias"]
 
 
 class _TinyTransformer(nn.Module):
@@ -522,6 +594,32 @@ def test_build_diffusion_parallel_manager_args_accepts_confignode_fsdp_config():
     assert manager_args["dp_size"] == 8
 
 
+def test_qwen_image_edit_recipe_configs_are_accepted():
+    """The shipped eight-GPU recipe resolves its typed scheduler and FSDP2 options."""
+    recipe_path = (
+        Path(__file__).resolve().parents[3] / "examples" / "diffusion" / "finetune" / "qwen_image_edit_2511_flow.yaml"
+    )
+    recipe = ConfigNode(yaml.safe_load(recipe_path.read_text(encoding="utf-8")))
+    typed_recipe = RecipeConfig(recipe)
+
+    manager_args = _build_diffusion_parallel_manager_args(
+        fsdp_cfg=typed_recipe.fsdp,
+        ddp_cfg=None,
+        world_size=8,
+        dtype=torch.bfloat16,
+        compute_dtype=torch.bfloat16,
+        lora_enabled=False,
+    )
+
+    assert manager_args["dp_size"] == 8
+    assert manager_args["mp_policy"].param_dtype is torch.bfloat16
+    assert manager_args["mp_policy"].reduce_dtype is torch.bfloat16
+    assert manager_args["mp_policy"].output_dtype is torch.bfloat16
+    assert typed_recipe.step_scheduler.global_batch_size == 8
+    assert typed_recipe.step_scheduler.log_remote_every_steps == 100
+    assert typed_recipe.step_scheduler.max_steps is None
+
+
 def test_build_diffusion_parallel_manager_args_accepts_confignode_ddp_config():
     manager_args = _build_diffusion_parallel_manager_args(
         fsdp_cfg=None,
@@ -564,6 +662,7 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
 
     _, optimizer, device_mesh = build_model_and_optimizer(
         model_id="dummy-model",
+        model_revision="abc123",
         finetune_mode=True,
         learning_rate=0.125,
         device=torch.device("cpu"),
@@ -611,6 +710,7 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
     assert calls["transformer_engine_fp8_safe_only"] is True
     assert calls["fuse_qkv_projections"] is True
     assert calls["compact_fused_qkv_projections"] is True
+    assert calls["revision"] == "abc123"
     assert pipe.transformer.attention_backend == "flash"
     assert device_mesh == "mesh"
     assert optimizer.defaults["lr"] == pytest.approx(0.125)
@@ -736,8 +836,8 @@ class _FakeStepScheduler:
         self._batch_group = batch_group
 
     def __iter__(self):
-        self.step = 1
         yield self._batch_group
+        self.step = 1
 
 
 def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypatch):
@@ -748,6 +848,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
         {"image_latents": torch.zeros(3, 1), "text_embeddings": torch.zeros(3, 1)},
     ]
     progress_bars = []
+    log_info = MagicMock()
 
     def fake_tqdm(iterable, desc):
         progress_bar = _FakeProgressBar(iterable, desc)
@@ -762,6 +863,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(diffusion_train, "is_main_process", lambda: True)
     monkeypatch.setattr(diffusion_train.wandb, "run", None, raising=False)
+    monkeypatch.setattr(diffusion_train.logging, "info", log_info)
 
     recipe.global_batch_size = 5
     recipe.local_batch_size = 2
@@ -794,8 +896,8 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
             "mem": 0.0,
             "memory_allocated_gb": 0.0,
             "memory_reserved_gb": 0.0,
-            "max_memory_allocated_gb": 0.0,
-            "max_memory_reserved_gb": 0.0,
+            "max_memory_allocated_gb": 3.5,
+            "max_memory_reserved_gb": 4.5,
         }
     )
     recipe.save_checkpoint = MagicMock()
@@ -829,3 +931,111 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
         "s/s": "2.5",
         "s/s/gpu": "2.50",
     }
+    train_log_calls = [call for call in log_info.call_args_list if call.args[0].startswith("[TRAIN]")]
+    assert len(train_log_calls) == 1
+    rendered_train_log = train_log_calls[0].args[0] % train_log_calls[0].args[1:]
+    assert "grad_clip=0.000s" in rendered_train_log
+    assert "max_allocated=3.50GB" in rendered_train_log
+    assert "max_reserved=4.50GB" in rendered_train_log
+
+
+@pytest.mark.parametrize(("start_step", "run_steps"), [(0, 120), (20, 100)])
+def test_run_train_validation_loop_measures_100_steps_after_warmup(monkeypatch, start_step, run_steps):
+    recipe = object.__new__(TrainDiffusionRecipe)
+    model = nn.Linear(1, 1)
+    dataloader = [{"image_latents": torch.zeros(1, 1)} for _ in range(run_steps)]
+    scheduler_dataloader = [object() for _ in range(120)]
+    wandb_log = MagicMock()
+
+    monkeypatch.setitem(sys.modules, "tqdm", SimpleNamespace(tqdm=lambda iterable, desc: iterable))
+    monkeypatch.setattr(diffusion_train, "prepare_for_grad_accumulation", MagicMock())
+    monkeypatch.setattr(diffusion_train, "prepare_for_final_backward", MagicMock())
+    monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
+    monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
+    monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(diffusion_train.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(diffusion_train, "is_main_process", lambda: True)
+    monkeypatch.setattr(diffusion_train.wandb, "run", object(), raising=False)
+    monkeypatch.setattr(diffusion_train.wandb, "log", wandb_log, raising=False)
+    monkeypatch.setattr(diffusion_train.wandb, "finish", MagicMock(), raising=False)
+
+    recipe.global_batch_size = 1
+    recipe.local_batch_size = 1
+    recipe.num_nodes = 1
+    recipe.dp_size = 1
+    recipe.world_size = 1
+    recipe.num_epochs = 1
+    recipe.sampler = None
+    recipe.dataloader = dataloader
+    recipe.step_scheduler = diffusion_train.StepScheduler(
+        global_batch_size=1,
+        local_batch_size=1,
+        dp_size=1,
+        dataloader=scheduler_dataloader,
+        ckpt_every_steps=250,
+        save_checkpoint_every_epoch=False,
+        start_step=start_step,
+        num_epochs=1,
+        max_steps=120,
+    )
+    recipe.optimizer = SimpleNamespace(
+        zero_grad=MagicMock(),
+        step=MagicMock(),
+        param_groups=[{"lr": 0.01}],
+    )
+    recipe.lr_scheduler = None
+    recipe.model = model
+    recipe.device = torch.device("cpu")
+    recipe.compute_dtype = torch.float32
+    recipe.check_loss = False
+    recipe.clip_grad_max_norm = 1.0
+    recipe.grad_clip_foreach = False
+    recipe.defer_fsdp_grad_sync = True
+    recipe.transformer_engine_fp8 = False
+    recipe.peft_cfg = None
+    recipe.log_every = 100
+    recipe.throughput_warmup_steps = 20
+    recipe.phase_timing = False
+    recipe._sync_device = MagicMock()
+    recipe._elapsed_seconds_since = MagicMock(return_value=(100.0, 0.0))
+    recipe._count_global_samples = MagicMock(side_effect=lambda local_samples: local_samples)
+    recipe._get_memory_metrics = MagicMock(
+        return_value={
+            "mem": 0.0,
+            "memory_allocated_gb": 0.0,
+            "memory_reserved_gb": 0.0,
+            "max_memory_allocated_gb": 0.0,
+            "max_memory_reserved_gb": 0.0,
+        }
+    )
+    recipe.save_checkpoint = MagicMock()
+    recipe.flow_matching_pipeline = SimpleNamespace(
+        step=MagicMock(
+            side_effect=lambda **_kwargs: (
+                None,
+                torch.tensor(1.0, requires_grad=True),
+                None,
+                {
+                    "perf/target_token_count": 2,
+                    "perf/context_token_count": 3,
+                    "perf/text_token_count": 4,
+                    "perf/total_token_count": 9,
+                },
+            )
+        )
+    )
+
+    recipe.run_train_validation_loop()
+
+    assert recipe.flow_matching_pipeline.step.call_count == run_steps
+    assert recipe.flow_matching_pipeline.step.call_args_list[0].kwargs["global_step"] == start_step
+    assert recipe.flow_matching_pipeline.step.call_args_list[-1].kwargs["global_step"] == 119
+    assert recipe.step_scheduler.step == 120
+    recipe._count_global_samples.assert_called_once_with(100)
+    recipe._elapsed_seconds_since.assert_called_once()
+    recipe.save_checkpoint.assert_called_once()
+    assert recipe.save_checkpoint.call_args.args[1] == 120
+    performance_logs = [call for call in wandb_log.call_args_list if "log_window_steps" in call.args[0]]
+    assert len(performance_logs) == 1
+    assert performance_logs[0].args[0]["log_window_steps"] == 100.0
+    assert performance_logs[0].kwargs["step"] == 120

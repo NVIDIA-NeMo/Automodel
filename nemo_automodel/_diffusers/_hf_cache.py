@@ -37,7 +37,7 @@ else:
     snapshot_download = None
 
 
-def resolve_diffusion_model_dir(model_id: str) -> str:
+def resolve_diffusion_model_dir(model_id: str, *, revision: str | None = None) -> str:
     """Resolve a HF repo id to a local snapshot directory.
 
     Mirrors the transformers bridge so a warm ``HF_HOME`` is never re-validated
@@ -49,6 +49,7 @@ def resolve_diffusion_model_dir(model_id: str) -> str:
 
     Args:
         model_id: A HuggingFace repo id or a local filesystem path.
+        revision: Optional immutable Hub revision used to select the snapshot.
 
     Returns:
         A local directory path containing the model snapshot. When
@@ -60,6 +61,6 @@ def resolve_diffusion_model_dir(model_id: str) -> str:
 
     if os.environ.get("HF_HUB_OFFLINE", "0") != "1":
         # Cold cache + online: fetch the snapshot once.
-        snapshot_download(model_id)
+        snapshot_download(model_id, revision=revision)
     # Resolve (and require) the local snapshot without revalidating over the network.
-    return snapshot_download(model_id, local_files_only=True)
+    return snapshot_download(model_id, revision=revision, local_files_only=True)

@@ -575,12 +575,18 @@ class OptimizerState:
 
         return state_dict
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """
-        Load the state dictionaries into the optimizer and scheduler.
+    def load_state_dict(self, state_dict: dict[str, Any], *, strict: bool = True) -> None:
+        """Load state dictionaries into the optimizer and scheduler.
 
         Args:
-            state_dict (dict): State dictionary containing optimizer and scheduler states to load.
+            state_dict: Mapping whose ``optim`` entry contains either flattened
+                ``state.<parameter_fqn>.<state_field>`` values or the optimizer's
+                native nested state. Tensor fields are scalars of shape [] or
+                parameter-shaped tensors of arbitrary rank. An optional ``sched``
+                entry contains scalar scheduler state.
+            strict: Require optimizer state for every trainable parameter. Set to
+                ``False`` only after the caller validates that absent state groups
+                were never materialized in the saved optimizer.
         """
         # For PEFT + quantized or expert-parallel models, use native load to match the native save path.
         if self.is_peft and (_has_expert_parallelism(self.model[0]) or _has_quantized_params(self.model[0])):
@@ -590,7 +596,7 @@ class OptimizerState:
             func = partial(
                 set_optimizer_state_dict,
                 optim_state_dict=state_dict["optim"],
-                options=StateDictOptions(flatten_optimizer_state_dict=True),
+                options=StateDictOptions(flatten_optimizer_state_dict=True, strict=strict),
             )
             list(map(func, self.model, self.optimizer))
 

@@ -19,6 +19,7 @@ import os
 from contextlib import ExitStack
 from datetime import timedelta
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -41,13 +42,17 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
     CheckpointingConfig,
     SaveConsolidatedMode,
+    _clear_unmaterialized_optimizer_state,
     _divide_keys_by_size,
     _ensure_dirs,
     _equally_divide_layers,
+    _get_hf_safetensors_reference_path,
     _is_custom_model,
     _model_has_dtensors,
     _new_gloo_process_group,
     _normalize_dtype_mapping_to_state_dict_keys,
+    _normalized_optimizer_fqn,
+    _prepare_optimizer_state_for_load,
     _reinit_non_persistent_buffers,
     _should_write_consolidated_safetensors,
     _summarize_state_dict_key_diff,
@@ -55,7 +60,11 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     is_cloud_path,
     save_config,
 )
-from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, _get_lm_head_weight_and_name
+from nemo_automodel.components.checkpoint.stateful_wrappers import (
+    ModelState,
+    OptimizerState,
+    _get_lm_head_weight_and_name,
+)
 from nemo_automodel.components.checkpoint.utils import (
     has_local_tied_lm_head,
     materialize_missing_tied_lm_head,
@@ -245,6 +254,127 @@ def test_get_fqn_to_file_index_mapping_uses_index_json_for_qwen35_names(tmp_path
         "model.layers.1.weight": 2,
         "lm_head.weight": 3,
     }
+
+
+def test_diffusers_transformer_index_uses_exact_snapshot_and_preserves_five_shards(tmp_path):
+    """A pinned Diffusers component keeps its 1,933-key upstream shard map."""
+    cache_dir = tmp_path / "hub"
+    repo_root = cache_dir / "models--Qwen--Qwen-Image-Edit-2511"
+    snapshots_root = repo_root / "snapshots"
+    stale_revision = "1" * 40
+    pinned_revision = "2" * 40
+
+    stale_snapshot = snapshots_root / stale_revision
+    stale_snapshot.mkdir(parents=True)
+    (stale_snapshot / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"stale.weight": "model-00001-of-00001.safetensors"}}),
+        encoding="utf-8",
+    )
+    refs_dir = repo_root / "refs"
+    refs_dir.mkdir()
+    (refs_dir / "main").write_text(stale_revision, encoding="utf-8")
+
+    transformer_dir = snapshots_root / pinned_revision / "transformer"
+    transformer_dir.mkdir(parents=True)
+    weight_map = {
+        f"transformer_blocks.{index}.weight": (f"diffusion_pytorch_model-{index % 5 + 1:05d}-of-00005.safetensors")
+        for index in range(1_933)
+    }
+    (transformer_dir / _DIFFUSERS_INDEX_FN).write_text(
+        json.dumps({"metadata": {"total_size": 0}, "weight_map": weight_map}),
+        encoding="utf-8",
+    )
+
+    reference_path = _get_hf_safetensors_reference_path(
+        cache_dir,
+        "Qwen/Qwen-Image-Edit-2511",
+        revision=pinned_revision,
+    )
+
+    assert reference_path == str(transformer_dir)
+    assert (
+        _get_hf_safetensors_reference_path(
+            cache_dir,
+            "Qwen/Qwen-Image-Edit-2511",
+            revision="3" * 40,
+        )
+        is None
+    )
+    mapping = get_fqn_to_file_index_mapping(reference_path)
+    assert len(mapping) == 1_933
+    assert set(mapping.values()) == {1, 2, 3, 4, 5}
+    assert mapping["transformer_blocks.0.weight"] == 1
+    assert mapping["transformer_blocks.1932.weight"] == 3
+
+    config = CheckpointingConfig(
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        model_cache_dir=cache_dir,
+        model_repo_id="Qwen/Qwen-Image-Edit-2511",
+        save_consolidated=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+    model = SimpleNamespace(
+        config=SimpleNamespace(_name_or_path=str(transformer_dir), model_type="qwen_image_transformer")
+    )
+    model_state = SimpleNamespace(model=[model], has_local_tied_lm_head=False, lm_head_param_name=None)
+    state_dict = {key: torch.empty(0) for key in weight_map}
+
+    assert checkpointer._maybe_build_consolidated_index(model_state, state_dict) == mapping
+
+
+def test_safetensors_reference_prefers_root_hf_weights_over_diffusers_component(tmp_path):
+    """Root Transformers checkpoints retain precedence over nested components."""
+    snapshot = tmp_path / "snapshot"
+    transformer_dir = snapshot / "transformer"
+    transformer_dir.mkdir(parents=True)
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {}}), encoding="utf-8")
+    (transformer_dir / _DIFFUSERS_INDEX_FN).write_text(json.dumps({"weight_map": {}}), encoding="utf-8")
+
+    assert _get_hf_safetensors_reference_path(None, str(snapshot)) == str(snapshot)
+
+
+def test_get_original_model_path_reads_config_without_probing_model_attributes(tmp_path):
+    """Config provenance must be used directly, without model-attribute probes.
+
+    Diffusers ``ModelMixin`` proxies unknown attributes to its config and emits a
+    deprecation warning for each direct ``_name_or_path`` access, so the resolver
+    must not touch those attributes on the model when the config provides them.
+    """
+
+    class _ConfigProxyingModel:
+        def __init__(self, config: SimpleNamespace) -> None:
+            self.config = config
+
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"model attribute {name!r} was probed instead of the config")
+
+    config = CheckpointingConfig(
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="Qwen/Qwen-Image-Edit-2511",
+        save_consolidated=False,
+    )
+    with patch("torch.distributed.is_initialized", return_value=False):
+        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
+
+    component_dir = tmp_path / "snapshot" / "transformer"
+    component_dir.mkdir(parents=True)
+    model = _ConfigProxyingModel(SimpleNamespace(_name_or_path=str(component_dir)))
+    model_state = SimpleNamespace(model=[model])
+
+    assert checkpointer._get_original_model_path(model_state) == str(component_dir)
+
+
+def test_get_fqn_to_dtype_mapping_reads_diffusers_index_shards(tmp_path):
+    shard_name = "diffusion_pytorch_model-00001-of-00001.safetensors"
+    save_file({"transformer.weight": torch.ones(2, dtype=torch.bfloat16)}, tmp_path / shard_name)
+    (tmp_path / _DIFFUSERS_INDEX_FN).write_text(
+        json.dumps({"weight_map": {"transformer.weight": shard_name}}),
+        encoding="utf-8",
+    )
+
+    assert get_fqn_to_dtype_mapping(str(tmp_path)) == {"transformer.weight": "BF16"}
 
 
 def test_get_fqn_to_dtype_mapping_reads_safetensors_headers_and_applies_key_mapping(tmp_path):
@@ -642,6 +772,127 @@ def test_summarize_state_dict_key_diff_limits_examples():
     assert summary["missing_count"] == 4
     assert summary["unexpected_count"] == 1
     assert summary["missing_examples"] == ["a", "b"]
+
+
+class _PartiallyUsedOptimizerModel(torch.nn.Module):
+    """Tiny model whose second layer legitimately receives no gradients."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.used = torch.nn.Linear(2, 2)
+        self.unused = torch.nn.Linear(2, 2)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Run the branch that receives gradients.
+
+        Args:
+            inputs: Tensor of shape [batch, features], where ``features`` is 2.
+
+        Returns:
+            Tensor of shape [batch, features], where ``features`` is 2.
+        """
+        return self.used(inputs)
+
+
+def _optimizer_load_template() -> tuple[OptimizerState, dict[str, Any], set[str]]:
+    model = _PartiallyUsedOptimizerModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, foreach=False)
+    optimizer_state = OptimizerState(model, optimizer)
+    state_dict = optimizer_state.state_dict()
+    checkpoint_keys = {f"optim.{key}" for key in state_dict["optim"]}
+    return optimizer_state, state_dict, checkpoint_keys
+
+
+def test_optimizer_fqn_normalization_removes_only_exact_wrapper_components():
+    assert _normalized_optimizer_fqn("submodule.weight") == "submodule.weight"
+    assert _normalized_optimizer_fqn("layers.0.module.weight") == "layers.0.weight"
+    assert _normalized_optimizer_fqn("_checkpoint_wrapped_module.layers.0._orig_mod.bias") == "layers.0.bias"
+
+
+def test_optimizer_fqn_normalization_rejects_wrapper_collision():
+    class CollisionModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(2, 2))
+            self.module = torch.nn.Linear(2, 2, bias=False)
+
+    model = CollisionModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, foreach=False)
+    optimizer_state = OptimizerState(model, optimizer)
+
+    with pytest.raises(RuntimeError, match="Multiple optimizer parameters normalize.*'weight'"):
+        _clear_unmaterialized_optimizer_state(optimizer_state, {"weight"})
+
+
+def test_prepare_optimizer_state_load_accepts_wholly_absent_lazy_groups():
+    optimizer_state, state_dict, checkpoint_keys = _optimizer_load_template()
+    checkpoint_keys = {
+        key for key in checkpoint_keys if not key.startswith(("optim.state.unused.weight.", "optim.state.unused.bias."))
+    }
+
+    empty_fqns = _prepare_optimizer_state_for_load(state_dict, optimizer_state, checkpoint_keys)
+
+    assert empty_fqns == {"unused.weight", "unused.bias"}
+    assert not any(key.startswith("state.unused.") for key in state_dict["optim"])
+    assert optimizer_state.optimizer[0].state[optimizer_state.model[0].unused.weight] == {}
+
+
+def test_prepare_optimizer_state_load_rejects_partial_state_group():
+    optimizer_state, state_dict, checkpoint_keys = _optimizer_load_template()
+    checkpoint_keys.remove("optim.state.unused.weight.exp_avg_sq")
+
+    with pytest.raises(RuntimeError, match="partial state group.*unused.weight"):
+        _prepare_optimizer_state_for_load(state_dict, optimizer_state, checkpoint_keys)
+
+
+def test_prepare_optimizer_state_load_rejects_missing_param_group_key():
+    optimizer_state, state_dict, checkpoint_keys = _optimizer_load_template()
+    missing_key = next(key for key in checkpoint_keys if key.startswith("optim.param_groups.unused.weight."))
+    checkpoint_keys.remove(missing_key)
+
+    with pytest.raises(RuntimeError, match="missing 1 required key"):
+        _prepare_optimizer_state_for_load(state_dict, optimizer_state, checkpoint_keys)
+
+
+def test_prepare_optimizer_state_load_rejects_unexpected_key():
+    optimizer_state, state_dict, checkpoint_keys = _optimizer_load_template()
+    checkpoint_keys.add("optim.state.not_in_model.weight.step")
+
+    with pytest.raises(RuntimeError, match="contains 1 unexpected key"):
+        _prepare_optimizer_state_for_load(state_dict, optimizer_state, checkpoint_keys)
+
+
+def test_checkpointer_round_trips_partially_materialized_adam_state(tmp_path):
+    model = _PartiallyUsedOptimizerModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, foreach=False)
+    model(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    saved_exp_avg = optimizer.state[model.used.weight]["exp_avg"].clone()
+    assert model.unused.weight not in optimizer.state
+
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str(tmp_path),
+        model_save_format="torch_save",
+        model_cache_dir=str(tmp_path / "cache"),
+        model_repo_id="test/model",
+        save_consolidated=False,
+    )
+    checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=None)
+    checkpoint_path = tmp_path / "step"
+    checkpointer.save_optimizer(optimizer, model, str(checkpoint_path))
+
+    resumed_model = _PartiallyUsedOptimizerModel()
+    resumed_optimizer = torch.optim.AdamW(resumed_model.parameters(), lr=1e-3, foreach=False)
+    checkpointer.load_optimizer(resumed_optimizer, resumed_model, str(checkpoint_path))
+
+    torch.testing.assert_close(resumed_optimizer.state[resumed_model.used.weight]["exp_avg"], saved_exp_avg)
+    assert resumed_optimizer.state[resumed_model.unused.weight] == {}
+    resumed_model.unused(torch.ones(1, 2)).sum().backward()
+    resumed_optimizer.step()
+    assert resumed_optimizer.state[resumed_model.unused.weight]["step"].item() == 1
+    checkpointer.close()
 
 
 # =============================================================================

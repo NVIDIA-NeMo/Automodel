@@ -14,23 +14,40 @@
 """Tests for Hugging Face diffusion dataset materialization."""
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
 
 from tools.diffusion.data import hf_dataset_export
 
+_RESOLVED_DATASET_REVISION = "a" * 40
+
 
 class FakeDataset:
     """Small dataset-like object for materialization tests."""
 
-    def __init__(self, rows):
+    def __init__(self, rows, *, config_name=None):
         self.rows = rows
         self.column_names = list(rows[0]) if rows else []
         self.features = {}
+        self.info = SimpleNamespace(config_name=config_name)
 
     def __iter__(self):
         return iter(self.rows)
+
+
+def _mock_dataset_info(monkeypatch, *, resolved_revision=_RESOLVED_DATASET_REVISION):
+    calls = []
+
+    class FakeHfApi:
+        def dataset_info(self, *, repo_id, revision):
+            calls.append((repo_id, revision))
+            return SimpleNamespace(sha=resolved_revision)
+
+    monkeypatch.setattr(hf_dataset_export.huggingface_hub, "HfApi", lambda: FakeHfApi())
+    return calls
 
 
 def test_materialize_hf_image_dataset_writes_jsonl_captions(tmp_path, monkeypatch):
@@ -118,3 +135,194 @@ def test_materialize_hf_dataset_errors_when_media_column_cannot_be_inferred(tmp_
 
     with pytest.raises(ValueError, match="Pass --dataset_media_column"):
         hf_dataset_export.materialize_hf_dataset("org/images", tmp_path, media_type="image")
+
+
+def test_materialize_hf_image_edit_dataset_writes_ordered_manifest_and_deduplicates_media(tmp_path, monkeypatch):
+    rows = [
+        {
+            "img_id": "42",
+            "turn_index": 2,
+            "source_img": Image.new("RGB", (8, 6), color="red"),
+            "mask_img": Image.new("L", (8, 6), color="white"),
+            "instruction": "make it blue",
+            "target_img": Image.new("RGB", (8, 6), color="blue"),
+        }
+    ]
+    load_calls = []
+
+    def fake_load_hf_dataset(*args, **kwargs):
+        load_calls.append((args, kwargs))
+        return FakeDataset(rows, config_name="magicbrush")
+
+    monkeypatch.setattr(hf_dataset_export, "_load_hf_dataset", fake_load_hf_dataset)
+    hub_calls = _mock_dataset_info(monkeypatch)
+    mappings = [
+        hf_dataset_export.HFDatasetMediaMapping("target", "target_img"),
+        hf_dataset_export.HFDatasetMediaMapping("context", "source_img"),
+        hf_dataset_export.HFDatasetMediaMapping("condition", "source_img"),
+    ]
+
+    export = hf_dataset_export.materialize_hf_dataset(
+        "org/image-edits",
+        tmp_path,
+        media_type="image-edit",
+        split="dev",
+        config_name="magicbrush",
+        revision="pinned-revision",
+        media_mappings=mappings,
+        caption_column="instruction",
+    )
+
+    assert export.total_items == 1
+    assert export.media_column == "target_img"
+    assert export.media_mappings == tuple(mappings)
+    assert export.manifest_file == tmp_path / "hf_image_edit_manifest.jsonl"
+    assert export.dataset_revision == _RESOLVED_DATASET_REVISION
+    assert export.dataset_config_name == "magicbrush"
+    assert len(list((tmp_path / "media").glob("*"))) == 2
+    assert hub_calls == [("org/image-edits", "pinned-revision")]
+    assert load_calls[0][1]["revision"] == _RESOLVED_DATASET_REVISION
+    assert load_calls[0][1]["config_name"] == "magicbrush"
+
+    manifest_row = json.loads(export.manifest_file.read_text(encoding="utf-8"))
+    assert manifest_row["id"] == "dev:00000000"
+    assert manifest_row["prompt"] == "make it blue"
+    assert [entry["role"] for entry in manifest_row["media"]] == ["target", "context", "condition"]
+    assert manifest_row["media"][1]["file_name"] == manifest_row["media"][2]["file_name"]
+    assert all(not Path(entry["file_name"]).is_absolute() for entry in manifest_row["media"])
+    assert manifest_row["metadata"]["dataset_name"] == "org/image-edits"
+    assert manifest_row["metadata"]["dataset_revision"] == _RESOLVED_DATASET_REVISION
+    assert manifest_row["metadata"]["dataset_config_name"] == "magicbrush"
+    assert manifest_row["metadata"]["dataset_split"] == "dev"
+    assert manifest_row["metadata"]["row_index"] == 0
+    assert manifest_row["metadata"]["row"]["img_id"] == "42"
+    assert manifest_row["metadata"]["row"]["turn_index"] == 2
+    mask_metadata = manifest_row["metadata"]["row"]["mask_img"]
+    assert mask_metadata["media_type"] == "image"
+    assert not Path(mask_metadata["file_name"]).is_absolute()
+    assert (tmp_path / mask_metadata["file_name"]).exists()
+
+
+@pytest.mark.parametrize(
+    ("mappings", "match"),
+    [
+        ([hf_dataset_export.HFDatasetMediaMapping("context", "source")], "exactly one target"),
+        ([hf_dataset_export.HFDatasetMediaMapping("target", "target")], "at least one context"),
+        (
+            [
+                hf_dataset_export.HFDatasetMediaMapping("target", "target"),
+                hf_dataset_export.HFDatasetMediaMapping("reference", "source"),
+            ],
+            "Unsupported image-edit media role",
+        ),
+    ],
+)
+def test_materialize_hf_image_edit_dataset_validates_roles(tmp_path, mappings, match):
+    with pytest.raises(ValueError, match=match):
+        hf_dataset_export.materialize_hf_dataset(
+            "org/image-edits",
+            tmp_path,
+            media_type="image-edit",
+            media_mappings=mappings,
+        )
+
+
+def test_materialize_hf_dataset_rejects_legacy_column_with_media_mappings(tmp_path):
+    with pytest.raises(ValueError, match="--dataset_media_column cannot be combined with --dataset_media_mapping"):
+        hf_dataset_export.materialize_hf_dataset(
+            "org/image-edits",
+            tmp_path,
+            media_type="image-edit",
+            media_column="target_img",
+            media_mappings=[
+                hf_dataset_export.HFDatasetMediaMapping("target", "target_img"),
+                hf_dataset_export.HFDatasetMediaMapping("context", "source_img"),
+            ],
+        )
+
+
+def test_materialize_hf_image_edit_dataset_validates_mapping_columns(tmp_path, monkeypatch):
+    rows = [{"target_img": Image.new("RGB", (8, 8)), "instruction": "edit it"}]
+    monkeypatch.setattr(hf_dataset_export, "_load_hf_dataset", lambda *args, **kwargs: FakeDataset(rows))
+    _mock_dataset_info(monkeypatch)
+
+    with pytest.raises(ValueError, match="source_img"):
+        hf_dataset_export.materialize_hf_dataset(
+            "org/image-edits",
+            tmp_path,
+            media_type="image-edit",
+            media_mappings=[
+                hf_dataset_export.HFDatasetMediaMapping("target", "target_img"),
+                hf_dataset_export.HFDatasetMediaMapping("context", "source_img"),
+            ],
+            caption_column="instruction",
+        )
+
+
+def test_materialize_hf_image_edit_dataset_rejects_non_commit_hub_resolution(tmp_path, monkeypatch):
+    mappings = [
+        hf_dataset_export.HFDatasetMediaMapping("target", "target_img"),
+        hf_dataset_export.HFDatasetMediaMapping("context", "source_img"),
+    ]
+    _mock_dataset_info(monkeypatch, resolved_revision="main")
+
+    with pytest.raises(ValueError, match="invalid commit SHA 'main'"):
+        hf_dataset_export.materialize_hf_dataset(
+            "org/image-edits",
+            tmp_path,
+            media_type="image-edit",
+            revision="branch-name",
+            media_mappings=mappings,
+        )
+
+
+def test_materialize_hf_image_edit_dataset_rejects_local_path(tmp_path):
+    dataset_path = tmp_path / "local_dataset"
+    dataset_path.mkdir()
+
+    with pytest.raises(ValueError, match="local dataset paths are not supported"):
+        hf_dataset_export.materialize_hf_dataset(
+            str(dataset_path),
+            tmp_path / "export",
+            media_type="image-edit",
+            revision="a" * 40,
+            media_mappings=[
+                hf_dataset_export.HFDatasetMediaMapping("target", "target_img"),
+                hf_dataset_export.HFDatasetMediaMapping("context", "source_img"),
+            ],
+        )
+
+
+def test_materialize_hf_dataset_forwards_revision(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_load_dataset(dataset_name, **kwargs):
+        calls.append((dataset_name, kwargs))
+        return FakeDataset([{"image": Image.new("RGB", (8, 8)), "text": "caption"}])
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+
+    export = hf_dataset_export.materialize_hf_dataset(
+        "org/image-edits",
+        tmp_path,
+        media_type="image",
+        split="dev",
+        config_name="default",
+        revision="pinned-revision",
+        streaming=True,
+        trust_remote_code=False,
+    )
+
+    assert export.total_items == 1
+    assert calls == [
+        (
+            "org/image-edits",
+            {
+                "split": "dev",
+                "streaming": True,
+                "name": "default",
+                "revision": "pinned-revision",
+                "trust_remote_code": False,
+            },
+        )
+    ]

@@ -22,6 +22,8 @@ diffusion models using the flow matching objective.
 import importlib
 
 _LAZY_ATTRS = {
+    "FlowMatchingAdapterConfig": (".config", "FlowMatchingAdapterConfig"),
+    "FlowMatchingConfig": (".config", "FlowMatchingConfig"),
     "FlowMatchingPipeline": (".pipeline", "FlowMatchingPipeline"),
     "create_adapter": (".pipeline", "create_adapter"),
     "create_pipeline": (".pipeline", "create_pipeline"),

@@ -13,10 +13,11 @@
 # limitations under the License.
 
 """
-Unified preprocessing tool for images and videos.
+Unified preprocessing tool for images, image edits, and videos.
 
 Supports:
 - Images: FLUX (and other image models)
+- Image edits: configured cached-latent encoders
 - Videos: Wan2.1, HunyuanVideo-1.5
 
 Usage:
@@ -47,13 +48,15 @@ Usage:
 
 import argparse
 import hashlib
+import importlib
 import json
 import logging
 import os
 import traceback
+from collections.abc import Callable
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +67,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from nemo_automodel.components.datasets.diffusion.multi_tier_bucketing import MultiTierBucketCalculator
-from tools.diffusion.data.hf_dataset_export import materialize_hf_dataset
+from tools.diffusion.data.hf_dataset_export import HFDatasetMediaMapping, materialize_hf_dataset
 from tools.diffusion.processors import (
     BaseModelProcessor,
     BaseVideoProcessor,
@@ -296,6 +299,7 @@ def preprocess_dataset(
     dataset_name: Optional[str] = None,
     dataset_split: str = "train",
     dataset_config_name: Optional[str] = None,
+    dataset_revision: str | None = None,
     dataset_media_column: Optional[str] = None,
     dataset_caption_column: Optional[str] = None,
     dataset_dir: Optional[str] = None,
@@ -318,6 +322,7 @@ def preprocess_dataset(
         dataset_name: Optional Hugging Face dataset ID to materialize before preprocessing.
         dataset_split: Hugging Face dataset split.
         dataset_config_name: Optional Hugging Face dataset config/subset name.
+        dataset_revision: Optional Hugging Face dataset revision.
         dataset_media_column: Optional image column name.
         dataset_caption_column: Optional caption/text column name.
         dataset_dir: Optional directory for materialized HF media.
@@ -337,6 +342,7 @@ def preprocess_dataset(
             media_type="image",
             split=dataset_split,
             config_name=dataset_config_name,
+            revision=dataset_revision,
             media_column=dataset_media_column,
             caption_column=dataset_caption_column,
             caption_field=caption_field,
@@ -898,6 +904,7 @@ def preprocess_video_dataset(
     dataset_name: Optional[str] = None,
     dataset_split: str = "train",
     dataset_config_name: Optional[str] = None,
+    dataset_revision: str | None = None,
     dataset_media_column: Optional[str] = None,
     dataset_caption_column: Optional[str] = None,
     dataset_dir: Optional[str] = None,
@@ -930,6 +937,7 @@ def preprocess_video_dataset(
         dataset_name: Optional Hugging Face dataset ID to materialize before preprocessing.
         dataset_split: Hugging Face dataset split.
         dataset_config_name: Optional Hugging Face dataset config/subset name.
+        dataset_revision: Optional Hugging Face dataset revision.
         dataset_media_column: Optional video column name.
         dataset_caption_column: Optional caption/text column name.
         dataset_dir: Optional directory for materialized HF media.
@@ -949,6 +957,7 @@ def preprocess_video_dataset(
             media_type="video",
             split=dataset_split,
             config_name=dataset_config_name,
+            revision=dataset_revision,
             media_column=dataset_media_column,
             caption_column=dataset_caption_column,
             caption_field=caption_field,
@@ -1097,11 +1106,137 @@ def preprocess_video_dataset(
 # =============================================================================
 
 
-def main():
-    """Run image or video preprocessing from the command line."""
+@runtime_checkable
+class _ImageEditManifestEncoder(Protocol):
+    """Contract implemented by configured image-edit cache encoders."""
+
+    def encode_manifest(
+        self,
+        *,
+        manifest_path: Path,
+        output_dir: Path,
+        max_pixels: int,
+        resolution_preset: str | None,
+        num_gpus: int,
+        verify: bool,
+    ) -> Path:
+        """Encode a materialized image-edit manifest into a training cache."""
+
+
+def _parse_dataset_media_mapping(value: str) -> HFDatasetMediaMapping:
+    """Parse one ``role=column`` CLI value."""
+    role, separator, column = value.partition("=")
+    role = role.strip()
+    column = column.strip()
+    if not separator or not role or not column:
+        raise argparse.ArgumentTypeError("dataset media mappings must use role=column")
+    return HFDatasetMediaMapping(role=role, column=column)
+
+
+def _resolve_processor_target(target_path: str) -> Callable[..., object]:
+    """Resolve an image-edit processor target from a dotted import path."""
+    module_name, separator, attribute = target_path.rpartition(".")
+    if not separator or not module_name or not attribute:
+        raise ValueError(f"processor_target must be a dotted import path, got {target_path!r}")
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ImportError(f"Could not import processor_target module {module_name!r}") from exc
+    try:
+        target = getattr(module, attribute)
+    except AttributeError as exc:
+        raise ImportError(f"processor_target {target_path!r} does not exist") from exc
+    if not callable(target):
+        raise TypeError(f"processor_target {target_path!r} must resolve to a class or callable")
+    return target
+
+
+def _preprocess_image_edit_dataset(
+    *,
+    dataset_name: str,
+    dataset_revision: str | None,
+    dataset_split: str,
+    dataset_config_name: str | None,
+    dataset_media_mappings: list[HFDatasetMediaMapping],
+    dataset_caption_column: str | None,
+    dataset_dir: str | None,
+    dataset_streaming: bool,
+    dataset_trust_remote_code: bool | None,
+    output_dir: str,
+    processor_target: str,
+    model_name: str | None,
+    model_revision: str | None,
+    max_sequence_length: int,
+    max_items: int | None,
+    max_pixels: int,
+    resolution_preset: str | None,
+    num_gpus: int,
+    verify: bool,
+) -> Path:
+    """Materialize an image-edit dataset and run its configured cache encoder."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    export_dir = Path(dataset_dir) if dataset_dir is not None else output_path / "_hf_dataset" / "image_edit"
+    export = materialize_hf_dataset(
+        dataset_name,
+        export_dir,
+        media_type="image-edit",
+        split=dataset_split,
+        config_name=dataset_config_name,
+        revision=dataset_revision,
+        media_mappings=dataset_media_mappings,
+        caption_column=dataset_caption_column,
+        max_items=max_items,
+        streaming=dataset_streaming,
+        trust_remote_code=dataset_trust_remote_code,
+    )
+    if export.manifest_file is None:
+        raise RuntimeError("Image-edit materialization did not produce a manifest")
+
+    target = _resolve_processor_target(processor_target)
+    try:
+        processor = target(
+            model_name=model_name,
+            revision=model_revision,
+            max_sequence_length=max_sequence_length,
+        )
+    except TypeError as exc:
+        raise TypeError(
+            f"processor_target {processor_target!r} must accept keyword arguments model_name, revision, "
+            "and max_sequence_length"
+        ) from exc
+    if not isinstance(processor, _ImageEditManifestEncoder) or not callable(processor.encode_manifest):
+        raise TypeError(f"processor_target {processor_target!r} must implement encode_manifest(...)")
+
+    cache_manifest = processor.encode_manifest(
+        manifest_path=export.manifest_file,
+        output_dir=output_path,
+        max_pixels=max_pixels,
+        resolution_preset=resolution_preset,
+        num_gpus=num_gpus,
+        verify=verify,
+    )
+    if not isinstance(cache_manifest, Path):
+        raise TypeError(
+            f"processor_target {processor_target!r} encode_manifest(...) must return pathlib.Path, "
+            f"got {type(cache_manifest).__name__}"
+        )
+
+    logger.info(
+        "Materialized and encoded %d HF image-edit samples from %s revision %s split %s",
+        export.total_items,
+        dataset_name,
+        export.dataset_revision,
+        dataset_split,
+    )
+    return cache_manifest
+
+
+def main() -> None:
+    """Run image, image-edit, or video preprocessing from the command line."""
 
     parser = argparse.ArgumentParser(
-        description="Unified preprocessing tool for images and videos",
+        description="Unified preprocessing tool for images, image edits, and videos",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1114,6 +1249,15 @@ Examples:
       --dataset_name lambdalabs/naruto-blip-captions \\
       --dataset_media_column image --dataset_caption_column text \\
       --output_dir /cache --processor flux
+
+  # Image-edit preprocessing from a Hugging Face dataset
+  python -m tools.diffusion.preprocessing_multiprocess image-edit \\
+      --dataset_name org/image-edit-dataset \\
+      --dataset_media_mapping target=target_image \\
+      --dataset_media_mapping context=source_image \\
+      --dataset_caption_column instruction \\
+      --processor_target package.module.ImageEditCacheEncoder \\
+      --output_dir /cache
 
   # Video preprocessing with Wan2.1
   python -m tools.diffusion.preprocessing_multiprocess video \\
@@ -1139,6 +1283,7 @@ Examples:
     image_parser.add_argument("--dataset_name", type=str, default=None, help="Hugging Face dataset ID to materialize")
     image_parser.add_argument("--dataset_split", type=str, default="train", help="HF dataset split")
     image_parser.add_argument("--dataset_config_name", type=str, default=None, help="HF dataset config/subset name")
+    image_parser.add_argument("--dataset_revision", type=str, default=None, help="HF dataset revision")
     image_parser.add_argument("--dataset_media_column", type=str, default=None, help="HF image column name")
     image_parser.add_argument("--dataset_caption_column", type=str, default=None, help="HF caption/text column name")
     image_parser.add_argument("--dataset_dir", type=str, default=None, help="Directory for materialized HF media")
@@ -1170,6 +1315,61 @@ Examples:
     image_res_group.add_argument("--max_pixels", type=int, help="Custom max pixel budget")
 
     # ===================
+    # Image-edit subcommand
+    # ===================
+    image_edit_parser = subparsers.add_parser("image-edit", help="Preprocess instruction-based image edits")
+    image_edit_parser.add_argument("--dataset_name", type=str, required=True, help="Hugging Face dataset ID")
+    image_edit_parser.add_argument("--dataset_split", type=str, default="train", help="HF dataset split")
+    image_edit_parser.add_argument(
+        "--dataset_config_name", type=str, default=None, help="HF dataset config/subset name"
+    )
+    image_edit_parser.add_argument("--dataset_revision", type=str, default=None, help="HF dataset revision")
+    image_edit_parser.add_argument(
+        "--dataset_media_mapping",
+        type=_parse_dataset_media_mapping,
+        action="append",
+        required=True,
+        help="Ordered image-edit media mapping as role=column; repeat for each target/context/condition",
+    )
+    image_edit_parser.add_argument(
+        "--dataset_caption_column", type=str, default=None, help="HF prompt/instruction column name"
+    )
+    image_edit_parser.add_argument(
+        "--dataset_dir", type=str, default=None, help="Directory for the materialized HF image-edit manifest"
+    )
+    image_edit_parser.add_argument("--dataset_streaming", action="store_true", help="Stream the HF dataset")
+    image_edit_parser.add_argument(
+        "--dataset_trust_remote_code",
+        action="store_true",
+        default=None,
+        help="Pass trust_remote_code=True to datasets.load_dataset",
+    )
+    image_edit_parser.add_argument("--output_dir", type=str, required=True, help="Output cache directory")
+    image_edit_parser.add_argument(
+        "--processor_target", type=str, required=True, help="Dotted target for the model-owned cache encoder"
+    )
+    image_edit_parser.add_argument("--model_name", type=str, default=None, help="Optional model name or path")
+    image_edit_parser.add_argument(
+        "--model_revision", type=str, default=None, help="Optional Hugging Face model revision"
+    )
+    image_edit_parser.add_argument(
+        "--max_sequence_length", type=int, default=512, help="Maximum prompt token sequence length"
+    )
+    image_edit_parser.add_argument("--max_items", type=int, default=None, help="Maximum dataset rows to process")
+    image_edit_parser.add_argument(
+        "--num_gpus", type=int, default=None, help="Number of GPUs for cache encoding (defaults to all visible GPUs)"
+    )
+    image_edit_parser.add_argument("--verify", action="store_true", help="Verify cached image-edit encodings")
+    image_edit_res_group = image_edit_parser.add_mutually_exclusive_group()
+    image_edit_res_group.add_argument(
+        "--resolution_preset",
+        type=str,
+        choices=["256p", "512p", "768p", "1024p", "1536p"],
+        help="Resolution preset for image-edit preprocessing",
+    )
+    image_edit_res_group.add_argument("--max_pixels", type=int, help="Custom maximum pixel budget")
+
+    # ===================
     # Video subcommand
     # ===================
     video_parser = subparsers.add_parser("video", help="Preprocess videos")
@@ -1177,6 +1377,7 @@ Examples:
     video_parser.add_argument("--dataset_name", type=str, default=None, help="Hugging Face dataset ID to materialize")
     video_parser.add_argument("--dataset_split", type=str, default="train", help="HF dataset split")
     video_parser.add_argument("--dataset_config_name", type=str, default=None, help="HF dataset config/subset name")
+    video_parser.add_argument("--dataset_revision", type=str, default=None, help="HF dataset revision")
     video_parser.add_argument("--dataset_media_column", type=str, default=None, help="HF video column name")
     video_parser.add_argument("--dataset_caption_column", type=str, default=None, help="HF caption/text column name")
     video_parser.add_argument("--dataset_dir", type=str, default=None, help="Directory for materialized HF media")
@@ -1287,11 +1488,53 @@ Examples:
             dataset_name=args.dataset_name,
             dataset_split=args.dataset_split,
             dataset_config_name=args.dataset_config_name,
+            dataset_revision=args.dataset_revision,
             dataset_media_column=args.dataset_media_column,
             dataset_caption_column=args.dataset_caption_column,
             dataset_dir=args.dataset_dir,
             dataset_streaming=args.dataset_streaming,
             dataset_trust_remote_code=args.dataset_trust_remote_code,
+        )
+
+    elif args.command == "image-edit":
+        if args.max_sequence_length <= 0:
+            parser.error("--max_sequence_length must be positive")
+        if args.max_items is not None and args.max_items <= 0:
+            parser.error("--max_items must be positive")
+
+        num_gpus = args.num_gpus if args.num_gpus is not None else torch.cuda.device_count()
+        if num_gpus <= 0:
+            parser.error("image-edit preprocessing requires at least one GPU")
+
+        if args.resolution_preset:
+            max_pixels = MultiTierBucketCalculator.RESOLUTION_PRESETS[args.resolution_preset]
+        elif args.max_pixels is not None:
+            if args.max_pixels <= 0:
+                parser.error("--max_pixels must be positive")
+            max_pixels = args.max_pixels
+        else:
+            max_pixels = 1024 * 1024
+
+        _preprocess_image_edit_dataset(
+            dataset_name=args.dataset_name,
+            dataset_revision=args.dataset_revision,
+            dataset_split=args.dataset_split,
+            dataset_config_name=args.dataset_config_name,
+            dataset_media_mappings=args.dataset_media_mapping,
+            dataset_caption_column=args.dataset_caption_column,
+            dataset_dir=args.dataset_dir,
+            dataset_streaming=args.dataset_streaming,
+            dataset_trust_remote_code=args.dataset_trust_remote_code,
+            output_dir=args.output_dir,
+            processor_target=args.processor_target,
+            model_name=args.model_name,
+            model_revision=args.model_revision,
+            max_sequence_length=args.max_sequence_length,
+            max_items=args.max_items,
+            max_pixels=max_pixels,
+            resolution_preset=args.resolution_preset,
+            num_gpus=num_gpus,
+            verify=args.verify,
         )
 
     elif args.command == "video":
@@ -1325,6 +1568,7 @@ Examples:
             dataset_name=args.dataset_name,
             dataset_split=args.dataset_split,
             dataset_config_name=args.dataset_config_name,
+            dataset_revision=args.dataset_revision,
             dataset_media_column=args.dataset_media_column,
             dataset_caption_column=args.dataset_caption_column,
             dataset_dir=args.dataset_dir,

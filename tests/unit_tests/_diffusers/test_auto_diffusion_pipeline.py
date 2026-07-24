@@ -44,7 +44,10 @@ def _no_hf_cache_resolution():
     (e.g. ``"dummy"``), so leaving this unmocked makes the helper hit the Hub.
     Pass the id through unchanged instead.
     """
-    with patch(f"{MODULE_PATH}.resolve_diffusion_model_dir", side_effect=lambda model_id: model_id):
+    with patch(
+        f"{MODULE_PATH}.resolve_diffusion_model_dir",
+        side_effect=lambda model_id, *, revision=None: model_id,
+    ):
         yield
 
 
@@ -627,6 +630,27 @@ def test_from_pretrained_returns_pipe_and_managers_tuple(caplog):
     assert mock_diffusion_pipeline.from_pretrained.call_count == 1
     # Both modules should be moved to device once
     assert mock_to.call_count == 2
+
+
+def test_from_pretrained_resolves_pinned_revision():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    dummy_pipe = DummyPipeline({"unet": DummyModule()})
+    mock_diffusion_pipeline = MagicMock()
+    mock_diffusion_pipeline.from_pretrained.return_value = dummy_pipe
+
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
+        patch(f"{MODULE_PATH}.resolve_diffusion_model_dir", return_value="/cache/pinned") as mock_resolve,
+    ):
+        NeMoAutoDiffusionPipeline.from_pretrained("some/repo-id", revision="abc123", move_to_device=False)
+
+    mock_resolve.assert_called_once_with("some/repo-id", revision="abc123")
+    mock_diffusion_pipeline.from_pretrained.assert_called_once_with(
+        "/cache/pinned",
+        torch_dtype=torch.bfloat16,
+    )
 
 
 def test_from_pretrained_skips_move_when_flag_false():

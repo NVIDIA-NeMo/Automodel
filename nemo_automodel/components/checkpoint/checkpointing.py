@@ -51,6 +51,7 @@ from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors 
 )
 from nemo_automodel.components.checkpoint._backports.filesystem import FileSystemReader, SerializationFormat
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
+    _DIFFUSERS_INDEX_FN,
     _HuggingFaceStorageReader,
     _HuggingFaceStorageWriter,
     _maybe_rename_index_for_diffusers,
@@ -265,6 +266,193 @@ def _get_checkpoint_metadata_keys(
     return set(metadata.state_dict_metadata.keys())
 
 
+def _optimizer_param_group_fqns(
+    flat_optimizer_state: dict[str, Any],
+    optimizer_state: OptimizerState,
+) -> set[str]:
+    """Extract parameter FQNs from a flattened optimizer state dictionary.
+
+    Args:
+        flat_optimizer_state: Flattened optimizer mapping whose
+            ``state.<parameter_fqn>.<state_field>`` tensor values are either
+            scalars of shape [] or parameter-shaped tensors of arbitrary rank,
+            and whose ``param_groups.<parameter_fqn>.<field>`` entries contain
+            scalar optimizer hyperparameters.
+        optimizer_state: Wrapper owning model parameters of arbitrary shape and
+            their scalar or parameter-shaped optimizer-state tensors.
+
+    Returns:
+        Fully qualified parameter names represented by the flattened parameter
+        groups. No tensors are returned.
+    """
+    param_group_fields = {
+        field
+        for optimizer in optimizer_state.optimizer
+        for param_group in optimizer.param_groups
+        for field in param_group
+        if field != "params"
+    }
+    fqns: set[str] = set()
+    for key in flat_optimizer_state:
+        if not key.startswith("param_groups."):
+            continue
+        body = key.removeprefix("param_groups.")
+        matches = [field for field in param_group_fields if body.endswith(f".{field}")]
+        if not matches:
+            raise RuntimeError(f"Could not identify the optimizer param-group field in checkpoint key {key!r}")
+        field = max(matches, key=len)
+        fqns.add(body[: -len(field) - 1])
+    return fqns
+
+
+def _normalized_optimizer_fqn(name: str) -> str:
+    """Strip transparent wrapper components omitted by PyTorch state-dict FQNs."""
+    wrapper_components = {"_checkpoint_wrapped_module", "_orig_mod", "module"}
+    return ".".join(component for component in name.split(".") if component not in wrapper_components)
+
+
+def _clear_unmaterialized_optimizer_state(
+    optimizer_state: OptimizerState,
+    empty_state_fqns: set[str],
+) -> None:
+    """Restore lazy optimizer semantics for parameters with no saved state.
+
+    Args:
+        optimizer_state: Wrapper owning model parameters of arbitrary shape and
+            their scalar or parameter-shaped optimizer-state tensors. Matching
+            state entries are removed in place.
+        empty_state_fqns: Parameter FQNs whose checkpoint contains no optimizer
+            state tensors.
+    """
+    optimizer_by_parameter = {
+        parameter: optimizer
+        for optimizer in optimizer_state.optimizer
+        for param_group in optimizer.param_groups
+        for parameter in param_group["params"]
+    }
+    parameter_by_fqn: dict[str, torch.nn.Parameter] = {}
+    for model in optimizer_state.model:
+        for name, parameter in model.named_parameters():
+            normalized_name = _normalized_optimizer_fqn(name)
+            existing = parameter_by_fqn.get(normalized_name)
+            if existing is not None and existing is not parameter:
+                raise RuntimeError(f"Multiple optimizer parameters normalize to state-dict FQN {normalized_name!r}")
+            parameter_by_fqn[normalized_name] = parameter
+
+    for fqn in empty_state_fqns:
+        parameter = parameter_by_fqn.get(_normalized_optimizer_fqn(fqn))
+        if parameter is None or parameter not in optimizer_by_parameter:
+            raise RuntimeError(f"Could not map unmaterialized optimizer state for {fqn!r} back to a parameter")
+        optimizer_by_parameter[parameter].state.pop(parameter, None)
+
+    # PyTorch's optimizer state-dict setter initializes every parameter when
+    # the destination optimizer state is completely empty. Keep one empty
+    # sentinel entry so an all-lazy checkpoint remains sparse during restore.
+    for optimizer in optimizer_state.optimizer:
+        if optimizer.state:
+            continue
+        first_parameter = next(
+            (parameter for param_group in optimizer.param_groups for parameter in param_group["params"]),
+            None,
+        )
+        if first_parameter is not None:
+            optimizer.state[first_parameter] = {}
+
+
+def _prepare_optimizer_state_for_load(
+    state_dict: dict[str, Any],
+    optimizer_state: OptimizerState,
+    checkpoint_keys: set[str],
+) -> set[str]:
+    """Validate and remove only wholly absent lazy optimizer-state groups.
+
+    ``get_optimizer_state_dict`` eagerly materializes a fresh destination
+    optimizer, while a valid checkpoint can omit state for trainable parameters
+    that have never received a gradient. DCP is otherwise kept strict: every
+    param-group key and every partially materialized state group must match.
+
+    Args:
+        state_dict: Destination mapping whose ``optim`` entry is a flattened
+            optimizer mapping. Its ``state.<parameter_fqn>.<state_field>``
+            tensor values are either scalars of shape [] or parameter-shaped
+            tensors of arbitrary rank; parameter-group entries contain scalar
+            optimizer hyperparameters. Wholly absent state groups are removed
+            in place before DCP loading.
+        optimizer_state: Wrapper owning model parameters of arbitrary shape and
+            their scalar or parameter-shaped destination optimizer-state
+            tensors.
+        checkpoint_keys: Fully qualified metadata keys present in the saved DCP
+            optimizer checkpoint.
+
+    Returns:
+        Parameter FQNs whose optimizer state was wholly absent from the
+        checkpoint. No tensors are returned.
+    """
+    flat_optimizer_state = state_dict.get("optim")
+    if not isinstance(flat_optimizer_state, dict):
+        raise RuntimeError("Expected a flattened optimizer state dictionary under the 'optim' key")
+    if "state" in flat_optimizer_state and "param_groups" in flat_optimizer_state:
+        # PEFT with quantized parameters or expert parallelism deliberately uses
+        # the optimizer's native, nested state-dict format. Preserve that path.
+        return set()
+
+    destination_keys = set(flat_optimizer_state)
+    saved_keys = {key.removeprefix("optim.") for key in checkpoint_keys if key.startswith("optim.")}
+    unexpected_keys = saved_keys - destination_keys
+    if unexpected_keys:
+        examples = sorted(unexpected_keys)[:10]
+        raise RuntimeError(
+            f"Optimizer checkpoint contains {len(unexpected_keys)} unexpected key(s); examples: {examples}"
+        )
+
+    param_group_fqns = _optimizer_param_group_fqns(flat_optimizer_state, optimizer_state)
+    state_keys_by_fqn: dict[str, set[str]] = {fqn: set() for fqn in param_group_fqns}
+    unmatched_state_keys: list[str] = []
+    for key in destination_keys:
+        if not key.startswith("state."):
+            continue
+        matches = [fqn for fqn in param_group_fqns if key.startswith(f"state.{fqn}.")]
+        if not matches:
+            unmatched_state_keys.append(key)
+            continue
+        state_keys_by_fqn[max(matches, key=len)].add(key)
+    if unmatched_state_keys:
+        raise RuntimeError(
+            "Could not associate flattened optimizer state key(s) with param groups; "
+            f"examples: {sorted(unmatched_state_keys)[:10]}"
+        )
+
+    empty_state_fqns: set[str] = set()
+    allowed_missing_keys: set[str] = set()
+    for fqn, destination_state_keys in state_keys_by_fqn.items():
+        saved_state_keys = destination_state_keys & saved_keys
+        if not saved_state_keys:
+            empty_state_fqns.add(fqn)
+            allowed_missing_keys.update(destination_state_keys)
+        elif saved_state_keys != destination_state_keys:
+            missing = sorted(destination_state_keys - saved_state_keys)
+            raise RuntimeError(
+                f"Optimizer checkpoint has a partial state group for {fqn!r}; missing key(s): {missing[:10]}"
+            )
+
+    disallowed_missing_keys = destination_keys - saved_keys - allowed_missing_keys
+    if disallowed_missing_keys:
+        examples = sorted(disallowed_missing_keys)[:10]
+        raise RuntimeError(
+            f"Optimizer checkpoint is missing {len(disallowed_missing_keys)} required key(s); examples: {examples}"
+        )
+
+    for key in allowed_missing_keys:
+        flat_optimizer_state.pop(key)
+    if empty_state_fqns:
+        _clear_unmaterialized_optimizer_state(optimizer_state, empty_state_fqns)
+        logger.info(
+            "Restoring sparse optimizer state with %d parameter state group(s) not yet materialized",
+            len(empty_state_fqns),
+        )
+    return empty_state_fqns
+
+
 if _is_geq_torch_2_9():
     from torch.distributed.checkpoint.staging import DefaultStager
     from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType, AsyncSaveResponse
@@ -425,6 +613,7 @@ class Checkpointer:
         moe_mesh: Optional[DeviceMesh] = None,
         process_group: torch.distributed.ProcessGroup | None = None,
         pp_group: Optional["torch.distributed.ProcessGroup"] = None,
+        model_state_dict_keys: list[str] | None = None,
     ) -> None:
         """
         Initialize the checkpointer.
@@ -439,6 +628,9 @@ class Checkpointer:
             pp_group: Optional pipeline-parallel process group. Passed to
                 ``ModelState`` so PEFT adapters are gathered across PP stages at
                 save time (complete adapter under ``pp_size > 1``).
+            model_state_dict_keys: Runtime snapshot of model state-dict key
+                names captured before parallelization. When omitted, the legacy
+                serialized config field is copied for backward compatibility.
         """
         self.config = config
         self.moe_mesh = moe_mesh
@@ -447,6 +639,12 @@ class Checkpointer:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.process_group = process_group
+        resolved_model_state_dict_keys = (
+            model_state_dict_keys if model_state_dict_keys is not None else config.model_state_dict_keys
+        )
+        self.model_state_dict_keys = (
+            list(resolved_model_state_dict_keys) if resolved_model_state_dict_keys is not None else None
+        )
 
         # async specific variables
         self._model_ctx = _AsyncSaveContext(stager=None, process_group=None, future=None, staging_active=False)
@@ -624,8 +822,12 @@ class Checkpointer:
         """
         optimizer_state = OptimizerState(model, optimizer, scheduler, is_peft=self.config.is_peft)
         state_dict = optimizer_state.state_dict()
-        self._do_load(state_dict, os.path.join(weights_path, "optim"))
-        optimizer_state.load_state_dict(state_dict)
+        optimizer_path = os.path.join(weights_path, "optim")
+        storage_reader = _maybe_msc_reader(optimizer_path, None)
+        checkpoint_keys = _get_checkpoint_metadata_keys(optimizer_path, storage_reader)
+        empty_state_fqns = _prepare_optimizer_state_for_load(state_dict, optimizer_state, checkpoint_keys)
+        self._do_load(state_dict, optimizer_path, storage_reader=storage_reader)
+        optimizer_state.load_state_dict(state_dict, strict=not empty_state_fqns)
 
     @torch.no_grad()
     def load_model(
@@ -1365,27 +1567,27 @@ fi
     def _maybe_build_consolidated_index(
         self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
     ) -> Optional[dict[str, int]]:
-        """
-        Build FQN to shard index mapping for consolidated HF export.
+        """Build FQN to shard index mapping for consolidated HF export.
 
         Uses the base checkpoint index (if present), removes non-persistent keys,
         and assigns new keys to the last shard by default.
 
         Args:
-            model_state: Wrapper exposing the primary model part.
-            state_dict: The state dict that will be saved.
+            model_state: Wrapper exposing model parameters of arbitrary shape;
+                only model provenance and key metadata are inspected here.
+            state_dict: Mapping from FQN to scalar tensors of shape [] or model
+                tensors of arbitrary parameter/buffer shape. Tensor storage is
+                read only for size-based fallback sharding.
 
         Returns:
-            Mapping from FQN to shard index, or None when not consolidating.
+            Mapping from tensor FQN to one-based output shard index, or ``None``
+            when Hugging Face metadata is disabled. No tensors are returned.
         """
         if not _should_write_hf_metadata(self.config):
             return None
         model = model_state.model[0]
         # we first need to find the FQN -> .safetensors mapping
-        reference_path = _get_hf_safetensors_reference_path(
-            self.config.model_cache_dir,
-            self.config.model_repo_id,
-        )
+        reference_path = self._get_safetensors_reference_path(model_state)
         if reference_path:
             # HF VLM models may contain a special checkpoint mapping attribute
             fqn_to_file_index_mapping = get_fqn_to_file_index_mapping(
@@ -1395,7 +1597,7 @@ fi
             config = getattr(model_part, "config", None)
             model_type = getattr(config, "model_type", None)
             pre_shard_hf_state_dict_keys = (
-                getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.config.model_state_dict_keys
+                getattr(model, "_pre_shard_hf_state_dict_keys", None) or self.model_state_dict_keys
             )
             if pre_shard_hf_state_dict_keys is None:
                 pre_shard_hf_state_dict_keys = list(state_dict.keys())
@@ -1419,7 +1621,7 @@ fi
         else:
             pre_shard_hf_state_dict_keys = getattr(model, "_pre_shard_hf_state_dict_keys", None)
             if pre_shard_hf_state_dict_keys is None:
-                pre_shard_hf_state_dict_keys = self.config.model_state_dict_keys
+                pre_shard_hf_state_dict_keys = self.model_state_dict_keys
             fallback_keys = pre_shard_hf_state_dict_keys or list(state_dict.keys())
             fqn_to_file_index_mapping = _divide_keys_by_size(
                 fallback_keys,
@@ -1449,21 +1651,29 @@ fi
     def _maybe_build_original_dtype_mapping(
         self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
     ) -> Optional[dict[str, str]]:
-        """
-        Build FQN to original HF safetensors dtype mapping for consolidated export.
+        """Build an original-dtype mapping for consolidated Hugging Face export.
 
         Returns None when the run started from config-only weights or the original HF
         safetensors headers are not available. In that case consolidation keeps the
         saved checkpoint dtype unless the user explicitly passes CAST_DTYPE to the
         offline helper.
+
+        Args:
+            model_state: Wrapper exposing model parameters of arbitrary shape;
+                only model provenance and adapter metadata are inspected here.
+            state_dict: Mapping from FQN to scalar tensors of shape [] or model
+                tensors of arbitrary parameter/buffer shape. Tensor values are
+                not mutated.
+
+        Returns:
+            Mapping from exported tensor FQN to its safetensors dtype name, or
+            ``None`` when original dtype metadata is unavailable. No tensors are
+            returned.
         """
         if not _should_write_hf_metadata(self.config):
             return None
 
-        reference_path = _get_hf_safetensors_reference_path(
-            self.config.model_cache_dir,
-            self.config.model_repo_id,
-        )
+        reference_path = self._get_safetensors_reference_path(model_state)
         if not reference_path:
             return None
 
@@ -1564,16 +1774,26 @@ fi
         return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
     def _get_original_model_path(self, model_state: ModelState) -> str | None:
-        """
-        Get the path to the original model from the Hugging Face checkpoint.
-        """
-        if not hasattr(model_state.model[0], "name_or_path") and not hasattr(
-            getattr(model_state.model[0], "config", None), "name_or_path"
-        ):
-            return None
+        """Get the original local model path from Hugging Face provenance.
 
-        pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path", None) or getattr(
-            getattr(model_state.model[0], "config", None), "name_or_path", None
+        Args:
+            model_state: Wrapper around model parameters of arbitrary shape;
+                only model/config provenance attributes are inspected.
+
+        Returns:
+            Exact local model or component directory, or ``None`` when the model
+            was not constructed from a cached Hugging Face checkpoint.
+        """
+        model = model_state.model[0]
+        config = getattr(model, "config", None)
+        # Read config provenance first: probing `_name_or_path` on the model itself
+        # routes through Diffusers' config-proxy ``__getattr__`` and emits a
+        # deprecation warning for every checkpoint save.
+        pretrained_model_name_or_path = (
+            getattr(config, "name_or_path", None)
+            or getattr(config, "_name_or_path", None)
+            or getattr(model, "name_or_path", None)
+            or getattr(model, "_name_or_path", None)
         )
         # Randomly initialized HF models often have an empty `name_or_path`. In that case,
         # there is no "original" HF snapshot to reference for metadata.
@@ -1583,19 +1803,121 @@ fi
         if os.path.isdir(pretrained_model_name_or_path):
             return pretrained_model_name_or_path
 
-        # `original_model_root_dir` exists on the config but may be None. In that case,
-        # fall back to the standard HF hub cache root.
-        cache_dir = getattr(self.config, "original_model_root_dir", None) or HF_HUB_CACHE
-        return _get_hf_safetensors_reference_path(cache_dir, pretrained_model_name_or_path)
+        # `original_model_root_dir` is populated by base-model loading. Diffusers
+        # recipes instead retain their configured Hub cache directory.
+        cache_dir = getattr(self.config, "original_model_root_dir", None) or self.config.model_cache_dir or HF_HUB_CACHE
+        revision = getattr(config, "_commit_hash", None)
+        return _get_hf_safetensors_reference_path(cache_dir, pretrained_model_name_or_path, revision=revision)
+
+    def _get_safetensors_reference_path(self, model_state: ModelState) -> str | None:
+        """Resolve the exact weight directory used to construct ``model_state``.
+
+        Diffusers registers its pre-resolved component directory in
+        ``config._name_or_path``. Prefer that exact snapshot/component path so a
+        pinned training run cannot accidentally copy shard metadata from another
+        cached revision. Fall back to the legacy config-owned repo/cache lookup
+        for models that do not expose their construction path.
+
+        Args:
+            model_state: Wrapper around the model being checkpointed. Model
+                parameters may have arbitrary tensor shapes; this method reads
+                provenance attributes only and does not access tensor storage.
+
+        Returns:
+            Directory containing root Hugging Face or Diffusers transformer
+            safetensors, or ``None`` when no local reference weights exist.
+        """
+        original_model_path = self._get_original_model_path(model_state)
+        if original_model_path is not None:
+            reference_path = _get_hf_safetensors_reference_path(None, original_model_path)
+            if reference_path is not None:
+                return reference_path
+        return _get_hf_safetensors_reference_path(self.config.model_cache_dir, self.config.model_repo_id)
 
 
-def _get_hf_safetensors_reference_path(cache_dir: str | Path | None, repo_id: str | None) -> str | None:
+def _find_safetensors_weight_directory(model_root: Path) -> Path | None:
+    """Find root HF weights or a Diffusers transformer component under ``model_root``.
+
+    Root-model weights take precedence so adding Diffusers support does not
+    change established Transformers/VLM checkpoint behavior.
+
+    Args:
+        model_root: Local model or snapshot directory to inspect.
+
+    Returns:
+        Directory containing an index or direct safetensors files, or ``None``
+        when neither the root nor its standard ``transformer`` component has
+        weights.
+    """
+    index_filenames = ("model.safetensors.index.json", _DIFFUSERS_INDEX_FN)
+    for candidate in (model_root, model_root / "transformer"):
+        if not candidate.is_dir():
+            continue
+        if any((candidate / filename).is_file() for filename in index_filenames):
+            return candidate
+        if any(candidate.glob("*.safetensors")):
+            return candidate
+    return None
+
+
+def _cached_snapshot_directories(snapshots_root: Path, revision: str | None) -> list[Path]:
+    """Return cached snapshot candidates, honoring an explicit revision exactly.
+
+    Args:
+        snapshots_root: Hugging Face repository ``snapshots`` directory.
+        revision: Optional snapshot commit or cached ref name. When supplied,
+            no other cached revision is returned.
+
+    Returns:
+        Ordered snapshot directories to inspect. With no explicit revision the
+        cached ``main`` ref is preferred, followed by deterministic commit-path
+        order.
+    """
+    if revision is not None:
+        revision_path = Path(revision)
+        revision_parts = revision_path.parts
+        if revision_path.is_absolute() or not revision_parts or any(part in {"", ".", ".."} for part in revision_parts):
+            return []
+
+        snapshot = snapshots_root / revision_path
+        if snapshot.is_dir():
+            return [snapshot]
+
+        ref_path = snapshots_root.parent / "refs" / revision_path
+        if ref_path.is_file():
+            snapshot_name = ref_path.read_text(encoding="utf-8").strip()
+            if snapshot_name and Path(snapshot_name).name == snapshot_name:
+                referenced_snapshot = snapshots_root / snapshot_name
+                if referenced_snapshot.is_dir():
+                    return [referenced_snapshot]
+        return []
+
+    snapshot_dirs = sorted(path for path in snapshots_root.glob("*") if path.is_dir())
+    main_ref = snapshots_root.parent / "refs" / "main"
+    if not main_ref.is_file():
+        return snapshot_dirs
+    main_snapshot_name = main_ref.read_text(encoding="utf-8").strip()
+    if not main_snapshot_name or Path(main_snapshot_name).name != main_snapshot_name:
+        return snapshot_dirs
+    main_snapshot = snapshots_root / main_snapshot_name
+    if not main_snapshot.is_dir():
+        return snapshot_dirs
+    return [main_snapshot, *(path for path in snapshot_dirs if path != main_snapshot)]
+
+
+def _get_hf_safetensors_reference_path(
+    cache_dir: str | Path | None,
+    repo_id: str | None,
+    *,
+    revision: str | None = None,
+) -> str | None:
     """Return the local HF safetensors reference directory for a model.
 
-    Prefer the snapshot directory containing `model.safetensors.index.json` for
-    sharded checkpoints. If no index exists but a snapshot directory is present,
-    return that directory as the single-file safetensors reference path. Return
-    None when `repo_id` is None or the repo has no cached snapshot directory.
+    Prefer root Hugging Face weights, then the standard Diffusers
+    ``transformer`` component. Both ``model.safetensors.index.json`` and
+    ``diffusion_pytorch_model.safetensors.index.json`` are recognized, along
+    with unindexed safetensors files. An explicit revision selects only its
+    cached snapshot; it never falls back to another cached revision.
 
     For example, if the located file is
 
@@ -1605,22 +1927,24 @@ def _get_hf_safetensors_reference_path(cache_dir: str | Path | None, repo_id: st
 
         /opt/models/models--meta-llama--Llama-3.2-3B/snapshots/13afe...
 
-    This will error if the model hasn't been downloaded or if the cache directory is incorrect.
-
     Args:
-        cache_dir: Path to cache directory
-        repo_id: Hugging Face repository ID
+        cache_dir: Path to the Hugging Face cache directory. Ignored when
+            ``repo_id`` is an existing local model path.
+        repo_id: Hugging Face repository ID or local model/snapshot path.
+        revision: Optional exact commit or cached Hugging Face ref to select.
 
     Returns:
-        Path to the snapshot/model directory containing safetensors weights, or
-        None when no Hugging Face repo ID or cached snapshot is available.
+        Path to the root model or Diffusers transformer directory containing
+        safetensors weights, or ``None`` when the requested local reference is
+        unavailable.
     """
     # repo_id can be None if the model is not Hugging Face Hub yet
     if repo_id is None:
         return None
 
-    if os.path.exists(repo_id):
-        return repo_id
+    if os.path.isdir(repo_id):
+        reference_path = _find_safetensors_weight_directory(Path(repo_id))
+        return str(reference_path) if reference_path is not None else None
 
     cache_dir = cache_dir or HF_HUB_CACHE
     if cache_dir is None:
@@ -1628,22 +1952,10 @@ def _get_hf_safetensors_reference_path(cache_dir: str | Path | None, repo_id: st
         raise ValueError("Hugging Face cache directory is not set (cache_dir=None).")
     repo_dir = f"models--{repo_id.replace('/', '--')}"
     snapshots_root = Path(cache_dir) / repo_dir / "snapshots"
-
-    # Look for an index file inside any snapshot directory.
-    pattern = snapshots_root / "*" / "model.safetensors.index.json"
-    matches = glob.glob(str(pattern))
-    if matches:
-        # Return the directory path that contains the index file.
-        return str(Path(matches[0]).parent)
-
-    # Fall back: if no index file, return the first available snapshot directory (if any).
-    # This is the case for single-file models.
-    snapshot_dirs = [p for p in glob.glob(str(snapshots_root / "*")) if Path(p).is_dir()]
-    if snapshot_dirs:
-        try:
-            return snapshot_dirs[0]
-        except IndexError:
-            raise FileNotFoundError(f"No snapshot directories found in {snapshots_root}")
+    for snapshot_dir in _cached_snapshot_directories(snapshots_root, revision):
+        reference_path = _find_safetensors_weight_directory(snapshot_dir)
+        if reference_path is not None:
+            return str(reference_path)
     return None
 
 

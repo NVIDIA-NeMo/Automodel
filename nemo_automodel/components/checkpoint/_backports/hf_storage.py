@@ -481,6 +481,26 @@ def _extract_file_index_with_status(filename: str) -> tuple[int, bool]:
     return 1, False
 
 
+def _find_safetensors_index_file(reference_model_path: str) -> str | None:
+    """Return a Transformers or Diffusers safetensors index in ``reference_model_path``.
+
+    Transformers' root-model index takes precedence when both formats are
+    present. Diffusers model components use
+    ``diffusion_pytorch_model.safetensors.index.json`` instead.
+
+    Args:
+        reference_model_path: Directory containing safetensors weights.
+
+    Returns:
+        Existing index path, or ``None`` for an unindexed checkpoint.
+    """
+    for filename in (_metadata_fn, _DIFFUSERS_INDEX_FN):
+        index_file = os.path.join(reference_model_path, filename)
+        if os.path.isfile(index_file):
+            return index_file
+    return None
+
+
 def get_fqn_to_file_index_mapping(
     reference_model_path: str, key_mapping: Optional[dict[str, str]] = None
 ) -> dict[str, int]:
@@ -498,8 +518,8 @@ def get_fqn_to_file_index_mapping(
     fqn_to_filename_mapping: dict[str, str] = {}
     filename_to_index: dict[str, tuple[int, bool]] = {}
 
-    index_file = os.path.join(reference_model_path, _metadata_fn)
-    if os.path.isfile(index_file):
+    index_file = _find_safetensors_index_file(reference_model_path)
+    if index_file is not None:
         with open(index_file) as f:
             index = json.load(f)
         weight_map = index.get("weight_map", {})
@@ -559,8 +579,8 @@ def get_fqn_to_dtype_mapping(reference_model_path: str, key_mapping: Optional[di
     fqn_to_dtype_mapping: dict[str, str] = {}
     filenames: set[str] = set()
 
-    index_file = os.path.join(reference_model_path, _metadata_fn)
-    if os.path.isfile(index_file):
+    index_file = _find_safetensors_index_file(reference_model_path)
+    if index_file is not None:
         with open(index_file) as f:
             index = json.load(f)
         filenames.update(index.get("weight_map", {}).values())
