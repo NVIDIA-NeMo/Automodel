@@ -197,6 +197,36 @@ def _preload_media(example, processor=None, preserve_video_metadata=False):
                             processor,
                             frame_indices=item.get("frame_indices"),
                         )
+                elif isinstance(vid, (list, tuple)) and vid and all(isinstance(f, str) for f in vid):
+                    # Pre-extracted frame sequence: every entry is an image path,
+                    # so frames load directly -- no video decoder required.
+                    temporal_patch_size = 2
+                    if processor is not None and hasattr(processor, "video_processor"):
+                        temporal_patch_size = getattr(processor.video_processor, "temporal_patch_size", 2)
+                    frames = [Image.open(f).convert("RGB") for f in vid]
+                    indices = list(range(len(frames)))
+                    # Pad to temporal_patch_size alignment by repeating the last
+                    # frame, mirroring the decord path above.
+                    remainder = len(indices) % temporal_patch_size
+                    if remainder != 0:
+                        pad = temporal_patch_size - remainder
+                        frames.extend([frames[-1]] * pad)
+                        indices.extend([indices[-1]] * pad)
+                    item["video"] = frames
+                    if preserve_video_metadata:
+                        fps = item.get("fps")
+                        if fps is None and processor is not None and hasattr(processor, "video_processor"):
+                            fps = getattr(processor.video_processor, "fps", None)
+                        if fps is None:
+                            raise ValueError(
+                                "fps is required for pre-extracted frame sequences when "
+                                "preserve_video_metadata is enabled, but none could be resolved. "
+                                "Set an 'fps' field on the video content item, or configure 'fps' "
+                                "on the processor's video_processor so that correct timestamps can "
+                                "be built for the extracted frames."
+                            )
+                        item["_video_fps"] = fps
+                        item["_frame_indices"] = indices
     return example
 
 
