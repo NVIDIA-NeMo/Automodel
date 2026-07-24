@@ -324,10 +324,56 @@ def apply_rotary_pos_emb(
     sin: torch.Tensor,
     position_ids: Optional[torch.Tensor] = None,
     unsqueeze_dim: int = 1,
+    fused: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply Rotary Position Embedding to query and key tensors."""
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
+    if fused:
+        return _bagel_fused_rope(q, k, cos, sin)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+# ---------------------------------------------------------------------------
+# Optional fused-kernel helpers. Pure functions; gated by BagelBackendConfig at
+# the call sites (default OFF).
+# ---------------------------------------------------------------------------
+
+
+@torch.compile(dynamic=True)
+def _bagel_fused_silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """Fused SwiGLU gate: ``silu(gate) * up`` in a single compiled pointwise kernel.
+
+    Compiling ONLY this pointwise activation — over regular (non-DTensor) activation tensors,
+    not the projections/attention that run on FSDP2 DTensor params — fuses the silu and the
+    multiply into one kernel (fewer launches, no materialization of the silu output) without
+    triggering the DTensor-spec recompile thrash that whole-layer ``torch.compile`` hits.
+    """
+    return torch.nn.functional.silu(gate) * up
+
+
+@torch.compile(dynamic=True)
+def _bagel_fused_rope(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused RoPE apply: rotate ``q`` and ``k`` in a single compiled pointwise kernel.
+
+    ``cos``/``sin`` arrive already unsqueezed to broadcast over the head dim. Compiling this
+    pointwise region — like the SwiGLU gate, over regular activation tensors and no FSDP2
+    DTensor parameters — fuses the ``rotate_half`` slice/negate/cat and the mul/add into far
+    fewer kernels than eager ATen, with no recompile thrash.
+
+    Args:
+        q: Query states, shape ``[tokens, heads, head_dim]``.
+        k: Key states, shape ``[tokens, kv_heads, head_dim]``.
+        cos: Cosine table, broadcastable to ``q`` and ``k``.
+        sin: Sine table, broadcastable to ``q`` and ``k``.
+
+    Returns:
+        Tuple of rotated ``(q_embed, k_embed)`` matching the inputs' shapes and dtypes.
+    """
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -345,9 +391,17 @@ class Qwen2MLP(nn.Module):
         self.up_proj = _initialize_linear(self.backend, self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = _initialize_linear(self.backend, self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        # Fuse silu(gate)*up only when the activation is silu (BAGEL/Qwen2 default).
+        self._fuse_silu_mul = (
+            getattr(self.backend, "fused_swiglu", False) and getattr(config, "hidden_act", "silu") == "silu"
+        )
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+        gate = self.gate_proj(hidden_state)
+        up = self.up_proj(hidden_state)
+        if self._fuse_silu_mul:
+            return self.down_proj(_bagel_fused_silu_mul(gate, up))
+        return self.down_proj(self.act_fn(gate) * up)
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +524,12 @@ class PackedAttention(_PackedAttentionBase):
 
         packed_cos, packed_sin = packed_position_embeddings
         packed_query_states, packed_key_states = apply_rotary_pos_emb(
-            packed_query_states, packed_key_states, packed_cos, packed_sin, unsqueeze_dim=1
+            packed_query_states,
+            packed_key_states,
+            packed_cos,
+            packed_sin,
+            unsqueeze_dim=1,
+            fused=self.backend.fused_rope,
         )
 
         if isinstance(attention_mask, list):
@@ -633,88 +692,139 @@ class PackedAttentionMoT(_PackedAttentionBase):
         packed_position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         packed_und_token_indexes: torch.LongTensor,
         packed_gen_token_indexes: torch.LongTensor,
+        mot_perm: Optional[torch.LongTensor] = None,
+        mot_inv: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
-        packed_sequence_und = packed_sequence[packed_und_token_indexes]
-        packed_sequence_gen = packed_sequence[packed_gen_token_indexes]
         freeze_und = getattr(self.config, "freeze_und", False)
 
-        packed_query_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_heads * self.head_dim))
-        packed_key_states = packed_sequence.new_zeros(
-            (packed_sequence.shape[0], self.num_key_value_heads * self.head_dim)
-        )
-        packed_value_states = packed_sequence.new_zeros(
-            (packed_sequence.shape[0], self.num_key_value_heads * self.head_dim)
-        )
-        _index_put_matching_dtype(packed_query_states, packed_und_token_indexes, self.q_proj(packed_sequence_und))
-        _index_put_matching_dtype(
-            packed_query_states, packed_gen_token_indexes, self.q_proj_moe_gen(packed_sequence_gen)
-        )
-        _index_put_matching_dtype(packed_key_states, packed_und_token_indexes, self.k_proj(packed_sequence_und))
-        _index_put_matching_dtype(packed_key_states, packed_gen_token_indexes, self.k_proj_moe_gen(packed_sequence_gen))
-        _index_put_matching_dtype(packed_value_states, packed_und_token_indexes, self.v_proj(packed_sequence_und))
-        _index_put_matching_dtype(
-            packed_value_states, packed_gen_token_indexes, self.v_proj_moe_gen(packed_sequence_gen)
-        )
+        if mot_perm is not None:
+            # MLM-style: und tokens are [:Lund], gen tokens [Lund:] — slice + concat, no gather/scatter.
+            lund = packed_und_token_indexes.shape[0]
+            seq_und = packed_sequence[:lund]
+            seq_gen = packed_sequence[lund:]
+            q = torch.cat([self.q_proj(seq_und), self.q_proj_moe_gen(seq_gen)], dim=0).view(
+                -1, self.num_heads, self.head_dim
+            )
+            k = torch.cat([self.k_proj(seq_und), self.k_proj_moe_gen(seq_gen)], dim=0).view(
+                -1, self.num_key_value_heads, self.head_dim
+            )
+            packed_value_states = torch.cat([self.v_proj(seq_und), self.v_proj_moe_gen(seq_gen)], dim=0).view(
+                -1, self.num_key_value_heads, self.head_dim
+            )
+            packed_query_states_ = torch.cat(
+                [
+                    _apply_qk_norm(self.q_norm, q[:lund], backend=self.backend, eps=self.config.rms_norm_eps),
+                    _apply_qk_norm(self.q_norm_moe_gen, q[lund:], backend=self.backend, eps=self.config.rms_norm_eps),
+                ],
+                dim=0,
+            )
+            packed_key_states_ = torch.cat(
+                [
+                    _apply_qk_norm(self.k_norm, k[:lund], backend=self.backend, eps=self.config.rms_norm_eps),
+                    _apply_qk_norm(self.k_norm_moe_gen, k[lund:], backend=self.backend, eps=self.config.rms_norm_eps),
+                ],
+                dim=0,
+            )
+            if freeze_und:
+                packed_value_states[:lund] = packed_value_states[:lund].detach()
+                packed_query_states_[:lund] = packed_query_states_[:lund].detach()
+                packed_key_states_[:lund] = packed_key_states_[:lund].detach()
+        else:
+            packed_sequence_und = packed_sequence[packed_und_token_indexes]
+            packed_sequence_gen = packed_sequence[packed_gen_token_indexes]
 
-        packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
-        packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
-        packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
-        if freeze_und:
-            packed_value_states[packed_und_token_indexes] = packed_value_states[packed_und_token_indexes].detach()
+            packed_query_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_heads * self.head_dim))
+            packed_key_states = packed_sequence.new_zeros(
+                (packed_sequence.shape[0], self.num_key_value_heads * self.head_dim)
+            )
+            packed_value_states = packed_sequence.new_zeros(
+                (packed_sequence.shape[0], self.num_key_value_heads * self.head_dim)
+            )
+            _index_put_matching_dtype(packed_query_states, packed_und_token_indexes, self.q_proj(packed_sequence_und))
+            _index_put_matching_dtype(
+                packed_query_states, packed_gen_token_indexes, self.q_proj_moe_gen(packed_sequence_gen)
+            )
+            _index_put_matching_dtype(packed_key_states, packed_und_token_indexes, self.k_proj(packed_sequence_und))
+            _index_put_matching_dtype(
+                packed_key_states, packed_gen_token_indexes, self.k_proj_moe_gen(packed_sequence_gen)
+            )
+            _index_put_matching_dtype(packed_value_states, packed_und_token_indexes, self.v_proj(packed_sequence_und))
+            _index_put_matching_dtype(
+                packed_value_states, packed_gen_token_indexes, self.v_proj_moe_gen(packed_sequence_gen)
+            )
 
-        packed_query_states_ = packed_query_states.new_zeros(packed_query_states.shape)
-        packed_key_states_ = packed_key_states.new_zeros(packed_key_states.shape)
+            packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
+            packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
+            packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
+            if freeze_und:
+                packed_value_states[packed_und_token_indexes] = packed_value_states[packed_und_token_indexes].detach()
 
-        _index_put_matching_dtype(
-            packed_query_states_,
-            packed_und_token_indexes,
-            _apply_qk_norm(
-                self.q_norm,
-                packed_query_states[packed_und_token_indexes],
-                backend=self.backend,
-                eps=self.config.rms_norm_eps,
-            ),
-        )
-        if freeze_und:
-            packed_query_states_[packed_und_token_indexes] = packed_query_states_[packed_und_token_indexes].detach()
-        _index_put_matching_dtype(
-            packed_query_states_,
-            packed_gen_token_indexes,
-            _apply_qk_norm(
-                self.q_norm_moe_gen,
-                packed_query_states[packed_gen_token_indexes],
-                backend=self.backend,
-                eps=self.config.rms_norm_eps,
-            ),
-        )
+            packed_query_states_ = packed_query_states.new_zeros(packed_query_states.shape)
+            packed_key_states_ = packed_key_states.new_zeros(packed_key_states.shape)
 
-        _index_put_matching_dtype(
-            packed_key_states_,
-            packed_und_token_indexes,
-            _apply_qk_norm(
-                self.k_norm,
-                packed_key_states[packed_und_token_indexes],
-                backend=self.backend,
-                eps=self.config.rms_norm_eps,
-            ),
-        )
-        if freeze_und:
-            packed_key_states_[packed_und_token_indexes] = packed_key_states_[packed_und_token_indexes].detach()
-        _index_put_matching_dtype(
-            packed_key_states_,
-            packed_gen_token_indexes,
-            _apply_qk_norm(
-                self.k_norm_moe_gen,
-                packed_key_states[packed_gen_token_indexes],
-                backend=self.backend,
-                eps=self.config.rms_norm_eps,
-            ),
-        )
+            _index_put_matching_dtype(
+                packed_query_states_,
+                packed_und_token_indexes,
+                _apply_qk_norm(
+                    self.q_norm,
+                    packed_query_states[packed_und_token_indexes],
+                    backend=self.backend,
+                    eps=self.config.rms_norm_eps,
+                ),
+            )
+            if freeze_und:
+                packed_query_states_[packed_und_token_indexes] = packed_query_states_[packed_und_token_indexes].detach()
+            _index_put_matching_dtype(
+                packed_query_states_,
+                packed_gen_token_indexes,
+                _apply_qk_norm(
+                    self.q_norm_moe_gen,
+                    packed_query_states[packed_gen_token_indexes],
+                    backend=self.backend,
+                    eps=self.config.rms_norm_eps,
+                ),
+            )
+
+            _index_put_matching_dtype(
+                packed_key_states_,
+                packed_und_token_indexes,
+                _apply_qk_norm(
+                    self.k_norm,
+                    packed_key_states[packed_und_token_indexes],
+                    backend=self.backend,
+                    eps=self.config.rms_norm_eps,
+                ),
+            )
+            if freeze_und:
+                packed_key_states_[packed_und_token_indexes] = packed_key_states_[packed_und_token_indexes].detach()
+            _index_put_matching_dtype(
+                packed_key_states_,
+                packed_gen_token_indexes,
+                _apply_qk_norm(
+                    self.k_norm_moe_gen,
+                    packed_key_states[packed_gen_token_indexes],
+                    backend=self.backend,
+                    eps=self.config.rms_norm_eps,
+                ),
+            )
 
         packed_cos, packed_sin = packed_position_embeddings
         packed_query_states_, packed_key_states_ = apply_rotary_pos_emb(
-            packed_query_states_, packed_key_states_, packed_cos, packed_sin, unsqueeze_dim=1
+            packed_query_states_,
+            packed_key_states_,
+            packed_cos,
+            packed_sin,
+            unsqueeze_dim=1,
+            fused=self.backend.fused_rope,
         )
+
+        if mot_inv is not None:
+            # Restore ORIGINAL token order for the attention kernel so the block-diagonal mask
+            # stays block-sparse (RoPE is already applied in grouped order with original position
+            # values, so this only re-scatters rows). Re-grouped after attention for the O-proj.
+            packed_query_states_ = packed_query_states_[mot_inv]
+            packed_key_states_ = packed_key_states_[mot_inv]
+            packed_value_states = packed_value_states[mot_inv]
 
         if isinstance(attention_mask, list):
             packed_key_states_ = packed_key_states_[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
@@ -739,7 +849,7 @@ class PackedAttentionMoT(_PackedAttentionBase):
                 unpacked_attn_output.append(attn_output.squeeze(0))
             packed_attn_output = torch.cat(unpacked_attn_output, dim=1)
         else:
-            pad_size = sum(sample_lens) - packed_query_states.shape[0]
+            pad_size = sum(sample_lens) - packed_query_states_.shape[0]
             packed_query_states_ = _pad_sequence(packed_query_states_.permute(1, 0, 2), pad_size)
             packed_key_states_ = _pad_sequence(packed_key_states_.permute(1, 0, 2), pad_size)
             packed_value_states = _pad_sequence(packed_value_states.permute(1, 0, 2), pad_size)
@@ -754,6 +864,14 @@ class PackedAttentionMoT(_PackedAttentionBase):
             packed_attn_output = packed_attn_output[0, :, :end_index, :]
 
         packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.num_heads * self.head_dim)
+        if mot_perm is not None:
+            # Re-group the attention output (original -> [und | gen]) for slice O-proj.
+            packed_attn_output = packed_attn_output[mot_perm]
+            lund = packed_und_token_indexes.shape[0]
+            return torch.cat(
+                [self.o_proj(packed_attn_output[:lund]), self.o_proj_moe_gen(packed_attn_output[lund:])],
+                dim=0,
+            )
         packed_attn_output_ = packed_attn_output.new_zeros(packed_attn_output.shape)
         _index_put_matching_dtype(
             packed_attn_output_,
@@ -1064,7 +1182,42 @@ class Qwen2MoTDecoderLayer(nn.Module):
         packed_position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         packed_und_token_indexes: torch.LongTensor,
         packed_gen_token_indexes: torch.LongTensor,
+        mot_perm: Optional[torch.LongTensor] = None,
+        mot_inv: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
+        if mot_perm is not None:
+            # MLM-style slice+concat routing at the scalar und/gen boundary.
+            lund = packed_und_token_indexes.shape[0]
+            residual = packed_sequence
+            packed_sequence_ = torch.cat(
+                [
+                    self.input_layernorm(packed_sequence[:lund]),
+                    self.input_layernorm_moe_gen(packed_sequence[lund:]),
+                ],
+                dim=0,
+            )
+            packed_sequence_ = self.self_attn(
+                packed_sequence=packed_sequence_,
+                sample_lens=sample_lens,
+                attention_mask=attention_mask,
+                packed_position_embeddings=packed_position_embeddings,
+                packed_und_token_indexes=packed_und_token_indexes,
+                packed_gen_token_indexes=packed_gen_token_indexes,
+                mot_perm=mot_perm,
+                mot_inv=mot_inv,
+            )
+            if self.freeze_und:
+                packed_sequence_[:lund] = packed_sequence_[:lund].detach()
+            packed_sequence = residual + packed_sequence_
+            residual = packed_sequence
+            und_out = self.mlp(self.post_attention_layernorm(packed_sequence[:lund]))
+            gen_out = self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(packed_sequence[lund:]))
+            mlp_out = torch.cat([und_out, gen_out], dim=0)
+            if self.freeze_und:
+                mlp_out[:lund] = mlp_out[:lund].detach()
+            packed_sequence = residual + mlp_out
+            return packed_sequence
+
         residual = packed_sequence
         packed_sequence_ = packed_sequence.new_zeros(packed_sequence.shape)
         _index_put_matching_dtype(
@@ -1266,10 +1419,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
         packed_position_ids: torch.Tensor,
         packed_und_token_indexes: Optional[torch.LongTensor] = None,
         packed_gen_token_indexes: Optional[torch.LongTensor] = None,
+        mot_perm: Optional[torch.LongTensor] = None,
+        mot_inv: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         freeze_und = getattr(self.config, "freeze_und", False)
         if freeze_und:
-            packed_sequence[packed_und_token_indexes] = packed_sequence[packed_und_token_indexes].detach()
+            if mot_perm is not None and packed_und_token_indexes is not None:
+                lund = packed_und_token_indexes.shape[0]
+                packed_sequence[:lund] = packed_sequence[:lund].detach()
+            else:
+                packed_sequence[packed_und_token_indexes] = packed_sequence[packed_und_token_indexes].detach()
 
         cos, sin = self.rotary_emb(packed_sequence, packed_position_ids.unsqueeze(0))
         cos = cos.squeeze(0)
@@ -1286,6 +1445,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 packed_und_token_indexes=packed_und_token_indexes,
                 packed_gen_token_indexes=packed_gen_token_indexes,
             )
+            if mot_perm is not None:
+                extra_inputs.update(mot_perm=mot_perm, mot_inv=mot_inv)
 
         for decoder_layer in self.layers:
             packed_sequence = decoder_layer(
@@ -1297,6 +1458,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
             )
 
         if self.use_moe:
+            if mot_perm is not None:
+                lund = packed_und_token_indexes.shape[0]
+                packed_sequence_ = torch.cat(
+                    [self.norm(packed_sequence[:lund]), self.norm_moe_gen(packed_sequence[lund:])], dim=0
+                )
+                if freeze_und:
+                    packed_sequence_[:lund] = packed_sequence_[:lund].detach()
+                return packed_sequence_
             packed_sequence_ = torch.zeros_like(packed_sequence)
             _index_put_matching_dtype(
                 packed_sequence_,
@@ -1440,6 +1609,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         packed_position_ids: torch.Tensor,
         packed_und_token_indexes: Optional[torch.LongTensor] = None,
         packed_gen_token_indexes: Optional[torch.LongTensor] = None,
+        mot_perm: Optional[torch.LongTensor] = None,
+        mot_inv: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         # BAGEL's forward_train returns the raw hidden states; the upstream
         # training loop applies lm_head only on text-token positions to save
@@ -1452,6 +1623,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             attention_mask=attention_mask,
             packed_und_token_indexes=packed_und_token_indexes,
             packed_gen_token_indexes=packed_gen_token_indexes,
+            mot_perm=mot_perm,
+            mot_inv=mot_inv,
         )
 
     def forward_inference(
