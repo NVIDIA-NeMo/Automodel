@@ -222,9 +222,11 @@ linting = [
 test = ["coverage", "pytest", "pytest-shard", "peft>=0.18.1", "ruamel.yaml", "onnxruntime-gpu; (platform_machine == 'x86_64' and platform_system != 'Darwin')"]
 dev = [
     "cut-cross-entropy",
-    "magi_attention",
     "liger-kernel; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
     "dion @ git+https://github.com/microsoft/dion.git; platform_machine == 'x86_64' and platform_system != 'Darwin'",
+]
+magi = [
+    "magi_attention",
 ]
 
 [tool.uv]
@@ -324,6 +326,7 @@ explicit = true
 [tool.uv.extra-build-dependencies]
 deep_ep = [{ requirement = "torch", match-runtime = true }]
 magi_attention = [
+    "cmake",
     "ninja",
     "packaging",
     "versioningit",

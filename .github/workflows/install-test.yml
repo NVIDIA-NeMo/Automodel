@@ -125,9 +125,6 @@ jobs:
           PAT: ${{ secrets.PAT }}
           UV_PROJECT_ENVIRONMENT: ./venv
           TORCH_CUDA_ARCH_LIST: "9.0 10.0 12.0"
-          MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY: "90,100"
-          MAGI_ATTENTION_PREBUILD_FFA: "0"
-          MAX_JOBS: "8"
         shell: bash
         run: |
           echo -e "machine github.com\n  login token\n  password ${{ secrets.PAT }}" > ~/.netrc
@@ -138,7 +135,7 @@ jobs:
 
           export PATH="./bin/:$PATH"
 
-          uv sync --link-mode copy --locked --all-groups --extra all
+          uv sync --link-mode copy --locked --all-groups --no-group magi --extra all
 
           uv pip install --no-deps -e .
 
@@ -282,12 +279,9 @@ jobs:
 
           if [[ $EXTRA == *"fa"* || $EXTRA == *"cuda"* || $EXTRA == *"all"* ]]; then
             pip install --find-links "${PIP_FIND_LINKS}" --index-url ${TORCH_CU_INDEX} "torch>=2.9.0"
-            pip install --find-links "${PIP_FIND_LINKS}" numpy packaging psutil pybind11 setuptools versioningit wheel wheel_stub
+            pip install --find-links "${PIP_FIND_LINKS}" numpy packaging psutil pybind11 setuptools wheel wheel_stub
             PIP_ARGS=(--no-build-isolation)
             export TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0"
-            export MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY="90,100"
-            export MAGI_ATTENTION_PREBUILD_FFA=0
-            export MAX_JOBS=8
           fi
 
           pip install --find-links "${PIP_FIND_LINKS}" ${PIP_ARGS[@]} .$EXTRA
@@ -341,7 +335,7 @@ jobs:
 
           uv sync --link-mode copy --locked --only-group build
 
-          uv sync --link-mode copy --locked --all-groups
+          uv sync --link-mode copy --locked --all-groups --no-group magi
 
           uv pip install --no-deps -e .
 
