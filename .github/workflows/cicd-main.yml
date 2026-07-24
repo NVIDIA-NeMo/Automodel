@@ -652,12 +652,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [pre-flight, Nemo_CICD_Test]
     if: |
-      (
-        (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
-        || success()
-        || (needs.pre-flight.outputs.is_member != 'true' && needs.Nemo_CICD_Test.result == 'success')
-      )
-      && !cancelled()
+      !cancelled()
+      && needs.Nemo_CICD_Test.result == 'success'
       && vars.ENABLE_CODECOV == 'true'
     strategy:
       matrix:
