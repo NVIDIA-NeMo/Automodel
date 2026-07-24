@@ -73,7 +73,7 @@ Three bugs in diffusers (≤ 0.39, `models/attention_dispatch.py`) restrict trai
 
 A related limitation (by design, not a bug): ring attention requires the attention backend to return log-sum-exp (`return_lse=True`) for merging partial results across ring steps, which the `native` SDPA backend cannot do — so even after the bugs above are fixed upstream, ring will require a flash-class backend.
 
-One benign quirk worth knowing: the `flash` backend's backward op on the CP path advances the CUDA RNG (philox) state on every call, even with dropout 0 — `native`, `_native_flash`, and `_native_cudnn` do not. Training remains correct (every CP peer executes the identical call sequence, so peers stay RNG-synchronized, and the step-0 gradient norm matches the cp=1 baseline exactly), but the noise/timestep draws from step 1 onward differ from any non-flash run, so per-step loss curves are only comparable against a baseline using the same backend.
+One benign quirk is that the `flash` backend's backward operation on the CP path advances the CUDA RNG (Philox) state on every call, even with dropout 0. The `native`, `_native_flash`, and `_native_cudnn` backends do not. Training remains correct because every CP peer executes the same call sequence, so peers stay RNG-synchronized, and the step-0 gradient norm matches the `cp_size = 1` baseline exactly. However, the noise and timestep draws from step 1 onward differ from any non-flash run, so per-step loss curves are comparable only to a baseline that uses the same backend.
 
 Both issues should be reported/fixed upstream; once they land, `cp_ring_degree` can be re-enabled here for ring or hybrid ring×Ulysses layouts (useful when CP spans nodes and all-to-all bandwidth is the constraint).
 
