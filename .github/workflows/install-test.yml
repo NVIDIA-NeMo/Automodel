@@ -203,6 +203,7 @@ jobs:
           mkdir -p "${WHEELHOUSE_DIR}"
           pip wheel --no-deps --no-build-isolation --wheel-dir "${WHEELHOUSE_DIR}" \
             causal-conv1d \
+            "flash-attn<=2.8.3" \
             mamba-ssm \
             nv-grouped-gemm \
             transformer-engine-torch \
@@ -214,6 +215,7 @@ jobs:
           # Ensure cache hit and freshly-built paths both provide the expected heavy wheels.
           ls -1 "${WHEELHOUSE_DIR}"/*.whl
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/causal_conv1d*.whl 2>/dev/null)"
+          test -n "$(ls -1 "${WHEELHOUSE_DIR}"/flash_attn*.whl 2>/dev/null)"
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/mamba_ssm*.whl 2>/dev/null)"
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/nv_grouped_gemm*.whl 2>/dev/null)"
           test -n "$(ls -1 "${WHEELHOUSE_DIR}"/transformer_engine_torch*.whl 2>/dev/null)"
@@ -240,11 +242,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12"]
-        # TEMP (PR #2397): "fa" removed from the matrix. The [fa] install compiles
-        # flash-attn from source on every run (~2h+) and dominates CI wall-time.
-        # Re-enable once a prebuilt flash-attn wheel is cached in the CUDA wheelhouse.
-        # cc @ko3n1g @thomasdhc (oliver könig, Dong Hyuk Chang)
-        extra-groups: ["", "cuda", "vlm", "media", "all"]
+        extra-groups: ["", "cuda", "fa", "vlm", "media", "all"]
     env:
       EXTRA: ${{ matrix.extra-groups != '' && format('[{0}]', matrix.extra-groups) || '' }}
       WHEELHOUSE_DIR: /tmp/cuda-wheelhouse

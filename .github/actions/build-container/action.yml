@@ -100,7 +100,26 @@ runs:
         echo "EOF" | tee -a $GITHUB_OUTPUT
 
     - name: Set up Docker Buildx
+      id: setup-buildx
       uses: docker/setup-buildx-action@v3
+
+    - name: Restore BuildKit cache mounts
+      id: buildkit-cache
+      uses: actions/cache@v4
+      with:
+        path: .buildkit-cache
+        # Compiled CUDA wheels are ABI-bound to the Dockerfile base image and lockfiles.
+        key: buildkit-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(inputs.dockerfile-path, 'docker/common/uv-pytorch.lock', 'uv.lock') }}
+
+    - name: Inject cache mounts into BuildKit
+      uses: reproducible-containers/buildkit-cache-dance@5b81f4d29dc8397a7d341dba3aeecc7ec54d6361 # v3.3.0
+      with:
+        builder: ${{ steps.setup-buildx.outputs.name }}
+        utility-image: ghcr.io/containerd/busybox@sha256:52f73a0a43a16cf37cd0720c90887ce972fe60ee06a687ee71fb93a7ca601df7
+        scratch-dir: .buildkit-cache/scratch
+        cache-dir: .buildkit-cache
+        dockerfile: ${{ inputs.dockerfile-path }}
+        skip-extraction: ${{ steps.buildkit-cache.outputs.cache-hit }}
 
     - name: Build and push
       uses: docker/build-push-action@v5

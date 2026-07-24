@@ -22,7 +22,7 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 
 # Add the media extra on top of the image's existing all-extra environment.
-uv sync --extra all --extra media --all-groups --locked --no-cache
+uv sync --extra all --extra media --all-groups --locked
 
 # torchcodec from source to match the container PyTorch ABI (the PyPI wheel mismatches).
 I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
