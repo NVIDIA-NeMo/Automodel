@@ -49,6 +49,10 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 
 # Use shared rope_utils (same implementation as Llama, supports both config formats)
@@ -56,9 +60,10 @@ from nemo_automodel.components.models.llama.rope_utils import (
     Qwen2RotaryEmbedding,
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_fused,
+    apply_rotary_pos_emb_quack,
 )
 from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
-from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
+from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator, safe_import_from
 
 __all__ = ["Qwen2ForCausalLM"]
 
@@ -78,6 +83,17 @@ class Qwen2Attention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
         self.rope_fusion = getattr(backend, "rope_fusion", False)
+        self.rope_backend = getattr(backend, "rope", "torch")
+        self._quack_apply_rotary_emb = None
+        if self.rope_backend == "quack":
+            available, apply_rotary_emb = safe_import_from(
+                "quack.rotary",
+                "apply_rotary_emb",
+                msg="rope='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
+            )
+            if not available:
+                raise ImportError("rope='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].")
+            self._quack_apply_rotary_emb = apply_rotary_emb
 
         # Separate projections -- same layout as HuggingFace default Qwen2
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=True)
@@ -107,7 +123,16 @@ class Qwen2Attention(nn.Module):
         key_states = k.view(hidden_shape).transpose(1, 2)
         value_states = v.view(hidden_shape).transpose(1, 2)
 
-        if self.rope_fusion and len(position_embeddings) == 3:
+        if self.rope_backend == "quack" and query_states.is_cuda:
+            cos, sin = position_embeddings[:2]
+            query_states, key_states = apply_rotary_pos_emb_quack(
+                query_states,
+                key_states,
+                cos,
+                sin,
+                self._quack_apply_rotary_emb,
+            )
+        elif self.rope_fusion and len(position_embeddings) == 3:
             cos, sin, freqs_cis = position_embeddings
             query_states, key_states = apply_rotary_pos_emb_fused(query_states, key_states, freqs_cis)
         else:
@@ -374,6 +399,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
     Uses separate q/k/v and gate/up projections -- HuggingFace layout.
     """
 
+    tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -392,6 +418,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         config: Qwen2Config,
         backend: Optional[BackendConfig] = None,
     ):
+        reject_unsupported_tie_word_embeddings(type(self), config)
         warn_deprecated_model_class("Qwen2ForCausalLM")
         super().__init__(config)
         self.backend = backend or BackendConfig()
@@ -430,6 +457,13 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def tie_weights(self, *_args: object, **_kwargs: object) -> None:
+        # Transformers v5 does not reliably tie this custom model from the
+        # dict-shaped _tied_weights_keys alone; honor the config flag explicitly
+        # (mirrors LlamaForCausalLM).
+        if getattr(self.config, "tie_word_embeddings", False):
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     @can_return_tuple
     def forward(

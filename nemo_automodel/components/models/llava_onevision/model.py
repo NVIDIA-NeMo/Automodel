@@ -34,8 +34,11 @@ import torch.nn as nn
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from nemo_automodel.components.checkpoint.utils import reject_unsupported_tied_word_embeddings
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.common.utils import compute_lm_head_logits
 from nemo_automodel.components.models.llava_onevision.rice_vit import RiceTransformer
 
@@ -284,6 +287,8 @@ class LLaVAOneVision1_5_Model(nn.Module):
 class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module):
     """LLaVA-OneVision-1.5 for conditional generation (Rice ViT + Qwen3 text)."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
+
     config_class = Llavaonevision1_5Config
 
     @dataclass(frozen=True)
@@ -314,7 +319,7 @@ class LLaVAOneVision1_5_ForConditionalGeneration(HFCheckpointingMixin, nn.Module
     ):
         super().__init__()
         self.config = config
-        reject_unsupported_tied_word_embeddings(config, type(self).__name__)
+        reject_unsupported_tie_word_embeddings(type(self), config)
         if attn_implementation is None:
             attn_implementation = getattr(config, "_attn_implementation", None) or "eager"
         self.model = LLaVAOneVision1_5_Model(config, attn_implementation=attn_implementation)

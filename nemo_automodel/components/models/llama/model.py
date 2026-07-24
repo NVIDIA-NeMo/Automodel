@@ -51,14 +51,19 @@ from nemo_automodel.components.models.common import (
     initialize_rms_norm_module,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.tie_word_embeddings import (
+    TieSupport,
+    reject_unsupported_tie_word_embeddings,
+)
 from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
 from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_fused,
+    apply_rotary_pos_emb_quack,
 )
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
-from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
+from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator, safe_import_from
 
 check_model_inputs = get_check_model_inputs_decorator()
 
@@ -85,6 +90,17 @@ class LlamaAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
         self.rope_fusion = getattr(backend, "rope_fusion", False)
+        self.rope_backend = getattr(backend, "rope", "torch")
+        self._quack_apply_rotary_emb = None
+        if self.rope_backend == "quack":
+            available, apply_rotary_emb = safe_import_from(
+                "quack.rotary",
+                "apply_rotary_emb",
+                msg="rope='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
+            )
+            if not available:
+                raise ImportError("rope='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].")
+            self._quack_apply_rotary_emb = apply_rotary_emb
 
         # Separate projections -- same layout as HuggingFace default Llama
         self.q_proj = nn.Linear(
@@ -121,7 +137,16 @@ class LlamaAttention(nn.Module):
         key_states = k.view(hidden_shape).transpose(1, 2)
         value_states = v.view(hidden_shape).transpose(1, 2)
 
-        if self.rope_fusion and len(position_embeddings) == 3:
+        if self.rope_backend == "quack" and query_states.is_cuda:
+            cos, sin = position_embeddings[:2]
+            query_states, key_states = apply_rotary_pos_emb_quack(
+                query_states,
+                key_states,
+                cos,
+                sin,
+                self._quack_apply_rotary_emb,
+            )
+        elif self.rope_fusion and len(position_embeddings) == 3:
             cos, sin, freqs_cis = position_embeddings
             query_states, key_states = apply_rotary_pos_emb_fused(query_states, key_states, freqs_cis)
         else:
@@ -393,6 +418,7 @@ class LlamaModel(LlamaPreTrainedModel):
 class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
     """Llama model with causal language modeling head."""
 
+    tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -402,7 +428,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         """Declared parallelism capabilities for this model class."""
 
         supports_tp: bool = True
-        supports_cp: bool = False
+        supports_cp: bool = True
         supports_pp: bool = True
         supports_ep: bool = False
 
@@ -420,6 +446,7 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
         config: LlamaConfig,
         backend: Optional[BackendConfig] = None,
     ):
+        reject_unsupported_tie_word_embeddings(type(self), config)
         warn_deprecated_model_class("LlamaForCausalLM")
         super().__init__(config)
         self.config = config

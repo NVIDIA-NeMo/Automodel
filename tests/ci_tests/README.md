@@ -8,6 +8,7 @@ Configuration, scripts, and utilities for AutoModel's CI recipe validation pipel
 ci_tests/
   configs/{test_folder}/
     nightly_recipes.yml         # Recipes included in nightly scope
+    release_recipes.yml         # Explicit release list for non-auto-discovered folders
     convergence_recipes.yml     # Recipes included in convergence scope (2x time)
     override_recipes.yml        # Exemptions, known issues
   scripts/
@@ -26,7 +27,8 @@ ci_tests/
 **Scopes:**
 - **nightly** -- Recipes listed in `nightly_recipes.yml`
 - **convergence** -- Recipes in `convergence_recipes.yml`, time automatically doubled
-- **release** -- All recipe YAMLs found under `examples/{test_folder}/`
+- **release** -- All recipe YAMLs in auto-discovered folders, or recipes listed
+  in `release_recipes.yml` for explicitly managed folders such as `llm_pretrain`
 
 **Stage assignment** is based on recipe type and configuration:
 
@@ -54,6 +56,8 @@ ci:
   max_steps: 50                   # Optional. Override max training steps for CI
   local_batch_size: 2             # Optional. Override batch size for CI
   nproc_per_node: 1               # Optional. GPUs per node, overrides cluster default (CI var: CONFIG_NPROC_PER_NODE)
+  env_vars:                       # Optional. Environment variables forwarded to the job
+    REQUIRE_FINITE_METRICS: "true" # Fail when no step metrics are logged or loss/grad_norm is non-finite
   vllm_deploy: true               # Optional. Enable vLLM deployment test
   checkpoint_robustness:          # Optional. Enable robustness testing
     hf_kl_threshold: 1e-3
@@ -68,12 +72,16 @@ ci:
 
 When `checkpoint_robustness` is present, the robustness test runs after the finetune under the same SLURM allocation. It trains for 5 steps, saves a checkpoint, then validates through:
 
-0. **Source-load parity** (optional) -- With `check_source_load_parity: true`, capture logits from the raw HF source load, release the HF model, construct the normal trainer model, then compare the constructed pre-training model against those HF logits
+0. **Source-load parity** (optional) -- With `check_source_load_parity: true`, capture logits from the raw HF source load, release the HF model, construct a parity-only trainer model, compare the constructed pre-training model against those HF logits, then release it so training starts from a fresh trainer
 1. **Reference logits** -- Capture logits before teardown
 2. **AutoModel reload** -- Reload from consolidated checkpoint, verify KL = 0
 3. **HF reload** -- Load into vanilla `transformers`/`peft`, verify KL below `hf_kl_threshold`
 4. **Cross-TP** (optional) -- Reload with different `tp_size`
 5. **Training resumption** (on by default) -- Baseline + resumed run, verify loss continuity
+
+LLM recipes use the causal-LM harness, while `examples/vlm_finetune/` recipes use the VLM finetune recipe and
+`AutoModelForImageTextToText`. VLM parity currently exercises the language path with text-only `input_ids`; real-image
+multimodal parity is a separate follow-up.
 
 Phase 5 is the most expensive (two additional training passes). Use `no_check_resume: true` to skip it.
 

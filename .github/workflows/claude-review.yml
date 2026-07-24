@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   claude-review:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@7d857ecb93f42b91e53dcc0577ec5402734cb433 #v1.8.3
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@209ac7913b0419a5ccbac47b02d00fbea4939243 #v1.8.4
     with:
       model: ${{ vars.CLAUDE_MODEL }}
       prompt: |
@@ -48,10 +48,12 @@ jobs:
            - Documentation, examples, or Fern changes: verify claims against current
              code, runnable commands and config keys, links, `uv` usage, and Fern
              navigation, slugs, redirects, and version aliases when applicable.
-           - Models, kernels, or state-dict adapters: check registry and capability
-             updates, exact weight mapping/combined-projection layout, backend and
-             dtype behavior, tensor layout documentation, save/load round trips,
-             and forward plus backward parity with the reference implementation.
+           - Models, kernels, or state-dict adapters: check `MODEL_ARCH_MAPPING`,
+             `_CUSTOM_CONFIG_REGISTRATIONS`, config-class / `AutoConfig`
+             resolution, capability updates, exact weight mapping/combined-projection
+             layout, backend and dtype behavior, tensor layout documentation,
+             save/load round trips, and forward plus backward parity with the
+             reference implementation.
            - Recipes, config, YAML, or CLI changes: keep recipes as thin
              `config.build(...)` orchestration, separate declarative fields from
              runtime arguments, avoid manual config serialization, verify `_target_`
@@ -181,6 +183,18 @@ jobs:
           that class's nested `ModelCapabilities` dataclass (static pattern) or
           inside the `get_capabilities(cls, config)` classmethod (dynamic
           dispatch pattern).
+        - Model registry and config mapping completeness. When a PR adds a new
+          model family, architecture class, `model_type`, or local config class,
+          require all applicable registry wiring in `_transformers/registry.py`:
+          `MODEL_ARCH_MAPPING` for architecture strings used by checkpoint
+          `architectures`, and `_CUSTOM_CONFIG_REGISTRATIONS` for `model_type`
+          values that are absent from the installed Transformers `CONFIG_MAPPING`
+          or whose local Automodel config must override/augment the HF config.
+          Do not accept relying on a newer Transformers release when Automodel owns
+          the model implementation or config contract. Require a focused test that
+          proves the relevant `AutoConfig` / `get_hf_config` path resolves the
+          local config class from a checkpoint-style `config.json`, including the
+          stale-Transformers case when that is the risk.
         - Checkpoint-free model initialization. When a PR adds or materially
           changes model parameters, persistent buffers, initialization methods,
           routing state, or a random-init recipe path, verify that construction

@@ -1,0 +1,143 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ============================================================================
+# Nemotron-Labs-Diffusion-8B hybrid SFT — LoRA fine-tune. Identical to
+# nemotron_labs_diffusion_sft.yaml except for the `peft` block. LoRA adapts
+# the attention and MLP linears; the diffusion head and lm_head stay frozen.
+# Generate from the result with:
+#   generate.py --checkpoint <base model or SFT ckpt> --adapter <lora ckpt dir>
+# ============================================================================
+
+recipe: DiffusionLMSFTRecipe
+
+step_scheduler:
+  global_batch_size: 32
+  local_batch_size: 1
+  ckpt_every_steps: 500
+  val_every_steps: 500
+  max_steps: null
+  num_epochs: 2
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+seed: 42
+
+wandb:
+  enable: false
+  project: dllm-baseline
+  name: nemotron-labs-diffusion-lora-run
+
+# The HF config.json ships with dlm_paradigm="bidirectional", which is the
+# inference-time mode (simulates block-wise attention).  For SFT we override
+# to "block_diff" — the training-time attention mask.
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: nvidia/Nemotron-Labs-Diffusion-8B-Base
+  torch_dtype: float32
+  trust_remote_code: true
+  dlm_paradigm: block_diff
+  block_size: 32
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: dllm_checkpoints/nemotron_labs_diffusion_lora/
+  model_save_format: safetensors
+  save_consolidated: false  # PEFT checkpoints save adapters; use generate.py --adapter
+
+# LoRA on the attention and MLP linears.
+peft:
+  _target_: nemo_automodel.components._peft.lora.PeftConfig
+  match_all_linear: false
+  target_modules:
+    - "*.q_proj"
+    - "*.k_proj"
+    - "*.v_proj"
+    - "*.o_proj"
+    - "*.gate_proj"
+    - "*.up_proj"
+    - "*.down_proj"
+  dim: 16
+  alpha: 32
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 2
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: float32
+  autocast_dtype: bfloat16
+  offload_policy:
+    _target_: torch.distributed.fsdp.CPUOffloadPolicy
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+# Hybrid (diffusion + AR) training.  ``ar_loss_alpha`` scales the diffusion
+# branch; the AR branch is unweighted.
+dllm:
+  mode: hybrid
+  mask_token_id: 100
+  eps: 0.001
+  block_size: null
+  half_life_ratio: null
+  ar_loss_alpha: 0.3
+  pad_block_size: 32
+  pad_seq_len_divisible: 1024
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.98]
+  eps: 1.0e-5
+  lr: 2.5e-6
+  weight_decay: 0.1
+
+clip_grad_norm:
+  max_norm: 1.0
+
+lr_scheduler:
+  lr_warmup_steps: 50
+  lr_decay_style: constant
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: allenai/tulu-3-sft-mixture
+  split: train
+  shuffle_seed: 42
+  seq_length: 8192
+  truncation: true
+  unshifted: true
+  tokenizer:
+    pretrained_model_name_or_path: nvidia/Nemotron-Labs-Diffusion-8B-Base
+    trust_remote_code: true
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+# Included in the dllm_sft nightly CI scope (tests/ci_tests/configs/dllm_sft).
+# Heavier than llada (8B, tp2, seq 8192, CPU offload); cold-cache budget covers
+# 8B download + tulu-3 + train + consolidate + reload + generate.
+ci:
+  recipe_owner: zyzhou5
+  time: "02:00:00"

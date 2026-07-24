@@ -40,7 +40,7 @@ from _prefix_tree_reference import build_reference_mask
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from nemo_automodel.components.datasets.llm.prefix_tree import fold_shared_prefix_rollouts
-from nemo_automodel.components.distributed.magi_attn_utils import AttnMaskSpec
+from nemo_automodel.components.distributed.context_parallel.magi import AttnMaskSpec
 
 # fp32 both sides: a tight tolerance that flags any mask error rather than noise.
 MAX_DIFF_TOL = 1e-3

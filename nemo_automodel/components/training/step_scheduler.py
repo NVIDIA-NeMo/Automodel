@@ -15,15 +15,17 @@
 from __future__ import annotations
 
 import logging
+import signal
 from dataclasses import asdict, dataclass
 from math import ceil
 from typing import TYPE_CHECKING, Optional
 
 from torch.distributed.checkpoint.stateful import Stateful
 
-from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
+from nemo_automodel.components.training.signal_handler import DistributedSignalHandler, SignalLike
 
 if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
     from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
@@ -72,6 +74,8 @@ class StepScheduler(Stateful):
         start_epoch: int = 0,
         num_epochs: Optional[int] = None,
         max_steps: Optional[int] = None,
+        preemption_signal: SignalLike | list[SignalLike] | None = signal.SIGTERM,
+        process_group: ProcessGroup | None = None,
     ):
         """
         Initialize the StepScheduler.
@@ -94,6 +98,11 @@ class StepScheduler(Stateful):
             start_epoch (int): Initial epoch. Used when resuming from checkpoint. Default: 0.
             num_epochs (Optional[int]): Total number of epochs. Default: None or calculated from max_steps if num_epochs is None or 10 if max_steps and num_epochs are both None.
             max_steps (Optional[int]): Maximum number of steps to run. If None, calculated from num_epochs.
+            preemption_signal (Optional[SignalLike | list[SignalLike]]): Signal(s) that trigger a graceful
+                preemption checkpoint, each given as a signal number, name (e.g. "SIGTERM"), or
+                ``signal.Signals`` member. When ``None``, no signal handler is installed and preemption
+                checkpointing is disabled. Default: ``signal.SIGTERM``.
+            process_group: Process group whose ranks participate in distributed signal handling.
         """
         if global_batch_size <= 0:
             raise ValueError(f"global_batch_size must be greater than 0, got {global_batch_size}")
@@ -169,9 +178,12 @@ class StepScheduler(Stateful):
             raise ValueError(f"ckpt_every_steps must be greater than 0, got {ckpt_every_steps}")
         self.ckpt_every_steps = ckpt_every_steps
         self.save_checkpoint_every_epoch = save_checkpoint_every_epoch
-
-        self.sig_handler = DistributedSignalHandler().__enter__()
+        if preemption_signal is None:
+            self.sig_handler = None
+        else:
+            self.sig_handler = DistributedSignalHandler(sig=preemption_signal, group=process_group).__enter__()
         self.sigterm_flag = False
+        self._sig_polled_step: Optional[int] = None
 
     def __iter__(self):
         """
@@ -281,7 +293,14 @@ class StepScheduler(Stateful):
         """
         Returns whether SIGTERM was received.
         """
-        self.sigterm_flag = self.sigterm_flag or any(self.sig_handler.signals_received())
+        if self.sigterm_flag:
+            return True
+        if self.sig_handler is None:
+            return False
+        if self._sig_polled_step == self.step:
+            return False
+        self._sig_polled_step = self.step
+        self.sigterm_flag = any(self.sig_handler.signals_received())
         return self.sigterm_flag
 
     @property
@@ -352,6 +371,9 @@ class StepSchedulerConfig:
             ``None`` disables manual GC.
         start_step: Initial global step (for checkpoint resume).
         start_epoch: Initial epoch (for checkpoint resume).
+        preemption_signal: Signal(s) that trigger a graceful preemption checkpoint, each given as
+            a signal number, name (e.g. ``"SIGTERM"``), or a list thereof.  ``None`` disables
+            preemption checkpointing.  Default: ``"SIGTERM"``.
     """
 
     global_batch_size: int = 32
@@ -365,14 +387,22 @@ class StepSchedulerConfig:
     gc_every_steps: int | None = None
     start_step: int = 0
     start_epoch: int = 0
+    preemption_signal: int | str | list[int | str] | None = "SIGTERM"
 
-    def build(self, dataloader: DataLoader, dp_group_size: int, local_batch_size: int) -> StepScheduler:
+    def build(
+        self,
+        dataloader: DataLoader,
+        dp_group_size: int,
+        local_batch_size: int,
+        process_group: ProcessGroup | None = None,
+    ) -> StepScheduler:
         """Build the step scheduler.
 
         Args:
             dataloader: The training dataloader.
             dp_group_size: The size of the data parallel group.
             local_batch_size: The size of the local batch.
+            process_group: Process group whose ranks participate in distributed signal handling.
 
         Returns:
             Configured StepScheduler.
@@ -381,4 +411,5 @@ class StepSchedulerConfig:
         kwargs["local_batch_size"] = local_batch_size
         kwargs["dp_size"] = dp_group_size
         kwargs["dataloader"] = dataloader
+        kwargs["process_group"] = process_group
         return StepScheduler(**kwargs)

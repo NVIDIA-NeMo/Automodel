@@ -75,7 +75,7 @@ checkpoint:
   enabled: true
   checkpoint_dir: dllm_checkpoints/diffusion_gemma_sft/
   model_save_format: safetensors
-  save_consolidated: false
+  save_consolidated: final  # final step exports the consolidated HF dir generate.py loads
 
 distributed:
   strategy: fsdp2
@@ -135,3 +135,8 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   collate_fn: nemo_automodel.components.datasets.utils.default_collater
   shuffle: true
+
+ci:
+  recipe_owner: zyzhou5
+  time: "02:00:00"
+  nodes: 1

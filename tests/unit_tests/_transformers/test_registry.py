@@ -210,6 +210,45 @@ def test_step3p7_registry_and_custom_config_registration():
     assert CONFIG_MAPPING["step3p7"].__name__ == "Step3p7Config"
 
 
+def test_resolve_custom_config_cls_uses_registry_for_non_builtin(monkeypatch):
+    from nemo_automodel._transformers import registry as reg
+
+    class FakeConfig:
+        pass
+
+    fake_module = types.SimpleNamespace(FakeConfig=FakeConfig)
+    monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "am_future", ("fake.config_module", "FakeConfig"))
+    monkeypatch.setattr(
+        reg.importlib, "import_module", lambda name: fake_module if name == "fake.config_module" else None
+    )
+
+    assert reg.resolve_custom_config_cls("am_future") is FakeConfig
+
+
+def test_resolve_custom_config_cls_defers_to_transformers_builtin(monkeypatch):
+    from nemo_automodel._transformers import registry as reg
+
+    monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "bert", ("fake.config_module", "FakeConfig"))
+
+    assert reg.resolve_custom_config_cls("bert") is None
+
+
+def test_resolve_custom_config_cls_can_override_transformers_builtin(monkeypatch):
+    from nemo_automodel._transformers import registry as reg
+
+    class FakeConfig:
+        pass
+
+    fake_module = types.SimpleNamespace(FakeConfig=FakeConfig)
+    monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "bert", ("fake.config_module", "FakeConfig"))
+    monkeypatch.setattr(reg, "_CUSTOM_CONFIG_OVERRIDES_BUILTIN", {"bert"})
+    monkeypatch.setattr(
+        reg.importlib, "import_module", lambda name: fake_module if name == "fake.config_module" else None
+    )
+
+    assert reg.resolve_custom_config_cls("bert") is FakeConfig
+
+
 def test_resolve_custom_model_cls_found():
     """resolve_custom_model_cls returns the class when it exists and has no supports_config."""
     from nemo_automodel._transformers import registry as reg
@@ -302,6 +341,43 @@ def test_custom_config_registrations_in_config_mapping():
     )
 
 
+def test_kimi_k2_config_loads_without_trust_remote_code(tmp_path):
+    """Kimi-K2 uses DeepseekV3Config and should not require remote config code."""
+    import json
+
+    from transformers import AutoConfig
+
+    import nemo_automodel._transformers.registry  # noqa: F401
+    from nemo_automodel.components.models.kimi_k2.config import KimiK2Config
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV3ForCausalLM"],
+                "auto_map": {
+                    "AutoConfig": "configuration_deepseek.DeepseekV3Config",
+                    "AutoModel": "modeling_deepseek.DeepseekV3Model",
+                    "AutoModelForCausalLM": "modeling_deepseek.DeepseekV3ForCausalLM",
+                },
+                "hidden_size": 64,
+                "model_type": "kimi_k2",
+                "num_attention_heads": 8,
+                "num_hidden_layers": 2,
+                "vocab_size": 256,
+            }
+        )
+    )
+
+    cfg = AutoConfig.from_pretrained(tmp_path, trust_remote_code=False)
+
+    from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+
+    assert isinstance(cfg, KimiK2Config)
+    assert isinstance(cfg, DeepseekV3Config)
+    assert cfg.model_type == "kimi_k2"
+    assert cfg.architectures == ["DeepseekV3ForCausalLM"]
+
+
 def test_kimi_k25_arch_alias_in_model_arch_mapping():
     """KimiK25ForConditionalGeneration (checkpoint arch) must map to KimiK25VLForConditionalGeneration."""
     from nemo_automodel._transformers.registry import MODEL_ARCH_MAPPING
@@ -374,3 +450,27 @@ def test_all_model_folders_registered_in_auto_map():
         f"in MODEL_ARCH_MAPPING (registry.py). Add an entry for each architecture "
         f"exported by these modules."
     )
+
+
+def test_minimax_m3_vl_config_overrides_transformers_builtin():
+    """Our MiniMaxM3VLConfig must win the AutoConfig registration even when transformers ships its own.
+
+    transformers 5.12 added a native ``minimax_m3_vl`` model_type (same class
+    names as ours). The skip-if-built-in registration then handed the native
+    config to our custom MiniMaxM3SparseForConditionalGeneration, whose vision
+    encoder reads ``config.rope_theta`` that the native vision config does not
+    carry -> AttributeError at model init. ``_CUSTOM_CONFIG_OVERRIDES_BUILTIN``
+    forces our config class for such model_types.
+    """
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from nemo_automodel.components.models.minimax_m3_vl.config import MiniMaxM3VLConfig
+
+    resolved = CONFIG_MAPPING["minimax_m3_vl"]
+    assert resolved is MiniMaxM3VLConfig, (
+        f"AutoConfig resolves minimax_m3_vl to {resolved.__module__}.{resolved.__name__}; "
+        "expected the nemo_automodel config class. The custom model's vision encoder "
+        "requires our config fields (e.g. rope_theta)."
+    )
+    # The concrete field the crash was about: our vision sub-config must default it.
+    assert MiniMaxM3VLConfig().vision_config.rope_theta is not None

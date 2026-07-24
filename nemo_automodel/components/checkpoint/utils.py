@@ -13,7 +13,11 @@
 # limitations under the License.
 
 import json
+import logging
+import math
 import os
+import re
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -21,6 +25,22 @@ from typing import Any
 import torch
 import torch.nn as nn
 from transformers.modeling_utils import _get_resolved_checkpoint_files, load_state_dict
+
+from nemo_automodel.shared.tied_weights import (
+    ensure_tied_lm_head as ensure_tied_lm_head,
+)
+from nemo_automodel.shared.tied_weights import (
+    get_input_embeddings_weight_and_name,
+    get_lm_head_weight_and_name,
+    is_tied_word_embeddings,
+)
+from nemo_automodel.shared.tied_weights import (
+    has_local_tied_lm_head as has_local_tied_lm_head,
+)
+
+logger = logging.getLogger(__name__)
+_AUTOMODEL_CHECKPOINT_RE = re.compile(r"^epoch_\d+_step_(\d+)$")
+_CHECKPOINT_STEP_RE = re.compile(r"step_(\d+)$")
 
 
 def get_rank_safe() -> int:
@@ -85,6 +105,203 @@ def format_output_file_count(count: int) -> str:
     return f"{count} output {'file' if count == 1 else 'files'}"
 
 
+def _checkpoint_step_num(path: Path) -> int:
+    """Return the trailing checkpoint step number, or -1 when the name is not a checkpoint."""
+    match = _CHECKPOINT_STEP_RE.search(path.name)
+    return int(match.group(1)) if match else -1
+
+
+def _list_existing_checkpoints(ckpt_root: Path) -> list[Path]:
+    """Return existing checkpoint directories whose names end in ``step_<N>``."""
+    if not ckpt_root.exists():
+        return []
+    checkpoints = [path for path in ckpt_root.glob("*step_*") if path.is_dir() and not path.is_symlink()]
+    return sorted((path for path in checkpoints if _checkpoint_step_num(path) >= 0), key=_checkpoint_step_num)
+
+
+def list_automodel_checkpoints(ckpt_root: Path) -> list[Path]:
+    """Return canonical AutoModel ``epoch_<E>_step_<S>`` checkpoint directories."""
+    return [path for path in _list_existing_checkpoints(ckpt_root) if _AUTOMODEL_CHECKPOINT_RE.fullmatch(path.name)]
+
+
+def _resolve_checkpoint_pointer_target(ckpt_root: Path, raw_target: str) -> Path | None:
+    """Resolve a checkpoint pointer target relative to ckpt_root."""
+    if not raw_target:
+        return None
+    target = Path(raw_target)
+    if not target.is_absolute():
+        target = ckpt_root / target
+    return Path(os.path.abspath(target))
+
+
+def read_checkpoint_pointer(ckpt_root: str | Path, link_name: str) -> Path | None:
+    """Resolve a checkpoint pointer symlink or fallback text file."""
+    root = Path(ckpt_root)
+    link_path = root / link_name
+    raw_target = None
+    if os.path.islink(link_path):
+        try:
+            raw_target = os.readlink(link_path)
+        except OSError:
+            pass
+    elif os.path.isfile(f"{link_path}.txt"):
+        try:
+            with open(f"{link_path}.txt", "r") as f:
+                raw_target = f.read().strip()
+        except (OSError, UnicodeError):
+            pass
+
+    return _resolve_checkpoint_pointer_target(root, raw_target) if raw_target else None
+
+
+def _checkpoint_contains_target(checkpoint: Path, target: Path) -> bool:
+    """Return whether target points at or inside checkpoint."""
+    checkpoint_abs = Path(os.path.abspath(checkpoint))
+    target_abs = Path(os.path.abspath(target))
+    return target_abs == checkpoint_abs or checkpoint_abs in target_abs.parents
+
+
+def read_checkpoint_metric(checkpoint: Path, metric_key: str | None) -> float | None:
+    """Read a validation metric from checkpoint loss metadata."""
+    try:
+        with open(checkpoint / "losses.json", "r") as f:
+            losses = json.load(f)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(losses, Mapping):
+        return None
+
+    candidate_keys = []
+    if metric_key is not None:
+        candidate_keys.append(metric_key)
+    candidate_keys.extend(["val_loss", "default"])
+
+    for key in candidate_keys:
+        if key not in losses:
+            continue
+        try:
+            value = float(losses[key])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def _is_checkpoint_pointer_text_file(path: Path, mode: int) -> bool:
+    """Return whether path looks like a symlink fallback checkpoint pointer."""
+    return stat.S_ISREG(mode) and path.suffix == ".txt" and path.stem.isupper()
+
+
+def find_pointer_protected_checkpoints(ckpt_root: Path, checkpoints: list[Path]) -> set[Path]:
+    """Return checkpoints targeted by top-level symlinks or symlink fallback text files."""
+    protected = set()
+    if not ckpt_root.exists():
+        return protected
+
+    entries = list(ckpt_root.iterdir())
+
+    for entry in entries:
+        raw_target = None
+        entry_mode = entry.lstat().st_mode
+        if stat.S_ISLNK(entry_mode):
+            raw_target = os.readlink(entry)
+        elif _is_checkpoint_pointer_text_file(entry, entry_mode):
+            raw_target = entry.read_text().strip()
+
+        target = _resolve_checkpoint_pointer_target(ckpt_root, raw_target) if raw_target else None
+        if target is None:
+            continue
+        for checkpoint in checkpoints:
+            if _checkpoint_contains_target(checkpoint, target):
+                protected.add(checkpoint)
+                break
+    return protected
+
+
+def resolve_restore_from_to_checkpoint_dir(checkpoint_dir: str | Path, restore_from: str) -> str | None:
+    """
+    Resolve restore_from to a checkpoint directory.
+
+    Returns:
+        - str: resolved checkpoint directory
+        - None: if restore_from='LATEST' but no checkpoint found (caller should start fresh)
+    """
+    # Handle checkpoint-root pointers such as LATEST and LOWEST_VAL.
+    if os.path.sep not in restore_from and not os.path.isabs(restore_from):
+        pointed_checkpoint = read_checkpoint_pointer(checkpoint_dir, restore_from)
+        if pointed_checkpoint is not None and pointed_checkpoint.is_dir():
+            return os.fspath(pointed_checkpoint)
+    if restore_from.upper() == "LATEST":
+        return find_latest_checkpoint(checkpoint_dir)
+
+    # If restore_from is just a directory name (no path separator), treat it as
+    # relative to checkpoint_dir. Otherwise use as-is (absolute or relative path).
+    if os.path.sep not in restore_from and not os.path.isabs(restore_from):
+        return os.path.join(checkpoint_dir, restore_from)
+    return restore_from
+
+
+def format_missing_checkpoint_dir_error(checkpoint_dir: str, restore_from: str, resolved_ckpt_dir: str) -> str:
+    """Format a helpful error message for a missing checkpoint directory."""
+    error_msg = [
+        f"\n{'=' * 80}",
+        "ERROR: Checkpoint directory does not exist",
+        f"{'=' * 80}",
+        f"Specified: checkpoint.restore_from: '{restore_from}'",
+        f"Resolved to: {resolved_ckpt_dir}",
+        "",
+        "Please check:",
+        "  1. The checkpoint directory exists",
+        f"  2. The path is correct (restore_from: '{restore_from}')",
+        f"  3. Available checkpoints in {checkpoint_dir}:",
+    ]
+
+    ckpt_root = Path(checkpoint_dir)
+    available_ckpts = _list_existing_checkpoints(ckpt_root)
+    if available_ckpts:
+        error_msg += [f"       {', '.join([p.name for p in available_ckpts[:5]])}"]
+        if len(available_ckpts) > 5:
+            error_msg += [f"       ... and {len(available_ckpts) - 5} more"]
+    else:
+        error_msg += (
+            ["       (no checkpoints found)"] if ckpt_root.exists() else ["       (checkpoint_dir does not exist)"]
+        )
+
+    error_msg += [f"{'=' * 80}"]
+    return "\n".join(error_msg)
+
+
+def find_latest_checkpoint(checkpoint_dir: str | Path) -> str | Path | None:
+    """
+    Resolve the most recent checkpoint directory.
+
+    Preference order:
+      1) Valid LATEST symlink or txt file under checkpoint_dir
+      2) Highest step directory under checkpoint_dir whose name ends in ``step_<N>``
+
+    Returns:
+        Path (or str) of the latest checkpoint directory, or None.
+    """
+    root = Path(checkpoint_dir)
+    if not root.exists():
+        return
+
+    latest = read_checkpoint_pointer(root, "LATEST")
+    if latest is not None and latest.is_dir():
+        return os.fspath(latest)
+
+    checkpoint_files = _list_existing_checkpoints(root)
+    if not checkpoint_files:
+        return
+
+    latest = max(checkpoint_files, key=_checkpoint_step_num)
+    if _checkpoint_step_num(latest) == -1:
+        return
+
+    return latest
+
+
 def resolve_trust_remote_code(pretrained_model_name_or_path):
     """
     Whitelist NVIDIA models to allow remote code execution.
@@ -99,195 +316,6 @@ def resolve_trust_remote_code(pretrained_model_name_or_path):
         return False
     # pretrained_model_name_or_path can be something like nvidia/NVIDIA-Nemotron-Nano-9B-v2
     return not os.path.isdir(pretrained_model_name_or_path) and pretrained_model_name_or_path.startswith("nvidia/")
-
-
-def get_controlling_tie_word_embeddings(config: object, model_class_name: str) -> bool:
-    """Resolve the ``tie_word_embeddings`` flag that actually controls lm_head tying.
-
-    HF ties ``lm_head`` based on the *top-level* config flag, not a nested
-    ``text_config`` (verified by construction for Gemma4 and Mistral3 under
-    transformers 5.8.1: the top-level flag decides tying regardless of the nested
-    value). So prefer the top-level flag, and only fall back to ``text_config``
-    for configs that don't expose a top-level ``tie_word_embeddings``.
-
-    Omni "thinker" models are the exception: the full wrapper config
-    (``Qwen2_5OmniConfig`` / ``Qwen3OmniMoeConfig``) does not expose
-    ``tie_word_embeddings`` at the top level at all -- the controlling flag lives
-    on ``config.thinker_config`` -- so unwrap to it for those classes.
-
-    Args:
-        config: The model's config (or anything exposing ``tie_word_embeddings``
-            and optionally ``get_text_config``).
-        model_class_name: ``type(model).__name__`` of the owning model class.
-
-    Returns:
-        bool: The controlling ``tie_word_embeddings`` value.
-    """
-    # Omni "thinker" models: the controlling flag lives on the thinker config.
-    # A full wrapper config (e.g. ``Qwen2_5OmniConfig`` / ``Qwen3OmniMoeConfig``)
-    # does not expose ``tie_word_embeddings`` at the top level at all -- it nests
-    # under ``config.thinker_config`` -- so unwrap to it when present. When the
-    # thinker config itself is passed, ``thinker_config`` is absent and we read
-    # its own top-level flag.
-    omni_thinker_models = (
-        "Qwen2_5OmniThinkerForConditionalGeneration",
-        "Qwen3OmniMoeThinkerForConditionalGeneration",
-    )
-    if any(name in model_class_name for name in omni_thinker_models):
-        thinker_config = getattr(config, "thinker_config", config)
-        return bool(getattr(thinker_config, "tie_word_embeddings", False))
-
-    # Other composite models whose top-level config owns the lm_head tying
-    # decision; their nested ``text_config`` flag can disagree and must be ignored.
-    # Return the top-level flag (not a forced ``False``) so a constructor guard can
-    # still see and reject an unsupported ``top-level=True``. The checkpoint save
-    # path stays safe through the storage-based ``has_local_tied_lm_head()`` check,
-    # which only drops ``lm_head.weight`` when the tensors actually share storage.
-    composite_top_level_models = (
-        "Mistral3FP8VLMForConditionalGeneration",
-        "Qwen3VLMoeForConditionalGeneration",
-    )
-    if any(name in model_class_name for name in composite_top_level_models):
-        return bool(getattr(config, "tie_word_embeddings", False))
-
-    # General rule: the top-level config wins when it exposes the flag.
-    if hasattr(config, "tie_word_embeddings"):
-        return bool(config.tie_word_embeddings)
-
-    # Fallback only for configs that do not expose a top-level tie flag.
-    text_config = getattr(config, "get_text_config", lambda: None)()
-    return bool(getattr(text_config, "tie_word_embeddings", False))
-
-
-def is_tied_word_embeddings(model: nn.Module) -> bool:
-    """
-    Check if the model's word embeddings are tied.
-
-    Delegates to :func:`get_controlling_tie_word_embeddings`, which follows HF's
-    top-level-first tying semantics (replacing the previous ``text_config``-first
-    resolution).
-
-    Args:
-        model (nn.Module): The model to check.
-
-    Returns:
-        bool: True if the model's word embeddings are tied, False otherwise.
-    """
-    config = getattr(model, "config", None)
-    if config is None:
-        return False
-    return get_controlling_tie_word_embeddings(config, type(model).__name__)
-
-
-def reject_unsupported_tied_word_embeddings(config: object, model_class_name: str) -> None:
-    """Reject ``tie_word_embeddings=True`` for models whose HF default is untied.
-
-    Separate-head architectures (HF default: distinct input/output embeddings)
-    don't build a shared ``lm_head``, so honoring ``tie_word_embeddings=True``
-    would silently leave a randomly-initialized head or require materializing a
-    tied weight NeMo does not support. Reject it explicitly with a clear message
-    instead of pretending to support it.
-
-    Uses :func:`get_controlling_tie_word_embeddings`, so composite VLM/omni configs
-    are read from the controlling top-level flag rather than a nested
-    ``text_config``.
-
-    Args:
-        config: The model's config.
-        model_class_name: ``type(self).__name__`` of the constructing model.
-
-    Raises:
-        NotImplementedError: if the controlling ``tie_word_embeddings`` flag is set.
-    """
-    if get_controlling_tie_word_embeddings(config, model_class_name):
-        raise NotImplementedError(
-            f"{model_class_name} has separate input and output embeddings and does not "
-            f"support tie_word_embeddings=True. The Hugging Face default for this "
-            f"architecture is untied; set tie_word_embeddings=False."
-        )
-
-
-def reject_unsupported_untied_word_embeddings(config: object, model_class_name: str) -> None:
-    """Reject ``tie_word_embeddings=False`` for models whose HF default is tied.
-
-    Tied-by-default architectures share ``lm_head`` with the input embedding and
-    ship checkpoints without a separate ``lm_head.weight``. Honoring
-    ``tie_word_embeddings=False`` would require materializing a distinct
-    ``lm_head`` NeMo does not build (and a tied checkpoint has no weights for it),
-    so reject it explicitly instead of running with a randomly-initialized head.
-
-    The mirror of :func:`reject_unsupported_tied_word_embeddings`; both read the
-    controlling flag via :func:`get_controlling_tie_word_embeddings`.
-
-    Args:
-        config: The model's config.
-        model_class_name: ``type(self).__name__`` of the constructing model.
-
-    Raises:
-        NotImplementedError: if the controlling ``tie_word_embeddings`` flag evaluates to ``False``.
-    """
-    if not get_controlling_tie_word_embeddings(config, model_class_name):
-        raise NotImplementedError(
-            f"{model_class_name} ties its input and output embeddings and does not "
-            f"support tie_word_embeddings=False. The Hugging Face default for this "
-            f"architecture is tied; set tie_word_embeddings=True."
-        )
-
-
-def _normalize_param_name(name: str) -> str:
-    """Strip wrapper-specific prefixes from a parameter name."""
-    return name.replace("_orig_mod.", "")
-
-
-def get_lm_head_weight_and_name(model: nn.Module) -> tuple[torch.Tensor | None, str | None]:
-    """Return the first ``lm_head.weight`` parameter found on a model.
-
-    Args:
-        model: Model to inspect.
-
-    Returns:
-        Tuple of the parameter tensor and its normalized FQN, or ``(None, None)``
-        when the model has no LM head weight.
-    """
-    for name, param in model.named_parameters(remove_duplicate=False):
-        normalized_name = _normalize_param_name(name)
-        if "lm_head" in normalized_name and normalized_name.endswith(".weight"):
-            return param, normalized_name
-    return None, None
-
-
-def get_input_embeddings_weight_and_name(model: nn.Module) -> tuple[torch.Tensor | None, str | None]:
-    """Return the input embedding weight and normalized name if present.
-
-    Args:
-        model: Model to inspect.
-
-    Returns:
-        Tuple of the embedding weight tensor and its normalized FQN, or
-        ``(None, None)`` when the current model partition does not own the input
-        embedding.
-    """
-    get_input_embeddings = getattr(model, "get_input_embeddings", None)
-    if callable(get_input_embeddings):
-        try:
-            input_embeddings = get_input_embeddings()
-        except Exception:
-            input_embeddings = None
-        if input_embeddings is not None and hasattr(input_embeddings, "weight"):
-            for name, param in model.named_parameters(remove_duplicate=False):
-                if param is input_embeddings.weight:
-                    return param, _normalize_param_name(name)
-
-    candidate_suffixes = (
-        "embed_tokens.weight",
-        "language_model.embed_tokens.weight",
-        "model.language_model.embed_tokens.weight",
-    )
-    for name, param in model.named_parameters(remove_duplicate=False):
-        normalized_name = _normalize_param_name(name)
-        if normalized_name.endswith(candidate_suffixes):
-            return param, normalized_name
-    return None, None
 
 
 def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | None = None) -> list[str]:
@@ -342,141 +370,6 @@ def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | No
         seen_source_names.add(source_name)
         deduped_source_names.append(source_name)
     return deduped_source_names
-
-
-def has_local_tied_lm_head(model: nn.Module) -> bool:
-    """Return whether the current model partition has an actual tied LM head.
-
-    This is stricter than ``is_tied_word_embeddings()``: pipeline stages often
-    keep the config flag set to ``True`` even when ``lm_head`` and
-    ``embed_tokens`` live on different partitions. Some custom models can also
-    declare tied embeddings in config without actually aliasing the parameters.
-    In that case omitting ``lm_head.weight`` from a checkpoint loses trained
-    state, so only treat it as safely tied when the local tensors share storage.
-
-    Args:
-        model: Model or pipeline stage to inspect.
-
-    Returns:
-        ``True`` when the model is configured with tied word embeddings, both
-        the local ``lm_head`` and the input embedding live on this partition,
-        and the two tensors share local storage. ``False`` when the config
-        isn't tied, the local partition is missing one of the two (typical for
-        PP non-last / non-first stages), or the tensors are separate despite
-        matching shapes.
-    """
-    if not is_tied_word_embeddings(model):
-        return False
-    lm_head_weight, _ = get_lm_head_weight_and_name(model)
-    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
-    if lm_head_weight is None or input_embeddings_weight is None:
-        return False
-    # Even when ``config.tie_word_embeddings`` is ``True``, refuse to treat
-    # the two as locally tied if their shapes disagree. This handles
-    # speculative-decoding draft models that intentionally keep a
-    # full-vocab ``embed_tokens`` but a shrunk-vocab ``lm_head`` (e.g.
-    # EAGLE-3 with ``draft_vocab_size < target_vocab_size``). Without this
-    # check the save path would drop ``lm_head.weight`` from the state
-    # dict and the load path would resurrect it from ``embed_tokens``,
-    # producing a strict-load shape mismatch on resume.
-    if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
-        return False
-    return _same_tensor_storage(lm_head_weight, input_embeddings_weight)
-
-
-def _get_module_by_normalized_name(model: nn.Module, normalized_module_name: str) -> nn.Module | None:
-    """Return a module by FQN after applying wrapper-prefix normalization."""
-    if normalized_module_name == "":
-        return model
-    for name, module in model.named_modules():
-        if _normalize_param_name(name) == normalized_module_name:
-            return module
-    return None
-
-
-def ensure_tied_lm_head(model: nn.Module) -> bool:
-    """Ensure a local tied LM head actually aliases the input embedding.
-
-    Hugging Face ``tie_weights()`` is the first choice because model classes can
-    have custom tying rules. The direct assignment fallback handles wrapped
-    models whose generic ``tie_weights()`` no longer reaches the local
-    ``lm_head``/embedding pair after sharding.
-
-    Args:
-        model: Model or pipeline stage to inspect and update.
-
-    Returns:
-        ``True`` if the local ``lm_head`` and input embedding are tied after the
-        call, otherwise ``False``.
-    """
-    if not is_tied_word_embeddings(model):
-        return False
-    if has_local_tied_lm_head(model):
-        return True
-
-    lm_head_weight, lm_head_param_name = get_lm_head_weight_and_name(model)
-    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
-    if lm_head_weight is not None and input_embeddings_weight is not None:
-        if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
-            return False
-
-    tie_weights = getattr(model, "tie_weights", None)
-    if callable(tie_weights):
-        try:
-            tie_weights()
-        except AttributeError:
-            pass
-        if has_local_tied_lm_head(model):
-            return True
-
-    lm_head_weight, lm_head_param_name = get_lm_head_weight_and_name(model)
-    input_embeddings_weight, _ = get_input_embeddings_weight_and_name(model)
-    if lm_head_weight is None or lm_head_param_name is None or input_embeddings_weight is None:
-        return False
-    if tuple(lm_head_weight.shape) != tuple(input_embeddings_weight.shape):
-        return False
-
-    lm_head_module_name = lm_head_param_name.rsplit(".", 1)[0]
-    lm_head_module = _get_module_by_normalized_name(model, lm_head_module_name)
-    if lm_head_module is None or not hasattr(lm_head_module, "weight"):
-        return False
-
-    try:
-        lm_head_module.weight = input_embeddings_weight
-    except (AttributeError, TypeError, RuntimeError):
-        return False
-
-    return has_local_tied_lm_head(model)
-
-
-def _same_tensor_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
-    """Return whether two tensors are aliases of the same local storage."""
-    if left is right:
-        return True
-
-    def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
-        to_local = getattr(tensor, "to_local", None)
-        if callable(to_local):
-            try:
-                return to_local()
-            except RuntimeError:
-                return tensor
-        return tensor
-
-    left_local = _local_tensor(left)
-    right_local = _local_tensor(right)
-    if left_local is right_local:
-        return True
-    if left_local.device.type == "meta" or right_local.device.type == "meta":
-        return False
-
-    try:
-        return (
-            left_local.untyped_storage().data_ptr() == right_local.untyped_storage().data_ptr()
-            and left_local.storage_offset() == right_local.storage_offset()
-        )
-    except RuntimeError:
-        return False
 
 
 def materialize_missing_tied_lm_head(
