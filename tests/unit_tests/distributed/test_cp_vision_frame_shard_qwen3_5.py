@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Composition tests for the real Qwen3.5 vision tower and CP vision sharding.
+"""Composition tests for the real Qwen3.5 vision tower and CP vision frame sharding.
 
 The dense Qwen3.5 VLM runs Transformers' ``Qwen3_5VisionModel`` in its CP pre-embed and,
 when the CP vision group is published, routes it through
-``cp_vision_shard.maybe_distribute_visual``. The helper relies on the exact tower's
+``cp_vision_frame_shard.maybe_distribute_visual``. The helper relies on the exact tower's
 per-frame independence, so
 
     visual(all_frames).pooler_output == concat_r visual(frames_of_rank_r).pooler_output
@@ -27,7 +27,7 @@ These CPU tests build a small real ``Qwen3_5VisionModel`` and assert that proper
 module's OWN contiguous partitioner (``_contiguous_balanced_bounds``) -- i.e. the tower plus the
 real partition/gather-order logic together reproduce the replicated full forward.  The
 collective/backward path of ``maybe_distribute_visual`` itself is covered (with real gloo
-collectives) in ``test_cp_vision_shard_gloo.py``.
+collectives) in ``test_cp_vision_frame_shard_gloo.py``.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from nemo_automodel.components.distributed import cp_vision_shard as vs
+from nemo_automodel.components.distributed import cp_vision_frame_shard as vs
 
 # The real tower class only exists in recent transformers; skip cleanly otherwise.
 _qwen3_5 = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")

@@ -143,18 +143,18 @@ def test_llama_declares_context_parallel_support():
         "Qwen3VLForConditionalGeneration",
     ],
 )
-def test_dense_qwen_vlms_declare_cp_vision_sharding_support(arch):
-    """Only production-integrated dense Qwen VLMs opt into CP vision sharding."""
+def test_dense_qwen_vlms_declare_cp_vision_frame_sharding_support(arch):
+    """Only production-integrated dense Qwen VLMs opt into CP vision frame sharding."""
     caps = query_capabilities(ModelRegistry.get_model_cls_from_model_arch(arch))
 
-    assert caps.supports_cp_vision_sharding is True
+    assert caps.supports_cp_vision_frame_sharding is True
 
 
-def test_qwen3_vl_moe_does_not_declare_cp_vision_sharding_support():
+def test_qwen3_vl_moe_does_not_declare_cp_vision_frame_sharding_support():
     """Qwen3-VL-MoE remains unsupported until it owns a production integration."""
     caps = query_capabilities(ModelRegistry.get_model_cls_from_model_arch("Qwen3VLMoeForConditionalGeneration"))
 
-    assert caps.supports_cp_vision_sharding is False
+    assert caps.supports_cp_vision_frame_sharding is False
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +220,7 @@ def test_query_returns_canonical_type_for_static_class():
     assert caps.supports_cp is False
     assert caps.supports_ep is False
     assert caps.supports_thd is True
-    assert caps.supports_cp_vision_sharding is False
+    assert caps.supports_cp_vision_frame_sharding is False
 
 
 def test_query_static_class_from_instance():

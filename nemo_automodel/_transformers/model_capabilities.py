@@ -55,7 +55,7 @@ class ModelCapabilities:
         supports_pp: Pipeline parallelism.
         supports_ep: Expert parallelism (MoE).
         supports_thd: THD packed-sequence inputs.
-        supports_cp_vision_sharding: Frame-level vision-tower sharding over
+        supports_cp_vision_frame_sharding: Frame-level vision-tower sharding over
             context-parallel ranks.
     """
 
@@ -64,11 +64,11 @@ class ModelCapabilities:
     supports_pp: bool = False
     supports_ep: bool = False
     supports_thd: bool = False
-    supports_cp_vision_sharding: bool = False
+    supports_cp_vision_frame_sharding: bool = False
 
 
 def _to_canonical(caps_obj) -> ModelCapabilities:
-    """Re-pack any object with the five ``supports_*`` fields into the canonical type.
+    """Re-pack an object with ``supports_*`` fields into the canonical type.
 
     Per-class nested ``ModelCapabilities`` dataclasses are their own types; this
     converts them to the canonical :class:`ModelCapabilities` so callers see a
@@ -82,7 +82,7 @@ def _to_canonical(caps_obj) -> ModelCapabilities:
         supports_pp=bool(caps_obj.supports_pp),
         supports_ep=bool(caps_obj.supports_ep),
         supports_thd=bool(caps_obj.supports_thd),
-        supports_cp_vision_sharding=bool(getattr(caps_obj, "supports_cp_vision_sharding", False)),
+        supports_cp_vision_frame_sharding=bool(getattr(caps_obj, "supports_cp_vision_frame_sharding", False)),
     )
 
 

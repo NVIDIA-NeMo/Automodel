@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """CPU unit tests for frame-level context-parallel vision-tower sharding
-(nemo_automodel/components/distributed/cp_vision_shard.py).
+(nemo_automodel/components/distributed/cp_vision_frame_shard.py).
 
 Headline guarantee: distributing the vision tower across CP ranks does not change the
 result.  Because the ViT attends per IMAGE/FRAME ("entry") via ``cu_seqlens``, entries are
@@ -31,7 +31,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nemo_automodel.components.distributed import cp_vision_shard as vs
+from nemo_automodel.components.distributed import cp_vision_frame_shard as vs
 
 
 # --------------------------------------------------------------------------------------
@@ -91,7 +91,7 @@ def _pixels(grid, in_dim=8, seed=0):
 
 
 def _policy(*, enabled=True, min_tokens=0, cost_alpha="auto"):
-    return vs.CpVisionShardingConfig(enabled=enabled, min_tokens=min_tokens, cost_alpha=cost_alpha)
+    return vs.CpVisionFrameShardingConfig(enabled=enabled, min_tokens=min_tokens, cost_alpha=cost_alpha)
 
 
 # entries with varied sizes; every patch count (t*h*w) is a multiple of sms_sq=4.
@@ -223,7 +223,7 @@ def test_auto_cost_alpha_discovers_supported_vision_widths(source, expected_hidd
 def test_cost_alpha_override_and_unknown_model_fallback():
     qwen_visual = SimpleNamespace(config=SimpleNamespace(hidden_size=1152))
 
-    assert vs.CpVisionShardingConfig().cost_alpha == "auto"
+    assert vs.CpVisionFrameShardingConfig().cost_alpha == "auto"
     assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha="auto")) == 3456
     assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha=None)) == 3456
     assert vs._vision_cost_alpha(qwen_visual, _policy(cost_alpha=777)) == 777
@@ -233,7 +233,7 @@ def test_cost_alpha_override_and_unknown_model_fallback():
 
     for invalid_alpha in (-1, True, "AUTO", "not-auto"):
         with pytest.raises(ValueError, match="cost_alpha"):
-            vs.CpVisionShardingConfig(cost_alpha=invalid_alpha)
+            vs.CpVisionFrameShardingConfig(cost_alpha=invalid_alpha)
 
 
 def test_partition_cost_alpha_flattens_mixed_frame_sizes():

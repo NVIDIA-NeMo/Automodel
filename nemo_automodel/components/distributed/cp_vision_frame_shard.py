@@ -15,7 +15,7 @@
 """Frame-level context-parallel vision-tower sharding.
 
 Under context parallelism (CP), a VLM must encode media and splice the resulting
-features before it shards the language sequence. Without vision sharding,
+features before it shards the language sequence. Without vision frame sharding,
 ``self.visual(...)`` runs the ENTIRE vision tower on the full, un-sharded set of
 images on EVERY CP rank. With ``cp_size=N`` that is N x redundant compute and
 O(all-images) vision activations per rank.
@@ -65,8 +65,8 @@ import torch
 import torch.distributed as dist
 
 __all__ = [
-    "CpVisionShardingConfig",
-    "cp_vision_sharding_active",
+    "CpVisionFrameShardingConfig",
+    "cp_vision_frame_sharding_active",
     "maybe_distribute_visual",
     "reset_cp_vision_group",
     "set_cp_vision_group",
@@ -79,11 +79,11 @@ _LOGGED_COST_ALPHAS: set[tuple[str, int, str]] = set()
 
 
 @dataclass(frozen=True)
-class CpVisionShardingConfig:
+class CpVisionFrameShardingConfig:
     """Declarative policy for sharding VLM vision work across CP ranks.
 
     Args:
-        enabled: Enable vision sharding when a multi-rank CP group is published. Disabled
+        enabled: Enable vision frame sharding when a multi-rank CP group is published. Disabled
             by default so existing CP recipes retain their replicated vision behavior.
         min_tokens: Minimum number of merged visual tokens required to use the sharded
             path. Smaller workloads stay replicated to avoid collective overhead.
@@ -100,14 +100,14 @@ class CpVisionShardingConfig:
     def __post_init__(self) -> None:
         """Validate the serialized policy fields."""
         if not isinstance(self.enabled, bool):
-            raise TypeError("distributed.cp_vision_sharding.enabled must be a boolean")
+            raise TypeError("distributed.cp_vision_frame_sharding.enabled must be a boolean")
         if isinstance(self.min_tokens, bool) or not isinstance(self.min_tokens, int) or self.min_tokens < 0:
-            raise ValueError("distributed.cp_vision_sharding.min_tokens must be a non-negative integer")
+            raise ValueError("distributed.cp_vision_frame_sharding.min_tokens must be a non-negative integer")
         if self.cost_alpha not in (None, "auto") and (
             isinstance(self.cost_alpha, bool) or not isinstance(self.cost_alpha, int) or self.cost_alpha < 0
         ):
             raise ValueError(
-                'distributed.cp_vision_sharding.cost_alpha must be "auto", null, or a non-negative integer'
+                'distributed.cp_vision_frame_sharding.cost_alpha must be "auto", null, or a non-negative integer'
             )
 
 
@@ -120,7 +120,7 @@ class _GroupScope:
     """
 
     group: dist.ProcessGroup
-    config: CpVisionShardingConfig
+    config: CpVisionFrameShardingConfig
     spans_only_cp: bool
 
 
@@ -235,7 +235,7 @@ def _grid_list_for_planning(grid_thw: torch.Tensor) -> tuple[list[list[int]], to
 def set_cp_vision_group(
     group: dist.ProcessGroup | None,
     *,
-    config: CpVisionShardingConfig,
+    config: CpVisionFrameShardingConfig,
     spans_only_cp: bool = True,
 ) -> CpVisionGroupToken:
     """Install the sharding process group for the current model forward.
@@ -265,7 +265,7 @@ def reset_cp_vision_group(token: CpVisionGroupToken) -> None:
     _CP_VISION_GROUP.reset(token)
 
 
-def cp_vision_sharding_active() -> bool:
+def cp_vision_frame_sharding_active() -> bool:
     """Return whether the current model forward has an active CP shard group.
 
     This intentionally shares :func:`maybe_distribute_visual`'s typed policy.
@@ -291,7 +291,7 @@ def _check_group_scope_for_trainable(visual: torch.nn.Module, scope: _GroupScope
         return
     if any(p.requires_grad for p in visual.parameters()):
         raise ValueError(
-            "cp_vision_shard: the vision tower has trainable parameters but the published "
+            "cp_vision_frame_shard: the vision tower has trainable parameters but the published "
             "sharding group was declared spans_only_cp=False (e.g. the flattened CP x TP rank "
             "set). The vision tower is replicated across TP ranks, so gathering frames over "
             "that group would accumulate the vision gradient tp-fold in the all-gather's "
@@ -380,7 +380,7 @@ def _infer_vision_hidden_size(source: object | None) -> int | None:
 
 def _vision_cost_alpha(
     source: object | None = None,
-    config: CpVisionShardingConfig | None = None,
+    config: CpVisionFrameShardingConfig | None = None,
 ) -> int:
     """Resolve the linear term in the vision partition cost ``p*(p+alpha)``.
 
@@ -433,7 +433,7 @@ def _contiguous_balanced_bounds(
     world: int,
     *,
     cost_alpha_source: object | None = None,
-    config: CpVisionShardingConfig | None = None,
+    config: CpVisionFrameShardingConfig | None = None,
 ) -> list[int] | None:
     """Partition ``len(patches)`` entries into ``world`` CONTIGUOUS groups balanced by
     approximate vision-attention cost, with >=1 entry per group.
@@ -552,7 +552,7 @@ def _raise_if_any_rank_failed(
     if not local_ok:
         raise ValueError(local_detail)
     raise ValueError(
-        "cp_vision_shard: another rank in the sharding group produced a visual output that did "
+        "cp_vision_frame_shard: another rank in the sharding group produced a visual output that did "
         "not match its planned token count, so the collective was aborted on every rank to "
         "avoid a hang. Check the diverging rank's log for the mismatch detail."
     )
@@ -649,7 +649,7 @@ def maybe_distribute_visual(
             _LOGGED_SMALL_FALLBACK = True
             logger.info(
                 "vision tower using replicated path for small visual workload "
-                "(tokens=%d < distributed.cp_vision_sharding.min_tokens=%d)",
+                "(tokens=%d < distributed.cp_vision_frame_sharding.min_tokens=%d)",
                 n_real_tokens,
                 min_shard_tokens,
             )
@@ -711,7 +711,7 @@ def maybe_distribute_visual(
         _LOGGED_ONCE = True
         frames_per_rank = [cuts[r + 1] - cuts[r] for r in range(world)]
         logger.info(
-            "vision tower SHARDED across vision-shard group (world=%d): %d entries / %d "
+            "vision tower SHARDED across vision-frame sharding group (world=%d): %d entries / %d "
             "frame-units (+%d dummy pad) -> per-rank frames=%s tokens=%s (was: full ViT replicated "
             "on every rank)",
             world,
@@ -759,7 +759,7 @@ def maybe_distribute_visual(
         actual_local_tokens == expected_local_tokens,
         group,
         local_out.pooler_output.device,
-        f"cp_vision_shard: rank {rank} produced {actual_local_tokens} visual tokens for its "
+        f"cp_vision_frame_shard: rank {rank} produced {actual_local_tokens} visual tokens for its "
         f"frame slice, expected {expected_local_tokens}.",
     )
 
@@ -784,7 +784,7 @@ def maybe_distribute_visual(
             ""
             if bad_k is None
             else (
-                f"cp_vision_shard: rank {rank} deepstack feature {bad_k} has "
+                f"cp_vision_frame_shard: rank {rank} deepstack feature {bad_k} has "
                 f"{deepstack[bad_k].shape[0]} visual tokens, expected {expected_local_tokens}."
             ),
         )

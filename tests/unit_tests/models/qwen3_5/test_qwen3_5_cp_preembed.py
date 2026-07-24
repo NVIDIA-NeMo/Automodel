@@ -269,7 +269,7 @@ class TestEmbedAndSpliceForCP:
         assert torch.allclose(emb[0, 2], torch.full((4,), 7.0))  # text token untouched
 
     @pytest.mark.parametrize("is_video", [False, True])
-    def test_active_vision_shard_routes_exact_visual_tower(self, monkeypatch, is_video):
+    def test_active_vision_frame_shard_routes_exact_visual_tower(self, monkeypatch, is_video):
         """Active CP sharding must bypass the replicated HF feature helpers."""
         model = _build_model()
         visual = types.SimpleNamespace(dtype=torch.bfloat16)
@@ -286,7 +286,7 @@ class TestEmbedAndSpliceForCP:
             captured.update(visual=visual_arg, pixel=pixel_arg, grid=grid_arg)
             return types.SimpleNamespace(pooler_output=expected)
 
-        monkeypatch.setattr(qwen3_5_model_module, "cp_vision_sharding_active", lambda: True)
+        monkeypatch.setattr(qwen3_5_model_module, "cp_vision_frame_sharding_active", lambda: True)
         monkeypatch.setattr(qwen3_5_model_module, "maybe_distribute_visual", _fake_distribute)
 
         actual = model._encode_vision_for_cp(pixel_values, grid_thw, is_video=is_video)

@@ -35,7 +35,7 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_sequence_for_cp_round_robin,
 )
 from nemo_automodel.components.distributed.context_parallel.utils import cp_dispatcher_suspended
-from nemo_automodel.components.distributed.cp_vision_shard import maybe_distribute_visual
+from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -59,7 +59,7 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         supports_pp: bool = False
         supports_ep: bool = False
         supports_thd: bool = False
-        supports_cp_vision_sharding: bool = True
+        supports_cp_vision_frame_sharding: bool = True
 
     def __init__(self, config: Qwen3VLConfig) -> None:
         """Construct the Hugging Face-compatible dense Qwen3-VL model.
@@ -88,7 +88,7 @@ class Qwen3VLForConditionalGeneration(HFCheckpointingMixin, HFQwen3VLForConditio
         """Encode and scatter Qwen3-VL visual features before sequence sharding.
 
         Images and videos share one vision-tower call when both are present. This
-        preserves collective ordering under FSDP and lets CP vision sharding
+        preserves collective ordering under FSDP and lets CP vision frame sharding
         partition their combined frame stream once.
 
         Args:

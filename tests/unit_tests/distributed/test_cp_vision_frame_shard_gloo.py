@@ -14,7 +14,7 @@
 
 """Two-rank REAL-collective (gloo, CPU) regression tests for CP vision-tower sharding.
 
-The mocked tests in ``test_cp_vision_shard.py`` prove the math with simulated ranks; these
+The mocked tests in ``test_cp_vision_frame_shard.py`` prove the math with simulated ranks; these
 tests drive ``maybe_distribute_visual`` forward AND backward through the actual
 ``all_gather`` / ``reduce_scatter(SUM)`` collectives on a 2-rank gloo group and assert
 numerical parity with the single-process replicated reference:
@@ -69,7 +69,7 @@ def _init_gloo(rank: int, world_size: int, port: int, timeout: timedelta | None 
 
 
 class _GlooVisual(torch.nn.Module):
-    """Entry-independent stub vision tower (mirrors ``test_cp_vision_shard._StubVisual``).
+    """Entry-independent stub vision tower (mirrors ``test_cp_vision_frame_shard._StubVisual``).
 
     ``forward`` takes ``pixel_values`` ``[total_patch_rows, in_dim]`` (frame-contiguous
     patch rows; ``in_dim`` = patch feature size), projects each row with a linear layer
@@ -144,10 +144,10 @@ def _sharded_forward_backward(
     rest per deepstack tensor), mirroring how CP sequence sharding consumes the full embeds.
     Returns the output object.
     """
-    from nemo_automodel.components.distributed import cp_vision_shard as vs
+    from nemo_automodel.components.distributed import cp_vision_frame_shard as vs
 
     visual.zero_grad(set_to_none=True)
-    config = vs.CpVisionShardingConfig(enabled=True, min_tokens=0)
+    config = vs.CpVisionFrameShardingConfig(enabled=True, min_tokens=0)
     token = vs.set_cp_vision_group(dist.group.WORLD, config=config)
     try:
         out = vs.maybe_distribute_visual(visual, pixel, grid)
@@ -262,7 +262,7 @@ def _divergent_count_worker(rank: int, world_size: int, port: int) -> None:
     try:
         _init_gloo(rank, world_size, port, timeout=timedelta(seconds=60))
         torch.set_num_threads(1)
-        from nemo_automodel.components.distributed import cp_vision_shard as vs
+        from nemo_automodel.components.distributed import cp_vision_frame_shard as vs
 
         torch.manual_seed(0)
         # >= world frame units -> balanced path (not the pad path); only the last rank diverges.
@@ -271,11 +271,11 @@ def _divergent_count_worker(rank: int, world_size: int, port: int) -> None:
         gen = torch.Generator().manual_seed(7)
         pixel = torch.randn(int(grid.prod(dim=-1).sum()), 8, generator=gen)
 
-        config = vs.CpVisionShardingConfig(enabled=True, min_tokens=0)
+        config = vs.CpVisionFrameShardingConfig(enabled=True, min_tokens=0)
         token = vs.set_cp_vision_group(dist.group.WORLD, config=config)
         try:
             # EVERY rank must raise (consensus), not only the diverging one.
-            with pytest.raises(ValueError, match="cp_vision_shard"):
+            with pytest.raises(ValueError, match="cp_vision_frame_shard"):
                 vs.maybe_distribute_visual(visual, pixel, grid)
         finally:
             vs.reset_cp_vision_group(token)
@@ -285,12 +285,12 @@ def _divergent_count_worker(rank: int, world_size: int, port: int) -> None:
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-def test_cp_vision_shard_two_rank_gloo_forward_backward_parity():
+def test_cp_vision_frame_shard_two_rank_gloo_forward_backward_parity():
     mp.spawn(_parity_worker, args=(2, _free_port()), nprocs=2, join=True)
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-def test_cp_vision_shard_two_rank_gloo_divergent_count_all_ranks_raise():
+def test_cp_vision_frame_shard_two_rank_gloo_divergent_count_all_ranks_raise():
     mp.spawn(_divergent_count_worker, args=(2, _free_port()), nprocs=2, join=True)
 
 
@@ -306,7 +306,7 @@ def _real_tower_worker(rank: int, world_size: int, port: int) -> None:
         from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
-        from nemo_automodel.components.distributed import cp_vision_shard as vs
+        from nemo_automodel.components.distributed import cp_vision_frame_shard as vs
 
         cfg = Qwen3_5VisionConfig(
             hidden_size=32,
@@ -329,7 +329,7 @@ def _real_tower_worker(rank: int, world_size: int, port: int) -> None:
 
         with torch.no_grad():
             rep = tower(pixel, grid_thw=grid, return_dict=True)
-            config = vs.CpVisionShardingConfig(enabled=True, min_tokens=0)
+            config = vs.CpVisionFrameShardingConfig(enabled=True, min_tokens=0)
             token = vs.set_cp_vision_group(dist.group.WORLD, config=config)
             try:
                 out = vs.maybe_distribute_visual(tower, pixel, grid)
@@ -344,10 +344,10 @@ def _real_tower_worker(rank: int, world_size: int, port: int) -> None:
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
 @pytest.mark.skipif(not _HAS_QWEN3_5, reason="transformers Qwen3.5 vision tower is not available")
-def test_cp_vision_shard_two_rank_gloo_real_qwen3_5_tower_forward_parity():
+def test_cp_vision_frame_shard_two_rank_gloo_real_qwen3_5_tower_forward_parity():
     mp.spawn(_real_tower_worker, args=(2, _free_port()), nprocs=2, join=True)
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is not available")
-def test_cp_vision_shard_two_rank_gloo_pad_path_parity():
+def test_cp_vision_frame_shard_two_rank_gloo_pad_path_parity():
     mp.spawn(_pad_path_worker, args=(2, _free_port()), nprocs=2, join=True)

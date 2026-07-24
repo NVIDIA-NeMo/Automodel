@@ -44,8 +44,8 @@ from nemo_automodel.components.distributed.context_parallel.sharder import (
     shard_batch_aux_only,
     shard_sequence_for_cp_round_robin,
 )
-from nemo_automodel.components.distributed.cp_vision_shard import (
-    cp_vision_sharding_active,
+from nemo_automodel.components.distributed.cp_vision_frame_shard import (
+    cp_vision_frame_sharding_active,
     maybe_distribute_visual,
 )
 from nemo_automodel.components.models.common import BackendConfig
@@ -828,7 +828,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         supports_pp: bool = True
         supports_ep: bool = False
         supports_thd: bool = False
-        supports_cp_vision_sharding: bool = True
+        supports_cp_vision_frame_sharding: bool = True
 
     @classmethod
     def from_config(
@@ -994,10 +994,10 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         """Encode one modality's patches into flat, entry-ordered visual tokens under CP.
 
         Under context parallelism the vision tower otherwise runs redundantly on the full,
-        un-sharded patch set on every CP rank. When the CP vision-shard group is published
-        (see :func:`~nemo_automodel.components.distributed.cp_vision_shard.set_cp_vision_group`),
+        un-sharded patch set on every CP rank. When the CP vision-frame sharding group is published
+        (see :func:`~nemo_automodel.components.distributed.cp_vision_frame_shard.set_cp_vision_group`),
         route the single ``self.model.visual`` call through
-        :func:`~nemo_automodel.components.distributed.cp_vision_shard.maybe_distribute_visual`,
+        :func:`~nemo_automodel.components.distributed.cp_vision_frame_shard.maybe_distribute_visual`,
         which shards the frames across the CP group and all-gathers the per-frame embeds in
         original entry order. Its ``pooler_output`` is the flat, already-concatenated tensor,
         identical to ``torch.cat(get_image_features(...).pooler_output, dim=0)`` (HF
@@ -1015,7 +1015,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
             ``[total_patch_rows / spatial_merge_size**2, hidden]`` flat merged-token embeddings
             in original entry order (vision hidden size), on the vision tower's output device.
         """
-        if cp_vision_sharding_active():
+        if cp_vision_frame_sharding_active():
             return maybe_distribute_visual(
                 self.model.visual, pixel_values.type(self.model.visual.dtype), grid_thw
             ).pooler_output

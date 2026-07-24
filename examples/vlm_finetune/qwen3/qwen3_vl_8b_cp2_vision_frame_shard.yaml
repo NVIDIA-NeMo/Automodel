@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Dense Qwen3-VL-8B with context parallelism and DeepStack-aware vision sharding.
+# Dense Qwen3-VL-8B with context parallelism and DeepStack-aware vision frame sharding.
 #
 # A/B on 8 GPUs (cp=2, dp=4):
-#   sharded  : automodel examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_shard.yaml --nproc-per-node 8
-#   baseline : automodel examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_shard.yaml --nproc-per-node 8 --distributed.cp_vision_sharding.enabled false
+#   sharded  : automodel examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml --nproc-per-node 8
+#   baseline : automodel examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml --nproc-per-node 8 --distributed.cp_vision_frame_sharding.enabled false
 
 recipe: FinetuneRecipeForVLM
 
@@ -63,7 +63,7 @@ distributed:
   ep_size: 1
   sequence_parallel: false
   activation_checkpointing: true
-  cp_vision_sharding:
+  cp_vision_frame_sharding:
     enabled: true
     min_tokens: 0
 

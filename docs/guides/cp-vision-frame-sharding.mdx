@@ -1,5 +1,5 @@
 ---
-title: "Context-Parallel Vision Sharding"
+title: "Context-Parallel Vision Frame Sharding"
 description: "Reduce duplicated vision-tower work by distributing image and video frames across context-parallel ranks."
 ---
 
@@ -10,14 +10,15 @@ vision-language model, however, the vision tower normally processes every image 
 on every CP rank before the language sequence is split. This repeats the same vision
 computation on each rank.
 
-Context-parallel vision sharding does not apply context-parallel attention inside the vision
-tower. Instead, it distributes independent image and video frames over the existing CP ranks.
-Each rank processes only its assigned frames, the resulting visual embeddings are gathered in
-their original order, and ordinary sequence CP then shards the assembled multimodal sequence.
-This reduces duplicated vision-tower computation while preserving the model's input ordering
-and gradients.
+Context-parallel vision frame sharding does not apply context-parallel attention inside
+the vision tower. Instead, it distributes independent image and video frames over the
+existing CP ranks. Each rank processes only its assigned frames, the resulting visual
+embeddings are gathered in their original order, and ordinary sequence CP then shards
+the assembled multimodal sequence. This reduces duplicated vision-tower computation
+while preserving the model's input ordering and gradients.
 
-The built-in integration supports the following model families:
+Only vision encoders that compute each image or video frame independently can use this
+feature. The built-in integration currently supports the following model families:
 
 | Model | Support |
 |---|---|
@@ -25,46 +26,46 @@ The built-in integration supports the following model families:
 | Dense Qwen3-VL | Supported, including DeepStack features |
 | Qwen3-VL-MoE | Not yet supported |
 
-## Configure Vision Sharding
+## Configure Vision Frame Sharding
 
-Enable context parallelism and vision sharding under `distributed`:
+Enable context parallelism and vision frame sharding under `distributed`:
 
 ```yaml
 distributed:
   cp_size: 2
-  cp_vision_sharding:
+  cp_vision_frame_sharding:
     enabled: true
     min_tokens: 2048
     cost_alpha: auto
 ```
 
-Vision sharding is disabled by default. A CP size greater than 1 and a supported model are
+Vision frame sharding is disabled by default. A CP size greater than 1 and a supported model are
 required for the sharded path.
 
 The following example recipes are available:
 
-- [Dense Qwen3-VL 8B with CP2 and vision sharding](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_shard.yaml)
-- [Dense Qwen3.5 4B with CP2 and vision sharding](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_shard.yaml)
+- [Dense Qwen3-VL 8B with CP2 and vision frame sharding](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml)
+- [Dense Qwen3.5 4B with CP2 and vision frame sharding](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_frame_shard.yaml)
 
 For example, run the Qwen3-VL recipe on eight GPUs:
 
 ```bash
 uv run automodel --nproc-per-node=8 \
-  examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_shard.yaml
+  examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml
 ```
 
 ### Configuration Fields
 
 | Field | Default | Description |
 |---|---|---|
-| `enabled` | `false` | Enables vision sharding across the CP group. |
-| `min_tokens` | `2048` | Uses the replicated path when the batch has fewer visual tokens than this threshold. Set it to `0` to always exercise vision sharding. |
+| `enabled` | `false` | Enables vision frame sharding across the CP group. |
+| `min_tokens` | `2048` | Uses the replicated path when the batch has fewer visual tokens than this threshold. Set it to `0` to always exercise vision frame sharding. |
 | `cost_alpha` | `auto` | Controls how frame cost is estimated for load balancing. `auto` uses the vision hidden size and is the recommended setting. A nonnegative integer overrides the inferred value; `0` uses a purely quadratic attention-cost estimate. |
 
 ## How It Works
 
 Qwen3.5- and Qwen3-VL-style vision towers process each frame independently. Vision
-sharding uses this property to:
+frame sharding uses this property to:
 
 1. Expand each image or video into individual frame units.
 2. Divide contiguous frames across CP ranks using an estimated per-frame compute cost.
@@ -98,8 +99,8 @@ line:
 
 ```bash
 uv run automodel --nproc-per-node=8 \
-  examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_shard.yaml \
-  --distributed.cp_vision_sharding.enabled false
+  examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml \
+  --distributed.cp_vision_frame_sharding.enabled false
 ```
 
 Use the same seed, batch, and topology for both runs. Confirm that training remains stable,
@@ -107,11 +108,14 @@ then compare step time and peak memory on a representative image or video worklo
 
 ## Limitations
 
+- Vision frame sharding applies only to vision encoders that compute each image or video
+  frame independently. Encoders with cross-frame coupling, including cross-frame attention,
+  require a separate model-specific parallelization path. Audio encoders are not supported.
 - The final visual embeddings are gathered on every CP rank before the language sequence is
   sharded. The larger intermediate vision activations are distributed, but the final
   embeddings remain replicated.
-- Activation checkpointing already reduces retained vision activations, so vision sharding
+- Activation checkpointing already reduces retained vision activations, so vision frame sharding
   can improve computation more noticeably than peak memory.
 - Additional VLM families require model-specific integration before they can use this
   policy.
-- CP vision sharding has no effect when `cp_size` is `1`.
+- CP vision frame sharding has no effect when `cp_size` is `1`.

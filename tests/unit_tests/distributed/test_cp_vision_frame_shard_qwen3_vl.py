@@ -19,7 +19,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from nemo_automodel.components.distributed import cp_vision_shard as vision_shard
+from nemo_automodel.components.distributed import cp_vision_frame_shard as vision_shard
 
 qwen3_vl = pytest.importorskip("transformers.models.qwen3_vl.modeling_qwen3_vl")
 Qwen3VLVisionConfig = pytest.importorskip("transformers.models.qwen3_vl.configuration_qwen3_vl").Qwen3VLVisionConfig

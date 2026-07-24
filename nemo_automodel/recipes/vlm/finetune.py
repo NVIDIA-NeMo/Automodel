@@ -50,8 +50,8 @@ from nemo_automodel.components.datasets.vlm.pp_media import stage_vlm_media_for_
 from nemo_automodel.components.distributed.config import DistributedSetup, MegatronFSDPConfig
 from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
 from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
-from nemo_automodel.components.distributed.cp_vision_shard import (
-    CpVisionShardingConfig,
+from nemo_automodel.components.distributed.cp_vision_frame_shard import (
+    CpVisionFrameShardingConfig,
     reset_cp_vision_group,
     set_cp_vision_group,
 )
@@ -105,28 +105,29 @@ except (ImportError, FileNotFoundError, OSError):
 # ---------------------------
 
 
-class _CpVisionShardingCapability(Protocol):
-    """Model capability required by the VLM vision-sharding recipe policy."""
+class _CpVisionFrameShardingCapability(Protocol):
+    """Model capability required by the VLM vision frame-sharding recipe policy."""
 
     @property
-    def supports_cp_vision_sharding(self) -> bool:
-        """Whether the model owns a verified CP vision-sharding integration."""
+    def supports_cp_vision_frame_sharding(self) -> bool:
+        """Whether the model owns a verified CP vision frame-sharding integration."""
         ...
 
 
-def _validate_cp_vision_sharding_support(
-    model: _CpVisionShardingCapability,
-    config: CpVisionShardingConfig,
+def _validate_cp_vision_frame_sharding_support(
+    model: _CpVisionFrameShardingCapability,
+    config: CpVisionFrameShardingConfig,
 ) -> None:
-    """Reject enabled vision sharding when the model has no production integration."""
-    if not config.enabled or model.supports_cp_vision_sharding:
+    """Reject enabled vision frame sharding when the model has no production integration."""
+    if not config.enabled or model.supports_cp_vision_frame_sharding:
         return
 
     model_name = type(model).__name__
     raise ValueError(
-        "distributed.cp_vision_sharding.enabled=true requires a model-owned frame-level "
-        f"vision-sharding integration, but {model_name} declares supports_cp_vision_sharding=False. "
-        "Disable the policy with distributed.cp_vision_sharding.enabled=false or use a supported model."
+        "distributed.cp_vision_frame_sharding.enabled=true requires a model-owned integration "
+        f"for sharding vision frames over CP ranks, but {model_name} declares "
+        "supports_cp_vision_frame_sharding=False. "
+        "Disable the policy with distributed.cp_vision_frame_sharding.enabled=false or use a supported model."
     )
 
 
@@ -468,7 +469,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             self.moe_parallel_config,
             self.activation_checkpointing,
         ) = self._distributed_setup_attributes(self._create_distributed_setup())
-        self.cp_vision_sharding = self.cfg.cp_vision_sharding
+        self.cp_vision_frame_sharding = self.cfg.cp_vision_frame_sharding
 
         if not self._should_setup_training_components():
             return
@@ -556,7 +557,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             cfg_quantization=self.cfg.get("quantization", None),
         )
         capability_model = model.parts[0] if isinstance(model, AutoPipeline) else model
-        _validate_cp_vision_sharding_support(capability_model, self.cp_vision_sharding)
+        _validate_cp_vision_frame_sharding_support(capability_model, self.cp_vision_frame_sharding)
         apply_te_patches()
         optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
         allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
@@ -806,7 +807,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 )
 
     @contextmanager
-    def _cp_vision_sharding_context(self):
+    def _cp_vision_frame_sharding_context(self):
         """Publish the CP-only group while a VLM forward may run its vision tower."""
         cp_active = (
             self.device_mesh is not None
@@ -819,7 +820,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
 
         token = set_cp_vision_group(
             self.device_mesh["cp"].get_group(),
-            config=self.cp_vision_sharding,
+            config=self.cp_vision_frame_sharding,
         )
         try:
             yield
@@ -883,7 +884,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
                 return
 
-            with self._cp_vision_sharding_context(), train_ctx():
+            with self._cp_vision_frame_sharding_context(), train_ctx():
                 losses = [] if self.pp.info.has_last_stage else None
                 if self.pp.info.has_last_stage:
                     masked_labels = labels.clone()
@@ -919,7 +920,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 if is_train
                 else nullcontext()
             )
-            with sync_ctx, self._cp_vision_sharding_context(), train_ctx():
+            with sync_ctx, self._cp_vision_frame_sharding_context(), train_ctx():
                 batch = filter_forward_kwargs(model, batch)
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
@@ -1170,7 +1171,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 )
                 train_ctx, batch = cp_sharder.shard(batch)
                 labels = batch.pop("labels")
-                with self._cp_vision_sharding_context(), train_ctx():
+                with self._cp_vision_frame_sharding_context(), train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                         out = self.model_parts[0](logits_to_keep=1, **batch)
