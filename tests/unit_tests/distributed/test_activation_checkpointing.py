@@ -168,6 +168,43 @@ def test_submodule_checkpointing_without_snapshot_context_recompute_sees_diverge
     assert attn.backend_states[1] != _MATH_ONLY
 
 
+class _LinearAttnBlock(nn.Module):
+    """Minimal hybrid decoder block whose mixer is named ``linear_attn``.
+
+    Mirrors Qwen3-Next / Qwen3.5 Gated DeltaNet layers, which name their token
+    mixer ``linear_attn`` (not ``self_attn``). Used to check that
+    ``apply_submodule_checkpointing`` wraps that submodule.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.linear_attn = nn.Linear(_D, _D)
+        self.mlp = nn.Sequential(nn.Linear(_D, _D), nn.Linear(_D, _D))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the linear-attention mixer + MLP.
+
+        Args:
+            x: Input activations of shape ``[S, H]`` (``S`` = tokens, ``H`` = hidden).
+
+        Returns:
+            Output activations of shape ``[S, H]``.
+        """
+        return x + self.mlp(self.linear_attn(x))
+
+
+def test_submodule_checkpointing_wraps_linear_attn_mixer():
+    """Gated DeltaNet blocks name their mixer ``linear_attn``; it must be checkpoint-wrapped."""
+    block = _LinearAttnBlock()
+    inner = block.linear_attn
+    ac.apply_submodule_checkpointing([block], has_kv_sharing=False)
+
+    assert isinstance(block.linear_attn, CheckpointWrapper)
+    assert isinstance(block.mlp, CheckpointWrapper)
+    # The wrapper preserves the original mixer as its inner module.
+    assert ac.unwrap_checkpoint_wrapper(block.linear_attn) is inner
+
+
 def test_submodule_checkpointing_preserves_canonical_state_dict_keys_for_property_aliases():
     class Mixer(nn.Module):
         def __init__(self):
