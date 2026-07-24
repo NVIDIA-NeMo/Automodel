@@ -214,6 +214,7 @@ navigation:
             path: ../../model-coverage/vlm/nvidia/nemotron-parse.mdx
           - page: "Ministral3 VL"
             path: ../../model-coverage/vlm/mistralai/ministral3-vl.mdx
+            slug: ministral3-vl
           - page: "Mistral Medium 3.5"
             path: ../../model-coverage/vlm/mistralai/mistral-medium-3-5.mdx
             slug: mistral-medium-3-5
@@ -221,14 +222,18 @@ navigation:
             path: ../../model-coverage/vlm/mistralai/mistral-small-4.mdx
           - page: "InternVL"
             path: ../../model-coverage/vlm/internlm/internvl.mdx
+            slug: internvl
           - page: "Llama 4"
             path: ../../model-coverage/vlm/meta/llama4.mdx
           - page: "LLaVA-OneVision"
             path: ../../model-coverage/vlm/lmms-lab/llava-onevision.mdx
+            slug: llava-onevision
           - page: "SmolVLM"
             path: ../../model-coverage/vlm/huggingface/smolvlm.mdx
+            slug: smolvlm
           - page: "LLaVA"
             path: ../../model-coverage/vlm/llava-hf/llava.mdx
+            slug: llava
           - page: "Step-3.7-Flash"
             path: ../../model-coverage/vlm/stepfun-ai/step-3-7.mdx
             slug: step-3-7-flash
