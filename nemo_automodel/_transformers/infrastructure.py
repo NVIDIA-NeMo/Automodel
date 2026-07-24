@@ -747,8 +747,9 @@ def apply_model_infrastructure(
                 else:
                     raise
 
-    # Configure dense context parallelism. Transformer Engine owns its THD
-    # communication, while SDPA uses DTensor context-parallel hooks.
+    # Configure dense attention parallelism. Transformer Engine must know its
+    # TP head partition even without CP; for CP, TE owns THD communication while
+    # SDPA uses DTensor context-parallel hooks.
     # These hooks strip attention_mask and set is_causal=True on self_attn modules
     # so that SDPA handles causal masking internally (compatible with DTensor sharding).
     #
@@ -759,7 +760,9 @@ def apply_model_infrastructure(
     # and clobber the model-owned ring (the original double-apply bug). Non-TE MoE
     # is not excluded by the _uses_te_attention check, so gate on ep_size: only
     # dense (non-MoE) models need this pass.
-    if mesh.cp_size > 1 and mesh.ep_size <= 1:
+    uses_te_attention = _uses_te_attention(model) if mesh.cp_size > 1 or mesh.tp_size > 1 else False
+    uses_thd_only_te_attention = _uses_thd_only_te_attention(model) if uses_te_attention else False
+    if mesh.ep_size <= 1 and (mesh.cp_size > 1 or (mesh.tp_size > 1 and uses_thd_only_te_attention)):
         from nemo_automodel.components.distributed.context_parallel.utils import (
             attach_context_parallel_hooks,
             attach_cp_sdpa_hooks,
@@ -767,17 +770,16 @@ def apply_model_infrastructure(
         )
 
         model_parts = model.parts if hasattr(model, "parts") else [model]
-        uses_te_attention = _uses_te_attention(model)
         if uses_te_attention:
-            cp_mesh = mesh.device_mesh["cp"]
+            cp_mesh = mesh.device_mesh["cp"] if mesh.cp_size > 1 else None
             tp_mesh = mesh.device_mesh["tp"] if mesh.tp_size > 1 else None
             configured = sum(attach_te_context_parallel(mp, cp_mesh, tp_mesh) for mp in model_parts)
             if configured == 0:
                 raise ValueError(
-                    "Context parallelism selected Transformer Engine attention, but no "
+                    "Tensor or context parallelism selected Transformer Engine attention, but no "
                     "DotProductAttention modules were found on the model."
                 )
-        if not uses_te_attention or _uses_thd_only_te_attention(model):
+        if mesh.cp_size > 1 and (not uses_te_attention or uses_thd_only_te_attention):
             is_compile_enabled = isinstance(model_wrapper, FSDP2Manager) and model_wrapper.enable_compile
             cp_mesh = mesh.device_mesh["cp"] if is_compile_enabled else None
             for mp in model_parts:

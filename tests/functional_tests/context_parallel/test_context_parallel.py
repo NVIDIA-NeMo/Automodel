@@ -28,6 +28,7 @@ CP_NEMOTRON_V3_ATTENTION_TEST_FILENAME = "L2_CP_NemotronV3_Attention_Test.sh"
 CP_NEMOTRON_V3_HYBRID_TEST_FILENAME = "L2_CP_NemotronV3_Hybrid_Test.sh"
 CP_QWEN3_5_MOE_LINEAR_ATTN_TEST_FILENAME = "L2_CP_Qwen3_5MoE_LinearAttn_Test.sh"
 CP_DENSE_PACKED_TEST_FILENAME = "L2_CP_Dense_Packed_Test.sh"
+TP_DENSE_PACKED_TEST_FILENAME = "L2_TP_Dense_Packed_Test.sh"
 TP_CP_DENSE_PACKED_TEST_FILENAME = "L2_TP_CP_Dense_Packed_Test.sh"
 
 
@@ -61,6 +62,10 @@ class TestContextParallelAttention:
     def test_cp_dense_packed(self):
         """Test two-layer packed THD forward and gradient parity for dense Llama, Qwen2, and Qwen3."""
         run_test_script(TEST_FOLDER, CP_DENSE_PACKED_TEST_FILENAME)
+
+    def test_tp_dense_packed(self):
+        """Test packed THD parity for dense Llama, Qwen2, and Qwen3 with TP=2 and CP=1."""
+        run_test_script(TEST_FOLDER, TP_DENSE_PACKED_TEST_FILENAME)
 
     def test_tp_cp_dense_packed(self):
         """Test packed THD parity for dense Llama, Qwen2, and Qwen3 with TP=2 and CP=2."""

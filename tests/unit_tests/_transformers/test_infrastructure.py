@@ -773,6 +773,57 @@ def test_apply_model_infrastructure_configures_dense_thd_te_and_bshd_sdpa_cp():
     attach_sdpa.assert_called_once_with(model)
 
 
+def test_apply_model_infrastructure_configures_dense_thd_te_for_tp_without_cp():
+    """Packed TP-only models must configure TE's tensor-parallel group."""
+    from nemo_automodel._transformers import infrastructure as infra
+
+    model = _DummyModel()
+    tp_mesh = SimpleNamespace(size=lambda: 2)
+    mesh = SimpleNamespace(
+        cp_size=1,
+        pp_size=1,
+        tp_size=2,
+        ep_size=1,
+        dp_size=1,
+        dp_shard_size=1,
+        dp_replicate_size=1,
+        device_mesh={"tp": tp_mesh},
+        moe_mesh=None,
+    )
+
+    with (
+        patch(f"{_INFRA_MODULE}.get_world_size_safe", return_value=1),
+        patch(f"{_INFRA_MODULE}._supports_logits_to_keep", return_value=True),
+        patch(f"{_INFRA_MODULE}.print_trainable_parameters"),
+        patch(f"{_INFRA_MODULE}._should_load_before_shard", return_value=False),
+        patch(f"{_INFRA_MODULE}._uses_te_attention", return_value=True),
+        patch(f"{_INFRA_MODULE}._uses_thd_only_te_attention", return_value=True),
+        patch(f"{_INFRA_MODULE}.Checkpointer") as MockCheckpointer,
+        patch(
+            "nemo_automodel.components.distributed.context_parallel.utils.attach_te_context_parallel",
+            return_value=1,
+        ) as attach_te,
+        patch(
+            "nemo_automodel.components.distributed.context_parallel.utils.attach_context_parallel_hooks",
+        ) as attach_sdpa,
+    ):
+        mock_ckpt = MockCheckpointer.return_value
+        mock_ckpt.config = MagicMock()
+        mock_ckpt.config.dequantize_base_checkpoint = False
+        infra.apply_model_infrastructure(
+            model=model,
+            is_meta_device=False,
+            device=torch.device("cpu"),
+            load_base_model=False,
+            model_wrapper=None,
+            mesh=mesh,
+            pretrained_model_name_or_path="",
+        )
+
+    attach_te.assert_called_once_with(model, None, tp_mesh)
+    attach_sdpa.assert_not_called()
+
+
 # =============================================================================
 # Tests for instantiate_infrastructure: MoE parallelize_fn option threading
 # =============================================================================

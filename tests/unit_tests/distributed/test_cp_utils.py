@@ -449,7 +449,7 @@ def test_attach_context_parallel_hooks_skips_non_self_attn():
 
 
 def test_attach_te_context_parallel_configures_full_and_sliding_attention(monkeypatch):
-    """TE CP setup must use p2p for full attention and all-gather for sliding attention."""
+    """TE setup must configure TP independently and choose the CP communication mode."""
 
     class _FakeDotProductAttention:
         def __init__(self):
@@ -481,6 +481,7 @@ def test_attach_te_context_parallel_configures_full_and_sliding_attention(monkey
     group = object()
     stream = object()
     cp_mesh = mock.MagicMock()
+    cp_mesh.size.return_value = 2
     cp_mesh.get_group.return_value = group
     tp_group = object()
     tp_mesh = mock.MagicMock()
@@ -503,6 +504,15 @@ def test_attach_te_context_parallel_configures_full_and_sliding_attention(monkey
         assert block.self_attn.attn_module.tp_calls == [tp_group]
         assert block.self_attn.attn_module.tp_size == 2
         assert block.self_attn.attn_module.num_gqa_groups_per_partition == 2
+
+    tp_only_model = torch.nn.ModuleList([_Block(None)])
+    configured = _cu.attach_te_context_parallel(tp_only_model, tp_mesh=tp_mesh)
+
+    assert configured == 1
+    assert tp_only_model[0].self_attn.attn_module.calls == []
+    assert tp_only_model[0].self_attn.attn_module.tp_calls == [tp_group]
+    assert tp_only_model[0].self_attn.attn_module.tp_size == 2
+    assert tp_only_model[0].self_attn.attn_module.num_gqa_groups_per_partition == 2
 
 
 # ============================================================================

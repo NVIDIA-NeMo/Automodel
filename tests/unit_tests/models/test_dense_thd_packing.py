@@ -30,6 +30,26 @@ from nemo_automodel.components.models.common import BackendConfig
 MODEL_KINDS = ("llama", "qwen2", "qwen3")
 
 
+def _create_causal_mask_without_cache_position(
+    config: object,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    *,
+    past_key_values: object,
+    position_ids: torch.Tensor | None = None,
+) -> None:
+    """Model the Transformers 5.12 causal-mask call contract.
+
+    Args:
+        config: Model configuration controlling the attention backend.
+        inputs_embeds: Hidden states ``[B, S, H]``.
+        attention_mask: Optional token mask ``[B, S]``.
+        past_key_values: Optional key/value cache.
+        position_ids: Optional position IDs ``[B, S]``.
+    """
+    del config, inputs_embeds, attention_mask, past_key_values, position_ids
+
+
 class _ReferencePackedAttention(nn.Module):
     """CPU reference for TE's causal variable-length THD attention."""
 
@@ -267,3 +287,20 @@ def test_packed_sliding_attention_matches_huggingface_window(model_kind, monkeyp
     ).logits
 
     torch.testing.assert_close(packed_logits, reference_logits, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("model_kind", MODEL_KINDS)
+def test_bshd_mask_call_matches_transformers_5_12_signature(model_kind, monkeypatch):
+    """Ordinary BSHD forward must not pass the removed cache_position mask argument."""
+    module = importlib.import_module(f"nemo_automodel.components.models.{model_kind}.model")
+    monkeypatch.setattr(module, "create_causal_mask", _create_causal_mask_without_cache_position)
+    model = _build_model(model_kind, monkeypatch).eval()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+
+    logits = model(
+        input_ids,
+        position_ids=torch.arange(input_ids.shape[1]).unsqueeze(0),
+        use_cache=False,
+    ).logits
+
+    assert logits.shape == (1, input_ids.shape[1], model.config.vocab_size)

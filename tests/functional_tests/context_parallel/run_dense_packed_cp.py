@@ -17,6 +17,7 @@
 Run with::
 
     torchrun --nproc-per-node=2 tests/functional_tests/context_parallel/run_dense_packed_cp.py
+    torchrun --nproc-per-node=2 tests/functional_tests/context_parallel/run_dense_packed_cp.py --tp-size 2
     torchrun --nproc-per-node=4 tests/functional_tests/context_parallel/run_dense_packed_cp.py --tp-size 2
 """
 
@@ -197,9 +198,10 @@ def _run_model(
 
     cp_model = _build_model(model_kind, device)
     _apply_tensor_parallel(cp_model, tp_mesh)
-    configured = attach_te_context_parallel(cp_model, cp_mesh, tp_mesh)
+    attention_cp_mesh = cp_mesh if cp_mesh.size() > 1 else None
+    configured = attach_te_context_parallel(cp_model, attention_cp_mesh, tp_mesh)
     assert configured == NUM_HIDDEN_LAYERS
-    cp_batch = make_cp_batch_for_te(cp_mesh, _clone_batch(batch))
+    cp_batch = make_cp_batch_for_te(attention_cp_mesh, _clone_batch(batch))
     cp_batch.pop("labels")
     local_logits = _full_tensor(cp_model(**cp_batch).logits).squeeze(0)
     (local_logits.float().square().sum() / loss_normalizer).backward()
@@ -301,9 +303,10 @@ def main() -> None:
         for model_kind in ("llama", "qwen2", "qwen3"):
             _run_model(model_kind, device, cp_mesh, tp_mesh)
             dist.barrier()
-        for model_kind in ("qwen2", "qwen3"):
-            _run_packed_sliding_attention(model_kind, device)
-            dist.barrier()
+        if args.tp_size == 1:
+            for model_kind in ("qwen2", "qwen3"):
+                _run_packed_sliding_attention(model_kind, device)
+                dist.barrier()
     finally:
         dist.destroy_process_group()
 
