@@ -254,7 +254,7 @@ dataset:
 The mask is built for `sdpa` or `eager` (dense additive) or `flex_attention` (sparse
 `BlockMask`, preferred at scale). FlashAttention-2 is unsupported (it ignores
 arbitrary masks), as is context parallelism. The paper trains a `block_length`
-1→2→3 curriculum (one epoch each); run the stages as successive fine-tunes,
+1→2→3 curriculum (one epoch each). Run the stages as successive fine-tunes,
 enabling `auto_balance_clean_loss` at the b3 stage.
 
 ## Fine-Tune the Model
