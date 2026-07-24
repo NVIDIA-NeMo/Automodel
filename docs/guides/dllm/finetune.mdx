@@ -76,9 +76,9 @@ The recipe uses a **strategy pattern** to handle differences between model famil
 | Mode | Strategy | Description |
 |------|----------|-------------|
 | `mdlm` | `MDLMStrategy` | LLaDA-style: model receives corrupted tokens, MDLM cross-entropy loss |
-| `hybrid` | `HybridStrategy` | Nemotron-Labs-Diffusion-style: model receives clean tokens + `masked_indices`, combined diffusion + AR loss |
-| `dflash` | `DFlashStrategy` | DFlash: frozen target LM provides hidden states; draft model trained with decay-weighted loss |
-| `idlm` | `IDLMStrategy` | I-DLM: converts an AR LM to a diffusion LM via an all-masked `[x_t \| x_0]` block-diffusion forward |
+| `hybrid` | `HybridStrategy` | Nemotron-Labs-Diffusion-style: model receives clean tokens and `masked_indices`, with a combined diffusion and AR loss |
+| `dflash` | `DFlashStrategy` | DFlash: frozen target LM provides hidden states. Draft model is trained with decay-weighted loss |
+| `idlm` | `IDLMStrategy` | I-DLM: converts an AR LM to a diffusion LM using an all-masked `[x_t \| x_0]` block-diffusion forward pass |
 
 ### LLaDA Configuration
 
