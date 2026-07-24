@@ -38,6 +38,8 @@ import torch
 
 import nemo_automodel.recipes.vlm.finetune as vlm_finetune
 from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.distributed.cp_vision_frame_shard import CpVisionFrameShardingConfig
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.vlm.finetune import FinetuneRecipeForVLM
 
 
@@ -106,7 +108,102 @@ class _FakeCPMesh:
 
     def __getitem__(self, key):
         assert key == "cp"
-        return SimpleNamespace(size=lambda: 2)
+        return SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group")
+
+
+def test_recipe_config_resolves_cp_vision_frame_sharding_policy():
+    cfg = RecipeConfig(
+        ConfigNode(
+            {
+                "distributed": {
+                    "cp_vision_frame_sharding": {
+                        "enabled": True,
+                        "min_tokens": 17,
+                        "cost_alpha": 0,
+                    }
+                }
+            }
+        )
+    )
+
+    assert cfg.cp_vision_frame_sharding == CpVisionFrameShardingConfig(enabled=True, min_tokens=17, cost_alpha=0)
+
+
+def test_recipe_config_disables_cp_vision_frame_sharding_by_default():
+    policy = RecipeConfig(ConfigNode({})).cp_vision_frame_sharding
+
+    assert policy == CpVisionFrameShardingConfig()
+    assert policy.cost_alpha == "auto"
+
+
+def test_recipe_config_accepts_explicit_auto_cost_alpha():
+    cfg = RecipeConfig(ConfigNode({"distributed": {"cp_vision_frame_sharding": {"cost_alpha": "auto"}}}))
+
+    assert cfg.cp_vision_frame_sharding.cost_alpha == "auto"
+
+
+class _UnsupportedVisionModel:
+    supports_cp_vision_frame_sharding = False
+
+
+class _SupportedVisionModel:
+    supports_cp_vision_frame_sharding = True
+
+
+def test_cp_vision_frame_sharding_rejects_model_without_capability():
+    policy = CpVisionFrameShardingConfig(enabled=True)
+
+    with pytest.raises(
+        ValueError,
+        match=r"_UnsupportedVisionModel declares supports_cp_vision_frame_sharding=False",
+    ):
+        vlm_finetune._validate_cp_vision_frame_sharding_support(_UnsupportedVisionModel(), policy)
+
+
+def test_cp_vision_frame_sharding_accepts_model_with_capability():
+    policy = CpVisionFrameShardingConfig(enabled=True)
+
+    vlm_finetune._validate_cp_vision_frame_sharding_support(_SupportedVisionModel(), policy)
+
+
+def test_disabled_cp_vision_frame_sharding_accepts_model_without_capability():
+    policy = CpVisionFrameShardingConfig(enabled=False)
+
+    vlm_finetune._validate_cp_vision_frame_sharding_support(_UnsupportedVisionModel(), policy)
+
+
+def test_cp_vision_frame_sharding_context_resets_published_group_after_failure(monkeypatch):
+    """The recipe must restore vision frame-sharding state when the model forward raises."""
+    recipe = object.__new__(FinetuneRecipeForVLM)
+    group = object()
+    token = object()
+    policy = CpVisionFrameShardingConfig(enabled=True)
+
+    class _Mesh(dict):
+        mesh_dim_names = ("cp",)
+
+    recipe.device_mesh = _Mesh(cp=SimpleNamespace(size=lambda: 2, get_group=lambda: group))
+    recipe.cp_vision_frame_sharding = policy
+    events = []
+
+    def _set(actual_group, *, config):
+        events.append(("set", actual_group, config))
+        return token
+
+    def _reset(actual_token):
+        events.append(("reset", actual_token))
+
+    monkeypatch.setattr(vlm_finetune, "set_cp_vision_group", _set)
+    monkeypatch.setattr(vlm_finetune, "reset_cp_vision_group", _reset)
+
+    with pytest.raises(RuntimeError, match="forward failed"):
+        with recipe._cp_vision_frame_sharding_context():
+            events.append(("forward",))
+            raise RuntimeError("forward failed")
+
+    assert events[0] == ("set", group, policy)
+    assert events[1] == ("forward",)
+    assert events[2] == ("reset", token)
 
 
 class _ScheduleSpy:
@@ -132,6 +229,7 @@ def test_forward_backward_step_pp_cp_first_stage_sunk_keeps_input_ids_full(monke
     recipe = object.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.device_mesh = _FakeCPMesh()
+    recipe.cp_vision_frame_sharding = CpVisionFrameShardingConfig(enabled=True)
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.model_parts = [model]
     recipe.pp_enabled = True
@@ -216,6 +314,7 @@ def _run_nonfirst_stage_fbstep(monkeypatch, model):
     recipe = object.__new__(FinetuneRecipeForVLM)
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.device_mesh = _FakeCPMesh()
+    recipe.cp_vision_frame_sharding = CpVisionFrameShardingConfig(enabled=True)
     recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
     recipe.model_parts = [model]
     recipe.pp_enabled = True
@@ -593,7 +692,8 @@ def test_run_validation_epoch_cp_active_runs_pre_embed(monkeypatch):
     recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
     recipe.model_parts = [_Model()]
     recipe.loss_fn = object()
-    recipe.device_mesh = _DM(cp=SimpleNamespace(size=lambda: 2))
+    recipe.device_mesh = _DM(cp=SimpleNamespace(size=lambda: 2, get_group=lambda: "cp-group"))
+    recipe.cp_vision_frame_sharding = CpVisionFrameShardingConfig(enabled=True)
     recipe.pp_enabled = False
     recipe.dist_env = SimpleNamespace(device=torch.device("cpu"))
     recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)

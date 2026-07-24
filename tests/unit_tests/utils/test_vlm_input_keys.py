@@ -65,7 +65,7 @@ def test_vlm_input_keys_covers_gemma4_modalities():
 
 def test_vlm_input_keys_covers_qwen_kimi_mistral_grid_keys():
     """Qwen-VL/Kimi-VL/Mistral4 grid + sizes keys must be present."""
-    expected = {"image_grid_hws", "image_grid_thw", "image_sizes"}
+    expected = {"image_grid_hws", "image_grid_thw", "video_grid_thw", "image_sizes"}
     missing = expected - set(VLM_INPUT_KEYS)
     assert not missing, f"missing grid/size keys: {missing}"
 

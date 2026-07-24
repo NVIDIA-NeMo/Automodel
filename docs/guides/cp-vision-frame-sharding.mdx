@@ -1,0 +1,121 @@
+---
+title: "Context-Parallel Vision Frame Sharding"
+description: "Reduce duplicated vision-tower work by distributing image and video frames across context-parallel ranks."
+---
+
+## Overview
+
+Context parallelism (CP) splits a model's language sequence across multiple GPUs. In a
+vision-language model, however, the vision tower normally processes every image and video
+on every CP rank before the language sequence is split. This repeats the same vision
+computation on each rank.
+
+Context-parallel vision frame sharding does not apply context-parallel attention inside
+the vision tower. Instead, it distributes independent image and video frames over the
+existing CP ranks. Each rank processes only its assigned frames, the resulting visual
+embeddings are gathered in their original order, and ordinary sequence CP then shards
+the assembled multimodal sequence. This reduces duplicated vision-tower computation
+while preserving the model's input ordering and gradients.
+
+Only vision encoders that compute each image or video frame independently can use this
+feature. The built-in integration currently supports the following model families:
+
+| Model | Support |
+|---|---|
+| Dense Qwen3.5 | Supported |
+| Dense Qwen3-VL | Supported, including DeepStack features |
+| Qwen3-VL-MoE | Not yet supported |
+
+## Configure Vision Frame Sharding
+
+Enable context parallelism and vision frame sharding under `distributed`:
+
+```yaml
+distributed:
+  cp_size: 2
+  cp_vision_frame_sharding:
+    enabled: true
+    min_tokens: 2048
+    cost_alpha: auto
+```
+
+Vision frame sharding is disabled by default. A CP size greater than 1 and a supported model are
+required for the sharded path.
+
+The following example recipes are available:
+
+- [Dense Qwen3-VL 8B with CP2 and vision frame sharding](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml)
+- [Dense Qwen3.5 4B with CP2 and vision frame sharding](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_5/qwen3_5_4b_cp2_vision_frame_shard.yaml)
+
+For example, run the Qwen3-VL recipe on eight GPUs:
+
+```bash
+uv run automodel --nproc-per-node=8 \
+  examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml
+```
+
+### Configuration Fields
+
+| Field | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Enables vision frame sharding across the CP group. |
+| `min_tokens` | `2048` | Uses the replicated path when the batch has fewer visual tokens than this threshold. Set it to `0` to always exercise vision frame sharding. |
+| `cost_alpha` | `auto` | Controls how frame cost is estimated for load balancing. `auto` uses the vision hidden size and is the recommended setting. A nonnegative integer overrides the inferred value; `0` uses a purely quadratic attention-cost estimate. |
+
+## How It Works
+
+Qwen3.5- and Qwen3-VL-style vision towers process each frame independently. Vision
+frame sharding uses this property to:
+
+1. Expand each image or video into individual frame units.
+2. Divide contiguous frames across CP ranks using an estimated per-frame compute cost.
+3. Run the vision tower once on each rank's local frames.
+4. Gather the visual embeddings in the original frame order.
+5. Continue through the model's existing multimodal embedding and CP sequence-sharding
+   path.
+
+The partitioner accounts for both attention cost and linear per-patch work. This helps
+balance batches that mix large images with many smaller video frames. Keeping each rank's
+frames contiguous allows the gathered outputs to be concatenated without reordering.
+
+The gather operation supports autograd, so a trainable vision tower receives the same
+gradient contributions as the replicated path. Built-in integrations shard across the CP
+dimension only, even when tensor parallelism is also enabled. This avoids over-counting
+gradients for vision-tower weights that are replicated across TP ranks.
+
+If a batch contains fewer frames than CP ranks, the implementation adds minimal dummy
+frames so every rank participates in the vision forward and collectives. The corresponding
+embeddings are discarded and contribute no gradient.
+
+## Check Your Workload
+
+The benefit depends on the amount and shape of visual input, the CP size, activation
+checkpointing, and communication between ranks. Small visual workloads can spend more time
+gathering embeddings than they save in vision computation, which is why `min_tokens`
+defaults to `2048`.
+
+Compare a sharded run with the replicated baseline by disabling the policy from the command
+line:
+
+```bash
+uv run automodel --nproc-per-node=8 \
+  examples/vlm_finetune/qwen3/qwen3_vl_8b_cp2_vision_frame_shard.yaml \
+  --distributed.cp_vision_frame_sharding.enabled false
+```
+
+Use the same seed, batch, and topology for both runs. Confirm that training remains stable,
+then compare step time and peak memory on a representative image or video workload.
+
+## Limitations
+
+- Vision frame sharding applies only to vision encoders that compute each image or video
+  frame independently. Encoders with cross-frame coupling, including cross-frame attention,
+  require a separate model-specific parallelization path. Audio encoders are not supported.
+- The final visual embeddings are gathered on every CP rank before the language sequence is
+  sharded. The larger intermediate vision activations are distributed, but the final
+  embeddings remain replicated.
+- Activation checkpointing already reduces retained vision activations, so vision frame sharding
+  can improve computation more noticeably than peak memory.
+- Additional VLM families require model-specific integration before they can use this
+  policy.
+- CP vision frame sharding has no effect when `cp_size` is `1`.
