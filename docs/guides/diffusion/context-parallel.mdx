@@ -75,7 +75,7 @@ A related limitation (by design, not a bug): ring attention requires the attenti
 
 One benign quirk is that the `flash` backend's backward operation on the CP path advances the CUDA RNG (Philox) state on every call, even with dropout 0. The `native`, `_native_flash`, and `_native_cudnn` backends do not. Training remains correct because every CP peer executes the same call sequence, so peers stay RNG-synchronized, and the step-0 gradient norm matches the `cp_size = 1` baseline exactly. However, the noise and timestep draws from step 1 onward differ from any non-flash run, so per-step loss curves are comparable only to a baseline that uses the same backend.
 
-Both issues should be reported/fixed upstream; once they land, `cp_ring_degree` can be re-enabled here for ring or hybrid ring×Ulysses layouts (useful when CP spans nodes and all-to-all bandwidth is the constraint).
+These issues should be reported and fixed upstream. After the fixes are available, `cp_ring_degree` can be re-enabled for ring or hybrid ring and Ulysses layouts. These layouts are useful when CP spans nodes and all-to-all bandwidth is the constraint.
 
 ## Current Limitations
 
