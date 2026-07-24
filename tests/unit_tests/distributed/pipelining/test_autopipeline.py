@@ -18,6 +18,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
+from torch.distributed.pipelining.microbatch import split_args_kwargs_into_chunks
 
 from nemo_automodel.components.distributed.pipelining.autopipeline import AutoPipeline
 from nemo_automodel.components.distributed.pipelining.functional import (
@@ -219,6 +220,77 @@ class TestAutoPipelineValidation:
 
         assert ap.world_mesh == world_mesh
         assert ap.pp_mesh is not None
+
+
+class _KwargsChunkHookPart(nn.Module):
+    def __init__(self, chunk_dims: dict[str, int]):
+        super().__init__()
+        self.chunk_dims = chunk_dims
+
+    def get_pipeline_kwargs_chunk_dims(self, kwargs):
+        return {key: dim for key, dim in self.chunk_dims.items() if key in kwargs}
+
+
+class TestAutoPipelineKwargsChunkSpec:
+    def _pipeline_with_parts(self, *parts: nn.Module):
+        ap = AutoPipeline(
+            world_mesh=FakeDeviceMesh(),
+            pp_axis_name="pp",
+            pp_schedule="1f1b",
+            pp_microbatch_size=1,
+            pp_batch_size=2,
+            device=torch.device("cpu"),
+        )
+        ap._info.schedule = types.SimpleNamespace(_kwargs_chunk_spec=None)
+        ap._info.model_parts = list(parts)
+        return ap
+
+    def test_model_hook_splits_mrope_position_ids_on_batch_axis(self):
+        """Model-owned PP chunk hook keeps all mRoPE axes in every microbatch."""
+        input_ids = torch.zeros(2, 8, dtype=torch.long)
+        position_ids = torch.arange(8, dtype=torch.long).view(1, 1, -1).expand(3, 2, -1).clone()
+        kwargs = {
+            "position_ids": position_ids,
+            "attention_mask": torch.ones(2, 8, dtype=torch.bool),
+            "qkv_format": "thd",
+        }
+
+        _, default_kwargs_split = split_args_kwargs_into_chunks((input_ids,), kwargs, 2)
+        assert default_kwargs_split[0]["position_ids"].shape == (2, 2, 8)
+
+        ap = self._pipeline_with_parts(_KwargsChunkHookPart({"position_ids": 1}))
+        ap.configure_schedule_kwargs_chunk_spec(kwargs)
+
+        _, fixed_kwargs_split = split_args_kwargs_into_chunks(
+            (input_ids,),
+            kwargs,
+            2,
+            kwargs_chunk_spec=ap.info.schedule._kwargs_chunk_spec,
+        )
+        assert fixed_kwargs_split[0]["position_ids"].shape == (3, 1, 8)
+        assert fixed_kwargs_split[1]["position_ids"].shape == (3, 1, 8)
+        torch.testing.assert_close(fixed_kwargs_split[0]["position_ids"], position_ids[:, :1])
+        torch.testing.assert_close(fixed_kwargs_split[1]["position_ids"], position_ids[:, 1:])
+        assert fixed_kwargs_split[0]["attention_mask"].shape == (1, 8)
+        assert fixed_kwargs_split[0]["qkv_format"] == "thd"
+        assert fixed_kwargs_split[1]["qkv_format"] == "thd"
+
+    def test_no_model_hook_uses_pytorch_default_chunking(self):
+        ap = self._pipeline_with_parts(nn.Module())
+        ap.info.schedule._kwargs_chunk_spec = {"stale": object()}
+
+        ap.configure_schedule_kwargs_chunk_spec({"attention_mask": torch.ones(2, 8)})
+
+        assert ap.info.schedule._kwargs_chunk_spec is None
+
+    def test_conflicting_model_hook_dims_raise(self):
+        ap = self._pipeline_with_parts(
+            _KwargsChunkHookPart({"position_ids": 0}),
+            _KwargsChunkHookPart({"position_ids": 1}),
+        )
+
+        with pytest.raises(ValueError, match="Conflicting PP chunk dims"):
+            ap.configure_schedule_kwargs_chunk_spec({"position_ids": torch.zeros(3, 2, 8)})
 
 
 # -----------------------------

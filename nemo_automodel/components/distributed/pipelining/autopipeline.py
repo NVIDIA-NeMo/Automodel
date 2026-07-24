@@ -14,13 +14,16 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.pipelining.microbatch import BlockMask, TensorChunkSpec
+from torch.distributed.pipelining.microbatch import _Replicate as ReplicateChunkSpec
 from torch.distributed.pipelining.schedules import _PipelineSchedule
 from torch.distributed.pipelining.stage import PipelineStage
+from torch.utils._pytree import tree_map
 
 from nemo_automodel.components.distributed.pipelining.functional import (
     ParallelizeFnProtocol,
@@ -214,6 +217,50 @@ class AutoPipeline:
         )
         self._pp_current_seq_len = seq_len
         logger.debug(f"PP stage shapes updated for seq_len={seq_len}")
+
+    def configure_schedule_kwargs_chunk_spec(self, kwargs: dict[str, Any]) -> None:
+        """Configure pipeline microbatch chunking for keyword inputs.
+
+        PyTorch's default schedule chunking splits every tensor kwarg on dim 0.
+        Most AutoModel batch tensors are batch-major and should keep that
+        default, but some model-owned input layouts place batch on another axis.
+        Model parts can declare those exceptions by implementing
+        ``get_pipeline_kwargs_chunk_dims(kwargs) -> dict[str, int]``.
+        """
+        schedule = self._info.schedule
+        if schedule is None:
+            raise RuntimeError("AutoPipeline.build() must be called before configuring PP kwarg chunk specs")
+
+        custom_chunk_dims: dict[str, int] = {}
+        for model_part in self._info.model_parts or []:
+            hook = getattr(model_part, "get_pipeline_kwargs_chunk_dims", None)
+            if hook is None:
+                continue
+            chunk_dims = hook(kwargs)
+            if chunk_dims is None:
+                continue
+            for key, split_dim in chunk_dims.items():
+                if key not in kwargs:
+                    raise ValueError(f"Model PP chunk hook returned unknown kwarg: {key}")
+                if key in custom_chunk_dims and custom_chunk_dims[key] != split_dim:
+                    raise ValueError(
+                        f"Conflicting PP chunk dims for kwarg '{key}': {custom_chunk_dims[key]} and {split_dim}"
+                    )
+                custom_chunk_dims[key] = split_dim
+
+        if not custom_chunk_dims:
+            schedule._kwargs_chunk_spec = None
+            return
+
+        def default_spec(value):
+            if isinstance(value, (torch.Tensor, BlockMask)):
+                return TensorChunkSpec(0)
+            return ReplicateChunkSpec()
+
+        kwargs_chunk_spec = tree_map(default_spec, kwargs, is_leaf=lambda value: isinstance(value, BlockMask))
+        for key, split_dim in custom_chunk_dims.items():
+            kwargs_chunk_spec[key] = TensorChunkSpec(split_dim)
+        schedule._kwargs_chunk_spec = kwargs_chunk_spec
 
     @property
     def parts(self) -> list[nn.Module]:
