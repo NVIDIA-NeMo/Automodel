@@ -5,9 +5,6 @@ position: 4
 ---
 NeMo AutoModel recipes use YAML configs. The YAML parser creates a `ConfigNode` that performs the following actions:
 
-- Translates common scalar strings into typed Python values (e.g., `"10"` → `10`).
-- Resolves `_target_` (and `*_fn`) into Python callables/classes.
-- Supports environment variable interpolation inside YAML strings.
 - Translates common scalar strings into typed Python values (for example, `"10"` → `10`)
 - Resolves `_target_` and `*_fn` into Python callables and classes
 - Supports environment variable interpolation inside YAML strings
