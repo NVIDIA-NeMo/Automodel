@@ -11,20 +11,47 @@ This dataset is used by the retrieval recipes in `examples/retrieval/bi_encoder/
 `examples/retrieval/cross_encoder/`, together with the retrieval collators. For an end-to-end training workflow, refer to
 [Retrieval Fine-Tuning](/recipes-e2e-examples/retrieval-finetune).
 
+AutoModel supports three raw retrieval input formats: local corpus ID-based JSON, AutoModel-format Hugging Face
+datasets, and inline JSONL. It also supports prepared normalized Arrow bundles for large corpus-backed datasets.
+Regardless of how the source data is stored, AutoModel converts it into the following common format for training. Later
+sections explain how to use the raw formats with `RetrievalDatasetConfig` and normalized Arrow with
+`NormalizedRetrievalDatasetConfig`.
+
+## Training-Time Record Format
+
+With `model_type: bi_encoder`, both dataset configs build a Hugging Face `datasets.Dataset` and transform each stored
+record into the same training-time schema:
+
+- `question`: query string
+- `doc_text`: list of document texts in the order `[positive, negative_1, negative_2, ...]`
+- `doc_image`: list of images (or empty strings), aligned with `doc_text`
+- `doc_id`: list of document identifiers aligned with `doc_text`. Corpus-backed and `hf://` sources preserve document
+  IDs. Pure inline JSONL produces empty IDs, so use a corpus-backed source or custom preprocessing when reliable
+  same-document masking is required.
+- `query_instruction` / `passage_instruction`: optional, used when `use_dataset_instruction: true` and the corpus
+  provides instructions through metadata
+
+With `model_type: cross_encoder`, the configs consume the same retrieval records but flatten each query with its
+positive and negative passages. `CrossEncoderCollator` then serializes each query-passage pair for reranking.
+
+For each query, both configs select exactly one positive passage. They use the first item in `pos_doc` by default. Set
+`cycle_positive_docs: true` to rotate through multiple positives deterministically by epoch
+(`epoch % len(pos_doc)`). For guidance about expanding multi-positive data and preventing sibling positives from
+becoming negatives, refer to
+[Convert Qrels and Multi-Positive Data](#convert-qrels-and-multi-positive-data).
+
 ## Raw Input Formats
 
-Raw retrieval data can use one of three formats: local corpus ID-based JSON, an AutoModel-format Hugging Face dataset
-referenced by an `hf://` URI, or inline JSONL. Configure any of these sources with
-`nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig`. The config chooses the loader from
-the URI or file extension. Use the `.jsonl` extension for inline records; a `.json` file is interpreted as corpus-backed
-data.
+`RetrievalDatasetConfig` selects the loader for the three raw formats from the source URI or file extension. Use
+`.jsonl` for inline records, `.json` for local corpus-backed data, and `hf://` for AutoModel-format Hugging Face
+sources.
 
 The following table compares the three supported source types:
 
-| Source | Query field | Required document fields | Typical use |
-|--------|-------------|--------------------------|-------------|
+| Source | Query field | Required structure | Typical use |
+|--------|-------------|--------------------|-------------|
 | Corpus ID JSON | `question` | `question_id`, `corpus_id`, `pos_doc`, and `neg_doc` IDs resolved through a local corpus | Local corpus-backed training and hard-negative mining |
-| `hf://` AutoModel schema | `question` | `pos_doc`, a companion Hugging Face corpus split, and `neg_doc` before training with `n_passages > 1` | Datasets hosted on Hugging Face that already use the AutoModel retrieval schema |
+| `hf://` AutoModel schema | `question` | `pos_doc`, a companion Hugging Face corpus split, and at least one `neg_doc` when `n_passages > 1` | Datasets hosted on Hugging Face that already use the AutoModel retrieval schema |
 | Inline JSONL | `query` or `question` | Inline text in `pos_doc` and `neg_doc` | Small custom text datasets |
 
 ### Corpus ID-Based JSON
@@ -81,9 +108,6 @@ The `corpus_id` in `merlin_metadata.json` must match the `corpus_id` in each tra
 The following behavior applies to corpus-backed records:
 
 - `pos_doc` and `neg_doc` can be lists of `{"id": ...}` dicts or raw IDs (they are normalized internally).
-- `cycle_positive_docs` defaults to `false`, so training uses `pos_doc[0]`. Set it to `true` to rotate through
-  multiple positive documents deterministically by epoch (`epoch % len(pos_doc)`).
-- With cycling disabled, additional positives are ignored unless you expand the data before training.
 - To train with corpus instructions, set `use_dataset_instruction: true` on both the dataset and the bi-encoder
   collator. The dataset surfaces `query_instruction` and `passage_instruction` from `merlin_metadata.json`. The collator
   prepends them before tokenization.
@@ -102,8 +126,7 @@ Each subset must provide:
 
 - `<subset>/dataset_metadata.json` with `corpus_id` metadata and `ids_only` set to `false` or omitted
 - a `<subset>_corpus` train split with `id` and `text` columns
-- a `<subset>` train split with `question` and `pos_doc`. `neg_doc` may be absent but must be available before training
-  with `n_passages > 1`
+- a `<subset>` train split with `question` and `pos_doc`, plus at least one `neg_doc` when `n_passages > 1`
 
 Datasets in BEIR, DPR, MS MARCO, MIRACL, or other layouts need preprocessing unless they have already been converted to
 the AutoModel schema above.
@@ -139,14 +162,15 @@ The following behavior applies to inline records:
 The following requirements apply to all three raw input types:
 
 - `pos_doc` must be non-empty.
-- `neg_doc` must be present in local JSON and JSONL training records. It may be empty only when `n_passages: 1`.
-- `hf://` sources may omit `neg_doc` in the source dataset.
-- For every source, `neg_doc` must contain at least one document before training with `n_passages > 1`.
+- Local JSON and JSONL records must include `neg_doc`; it may be empty only when `n_passages: 1`.
+- An `hf://` source may omit `neg_doc` only when `n_passages: 1`.
+- With `n_passages > 1`, every record must provide at least one negative. If it provides fewer than
+  `n_passages - 1`, AutoModel repeats the available negatives to fill the requested passage count.
 
 <Warning>
-`n_passages: 1` is a schema escape hatch, not a good default training setup. The standard bi-encoder and cross-encoder
-recipes need at least one negative candidate for meaningful contrastive or reranking supervision, unless you add a
-custom negative strategy such as qrels-aware in-batch negatives.
+`n_passages: 1` is supported, but it is not the usual training setup. The standard bi-encoder and cross-encoder recipes
+need at least one negative candidate for meaningful contrastive or reranking supervision, unless you add a custom
+negative strategy such as qrels-aware in-batch negatives.
 </Warning>
 
 ## Choose How to Load the Data
@@ -173,8 +197,8 @@ Use normalized Arrow for full-scale or image-heavy vision-language (VL) retrieva
 loading the source data directly with `RetrievalDatasetConfig` is usually simpler. Normalization can still help when a
 large text corpus has expensive startup or when you need a portable prepared dataset.
 
-The CPU preparation tool currently accepts corpus ID-based JSON sources. It does not accept `hf://` URIs or inline
-JSONL directly. Materialize those sources as corpus ID-based JSON first, or continue using `RetrievalDatasetConfig`.
+The CPU preparation tool currently accepts corpus ID-based JSON sources. For `hf://` or inline JSONL sources, continue
+using `RetrievalDatasetConfig` unless you first convert them to corpus ID-based JSON.
 
 Prepare the bundle before launching GPU training:
 
@@ -195,36 +219,14 @@ dataset:
   n_passages: 5
 ```
 
-For large datasets on a Slurm cluster, prepare sources in parallel with the CPU array launcher. The
-[retrieval data preparation tools](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/retrieval/README.md)
-document local and Slurm commands, source selection, append and resume behavior, and the cache-warming alternative.
-
-## Training-Time Record Format
-
-Both dataset configs build a Hugging Face `datasets.Dataset` and transform each stored record into the same
-training-time schema:
-
-- `question`: query string
-- `doc_text`: list of document texts in the order `[positive, negative_1, negative_2, ...]`
-- `doc_image`: list of images (or empty strings), aligned with `doc_text`
-- `doc_id`: list of document identifiers aligned with `doc_text`. Corpus-backed and `hf://` sources preserve document
-  IDs. Pure inline JSONL produces empty IDs, so use a corpus-backed source or custom preprocessing when reliable
-  same-document masking is required.
-- `query_instruction` / `passage_instruction`: optional, used when `use_dataset_instruction: true` and the corpus
-  provides instructions through metadata
-
-The cross-encoder recipe consumes the same retrieval records, but sets `model_type: cross_encoder`. Its dataset
-transform flattens each query with its positive and negative passages, and `CrossEncoderCollator` serializes each
-query-passage pair for reranking.
-
-Each transformed training example uses exactly one positive passage. Both configs use the first item in `pos_doc` by
-default. Set `cycle_positive_docs: true` to rotate through multiple positives by epoch. For guidance about expanding
-multi-positive data and preventing sibling positives from becoming negatives, refer to
-[Convert Qrels and Multi-Positive Data](#convert-qrels-and-multi-positive-data).
+For large datasets on a Slurm cluster, use the CPU normalized dataset preparation scripts to process sources in
+parallel. See the
+[retrieval data preparation tools](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/retrieval/README.md) for
+local and Slurm commands, source selection, append and resume behavior, and the cache-warming alternative.
 
 ## Configure the Dataset and Collator in YAML
 
-Use `RetrievalDatasetConfig` with the appropriate collator for every supported source. The following corpus-backed
+Use `RetrievalDatasetConfig` with the appropriate collator for every supported raw source. The following corpus-backed
 example also works with an `hf://` source:
 
 ```yaml
@@ -305,7 +307,7 @@ qrels-style data into retrieval records before training:
 4. For hard-negative mining, include every known positive document ID for the query in `pos_doc`. The miner excludes
    only IDs in the input record, not an external qrels file.
 5. If you expand a query into multiple records, keep sibling-positive records out of the same in-batch-negative training
-   batch or use known-positive masking.
+   batch or add a custom known-positive mask.
 
 Preserve the complete qrels separately for offline full-corpus retrieval evaluation and use them to audit mined
 negatives before reusing the output for training.
