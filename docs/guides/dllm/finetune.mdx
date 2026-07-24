@@ -106,7 +106,7 @@ See [`nemotron_labs_diffusion_sft.yaml`](https://github.com/NVIDIA-NeMo/Automode
 ```yaml
 model:
   pretrained_model_name_or_path: nvidia/Nemotron-Labs-Diffusion-8B-Base
-  torch_dtype: float32          # Master-weight dtype. Use `float32` for an fp32 master copy or `bfloat16` for bf16.
+  torch_dtype: float32          # Master-weight dtype. Use `float32` for an fp32 master copy or `bfloat16` for BF16.
   trust_remote_code: true
   dlm_paradigm: block_diff       # Required for SFT: HF default "bidirectional" is the inference mode
   block_size: 32
