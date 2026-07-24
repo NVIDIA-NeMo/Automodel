@@ -85,7 +85,7 @@ Both issues should be reported/fixed upstream; once they land, `cp_ring_degree` 
 
 ## Example
 
-Fine-tune Wan 2.1 on 8 GPUs with sequence sharding across 2:
+To fine-tune Wan 2.1 on eight GPUs with sequence sharding across two GPUs, run the following command:
 
 ```bash
 torchrun --nproc-per-node 8 examples/diffusion/finetune/finetune.py \
