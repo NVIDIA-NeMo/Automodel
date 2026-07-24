@@ -1539,11 +1539,22 @@ class _MockAutoPipeline:
     def __init__(self, has_first_stage=True, has_last_stage=True, n_microbatches=2, add_losses=True):
         self._info = _MockPPInfo(has_first_stage, has_last_stage, n_microbatches, add_losses)
         self.info = self._info
+        self.kwargs_chunk_spec_batches = []
 
     def update_seq_len(self, seq_len: int) -> None:
         # Dynamic seq-len hook is a no-op in tests; AutoPipeline exposes this for
         # variable-length VLM batches.
         return None
+
+    def configure_schedule_kwargs_chunk_spec(self, kwargs) -> None:
+        """Record schedule kwarg chunk-spec inputs.
+
+        Args:
+            kwargs: Mapping of keyword inputs passed to the PP schedule after
+                model input and labels are removed. Tensor values keep the same
+                arbitrary shapes and axis order that ``schedule.step`` receives.
+        """
+        self.kwargs_chunk_spec_batches.append(dict(kwargs))
 
 
 def _create_pp_recipe(model=None):
@@ -1666,9 +1677,39 @@ class TestForwardBackwardStepPP:
 
         # Verify schedule.step was called
         pp_recipe.pp.info.schedule.step.assert_called_once()
+        assert pp_recipe.pp.kwargs_chunk_spec_batches == [{}]
 
         # Verify loss was computed
         assert len(loss_buffer) == 1
+
+    def test_pp_configures_schedule_kwargs_chunk_spec_with_remaining_kwargs(self, pp_recipe, monkeypatch):
+        """The recipe asks AutoPipeline to configure schedule kwarg chunking before PP step."""
+        pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
+
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
+        )
+
+        position_ids = torch.zeros(3, 2, 8, dtype=torch.long)
+        batch = {
+            "labels": torch.ones(2, 8, dtype=torch.long),
+            "input_ids": torch.ones(2, 8, dtype=torch.long),
+            "position_ids": position_ids,
+        }
+
+        pp_recipe._forward_backward_step(
+            idx=0,
+            batch=batch,
+            loss_buffer=[],
+            num_label_tokens=16,
+            num_batches=1,
+            is_train=True,
+        )
+
+        assert len(pp_recipe.pp.kwargs_chunk_spec_batches) == 1
+        assert pp_recipe.pp.kwargs_chunk_spec_batches[0].keys() == {"position_ids"}
+        assert torch.equal(pp_recipe.pp.kwargs_chunk_spec_batches[0]["position_ids"], position_ids)
 
     def test_pp_vlm_chunking_videos_uses_video_grid_and_counts(self, pp_recipe, monkeypatch):
         """Video tensors are chunked by per-sample video counts before schedule.step."""
