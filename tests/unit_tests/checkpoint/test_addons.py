@@ -13,12 +13,16 @@
 # limitations under the License.
 
 import os
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint.addons import (
+    ConsolidatedHFAddon,
     _extract_target_modules,
     _group_barrier,
     _is_group_rank_0,
@@ -97,6 +101,64 @@ def test_maybe_save_custom_model_code_noop_for_none_or_non_dir(tmp_path):
     some_file.write_text("hello")
     _maybe_save_custom_model_code(str(some_file), str(dst_root))
     assert list(dst_root.rglob("*.py")) == []
+
+
+@pytest.mark.parametrize("use_ddp", [False, True])
+def test_consolidated_hf_addon_delegates_to_model_metadata_exporter(tmp_path, use_ddp):
+    metadata_dir = tmp_path / "metadata"
+    metadata_dir.mkdir()
+    exporter = SimpleNamespace(validate=MagicMock(), save=MagicMock())
+    model = nn.Module()
+    model._get_consolidated_hf_metadata_exporter = lambda: exporter
+    wrapped_model = object.__new__(DistributedDataParallel)
+    nn.Module.__init__(wrapped_model)
+    wrapped_model.module = model
+    tokenizer = MagicMock()
+
+    ConsolidatedHFAddon().pre_save(
+        model_state=SimpleNamespace(model=[wrapped_model if use_ddp else model]),
+        hf_metadata_dir=str(metadata_dir),
+        tokenizer=tokenizer,
+        fqn_to_file_index_mapping={"w": 1},
+        fqn_to_dtype_mapping=None,
+        original_model_path="/source",
+        v4_compatible=True,
+    )
+
+    exporter.validate.assert_called_once_with(tokenizer=tokenizer, original_model_path="/source")
+    exporter.save.assert_called_once_with(
+        hf_metadata_dir=str(metadata_dir),
+        tokenizer=tokenizer,
+        original_model_path="/source",
+    )
+
+
+def test_consolidated_hf_addon_validates_model_exporter_on_nonzero_rank(tmp_path):
+    exporter = SimpleNamespace(
+        validate=MagicMock(side_effect=ValueError("invalid export")),
+        save=MagicMock(),
+    )
+    model = nn.Module()
+    model._get_consolidated_hf_metadata_exporter = lambda: exporter
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_rank", return_value=1),
+        patch("torch.distributed.barrier") as barrier,
+        pytest.raises(ValueError, match="invalid export"),
+    ):
+        ConsolidatedHFAddon().pre_save(
+            model_state=SimpleNamespace(model=[model]),
+            hf_metadata_dir=str(tmp_path),
+            tokenizer=None,
+            fqn_to_file_index_mapping={"w": 1},
+            fqn_to_dtype_mapping=None,
+            original_model_path=None,
+            v4_compatible=False,
+        )
+
+    exporter.save.assert_not_called()
+    barrier.assert_not_called()
 
 
 def test_model_state_keeps_lm_head_when_storage_not_shared():

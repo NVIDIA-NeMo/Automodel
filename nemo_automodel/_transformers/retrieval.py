@@ -22,15 +22,53 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
+from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PretrainedConfig, PreTrainedModel
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING, MODEL_MAPPING
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel._transformers.sentence_transformer_export import (
+    SentenceTransformerExportConfig,
+    SentenceTransformerWrapperOptions,
+    _cache_hub_source_legal_assets,
+    _load_sentence_transformer_wrapper_options,
+    _resolve_cached_source_model_path,
+    _resolve_cached_source_repository_path,
+    _SentenceTransformerMetadataExporter,
+    _supports_standard_sentence_transformer_export,
+)
 from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
 
 logger = logging.get_logger(__name__)
+
+
+_BI_ENCODER_DEFAULT_POOLING = "avg"
+_BI_ENCODER_DEFAULT_L2_NORMALIZE = True
+_EXPORT_ONLY_BI_ENCODER_KWARGS = {
+    "query_prompt",
+    "document_prompt",
+    "sentence_transformer_max_seq_length",
+    "similarity_fn_name",
+    "do_lower_case",
+}
+
+
+def _resolve_bi_encoder_options(
+    config: PretrainedConfig,
+    saved_options: SentenceTransformerWrapperOptions | None,
+    pooling: str | None,
+    l2_normalize: bool | None,
+) -> tuple[str, bool]:
+    """Resolve explicit wrapper arguments, then standard saved metadata, then defaults."""
+    if pooling is None:
+        if saved_options is not None:
+            pooling = saved_options.pooling
+        else:
+            pooling = getattr(config, "pooling", None) or _BI_ENCODER_DEFAULT_POOLING
+    if l2_normalize is None:
+        l2_normalize = saved_options.l2_normalize if saved_options is not None else _BI_ENCODER_DEFAULT_L2_NORMALIZE
+    return pooling, l2_normalize
 
 
 def _extract_submodel(model: nn.Module, extract_submodel: str) -> PreTrainedModel:
@@ -227,6 +265,7 @@ def build_encoder_backbone(
     extract_submodel: Optional[str] = None,
     num_labels: Optional[int] = None,
     temperature: Optional[float] = None,
+    loaded_config: PretrainedConfig | None = None,
     **hf_kwargs,
 ) -> PreTrainedModel:
     """Build an encoder backbone from a pretrained checkpoint.
@@ -256,6 +295,7 @@ def build_encoder_backbone(
             (e.g. ``"language_model"`` to extract the text backbone from a VLM).
         num_labels: Number of labels for reranking/classification backbones.
         temperature: Optional retrieval score temperature for custom retrieval backbones.
+        loaded_config: A previously loaded config used to keep model and metadata resolution on the same revision.
         **hf_kwargs: Extra keyword arguments forwarded to ``from_pretrained``.
 
     Returns:
@@ -265,7 +305,13 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
-    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code, **hf_kwargs)
+    config = loaded_config
+    if config is None:
+        config = AutoConfig.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **hf_kwargs,
+        )
     model_type = getattr(config, "model_type", "")
 
     if extract_submodel is not None:
@@ -321,7 +367,8 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
 
     If ``checkpointer`` is present in *kwargs*, delegates to
     ``Checkpointer.save_model`` for distributed/FSDP-safe saving.
-    Otherwise falls back to the inner ``PreTrainedModel.save_pretrained``.
+    Otherwise saves the inner ``PreTrainedModel`` and generates standard
+    Sentence Transformers metadata when the encoder can be represented by that format.
 
     The inner model is expected to be stored as ``model.model`` (the
     backbone wrapped by the encoder).
@@ -350,7 +397,32 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
         return
 
     logger.info(f"Saving encoder model to {save_directory}")
+    export_config = getattr(model, "sentence_transformer_export_config", None)
+    tokenizer = kwargs.get("tokenizer", None)
+    if export_config is not None and tokenizer is None:
+        raise ValueError("A tokenizer is required to export a loadable Sentence Transformers checkpoint.")
+    deploy_config = model.get_hf_export_config() if export_config is not None else None
+    original_model_path = getattr(model, "source_model_path", None)
+    if original_model_path is None:
+        model_reference = getattr(model.model, "name_or_path", None) or getattr(
+            model.model.config, "name_or_path", None
+        )
+        original_model_path = str(model_reference) if model_reference and os.path.isdir(str(model_reference)) else None
+    if export_config is not None:
+        from nemo_automodel._transformers.sentence_transformer_export import (
+            _save_generated_sentence_transformer_assets,
+            _validate_sentence_transformer_export,
+        )
+
+        _validate_sentence_transformer_export(model, tokenizer, original_model_path)
+
     model.model.save_pretrained(save_directory)
+    if export_config is None:
+        return
+
+    deploy_config.save_pretrained(save_directory)
+    tokenizer.save_pretrained(save_directory)
+    _save_generated_sentence_transformer_assets(model, export_config, original_model_path, save_directory, tokenizer)
 
 
 # Model types that require a registered custom retrieval backbone for each task.
@@ -401,6 +473,9 @@ class BiEncoderModel(nn.Module):
         _init_encoder_common(self, model)
         self.pooling = pooling
         self.l2_normalize = l2_normalize
+        self.sentence_transformer_export_config: SentenceTransformerExportConfig | None = None
+        if _supports_standard_sentence_transformer_export(model, pooling):
+            self.sentence_transformer_export_config = SentenceTransformerExportConfig()
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
         self.detach_distributed_inbatch_negatives = detach_distributed_inbatch_negatives
 
@@ -409,8 +484,8 @@ class BiEncoderModel(nn.Module):
         cls,
         model_name_or_path: str,
         task: str = None,
-        pooling: str = "avg",
-        l2_normalize: bool = True,
+        pooling: str | None = None,
+        l2_normalize: bool | None = None,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
         trust_remote_code: bool = False,
@@ -420,20 +495,112 @@ class BiEncoderModel(nn.Module):
         effective_task = cls._TASK if cls._TASK is not None else task
         if effective_task is None:
             raise ValueError("task must be specified when calling build()")
+        export_only_kwargs = _EXPORT_ONLY_BI_ENCODER_KWARGS.intersection(hf_kwargs)
+        if export_only_kwargs:
+            names = ", ".join(sorted(export_only_kwargs))
+            raise TypeError(
+                f"Sentence Transformers export metadata is derived from effective NeMo settings; remove: {names}."
+            )
 
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
 
+        config = AutoConfig.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **hf_kwargs,
+        )
+        metadata_kwargs = dict(hf_kwargs)
+        commit_hash = getattr(config, "_commit_hash", None)
+        if commit_hash is not None:
+            metadata_kwargs["revision"] = commit_hash
+        saved_options = _load_sentence_transformer_wrapper_options(model_name_or_path, metadata_kwargs)
+        pooling, l2_normalize = _resolve_bi_encoder_options(
+            config,
+            saved_options,
+            pooling,
+            l2_normalize,
+        )
         backbone = build_encoder_backbone(
-            model_name_or_path, effective_task, trust_remote_code=trust_remote_code, pooling=pooling, **hf_kwargs
+            model_name_or_path,
+            effective_task,
+            trust_remote_code=trust_remote_code,
+            pooling=pooling,
+            loaded_config=config,
+            **hf_kwargs,
         )
 
-        return cls(
+        encoder = cls(
             model=backbone,
             pooling=pooling,
             l2_normalize=l2_normalize,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
             detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
         )
+        if saved_options is not None:
+            encoder.configure_sentence_transformer_prompts(
+                query_prompt=saved_options.query_prompt or "",
+                document_prompt=saved_options.document_prompt or "",
+            )
+        encoder.source_model_path = _resolve_cached_source_model_path(
+            model_name_or_path,
+            backbone.config,
+            hf_kwargs,
+        )
+        encoder.source_repository_path = _resolve_cached_source_repository_path(
+            model_name_or_path,
+            encoder.source_model_path,
+            hf_kwargs,
+        )
+        if encoder.sentence_transformer_export_config is not None:
+            encoder.source_repository_path = (
+                _cache_hub_source_legal_assets(model_name_or_path, config, hf_kwargs) or encoder.source_repository_path
+            )
+        return encoder
+
+    def configure_sentence_transformer_prompts(self, query_prompt: str, document_prompt: str) -> None:
+        """Set the exact prompts used by the current retrieval pipeline."""
+        export_config = self.sentence_transformer_export_config
+        if export_config is None:
+            return
+        export_config.query_prompt = query_prompt
+        export_config.document_prompt = document_prompt
+
+    def disable_sentence_transformer_export(self) -> None:
+        """Disable standard export when runtime behavior cannot be represented faithfully."""
+        self.sentence_transformer_export_config = None
+
+    def _get_consolidated_hf_metadata_exporter(self) -> _SentenceTransformerMetadataExporter | None:
+        """Return the retrieval-owned exporter for consolidated Hugging Face metadata."""
+        export_config = self.sentence_transformer_export_config
+        if export_config is None:
+            return None
+        return _SentenceTransformerMetadataExporter(self, export_config)
+
+    def get_hf_export_config(self) -> PretrainedConfig:
+        """Return a deployable Hugging Face config describing the effective bi-encoder."""
+        config_dict = self.config.to_dict()
+        model_type = getattr(type(self.config), "model_type", "")
+        if model_type.endswith("_bidirec"):
+            export_config_class = type(self.config).__mro__[1]
+            if not issubclass(export_config_class, PretrainedConfig):
+                raise TypeError(f"Unable to determine deployable Hugging Face classes for {type(self.model).__name__}.")
+
+            config_dict.pop("model_type", None)
+            config_dict.pop("auto_map", None)
+            export_config = export_config_class.from_dict(config_dict)
+            try:
+                export_model_class = MODEL_MAPPING[type(export_config)]
+            except KeyError as exc:
+                raise TypeError(
+                    f"Unable to determine deployable Hugging Face classes for {type(self.model).__name__}."
+                ) from exc
+            export_config.architectures = [export_model_class.__name__]
+            export_config.is_causal = False
+        else:
+            export_config = self.config.__class__.from_dict(config_dict)
+
+        export_config.pooling = self.pooling
+        return export_config
 
     def save_pretrained(self, save_directory: str, **kwargs):
         save_encoder_pretrained(self, save_directory, **kwargs)

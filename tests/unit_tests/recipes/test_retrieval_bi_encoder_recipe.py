@@ -22,6 +22,7 @@ from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
 from nemo_automodel.recipes.retrieval import train_bi_encoder
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     TrainBiEncoderRecipe,
+    _configure_sentence_transformer_export,
     _get_autocast_ctx,
     _get_model_instantiate_kwargs,
     _unwrap_model_for_attrs,
@@ -65,6 +66,61 @@ def test_retrieval_attrs_accept_unwrapped_model():
 
     assert _unwrap_model_for_attrs(inner) is inner
     assert _uses_multi_vector_scoring(inner) is True
+
+
+def test_configure_sentence_transformer_export_binds_exact_static_collator_prompts():
+    captured = {}
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def configure_sentence_transformer_prompts(self, **kwargs):
+            captured.update(kwargs)
+
+    collator = SimpleNamespace(
+        query_prefix="query:",
+        passage_prefix="passage:",
+        use_dataset_instruction=False,
+    )
+
+    wrapped = _DDPLikeWrapper(_Model())
+    _configure_sentence_transformer_export(wrapped, collator)
+
+    assert captured == {"query_prompt": "query: ", "document_prompt": "passage: "}
+
+
+def test_configure_sentence_transformer_export_ignores_collator_when_export_is_disabled():
+    class _Model:
+        sentence_transformer_export_config = None
+
+        def configure_sentence_transformer_prompts(self, **kwargs):
+            raise AssertionError(f"disabled export must not configure prompts: {kwargs}")
+
+    _configure_sentence_transformer_export(_Model(), SimpleNamespace())
+
+
+def test_configure_sentence_transformer_export_disables_export_for_dataset_instructions(caplog):
+    class _Model:
+        sentence_transformer_export_config = object()
+
+        def configure_sentence_transformer_prompts(self, **kwargs):
+            raise AssertionError(f"static prompts must not be configured: {kwargs}")
+
+        def disable_sentence_transformer_export(self):
+            self.sentence_transformer_export_config = None
+
+    collator = SimpleNamespace(
+        query_prefix="ignored query:",
+        passage_prefix="ignored passage:",
+        use_dataset_instruction=True,
+    )
+
+    model = _Model()
+    _configure_sentence_transformer_export(model, collator)
+
+    assert model.sentence_transformer_export_config is None
+    assert "per-example dataset instructions" in caplog.text
 
 
 def test_retrieval_autocast_ctx_disabled_by_default(monkeypatch):

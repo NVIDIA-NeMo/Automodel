@@ -479,6 +479,8 @@ def test_encoder_build_hub_and_errors(tmp_path, monkeypatch):
         return FakeConfig()
 
     monkeypatch.setattr(encoder_module.AutoConfig, "from_pretrained", fake_auto_config_from_pretrained)
+    monkeypatch.setattr(encoder_module, "_load_sentence_transformer_wrapper_options", lambda *args, **kwargs: None)
+    monkeypatch.setattr(encoder_module, "_cache_hub_source_legal_assets", lambda *args, **kwargs: None)
 
     # Hub path
     m1 = BiEncoderModel.build(model_name_or_path="llama-tiny")

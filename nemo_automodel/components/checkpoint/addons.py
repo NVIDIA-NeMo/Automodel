@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 
 from nemo_automodel.components.checkpoint._backports.hf_utils import (
     FQN_TO_DTYPE_MAPPING_FILENAME,
@@ -42,6 +43,67 @@ def _group_barrier(process_group: "ProcessGroup | None") -> None:
         torch.distributed.barrier(group=process_group)
 
 
+def _unwrap_ddp_model(model: nn.Module) -> nn.Module:
+    """Return the module that owns export metadata hidden by DDP."""
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
+
+
+def _save_generated_hf_assets(
+    model_part: nn.Module,
+    metadata_reference_path: str | None,
+    hf_metadata_dir: str,
+    tokenizer,
+    v4_compatible: bool,
+    model_config=None,
+    save_custom_model_code: bool = True,
+) -> None:
+    """Run the existing generated Hugging Face metadata export path."""
+    if save_custom_model_code:
+        _maybe_save_custom_model_code(metadata_reference_path, hf_metadata_dir, model_part=model_part)
+
+    config = model_config if model_config is not None else getattr(model_part, "config", None)
+    if config is not None:
+        config_name = "config.json"
+        if v4_compatible and _config_exists(metadata_reference_path, config_name):
+            _save_original_config_json(metadata_reference_path, hf_metadata_dir, config_name)
+            config_name = "config.v5.json"
+
+        _maybe_strip_quantization_config(model_part, config=config)
+        with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
+            if hasattr(config, "to_json_string"):
+                # Use ``use_diff=False`` so the full config (not the
+                # diff against class defaults) is serialized. For
+                # remote-code configs registered via
+                # ``register_for_auto_class`` (e.g. DeciLM /
+                # Llama-Nemotron-Super-49B ``model_type='nemotron-nas'``),
+                # ``to_diff_dict`` sees the class-level ``model_type``
+                # attribute as equal to the class default and drops
+                # it from the serialized JSON. Reloading via
+                # ``AutoConfig.from_pretrained`` on the resulting
+                # consolidated directory then raises
+                # ``Unrecognized model ... Should have a 'model_type'
+                # key``. Writing the full dict guarantees
+                # ``model_type``, ``architectures`` and ``auto_map``
+                # land in the saved config regardless of class defaults.
+                f.write(config.to_json_string(use_diff=False))
+            else:
+                # Diffusers models use FrozenDict for config instead of PretrainedConfig
+                json.dump(dict(config), f, indent=2, default=str)
+
+    if getattr(model_part, "generation_config", None) is not None:
+        config_name = "generation_config.json"
+        if v4_compatible and _config_exists(metadata_reference_path, config_name):
+            _save_original_config_json(metadata_reference_path, hf_metadata_dir, config_name)
+            config_name = "generation_config.v5.json"
+        with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
+            f.write(model_part.generation_config.to_json_string())
+
+    if tokenizer is not None:
+        tokenizer.save_pretrained(hf_metadata_dir)
+
+
 class CheckpointAddon(Protocol):
     """
     Optional hooks that run around backend IO (used for PEFT and consolidated HF metadata).
@@ -52,12 +114,31 @@ class CheckpointAddon(Protocol):
     def post_save(self, **kwargs) -> None: ...
 
 
+class _ConsolidatedHFMetadataExporter(Protocol):
+    """Model-provided writer for consolidated Hugging Face metadata."""
+
+    def validate(self, *, tokenizer: object, original_model_path: str | None) -> None:
+        """Validate exporter inputs before any distributed rank writes files."""
+        ...
+
+    def save(
+        self,
+        *,
+        hf_metadata_dir: str,
+        tokenizer: object,
+        original_model_path: str | None,
+    ) -> None:
+        """Write model-specific metadata into the shared Hugging Face metadata directory."""
+        ...
+
+
 class ConsolidatedHFAddon:
     """
     Addon that writes consolidated Hugging Face metadata alongside sharded weights.
 
-    On rank 0, this saves `config.json`, `generation_config.json`, and tokenizer
-    artifacts into the provided consolidated directory, then synchronizes ranks.
+    Models can provide a custom consolidated metadata exporter; all other models
+    retain the generated config, custom-code, and tokenizer path. Rank 0 writes
+    the artifacts, then synchronizes ranks.
     """
 
     def pre_save(self, **kwargs) -> None:
@@ -69,6 +150,7 @@ class ConsolidatedHFAddon:
             hf_metadata_dir (str): Target directory for HF metadata artifacts.
             tokenizer (PreTrainedTokenizerBase | None): Optional tokenizer to save.
             fqn_to_dtype_mapping (dict[str, str] | None): Original HF safetensors dtype map.
+            original_model_path (str | None): Authoritative source checkpoint snapshot.
         """
         model_state = kwargs["model_state"]
         hf_metadata_dir = kwargs["hf_metadata_dir"]
@@ -79,52 +161,33 @@ class ConsolidatedHFAddon:
         original_model_path = kwargs["original_model_path"]
         process_group = kwargs.get("process_group")
 
+        export_model = _unwrap_ddp_model(model_part)
+        get_metadata_exporter = getattr(export_model, "_get_consolidated_hf_metadata_exporter", None)
+        metadata_exporter: _ConsolidatedHFMetadataExporter | None = (
+            get_metadata_exporter() if callable(get_metadata_exporter) else None
+        )
+        if metadata_exporter is not None:
+            metadata_exporter.validate(
+                tokenizer=tokenizer,
+                original_model_path=original_model_path,
+            )
+
         # Perform save operations on rank 0
         if _is_group_rank_0(process_group):
-            # if the HF model has custom model code, we need to save it as part of the checkpoint
-            _maybe_save_custom_model_code(original_model_path, hf_metadata_dir, model_part=model_part)
-            # save the config.json file
-            if hasattr(model_part, "config"):
-                v4_compatible = kwargs.get("v4_compatible", False)
-                config_name = "config.json"
-                if v4_compatible and _config_exists(original_model_path, config_name):
-                    _save_original_config_json(original_model_path, hf_metadata_dir, config_name)
-                    config_name = "config.v5.json"
-
-                _maybe_strip_quantization_config(model_part)
-                with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
-                    if hasattr(model_part.config, "to_json_string"):
-                        # Use ``use_diff=False`` so the full config (not the
-                        # diff against class defaults) is serialized. For
-                        # remote-code configs registered via
-                        # ``register_for_auto_class`` (e.g. DeciLM /
-                        # Llama-Nemotron-Super-49B ``model_type='nemotron-nas'``),
-                        # ``to_diff_dict`` sees the class-level ``model_type``
-                        # attribute as equal to the class default and drops
-                        # it from the serialized JSON. Reloading via
-                        # ``AutoConfig.from_pretrained`` on the resulting
-                        # consolidated directory then raises
-                        # ``Unrecognized model ... Should have a 'model_type'
-                        # key``. Writing the full dict guarantees
-                        # ``model_type``, ``architectures`` and ``auto_map``
-                        # land in the saved config regardless of class defaults.
-                        f.write(model_part.config.to_json_string(use_diff=False))
-                    else:
-                        # Diffusers models use FrozenDict for config instead of PretrainedConfig
-                        json.dump(dict(model_part.config), f, indent=2, default=str)
-
-            # save the generation_config.json file
-            if getattr(model_part, "generation_config", None) is not None:
-                config_name = "generation_config.json"
-                if v4_compatible and _config_exists(original_model_path, config_name):
-                    _save_original_config_json(original_model_path, hf_metadata_dir, config_name)
-                    config_name = "generation_config.v5.json"
-                with open(os.path.join(hf_metadata_dir, config_name), "w") as f:
-                    f.write(model_part.generation_config.to_json_string())
-
-            # save the tokenizer
-            if tokenizer is not None:
-                tokenizer.save_pretrained(hf_metadata_dir)
+            if metadata_exporter is not None:
+                metadata_exporter.save(
+                    hf_metadata_dir=hf_metadata_dir,
+                    tokenizer=tokenizer,
+                    original_model_path=original_model_path,
+                )
+            else:
+                _save_generated_hf_assets(
+                    model_part,
+                    original_model_path,
+                    hf_metadata_dir,
+                    tokenizer,
+                    v4_compatible=kwargs.get("v4_compatible", False),
+                )
 
             # save the fqn_to_file_index_mapping file
             with open(os.path.join(hf_metadata_dir, FQN_TO_FILE_INDEX_MAPPING_FILENAME), "w") as f:
@@ -448,7 +511,7 @@ def _extract_target_modules(
     return sorted(final_target_modules)
 
 
-def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
+def _maybe_strip_quantization_config(model_part: nn.Module, config=None) -> None:
     """Remove ``quantization_config`` from the HF config when no parameters are quantized.
 
     Models loaded from quantized checkpoints (e.g. mxfp4 GPT-OSS) carry a
@@ -458,7 +521,8 @@ def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
     checkpoint is a clean bf16 checkpoint, consistent with e.g.
     ``unsloth/gpt-oss-20b-BF16``.
     """
-    config = getattr(model_part, "config", None)
+    if config is None:
+        config = getattr(model_part, "config", None)
     if config is None or not hasattr(config, "quantization_config"):
         return
 
@@ -469,7 +533,7 @@ def _maybe_strip_quantization_config(model_part: nn.Module) -> None:
     delattr(config, "quantization_config")
 
 
-def _config_exists(original_model_path: str, config_name: str) -> bool:
+def _config_exists(original_model_path: str | None, config_name: str) -> bool:
     if original_model_path is None or not os.path.isdir(original_model_path):
         return False
     src = os.path.join(original_model_path, config_name)
