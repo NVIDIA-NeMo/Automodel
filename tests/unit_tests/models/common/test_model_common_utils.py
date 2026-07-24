@@ -27,9 +27,58 @@ from nemo_automodel.components.models.common.utils import (
     get_is_first_microbatch,
     get_is_optim_step,
     get_rope_config,
+    initialize_linear_module,
+    initialize_rms_norm_module,
     set_is_first_microbatch,
     set_is_optim_step,
 )
+
+
+class TestQuackBackend:
+    def test_quack_linear_preserves_linear_contract(self):
+        class FakeQuackLinear(nn.Linear):
+            pass
+
+        with patch(
+            "nemo_automodel.components.models.common.utils.safe_import_from",
+            return_value=(True, FakeQuackLinear),
+        ):
+            module = initialize_linear_module("quack", 8, 16, bias=True, device="cpu", dtype=torch.float32)
+
+        assert isinstance(module, FakeQuackLinear)
+        assert module.weight.shape == (16, 8)
+        assert module.bias.shape == (16,)
+
+    def test_quack_rms_norm_preserves_rms_norm_contract(self):
+        class FakeQuackRMSNorm(nn.RMSNorm):
+            pass
+
+        with patch(
+            "nemo_automodel.components.models.common.utils.safe_import_from",
+            return_value=(True, FakeQuackRMSNorm),
+        ):
+            module = initialize_rms_norm_module("quack", 8, eps=1e-6, device="cpu", dtype=torch.float32)
+
+        assert isinstance(module, FakeQuackRMSNorm)
+        assert module.weight.shape == (8,)
+        assert module.eps == 1e-6
+
+    @pytest.mark.parametrize(
+        ("initializer", "args", "match"),
+        [
+            (initialize_linear_module, ("quack", 8, 16), "linear='quack'"),
+            (initialize_rms_norm_module, ("quack", 8), "rms_norm='quack'"),
+        ],
+    )
+    def test_quack_backend_reports_missing_optional_dependency(self, initializer, args, match):
+        with (
+            patch(
+                "nemo_automodel.components.models.common.utils.safe_import_from",
+                return_value=(False, object()),
+            ),
+            pytest.raises(ImportError, match=match),
+        ):
+            initializer(*args)
 
 
 class TestIsOptimStep:

@@ -65,9 +65,10 @@ from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_fused,
+    apply_rotary_pos_emb_quack,
 )
 from nemo_automodel.components.models.llama.state_dict_adapter import LlamaStateDictAdapter
-from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
+from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator, safe_import_from
 
 check_model_inputs = get_check_model_inputs_decorator()
 
@@ -95,6 +96,17 @@ class LlamaAttention(nn.Module):
         self.is_causal = True
         self.backend = backend or BackendConfig()
         self.rope_fusion = self.backend.rope_fusion
+        self.rope_backend = self.backend.rope
+        self._quack_apply_rotary_emb = None
+        if self.rope_backend == "quack":
+            available, apply_rotary_emb = safe_import_from(
+                "quack.rotary",
+                "apply_rotary_emb",
+                msg="rope='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
+            )
+            if not available:
+                raise ImportError("rope='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].")
+            self._quack_apply_rotary_emb = apply_rotary_emb
 
         # Separate projections -- same layout as HuggingFace default Llama
         self.q_proj = nn.Linear(
@@ -175,7 +187,16 @@ class LlamaAttention(nn.Module):
             key_states = k.view(*input_shape, -1, self.head_dim).transpose(1, 2)
             value_states = v.view(*input_shape, -1, self.head_dim).transpose(1, 2)
 
-        if self.rope_fusion and len(position_embeddings) == 3:
+        if self.rope_backend == "quack" and query_states.is_cuda:
+            cos, sin = position_embeddings[:2]
+            query_states, key_states = apply_rotary_pos_emb_quack(
+                query_states,
+                key_states,
+                cos,
+                sin,
+                self._quack_apply_rotary_emb,
+            )
+        elif self.rope_fusion and len(position_embeddings) == 3:
             cos, sin, freqs_cis = position_embeddings
             query_states, key_states = apply_rotary_pos_emb_fused(
                 query_states,

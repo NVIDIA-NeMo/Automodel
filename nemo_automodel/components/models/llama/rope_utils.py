@@ -71,6 +71,51 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+def apply_rotary_pos_emb_quack(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    quack_apply_rotary_emb,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Llama-style RoPE with QuACK's fused rotary kernel.
+
+    QuACK consumes BSHD tensors and half-width cosine/sine tables, whereas the
+    HuggingFace contract uses BHSD tensors and duplicates the table across the
+    full head dimension. Batch size one uses QuACK's in-place path. Larger
+    batches are rotated independently so batch-specific position IDs remain
+    correct rather than assuming every sequence uses the same positions.
+    """
+
+    rotary_dim = cos.shape[-1]
+    rotary_dim_half = rotary_dim // 2
+
+    def _apply(x: torch.Tensor) -> torch.Tensor:
+        x_bshd = x.permute(0, 2, 1, 3)
+        if x_bshd.shape[0] == 1:
+            out = quack_apply_rotary_emb(
+                x_bshd,
+                cos[0, :, :rotary_dim_half],
+                sin[0, :, :rotary_dim_half],
+                inplace=True,
+            )
+        else:
+            out = torch.cat(
+                [
+                    quack_apply_rotary_emb(
+                        x_bshd[batch_idx : batch_idx + 1],
+                        cos[batch_idx, :, :rotary_dim_half],
+                        sin[batch_idx, :, :rotary_dim_half],
+                    )
+                    for batch_idx in range(x_bshd.shape[0])
+                ],
+                dim=0,
+            )
+        return out.permute(0, 2, 1, 3)
+
+    return _apply(q), _apply(k)
+
+
 def apply_rotary_pos_emb_fused(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -360,4 +405,5 @@ __all__ = [
     "rotate_half",
     "apply_rotary_pos_emb",
     "apply_rotary_pos_emb_fused",
+    "apply_rotary_pos_emb_quack",
 ]
