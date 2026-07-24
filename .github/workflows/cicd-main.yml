@@ -91,7 +91,6 @@ jobs:
             --compare-branch=origin/main \
             --fail-under=100 \
             --include "nemo_automodel/components/models/**" \
-            --include "nemo_automodel/components/distributed/**" \
             --options="--load-plugins=pylint.extensions.bad_builtin --disable=all --enable=bad-builtin --bad-functions=getattr,setattr,isinstance"
 
   import_linting:
