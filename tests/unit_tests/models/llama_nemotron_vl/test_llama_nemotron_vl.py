@@ -12,19 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import yaml
 from PIL import Image
 from transformers.image_utils import PILImageResampling
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_utils import PreTrainedModel
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
+from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 from transformers.processing_utils import ProcessorMixin
 
+from nemo_automodel.components.config.loader import ConfigNode
+from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.llama_nemotron_vl.model import (
+    FusedTESiglipEncoderLayer,
     LlamaBidirectionalConfig,
+    LlamaBidirectionalModel,
     LlamaNemotronVLConfig,
+    LlamaNemotronVLEncoderStateDictAdapter,
     LlamaNemotronVLModel,
+    LlamaNemotronVLRetrievalOptimizationConfig,
+    OptimizedFusedTERMSNormMLP,
+    OptimizedFusedTERMSNormQKV,
+    OptimizedLlamaBidirectionalModel,
+    disable_unused_siglip_pooling_head_grad,
+    replace_language_model_with_custom_llama,
+    replace_llama_mlp_with_te_fused,
+    replace_llama_qkv_with_te_fused,
+    replace_siglip_encoder_layers_with_te_fused,
 )
 from nemo_automodel.components.models.llama_nemotron_vl.processor import (
     LlamaNemotronVLImageProcessor,
@@ -34,6 +56,7 @@ from nemo_automodel.components.models.llama_nemotron_vl.processor import (
 )
 
 IMG_CONTEXT_TOKEN_ID = 99
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 class FakeTokenizer:
@@ -62,6 +85,11 @@ class FakeTokenizer:
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
         }
+
+    def convert_tokens_to_ids(self, token):
+        if token == "<IMG_CONTEXT>":
+            return IMG_CONTEXT_TOKEN_ID
+        return 0
 
 
 class FakeVisionModel(nn.Module):
@@ -92,16 +120,21 @@ class FakeLanguageModel(nn.Module):
         inputs_embeds,
         attention_mask=None,
         position_ids=None,
+        bidirectional_mask=None,
+        bidirectional_mask_precomputed=False,
         past_key_values=None,
         use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
+        **kwargs,
     ):
         self.forward_calls.append(
             {
                 "inputs_embeds": inputs_embeds.detach().clone(),
                 "attention_mask": attention_mask.detach().clone() if attention_mask is not None else None,
                 "position_ids": position_ids,
+                "bidirectional_mask": bidirectional_mask,
+                "bidirectional_mask_precomputed": bidirectional_mask_precomputed,
                 "past_key_values": past_key_values,
                 "use_cache": use_cache,
                 "output_attentions": output_attentions,
@@ -158,6 +191,121 @@ def tiny_model(monkeypatch, processor):
     return model
 
 
+@pytest.fixture
+def fake_transformer_engine(monkeypatch):
+    import nemo_automodel.components.models.llama_nemotron_vl.layers as layers_module
+
+    class FakeLayerNormLinear(nn.Module):
+        def __init__(
+            self,
+            in_features,
+            out_features,
+            eps=1e-6,
+            normalization="RMSNorm",
+            bias=False,
+            params_dtype=torch.float32,
+            device=None,
+            **kwargs,
+        ):
+            del eps, normalization, kwargs
+            super().__init__()
+            self.layer_norm_weight = nn.Parameter(torch.ones(in_features, device=device, dtype=params_dtype))
+            self.weight = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=params_dtype))
+            self.bias = nn.Parameter(torch.zeros(out_features, device=device, dtype=params_dtype)) if bias else None
+
+        def forward(self, x):
+            return F.linear(x, self.weight, self.bias)
+
+    class FakeLayerNormMLP(nn.Module):
+        def __init__(
+            self,
+            hidden_size,
+            ffn_hidden_size,
+            eps=1e-6,
+            normalization="RMSNorm",
+            activation="swiglu",
+            bias=False,
+            params_dtype=torch.float32,
+            device=None,
+            **kwargs,
+        ):
+            del eps, normalization, activation, kwargs
+            super().__init__()
+            self.layer_norm_weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=params_dtype))
+            self.fc1_weight = nn.Parameter(
+                torch.empty(2 * ffn_hidden_size, hidden_size, device=device, dtype=params_dtype)
+            )
+            self.fc2_weight = nn.Parameter(torch.empty(hidden_size, ffn_hidden_size, device=device, dtype=params_dtype))
+            self.fc1_bias = (
+                nn.Parameter(torch.zeros(2 * ffn_hidden_size, device=device, dtype=params_dtype)) if bias else None
+            )
+            self.fc2_bias = nn.Parameter(torch.zeros(hidden_size, device=device, dtype=params_dtype)) if bias else None
+
+        def forward(self, x):
+            gate, up = F.linear(x, self.fc1_weight, self.fc1_bias).chunk(2, dim=-1)
+            return F.linear(F.silu(gate) * up, self.fc2_weight, self.fc2_bias)
+
+    class FakeSelfAttention(nn.Module):
+        def __init__(self, hidden_size, params_dtype=torch.float32, device=None):
+            super().__init__()
+            self.layernorm_qkv = FakeLayerNormLinear(
+                hidden_size,
+                3 * hidden_size,
+                bias=True,
+                params_dtype=params_dtype,
+                device=device,
+            )
+            self.layernorm_qkv.layer_norm_bias = nn.Parameter(
+                torch.zeros(hidden_size, device=device, dtype=params_dtype)
+            )
+            self.proj = nn.Linear(hidden_size, hidden_size, device=device, dtype=params_dtype)
+
+    class FakeLayerNormDenseMLP(nn.Module):
+        def __init__(self, hidden_size, ffn_hidden_size, params_dtype=torch.float32, device=None):
+            super().__init__()
+            self.layer_norm_weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=params_dtype))
+            self.layer_norm_bias = nn.Parameter(torch.zeros(hidden_size, device=device, dtype=params_dtype))
+            self.fc1_weight = nn.Parameter(torch.empty(ffn_hidden_size, hidden_size, device=device, dtype=params_dtype))
+            self.fc1_bias = nn.Parameter(torch.zeros(ffn_hidden_size, device=device, dtype=params_dtype))
+            self.fc2_weight = nn.Parameter(torch.empty(hidden_size, ffn_hidden_size, device=device, dtype=params_dtype))
+            self.fc2_bias = nn.Parameter(torch.zeros(hidden_size, device=device, dtype=params_dtype))
+
+    class FakeTransformerLayer(nn.Module):
+        def __init__(
+            self,
+            hidden_size,
+            ffn_hidden_size,
+            params_dtype=torch.float32,
+            device=None,
+            **kwargs,
+        ):
+            del kwargs
+            super().__init__()
+            self.self_attention = FakeSelfAttention(hidden_size, params_dtype=params_dtype, device=device)
+            self.layernorm_mlp = FakeLayerNormDenseMLP(
+                hidden_size,
+                ffn_hidden_size,
+                params_dtype=params_dtype,
+                device=device,
+            )
+
+        def forward(self, hidden_states, *args, **kwargs):
+            del args, kwargs
+            return hidden_states
+
+    te_module = ModuleType("transformer_engine")
+    te_pytorch = ModuleType("transformer_engine.pytorch")
+    te_pytorch.LayerNormLinear = FakeLayerNormLinear
+    te_pytorch.LayerNormMLP = FakeLayerNormMLP
+    te_pytorch.TransformerLayer = FakeTransformerLayer
+    te_module.pytorch = te_pytorch
+
+    monkeypatch.setitem(sys.modules, "transformer_engine", te_module)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", te_pytorch)
+    monkeypatch.setattr(layers_module, "safe_import_te", lambda: (True, te_module))
+    return te_pytorch
+
+
 def _tiny_vision_config():
     return {
         "model_type": "siglip_vision_model",
@@ -181,6 +329,499 @@ def _tiny_llm_config():
         "num_attention_heads": 1,
         "num_key_value_heads": 1,
     }
+
+
+def _adapter_with_all_fusions():
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            llm_config=LlamaBidirectionalConfig(
+                architectures=["LlamaBidirectionalModel"],
+                model_type="llama",
+                vocab_size=32,
+                hidden_size=4,
+                intermediate_size=6,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=2,
+            ),
+            vision_config=SiglipVisionConfig(
+                hidden_size=4,
+                image_size=4,
+                patch_size=2,
+                num_hidden_layers=1,
+                num_attention_heads=1,
+                intermediate_size=8,
+            ),
+        ),
+        _nemo_use_te_fused_llama_mlp=True,
+        _nemo_use_te_fused_llama_qkv=True,
+        _nemo_use_te_fused_siglip_layer=True,
+    )
+    return LlamaNemotronVLEncoderStateDictAdapter(model)
+
+
+def _adapter_with_flattened_siglip_fusion():
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            llm_config=LlamaBidirectionalConfig(
+                architectures=["LlamaBidirectionalModel"],
+                model_type="llama",
+                vocab_size=32,
+                hidden_size=4,
+                intermediate_size=6,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=2,
+            ),
+            vision_config=SiglipVisionConfig(
+                hidden_size=4,
+                image_size=4,
+                patch_size=2,
+                num_hidden_layers=1,
+                num_attention_heads=1,
+                intermediate_size=8,
+            ),
+        ),
+        vision_model=SimpleNamespace(encoder=SimpleNamespace(layers=nn.ModuleList())),
+        _nemo_use_te_fused_llama_mlp=False,
+        _nemo_use_te_fused_llama_qkv=False,
+        _nemo_use_te_fused_siglip_layer=True,
+    )
+    return LlamaNemotronVLEncoderStateDictAdapter(model)
+
+
+def test_vl_encoder_state_dict_adapter_exports_hf_keys_for_fused_layers():
+    adapter = _adapter_with_all_fusions()
+    state_dict = {
+        "model.language_model.layers.0.self_attn.pre_attention_qkv.fused.layer_norm_weight": torch.ones(4),
+        "model.language_model.layers.0.self_attn.pre_attention_qkv.fused.weight": torch.arange(32).reshape(8, 4),
+        "model.language_model.layers.0.mlp.fused.layer_norm_weight": torch.ones(4) * 2,
+        "model.language_model.layers.0.mlp.fused.fc1_weight": torch.arange(48).reshape(12, 4),
+        "model.language_model.layers.0.mlp.fused.fc2_weight": torch.arange(24).reshape(4, 6),
+        "model.vision_model.vision_model.encoder.layers.0.mlp.fused.self_attention.layernorm_qkv.layer_norm_weight": torch.ones(
+            4
+        ),
+        "model.vision_model.vision_model.encoder.layers.0.mlp.fused.self_attention.layernorm_qkv.weight": torch.arange(
+            48
+        ).reshape(12, 4),
+        "model.vision_model.vision_model.encoder.layers.0.mlp.fused.self_attention.proj.weight": torch.arange(
+            16
+        ).reshape(4, 4),
+        "model.vision_model.vision_model.encoder.layers.0.mlp.fused.layernorm_mlp.fc1_weight": torch.arange(32).reshape(
+            8, 4
+        ),
+    }
+
+    hf_state_dict = adapter.to_hf(state_dict)
+
+    assert "language_model.layers.0.self_attn.pre_attention_qkv.fused.weight" not in hf_state_dict
+    assert torch.equal(
+        hf_state_dict["language_model.layers.0.self_attn.q_proj.weight"],
+        torch.arange(32).reshape(8, 4)[:4],
+    )
+    assert torch.equal(
+        hf_state_dict["language_model.layers.0.self_attn.k_proj.weight"],
+        torch.arange(32).reshape(8, 4)[4:6],
+    )
+    assert torch.equal(
+        hf_state_dict["language_model.layers.0.mlp.gate_proj.weight"],
+        torch.arange(48).reshape(12, 4)[:6],
+    )
+    assert (
+        "vision_model.vision_model.encoder.layers.0.mlp.fused.self_attention.layernorm_qkv.weight" not in hf_state_dict
+    )
+    assert torch.equal(
+        hf_state_dict["vision_model.vision_model.encoder.layers.0.self_attn.v_proj.weight"],
+        torch.arange(48).reshape(12, 4)[8:12],
+    )
+
+
+def test_vl_encoder_state_dict_adapter_exports_single_fused_tensor_to_hf_keys():
+    adapter = _adapter_with_all_fusions()
+    tensor = torch.arange(32).reshape(8, 4)
+
+    converted = adapter.convert_single_tensor_to_hf(
+        "model.language_model.layers.0.self_attn.pre_attention_qkv.fused.weight",
+        tensor,
+    )
+
+    assert [key for key, _ in converted] == [
+        "language_model.layers.0.self_attn.q_proj.weight",
+        "language_model.layers.0.self_attn.k_proj.weight",
+        "language_model.layers.0.self_attn.v_proj.weight",
+    ]
+    assert torch.equal(converted[0][1], tensor[:4])
+    assert torch.equal(converted[1][1], tensor[4:6])
+    assert torch.equal(converted[2][1], tensor[6:8])
+
+
+def test_vl_encoder_state_dict_adapter_supports_flattened_siglip_keys():
+    adapter = _adapter_with_flattened_siglip_fusion()
+    tensor = torch.arange(48).reshape(12, 4)
+
+    converted = adapter.convert_single_tensor_to_hf(
+        "model.vision_model.encoder.layers.0.mlp.fused.self_attention.layernorm_qkv.weight",
+        tensor,
+    )
+
+    assert [key for key, _ in converted] == [
+        "vision_model.encoder.layers.0.self_attn.q_proj.weight",
+        "vision_model.encoder.layers.0.self_attn.k_proj.weight",
+        "vision_model.encoder.layers.0.self_attn.v_proj.weight",
+    ]
+
+    hf_state_dict = {
+        "vision_model.encoder.layers.0.layer_norm1.weight": torch.ones(4),
+        "vision_model.encoder.layers.0.self_attn.q_proj.weight": torch.ones(4, 4),
+        "vision_model.encoder.layers.0.self_attn.k_proj.weight": torch.ones(4, 4) * 2,
+        "vision_model.encoder.layers.0.self_attn.v_proj.weight": torch.ones(4, 4) * 3,
+    }
+    internal_state_dict = adapter.from_hf(hf_state_dict)
+
+    assert (
+        "model.vision_model.encoder.layers.0.mlp.fused.self_attention.layernorm_qkv.layer_norm_weight"
+        in internal_state_dict
+    )
+    assert "model.vision_model.encoder.layers.0.self_attn.q_proj.weight" not in internal_state_dict
+    fused_qkv = internal_state_dict["model.vision_model.encoder.layers.0.mlp.fused.self_attention.layernorm_qkv.weight"]
+    assert fused_qkv.shape == (12, 4)
+
+
+def test_vl_encoder_state_dict_adapter_imports_hf_keys_for_fused_layers():
+    adapter = _adapter_with_all_fusions()
+    hf_state_dict = {
+        "language_model.layers.0.input_layernorm.weight": torch.ones(4),
+        "language_model.layers.0.self_attn.q_proj.weight": torch.ones(4, 4),
+        "language_model.layers.0.self_attn.k_proj.weight": torch.ones(2, 4) * 2,
+        "language_model.layers.0.self_attn.v_proj.weight": torch.ones(2, 4) * 3,
+        "language_model.layers.0.post_attention_layernorm.weight": torch.ones(4) * 4,
+        "language_model.layers.0.mlp.gate_proj.weight": torch.ones(6, 4),
+        "language_model.layers.0.mlp.up_proj.weight": torch.ones(6, 4) * 2,
+        "language_model.layers.0.mlp.down_proj.weight": torch.ones(4, 6),
+        "mlp1.0.weight": torch.ones(8),
+        "mlp1.1.weight": torch.ones(4, 8),
+        "mlp1.3.weight": torch.ones(4, 4),
+    }
+
+    internal_state_dict = adapter.from_hf(hf_state_dict)
+
+    assert "model.language_model.layers.0.self_attn.q_proj.weight" not in internal_state_dict
+    fused_qkv = internal_state_dict["model.language_model.layers.0.self_attn.pre_attention_qkv.fused.weight"]
+    assert fused_qkv.shape == (8, 4)
+    assert torch.equal(fused_qkv[:4], torch.ones(4, 4))
+    assert torch.equal(fused_qkv[4:6], torch.ones(2, 4) * 2)
+    assert "model.language_model.layers.0.mlp.gate_proj.weight" not in internal_state_dict
+    assert internal_state_dict["model.language_model.layers.0.mlp.fused.fc1_weight"].shape == (12, 4)
+    assert torch.equal(internal_state_dict["model.mlp1.0.weight"], torch.ones(8))
+
+
+def test_siglip_te_fusion_rejects_intermediate_select_layer():
+    model = SimpleNamespace(select_layer=0, config=SimpleNamespace(select_layer=0))
+    with pytest.raises(ValueError, match="select_layer=-1"):
+        replace_siglip_encoder_layers_with_te_fused(model)
+
+
+def test_replace_language_model_with_custom_llama_builds_optimized_stack(monkeypatch, processor):
+    import nemo_automodel.components.models.llama_nemotron_vl.model as model_module
+
+    monkeypatch.setattr(model_module.AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
+    config = LlamaNemotronVLConfig(
+        vision_config=_tiny_vision_config(),
+        llm_config=_tiny_llm_config(),
+        pooling="avg",
+        img_context_token_id=IMG_CONTEXT_TOKEN_ID,
+    )
+    language_model = LlamaBidirectionalModel(config.llm_config)
+    model = LlamaNemotronVLModel(
+        config,
+        vision_model=FakeVisionModel(),
+        language_model=language_model,
+    )
+
+    replaced = replace_language_model_with_custom_llama(
+        model,
+        backend=BackendConfig(linear="torch", rms_norm="torch", rope_fusion=False),
+    )
+
+    assert replaced is True
+    assert model._nemo_use_custom_llama_backend is True
+    assert isinstance(model.language_model, OptimizedLlamaBidirectionalModel)
+    outputs = model.language_model(
+        input_ids=torch.tensor([[1, 2, 3]]),
+        attention_mask=torch.ones((1, 3), dtype=torch.long),
+        bidirectional_mask_precomputed=True,
+        bidirectional_mask=None,
+        output_hidden_states=True,
+    )
+    assert outputs.last_hidden_state.shape == (1, 3, config.llm_config.hidden_size)
+    assert len(outputs.hidden_states) == config.llm_config.num_hidden_layers + 1
+
+
+def test_replace_language_model_with_custom_llama_skips_non_vl_models():
+    assert replace_language_model_with_custom_llama(nn.Linear(2, 2)) is False
+
+
+def test_optimized_recipe_instantiates_model_owned_optimization_config():
+    config_path = REPO_ROOT / "examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_optimized.yaml"
+    raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    optimization_config = ConfigNode(raw_config["model"]["optimization_config"]).instantiate()
+
+    assert optimization_config == LlamaNemotronVLRetrievalOptimizationConfig(
+        use_custom_llama_backend=True,
+        use_te_fused_mlp=True,
+        use_te_fused_qkv=True,
+        use_te_fused_siglip_layer=True,
+        disable_unused_siglip_pooling_head=True,
+    )
+
+
+@pytest.mark.parametrize("flag", ["use_te_fused_mlp", "use_te_fused_qkv"])
+def test_retrieval_optimization_config_rejects_llama_fusions_without_custom_backend(flag):
+    with pytest.raises(ValueError, match=rf"{flag} requires use_custom_llama_backend=True"):
+        LlamaNemotronVLRetrievalOptimizationConfig(**{flag: True})
+
+
+def test_retrieval_optimization_config_rejects_other_models():
+    with pytest.raises(TypeError, match="Expected LlamaNemotronVLModel, got Linear"):
+        LlamaNemotronVLRetrievalOptimizationConfig().build(model=nn.Linear(2, 2))
+
+
+def test_retrieval_optimization_config_applies_full_path(monkeypatch, processor, fake_transformer_engine):
+    del fake_transformer_engine
+    import nemo_automodel.components.models.llama_nemotron_vl.model as model_module
+
+    monkeypatch.setattr(model_module.AutoProcessor, "from_pretrained", lambda *args, **kwargs: processor)
+    config = LlamaNemotronVLConfig(
+        vision_config=_tiny_vision_config(),
+        llm_config=_tiny_llm_config(),
+        pooling="avg",
+        img_context_token_id=IMG_CONTEXT_TOKEN_ID,
+    )
+    model = LlamaNemotronVLModel(
+        config,
+        vision_model=SiglipVisionModel(config.vision_config),
+        language_model=LlamaBidirectionalModel(config.llm_config),
+    )
+    pooling_head = model.vision_model.head
+    optimization_config = LlamaNemotronVLRetrievalOptimizationConfig(
+        use_custom_llama_backend=True,
+        use_te_fused_mlp=True,
+        use_te_fused_qkv=True,
+        use_te_fused_siglip_layer=True,
+        disable_unused_siglip_pooling_head=True,
+    )
+
+    optimized_model = optimization_config.build(model=model)
+
+    assert optimized_model is model
+    assert isinstance(model.language_model, OptimizedLlamaBidirectionalModel)
+    assert isinstance(model.language_model.layers[0].mlp, OptimizedFusedTERMSNormMLP)
+    assert isinstance(model.language_model.layers[0].self_attn.pre_attention_qkv, OptimizedFusedTERMSNormQKV)
+    assert isinstance(model.vision_model.encoder.layers[0], FusedTESiglipEncoderLayer)
+    assert model.vision_model.use_head is False
+    assert all(not parameter.requires_grad for parameter in pooling_head.parameters())
+
+
+@pytest.mark.parametrize(
+    ("config_kwargs", "failing_helper", "bad_return", "error_match"),
+    [
+        (
+            {"use_custom_llama_backend": True},
+            "replace_language_model_with_custom_llama",
+            False,
+            "use_custom_llama_backend requested but the loaded backbone was not replaced",
+        ),
+        (
+            {"use_custom_llama_backend": True, "use_te_fused_mlp": True},
+            "replace_llama_mlp_with_te_fused",
+            0,
+            "use_te_fused_mlp requested but no custom LLaMA MLP layers were fused",
+        ),
+        (
+            {"use_custom_llama_backend": True, "use_te_fused_qkv": True},
+            "replace_llama_qkv_with_te_fused",
+            0,
+            "use_te_fused_qkv requested but no custom LLaMA QKV layers were fused",
+        ),
+        (
+            {"use_te_fused_siglip_layer": True},
+            "replace_siglip_encoder_layers_with_te_fused",
+            0,
+            "use_te_fused_siglip_layer requested but no SigLIP encoder layers were replaced",
+        ),
+        (
+            {"disable_unused_siglip_pooling_head": True},
+            "disable_unused_siglip_pooling_head_grad",
+            0,
+            "disable_unused_siglip_pooling_head requested but no SigLIP pooling-head parameters were disabled",
+        ),
+    ],
+)
+def test_retrieval_optimization_config_raises_when_requested_change_does_not_apply(
+    monkeypatch, config_kwargs, failing_helper, bad_return, error_match
+):
+    import nemo_automodel.components.models.llama_nemotron_vl.model as model_module
+
+    model = LlamaNemotronVLModel.__new__(LlamaNemotronVLModel)
+    nn.Module.__init__(model)
+    monkeypatch.setattr(model_module, "replace_language_model_with_custom_llama", lambda model: True)
+    monkeypatch.setattr(model_module, "replace_llama_mlp_with_te_fused", lambda model: 1)
+    monkeypatch.setattr(model_module, "replace_llama_qkv_with_te_fused", lambda model: 1)
+    monkeypatch.setattr(model_module, "replace_siglip_encoder_layers_with_te_fused", lambda model: 1)
+    monkeypatch.setattr(model_module, "disable_unused_siglip_pooling_head_grad", lambda model: 1)
+    monkeypatch.setattr(model_module, failing_helper, lambda model: bad_return)
+
+    with pytest.raises(RuntimeError, match=error_match):
+        LlamaNemotronVLRetrievalOptimizationConfig(**config_kwargs).build(model=model)
+
+
+def test_from_pretrained_applies_retrieval_optimization_config(monkeypatch):
+    model = LlamaNemotronVLModel.__new__(LlamaNemotronVLModel)
+    nn.Module.__init__(model)
+    calls = []
+
+    def fake_from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        calls.append((cls, pretrained_model_name_or_path, model_args, kwargs))
+        return model
+
+    def fake_build(self, *, model):
+        calls.append((self, model))
+        return model
+
+    monkeypatch.setattr(PreTrainedModel, "from_pretrained", classmethod(fake_from_pretrained))
+    monkeypatch.setattr(LlamaNemotronVLRetrievalOptimizationConfig, "build", fake_build)
+    optimization_config = LlamaNemotronVLRetrievalOptimizationConfig()
+
+    loaded_model = LlamaNemotronVLModel.from_pretrained(
+        "local-checkpoint",
+        optimization_config=optimization_config,
+        torch_dtype=torch.bfloat16,
+    )
+
+    assert loaded_model is model
+    assert calls == [
+        (LlamaNemotronVLModel, "local-checkpoint", (), {"torch_dtype": torch.bfloat16}),
+        (optimization_config, model),
+    ]
+
+
+def test_te_llama_mlp_and_qkv_replacements_use_fused_modules(fake_transformer_engine):
+    del fake_transformer_engine
+    config = LlamaBidirectionalConfig(**_tiny_llm_config())
+    holder = SimpleNamespace(
+        language_model=OptimizedLlamaBidirectionalModel(
+            config,
+            backend=BackendConfig(linear="torch", rms_norm="torch", rope_fusion=False),
+        )
+    )
+
+    assert replace_llama_mlp_with_te_fused(holder) == config.num_hidden_layers
+    assert isinstance(holder.language_model.layers[0].mlp, OptimizedFusedTERMSNormMLP)
+    assert not hasattr(holder.language_model.layers[0], "post_attention_layernorm")
+    assert holder._nemo_use_te_fused_llama_mlp is True
+
+    assert replace_llama_qkv_with_te_fused(holder) == config.num_hidden_layers
+    attention = holder.language_model.layers[0].self_attn
+    assert isinstance(attention.pre_attention_qkv, OptimizedFusedTERMSNormQKV)
+    assert attention.q_proj is None
+    assert attention.k_proj is None
+    assert attention.v_proj is None
+    assert not hasattr(holder.language_model.layers[0], "input_layernorm")
+    assert holder._nemo_use_te_fused_llama_qkv is True
+
+
+class _FakeSiglipAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.num_heads = 1
+        self.head_dim = 8
+        self.dropout = 0.0
+        self.q_proj = nn.Linear(8, 8)
+        self.k_proj = nn.Linear(8, 8)
+        self.v_proj = nn.Linear(8, 8)
+        self.out_proj = nn.Linear(8, 8)
+
+
+class _FakeSiglipMLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(8, 16)
+        self.fc2 = nn.Linear(16, 8)
+
+
+class _FakeSiglipLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed_dim = 8
+        self.self_attn = _FakeSiglipAttention()
+        self.layer_norm1 = nn.LayerNorm(8)
+        self.layer_norm2 = nn.LayerNorm(8)
+        self.mlp = _FakeSiglipMLP()
+
+
+def _fake_siglip_vision_transformer():
+    return SimpleNamespace(encoder=SimpleNamespace(layers=nn.ModuleList([_FakeSiglipLayer()])))
+
+
+def test_replace_siglip_encoder_layers_with_te_fused_swaps_layers(fake_transformer_engine):
+    del fake_transformer_engine
+
+    model = SimpleNamespace(
+        select_layer=-1,
+        vision_model=SimpleNamespace(
+            vision_model=_fake_siglip_vision_transformer(),
+        ),
+    )
+
+    assert replace_siglip_encoder_layers_with_te_fused(model) == 1
+    assert isinstance(model.vision_model.vision_model.encoder.layers[0], FusedTESiglipEncoderLayer)
+    assert model._nemo_use_te_fused_siglip_layer is True
+
+
+def test_replace_siglip_encoder_layers_with_te_fused_supports_flattened_layout(fake_transformer_engine):
+    del fake_transformer_engine
+    model = SimpleNamespace(select_layer=-1, vision_model=_fake_siglip_vision_transformer())
+
+    assert replace_siglip_encoder_layers_with_te_fused(model) == 1
+    assert isinstance(model.vision_model.encoder.layers[0], FusedTESiglipEncoderLayer)
+    assert model._nemo_use_te_fused_siglip_layer is True
+
+
+def test_replace_siglip_encoder_layers_with_te_fused_supports_real_siglip_layout(fake_transformer_engine):
+    del fake_transformer_engine
+    config = SiglipVisionConfig(**_tiny_vision_config())
+    model = SimpleNamespace(select_layer=-1, vision_model=SiglipVisionModel(config))
+
+    assert replace_siglip_encoder_layers_with_te_fused(model) == config.num_hidden_layers
+    assert all(isinstance(layer, FusedTESiglipEncoderLayer) for layer in model.vision_model.encoder.layers)
+    assert model._nemo_use_te_fused_siglip_layer is True
+
+
+def test_disable_unused_siglip_pooling_head_grad_disables_head():
+    pooling_head = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 2))
+    vision_transformer = SimpleNamespace(head=pooling_head, use_head=True)
+    model = SimpleNamespace(vision_model=SimpleNamespace(vision_model=vision_transformer))
+
+    disabled = disable_unused_siglip_pooling_head_grad(model)
+
+    assert disabled == sum(param.numel() for param in pooling_head.parameters())
+    assert vision_transformer.use_head is False
+    assert all(not param.requires_grad for param in pooling_head.parameters())
+
+
+def test_disable_unused_siglip_pooling_head_grad_supports_flattened_layout():
+    pooling_head = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 2))
+    vision_transformer = SimpleNamespace(head=pooling_head, use_head=True)
+    model = SimpleNamespace(vision_model=vision_transformer)
+
+    disabled = disable_unused_siglip_pooling_head_grad(model)
+
+    assert disabled == sum(param.numel() for param in pooling_head.parameters())
+    assert vision_transformer.use_head is False
+    assert all(not param.requires_grad for param in pooling_head.parameters())
 
 
 def test_processor_initializes_tokenizer_for_pixel_values(processor):
@@ -241,9 +882,10 @@ def test_processor_process_documents_supports_pil_images_and_text(processor):
 
     output = processor.process_documents({"images": images, "texts": ["text 1", "text 2"]})
 
-    assert set(output) == {"input_ids", "attention_mask", "pixel_values"}
+    assert set(output) == {"input_ids", "attention_mask", "pixel_values", "image_token_indices"}
     assert output["pixel_values"].shape == (4, 3, 4, 4)
     assert output["pixel_values"].dtype == torch.bfloat16
+    assert output["image_token_indices"].numel() == 8
 
     call = processor.tokenizer.calls[-1]
     assert call["texts"][0].startswith("passage: <img>")

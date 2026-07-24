@@ -17,126 +17,41 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
-from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
     LlamaDecoderLayer,
-    LlamaModel,
 )
-from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
+from transformers.models.llama.modeling_llama import (
+    LlamaModel as HFLlamaModel,
+)
 from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 from transformers.utils import logging
 
+from nemo_automodel.components.models.common import BackendConfig, initialize_rms_norm_module
+from nemo_automodel.components.models.llama.rope_utils import (
+    LlamaRotaryEmbedding as OptimizedLlamaRotaryEmbedding,
+)
+from nemo_automodel.components.models.llama_nemotron_vl.config import (
+    LlamaBidirectionalConfig,
+    LlamaNemotronVLConfig,
+)
+from nemo_automodel.components.models.llama_nemotron_vl.layers import (
+    FusedTESiglipEncoderLayer,
+    FusedTESiglipTransformerLayer,
+    OptimizedFusedTERMSNormMLP,
+    OptimizedFusedTERMSNormQKV,
+    OptimizedLlamaAttention,
+    OptimizedLlamaDecoderLayer,
+    OptimizedLlamaMLP,
+    disable_unused_siglip_pooling_head_grad,
+    replace_llama_mlp_with_te_fused,
+    replace_llama_qkv_with_te_fused,
+    replace_siglip_encoder_layers_with_te_fused,
+)
+from nemo_automodel.components.models.llama_nemotron_vl.state_dict_adapter import (
+    LlamaNemotronVLEncoderStateDictAdapter,
+)
+
 logger = logging.get_logger(__name__)
-
-# ============================================================================
-# Bidirectional LLaMA Configuration
-# ============================================================================
-
-
-class LlamaBidirectionalConfig(LlamaConfig):
-    """Configuration for bidirectional (non-causal) LLaMA model."""
-
-    model_type = "llama_bidirec"
-
-    def __init__(
-        self,
-        pooling="avg",
-        temperature=1.0,
-        **kwargs,
-    ):
-        self.pooling = pooling
-        self.temperature = temperature
-        super().__init__(
-            **kwargs,
-        )
-
-
-# ============================================================================
-# LlamaNemotronVL Configuration Classes
-# ============================================================================
-
-
-class LlamaNemotronVLConfig(PretrainedConfig):
-    """
-    Base configuration for vision-language models combining vision and language components.
-    This serves as the foundation for LlamaNemotronVL configurations.
-    """
-
-    model_type = "llama_nemotron_vl"
-    is_composition = True
-    # is_composition was renamed to has_no_defaults_at_init in transformers 4.52.1
-    # In PR https://github.com/huggingface/transformers/pull/36263
-    has_no_defaults_at_init = True
-    # Declare sub-configs so transformers can propagate per-backbone attn_implementation
-    # e.g. from_pretrained(attn_implementation={"vision_config": "sdpa", "llm_config": "flash_attention_2"})
-    sub_configs = {"vision_config": SiglipVisionConfig, "llm_config": LlamaBidirectionalConfig}
-
-    def __init__(
-        self,
-        vision_config=None,
-        llm_config=None,
-        use_backbone_lora=0,
-        use_llm_lora=0,
-        select_layer=-1,
-        force_image_size=None,
-        downsample_ratio=0.5,
-        template=None,
-        dynamic_image_size=False,
-        use_thumbnail=False,
-        min_dynamic_patch=1,
-        max_dynamic_patch=6,
-        mlp_checkpoint=True,
-        pre_feature_reduction=False,
-        keep_aspect_ratio=False,
-        vocab_size=-1,
-        q_max_length: Optional[int] = 512,
-        p_max_length: Optional[int] = 10240,
-        query_prefix: str = "query:",
-        passage_prefix: str = "passage:",
-        pooling: str = "last",
-        bidirectional_attention: bool = False,
-        max_input_tiles: int = 2,
-        img_context_token_id: int = 128258,  # tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
-        **kwargs,
-    ):
-        if vision_config is not None:
-            if vision_config["model_type"] == "siglip_vision_model":
-                self.vision_config = SiglipVisionConfig(**vision_config)
-            else:
-                raise ValueError("Unsupported model_type: {}".format(vision_config["model_type"]))
-
-        if llm_config is not None:
-            if llm_config["architectures"][0] in {
-                "LlamaBidirectionalModel",
-                "LlamaBidirectionalForSequenceClassification",
-            }:
-                self.llm_config = LlamaBidirectionalConfig(**llm_config)
-            else:
-                raise ValueError("Unsupported architecture: {}".format(llm_config["architectures"][0]))
-            self.vocab_size = self.llm_config.vocab_size
-        self.use_backbone_lora = use_backbone_lora
-        self.use_llm_lora = use_llm_lora
-        self.select_layer = select_layer
-        self.force_image_size = force_image_size
-        self.downsample_ratio = downsample_ratio
-        self.template = template
-        self.dynamic_image_size = dynamic_image_size
-        self.use_thumbnail = use_thumbnail
-        self.min_dynamic_patch = min_dynamic_patch
-        self.max_dynamic_patch = max_dynamic_patch
-        self.mlp_checkpoint = mlp_checkpoint
-        self.pre_feature_reduction = pre_feature_reduction
-        self.keep_aspect_ratio = keep_aspect_ratio
-
-        self.q_max_length = q_max_length
-        self.p_max_length = p_max_length
-        self.query_prefix = query_prefix
-        self.passage_prefix = passage_prefix
-        self.pooling = pooling
-        self.bidirectional_attention = bidirectional_attention
-        self.img_context_token_id = img_context_token_id
-        self.max_input_tiles = max_input_tiles
-        super().__init__(**kwargs)
 
 
 # Check if native create_bidirectional_mask exists (transformers >= 5.0)
@@ -157,6 +72,32 @@ _dynamic_cache_init_params = inspect.signature(DynamicCache.__init__).parameters
 _USE_PLURAL_CACHE_PARAM = "past_key_values" in _decoder_forward_params
 # DynamicCache accepts config parameter in >= 4.56
 _DYNAMIC_CACHE_ACCEPTS_CONFIG = "config" in _dynamic_cache_init_params
+
+
+def _create_bidirectional_attention_mask(
+    config: PretrainedConfig,
+    input_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    bidirectional_mask: torch.Tensor | None = None,
+    bidirectional_mask_precomputed: bool = False,
+) -> torch.Tensor | None:
+    if bidirectional_mask_precomputed:
+        return bidirectional_mask
+    if attention_mask is None:
+        return None
+
+    if _HAS_NATIVE_BIDIRECTIONAL_MASK:
+        return create_bidirectional_mask(
+            config,
+            input_embeds,
+            attention_mask=attention_mask,
+        )
+
+    if getattr(config, "_attn_implementation", None) == "flash_attention_2":
+        has_masked_tokens = (attention_mask == 0).any()
+        return attention_mask if has_masked_tokens else None
+
+    return _prepare_4d_attention_mask(attention_mask, input_embeds.dtype)
 
 
 def split_model(model_path, device):
@@ -188,6 +129,7 @@ def split_model(model_path, device):
 
 
 def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_type: str) -> torch.Tensor:
+    """Pool token-level hidden states into sequence embeddings using the given strategy."""
     last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
 
     if pool_type == "avg":
@@ -219,12 +161,16 @@ def _replace_image_token_embeddings(
     input_ids: torch.Tensor,
     vit_embeds: torch.Tensor,
     img_context_token_id: int,
+    image_token_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Replace image placeholder token embeddings with vision embeddings."""
     batch_size, seq_len, hidden_size = input_embeds.shape
     flat_embeds = input_embeds.reshape(batch_size * seq_len, hidden_size)
-    flat_input_ids = input_ids.reshape(batch_size * seq_len)
-    selected_indices = (flat_input_ids == img_context_token_id).nonzero(as_tuple=False).squeeze(1)
+    if image_token_indices is None:
+        flat_input_ids = input_ids.reshape(batch_size * seq_len)
+        selected_indices = (flat_input_ids == img_context_token_id).nonzero(as_tuple=False).squeeze(1)
+    else:
+        selected_indices = image_token_indices.reshape(-1).to(device=flat_embeds.device, dtype=torch.long)
     vit_embeds = vit_embeds.reshape(-1, hidden_size).to(dtype=flat_embeds.dtype)
 
     n_token = selected_indices.numel()
@@ -257,7 +203,7 @@ def _filter_vision_embeddings_by_image_flags(
 # ============================================================================
 
 
-class LlamaBidirectionalModel(LlamaModel):
+class LlamaBidirectionalModel(HFLlamaModel):
     """
     LlamaModel modified to use bidirectional (non-causal) attention.
     Supports transformers 4.44+ through 5.x with a unified forward() implementation.
@@ -275,23 +221,16 @@ class LlamaBidirectionalModel(LlamaModel):
         self,
         input_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None,
+        bidirectional_mask: torch.Tensor | None = None,
+        bidirectional_mask_precomputed: bool = False,
     ) -> torch.Tensor | None:
-        if attention_mask is None:
-            return None
-
-        if _HAS_NATIVE_BIDIRECTIONAL_MASK:
-            return create_bidirectional_mask(
-                self.config,
-                input_embeds,
-                attention_mask=attention_mask,
-            )
-
-        # Fallback for transformers < 5.0
-        if getattr(self.config, "_attn_implementation", None) == "flash_attention_2":
-            has_masked_tokens = (attention_mask == 0).any()
-            return attention_mask if has_masked_tokens else None
-
-        return _prepare_4d_attention_mask(attention_mask, input_embeds.dtype)
+        return _create_bidirectional_attention_mask(
+            self.config,
+            input_embeds,
+            attention_mask,
+            bidirectional_mask,
+            bidirectional_mask_precomputed,
+        )
 
     def forward(
         self,
@@ -301,6 +240,8 @@ class LlamaBidirectionalModel(LlamaModel):
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         cache_position: torch.LongTensor | None = None,
+        bidirectional_mask: torch.Tensor | None = None,
+        bidirectional_mask_precomputed: bool = False,
         use_cache: bool | None = None,
         output_hidden_states: bool | None = None,
         **kwargs,
@@ -329,7 +270,12 @@ class LlamaBidirectionalModel(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        bidirectional_mask = self._create_bidirectional_mask(inputs_embeds, attention_mask)
+        bidirectional_mask = self._create_bidirectional_mask(
+            inputs_embeds,
+            attention_mask,
+            bidirectional_mask,
+            bidirectional_mask_precomputed,
+        )
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -373,6 +319,293 @@ class LlamaBidirectionalModel(LlamaModel):
         )
 
 
+class OptimizedLlamaBidirectionalModel(PreTrainedModel):
+    """Self-contained optimized LLaMA stack for Nemotron VL retrieval only."""
+
+    config_class = LlamaBidirectionalConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["OptimizedLlamaDecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+    _supports_flash_attn_2 = True  # transformers < 4.54
+    _supports_flash_attn = True  # transformers >= 4.54
+    _supports_sdpa = True
+    _supports_flex_attn = True
+    _can_compile_fullgraph = True
+    _supports_attention_backend = True
+    _can_record_outputs = {
+        "hidden_states": OptimizedLlamaDecoderLayer,
+        "attentions": OptimizedLlamaAttention,
+    }
+
+    def __init__(self, config: LlamaBidirectionalConfig, backend: BackendConfig | None = None):
+        super().__init__(config)
+        backend = backend or BackendConfig()
+        self.backend = backend
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList(
+            [
+                OptimizedLlamaDecoderLayer(config=config, layer_idx=layer_idx, backend=backend)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
+        )
+        self.rotary_emb = OptimizedLlamaRotaryEmbedding(config=config, rope_fusion=backend.rope_fusion)
+        self.gradient_checkpointing = False
+        self.post_init()
+
+    def _create_bidirectional_mask(
+        self,
+        input_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        bidirectional_mask: torch.Tensor | None = None,
+        bidirectional_mask_precomputed: bool = False,
+    ) -> torch.Tensor | None:
+        return _create_bidirectional_attention_mask(
+            self.config,
+            input_embeds,
+            attention_mask,
+            bidirectional_mask,
+            bidirectional_mask_precomputed,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        bidirectional_mask: torch.Tensor | None = None,
+        bidirectional_mask_precomputed: bool = False,
+        use_cache: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs,
+    ) -> BaseModelOutputWithPast:
+        """Run the optimized bidirectional LLaMA stack.
+
+        Args:
+            input_ids: Optional token IDs of shape [batch, sequence]. Mutually
+                exclusive with ``inputs_embeds``.
+            attention_mask: Optional padding mask of shape [batch, sequence].
+            position_ids: Optional absolute position IDs of shape [batch, sequence].
+            past_key_values: Optional cache whose per-layer key and value tensors
+                have shape [batch, key_value_heads, cached_sequence, head_dim].
+            inputs_embeds: Optional token embeddings of shape [batch, sequence,
+                hidden]. Mutually exclusive with ``input_ids``.
+            cache_position: Optional tensor of shape [sequence] containing absolute
+                positions for cache updates.
+            bidirectional_mask: Optional precomputed mask of shape [batch, sequence]
+                for FlashAttention 2, or [batch, 1, sequence, key_value_sequence]
+                for eager and SDPA attention.
+            bidirectional_mask_precomputed: Whether ``bidirectional_mask`` is ready
+                for the selected attention backend.
+            use_cache: Whether to create or update ``past_key_values``.
+            output_hidden_states: Whether to return the embedding output and every
+                decoder-layer output.
+            return_dict: Whether to return ``BaseModelOutputWithPast`` instead of a tuple.
+            **kwargs: Additional decoder-layer arguments. Tensor-valued entries use
+                the layouts required by the selected attention backend.
+
+        Returns:
+            ``BaseModelOutputWithPast`` whose ``last_hidden_state`` has shape
+            [batch, sequence, hidden], whose cached key and value tensors have shape
+            [batch, key_value_heads, cached_sequence, head_dim], and whose optional
+            ``hidden_states`` entries each have shape [batch, sequence, hidden]. If
+            ``return_dict`` is false, these populated fields are returned as a tuple
+            in the same order.
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if use_cache and past_key_values is None:
+            if _DYNAMIC_CACHE_ACCEPTS_CONFIG:
+                past_key_values = DynamicCache(config=self.config)
+            else:
+                past_key_values = DynamicCache()
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        bidirectional_mask = self._create_bidirectional_mask(
+            inputs_embeds,
+            attention_mask,
+            bidirectional_mask,
+            bidirectional_mask_precomputed,
+        )
+
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        all_hidden_states = () if output_hidden_states else None
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=bidirectional_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
+        hidden_states = self.norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, past_key_values, all_hidden_states] if v is not None)
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+            hidden_states=all_hidden_states,
+        )
+
+
+def replace_language_model_with_custom_llama(
+    model: nn.Module,
+    *,
+    backend: BackendConfig | None = None,
+) -> bool:
+    """Replace a loaded LlamaNemotronVL language tower with the local optimized LLaMA stack."""
+    if not isinstance(model, LlamaNemotronVLModel):
+        return False
+
+    old_language_model = model.language_model
+    if not isinstance(old_language_model, LlamaBidirectionalModel):
+        logger.info(
+            "Skipping custom LLaMA language replacement: expected LlamaBidirectionalModel, got %s",
+            type(old_language_model).__name__,
+        )
+        return False
+
+    parameter = next(old_language_model.parameters(), None)
+    buffer = next(old_language_model.buffers(), None)
+    device = parameter.device if parameter is not None else buffer.device if buffer is not None else None
+    dtype = parameter.dtype if parameter is not None else buffer.dtype if buffer is not None else None
+
+    new_language_model = OptimizedLlamaBidirectionalModel(old_language_model.config, backend=backend)
+    # assign=True adopts the old tower's tensors in place of the freshly
+    # initialized ones, so the swap never holds a second copy of the weights
+    # on device; the .to() below only moves buffers absent from the state dict.
+    missing, unexpected = new_language_model.load_state_dict(old_language_model.state_dict(), strict=False, assign=True)
+    if device is not None:
+        if dtype is not None and dtype.is_floating_point:
+            new_language_model = new_language_model.to(device=device, dtype=dtype)
+        else:
+            new_language_model = new_language_model.to(device=device)
+    extra_state_missing = [key for key in missing if key.endswith("._extra_state")]
+    real_missing = [key for key in missing if key not in extra_state_missing]
+    if real_missing or unexpected:
+        raise RuntimeError(
+            "Custom LLaMA language replacement state dict mismatch: "
+            f"missing={real_missing[:8]} unexpected={list(unexpected)[:8]}"
+        )
+
+    model.language_model = new_language_model
+    model._nemo_use_custom_llama_backend = True
+    logger.info(
+        "Replaced LlamaNemotronVL language model with local optimized LLaMA stack "
+        "(backend=%s, ignored_te_extra_state=%d)",
+        new_language_model.backend,
+        len(extra_state_missing),
+    )
+    return True
+
+
+@dataclass(frozen=True, kw_only=True)
+class LlamaNemotronVLRetrievalOptimizationConfig:
+    """Model-owned optimizations for Llama Nemotron VL retrieval training.
+
+    Attributes:
+        use_custom_llama_backend: Replace the Hugging Face Llama tower with the optimized local implementation.
+        use_te_fused_mlp: Fuse Llama RMSNorm and MLP projections with Transformer Engine.
+        use_te_fused_qkv: Fuse Llama RMSNorm and QKV projections with Transformer Engine.
+        use_te_fused_siglip_layer: Replace SigLIP encoder layers with Transformer Engine layers.
+        disable_unused_siglip_pooling_head: Disable gradients and execution for the unused SigLIP pooling head.
+    """
+
+    use_custom_llama_backend: bool = False
+    use_te_fused_mlp: bool = False
+    use_te_fused_qkv: bool = False
+    use_te_fused_siglip_layer: bool = False
+    disable_unused_siglip_pooling_head: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate dependencies between the model-specific optimizations."""
+        if self.use_te_fused_mlp and not self.use_custom_llama_backend:
+            raise ValueError("use_te_fused_mlp requires use_custom_llama_backend=True")
+        if self.use_te_fused_qkv and not self.use_custom_llama_backend:
+            raise ValueError("use_te_fused_qkv requires use_custom_llama_backend=True")
+
+    def build(self, *, model: "LlamaNemotronVLModel") -> "LlamaNemotronVLModel":
+        """Apply the requested optimizations to a loaded Llama Nemotron VL model.
+
+        Args:
+            model: Loaded model to optimize before distributed wrapping and optimizer construction.
+
+        Returns:
+            The optimized model.
+
+        Raises:
+            TypeError: If ``model`` is not a ``LlamaNemotronVLModel``.
+            RuntimeError: If a requested optimization cannot be applied.
+        """
+        if not isinstance(model, LlamaNemotronVLModel):
+            raise TypeError(f"Expected LlamaNemotronVLModel, got {type(model).__name__}")
+
+        if self.use_custom_llama_backend:
+            replaced = replace_language_model_with_custom_llama(model)
+            if not replaced:
+                raise RuntimeError("use_custom_llama_backend requested but the loaded backbone was not replaced")
+            if self.use_te_fused_mlp:
+                fused = replace_llama_mlp_with_te_fused(model)
+                if fused == 0:
+                    raise RuntimeError("use_te_fused_mlp requested but no custom LLaMA MLP layers were fused")
+            if self.use_te_fused_qkv:
+                fused = replace_llama_qkv_with_te_fused(model)
+                if fused == 0:
+                    raise RuntimeError("use_te_fused_qkv requested but no custom LLaMA QKV layers were fused")
+
+        if self.use_te_fused_siglip_layer:
+            replaced = replace_siglip_encoder_layers_with_te_fused(model)
+            if replaced == 0:
+                raise RuntimeError("use_te_fused_siglip_layer requested but no SigLIP encoder layers were replaced")
+        if self.disable_unused_siglip_pooling_head:
+            disabled = disable_unused_siglip_pooling_head_grad(model)
+            if disabled == 0:
+                raise RuntimeError(
+                    "disable_unused_siglip_pooling_head requested but no SigLIP pooling-head parameters were disabled"
+                )
+
+        return model
+
+
 # ============================================================================
 # LlamaNemotronVL Model Classes
 # ============================================================================
@@ -400,6 +633,30 @@ class LlamaNemotronVLModel(PreTrainedModel):
     _supports_flash_attn_2 = True  # transformers < 4.54
     _supports_flash_attn = True  # transformers >= 4.54
     _supports_sdpa = True
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args: Any,
+        optimization_config: Optional[LlamaNemotronVLRetrievalOptimizationConfig] = None,
+        **kwargs: Any,
+    ) -> "LlamaNemotronVLModel":
+        """Load the model and apply model-specific retrieval optimizations.
+
+        Args:
+            pretrained_model_name_or_path: Hugging Face model identifier or local checkpoint path.
+            *model_args: Positional arguments forwarded to Hugging Face model loading.
+            optimization_config: Optional typed configuration for model-specific optimizations.
+            **kwargs: Keyword arguments forwarded to Hugging Face model loading.
+
+        Returns:
+            The loaded model, with requested optimizations applied before it is returned.
+        """
+        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        if optimization_config is not None:
+            model = optimization_config.build(model=model)
+        return model
 
     def __init__(
         self,
@@ -488,6 +745,9 @@ class LlamaNemotronVLModel(PreTrainedModel):
                 f"Please use transformers <=4.53.x or >=4.56.0."
             )
 
+    def get_encoder_state_dict_adapter(self):
+        return LlamaNemotronVLEncoderStateDictAdapter(self)
+
     def _embed_batch(self, inputs: Dict[str, Any], pool_type: Optional[str] = None):
         """
         Encodes the inputs into a tensor of embeddings.
@@ -558,6 +818,9 @@ class LlamaNemotronVLModel(PreTrainedModel):
         return_dict: Optional[bool] = None,
         num_patches_list: Optional[List[torch.Tensor]] = None,
         run_dummy_vision: Optional[bool] = None,
+        image_token_indices: torch.LongTensor | None = None,
+        bidirectional_mask: torch.Tensor | None = None,
+        bidirectional_mask_precomputed: bool = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -574,6 +837,7 @@ class LlamaNemotronVLModel(PreTrainedModel):
                 input_ids,
                 vit_embeds,
                 self.config.img_context_token_id,
+                image_token_indices=image_token_indices,
             )
 
         elif self.training and run_dummy_vision is not False:
@@ -590,6 +854,8 @@ class LlamaNemotronVLModel(PreTrainedModel):
             inputs_embeds=input_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            bidirectional_mask=bidirectional_mask,
+            bidirectional_mask_precomputed=bidirectional_mask_precomputed,
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
@@ -616,11 +882,15 @@ class LlamaNemotronVLModel(PreTrainedModel):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
+        hidden_states = outputs.hidden_states
+        if hidden_states is None and hasattr(outputs, "last_hidden_state"):
+            hidden_states = (outputs.last_hidden_state,)
+
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
+            hidden_states=hidden_states,
             attentions=outputs.attentions,
         )
 
@@ -711,7 +981,25 @@ def _register_with_hf_auto_classes():
 _register_with_hf_auto_classes()
 
 __all__ = [
-    "LlamaNemotronVLModel",
+    "FusedTESiglipEncoderLayer",
+    "FusedTESiglipTransformerLayer",
+    "LlamaBidirectionalConfig",
+    "LlamaBidirectionalModel",
     "LlamaNemotronVLConfig",
+    "LlamaNemotronVLEncoderStateDictAdapter",
+    "LlamaNemotronVLModel",
+    "LlamaNemotronVLRetrievalOptimizationConfig",
     "ModelClass",
+    "OptimizedFusedTERMSNormMLP",
+    "OptimizedFusedTERMSNormQKV",
+    "OptimizedLlamaAttention",
+    "OptimizedLlamaBidirectionalModel",
+    "OptimizedLlamaDecoderLayer",
+    "OptimizedLlamaMLP",
+    "disable_unused_siglip_pooling_head_grad",
+    "pool",
+    "replace_language_model_with_custom_llama",
+    "replace_llama_mlp_with_te_fused",
+    "replace_llama_qkv_with_te_fused",
+    "replace_siglip_encoder_layers_with_te_fused",
 ]

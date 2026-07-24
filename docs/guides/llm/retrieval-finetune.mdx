@@ -449,6 +449,11 @@ gradient_accumulation_steps = global_batch_size / (local_batch_size * data_paral
 For the supported data-parallel FSDP2 configuration, `data_parallel_size` is the total GPU count. For example, two
 8-GPU nodes have `data_parallel_size: 16`.
 
+For DDP recipes, keep `distributed.static_graph: false` whenever `gradient_accumulation_steps > 1`. Recalculate the
+accumulation steps after changing the GPU count, `global_batch_size`, or `local_batch_size`. When the result is `1` and
+the model follows the same execution path on every iteration, you can set `distributed.static_graph: true` to reduce
+DDP overhead.
+
 `local_batch_size` is the number of query groups per rank. For memory pressure, reduce
 `step_scheduler.local_batch_size` first, then sequence lengths (`q_max_len`, `p_max_len`, or `rerank_max_length`), then
 `n_passages`. Bi-encoders scale memory with query length plus `local_batch_size * n_passages` passage sequences.
@@ -861,3 +866,6 @@ Refer to the following files for implementation and configuration details:
 - Retrieval dataset guide: [Retrieval Dataset](/datasets/retrieval-dataset)
 - Llama-Embed-Nemotron-8B example:
   [examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/llama_embed_nemotron_8b/llama_embed_nemotron_8b.yaml)
+- Llama-Nemotron-Embed-VL-1B multimodal (visual document retrieval) example, including an optimized
+  configuration and examples for adjusting batch size and activation checkpointing:
+  [examples/retrieval/bi_encoder/nemotron_vl_1b/README.md](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/retrieval/bi_encoder/nemotron_vl_1b/README.md)

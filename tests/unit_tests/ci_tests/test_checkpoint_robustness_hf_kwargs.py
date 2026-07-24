@@ -19,6 +19,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_biencoder import (
+    _extract_custom_args as _extract_biencoder_custom_args,
+)
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm import (
     _compare_source_load_parity,
     _dequantize_hf_fp8_weights_in_place,
@@ -360,3 +363,36 @@ def test_record_deferred_failure_preserves_all_comparison_failures():
     _record_deferred_failure(failures, "Phase 4 HF reload parity", "HF parity failed")
 
     assert failures == ["Phase 4 HF reload parity:\nHF parity failed"]
+
+
+def test_biencoder_robustness_reads_hf_reload_settings_from_config(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text(
+        "ci:\n"
+        "  checkpoint_robustness:\n"
+        "    check_hf_reload: true\n"
+        "    cosine_threshold: 0.998\n"
+        "    hf_cosine_threshold: 0.997\n"
+        "    dataloader.num_workers: 0\n"
+    )
+
+    custom, remaining = _extract_biencoder_custom_args(["--config", str(config_path)])
+
+    assert custom == {
+        "check_hf_reload": True,
+        "check_resume": True,
+        "cosine_threshold": "0.998",
+        "hf_cosine_threshold": "0.997",
+    }
+    assert remaining == ["--config", str(config_path), "--dataloader.num_workers", "0"]
+
+
+def test_biencoder_robustness_can_disable_resume_from_config(tmp_path):
+    config_path = tmp_path / "recipe.yaml"
+    config_path.write_text("ci:\n  checkpoint_robustness:\n    no_check_resume: true\n")
+
+    custom, remaining = _extract_biencoder_custom_args(["--config", str(config_path)])
+
+    assert "check_resume" not in custom
+    assert "no_check_resume" not in custom
+    assert remaining == ["--config", str(config_path)]

@@ -35,7 +35,7 @@ from nemo_automodel.components.distributed.parallelizer import (
 logger = logging.getLogger(__name__)
 
 
-def _patch_is_packed_sequence_for_training() -> None:
+def _patch_is_packed_sequence_for_training() -> bool:
     """Eliminate CPU-GPU sync from flash attention for standard (non-packed) training.
 
     transformers._is_packed_sequence() returns a GPU bool scalar when batch_size==1,
@@ -52,7 +52,9 @@ def _patch_is_packed_sequence_for_training() -> None:
         import transformers.modeling_flash_attention_utils as _fa_utils
 
         if getattr(_fa_utils, "_is_packed_sequence_patched", False):
-            return  # already patched
+            return True  # already patched
+        if not hasattr(_fa_utils, "_is_packed_sequence"):
+            return False
 
         def _is_packed_sequence_no_sync(position_ids, batch_size):
             # Non-packed training: position_ids is always a simple arange -- never packed.
@@ -60,8 +62,9 @@ def _patch_is_packed_sequence_for_training() -> None:
 
         _fa_utils._is_packed_sequence = _is_packed_sequence_no_sync
         _fa_utils._is_packed_sequence_patched = True
+        return True
     except (ImportError, AttributeError):
-        pass
+        return False
 
 
 class FSDP2Manager:

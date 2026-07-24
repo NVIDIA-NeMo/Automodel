@@ -23,6 +23,7 @@ import torch
 from nemo_automodel._transformers.auto_model import (
     _MAX_BUILD_RETRIES,
     NeMoAutoModelForCausalLM,
+    NeMoAutoModelBiEncoder,
     _alias_remote_auto_map_for_target,
     _BaseNeMoAutoModelClass,
     _consume_config_overrides,
@@ -120,6 +121,45 @@ class TestResolveMeshContext:
         assert isinstance(setup.mesh_context, MeshContext)
         assert setup.strategy_config is None
         assert setup.activation_checkpointing is False
+
+
+def test_retrieval_te_attention_survives_liger_retry():
+    """A retrieval retry must preserve the requested TE attention injection."""
+    first_model = MagicMock()
+    retried_model = MagicMock()
+    final_model = MagicMock()
+    setup = DistributedSetup(mesh_context=MeshContext())
+
+    with (
+        patch(
+            "nemo_automodel._transformers.retrieval.BiEncoderModel.build",
+            side_effect=[first_model, retried_model],
+        ) as mock_build,
+        patch(
+            "nemo_automodel._transformers.auto_model.instantiate_infrastructure",
+            return_value=(None, None, None, None),
+        ),
+        patch("nemo_automodel._transformers.auto_model._patch_liger_kernel", side_effect=RuntimeError("failed")),
+        patch(
+            "nemo_automodel._transformers.auto_model.apply_model_infrastructure",
+            return_value=final_model,
+        ) as mock_apply_infrastructure,
+        patch("torch.cuda.current_device", return_value=0),
+    ):
+        result = NeMoAutoModelBiEncoder.from_pretrained(
+            "local-model",
+            attn_implementation="te",
+            use_liger_kernel=True,
+            use_sdpa_patching=False,
+            distributed_setup=setup,
+        )
+
+    assert result is final_model
+    assert mock_build.call_count == 2
+    assert [call.kwargs["attn_implementation"] for call in mock_build.call_args_list] == ["sdpa", "sdpa"]
+    mock_apply_infrastructure.assert_called_once()
+    assert mock_apply_infrastructure.call_args.kwargs["model"] is retried_model
+    assert mock_apply_infrastructure.call_args.kwargs["inject_te_attention"] is True
 
 
 class TestFromPretrainedDeviceMesh:
@@ -1571,6 +1611,33 @@ class TestBuildModelRetryDepth:
 
         assert result is sentinel_model
         assert order == ["runtime_patches", "infrastructure"]
+
+    def test_te_attention_init_uses_sdpa_without_duplicate_kwarg(self):
+        """TE attention is loaded as SDPA, then injected by infrastructure."""
+        build_kwargs, mock_config = self._make_build_kwargs()
+        build_kwargs["attn_implementation"] = "te"
+        sentinel_model = MagicMock()
+
+        with (
+            patch("nemo_automodel._transformers.auto_model._apply_preload_overrides", return_value=("sdpa", False)),
+            patch(
+                "nemo_automodel._transformers.auto_model._init_model", return_value=(False, sentinel_model)
+            ) as mock_init,
+            patch("nemo_automodel._transformers.auto_model.get_world_size_safe", return_value=1),
+            patch("nemo_automodel._transformers.auto_model._verify_sdpa_support"),
+            patch("nemo_automodel._transformers.capabilities.attach_capabilities_and_validate"),
+            patch(
+                "nemo_automodel._transformers.auto_model.apply_model_infrastructure",
+                return_value=sentinel_model,
+            ) as mock_apply_infra,
+            patch("torch.cuda.current_device", return_value=0),
+        ):
+            result = _BaseNeMoAutoModelClass._build_model(mock_config, **build_kwargs)
+
+        assert result is sentinel_model
+        assert mock_init.call_args.args[2] == "sdpa"
+        assert "attn_implementation" not in mock_init.call_args.kwargs
+        assert mock_apply_infra.call_args.kwargs["inject_te_attention"] is True
 
     def test_custom_model_gets_sdpa_patch_when_method_resolved(self):
         """Custom models need resolved SDPA method constraints too, e.g. to exclude cuDNN under AC."""

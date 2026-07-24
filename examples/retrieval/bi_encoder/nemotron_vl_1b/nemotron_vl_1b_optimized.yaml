@@ -12,9 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# To run this recipe:
-#   automodel examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml --nproc-per-node 8
-# Adjust --nproc-per-node to the number of GPUs available on your machine.
+# Optimized configuration for Llama Nemotron VL 1B retrieval fine-tuning.
+#
+# The default global batch size is 64 and the local batch size is 2. On one
+# 8-GPU node, this uses four gradient accumulation steps, so static_graph must
+# remain false. On 4 nodes with 8 GPUs each, there is no gradient accumulation;
+# set static_graph to true for that launch.
+#
+# Before launching on 80 GB GPUs, set:
+#
+#   export PYTORCH_ALLOC_CONF=expandable_segments:True
+#
+# To use fewer GPUs with a larger local batch size, enable activation
+# checkpointing with distributed.activation_checkpointing=true and set
+# distributed.activation_checkpointing_scope to vision or all. See README.md
+# for complete 8-GPU, 32-GPU, and 4-GPU examples.
 
 recipe: TrainBiEncoderRecipe
 
@@ -22,9 +34,14 @@ seed: 0
 
 temperature: 0.02
 
+# Prepare the bidirectional attention inputs outside the training step.
+bi_encoder_optimization:
+  patch_flash_attention_is_packed_sequence: true
+  precompute_bidirectional_mask: true
+
 step_scheduler:
-  global_batch_size: 8
-  local_batch_size: 1
+  global_batch_size: 64
+  local_batch_size: 2
   ckpt_every_steps: 5000
   val_every_steps: 500
   num_epochs: 1
@@ -46,6 +63,18 @@ model:
   do_distributed_inbatch_negative: true
   detach_distributed_inbatch_negatives: false
 
+  optimization_config:
+    _target_: nemo_automodel.components.models.llama_nemotron_vl.model.LlamaNemotronVLRetrievalOptimizationConfig
+
+    # Optimized language model backend.
+    use_custom_llama_backend: true
+    use_te_fused_mlp: true
+    use_te_fused_qkv: true
+
+    # Optimized vision encoder.
+    use_te_fused_siglip_layer: true
+    disable_unused_siglip_pooling_head: true
+
 tokenizer:
   _target_: nemo_automodel.components.models.llama_nemotron_vl.processor.LlamaNemotronVLProcessor.from_pretrained
   pretrained_model_name_or_path: nvidia/llama-nemotron-embed-vl-1b-v2
@@ -54,7 +83,6 @@ tokenizer:
   query_prefix: "query:"
   passage_prefix: "passage:"
   max_input_tiles: 2
-
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.retrieval_dataset.RetrievalDatasetConfig
@@ -91,26 +119,47 @@ lr_scheduler:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: ./output/nemotron_vl_1b_example/checkpoints
+  checkpoint_dir: ./output/nemotron_vl_1b_optimized/checkpoints
   model_save_format: safetensors
   save_consolidated: true
 
 distributed:
   strategy: ddp
   find_unused_parameters: false
-  static_graph: true
+  # Required for the default 8-GPU launch, which uses gradient accumulation.
+  # Set this to true only when accumulation is 1 and every iteration uses the
+  # same execution path, such as the documented 4-node x 8-GPU launch.
+  static_graph: false
   bucket_cap_mb: 400
   gradient_as_bucket_view: true
 
 # Uncomment and configure for W&B logging
-wandb:
-  project: YOUR_WANDB_PROJECT
-  entity: YOUR_WANDB_ENTITY
-  name: nemotron_vl_1b_embedding_example
-  enable: false
-  #save_dir: <your_wandb_save_dir> 
+# wandb:
+#   project: <your_wandb_project>
+#   entity: <your_wandb_entity>
+#   name: nemotron_vl_1b_optimized
 
 ci:
   recipe_owner: yuhez
-  time: "00:30:00"
+  time: "00:45:00"
   nodes: 1
+  nightly:
+    # CI uses the public text corpus; the model still executes a dummy vision
+    # forward for rank symmetry, and checkpoint robustness tests an image input.
+    dataset.data_dir_list:
+      - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
+        num_samples: 5000
+    dataloader.num_workers: 0
+    tokenizer.p_max_length: 1536
+    distributed.static_graph: false
+  checkpoint_robustness:
+    dataset.data_dir_list:
+      - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
+        num_samples: 5000
+    dataloader.num_workers: 0
+    tokenizer.p_max_length: 1536
+    distributed.static_graph: false
+    cosine_threshold: 0.999
+    hf_cosine_threshold: 0.999
+    check_hf_reload: true
+    check_resume: true

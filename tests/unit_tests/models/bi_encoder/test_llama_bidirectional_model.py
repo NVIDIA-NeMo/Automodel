@@ -213,7 +213,7 @@ class FakeLM(nn.Module):
     def gradient_checkpointing_enable(self):
         self._ckpt = True
 
-    def save_pretrained(self, out_dir):
+    def save_pretrained(self, out_dir, state_dict=None):
         self.saved.append(out_dir)
 
 

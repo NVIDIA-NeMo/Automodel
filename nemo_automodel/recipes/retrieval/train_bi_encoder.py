@@ -19,6 +19,7 @@ import pathlib
 import time
 from collections import deque
 from contextlib import nullcontext
+from functools import partial
 from typing import Any
 
 import torch
@@ -28,7 +29,9 @@ from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.utils import add_bidirectional_masks_to_retrieval_batch
 from nemo_automodel.components.distributed.config import DDPConfig
+from nemo_automodel.components.distributed.fsdp2 import _patch_is_packed_sequence_for_training
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, get_sync_ctx
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -66,6 +69,10 @@ def _get_autocast_ctx(distributed_config):
     if autocast_dtype is None or not torch.cuda.is_available():
         return nullcontext()
     return torch.autocast(device_type="cuda", dtype=autocast_dtype)
+
+
+def _move_batch_to_device(batch, device):
+    return {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
 
 def _get_model_instantiate_kwargs(cfg, distributed_setup, peft_config):
@@ -181,6 +188,47 @@ def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
     return query_batch_dict, doc_batch_dict
 
 
+def _get_bidirectional_mask_model_config(model):
+    """Return the language model config used for bidirectional mask creation."""
+    model = _unwrap_model_for_attrs(model)
+    backbone = getattr(model, "model", model)
+    language_model = getattr(backbone, "language_model", None)
+    if language_model is not None and getattr(language_model, "config", None) is not None:
+        return language_model.config
+    return getattr(backbone, "config", None)
+
+
+def _get_first_parameter_dtype(model):
+    for param in model.parameters():
+        return param.dtype
+    return None
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _get_bi_encoder_optimization_bool(cfg, key: str, default=False) -> bool:
+    return _as_bool(cfg.get(f"bi_encoder_optimization.{key}", default))
+
+
+class _BidirectionalMaskCollator:
+    def __init__(self, base_collate_fn, model_config, mask_dtype=None):
+        self.base_collate_fn = base_collate_fn
+        self.model_config = model_config
+        self.mask_dtype = mask_dtype
+
+    def __call__(self, batch):
+        batch = self.base_collate_fn(batch)
+        return add_bidirectional_masks_to_retrieval_batch(
+            batch,
+            model_config=self.model_config,
+            dtype=self.mask_dtype,
+        )
+
+
 class TrainBiEncoderRecipe(BaseRecipe):
     """Recipe for training encoder models with contrastive learning."""
 
@@ -222,6 +270,15 @@ class TrainBiEncoderRecipe(BaseRecipe):
             timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
         )
         setup_logging()
+
+        if _get_bi_encoder_optimization_bool(self.cfg, "patch_flash_attention_is_packed_sequence"):
+            if _patch_is_packed_sequence_for_training():
+                logger.info("Patched transformers._is_packed_sequence for non-packed retrieval training")
+            else:
+                logger.warning(
+                    "Could not patch transformers._is_packed_sequence; the private flash-attention helper "
+                    "may have moved in this transformers version."
+                )
 
         apply_cache_compatibility_patches()
         apply_te_patches()
@@ -309,6 +366,23 @@ class TrainBiEncoderRecipe(BaseRecipe):
             tokenizer.pad_token = self.tokenizer.eos_token
             tokenizer.padding_side = "left"
 
+        precompute_bidirectional_mask = _get_bi_encoder_optimization_bool(self.cfg, "precompute_bidirectional_mask")
+        bidirectional_mask_model_config = (
+            _get_bidirectional_mask_model_config(self.model_parts[0]) if precompute_bidirectional_mask else None
+        )
+        bidirectional_mask_dtype = (
+            _get_first_parameter_dtype(self.model_parts[0]) if precompute_bidirectional_mask else None
+        )
+        collate_wrapper = (
+            partial(
+                _BidirectionalMaskCollator,
+                model_config=bidirectional_mask_model_config,
+                mask_dtype=bidirectional_mask_dtype,
+            )
+            if precompute_bidirectional_mask
+            else None
+        )
+
         dataloader_config = self.cfg.dataloader
         if dataloader_config is None:
             raise ValueError("Retrieval training requires a top-level dataset config")
@@ -321,6 +395,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     dataset_build_context=build_context,
                     dp_rank=self._get_dp_rank(),
                     dp_world_size=self._get_dp_group_size(),
+                    collate_wrapper=collate_wrapper,
                 )
 
         self.dataloader = materialize_loader(dataloader_config)
@@ -405,10 +480,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
     def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
         """Forward and backward pass for a single micro-batch."""
-        batch = {
-            k: v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-            for k, v in batch.items()
-        }
+        batch = _move_batch_to_device(batch, self.dist_env.device)
         query, passage = _unpack_qp(batch)
 
         model = self.model_parts[0]
@@ -429,13 +501,17 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     query["run_dummy_vision"] = False
                 if passage is not None:
                     passage["run_dummy_vision"] = True
-            q_reps = model(query)
-            p_reps = model(passage)
             attr_model = _unwrap_model_for_attrs(model)
 
             n_passages = self.train_n_passages
             use_multi_vector_scoring = _uses_multi_vector_scoring(model)
-            if is_train and getattr(attr_model, "do_distributed_inbatch_negative", False):
+            use_dist_neg = is_train and getattr(attr_model, "do_distributed_inbatch_negative", False)
+            passage_attention_mask_for_scores = passage["attention_mask"]
+
+            p_reps = model(passage)
+            q_reps = model(query)
+
+            if use_dist_neg:
                 from nemo_automodel.components.models.common.inbatch_neg_utils import (
                     dist_gather_tensor,
                     dist_gather_tensor_with_dim1_padding,
@@ -450,7 +526,9 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
                 if use_multi_vector_scoring:
                     all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
-                    all_p_mask = dist_gather_tensor_with_dim1_padding(passage["attention_mask"], padding_value=False)
+                    all_p_mask = dist_gather_tensor_with_dim1_padding(
+                        passage_attention_mask_for_scores, padding_value=False
+                    )
                     expected_p = world_size * local_bs * n_passages
                     assert all_p.shape[0] == expected_p, (
                         f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
@@ -488,7 +566,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
                         q_reps,
                         p_reps,
                         n_passages,
-                        passage["attention_mask"],
+                        passage_attention_mask_for_scores,
                     )
                 else:
                     scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
@@ -508,7 +586,13 @@ class TrainBiEncoderRecipe(BaseRecipe):
         """Run one optimization step with gradient accumulation."""
         loss_buffer = []
         for idx, batch in enumerate(batches):
-            self._forward_backward_step(idx, batch, loss_buffer=loss_buffer, num_batches=len(batches), is_train=True)
+            self._forward_backward_step(
+                idx,
+                batch,
+                loss_buffer=loss_buffer,
+                num_batches=len(batches),
+                is_train=True,
+            )
 
         grad_norm = scale_grads_and_clip_grad_norm(
             max_grad_norm,
@@ -540,16 +624,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
         if torch.distributed.is_initialized():
             reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
             reporting_loss = reporting_loss / self._get_dp_group_size(include_cp=True)
-        reporting_loss = reporting_loss.cpu().item()
+        reporting_loss = reporting_loss.detach()
         self.loss_average_window.append(reporting_loss)
-        average_loss = sum(self.loss_average_window) / len(self.loss_average_window)
+        average_loss = torch.stack(tuple(self.loss_average_window)).mean()
         elapsed = time.perf_counter() - self.timestamp
         self.timestamp = time.perf_counter()
         mem_allocated = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
 
         metrics = {
-            "loss": reporting_loss,
-            "loss_avg_window": average_loss,
+            "loss": reporting_loss.item(),
+            "loss_avg_window": average_loss.item(),
             "grad_norm": grad_norm,
             "lr": lr,
             "mem": mem_allocated,

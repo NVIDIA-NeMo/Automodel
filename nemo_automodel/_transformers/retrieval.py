@@ -27,8 +27,13 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICA
 from transformers.utils import logging
 
 from nemo_automodel._transformers.registry import ModelRegistry
+from nemo_automodel.components.checkpoint.checkpointing import (
+    _materialize_to_hf_views_for_save,
+    _maybe_adapt_state_dict_to_hf,
+)
 from nemo_automodel.components.loss.intermediate_distill import LayerCapture
 from nemo_automodel.components.models.common.bidirectional import EncoderStateDictAdapter
+from nemo_automodel.components.utils.model_utils import apply_parameter_freezing
 
 logger = logging.get_logger(__name__)
 
@@ -253,6 +258,12 @@ def build_encoder_backbone(
         ValueError: If the task is unsupported for a known model type, or the
             architecture class is missing from :class:`ModelRegistry`.
     """
+    # ``te`` is a NeMo extension handled after model construction by the
+    # infrastructure layer. Transformers must see SDPA while loading the
+    # retrieval backbone, otherwise it rejects the extension value before TE
+    # injection can run.
+    if hf_kwargs.get("attn_implementation") == "te":
+        hf_kwargs["attn_implementation"] = "sdpa"
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
     model_type = getattr(config, "model_type", "")
 
@@ -325,7 +336,9 @@ def save_encoder_pretrained(model: nn.Module, save_directory: str, **kwargs) -> 
         return
 
     logger.info(f"Saving encoder model to {save_directory}")
-    model.model.save_pretrained(save_directory)
+    state_dict = _maybe_adapt_state_dict_to_hf(model, model.state_dict())
+    _materialize_to_hf_views_for_save(state_dict)
+    model.model.save_pretrained(save_directory, state_dict=state_dict)
 
 
 # HuggingFace model_type -> task -> bidirectional architecture class name in ModelRegistry
@@ -356,7 +369,8 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
         encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
     else:
         encoder.name_or_path = getattr(model.config, "name_or_path", "")
-    encoder.state_dict_adapter = EncoderStateDictAdapter()
+    adapter_factory = getattr(model, "get_encoder_state_dict_adapter", None)
+    encoder.state_dict_adapter = adapter_factory() if callable(adapter_factory) else EncoderStateDictAdapter()
     configure_encoder_metadata(model, model.config)
 
 
@@ -398,10 +412,13 @@ class BiEncoderModel(nn.Module):
             raise ValueError("task must be specified when calling build()")
 
         logger.info(f"Building BiEncoderModel from {model_name_or_path}")
+        freeze_config = hf_kwargs.pop("freeze_config", None)
 
         backbone = build_encoder_backbone(
             model_name_or_path, effective_task, trust_remote_code=trust_remote_code, pooling=pooling, **hf_kwargs
         )
+        if freeze_config is not None:
+            apply_parameter_freezing(backbone, freeze_config)
 
         return cls(
             model=backbone,
@@ -437,13 +454,15 @@ class BiEncoderModel(nn.Module):
         outputs = self.model(
             **model_inputs,
             return_dict=True,
-            output_hidden_states=True,
+            output_hidden_states=False,
         )
 
-        if hasattr(outputs, "last_hidden_state"):
+        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
             hidden_state = outputs.last_hidden_state
-        else:
+        elif outputs.hidden_states is not None:
             hidden_state = outputs.hidden_states[-1]
+        else:
+            raise RuntimeError("encoder model did not return a final hidden state for pooling")
 
         embeds = pool(
             last_hidden_states=hidden_state,

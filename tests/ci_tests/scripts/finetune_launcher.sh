@@ -95,6 +95,9 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
 
   ROBUSTNESS_TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py"
   case "$CONFIG_PATH" in
+    *retrieval/bi_encoder/*)
+      ROBUSTNESS_TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_biencoder.py"
+      ;;
     *vlm_finetune*)
       ROBUSTNESS_TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_vlm.py"
       ;;
