@@ -91,6 +91,7 @@ dependencies = [
     "torchao",
     "mlflow",
     "flashoptim>=0.1.3",
+    "quack-kernels==0.6.1; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -134,7 +135,7 @@ cuda_source = [
 ]
 extra = ["perceptron", "sentencepiece"]
 fa = ["flash-attn<=2.8.3"]
-ffpa = ["ffpa-attn>=0.1.19", "nvidia-cutlass-dsl>=4.5.1,<4.6"]
+ffpa = ["ffpa-attn>=0.2.1", "nvidia-cutlass-dsl==4.6.0"]
 fla = [
     "flash-linear-attention>=0.4.2",
 ]

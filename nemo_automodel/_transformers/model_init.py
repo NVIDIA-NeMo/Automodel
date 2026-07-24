@@ -67,6 +67,11 @@ from nemo_automodel.components.models.common.gated_delta_net_fp32 import (
     is_gated_delta_net_fp32_param_key,
 )
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
+from nemo_automodel.components.models.common.utils import (
+    BackendConfig,
+    initialize_linear_module,
+    initialize_rms_norm_module,
+)
 from nemo_automodel.components.utils.model_utils import resolve_trust_remote_code, skip_random_init
 from nemo_automodel.shared.utils import dtype_from_str
 
@@ -1048,6 +1053,66 @@ def _tie_weights_nemo(model):
         get_module_by_fqn(model, k).weight = get_module_by_fqn(model, v).weight
 
 
+def _apply_backend_module_overrides(model: torch.nn.Module, backend: BackendConfig) -> None:
+    """Apply generic backend choices to standard modules left by model constructors.
+
+    Model-owned constructors remain responsible for specialized projections and
+    normalization layers. This pass only replaces exact PyTorch ``Linear`` and
+    ``RMSNorm`` modules, preserving their parameter objects so checkpoint keys,
+    tied weights, optimizer-visible identities, dtype, and device remain unchanged.
+
+    Args:
+        model: Newly constructed model whose standard child modules may need a
+            backend-specific implementation.
+        backend: Backend selection to apply.
+    """
+    replacements: dict[int, torch.nn.Module] = {}
+    visited: set[int] = set()
+    pending = [model]
+
+    while pending:
+        parent = pending.pop()
+        if id(parent) in visited:
+            continue
+        visited.add(id(parent))
+
+        for name, child in tuple(parent._modules.items()):
+            if child is None:
+                continue
+
+            replacement = replacements.get(id(child))
+            if replacement is None and backend.linear == "quack" and type(child) is torch.nn.Linear:
+                replacement = initialize_linear_module(
+                    "quack",
+                    child.in_features,
+                    child.out_features,
+                    bias=child.bias is not None,
+                    device=child.weight.device,
+                    dtype=child.weight.dtype,
+                )
+                replacement.weight = child.weight
+                replacement.bias = child.bias
+            elif replacement is None and backend.rms_norm == "quack" and type(child) is torch.nn.RMSNorm:
+                normalized_shape = tuple(child.normalized_shape)
+                if len(normalized_shape) == 1:
+                    parameter = child.weight
+                    replacement = initialize_rms_norm_module(
+                        "quack",
+                        normalized_shape[0],
+                        eps=child.eps,
+                        device=parameter.device if parameter is not None else None,
+                        dtype=parameter.dtype if parameter is not None else torch.get_default_dtype(),
+                    )
+                    replacement.weight = parameter
+
+            if replacement is not None:
+                replacement.train(child.training)
+                replacements[id(child)] = replacement
+                setattr(parent, name, replacement)
+            else:
+                pending.append(child)
+
+
 def _init_model(
     cls,
     pretrained_model_name_or_path_or_config,
@@ -1058,6 +1123,10 @@ def _init_model(
     *model_args,
     **kwargs,
 ):
+    requested_backend = kwargs.get("backend")
+    if isinstance(requested_backend, dict):
+        requested_backend = BackendConfig(**requested_backend)
+
     is_custom_model, model = __init_model(
         cls,
         pretrained_model_name_or_path_or_config,
@@ -1068,6 +1137,11 @@ def _init_model(
         *model_args,
         **kwargs,
     )
+    if is_custom_model and requested_backend is not None:
+        _apply_backend_module_overrides(model, requested_backend)
+        if not hasattr(model, "backend"):
+            model.backend = requested_backend
+
     # https://github.com/NVIDIA-NeMo/Automodel/blob/a3a57176f68add7917faaa32f19228f49fcbb1ba/examples/llm_finetune/nemotron_flash/nemotron_flash_1b_squad.yaml#L41
     # this happens in nemotron_flash, where we load using force_hf, and the model is pre 5.x
     #

@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel._transformers.model_init import (
+    _apply_backend_module_overrides,
     _consume_config_overrides,
     _has_safetensors,
     _init_model,
@@ -36,6 +37,219 @@ from nemo_automodel._transformers.model_init import (
     get_hf_config,
 )
 from nemo_automodel.components.models.common.utils import BackendConfig
+
+
+class TestBackendModuleOverrides:
+    def test_quack_replaces_standard_modules_without_replacing_parameters(self):
+        class FakeQuackLinear(nn.Linear):
+            pass
+
+        class FakeQuackRMSNorm(nn.RMSNorm):
+            pass
+
+        model = nn.Module()
+        model.projection = nn.Linear(8, 16, bias=True, dtype=torch.float32)
+        model.norm = nn.RMSNorm(16, eps=1e-6, dtype=torch.float32)
+        model.projection_alias = model.projection
+        model.eval()
+
+        weight = model.projection.weight
+        bias = model.projection.bias
+        norm_weight = model.norm.weight
+        with (
+            patch(
+                "nemo_automodel._transformers.model_init.initialize_linear_module",
+                side_effect=lambda _backend, in_features, out_features, **kwargs: FakeQuackLinear(
+                    in_features, out_features, **kwargs
+                ),
+            ),
+            patch(
+                "nemo_automodel._transformers.model_init.initialize_rms_norm_module",
+                side_effect=lambda _backend, dim, **kwargs: FakeQuackRMSNorm(dim, **kwargs),
+            ),
+        ):
+            _apply_backend_module_overrides(model, BackendConfig(linear="quack", rms_norm="quack"))
+
+        assert isinstance(model.projection, FakeQuackLinear)
+        assert model.projection_alias is model.projection
+        assert model.projection.weight is weight
+        assert model.projection.bias is bias
+        assert model.projection.training is False
+        assert isinstance(model.norm, FakeQuackRMSNorm)
+        assert model.norm.weight is norm_weight
+        assert model.norm.eps == 1e-6
+
+    def test_nonstandard_subclasses_remain_model_owned(self):
+        class SpecializedLinear(nn.Linear):
+            pass
+
+        model = nn.Module()
+        model.projection = SpecializedLinear(8, 16)
+        original = model.projection
+
+        with patch("nemo_automodel._transformers.model_init.initialize_linear_module") as initialize:
+            _apply_backend_module_overrides(model, BackendConfig(linear="quack"))
+
+        assert model.projection is original
+        initialize.assert_not_called()
+
+    def test_registered_llama_uses_quack_for_all_standard_linear_and_rmsnorm_modules(self):
+        from transformers import LlamaConfig
+
+        class FakeQuackLinear(nn.Linear):
+            pass
+
+        class FakeQuackRMSNorm(nn.RMSNorm):
+            pass
+
+        def fake_safe_import(module_name, _symbol_name, **_kwargs):
+            if module_name == "quack.linear":
+                return True, FakeQuackLinear
+            if module_name == "quack.rmsnorm":
+                return True, FakeQuackRMSNorm
+            raise AssertionError(f"Unexpected optional import: {module_name}")
+
+        config = LlamaConfig(
+            architectures=["LlamaForCausalLM"],
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=64,
+            max_position_embeddings=32,
+        )
+        backend = BackendConfig(
+            attn="sdpa",
+            linear="quack",
+            rms_norm="quack",
+            rope_fusion=False,
+        )
+
+        with patch(
+            "nemo_automodel.components.models.common.utils.safe_import_from",
+            side_effect=fake_safe_import,
+        ):
+            is_custom, model = _init_model(
+                cls=MagicMock(),
+                pretrained_model_name_or_path_or_config=config,
+                attn_implementation="sdpa",
+                torch_dtype=torch.float32,
+                quantization_config=None,
+                force_hf=False,
+                backend=backend,
+            )
+
+        assert is_custom is True
+        assert sum(isinstance(module, FakeQuackLinear) for module in model.modules()) == 8
+        assert sum(type(module) is nn.Linear for module in model.modules()) == 0
+        assert sum(isinstance(module, FakeQuackRMSNorm) for module in model.modules()) == 3
+        assert sum(type(module) is nn.RMSNorm for module in model.modules()) == 0
+
+        output = model(torch.randint(0, config.vocab_size, (2, 8)))
+        assert output.logits.shape == (2, 8, config.vocab_size)
+        assert torch.isfinite(output.logits).all()
+
+    def test_registered_legacy_model_uses_quack_without_backend_constructor_parameter(self):
+        from nemo_automodel.components.models.baichuan.configuration import BaichuanConfig
+
+        class FakeQuackLinear(nn.Linear):
+            pass
+
+        config = BaichuanConfig(
+            architectures=["BaichuanForCausalLM"],
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            max_position_embeddings=32,
+        )
+        backend = BackendConfig(
+            attn="eager",
+            linear="quack",
+            rms_norm="torch",
+            rope_fusion=False,
+        )
+
+        with patch(
+            "nemo_automodel.components.models.common.utils.safe_import_from",
+            return_value=(True, FakeQuackLinear),
+        ):
+            is_custom, model = _init_model(
+                cls=MagicMock(),
+                pretrained_model_name_or_path_or_config=config,
+                attn_implementation="eager",
+                torch_dtype=torch.float32,
+                quantization_config=None,
+                force_hf=False,
+                backend=backend,
+            )
+
+        assert is_custom is True
+        assert model.backend is backend
+        assert sum(isinstance(module, FakeQuackLinear) for module in model.modules()) == 5
+        assert sum(type(module) is nn.Linear for module in model.modules()) == 0
+
+        output = model(torch.randint(0, config.vocab_size, (2, 8)))
+        assert output.logits.shape == (2, 8, config.vocab_size)
+        assert torch.isfinite(output.logits).all()
+
+    def test_registered_qwen2_uses_quack_for_benchmark_modules(self):
+        from transformers import Qwen2Config
+
+        class FakeQuackLinear(nn.Linear):
+            pass
+
+        class FakeQuackRMSNorm(nn.RMSNorm):
+            pass
+
+        def fake_safe_import(module_name, _symbol_name, **_kwargs):
+            implementations = {
+                "quack.linear": FakeQuackLinear,
+                "quack.rmsnorm": FakeQuackRMSNorm,
+            }
+            return True, implementations[module_name]
+
+        config = Qwen2Config(
+            architectures=["Qwen2ForCausalLM"],
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+        )
+        backend = BackendConfig(
+            attn="sdpa",
+            linear="quack",
+            rms_norm="quack",
+            rope_fusion=False,
+        )
+
+        with patch(
+            "nemo_automodel.components.models.common.utils.safe_import_from",
+            side_effect=fake_safe_import,
+        ):
+            is_custom, model = _init_model(
+                cls=MagicMock(),
+                pretrained_model_name_or_path_or_config=config,
+                attn_implementation="sdpa",
+                torch_dtype=torch.float32,
+                quantization_config=None,
+                force_hf=False,
+                backend=backend,
+            )
+
+        assert is_custom is True
+        assert sum(isinstance(module, FakeQuackLinear) for module in model.modules()) == 8
+        assert sum(type(module) is nn.Linear for module in model.modules()) == 0
+        assert sum(isinstance(module, FakeQuackRMSNorm) for module in model.modules()) == 3
+
+        output = model(torch.randint(0, config.vocab_size, (2, 8)))
+        assert output.logits.shape == (2, 8, config.vocab_size)
+        assert torch.isfinite(output.logits).all()
 
 
 class TestConsumeConfigOverridesNestedDict:
@@ -213,6 +427,35 @@ class TestBackendDictCoercion:
         captured = self._run_init_model(mock_resolve_cls)
 
         assert "backend" not in captured
+
+    @patch("nemo_automodel._transformers.model_init._download_model_weights")
+    @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
+    def test_backend_applies_to_registered_model_without_backend_parameter(self, mock_resolve_cls, _mock_download):
+        """Legacy registered models still receive generic QuACK module overrides."""
+
+        class LegacyModel(nn.Module):
+            def __init__(self, config):
+                super().__init__()
+                self.config = config
+                self.projection = nn.Linear(8, 8)
+
+        mock_resolve_cls.return_value = LegacyModel
+        backend = BackendConfig(linear="quack")
+
+        with patch("nemo_automodel._transformers.model_init._apply_backend_module_overrides") as apply_overrides:
+            is_custom, model = _init_model(
+                cls=MagicMock(),
+                pretrained_model_name_or_path_or_config=self._make_config(),
+                attn_implementation="flash_attention_2",
+                torch_dtype="auto",
+                quantization_config=None,
+                force_hf=False,
+                backend=backend,
+            )
+
+        assert is_custom is True
+        assert model.backend is backend
+        apply_overrides.assert_called_once_with(model, backend)
 
     @patch("nemo_automodel._transformers.model_init._download_model_weights")
     @patch("nemo_automodel._transformers.model_init._resolve_custom_model_cls_for_config")
