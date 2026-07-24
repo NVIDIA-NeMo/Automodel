@@ -562,11 +562,12 @@ def apply_lora_to_linear_modules(
     Note:
         target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
 
-        Beyond per-linear LoRA, after the linear layers are patched this also fuses SiLU-SwiGLU
-        (gate/up/down) and ReLU² (up/down) MLPs whose projections were all LoRA-patched: their
-        forward is swapped to a single memory-efficient autograd op (see ``install_fused_lora_mlp``)
-        that recomputes the activation in backward. It transparently falls back to the per-linear
-        path under tensor/expert parallelism (DTensor), DoRA, or active dropout.
+        When ``use_memory_efficient_lora`` is enabled, after the linear layers are patched this also
+        fuses SiLU-SwiGLU (gate/up/down) and ReLU² (up/down) MLPs whose projections were all
+        LoRA-patched: their forward is swapped to a single memory-efficient autograd op (see
+        ``install_fused_lora_mlp``) that recomputes the activation in backward. It transparently
+        falls back to the per-linear path under tensor/expert parallelism (DTensor), DoRA, or active
+        dropout.
     """
     # Freeze base model parameters
     if not skip_freeze:
@@ -659,14 +660,15 @@ def apply_lora_to_linear_modules(
                     layer_name=name,
                 )
 
-    # Fuse SwiGLU/ReLU² MLPs whose projections were just LoRA-patched into one memory-efficient
-    # autograd op (recompute the activation in backward); falls back per-MLP under
-    # sharding (DTensor) / DoRA / active dropout.
-    from nemo_automodel.components._peft.lora_mlp import install_fused_lora_mlp
+    if getattr(peft_config, "use_memory_efficient_lora", True):
+        # Fuse SwiGLU/ReLU² MLPs whose projections were just LoRA-patched into one memory-efficient
+        # autograd op (recompute the activation in backward); falls back per-MLP under
+        # sharding (DTensor) / DoRA / active dropout.
+        from nemo_automodel.components._peft.lora_mlp import install_fused_lora_mlp
 
-    n_fused_mlps = install_fused_lora_mlp(model)
-    if n_fused_mlps:
-        logger.info("Fused %d LoRA SwiGLU/ReLU2 MLP module(s) for memory-efficient backward.", n_fused_mlps)
+        n_fused_mlps = install_fused_lora_mlp(model)
+        if n_fused_mlps:
+            logger.info("Fused %d LoRA SwiGLU/ReLU2 MLP module(s) for memory-efficient backward.", n_fused_mlps)
 
     return num_modules_matched
 

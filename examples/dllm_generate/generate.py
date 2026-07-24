@@ -17,6 +17,7 @@
 Provides ``DLLMSampler`` (core logic) with preset subclasses:
 
 - ``LLaDASampler``: no-cache, full-forward defaults.
+- ``LLaDA2Sampler``: built-in block-refinement generation defaults.
 - ``NemotronLabsDLLMSampler``: KV-cache block-diffusion defaults.
 
 Usage
@@ -28,6 +29,13 @@ LLaDA generation::
         --prompt "Explain what a neural network is." \
         --sampler llada
 
+LLaDA2 generation::
+
+    python examples/dllm_generate/generate.py \
+        --checkpoint <path> \
+        --prompt "Explain what a neural network is." \
+        --sampler llada2
+
 Nemotron-Labs-Diffusion generation::
 
     python examples/dllm_generate/generate.py \
@@ -35,13 +43,21 @@ Nemotron-Labs-Diffusion generation::
         --prompt "What is 2+2?" \
         --sampler nemotron
 
+Generate from a LoRA (PEFT) checkpoint — any sampler::
+
+    python examples/dllm_generate/generate.py \
+        --checkpoint <base model id or SFT checkpoint> \
+        --adapter <lora checkpoint dir> \
+        --prompt "Explain what a neural network is." \
+        --sampler llada
+
 Override preset defaults::
 
     python examples/dllm_generate/generate.py \
         --checkpoint <path> \
         --sampler nemotron --temperature 0.5 --steps 2048
 
-Infilling (any sampler)::
+Infilling (LLaDA and Nemotron samplers)::
 
     python examples/dllm_generate/generate.py \
         --checkpoint <path> \
@@ -67,9 +83,11 @@ from typing import Optional
 
 import torch
 from utils import (
+    GEMMA_ADAPTER_KEY_MAP,
     get_num_transfer_tokens,
     get_transfer_index,
     load_model_and_tokenizer,
+    merge_adapter,
     resolve_checkpoint,
     trim_response,
 )
@@ -366,6 +384,22 @@ class LLaDASampler(DLLMSampler):
     )
 
 
+class LLaDA2Sampler(DLLMSampler):
+    """LLaDA2 defaults for the model's built-in block-refinement generation."""
+
+    default_config = SamplerConfig(
+        steps=32,
+        max_new_tokens=128,
+        block_size=32,
+        temperature=0.0,
+        remasking="low_confidence",
+        use_kv_cache=False,
+        threshold=0.5,
+        causal_context=False,
+        eos_token_id=None,
+    )
+
+
 class NemotronLabsDLLMSampler(DLLMSampler):
     """DLLMSampler with Nemotron-Labs-Diffusion defaults: KV cache, causal context, threshold.
 
@@ -391,8 +425,58 @@ class NemotronLabsDLLMSampler(DLLMSampler):
 
 SAMPLERS = {
     "llada": LLaDASampler,
+    "llada2": LLaDA2Sampler,
     "nemotron": NemotronLabsDLLMSampler,
 }
+
+
+@torch.no_grad()
+def generate_llada2(model, tokenizer, inputs, config: SamplerConfig, mask_id: int, eos_id: int) -> list[str]:
+    """Generate one LLaDA2 response per prompt with the model's native sampler.
+
+    LLaDA2's remote-code implementation only supports batch size one and
+    returns generated tokens without the prompt, so prompts are processed
+    individually and the returned token IDs are decoded directly.
+    """
+    if mask_id is None or eos_id is None:
+        raise ValueError("LLaDA2 generation requires tokenizer mask and EOS token IDs")
+
+    device = next(model.parameters()).device
+    sequences = []
+    for prompt_ids in inputs:
+        prompt_tensor = torch.as_tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+        generated = model.generate(
+            inputs=prompt_tensor,
+            temperature=config.temperature,
+            block_length=config.block_size,
+            steps=config.steps,
+            gen_length=config.max_new_tokens,
+            eos_early_stop=True,
+            threshold=config.threshold,
+            # LLaDA2-specific speed-mode settings; keep them out of the shared CLI.
+            editing_threshold=0.0,
+            max_post_steps=16,
+            eos_id=eos_id,
+            mask_id=mask_id,
+        )
+        sequences.append(tokenizer.decode(generated[0], skip_special_tokens=True))
+    return sequences
+
+
+def encode_generation_prompts(tokenizer, prompts: list[str], raw: bool) -> list[list[int]]:
+    """Tokenize raw prompts or a batch of single-turn chat prompts."""
+    if raw:
+        return [tokenizer.encode(prompt, add_special_tokens=True) for prompt in prompts]
+
+    messages = [[{"role": "user", "content": prompt}] for prompt in prompts]
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_tensors=None,
+        return_dict=True,
+    )
+    return encoded["input_ids"]
 
 
 # ---------------------------------------------------------------------------
@@ -427,8 +511,16 @@ def main():
     )
     parser.add_argument("--raw", action="store_true", help="No chat template")
     parser.add_argument("--infill", action="store_true", help="Infilling mode")
+    parser.add_argument(
+        "--adapter",
+        default=None,
+        help="Path to a PEFT (LoRA) adapter checkpoint dir; merged into the base --checkpoint model before generation",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    if args.infill and args.sampler == "llada2":
+        parser.error("--infill is not supported by the LLaDA2 generation path")
 
     try:
         checkpoint_path = resolve_checkpoint(args.checkpoint)
@@ -442,8 +534,22 @@ def main():
 
     model, tokenizer, mask_id, eos_id = load_model_and_tokenizer(checkpoint_path, sampler_name=args.sampler)
 
+    if args.adapter:
+        print(f"Merging adapter: {args.adapter}")
+        # DiffusionGemma trains on the native Automodel implementation but
+        # generates through the HF class; re-parent the adapter module paths.
+        key_map = GEMMA_ADAPTER_KEY_MAP if args.sampler == "gemma" else None
+        model = merge_adapter(model, args.adapter, key_map=key_map)
+
     overrides = {}
-    for key in ["steps", "max_new_tokens", "block_size", "temperature", "remasking", "threshold"]:
+    for key in [
+        "steps",
+        "max_new_tokens",
+        "block_size",
+        "temperature",
+        "remasking",
+        "threshold",
+    ]:
         val = getattr(args, key)
         if val is not None:
             overrides[key] = val
@@ -472,6 +578,7 @@ def main():
             add_generation_prompt=False,
             tokenize=True,
             return_tensors=None,
+            return_dict=True,
         )
         outputs = sampler.infill(encoded["input_ids"])
         for i, prompt in enumerate(args.prompt):
@@ -480,17 +587,7 @@ def main():
     else:
         gen_mode = "RAW" if args.raw else "CHAT"
         print(f"\n{'=' * 80}\n{f'{gen_mode} GENERATION ({args.sampler})':^80}\n{'=' * 80}")
-        if args.raw:
-            inputs = [tokenizer.encode(p, add_special_tokens=True) for p in args.prompt]
-        else:
-            messages_list = [[{"role": "user", "content": p}] for p in args.prompt]
-            encoded = tokenizer.apply_chat_template(
-                messages_list,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_tensors=None,
-            )
-            inputs = encoded["input_ids"]
+        inputs = encode_generation_prompts(tokenizer, args.prompt, args.raw)
 
         if args.sampler == "nemotron":
             # Use the model's built-in block-diffusion generate (with the
@@ -520,6 +617,11 @@ def main():
                     )
                 generated = out_ids[0, prompt_tensor.shape[1] :]
                 sequences.append(tokenizer.decode(generated, skip_special_tokens=True))
+        elif args.sampler == "llada2":
+            # LLaDA2 checkpoints ship a model-specific block-refinement
+            # ``generate`` implementation. It returns generated-only IDs and
+            # currently supports one prompt per call.
+            sequences = generate_llada2(model, tokenizer, inputs, sampler.default_config, mask_id, eos_id)
         else:
             # LLaDA path: LLaDA checkpoints don't ship a built-in ``generate``
             # method, so fall back to the standalone ``DLLMSampler`` here.

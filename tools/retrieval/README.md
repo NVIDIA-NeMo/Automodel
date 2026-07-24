@@ -11,15 +11,16 @@ its dataset cache can substantially delay the first training step. In a multi-GP
 that startup, which can waste GPU-hours before optimization begins. Run the normalized dataset preparation script on CPU
 nodes first, then point the training config at the generated Arrow dataset.
 
-- **Original dataset factory:** the default for typical text-only retrieval and small smoke tests.
+- **Original dataset config:** use `RetrievalDatasetConfig` for typical text-only retrieval, `hf://` sources, inline
+  JSONL, and small verification runs.
 - **Normalized Arrow:** recommended for full-scale or image-heavy VL retrieval. Prepare a portable dataset bundle once,
   then train with
   `nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig`.
-- **Warm HF cache:** use the CPU cache-warming script when the original dataset factory starts slowly and you do not want
-  to change the dataset configuration.
+- **Warm HF cache:** use the CPU cache-warming script when direct source loading starts slowly and you want to keep the
+  original dataset configuration.
 
-Although some file names include `vl`, the preparation scripts also accept text-only corpora. Normalization can still
-help with an unusually large text corpus or when you need a portable dataset.
+Although some file names include `vl`, normalization also accepts text-only corpus ID-based JSON sources. It can help
+with an unusually large text corpus or when you need a portable prepared dataset.
 
 ## Normalized Arrow (Recommended for Full-Scale VL)
 
@@ -27,7 +28,7 @@ Normalized Arrow keeps the original retrieval structure, but prepares the corpus
 bundle:
 
 - Train rows store query text plus positive/negative document IDs.
-- Local corpus shards store each referenced document and optional image once.
+- Each source's local corpus shards store every referenced document and optional image once.
 - Training still resolves `doc_id -> document`, but it reads from local Arrow instead of rebuilding Hugging Face cache
   state in the GPU job.
 
@@ -36,9 +37,14 @@ in every training row.
 
 ### Prepare
 
+The normalization tool accepts local corpus ID-based JSON sources. Before running it, make sure every entry in the
+config's `dataset.data_dir_list` points to that local format. The tool does not accept `hf://` URIs or inline JSONL
+directly. Materialize those sources as corpus ID-based JSON first, or keep using `RetrievalDatasetConfig` and optionally
+warm its Hugging Face cache.
+
 ```bash
 uv run python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
-  --config /path/to/original_retrieval_config.yaml \
+  --config /path/to/retrieval_config_with_local_json_sources.yaml \
   --output-dir /path/to/normalized_vl_retrieval
 ```
 
@@ -47,7 +53,7 @@ On Slurm CPU nodes, use the array launcher for full-scale VL datasets before sub
 then a dependent finalizer writes the top-level metadata after every source succeeds:
 
 ```bash
-CONFIG=/path/to/original_retrieval_config.yaml \
+CONFIG=/path/to/retrieval_config_with_local_json_sources.yaml \
 OUT_DIR=/path/to/normalized_vl_retrieval \
 NUM_SOURCES=7 \
 PARTITION=cpu_short \
@@ -58,8 +64,8 @@ EXTRA_CONTAINER_MOUNTS=/path/to/source_data:/path/to/source_data \
 tools/retrieval/submit_prepare_normalized_vl_retrieval_data_cpu_array.sh
 ```
 
-The non-array `submit_prepare_normalized_vl_retrieval_data_cpu.sh` launcher is useful for smoke tests and small source
-lists, but it prepares sources serially.
+The non-array `submit_prepare_normalized_vl_retrieval_data_cpu.sh` launcher is useful for small verification runs and
+short source lists, but it prepares sources serially.
 
 ### Train
 
@@ -146,7 +152,7 @@ If the local preparation command stops before it finishes, run the same command 
 
 ```bash
 uv run python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
-  --config /path/to/original_retrieval_config.yaml \
+  --config /path/to/retrieval_config_with_local_json_sources.yaml \
   --output-dir /path/to/normalized_vl_retrieval \
   --resume
 ```
@@ -163,8 +169,7 @@ Use resume only to continue an interrupted run. To add new sources to a finished
 
 ## Warm Hugging Face Dataset Cache
 
-This option keeps the original training dataset unchanged:
-`nemo_automodel.components.datasets.llm.make_retrieval_dataset`.
+This option keeps the original `RetrievalDatasetConfig` in the training config unchanged.
 
 The script populates the Hugging Face cache on CPU nodes so the GPU job can reuse it. It does not create a portable
 dataset.

@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# To run this recipe:
+# From a source checkout, use uv to run with the project dependencies:
+#   uv run automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
+# In the NeMo AutoModel container or another environment with dependencies already installed:
 #   automodel examples/retrieval/bi_encoder/llama3_2_1b.yaml --nproc-per-node 8
 # Adjust --nproc-per-node to the number of GPUs available on your machine.
 
@@ -31,7 +33,7 @@ step_scheduler:
 
 dist_env:
   backend: nccl
-  timeout_minutes: 1
+  timeout_minutes: 30
 
 model:
   _target_: nemo_automodel.NeMoAutoModelBiEncoder.from_pretrained
@@ -57,7 +59,6 @@ dataset:
   data_type: train
   n_passages: 5
   seed: 42
-  do_shuffle: true
 
 dataloader:
   collate_fn:
@@ -78,9 +79,6 @@ dataloader:
 #   data_type: eval
 #   n_passages: 5
 #   seed: 42
-#   do_shuffle: false
-#   max_train_samples: 1000
-#   train_data_select_offset: 0
 #
 # validation_dataloader:
 #   collate_fn:
@@ -108,7 +106,7 @@ dataloader:
 #     - up_proj
 #     - down_proj
 #   exclude_modules: []
-#   match_all_linear: True
+#   match_all_linear: false
 #   dim: 16
 #   alpha: 32
 #   use_triton: true
@@ -151,3 +149,10 @@ ci:
   time: "01:30:00"
   nodes: 1
   embed_eval: true
+  # The downstream golden-metric evaluation consumes this full-epoch checkpoint.
+  nightly: &full_epoch_ci
+    step_scheduler.max_steps: null
+    step_scheduler.ckpt_every_steps: 2000
+    step_scheduler.val_every_steps: 500
+    lr_scheduler.lr_warmup_steps: 100
+  release: *full_epoch_ci

@@ -15,7 +15,7 @@ embedding model to adapt it to a specific domain.
 
 The NeMo AutoModel Retrieval recipe expects a training set with the corpus ID-based JSON schema shown below. For
 details, refer to the
-[Corpus ID-Based JSON documentation](https://docs.nvidia.com/nemo/automodel/latest/datasets/retrieval-dataset#corpus-id-based-json-merlin-or-nemo-retriever-style).
+[Corpus ID-Based JSON documentation](https://docs.nvidia.com/nemo/automodel/latest/datasets/retrieval-dataset#corpus-id-based-json).
 
 ```json
 {
@@ -66,16 +66,30 @@ text retrieval. Use `num_samples` to control how many examples to load from each
 
 #### Normalize on CPU First for Full-Scale VL Training
 
-For a full-scale VL run, use the updated example config as the input to the normalized dataset preparation script:
+The normalization tool accepts local corpus ID-based JSON sources. Before preparing a full-scale VL dataset, make a
+copy of the example config for CPU preparation:
+
+1. Keep the generated local `colpali_train.json` source.
+2. Remove the `hf://` MIRACL source if the run does not need it, or materialize MIRACL as local corpus-backed data:
+
+   ```bash
+   uv run python examples/retrieval/bi_encoder/llama_embed_nemotron_8b/data_preparation.py \
+     --download-path ./embed_nemotron_dataset_v1
+   ```
+
+   Then replace the MIRACL URI in the preparation config with
+   `./embed_nemotron_dataset_v1/MIRACL/MIRACL.json`.
+
+Run the normalization tool with that local-source config:
 
 ```bash
 uv run python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
-  --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml \
+  --config /path/to/nemotron_vl_1b_normalized_prep.yaml \
   --output-dir /path/to/normalized_vl_retrieval
 ```
 
-This command reads every source in the original `dataset.data_dir_list`, including the files produced by the notebook,
-and writes one portable Arrow bundle. For large datasets on a Slurm cluster, use the CPU array launcher described in the
+This command reads every local source in `dataset.data_dir_list` and writes one portable Arrow bundle. For large
+datasets on a Slurm cluster, use the CPU array launcher described in the
 [retrieval data preparation tools](../../../../tools/retrieval/README.md).
 
 Then replace the `dataset` section in the training config with the normalized loader:
@@ -94,8 +108,8 @@ loaded and its dataset cache is built. Normalizing on CPU moves that work before
 
 #### Load the Source Data Directly for Small Runs
 
-For a smoke test or a small dataset, skip normalization and keep the original dataset config. It reads the notebook's
-JSON and corpus files directly:
+For a small verification run or a small dataset, skip normalization and keep the original dataset config. It reads the
+notebook's JSON and corpus files directly:
 
 ```yaml
 dataset:

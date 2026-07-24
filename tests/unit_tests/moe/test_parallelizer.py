@@ -311,6 +311,7 @@ def _import_parallelizer_with_stubs(monkeypatch):
 
     mesh_utils_stub = types.ModuleType("nemo_automodel.components.distributed.mesh_utils")
     mesh_utils_stub.get_submesh = lambda mesh, axis_names: mesh[axis_names]
+    mesh_utils_stub.get_fsdp_dp_mesh = lambda mesh, *_axis_names: mesh[("dp_replicate", "dp_shard_cp")]
     monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.mesh_utils", mesh_utils_stub)
 
     # Stub dtype_from_str utility
@@ -932,6 +933,33 @@ class FakeMoeMesh:
 
     def __getitem__(self, key):
         return MeshView(self._sizes[key])
+
+
+def test_parallelize_model_uses_root_preserving_hsdp_mesh(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    mesh_utils = sys.modules["nemo_automodel.components.distributed.mesh_utils"]
+    hsdp_mesh = MeshView(16)
+    get_fsdp_dp_mesh_mock = MagicMock(return_value=hsdp_mesh)
+    monkeypatch.setattr(mesh_utils, "get_fsdp_dp_mesh", get_fsdp_dp_mesh_mock)
+    apply_fsdp_mock = MagicMock()
+    monkeypatch.setattr(P, "apply_fsdp", apply_fsdp_mock)
+
+    world_mesh = FakeWorldMesh(
+        {("dp_replicate", "dp_shard_cp"): 16, "tp": 1},
+        mesh_dim_names=["dp_replicate", "dp_shard", "cp", "tp"],
+    )
+    model = type("Outer", (), {"moe_config": type("MoeConfig", (), {"n_routed_experts": 128})()})()
+
+    P.parallelize_model(
+        model=model,
+        world_mesh=world_mesh,
+        moe_mesh=None,
+        dp_axis_names=("dp_replicate", "dp_shard_cp"),
+        activation_checkpointing=False,
+    )
+
+    get_fsdp_dp_mesh_mock.assert_called_once_with(world_mesh, "dp_replicate", "dp_shard_cp")
+    assert apply_fsdp_mock.call_args.args[1] is hsdp_mesh
 
 
 def test_parallelize_model_calls_subsystems_and_validates(monkeypatch):
@@ -2636,10 +2664,10 @@ class _FakeBlockWithAttn:
 
 
 def _stub_dense_cp_hooks(monkeypatch):
-    cp_utils_stub = types.ModuleType("nemo_automodel.components.distributed.cp_utils")
+    cp_utils_stub = types.ModuleType("nemo_automodel.components.distributed.context_parallel.utils")
     cp_utils_stub.attach_context_parallel_hooks = MagicMock()
     cp_utils_stub.attach_cp_sdpa_hooks = MagicMock()
-    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.cp_utils", cp_utils_stub)
+    monkeypatch.setitem(sys.modules, "nemo_automodel.components.distributed.context_parallel.utils", cp_utils_stub)
     return cp_utils_stub
 
 

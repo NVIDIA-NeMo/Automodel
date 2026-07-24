@@ -595,6 +595,13 @@ class DataloaderConfig:
         """Whether dataset construction must bypass rank-zero-first ordering."""
         return isinstance(self.dataset_config, AllRanksDatasetConfig)
 
+    @property
+    def emits_thd(self) -> bool:
+        """Whether this configuration produces THD-formatted batches."""
+        from nemo_automodel.components.datasets.utils import packed_sequence_thd_collater
+
+        return isinstance(self.packing, ThdPackingConfig) or self.collate_fn is packed_sequence_thd_collater
+
     def _build_dataset(
         self,
         *,
