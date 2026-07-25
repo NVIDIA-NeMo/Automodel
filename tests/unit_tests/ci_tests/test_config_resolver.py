@@ -387,6 +387,9 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
 @pytest.mark.parametrize(
     "recipe_path",
     [
+        "examples/long_context_validation/gemma4_31B/gemma4_31b_base_coderforge_cp8_64k_1e5_800steps.yaml",
+        "examples/vlm_finetune/gemma4/gemma4_31b_tulu3_text_cp8_16k.yaml",
+        "examples/vlm_finetune/gemma4/gemma4_e4b_tulu3_text_cp16_64k.yaml",
         "examples/vlm_finetune/gemma4_joint_drafter/gemma4_4b_joint_drafter_tulu_magicoder_mix.yaml",
         "examples/vlm_finetune/gemma4_joint_drafter/gemma4_31b_joint_drafter_tulu_magicoder_mix.yaml",
     ],

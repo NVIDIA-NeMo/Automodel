@@ -773,11 +773,9 @@ def apply_fsdp(
             # outer model would then land in no FSDP unit at all, losing
             # gradient reduction across DP ranks (covered by
             # test_apply_fsdp_without_outer_root_allows_supported_multimodal_policies).
-            # The open item is the other side of the asymmetry:
-            # ``moe/fsdp_mixin.py::_iter_fsdp_modules`` still enumerates only
-            # ``audio_tower``/``visual``, so units created here for other names
-            # are invisible to the gradient-accumulation sync state machine.
-            # Both sides should be widened together -- see AM-766.
+            # ``moe/fsdp_mixin.py::_iter_fsdp_modules`` reuses the same shared
+            # multimodal taxonomy so every unit created here also participates
+            # in the gradient-accumulation sync state machine.
             fully_shard_default(module)
         elif frozen_multimodal_sharding == "per_layer":
             shard_multimodal_module(module, fully_shard_default)
