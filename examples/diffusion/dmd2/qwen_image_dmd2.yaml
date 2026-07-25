@@ -4,8 +4,7 @@ model:
   attention_backend: flash
 
 dmd2:
-  config:
-    _target_: modelopt.torch.fastgen.DMDConfig
+  modelopt_config:
     pred_type: flow
     guidance_scale: 4.0
     student_sample_steps: 4
@@ -21,22 +20,13 @@ dmd2:
     # The validated run disabled EMA. Set an EMAConfig here to enable it.
     ema: null
 
-  pipeline:
-    _target_: modelopt.torch.fastgen.plugins.qwen_image.QwenImageDMDPipeline
   discriminator:
-    _target_: modelopt.torch.fastgen.discriminators.Discriminator_ImageDiT
     feature_indices: [30]
     num_blocks: 60
     inner_dim: 3072
-  feature_capture_fn: modelopt.torch.fastgen.plugins.qwen_image.attach_feature_capture
-  feature_capture_kwargs:
-    feature_indices: [30]
-  register_parallel_strategy_fn: nemo_automodel.components.models.qwen_image.fsdp.register_qwen_image_parallel_strategy
 
   # Generate this once with the same Qwen text encoder used for the data cache.
   negative_prompt_embedding_path: PATH_TO_NEGATIVE_PROMPT_EMBEDDING
-  fake_score_lr: 2.0e-6
-  discriminator_lr: 2.0e-6
 
 optim:
   learning_rate: 2.0e-6

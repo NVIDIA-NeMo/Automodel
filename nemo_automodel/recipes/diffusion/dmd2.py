@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import logging
 from math import ceil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -27,6 +26,7 @@ from torch import nn
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
+from nemo_automodel.components.models.qwen_image.fsdp import register_qwen_image_parallel_strategy
 from nemo_automodel.components.training.utils import (
     clip_grad_norm,
     prepare_after_first_microbatch,
@@ -36,12 +36,22 @@ from nemo_automodel.components.training.utils import (
 from nemo_automodel.recipes.diffusion.train import (
     _build_diffusion_parallel_manager_args,
     _build_optimizer,
-    is_main_process,
 )
 
 if TYPE_CHECKING:
     from nemo_automodel.components.config.loader import ConfigNode
     from nemo_automodel.recipes.diffusion.train import TrainDiffusionRecipe
+
+
+def _require_qwen_fastgen() -> tuple[Any, Any, Any]:
+    """Import ModelOpt only when Qwen-Image DMD2 is configured."""
+    try:
+        import modelopt.torch.fastgen as fastgen
+        import modelopt.torch.fastgen.discriminators as fastgen_discriminators
+        import modelopt.torch.fastgen.plugins.qwen_image as qwen_fastgen
+    except ImportError as exc:
+        raise ImportError("Qwen-Image DMD2 requires ModelOpt FastGen; install with `uv sync --extra dmd2`.") from exc
+    return fastgen, fastgen_discriminators, qwen_fastgen
 
 
 def _load_negative_prompt_embedding(path: str) -> torch.Tensor:
@@ -69,18 +79,19 @@ class DMD2Objective:
 
     def __init__(self, cfg: ConfigNode) -> None:
         self.cfg = cfg
-        self.config = cfg.config.instantiate()
-        if self.config.student_update_freq < 1:
-            raise ValueError("dmd2.config.student_update_freq must be at least 1.")
+        fastgen, _, _ = _require_qwen_fastgen()
+        self.modelopt_config = fastgen.DMDConfig(**cfg.modelopt_config.to_dict())
+        if self.modelopt_config.student_update_freq < 1:
+            raise ValueError("dmd2.modelopt_config.student_update_freq must be at least 1.")
 
-        self.pipeline: Any | None = None
+        self.modelopt_pipeline: Any | None = None
         self.teacher: nn.Module | None = None
         self.fake_score: nn.Module | None = None
         self.fake_score_optimizer: torch.optim.Optimizer | None = None
         self.discriminator: nn.Module | None = None
         self.discriminator_optimizer: torch.optim.Optimizer | None = None
         self.negative_prompt_embedding: torch.Tensor | None = None
-        self._feature_capture_attached = False
+        self._feature_capture_shape: tuple[int, int] | None = None
         self._fake_score_state: ModelState | None = None
         self._fake_score_optimizer_state: OptimizerState | None = None
         self._discriminator_state: ModelState | None = None
@@ -111,22 +122,22 @@ class DMD2Objective:
         if bool(recipe.cfg.get("model.transformer_engine_fp8", False)):
             raise ValueError("DMD2 does not yet support Transformer Engine FP8 state.")
 
-        ema = self.config.ema
+        ema = self.modelopt_config.ema
         if ema is not None and (not ema.fsdp2 or ema.mode != "full_tensor"):
             raise ValueError("DMD2 checkpoint resume requires EMA with fsdp2=true and mode=full_tensor.")
 
-        register_parallel_strategy = self.cfg.get("register_parallel_strategy_fn", None)
-        if register_parallel_strategy is not None:
-            register_parallel_strategy()
+        register_qwen_image_parallel_strategy()
 
     def primary_optimizer_steps(self, outer_steps: int) -> int:
         """Return the number of student updates in ``outer_steps``."""
-        return ceil(outer_steps / int(self.config.student_update_freq))
+        return ceil(outer_steps / int(self.modelopt_config.student_update_freq))
 
     def setup(self, recipe: TrainDiffusionRecipe) -> None:
         """Create DMD2 auxiliaries before the native checkpoint restore."""
+        _, fastgen_discriminators, qwen_fastgen = _require_qwen_fastgen()
+
         negative_path = self.cfg.get("negative_prompt_embedding_path", None)
-        if self.config.guidance_scale is not None:
+        if self.modelopt_config.guidance_scale is not None:
             if not negative_path:
                 raise ValueError("DMD2 CFG requires dmd2.negative_prompt_embedding_path.")
             self.negative_prompt_embedding = _load_negative_prompt_embedding(str(negative_path)).to(
@@ -152,29 +163,26 @@ class DMD2Objective:
             float(self.cfg.get("fake_score_lr", recipe.learning_rate)),
         )
 
-        if self.config.gan_loss_weight_gen > 0:
+        if self.modelopt_config.gan_loss_weight_gen > 0:
             discriminator_cfg = self.cfg.get("discriminator", None)
             if discriminator_cfg is None:
-                raise ValueError("DMD2 GAN requires a dmd2.discriminator target.")
-            self.discriminator = discriminator_cfg.instantiate().to(
+                raise ValueError("DMD2 GAN requires dmd2.discriminator arguments.")
+            self.discriminator = fastgen_discriminators.Discriminator_ImageDiT(**discriminator_cfg.to_dict()).to(
                 device=recipe.device,
                 dtype=recipe.compute_dtype,
             )
-            self.discriminator.train()
             self._broadcast_discriminator(recipe)
             self.discriminator_optimizer = _build_optimizer(
                 list(self.discriminator.parameters()),
                 recipe.cfg.get("optim.optimizer", {}),
                 float(self.cfg.get("discriminator_lr", recipe.learning_rate)),
             )
-            if self.cfg.get("feature_capture_fn", None) is None:
-                raise ValueError("DMD2 GAN requires dmd2.feature_capture_fn.")
 
-        self.pipeline = self.cfg.pipeline.instantiate(
+        self.modelopt_pipeline = qwen_fastgen.QwenImageDMDPipeline(
             student=recipe.model,
             teacher=self.teacher,
             fake_score=self.fake_score,
-            config=self.config,
+            config=self.modelopt_config,
             discriminator=self.discriminator,
         )
 
@@ -192,22 +200,12 @@ class DMD2Objective:
                 cpu_offload=recipe.cpu_offload,
             )
 
-        if is_main_process():
-            logging.info(
-                "[DMD2] ready: guidance=%s student_steps=%s update_freq=%s gan_weight=%s ema=%s",
-                self.config.guidance_scale,
-                self.config.student_sample_steps,
-                self.config.student_update_freq,
-                self.config.gan_loss_weight_gen,
-                self.config.ema is not None,
-            )
-
     def after_restore(self, recipe: TrainDiffusionRecipe) -> None:
         """Verify the restored student scheduler is on the DMD2 phase boundary."""
         if recipe.lr_scheduler is None:
             return
         completed_steps = int(recipe.step_scheduler.step)
-        expected_student_steps = ceil(completed_steps / int(self.config.student_update_freq))
+        expected_student_steps = ceil(completed_steps / int(self.modelopt_config.student_update_freq))
         restored_student_steps = int(recipe.lr_scheduler[0].num_steps)
         if restored_student_steps != expected_student_steps:
             raise ValueError(
@@ -228,8 +226,8 @@ class DMD2Objective:
             state["discriminator"] = self._discriminator_state.state_dict()
         if self._discriminator_optimizer_state is not None:
             state["discriminator_optimizer"] = self._discriminator_optimizer_state.state_dict()
-        if self.pipeline.ema is not None:
-            state["ema"] = self.pipeline.ema.state_dict()
+        if self.modelopt_pipeline.ema is not None:
+            state["ema"] = self.modelopt_pipeline.ema.state_dict()
         return state
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -243,15 +241,15 @@ class DMD2Objective:
             self._discriminator_state.load_state_dict(state["discriminator"])
         if self._discriminator_optimizer_state is not None:
             self._discriminator_optimizer_state.load_state_dict(state["discriminator_optimizer"])
-        if self.pipeline.ema is not None:
-            self.pipeline.ema.load_state_dict(state["ema"])
+        if self.modelopt_pipeline.ema is not None:
+            self.modelopt_pipeline.ema.load_state_dict(state["ema"])
 
     def train_batch_group(
         self,
         recipe: TrainDiffusionRecipe,
         batch_group: list[dict[str, Any]],
         global_step: int,
-    ) -> tuple[float, float, float, dict[str, float]]:
+    ) -> tuple[float, float]:
         """Run one student or fake-score/discriminator optimizer phase."""
         self._require_ready()
         assert self.fake_score is not None
@@ -260,7 +258,7 @@ class DMD2Objective:
         if not batch_group:
             raise RuntimeError("DMD2 received an empty gradient-accumulation group.")
 
-        student_phase = global_step % int(self.config.student_update_freq) == 0
+        student_phase = global_step % int(self.modelopt_config.student_update_freq) == 0
         phase = "student" if student_phase else "fake_score"
         active_model = recipe.model if student_phase else self.fake_score
         active_optimizer = recipe.optimizer if student_phase else self.fake_score_optimizer
@@ -273,7 +271,6 @@ class DMD2Objective:
             self.discriminator_optimizer.zero_grad(set_to_none=True)
 
         prepare_for_grad_accumulation([active_model], pp_enabled=False)
-        component_sums: dict[str, float] = {}
         total_losses: list[torch.Tensor] = []
         num_microbatches = len(batch_group)
 
@@ -284,32 +281,24 @@ class DMD2Objective:
             latents, noise, text_embeddings, negative_embeddings = self._prepare_batch(recipe, micro_batch)
             kwargs = {"encoder_hidden_states": text_embeddings, "encoder_hidden_states_mask": None}
             if student_phase:
-                losses = self.pipeline.compute_student_loss(
+                losses = self.modelopt_pipeline.compute_student_loss(
                     latents,
                     noise,
                     negative_encoder_hidden_states=negative_embeddings,
                     **kwargs,
                 )
             else:
-                losses = self.pipeline.compute_fake_score_loss(latents, noise, **kwargs)
+                losses = self.modelopt_pipeline.compute_fake_score_loss(latents, noise, **kwargs)
 
             total = losses["total"]
-            for name, value in losses.items():
-                component_sums[f"{phase}/{name}"] = component_sums.get(f"{phase}/{name}", 0.0) + float(
-                    value.detach().item()
-                )
-
             if recipe.check_loss and not torch.isfinite(total).all():
                 raise FloatingPointError(f"Non-finite DMD2 {phase} loss at step {global_step}.")
             (total / num_microbatches).backward()
             reported_total = total.detach()
 
             if not student_phase and self.discriminator_optimizer is not None:
-                discriminator_losses = self.pipeline.compute_discriminator_loss(latents, noise, **kwargs)
+                discriminator_losses = self.modelopt_pipeline.compute_discriminator_loss(latents, noise, **kwargs)
                 discriminator_total = discriminator_losses["total"]
-                for name, value in discriminator_losses.items():
-                    key = f"discriminator/{name}"
-                    component_sums[key] = component_sums.get(key, 0.0) + float(value.detach().item())
                 if recipe.check_loss and not torch.isfinite(discriminator_total).all():
                     raise FloatingPointError(f"Non-finite DMD2 discriminator loss at step {global_step}.")
                 (discriminator_total / num_microbatches).backward()
@@ -326,11 +315,13 @@ class DMD2Objective:
         )
         grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else float(grad_norm)
 
-        discriminator_grad_norm = None
         if not student_phase and self.discriminator_optimizer is not None:
             self._synchronize_discriminator_gradients(recipe)
-            discriminator_grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), recipe.clip_grad_max_norm)
+            clip_grad_norm(
+                recipe.clip_grad_max_norm,
+                [self.discriminator],
+                foreach=recipe.grad_clip_foreach,
+                use_torch_clip_grad_norm=True,
             )
 
         active_optimizer.step()
@@ -339,25 +330,15 @@ class DMD2Objective:
         if student_phase:
             if recipe.lr_scheduler is not None:
                 recipe.lr_scheduler[0].step(1)
-            self.pipeline.update_ema(iteration=global_step // int(self.config.student_update_freq) + 1)
+            self.modelopt_pipeline.update_ema(
+                iteration=global_step // int(self.modelopt_config.student_update_freq) + 1
+            )
 
         active_optimizer.zero_grad(set_to_none=True)
         if not student_phase and self.discriminator_optimizer is not None:
             self.discriminator_optimizer.zero_grad(set_to_none=True)
 
-        metrics = {f"dmd2/{name}": value / num_microbatches for name, value in component_sums.items()}
-        metrics["dmd2/student_phase"] = float(student_phase)
-        metrics["dmd2/lr_student"] = float(recipe.optimizer.param_groups[0]["lr"])
-        metrics["dmd2/lr_fake_score"] = float(self.fake_score_optimizer.param_groups[0]["lr"])
-        if discriminator_grad_norm is not None:
-            metrics["dmd2/discriminator/grad_norm"] = discriminator_grad_norm
-
-        return (
-            float(torch.stack(total_losses).mean().item()),
-            grad_norm,
-            float(active_optimizer.param_groups[0]["lr"]),
-            metrics,
-        )
+        return float(torch.stack(total_losses).mean().item()), grad_norm
 
     def _load_transformer(
         self,
@@ -381,7 +362,6 @@ class DMD2Objective:
             compact_fused_qkv_projections=recipe.compact_fused_qkv_projections,
         )
         model = pipe.transformer
-        del pipe
         if recipe.attention_backend is not None:
             getattr(model, "module", model).set_attention_backend(recipe.attention_backend)
         model.train(trainable)
@@ -407,16 +387,17 @@ class DMD2Objective:
                 f"got {tuple(latents.shape)} and {tuple(text_embeddings.shape)}."
             )
 
-        if self.discriminator is not None and not self._feature_capture_attached:
-            kwargs_cfg = self.cfg.get("feature_capture_kwargs", None)
-            kwargs = kwargs_cfg.to_dict() if kwargs_cfg is not None else {}
-            self.cfg.feature_capture_fn(
+        feature_shape = (latents.shape[-2], latents.shape[-1])
+        if self.discriminator is not None and self._feature_capture_shape != feature_shape:
+            _, _, qwen_fastgen = _require_qwen_fastgen()
+
+            qwen_fastgen.attach_feature_capture(
                 self.teacher,
-                h_lat=latents.shape[-2],
-                w_lat=latents.shape[-1],
-                **kwargs,
+                feature_indices=sorted(self.discriminator.feature_indices),
+                h_lat=feature_shape[0],
+                w_lat=feature_shape[1],
             )
-            self._feature_capture_attached = True
+            self._feature_capture_shape = feature_shape
 
         negative = None
         if self.negative_prompt_embedding is not None:
@@ -430,7 +411,6 @@ class DMD2Objective:
         recipe.model.requires_grad_(student_phase)
         self.fake_score.train(not student_phase)
         self.fake_score.requires_grad_(not student_phase)
-        self.teacher.eval()
         if self.discriminator is not None:
             self.discriminator.train(not student_phase)
             self.discriminator.requires_grad_(not student_phase)
@@ -452,5 +432,5 @@ class DMD2Objective:
                 parameter.grad.div_(dp_size)
 
     def _require_ready(self) -> None:
-        if self.pipeline is None or self.fake_score is None or self.fake_score_optimizer is None:
+        if self.modelopt_pipeline is None or self.fake_score is None or self.fake_score_optimizer is None:
             raise RuntimeError("DMD2 objective has not been set up.")

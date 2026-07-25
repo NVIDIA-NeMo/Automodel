@@ -776,8 +776,7 @@ class TrainDiffusionRecipe(BaseRecipe):
             )
             self._te_fp8_group = dist.group.WORLD if dist.is_initialized() else None
 
-        trainer_name = "DMD2" if self.cfg.get("dmd2", None) is not None else "Flow Matching"
-        logging.info(f"[INFO] Diffusion Trainer with {trainer_name}")
+        logging.info("[INFO] Diffusion Trainer")
         logging.info(
             f"[INFO] Total GPUs: {self.world_size}, GPUs per node: {self.local_world_size}, Num nodes: {self.num_nodes}"
         )
@@ -1130,7 +1129,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         self,
         batch_group: list[Dict[str, Any]],
         global_step: int,
-    ) -> tuple[float, float, float, dict[str, float]]:
+    ) -> tuple[float, float]:
         """Run one accumulated optimizer step for the configured objective."""
         dmd2 = getattr(self, "dmd2", None)
         if dmd2 is not None:
@@ -1191,18 +1190,10 @@ class TrainDiffusionRecipe(BaseRecipe):
         if self.lr_scheduler is not None:
             self.lr_scheduler[0].step(1)
 
-        return (
-            float(torch.stack(micro_losses).mean().item()),
-            grad_norm,
-            float(self.optimizer.param_groups[0]["lr"]),
-            {},
-        )
+        return float(torch.stack(micro_losses).mean().item()), grad_norm
 
     def run_train_validation_loop(self):
-        if getattr(self, "dmd2", None) is not None:
-            logging.info("[INFO] Starting DMD2 training")
-        else:
-            logging.info("[INFO] Starting T2V training with Flow Matching")
+        logging.info("[INFO] Starting diffusion training")
         logging.info(f"[INFO] Global Batch size: {self.global_batch_size}; Local Batch size: {self.local_batch_size}")
         logging.info(f"[INFO] Num nodes: {self.num_nodes}; DP size: {self.dp_size}")
 
@@ -1231,11 +1222,12 @@ class TrainDiffusionRecipe(BaseRecipe):
             num_steps = 0
 
             for batch_group in self.step_scheduler:
-                global_step = int(self.step_scheduler.step)
-                group_loss_mean, grad_norm, learning_rate, step_metrics = self._train_batch_group(
+                batch_step = int(self.step_scheduler.step) if getattr(self, "dmd2", None) is not None else global_step
+                group_loss_mean, grad_norm = self._train_batch_group(
                     batch_group,
-                    global_step,
+                    batch_step,
                 )
+                global_step = int(self.step_scheduler.step)
 
                 perf_window_steps += 1
                 perf_window_local_samples += _count_local_batch_group_samples(batch_group)
@@ -1262,11 +1254,10 @@ class TrainDiffusionRecipe(BaseRecipe):
                     log_dict = {
                         "train_loss": group_loss_mean,
                         "train_avg_loss": avg_loss,
-                        "lr": learning_rate,
+                        "lr": self.optimizer.param_groups[0]["lr"],
                         "grad_norm": grad_norm,
                         "epoch": epoch,
                         "global_step": global_step,
-                        **step_metrics,
                         **throughput_metrics,
                         **memory_metrics,
                     }
@@ -1279,7 +1270,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                         epoch,
                         group_loss_mean,
                         avg_loss,
-                        learning_rate,
+                        self.optimizer.param_groups[0]["lr"],
                         grad_norm,
                         throughput_metrics["step_time"],
                         throughput_metrics["samples_per_sec"],
@@ -1293,7 +1284,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                             {
                                 "loss": f"{group_loss_mean:.4f}",
                                 "avg": f"{(avg_loss):.4f}",
-                                "lr": f"{learning_rate:.2e}",
+                                "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
                                 "gn": f"{grad_norm:.2f}",
                                 "s/s": f"{throughput_metrics['samples_per_sec']:.1f}",
                                 "s/s/gpu": f"{throughput_metrics['samples_per_sec_per_gpu']:.2f}",

@@ -3,14 +3,17 @@
 This example runs DMD2 through AutoModel's standard diffusion fine-tuning
 trainer. AutoModel continues to own data loading, FSDP2, optimizers, gradient
 accumulation, logging, and checkpoint cadence. The top-level `dmd2` block in
-the YAML selects Model Optimizer's DMD2 config, Qwen-Image pipeline,
-discriminator, and feature hook.
+the YAML contains only DMD2 parameters; the integration explicitly calls
+Model Optimizer's Qwen-Image pipeline.
 
 Install the DMD2 dependency:
 
 ```bash
 uv sync --extra dmd2
 ```
+
+The required FastGen APIs are currently pinned to a ModelOpt commit, so use
+this source-checkout `uv` workflow until they are included in a ModelOpt release.
 
 The negative-prompt embedding is required by CFG, not by DMD2 itself. Because
 this example uses `guidance_scale: 4.0`, generate it once with the same
@@ -28,10 +31,8 @@ output = "/path/to/negative_prompt_embedding.pt"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 processor = QwenImageProcessor()
-pipeline = processor.load_models(model, device)["pipeline"]
-with torch.no_grad():
-    embed, _ = pipeline.encode_prompt(prompt="", device=device)
-embed = embed.detach().cpu().to(torch.bfloat16)
+models = processor.load_models(model, device)
+embed = processor.encode_text("", models, device)["prompt_embeds"]
 if embed.ndim != 3 or embed.shape[0] != 1:
     raise ValueError(f"Expected [1, sequence, hidden], got {tuple(embed.shape)}")
 torch.save(embed.squeeze(0).contiguous(), output)
