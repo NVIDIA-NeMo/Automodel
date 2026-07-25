@@ -227,6 +227,12 @@ def test_resolve_custom_config_cls_uses_registry_for_non_builtin(monkeypatch):
     assert reg.resolve_custom_config_cls("am_future") is FakeConfig
 
 
+def test_resolve_custom_config_cls_returns_none_for_unregistered_model_type():
+    from nemo_automodel._transformers import registry as reg
+
+    assert reg.resolve_custom_config_cls("not_registered") is None
+
+
 def test_resolve_custom_config_cls_defers_to_builtin_only_when_opted_out(monkeypatch):
     from nemo_automodel._transformers import registry as reg
 
@@ -250,6 +256,19 @@ def test_resolve_custom_config_cls_overrides_transformers_builtin_by_default(mon
     )
 
     assert reg.resolve_custom_config_cls("bert") is FakeConfig
+
+
+def test_resolve_custom_config_cls_returns_none_when_registered_import_fails(monkeypatch):
+    from nemo_automodel._transformers import registry as reg
+
+    def raise_import_error(name):
+        raise ImportError(name)
+
+    monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "am_broken", ("fake.missing_module", "MissingConfig"))
+    monkeypatch.setattr(reg, "_KEEP_BUILTIN_CONFIG", set())
+    monkeypatch.setattr(reg.importlib, "import_module", raise_import_error)
+
+    assert reg.resolve_custom_config_cls("am_broken") is None
 
 
 @pytest.mark.parametrize("model_type", sorted(_CUSTOM_CONFIG_REGISTRATIONS))
