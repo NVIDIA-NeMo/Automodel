@@ -217,25 +217,27 @@ def _minimal_diffusion_recipe_cfg(
     adapter_type="hunyuan",
     attention_backend="flash_varlen",
     optimize_hunyuan_flash_varlen_mask=True,
+    fsdp=None,
 ):
-    return ConfigNode(
-        {
-            "model": {
-                "pretrained_model_name_or_path": "dummy-model",
-                "attention_backend": attention_backend,
-                "optimize_hunyuan_flash_varlen_mask": optimize_hunyuan_flash_varlen_mask,
-            },
-            "flow_matching": {"adapter_type": adapter_type},
-            "optimizer": {"_target_": "torch.optim.AdamW", "lr": 1.0e-4},
-            "performance": {},
-            "step_scheduler": {
-                "num_epochs": 1,
-                "local_batch_size": 1,
-                "global_batch_size": 1,
-                "ckpt_every_steps": 1,
-            },
-        }
-    )
+    cfg = {
+        "model": {
+            "pretrained_model_name_or_path": "dummy-model",
+            "attention_backend": attention_backend,
+            "optimize_hunyuan_flash_varlen_mask": optimize_hunyuan_flash_varlen_mask,
+        },
+        "flow_matching": {"adapter_type": adapter_type},
+        "optimizer": {"_target_": "torch.optim.AdamW", "lr": 1.0e-4},
+        "performance": {},
+        "step_scheduler": {
+            "num_epochs": 1,
+            "local_batch_size": 1,
+            "global_batch_size": 1,
+            "ckpt_every_steps": 1,
+        },
+    }
+    if fsdp is not None:
+        cfg["fsdp"] = fsdp
+    return ConfigNode(cfg)
 
 
 def _patch_lightweight_diffusion_recipe_setup(monkeypatch):
@@ -315,6 +317,61 @@ def test_diffusion_recipe_enables_hunyuan_flash_varlen_mask_optimization_before_
         recipe.setup()
 
     enable_optimization.assert_called_once_with()
+
+
+def test_diffusion_recipe_reseeds_rng_by_dp_rank_when_cp_enabled(monkeypatch):
+    """With cp_size > 1 all CP peers must draw identical noise/timesteps: the
+    recipe re-seeds every RNG with seed + dp_rank (unranked) after the mesh is
+    built, so CP peers match while DP ranks stay decorrelated."""
+    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
+    monkeypatch.setattr(
+        diffusion_train,
+        "build_diffusion_pipeline",
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+    )
+    init_all_rng = MagicMock()
+    monkeypatch.setattr(diffusion_train, "init_all_rng", init_all_rng)
+
+    recipe = TrainDiffusionRecipe(
+        _minimal_diffusion_recipe_cfg(
+            adapter_type="simple",
+            attention_backend=None,
+            optimize_hunyuan_flash_varlen_mask=False,
+            fsdp={"cp_size": 2},
+        )
+    )
+
+    with pytest.raises(ValueError, match="checkpoint config is required"):
+        recipe.setup()
+
+    assert recipe.cp_size == 2
+    # dist is not initialized in the harness, so dp_rank resolves to 0.
+    init_all_rng.assert_called_once_with(recipe.seed + 0, ranked=False)
+
+
+def test_diffusion_recipe_does_not_reseed_rng_without_cp(monkeypatch):
+    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
+    monkeypatch.setattr(
+        diffusion_train,
+        "build_diffusion_pipeline",
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
+    )
+    init_all_rng = MagicMock()
+    monkeypatch.setattr(diffusion_train, "init_all_rng", init_all_rng)
+
+    recipe = TrainDiffusionRecipe(
+        _minimal_diffusion_recipe_cfg(
+            adapter_type="simple",
+            attention_backend=None,
+            optimize_hunyuan_flash_varlen_mask=False,
+        )
+    )
+
+    with pytest.raises(ValueError, match="checkpoint config is required"):
+        recipe.setup()
+
+    assert recipe.cp_size == 1
+    init_all_rng.assert_not_called()
 
 
 class _TinyTransformer(nn.Module):
@@ -481,7 +538,9 @@ def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
     assert calls["transformer_engine_fp8_safe_only"] is True
     assert calls["fuse_qkv_projections"] is True
     assert calls["compact_fused_qkv_projections"] is True
-    assert pipe.transformer.attention_backend == "flash"
+    # attention_backend is forwarded to from_pretrained, which applies it via
+    # set_attention_backend before sharding (required for context parallelism).
+    assert calls["attention_backend"] == "flash"
     assert built_pipe is pipe
     assert device_mesh == "mesh"
 
@@ -633,6 +692,7 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     recipe.local_batch_size = 2
     recipe.num_nodes = 1
     recipe.dp_size = 1
+    recipe.cp_size = 1
     recipe.world_size = 1
     recipe.num_epochs = 1
     recipe.sampler = SimpleNamespace(set_epoch=MagicMock())

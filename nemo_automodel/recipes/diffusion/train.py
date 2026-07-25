@@ -30,7 +30,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
-from nemo_automodel.components.training.rng import StatefulRNG
+from nemo_automodel.components.training.rng import StatefulRNG, init_all_rng
 from nemo_automodel.components.training.utils import (
     clip_grad_norm,
     prepare_after_first_microbatch,
@@ -190,6 +190,10 @@ def _build_diffusion_parallel_manager_args(
 
     fsdp_options = dict(fsdp_cfg or {})
     ignored_options = {"use_hf_tp_plan": fsdp_options.pop("use_hf_tp_plan", False)}
+    # Diffusion-specific CP knobs (consumed by _enable_context_parallel, not the
+    # shared distributed parser): how the cp axis splits into ring x ulysses.
+    cp_ring_degree = int(fsdp_options.pop("cp_ring_degree", 1))
+    cp_ulysses_degree = fsdp_options.pop("cp_ulysses_degree", None)
     fsdp_options.pop("backend", None)
     cpu_offload = bool(fsdp_options.pop("cpu_offload", False))
     reduce_dtype = dtype_from_str(fsdp_options.pop("reduce_dtype", None), default=torch.float32)
@@ -213,6 +217,10 @@ def _build_diffusion_parallel_manager_args(
         }
     )
 
+    if cp_ulysses_degree is None:
+        # Default to pure Ulysses: ring-attention backward is broken in diffusers<=0.39.
+        cp_ulysses_degree = max(1, parsed["cp_size"] // cp_ring_degree)
+
     return {
         "_manager_type": "fsdp2",
         "world_size": world_size,
@@ -220,6 +228,8 @@ def _build_diffusion_parallel_manager_args(
         "dp_replicate_size": parsed["dp_replicate_size"],
         "tp_size": parsed["tp_size"],
         "cp_size": parsed["cp_size"],
+        "cp_ring_degree": cp_ring_degree,
+        "cp_ulysses_degree": int(cp_ulysses_degree),
         "pp_size": parsed["pp_size"],
         "ep_size": parsed["ep_size"],
         **parsed["strategy_config"].to_dict(),
@@ -390,6 +400,7 @@ def build_diffusion_pipeline(
             transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
             fuse_qkv_projections=fuse_qkv_projections,
             compact_fused_qkv_projections=compact_fused_qkv_projections,
+            attention_backend=attention_backend,
         )
     else:
         # Pretraining: initialize with random weights using pipeline_spec
@@ -413,13 +424,10 @@ def build_diffusion_pipeline(
             transformer_engine_fp8_safe_only=transformer_engine_fp8_safe_only,
             fuse_qkv_projections=fuse_qkv_projections,
             compact_fused_qkv_projections=compact_fused_qkv_projections,
+            attention_backend=attention_backend,
         )
     fsdp2_manager = created_managers["transformer"]
     transformer_module = pipe.transformer
-    transformer_module_for_attrs = getattr(transformer_module, "module", transformer_module)
-    if attention_backend is not None:
-        logging.info(f"[INFO] Setting attention backend to {attention_backend}")
-        transformer_module_for_attrs.set_attention_backend(attention_backend)
 
     if lora_enabled:
         # LoRA params must be collected AFTER FSDP2 wrapping from the live wrapped
@@ -679,6 +687,24 @@ class TrainDiffusionRecipe(BaseRecipe):
         )
 
         self.model = self.pipe.transformer
+
+        self.cp_size = int((fsdp_cfg or {}).get("cp_size", 1) or 1)
+        if self.cp_size > 1:
+            # CP peers receive the same batch (dataloader shards by dp rank, cp
+            # excluded) but the flow-matching step samples noise, timesteps, and
+            # CFG dropout per rank. Re-seed by data rank so all CP peers draw
+            # identical values while DP ranks stay decorrelated; the initial
+            # ranked=True seeding above only covered pre-mesh setup. Seeds are
+            # reinitialized in place because self.rng is checkpoint-tracked and
+            # must not be reassigned.
+            init_all_rng(self.seed + self._get_dp_rank(), ranked=False)
+            logging.info(
+                "[CP] Re-seeded RNG for context parallelism: seed=%d + dp_rank=%d (cp_size=%d)",
+                self.seed,
+                self._get_dp_rank(),
+                self.cp_size,
+            )
+
         if self.optimize_hunyuan_flash_varlen_mask:
             from nemo_automodel.components.flow_matching.adapters.hunyuan import (
                 enable_hunyuan_flash_varlen_mask_optimization,
@@ -900,8 +926,14 @@ class TrainDiffusionRecipe(BaseRecipe):
                         logging.info(f"[DEBUG] Batch shapes - video: {video_shape}, text: {text_shape}")
                         raise
 
-                    # Use average_weighted_loss for backprop (scalar for gradient accumulation)
-                    (average_weighted_loss / num_microbatches).backward()
+                    # Use average_weighted_loss for backprop (scalar for gradient accumulation).
+                    # With CP, every peer computes the full-sequence loss on the gathered
+                    # output, so each rank's backward yields a partial gradient (its
+                    # sequence chunk's contribution); FSDP2 then mean-reduces over the
+                    # dp_shard_cp mesh. Scaling the loss by cp_size turns that mean into
+                    # a sum over CP peers and a mean over DP ranks, matching the
+                    # single-GPU gradient (verified numerically against a 1-GPU baseline).
+                    (average_weighted_loss * self.cp_size / num_microbatches).backward()
                     micro_losses.append(average_weighted_loss.detach())
 
                     if microbatch_idx == 0:
