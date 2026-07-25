@@ -106,6 +106,7 @@ class TestCheckpointingConfig:
         assert cfg.diffusers_compatible is False
         assert cfg.best_metric_key == "default"
         assert cfg.consolidation_timeout_minutes == 30
+        assert cfg.max_recent_checkpoints is None
 
     def test_consolidation_timeout_override(self):
         cfg = CheckpointingConfig(consolidation_timeout_minutes=45)
@@ -116,6 +117,19 @@ class TestCheckpointingConfig:
     def test_consolidation_timeout_must_be_positive(self, timeout_minutes):
         with pytest.raises(ValueError, match="consolidation_timeout_minutes must be greater than 0"):
             CheckpointingConfig(consolidation_timeout_minutes=timeout_minutes)
+
+    @pytest.mark.parametrize("invalid_value", [0, -1, True, False, 1.5, "2"])
+    def test_max_recent_checkpoints_rejects_invalid_values(self, invalid_value):
+        with pytest.raises(ValueError, match="checkpoint.max_recent_checkpoints must be unset or a positive integer"):
+            CheckpointingConfig(max_recent_checkpoints=invalid_value)
+
+    def test_max_recent_checkpoints_rejects_msc_checkpoint_dir(self):
+        with pytest.raises(ValueError, match="max_recent_checkpoints is only supported for local checkpoint"):
+            CheckpointingConfig(
+                checkpoint_dir="msc://bucket/checkpoints",
+                save_consolidated=False,
+                max_recent_checkpoints=1,
+            )
 
     def test_importable_from_checkpointing(self):
         """Verify backward compat: import from checkpointing.py still works."""
@@ -137,6 +151,7 @@ class TestCheckpointingConfig:
         assert cfg.model_repo_id is None
         # model_cache_dir falls back to the HF hub cache when None.
         assert str(cfg.model_cache_dir) == str(hf_constants.HF_HUB_CACHE)
+        assert cfg.max_recent_checkpoints is None
 
     def test_explicit_cache_dir_is_kept(self):
         cfg = CheckpointingConfig(model_cache_dir="/tmp/cache")

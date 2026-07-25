@@ -57,6 +57,7 @@ from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.utils import calculate_loss
+from nemo_automodel.components.optim.precision_warnings import resolve_storage_dtype
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
 from nemo_automodel.components.training.utils import (
@@ -310,6 +311,14 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         # Right now, we only support tokenizer compatibility for the same tokenizer.
         # We will add support for different tokenizers in the future.
         _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
+
+        resolve_storage_dtype(
+            self.cfg.get("model"),
+            self.cfg.get("optimizer"),
+            is_peft=self.cfg.get("peft", None) is not None,
+            context="llm-kd",
+            logger=logger,
+        )
 
         # Let the parent class build *everything* for the student first.
         super().setup()
@@ -1053,7 +1062,7 @@ class KnowledgeDistillationRecipeForNextTokenPrediction(TrainFinetuneRecipeForNe
         self.metric_logger_train.close()
         for v in self.metric_logger_valid.values():
             v.close()
-        self.checkpointer.close()
+        self._finalize_and_close_checkpointer()
 
     @torch.no_grad()
     def _run_validation_epoch(self, val_dataloader):

@@ -1319,12 +1319,14 @@ class TestBuildCheckpointConfig:
         assert config.model_cache_dir == "/tmp/cache"
         assert config.save_consolidated.value == "final"
         assert config.is_peft is False
+        assert config.max_recent_checkpoints is None
 
     def test_build_checkpoint_config_with_custom_config(self):
         """Test checkpoint config with custom settings."""
         cfg_ckpt = MagicMock()
         cfg_ckpt.to_dict.return_value = {
             "checkpoint_dir": "/custom/ckpt/",
+            "max_recent_checkpoints": 3,
             "save_consolidated": False,
             "restore_from": "/some/path",  # Should be removed
         }
@@ -1337,6 +1339,7 @@ class TestBuildCheckpointConfig:
         )
 
         assert config.checkpoint_dir == "/custom/ckpt/"
+        assert config.max_recent_checkpoints == 3
         assert config.save_consolidated.value == "false"
         assert config.is_peft is True
 
@@ -1348,6 +1351,7 @@ class TestBuildCheckpointConfig:
         cfg_ckpt.to_dict.return_value = {
             "model_save_format": "torch_save",
             "checkpoint_dir": "/user/ckpt/",
+            "max_recent_checkpoints": 2,
             "save_consolidated": False,
         }
 
@@ -1362,9 +1366,10 @@ class TestBuildCheckpointConfig:
         assert any("falling back" in rec.message.lower() for rec in caplog.records)
         assert config.is_peft is True
         assert config.model_save_format == SerializationFormat.SAFETENSORS
-        # checkpoint_dir is preserved from the user config
+        # The builder preserves `checkpoint_dir` and `max_recent_checkpoints` from the user configuration.
         assert config.checkpoint_dir == "/user/ckpt/"
-        # other user-provided torch_save options are discarded; save_consolidated falls back to the default "final"
+        assert config.max_recent_checkpoints == 2
+        # The builder coerces incompatible `torch_save` options and restores the default `save_consolidated="final"`.
         assert config.save_consolidated.value == "final"
         assert config.is_async is False
 
@@ -2860,14 +2865,19 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_pp_rank", lambda self: 0)
 
 
-def _minimal_vlm_cfg(cp_size: int, rope_fusion: bool, prewarm: dict[str, bool] | None = None) -> ConfigNode:
+def _minimal_vlm_cfg(
+    cp_size: int,
+    rope_fusion: bool,
+    prewarm: dict[str, bool] | None = None,
+    optimizer_target: str | None = None,
+) -> ConfigNode:
     cfg = {
         "model": {"backend": {"rope_fusion": rope_fusion}},
         "dataloader": {},
         "dataset": {"path_or_dataset": "dummy"},
         "validation_dataloader": {},
         "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
-        "optimizer": {},
+        "optimizer": {"_target_": optimizer_target} if optimizer_target is not None else {},
         "loss_fn": {},
         "checkpoint": {"best_metric_key": "default"},
         "distributed": {"cp_size": cp_size},
@@ -2919,6 +2929,23 @@ def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
     trainer.setup()
 
     assert cfg.model.backend.rope_fusion is True
+
+
+def test_vlm_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True, optimizer_target="torch.optim.AdamW")
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
+    optimizer_config = build_optimizer_config("torch.optim.AdamW", {"lr": 0.01})
+    monkeypatch.setattr(optimizer_config, "build", lambda *a, **k: [dummy_opt])
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: optimizer_config),
+    )
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert not hasattr(cfg.model, "torch_dtype")
 
 
 def test_vlm_rope_fusion_stays_false_when_already_disabled(monkeypatch):

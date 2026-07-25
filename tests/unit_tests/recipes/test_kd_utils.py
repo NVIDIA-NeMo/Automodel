@@ -40,6 +40,17 @@ _KD_FP32_MASTER_YAMLS = (
     "tests/functional_tests/llm_pretrain_and_kd/kd_sep_mesh_gemma_dense.yaml",
     "tests/functional_tests/llm_pretrain_and_kd/kd_sep_mesh_gemma_moe.yaml",
 )
+_EXPECTED_TORCH_OPTIMIZER_TARGETS = {
+    "examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_cp2.yaml": "torch.optim.Adam",
+    "examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_pp2.yaml": "torch.optim.Adam",
+    "examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_tp2.yaml": "torch.optim.Adam",
+    "examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd_separate_mesh_teacher_cp2.yaml": "torch.optim.AdamW",
+    "examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd_separate_mesh_teacher_dp2.yaml": "torch.optim.AdamW",
+    "examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd_separate_mesh_teacher_tp2.yaml": "torch.optim.AdamW",
+    "tests/functional_tests/llm_pretrain_and_kd/kd_separate_mesh.yaml": "torch.optim.AdamW",
+    "tests/functional_tests/llm_pretrain_and_kd/kd_sep_mesh_gemma_dense.yaml": "torch.optim.AdamW",
+    "tests/functional_tests/llm_pretrain_and_kd/kd_sep_mesh_gemma_moe.yaml": "torch.optim.AdamW",
+}
 
 
 def test_tiny_kd_dataset_requests_flat_chat_template_token_ids():
@@ -108,16 +119,16 @@ def test_tiny_kd_sft_dataset_masks_generation_prompt():
     assert dataset[1]["labels"][3] == 20
 
 
-def test_kd_yamls_use_fp32_optimizer_master_weights():
+def test_kd_yamls_use_torch_optim_with_fp32_student_storage():
     for relative_path in _KD_FP32_MASTER_YAMLS:
         cfg = yaml.safe_load((_REPO_ROOT / relative_path).read_text())
 
         optimizer = cfg["optimizer"]
-        assert optimizer["_target_"] == "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam"
-        assert optimizer["master_weights"] is True
-        assert optimizer["master_weight_dtype"] == "torch.float32"
+        assert optimizer["_target_"] == _EXPECTED_TORCH_OPTIMIZER_TARGETS[relative_path]
+        assert "master_weights" not in optimizer
+        assert "master_weight_dtype" not in optimizer
 
-        assert cfg["model"]["torch_dtype"] == "bfloat16"
+        assert cfg["model"]["torch_dtype"] == "float32"
         assert cfg["teacher_model"]["torch_dtype"] == "bfloat16"
 
 

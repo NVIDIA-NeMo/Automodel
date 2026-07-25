@@ -57,6 +57,7 @@ from nemo_automodel.components.distributed.utils import get_sync_ctx
 from nemo_automodel.components.loggers.metric_logger import MetricsSample
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+from nemo_automodel.components.optim.precision_warnings import resolve_storage_dtype
 from nemo_automodel.components.training.rng import ScopedRNG
 from nemo_automodel.components.training.signal_handler import DistributedSignalHandler
 from nemo_automodel.components.training.utils import (
@@ -219,6 +220,14 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
     def setup(self):
         """Build student & teacher, dataloaders, optimizers, etc."""
         _verify_tokenizer_compatibility(self.cfg.get("model", None), self.cfg.get("teacher_model", None))
+
+        resolve_storage_dtype(
+            self.cfg.get("model"),
+            self.cfg.get("optimizer"),
+            is_peft=self.cfg.get("peft", None) is not None,
+            context="vlm-kd",
+            logger=logger,
+        )
 
         super().setup()
 

@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -430,9 +431,49 @@ def test_eagle1_save_checkpoint_async_stores_best_pending(tmp_path):
     assert recipe._last_pending_best_checkpoint_info["val"] == 0.25
 
 
+@pytest.mark.parametrize("recipe_factory", [_bare_eagle1_recipe, _bare_eagle3_recipe])
+def test_eagle_async_checkpoint_retention_prunes_completed_window(tmp_path, recipe_factory):
+    """EAGLE async saves prune completed checkpoints during long-running jobs."""
+    recipe = recipe_factory(tmp_path)
+    recipe.checkpointer.config.is_async = True
+    recipe.checkpointer.config.max_recent_checkpoints = 1
+
+    for step in [1, 2, 3]:
+        recipe.runtime.global_step = step
+        recipe.save_checkpoint(epoch=0, step=step, train_loss=0.1 * step)
+
+    ckpt_root = Path(recipe.checkpoint_config.checkpoint_dir)
+    checkpoints = sorted(p.name for p in ckpt_root.glob("epoch_*_step_*") if p.is_dir())
+    assert checkpoints == ["epoch_0_step_2", "epoch_0_step_3"]
+
+
 # ---------------------------------------------------------------------------
 # save_checkpoint: FileExistsError when checkpoint dir already exists
 # ---------------------------------------------------------------------------
+
+
+def test_eagle1_final_checkpoint_saved_before_close(tmp_path):
+    """EAGLE-1 saves the final checkpoint before finalizing and closing async checkpointing."""
+    recipe = _bare_eagle1_recipe(tmp_path)
+    recipe.num_epochs = 1
+    recipe.grad_accumulation_steps = 1
+    recipe.max_grad_norm = 1.0
+    recipe.ckpt_every_steps = None
+    recipe.save_checkpoint_every_epoch = False
+    recipe.train_dataloader = []
+    recipe.runtime.global_step = 1
+    recipe.total_optim_steps = 1
+    recipe._make_progress_bar = lambda **kwargs: None
+    events = []
+
+    recipe._maybe_save_final_checkpoint = lambda completed_epochs: events.append(("final", completed_epochs)) or True
+    recipe._finalize_pending_checkpoint = lambda: events.append(("finalize", None))
+    recipe.checkpointer.close = lambda: events.append(("close", None))
+    recipe._run_eval = lambda: None
+
+    recipe.run_train_validation_loop()
+
+    assert events == [("final", 1), ("finalize", None), ("close", None)]
 
 
 def test_eagle1_save_checkpoint_raises_on_existing_dir(tmp_path):

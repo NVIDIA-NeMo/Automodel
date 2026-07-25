@@ -19,6 +19,7 @@ import pytest
 import torch
 from torch import nn
 
+from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.recipes.llm import kd as llm_kd
 from nemo_automodel.recipes.vlm import kd as vlm_kd
 
@@ -50,6 +51,34 @@ _RECIPE_CASES = (
         id="vlm",
     ),
 )
+
+
+@pytest.mark.parametrize("recipe_module,recipe_cls,parent_cls", _RECIPE_CASES)
+def test_kd_setup_defaults_torch_optimizer_storage_to_fp32(monkeypatch, recipe_module, recipe_cls, parent_cls):
+    class SetupStopped(Exception):
+        pass
+
+    cfg = ConfigNode(
+        {
+            "model": {},
+            "teacher_model": {},
+            "optimizer": {"_target_": "torch.optim.AdamW", "lr": 0.01},
+        }
+    )
+
+    def stop_parent_setup(self):
+        raise SetupStopped
+
+    monkeypatch.setattr(recipe_module, "_verify_tokenizer_compatibility", lambda *args, **kwargs: None)
+    monkeypatch.setattr(parent_cls, "setup", stop_parent_setup)
+
+    recipe = object.__new__(recipe_cls)
+    recipe.cfg = cfg
+
+    with pytest.raises(SetupStopped):
+        recipe.setup()
+
+    assert cfg.model.torch_dtype == "float32"
 
 
 @pytest.mark.parametrize("recipe_module,recipe_cls,_", _RECIPE_CASES)
