@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tests.ci_tests.utils.generate_ci_tests import generate_pipeline
+from pathlib import Path
+
+from tests.ci_tests.utils.generate_ci_tests import generate_job, generate_pipeline
 
 
 def test_generate_deepseek_v4_pretrain_nightly_job():
@@ -32,3 +34,21 @@ def test_generate_deepseek_v4_pretrain_release_job():
     job = pipeline["deepseek_v4_flash_pretrain"]
     assert job["extends"] == ".llm_pretrain_test"
     assert job["variables"]["TEST_LEVEL"] == "release"
+
+
+def test_generate_vllm_deploy_time_override(tmp_path):
+    config = Path("model_peft.yaml")
+    (tmp_path / config).write_text(
+        """
+ci:
+  time: "00:25:00"
+  vllm_deploy: true
+  vllm_deploy_time: "00:30:00"
+""",
+        encoding="utf-8",
+    )
+
+    jobs = dict(generate_job(config, {}, "nightly", "llm_finetune", str(tmp_path)))
+
+    assert jobs[""]["variables"]["TIME"] == "00:25:00"
+    assert jobs["_vllm_deploy"]["variables"]["TIME"] == "00:30:00"
