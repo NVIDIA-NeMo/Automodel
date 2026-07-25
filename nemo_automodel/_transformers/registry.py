@@ -316,7 +316,11 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 # silently collapses the DSV4 context-parallel shard multiple to 1.
 # Only list a model_type here once its custom model is verified to run on the
 # native config (mistral4 was written against it and runs green).
-_KEEP_BUILTIN_CONFIG = {  # pragma: no cover - static policy data
+# Policy summary:
+# - registered Automodel configs win by default;
+# - transformers-native configs win only for explicit opt-outs;
+# - opt-outs require model-specific verification against the native schema.
+_KEEP_BUILTIN_CONFIG = {
     "mistral4",
 }
 
@@ -326,16 +330,16 @@ def resolve_custom_config_cls(model_type: str) -> Type[PretrainedConfig] | None:
     if model_type not in _CUSTOM_CONFIG_REGISTRATIONS:
         return None
 
-    if model_type in _KEEP_BUILTIN_CONFIG:  # pragma: no cover - covered by focused registry tests
+    if model_type in _KEEP_BUILTIN_CONFIG:
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
         if model_type in CONFIG_MAPPING:
             return None
 
-    module_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS[model_type]  # pragma: no cover
+    module_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS[model_type]
     try:
         mod = importlib.import_module(module_path)
-        return getattr(mod, cls_name)  # pragma: no cover
+        return getattr(mod, cls_name)
     except Exception:
         logger.debug("Failed to resolve custom config for model_type=%s", model_type, exc_info=True)
         return None
