@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 from transformers import LlamaConfig
 
+from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
 from nemo_automodel.components.speculative.eagle.msd import (
     MSDTrainerModule,
     MultimodalEagleDraftModel,
@@ -89,6 +90,31 @@ def test_msd_draft_supports_bfloat16_inputs() -> None:
     )
 
     assert output.dtype == torch.bfloat16
+
+
+def test_msd_draft_holds_no_token_embedding_table() -> None:
+    """MSD consumes target embeddings, so every draft parameter takes gradient."""
+    draft = MultimodalEagleDraftModel(_draft_config())
+    assert not hasattr(draft, "embed_tokens")
+    assert "embed_tokens.weight" not in draft.state_dict()
+    # EAGLE-1/2 keeps its own table, so the opt-out must not leak into the base.
+    assert LlamaEagleDraftModel(_draft_config()).embed_tokens.weight.requires_grad
+
+    output = draft(
+        inputs_embeds=torch.randn(1, 3, 8),
+        target_hidden_states=torch.randn(1, 3, 8),
+        attention_mask=torch.ones(1, 3),
+        image_mask=torch.zeros(1, 3, dtype=torch.bool),
+    )
+    output.sum().backward()
+
+    # A parameter that never receives a gradient makes DDP abort its reduction.
+    assert [name for name, parameter in draft.named_parameters() if parameter.grad is None] == []
+
+    with pytest.raises(NotImplementedError):
+        draft.freeze_embeddings()
+    with pytest.raises(NotImplementedError):
+        draft.copy_embeddings_from_target(nn.Embedding(11, 8))
 
 
 class _PerfectDraft(nn.Module):
@@ -247,9 +273,33 @@ def test_msd_target_captures_fused_image_embeddings_and_alignment() -> None:
     )
 
     assert torch.equal(batch.image_mask, torch.tensor([[True, False, False]]))
-    assert torch.equal(batch.loss_mask, torch.tensor([[True, False, True]]))
+    # The collator's mask is already next-token aligned, so only its final entry
+    # is dropped: that position's supervision tensors are the zero-filled tail.
+    assert torch.equal(batch.loss_mask, torch.tensor([[True, False, False]]))
     assert torch.allclose(batch.inputs_embeds[0, 0], torch.full((4,), 5.0))
     assert torch.equal(batch.target_hidden_states[:, -1], torch.zeros(1, 4))
+
+
+def test_msd_target_never_supervises_the_zero_filled_tail() -> None:
+    """A fully supervised collator mask still excludes the shifted zero tail."""
+    model = _TinyVLM()
+    wrapper = HFMSDTargetModel(model)
+    input_ids = torch.tensor([[1, 3, 2]])
+    loss_mask = torch.ones(1, 3, dtype=torch.bool)
+    batch = wrapper.generate_batch(
+        input_ids=input_ids,
+        attention_mask=torch.ones(1, 3),
+        loss_mask=loss_mask,
+        model_inputs={
+            "input_ids": input_ids,
+            "attention_mask": torch.ones(1, 3),
+            "pixel_values": torch.full((1, 3, 2, 2), 5.0),
+        },
+    )
+
+    assert torch.equal(batch.loss_mask, torch.tensor([[True, True, False]]))
+    # The caller's tensor is left untouched.
+    assert torch.equal(loss_mask, torch.ones(1, 3, dtype=torch.bool))
 
 
 def test_msd_target_captures_embeddings_from_nested_language_backbone() -> None:

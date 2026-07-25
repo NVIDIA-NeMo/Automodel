@@ -169,10 +169,15 @@ class LlamaEagleDraftModel(PreTrainedModel):
 
     config_class = PretrainedConfig
     main_input_name = "input_ids"
+    # Subclasses whose input embeddings come from the target model (MSD) set this
+    # to False so construction skips the vocabulary-sized table instead of
+    # allocating and initializing one that is never read.
+    builds_token_embeddings = True
 
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        if self.builds_token_embeddings:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
         num_layers = max(1, int(getattr(config, "draft_num_hidden_layers", config.num_hidden_layers)))
         self.layers = nn.ModuleList([EagleLlamaDecoderLayer(config) for _ in range(num_layers)])

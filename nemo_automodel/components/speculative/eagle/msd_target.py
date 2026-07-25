@@ -101,7 +101,10 @@ class HFMSDTargetModel:
             attention_mask: Tensor of shape [batch, sequence], where one denotes
                 a real token and zero denotes padding.
             loss_mask: Bool tensor of shape [batch, sequence], already aligned to
-                next-token logits. VLM collators produce this from ``labels != -100``.
+                next-token logits. VLM collators produce this from ``labels != -100``;
+                they emit ``labels[:, 1:]`` against ``input_ids[:, :-1]``, so no
+                further shift is applied here. Its final position is always
+                dropped because the shifted supervision tensors zero-fill there.
             model_inputs: Mapping of VLM forward inputs. It includes ``input_ids``
                 and ``attention_mask`` plus any vision tensors such as
                 ``pixel_values`` and ``image_grid_thw``.
@@ -123,12 +126,17 @@ class HFMSDTargetModel:
         hidden_states = outputs.hidden_states[-1]
         logits = outputs.logits
         image_mask = input_ids.eq(self.image_token_id)
+        # Every supervision tensor is shifted left with a zero tail, so the last
+        # position has no target to match. Supervising it would train the draft
+        # towards a zero hidden state and a uniform soft-token distribution.
+        supervised_mask = loss_mask.bool().clone()
+        supervised_mask[:, -1] = False
         return MSDTargetBatch(
             inputs_embeds=_shift_left_with_zero(capture.value),
             input_hidden_states=hidden_states,
             target_hidden_states=_shift_left_with_zero(hidden_states),
             target_logits=_shift_left_with_zero(logits),
             attention_mask=attention_mask,
-            loss_mask=loss_mask.bool(),
+            loss_mask=supervised_mask,
             image_mask=_shift_left_with_zero(image_mask),
         )

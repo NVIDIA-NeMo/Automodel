@@ -42,6 +42,24 @@ class MultimodalEagleDraftModel(LlamaEagleDraftModel):
 
     config_class = PretrainedConfig
 
+    # MSD feeds the target VLM's fused text and image embeddings straight into
+    # the draft, so the base class must not build a token embedding table: it
+    # would never receive a gradient and would abort a DDP reduction.
+    builds_token_embeddings = False
+
+    def copy_embeddings_from_target(self, target_embeddings: nn.Module) -> None:
+        """Raise: MSD drafts consume target embeddings instead of holding their own."""
+        raise NotImplementedError(
+            "MultimodalEagleDraftModel has no token embedding table. MSD feeds the target VLM's "
+            "fused text and image embeddings straight into the draft."
+        )
+
+    def freeze_embeddings(self) -> None:
+        """Raise: MSD drafts have no token embedding table to freeze."""
+        raise NotImplementedError(
+            "MultimodalEagleDraftModel has no token embedding table, so there is nothing to freeze."
+        )
+
     def forward(
         self,
         inputs_embeds: torch.Tensor,

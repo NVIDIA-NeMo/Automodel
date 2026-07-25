@@ -23,12 +23,14 @@ verifies each leaf independently for correctness and integration testing.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Iterable
 
 import torch
 import torch.nn as nn
 
+from nemo_automodel.components.speculative.eagle.draft_llama import _is_right_padded_attention_mask
 from nemo_automodel.components.speculative.eagle.msd_target import HFMSDTargetModel
 
 
@@ -128,6 +130,36 @@ class _DraftState:
     log_probability: float
 
 
+def _validate_generator_device(generator: torch.Generator | None, device: torch.device) -> None:
+    """Reject a random generator whose device type differs from the sampling device.
+
+    ``torch.rand`` and ``torch.multinomial`` both refuse such a generator, so a
+    mismatch here would otherwise surface as an opaque failure part-way through
+    verification. The check is deliberately type-level, matching PyTorch's own
+    generator check, which likewise ignores the device index.
+    """
+    if generator is not None and generator.device.type != device.type:
+        raise ValueError(
+            f"MSD stochastic verification needs a generator on the sampling device: got a "
+            f"'{generator.device.type}' generator for '{device.type}' logits."
+        )
+
+
+def _right_padded_active_length(attention_mask: torch.Tensor) -> int:
+    """Return the prefix length of a batch-one right-padded attention mask.
+
+    The reference decoder slices every tensor as ``[:, :active_length]``, which
+    is only the real prefix when padding sits at the end. Left padding would
+    silently select pad positions, so reject it instead.
+    """
+    if not _is_right_padded_attention_mask(attention_mask):
+        raise ValueError(
+            "MSD reference decoding requires a right-padded attention mask (real tokens first, "
+            "padding last), but the given mask has padding inside its active prefix."
+        )
+    return int(attention_mask[0].sum().item())
+
+
 def build_msd_tree_layout(
     nodes: Iterable[MSDTreeNode], leaf_indices: Iterable[int], *, device: torch.device
 ) -> MSDTreeLayout:
@@ -196,7 +228,8 @@ class MSDTreeDraftGenerator:
         next-token alignment as :class:`HFMSDTargetModel`. The final shifted
         embedding is replaced with the target root token embedding, then each
         recursive draft prediction is appended as the feature context for its
-        child nodes.
+        child nodes. ``attention_mask`` must be right-padded, since the prefix is
+        taken as its leading active slice.
         """
         if draft_steps < 1 or top_k < 1 or beam_width < 1:
             raise ValueError("draft_steps, top_k, and beam_width must all be positive.")
@@ -207,7 +240,7 @@ class MSDTreeDraftGenerator:
         if shifted_inputs_embeds.shape[0] != 1:
             raise ValueError("The reference MSD tree generator currently supports batch size one.")
 
-        active_length = int(attention_mask[0].sum().item())
+        active_length = _right_padded_active_length(attention_mask)
         if active_length < 2:
             raise ValueError("MSD drafting requires at least two non-padding prefix tokens.")
         root_ids = torch.tensor([[root_token_id]], dtype=torch.long, device=shifted_inputs_embeds.device)
@@ -337,24 +370,44 @@ def accept_or_resample(
     generator: torch.Generator | None = None,
     random_value: float | None = None,
 ) -> MSDStochasticStep:
-    """Apply the lossless speculative acceptance rule for one candidate token."""
+    """Apply the lossless speculative acceptance rule for one candidate token.
+
+    ``generator`` must live on the same device as the logits, because both the
+    acceptance draw and the residual resample run there. ``random_value`` comes
+    from the half-open interval ``[0, 1)`` that ``torch.rand`` samples, and the
+    candidate is accepted on a strict ``draw < acceptance`` so a token the target
+    assigns zero probability can never be accepted.
+    """
     if target_logits.ndim != 1 or draft_logits.ndim != 1 or target_logits.shape != draft_logits.shape:
         raise ValueError("target_logits and draft_logits must be matching one-dimensional tensors.")
     if not 0 <= candidate_token_id < target_logits.numel():
         raise ValueError("candidate_token_id must be inside the shared vocabulary.")
-    if random_value is not None and not 0.0 <= random_value <= 1.0:
-        raise ValueError("random_value must be in [0, 1].")
+    if random_value is not None and not 0.0 <= random_value < 1.0:
+        raise ValueError("random_value must be in [0, 1).")
+    _validate_generator_device(generator, target_logits.device)
 
     target_probs = torch.softmax(target_logits.float(), dim=-1)
     draft_probs = torch.softmax(draft_logits.float(), dim=-1)
-    acceptance = min(1.0, float((target_probs[candidate_token_id] / draft_probs[candidate_token_id]).item()))
-    draw = random_value if random_value is not None else float(torch.rand((), generator=generator).item())
-    if draw <= acceptance:
+    # A candidate both models rule out underflows to 0/0, whose NaN ratio would
+    # survive ``min`` as 1.0 and accept a token the target gives no mass to. A
+    # draft-only zero still divides to +inf, which correctly accepts.
+    ratio = float((target_probs[candidate_token_id] / draft_probs[candidate_token_id]).item())
+    acceptance = 0.0 if math.isnan(ratio) else min(1.0, ratio)
+    draw = (
+        random_value
+        if random_value is not None
+        else float(torch.rand((), generator=generator, device=target_logits.device).item())
+    )
+    if draw < acceptance:
         return MSDStochasticStep(token_id=candidate_token_id, accepted=True)
 
     residual = (target_probs - draft_probs).clamp_min(0)
-    residual = residual / residual.sum().clamp_min(torch.finfo(residual.dtype).eps)
-    token_id = int(torch.multinomial(residual, num_samples=1, generator=generator).item())
+    residual_mass = residual.sum()
+    # Identical target and draft distributions leave no positive residual, and
+    # normalizing zeros keeps them zero, which ``multinomial`` rejects outright.
+    # The lossless correction then reduces to a plain draw from the target.
+    correction = residual / residual_mass if bool(residual_mass > 0) else target_probs
+    token_id = int(torch.multinomial(correction, num_samples=1, generator=generator).item())
     return MSDStochasticStep(token_id=token_id, accepted=False)
 
 
@@ -373,6 +426,7 @@ def verify_stochastic_chain(
         raise ValueError("Verification requires one target-logits row per candidate plus one bonus row.")
     if draft_logits.shape[0] != len(candidates) + 1:
         raise ValueError("draft_logits must include an unused final row for shape alignment.")
+    _validate_generator_device(generator, target_logits.device)
 
     accepted: list[int] = []
     for index, candidate in enumerate(candidates):
@@ -416,7 +470,7 @@ def verify_hf_greedy_tree(
     attention_mask = model_inputs["attention_mask"]
     if input_ids.shape[0] != 1 or attention_mask.shape[0] != 1:
         raise ValueError("The Hugging Face MSD reference verifier currently supports batch size one.")
-    active_length = int(attention_mask[0].sum().item())
+    active_length = _right_padded_active_length(attention_mask)
     if active_length < 1:
         raise ValueError("MSD verification requires a non-empty prompt.")
 
@@ -478,9 +532,12 @@ class MSDGreedyDecoder:
         """Draft and greedily verify one MSD candidate tree for a VLM prompt."""
         input_ids = model_inputs["input_ids"]
         attention_mask = model_inputs["attention_mask"]
-        active_length = int(attention_mask[0].sum().item())
-        if input_ids.shape[0] != 1 or active_length < 2:
-            raise ValueError("The MSD reference decoder requires a batch-one prompt with at least two tokens.")
+        shape_error = "The MSD reference decoder requires a batch-one prompt with at least two tokens."
+        if input_ids.shape[0] != 1:
+            raise ValueError(shape_error)
+        active_length = _right_padded_active_length(attention_mask)
+        if active_length < 2:
+            raise ValueError(shape_error)
         target_batch = self.target.generate_batch(
             input_ids=input_ids,
             attention_mask=attention_mask,

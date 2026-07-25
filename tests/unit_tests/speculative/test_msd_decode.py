@@ -102,11 +102,91 @@ def test_msd_lossless_acceptance_and_correction_distribution() -> None:
         target_logits=target_logits,
         draft_logits=draft_logits,
         candidate_token_id=1,
-        random_value=1.0,
+        random_value=0.999,
     )
 
     assert accepted.accepted and accepted.token_id == 1
     assert not rejected.accepted and rejected.token_id == 0
+
+
+def test_msd_acceptance_never_emits_a_zero_probability_token() -> None:
+    """A candidate the target rules out is rejected even on a zero draw."""
+    target_logits = torch.tensor([0.0, -1e30])
+    draft_logits = torch.tensor([0.0, 0.0])
+
+    step = accept_or_resample(
+        target_logits=target_logits,
+        draft_logits=draft_logits,
+        candidate_token_id=1,
+        random_value=0.0,
+    )
+
+    assert not step.accepted and step.token_id == 0
+
+    # Both models underflowing to zero gives a 0/0 ratio, which must not accept.
+    ruled_out = accept_or_resample(
+        target_logits=torch.tensor([0.0, -1e30]),
+        draft_logits=torch.tensor([0.0, -1e30]),
+        candidate_token_id=1,
+        random_value=0.0,
+    )
+    assert not ruled_out.accepted and ruled_out.token_id == 0
+
+    # Rounding of the two softmax normalizers can leave the target dominated at
+    # every index without the distributions being equal, so the positive
+    # residual carries no mass and cannot be normalized into a distribution.
+    target_logits = torch.tensor([41.3499, -19.4971, -34.1979, 2.7798])
+    draft_logits = torch.tensor([44.5302, 24.0608, -11.3887, 18.6314])
+    assert (torch.softmax(target_logits, -1) - torch.softmax(draft_logits, -1)).clamp_min(0).sum() == 0
+    drained = accept_or_resample(
+        target_logits=target_logits,
+        draft_logits=draft_logits,
+        candidate_token_id=1,
+        random_value=0.999999,
+    )
+    assert not drained.accepted and drained.token_id == 0
+
+    # A draft-only zero divides to +inf and must still accept.
+    draft_only_zero = accept_or_resample(
+        target_logits=torch.tensor([0.0, 0.0]),
+        draft_logits=torch.tensor([0.0, -1e30]),
+        candidate_token_id=1,
+        random_value=0.999,
+    )
+    assert draft_only_zero.accepted and draft_only_zero.token_id == 1
+
+    with pytest.raises(ValueError, match=r"random_value must be in \[0, 1\)"):
+        accept_or_resample(
+            target_logits=target_logits,
+            draft_logits=draft_logits,
+            candidate_token_id=1,
+            random_value=1.0,
+        )
+
+
+def test_msd_acceptance_rejects_a_generator_off_the_sampling_device() -> None:
+    """A device-mismatched generator fails up front instead of mid-verification.
+
+    ``torch.rand`` defaults to CPU while the residual resample follows the
+    logits, so a single generator cannot otherwise serve both calls on GPU.
+    """
+    generator = SimpleNamespace(device=torch.device("cuda"))
+
+    with pytest.raises(ValueError, match="generator on the sampling device"):
+        accept_or_resample(
+            target_logits=torch.tensor([1.0, 0.0]),
+            draft_logits=torch.tensor([0.0, 1.0]),
+            candidate_token_id=1,
+            generator=generator,  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(ValueError, match="generator on the sampling device"):
+        verify_stochastic_chain(
+            candidate_token_ids=(1,),
+            target_logits=_logits(1, 0),
+            draft_logits=_logits(1, 1),
+            generator=generator,  # type: ignore[arg-type]
+        )
 
 
 def test_msd_stochastic_verifier_stops_at_first_rejection_or_samples_bonus() -> None:
@@ -184,6 +264,25 @@ def test_msd_tree_generator_keeps_indices_dense_after_beam_pruning() -> None:
 
     assert [node.index for node in proposal.nodes] == [1, 2]
     assert proposal.layout.attention_mask.shape == (3, 3)
+
+
+def test_msd_tree_generator_rejects_left_padded_prompts() -> None:
+    """Left padding would silently make the prefix slice select pad positions."""
+    embeddings = nn.Embedding.from_pretrained(torch.eye(5), freeze=True)
+    lm_head = nn.Linear(5, 5, bias=False)
+    generator = MSDTreeDraftGenerator(_IdentityFeatureDraft(), lm_head, embeddings)
+
+    with pytest.raises(ValueError, match="right-padded attention mask"):
+        generator.propose(
+            shifted_inputs_embeds=torch.zeros(1, 3, 5),
+            input_hidden_states=torch.zeros(1, 3, 5),
+            attention_mask=torch.tensor([[0.0, 1.0, 1.0]]),
+            shifted_image_mask=torch.zeros(1, 3, dtype=torch.bool),
+            root_token_id=2,
+            draft_steps=1,
+            top_k=1,
+            beam_width=1,
+        )
 
 
 class _TinyVerifierModel(nn.Module):
