@@ -101,13 +101,6 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
         experts="torch_mm",
     )
     model = DeepseekV4ForCausalLM(config, backend=backend)
-    # The model mixes per-module dtype defaults (``embed_tokens`` is built bf16
-    # via the now-deprecated ``config.torch_dtype`` path; bare ``nn.Linear``
-    # sub-modules pick up the global fp32 default).  Force everything to a
-    # single fp32 dtype for the smoke test so matmuls don't hit dtype mismatch.
-    # ``DeepseekV4HyperConnection`` keeps its parameters in fp32 explicitly —
-    # ``model.float()`` is a no-op for those.
-    model = model.float()
     # Zero all float params: Gate/GroupedExperts use torch.empty (uninitialized memory
     # that may contain NaN bit patterns). initialize_weights() is not called in smoke tests.
     with torch.no_grad():
@@ -116,6 +109,20 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
                 p.zero_()
     model.eval()
     return model
+
+
+def test_fp32_config_constructs_all_floating_parameters_in_fp32():
+    """An fp32 config must not leave RMSNorm weights in the bf16 helper default."""
+    config = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[4])
+    model = _make_model(config)
+
+    mismatches = {
+        name: param.dtype
+        for name, param in model.named_parameters()
+        if param.is_floating_point() and param.dtype != torch.float32
+    }
+
+    assert not mismatches
 
 
 class TestDeepseekV4ModelSmoke:
@@ -166,7 +173,7 @@ class TestDeepseekV4ModelSmoke:
         assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(TwoDimMesh()) is None
         assert dsv4_fsdp._hca_param_sync_group_from_1d_mesh(NamedOneDimMesh()) is named_hca_group
 
-    def test_dsv4_fsdp_attaches_hca_group_before_all_fp32_fast_path(self, monkeypatch):
+    def test_dsv4_fsdp_uses_bf16_compute_for_uniform_fp32_master_weights(self, monkeypatch):
         cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[128])
         model = _make_model(cfg)
         block = model.model.layers["0"]
@@ -204,6 +211,35 @@ class TestDeepseekV4ModelSmoke:
         )
 
         assert block.self_attn.compressor._hca_param_sync_group is hca_group
+        assert calls[-1][0] is block
+        assert calls[-1][1]["mp_policy"].param_dtype == torch.bfloat16
+        assert calls[-1][1]["mp_policy"].reduce_dtype == torch.float32
+        assert any(module is not block and kwargs["mp_policy"].param_dtype == torch.float32 for module, kwargs in calls)
+
+    def test_dsv4_fsdp_preserves_explicit_all_fp32_compute_fast_path(self, monkeypatch):
+        cfg = _tiny_config(num_hidden_layers=1, num_hash_layers=0, compress_ratios=[128])
+        block = _make_model(cfg).model.layers["0"]
+        calls = []
+
+        def fake_fully_shard(module, **kwargs):
+            calls.append((module, kwargs))
+            return module
+
+        monkeypatch.setattr(dsv4_fsdp, "fully_shard", fake_fully_shard)
+
+        input_policy = MixedPrecisionPolicy(
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+        )
+
+        dsv4_fsdp.fully_shard_deepseek_v4(
+            block,
+            mesh=object(),
+            mp_policy=input_policy,
+            offload_policy=object(),
+        )
+
         assert len(calls) == 1
         assert calls[0][0] is block
         assert calls[0][1]["mp_policy"].param_dtype == torch.float32

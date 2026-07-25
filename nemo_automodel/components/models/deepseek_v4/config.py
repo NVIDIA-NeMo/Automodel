@@ -133,7 +133,6 @@ class DeepseekV4Config(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.pretraining_tp = pretraining_tp
         self.initializer_range = initializer_range
-        self.torch_dtype = torch_dtype
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -143,3 +142,4 @@ class DeepseekV4Config(PretrainedConfig):
             use_cache=use_cache,
             **kwargs,
         )
+        self.torch_dtype = torch_dtype
