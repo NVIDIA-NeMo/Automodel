@@ -247,17 +247,22 @@ def process_input_for_thd(
         if cu_seqlens is not None and cu_seqlens.numel() > 1:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().to(dtype=torch.int32)
 
+    if valid_seq_lens is None:
+        padding_mask = thd_padding_mask_from_token_ids(input_ids_thd, padding_token_id)
+    else:
+        padding_mask = _thd_padding_mask(
+            total_tokens=int(total_tokens),
+            valid_seq_lens=valid_seq_lens,
+            valid_seq_lens_padded=valid_seq_lens_padded,
+            device=input_ids_thd.device,
+        )
+
     result = {
         "input_ids": input_ids_thd,
         "position_ids": position_ids_thd,
         "cu_seqlens": cu_seqlens,
         "labels": labels_thd,
-        "padding_mask": _thd_padding_mask(
-            total_tokens=int(total_tokens),
-            valid_seq_lens=valid_seq_lens,
-            valid_seq_lens_padded=valid_seq_lens_padded,
-            device=input_ids_thd.device,
-        ),
+        "padding_mask": padding_mask,
     }
     # Emit cu_seqlens_padded only when it differs from cu_seqlens — its
     # presence is what flips TE's pad_between_seqs=True path in

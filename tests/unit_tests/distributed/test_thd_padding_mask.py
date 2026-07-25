@@ -75,6 +75,22 @@ def test_trailing_pack_pad_is_masked():
     assert out["padding_mask"].tolist() == [False, False, False, True, True, True]
 
 
+def test_seq_lens_none_uses_token_value_fallback():
+    ids = torch.tensor([[5, 6, 0, 0]])
+    out = process_input_for_thd(
+        {
+            "input_ids": ids,
+            "labels": ids.clone(),
+            "position_ids": torch.arange(ids.shape[1]).unsqueeze(0),
+            "seq_lens": None,
+            "seq_lens_padded": None,
+        },
+        padding_token_id=0,
+    )
+
+    assert out["padding_mask"].tolist() == [False, False, True, True]
+
+
 def test_token_value_fallback_rejects_a_pad_id_used_as_content():
     # The metadata-free fallback: a pad id that also appears as content cannot
     # yield a right-padded run, so it raises instead of masking real tokens.
