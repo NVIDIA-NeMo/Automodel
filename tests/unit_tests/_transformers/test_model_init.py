@@ -597,7 +597,7 @@ class TestResolveCustomConfigRegistry:
         from nemo_automodel._transformers import registry as reg
 
         monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "bert", ("fake.config_module", "FakeConfig"))
-        monkeypatch.setattr(reg, "_KEEP_BUILTIN_CONFIG", {"bert"})
+        monkeypatch.setattr(reg, "_CUSTOM_CONFIG_OVERRIDES_BUILTIN", set())
 
         assert reg.resolve_custom_config_cls("bert") is None
 
@@ -609,7 +609,7 @@ class TestResolveCustomConfigRegistry:
 
         fake_module = types.SimpleNamespace(FakeConfig=FakeConfig)
         monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "bert", ("fake.config_module", "FakeConfig"))
-        monkeypatch.setattr(reg, "_KEEP_BUILTIN_CONFIG", set())
+        monkeypatch.setattr(reg, "_CUSTOM_CONFIG_OVERRIDES_BUILTIN", {"bert"})
         monkeypatch.setattr(
             reg.importlib, "import_module", lambda name: fake_module if name == "fake.config_module" else None
         )
