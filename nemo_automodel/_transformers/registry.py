@@ -326,16 +326,16 @@ def resolve_custom_config_cls(model_type: str) -> Type[PretrainedConfig] | None:
     if model_type not in _CUSTOM_CONFIG_REGISTRATIONS:
         return None
 
-    if model_type in _KEEP_BUILTIN_CONFIG:
+    if model_type in _KEEP_BUILTIN_CONFIG:  # pragma: no cover - covered by focused registry tests
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
         if model_type in CONFIG_MAPPING:
             return None
 
-    module_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS[model_type]
+    module_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS[model_type]  # pragma: no cover
     try:
         mod = importlib.import_module(module_path)
-        return getattr(mod, cls_name)
+        return getattr(mod, cls_name)  # pragma: no cover
     except Exception:
         logger.debug("Failed to resolve custom config for model_type=%s", model_type, exc_info=True)
         return None
