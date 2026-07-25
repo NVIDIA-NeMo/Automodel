@@ -759,6 +759,43 @@ def test_tilelang_sparse_mla_backward_wrapper_launches_kernels(monkeypatch):
     torch.testing.assert_close(dkv, torch.full_like(kv, 2.0))
 
 
+@pytest.mark.parametrize(
+    ("heads", "threads", "expected_threads"),
+    [
+        pytest.param(32, None, 128, id="small-head-block-auto"),
+        pytest.param(33, None, 256, id="adaptive-threshold"),
+        pytest.param(64, None, 256, id="full-head-block-auto"),
+        pytest.param(64, 128, 128, id="explicit-override"),
+    ],
+)
+def test_tilelang_sparse_mla_backward_builder_selects_launch_threads(monkeypatch, heads, threads, expected_threads):
+    from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_sparse_mla_bwd as sparse_bwd_mod
+
+    _patch_fake_tilelang(monkeypatch, sparse_bwd_mod)
+    launched_threads = []
+
+    def capture_kernel(*axes, threads):
+        launched_threads.append(threads)
+        return _FakeKernelContext(axes)
+
+    monkeypatch.setattr(sparse_bwd_mod.T, "Kernel", capture_kernel)
+    fake = _FakeTileLangValue()
+    thread_override = {} if threads is None else {"threads": threads}
+    kernel = sparse_bwd_mod.bwd.__wrapped__(
+        B=1,
+        S=1,
+        S_kv=1,
+        H=heads,
+        D=512,
+        D_tail=64,
+        topk=32,
+        **thread_override,
+    )
+    kernel(fake, fake, fake, fake, fake, fake, fake, fake)
+
+    assert launched_threads == [expected_threads]
+
+
 def test_raw_tilelang_kernel_builders_with_fake_language(monkeypatch):
     from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_indexer_bwd as indexer_bwd_mod
     from nemo_automodel.components.models.glm_moe_dsa.kernels import tilelang_sparse_mla_bwd as sparse_bwd_mod
