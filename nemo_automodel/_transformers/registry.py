@@ -316,7 +316,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
 # silently collapses the DSV4 context-parallel shard multiple to 1.
 # Only list a model_type here once its custom model is verified to run on the
 # native config (mistral4 was written against it and runs green).
-_KEEP_BUILTIN_CONFIG = {
+_KEEP_BUILTIN_CONFIG = {  # pragma: no cover - static policy data
     "mistral4",
 }
 
