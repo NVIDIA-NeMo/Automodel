@@ -1,12 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-# Hub flash attention only (requires: uv sync --extra hub_kernels).
+# Hub flash attention + Hub layer kernels (requires: uv sync --extra hub_kernels).
 #
-# attn_implementation loads kernels-community/flash-attn2 for attention layers.
-# use_kernels is NOT required for that — it is only for non-attention layers
-# (RMSNorm, MLP, Linear, activations, RoPE, fused CE). See qwen2_5_7b_hub_kernels_layers.yaml
-# for attn + Hub layer kernels. Default use_liger_kernel=True still applies pip Liger here.
+# attn_implementation: Hub FA2 for attention (same as qwen2_5_7b_hub_kernels.yaml).
+# use_kernels: true replaces RMSNorm / MLP / Linear / activations / RoPE via
+#   kernels-community/liger-kernels (Transformers kernelize). Orthogonal to attn.
+# use_liger_kernel: false avoids double-patching with pip liger_kernel.
 recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 
@@ -47,6 +47,8 @@ model:
   trust_remote_code: true
   output_hidden_states: true
   attn_implementation: kernels-community/flash-attn2
+  use_kernels: true
+  use_liger_kernel: false
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa

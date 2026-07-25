@@ -709,10 +709,12 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 the model with Liger kernels for faster inference/training.
                 Ignored when ``use_kernels=True`` (Transformers Hub kernels
                 replace Liger on the HF load path).
-            use_kernels (bool, default=False): When ``True``, forward to
-                Transformers' Hub kernel integration (``kernelize``) for
-                RMSNorm, MLP, Linear, activations, and related layers. Requires
-                the optional ``hub_kernels`` extra.
+            use_kernels (bool, default=False): When ``True``, apply Transformers
+                Hub ``kernelize`` for **non-attention** layers (RMSNorm, MLP,
+                Linear, activations, RoPE, etc.). **Not required** when
+                ``attn_implementation`` is already a Hub repo id — that flag
+                only selects the attention backend. Set ``use_liger_kernel=False``
+                when enabling this to avoid double-patching with pip Liger.
             allow_all_kernels (bool, default=False): Allow any Hub kernel repo
                 when ``use_kernels=True`` (Transformers ``allow_all_kernels``).
             kernel_config: Optional Transformers ``KernelConfig`` mapping for
