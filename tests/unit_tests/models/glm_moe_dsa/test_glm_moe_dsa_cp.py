@@ -44,6 +44,8 @@ def _thd_chunk(num_tokens=6):
         "cu_seqlens": torch.tensor([0, num_tokens // 2, num_tokens], dtype=torch.int64),
         "max_seqlen": torch.tensor(num_tokens // 2, dtype=torch.int64),
         "cu_seqlens_padded": torch.tensor([0, num_tokens // 2 + 1, num_tokens + 2], dtype=torch.int64),
+        # Pack-derived, as process_input_for_thd emits it.
+        "padding_mask": torch.tensor([i == 3 for i in range(num_tokens)]),
     }
 
 
@@ -165,6 +167,7 @@ def test_make_glm_dsa_packed_cp_batch_stacks_pipeline_chunks(monkeypatch):
         "cu_seqlens": torch.tensor([[0, 4], [0, 4]], dtype=torch.int64),
         "max_seqlen": torch.tensor([4, 4], dtype=torch.int64),
         "cu_seqlens_padded": torch.tensor([[0, 4], [0, 4]], dtype=torch.int64),
+        "padding_mask": torch.tensor([[False, False, False, False], [False, False, True, False]]),
     }
     monkeypatch.setattr(glm_cp, "split_batch_into_thd_chunks", lambda *args, **kwargs: thd_batch)
     monkeypatch.setattr(glm_cp.dist, "is_available", lambda: True)
