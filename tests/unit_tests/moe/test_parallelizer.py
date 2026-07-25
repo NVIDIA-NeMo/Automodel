@@ -75,6 +75,13 @@ class DummyModel:
         self.audio_tower = audio_tower
         self.visual = visual
 
+    def parameters(self):
+        """Aggregate child parameters like ``nn.Module.parameters()``."""
+        for child in (self.layers, self.embed_tokens, self.lm_head, self.audio_tower, self.visual):
+            child_parameters = getattr(child, "parameters", None)
+            if callable(child_parameters):
+                yield from child_parameters()
+
 
 def _install_torch_and_layers_stubs(monkeypatch):
     # Build minimal torch stub hierarchy
@@ -90,9 +97,28 @@ def _install_torch_and_layers_stubs(monkeypatch):
     class Module:
         pass
 
+    # Real containers, so production code can use plain ``isinstance`` checks and
+    # runtime ``torch.Tensor`` annotations instead of defensive ``getattr``.
+    # Without these the stub silently changes container-detection behavior, and
+    # modules annotated with ``torch.Tensor`` (e.g. ``shared/tied_weights.py``)
+    # only import when some earlier test happened to cache them under real torch.
+    class ModuleList(list):
+        def named_children(self):
+            return [(str(i), child) for i, child in enumerate(self)]
+
+    class ModuleDict(dict):
+        def named_children(self):
+            return list(self.items())
+
+    class Tensor:
+        pass
+
     nn_stub.Parameter = Parameter
     nn_stub.Module = Module
+    nn_stub.ModuleList = ModuleList
+    nn_stub.ModuleDict = ModuleDict
     torch_stub.nn = nn_stub
+    torch_stub.Tensor = Tensor
 
     # cuda submodule
     cuda_stub = types.ModuleType("torch.cuda")
@@ -911,6 +937,9 @@ def test_apply_fsdp_handles_multimodal_components(monkeypatch, audio_trainable, 
         def parameters(self):
             return iter(self._params)
 
+        def named_children(self):
+            return []
+
     audio_tower = Tower(audio_trainable)
     visual_tower = Tower(visual_trainable)
 
@@ -978,6 +1007,9 @@ def test_apply_fsdp_applies_nested_frozen_multimodal_policy(
                 parameters = getattr(child, "parameters", None)
                 if callable(parameters):
                     yield from parameters()
+
+        def named_children(self):
+            return list(self._children.items())
 
         def named_modules(self):
             yield "", self
@@ -1094,6 +1126,9 @@ def test_apply_fsdp_without_outer_root_allows_supported_multimodal_policies(
 
         def parameters(self):
             return iter(self._params)
+
+        def named_children(self):
+            return []
 
     class OuterModel:
         def __init__(self):

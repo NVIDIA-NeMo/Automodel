@@ -21,16 +21,30 @@ import torch.nn as nn
 
 FrozenMultimodalSharding = Literal["root", "per_layer", "replicate"]
 
-MULTIMODAL_FSDP_MODULE_NAMES = (
-    "audio_tower",
+# Multimodal submodule names, split by role because the two groups have
+# different consumers: ``_has_trainable_multimodal_tower`` in
+# ``components/moe/parallelizer.py`` gates on towers alone, while FSDP policy
+# resolution uses the union. Keep this the single definition -- a second copy
+# drifts silently, and the drift only shows up as a sharding difference.
+MULTIMODAL_TOWER_NAMES = (
     "visual",
     "vision_tower",
     "vision_model",
+    "vit_model",
     "image_encoder",
     "vision_encoder",
-    "embed_vision",
+    "audio_tower",
     "audio_encoder",
     "audio_model",
+)
+
+# Projector/embedder modules mapping tower output into the text hidden space.
+# ``embed_vision`` and ``embed_audio`` are sibling ``Gemma4MultimodalEmbedder``
+# instances on ``Gemma4Model``; listing only one gives two instances of the same
+# class different FSDP treatment under every policy.
+MULTIMODAL_PROJECTOR_NAMES = (
+    "embed_vision",
+    "embed_audio",
     "mm_projector",
     "multi_modal_projector",
     "multimodal_projector",
@@ -38,6 +52,8 @@ MULTIMODAL_FSDP_MODULE_NAMES = (
     "vit_large_projector",
     "audio_projector",
 )
+
+MULTIMODAL_MODULE_NAMES = MULTIMODAL_TOWER_NAMES + MULTIMODAL_PROJECTOR_NAMES
 
 VALID_FROZEN_MULTIMODAL_SHARDING: tuple[FrozenMultimodalSharding, ...] = ("root", "per_layer", "replicate")
 
@@ -55,15 +71,12 @@ def normalize_frozen_multimodal_sharding(value: str) -> FrozenMultimodalSharding
 
 def is_multimodal_module_name(name: str) -> bool:
     """Return True when ``name`` identifies a known multimodal tower/projector."""
-    return name in MULTIMODAL_FSDP_MODULE_NAMES
+    return name in MULTIMODAL_MODULE_NAMES
 
 
 def module_parameters(module: nn.Module) -> list[nn.Parameter]:
-    """Return direct and recursive parameters for module-like test doubles too."""
-    parameters = getattr(module, "parameters", None)
-    if not callable(parameters):
-        return []
-    return list(parameters())
+    """Return the module's recursive parameters."""
+    return list(module.parameters())
 
 
 def module_is_fully_frozen(module: nn.Module) -> bool:
@@ -73,22 +86,13 @@ def module_is_fully_frozen(module: nn.Module) -> bool:
 
 
 def _is_module_container(module: nn.Module) -> bool:
-    container_types = tuple(cls for cls in (getattr(nn, "ModuleList", None), getattr(nn, "ModuleDict", None)) if cls)
-    return bool(container_types) and isinstance(module, container_types)
+    return isinstance(module, (nn.ModuleList, nn.ModuleDict))
 
 
 def _container_items(module: nn.Module) -> list[tuple[object, nn.Module]]:
-    module_dict_cls = getattr(nn, "ModuleDict", None)
-    if module_dict_cls is not None and isinstance(module, module_dict_cls):
+    if isinstance(module, nn.ModuleDict):
         return list(module.items())
     return list(enumerate(module))
-
-
-def _named_children(module: nn.Module) -> list[tuple[str, nn.Module]]:
-    named_children = getattr(module, "named_children", None)
-    if not callable(named_children):
-        return []
-    return list(named_children())
 
 
 def _shard_layer_containers_recursively(
@@ -96,7 +100,7 @@ def _shard_layer_containers_recursively(
     shard_module: Callable[[nn.Module], object],
 ) -> bool:
     sharded_child = False
-    for _, child in _named_children(module):
+    for _, child in module.named_children():
         if _is_module_container(child):
             for _, item in _container_items(child):
                 if _is_module_container(item):
@@ -116,7 +120,20 @@ def shard_multimodal_module(module: nn.Module, shard_module: Callable[[nn.Module
 
 
 def iter_multimodal_modules(model: nn.Module) -> Iterator[tuple[str, nn.Module]]:
-    """Yield maximal multimodal submodules by qualified name."""
+    """Yield maximal multimodal submodules by qualified name.
+
+    ``named_modules`` is depth-first pre-order, so a parent is always seen
+    before its descendants; already-selected prefixes are skipped to keep each
+    tower/projector maximal (e.g. ``vision_tower`` rather than the
+    ``vision_tower.vision_model`` nested inside it).
+
+    The attribute-scan fallback only serves ``tests/unit_tests/moe`` model
+    doubles, which are plain classes rather than ``nn.Module`` subclasses. It
+    uses different (non-maximal, top-two-levels-only) selection than the real
+    path, so tests that exercise it are not testing production behavior.
+    Removing it requires converting ~30 doubles across that file to real
+    modules; tracked separately rather than widening this change.
+    """
     named_modules = getattr(model, "named_modules", None)
     if callable(named_modules):
         selected_names: list[str] = []
@@ -138,7 +155,7 @@ def iter_multimodal_modules(model: nn.Module) -> Iterator[tuple[str, nn.Module]]
         owners.append(("model", inner_model))
 
     for owner_name, owner in owners:
-        for attr_name in MULTIMODAL_FSDP_MODULE_NAMES:
+        for attr_name in MULTIMODAL_MODULE_NAMES:
             module = getattr(owner, attr_name, None)
             if module is None or id(module) in seen_ids:
                 continue

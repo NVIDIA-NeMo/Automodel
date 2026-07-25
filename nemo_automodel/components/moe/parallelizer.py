@@ -36,6 +36,7 @@ from nemo_automodel.components.moe.layers import (
 )
 from nemo_automodel.components.moe.tp_plan_validation import _validate_moe_tp_plan
 from nemo_automodel.shared.multimodal_fsdp import (
+    MULTIMODAL_TOWER_NAMES,
     FrozenMultimodalSharding,
     ignored_params_for_root,
     iter_multimodal_modules,
@@ -281,14 +282,9 @@ def apply_ep(model: nn.Module, ep_mesh: DeviceMesh, moe_mesh: DeviceMesh | None 
             )
 
 
-_MULTIMODAL_TOWER_ATTRS = (
-    "visual",
-    "vision_tower",
-    "vision_model",
-    "vit_model",
-    "audio_tower",
-    "audio_model",
-)
+# Alias of the shared tower taxonomy. Previously a private copy that had drifted
+# from the other multimodal name lists in the tree.
+_MULTIMODAL_TOWER_ATTRS = MULTIMODAL_TOWER_NAMES
 
 
 def _has_trainable_multimodal_tower(model: nn.Module) -> bool:
@@ -768,8 +764,20 @@ def apply_fsdp(
     ignored_multimodal_params: set[nn.Parameter] = set()
     for module_name, module, module_params, is_fully_frozen in multimodal_modules:
         if not is_fully_frozen:
-            # Preserve the existing trainable-tower topology. This policy is
-            # intentionally limited to fully frozen multimodal modules.
+            # Trainable multimodal modules keep normal standalone sharding; this
+            # policy is intentionally limited to fully frozen modules.
+            #
+            # NOTE: this is wider than pre-#2763, which sharded only top-level
+            # ``audio_tower``/``visual``. Narrowing it back is NOT safe: with
+            # ``wrap_outer_model=False`` a trainable multimodal module on the
+            # outer model would then land in no FSDP unit at all, losing
+            # gradient reduction across DP ranks (covered by
+            # test_apply_fsdp_without_outer_root_allows_supported_multimodal_policies).
+            # The open item is the other side of the asymmetry:
+            # ``moe/fsdp_mixin.py::_iter_fsdp_modules`` still enumerates only
+            # ``audio_tower``/``visual``, so units created here for other names
+            # are invisible to the gradient-accumulation sync state machine.
+            # Both sides should be widened together -- see AM-766.
             fully_shard_default(module)
         elif frozen_multimodal_sharding == "per_layer":
             shard_multimodal_module(module, fully_shard_default)
