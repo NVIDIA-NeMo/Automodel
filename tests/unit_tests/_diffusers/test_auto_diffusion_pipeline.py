@@ -1093,6 +1093,90 @@ def test_select_active_transformer_noop_on_single_transformer_pipeline():
 
 
 # =============================================================================
+# attention_backend tests
+# =============================================================================
+
+
+class BackendModule(torch.nn.Module):
+    """Module exposing diffusers' set_attention_backend hook for tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(2, 2)
+        self.backend = None
+
+    def set_attention_backend(self, backend: str) -> None:
+        self.backend = backend
+
+
+def test_from_pretrained_sets_attention_backend_on_transformer_only():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    transformer = BackendModule()
+    text_encoder = BackendModule()
+    dummy_pipe = DummyPipeline({"transformer": transformer, "text_encoder": text_encoder})
+    mock_diffusion_pipeline = MagicMock()
+    mock_diffusion_pipeline.from_pretrained.return_value = dummy_pipe
+
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
+    ):
+        NeMoAutoDiffusionPipeline.from_pretrained(
+            "dummy",
+            move_to_device=False,
+            attention_backend="_native_cudnn",
+        )
+
+    assert transformer.backend == "_native_cudnn"
+    assert text_encoder.backend is None
+
+
+def test_from_pretrained_attention_backend_respects_components_to_load():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    transformer = BackendModule()
+    dummy_pipe = DummyPipeline({"transformer": transformer, "text_encoder": BackendModule()})
+    mock_diffusion_pipeline = MagicMock()
+    mock_diffusion_pipeline.from_pretrained.return_value = dummy_pipe
+
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}.DiffusionPipeline", mock_diffusion_pipeline),
+    ):
+        NeMoAutoDiffusionPipeline.from_pretrained(
+            "dummy",
+            move_to_device=False,
+            components_to_load=["text_encoder"],
+            attention_backend="_native_cudnn",
+        )
+
+    assert transformer.backend is None
+
+
+def test_from_config_sets_attention_backend_on_transformer():
+    from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
+
+    transformer = BackendModule()
+    mock_transformer_cls = MagicMock()
+    mock_transformer_cls.load_config.return_value = {}
+    mock_transformer_cls.from_config.return_value = transformer
+
+    with (
+        patch(f"{MODULE_PATH}.DIFFUSERS_AVAILABLE", True),
+        patch(f"{MODULE_PATH}._import_diffusers_class", return_value=mock_transformer_cls),
+        patch(f"{MODULE_PATH}.torch.cuda.is_available", return_value=False),
+    ):
+        NeMoAutoDiffusionPipeline.from_config(
+            "model-id",
+            pipeline_spec={"transformer_cls": "FakeTransformer"},
+            attention_backend="_native_cudnn",
+        )
+
+    assert transformer.backend == "_native_cudnn"
+
+
+# =============================================================================
 # _enable_context_parallel tests
 # =============================================================================
 
