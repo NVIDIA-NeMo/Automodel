@@ -17,7 +17,6 @@
 import importlib
 
 _LAZY_ATTRS = {
-    "DMD2DiffusionRecipe": (".dmd2", "DMD2DiffusionRecipe"),
     "TrainDiffusionRecipe": (".train", "TrainDiffusionRecipe"),
     "build_model_and_optimizer": (".train", "build_model_and_optimizer"),
     "build_lr_scheduler": (".train", "build_lr_scheduler"),

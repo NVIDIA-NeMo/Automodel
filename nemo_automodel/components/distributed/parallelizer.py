@@ -17,7 +17,6 @@ import inspect
 import logging
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from contextlib import contextmanager
 from functools import lru_cache
 from types import FunctionType
@@ -932,53 +931,6 @@ def register_parallel_strategy(arg=None, *, name: Optional[str] = None):
         raise ValueError("name is required")
     # If used with parentheses (possibly with arguments)
     return _register
-
-
-def register_full_block_checkpointing_strategy(
-    *,
-    model_class_name: str,
-    checkpoint_blocks: Callable[[nn.Module], int],
-) -> None:
-    """Register a model-owned full-block checkpointing boundary.
-
-    The model owner supplies only the architecture-specific block selection and
-    wrapping callback. This distributed component retains ownership of the
-    parallelization strategy and delegates TP/FSDP2 behavior to the default
-    implementation. Registration is idempotent and preserves an existing native
-    strategy for the model class.
-
-    Args:
-        model_class_name: Exact model class name used by the strategy registry.
-        checkpoint_blocks: Callback that checkpoint-wraps model-owned blocks and
-            returns the number wrapped.
-    """
-    if model_class_name in PARALLELIZATION_STRATEGIES:
-        return
-
-    @register_parallel_strategy(name=model_class_name)
-    class FullBlockCheckpointingStrategy(DefaultParallelizationStrategy):
-        """Apply a model-owned checkpoint boundary before native FSDP2."""
-
-        def parallelize(
-            self,
-            model: nn.Module,
-            device_mesh: DeviceMesh,
-            activation_checkpointing: bool = False,
-            **kwargs: Any,
-        ) -> nn.Module:
-            """Checkpoint full blocks when enabled, then delegate unchanged."""
-            if activation_checkpointing:
-                wrapped_count = checkpoint_blocks(model)
-                logger.info(
-                    "Applied model-owned full-block activation checkpointing to %d blocks.",
-                    wrapped_count,
-                )
-            return super().parallelize(
-                model,
-                device_mesh,
-                activation_checkpointing=False,
-                **kwargs,
-            )
 
 
 def _patch_dtensor_spec_hash_for_symint() -> None:

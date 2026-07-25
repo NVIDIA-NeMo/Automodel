@@ -12,44 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen-Image activation checkpointing boundaries."""
+"""Qwen-Image FSDP2 registration."""
 
-from __future__ import annotations
-
-import logging
-
-from torch import nn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    CheckpointImpl,
-    checkpoint_wrapper,
-)
-
-logger = logging.getLogger(__name__)
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
 
 
-def checkpoint_qwen_image_transformer_blocks(model: nn.Module) -> int:
-    """Checkpoint all Diffusers Qwen-Image transformer blocks.
-
-    Diffusers Qwen-Image blocks have joint ``attn``, ``img_mlp``, and
-    ``txt_mlp`` paths. AutoModel's generic submodule checkpointing does not
-    cover both MLP streams, so the model-owned boundary is each complete block.
-
-    Args:
-        model: A ``QwenImageTransformer2DModel`` exposing ``transformer_blocks``.
-
-    Returns:
-        The number of checkpoint-wrapped transformer blocks.
-    """
-    blocks = getattr(model, "transformer_blocks", None)
-    if blocks is None:
-        raise AttributeError("QwenImageTransformer2DModel does not expose `transformer_blocks`.")
-    for index, block in enumerate(blocks):
-        blocks[index] = checkpoint_wrapper(
-            block,
-            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-        )
-    logger.info(
-        "Qwen-Image activation checkpointing enabled for %d full blocks.",
-        len(blocks),
+def register_qwen_image_parallel_strategy() -> None:
+    """Register full-block Qwen-Image activation checkpointing."""
+    from nemo_automodel.components.distributed.parallelizer import (
+        PARALLELIZATION_STRATEGIES,
+        DefaultParallelizationStrategy,
+        register_parallel_strategy,
     )
-    return len(blocks)
+
+    name = "QwenImageTransformer2DModel"
+    if name in PARALLELIZATION_STRATEGIES:
+        return
+
+    @register_parallel_strategy(name=name)
+    class QwenImageParallelizationStrategy(DefaultParallelizationStrategy):
+        def parallelize(self, model, device_mesh, activation_checkpointing=False, **kwargs):
+            if activation_checkpointing:
+                for index, block in enumerate(model.transformer_blocks):
+                    model.transformer_blocks[index] = checkpoint_wrapper(
+                        block,
+                        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                    )
+            return super().parallelize(
+                model,
+                device_mesh,
+                activation_checkpointing=False,
+                **kwargs,
+            )
