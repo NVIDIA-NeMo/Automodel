@@ -16,6 +16,8 @@ import types
 
 import pytest
 
+from nemo_automodel._transformers.registry import _CUSTOM_CONFIG_REGISTRATIONS
+
 
 def _new_registry_instance(registry_module):
     """Create a fresh registry with an empty auto_map for testing."""
@@ -225,15 +227,16 @@ def test_resolve_custom_config_cls_uses_registry_for_non_builtin(monkeypatch):
     assert reg.resolve_custom_config_cls("am_future") is FakeConfig
 
 
-def test_resolve_custom_config_cls_defers_to_transformers_builtin(monkeypatch):
+def test_resolve_custom_config_cls_defers_to_builtin_only_when_opted_out(monkeypatch):
     from nemo_automodel._transformers import registry as reg
 
     monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "bert", ("fake.config_module", "FakeConfig"))
+    monkeypatch.setattr(reg, "_KEEP_BUILTIN_CONFIG", {"bert"})
 
     assert reg.resolve_custom_config_cls("bert") is None
 
 
-def test_resolve_custom_config_cls_can_override_transformers_builtin(monkeypatch):
+def test_resolve_custom_config_cls_overrides_transformers_builtin_by_default(monkeypatch):
     from nemo_automodel._transformers import registry as reg
 
     class FakeConfig:
@@ -241,12 +244,32 @@ def test_resolve_custom_config_cls_can_override_transformers_builtin(monkeypatch
 
     fake_module = types.SimpleNamespace(FakeConfig=FakeConfig)
     monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "bert", ("fake.config_module", "FakeConfig"))
-    monkeypatch.setattr(reg, "_CUSTOM_CONFIG_OVERRIDES_BUILTIN", {"bert"})
+    monkeypatch.setattr(reg, "_KEEP_BUILTIN_CONFIG", set())
     monkeypatch.setattr(
         reg.importlib, "import_module", lambda name: fake_module if name == "fake.config_module" else None
     )
 
     assert reg.resolve_custom_config_cls("bert") is FakeConfig
+
+
+@pytest.mark.parametrize("model_type", sorted(_CUSTOM_CONFIG_REGISTRATIONS))
+def test_registered_config_wins_over_transformers_builtin(model_type):
+    """A registered model_type must resolve to Automodel's config, not the built-in.
+
+    A registration means the custom model reads fields only our config provides,
+    so a transformers release that starts shipping the same ``model_type`` must
+    not silently take over. Opt-outs live in ``_KEEP_BUILTIN_CONFIG``.
+    """
+    from nemo_automodel._transformers import registry as reg
+
+    if model_type in reg._KEEP_BUILTIN_CONFIG:
+        pytest.skip(f"{model_type} is verified to run on the transformers built-in config")
+
+    resolved = reg.resolve_custom_config_cls(model_type)
+    assert resolved is not None, f"{model_type} resolves to no config class"
+    assert resolved.__module__.startswith("nemo_automodel"), (
+        f"{model_type} resolves to {resolved.__module__}.{resolved.__name__}, not Automodel's config"
+    )
 
 
 def test_resolve_custom_model_cls_found():

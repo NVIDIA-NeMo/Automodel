@@ -304,19 +304,20 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
 }
 
-# model_types whose custom model implementation reads fields that only our
-# config class provides. When a transformers release starts shipping its own
-# config for one of these model_types (same model_type string, often the same
-# class name), the skip-if-built-in registration below would silently hand the
-# native config to our custom model and break its field protocol at init
-# (transformers 5.12 added minimax_m3_vl whose vision config drops rope_theta
-# -> ``'MiniMaxM3VLVisionConfig' object has no attribute 'rope_theta'``).
-# These entries override the built-in registration instead. Entries NOT listed
-# here keep the built-in config when one exists (mistral4's custom model was
-# written against the native config and runs green with it).
-_CUSTOM_CONFIG_OVERRIDES_BUILTIN = {
-    "laguna",
-    "minimax_m3_vl",
+# model_types registered above that must keep the transformers built-in config
+# when one exists. A registration means the custom model reads fields only our
+# config class provides, so the built-in must NOT win by default: when a
+# transformers release starts shipping a config for a registered model_type
+# (same model_type string, often the same class name) it would silently replace
+# ours and break the model's field protocol at init -- e.g. transformers 5.12
+# added minimax_m3_vl whose vision config drops rope_theta
+# (``'MiniMaxM3VLVisionConfig' object has no attribute 'rope_theta'``), and its
+# deepseek_v4 config renames ``compress_ratios`` to ``compress_rates``, which
+# silently collapses the DSV4 context-parallel shard multiple to 1.
+# Only list a model_type here once its custom model is verified to run on the
+# native config (mistral4 was written against it and runs green).
+_KEEP_BUILTIN_CONFIG = {
+    "mistral4",
 }
 
 
@@ -325,11 +326,11 @@ def resolve_custom_config_cls(model_type: str) -> Type[PretrainedConfig] | None:
     if model_type not in _CUSTOM_CONFIG_REGISTRATIONS:
         return None
 
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    if model_type in _KEEP_BUILTIN_CONFIG:
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    is_builtin = model_type in CONFIG_MAPPING
-    if is_builtin and model_type not in _CUSTOM_CONFIG_OVERRIDES_BUILTIN:
-        return None
+        if model_type in CONFIG_MAPPING:
+            return None
 
     module_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS[model_type]
     try:
