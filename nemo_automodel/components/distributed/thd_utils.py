@@ -312,6 +312,8 @@ def split_batch_into_thd_chunks(
             If num_chunks <= 1, returns the result from process_input_for_thd directly.
         seq_lens_padding_value: Value used to indicate padding in seq_lens/seq_lens_padded
             tensors and for padding cu_seqlens to uniform length (default: -1000)
+        padding_token_id: Filler token id. Only consulted by the metadata-free
+            fallback when a chunk has no pack metadata.
 
     Returns:
         Dictionary containing:
