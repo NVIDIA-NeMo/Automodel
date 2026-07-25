@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG, init_all_rng
+from nemo_automodel.components.training.rng import ScopedRNG, init_all_rng
 
 
 def _next_values():
@@ -117,31 +117,6 @@ def test_stateful_rng_restores_state():
     # NumPy & torch states are numpy arrays / tensors – use dedicated checks
     assert all(np.array_equal(a, b) for a, b in zip(pre_state[1][1:], post_state[1][1:]))
     assert torch.equal(pre_state[2], post_state[2])
-
-
-@pytest.mark.parametrize("materialize_before_load", [False, True])
-def test_stateful_rng_checkpoints_explicit_generator(materialize_before_load: bool) -> None:
-    """Global and explicit recipe generators resume at the exact saved offset.
-
-    The materialized case matches recipe setup, where the flow generator is
-    created before checkpoint restoration.
-    """
-    rng = StatefulRNG(seed=123)
-    generator = rng.generator("cpu")
-    torch.rand(4, generator=generator)
-    state = rng.state_dict()
-    expected = torch.rand(4, generator=generator)
-    expected_global_values = _next_values()
-
-    restored_rng = StatefulRNG(seed=999)
-    if materialize_before_load:
-        restored_rng.generator("cpu")
-    restored_rng.load_state_dict(state)
-    actual = torch.rand(4, generator=restored_rng.generator("cpu"))
-    actual_global_values = _next_values()
-
-    assert torch.equal(actual, expected)
-    assert actual_global_values == expected_global_values
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

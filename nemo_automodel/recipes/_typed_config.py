@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable, Mapping
-from dataclasses import fields, is_dataclass, replace
+from dataclasses import fields, is_dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
@@ -567,25 +567,7 @@ class RecipeConfig:
     def diffusion_dataloader(self) -> "DiffusionDataloaderConfig" | None:
         """Typed diffusion dataloader config resolved from ``data.dataloader``."""
         node = self._raw.get("data.dataloader", None)
-        if node is None:
-            return None
-        config = self.resolve_diffusion_dataloader(node)
-
-        from nemo_automodel.components.datasets.diffusion.image_edit_dataset import ImageEditDataloaderConfig
-
-        if isinstance(config, ImageEditDataloaderConfig):
-            model_name = self._raw.get("model.pretrained_model_name_or_path", None)
-            model_revision = self._raw.get("model.revision", None)
-            if config.expected_model_name not in (None, model_name):
-                raise ValueError("data.dataloader.expected_model_name must match model.pretrained_model_name_or_path")
-            if config.expected_model_revision not in (None, model_revision):
-                raise ValueError("data.dataloader.expected_model_revision must match model.revision")
-            config = replace(
-                config,
-                expected_model_name=model_name,
-                expected_model_revision=model_revision,
-            )
-        return config
+        return self.resolve_diffusion_dataloader(node) if node is not None else None
 
     @cached_property
     def bagel_dataloader(self) -> "BagelDataloaderConfig" | None:

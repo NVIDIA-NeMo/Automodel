@@ -152,54 +152,6 @@ def _calculate_throughput_metrics(
     }
 
 
-class _PhaseTimer:
-    """Accumulate optional CPU or CUDA-event phase timings for one log window."""
-
-    def __init__(self, *, enabled: bool, device: torch.device) -> None:
-        self.enabled = enabled
-        self.device = device
-        self._use_cuda_events = enabled and device.type == "cuda" and torch.cuda.is_available()
-        self._cpu_seconds: Dict[str, float] = {}
-        self._cuda_events: Dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
-
-    def start(self) -> float | torch.cuda.Event | None:
-        """Start one phase without synchronizing the accelerator."""
-        if not self.enabled:
-            return None
-        if self._use_cuda_events:
-            event = torch.cuda.Event(enable_timing=True)
-            event.record(torch.cuda.current_stream(self.device))
-            return event
-        return time.perf_counter()
-
-    def stop(self, name: str, started: float | torch.cuda.Event | None) -> None:
-        """Stop and accumulate one named phase without an eager device sync."""
-        if started is None:
-            return
-        if self._use_cuda_events:
-            if not isinstance(started, torch.cuda.Event):
-                raise TypeError(f"CUDA phase {name!r} must start with torch.cuda.Event")
-            ended = torch.cuda.Event(enable_timing=True)
-            ended.record(torch.cuda.current_stream(self.device))
-            self._cuda_events.setdefault(name, []).append((started, ended))
-            return
-        if not isinstance(started, float):
-            raise TypeError(f"CPU phase {name!r} must start with a perf-counter timestamp")
-        self._cpu_seconds[name] = self._cpu_seconds.get(name, 0.0) + (time.perf_counter() - started)
-
-    def elapsed_seconds(self) -> Dict[str, float]:
-        """Return accumulated seconds after the caller has synchronized CUDA."""
-        elapsed = dict(self._cpu_seconds)
-        for name, event_pairs in self._cuda_events.items():
-            elapsed[name] = sum(start.elapsed_time(end) for start, end in event_pairs) / 1000.0
-        return elapsed
-
-    def reset(self) -> None:
-        """Clear completed measurements for the next log window."""
-        self._cpu_seconds.clear()
-        self._cuda_events.clear()
-
-
 def _build_diffusion_parallel_manager_args(
     *,
     fsdp_cfg: Optional[Dict[str, Any]],
@@ -334,7 +286,6 @@ def _resolve_transformer_engine_autocast() -> Any:
 def build_diffusion_pipeline(
     *,
     model_id: str,
-    model_revision: str | None = None,
     finetune_mode: bool,
     device: torch.device,
     dtype: torch.dtype,
@@ -360,7 +311,6 @@ def build_diffusion_pipeline(
 
     Args:
         model_id: Pretrained model name or path.
-        model_revision: Optional immutable Hugging Face revision for the pretrained model.
         finetune_mode: Whether to load for finetuning (True) or pretraining (False).
         device: Target device.
         dtype: Model parameter storage dtype.
@@ -427,7 +377,6 @@ def build_diffusion_pipeline(
             logging.info("[INFO] Active transformer: %s", active_transformer)
         pipe, created_managers = NeMoAutoDiffusionPipeline.from_pretrained(
             model_id,
-            revision=model_revision,
             torch_dtype=dtype,
             device=device,
             parallel_scheme=parallel_scheme,
@@ -541,7 +490,6 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.rng = StatefulRNG(seed=self.seed, ranked=True)
 
         self.model_id = self.cfg.get("model.pretrained_model_name_or_path")
-        self.model_revision = self.cfg.get("model.revision", None)
         self.attention_backend = self.cfg.get("model.attention_backend")
         self.transformer_engine_linear = bool(self.cfg.get("model.transformer_engine_linear", False))
         self.transformer_engine_fp8 = bool(self.cfg.get("model.transformer_engine_fp8", False))
@@ -564,10 +512,6 @@ class TrainDiffusionRecipe(BaseRecipe):
         performance_cfg = self.cfg.get("performance", {}) or {}
         self.check_loss = bool(performance_cfg.get("check_loss", False))
         self.grad_clip_foreach = bool(performance_cfg.get("grad_clip_foreach", True))
-        self.throughput_warmup_steps = int(performance_cfg.get("throughput_warmup_steps", 0))
-        self.phase_timing = bool(performance_cfg.get("phase_timing", False))
-        if self.throughput_warmup_steps < 0:
-            raise ValueError("performance.throughput_warmup_steps must be non-negative")
 
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -575,7 +519,6 @@ class TrainDiffusionRecipe(BaseRecipe):
             self.device = torch.device("cuda", self.local_rank)
         else:
             self.device = torch.device("cpu")
-        self.flow_generator = self.rng.generator(self.device)
 
         self.local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", self.world_size))
         self.local_world_size = max(self.local_world_size, 1)
@@ -611,11 +554,9 @@ class TrainDiffusionRecipe(BaseRecipe):
         logging.info("[INFO] Optimize Hunyuan flash-varlen mask: %s", self.optimize_hunyuan_flash_varlen_mask)
         logging.info("[INFO] Precision: model_dtype=%s, compute_dtype=%s", self.model_dtype, self.compute_dtype)
         logging.info(
-            "[INFO] Performance config: check_loss=%s, grad_clip_foreach=%s, warmup_steps=%s, phase_timing=%s",
+            "[INFO] Performance config: check_loss=%s, grad_clip_foreach=%s",
             self.check_loss,
             self.grad_clip_foreach,
-            self.throughput_warmup_steps,
-            self.phase_timing,
         )
 
         # Get distributed training configs (mutually exclusive)
@@ -682,12 +623,6 @@ class TrainDiffusionRecipe(BaseRecipe):
         logging.info("[INFO] Flow Matching V2 Pipeline")
         logging.info(f"[INFO]   - Adapter type: {self.adapter_type}")
         logging.info(f"[INFO]   - Timestep sampling: {self.timestep_sampling}")
-        if self.timestep_sampling == "beta":
-            logging.info(
-                "[INFO]   - Beta parameters: alpha=%s, beta=%s",
-                self.flow_matching_config.beta_alpha,
-                self.flow_matching_config.beta_beta,
-            )
         logging.info(f"[INFO]   - Flow shift: {self.flow_shift}")
         logging.info(f"[INFO]   - Mix uniform ratio: {self.mix_uniform_ratio}")
         logging.info(f"[INFO]   - Use sigma noise: {self.use_sigma_noise}")
@@ -725,7 +660,6 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         self.pipe, self.device_mesh = build_diffusion_pipeline(
             model_id=self.model_id,
-            model_revision=self.model_revision,
             finetune_mode=self.cfg.get("model.mode", "finetune").lower() == "finetune",
             device=self.device,
             dtype=self.model_dtype,
@@ -808,11 +742,9 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         # Typed checkpoint config from the YAML ``checkpoint:`` block; model-derived
         # fields (model_repo_id, model_cache_dir, is_peft) are filled by RecipeConfig.
-        # Pre-shard model keys are runtime-only ``build(...)`` input; the
+        # The checkpointer discovers the pre-shard state-dict keys via the
         # `_pre_shard_hf_state_dict_keys` attribute stamped on the transformer in
-        # `_apply_parallelization` (_diffusers/auto_diffusion_pipeline.py) takes
-        # precedence when present.
-        model_state_dict_keys = list(self.model.state_dict().keys())
+        # `_apply_parallelization` (_diffusers/auto_diffusion_pipeline.py).
         self.checkpoint_config = self.cfg.checkpoint
         self.restore_from = self.cfg.get("checkpoint.restore_from", None)
         self.checkpointer = self.checkpoint_config.build(
@@ -820,7 +752,6 @@ class TrainDiffusionRecipe(BaseRecipe):
             tp_rank=self._get_tp_rank(),
             pp_rank=self._get_pp_rank(),
             moe_mesh=None,
-            model_state_dict_keys=model_state_dict_keys,
         )
 
         dataloader_config = self.cfg.diffusion_dataloader
@@ -872,10 +803,10 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         self.load_checkpoint(self.restore_from)
 
+        # Init Flow Matching Pipeline V2 with the adapter built in __init__
         self.flow_matching_pipeline = self.flow_matching_config.build(
             model_adapter=self.model_adapter,
             device=self.device,
-            generator=self.flow_generator,
             sigma_min=self.sigma_min,
             sigma_max=self.sigma_max,
         )
@@ -908,16 +839,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         perf_window_start_time = time.perf_counter()
         perf_window_steps = 0
         perf_window_local_samples = 0
-        perf_window_local_target_tokens = 0
-        perf_window_local_context_tokens = 0
-        perf_window_local_text_tokens = 0
-        perf_window_local_total_tokens = 0
-        perf_window_local_dataloader_wait = 0.0
-        warmup_steps = max(int(getattr(self, "throughput_warmup_steps", 0)), 0)
-        measurement_started = global_step >= warmup_steps
-        phase_timer = _PhaseTimer(enabled=bool(getattr(self, "phase_timing", False)), device=self.device)
-        batch_wait_started = time.perf_counter()
-        if measurement_started and torch.cuda.is_available():
+        if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
         for epoch in self.step_scheduler.epochs:
@@ -936,15 +858,10 @@ class TrainDiffusionRecipe(BaseRecipe):
             num_steps = 0
 
             for batch_group in self.step_scheduler:
-                dataloader_wait = max(time.perf_counter() - batch_wait_started, 0.0)
-                measure_step = measurement_started
-                if measure_step:
-                    perf_window_local_dataloader_wait += dataloader_wait
                 for optimizer in self.optimizer:
                     optimizer.zero_grad(set_to_none=True)
 
                 micro_losses = []
-                micro_metrics: list[Dict[str, Any]] = []
                 prepare_for_grad_accumulation([self.model], pp_enabled=False)
                 num_microbatches = len(batch_group)
                 for microbatch_idx, micro_batch in enumerate(batch_group):
@@ -955,52 +872,36 @@ class TrainDiffusionRecipe(BaseRecipe):
                     sync_context = get_sync_ctx(
                         self.model,
                         is_final_microbatch,
-                        defer_fsdp_grad_sync=getattr(self, "defer_fsdp_grad_sync", True),
+                        defer_fsdp_grad_sync=self.defer_fsdp_grad_sync,
                     )
                     with sync_context:
                         try:
-                            phase_started = phase_timer.start() if measure_step else None
-                            with torch.profiler.record_function("diffusion.forward"):
-                                with self._transformer_engine_fp8_context():
-                                    _, average_weighted_loss, _, metrics = self.flow_matching_pipeline.step(
-                                        model=self.model,
-                                        batch=micro_batch,
-                                        device=self.device,
-                                        dtype=self.compute_dtype,
-                                        global_step=global_step,
-                                        collect_metrics=False,
-                                        check_loss=self.check_loss,
-                                    )
-                            phase_timer.stop("forward", phase_started)
+                            with self._transformer_engine_fp8_context():
+                                _, average_weighted_loss, _, _ = self.flow_matching_pipeline.step(
+                                    model=self.model,
+                                    batch=micro_batch,
+                                    device=self.device,
+                                    dtype=self.compute_dtype,
+                                    global_step=global_step,
+                                    collect_metrics=False,
+                                    check_loss=self.check_loss,
+                                )
                         except Exception as exc:
                             logging.info(f"[ERROR] Training step failed at epoch {epoch}, step {num_steps}: {exc}")
                             video_shape = micro_batch.get("video_latents", torch.tensor([])).shape
-                            image_shape = micro_batch.get("image_latents", torch.tensor([])).shape
                             text_shape = micro_batch.get("text_embeddings", torch.tensor([])).shape
-                            logging.info(
-                                "[DEBUG] Batch shapes - video: %s, image: %s, text: %s",
-                                video_shape,
-                                image_shape,
-                                text_shape,
-                            )
+                            logging.info(f"[DEBUG] Batch shapes - video: {video_shape}, text: {text_shape}")
                             raise
 
                         # Use average_weighted_loss for backprop (scalar for gradient accumulation)
-                        phase_started = phase_timer.start() if measure_step else None
-                        with torch.profiler.record_function("diffusion.backward_and_communication"):
-                            (average_weighted_loss / num_microbatches).backward()
-                        phase_timer.stop("backward", phase_started)
+                        (average_weighted_loss / num_microbatches).backward()
                     micro_losses.append(average_weighted_loss.detach())
-                    micro_metrics.append(metrics)
 
                     if microbatch_idx == 0:
                         prepare_after_first_microbatch()
 
-                phase_started = phase_timer.start() if measure_step else None
-                with torch.profiler.record_function("diffusion.grad_clip"):
-                    grad_norm = clip_grad_norm(self.clip_grad_max_norm, [self.model], foreach=self.grad_clip_foreach)
-                    grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
-                phase_timer.stop("grad_clip", phase_started)
+                grad_norm = clip_grad_norm(self.clip_grad_max_norm, [self.model], foreach=self.grad_clip_foreach)
+                grad_norm = float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm
 
                 # ── LoRA gradient diagnostic (step 1 only) ───────────────────
                 if global_step == 1 and self.peft_cfg is not None:
@@ -1015,41 +916,22 @@ class TrainDiffusionRecipe(BaseRecipe):
                             )
                             break
 
-                phase_started = phase_timer.start() if measure_step else None
-                with torch.profiler.record_function("diffusion.optimizer"):
-                    for optimizer in self.optimizer:
-                        optimizer.step()
-                    if self.lr_scheduler is not None:
-                        self.lr_scheduler[0].step(1)
-                phase_timer.stop("optimizer", phase_started)
+                for optimizer in self.optimizer:
+                    optimizer.step()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler[0].step(1)
 
-                if measure_step:
-                    perf_window_steps += 1
-                    perf_window_local_samples += _count_local_batch_group_samples(batch_group)
-                    perf_window_local_target_tokens += sum(
-                        int(metrics.get("perf/target_token_count", 0)) for metrics in micro_metrics
-                    )
-                    perf_window_local_context_tokens += sum(
-                        int(metrics.get("perf/context_token_count", 0)) for metrics in micro_metrics
-                    )
-                    perf_window_local_text_tokens += sum(
-                        int(metrics.get("perf/text_token_count", 0)) for metrics in micro_metrics
-                    )
-                    perf_window_local_total_tokens += sum(
-                        int(metrics.get("perf/total_token_count", 0)) for metrics in micro_metrics
-                    )
+                perf_window_steps += 1
+                perf_window_local_samples += _count_local_batch_group_samples(batch_group)
                 group_loss_mean = float(torch.stack(micro_losses).mean().item())
                 epoch_loss += group_loss_mean
                 num_steps += 1
-                # StepScheduler increments after yielding, so its current value still
-                # identifies the update that just ran. Metrics and checkpoint names
-                # use the number of completed optimizer steps instead.
-                global_step = int(self.step_scheduler.step) + 1
+                global_step = int(self.step_scheduler.step)
 
                 log_every = self.step_scheduler.log_remote_every_steps
-                should_log = measurement_started and log_every and log_every > 0 and perf_window_steps >= log_every
+                should_log = log_every and log_every > 0 and global_step % log_every == 0
                 if should_log:
-                    elapsed_seconds, _ = self._elapsed_seconds_since(perf_window_start_time)
+                    elapsed_seconds, perf_window_end_time = self._elapsed_seconds_since(perf_window_start_time)
                     perf_window_global_samples = self._count_global_samples(perf_window_local_samples)
                     throughput_metrics = _calculate_throughput_metrics(
                         elapsed_seconds=elapsed_seconds,
@@ -1057,47 +939,10 @@ class TrainDiffusionRecipe(BaseRecipe):
                         global_samples=perf_window_global_samples,
                         world_size=self.world_size,
                     )
-                    global_token_counts = self._count_global_token_metrics(
-                        target=perf_window_local_target_tokens,
-                        context=perf_window_local_context_tokens,
-                        text=perf_window_local_text_tokens,
-                        total=perf_window_local_total_tokens,
-                    )
-                    throughput_metrics.update(
-                        {
-                            "target_latent_tokens_per_sec": global_token_counts["target"] / elapsed_seconds,
-                            "total_latent_tokens_per_sec": (
-                                global_token_counts["target"] + global_token_counts["context"]
-                            )
-                            / elapsed_seconds,
-                            "text_tokens_per_sec": global_token_counts["text"] / elapsed_seconds,
-                            "total_tokens_per_sec": global_token_counts["total"] / elapsed_seconds,
-                        }
-                    )
-                    local_phase_seconds = {
-                        "dataloader_wait": perf_window_local_dataloader_wait,
-                        **phase_timer.elapsed_seconds(),
-                    }
-                    global_phase_seconds = self._max_global_timing_metrics(local_phase_seconds)
-                    timed_steps = max(perf_window_steps, 1)
-                    throughput_metrics.update(
-                        {
-                            "dataloader_wait_time": global_phase_seconds.get("dataloader_wait", 0.0) / timed_steps,
-                            "forward_time": global_phase_seconds.get("forward", 0.0) / timed_steps,
-                            "backward_time": global_phase_seconds.get("backward", 0.0) / timed_steps,
-                            "grad_clip_time": global_phase_seconds.get("grad_clip", 0.0) / timed_steps,
-                            "optimizer_time": global_phase_seconds.get("optimizer", 0.0) / timed_steps,
-                        }
-                    )
                     memory_metrics = self._get_memory_metrics()
+                    perf_window_start_time = perf_window_end_time
                     perf_window_steps = 0
                     perf_window_local_samples = 0
-                    perf_window_local_target_tokens = 0
-                    perf_window_local_context_tokens = 0
-                    perf_window_local_text_tokens = 0
-                    perf_window_local_total_tokens = 0
-                    perf_window_local_dataloader_wait = 0.0
-                    phase_timer.reset()
 
                 if should_log and self.dist_env.is_main:
                     avg_loss = epoch_loss / num_steps
@@ -1115,10 +960,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                         wandb.log(log_dict, step=global_step)
                     logging.info(
                         "[TRAIN] step=%s epoch=%s loss=%.6f avg_loss=%.6f lr=%.3e grad_norm=%.3f "
-                        "step_time=%.3fs samples_per_sec=%.2f samples_per_sec_per_gpu=%.2f "
-                        "target_tokens_per_sec=%.2f total_latent_tokens_per_sec=%.2f "
-                        "wait=%.3fs fwd=%.3fs bwd=%.3fs grad_clip=%.3fs opt=%.3fs "
-                        "max_allocated=%.2fGB max_reserved=%.2fGB",
+                        "step_time=%.3fs samples_per_sec=%.2f samples_per_sec_per_gpu=%.2f mem=%.2fGB",
                         global_step,
                         epoch,
                         group_loss_mean,
@@ -1128,15 +970,7 @@ class TrainDiffusionRecipe(BaseRecipe):
                         throughput_metrics["step_time"],
                         throughput_metrics["samples_per_sec"],
                         throughput_metrics["samples_per_sec_per_gpu"],
-                        throughput_metrics["target_latent_tokens_per_sec"],
-                        throughput_metrics["total_latent_tokens_per_sec"],
-                        throughput_metrics["dataloader_wait_time"],
-                        throughput_metrics["forward_time"],
-                        throughput_metrics["backward_time"],
-                        throughput_metrics["grad_clip_time"],
-                        throughput_metrics["optimizer_time"],
                         memory_metrics["max_memory_allocated_gb"],
-                        memory_metrics["max_memory_reserved_gb"],
                     )
 
                     # Update tqdm if present
@@ -1154,24 +988,6 @@ class TrainDiffusionRecipe(BaseRecipe):
 
                 if self.step_scheduler.is_ckpt_step:
                     self.save_checkpoint(epoch, global_step, epoch_loss / num_steps)
-
-                started_after_warmup = not measurement_started and global_step >= warmup_steps
-                if started_after_warmup:
-                    measurement_started = True
-                    perf_window_steps = 0
-                    perf_window_local_samples = 0
-                    perf_window_local_target_tokens = 0
-                    perf_window_local_context_tokens = 0
-                    perf_window_local_text_tokens = 0
-                    perf_window_local_total_tokens = 0
-                    perf_window_local_dataloader_wait = 0.0
-                    phase_timer.reset()
-
-                if should_log or started_after_warmup:
-                    perf_window_start_time = time.perf_counter()
-                    if torch.cuda.is_available():
-                        torch.cuda.reset_peak_memory_stats()
-                batch_wait_started = time.perf_counter()
 
             if num_steps == 0:
                 logging.info(f"[INFO] Epoch {epoch + 1} skipped (already completed in previous run)")
@@ -1238,32 +1054,6 @@ class TrainDiffusionRecipe(BaseRecipe):
             dist.all_reduce(sample_count, op=dist.ReduceOp.SUM, group=self._get_dp_group())
             global_samples = int(sample_count.item())
         return global_samples
-
-    def _count_global_token_metrics(self, *, target: int, context: int, text: int, total: int) -> Dict[str, int]:
-        """Sum cached CPU token counts across the data-parallel group."""
-        names = ("target", "context", "text", "total")
-        counts = torch.tensor(
-            [target, context, text, total],
-            device=self._get_collective_device(),
-            dtype=torch.long,
-        )
-        if dist.is_initialized():
-            dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=self._get_dp_group())
-        return dict(zip(names, (int(value) for value in counts.tolist())))
-
-    def _max_global_timing_metrics(self, timings: Dict[str, float]) -> Dict[str, float]:
-        """Max-reduce phase seconds across all training ranks."""
-        if not timings:
-            return {}
-        names = tuple(sorted(timings))
-        values = torch.tensor(
-            [timings[name] for name in names],
-            device=self._get_collective_device(),
-            dtype=torch.float64,
-        )
-        if dist.is_initialized():
-            dist.all_reduce(values, op=dist.ReduceOp.MAX, group=None)
-        return dict(zip(names, (float(value) for value in values.tolist())))
 
     def _get_memory_metrics(self) -> Dict[str, float]:
         """Return PyTorch CUDA allocator memory counters, max-reduced across ranks."""

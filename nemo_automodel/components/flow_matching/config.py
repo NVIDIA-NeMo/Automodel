@@ -88,7 +88,6 @@ class FlowMatchingConfig:
         *,
         model_adapter: ModelAdapter,
         device: torch.device,
-        generator: torch.Generator,
         sigma_min: float | None = None,
         sigma_max: float | None = None,
     ) -> "FlowMatchingPipeline":
@@ -97,7 +96,6 @@ class FlowMatchingConfig:
         Args:
             model_adapter: Adapter constructed before model parallelization.
             device: Training device.
-            generator: Checkpointable, rank-local recipe generator.
             sigma_min: Optional runtime override for staged diffusion training.
             sigma_max: Optional runtime override for staged diffusion training.
 
@@ -126,5 +124,4 @@ class FlowMatchingConfig:
             log_interval=self.log_interval,
             summary_log_interval=self.summary_log_interval,
             device=device,
-            generator=generator,
         )

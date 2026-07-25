@@ -97,7 +97,7 @@ Each versioned cache sample contains:
 - `conditioning_tensors`: optional explicitly named tensors
 - `metadata`: original IDs, source revision, tensor shapes, token lengths, and the compound target/context bucket signature
 
-The top-level `metadata.json` records the cache format version, source dataset ID, resolved dataset revision and config, split, row limit, resolved model revision, and preprocessing settings. Batches contain only compatible target and ordered-context shapes. Their CPU metadata includes target, context, text, and total token counts, so throughput logging does not inspect accelerator tensors.
+The top-level `metadata.json` records the cache format version, source dataset ID, dataset revision and config when provided, split, row limit, model revision, and preprocessing settings. Batches contain only compatible target and ordered-context shapes, and their CPU metadata includes target, context, text, and total token counts.
 
 ## Train
 
@@ -109,7 +109,7 @@ uv run torchrun --nproc-per-node=8 \
   -c examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml
 ```
 
-The baseline uses BF16 parameters and compute, whole Qwen transformer-block activation checkpointing, beta timestep sampling from the recipe's checkpointed rank-local generator, and the distributed checkpoint manager. Consolidated model checkpoints retain the upstream Diffusers transformer state-dict representation. Set `checkpoint.restore_from: LATEST` to resume the optimizer, scheduler, dataloader, sampler, step, and RNG state.
+The baseline uses BF16 parameters and compute, whole Qwen transformer-block activation checkpointing, beta timestep sampling, and the distributed checkpoint manager. Consolidated model checkpoints retain the upstream Diffusers transformer state-dict representation. Set `checkpoint.restore_from: LATEST` to resume the optimizer, scheduler, dataloader, sampler, and step state.
 
 ### Checkpoint-resume smoke test
 
@@ -129,8 +129,7 @@ uv run torchrun --nproc-per-node=8 \
   --step_scheduler.max_steps 10 \
   --step_scheduler.ckpt_every_steps 10 \
   --step_scheduler.log_remote_every_steps 1 \
-  --performance.check_loss true \
-  --performance.throughput_warmup_steps 0
+  --performance.check_loss true
 ```
 
 Resume the same run and continue to 20 completed optimizer steps:
@@ -146,19 +145,10 @@ uv run torchrun --nproc-per-node=8 \
   --step_scheduler.max_steps 20 \
   --step_scheduler.ckpt_every_steps 10 \
   --step_scheduler.log_remote_every_steps 1 \
-  --performance.check_loss true \
-  --performance.throughput_warmup_steps 0
+  --performance.check_loss true
 ```
 
 The smoke test passes when the first launch writes the step-10 checkpoint, the second launch restores it and reaches step 20, and every reported loss and gradient norm is finite.
-
-## H100 Benchmark Protocol
-
-Use the fixed performance cache for 20 warm-up steps and 100 timed optimization steps, repeated three times. The recipe's `performance.throughput_warmup_steps: 20` excludes warm-up work and logging overhead from the 100-step window. Dataloader wait uses the CPU wall clock; CUDA events measure forward, backward, gradient clipping, and optimizer phases. Set `step_scheduler.max_steps: 120` for a benchmark-only run. Report the median samples/second, target and total latent tokens/second, step time, peak allocated and reserved memory, and phase times.
-
-The `diffusion.forward`, `diffusion.backward_and_communication`, `diffusion.grad_clip`, and `diffusion.optimizer` PyTorch Profiler ranges identify phase boundaries. Because FSDP communication overlaps backward execution, use the NCCL events in a profiler trace to report communication time separately; the scalar `backward_time` includes that overlap.
-
-Sweep one setting at a time: supported attention backends, `torch.compile`, whole-block versus selective activation checkpointing, FSDP reshard-after-forward, forward/backward prefetch, reduce-scatter dtype, and supported QKV fusion, Transformer Engine, or FP8 paths. Keep only configurations with finite loss and gradients, checkpoint-resume correctness, and loss/gradient parity.
 
 ## Install
 

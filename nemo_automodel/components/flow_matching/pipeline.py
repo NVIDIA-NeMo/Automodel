@@ -31,7 +31,7 @@ import logging
 import math
 import os
 import random
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -48,20 +48,6 @@ from .adapters import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _collect_cached_token_metrics(batch: Dict[str, Any], batch_size: int) -> Dict[str, int]:
-    """Collect CPU-only token counts emitted by cached diffusion dataloaders."""
-    metadata = batch.get("metadata")
-    if not isinstance(metadata, dict):
-        return {}
-
-    metrics = {"perf/batch_size": int(metadata.get("batch_size", batch_size))}
-    for name in ("target", "context", "text", "total"):
-        value = metadata.get(f"{name}_token_count")
-        if isinstance(value, int):
-            metrics[f"perf/{name}_token_count"] = value
-    return metrics
 
 
 # =============================================================================
@@ -151,9 +137,8 @@ class FlowMatchingPipeline:
         # Logging
         log_interval: int = 100,
         summary_log_interval: int = 10,
-        device: torch.device | None = None,
-        generator: torch.Generator | None = None,
-    ) -> None:
+        device: Optional[torch.device] = None,
+    ):
         """
         Initialize the FlowMatching pipeline.
 
@@ -187,7 +172,6 @@ class FlowMatchingPipeline:
             log_interval: Steps between detailed logs
             summary_log_interval: Steps between summary logs
             device: Device to use for computations
-            generator: Recipe-owned, rank-local generator for timestep and noise sampling
         """
         self.model_adapter = model_adapter
         self.num_train_timesteps = num_train_timesteps
@@ -200,6 +184,8 @@ class FlowMatchingPipeline:
         self.mix_uniform_ratio = mix_uniform_ratio
         self.beta_alpha = float(beta_alpha)
         self.beta_beta = float(beta_beta)
+        if self.beta_alpha <= 0 or self.beta_beta <= 0:
+            raise ValueError("beta_alpha and beta_beta must both be positive")
         self.use_sigma_noise = use_sigma_noise
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
@@ -219,10 +205,6 @@ class FlowMatchingPipeline:
         self.log_interval = log_interval
         self.summary_log_interval = summary_log_interval
         self.device = device if device is not None else torch.device("cuda")
-        self.generator = generator
-
-        if self.beta_alpha <= 0 or self.beta_beta <= 0:
-            raise ValueError("beta_alpha and beta_beta must both be positive")
 
         # Initialize noise schedule
         self.noise_schedule = LinearInterpolationSchedule()
@@ -243,8 +225,8 @@ class FlowMatchingPipeline:
     def sample_timesteps(
         self,
         batch_size: int,
-        device: torch.device | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, str]:
+        device: Optional[torch.device] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, str]:
         """
         Sample timesteps and compute sigma values with flow shift.
 
@@ -256,10 +238,9 @@ class FlowMatchingPipeline:
             device: Device for tensor operations
 
         Returns:
-            Tuple containing a tensor of shape [batch] with sigma values in
-            ``[sigma_min, sigma_max]``, a tensor of shape [batch] with timesteps
-            in ``[0, num_train_timesteps]``, and the sampling-method name. Both
-            tensors are float32 on ``device``.
+            sigma: Sigma values in [sigma_min, sigma_max]
+            timesteps: Timesteps in [0, num_train_timesteps]
+            sampling_method: Name of the sampling method used
         """
         if device is None:
             device = self.device
@@ -267,27 +248,26 @@ class FlowMatchingPipeline:
         # Backward-compatible path from pre-migration training step:
         # disable flow shift and sample plain uniform sigma.
         if not self.use_sigma_noise:
-            sigma = torch.rand(size=(batch_size,), device=device, generator=self.generator)
+            sigma = torch.rand(size=(batch_size,), device=device)
             sigma = torch.clamp(sigma, self.sigma_min, self.sigma_max)
             timesteps = sigma * self.num_train_timesteps
             return sigma, timesteps, "uniform_no_shift"
 
         if self.timestep_sampling == "beta":
-            if self.generator is None:
-                raise ValueError("Beta timestep sampling requires a recipe-owned torch.Generator")
-            sigma = self._sample_beta(batch_size, device)
+            alpha = torch.full((batch_size,), self.beta_alpha, dtype=torch.float32, device=device)
+            beta = torch.full((batch_size,), self.beta_beta, dtype=torch.float32, device=device)
+            sigma = torch.distributions.Beta(alpha, beta).sample()
             sigma = torch.clamp(sigma, self.sigma_min, self.sigma_max)
             timesteps = sigma * self.num_train_timesteps
             return sigma, timesteps, "beta"
 
         # Determine if we should use uniform (for mix strategy)
         use_uniform = self.timestep_sampling == "uniform" or (
-            self.mix_uniform_ratio > 0
-            and torch.rand((), device=device, generator=self.generator).item() < self.mix_uniform_ratio
+            self.mix_uniform_ratio > 0 and torch.rand(1).item() < self.mix_uniform_ratio
         )
 
         if use_uniform:
-            u = torch.rand(size=(batch_size,), device=device, generator=self.generator)
+            u = torch.rand(size=(batch_size,), device=device)
             sampling_method = "uniform"
         else:
             u = self._sample_from_distribution(batch_size, device)
@@ -305,62 +285,33 @@ class FlowMatchingPipeline:
 
         return sigma, timesteps, sampling_method
 
-    def _sample_beta(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Sample ``Beta(alpha, beta)`` without touching global RNG state.
-
-        Args:
-            batch_size: Number of samples.
-            device: Device on which to allocate samples.
-
-        Returns:
-            Float32 tensor of shape [batch] on ``device``.
-        """
-        alpha = torch.full((batch_size,), self.beta_alpha, dtype=torch.float32, device=device)
-        beta = torch.full((batch_size,), self.beta_beta, dtype=torch.float32, device=device)
-        # torch.distributions.Beta.sample() has no generator argument. Sampling
-        # its two gamma variates directly preserves the standard construction
-        # while keeping randomness on the checkpointed recipe generator.
-        alpha_gamma = torch._standard_gamma(alpha, generator=self.generator)
-        beta_gamma = torch._standard_gamma(beta, generator=self.generator)
-        denominator = (alpha_gamma + beta_gamma).clamp_min(torch.finfo(torch.float32).tiny)
-        return alpha_gamma / denominator
-
     def _sample_from_distribution(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Sample values from the configured distribution.
-
-        Args:
-            batch_size: Number of samples.
-            device: Device on which to allocate samples.
-
-        Returns:
-            Float32 tensor of shape [batch] on ``device``.
-        """
+        """Sample u values from the configured distribution."""
         if self.timestep_sampling == "logit_normal":
             u = torch.normal(
                 mean=self.logit_mean,
                 std=self.logit_std,
                 size=(batch_size,),
                 device=device,
-                generator=self.generator,
             )
             u = torch.sigmoid(u)
 
         elif self.timestep_sampling == "lognorm":
-            u = torch.normal(mean=0.0, std=1.0, size=(batch_size,), device=device, generator=self.generator)
+            u = torch.normal(mean=0.0, std=1.0, size=(batch_size,), device=device)
             u = torch.sigmoid(u)
 
         elif self.timestep_sampling == "mode":
             mode_scale = 1.29
-            u = torch.rand(size=(batch_size,), device=device, generator=self.generator)
+            u = torch.rand(size=(batch_size,), device=device)
             u = 1.0 - u - mode_scale * (torch.cos(math.pi * u / 2.0) ** 2 - 1.0 + u)
             u = torch.clamp(u, 0.0, 1.0)
 
         elif self.timestep_sampling == "mix":
-            u = torch.normal(mean=0.0, std=1.0, size=(batch_size,), device=device, generator=self.generator)
+            u = torch.normal(mean=0.0, std=1.0, size=(batch_size,), device=device)
             u = torch.sigmoid(u)
 
         else:
-            u = torch.rand(size=(batch_size,), device=device, generator=self.generator)
+            u = torch.rand(size=(batch_size,), device=device)
 
         return u
 
@@ -378,23 +329,26 @@ class FlowMatchingPipeline:
         model_pred: torch.Tensor,
         target: torch.Tensor,
         sigma: torch.Tensor,
-        batch: dict[str, Any] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        batch: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Compute flow matching loss with optional weighting.
 
         Loss weight: w = 1 + flow_shift * σ
 
         Args:
-            model_pred: Tensor of shape [batch, ...] containing the model prediction.
-            target: Tensor of shape [batch, ...] matching ``model_pred``, containing velocity as noise minus clean.
-            sigma: Tensor of shape [batch] containing one sigma value per sample.
-            batch: Optional batch mapping. When present, ``loss_mask`` is a tensor broadcastable to
-                shape [batch, ...].
+            model_pred: Model prediction
+            target: Target (velocity = noise - clean)
+            sigma: Sigma values for each sample
+            batch: Optional batch dictionary containing loss_mask
 
         Returns:
-            Tuple containing weighted and unweighted loss tensors of shape [batch, ...], their scalar averages,
-            a weight tensor broadcastable to shape [batch, ...], and the optional loss-mask tensor from ``batch``.
+            weighted_loss: Per-element weighted loss
+            average_weighted_loss: Scalar average weighted loss
+            unweighted_loss: Per-element raw MSE loss
+            average_unweighted_loss: Scalar average unweighted loss
+            loss_weight: Applied weights
+            loss_mask: Loss mask from batch (or None if not present)
         """
         loss = self.model_adapter.compute_loss(model_pred, target)
         loss_mask = batch.get("loss_mask") if batch is not None else None
@@ -428,7 +382,7 @@ class FlowMatchingPipeline:
         global_step: int = 0,
         collect_metrics: bool = True,
         check_loss: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
         """
         Execute a single training step with flow matching.
 
@@ -444,9 +398,7 @@ class FlowMatchingPipeline:
 
         Args:
             model: The model to train
-            batch: Batch mapping containing either ``image_latents`` with shape [batch, channels, height, width] or
-                ``video_latents`` with shape [batch, channels, frames, height, width]. Model-specific tensor fields
-                are forwarded unchanged to the adapter.
+            batch: Batch of training data
             device: Device to use
             dtype: Data type for operations
             global_step: Current training step (for logging)
@@ -456,9 +408,10 @@ class FlowMatchingPipeline:
                 hot training paths to avoid host/device synchronizations.
 
         Returns:
-            Tuple containing a per-element weighted-loss tensor matching the latent prediction layout, a scalar
-            average weighted-loss tensor, an optional loss-mask tensor broadcastable to the loss, and scalar/metadata
-            metrics.
+            weighted_loss: Per-element weighted loss
+            average_weighted_loss: Scalar average weighted loss
+            loss_mask: Mask indicating valid loss elements (or None)
+            metrics: Dictionary of training metrics
         """
         debug_mode = os.environ.get("DEBUG_TRAINING", "0") == "1"
         detailed_log = global_step % self.log_interval == 0
@@ -487,12 +440,7 @@ class FlowMatchingPipeline:
         # ====================================================================
         # Flow Matching: Add Noise
         # ====================================================================
-        noise = torch.randn(
-            latents.shape,
-            dtype=torch.float32,
-            device=latents.device,
-            generator=self.generator,
-        )
+        noise = torch.randn_like(latents, dtype=torch.float32)
 
         # x_t = (1 - σ) * x_0 + σ * ε
         noisy_latents = self.noise_schedule.forward(latents.float(), noise, sigma)
@@ -563,8 +511,7 @@ class FlowMatchingPipeline:
                 f"w=[{loss_weight.min():.2f},{loss_weight.max():.2f}]"
             )
 
-        cached_token_metrics = _collect_cached_token_metrics(batch, batch_size)
-        metrics: Dict[str, Any] = cached_token_metrics
+        metrics = {}
         if collect_metrics:
             metrics = {
                 "loss": average_weighted_loss.item(),
@@ -581,7 +528,6 @@ class FlowMatchingPipeline:
                 "sampling_method": sampling_method,
                 "task_type": task_type,
                 "data_type": data_type,
-                **cached_token_metrics,
             }
 
         return weighted_loss, average_weighted_loss, loss_mask, metrics

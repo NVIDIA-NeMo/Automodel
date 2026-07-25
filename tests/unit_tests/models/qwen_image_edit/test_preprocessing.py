@@ -26,7 +26,6 @@ import torch.nn.functional as F
 from PIL import Image
 
 from nemo_automodel.components.datasets.diffusion.image_edit_dataset import ImageEditDataset
-from nemo_automodel.components.models.qwen_image_edit import preprocessing as qwen_preprocessing
 from nemo_automodel.components.models.qwen_image_edit.preprocessing import (
     QwenImageEditCacheEncoder,
     _resize_condition_image,
@@ -169,19 +168,12 @@ def test_encoder_writes_dataset_compatible_versioned_cache(tmp_path: Path, monke
         device="cpu",
         torch_dtype="float32",
     )
-    hub_calls = []
     load_calls = []
-
-    class FakeHfApi:
-        def model_info(self, *, repo_id, revision):
-            hub_calls.append((repo_id, revision))
-            return SimpleNamespace(sha=_MODEL_REVISION)
 
     def fake_load_pipeline(device, *, revision):
         load_calls.append((device, revision))
         return pipeline
 
-    monkeypatch.setattr(qwen_preprocessing.huggingface_hub, "HfApi", lambda: FakeHfApi())
     monkeypatch.setattr(encoder, "_load_pipeline", fake_load_pipeline)
 
     metadata_path = encoder.encode_manifest(
@@ -205,7 +197,7 @@ def test_encoder_writes_dataset_compatible_versioned_cache(tmp_path: Path, monke
         "max_pixels": 64 * 64,
         "max_sequence_length": 5,
         "model_name": "Qwen/Qwen-Image-Edit-2511",
-        "model_revision": _MODEL_REVISION,
+        "model_revision": "model-branch",
         "num_gpus": 1,
         "processor_target": (
             "nemo_automodel.components.models.qwen_image_edit.preprocessing.QwenImageEditCacheEncoder"
@@ -217,8 +209,7 @@ def test_encoder_writes_dataset_compatible_versioned_cache(tmp_path: Path, monke
         "vae_latent_sampling": "mode",
         "verify": True,
     }
-    assert hub_calls == [("Qwen/Qwen-Image-Edit-2511", "model-branch")]
-    assert load_calls == [(torch.device("cpu"), _MODEL_REVISION)]
+    assert load_calls == [(torch.device("cpu"), "model-branch")]
 
     dataset = ImageEditDataset(cache_dir=str(output_dir), quantization=32)
     sample = dataset[0]
@@ -256,67 +247,6 @@ def test_condition_resize_matches_upstream_qwen_edit_dimensions() -> None:
     expected = qwen_pipeline.calculate_dimensions(384 * 384, image.width / image.height)
 
     assert resized.size == expected == (480, 320)
-
-
-def test_encoder_requires_pinned_dataset_revision(tmp_path: Path) -> None:
-    """Fail before loading model weights when source provenance is unpinned."""
-    output_dir = tmp_path / "cache"
-    manifest_path = _make_materialized_manifest(output_dir)
-    _write_manifest(manifest_path, revision=None)
-    encoder = QwenImageEditCacheEncoder(torch_dtype="float32")
-
-    with pytest.raises(ValueError, match="dataset_revision must be a non-empty string"):
-        encoder.encode_manifest(
-            manifest_path=manifest_path,
-            output_dir=output_dir,
-            max_pixels=64 * 64,
-            resolution_preset=None,
-            num_gpus=1,
-            verify=False,
-        )
-
-
-def test_encoder_requires_immutable_dataset_revision(tmp_path: Path) -> None:
-    """Reject a human-readable dataset ref that bypassed Hub resolution."""
-    output_dir = tmp_path / "cache"
-    manifest_path = _make_materialized_manifest(output_dir)
-    _write_manifest(manifest_path, revision="main")
-    encoder = QwenImageEditCacheEncoder(torch_dtype="float32")
-
-    with pytest.raises(ValueError, match="40-character Hugging Face commit SHA"):
-        encoder.encode_manifest(
-            manifest_path=manifest_path,
-            output_dir=output_dir,
-            max_pixels=64 * 64,
-            resolution_preset=None,
-            num_gpus=1,
-            verify=False,
-        )
-
-
-def test_encoder_rejects_non_commit_model_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fail before loading weights when the Hub does not return an immutable model SHA."""
-    output_dir = tmp_path / "cache"
-    manifest_path = _make_materialized_manifest(output_dir)
-    encoder = QwenImageEditCacheEncoder(revision="model-branch", torch_dtype="float32")
-
-    class FakeHfApi:
-        def model_info(self, *, repo_id, revision):
-            assert repo_id == "Qwen/Qwen-Image-Edit-2511"
-            assert revision == "model-branch"
-            return SimpleNamespace(sha="main")
-
-    monkeypatch.setattr(qwen_preprocessing.huggingface_hub, "HfApi", lambda: FakeHfApi())
-
-    with pytest.raises(ValueError, match="resolved model revision must be a 40-character"):
-        encoder.encode_manifest(
-            manifest_path=manifest_path,
-            output_dir=output_dir,
-            max_pixels=64 * 64,
-            resolution_preset=None,
-            num_gpus=1,
-            verify=False,
-        )
 
 
 def test_encoder_refuses_existing_cache_artifacts(tmp_path: Path) -> None:

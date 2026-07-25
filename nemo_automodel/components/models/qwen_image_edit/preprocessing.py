@@ -20,7 +20,6 @@ import json
 import logging
 import math
 import multiprocessing
-import re
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,10 +42,6 @@ DIFFUSERS_AVAILABLE, diffusers = safe_import(
     "diffusers",
     msg="Qwen image-edit preprocessing requires the diffusion optional dependencies",
 )
-HF_HUB_AVAILABLE, huggingface_hub = safe_import(
-    "huggingface_hub",
-    msg="Qwen image-edit preprocessing requires huggingface_hub for immutable model provenance",
-)
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +60,6 @@ _DTYPES = {
     "float32": torch.float32,
 }
 _DEFAULT_MODEL_NAME = "Qwen/Qwen-Image-Edit-2511"
-_HF_COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 class _CompoundBucketSignature(TypedDict):
@@ -130,8 +124,8 @@ class QwenImageEditCacheEncoder:
                 ``None`` selects ``Qwen/Qwen-Image-Edit-2511`` so the generic
                 preprocessing CLI can leave ``--model_name`` unset.
             max_sequence_length: Maximum cached Qwen2.5-VL token count.
-            revision: Optional Hugging Face model revision. Remote refs are
-                resolved to immutable commit SHAs before Diffusers loads them.
+            revision: Optional Hugging Face model revision passed through to
+                Diffusers when loading the encoding pipeline.
             device: Optional explicit encoding device. By default each worker
                 selects its assigned CUDA device, with CPU as a unit-test fallback.
             torch_dtype: VAE/text-encoder compute and cache dtype. Supported
@@ -205,16 +199,13 @@ class QwenImageEditCacheEncoder:
 
         samples = _read_manifest(manifest_path)
         dataset_name = _shared_metadata_string(samples, "dataset_name")
-        dataset_revision = _require_hf_commit_sha(
-            _shared_metadata_string(samples, "dataset_revision"),
-            field_name="metadata.dataset_revision",
-        )
+        dataset_revision = _shared_metadata_optional_string(samples, "dataset_revision")
         dataset_config_name = _shared_metadata_optional_string(samples, "dataset_config_name")
         dataset_split = _shared_metadata_string(samples, "dataset_split")
 
         output_dir.mkdir(parents=True, exist_ok=True)
         _validate_output_directory(output_dir, manifest_path=manifest_path)
-        model_revision = _resolve_hf_model_revision(self.model_name, self.revision)
+        model_revision = self.revision
         (output_dir / "samples").mkdir()
 
         settings = _WorkerSettings(
@@ -458,13 +449,13 @@ class QwenImageEditCacheEncoder:
         target_token_length = (target_shape[-2] // 2) * (target_shape[-1] // 2)
         context_token_lengths = [(shape[-2] // 2) * (shape[-1] // 2) for shape in context_shapes]
         text_token_length = int(prompt_attention_mask.sum().item())
-        source_revision = str(sample.metadata["dataset_revision"])
+        source_revision = sample.metadata.get("dataset_revision")
         metadata = {
             "original_ids": {
                 "id": sample.identifier,
                 "row_index": sample.row_index,
             },
-            "source_revision": source_revision,
+            "source_revision": str(source_revision) if source_revision is not None else None,
             "target_spatial_shape": target_shape[-2:],
             "context_spatial_shapes": [shape[-2:] for shape in context_shapes],
             "target_token_length": target_token_length,
@@ -615,31 +606,6 @@ def _shared_metadata_optional_string(samples: list[_ManifestSample], field_name:
     if any(value != first_value for value in values[1:]):
         raise ValueError(f"Manifest rows must share one {field_name}, got {values!r}")
     return cast(str | None, first_value)
-
-
-def _require_hf_commit_sha(revision: str, *, field_name: str) -> str:
-    """Validate and normalize an immutable Hugging Face commit SHA."""
-    if not _HF_COMMIT_SHA_PATTERN.fullmatch(revision):
-        raise ValueError(f"{field_name} must be a 40-character Hugging Face commit SHA, got {revision!r}")
-    return revision.lower()
-
-
-def _resolve_hf_model_revision(model_name: str, revision: str | None) -> str | None:
-    """Resolve a remote Qwen pipeline ref to an immutable model commit SHA."""
-    if Path(model_name).exists():
-        if revision is not None:
-            raise ValueError("revision must be omitted when model_name is a local pipeline path")
-        return None
-    if revision is not None and _HF_COMMIT_SHA_PATTERN.fullmatch(revision):
-        return revision.lower()
-    if not HF_HUB_AVAILABLE:
-        raise ImportError("Remote Qwen image-edit model provenance requires huggingface_hub")
-
-    model_info = huggingface_hub.HfApi().model_info(repo_id=model_name, revision=revision)
-    resolved_revision = model_info.sha
-    if not isinstance(resolved_revision, str):
-        raise ValueError(f"Hugging Face resolved model {model_name!r} revision {revision!r} without a commit SHA")
-    return _require_hf_commit_sha(resolved_revision, field_name="resolved model revision")
 
 
 def _validate_output_directory(output_dir: Path, *, manifest_path: Path) -> None:

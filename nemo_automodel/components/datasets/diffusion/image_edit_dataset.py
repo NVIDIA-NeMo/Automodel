@@ -181,10 +181,6 @@ class ImageEditDatasetConfig:
     """Directory containing a versioned image-edit cache."""
     quantization: int = 64
     """Spatial quantization used for dynamic batch-size calculation."""
-    expected_model_name: str | None = None
-    """Model ID expected in cache preprocessing provenance."""
-    expected_model_revision: str | None = None
-    """Immutable model revision expected in cache preprocessing provenance."""
 
     def build(self) -> ImageEditDataset:
         """Build the configured image-edit dataset.
@@ -195,8 +191,6 @@ class ImageEditDatasetConfig:
         return ImageEditDataset(
             cache_dir=self.cache_dir,
             quantization=self.quantization,
-            expected_model_name=self.expected_model_name,
-            expected_model_revision=self.expected_model_revision,
         )
 
 
@@ -213,9 +207,6 @@ class ImageEditDataset(BaseMultiresolutionDataset):
         self,
         cache_dir: str,
         quantization: int = 64,
-        *,
-        expected_model_name: str | None = None,
-        expected_model_revision: str | None = None,
     ) -> None:
         """Load and organize a versioned image-edit cache.
 
@@ -224,15 +215,11 @@ class ImageEditDataset(BaseMultiresolutionDataset):
                 and tensor cache files.
             quantization: Spatial quantization used for dynamic batch-size
                 calculation.
-            expected_model_name: Model ID that must match cache preprocessing provenance.
-            expected_model_revision: Immutable model revision that must match cache preprocessing provenance.
         """
         if quantization <= 0:
             raise ValueError(f"quantization must be positive, got {quantization}")
         self.cache_manifest: dict[str, object] = {}
         self.source_revision: str | None = None
-        self.expected_model_name = expected_model_name
-        self.expected_model_revision = expected_model_revision
         super().__init__(cache_dir=cache_dir, quantization=quantization)
 
     def _resolve_contained_path(self, path_value: object, *, field_name: str) -> Path:
@@ -277,27 +264,7 @@ class ImageEditDataset(BaseMultiresolutionDataset):
             raise ValueError(f"Invalid metadata format in {metadata_file}: 'shards' must be a list of file names")
 
         revision = manifest.get("dataset_revision", manifest.get("source_revision"))
-        if not isinstance(revision, str) or not revision:
-            raise ValueError("Image-edit cache metadata.json must declare a non-empty dataset_revision")
-        self.source_revision = revision
-
-        preprocessing_config = manifest.get("preprocessing_config")
-        if preprocessing_config is None and self.expected_model_name is None and self.expected_model_revision is None:
-            preprocessing_config = {}
-        elif not isinstance(preprocessing_config, dict):
-            raise ValueError("Image-edit cache metadata.json must declare a preprocessing_config mapping")
-        cached_model_name = preprocessing_config.get("model_name")
-        cached_model_revision = preprocessing_config.get("model_revision")
-        if self.expected_model_name is not None and cached_model_name != self.expected_model_name:
-            raise ValueError(
-                f"Image-edit cache model_name {cached_model_name!r} does not match training model "
-                f"{self.expected_model_name!r}"
-            )
-        if self.expected_model_revision is not None and cached_model_revision != self.expected_model_revision:
-            raise ValueError(
-                f"Image-edit cache model_revision {cached_model_revision!r} does not match training revision "
-                f"{self.expected_model_revision!r}"
-            )
+        self.source_revision = revision if isinstance(revision, str) and revision else None
         self.cache_manifest = manifest
 
         metadata: list[dict[str, object]] = []
@@ -409,13 +376,14 @@ class ImageEditDataset(BaseMultiresolutionDataset):
             )
 
         revision = cache_metadata.get("source_revision")
-        if not isinstance(revision, str) or not revision:
-            raise ValueError(f"Image-edit cache {cache_file} metadata.source_revision must be a non-empty string")
-        if self.source_revision is not None and revision != self.source_revision:
-            raise ValueError(
-                f"Image-edit cache {cache_file} source revision {revision!r} does not match manifest "
-                f"revision {self.source_revision!r}"
-            )
+        if revision is not None:
+            if not isinstance(revision, str) or not revision:
+                raise ValueError(f"Image-edit cache {cache_file} metadata.source_revision must be a non-empty string")
+            if self.source_revision is not None and revision != self.source_revision:
+                raise ValueError(
+                    f"Image-edit cache {cache_file} source revision {revision!r} does not match manifest "
+                    f"revision {self.source_revision!r}"
+                )
 
         target_spatial_shape = _normalize_shape(
             cache_metadata.get("target_spatial_shape"),
@@ -777,8 +745,6 @@ class ImageEditDataloaderConfig:
     pin_memory: bool = True
     prefetch_factor: int = 2
     seed: int = 42
-    expected_model_name: str | None = None
-    expected_model_revision: str | None = None
 
     def build(self, *, dp_rank: int, dp_world_size: int, batch_size: int) -> DiffusionDataloaderBuild:
         """Build the configured dataset, bucket sampler, and stateful dataloader.
@@ -812,8 +778,6 @@ class ImageEditDataloaderConfig:
         dataset = ImageEditDatasetConfig(
             cache_dir=self.cache_dir,
             quantization=self.quantization,
-            expected_model_name=self.expected_model_name,
-            expected_model_revision=self.expected_model_revision,
         ).build()
         sampler = SequentialBucketSampler(
             dataset,

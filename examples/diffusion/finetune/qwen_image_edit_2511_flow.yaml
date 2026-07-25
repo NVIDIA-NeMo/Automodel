@@ -1,6 +1,5 @@
 model:
   pretrained_model_name_or_path: "Qwen/Qwen-Image-Edit-2511"
-  revision: "6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9"
   mode: "finetune"
   model_type: "qwen_image_edit"
   cache_dir: null
@@ -11,14 +10,16 @@ model:
   transformer_engine_fp8: false
   fuse_qkv_projections: false
 
-optim:
-  learning_rate: 2e-6
-  clip_grad: 1.0
-  optimizer:
-    weight_decay: 0.05
-    betas: [0.9, 0.999]
-    foreach: false
-    fused: true
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2e-6
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  foreach: false
+  fused: true
+
+clip_grad_norm:
+  max_norm: 1.0
 
 # Single-node baseline: one FSDP2 data-parallel rank per H100.
 fsdp:
@@ -30,7 +31,6 @@ fsdp:
   defer_fsdp_grad_sync: true
   cpu_offload: false
   reduce_dtype: bfloat16
-  reshard_after_forward: true
   enable_compile: false
   enable_fsdp2_prefetch: true
   fsdp2_backward_prefetch_depth: 2
@@ -57,7 +57,6 @@ step_scheduler:
   global_batch_size: 8
   ckpt_every_steps: 250
   save_checkpoint_every_epoch: false
-  # With the 20-step performance warm-up below, this emits one 100-step timed window.
   log_remote_every_steps: 100
   max_steps: null
 
@@ -86,8 +85,6 @@ checkpoint:
 performance:
   check_loss: false
   grad_clip_foreach: true
-  throughput_warmup_steps: 20
-  phase_timing: true
 
 wandb:
   enable: false

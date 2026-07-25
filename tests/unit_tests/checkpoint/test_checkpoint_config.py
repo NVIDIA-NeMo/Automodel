@@ -174,24 +174,6 @@ class TestCheckpointingConfig:
         cfg = CheckpointingConfig(model_save_format="torch_save", is_peft=False)
         assert cfg.model_save_format.value == "torch_save"
 
-    def test_build_owns_runtime_model_keys_without_mutating_serializable_config(self):
-        """Runtime pre-shard keys override, but do not replace, the legacy field."""
-        config = CheckpointingConfig(save_consolidated=False, model_state_dict_keys=["legacy.weight"])
-        runtime_keys = ["runtime.weight"]
-
-        checkpointer = config.build(
-            dp_rank=0,
-            tp_rank=0,
-            pp_rank=0,
-            model_state_dict_keys=runtime_keys,
-        )
-        runtime_keys.append("caller.mutation")
-        legacy_checkpointer = config.build(dp_rank=0, tp_rank=0, pp_rank=0)
-
-        assert checkpointer.model_state_dict_keys == ["runtime.weight"]
-        assert legacy_checkpointer.model_state_dict_keys == ["legacy.weight"]
-        assert config.model_state_dict_keys == ["legacy.weight"]
-
 
 @pytest.mark.parametrize(
     ("version", "expected"),

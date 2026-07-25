@@ -15,7 +15,6 @@
 
 import json
 import logging
-import re
 import shutil
 import urllib.request
 from collections.abc import Sequence
@@ -40,7 +39,6 @@ CAPTION_COLUMN_CANDIDATES = ("caption", "text", "prompt", "description")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 IMAGE_EDIT_MEDIA_ROLES = {"target", "context", "condition"}
-_HF_COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 @dataclass(frozen=True)
@@ -68,8 +66,7 @@ class HFDatasetExport:
         caption_file: Generated caption metadata path for image exports.
         media_mappings: Ordered image-edit role-to-column mappings.
         manifest_file: Generated generic image-edit manifest path.
-        dataset_revision: Effective dataset revision. Image-edit exports use
-            the immutable Hugging Face commit SHA returned by the Hub.
+        dataset_revision: Effective dataset revision, when one was requested.
         dataset_config_name: Dataset config selected by ``load_dataset``.
     """
 
@@ -114,8 +111,7 @@ def materialize_hf_dataset(
         media_type: ``"image"``, ``"video"``, or ``"image-edit"``.
         split: Dataset split to load.
         config_name: Optional dataset config/subset name.
-        revision: Optional dataset revision. Image-edit exports resolve this
-            ref through the Hub and load the resulting immutable commit SHA.
+        revision: Optional dataset revision forwarded to ``load_dataset``.
         media_column: Optional source media column. If omitted, common names are
             inferred from features or the first row. This legacy option cannot
             be combined with ``media_mappings``.
@@ -143,11 +139,6 @@ def materialize_hf_dataset(
         raise ValueError("--dataset_media_column cannot be combined with --dataset_media_mapping")
     if media_type == "image-edit":
         resolved_mappings = _validate_media_mappings(media_mappings)
-        if Path(dataset_name).exists():
-            raise ValueError(
-                "media_type='image-edit' requires a Hugging Face Hub dataset ID so provenance can be resolved "
-                "to an immutable commit SHA; local dataset paths are not supported"
-            )
     elif media_mappings:
         raise ValueError("media_mappings are only supported for media_type='image-edit'")
     else:
@@ -164,8 +155,6 @@ def materialize_hf_dataset(
         raise ValueError("HF materialization directory is not empty; choose a new directory")
 
     resolved_revision = revision
-    if media_type == "image-edit":
-        resolved_revision = _resolve_hf_dataset_revision(dataset_name, revision)
 
     dataset = _load_hf_dataset(
         dataset_name,
@@ -275,42 +264,12 @@ def materialize_hf_dataset(
     )
 
 
-def _resolve_hf_dataset_revision(dataset_name: str, revision: str | None) -> str | None:
-    """Resolve a remote Hugging Face dataset ref to an immutable commit SHA.
-
-    Local dataset paths retain their caller-provided revision because they do
-    not have a Hugging Face repository commit to resolve.
-    """
-    if Path(dataset_name).exists():
-        return revision
-    if revision is not None and _HF_COMMIT_SHA_PATTERN.fullmatch(revision):
-        return revision.lower()
-    if not HF_HUB_AVAILABLE:
-        raise ImportError("Remote image-edit dataset provenance requires huggingface_hub")
-
-    dataset_info = huggingface_hub.HfApi().dataset_info(repo_id=dataset_name, revision=revision)
-    resolved_revision = dataset_info.sha
-    if not isinstance(resolved_revision, str) or not _HF_COMMIT_SHA_PATTERN.fullmatch(resolved_revision):
-        raise ValueError(
-            f"Hugging Face resolved dataset {dataset_name!r} revision {revision!r} to invalid commit SHA "
-            f"{resolved_revision!r}"
-        )
-    return resolved_revision.lower()
-
-
 def _resolve_dataset_config_name(dataset: object, requested_config_name: str | None) -> str | None:
     """Return the config name selected by ``datasets.load_dataset``."""
     dataset_info = getattr(dataset, "info", None)
     resolved_config_name = getattr(dataset_info, "config_name", None)
-    if resolved_config_name is None:
+    if resolved_config_name is None or not isinstance(resolved_config_name, str) or not resolved_config_name:
         return requested_config_name
-    if not isinstance(resolved_config_name, str) or not resolved_config_name:
-        raise ValueError(f"Loaded Hugging Face dataset has invalid config name {resolved_config_name!r}")
-    if requested_config_name is not None and resolved_config_name != requested_config_name:
-        raise ValueError(
-            f"Requested Hugging Face dataset config {requested_config_name!r}, but load_dataset selected "
-            f"{resolved_config_name!r}"
-        )
     return resolved_config_name
 
 

@@ -223,29 +223,6 @@ def test_dataloader_rng_is_global_state_independent_and_resume_is_exact(tmp_path
     assert torch.equal(torch.get_rng_state(), global_state)
 
 
-@pytest.mark.parametrize(
-    ("model_name", "model_revision", "message"),
-    [
-        ("Qwen/another-model", MODEL_REVISION, "model_name"),
-        (MODEL_NAME, "a" * 40, "model_revision"),
-    ],
-)
-def test_dataloader_rejects_cache_from_different_model(
-    tmp_path: Path,
-    model_name: str,
-    model_revision: str,
-    message: str,
-) -> None:
-    _write_cache(tmp_path, [_make_payload(0)])
-
-    with pytest.raises(ValueError, match=message):
-        ImageEditDataloaderConfig(
-            cache_dir=str(tmp_path),
-            expected_model_name=model_name,
-            expected_model_revision=model_revision,
-        ).build(dp_rank=0, dp_world_size=1, batch_size=1)
-
-
 def test_dataset_falls_back_to_spatial_and_sequence_token_lengths(tmp_path: Path) -> None:
     payload = _make_payload(
         0,

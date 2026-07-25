@@ -13,29 +13,13 @@
 # limitations under the License.
 
 import random
-from dataclasses import dataclass, field
-from types import TracebackType
-from typing import Any
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 
 
-def _ranked_seed(seed: int, ranked: bool) -> int:
-    """Return the process-local seed used by ranked RNG streams."""
-    if not ranked:
-        return seed
-    try:
-        import torch.distributed as dist
-
-        if dist.is_initialized():
-            return seed + dist.get_rank()
-    except ImportError:
-        pass
-    return seed
-
-
-def init_all_rng(seed: int, ranked: bool = False) -> None:
+def init_all_rng(seed: int, ranked: bool = False):
     """Initialize RNGs for Python, NumPy, and PyTorch (incl. CUDA) with a seed.
 
     Args:
@@ -45,7 +29,15 @@ def init_all_rng(seed: int, ranked: bool = False) -> None:
     assert isinstance(seed, int) and seed >= 0, ("Seed must be a non-negative integer", seed)
     assert isinstance(ranked, bool), "Ranked must be a boolean"
 
-    seed = _ranked_seed(seed, ranked)
+    if ranked:
+        # Example: use PyTorch's distributed rank if available
+        try:
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                seed += dist.get_rank()
+        except ImportError:
+            pass
 
     random.seed(seed)
     np.random.seed(seed)
@@ -59,13 +51,12 @@ class RNGState:
     """Snapshot of Python, NumPy, Torch, and CUDA RNG states."""
 
     random_rng_state: tuple
-    np_rng_state: tuple | dict[str, Any]
+    np_rng_state: tuple
     torch_rng_state: torch.Tensor
-    cuda_rng_state: list[torch.Tensor]
-    generator_states: dict[str, torch.Tensor] = field(default_factory=dict)
+    cuda_rng_state: torch.Tensor
 
 
-def _get_rng_state() -> RNGState:
+def _get_rng_state():
     """Get current RNG states.
 
     Returns:
@@ -79,7 +70,7 @@ def _get_rng_state() -> RNGState:
     )
 
 
-def _restore_rng_state(state: RNGState) -> None:
+def _restore_rng_state(state):
     """Restore RNG states from a saved state.
 
     Args:
@@ -95,7 +86,7 @@ class StatefulRNG:
     """
     RNG manager for reproducible RNG states across random, NumPy, and PyTorch."""
 
-    def __init__(self, seed: int, ranked: bool = False) -> None:
+    def __init__(self, seed: int, ranked: bool = False):
         """Initialize and optionally rank-adjust RNGs with a given seed.
 
         Args:
@@ -104,93 +95,47 @@ class StatefulRNG:
         """
         self.seed = seed
         self.ranked = ranked
-        self._effective_seed = _ranked_seed(seed, ranked)
-        self._generators: dict[str, torch.Generator] = {}
-        self._pending_generator_states: dict[str, torch.Tensor] = {}
         init_all_rng(self.seed, self.ranked)
 
-    def generator(self, device: torch.device | str = "cpu") -> torch.Generator:
-        """Return a checkpointable process-local generator for ``device``.
-
-        Args:
-            device: Device on which random tensors will be sampled.
-
-        Returns:
-            Rank-local generator whose state is included in ``state_dict()``.
-        """
-        resolved_device = torch.device(device)
-        key = str(resolved_device)
-        if key not in self._generators:
-            generator = torch.Generator(device=resolved_device)
-            generator.manual_seed(self._effective_seed)
-            pending_state = self._pending_generator_states.pop(key, None)
-            if pending_state is not None:
-                generator.set_state(pending_state)
-            self._generators[key] = generator
-        return self._generators[key]
-
-    def state_dict(self) -> RNGState:
+    def state_dict(self):
         """Get current RNG states.
 
         Returns:
-            RNG snapshot containing the Python and NumPy states, the CPU Torch
-            uint8 state tensor of shape ``[cpu_state_bytes]``, one CUDA uint8
-            state tensor of shape ``[cuda_state_bytes]`` per device, and any
-            explicit generator uint8 state tensors of shape
-            ``[generator_state_bytes]`` keyed by device.
+            dict: RNG states for random, NumPy, and PyTorch.
         """
-        state = _get_rng_state()
-        state.generator_states = {
-            key: generator.get_state() for key, generator in self._generators.items()
-        } | self._pending_generator_states
-        return state
+        return _get_rng_state()
 
-    def load_state_dict(self, state: RNGState) -> None:
+    def load_state_dict(self, state):  # pragma: no cover
         """Restore RNG states from a saved state.
 
         Args:
-            state: RNG snapshot returned by ``state_dict()``. Torch CPU, CUDA,
-                and explicit generator state tensors are uint8 tensors of shape
-                ``[cpu_state_bytes]``, ``[cuda_state_bytes]``, and
-                ``[generator_state_bytes]``, respectively.
+            state (dict): RNG states as returned by state_dict().
         """
         _restore_rng_state(state)
-        generator_states = dict(getattr(state, "generator_states", {}))
-        for key, generator in self._generators.items():
-            generator_state = generator_states.pop(key, None)
-            if generator_state is not None:
-                generator.set_state(generator_state)
-        self._pending_generator_states = generator_states
 
 
 class ScopedRNG:
     """Context manager for reproducible RNG states across random, NumPy, and PyTorch."""
 
-    def __init__(self, seed: int = 95050, ranked: bool = False) -> None:
+    def __init__(self, seed: int = 95050, ranked: bool = False):
         """Initialize and optionally rank-adjust RNGs with a given seed.
 
         Args:
             seed (int): Base seed for RNGs.
             ranked (bool): Adjust seed based on process rank.
         """
-        self._saved_state: RNGState | None = None
+        self._saved_state = None
         self.seed = seed
         self.ranked = ranked
 
-    def __enter__(self) -> "ScopedRNG":
+    def __enter__(self):
         """Save current RNG states."""
         assert self._saved_state is None
         self._saved_state = _get_rng_state()
         init_all_rng(self.seed, self.ranked)
         return self
 
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
+    def __exit__(self, exc_type, exc_value, traceback):
         """Restore RNG states on context exit."""
-        assert self._saved_state is not None
         _restore_rng_state(self._saved_state)
         self._saved_state = None

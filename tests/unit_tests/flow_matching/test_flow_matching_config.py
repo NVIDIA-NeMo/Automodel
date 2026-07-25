@@ -73,5 +73,3 @@ def test_qwen_image_edit_recipe_uses_canonical_typed_targets():
     assert config.flow_matching.adapter_type is None
     assert type(config.flow_matching.build_adapter()).__name__ == "QwenImageEditAdapter"
     assert type(config.diffusion_dataloader).__name__ == "ImageEditDataloaderConfig"
-    assert config.diffusion_dataloader.expected_model_name == "Qwen/Qwen-Image-Edit-2511"
-    assert config.diffusion_dataloader.expected_model_revision == "6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9"
