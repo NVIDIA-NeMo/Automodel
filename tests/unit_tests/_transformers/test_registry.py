@@ -482,8 +482,9 @@ def test_minimax_m3_vl_config_overrides_transformers_builtin():
     names as ours). The skip-if-built-in registration then handed the native
     config to our custom MiniMaxM3SparseForConditionalGeneration, whose vision
     encoder reads ``config.rope_theta`` that the native vision config does not
-    carry -> AttributeError at model init. ``_CUSTOM_CONFIG_OVERRIDES_BUILTIN``
-    forces our config class for such model_types.
+    carry -> AttributeError at model init. Automodel now prefers registered
+    local config classes by default; only model_types in ``_KEEP_BUILTIN_CONFIG``
+    opt out to the transformers-native config.
     """
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
