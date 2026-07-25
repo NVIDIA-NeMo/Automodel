@@ -52,7 +52,7 @@ distributed:
     scale_grads_in_schedule: false
     patch_inner_model: false
     patch_causal_lm_model: false
-    layers_per_stage: 2
+    layers_per_stage: 12
   moe:
     reshard_after_forward: false
     wrap_outer_model: false
