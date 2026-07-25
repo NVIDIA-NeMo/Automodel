@@ -88,32 +88,40 @@ class HFMSDTargetModel:
     def generate_batch(
         self,
         *,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         model_inputs: dict[str, torch.Tensor],
     ) -> MSDTargetBatch:
         """Run a VLM and construct shifted multimodal draft supervision.
 
+        ``input_ids`` and ``attention_mask`` are read from ``model_inputs`` rather
+        than taken separately, so the tensors the target actually runs on are the
+        same ones the image mask and the returned attention mask are derived from.
+        A second copy would misalign the draft's modality routing without raising.
+
         Args:
-            input_ids: Long tensor of shape [batch, sequence], with image-token
-                placeholders at positions that receive projected vision features.
-            attention_mask: Tensor of shape [batch, sequence], where one denotes
-                a real token and zero denotes padding.
             loss_mask: Bool tensor of shape [batch, sequence], already aligned to
                 next-token logits. VLM collators produce this from ``labels != -100``;
                 they emit ``labels[:, 1:]`` against ``input_ids[:, :-1]``, so no
                 further shift is applied here. Its final position is always
                 dropped because the shifted supervision tensors zero-fill there.
-            model_inputs: Mapping of VLM forward inputs. It includes ``input_ids``
-                and ``attention_mask`` plus any vision tensors such as
-                ``pixel_values`` and ``image_grid_thw``.
+            model_inputs: Mapping of VLM forward inputs. It must include
+                ``input_ids`` of shape [batch, sequence], with image-token
+                placeholders at positions that receive projected vision features,
+                and ``attention_mask`` of the same shape, where one denotes a real
+                token and zero denotes padding. It also carries any vision tensors
+                such as ``pixel_values`` and ``image_grid_thw``.
 
         Returns:
             MSDTargetBatch with shifted image-aware embeddings, target hidden
             states, target logits, and masks. Tensor layouts retain [batch,
             sequence, hidden] or [batch, sequence, vocab] as appropriate.
         """
+        missing = [key for key in ("input_ids", "attention_mask") if key not in model_inputs]
+        if missing:
+            raise ValueError(f"MSD requires {' and '.join(missing)} in model_inputs to align draft supervision.")
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+
         capture = _InputEmbeddingCapture()
         handle = self.language_backbone.register_forward_pre_hook(capture, with_kwargs=True)
         try:

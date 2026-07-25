@@ -310,7 +310,13 @@ class MSDTreeDraftGenerator:
                     )
                 )
 
-        leaf_indices = tuple(state.node_index for state in states)
+        # A leaf is any node the beam never extended, not just the final depth.
+        # Beam pruning abandons nodes mid-tree whenever the surviving candidates
+        # share a parent, and those nodes still occupy a tree-mask row, so the
+        # target computes their logits either way. Dropping them from retrieval
+        # would pay for that compute and then refuse to accept their path.
+        parent_indices = {node.parent_index for node in nodes}
+        leaf_indices = tuple(node.index for node in nodes if node.index not in parent_indices)
         layout = build_msd_tree_layout(nodes, leaf_indices, device=shifted_inputs_embeds.device)
         return MSDTreeProposal(
             root_token_id=root_token_id,
@@ -539,8 +545,6 @@ class MSDGreedyDecoder:
         if active_length < 2:
             raise ValueError(shape_error)
         target_batch = self.target.generate_batch(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
             loss_mask=torch.ones_like(input_ids, dtype=torch.bool),
             model_inputs=model_inputs,
         )

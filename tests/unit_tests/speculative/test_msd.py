@@ -266,8 +266,6 @@ def test_msd_target_captures_fused_image_embeddings_and_alignment() -> None:
     input_ids = torch.tensor([[1, 3, 2]])
     pixel_values = torch.full((1, 3, 2, 2), 5.0)
     batch = wrapper.generate_batch(
-        input_ids=input_ids,
-        attention_mask=torch.ones(1, 3),
         loss_mask=torch.tensor([[True, False, True]]),
         model_inputs={"input_ids": input_ids, "attention_mask": torch.ones(1, 3), "pixel_values": pixel_values},
     )
@@ -287,8 +285,6 @@ def test_msd_target_never_supervises_the_zero_filled_tail() -> None:
     input_ids = torch.tensor([[1, 3, 2]])
     loss_mask = torch.ones(1, 3, dtype=torch.bool)
     batch = wrapper.generate_batch(
-        input_ids=input_ids,
-        attention_mask=torch.ones(1, 3),
         loss_mask=loss_mask,
         model_inputs={
             "input_ids": input_ids,
@@ -302,14 +298,37 @@ def test_msd_target_never_supervises_the_zero_filled_tail() -> None:
     assert torch.equal(loss_mask, torch.ones(1, 3, dtype=torch.bool))
 
 
+def test_msd_target_derives_masks_from_the_forwarded_inputs() -> None:
+    """The image mask must come from the tensors the target actually ran on."""
+    model = _TinyVLM()
+    wrapper = HFMSDTargetModel(model)
+    input_ids = torch.tensor([[1, 3, 2]])
+    batch = wrapper.generate_batch(
+        loss_mask=torch.ones(1, 3, dtype=torch.bool),
+        model_inputs={
+            "input_ids": input_ids,
+            "attention_mask": torch.tensor([[1.0, 1.0, 0.0]]),
+            "pixel_values": torch.full((1, 3, 2, 2), 5.0),
+        },
+    )
+
+    # Image token 3 sits at position 1, so the shifted mask marks position 0.
+    assert torch.equal(batch.image_mask, torch.tensor([[True, False, False]]))
+    assert torch.equal(batch.attention_mask, torch.tensor([[1.0, 1.0, 0.0]]))
+
+    with pytest.raises(ValueError, match="attention_mask in model_inputs"):
+        wrapper.generate_batch(
+            loss_mask=torch.ones(1, 3, dtype=torch.bool),
+            model_inputs={"input_ids": input_ids},
+        )
+
+
 def test_msd_target_captures_embeddings_from_nested_language_backbone() -> None:
     """The target wrapper supports VLMs that expose ``model.language_model``."""
     model = _NestedTinyVLM()
     wrapper = HFMSDTargetModel(model)
     input_ids = torch.tensor([[1, 3, 2]])
     batch = wrapper.generate_batch(
-        input_ids=input_ids,
-        attention_mask=torch.ones(1, 3),
         loss_mask=torch.ones(1, 3, dtype=torch.bool),
         model_inputs={
             "input_ids": input_ids,

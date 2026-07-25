@@ -240,9 +240,16 @@ def test_msd_tree_generator_recursively_expands_and_prunes_feature_paths() -> No
     )
 
     assert len(proposal.nodes) == 4
-    assert len(proposal.leaf_indices) == 2
-    assert all(len(path) == 3 for path in proposal.candidate_paths())
     assert all(path[0] == 2 for path in proposal.candidate_paths())
+
+    # Both depth-2 nodes descend from node 1, so beam pruning abandoned node 2
+    # mid-tree. It is still a candidate continuation and must be verifiable.
+    parent_indices = {node.parent_index for node in proposal.nodes}
+    assert parent_indices == {0, 1}
+    assert proposal.leaf_indices == (2, 3, 4)
+    assert sorted(len(path) for path in proposal.candidate_paths()) == [2, 3, 3]
+    # Shorter paths are right-padded with -1 so retrieval stays rectangular.
+    assert proposal.layout.retrieve_indices[0].tolist() == [0, 2, -1]
 
 
 def test_msd_tree_generator_keeps_indices_dense_after_beam_pruning() -> None:
@@ -354,8 +361,8 @@ class _TinyDecodeTarget:
 
     def generate_batch(self, **kwargs):
         """Return a minimal MSD target batch aligned to input ids."""
-        input_ids = kwargs["input_ids"]
-        attention_mask = kwargs["attention_mask"]
+        input_ids = kwargs["model_inputs"]["input_ids"]
+        attention_mask = kwargs["model_inputs"]["attention_mask"]
         embeddings = self.model.embeddings(input_ids)
         logits = self.model(
             input_ids=input_ids, attention_mask=attention_mask, return_dict=True, use_cache=False
