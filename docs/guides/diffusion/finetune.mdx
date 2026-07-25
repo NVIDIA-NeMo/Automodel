@@ -154,7 +154,8 @@ step_scheduler:
   local_batch_size: 1        # Per-GPU batch size (gradient accumulation = global/local/num_gpus)
   ckpt_every_steps: 1000     # Checkpoint frequency
   num_epochs: 100
-  log_every: 2               # Log metrics every N steps
+  log_remote_every_steps: 2  # Log metrics every N steps
+  save_checkpoint_every_epoch: false
 
 # Data: uses pre-encoded .meta files
 data:
@@ -169,11 +170,11 @@ data:
     num_workers: 0
 
 # Optimizer
-optim:
-  learning_rate: 5e-6
-  optimizer:
-    weight_decay: 0.01
-    betas: [0.9, 0.999]
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 5e-6
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
 
 # Learning rate scheduler
 lr_scheduler:
@@ -222,7 +223,7 @@ checkpoint:
 | `model` | Yes | Set `pretrained_model_name_or_path` to the Hugging Face model ID. Set `mode: finetune`. |
 | `step_scheduler` | Yes | `global_batch_size` is the effective batch size across all GPUs. `ckpt_every_steps` controls checkpoint frequency. |
 | `data` | Yes | Set `cache_dir` to the path containing your preprocessed `.meta` files. Change `model_type` and `_target_` for different models (see [Model-Specific Notes](#model-specific-notes)). |
-| `optim` | Yes | `learning_rate: 5e-6` is a good default for fine-tuning. |
+| `optimizer` | Yes | `_target_` selects the optimizer class; `lr: 5e-6` is a good default for fine-tuning. |
 | `flow_matching` | Yes | `adapter_type` must match the model (`simple` for Wan, `flux` for FLUX, `hunyuan` for HunyuanVideo). |
 | `fsdp` | Yes | Set `dp_size` to the number of GPUs on your node. |
 | `checkpoint` | Recommended | Set `checkpoint_dir` to a persistent path, especially in Docker. |

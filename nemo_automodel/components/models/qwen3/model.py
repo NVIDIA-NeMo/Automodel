@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,34 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Custom Qwen2 model implementation for NeMo Automodel.
-
-This module provides a self-contained Qwen2 implementation with separate
-HuggingFace-style q/k/v and gate/up projections.
-
-Example (YAML):
-
-```yaml
-model:
-  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: Qwen/Qwen2.5-7B
-```
-"""
+"""Dense Qwen3 implementation with packed THD context parallelism."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Union
 
 import torch
 import torch.nn as nn
-from transformers import Qwen2Config
+from transformers import Qwen3Config
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.generation import GenerationMixin
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.models.qwen2.modeling_qwen2 import eager_attention_forward
+from transformers.modeling_utils import PreTrainedModel
+from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3Attention as HFQwen3Attention,
+)
+from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3DecoderLayer as HFQwen3DecoderLayer,
+)
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 
@@ -48,69 +41,32 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
-from nemo_automodel.components.models.common import (
-    BackendConfig,
-    compute_lm_head_logits,
-    initialize_rms_norm_module,
-)
+from nemo_automodel.components.models.common import BackendConfig, compute_lm_head_logits
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
-from nemo_automodel.components.models.common.tie_word_embeddings import (
-    TieSupport,
-    reject_unsupported_tie_word_embeddings,
-)
-from nemo_automodel.components.models.deprecation import warn_deprecated_model_class
-
-# Use shared rope_utils (same implementation as Llama, supports both config formats)
+from nemo_automodel.components.models.common.tie_word_embeddings import TieSupport
+from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.llama.rope_utils import (
     Qwen2RotaryEmbedding,
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_fused,
-    apply_rotary_pos_emb_quack,
 )
-from nemo_automodel.components.models.qwen2.state_dict_adapter import Qwen2StateDictAdapter
-from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator, safe_import_from
+from nemo_automodel.components.models.qwen3.state_dict_adapter import Qwen3StateDictAdapter
+from nemo_automodel.shared.import_utils import get_check_model_inputs_decorator
 
-__all__ = ["Qwen2ForCausalLM"]
+__all__ = ["Qwen3ForCausalLM"]
 
 check_model_inputs = get_check_model_inputs_decorator()
 
 
-class Qwen2Attention(nn.Module):
-    """Multi-headed attention with separate QKV projections — HuggingFace default layout."""
+class Qwen3Attention(HFQwen3Attention):
+    """HuggingFace Qwen3 attention extended with a packed THD TE path."""
 
-    def __init__(self, config: Qwen2Config, layer_idx: int, backend: Optional["BackendConfig"] = None):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
-        self.is_causal = True
-        self.backend = backend or BackendConfig()
-        self.rope_fusion = self.backend.rope_fusion
-        self.rope_backend = self.backend.rope
-        self._quack_apply_rotary_emb = None
-        if self.rope_backend == "quack":
-            available, apply_rotary_emb = safe_import_from(
-                "quack.rotary",
-                "apply_rotary_emb",
-                msg="rope='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].",
-            )
-            if not available:
-                raise ImportError("rope='quack' requires the 'quack-kernels' package. Install nemo-automodel[cuda].")
-            self._quack_apply_rotary_emb = apply_rotary_emb
-
-        # Separate projections -- same layout as HuggingFace default Qwen2
-        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
-
-        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
-        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
-        if self.backend.attn == "te":
-            # BSHD continues through the HuggingFace attention interface; this
-            # module is selected only for packed THD batches.
+    def __init__(self, config: Qwen3Config, layer_idx: int, backend: BackendConfig) -> None:
+        super().__init__(config=config, layer_idx=layer_idx)
+        self.backend = backend
+        self.rope_fusion = backend.rope_fusion
+        if backend.attn == "te":
+            # Ordinary BSHD inputs retain the HuggingFace attention interface.
             self._te_thd_only = True
             self.attn_module, self.attn_func = initialize_attn_module_and_func(
                 attn_impl="te",
@@ -125,13 +81,12 @@ class Qwen2Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run Qwen2 attention over padded BSHD or packed THD states.
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run Qwen3 attention over padded BSHD or packed THD states.
 
         Args:
             hidden_states: Hidden states ``[B, S, H]`` or packed local states
@@ -143,7 +98,6 @@ class Qwen2Attention(nn.Module):
             attention_mask: Padded attention mask for BSHD; THD uses cumulative
                 document lengths from ``kwargs``.
             past_key_values: Optional BSHD KV cache; unsupported for THD.
-            cache_position: Optional BSHD cache positions ``[S]``.
             **kwargs: THD requires ``qkv_format='thd'`` and ``cu_seqlens``
                 ``[N + 1]``; CP additionally supplies ``cp_size`` and ``cp_rank``.
 
@@ -152,241 +106,123 @@ class Qwen2Attention(nn.Module):
             attention weights. THD returns ``None`` for the weights.
         """
         is_thd = kwargs.get("qkv_format") == "thd"
-        if is_thd and hidden_states.ndim != 2:
-            raise ValueError(f"THD attention requires hidden_states [T, H], got {tuple(hidden_states.shape)}.")
-
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
-
-        if is_thd:
-            query_states = q.view(hidden_shape)
-            key_states = k.view(hidden_states.shape[0], -1, self.head_dim)
-            value_states = v.view(hidden_states.shape[0], -1, self.head_dim)
-        else:
-            query_states = q.view(hidden_shape).transpose(1, 2)
-            key_states = k.view(*input_shape, -1, self.head_dim).transpose(1, 2)
-            value_states = v.view(*input_shape, -1, self.head_dim).transpose(1, 2)
-
-        if self.rope_backend == "quack" and query_states.is_cuda:
-            cos, sin = position_embeddings[:2]
-            query_states, key_states = apply_rotary_pos_emb_quack(
-                query_states,
-                key_states,
-                cos,
-                sin,
-                self._quack_apply_rotary_emb,
+        if not is_thd:
+            return super().forward(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings[:2],
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                **kwargs,
             )
-        elif self.rope_fusion and len(position_embeddings) == 3:
-            cos, sin, freqs_cis = position_embeddings
+        if hidden_states.ndim != 2:
+            raise ValueError(f"THD attention requires hidden_states [T, H], got {tuple(hidden_states.shape)}.")
+        if past_key_values is not None:
+            raise ValueError("Packed THD attention does not support past_key_values.")
+        attn_module = getattr(self, "attn_module", None)
+        if attn_module is None:
+            raise ValueError("Packed THD attention requires backend.attn='te'.")
+
+        token_count = hidden_states.shape[0]
+        query_states = self.q_norm(self.q_proj(hidden_states).view(token_count, -1, self.head_dim))
+        key_states = self.k_norm(self.k_proj(hidden_states).view(token_count, -1, self.head_dim))
+        value_states = self.v_proj(hidden_states).view(token_count, -1, self.head_dim)
+
+        if self.rope_fusion and len(position_embeddings) == 3:
             query_states, key_states = apply_rotary_pos_emb_fused(
                 query_states,
                 key_states,
-                freqs_cis,
+                position_embeddings[2],
                 cu_seqlens=kwargs.get("cu_seqlens"),
                 cp_size=kwargs.get("cp_size", 1),
                 cp_rank=kwargs.get("cp_rank", 0),
             )
         else:
-            cos, sin = position_embeddings[:2]
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if is_thd:
-            if past_key_values is not None:
-                raise ValueError("Packed THD attention does not support past_key_values.")
-            attn_module = getattr(self, "attn_module", None)
-            if attn_module is None:
-                raise ValueError("Packed THD attention requires backend.attn='te'.")
-            window_size = (-1, 0) if self.sliding_window is None else (self.sliding_window - 1, 0)
-            query_states, key_states, value_states, te_kwargs = preprocess_args_and_kwargs_for_attn(
+            query_states, key_states = apply_rotary_pos_emb(
                 query_states,
                 key_states,
-                value_states,
-                attention_mask,
-                "te",
-                window_size=window_size,
-                **kwargs,
+                position_embeddings[0],
+                position_embeddings[1],
             )
-            attn_output = attn_module(query_states, key_states, value_states, **te_kwargs)
-            attn_output = postprocess_output_for_attn(attn_output, "te")
-            return self.o_proj(attn_output.flatten(1)), None
 
-        if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        # Select attention interface based on config
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
+        window_size = (-1, 0) if self.sliding_window is None else (self.sliding_window - 1, 0)
+        query_states, key_states, value_states, te_kwargs = preprocess_args_and_kwargs_for_attn(
             query_states,
             key_states,
             value_states,
             attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # Qwen2 feature
+            "te",
+            window_size=window_size,
             **kwargs,
         )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
-
-
-class Qwen2SeparateMLP(nn.Module):
-    """SwiGLU MLP with separate gate_proj and up_proj -- identical to HuggingFace default."""
-
-    def __init__(self, config: Qwen2Config):
-        super().__init__()
-        from transformers.activations import ACT2FN
-
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        mlp_bias = getattr(config, "mlp_bias", False)
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=mlp_bias)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        attn_output = attn_module(query_states, key_states, value_states, **te_kwargs)
+        attn_output = postprocess_output_for_attn(attn_output, "te")
+        return self.o_proj(attn_output.flatten(1)), None
 
 
-class Qwen2DecoderLayer(GradientCheckpointingLayer):
-    """Single Qwen2 decoder layer with RMSNorm, attention, and MLP."""
+class Qwen3DecoderLayer(HFQwen3DecoderLayer):
+    """Qwen3 decoder layer using the packed-aware attention implementation."""
 
-    def __init__(
-        self,
-        config: Qwen2Config,
-        layer_idx: int,
-        backend: BackendConfig,
-    ):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-
-        self.self_attn = Qwen2Attention(config=config, layer_idx=layer_idx, backend=backend)
-
-        self.mlp = Qwen2SeparateMLP(config=config)
-
-        self.input_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
-        )
-        self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
-        )
+    def __init__(self, config: Qwen3Config, layer_idx: int, backend: BackendConfig) -> None:
+        super().__init__(config=config, layer_idx=layer_idx)
+        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx, backend=backend)
         self.attention_type = config.layer_types[layer_idx]
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
 
-        # Self Attention
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
+class Qwen3PreTrainedModel(PreTrainedModel):
+    """Base class for the dense Qwen3 implementation."""
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
-
-
-class Qwen2PreTrainedModel(PreTrainedModel):
-    """Abstract class for Qwen2 pretrained models."""
-
-    config_class = Qwen2Config
+    config_class = Qwen3Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["Qwen2DecoderLayer"]
+    _no_split_modules = ["Qwen3DecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
     _supports_flex_attn = True
-
     _can_compile_fullgraph = True
     _supports_attention_backend = True
     _can_record_outputs = {
-        "hidden_states": Qwen2DecoderLayer,
-        "attentions": Qwen2Attention,
+        "hidden_states": Qwen3DecoderLayer,
+        "attentions": Qwen3Attention,
     }
 
 
-class Qwen2Model(Qwen2PreTrainedModel):
-    """Qwen2 transformer model (embeddings + decoder layers + norm)."""
+class Qwen3Model(Qwen3PreTrainedModel):
+    """Dense Qwen3 decoder supporting padded BSHD and packed THD layouts."""
 
-    def __init__(
-        self,
-        config: Qwen2Config,
-        backend: BackendConfig,
-    ):
+    def __init__(self, config: Qwen3Config, backend: BackendConfig) -> None:
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [
-                Qwen2DecoderLayer(
-                    config=config,
-                    layer_idx=layer_idx,
-                    backend=backend,
-                )
-                for layer_idx in range(config.num_hidden_layers)
+                Qwen3DecoderLayer(config=config, layer_idx=idx, backend=backend)
+                for idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, device=None
-        )
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2RotaryEmbedding(config=config, rope_fusion=backend.rope_fusion)
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
-
-        # Initialize weights and apply final processing
         self.post_init()
 
     @check_model_inputs
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
-        """Run the Qwen2 decoder in padded BSHD or packed THD layout.
+        """Run the Qwen3 decoder in padded BSHD or packed THD layout.
 
         Args:
             input_ids: Token IDs ``[B, S]`` or packed local IDs ``[T]``.
@@ -416,7 +252,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -430,7 +265,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         if not is_thd and use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
-
         if not is_thd and cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
@@ -445,7 +279,6 @@ class Qwen2Model(Qwen2PreTrainedModel):
             else:
                 position_ids = cache_position.unsqueeze(0)
 
-        # Create masks (Qwen2 supports sliding window attention)
         if is_thd:
             causal_mask_mapping = {"full_attention": None, "sliding_attention": None}
         elif not isinstance(causal_mask_mapping := attention_mask, dict):
@@ -456,9 +289,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-            }
+            causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
             if self.has_sliding_layers:
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
@@ -469,9 +300,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             qkv_format="thd" if is_thd else "bshd",
             cp_size=kwargs.get("cp_size", 1),
         )
-
         all_hidden_states = () if output_hidden_states else None
-
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -489,18 +318,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-
         if not return_dict:
             return tuple(
-                v
-                for v in [
-                    hidden_states,
-                    past_key_values if use_cache else None,
-                    all_hidden_states,
-                ]
-                if v is not None
+                value
+                for value in [hidden_states, past_key_values if use_cache else None, all_hidden_states]
+                if value is not None
             )
-
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
@@ -509,16 +332,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
         )
 
 
-class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
-    """Qwen2 model with causal language modeling head.
-
-    Uses separate q/k/v and gate/up projections -- HuggingFace layout.
-    """
+class Qwen3ForCausalLM(HFCheckpointingMixin, Qwen3PreTrainedModel, GenerationMixin):
+    """Dense Qwen3 causal LM with packed THD context parallelism."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.BOTH
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _keep_in_fp32_modules = ["rotary_emb"]
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -529,73 +350,49 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         supports_pp: bool = True
         supports_ep: bool = False
 
-    def __init__(
-        self,
-        config: Qwen2Config,
-        backend: Optional[BackendConfig] = None,
-    ):
-        reject_unsupported_tie_word_embeddings(type(self), config)
-        warn_deprecated_model_class("Qwen2ForCausalLM")
+    def __init__(self, config: Qwen3Config, backend: BackendConfig | None = None) -> None:
         super().__init__(config)
         self.backend = backend or BackendConfig()
-        self.model = Qwen2Model(config=config, backend=self.backend)
+        self.model = Qwen3Model(config=config, backend=self.backend)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Create state_dict_adapter if enabled (needed to convert HF checkpoints)
         if self.backend.enable_hf_state_dict_adapter:
-            self.state_dict_adapter = Qwen2StateDictAdapter(config=self.config)
-
-        # Initialize weights and apply final processing
+            self.state_dict_adapter = Qwen3StateDictAdapter(config=self.config)
         self.post_init()
+        if config.dtype is not None:
+            cast_model_to_dtype(self, config.dtype)
 
-        # Tie weights if specified in config (standard for Qwen2/Llama)
-        # Must be done after post_init() to ensure embed_tokens is initialized
-        if getattr(config, "tie_word_embeddings", True):
-            self.tie_weights()
-
-        # Convert to configured dtype if specified
-        if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
-            self.to(dtype=config.torch_dtype)
-
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            print(f"[Qwen2ForCausalLM] Attention implementation: {self.config._attn_implementation}")
-            print(f"[Qwen2ForCausalLM] torch_dtype: {self.config.torch_dtype}")
-
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens
 
-    def set_input_embeddings(self, value):
+    def set_input_embeddings(self, value: nn.Module) -> None:
         self.model.embed_tokens = value
 
-    def get_output_embeddings(self):
+    def get_output_embeddings(self) -> nn.Module:
         return self.lm_head
 
-    def set_output_embeddings(self, new_embeddings):
+    def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
         self.lm_head = new_embeddings
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
-        # Transformers v5 does not reliably tie this custom model from the
-        # dict-shaped _tied_weights_keys alone; honor the config flag explicitly
-        # (mirrors LlamaForCausalLM).
         if getattr(self.config, "tie_word_embeddings", False):
             self.lm_head.weight = self.model.embed_tokens.weight
 
     @can_return_tuple
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         """Run causal LM projection for BSHD or packed THD inputs.
@@ -653,7 +450,6 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
                 labels = labels.squeeze(0)
             attention_mask = None
 
-        # Always use return_dict internally so we can reliably access fields.
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -667,10 +463,7 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
             cache_position=cache_position,
             **kwargs,
         )
-
-        hidden_states = outputs.last_hidden_state
-
-        logits = compute_lm_head_logits(self.lm_head, hidden_states, logits_to_keep, is_thd=is_thd).logits
+        logits = compute_lm_head_logits(self.lm_head, outputs.last_hidden_state, logits_to_keep, is_thd=is_thd).logits
 
         loss = None
         if labels is not None:
@@ -689,4 +482,4 @@ class Qwen2ForCausalLM(HFCheckpointingMixin, Qwen2PreTrainedModel):
         return out.to_tuple()
 
 
-ModelClass = Qwen2ForCausalLM
+ModelClass = Qwen3ForCausalLM

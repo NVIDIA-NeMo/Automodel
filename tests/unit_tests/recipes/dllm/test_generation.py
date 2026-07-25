@@ -15,6 +15,7 @@
 """Tests for the example dLLM generation entry point."""
 
 import sys
+import types
 from dataclasses import replace
 from pathlib import Path
 
@@ -24,7 +25,15 @@ import torch
 EXAMPLE_DIR = Path(__file__).resolve().parents[4] / "examples" / "dllm_generate"
 sys.path.insert(0, str(EXAMPLE_DIR))
 
-from generate import SAMPLERS, LLaDA2Sampler, encode_generation_prompts, generate_llada2, main  # noqa: E402
+from generate import (  # noqa: E402
+    SAMPLERS,
+    DiffusionGemmaSampler,
+    LLaDA2Sampler,
+    encode_generation_prompts,
+    generate_gemma,
+    generate_llada2,
+    main,
+)
 
 
 class _FakeLLaDA2(torch.nn.Module):
@@ -135,6 +144,65 @@ def test_llada2_infill_is_rejected_before_loading(monkeypatch, capsys):
         main()
 
     assert "--infill is not supported by the LLaDA2 generation path" in capsys.readouterr().err
+
+
+class _FakeGemma(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+        self.generate_calls = []
+
+    def generate(self, **kwargs):
+        self.generate_calls.append(kwargs)
+        prompt = kwargs["input_ids"]
+        generated = torch.tensor([[901, 902]], device=prompt.device)
+        return types.SimpleNamespace(sequences=torch.cat([prompt, generated], dim=1))
+
+
+def test_gemma_sampler_is_registered_with_hf_generation_defaults():
+    assert SAMPLERS["gemma"] is DiffusionGemmaSampler
+    config = DiffusionGemmaSampler.default_config
+    assert config.max_new_tokens == 256
+    assert config.steps == 48
+
+
+def test_generate_gemma_decodes_generated_only_tokens():
+    model = _FakeGemma()
+    tokenizer = _FakeTokenizer()
+    config = replace(DiffusionGemmaSampler.default_config, max_new_tokens=64, steps=12)
+
+    responses = generate_gemma(model, tokenizer, [[11, 12, 13], [21]], config, eos_id=1)
+
+    assert responses == ["decoded:[901, 902]", "decoded:[901, 902]"]
+    assert tokenizer.decode_calls == [([901, 902], True), ([901, 902], True)]
+    assert len(model.generate_calls) == 2
+    assert model.generate_calls[0]["input_ids"].tolist() == [[11, 12, 13]]
+    assert model.generate_calls[1]["input_ids"].tolist() == [[21]]
+    for call in model.generate_calls:
+        assert {key: value for key, value in call.items() if key != "input_ids"} == {
+            "max_new_tokens": 64,
+            "max_denoising_steps": 12,
+            "eos_token_id": 1,
+            "pad_token_id": 1,  # falls back to eos when the tokenizer has no pad token
+        }
+
+
+def test_generate_gemma_requires_eos_token_id():
+    with pytest.raises(ValueError, match="EOS token ID"):
+        generate_gemma(_FakeGemma(), _FakeTokenizer(), [[1]], DiffusionGemmaSampler.default_config, eos_id=None)
+
+
+def test_gemma_infill_is_rejected_before_loading(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["generate.py", "--checkpoint", "unused", "--prompt", "hello", "--sampler", "gemma", "--infill"],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        main()
+
+    assert "--infill is not supported by the DiffusionGemma generation path" in capsys.readouterr().err
 
 
 class _TinyProj(torch.nn.Module):

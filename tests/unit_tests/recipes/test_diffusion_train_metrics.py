@@ -28,7 +28,7 @@ from nemo_automodel.recipes.diffusion.train import (
     _calculate_throughput_metrics,
     _count_local_batch_group_samples,
     _get_diffusion_microbatch_size,
-    build_model_and_optimizer,
+    build_diffusion_pipeline,
 )
 
 
@@ -93,90 +93,6 @@ def test_calculate_throughput_metrics_clamps_invalid_inputs():
     assert metrics["samples_per_step"] == pytest.approx(0.0)
     assert metrics["log_window_steps"] == pytest.approx(0.0)
     assert metrics["log_window_samples"] == pytest.approx(0.0)
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        ("bf16", torch.bfloat16),
-        ("torch.float32", torch.float32),
-        ("unknown", "unknown"),
-        (0.125, 0.125),
-    ],
-)
-def test_normalize_optimizer_value_converts_dtype_aliases(value, expected):
-    assert diffusion_train._normalize_optimizer_value(value) == expected
-
-
-def test_resolve_optimizer_class_handles_default_callable_and_imported_targets(monkeypatch):
-    class CustomOptimizer:
-        pass
-
-    def fake_safe_import_from(module_name, symbol_name, msg):
-        assert module_name == "custom.optim"
-        assert symbol_name == "CustomOptimizer"
-        assert "custom.optim.CustomOptimizer" in msg
-        return True, CustomOptimizer
-
-    monkeypatch.setattr(diffusion_train, "safe_import_from", fake_safe_import_from)
-
-    assert diffusion_train._resolve_optimizer_class("torch.optim.AdamW") is torch.optim.AdamW
-    assert diffusion_train._resolve_optimizer_class(CustomOptimizer) is CustomOptimizer
-    assert diffusion_train._resolve_optimizer_class("custom.optim.CustomOptimizer") is CustomOptimizer
-
-
-@pytest.mark.parametrize("target", ["AdamW", object()])
-def test_resolve_optimizer_class_rejects_invalid_targets(target):
-    with pytest.raises(ValueError, match="Optimizer target must be"):
-        diffusion_train._resolve_optimizer_class(target)
-
-
-def test_resolve_optimizer_class_raises_when_import_fails(monkeypatch):
-    monkeypatch.setattr(diffusion_train, "safe_import_from", lambda *_args, **_kwargs: (False, None))
-
-    with pytest.raises(ImportError, match="could not be imported"):
-        diffusion_train._resolve_optimizer_class("missing.optim.CustomOptimizer")
-
-
-def test_filter_optimizer_kwargs_keeps_only_supported_parameters():
-    class OptimizerWithoutKwargs:
-        def __init__(self, params, lr=0.1, *, beta=0.9):
-            self.params = params
-            self.lr = lr
-            self.beta = beta
-
-    optimizer_kwargs = {"lr": 0.01, "beta": 0.95, "weight_decay": 0.1}
-
-    assert diffusion_train._filter_optimizer_kwargs(
-        "custom.OptimizerWithoutKwargs", OptimizerWithoutKwargs, optimizer_kwargs
-    ) == {"lr": 0.01, "beta": 0.95}
-
-
-def test_filter_optimizer_kwargs_passes_all_kwargs_when_target_accepts_var_kwargs():
-    class OptimizerWithKwargs:
-        def __init__(self, params, **kwargs):
-            self.params = params
-            self.kwargs = kwargs
-
-    optimizer_kwargs = {"lr": 0.01, "weight_decay": 0.1}
-
-    assert (
-        diffusion_train._filter_optimizer_kwargs("custom.OptimizerWithKwargs", OptimizerWithKwargs, optimizer_kwargs)
-        is optimizer_kwargs
-    )
-
-
-def test_filter_optimizer_kwargs_passes_all_kwargs_when_signature_cannot_be_inspected(monkeypatch):
-    optimizer_kwargs = {"lr": 0.01, "weight_decay": 0.1}
-
-    def raise_value_error(_target):
-        raise ValueError("no signature")
-
-    monkeypatch.setattr(diffusion_train.inspect, "signature", raise_value_error)
-
-    assert (
-        diffusion_train._filter_optimizer_kwargs("custom.NoSignature", object(), optimizer_kwargs) is optimizer_kwargs
-    )
 
 
 def test_build_transformer_engine_fp8_recipe_dispatches_recipe_names(monkeypatch):
@@ -301,27 +217,25 @@ def _minimal_diffusion_recipe_cfg(
     adapter_type="hunyuan",
     attention_backend="flash_varlen",
     optimize_hunyuan_flash_varlen_mask=True,
-    checkpoint=None,
 ):
-    cfg = {
-        "model": {
-            "pretrained_model_name_or_path": "dummy-model",
-            "attention_backend": attention_backend,
-            "optimize_hunyuan_flash_varlen_mask": optimize_hunyuan_flash_varlen_mask,
-        },
-        "flow_matching": {"adapter_type": adapter_type},
-        "optim": {"learning_rate": 1.0e-4},
-        "performance": {},
-        "step_scheduler": {
-            "num_epochs": 1,
-            "local_batch_size": 1,
-            "global_batch_size": 1,
-            "ckpt_every_steps": 1,
-        },
-    }
-    if checkpoint is not None:
-        cfg["checkpoint"] = checkpoint
-    return ConfigNode(cfg)
+    return ConfigNode(
+        {
+            "model": {
+                "pretrained_model_name_or_path": "dummy-model",
+                "attention_backend": attention_backend,
+                "optimize_hunyuan_flash_varlen_mask": optimize_hunyuan_flash_varlen_mask,
+            },
+            "flow_matching": {"adapter_type": adapter_type},
+            "optimizer": {"_target_": "torch.optim.AdamW", "lr": 1.0e-4},
+            "performance": {},
+            "step_scheduler": {
+                "num_epochs": 1,
+                "local_batch_size": 1,
+                "global_batch_size": 1,
+                "ckpt_every_steps": 1,
+            },
+        }
+    )
 
 
 def _patch_lightweight_diffusion_recipe_setup(monkeypatch):
@@ -348,8 +262,8 @@ def test_diffusion_recipe_validates_hunyuan_flash_varlen_mask_requirements(
     expected_error,
 ):
     _patch_lightweight_diffusion_recipe_setup(monkeypatch)
-    build_model_and_optimizer_mock = MagicMock()
-    monkeypatch.setattr(diffusion_train, "build_model_and_optimizer", build_model_and_optimizer_mock)
+    build_diffusion_pipeline_mock = MagicMock()
+    monkeypatch.setattr(diffusion_train, "build_diffusion_pipeline", build_diffusion_pipeline_mock)
 
     recipe = TrainDiffusionRecipe(
         _minimal_diffusion_recipe_cfg(adapter_type=adapter_type, attention_backend=attention_backend)
@@ -358,15 +272,15 @@ def test_diffusion_recipe_validates_hunyuan_flash_varlen_mask_requirements(
     with pytest.raises(ValueError, match=expected_error):
         recipe.setup()
 
-    build_model_and_optimizer_mock.assert_not_called()
+    build_diffusion_pipeline_mock.assert_not_called()
 
 
 def test_diffusion_recipe_raises_when_hunyuan_flash_varlen_mask_optimization_fails(monkeypatch):
     _patch_lightweight_diffusion_recipe_setup(monkeypatch)
     monkeypatch.setattr(
         diffusion_train,
-        "build_model_and_optimizer",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), object(), None)),
+        "build_diffusion_pipeline",
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
     )
 
     from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
@@ -386,8 +300,8 @@ def test_diffusion_recipe_enables_hunyuan_flash_varlen_mask_optimization_before_
     _patch_lightweight_diffusion_recipe_setup(monkeypatch)
     monkeypatch.setattr(
         diffusion_train,
-        "build_model_and_optimizer",
-        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), object(), None)),
+        "build_diffusion_pipeline",
+        MagicMock(return_value=(SimpleNamespace(transformer=nn.Linear(1, 1)), None)),
     )
 
     from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
@@ -401,41 +315,6 @@ def test_diffusion_recipe_enables_hunyuan_flash_varlen_mask_optimization_before_
         recipe.setup()
 
     enable_optimization.assert_called_once_with()
-
-
-def test_diffusion_recipe_forwards_consolidation_timeout(monkeypatch):
-    class StopAfterCheckpointConfig(Exception):
-        pass
-
-    _patch_lightweight_diffusion_recipe_setup(monkeypatch)
-    model = SimpleNamespace(transformer=nn.Linear(1, 1), state_dict=lambda: {"weight": torch.ones(1)})
-    monkeypatch.setattr(
-        diffusion_train,
-        "build_model_and_optimizer",
-        MagicMock(return_value=(model, object(), None)),
-    )
-
-    from nemo_automodel.components.flow_matching.adapters import hunyuan as hunyuan_module
-
-    monkeypatch.setattr(hunyuan_module, "enable_hunyuan_flash_varlen_mask_optimization", MagicMock(return_value=True))
-    checkpoint_config = MagicMock(side_effect=StopAfterCheckpointConfig)
-    monkeypatch.setattr(diffusion_train, "CheckpointingConfig", checkpoint_config)
-    recipe = TrainDiffusionRecipe(
-        _minimal_diffusion_recipe_cfg(
-            checkpoint={
-                "enabled": True,
-                "checkpoint_dir": "checkpoints",
-                "model_save_format": "safetensors",
-                "save_consolidated": "final",
-                "consolidation_timeout_minutes": 45,
-            }
-        )
-    )
-
-    with pytest.raises(StopAfterCheckpointConfig):
-        recipe.setup()
-
-    assert checkpoint_config.call_args.kwargs["consolidation_timeout_minutes"] == 45
 
 
 class _TinyTransformer(nn.Module):
@@ -545,7 +424,7 @@ def test_build_diffusion_parallel_manager_args_accepts_confignode_ddp_config():
     }
 
 
-def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(monkeypatch):
+def test_build_diffusion_pipeline_forwards_perf_options(monkeypatch):
     pipe = SimpleNamespace(transformer=_TinyTransformer())
     manager = SimpleNamespace(device_mesh="mesh")
     calls = {}
@@ -562,10 +441,9 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
     )
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
 
-    _, optimizer, device_mesh = build_model_and_optimizer(
+    built_pipe, device_mesh = build_diffusion_pipeline(
         model_id="dummy-model",
         finetune_mode=True,
-        learning_rate=0.125,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
         fsdp_cfg={
@@ -586,14 +464,6 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
         transformer_engine_fp8_safe_only=True,
         fuse_qkv_projections=True,
         compact_fused_qkv_projections=True,
-        optimizer_cfg={
-            "weight_decay": 0.25,
-            "betas": [0.8, 0.95],
-            "eps": 1e-7,
-            "amsgrad": True,
-            "foreach": False,
-            "maximize": True,
-        },
     )
 
     manager_args = calls["parallel_scheme"]["transformer"]
@@ -612,17 +482,11 @@ def test_build_model_and_optimizer_forwards_perf_options_and_optimizer_kwargs(mo
     assert calls["fuse_qkv_projections"] is True
     assert calls["compact_fused_qkv_projections"] is True
     assert pipe.transformer.attention_backend == "flash"
+    assert built_pipe is pipe
     assert device_mesh == "mesh"
-    assert optimizer.defaults["lr"] == pytest.approx(0.125)
-    assert optimizer.defaults["weight_decay"] == pytest.approx(0.25)
-    assert optimizer.defaults["betas"] == (0.8, 0.95)
-    assert optimizer.defaults["eps"] == pytest.approx(1e-7)
-    assert optimizer.defaults["amsgrad"] is True
-    assert optimizer.defaults["foreach"] is False
-    assert optimizer.defaults["maximize"] is True
 
 
-def test_build_model_and_optimizer_rejects_foreach_and_fused_together(monkeypatch):
+def test_build_diffusion_pipeline_raises_when_lora_params_missing(monkeypatch):
     pipe = SimpleNamespace(transformer=_TinyTransformer())
     manager = SimpleNamespace(device_mesh=None)
 
@@ -631,16 +495,17 @@ def test_build_model_and_optimizer_rejects_foreach_and_fused_together(monkeypatc
         "from_pretrained",
         staticmethod(lambda *_args, **_kwargs: (pipe, {"transformer": manager})),
     )
+    monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
 
-    with pytest.raises(ValueError, match="foreach=True and fused=True"):
-        build_model_and_optimizer(
+    with pytest.raises(RuntimeError, match="no LoRA params found"):
+        build_diffusion_pipeline(
             model_id="dummy-model",
             finetune_mode=True,
-            learning_rate=0.125,
             device=torch.device("cpu"),
             dtype=torch.bfloat16,
             fsdp_cfg={"dp_size": 1},
-            optimizer_cfg={"foreach": True, "fused": True},
+            peft_cfg=SimpleNamespace(dim=4, alpha=8),
+            model_type="wan",
         )
 
 
@@ -733,6 +598,7 @@ class _FakeStepScheduler:
         self.epochs = [0]
         self.dataloader = None
         self.is_ckpt_step = False
+        self.log_remote_every_steps = 1
         self._batch_group = batch_group
 
     def __iter__(self):
@@ -760,9 +626,9 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     monkeypatch.setattr(diffusion_train, "prepare_after_first_microbatch", MagicMock())
     monkeypatch.setattr(diffusion_train, "clip_grad_norm", MagicMock(return_value=torch.tensor(0.25)))
     monkeypatch.setattr(diffusion_train.torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(diffusion_train, "is_main_process", lambda: True)
     monkeypatch.setattr(diffusion_train.wandb, "run", None, raising=False)
 
+    recipe.dist_env = SimpleNamespace(is_main=True)
     recipe.global_batch_size = 5
     recipe.local_batch_size = 2
     recipe.num_nodes = 1
@@ -772,11 +638,13 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     recipe.sampler = SimpleNamespace(set_epoch=MagicMock())
     recipe.dataloader = [object()]
     recipe.step_scheduler = _FakeStepScheduler(batch_group)
-    recipe.optimizer = SimpleNamespace(
-        zero_grad=MagicMock(),
-        step=MagicMock(),
-        param_groups=[{"lr": 0.01}],
-    )
+    recipe.optimizer = [
+        SimpleNamespace(
+            zero_grad=MagicMock(),
+            step=MagicMock(),
+            param_groups=[{"lr": 0.01}],
+        )
+    ]
     recipe.lr_scheduler = [SimpleNamespace(step=MagicMock())]
     recipe.model = model
     recipe.device = torch.device("cpu")
@@ -786,7 +654,6 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     recipe.grad_clip_foreach = False
     recipe.transformer_engine_fp8 = False
     recipe.peft_cfg = None
-    recipe.log_every = 1
     recipe._elapsed_seconds_since = MagicMock(return_value=(2.0, 10.0))
     recipe._count_global_samples = MagicMock(return_value=5)
     recipe._get_memory_metrics = MagicMock(
@@ -814,8 +681,8 @@ def test_run_train_validation_loop_uses_hot_path_and_logs_perf_metrics(monkeypat
     diffusion_train.prepare_for_final_backward.assert_called_once_with([model], pp_enabled=False)
     diffusion_train.prepare_after_first_microbatch.assert_called_once()
     diffusion_train.clip_grad_norm.assert_called_once_with(0.5, [model], foreach=False)
-    recipe.optimizer.zero_grad.assert_called_once_with(set_to_none=True)
-    recipe.optimizer.step.assert_called_once()
+    recipe.optimizer[0].zero_grad.assert_called_once_with(set_to_none=True)
+    recipe.optimizer[0].step.assert_called_once()
     recipe.lr_scheduler[0].step.assert_called_once_with(1)
     recipe._count_global_samples.assert_called_once_with(5)
     recipe.save_checkpoint.assert_not_called()
