@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Hub kernel availability helpers."""
+"""Tests for Hub kernel config and attn resolution helpers."""
 
 import types
 

@@ -160,10 +160,9 @@ class BackendConfig:
 
     Attributes:
         attn: Attention backend ("te", "sdpa", "flex", "eager", "hub", or "tilelang").
-            ``hub`` uses kernels-community flash attention in native MLA/GQA
-            factories (see ``hub_kernels.attn_repo``). For HF-model paths prefer
-            ``attn_implementation="kernels-community/flash-attn2"`` or
-            ``use_kernels=True`` instead of sprinkling Hub backends on every field.
+            For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
+            indexer, and Sinkhorn kernels together. ``hub`` uses Hub flash attention
+            in native MLA/GQA factories (see ``hub_kernels``).
         linear: Linear layer backend ("torch", "te", or "quack").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently
@@ -198,9 +197,9 @@ class BackendConfig:
         compile_attn: torch.compile(fullgraph) the attention module's forward — both the
             DeepSeek-V3 MLA and standard GQA attention (e.g. Qwen3-MoE) honor it. Requires
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
-        hub_kernels: Optional Hub kernel settings for native attention repo
-            selection. Layer replacements should use ``use_kernels=True`` on
-            ``NeMoAutoModel`` rather than duplicating Hub loading in linear/rms_norm.
+        hub_kernels: Optional Hub kernel repo settings for native ``attn="hub"``.
+            HF models should set ``attn_implementation`` and ``use_kernels`` on
+            ``NeMoAutoModel`` instead.
     """
 
     attn: Literal["te", "sdpa", "flex", "eager", "hub", "tilelang"] = (

@@ -55,60 +55,35 @@ kernels download
 
 ### AutoModel wrapper (this branch)
 
-A thin spike module wraps the upstream API without replacing existing call sites yet:
-
 - `nemo_automodel/components/kernels/hub.py` — `get_hub_kernel()`, `has_hub_kernel()`, `get_flash_attn_varlen_func()`, `has_flash_attn_available()`
-- Unit tests: `tests/unit_tests/components/kernels/test_hub.py`
+- `nemo_automodel/components/kernels/config.py` — `HubKernelConfig` for native `backend.attn="hub"`
+- Unit tests: `tests/unit_tests/components/kernels/`
 
-Phase 2 migrated blockdiag CP varlen to `get_flash_attn_varlen_func()`. Remaining direct-import sites: KimiVL, BAGEL, EAGLE ring attention.
+Blockdiag CP varlen uses `get_flash_attn_varlen_func()`. Remaining direct-import sites: KimiVL, BAGEL, EAGLE ring attention.
 
 ---
 
 ## Design: Why Not Copy the QuACK Backend Pattern?
 
-QuACK integration adds `"quack"` to **every** `BackendConfig` field (`linear`, `rms_norm`, `rope`) and wires factory branches in `utils.py` plus `_apply_backend_module_overrides` in `model_init.py`. That pattern fits **pip-installed optional deps** where NeMo owns native model construction.
+QuACK adds `"quack"` to each `BackendConfig` field (`linear`, `rms_norm`, `rope`) and wires factory branches in `utils.py` plus `_apply_backend_module_overrides` in `model_init.py`. That fits pip optional deps where NeMo owns native model construction.
 
-Hub kernels are different:
+Hub kernels differ: Transformers already loads attention from Hub repo ids and replaces norms/MLP/linear via `use_kernels=True`. Duplicating that in NeMo factories would fight Transformers.
 
-| Concern | QuACK-style `"kernels"` on each field | Lean integration (implemented) |
+| Concern | QuACK-style on every field | Lean integration |
 |---|---|---|
-| HF-model RMSNorm/MLP/Linear | Duplicate Hub loading in NeMo factories | `use_kernels=True` → Transformers `kernelize` |
-| HF flash attention | Custom factory branch | `attn_implementation="kernels-community/flash-attn2"` (Transformers dispatch) |
-| Native MLA attention | N/A in QuACK | `backend.attn: hub` + `initialize_attn_module_and_func` |
+| HF RMSNorm / MLP / Linear | Duplicate Hub loading | `use_kernels=True` |
+| HF flash attention | Custom factory branch | `attn_implementation="kernels-community/flash-attn2"` |
+| Native MLA attention | N/A | `backend.attn: hub` |
 | Liger conflict | Separate pip path | `use_kernels=True` disables `_patch_liger_kernel` |
-| Config surface | Sprawl across 5+ backend fields | `use_kernels`, `kernel_config`, optional `HubKernelConfig` |
 
-**Rule of thumb:** use Transformers passthrough for anything `hub_kernels.kernelize` already replaces; use NeMo helpers only where Transformers does not run (blockdiag varlen, native MLA `attn: hub`).
+Example recipes (see `examples/llm_benchmark/qwen/`):
 
-Example recipes:
+- `qwen2_5_7b_hub_kernels.yaml` — Hub flash-attn2 attention only
+- `qwen2_5_7b_hub_kernels_layers.yaml` — Hub flash-attn2 plus `use_kernels` layer replacements
 
-- `examples/llm_benchmark/qwen/qwen2_5_7b_hub_kernels.yaml` — Hub FA2 attention only (no `use_kernels`)
-- `examples/llm_benchmark/qwen/qwen2_5_7b_hub_kernels_layers.yaml` — Hub FA2 + Hub layer kernels (`use_kernels=true`)
+Install: `uv sync --extra hub_kernels`
 
-Optional extra: `uv sync --extra hub_kernels`
-
-### Attention vs layer kernels (orthogonal flags)
-
-Transformers treats these as **separate** code paths:
-
-| Setting | Scope | Required when |
-|---|---|---|
-| `attn_implementation: kernels-community/flash-attn2` | Attention only (`load_and_register_attn_kernel`) | You want Hub flash attention |
-| `attn_implementation: flash_attention_2` | Attention; falls back to Hub FA2 when pip `flash-attn` absent | Shorthand for Hub-or-pip FA2 |
-| `use_kernels: true` | RMSNorm, MLP, Linear, activations, RoPE, fused CE, … (`kernelize`) | You want Hub replacements for **non-attention** layers |
-| `use_liger_kernel: true` (default) | Same layer types via **pip** `liger_kernel` | Default AutoModel path; disable when `use_kernels=true` |
-
-**You do not need `use_kernels` when `attn_implementation` is already a Hub repo id** — unless you also want Hub layer kernels instead of torch or pip Liger.
-
-```yaml
-# Attention only — sufficient for Hub FA2
-attn_implementation: kernels-community/flash-attn2
-
-# Full Hub stack — both flags, disable pip Liger to avoid double patch
-attn_implementation: kernels-community/flash-attn2
-use_kernels: true
-use_liger_kernel: false
-```
+`attn_implementation` and `use_kernels` are independent. A Hub repo id on `attn_implementation` selects the attention backend only; add `use_kernels: true` (and `use_liger_kernel: false`) when non-attention layers should also come from Hub.
 
 ---
 
@@ -127,25 +102,26 @@ Transformers 5.x extends this with:
 
 | File | What it does today |
 |---|---|
-| `kernel_patches.py` | Direct `safe_import("flash_attn")`; FA2/FA3/FA4 detection; fallback ladder; Liger patching via `liger_kernel.transformers`; SDPA patching |
+| `kernel_patches.py` | FA2/FA3/FA4 and Hub availability; fallback ladder; Liger and SDPA patching |
 | `auto_model.py` | Passes `attn_implementation`; forwards `use_kernels` / `kernel_config`; skips Liger when `use_kernels=true` |
 
 Default attention selection (`kernel_patches.py`):
 
 ```python
-DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if HAS_FA else "sdpa"
+DEFAULT_ATTN_IMPLEMENTATION = "flash_attention_2" if has_flash_attn_available() else "sdpa"
 ```
 
-Availability is gated on **compiled package presence**, not Hub kernel availability.
+`has_flash_attn_available()` checks compiled `flash-attn` first, then Hub FA2/3/4.
 
 ### 2. Native model path (`BackendConfig`)
 
-NeMo-native models use `BackendConfig` (`components/models/common/utils.py`) with explicit backends:
+NeMo-native models use `BackendConfig` (`components/models/common/utils.py`):
 
-- `attn`: `te | sdpa | flex | eager | tilelang`
+- `attn`: `te | sdpa | flex | eager | hub | tilelang`
+- `hub_kernels`: optional repo settings when `attn="hub"`
 - `linear`, `rms_norm`, `experts`, `dispatcher`, …
 
-This path is **orthogonal** to the HF Hub-kernel system and does not use `kernels` today.
+HF `attn_implementation` and `use_kernels` apply to the transformers load path, not native factories.
 
 ### 3. Direct `flash_attn` imports (bypass transformers)
 
@@ -153,7 +129,7 @@ These call `flash_attn` APIs directly and would **not** benefit from transformer
 
 | Location | Usage |
 |---|---|
-| `components/distributed/blockdiag_cp/kernels.py` | `flash_attn_varlen_func` for CP varlen attention |
+| `components/distributed/blockdiag_cp/kernels.py` | `get_flash_attn_varlen_func()` (Hub-aware) |
 | `components/speculative/eagle/ring_attention.py` | Private `_flash_attn_forward/_backward` (pinned to FA 2.8.x ABI) |
 | `components/models/kimivl/model.py` | `flash_attn_varlen_func` |
 | `components/models/bagel/modeling_qwen2_packed.py` | `flash_attn_varlen_func` for packed inference |
@@ -164,7 +140,8 @@ These call `flash_attn` APIs directly and would **not** benefit from transformer
 |---|---|
 | `fa` | `flash-attn<=2.8.3` |
 | `cuda` | `mamba-ssm`, `causal-conv1d`, `transformer-engine`, `tilelang`, … |
-| `diffusion_kernels` | `kernels` (declared but **no Python imports yet**) |
+| `diffusion_kernels` | `kernels` |
+| `hub_kernels` | `kernels>=0.11.0` |
 | (implicit) | `liger-kernel` via runtime import in `kernel_patches.py` |
 
 Docker images compile `flash-attn` from source; this is a major install-time cost Hub kernels could eliminate.
@@ -176,27 +153,29 @@ Docker images compile `flash-attn` from source; this is a major install-time cos
 With `uv sync --extra hub_kernels`:
 
 ```yaml
-# Hub flash attention only — use_kernels not required
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-3B
   attn_implementation: kernels-community/flash-attn2
+```
 
-# Or shorthand: pip flash-attn when installed, else Hub FA2
-  attn_implementation: flash_attention_2
+`flash_attention_2` also works: Transformers uses pip `flash-attn` when installed, else Hub FA2.
 
-# Optional: also Hub-ize norms / MLP / linear (see qwen2_5_7b_hub_kernels_layers.yaml)
+For Hub layer replacements (RMSNorm, MLP, Linear, etc.), see `qwen2_5_7b_hub_kernels_layers.yaml`:
+
+```yaml
+  attn_implementation: kernels-community/flash-attn2
   use_kernels: true
   use_liger_kernel: false
 ```
 
-**Fixed on this branch:** Hub-aware `kernel_patches` (availability, packed sequences, fallback ladder); `use_kernels` / `kernel_config` passthrough; Liger gated off when `use_kernels=true`; blockdiag CP varlen via Hub.
+Implemented on this branch: Hub-aware `kernel_patches`; `use_kernels` passthrough; Liger gated when `use_kernels=true`; blockdiag CP varlen via Hub.
 
-**Remaining gaps:**
+Remaining gaps:
 
 1. KimiVL / BAGEL / EAGLE ring attention still import pip `flash_attn` directly.
-2. Native models need `backend.attn: hub` for MLA factories; HF `attn_implementation` does not apply there.
-3. TE + Hub FA mutual exclusion still applies (TE pins compiled `flash-attn`).
+2. Native models need `backend.attn: hub`; HF `attn_implementation` does not apply there.
+3. TE and Hub FA remain mutually exclusive (TE pins compiled `flash-attn`).
 
 ---
 
@@ -204,13 +183,13 @@ model:
 
 | AutoModel feature | Current backend | Hub kernel available? | Notes |
 |---|---|---|---|
-| HF attention (FA2/3/4) | `flash-attn` pip package | ✅ `kernels-community/flash-attn{2,3,4}` | Transformers handles wrapper; AutoModel needs availability + fallback fixes |
-| Liger (RMSNorm, MLP, Linear, loss) | `liger_kernel` pip | ✅ `kernels-community/liger-kernels` | Transformers `use_kernels=True` replaces `_patch_liger_kernel` |
+| HF attention (FA2/3/4) | `flash-attn` pip or Hub | ✅ `kernels-community/flash-attn{2,3,4}` | Transformers dispatch; AutoModel fallback ladder is Hub-aware |
+| Liger (RMSNorm, MLP, Linear, loss) | `liger_kernel` pip | ✅ `kernels-community/liger-kernels` | `use_kernels=True` replaces `_patch_liger_kernel` |
 | Mamba / GDN conv | `mamba-ssm`, `causal-conv1d` | ✅ `kernels-community/mamba-ssm` | Includes `causal_conv1d_*`, selective scan, Mamba2 |
 | Activations (GELU, SiLU) | PyTorch / TE | ✅ `kernels-community/activation` | Inference + compile modes |
 | RoPE | TE fused / torch | ✅ `kernels-community/rotary` | TE fused RoPE currently force-disabled (#3027) |
 | MoE expert GEMM | TE / grouped_gemm / torch_mm | ⚠️ `kernels-community/megablocks` | Different API; not a drop-in for DeepEP path |
-| CP blockdiag varlen | Direct `flash_attn_varlen_func` | ✅ via Hub FA2 module | Needs thin loader wrapper |
+| CP blockdiag varlen | `get_flash_attn_varlen_func()` | ✅ via Hub FA2 module | Wired on this branch |
 | EAGLE ring attention | Direct FA 2.8.x private API | ❓ | Uses `_flash_attn_forward` positional ABI; Hub FA2 may differ — needs parity test |
 | TE attention / FP8 | `transformer-engine` | ❌ | NVIDIA proprietary; stays as direct dep |
 | DeepEP / UCCL-EP | `deep_ep` | ❌ | Not in kernels-community |

@@ -23,22 +23,14 @@ from nemo_automodel.components.kernels.hub import HUB_FLASH_ATTN2
 
 @dataclass(kw_only=True)
 class HubKernelConfig:
-    """Hub kernel settings for attention resolution and native-model kernelize.
-
-    Layer replacements (RMSNorm, MLP, Linear, activations, RoPE) should use
-    ``use_kernels=True`` on ``NeMoAutoModel.from_pretrained`` / ``from_config``
-    so Transformers' ``hub_kernels.kernelize`` owns the mapping. This config
-    focuses on attention repo selection for native MLA/GQA factories and optional
-    ``backend.hub_kernels`` overrides in recipes.
+    """Hub kernel settings for native ``BackendConfig.attn="hub"``.
 
     Attributes:
-        attn_repo: Hub repo id for flash attention (e.g.
-            ``kernels-community/flash-attn2``). When set on ``BackendConfig``,
-            overrides a top-level ``attn_implementation="hub"`` alias.
-        attn_version: Kernel major version branch passed to ``get_kernel``.
-        kernelize_layers: When True and ``use_kernels=True`` on a custom model,
-            apply ``kernelize`` after construction. Ignored on the HF load path
-            (Transformers kernelizes during ``from_pretrained``).
+        attn_repo: Hub repo id for flash attention (default
+            ``kernels-community/flash-attn2``).
+        attn_version: Kernel major version passed to ``kernels.get_kernel``.
+        kernelize_layers: When ``True`` and ``use_kernels=True`` on a custom
+            model, apply Transformers ``kernelize`` after construction.
     """
 
     attn_repo: str | None = HUB_FLASH_ATTN2

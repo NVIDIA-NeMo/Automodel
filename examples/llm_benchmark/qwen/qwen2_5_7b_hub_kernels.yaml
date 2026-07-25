@@ -1,12 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-# Hub flash attention only (requires: uv sync --extra hub_kernels).
-#
-# attn_implementation loads kernels-community/flash-attn2 for attention layers.
-# use_kernels is NOT required for that — it is only for non-attention layers
-# (RMSNorm, MLP, Linear, activations, RoPE, fused CE). See qwen2_5_7b_hub_kernels_layers.yaml
-# for attn + Hub layer kernels. Default use_liger_kernel=True still applies pip Liger here.
+# Hub flash-attn2 attention; compare with qwen2_5_7b_hub_kernels_layers.yaml.
 recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 

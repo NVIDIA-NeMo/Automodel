@@ -707,18 +707,15 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 `AutoModelForCausalLM.from_pretrained`.
             use_liger_kernel (bool, default=True): If `True`, try to patch
                 the model with Liger kernels for faster inference/training.
-                Ignored when ``use_kernels=True`` (Transformers Hub kernels
-                replace Liger on the HF load path).
-            use_kernels (bool, default=False): When ``True``, apply Transformers
-                Hub ``kernelize`` for **non-attention** layers (RMSNorm, MLP,
-                Linear, activations, RoPE, etc.). **Not required** when
-                ``attn_implementation`` is already a Hub repo id — that flag
-                only selects the attention backend. Set ``use_liger_kernel=False``
-                when enabling this to avoid double-patching with pip Liger.
-            allow_all_kernels (bool, default=False): Allow any Hub kernel repo
-                when ``use_kernels=True`` (Transformers ``allow_all_kernels``).
-            kernel_config: Optional Transformers ``KernelConfig`` mapping for
-                ``use_kernels=True``. Automatically enables ``use_kernels`` when set.
+                Ignored when ``use_kernels=True``.
+            use_kernels (bool, default=False): If `True`, apply Transformers Hub
+                ``kernelize`` to non-attention layers (RMSNorm, MLP, Linear, etc.).
+                Independent of ``attn_implementation``. Requires the ``hub_kernels``
+                extra. Set ``use_liger_kernel=False`` when enabled.
+            allow_all_kernels (bool, default=False): If `True`, allow any Hub
+                kernel repo when ``use_kernels=True``.
+            kernel_config: Optional Transformers ``KernelConfig`` for
+                ``use_kernels=True``. Enables ``use_kernels`` when set.
             use_sdpa_patching (bool, default=True): If `True`, patch the
                 model with SDPA-based attention optimizations.
             sdpa_method (list[SDPBackend | str] | None, optional): Explicit list of
@@ -730,10 +727,11 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                 Data type passed to the underlying `from_pretrained` call.
             attn_implementation (str, optional):
                 Specifies which attention implementation to use (e.g.,
-                ``"flash_attention_2"``, ``"kernels-community/flash-attn2"``,
-                ``"eager"``). Only applied when the base model supports this
-                kwarg. Defaults to ``"flash_attention_2"`` when flash attention
-                is available (pip or Hub), else ``"sdpa"``.
+                ``"flash_attention_2"``, ``"eager"``). Hub repo ids such as
+                ``"kernels-community/flash-attn2"`` are also supported. Only
+                applied when the base model supports this kwarg. Defaults to
+                ``"flash_attention_2"`` when flash attention is available, else
+                ``"sdpa"``.
             quantization_config (optional): BitsAndBytesConfig configuration object that
                 specifies all quantization settings. If provided, quantization
                 will be applied to the model.

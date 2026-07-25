@@ -1,12 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-# Hub flash attention + Hub layer kernels (requires: uv sync --extra hub_kernels).
-#
-# attn_implementation: Hub FA2 for attention (same as qwen2_5_7b_hub_kernels.yaml).
-# use_kernels: true replaces RMSNorm / MLP / Linear / activations / RoPE via
-#   kernels-community/liger-kernels (Transformers kernelize). Orthogonal to attn.
-# use_liger_kernel: false avoids double-patching with pip liger_kernel.
+# Hub flash-attn2 with use_kernels layer replacements; compare with qwen2_5_7b_hub_kernels.yaml.
 recipe: BenchmarkingRecipeForNextTokenPrediction
 seed: 1234
 
