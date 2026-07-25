@@ -206,7 +206,15 @@ def _install_torch_and_layers_stubs(monkeypatch):
     def checkpoint_wrapper(*args, **kwargs):
         return args[0]
 
+    class CheckpointImpl:
+        NO_REENTRANT = "no_reentrant"
+        REENTRANT = "reentrant"
+
     cpw_stub.checkpoint_wrapper = checkpoint_wrapper
+    # components/distributed/activation_checkpointing.py imports this at module
+    # scope; without it that module only imports when an earlier test happened to
+    # cache it under real torch, making this file order-dependent.
+    cpw_stub.CheckpointImpl = CheckpointImpl
 
     # utils module hierarchy
     utils_stub = types.ModuleType("torch.utils")
