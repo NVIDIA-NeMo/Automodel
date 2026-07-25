@@ -184,6 +184,29 @@ class MoEParallelizerConfig:
 
 
 @dataclass
+class MultimodalDistributedConfig:
+    """Distributed policies for resolved multimodal modules.
+
+    Attributes:
+        frozen_sharding: Controls fully frozen multimodal modules such as
+            vision/audio towers and projectors. ``"root"`` (default) keeps
+            their parameters in an always-run outer FSDP root, which is safe
+            when modality execution differs across ranks. ``"per_layer"``
+            uses normal layer/container FSDP units and requires every rank in
+            the FSDP group to execute or skip the module identically on every
+            microbatch. ``"replicate"`` excludes the frozen parameters from
+            FSDP roots so each rank keeps a full copy. Modules with any
+            trainable parameters use normal layer/container sharding
+            regardless of this setting.
+    """
+
+    frozen_sharding: FrozenMultimodalSharding = "root"
+
+    def __post_init__(self) -> None:
+        self.frozen_sharding = normalize_frozen_multimodal_sharding(self.frozen_sharding)
+
+
+@dataclass
 class FSDP2Config:
     """
     Additional configuration for FSDP2 distributed training.
@@ -252,16 +275,8 @@ class FSDP2Config:
             memory at a small throughput cost.  Default ``2``.
         fsdp2_forward_prefetch_depth (int): Number of FSDP units to prefetch during
             forward pass.  Default ``1``.
-        frozen_multimodal_sharding (str): Controls fully frozen multimodal modules
-            such as vision/audio towers and projectors. ``"root"`` (default)
-            keeps their parameters in an always-run outer FSDP root, which is
-            safe when modality execution differs across ranks. ``"per_layer"``
-            uses normal layer/container FSDP units and requires every rank in
-            the FSDP group to execute or skip the module identically on every
-            microbatch. ``"replicate"`` excludes the frozen parameters from
-            FSDP roots so each rank keeps a full copy. Modules with any trainable
-            parameters use normal layer/container sharding regardless of this
-            setting.
+        multimodal: Policies for resolved multimodal modules that use the text
+            model's distributed axes.
     """
 
     sequence_parallel: bool = False
@@ -286,9 +301,9 @@ class FSDP2Config:
     enable_fsdp2_prefetch: bool = False
     fsdp2_backward_prefetch_depth: int = 2
     fsdp2_forward_prefetch_depth: int = 1
-    frozen_multimodal_sharding: FrozenMultimodalSharding = "root"
+    multimodal: MultimodalDistributedConfig = field(default_factory=MultimodalDistributedConfig)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.mp_policy is None:
             # FSDP2 default: bf16 compute and fp32 gradient reduction. Pair with
             # ``model.torch_dtype: float32`` for fp32 optimizer state. See
@@ -302,7 +317,8 @@ class FSDP2Config:
         self.activation_checkpointing_scope = normalize_activation_checkpointing_scope(
             self.activation_checkpointing_scope
         )
-        self.frozen_multimodal_sharding = normalize_frozen_multimodal_sharding(self.frozen_multimodal_sharding)
+        if not isinstance(self.multimodal, MultimodalDistributedConfig):
+            raise TypeError("FSDP2Config.multimodal must be a MultimodalDistributedConfig instance.")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary (shallow, preserves policy objects)."""

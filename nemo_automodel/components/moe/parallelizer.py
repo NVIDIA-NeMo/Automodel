@@ -649,16 +649,16 @@ def apply_fsdp(
         ]
         if unowned_module_names:
             raise ValueError(
-                "frozen_multimodal_sharding='root' requires wrap_outer_model=True when fully frozen multimodal "
-                f"modules are outside the inner text FSDP root: {', '.join(unowned_module_names)}. "
-                "Set wrap_outer_model=True, or choose frozen_multimodal_sharding='per_layer' with "
-                "collective-uniform modality execution, or frozen_multimodal_sharding='replicate'."
+                "distributed.multimodal.frozen_sharding='root' requires wrap_outer_model=True when fully frozen "
+                f"multimodal modules are outside the inner text FSDP root: {', '.join(unowned_module_names)}. "
+                "Set wrap_outer_model=True, or choose distributed.multimodal.frozen_sharding='per_layer' with "
+                "collective-uniform modality execution, or distributed.multimodal.frozen_sharding='replicate'."
             )
     if frozen_multimodal_sharding == "per_layer" and frozen_multimodal_modules:
         logger.warning(
-            "frozen_multimodal_sharding='per_layer' selected for %s. Every rank in the FSDP group must execute "
-            "or skip these modules the same number of times and in the same order on every microbatch; "
-            "rank-asymmetric modality execution can hang or desynchronize FSDP collectives.",
+            "distributed.multimodal.frozen_sharding='per_layer' selected for %s. Every rank in the FSDP group "
+            "must execute or skip these modules the same number of times and in the same order on every "
+            "microbatch; rank-asymmetric modality execution can hang or desynchronize FSDP collectives.",
             ", ".join(module_name for module_name, _ in frozen_multimodal_modules),
         )
 

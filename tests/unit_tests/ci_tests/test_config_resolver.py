@@ -366,7 +366,7 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
     assert robustness["check_source_load_parity"] is True
     assert robustness["tokenizer_name"] == resolved["model"]["pretrained_model_name_or_path"]
     if Path(recipe_path).stem == "gemma4_26b_a4b_moe":
-        assert resolved["distributed"]["frozen_multimodal_sharding"] == "replicate"
+        assert resolved["distributed"]["multimodal"]["frozen_sharding"] == "replicate"
     pp_size = resolved["distributed"].get("pp_size", 1)
     pp_microbatch_size = resolved["distributed"].get("pipeline", {}).get("pp_microbatch_size", 1)
     assert resolved["step_scheduler"]["local_batch_size"] // pp_microbatch_size >= pp_size
@@ -399,7 +399,7 @@ def test_rank_uniform_text_only_vlm_recipes_opt_into_per_layer(recipe_path):
     resolved = yaml.load((REPO_ROOT / recipe_path).read_text())
 
     assert resolved["freeze_config"]["freeze_vision_tower"] is True
-    assert resolved["distributed"]["frozen_multimodal_sharding"] == "per_layer"
+    assert resolved["distributed"]["multimodal"]["frozen_sharding"] == "per_layer"
 
 
 def test_end_to_end_dry_run_does_not_write(tmp_path, synthetic_recipe):

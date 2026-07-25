@@ -77,8 +77,9 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
-  # Every rank receives text-only batches, so the frozen multimodal modules are skipped uniformly.
-  frozen_multimodal_sharding: per_layer
+  multimodal:
+    # Every rank receives text-only batches, so the frozen multimodal modules are skipped uniformly.
+    frozen_sharding: per_layer
   dp_size: none
   tp_size: 1
   cp_size: 16

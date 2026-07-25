@@ -16,7 +16,8 @@ To retain the previous dense vision topology, opt in explicitly:
 ```yaml
 distributed:
   strategy: fsdp2
-  frozen_multimodal_sharding: per_layer
+  multimodal:
+    frozen_sharding: per_layer
 ```
 
 `per_layer` requires every rank in the FSDP group to execute or skip the frozen multimodal units the same number of

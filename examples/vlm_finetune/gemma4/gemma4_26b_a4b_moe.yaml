@@ -65,7 +65,8 @@ checkpoint:
 
 distributed:
   strategy: fsdp2
-  frozen_multimodal_sharding: replicate
+  multimodal:
+    frozen_sharding: replicate
   dp_size: none
   tp_size: 1
   cp_size: 1

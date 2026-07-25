@@ -299,9 +299,9 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
         ]
         if frozen_multimodal_sharding == "per_layer" and frozen_multimodal_modules:
             logger.warning(
-                "frozen_multimodal_sharding='per_layer' selected for %s. Every rank in the FSDP group must "
-                "execute or skip these modules the same number of times and in the same order on every microbatch; "
-                "rank-asymmetric modality execution can hang or desynchronize FSDP collectives.",
+                "distributed.multimodal.frozen_sharding='per_layer' selected for %s. Every rank in the FSDP "
+                "group must execute or skip these modules the same number of times and in the same order on every "
+                "microbatch; rank-asymmetric modality execution can hang or desynchronize FSDP collectives.",
                 ", ".join(frozen_multimodal_modules),
             )
         tp_mesh = device_mesh[tp_mesh_name]

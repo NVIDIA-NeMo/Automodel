@@ -107,7 +107,8 @@ FSDP2 uses the correctness-first `root` policy for fully frozen vision/audio tow
 ```yaml
 distributed:
   strategy: fsdp2
-  frozen_multimodal_sharding: root
+  multimodal:
+    frozen_sharding: root
 ```
 
 The supported policies are:

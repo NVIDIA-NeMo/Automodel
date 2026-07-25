@@ -43,7 +43,12 @@ from nemo_automodel._transformers.model_init import (
     no_hf_meta_device,
 )
 from nemo_automodel.components.checkpoint.utils import _get_checkpoint_tensor_dtypes
-from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MoEParallelizerConfig
+from nemo_automodel.components.distributed.config import (
+    DistributedSetup,
+    FSDP2Config,
+    MoEParallelizerConfig,
+    MultimodalDistributedConfig,
+)
 from nemo_automodel.components.distributed.mesh import MeshAxisName, MeshContext
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 
@@ -127,7 +132,7 @@ class TestResolveMeshContext:
         mesh = MeshContext.from_meshes(device_mesh, moe_mesh)
 
         _, _, parallelize_fn, _ = instantiate_infrastructure(
-            distributed_config=FSDP2Config(frozen_multimodal_sharding="replicate"),
+            distributed_config=FSDP2Config(multimodal=MultimodalDistributedConfig(frozen_sharding="replicate")),
             moe_parallel_config=MoEParallelizerConfig(),
             activation_checkpointing=False,
             mesh=mesh,

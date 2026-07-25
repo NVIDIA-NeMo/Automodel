@@ -61,11 +61,11 @@ VALID_FROZEN_MULTIMODAL_SHARDING: tuple[FrozenMultimodalSharding, ...] = ("root"
 def normalize_frozen_multimodal_sharding(value: str) -> FrozenMultimodalSharding:
     """Validate and normalize the frozen multimodal FSDP policy."""
     if not isinstance(value, str):
-        raise ValueError(f"frozen_multimodal_sharding must be a string. Got {type(value).__name__}.")
+        raise ValueError(f"distributed.multimodal.frozen_sharding must be a string. Got {type(value).__name__}.")
     normalized = value.lower().replace("-", "_")
     if normalized not in VALID_FROZEN_MULTIMODAL_SHARDING:
         valid = ", ".join(VALID_FROZEN_MULTIMODAL_SHARDING)
-        raise ValueError(f"frozen_multimodal_sharding must be one of: {valid}. Got {value!r}.")
+        raise ValueError(f"distributed.multimodal.frozen_sharding must be one of: {valid}. Got {value!r}.")
     return cast(FrozenMultimodalSharding, normalized)
 
 
