@@ -63,6 +63,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
     get_combined_key_mapping,
     requires_tensor_merging,
 )
+from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
     ensure_tied_lm_head,
@@ -686,7 +687,9 @@ class Checkpointer:
 
         # Check if this model requires tensor merging (e.g., Mixtral with grouped experts)
         model_type = getattr(getattr(model_state.model[0], "config", None), "model_type", None)
-        has_state_dict_adapter = hasattr(_unwrap_ddp_model(model_state.model[0]), "state_dict_adapter")
+        unwrapped_model_part = _unwrap_ddp_model(model_state.model[0])
+        state_dict_adapter = getattr(unwrapped_model_part, "state_dict_adapter", None)
+        has_state_dict_adapter = hasattr(unwrapped_model_part, "state_dict_adapter")
 
         # For models that need tensor merging and don't have an adapter, try using transformers' conversion
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
@@ -798,6 +801,12 @@ class Checkpointer:
             model_path, reader_key_mapping, is_init_step=is_init_step, is_safetensors=is_safetensors
         )
 
+        checkpoint_metadata_keys: set[str] = set()
+        checkpoint_metadata_loaded = False
+        if isinstance(state_dict_adapter, StateDictAdapter) and state_dict_adapter._requires_checkpoint_metadata_keys:
+            checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+            checkpoint_metadata_loaded = True
+
         # MoE adapters return views into model storage; DCP writes safetensors
         # data straight through them and from_hf skips the rebuild.
         state_dict = _maybe_adapt_state_dict_to_hf(
@@ -805,6 +814,7 @@ class Checkpointer:
             state_dict,
             quantization=self.config.dequantize_base_checkpoint,
             device_mesh=self.moe_mesh,
+            checkpoint_metadata_keys=checkpoint_metadata_keys if checkpoint_metadata_loaded else None,
         )
 
         compat_tied_lm_head_source_key: str | None = None
@@ -815,10 +825,12 @@ class Checkpointer:
             and isinstance(lm_head_param_name, str)
             and lm_head_param_name in state_dict
         )
-        checkpoint_metadata_keys: set[str] = set()
         extra_state_keys = sorted(key for key in state_dict if key.endswith("_extra_state"))
-        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys:
+        if (
+            should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys
+        ) and not checkpoint_metadata_loaded:
             checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+            checkpoint_metadata_loaded = True
         if extra_state_keys:
             missing_extra_state_keys = [key for key in extra_state_keys if key not in checkpoint_metadata_keys]
             if missing_extra_state_keys:
@@ -2173,13 +2185,25 @@ def _convert_checkpoint_with_transformers(
 
 
 def _maybe_adapt_state_dict_to_hf(
-    model_part: nn.Module, state_dict: dict[str, torch.Tensor], quantization: bool = False, **kwargs
+    model_part: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    quantization: bool = False,
+    checkpoint_metadata_keys: set[str] | None = None,
+    **kwargs,
 ) -> dict[str, torch.Tensor]:
     """
     Custom models use state dict adapters to convert the state dict to the Hugging Face format.
     """
     adapter = getattr(_unwrap_ddp_model(model_part), "state_dict_adapter", None)
     if adapter:
+        if checkpoint_metadata_keys is not None:
+            return adapter.to_hf(
+                state_dict,
+                exclude_key_regex=r".*_extra_state.*",
+                quantization=quantization,
+                checkpoint_metadata_keys=checkpoint_metadata_keys,
+                **kwargs,
+            )
         return adapter.to_hf(state_dict, exclude_key_regex=r".*_extra_state.*", quantization=quantization, **kwargs)
     return state_dict
 

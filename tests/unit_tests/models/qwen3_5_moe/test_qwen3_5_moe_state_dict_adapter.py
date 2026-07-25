@@ -18,8 +18,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 import nemo_automodel.components.models.qwen3_5_moe.model as qwen3_5_moe_model
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.models.common import BackendConfig
 from nemo_automodel.components.models.qwen3_5_moe.state_dict_adapter import Qwen3_5MoeStateDictAdapter
 from nemo_automodel.components.moe.layers import MoEConfig
@@ -133,6 +135,15 @@ class TestInitialization:
 
         with pytest.raises(ValueError, match="Unsupported MTP expert HF layout"):
             adapter._get_mtp_expert_hf_layout()
+
+    def test_mtp_layout_rejects_mixed_checkpoint_keys(self, adapter):
+        checkpoint_keys = {
+            "mtp.layers.0.mlp.experts.down_proj",
+            "mtp.layers.0.mlp.experts.0.down_proj.weight",
+        }
+
+        with pytest.raises(ValueError, match="both split and grouped MTP expert keys"):
+            adapter._get_mtp_expert_hf_layout(checkpoint_keys)
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +286,86 @@ class TestToHF:
 
         for key in hf_state:
             torch.testing.assert_close(roundtrip[key], hf_state[key])
+
+    @pytest.mark.parametrize(
+        ("checkpoint_layout", "misleading_model_name"),
+        [
+            ("split", "/arbitrary/local/consolidated"),
+            ("grouped", "/cache/Qwen3.5-35B-A3B/consolidated"),
+        ],
+    )
+    def test_consolidated_round_trip_infers_mtp_layout_from_checkpoint_keys(
+        self,
+        tmp_path,
+        config,
+        moe_config,
+        backend_config,
+        checkpoint_layout,
+        misleading_model_name,
+    ):
+        gate_up = torch.arange(4 * 8 * 128, dtype=torch.float32).reshape(4, 8, 128)
+        down = torch.arange(4 * 64 * 8, dtype=torch.float32).reshape(4, 64, 8)
+        native_state = {
+            "mtp.layers.0.mlp.experts.gate_and_up_projs": gate_up,
+            "mtp.layers.0.mlp.experts.down_projs": down,
+        }
+        writer_adapter = Qwen3_5MoeStateDictAdapter(
+            config=config,
+            moe_config=moe_config,
+            backend=backend_config,
+            mtp_expert_hf_layout=checkpoint_layout,
+        )
+        checkpoint_state = writer_adapter.to_hf(native_state)
+        checkpoint_path = tmp_path / checkpoint_layout
+        checkpoint_path.mkdir()
+        save_file(
+            {key: value.contiguous() for key, value in checkpoint_state.items()},
+            checkpoint_path / "model.safetensors",
+        )
+
+        target = torch.nn.Module()
+        target.mtp = torch.nn.Module()
+        target.mtp.layers = torch.nn.ModuleList([torch.nn.Module()])
+        target.mtp.layers[0].mlp = torch.nn.Module()
+        target.mtp.layers[0].mlp.experts = torch.nn.Module()
+        target.mtp.layers[0].mlp.experts.gate_and_up_projs = torch.nn.Parameter(torch.zeros_like(gate_up))
+        target.mtp.layers[0].mlp.experts.down_projs = torch.nn.Parameter(torch.zeros_like(down))
+        local_config = SimpleNamespace(
+            _name_or_path=misleading_model_name,
+            name_or_path=misleading_model_name,
+        )
+        target.state_dict_adapter = Qwen3_5MoeStateDictAdapter(
+            config=local_config,
+            moe_config=moe_config,
+            backend=backend_config,
+            pretrained_model_name_or_path=misleading_model_name,
+        )
+
+        checkpointing_config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path),
+            model_save_format="safetensors",
+            model_cache_dir=str(tmp_path / "cache"),
+            model_repo_id="test/model",
+            save_consolidated=False,
+            is_peft=False,
+        )
+        with patch("torch.distributed.is_initialized", return_value=False):
+            checkpointer = Checkpointer(
+                checkpointing_config,
+                dp_rank=0,
+                tp_rank=0,
+                pp_rank=0,
+                moe_mesh=None,
+            )
+        checkpointer.load_model(target, model_path=str(checkpoint_path))
+
+        torch.testing.assert_close(target.mtp.layers[0].mlp.experts.gate_and_up_projs, gate_up)
+        torch.testing.assert_close(target.mtp.layers[0].mlp.experts.down_projs, down)
+        roundtrip_state = target.state_dict_adapter.to_hf(target.state_dict())
+        assert set(roundtrip_state) == set(checkpoint_state)
+        for key in checkpoint_state:
+            torch.testing.assert_close(roundtrip_state[key], checkpoint_state[key])
 
     def test_exclude_regex_filters_expert_key(self, adapter):
         """exclude_key_regex should filter expert keys after rename."""
@@ -561,9 +652,9 @@ class TestFromHF:
         expected_gate_up = []
         expected_down = []
         for expert_id in range(adapter.moe_config.n_routed_experts):
-            gate = torch.randn(32, 64)
-            up = torch.randn(32, 64)
-            down = torch.randn(64, 32)
+            gate = torch.randn(64, 64)
+            up = torch.randn(64, 64)
+            down = torch.randn(64, 64)
             hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.gate_proj.weight"] = gate
             hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.up_proj.weight"] = up
             hf_state[f"mtp.layers.0.mlp.experts.{expert_id}.down_proj.weight"] = down
@@ -580,6 +671,10 @@ class TestFromHF:
             out["mtp.layers.0.mlp.experts.down_projs"],
             torch.stack(expected_down, dim=0).to(adapter.dtype),
         )
+        roundtrip = adapter.to_hf(out)
+        assert set(roundtrip) == set(hf_state)
+        for key in hf_state:
+            torch.testing.assert_close(roundtrip[key], hf_state[key])
 
     def test_expert_parallel_sharding(self, adapter, monkeypatch):
         """When device_mesh is provided, from_hf should slice experts by rank."""

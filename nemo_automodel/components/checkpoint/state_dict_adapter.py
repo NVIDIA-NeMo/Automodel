@@ -26,6 +26,9 @@ class StateDictAdapter(ABC):
     state dict format and other model state dict formats.
     """
 
+    # Override when ``to_hf`` needs source checkpoint keys to build DCP load destinations.
+    _requires_checkpoint_metadata_keys: bool = False
+
     @abstractmethod
     def to_hf(self, state_dict: dict[str, Any], **kwargs) -> dict[str, Any]:
         """Convert from native model state dict to HuggingFace format.

@@ -58,6 +58,9 @@ from nemo_automodel.components.models.qwen3_5.state_dict_adapter import (
 from nemo_automodel.components.moe import state_dict_utils
 from nemo_automodel.components.moe.layers import MoEConfig
 
+_MTP_SPLIT_EXPERT_KEY = re.compile(r"mtp\.layers\.\d+\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)\.weight")
+_MTP_GROUPED_EXPERT_KEY = re.compile(r"mtp\.layers\.\d+\.mlp\.experts\.(?:gate_up_proj|down_proj)")
+
 
 def _strip_fp32_params(key: str) -> str:
     """Strip the fp32 holder segment from GDN state-dict keys."""
@@ -96,6 +99,8 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         NeMo: .mlp.shared_experts.{gate,up,down}_proj.weight
     """
 
+    _requires_checkpoint_metadata_keys = True
+
     def __init__(
         self,
         config: Any,
@@ -111,6 +116,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         self.dtype = dtype
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
         self.mtp_expert_hf_layout = mtp_expert_hf_layout
+        self._inferred_mtp_expert_hf_layout: str | None = None
         self._uses_model_prefix = True
 
         self.hf_to_internal_map = {
@@ -118,20 +124,46 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         }
         self.internal_to_hf_map = {v: k for k, v in self.hf_to_internal_map.items()}
 
-    def _get_mtp_expert_hf_layout(self) -> str:
-        """Return whether MTP experts are stored as split or grouped HF tensors."""
+    def _get_mtp_expert_hf_layout(self, checkpoint_metadata_keys: set[str] | None = None) -> str:
+        """Resolve and remember whether MTP experts use split or grouped HF keys."""
         layout = self.mtp_expert_hf_layout
         if layout is None:
             config_layout = getattr(self.config, "mtp_expert_hf_layout", None)
             layout = config_layout if isinstance(config_layout, str) else None
 
+        configured_layout = None
         if layout is not None:
             normalized = layout.lower().replace("_", "-")
             if normalized in {"split", "per-expert", "per-expert-safetensors"}:
-                return "split"
-            if normalized in {"grouped", "group"}:
-                return "grouped"
-            raise ValueError(f"Unsupported MTP expert HF layout: {layout!r}")
+                configured_layout = "split"
+            elif normalized in {"grouped", "group"}:
+                configured_layout = "grouped"
+            else:
+                raise ValueError(f"Unsupported MTP expert HF layout: {layout!r}")
+
+        if checkpoint_metadata_keys:
+            split_key = next(
+                (key for key in checkpoint_metadata_keys if _MTP_SPLIT_EXPERT_KEY.fullmatch(key)),
+                None,
+            )
+            grouped_key = next(
+                (key for key in checkpoint_metadata_keys if _MTP_GROUPED_EXPERT_KEY.fullmatch(key)),
+                None,
+            )
+            if split_key is not None and grouped_key is not None:
+                raise ValueError(
+                    "Checkpoint contains both split and grouped MTP expert keys; "
+                    f"cannot infer one layout (examples: {split_key!r}, {grouped_key!r})"
+                )
+            if split_key is not None:
+                self._inferred_mtp_expert_hf_layout = "split"
+            elif grouped_key is not None:
+                self._inferred_mtp_expert_hf_layout = "grouped"
+
+        if self._inferred_mtp_expert_hf_layout is not None:
+            return self._inferred_mtp_expert_hf_layout
+        if configured_layout is not None:
+            return configured_layout
 
         model_names = [self.pretrained_model_name_or_path]
         for attr in ("_name_or_path", "name_or_path"):
@@ -163,12 +195,34 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         return new_state_dict
 
     def to_hf(
-        self, state_dict: dict[str, Any], exclude_key_regex: Optional[str] = None, quantization: bool = False, **kwargs
+        self,
+        state_dict: dict[str, Any],
+        exclude_key_regex: Optional[str] = None,
+        quantization: bool = False,
+        checkpoint_metadata_keys: set[str] | None = None,
+        **kwargs,
     ) -> dict[str, Any]:
-        """Rename native keys to HF keys and transpose expert tensors. No comms needed."""
+        """Rename native keys to HF keys and transpose expert tensors.
+
+        Args:
+            state_dict: Native model state dict.
+            exclude_key_regex: Optional regex for keys to omit.
+            quantization: Whether the caller is loading a quantized checkpoint.
+            checkpoint_metadata_keys: Source checkpoint keys used to choose the
+                MTP expert serialization layout before DCP loads tensor data.
+
+        Returns:
+            State dict with Hugging Face keys and tensor layouts.
+        """
+        mtp_expert_hf_layout = self._get_mtp_expert_hf_layout(checkpoint_metadata_keys)
         hf_state_dict: dict[str, Any] = {}
         for fqn, tensor in state_dict.items():
-            for key, value in self.convert_single_tensor_to_hf(fqn, tensor, exclude_key_regex=exclude_key_regex):
+            for key, value in self.convert_single_tensor_to_hf(
+                fqn,
+                tensor,
+                exclude_key_regex=exclude_key_regex,
+                mtp_expert_hf_layout=mtp_expert_hf_layout,
+            ):
                 hf_state_dict[key] = value
         return hf_state_dict
 
@@ -183,6 +237,7 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         DTensors (DCP path): rename + transpose, no slicing — DCP handles sharding.
         Plain tensors (init path): slice to local EP shard, transpose, create DTensor.
         """
+        self._get_mtp_expert_hf_layout(set(hf_state_dict))
         self._uses_model_prefix = any(key.startswith("model.") for key in hf_state_dict if not key.startswith("mtp."))
         model_prefix = "model." if self._uses_model_prefix else ""
 
@@ -329,7 +384,10 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
         value = tensor
         mtp_gate_up_match = re.match(r"mtp\.layers\.(\d+)\.mlp\.experts\.gate_and_up_projs$", fqn)
         mtp_down_match = re.match(r"mtp\.layers\.(\d+)\.mlp\.experts\.down_projs$", fqn)
-        if self._get_mtp_expert_hf_layout() == "split":
+        mtp_expert_hf_layout = kwargs.get("mtp_expert_hf_layout")
+        if mtp_expert_hf_layout is None:
+            mtp_expert_hf_layout = self._get_mtp_expert_hf_layout()
+        if mtp_expert_hf_layout == "split":
             if mtp_gate_up_match:
                 layer_num = mtp_gate_up_match.group(1)
                 splits, expert_ids = state_dict_utils.split_experts_weights_dtensor_aware(
