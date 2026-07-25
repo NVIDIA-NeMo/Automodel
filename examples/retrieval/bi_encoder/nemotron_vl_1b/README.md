@@ -1,12 +1,21 @@
-# Fine-Tuning Llama Nemotron VL 1B Embedding Model
+# Fine-Tune the Llama Nemotron VL 1B Embedding Model
 
-This example shows how to fine-tune an embedding model for visual document retrieval: [nvidia/llama-nemotron-embed-vl-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2). The model can embed document pages in the form of image, text, or combined image-text inputs. Documents can be retrieved given a user query in text form. The model supports page images containing text, tables, charts, and infographics. You can check the performance of the model on vision document retrieval and text retrieval benchmarks [here](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2#evaluation-results).
-
+This example shows how to fine-tune an embedding model for visual document retrieval:
+[nvidia/llama-nemotron-embed-vl-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2). The model can
+embed document pages as image, text, or combined image-text inputs. Documents can be retrieved given a user query in
+text form. The model supports page images containing text, tables, charts, and infographics. Review the model's
+performance on the
+[vision document retrieval and text retrieval benchmarks](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2#evaluation-results).
 
 ## Fine-Tune for Domain Adaptation
-You can fine-tune the [nvidia/llama-nemotron-embed-vl-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2) open multimodal embedding model for specific domain adaptation.
 
-The NeMo AutoModel Retrieval recipe expects a training set with a Corpus ID-Based JSON schema, which is presented below and documented [here](https://docs.nvidia.com/nemo/automodel/latest/guides/llm/retrieval-dataset.html#corpus-id-based-json-merlin-nemo-retriever-style).
+You can further fine-tune the
+[nvidia/llama-nemotron-embed-vl-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2) open multimodal
+embedding model to adapt it to a specific domain.
+
+The NeMo AutoModel Retrieval recipe expects a training set with the corpus ID-based JSON schema shown below. For
+details, refer to the
+[Corpus ID-Based JSON documentation](https://docs.nvidia.com/nemo/automodel/latest/datasets/retrieval-dataset#corpus-id-based-json).
 
 ```json
 {
@@ -30,16 +39,77 @@ The NeMo AutoModel Retrieval recipe expects a training set with a Corpus ID-Base
 }
 ```
 
-The "corpus" path points to a directory with the corpus in Parquet format containing a field with the document ID.  
-The "data" field contains the list of training samples for contrastive learning, in particular the question, positive samples (`pos_doc`), and negative samples (`neg_doc`), which are document IDs from the corpus. Positive and negative samples can be document page images or chunks of text (passages). 
+The `corpus` path points to a directory that contains the corpus in Parquet format, with a field for the document ID.
+The `data` key contains the training samples for contrastive learning: the question, positive samples (`pos_doc`), and
+negative samples (`neg_doc`). The positive and negative samples are document IDs from the corpus and can represent
+document page images or chunks of text (passages).
 
-### Prepare the Vision Retrieval Training Set
-This example includes a notebook that demonstrates how to prepare a vision retrieval training dataset using [ColPali](https://huggingface.co/datasets/vidore/colpali_train_set): [prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb](prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb). It performs the following steps:
-1. Downloads a [train set](https://huggingface.co/datasets/Tevatron/colpali) that includes mined hard-negatives (for faster contrastive learning) and the corresponding [corpus](https://huggingface.co/datasets/Tevatron/colpali-corpus)
-2. Converts and saves that data into the Corpus ID-Based JSON schema expected for training biencoder models with Nemo Automodel.
+### Prepare the ColPali Source Data
 
-After running the notebook, open [nemotron_vl_1b_example.yaml](nemotron_vl_1b_example.yaml) and modify the path of the ColPali dataset (`colpali_train.json`) inside `data_dir_list` to match the path set when running the notebook, as shown in the example below. 
-Notice that a second dataset is present in `data_dir_list`, where the positive and negative samples are text passages (from the [MIRACL training set](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1/viewer/MIRACL), which focuses on multilingual text retrieval). You can also set the number of samples per dataset, as shown in the following example.
+Run
+[`prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb`](../prepare_dataset_for_vdr/convert_colpali_dataset_for_training.ipynb)
+to prepare the ColPali example. The notebook:
+
+1. Downloads a [train set](https://huggingface.co/datasets/Tevatron/colpali) with mined hard negatives and its
+   [corpus](https://huggingface.co/datasets/Tevatron/colpali-corpus).
+2. Writes the corpus as local Parquet shards and writes `colpali_train.json` in AutoModel's corpus ID-based schema.
+
+These files are the source data for both loading paths below. The notebook does not create normalized Arrow; that is a
+separate CPU preparation step for full-scale training.
+
+After the notebook finishes, open [`nemotron_vl_1b_example.yaml`](nemotron_vl_1b_example.yaml) and replace the ColPali
+path in `dataset.data_dir_list` with the generated `colpali_train.json` path. The example also includes the
+[MIRACL train set](https://huggingface.co/datasets/nvidia/embed-nemotron-dataset-v1/viewer/MIRACL) for multilingual
+text retrieval. Use `num_samples` to control how many examples to load from each source.
+
+### Choose How Training Loads the Prepared Data
+
+#### Normalize on CPU First for Full-Scale VL Training
+
+The normalization tool accepts local corpus ID-based JSON sources. Before preparing a full-scale VL dataset, make a
+copy of the example config for CPU preparation:
+
+1. Keep the generated local `colpali_train.json` source.
+2. Remove the `hf://` MIRACL source if the run does not need it, or materialize MIRACL as local corpus-backed data:
+
+   ```bash
+   uv run python examples/retrieval/bi_encoder/llama_embed_nemotron_8b/data_preparation.py \
+     --download-path ./embed_nemotron_dataset_v1
+   ```
+
+   Then replace the MIRACL URI in the preparation config with
+   `./embed_nemotron_dataset_v1/MIRACL/MIRACL.json`.
+
+Run the normalization tool with that local-source config:
+
+```bash
+uv run python tools/retrieval/prepare_normalized_vl_retrieval_data.py \
+  --config /path/to/nemotron_vl_1b_normalized_prep.yaml \
+  --output-dir /path/to/normalized_vl_retrieval
+```
+
+This command reads every local source in `dataset.data_dir_list` and writes one portable Arrow bundle. For large
+datasets on a Slurm cluster, use the CPU array launcher described in the
+[retrieval data preparation tools](../../../../tools/retrieval/README.md).
+
+Then replace the `dataset` section in the training config with the normalized loader:
+
+```yaml
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.retrieval_dataset_normalized.NormalizedRetrievalDatasetConfig
+  data_path: /path/to/normalized_vl_retrieval
+  model_type: bi_encoder
+  data_type: train
+  n_passages: 5
+```
+
+Starting GPU training directly from a large image corpus can leave every allocated GPU waiting while the corpus is
+loaded and its dataset cache is built. Normalizing on CPU moves that work before the GPU allocation.
+
+#### Load the Source Data Directly for Small Runs
+
+For a small verification run or a small dataset, skip normalization and keep the original dataset config. It reads the
+notebook's JSON and corpus files directly:
 
 ```yaml
 dataset:
@@ -50,19 +120,28 @@ dataset:
       num_samples: 5000
     - path: hf://nvidia/embed-nemotron-dataset-v1/MIRACL
       num_samples: 5000
+  data_type: train
+  n_passages: 5
 ```
 
-Also, if you have a Weights & Biases (W&B) account, you can configure the YAML file to log training metrics during training.
-```
+The direct path is usually sufficient for text-only retrieval. If its initial startup is slow, the retrieval data tools
+also provide a CPU cache-warming script that keeps this dataset configuration unchanged.
+
+If you have a Weights & Biases (W&B) account, configure the YAML file to log training metrics during training:
+
+```yaml
 wandb:
   project: YOUR_WANDB_PROJECT
   entity: YOUR_WANDB_ENTITY
   name: nemotron_vl_1b_embedding_example
 ```
 
-### Fine-Tune with NeMo AutoModel
+### Fine-Tune with AutoModel
 
-Here is an example of how to fine-tune the [nvidia/llama-nemotron-embed-vl-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2) embedding model, distributed across 8 A100 GPUs in a single instance. If you have fewer GPUs available, you can set `--nproc-per-node` accordingly. For multi-node training, use the `sbatch` command for Slurm clusters.
+The following example fine-tunes the
+[nvidia/llama-nemotron-embed-vl-1b-v2](https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2) embedding model
+across eight A100 GPUs in a single instance. If you have fewer GPUs available, set `--nproc-per-node` accordingly. For
+multi-node training on a Slurm cluster, use `sbatch`.
 
 ```bash
 torchrun --nproc-per-node=8 examples/retrieval/bi_encoder/finetune.py --config examples/retrieval/bi_encoder/nemotron_vl_1b/nemotron_vl_1b_example.yaml

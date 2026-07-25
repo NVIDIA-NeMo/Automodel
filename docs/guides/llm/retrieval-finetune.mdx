@@ -150,6 +150,18 @@ matches the workflow you need:
 | `hf://` AutoModel retrieval schema | You want a tutorial run or shared public dataset | Requires an AutoModel-style HF subset with a companion corpus split. |
 | Inline JSONL | You want a small custom run without hard-negative mining | Documents are embedded directly in each record. Pure inline records do not provide document IDs for same-document masking. |
 | Corpus ID-based JSON | You need hard-negative mining, reusable corpora, or same-document masking | Records reference document IDs in a local corpus that can be loaded by Hugging Face `datasets`. |
+| Normalized Arrow | You are training on a full-scale or image-heavy VL retrieval dataset | Prepare local corpus ID-based JSON sources on CPU, then train from portable Arrow shards with `NormalizedRetrievalDatasetConfig`. |
+
+For typical text-only retrieval, load the source directly with `RetrievalDatasetConfig`. For full-scale or image-heavy
+VL retrieval, prepare normalized Arrow before requesting GPUs. Loading a large image corpus and building its dataset
+cache during distributed startup can leave every allocated GPU waiting and waste GPU-hours before the first training
+step.
+
+The normalized preparation tool currently accepts local corpus ID-based JSON sources. Convert `hf://` or inline JSONL
+data to that layout first, or keep loading those sources directly. Refer to
+[Retrieval Dataset](/datasets/retrieval-dataset#normalized-arrow-for-large-vl-datasets) for the training config and to
+the [retrieval data preparation tools](https://github.com/NVIDIA-NeMo/Automodel/blob/main/tools/retrieval/README.md)
+for local and Slurm CPU commands.
 
 The key field requirements differ by source:
 
@@ -433,11 +445,11 @@ uv run torchrun \
   -m nemo_automodel.cli.app examples/retrieval/bi_encoder/llama3_2_1b.yaml
 ```
 
-Use a shared or pre-populated Hugging Face cache on every node, make dataset paths visible to every rank, and use a
-unique `checkpoint_dir` for each experiment. For multi-node training, `checkpoint_dir` must be on a shared, persistent
-filesystem mounted at the same path from every node. Relative `./output/...` paths are appropriate only when they resolve
-to shared storage. Increase `dist_env.timeout_minutes` for first model downloads, slow shared filesystems, multi-node
-collectives, or large checkpoint writes.
+Mount dataset and Hugging Face cache paths at the same location on every node. If first-time data loading is expensive,
+populate the cache before requesting GPUs. Use a unique `checkpoint_dir` for each experiment. For multi-node training,
+`checkpoint_dir` must be on a persistent filesystem mounted at the same path from every node. Relative `./output/...`
+paths are appropriate only when they resolve to that storage. Increase `dist_env.timeout_minutes` for first model
+downloads, slow filesystems, multi-node collectives, or large checkpoint writes.
 
 The step scheduler computes gradient accumulation from:
 
