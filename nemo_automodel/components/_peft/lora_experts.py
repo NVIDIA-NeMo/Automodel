@@ -534,18 +534,25 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         permuted_probs = permuted_probs.unsqueeze(-1)
 
         compute_dtype = x.dtype
-        to_operand = _to_grouped_mm_operand if self.use_torch_mm else _to_gmm_operand
-        gate_and_up_projs = to_operand(self.gate_and_up_projs, compute_dtype)
-        down_projs = to_operand(self.down_projs, compute_dtype)
-        lora_gate_and_up_A = to_operand(self.lora_gate_and_up_A, compute_dtype)
-        lora_gate_and_up_B = to_operand(self.lora_gate_and_up_B, compute_dtype)
-        lora_down_A = to_operand(self.lora_down_A, compute_dtype)
-        lora_down_B = to_operand(self.lora_down_B, compute_dtype)
+        if self.use_torch_mm:
+            gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
+            down_projs = _to_grouped_mm_operand(self.down_projs, compute_dtype)
+        else:
+            gate_and_up_projs = _to_gmm_operand(self.gate_and_up_projs, compute_dtype)
+            down_projs = _to_gmm_operand(self.down_projs, compute_dtype)
+        lora_gate_and_up_A = _to_gmm_operand(self.lora_gate_and_up_A, compute_dtype)
+        lora_gate_and_up_B = _to_gmm_operand(self.lora_gate_and_up_B, compute_dtype)
+        lora_down_A = _to_gmm_operand(self.lora_down_A, compute_dtype)
+        lora_down_B = _to_gmm_operand(self.lora_down_B, compute_dtype)
 
         if permuted_local_hidden_states.size(0) > 0:
             if self.use_torch_mm:
                 use_grouped_gemm_lora = _use_grouped_gemm_for_lora(lora_gate_and_up_A)
                 if not use_grouped_gemm_lora:
+                    lora_gate_and_up_A = _to_grouped_mm_operand(lora_gate_and_up_A, compute_dtype)
+                    lora_gate_and_up_B = _to_grouped_mm_operand(lora_gate_and_up_B, compute_dtype)
+                    lora_down_A = _to_grouped_mm_operand(lora_down_A, compute_dtype)
+                    lora_down_B = _to_grouped_mm_operand(lora_down_B, compute_dtype)
                     lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
                         lora_gate_and_up_A, lora_gate_and_up_B
                     )
