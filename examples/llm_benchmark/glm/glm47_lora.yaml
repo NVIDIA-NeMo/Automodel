@@ -45,6 +45,11 @@ distributed:
   ep_size: 32
   sequence_parallel: false
   activation_checkpointing: true
+  mp_policy:
+    param_dtype: bfloat16
+    reduce_dtype: bfloat16
+    output_dtype: bfloat16
+    cast_forward_inputs: true
   pipeline:
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 1
