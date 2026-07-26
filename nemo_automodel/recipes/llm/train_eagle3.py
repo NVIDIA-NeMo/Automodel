@@ -35,7 +35,9 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 from nemo_automodel.components.checkpoint.checkpointing import (
     CheckpointingConfig,
+    is_legacy_pickle_restore_allowed,
     load_hf_safetensors_state_dict,
+    safe_torch_load,
     save_config,
 )
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
@@ -1608,7 +1610,12 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             legacy = os.path.join(ckpt_dir, "eagle3_meta.pt")
             meta_path = legacy if os.path.exists(legacy) else meta_path
         if os.path.exists(meta_path):
-            meta = torch.load(meta_path, weights_only=False, map_location="cpu")
+            meta = safe_torch_load(
+                meta_path,
+                map_location="cpu",
+                allow_legacy_pickle_restore=is_legacy_pickle_restore_allowed(self),
+                description="EAGLE metadata",
+            )
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
             # Align the regen launch cadence to the restored step so resume does not

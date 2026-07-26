@@ -14,6 +14,7 @@
 
 import random
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -56,18 +57,50 @@ class RNGState:
     cuda_rng_state: torch.Tensor
 
 
+_RNG_STATE_FORMAT = "nemo_automodel_stateful_rng_v1"
+
+
+def _python_random_state_to_safe(state: tuple) -> list[Any]:
+    return [int(state[0]), list(state[1]), state[2]]
+
+
+def _python_random_state_from_safe(state: list[Any] | tuple[Any, ...]) -> tuple:
+    return (int(state[0]), tuple(int(x) for x in state[1]), state[2])
+
+
+def _numpy_random_state_to_safe(state: tuple) -> dict[str, Any]:
+    return {
+        "bit_generator": state[0],
+        "state": torch.as_tensor(state[1].astype(np.int64)),
+        "pos": int(state[2]),
+        "has_gauss": int(state[3]),
+        "cached_gaussian": float(state[4]),
+    }
+
+
+def _numpy_random_state_from_safe(state: dict[str, Any]) -> tuple:
+    return (
+        str(state["bit_generator"]),
+        state["state"].cpu().numpy().astype(np.uint32),
+        int(state["pos"]),
+        int(state["has_gauss"]),
+        float(state["cached_gaussian"]),
+    )
+
+
 def _get_rng_state():
     """Get current RNG states.
 
     Returns:
         dict: RNG states for random, NumPy, and PyTorch.
     """
-    return RNGState(
-        random_rng_state=random.getstate(),
-        np_rng_state=np.random.get_state(),
-        torch_rng_state=torch.get_rng_state(),
-        cuda_rng_state=torch.cuda.get_rng_state_all(),
-    )
+    return {
+        "format": _RNG_STATE_FORMAT,
+        "python_random": _python_random_state_to_safe(random.getstate()),
+        "numpy_random": _numpy_random_state_to_safe(np.random.get_state()),
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state_all(),
+    }
 
 
 def _restore_rng_state(state):
@@ -76,10 +109,20 @@ def _restore_rng_state(state):
     Args:
         state (dict): RNG states as returned by state_dict().
     """
-    random.setstate(state.random_rng_state)
-    np.random.set_state(state.np_rng_state)
-    torch.set_rng_state(state.torch_rng_state)
-    torch.cuda.set_rng_state_all(state.cuda_rng_state)
+    if isinstance(state, RNGState):
+        random.setstate(state.random_rng_state)
+        np.random.set_state(state.np_rng_state)
+        torch.set_rng_state(state.torch_rng_state)
+        torch.cuda.set_rng_state_all(state.cuda_rng_state)
+        return
+
+    if not isinstance(state, dict) or state.get("format") != _RNG_STATE_FORMAT:
+        raise ValueError("Unsupported StatefulRNG checkpoint format")
+
+    random.setstate(_python_random_state_from_safe(state["python_random"]))
+    np.random.set_state(_numpy_random_state_from_safe(state["numpy_random"]))
+    torch.set_rng_state(state["torch_rng_state"])
+    torch.cuda.set_rng_state_all(state["cuda_rng_state"])
 
 
 class StatefulRNG:

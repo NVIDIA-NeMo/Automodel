@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from nemo_automodel.components.training.rng import ScopedRNG, init_all_rng
+from nemo_automodel.components.training.rng import RNGState, ScopedRNG, StatefulRNG, init_all_rng
 
 
 def _next_values():
@@ -117,6 +117,40 @@ def test_stateful_rng_restores_state():
     # NumPy & torch states are numpy arrays / tensors – use dedicated checks
     assert all(np.array_equal(a, b) for a, b in zip(pre_state[1][1:], post_state[1][1:]))
     assert torch.equal(pre_state[2], post_state[2])
+
+
+def test_stateful_rng_checkpoint_is_weights_only_loadable(tmp_path):
+    """StatefulRNG checkpoints must not require pickle-based torch.load."""
+    rng = StatefulRNG(seed=123)
+    path = tmp_path / "rng.pt"
+    torch.save(rng.state_dict(), path)
+
+    loaded = torch.load(path, weights_only=True)
+    expected = _next_values()
+
+    init_all_rng(999)
+    rng.load_state_dict(loaded)
+    actual = _next_values()
+
+    assert actual == expected
+
+
+def test_stateful_rng_loads_legacy_rngstate_after_explicit_unsafe_load():
+    """The runtime restore path still understands legacy RNGState objects after migration loading."""
+    init_all_rng(123)
+    legacy_state = RNGState(
+        random_rng_state=random.getstate(),
+        np_rng_state=np.random.get_state(),
+        torch_rng_state=torch.get_rng_state(),
+        cuda_rng_state=torch.cuda.get_rng_state_all(),
+    )
+    expected = _next_values()
+
+    rng = StatefulRNG(seed=999)
+    rng.load_state_dict(legacy_state)
+    actual = _next_values()
+
+    assert actual == expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
