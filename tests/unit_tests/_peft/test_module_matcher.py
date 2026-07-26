@@ -90,9 +90,10 @@ class TestModuleMatcherValidation:
         m = ModuleMatcher()
         assert m.target_modules == ["*_proj"]
 
-    def test_rejects_target_and_exclude_together(self):
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            ModuleMatcher(target_modules=["linear_qkv"], exclude_modules=["linear_proj"])
+    def test_accepts_target_and_exclude_together(self):
+        m = ModuleMatcher(target_modules=["linear_qkv"], exclude_modules=["linear_proj"])
+        assert m.target_modules == ["linear_qkv"]
+        assert m.exclude_modules == ["linear_proj"]
 
     def test_rejects_match_all_linear_with_target_modules(self):
         with pytest.raises(ValueError):
@@ -173,6 +174,24 @@ class TestModuleMatcherMatch:
                 prefix="decoder.layers.1.self_attention",
             )
             is False
+        )
+
+    def test_target_modules_exclude_by_name_vetoes_match(self):
+        matcher = ModuleMatcher(target_modules=["*"], exclude_modules=["lm_head"])
+        assert not matcher.match(nn.Linear(10, 10), name="lm_head")
+        assert matcher.match(nn.Linear(10, 10), name="q_proj") is True
+
+    def test_target_modules_exclude_by_wildcard_vetoes_match(self):
+        matcher = ModuleMatcher(target_modules=["*"], exclude_modules=["*.layers.0.*.linear_proj"])
+        assert not matcher.match(
+            nn.Linear(10, 10),
+            name="linear_proj",
+            prefix="decoder.layers.0.self_attention",
+        )
+        assert matcher.match(
+            nn.Linear(10, 10),
+            name="linear_proj",
+            prefix="decoder.layers.1.self_attention",
         )
 
     def test_exclude_modules_excludes_by_name(self):

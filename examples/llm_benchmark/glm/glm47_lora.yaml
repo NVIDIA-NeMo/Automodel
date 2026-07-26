@@ -80,6 +80,7 @@ model:
 peft:
   _target_: nemo_automodel.components._peft.lora.PeftConfig
   target_modules: ["*"]
+  exclude_modules: ["lm_head"]
   dim: 32
   alpha: 32
   dropout: 0.0
