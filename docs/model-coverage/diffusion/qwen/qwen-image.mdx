@@ -22,7 +22,7 @@ description: "Train Qwen-Image text-to-image and Qwen-Image-Edit-2511 image-edit
 | Qwen-Image | [`Qwen/Qwen-Image`](https://huggingface.co/Qwen/Qwen-Image) | Text-to-image training and fine-tuning |
 | Qwen-Image-Edit-2511 | [`Qwen/Qwen-Image-Edit-2511`](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Cached, full-parameter, single-node training |
 
-Qwen-Image-Edit-2511 support is intentionally limited to cached target/context latents and cached Qwen2.5-VL prompt conditioning. Raw-image online encoding, LoRA, inference onboarding, older Qwen image-edit checkpoints, and multinode tuning are not supported by this recipe.
+Qwen-Image-Edit-2511 training is intentionally limited to cached target/context latents and cached Qwen2.5-VL prompt conditioning. Raw-image online encoding, LoRA, older Qwen image-edit checkpoints, and multinode tuning are not supported by the training recipe. Image-edit inference is supported by the generic generation script.
 
 ## Recipes
 
@@ -145,6 +145,22 @@ uv run torchrun --nproc-per-node=8 \
 ```
 
 The smoke test passes when the first launch writes the step-10 checkpoint, the second launch restores it and reaches step 20, and every reported loss and gradient norm is finite.
+
+## Generate
+
+Use [generate_qwen_image_edit.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/diffusion/generate/configs/generate_qwen_image_edit.yaml) to edit an image with the base model or a consolidated training checkpoint. Each entry in `inference.input_images` is paired with the prompt at the same position, so both lists must have the same length.
+
+Pass the epoch checkpoint directory, source image, and edit instruction to the generic generation script:
+
+```bash
+uv run python examples/diffusion/generate/generate.py \
+  -c examples/diffusion/generate/configs/generate_qwen_image_edit.yaml \
+  --model.checkpoint /checkpoints/qwen-edit/epoch_12_step_99 \
+  --inference.input_images '["/data/source.png"]' \
+  --inference.prompts '["Add mountains in the background"]'
+```
+
+The checkpoint directory must contain the consolidated Diffusers-compatible safetensors written by training with `checkpoint.save_consolidated: final`. Omit `--model.checkpoint` to run with the base `Qwen/Qwen-Image-Edit-2511` weights.
 
 ## Install
 
