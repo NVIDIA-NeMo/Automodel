@@ -91,7 +91,20 @@ def _run_post_backward_hooks(fsdp_module: FSDPModule) -> Callable:
     for state in fsdp_state._state_ctx.all_states:
         if state._fsdp_param_group:
             state._fsdp_param_group.post_backward()
+    _ensure_root_post_backward_comm_context(fsdp_state)
     return fsdp_state._root_post_backward_final_callback
+
+
+def _ensure_root_post_backward_comm_context(fsdp_state: Any) -> None:
+    comm_ctx = getattr(fsdp_state, "_comm_ctx", None)
+    if comm_ctx is None:
+        return
+    if not hasattr(comm_ctx, "post_forward_order"):
+        comm_ctx.post_forward_order = []
+    if not hasattr(comm_ctx, "reduce_scatter_state"):
+        comm_ctx.reduce_scatter_state = None
+    if not hasattr(comm_ctx, "reduce_scatter_states"):
+        comm_ctx.reduce_scatter_states = []
 
 
 class MoEFSDPSyncMixin:
@@ -277,6 +290,7 @@ def patched_backward_maybe_with_nosync(
                 # it would be much better if pipelining backward invoked .backward so autograd hooks
                 # worked and modules like DDP/FSDP behaved as expected.  Working around this for the time being,
                 # we need to call this too to ensure FSDP syncs its grad reduction ops back to the default stream.
+                _ensure_root_post_backward_comm_context(fsdp_state)
                 fsdp_state._root_post_backward_final_callback()
 
             run_post_backward(self.submod)

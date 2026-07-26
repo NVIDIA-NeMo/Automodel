@@ -19,6 +19,7 @@ from nemo_automodel.components.moe.fsdp_mixin import (
     MoEFSDPSyncMixin,
     _configure_fsdp_module,
     _disable_fsdp_for_moe_module,
+    _ensure_root_post_backward_comm_context,
     _iter_fsdp_modules,
     _run_post_backward_for_moe_module,
     _run_post_backward_hooks,
@@ -447,6 +448,22 @@ class TestGlobalOptimStepFlag:
 
 class TestRunPostBackwardHooks:
     """Test _run_post_backward_hooks helper function."""
+
+    def test_initializes_missing_root_callback_comm_context_attrs(self):
+        class CommContext:
+            pass
+
+        class FSDPState:
+            pass
+
+        fsdp_state = FSDPState()
+        fsdp_state._comm_ctx = CommContext()
+
+        _ensure_root_post_backward_comm_context(fsdp_state)
+
+        assert fsdp_state._comm_ctx.post_forward_order == []
+        assert fsdp_state._comm_ctx.reduce_scatter_state is None
+        assert fsdp_state._comm_ctx.reduce_scatter_states == []
 
     @patch("nemo_automodel.components.moe.fsdp_mixin.fully_shard")
     def test_runs_post_backward_and_returns_callback(self, mock_fully_shard):
