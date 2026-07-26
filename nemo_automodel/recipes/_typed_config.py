@@ -20,9 +20,9 @@ recipe body only ever sees typed component configs and calls
 ``self.cfg.<section>.build(...)`` directly.
 
 Known sections are exposed as cached, typed attributes that own a ``build()`` or
-``apply()``: ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``flow_matching``/
-``prewarm``/``embedding_row_repair`` map to component config dataclasses; the
-``optimizer`` and ``loss_fn`` blocks resolve to a component
+``apply()``: ``wandb``/``mlflow``/``step_scheduler``/``lr_scheduler``/``prewarm``/
+``embedding_row_repair`` map to component config dataclasses; the ``optimizer``
+and ``loss_fn`` blocks resolve to a component
 :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig` /
 :class:`~nemo_automodel.components.loss.loss.LossConfig` via
 ``build_optimizer_config`` / ``build_loss_config`` (which own a ``build()``),
@@ -130,7 +130,7 @@ def _model_name_from_cfg(cfg_model: Any) -> str | None:
 class RecipeConfig:
     """Typed view over the YAML config consumed by recipes.
 
-    ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``flow_matching``, ``optimizer``,
+    ``wandb``, ``mlflow``, ``step_scheduler``, ``lr_scheduler``, ``optimizer``,
     ``loss_fn`` and ``checkpoint`` are exposed as typed objects that own a
     ``.build(...)`` (``optimizer`` is an
     :class:`~nemo_automodel.components.optim.optimizer.OptimizerConfig`,
