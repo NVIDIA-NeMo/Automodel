@@ -408,7 +408,8 @@ def apply_ac(
         activation_checkpointing_modules: Which decoder submodules to wrap for
             non-selective activation checkpointing. ``"all"`` keeps the existing
             whole-decoder-block behavior. ``"mlp"`` checkpoints only the
-            feed-forward/MoE path with the same router-save policy.
+            feed-forward/MoE path with the same router-save policy. Attention
+            submodule checkpointing uses the dense selective AC save policy.
 
     Trainable VLM vision-tower blocks selected by the scope get the same per-submodule
     wrapping (attention/MLP/norms) as the generic FSDP2/DDP path, with the SDPA backend
@@ -536,9 +537,11 @@ def apply_ac(
     if ac_modules != ("all",):
         attention_context_fn = None
         if "attention" in ac_modules:
-            from nemo_automodel.components.distributed.activation_checkpointing import sdpa_backend_snapshot_context_fn
+            from nemo_automodel.components.distributed.activation_checkpointing import (
+                make_selective_checkpoint_context_fn,
+            )
 
-            attention_context_fn = sdpa_backend_snapshot_context_fn
+            attention_context_fn = make_selective_checkpoint_context_fn()
 
         def _checkpoint_child(block: nn.Module, attr_names: tuple[str, ...], *, context_fn=None) -> int:
             checkpoint_kwargs = {"preserve_rng_state": True}
