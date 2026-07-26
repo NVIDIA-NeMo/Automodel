@@ -141,11 +141,8 @@ def _import_diffusers_class(class_name: str):
 
 def _init_parallelizer():
     """Register custom parallelization strategies."""
-    from nemo_automodel.components.models.qwen_image_edit.fsdp import register_qwen_image_edit_parallel_strategy
-
     parallelizer.PARALLELIZATION_STRATEGIES["WanTransformer3DModel"] = WanParallelizationStrategy()
     parallelizer.PARALLELIZATION_STRATEGIES["HunyuanVideo15Transformer3DModel"] = HunyuanParallelizationStrategy()
-    register_qwen_image_edit_parallel_strategy()
 
 
 def _choose_device(device: Optional[torch.device]) -> torch.device:

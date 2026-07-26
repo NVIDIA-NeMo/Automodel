@@ -64,7 +64,7 @@ def _two_rank_worker(
         from nemo_automodel.components.distributed.utils import get_sync_ctx
         from nemo_automodel.components.flow_matching.adapters.base import FlowMatchingContext
         from nemo_automodel.components.models.qwen_image_edit.adapter import QwenImageEditAdapter
-        from nemo_automodel.components.models.qwen_image_edit.fsdp import QwenImageEditParallelizationStrategy
+        from nemo_automodel.components.distributed.parallelizer import QwenImageEditParallelizationStrategy
         from nemo_automodel.components.training.utils import (
             prepare_after_first_microbatch,
             prepare_for_final_backward,
