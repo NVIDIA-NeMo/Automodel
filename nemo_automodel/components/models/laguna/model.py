@@ -927,8 +927,9 @@ class LagunaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
     def update_moe_gate_bias(self) -> None:
         for layer in self.model.layers.values():
-            if isinstance(layer.mlp, MoE) and layer.mlp.gate.bias_update_factor > 0:
-                layer.mlp.gate.update_bias()
+            mlp = unwrap_checkpoint_wrapper(layer.mlp)
+            if isinstance(mlp, MoE) and mlp.gate.bias_update_factor > 0:
+                mlp.gate.update_bias()
 
     def forward(
         self,

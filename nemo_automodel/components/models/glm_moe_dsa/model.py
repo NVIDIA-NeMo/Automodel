@@ -264,8 +264,9 @@ class GlmMoeDsaModel(nn.Module):
         """Update the noaux router correction bias of each local MoE layer; dense layers and disabled gates are skipped."""
         with torch.no_grad():
             for block in self.layers.values():
-                if isinstance(block.mlp, MoE) and block.mlp.gate.bias_update_factor > 0:
-                    block.mlp.gate.update_bias()
+                mlp = unwrap_checkpoint_wrapper(block.mlp)
+                if isinstance(mlp, MoE) and mlp.gate.bias_update_factor > 0:
+                    mlp.gate.update_bias()
 
 
 class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
@@ -567,10 +568,11 @@ class GlmMoeDsaForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         self.to(dtype)
         for layer in self.model.layers.values():
-            if isinstance(layer.mlp, MoE):
-                layer.mlp.gate.e_score_correction_bias = torch.zeros(
-                    (self.config.n_routed_experts), dtype=torch.float32
-                ).to(buffer_device)
+            mlp = unwrap_checkpoint_wrapper(layer.mlp)
+            if isinstance(mlp, MoE):
+                mlp.gate.e_score_correction_bias = torch.zeros((self.config.n_routed_experts), dtype=torch.float32).to(
+                    buffer_device
+                )
 
 
 ModelClass = GlmMoeDsaForCausalLM

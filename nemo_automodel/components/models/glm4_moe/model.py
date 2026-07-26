@@ -365,10 +365,11 @@ class Glm4MoeForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
 
         cast_model_to_dtype(self, dtype)
         for layer in self.model.layers.values():
-            if isinstance(layer.mlp, MoE):
-                layer.mlp.gate.e_score_correction_bias = torch.zeros(
-                    (self.config.n_routed_experts), dtype=torch.float32
-                ).to(buffer_device)
+            mlp = unwrap_checkpoint_wrapper(layer.mlp)
+            if isinstance(mlp, MoE):
+                mlp.gate.e_score_correction_bias = torch.zeros((self.config.n_routed_experts), dtype=torch.float32).to(
+                    buffer_device
+                )
         with buffer_device:
             # Ensure rotary embedding uses correct device after dtype move
             self.model.rotary_emb.device = buffer_device

@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -281,8 +282,9 @@ class Mistral4Model(nn.Module):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for _, block in self.layers.named_children():
-                if isinstance(block.mlp, MoE):
-                    block.mlp.gate.update_bias()
+                mlp = unwrap_checkpoint_wrapper(block.mlp)
+                if isinstance(mlp, MoE):
+                    mlp.gate.update_bias()
 
     @torch.no_grad()
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
@@ -425,8 +427,9 @@ class Mistral4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():
             for _, block in self.model.layers.named_children():
-                if isinstance(block.mlp, MoE):
-                    block.mlp.gate.update_bias()
+                mlp = unwrap_checkpoint_wrapper(block.mlp)
+                if isinstance(mlp, MoE):
+                    mlp.gate.update_bias()
 
     @torch.no_grad()
     def initialize_weights(
@@ -865,8 +868,9 @@ if _HF_MISTRAL3_AVAILABLE:
         def update_moe_gate_bias(self) -> None:
             with torch.no_grad():
                 for _, block in self.model.language_model.layers.named_children():
-                    if isinstance(block.mlp, MoE):
-                        block.mlp.gate.update_bias()
+                    mlp = unwrap_checkpoint_wrapper(block.mlp)
+                    if isinstance(mlp, MoE):
+                        mlp.gate.update_bias()
 
         @torch.no_grad()
         def initialize_weights(
