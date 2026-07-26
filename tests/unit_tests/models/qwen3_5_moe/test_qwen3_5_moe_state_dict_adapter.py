@@ -126,6 +126,31 @@ class TestInitialization:
 
         assert adapter._get_mtp_expert_hf_layout() == "grouped"
 
+    @pytest.mark.parametrize("override_source", ["constructor", "config"])
+    def test_mtp_layout_override_takes_precedence_over_local_checkpoint(
+        self, tmp_path, config, moe_config, backend_config, override_source
+    ):
+        split_key = "mtp.layers.0.mlp.experts.0.down_proj.weight"
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {split_key: "model-00001-of-00001.safetensors"}})
+        )
+        config._name_or_path = str(tmp_path)
+        config.name_or_path = str(tmp_path)
+        explicit_layout = None
+        if override_source == "constructor":
+            explicit_layout = "grouped"
+        else:
+            config.mtp_expert_hf_layout = "grouped"
+        adapter = Qwen3_5MoeStateDictAdapter(
+            config=config,
+            moe_config=moe_config,
+            backend=backend_config,
+            pretrained_model_name_or_path=str(tmp_path),
+            mtp_expert_hf_layout=explicit_layout,
+        )
+
+        assert adapter._get_mtp_expert_hf_layout() == "grouped"
+
     def test_mtp_layout_rejects_unknown_override(self, config, moe_config, backend_config):
         adapter = Qwen3_5MoeStateDictAdapter(
             config=config,

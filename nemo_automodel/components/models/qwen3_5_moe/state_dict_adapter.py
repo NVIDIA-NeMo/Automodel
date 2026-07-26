@@ -193,6 +193,8 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
                 configured_layout = "grouped"
             else:
                 raise ValueError(f"Unsupported MTP expert HF layout: {layout!r}")
+        if configured_layout is not None:
+            return configured_layout
 
         inferred_layout = _infer_mtp_expert_hf_layout(checkpoint_keys) if checkpoint_keys is not None else None
         if checkpoint_keys is None and not self._local_checkpoint_layout_checked:
@@ -211,8 +213,6 @@ class Qwen3_5MoeStateDictAdapter(StateDictAdapter):
 
         if self._inferred_mtp_expert_hf_layout is not None:
             return self._inferred_mtp_expert_hf_layout
-        if configured_layout is not None:
-            return configured_layout
 
         model_names = [self.pretrained_model_name_or_path]
         for attr in ("_name_or_path", "name_or_path"):
