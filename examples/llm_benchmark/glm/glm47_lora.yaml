@@ -45,7 +45,7 @@ distributed:
   ep_size: 32
   sequence_parallel: false
   activation_checkpointing: true
-  activation_checkpointing_modules: ["attention", "mlp"]
+  activation_checkpointing_modules: ["mlp"]
   pipeline:
     pp_schedule: interleaved1f1b
     pp_microbatch_size: 1
@@ -55,7 +55,7 @@ distributed:
     patch_causal_lm_model: false
     layers_per_stage: 2
   moe:
-    reshard_after_forward: false
+    reshard_after_forward: true
     wrap_outer_model: false
 dist_env:
   backend: nccl
