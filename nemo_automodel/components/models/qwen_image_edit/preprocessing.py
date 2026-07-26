@@ -27,7 +27,6 @@ from typing import Any, TypedDict, cast
 
 import torch
 
-from nemo_automodel.shared.image_edit_cache import IMAGE_EDIT_CACHE_FORMAT_VERSION
 from nemo_automodel.shared.import_utils import safe_import
 
 NUMPY_AVAILABLE, np = safe_import(
@@ -103,7 +102,7 @@ class _WorkerSettings:
 
 
 class QwenImageEditCacheEncoder:
-    """Encode generic image-edit manifests into the versioned cached contract.
+    """Encode generic image-edit manifests into the cached contract.
 
     The encoder loads only the upstream Diffusers VAE and Qwen2.5-VL
     conditioning stack. The trainable transformer is explicitly omitted.
@@ -244,7 +243,6 @@ class QwenImageEditCacheEncoder:
         records.sort(key=lambda record: record["row_index"])
         shard_names = _write_metadata_shards(records, output_dir)
         metadata = {
-            "cache_format_version": IMAGE_EDIT_CACHE_FORMAT_VERSION,
             "dataset_name": dataset_name,
             "dataset_revision": dataset_revision,
             "dataset_config_name": dataset_config_name,

@@ -27,7 +27,6 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_automodel.components.datasets.diffusion.loader import DiffusionDataloaderBuild
-from nemo_automodel.shared.image_edit_cache import IMAGE_EDIT_CACHE_FORMAT_VERSION
 
 from .base_dataset import BaseMultiresolutionDataset
 from .sampler import SequentialBucketSampler
@@ -178,7 +177,7 @@ class ImageEditDatasetConfig:
     """Construction-time configuration for :class:`ImageEditDataset`."""
 
     cache_dir: str
-    """Directory containing a versioned image-edit cache."""
+    """Directory containing a preprocessed image-edit cache."""
     quantization: int = 64
     """Spatial quantization used for dynamic batch-size calculation."""
 
@@ -186,7 +185,7 @@ class ImageEditDatasetConfig:
         """Build the configured image-edit dataset.
 
         Returns:
-            Dataset backed by the configured versioned cache.
+            Dataset backed by the configured preprocessed cache.
         """
         return ImageEditDataset(
             cache_dir=self.cache_dir,
@@ -208,7 +207,7 @@ class ImageEditDataset(BaseMultiresolutionDataset):
         cache_dir: str,
         quantization: int = 64,
     ) -> None:
-        """Load and organize a versioned image-edit cache.
+        """Load and organize a preprocessed image-edit cache.
 
         Args:
             cache_dir: Directory containing ``metadata.json``, metadata shards,
@@ -247,17 +246,6 @@ class ImageEditDataset(BaseMultiresolutionDataset):
         if not isinstance(raw_manifest, dict):
             raise ValueError(f"Invalid metadata format in {metadata_file}: expected a mapping")
         manifest = cast(dict[str, object], raw_manifest)
-
-        cache_format_version = manifest.get("cache_format_version")
-        if (
-            isinstance(cache_format_version, bool)
-            or not isinstance(cache_format_version, int)
-            or cache_format_version != IMAGE_EDIT_CACHE_FORMAT_VERSION
-        ):
-            raise ValueError(
-                f"Unsupported image-edit cache format version {cache_format_version!r}; "
-                f"expected {IMAGE_EDIT_CACHE_FORMAT_VERSION}"
-            )
 
         raw_shards = manifest.get("shards")
         if not isinstance(raw_shards, list) or not all(isinstance(name, str) and name for name in raw_shards):

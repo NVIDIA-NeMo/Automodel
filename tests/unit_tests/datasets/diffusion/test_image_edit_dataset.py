@@ -21,7 +21,6 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_automodel.components.datasets.diffusion.image_edit_dataset import ImageEditDataloaderConfig, ImageEditDataset
 from nemo_automodel.components.datasets.diffusion.sampler import SequentialBucketSampler
-from nemo_automodel.shared.image_edit_cache import IMAGE_EDIT_CACHE_FORMAT_VERSION
 
 REVISION = "1d8d4629150d18ca50afab66391866f2085be989"
 MODEL_NAME = "Qwen/Qwen-Image-Edit-2511"
@@ -107,7 +106,6 @@ def _write_cache(
     payloads: list[dict[str, object]],
     *,
     shard_signatures: list[dict[str, object]] | None = None,
-    cache_format_version: int = IMAGE_EDIT_CACHE_FORMAT_VERSION,
 ) -> None:
     """Write cached payloads and their manifest.
 
@@ -118,7 +116,6 @@ def _write_cache(
             ``[sequence, hidden]``, and prompt masks have shape ``[sequence]``.
         shard_signatures: Optional metadata signatures to write instead of the
             signatures embedded in ``payloads``.
-        cache_format_version: Generic image-edit cache schema version.
     """
     records = []
     for index, payload in enumerate(payloads):
@@ -137,7 +134,6 @@ def _write_cache(
     shard_file = cache_dir / "metadata_shard_0000.json"
     shard_file.write_text(json.dumps(records), encoding="utf-8")
     manifest = {
-        "cache_format_version": cache_format_version,
         "dataset_name": "osunlp/MagicBrush",
         "dataset_revision": REVISION,
         "split": "dev",
@@ -354,7 +350,6 @@ def test_dataset_rejects_cache_path_outside_cache_directory(tmp_path: Path) -> N
     (tmp_path / "metadata.json").write_text(
         json.dumps(
             {
-                "cache_format_version": IMAGE_EDIT_CACHE_FORMAT_VERSION,
                 "dataset_revision": REVISION,
                 "shards": [shard_file.name],
             }
@@ -365,10 +360,3 @@ def test_dataset_rejects_cache_path_outside_cache_directory(tmp_path: Path) -> N
     dataset = ImageEditDataset(str(tmp_path))
     with pytest.raises(ValueError, match="outside cache directory"):
         dataset[0]
-
-
-def test_dataset_rejects_unknown_cache_format_version(tmp_path: Path) -> None:
-    _write_cache(tmp_path, [_make_payload(0)], cache_format_version=IMAGE_EDIT_CACHE_FORMAT_VERSION + 1)
-
-    with pytest.raises(ValueError, match="Unsupported image-edit cache format version"):
-        ImageEditDataset(str(tmp_path))

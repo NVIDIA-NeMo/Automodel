@@ -32,7 +32,6 @@ from nemo_automodel.components.models.qwen_image_edit.preprocessing import (
     _resize_vae_image,
     _validate_output_directory,
 )
-from nemo_automodel.shared.image_edit_cache import IMAGE_EDIT_CACHE_FORMAT_VERSION
 
 _PINNED_REVISION = "1d8d4629150d18ca50afab66391866f2085be989"
 _MODEL_REVISION = "b" * 40
@@ -157,7 +156,7 @@ def _make_materialized_manifest(output_dir: Path) -> Path:
     return manifest_path
 
 
-def test_encoder_writes_dataset_compatible_versioned_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_encoder_writes_dataset_compatible_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Round-trip fake VAE/text outputs through the generic cached dataset."""
     output_dir = tmp_path / "cache"
     manifest_path = _make_materialized_manifest(output_dir)
@@ -186,7 +185,6 @@ def test_encoder_writes_dataset_compatible_versioned_cache(tmp_path: Path, monke
     )
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert metadata["cache_format_version"] == IMAGE_EDIT_CACHE_FORMAT_VERSION
     assert metadata["dataset_name"] == "osunlp/MagicBrush"
     assert metadata["dataset_revision"] == _PINNED_REVISION
     assert metadata["dataset_config_name"] == "magicbrush"
