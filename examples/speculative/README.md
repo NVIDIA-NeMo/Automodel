@@ -32,6 +32,16 @@ to P-EAGLE, all from the same draft class. Domino and JetSpec reuse the DFlash
 draft class and checkpoint format; only their training wrappers (and, for
 Domino, the extra head weights) differ.
 
+**Not yet runnable: MSD (multimodal speculative decoding).** `eagle/msd.py`,
+`msd_target.py`, `msd_curriculum.py`, and `msd_decode.py` implement the MSD
+training core, the frozen VLM target wrapper, the two-stage data curriculum, and
+the reference tree-decoding path. MSD extends EAGLE-1/2 feature drafting to
+vision-language targets: text positions keep the usual concatenation of target
+features and next-token embeddings, while image positions feed the target's
+already-projected image embeddings straight into the draft. It is deliberately
+absent from the table above because no recipe or config wires it up yet, so there
+is nothing to launch. The recipe and data pipeline are a follow-up change.
+
 ## Supported target models
 
 A target's `config.architectures` string selects the draft architecture through a
@@ -46,6 +56,13 @@ The shipped example configs only cover a subset.
 - **gpt-oss** (`GptOssForCausalLM`): EAGLE-3 only, via a dedicated draft class.
 - **DeepSeek-V3** (`DeepseekV3ForCausalLM`): EAGLE-3 only, via a dedicated MLA
   draft class (eager attention; sequence packing not supported yet).
+- **Gemma4** (`Gemma4ForConditionalGeneration`): EAGLE-3 only, via a dedicated
+  draft class that reconciles the Gemma4 text config (`hidden_activation`, nested
+  per-attention-type `rope_parameters`). The target is multimodal but the draft is
+  trained on its **text backbone only**: the decoder config is read through
+  `config.get_text_config()` and the draft consumes post-block hidden states, so
+  images do not participate in drafting. Configs: `eagle3/gemma4_e2b_eagle3.yaml`,
+  `gemma4_e4b_eagle3.yaml`, `gemma4_31b_eagle3.yaml`, `gemma4_26b_a4b_eagle3.yaml`.
 - **DFlash / Domino / JetSpec**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`.
 - **DSpark**: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`,
   `DeepseekV4ForCausalLM`, GLM-5.2 (`GlmMoeDsaForCausalLM`), Gemma4
@@ -314,6 +331,66 @@ recipe_args:
 Datasets are consumed by `ChatDataset`: a `messages` list of `{role, content}`,
 or a `conversations` column (ShareGPT or OpenAI style) that is auto-converted.
 
+## Context parallelism for draft training
+
+`distributed.cp_size > 1` shards the sequence across ranks for long-context draft
+training. The draft's attention runs as a differentiable ring
+(`eagle/ring_attention.py`, with a load-balanced zig-zag layout in
+`zigzag_ring_attention.py`); `target_cp.py` prepares the target-side inputs.
+
+The constraints are enforced, not advisory: every combination below raises at
+setup rather than training something subtly wrong.
+
+| Constraint | Applies to |
+|---|---|
+| Cannot combine with sequence packing (`packed_sequence_size > 0`); CP shards the sequence and strips the block-causal mask packing relies on | EAGLE-1/2, EAGLE-3, DFlash, DSpark |
+| Colocated target backend only; the remote backend runs the target out-of-process | EAGLE-3 |
+| Cannot combine with tensor parallelism (`tp_size > 1`) | DFlash |
+| Dense Qwen3-style draft only | DSpark |
+| EAGLE-3 draft attention must be the `Eagle3LlamaAttention` ring path; architectures without it (the DeepSeek MLA draft) raise `NotImplementedError` | EAGLE-3 |
+
+## During-training tools (EAGLE-3)
+
+Both are opt-in, off unless their block sets `every_steps`, and both run their
+work in a **detached subprocess on GPUs the training run does not use**, so
+`cuda_visible_devices` is required rather than defaulted.
+
+### Periodic real acceptance length (`decode_eval`)
+
+Training loss and simulated accept length are proxies. The acceptance length that
+matters is the one an inference engine produces from the draft plus the target.
+`decode_eval` snapshots the draft every `every_steps` optimizer steps, serves the
+snapshot, benchmarks it, and reports the engine's real `accept_length` back into
+the training log and W&B.
+
+```yaml
+decode_eval:
+  every_steps: 500
+  cuda_visible_devices: "7"     # required: a GPU the training run is not using
+  target_model: meta-llama/Llama-3.1-8B-Instruct
+  input_data: /path/to/eval.jsonl
+  num_speculative_tokens: 4
+```
+
+A cycle whose predecessor is still running is skipped rather than queued, so a
+cadence faster than one eval takes will simply measure less often.
+
+### On-policy regeneration (`regen`)
+
+The draft is trained against target answers, and those answers age as the draft
+changes what it is asked to draft. `regen` periodically regenerates a slice of the
+corpus with the target and swaps the fresh shards into the dataloader. The swap
+happens at an epoch boundary (a mid-epoch dataloader rebuild would disturb the
+sampler), so a completed cycle waits for the next boundary.
+
+```yaml
+regen:
+  every_steps: 1000
+  cuda_visible_devices: "6"
+  target_model: meta-llama/Llama-3.1-8B-Instruct
+  input_data: /path/to/prompts.jsonl
+```
+
 ## Serve and benchmark a trained draft
 
 ### SGLang
@@ -505,12 +582,18 @@ Implementation:
 ```
 nemo_automodel/components/speculative/
   eagle/        core(.py/_v12), draft_llama(.py/_v12), draft_gpt_oss,
-                draft_deepseek, backend, registry, target(.py/_v12),
-                peagle_*, remote/
+                draft_deepseek, draft_gemma, backend, registry,
+                target(.py/_v12), peagle_*, remote/,
+                msd*                        # MSD core (no recipe yet)
+                ring_attention, zigzag_ring_attention   # draft-side CP
+                {sglang,vllm}_target, *_runner          # engine-backed targets
   dflash/       core, domino_core, jetspec_core, draft_qwen3, registry, target
   dspark/       core, draft_qwen3, draft_deepseek_v4, draft_glm_5_2,
                 draft_gemma4, draft_minimax_m3, markov_head, registry, target
   regenerate.py            # dataset regeneration with the target model
+  regen_loop.py            # on-policy regeneration during training (regen block)
+  decode_eval.py           # periodic real accept-length eval (decode_eval block)
+  target_cp.py             # target-side context-parallel input prep
   precompute_eagle3.py     # offline target-output cache
   serve_target.py          # remote target server (HTTP + NCCL)
   serve_sglang.py          # serve a trained draft via SGLang
