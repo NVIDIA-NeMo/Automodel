@@ -15,6 +15,7 @@
 """Tests for nested config override handling in get_hf_config and _consume_config_overrides."""
 
 import os
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -582,6 +583,38 @@ class TestGetHfConfigCustomRegistry:
 
         assert result is fallback_config
         mock_auto_config.assert_called_once()
+
+
+class TestResolveCustomConfigRegistry:
+    """resolve_custom_config_cls should prefer Automodel configs unless explicitly opted out."""
+
+    def test_unregistered_model_type_returns_none(self):
+        from nemo_automodel._transformers import registry as reg
+
+        assert reg.resolve_custom_config_cls("not_registered") is None
+
+    def test_keep_builtin_config_defers_to_transformers_builtin(self, monkeypatch):
+        from nemo_automodel._transformers import registry as reg
+
+        monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "bert", ("fake.config_module", "FakeConfig"))
+        monkeypatch.setattr(reg, "_CUSTOM_CONFIG_OVERRIDES_BUILTIN", set())
+
+        assert reg.resolve_custom_config_cls("bert") is None
+
+    def test_registered_builtin_uses_automodel_config_by_default(self, monkeypatch):
+        from nemo_automodel._transformers import registry as reg
+
+        class FakeConfig:
+            pass
+
+        fake_module = types.SimpleNamespace(FakeConfig=FakeConfig)
+        monkeypatch.setitem(reg._CUSTOM_CONFIG_REGISTRATIONS, "bert", ("fake.config_module", "FakeConfig"))
+        monkeypatch.setattr(reg, "_CUSTOM_CONFIG_OVERRIDES_BUILTIN", {"bert"})
+        monkeypatch.setattr(
+            reg.importlib, "import_module", lambda name: fake_module if name == "fake.config_module" else None
+        )
+
+        assert reg.resolve_custom_config_cls("bert") is FakeConfig
 
 
 class TestDictConfigOverrideKeepsCustomPath:
