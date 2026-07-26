@@ -30,6 +30,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _finish_hf_reload_sync,
     _get_input_ids,
     _hf_source_load_kwargs,
+    _keep_hf_modules_in_fp32,
     _load_hf_fp8_dequantized_config,
     _post_load_dequant_max_memory,
     _prepare_hf_reload_sync,
@@ -69,9 +70,7 @@ def test_release_recipe_memory_frees_deepep_buffer_between_phases():
     )
 
     with (
-        patch(
-            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._barrier"
-        ) as barrier,
+        patch("tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._barrier") as barrier,
         patch("nemo_automodel.components.moe.megatron.fused_a2a.free_buffer") as free_buffer,
         patch.object(torch.cuda, "is_available", return_value=False),
     ):
@@ -192,6 +191,46 @@ def test_extract_custom_args_accepts_hf_source_post_load_dequantize():
     custom, remaining = _extract_custom_args(["--hf_source_post_load_dequantize", "--other-arg"])
 
     assert custom["hf_source_post_load_dequantize"] is True
+    assert remaining == ["--other-arg"]
+
+
+def test_keep_hf_modules_in_fp32_uses_strict_dtype_plan_and_restores_class_state(tmp_path):
+    from transformers import PretrainedConfig, PreTrainedModel
+
+    class TinyConfig(PretrainedConfig):
+        model_type = "checkpoint-robustness-gdn-dtype-test"
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._experts_implementation_internal = "eager"
+
+    class TinyModel(PreTrainedModel):
+        config_class = TinyConfig
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.A_log = torch.nn.Parameter(torch.tensor([1.234567]))
+            self.dt_bias = torch.nn.Parameter(torch.tensor([0.25]))
+            self.post_init()
+
+    previous = getattr(PreTrainedModel, "_keep_in_fp32_modules_strict", None)
+    TinyModel(TinyConfig()).save_pretrained(tmp_path)
+    plain = TinyModel.from_pretrained(tmp_path, dtype=torch.bfloat16)
+    with _keep_hf_modules_in_fp32(("A_log", "dt_bias")):
+        assert set(PreTrainedModel._keep_in_fp32_modules_strict) >= {"A_log", "dt_bias"}
+        strict = TinyModel.from_pretrained(tmp_path, dtype=torch.bfloat16)
+
+    assert PreTrainedModel._keep_in_fp32_modules_strict == previous
+    assert plain.A_log.dtype == torch.bfloat16
+    assert plain.dt_bias.dtype == torch.bfloat16
+    assert strict.A_log.dtype == torch.float32
+    assert strict.dt_bias.dtype == torch.float32
+
+
+def test_extract_custom_args_accepts_hf_keep_in_fp32_modules():
+    custom, remaining = _extract_custom_args(["--hf_keep_in_fp32_modules", "A_log,dt_bias", "--other-arg"])
+
+    assert custom["hf_keep_in_fp32_modules"] == "A_log,dt_bias"
     assert remaining == ["--other-arg"]
 
 

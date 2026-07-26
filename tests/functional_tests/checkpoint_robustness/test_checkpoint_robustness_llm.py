@@ -32,6 +32,7 @@ import sys
 import time
 import traceback
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 
 import datasets
@@ -65,6 +66,7 @@ def _extract_custom_args(argv):
         "--cross_tp_size",
         "--cross_tp_kl_threshold",
         "--experts_implementation",
+        "--hf_keep_in_fp32_modules",
         "--tokenizer_name",
         "--max_vram_gb",
         "--max_cpu_gb",
@@ -407,6 +409,24 @@ def _release_model_memory() -> None:
         torch.cuda.empty_cache()
 
 
+@contextmanager
+def _keep_hf_modules_in_fp32(module_names: tuple[str, ...]):
+    """Keep selected HF parameters in fp32 while an auto-model class is resolved and loaded."""
+    if not module_names:
+        yield
+        return
+
+    from transformers import PreTrainedModel
+
+    attr = "_keep_in_fp32_modules_strict"
+    previous = getattr(PreTrainedModel, attr, None)
+    setattr(PreTrainedModel, attr, set(previous or ()) | set(module_names))
+    try:
+        yield
+    finally:
+        setattr(PreTrainedModel, attr, previous)
+
+
 def _preinit_global_rank() -> int:
     """Return the torchrun global rank before torch.distributed is initialized."""
     if dist.is_initialized():
@@ -559,6 +579,7 @@ def _prepare_source_load_reference(
     hf_model_cls: type,
     trust_remote_code: bool,
     experts_implementation: str | None,
+    hf_keep_in_fp32_modules: tuple[str, ...],
     hf_device_map_auto: bool,
     hf_source_post_load_dequantize: bool,
 ) -> tuple[torch.Tensor, bool | None, bool | None] | None:
@@ -585,6 +606,7 @@ def _prepare_source_load_reference(
             hf_model_cls=hf_model_cls,
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
+            hf_keep_in_fp32_modules=hf_keep_in_fp32_modules,
             hf_device_map_auto=hf_device_map_auto,
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
         )
@@ -605,6 +627,7 @@ def _prepare_source_load_reference_rank0(
     hf_model_cls: type,
     trust_remote_code: bool,
     experts_implementation: str | None,
+    hf_keep_in_fp32_modules: tuple[str, ...],
     hf_device_map_auto: bool,
     hf_source_post_load_dequantize: bool,
 ) -> tuple[torch.Tensor, bool | None, bool | None]:
@@ -661,7 +684,7 @@ def _prepare_source_load_reference_rank0(
         no_meta = nullcontext()
 
     print(f"\n[Phase 0] Source-load reference: vanilla HF for {original_pretrained_path}")
-    with no_meta:
+    with no_meta, _keep_hf_modules_in_fp32(hf_keep_in_fp32_modules):
         if "device_map" in hf_kwargs:
             hf_model = hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
         else:
@@ -1056,6 +1079,9 @@ def run_checkpoint_robustness(
     cross_tp_kl_threshold = float(custom_args.get("cross_tp_kl_threshold", "5e-3"))
     trust_remote_code = bool(custom_args.get("trust_remote_code", False))
     experts_implementation = custom_args.get("experts_implementation", None)
+    hf_keep_in_fp32_modules = tuple(
+        name.strip() for name in custom_args.get("hf_keep_in_fp32_modules", "").split(",") if name.strip()
+    )
     tokenizer_name = custom_args.get("tokenizer_name", None)
     max_vram_gb = float(custom_args.get("max_vram_gb", "0"))
     max_cpu_gb = float(custom_args.get("max_cpu_gb", "0"))
@@ -1083,6 +1109,7 @@ def run_checkpoint_robustness(
             hf_model_cls=hf_model_cls,
             trust_remote_code=trust_remote_code,
             experts_implementation=experts_implementation,
+            hf_keep_in_fp32_modules=hf_keep_in_fp32_modules,
             hf_device_map_auto=hf_device_map_auto,
             hf_source_post_load_dequantize=hf_source_post_load_dequantize,
         )
@@ -1283,7 +1310,7 @@ def run_checkpoint_robustness(
         if is_peft:
             from peft import PeftModel
 
-            with _no_meta:
+            with _no_meta, _keep_hf_modules_in_fp32(hf_keep_in_fp32_modules):
                 if "device_map" in hf_kwargs:
                     base_model = hf_model_cls.from_pretrained(original_pretrained_path, **hf_kwargs)
                 else:
@@ -1330,7 +1357,7 @@ def run_checkpoint_robustness(
             del peft_model, base_model
         else:
             _prepopulate_hf_dynamic_modules_cache(consolidated_dir)
-            with _no_meta:
+            with _no_meta, _keep_hf_modules_in_fp32(hf_keep_in_fp32_modules):
                 if "device_map" in hf_kwargs:
                     hf_model = hf_model_cls.from_pretrained(str(consolidated_dir), **hf_kwargs)
                 else:
