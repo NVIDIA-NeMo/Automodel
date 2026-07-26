@@ -89,6 +89,9 @@ dataset:
   seq_length: 1024
   truncation: true
   unshifted: true
+  # LLaDA-8B-Base's native chat template appends an assistant prompt and lacks
+  # generation tags, so multi-turn answer-only masks cannot be derived safely.
+  chat_template: examples/dllm_sft/llada_chat_template.jinja
   tokenizer:
     pretrained_model_name_or_path: GSAI-ML/LLaDA-8B-Base
     trust_remote_code: true
