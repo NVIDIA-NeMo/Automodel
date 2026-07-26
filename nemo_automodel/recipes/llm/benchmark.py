@@ -404,7 +404,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     sort_by="cuda_time_total",
                     row_limit=self._bench_torch_profile_row_limit,
                 )
-                logger.info(f"Rank {rank} | torch.profiler key averages at iteration {i}:\n{table}")
+                message = f"Rank {rank} | torch.profiler key averages at iteration {i}:\n{table}"
+                logger.info(message)
+                print(message, flush=True)
 
             # Synchronize num_label_tokens across DP ranks
             num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)

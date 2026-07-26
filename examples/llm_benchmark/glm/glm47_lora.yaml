@@ -29,7 +29,7 @@ benchmark:
   nsys_end: -1
   nsys_ranks: []
   torch_profile_iteration: 10
-  torch_profile_ranks: [0, 32]
+  torch_profile_ranks: [32]
   torch_profile_row_limit: 40
   num_nodes: 8
 step_scheduler:
@@ -39,7 +39,7 @@ step_scheduler:
   ckpt_every_steps: 1000
   val_every_steps: 1000
   num_epochs: 1
-  max_steps: 12
+  max_steps: 11
 distributed:
   strategy: fsdp2
   tp_size: 1
