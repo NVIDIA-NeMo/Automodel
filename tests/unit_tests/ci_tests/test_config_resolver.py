@@ -375,6 +375,7 @@ def test_vlm_checkpoint_robustness_recipes_resolve(tmp_path, recipe_path):
     if Path(recipe_path).stem == "qwen3_vl_moe_30b_te_deepep":
         assert robustness["resume_loss_threshold"] == 1e-2
     if Path(recipe_path).stem == "qwen3_5_35b":
+        assert robustness["experts_implementation"] == "grouped_mm"
         assert resolved["step_scheduler"]["global_batch_size"] == 16
         assert resolved["step_scheduler"]["local_batch_size"] == 1
     assert "known_issue_id" not in resolved["ci"]

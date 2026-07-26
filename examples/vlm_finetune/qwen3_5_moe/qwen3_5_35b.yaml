@@ -120,6 +120,7 @@ ci:
   # Keep failures blocking; source/reload defects are tracked by AM-711/AM-717.
   checkpoint_robustness:
     check_source_load_parity: true
+    experts_implementation: grouped_mm
     hf_device_map_auto: true
     step_scheduler.global_batch_size: 16
     step_scheduler.local_batch_size: 1
