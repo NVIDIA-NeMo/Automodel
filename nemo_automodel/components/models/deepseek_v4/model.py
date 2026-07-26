@@ -49,6 +49,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
@@ -218,8 +219,9 @@ class DeepseekV4Block(nn.Module):
 
         # Hash-routing layers need the current batch's input_ids to do the
         # tid2eid lookup; stash it on the gate just before the MoE call.
-        if self.is_hash_routing_layer and isinstance(self.mlp.gate, DeepseekV4HashGate):
-            self.mlp.gate.set_input_ids(input_ids)
+        mlp = unwrap_checkpoint_wrapper(self.mlp)
+        if self.is_hash_routing_layer and isinstance(mlp.gate, DeepseekV4HashGate):
+            mlp.gate.set_input_ids(input_ids)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), padding_mask)
         dtype = x.dtype
         return post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2).to(dtype), x)
@@ -229,8 +231,9 @@ class DeepseekV4Block(nn.Module):
         self.post_attention_layernorm.reset_parameters()
         self.self_attn.init_weights(buffer_device, init_std=init_std)
         self.mlp.init_weights(buffer_device, init_std=init_std)
-        if isinstance(self.mlp.gate, DeepseekV4HashGate):
-            self.mlp.gate.init_weights(init_std=init_std)
+        mlp = unwrap_checkpoint_wrapper(self.mlp)
+        if isinstance(mlp.gate, DeepseekV4HashGate):
+            mlp.gate.init_weights(init_std=init_std)
         self.attn_hc.init_weights(init_std)
         self.ffn_hc.init_weights(init_std)
 

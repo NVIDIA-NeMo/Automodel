@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import (
     BackendConfig,
     initialize_linear_module,
@@ -371,7 +372,8 @@ class MiMoV2FlashBlock(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if isinstance(self.mlp, MoE):
+        mlp = unwrap_checkpoint_wrapper(self.mlp)
+        if isinstance(mlp, MoE):
             hidden_states = self.mlp(hidden_states, padding_mask)
         else:
             hidden_states = self.mlp(hidden_states)

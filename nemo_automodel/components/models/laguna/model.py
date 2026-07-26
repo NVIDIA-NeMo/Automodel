@@ -26,6 +26,7 @@ from transformers.masking_utils import create_causal_mask, create_sliding_window
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 
+from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
@@ -599,7 +600,8 @@ class LagunaBlock(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if isinstance(self.mlp, MoE):
+        mlp = unwrap_checkpoint_wrapper(self.mlp)
+        if isinstance(mlp, MoE):
             hidden_states = self.mlp(hidden_states, padding_mask)
         else:
             hidden_states = self.mlp(hidden_states)

@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFCheckpointingMixin
 from nemo_automodel.components.models.common.tie_word_embeddings import (
     TieSupport,
@@ -100,10 +101,11 @@ class Block(nn.Module):
         return x
 
     def _mlp(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
-        if isinstance(self.mlp, MLP):
+        mlp = unwrap_checkpoint_wrapper(self.mlp)
+        if isinstance(mlp, MLP):
             return self.mlp(x)
         else:
-            assert isinstance(self.mlp, MoE)
+            assert isinstance(mlp, MoE)
             return self.mlp(x, padding_mask)
 
     def init_weights(self, buffer_device: torch.device):

@@ -28,6 +28,7 @@ from nemo_automodel.components.attention.utils import (
     postprocess_output_for_attn,
     preprocess_args_and_kwargs_for_attn,
 )
+from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.models.common import (
     BackendConfig,
     compute_lm_head_logits,
@@ -250,7 +251,8 @@ class Ernie4_5MoeBlock(nn.Module):
         )
         x = x + attn_out
         mlp_in = self.post_attention_layernorm(x)
-        if isinstance(self.mlp, MoE):
+        mlp = unwrap_checkpoint_wrapper(self.mlp)
+        if isinstance(mlp, MoE):
             x = x + self.mlp(mlp_in, padding_mask)
         else:
             x = x + self.mlp(mlp_in)
