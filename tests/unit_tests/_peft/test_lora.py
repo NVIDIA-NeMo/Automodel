@@ -307,6 +307,27 @@ def test_linear_lora_memory_efficient_matches_legacy_module_forward_and_backward
     assert torch.allclose(efficient.lora_B.weight.grad, legacy.lora_B.weight.grad)
 
 
+def test_linear_lora_legacy_path_folds_residual_add_in_place():
+    """The fallback path should avoid allocating a third full-size output tensor."""
+    torch.manual_seed(1234)
+    base = nn.Linear(16, 12, bias=False)
+    x = torch.randn(8, 16, requires_grad=True)
+    lora = LinearLoRA(base, dim=4, alpha=8, use_memory_efficient_lora=False)
+
+    captured = {}
+    handle = lora.lora_B.register_forward_hook(lambda _module, _inputs, output: captured.setdefault("lora_b", output))
+    try:
+        out = lora(x)
+    finally:
+        handle.remove()
+
+    assert out is captured["lora_b"]
+    out.sum().backward()
+    assert x.grad is not None
+    assert lora.lora_A.weight.grad is not None
+    assert lora.lora_B.weight.grad is not None
+
+
 def test_materialized_effective_weight_matches_linear_lora_forward_and_backward():
     """The effective dense weight must preserve ordinary LoRA outputs and gradients."""
     torch.manual_seed(1234)
