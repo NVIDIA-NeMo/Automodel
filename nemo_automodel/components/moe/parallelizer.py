@@ -102,6 +102,7 @@ def _iter_transformer_and_mtp_blocks(model: nn.Module):
 def _get_moe_module(block: nn.Module) -> MoE | None:
     for name in ("moe", "mlp"):
         module = getattr(block, name, None)
+        module = getattr(module, "_checkpoint_wrapped_module", module)
         if isinstance(module, MoE):
             return module
 
