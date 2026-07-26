@@ -44,6 +44,7 @@ distributed:
   pp_size: 2
   ep_size: 32
   sequence_parallel: false
+  patch_is_packed_sequence: true
   activation_checkpointing: true
   mp_policy:
     param_dtype: bfloat16
