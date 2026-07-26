@@ -297,7 +297,6 @@ def preprocess_dataset(
     dataset_name: Optional[str] = None,
     dataset_split: str = "train",
     dataset_config_name: Optional[str] = None,
-    dataset_revision: str | None = None,
     dataset_media_column: Optional[str] = None,
     dataset_caption_column: Optional[str] = None,
     dataset_dir: Optional[str] = None,
@@ -320,7 +319,6 @@ def preprocess_dataset(
         dataset_name: Optional Hugging Face dataset ID to materialize before preprocessing.
         dataset_split: Hugging Face dataset split.
         dataset_config_name: Optional Hugging Face dataset config/subset name.
-        dataset_revision: Optional Hugging Face dataset revision.
         dataset_media_column: Optional image column name.
         dataset_caption_column: Optional caption/text column name.
         dataset_dir: Optional directory for materialized HF media.
@@ -340,7 +338,6 @@ def preprocess_dataset(
             media_type="image",
             split=dataset_split,
             config_name=dataset_config_name,
-            revision=dataset_revision,
             media_column=dataset_media_column,
             caption_column=dataset_caption_column,
             caption_field=caption_field,
@@ -902,7 +899,6 @@ def preprocess_video_dataset(
     dataset_name: Optional[str] = None,
     dataset_split: str = "train",
     dataset_config_name: Optional[str] = None,
-    dataset_revision: str | None = None,
     dataset_media_column: Optional[str] = None,
     dataset_caption_column: Optional[str] = None,
     dataset_dir: Optional[str] = None,
@@ -935,7 +931,6 @@ def preprocess_video_dataset(
         dataset_name: Optional Hugging Face dataset ID to materialize before preprocessing.
         dataset_split: Hugging Face dataset split.
         dataset_config_name: Optional Hugging Face dataset config/subset name.
-        dataset_revision: Optional Hugging Face dataset revision.
         dataset_media_column: Optional video column name.
         dataset_caption_column: Optional caption/text column name.
         dataset_dir: Optional directory for materialized HF media.
@@ -955,7 +950,6 @@ def preprocess_video_dataset(
             media_type="video",
             split=dataset_split,
             config_name=dataset_config_name,
-            revision=dataset_revision,
             media_column=dataset_media_column,
             caption_column=dataset_caption_column,
             caption_field=caption_field,
@@ -1134,7 +1128,6 @@ def _parse_dataset_media_mapping(value: str) -> HFDatasetMediaMapping:
 def _preprocess_image_edit_dataset(
     *,
     dataset_name: str,
-    dataset_revision: str | None,
     dataset_split: str,
     dataset_config_name: str | None,
     dataset_media_mappings: list[HFDatasetMediaMapping],
@@ -1145,7 +1138,6 @@ def _preprocess_image_edit_dataset(
     output_dir: str,
     processor_name: str,
     model_name: str | None,
-    model_revision: str | None,
     max_sequence_length: int,
     max_items: int | None,
     max_pixels: int,
@@ -1163,7 +1155,6 @@ def _preprocess_image_edit_dataset(
         media_type="image-edit",
         split=dataset_split,
         config_name=dataset_config_name,
-        revision=dataset_revision,
         media_mappings=dataset_media_mappings,
         caption_column=dataset_caption_column,
         max_items=max_items,
@@ -1177,12 +1168,11 @@ def _preprocess_image_edit_dataset(
     try:
         processor = processor_cls(
             model_name=model_name,
-            revision=model_revision,
             max_sequence_length=max_sequence_length,
         )
     except TypeError as exc:
         raise TypeError(
-            f"processor {processor_name!r} must accept keyword arguments model_name, revision, and max_sequence_length"
+            f"processor {processor_name!r} must accept keyword arguments model_name and max_sequence_length"
         ) from exc
     if not isinstance(processor, _ImageEditManifestEncoder) or not callable(processor.encode_manifest):
         raise TypeError(f"processor {processor_name!r} must implement encode_manifest(...)")
@@ -1202,10 +1192,9 @@ def _preprocess_image_edit_dataset(
         )
 
     logger.info(
-        "Materialized and encoded %d HF image-edit samples from %s revision %s split %s",
+        "Materialized and encoded %d HF image-edit samples from %s split %s",
         export.total_items,
         dataset_name,
-        export.dataset_revision,
         dataset_split,
     )
     return cache_manifest
@@ -1262,7 +1251,6 @@ Examples:
     image_parser.add_argument("--dataset_name", type=str, default=None, help="Hugging Face dataset ID to materialize")
     image_parser.add_argument("--dataset_split", type=str, default="train", help="HF dataset split")
     image_parser.add_argument("--dataset_config_name", type=str, default=None, help="HF dataset config/subset name")
-    image_parser.add_argument("--dataset_revision", type=str, default=None, help="HF dataset revision")
     image_parser.add_argument("--dataset_media_column", type=str, default=None, help="HF image column name")
     image_parser.add_argument("--dataset_caption_column", type=str, default=None, help="HF caption/text column name")
     image_parser.add_argument("--dataset_dir", type=str, default=None, help="Directory for materialized HF media")
@@ -1302,7 +1290,6 @@ Examples:
     image_edit_parser.add_argument(
         "--dataset_config_name", type=str, default=None, help="HF dataset config/subset name"
     )
-    image_edit_parser.add_argument("--dataset_revision", type=str, default=None, help="HF dataset revision")
     image_edit_parser.add_argument(
         "--dataset_media_mapping",
         type=_parse_dataset_media_mapping,
@@ -1329,9 +1316,6 @@ Examples:
     )
     image_edit_parser.add_argument("--model_name", type=str, default=None, help="Optional model name or path")
     image_edit_parser.add_argument(
-        "--model_revision", type=str, default=None, help="Optional Hugging Face model revision"
-    )
-    image_edit_parser.add_argument(
         "--max_sequence_length", type=int, default=512, help="Maximum prompt token sequence length"
     )
     image_edit_parser.add_argument("--max_items", type=int, default=None, help="Maximum dataset rows to process")
@@ -1356,7 +1340,6 @@ Examples:
     video_parser.add_argument("--dataset_name", type=str, default=None, help="Hugging Face dataset ID to materialize")
     video_parser.add_argument("--dataset_split", type=str, default="train", help="HF dataset split")
     video_parser.add_argument("--dataset_config_name", type=str, default=None, help="HF dataset config/subset name")
-    video_parser.add_argument("--dataset_revision", type=str, default=None, help="HF dataset revision")
     video_parser.add_argument("--dataset_media_column", type=str, default=None, help="HF video column name")
     video_parser.add_argument("--dataset_caption_column", type=str, default=None, help="HF caption/text column name")
     video_parser.add_argument("--dataset_dir", type=str, default=None, help="Directory for materialized HF media")
@@ -1467,7 +1450,6 @@ Examples:
             dataset_name=args.dataset_name,
             dataset_split=args.dataset_split,
             dataset_config_name=args.dataset_config_name,
-            dataset_revision=args.dataset_revision,
             dataset_media_column=args.dataset_media_column,
             dataset_caption_column=args.dataset_caption_column,
             dataset_dir=args.dataset_dir,
@@ -1496,7 +1478,6 @@ Examples:
 
         _preprocess_image_edit_dataset(
             dataset_name=args.dataset_name,
-            dataset_revision=args.dataset_revision,
             dataset_split=args.dataset_split,
             dataset_config_name=args.dataset_config_name,
             dataset_media_mappings=args.dataset_media_mapping,
@@ -1507,7 +1488,6 @@ Examples:
             output_dir=args.output_dir,
             processor_name=args.processor,
             model_name=args.model_name,
-            model_revision=args.model_revision,
             max_sequence_length=args.max_sequence_length,
             max_items=args.max_items,
             max_pixels=max_pixels,
@@ -1547,7 +1527,6 @@ Examples:
             dataset_name=args.dataset_name,
             dataset_split=args.dataset_split,
             dataset_config_name=args.dataset_config_name,
-            dataset_revision=args.dataset_revision,
             dataset_media_column=args.dataset_media_column,
             dataset_caption_column=args.dataset_caption_column,
             dataset_dir=args.dataset_dir,

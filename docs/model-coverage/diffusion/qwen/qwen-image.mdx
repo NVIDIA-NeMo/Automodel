@@ -34,7 +34,7 @@ Qwen-Image-Edit-2511 support is intentionally limited to cached target/context l
 
 ## Prepare MagicBrush
 
-The validation protocol uses [`osunlp/MagicBrush`](https://huggingface.co/datasets/osunlp/MagicBrush), an instruction-based editing dataset released under CC-BY-4.0. It contains 8,807 training examples and 528 development examples. The commands pin MagicBrush revision `1d8d4629150d18ca50afab66391866f2085be989` and Qwen-Image-Edit-2511 revision `6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9`.
+The validation protocol uses [`osunlp/MagicBrush`](https://huggingface.co/datasets/osunlp/MagicBrush), an instruction-based editing dataset released under CC-BY-4.0. It contains 8,807 training examples and 528 development examples.
 
 The generic exporter maps dataset columns to ordered editing roles. Mapping `source_img` to both `context` and `condition` writes the image only once while retaining both role entries. The dataset's mask is retained in source-manifest metadata for future masked-edit adapters.
 
@@ -43,7 +43,6 @@ Create the 64-example correctness cache with aspect-ratio-preserving processing 
 ```bash
 uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
   --dataset_name osunlp/MagicBrush \
-  --dataset_revision 1d8d4629150d18ca50afab66391866f2085be989 \
   --dataset_split dev \
   --dataset_streaming \
   --dataset_media_mapping target=target_img \
@@ -55,7 +54,6 @@ uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
   --max_sequence_length 512 \
   --processor qwen_image_edit \
   --model_name Qwen/Qwen-Image-Edit-2511 \
-  --model_revision 6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9 \
   --num_gpus 8 \
   --verify \
   --output_dir /cache/magicbrush-qwen-edit-correctness
@@ -66,7 +64,6 @@ Create the 1,024-example fixed-square performance cache by replacing the split, 
 ```bash
 uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
   --dataset_name osunlp/MagicBrush \
-  --dataset_revision 1d8d4629150d18ca50afab66391866f2085be989 \
   --dataset_split train \
   --dataset_streaming \
   --dataset_media_mapping target=target_img \
@@ -78,7 +75,6 @@ uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
   --max_sequence_length 512 \
   --processor qwen_image_edit \
   --model_name Qwen/Qwen-Image-Edit-2511 \
-  --model_revision 6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9 \
   --num_gpus 8 \
   --verify \
   --output_dir /cache/magicbrush-qwen-edit-performance
@@ -95,9 +91,9 @@ Each versioned cache sample contains:
 - `prompt_embeddings`: `[sequence, hidden]`
 - `prompt_attention_mask`: `[sequence]`
 - `conditioning_tensors`: optional explicitly named tensors
-- `metadata`: original IDs, source revision, tensor shapes, token lengths, and the compound target/context bucket signature
+- `metadata`: original IDs, tensor shapes, token lengths, and the compound target/context bucket signature
 
-The top-level `metadata.json` records the cache format version, source dataset ID, dataset revision and config when provided, split, row limit, model revision, and preprocessing settings. Batches contain only compatible target and ordered-context shapes, and their CPU metadata includes target, context, text, and total token counts.
+The top-level `metadata.json` records the source dataset ID, dataset config when provided, split, row limit, and preprocessing settings. Batches contain only compatible target and ordered-context shapes, and their CPU metadata includes target, context, text, and total token counts.
 
 ## Train
 

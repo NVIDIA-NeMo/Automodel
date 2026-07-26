@@ -153,7 +153,6 @@ def test_materialize_hf_image_edit_dataset_writes_ordered_manifest_and_deduplica
         media_type="image-edit",
         split="dev",
         config_name="magicbrush",
-        revision="pinned-revision",
         media_mappings=mappings,
         caption_column="instruction",
     )
@@ -162,10 +161,8 @@ def test_materialize_hf_image_edit_dataset_writes_ordered_manifest_and_deduplica
     assert export.media_column == "target_img"
     assert export.media_mappings == tuple(mappings)
     assert export.manifest_file == tmp_path / "hf_image_edit_manifest.jsonl"
-    assert export.dataset_revision == "pinned-revision"
     assert export.dataset_config_name == "magicbrush"
     assert len(list((tmp_path / "media").glob("*"))) == 2
-    assert load_calls[0][1]["revision"] == "pinned-revision"
     assert load_calls[0][1]["config_name"] == "magicbrush"
 
     manifest_row = json.loads(export.manifest_file.read_text(encoding="utf-8"))
@@ -175,7 +172,6 @@ def test_materialize_hf_image_edit_dataset_writes_ordered_manifest_and_deduplica
     assert manifest_row["media"][1]["file_name"] == manifest_row["media"][2]["file_name"]
     assert all(not Path(entry["file_name"]).is_absolute() for entry in manifest_row["media"])
     assert manifest_row["metadata"]["dataset_name"] == "org/image-edits"
-    assert manifest_row["metadata"]["dataset_revision"] == "pinned-revision"
     assert manifest_row["metadata"]["dataset_config_name"] == "magicbrush"
     assert manifest_row["metadata"]["dataset_split"] == "dev"
     assert manifest_row["metadata"]["row_index"] == 0
@@ -242,7 +238,7 @@ def test_materialize_hf_image_edit_dataset_validates_mapping_columns(tmp_path, m
         )
 
 
-def test_materialize_hf_dataset_forwards_revision(tmp_path, monkeypatch):
+def test_materialize_hf_dataset_forwards_load_kwargs(tmp_path, monkeypatch):
     calls = []
 
     def fake_load_dataset(dataset_name, **kwargs):
@@ -257,7 +253,6 @@ def test_materialize_hf_dataset_forwards_revision(tmp_path, monkeypatch):
         media_type="image",
         split="dev",
         config_name="default",
-        revision="pinned-revision",
         streaming=True,
         trust_remote_code=False,
     )
@@ -270,7 +265,6 @@ def test_materialize_hf_dataset_forwards_revision(tmp_path, monkeypatch):
                 "split": "dev",
                 "streaming": True,
                 "name": "default",
-                "revision": "pinned-revision",
                 "trust_remote_code": False,
             },
         )

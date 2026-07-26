@@ -41,7 +41,6 @@ class _CompoundBucketSignatureMetadata(TypedDict):
 
 class _ImageEditCacheMetadata(TypedDict, total=False):
     original_ids: dict[str, str | int]
-    source_revision: str
     target_spatial_shape: list[int]
     context_spatial_shapes: list[list[int]]
     target_token_length: int
@@ -218,7 +217,6 @@ class ImageEditDataset(BaseMultiresolutionDataset):
         if quantization <= 0:
             raise ValueError(f"quantization must be positive, got {quantization}")
         self.cache_manifest: dict[str, object] = {}
-        self.source_revision: str | None = None
         super().__init__(cache_dir=cache_dir, quantization=quantization)
 
     def _resolve_contained_path(self, path_value: object, *, field_name: str) -> Path:
@@ -251,8 +249,6 @@ class ImageEditDataset(BaseMultiresolutionDataset):
         if not isinstance(raw_shards, list) or not all(isinstance(name, str) and name for name in raw_shards):
             raise ValueError(f"Invalid metadata format in {metadata_file}: 'shards' must be a list of file names")
 
-        revision = manifest.get("dataset_revision", manifest.get("source_revision"))
-        self.source_revision = revision if isinstance(revision, str) and revision else None
         self.cache_manifest = manifest
 
         metadata: list[dict[str, object]] = []
@@ -363,16 +359,6 @@ class ImageEditDataset(BaseMultiresolutionDataset):
                 f"Image-edit cache {cache_file} metadata.original_ids must map non-empty names to string or integer IDs"
             )
 
-        revision = cache_metadata.get("source_revision")
-        if revision is not None:
-            if not isinstance(revision, str) or not revision:
-                raise ValueError(f"Image-edit cache {cache_file} metadata.source_revision must be a non-empty string")
-            if self.source_revision is not None and revision != self.source_revision:
-                raise ValueError(
-                    f"Image-edit cache {cache_file} source revision {revision!r} does not match manifest "
-                    f"revision {self.source_revision!r}"
-                )
-
         target_spatial_shape = _normalize_shape(
             cache_metadata.get("target_spatial_shape"),
             field_name=f"{cache_file}.metadata.target_spatial_shape",
@@ -481,7 +467,6 @@ class ImageEditDataset(BaseMultiresolutionDataset):
 
         normalized = cast(_ImageEditCacheMetadata, dict(cache_metadata))
         normalized["original_ids"] = cast(dict[str, str | int], original_ids)
-        normalized["source_revision"] = revision
         normalized["target_spatial_shape"] = list(target_spatial_shape)
         normalized["context_spatial_shapes"] = [list(shape) for shape in context_spatial_shapes]
         normalized["target_token_length"] = target_token_length

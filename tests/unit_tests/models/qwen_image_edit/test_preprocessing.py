@@ -33,9 +33,6 @@ from nemo_automodel.components.models.qwen_image_edit.preprocessing import (
     _validate_output_directory,
 )
 
-_PINNED_REVISION = "1d8d4629150d18ca50afab66391866f2085be989"
-_MODEL_REVISION = "b" * 40
-
 
 class _FakeLatentDistribution:
     def __init__(self, latent: torch.Tensor) -> None:
@@ -122,7 +119,7 @@ class _FakePipeline:
         return embeddings, mask
 
 
-def _write_manifest(manifest_path: Path, *, revision: str | None = _PINNED_REVISION) -> None:
+def _write_manifest(manifest_path: Path) -> None:
     """Write one generic target/context/condition image-edit row."""
     row = {
         "id": "dev:00000000",
@@ -134,7 +131,6 @@ def _write_manifest(manifest_path: Path, *, revision: str | None = _PINNED_REVIS
         ],
         "metadata": {
             "dataset_name": "osunlp/MagicBrush",
-            "dataset_revision": revision,
             "dataset_config_name": "magicbrush",
             "dataset_split": "dev",
             "row_index": 0,
@@ -163,14 +159,13 @@ def test_encoder_writes_dataset_compatible_cache(tmp_path: Path, monkeypatch: py
     pipeline = _FakePipeline()
     encoder = QwenImageEditCacheEncoder(
         max_sequence_length=5,
-        revision="model-branch",
         device="cpu",
         torch_dtype="float32",
     )
     load_calls = []
 
-    def fake_load_pipeline(device, *, revision):
-        load_calls.append((device, revision))
+    def fake_load_pipeline(device):
+        load_calls.append(device)
         return pipeline
 
     monkeypatch.setattr(encoder, "_load_pipeline", fake_load_pipeline)
@@ -186,7 +181,6 @@ def test_encoder_writes_dataset_compatible_cache(tmp_path: Path, monkeypatch: py
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["dataset_name"] == "osunlp/MagicBrush"
-    assert metadata["dataset_revision"] == _PINNED_REVISION
     assert metadata["dataset_config_name"] == "magicbrush"
     assert metadata["split"] == "dev"
     assert metadata["row_limit"] == 1
@@ -195,7 +189,6 @@ def test_encoder_writes_dataset_compatible_cache(tmp_path: Path, monkeypatch: py
         "max_pixels": 64 * 64,
         "max_sequence_length": 5,
         "model_name": "Qwen/Qwen-Image-Edit-2511",
-        "model_revision": "model-branch",
         "num_gpus": 1,
         "processor_target": (
             "nemo_automodel.components.models.qwen_image_edit.preprocessing.QwenImageEditCacheEncoder"
@@ -207,7 +200,7 @@ def test_encoder_writes_dataset_compatible_cache(tmp_path: Path, monkeypatch: py
         "vae_latent_sampling": "mode",
         "verify": True,
     }
-    assert load_calls == [(torch.device("cpu"), "model-branch")]
+    assert load_calls == [torch.device("cpu")]
 
     dataset = ImageEditDataset(cache_dir=str(output_dir), quantization=32)
     sample = dataset[0]

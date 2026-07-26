@@ -66,7 +66,6 @@ class HFDatasetExport:
         caption_file: Generated caption metadata path for image exports.
         media_mappings: Ordered image-edit role-to-column mappings.
         manifest_file: Generated generic image-edit manifest path.
-        dataset_revision: Effective dataset revision, when one was requested.
         dataset_config_name: Dataset config selected by ``load_dataset``.
     """
 
@@ -77,7 +76,6 @@ class HFDatasetExport:
     caption_file: Path | None = None
     media_mappings: tuple[HFDatasetMediaMapping, ...] = ()
     manifest_file: Path | None = None
-    dataset_revision: str | None = None
     dataset_config_name: str | None = None
 
 
@@ -88,7 +86,6 @@ def materialize_hf_dataset(
     media_type: str,
     split: str = "train",
     config_name: str | None = None,
-    revision: str | None = None,
     media_column: str | None = None,
     media_mappings: Sequence[HFDatasetMediaMapping] | None = None,
     caption_column: str | None = None,
@@ -111,7 +108,6 @@ def materialize_hf_dataset(
         media_type: ``"image"``, ``"video"``, or ``"image-edit"``.
         split: Dataset split to load.
         config_name: Optional dataset config/subset name.
-        revision: Optional dataset revision forwarded to ``load_dataset``.
         media_column: Optional source media column. If omitted, common names are
             inferred from features or the first row. This legacy option cannot
             be combined with ``media_mappings``.
@@ -154,13 +150,10 @@ def materialize_hf_dataset(
     if has_exported_samples:
         raise ValueError("HF materialization directory is not empty; choose a new directory")
 
-    resolved_revision = revision
-
     dataset = _load_hf_dataset(
         dataset_name,
         split=split,
         config_name=config_name,
-        revision=resolved_revision,
         streaming=streaming,
         trust_remote_code=trust_remote_code,
     )
@@ -242,7 +235,6 @@ def materialize_hf_dataset(
                 mappings=resolved_mappings,
                 output_dir=output_path,
                 dataset_name=dataset_name,
-                dataset_revision=resolved_revision,
                 dataset_config_name=resolved_config_name,
                 dataset_split=split,
                 caption_column=caption_column,
@@ -259,7 +251,6 @@ def materialize_hf_dataset(
         caption_file=caption_file,
         media_mappings=resolved_mappings,
         manifest_file=manifest_file,
-        dataset_revision=resolved_revision,
         dataset_config_name=resolved_config_name,
     )
 
@@ -278,7 +269,6 @@ def _load_hf_dataset(
     *,
     split: str,
     config_name: str | None,
-    revision: str | None,
     streaming: bool,
     trust_remote_code: bool | None,
 ):
@@ -288,8 +278,6 @@ def _load_hf_dataset(
     kwargs: dict[str, Any] = {"split": split, "streaming": streaming}
     if config_name is not None:
         kwargs["name"] = config_name
-    if revision is not None:
-        kwargs["revision"] = revision
     if trust_remote_code is not None:
         kwargs["trust_remote_code"] = trust_remote_code
 
@@ -366,7 +354,6 @@ def _append_image_edit_manifest_row(
     mappings: tuple[HFDatasetMediaMapping, ...],
     output_dir: Path,
     dataset_name: str,
-    dataset_revision: str | None,
     dataset_config_name: str | None,
     dataset_split: str,
     caption_column: str | None,
@@ -402,7 +389,6 @@ def _append_image_edit_manifest_row(
         "media": media,
         "metadata": {
             "dataset_name": dataset_name,
-            "dataset_revision": dataset_revision,
             "dataset_config_name": dataset_config_name,
             "dataset_split": dataset_split,
             "row_index": index,

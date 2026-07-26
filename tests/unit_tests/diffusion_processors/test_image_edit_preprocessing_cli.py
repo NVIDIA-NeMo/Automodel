@@ -49,13 +49,12 @@ def test_image_edit_cli_materializes_and_invokes_configured_encoder(tmp_path, mo
             caption_column="instruction",
             media_mappings=tuple(kwargs["media_mappings"]),
             manifest_file=source_manifest,
-            dataset_revision="a" * 40,
             dataset_config_name="magicbrush",
         )
 
     class FakeEncoder:
-        def __init__(self, *, model_name, revision, max_sequence_length):
-            calls["constructor"] = (model_name, revision, max_sequence_length)
+        def __init__(self, *, model_name, max_sequence_length):
+            calls["constructor"] = (model_name, max_sequence_length)
 
         def encode_manifest(
             self,
@@ -92,8 +91,6 @@ def test_image_edit_cli_materializes_and_invokes_configured_encoder(tmp_path, mo
             "image-edit",
             "--dataset_name",
             "org/image-edits",
-            "--dataset_revision",
-            "pinned-revision",
             "--dataset_split",
             "dev",
             "--dataset_streaming",
@@ -109,8 +106,6 @@ def test_image_edit_cli_materializes_and_invokes_configured_encoder(tmp_path, mo
             "qwen_image_edit",
             "--model_name",
             "org/model",
-            "--model_revision",
-            "model-branch",
             "--max_sequence_length",
             "384",
             "--max_items",
@@ -130,7 +125,6 @@ def test_image_edit_cli_materializes_and_invokes_configured_encoder(tmp_path, mo
     assert dataset_name == "org/image-edits"
     assert export_dir == tmp_path / "cache" / "_hf_dataset" / "image_edit"
     assert materialize_kwargs["media_type"] == "image-edit"
-    assert materialize_kwargs["revision"] == "pinned-revision"
     assert materialize_kwargs["split"] == "dev"
     assert materialize_kwargs["streaming"] is True
     assert materialize_kwargs["max_items"] == 64
@@ -140,7 +134,7 @@ def test_image_edit_cli_materializes_and_invokes_configured_encoder(tmp_path, mo
         HFDatasetMediaMapping("condition", "source_img"),
     ]
     assert calls["processor_name"] == "qwen_image_edit"
-    assert calls["constructor"] == ("org/model", "model-branch", 384)
+    assert calls["constructor"] == ("org/model", 384)
     assert calls["encode"] == {
         "manifest_path": source_manifest,
         "output_dir": tmp_path / "cache",
@@ -161,7 +155,7 @@ def test_image_edit_preprocessing_requires_encoder_contract(tmp_path, monkeypatc
     )
 
     class MissingEncodeManifest:
-        def __init__(self, *, model_name, revision, max_sequence_length):
+        def __init__(self, *, model_name, max_sequence_length):
             pass
 
     monkeypatch.setattr(preprocessing_multiprocess, "materialize_hf_dataset", lambda *args, **kwargs: export)
@@ -170,7 +164,6 @@ def test_image_edit_preprocessing_requires_encoder_contract(tmp_path, monkeypatc
     with pytest.raises(TypeError, match=r"must implement encode_manifest\(\.\.\.\)"):
         preprocessing_multiprocess._preprocess_image_edit_dataset(
             dataset_name="org/image-edits",
-            dataset_revision="pinned-revision",
             dataset_split="dev",
             dataset_config_name=None,
             dataset_media_mappings=[
@@ -184,7 +177,6 @@ def test_image_edit_preprocessing_requires_encoder_contract(tmp_path, monkeypatc
             output_dir=str(tmp_path / "cache"),
             processor_name="qwen_image_edit",
             model_name=None,
-            model_revision=None,
             max_sequence_length=512,
             max_items=64,
             max_pixels=1024 * 1024,

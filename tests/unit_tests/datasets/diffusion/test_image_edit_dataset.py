@@ -22,9 +22,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_automodel.components.datasets.diffusion.image_edit_dataset import ImageEditDataloaderConfig, ImageEditDataset
 from nemo_automodel.components.datasets.diffusion.sampler import SequentialBucketSampler
 
-REVISION = "1d8d4629150d18ca50afab66391866f2085be989"
 MODEL_NAME = "Qwen/Qwen-Image-Edit-2511"
-MODEL_REVISION = "6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9"
 
 
 def _signature(
@@ -69,7 +67,6 @@ def _make_payload(
 
     metadata = {
         "original_ids": {"row_index": sample_index, "image_id": f"image-{sample_index}"},
-        "source_revision": REVISION,
         "target_spatial_shape": list(target_shape[-2:]),
         "context_spatial_shapes": [list(shape[-2:]) for shape in context_shapes],
         "compound_bucket_signature": signature,
@@ -135,13 +132,11 @@ def _write_cache(
     shard_file.write_text(json.dumps(records), encoding="utf-8")
     manifest = {
         "dataset_name": "osunlp/MagicBrush",
-        "dataset_revision": REVISION,
         "split": "dev",
         "row_limit": len(payloads),
         "preprocessing_config": {
             "max_pixels": 1024 * 1024,
             "model_name": MODEL_NAME,
-            "model_revision": MODEL_REVISION,
         },
         "shards": [shard_file.name],
     }
@@ -327,16 +322,6 @@ def test_dataloader_rejects_incompatible_conditioning_tensors(tmp_path: Path) ->
         next(iter(result.dataloader))
 
 
-def test_dataset_rejects_source_revision_mismatch(tmp_path: Path) -> None:
-    payload = _make_payload(0)
-    payload["metadata"]["source_revision"] = "different-revision"
-    _write_cache(tmp_path, [payload])
-
-    dataset = ImageEditDataset(str(tmp_path))
-    with pytest.raises(ValueError, match="does not match manifest revision"):
-        dataset[0]
-
-
 def test_dataset_rejects_cache_path_outside_cache_directory(tmp_path: Path) -> None:
     payload = _make_payload(0)
     outside_file = tmp_path.parent / f"{tmp_path.name}_outside.pt"
@@ -350,7 +335,6 @@ def test_dataset_rejects_cache_path_outside_cache_directory(tmp_path: Path) -> N
     (tmp_path / "metadata.json").write_text(
         json.dumps(
             {
-                "dataset_revision": REVISION,
                 "shards": [shard_file.name],
             }
         ),

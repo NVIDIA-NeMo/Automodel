@@ -96,7 +96,6 @@ class _ManifestSample:
 class _WorkerSettings:
     model_name: str
     max_sequence_length: int
-    revision: str | None
     device: str | None
     torch_dtype: str
 
@@ -112,7 +111,6 @@ class QwenImageEditCacheEncoder:
         self,
         model_name: str | None = None,
         max_sequence_length: int = 512,
-        revision: str | None = None,
         device: str | None = None,
         torch_dtype: str = "bfloat16",
     ) -> None:
@@ -123,8 +121,6 @@ class QwenImageEditCacheEncoder:
                 ``None`` selects ``Qwen/Qwen-Image-Edit-2511`` so the generic
                 preprocessing CLI can leave ``--model_name`` unset.
             max_sequence_length: Maximum cached Qwen2.5-VL token count.
-            revision: Optional Hugging Face model revision passed through to
-                Diffusers when loading the encoding pipeline.
             device: Optional explicit encoding device. By default each worker
                 selects its assigned CUDA device, with CPU as a unit-test fallback.
             torch_dtype: VAE/text-encoder compute and cache dtype. Supported
@@ -140,7 +136,6 @@ class QwenImageEditCacheEncoder:
 
         self.model_name = model_name
         self.max_sequence_length = max_sequence_length
-        self.revision = revision
         self.device = device
         self.torch_dtype = torch_dtype
 
@@ -198,19 +193,16 @@ class QwenImageEditCacheEncoder:
 
         samples = _read_manifest(manifest_path)
         dataset_name = _shared_metadata_string(samples, "dataset_name")
-        dataset_revision = _shared_metadata_optional_string(samples, "dataset_revision")
         dataset_config_name = _shared_metadata_optional_string(samples, "dataset_config_name")
         dataset_split = _shared_metadata_string(samples, "dataset_split")
 
         output_dir.mkdir(parents=True, exist_ok=True)
         _validate_output_directory(output_dir, manifest_path=manifest_path)
-        model_revision = self.revision
         (output_dir / "samples").mkdir()
 
         settings = _WorkerSettings(
             model_name=self.model_name,
             max_sequence_length=self.max_sequence_length,
-            revision=model_revision,
             device=self.device,
             torch_dtype=self.torch_dtype,
         )
@@ -220,7 +212,6 @@ class QwenImageEditCacheEncoder:
                 output_dir=output_dir,
                 max_pixels=max_pixels,
                 resolution_preset=resolution_preset,
-                model_revision=model_revision,
                 worker_index=0,
                 verify=verify,
             )
@@ -244,7 +235,6 @@ class QwenImageEditCacheEncoder:
         shard_names = _write_metadata_shards(records, output_dir)
         metadata = {
             "dataset_name": dataset_name,
-            "dataset_revision": dataset_revision,
             "dataset_config_name": dataset_config_name,
             "split": dataset_split,
             "row_limit": len(samples),
@@ -253,7 +243,6 @@ class QwenImageEditCacheEncoder:
                     "nemo_automodel.components.models.qwen_image_edit.preprocessing.QwenImageEditCacheEncoder"
                 ),
                 "model_name": self.model_name,
-                "model_revision": model_revision,
                 "max_sequence_length": self.max_sequence_length,
                 "max_pixels": max_pixels,
                 "resolution_preset": resolution_preset,
@@ -280,7 +269,6 @@ class QwenImageEditCacheEncoder:
         output_dir: Path,
         max_pixels: int,
         resolution_preset: str | None,
-        model_revision: str | None,
         worker_index: int,
         verify: bool,
     ) -> list[_CacheRecord]:
@@ -292,8 +280,6 @@ class QwenImageEditCacheEncoder:
                 derived from globally unique row indices.
             max_pixels: Maximum target/context pixel area without a preset.
             resolution_preset: Optional fixed square spatial preset.
-            model_revision: Immutable Hugging Face model commit SHA, or
-                ``None`` for a local pipeline path.
             worker_index: CUDA device index owned by this worker.
             verify: Whether to decode and validate each target latent tensor of
                 shape [channels, target_height, target_width].
@@ -303,7 +289,7 @@ class QwenImageEditCacheEncoder:
             shape and prompt token count.
         """
         device = self._worker_device(worker_index)
-        pipeline = self._load_pipeline(device, revision=model_revision)
+        pipeline = self._load_pipeline(device)
         records = []
         try:
             for sample in samples:
@@ -333,25 +319,17 @@ class QwenImageEditCacheEncoder:
             return torch.device("cuda", worker_index)
         return torch.device("cpu")
 
-    def _load_pipeline(self, device: torch.device, *, revision: str | None):
+    def _load_pipeline(self, device: torch.device):
         """Load only upstream VAE and Qwen2.5-VL conditioning components."""
         if not DIFFUSERS_AVAILABLE:
             raise ImportError("Qwen image-edit preprocessing requires diffusers")
 
         dtype = _DTYPES[self.torch_dtype]
-        if revision is None:
-            pipeline = diffusers.QwenImageEditPlusPipeline.from_pretrained(
-                self.model_name,
-                transformer=None,
-                torch_dtype=dtype,
-            )
-        else:
-            pipeline = diffusers.QwenImageEditPlusPipeline.from_pretrained(
-                self.model_name,
-                transformer=None,
-                revision=revision,
-                torch_dtype=dtype,
-            )
+        pipeline = diffusers.QwenImageEditPlusPipeline.from_pretrained(
+            self.model_name,
+            transformer=None,
+            torch_dtype=dtype,
+        )
         pipeline.vae.requires_grad_(False).eval().to(device=device, dtype=dtype)
         pipeline.text_encoder.requires_grad_(False).eval().to(device=device, dtype=dtype)
         return pipeline
@@ -447,13 +425,11 @@ class QwenImageEditCacheEncoder:
         target_token_length = (target_shape[-2] // 2) * (target_shape[-1] // 2)
         context_token_lengths = [(shape[-2] // 2) * (shape[-1] // 2) for shape in context_shapes]
         text_token_length = int(prompt_attention_mask.sum().item())
-        source_revision = sample.metadata.get("dataset_revision")
         metadata = {
             "original_ids": {
                 "id": sample.identifier,
                 "row_index": sample.row_index,
             },
-            "source_revision": str(source_revision) if source_revision is not None else None,
             "target_spatial_shape": target_shape[-2:],
             "context_spatial_shapes": [shape[-2:] for shape in context_shapes],
             "target_token_length": target_token_length,
@@ -812,7 +788,6 @@ def _encode_rows_worker(
     encoder = QwenImageEditCacheEncoder(
         model_name=settings.model_name,
         max_sequence_length=settings.max_sequence_length,
-        revision=settings.revision,
         device=settings.device,
         torch_dtype=settings.torch_dtype,
     )
@@ -821,7 +796,6 @@ def _encode_rows_worker(
         output_dir=output_dir,
         max_pixels=max_pixels,
         resolution_preset=resolution_preset,
-        model_revision=settings.revision,
         worker_index=worker_index,
         verify=verify,
     )
