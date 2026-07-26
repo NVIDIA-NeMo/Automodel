@@ -109,6 +109,9 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
   echo "============================================"
   ROBUSTNESS_START=$SECONDS
 
+  # Repeated model teardown/reload phases can fragment the CUDA allocator
+  # before the resume-training check. Preserve any caller-provided setting.
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
   eval $ROBUSTNESS_CMD
   ROBUSTNESS_EXIT_CODE=$?
 
