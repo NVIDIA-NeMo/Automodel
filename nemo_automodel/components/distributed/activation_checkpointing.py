@@ -421,6 +421,7 @@ def apply_submodule_checkpointing(
     layers: List[nn.Module],
     has_kv_sharing: bool,
     *,
+    activation_checkpointing_modules: str | list[str] | tuple[str, ...] = "all",
     context_fn: Callable[[], tuple[AbstractContextManager, AbstractContextManager]] | None = None,
 ) -> None:
     """Wrap a transformer block's sub-modules with ``checkpoint_wrapper``.
@@ -436,12 +437,22 @@ def apply_submodule_checkpointing(
     Args:
         layers: Transformer decoder layers to wrap (mutated in place).
         has_kv_sharing: Whether the model reuses K/V across layers via the cache.
+        activation_checkpointing_modules: Which decoder submodules to wrap.
+            ``"all"`` preserves the historical attention, MLP, and norm
+            wrapping. ``"mlp"`` checkpoints only the feed-forward/MoE path.
         context_fn: Optional factory returning ``(forward_ctx, recompute_ctx)``
             for the attention and MLP checkpoint wrappers (e.g.
             ``sdpa_backend_snapshot_context_fn``). Norm wrappers stay plain:
             they dispatch no SDPA, so their recompute cannot diverge on
             backend state.
     """
+    from nemo_automodel.components.distributed.config import normalize_activation_checkpointing_modules
+
+    ac_modules = normalize_activation_checkpointing_modules(activation_checkpointing_modules)
+    wrap_all = ac_modules == ("all",)
+    wrap_mlp = wrap_all or "mlp" in ac_modules
+    wrap_attention = wrap_all or "attention" in ac_modules
+    wrap_norm = wrap_all or "norm" in ac_modules
     wrapped_counts: dict[str, int] = {
         "mlp": 0,
         "attention": 0,
@@ -450,7 +461,12 @@ def apply_submodule_checkpointing(
         "mot": 0,
     }
     for layer in layers:
-        wrapped_counts["mlp"] += _wrap_first_existing_attr(layer, ("mlp", "feed_forward", "ffn"), context_fn=context_fn)
+        wrapped_counts["mlp"] += _wrap_first_existing_attr(
+            layer,
+            ("mlp", "feed_forward", "ffn"),
+            skip=not wrap_mlp,
+            context_fn=context_fn,
+        )
         wrapped_counts["attention"] += _wrap_first_existing_attr(
             layer,
             # "linear_attn" covers hybrid linear-attention blocks (e.g. Qwen3-Next /
@@ -459,32 +475,39 @@ def apply_submodule_checkpointing(
             # long-context training OOMs. A hybrid block has either "self_attn" or
             # "linear_attn" (never both), so first-match wrapping stays unambiguous.
             ("self_attn", "attention", "attn", "linear_attn"),
-            skip=has_kv_sharing,
+            skip=has_kv_sharing or not wrap_attention,
             context_fn=context_fn,
         )
         wrapped_counts["pre_norm"] += _wrap_first_existing_attr(
             layer,
             ("input_layernorm", "attention_norm", "layer_norm1", "norm1"),
+            skip=not wrap_norm,
         )
         wrapped_counts["post_norm"] += _wrap_first_existing_attr(
             layer,
             ("post_attention_layernorm", "ffn_norm", "layer_norm2", "norm2"),
+            skip=not wrap_norm,
         )
 
         # MoT (mixture-of-transformers) sibling submodules -- present in BAGEL's
         # Qwen2MoTDecoderLayer for the generation expert. mlp_moe_gen is a full
         # Qwen2MLP duplicate (same size as mlp), so omitting it from AC roughly
         # doubles per-layer activation memory in Stage-2 BAGEL training.
-        if hasattr(layer, "mlp_moe_gen"):
+        if wrap_mlp and hasattr(layer, "mlp_moe_gen"):
             layer.mlp_moe_gen = checkpoint_wrapper(layer.mlp_moe_gen)  # type: ignore
             wrapped_counts["mot"] += 1
-        if hasattr(layer, "input_layernorm_moe_gen"):
+        if wrap_norm and hasattr(layer, "input_layernorm_moe_gen"):
             layer.input_layernorm_moe_gen = checkpoint_wrapper(layer.input_layernorm_moe_gen)  # type: ignore
             wrapped_counts["mot"] += 1
-        if hasattr(layer, "post_attention_layernorm_moe_gen"):
+        if wrap_norm and hasattr(layer, "post_attention_layernorm_moe_gen"):
             layer.post_attention_layernorm_moe_gen = checkpoint_wrapper(layer.post_attention_layernorm_moe_gen)  # type: ignore
             wrapped_counts["mot"] += 1
-    logger.info("Applied submodule activation checkpointing to %d layers: %s", len(layers), wrapped_counts)
+    logger.info(
+        "Applied submodule activation checkpointing to %d layers with modules=%s: %s",
+        len(layers),
+        ac_modules,
+        wrapped_counts,
+    )
 
 
 def _replace_child_module(root: nn.Module, target: nn.Module, replacement: nn.Module) -> bool:

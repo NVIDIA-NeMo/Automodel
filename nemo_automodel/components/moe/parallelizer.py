@@ -302,7 +302,11 @@ def _has_trainable_multimodal_tower(model: nn.Module) -> bool:
     return False
 
 
-def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> None:
+def _apply_multimodal_tower_ac(
+    model: nn.Module,
+    scopes: tuple[str, ...],
+    activation_checkpointing_modules: str | list[str] | tuple[str, ...] = "all",
+) -> None:
     """Checkpoint trainable multimodal (vision/audio) tower blocks on the expert-parallel path.
 
     ``apply_ac`` iterates only the text/MTP decoder stack
@@ -362,7 +366,12 @@ def _apply_multimodal_tower_ac(model: nn.Module, scopes: tuple[str, ...]) -> Non
         return
     # Vision towers have no KV cache, so KV-sharing (a text-decoder concern)
     # never applies here.
-    apply_submodule_checkpointing(tower_layers, has_kv_sharing=False, context_fn=sdpa_backend_snapshot_context_fn)
+    apply_submodule_checkpointing(
+        tower_layers,
+        has_kv_sharing=False,
+        activation_checkpointing_modules=activation_checkpointing_modules,
+        context_fn=sdpa_backend_snapshot_context_fn,
+    )
 
 
 def apply_ac(
@@ -372,6 +381,7 @@ def apply_ac(
     num_experts: int | None = None,
     selective: bool = False,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
+    activation_checkpointing_modules: str | list[str] | tuple[str, ...] = "all",
 ):
     """Apply activation checkpointing to the model.
 
@@ -394,6 +404,10 @@ def apply_ac(
             tower blocks, skipping decoder checkpointing entirely. The scope decides WHICH
             groups participate; the ``selective``/``ignore_router`` mode decides HOW the
             selected decoder blocks are checkpointed.
+        activation_checkpointing_modules: Which decoder submodules to wrap for
+            non-selective activation checkpointing. ``"all"`` keeps the existing
+            whole-decoder-block behavior. ``"mlp"`` checkpoints only the
+            feed-forward/MoE path with the same router-save policy.
 
     Trainable VLM vision-tower blocks selected by the scope get the same per-submodule
     wrapping (attention/MLP/norms) as the generic FSDP2/DDP path, with the SDPA backend
@@ -403,9 +417,13 @@ def apply_ac(
     # Lazy import: keeps the scope normalization single-sourced with the strategy
     # configs without importing distributed.config on the (torch-stub-friendly)
     # module import path.
-    from nemo_automodel.components.distributed.config import normalize_activation_checkpointing_scope
+    from nemo_automodel.components.distributed.config import (
+        normalize_activation_checkpointing_modules,
+        normalize_activation_checkpointing_scope,
+    )
 
     scopes = normalize_activation_checkpointing_scope(activation_checkpointing_scope)
+    ac_modules = normalize_activation_checkpointing_modules(activation_checkpointing_modules)
     checkpoint_decoder = "all" in scopes or "language" in scopes
     if checkpoint_decoder and not selective and not ignore_router:
         logger.warning(
@@ -436,13 +454,13 @@ def apply_ac(
                 # enabled, so it is a no-op for every other mode.
                 setattr(block, SELECTIVE_AC_WRAPPER_FLAG, True)
                 parent_layers.register_module(layer_id, block)
-        _apply_multimodal_tower_ac(model, scopes)
+        _apply_multimodal_tower_ac(model, scopes, ac_modules)
         return
 
     if not checkpoint_decoder:
         # Vision-only (or otherwise non-language) scope: skip decoder checkpointing
         # entirely, including the hidden_size/num_experts derivation it needs.
-        _apply_multimodal_tower_ac(model, scopes)
+        _apply_multimodal_tower_ac(model, scopes, ac_modules)
         return
 
     # Derive hidden_size and num_experts from model.config if not provided
@@ -514,6 +532,64 @@ def apply_ac(
     if mtp_repeated and mtp_block_ids:
         logger.info("Skipping activation checkpointing on %d weight-tied MTP head block(s)", len(mtp_block_ids))
 
+    if ac_modules != ("all",):
+        attention_context_fn = None
+        if "attention" in ac_modules:
+            from nemo_automodel.components.distributed.activation_checkpointing import sdpa_backend_snapshot_context_fn
+
+            attention_context_fn = sdpa_backend_snapshot_context_fn
+
+        def _checkpoint_child(block: nn.Module, attr_names: tuple[str, ...], *, context_fn=None) -> int:
+            checkpoint_kwargs = {"preserve_rng_state": True}
+            if context_fn is not None:
+                checkpoint_kwargs["context_fn"] = context_fn
+            for attr in attr_names:
+                child = getattr(block, attr, None)
+                if not isinstance(child, nn.Module):
+                    continue
+                child_name = attr if block._modules.get(attr) is child else None
+                if child_name is None:
+                    for registered_name, registered_child in block._modules.items():
+                        if registered_child is child:
+                            child_name = registered_name
+                            break
+                if child_name is None:
+                    continue
+                if hasattr(child, "_checkpoint_wrapped_module"):
+                    return 0
+                setattr(block, child_name, ptd_checkpoint_wrapper(child, **checkpoint_kwargs))
+                return 1
+            return 0
+
+        wrapped_counts = {"mlp": 0, "attention": 0, "norm": 0}
+        for _, _, block in _iter_transformer_and_mtp_blocks(model):
+            if mtp_repeated and id(block) in mtp_block_ids:
+                continue
+            if "mlp" in ac_modules:
+                wrapped_counts["mlp"] += _checkpoint_child(
+                    block,
+                    ("mlp", "feed_forward", "ffn"),
+                    context_fn=selective_checkpointing_context_fn if ignore_router else None,
+                )
+            if "attention" in ac_modules:
+                wrapped_counts["attention"] += _checkpoint_child(
+                    block,
+                    ("self_attn", "attention", "attn", "linear_attn"),
+                    context_fn=attention_context_fn,
+                )
+            if "norm" in ac_modules:
+                wrapped_counts["norm"] += _checkpoint_child(
+                    block,
+                    ("input_layernorm", "attention_norm", "layer_norm1", "norm1"),
+                )
+                wrapped_counts["norm"] += _checkpoint_child(
+                    block,
+                    ("post_attention_layernorm", "ffn_norm", "layer_norm2", "norm2"),
+                )
+        logger.info("Applied MoE submodule activation checkpointing with modules=%s: %s", ac_modules, wrapped_counts)
+        _apply_multimodal_tower_ac(model, scopes, ac_modules)
+        return
+
     for parent_layers, layer_id, block in _iter_transformer_and_mtp_blocks(model):
         if mtp_repeated and id(block) in mtp_block_ids:
             continue
@@ -528,7 +604,7 @@ def apply_ac(
 
         parent_layers.register_module(layer_id, block)
 
-    _apply_multimodal_tower_ac(model, scopes)
+    _apply_multimodal_tower_ac(model, scopes, ac_modules)
 
 
 def _shard_fp32_param_holders(block, fsdp_mesh, reshard_after_forward, offload_policy):
@@ -843,6 +919,7 @@ def parallelize_model(
     activation_checkpointing: bool | str = False,
     ignore_router_for_ac: bool = True,
     activation_checkpointing_scope: str | list[str] | tuple[str, ...] = "all",
+    activation_checkpointing_modules: str | list[str] | tuple[str, ...] = "all",
     reshard_after_forward: bool = False,
     lm_head_precision: str | torch.dtype | None = None,
     wrap_outer_model: bool = True,
@@ -915,6 +992,7 @@ def parallelize_model(
             ignore_router=ignore_router_for_ac,
             selective=_is_selective_ac(activation_checkpointing),
             activation_checkpointing_scope=activation_checkpointing_scope,
+            activation_checkpointing_modules=activation_checkpointing_modules,
         )
 
     if ep_shard_axis_names is not None:
