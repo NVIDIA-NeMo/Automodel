@@ -116,4 +116,17 @@ freeze_config:
 
 ci:
   recipe_owner: athitten
-  time: "00:20:00"
+  nodes: 1
+  # Full robustness takes about 50 minutes before the known resume OOM and may
+  # need to continue through the restored-resume run once AM-707 is fixed.
+  time: "01:15:00"
+  # Keep failures blocking; source/reload defects are tracked by AM-707/AM-719.
+  checkpoint_robustness:
+    # The shared robustness batch of 2 exceeds this 26B MoE recipe's memory
+    # envelope; 1 matches the recipe's validated per-rank image batch.
+    step_scheduler.local_batch_size: 1
+    check_source_load_parity: true
+    check_resume: true
+    hf_kl_threshold: 2e-2
+    hf_device_map_auto: true
+    tokenizer_name: google/gemma-4-26B-A4B-it

@@ -113,50 +113,54 @@ def test_fused_cross_entropy_raises_when_dependency_missing(monkeypatch):
 def test_is_triton_greater_or_equal(monkeypatch):
     """Unit test for new_is_triton_greater_or_equal helper (lines 89-99).
 
-    We monkeypatch pkg_resources.get_distribution to control the installed
+    We monkeypatch importlib.metadata.version to control the installed
     version string and assert the comparison logic works as intended.
     """
 
-    import pkg_resources
-    from nemo_automodel.components.loss.linear_ce import new_is_triton_greater_or_equal
+    from importlib.metadata import PackageNotFoundError
 
-    class _DummyDist:
-        def __init__(self, version):
-            self.version = version
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
+
+    def _metadata_version(versions):
+        def _version(package_name):
+            try:
+                return versions[package_name]
+            except KeyError:
+                raise PackageNotFoundError(package_name)
+
+        return _version
 
     # Case 1: installed version is higher ⇒ function returns True
-    monkeypatch.setattr(pkg_resources, "get_distribution", lambda _: _DummyDist("3.5.0"))
-    assert new_is_triton_greater_or_equal("3.1.0") is True
+    monkeypatch.setattr(linear_ce_mod, "metadata_version", _metadata_version({"pytorch-triton": "3.5.0"}))
+    assert linear_ce_mod.new_is_triton_greater_or_equal("3.1.0") is True
 
     # Case 2: installed version is lower ⇒ returns False
-    monkeypatch.setattr(pkg_resources, "get_distribution", lambda _: _DummyDist("2.9.0"))
-    assert new_is_triton_greater_or_equal("3.1.0") is False
+    monkeypatch.setattr(linear_ce_mod, "metadata_version", _metadata_version({"pytorch-triton": "2.9.0"}))
+    assert linear_ce_mod.new_is_triton_greater_or_equal("3.1.0") is False
 
-    # Case 3: package not installed ⇒ DistributionNotFound ⇒ returns False
-    def _raise_dist_not_found(_):
-        raise pkg_resources.DistributionNotFound
+    # Case 3: pytorch-triton package missing, but triton is installed ⇒ use triton
+    monkeypatch.setattr(linear_ce_mod, "metadata_version", _metadata_version({"triton": "3.5.0"}))
+    assert linear_ce_mod.new_is_triton_greater_or_equal("3.1.0") is True
 
-    monkeypatch.setattr(pkg_resources, "get_distribution", _raise_dist_not_found)
-    assert new_is_triton_greater_or_equal("3.1.0") is False
+    # Case 4: package not installed ⇒ PackageNotFoundError ⇒ returns False
+    def _raise_package_not_found(package_name):
+        raise PackageNotFoundError(package_name)
+
+    monkeypatch.setattr(linear_ce_mod, "metadata_version", _raise_package_not_found)
+    assert linear_ce_mod.new_is_triton_greater_or_equal("3.1.0") is False
 
 
 def test_is_triton_greater_or_equal_3_2_0(monkeypatch):
     """Ensure the convenience wrapper compares against 3.1.0 (despite name)."""
 
-    import pkg_resources
-    from nemo_automodel.components.loss.linear_ce import (
-        new_is_triton_greater_or_equal_3_2_0,
-    )
+    from nemo_automodel.components.loss import linear_ce as linear_ce_mod
 
-    class _DummyDist:
-        def __init__(self, version):
-            self.version = version
+    monkeypatch.setattr(linear_ce_mod, "metadata_version", lambda _: "3.5.0")
+    assert linear_ce_mod.new_is_triton_greater_or_equal_3_2_0() is True
 
-    monkeypatch.setattr(pkg_resources, "get_distribution", lambda _: _DummyDist("3.5.0"))
-    assert new_is_triton_greater_or_equal_3_2_0() is True
+    monkeypatch.setattr(linear_ce_mod, "metadata_version", lambda _: "3.0.0")
+    assert linear_ce_mod.new_is_triton_greater_or_equal_3_2_0() is False
 
-    monkeypatch.setattr(pkg_resources, "get_distribution", lambda _: _DummyDist("3.0.0"))
-    assert new_is_triton_greater_or_equal_3_2_0() is False
 
 def test_fused_cross_entropy_normalizes_by_num_tokens(monkeypatch):
     """When num_label_tokens is passed and reduction='sum', the returned loss

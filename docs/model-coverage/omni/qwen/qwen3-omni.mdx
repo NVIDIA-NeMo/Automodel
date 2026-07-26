@@ -37,23 +37,18 @@ description: ""
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
-
-```bash
-pip install "nemo-automodel[vlm,vlm-media]"
-```
-
-**2. Clone the repo** to get the example recipes:
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
+uv sync --locked --all-groups --all-extras --extra vlm-media
 ```
 
-**3. Run the recipe** from inside the repo:
+**2. Run the recipe** from inside the repo:
 
 ```bash
-automodel --nproc-per-node=8 examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml
+uv run automodel --nproc-per-node=8 examples/vlm_finetune/qwen3/qwen3_omni_moe_30b_te_deepep.yaml
 ```
 
 <Accordion title="Run with Docker">

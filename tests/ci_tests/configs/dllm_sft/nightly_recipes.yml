@@ -1,0 +1,35 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# dLLM (diffusion-LLM) SFT recipes included in the nightly scope.
+# `examples_dir` defaults to the test-folder name (dllm_sft), so each entry
+# resolves to examples/dllm_sft/<config>.
+#
+# The launcher runs a train -> generate smoke test: recipes with an
+# examples/dllm_generate sampler preset (`llada`, `nemotron`) train then
+# generate; recipes without a preset would be train-only.
+#
+# Every listed recipe MUST carry a top-level `ci:` block (recipe_owner + time)
+# in its YAML -- generate_ci_tests.py reads it for SLURM wall time and ownership.
+# These recipes download 8B checkpoints + a large SFT dataset on a cold HF cache,
+# so allow generous `ci.time`.
+configs:
+  # -- LLaDA: pure MDLM, `llada` sampler --
+  - llada_sft.yaml             # GSAI-ML/LLaDA-8B-Base  (8B, seq 1024, tp1)
+
+  # -- Nemotron-Labs-Diffusion: hybrid block-diffusion, `nemotron` sampler --
+  - nemotron_labs_diffusion_sft.yaml   # nvidia/Nemotron-Labs-Diffusion-8B-Base (8B, seq 8192, tp2)
+
+  # -- DiffusionGemma: block-diffusion, train-only --
+  - diffusion_gemma_sft.yaml   # google/diffusiongemma-26B-A4B-it (26B-A4B, seq 1024, ep8)

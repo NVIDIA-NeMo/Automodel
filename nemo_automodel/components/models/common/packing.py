@@ -38,6 +38,8 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
+_FLASH_ATTN_IMPLEMENTATIONS = ("flash_attention_2", "flash_attention_3", "flash_attention_4")
+
 
 def get_seqlens_in_batch(attention_mask: torch.Tensor) -> torch.Tensor:
     """Extract per-document sequence lengths from an indexed attention mask.
@@ -128,10 +130,11 @@ def _passthrough_create_causal_mask(
 ):
     """Replacement for ``create_causal_mask`` that passes through packed masks.
 
-    FA2 handles masking internally, so always pass through.  For non-FA2
-    backends, pass through packed masks but delegate normal 2D masks to HF.
+    Flash attention (FA2/FA3/FA4) handles masking internally, so always pass
+    through.  For other backends, pass through packed masks but delegate
+    normal 2D masks to HF.
     """
-    if config is not None and getattr(config, "_attn_implementation", None) == "flash_attention_2":
+    if config is not None and getattr(config, "_attn_implementation", None) in _FLASH_ATTN_IMPLEMENTATIONS:
         return attention_mask
 
     if attention_mask is not None:
@@ -165,9 +168,109 @@ def get_attn_implementation(cfg_model):
     return "sdpa"
 
 
+def _patch_preprocess_mask_arguments_for_packing() -> None:
+    """Keep indexed packing masks intact for the supported FA2 path.
+
+    Transformers 5.x preprocesses 2D attention masks before dispatching
+    attention. For flash attention this can coerce integer indexed masks
+    (``1, 2, ...`` per packed document) to bool masks, losing the document
+    boundaries that ``get_unpad_data`` needs. Preserve indexed 2D masks for
+    FA2 so the patched flash-attention path can derive per-document
+    ``cu_seqlens``. Validate the private Transformers contract before installing
+    the shim so an incompatible dependency fails instead of silently enabling
+    cross-document attention.
+    """
+    import transformers
+
+    try:
+        import transformers.masking_utils as masking_utils
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "Cannot enable FA2 neat packing because transformers.masking_utils is unavailable "
+            f"in transformers {transformers.__version__}. Refusing to continue because losing "
+            "indexed mask values would enable cross-document attention."
+        ) from exc
+
+    if getattr(masking_utils, "_nemo_automodel_packing_preprocess_patched", False):
+        return
+
+    original_preprocess = getattr(masking_utils, "_preprocess_mask_arguments", None)
+    if original_preprocess is None:
+        raise RuntimeError(
+            "Cannot enable FA2 neat packing because transformers.masking_utils has no "
+            f"_preprocess_mask_arguments in transformers {transformers.__version__}. Refusing to "
+            "continue because losing indexed mask values would enable cross-document attention."
+        )
+
+    # A 4D mask takes Transformers' immediate pass-through branch, so this
+    # constant-size probe verifies the private call and return contract without
+    # allocating an O(sequence^2) tensor for a real long-context batch.
+    probe_mask = torch.zeros((1, 1, 1, 1), dtype=torch.bool)
+    try:
+        preprocess_result_template = original_preprocess(
+            config=None,
+            inputs_embeds=torch.zeros((1, 1, 1)),
+            attention_mask=probe_mask,
+            past_key_values=None,
+            position_ids=None,
+            layer_idx=None,
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Cannot enable FA2 neat packing because transformers "
+            f"{transformers.__version__} has an incompatible _preprocess_mask_arguments signature. "
+            "Refusing to continue because losing indexed mask values would enable cross-document attention."
+        ) from exc
+
+    if (
+        not isinstance(preprocess_result_template, tuple)
+        or len(preprocess_result_template) < 2
+        or preprocess_result_template[0] is not True
+        or preprocess_result_template[1] is not probe_mask
+    ):
+        raise RuntimeError(
+            "Cannot enable FA2 neat packing because transformers "
+            f"{transformers.__version__} returned an incompatible _preprocess_mask_arguments "
+            "early-exit result. Refusing to continue because losing indexed mask values would "
+            "enable cross-document attention."
+        )
+
+    def _patched_preprocess_mask_arguments(*args, **kwargs):
+        """Preserve indexed masks while matching the installed private HF API.
+
+        Args:
+            *args: Positional HF arguments. When present, index 1 is an input
+                tensor of shape [batch, sequence, hidden] and index 2 is an
+                attention mask of shape [batch, sequence].
+            **kwargs: Keyword form of the same HF arguments.
+
+        Returns:
+            Tuple matching the installed Transformers preprocessing result. For
+            indexed FA2 masks, the first entries are ``True`` and the unchanged
+            mask tensor of shape [batch, sequence].
+        """
+        config = kwargs.get("config", args[0] if len(args) > 0 else None)
+        attention_mask = kwargs.get("attention_mask", args[2] if len(args) > 2 else None)
+        attn_impl = getattr(config, "_attn_implementation", None) or getattr(
+            config, "_attn_implementation_internal", None
+        )
+        if attn_impl in _FLASH_ATTN_IMPLEMENTATIONS and is_indexed_packed_mask(attention_mask):
+            return (
+                preprocess_result_template[0],
+                attention_mask,
+                *preprocess_result_template[2:],
+            )
+        return original_preprocess(*args, **kwargs)
+
+    masking_utils._preprocess_mask_arguments = _patched_preprocess_mask_arguments
+    masking_utils._nemo_automodel_packing_preprocess_patched = True
+
+
 # Model modules whose ``create_causal_mask`` must be patched for neat packing.
 # TODO: perhaps its for ALL models.
 _PACKING_PATCH_MODULES = [
+    "transformers.models.llama.modeling_llama",
+    "transformers.models.qwen3.modeling_qwen3",
     "transformers.models.qwen2.modeling_qwen2",
     "transformers.models.qwen2_5_vl.modeling_qwen2_5_vl",
     "transformers.models.qwen2_vl.modeling_qwen2_vl",
@@ -178,20 +281,24 @@ _PACKING_PATCH_MODULES = [
 
 
 def configure_packing(attn_implementation: str = "sdpa") -> None:
-    """Apply monkey-patches for packed-sequence training with flash_attention_2.
+    """Apply monkey-patches for packed-sequence training with flash attention.
 
-    Only patches when ``attn_implementation == "flash_attention_2"``.
+    Only patches when ``attn_implementation`` is a flash-attention variant
+    (``flash_attention_2`` / ``flash_attention_3`` / ``flash_attention_4``);
+    transformers routes all three through the same varlen wrapper, so the
+    ``_get_unpad_data`` patch applies uniformly.
 
     Args:
         attn_implementation: The attention implementation used by the model.
     """
-    if attn_implementation != "flash_attention_2":
+    if attn_implementation not in _FLASH_ATTN_IMPLEMENTATIONS:
         return
 
     import sys
 
     import transformers.modeling_flash_attention_utils
 
+    _patch_preprocess_mask_arguments_for_packing()
     transformers.modeling_flash_attention_utils._get_unpad_data = get_unpad_data
 
     # Each model module imports create_causal_mask into its own namespace at

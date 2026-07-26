@@ -217,14 +217,17 @@ class TestWeightedBiasGegluImpl:
 class TestIsGatedActivation:
     def test_geglu_is_gated(self):
         from nemo_automodel.components.moe.experts import is_gated_activation
+
         assert is_gated_activation("geglu") is True
 
     def test_swiglu_is_gated(self):
         from nemo_automodel.components.moe.experts import is_gated_activation
+
         assert is_gated_activation("swiglu") is True
 
     def test_relu2_is_not_gated(self):
         from nemo_automodel.components.moe.experts import is_gated_activation
+
         assert is_gated_activation("relu2") is False
 
 
@@ -262,12 +265,21 @@ class TestGetExpertActivation:
         from nemo_automodel.components.moe.experts import get_expert_activation_for_deepep
 
         cfg = MoEConfig(
-            dim=64, inter_dim=128, moe_inter_dim=32,
-            n_routed_experts=4, n_shared_experts=0, n_activated_experts=2,
-            n_expert_groups=0, n_limited_groups=0,
-            train_gate=True, gate_bias_update_factor=0.0,
-            score_func="softmax", route_scale=1.0, aux_loss_coeff=0.0,
-            norm_topk_prob=True, expert_activation="invalid_act",
+            dim=64,
+            inter_dim=128,
+            moe_inter_dim=32,
+            n_routed_experts=4,
+            n_shared_experts=0,
+            n_activated_experts=2,
+            n_expert_groups=0,
+            n_limited_groups=0,
+            train_gate=True,
+            gate_bias_update_factor=0.0,
+            score_func="softmax",
+            route_scale=1.0,
+            aux_loss_coeff=0.0,
+            norm_topk_prob=True,
+            expert_activation="invalid_act",
             softmax_before_topk=False,
         )
         with pytest.raises(ValueError, match="Invalid expert activation"):

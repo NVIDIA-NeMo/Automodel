@@ -19,6 +19,7 @@ from pathlib import Path
 from shutil import rmtree
 
 import pytest
+import torch
 
 os.environ.setdefault("HF_CACHE", "/home/TestData/lite/hf_cache")
 os.environ.setdefault("HF_HOME", "/home/TestData/HF_HOME")
@@ -119,6 +120,53 @@ def reset_env_vars():
     os.environ.update(original_env)
 
 
+@pytest.fixture(autouse=True)
+def enforce_torch_memory_limit(request):
+    """Enforce opt-in per-test PyTorch allocator budgets."""
+    marker = request.node.get_closest_marker("torch_memory_limit")
+    if marker is None:
+        yield
+        return
+
+    cpu_limit_mb = marker.kwargs.get("cpu_mb")
+    cuda_limit_mb = marker.kwargs.get("cuda_mb")
+    if cpu_limit_mb is None and cuda_limit_mb is None:
+        pytest.fail("torch_memory_limit requires cpu_mb and/or cuda_mb")
+
+    cuda_device = None
+    cuda_allocated_before = 0
+    if cuda_limit_mb is not None and torch.cuda.is_available():
+        cuda_device = torch.cuda.current_device()
+        torch.cuda.reset_peak_memory_stats(cuda_device)
+        cuda_allocated_before = torch.cuda.memory_allocated(cuda_device)
+
+    if cpu_limit_mb is None:
+        yield
+        profiler = None
+    else:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            profile_memory=True,
+            acc_events=True,
+        ) as profiler:
+            yield
+
+    bytes_per_mb = 1024**2
+    if profiler is not None:
+        cpu_allocated_bytes = sum(max(0, event.self_cpu_memory_usage) for event in profiler.key_averages())
+        assert cpu_allocated_bytes <= cpu_limit_mb * bytes_per_mb, (
+            f"test allocated {cpu_allocated_bytes / bytes_per_mb:.1f} MiB through the PyTorch CPU allocator; "
+            f"limit is {cpu_limit_mb} MiB"
+        )
+
+    if cuda_device is not None:
+        cuda_peak_delta_bytes = torch.cuda.max_memory_allocated(cuda_device) - cuda_allocated_before
+        assert cuda_peak_delta_bytes <= cuda_limit_mb * bytes_per_mb, (
+            f"test allocated {cuda_peak_delta_bytes / bytes_per_mb:.1f} MiB through the PyTorch CUDA allocator; "
+            f"limit is {cuda_limit_mb} MiB"
+        )
+
+
 def pytest_configure(config):
     """Initial configuration of conftest.
     The function checks if test_data.tar.gz is present in tests/.data.
@@ -132,4 +180,8 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "with_downloads: runs the test using data present in tests/.data",
+    )
+    config.addinivalue_line(
+        "markers",
+        "torch_memory_limit(cpu_mb=None, cuda_mb=None): limits per-test PyTorch allocator usage",
     )

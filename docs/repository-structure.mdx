@@ -34,13 +34,16 @@ $ tree -L 1 nemo_automodel/components/
 ├── config/         - Utils to load YAML files and CLI-parsing helpers.
 ├── datasets/       - LLM and VLM datasets and utils (collate functions, preprocessing).
 ├── distributed/    - Distributed processing primitives (DDP, FSDP2, MegatronFSDP) and pipeline parallelism (AutoPipeline).
-├── launcher/       - Job launcher for interactive and batch (Slurm, K8s) processing.
+├── eval/           - Evaluation helpers, including tool-call parsing and scoring.
+├── flow_matching/  - Flow-matching pipelines and model adapters for diffusion training.
+├── launcher/       - Interactive, SkyPilot (including Kubernetes), and NeMo-Run job launchers.
 ├── loggers/        - Metric/event logging for Weights & Biases and other tools.
 ├── loss/           - Loss functions (such as cross-entropy and linear cross-entropy, etc.).
 ├── models/         - Optimized model implementations for LLMs and VLMs.
 ├── moe/            - Mixture of Experts modules and routing utilities for scalable model architectures.
 ├── optim/          - Optimizers and LR schedulers, including fused or second-order variants.
 ├── quantization/   - Quantization layers and helpers for 4-bit/8-bit or other reduced-precision training and inference.
+├── speculative/    - Speculative decoding training, serving, and benchmarking components.
 ├── training/       - Training and fine-tuning utils.
 └── utils/          - Small, dependency-free helpers (seed, profiler, timing, fs).
 ```
@@ -55,15 +58,38 @@ Recipes define **end-to-end workflows** (data and model loading → training wit
 for a variety of tasks, such as training, fine-tuning, and knowledge distillation.
 
 #### Available Recipes
-The following directory listing shows all components along with explanations of their contents.
+The following directory listing shows the top-level recipe domains and their non-private Python modules. Package initializers and underscore-prefixed support modules are omitted.
 ```
 $ tree -L 2 nemo_automodel/recipes/
-├── llm
-│   ├── benchmark.py  - Benchmark recipe for LLMs
-│   ├── kd.py         - Knowledge Distillation for LLMs
-│   └── train_ft.py   - Train recipe for LLMs (Pretrain & Finetune SFT, PEFT).
-└── vlm
-    └── finetune.py   - Finetune recipe for VLMs (SFT, PEFT).
+├── diffusion/
+│   └── train.py                 - Diffusion training.
+├── dllm/
+│   ├── strategy.py              - Shared diffusion language-model strategy helpers.
+│   └── train_ft.py              - Diffusion language-model fine-tuning.
+├── llm/
+│   ├── benchmark.py             - LLM benchmarking.
+│   ├── kd.py                    - LLM knowledge distillation.
+│   ├── peagle_recipe.py         - Shared PEAGLE recipe behavior.
+│   ├── precompute_dspark_dist.py - DSpark distance precomputation.
+│   ├── train_dflash.py          - DFlash speculative training.
+│   ├── train_domino.py          - Domino speculative training.
+│   ├── train_dspark.py          - DSpark speculative training.
+│   ├── train_eagle1.py          - EAGLE-1 speculative training.
+│   ├── train_eagle2.py          - EAGLE-2 speculative training.
+│   ├── train_eagle3.py          - EAGLE-3 speculative training.
+│   ├── train_ft.py              - LLM pretraining and fine-tuning.
+│   ├── train_jetspec.py         - JetSpec speculative training.
+│   └── train_seq_cls.py         - Sequence-classification fine-tuning.
+├── multimodal/
+│   ├── finetune.py              - Multimodal fine-tuning.
+│   └── pretrain.py              - Multimodal pretraining.
+├── retrieval/
+│   ├── mine_hard_negatives.py   - Hard-negative mining.
+│   ├── train_bi_encoder.py      - Bi-encoder training.
+│   └── train_cross_encoder.py   - Cross-encoder training.
+└── vlm/
+    ├── finetune.py              - VLM fine-tuning.
+    └── kd.py                    - VLM knowledge distillation.
 ```
 
 #### Run a Recipe
@@ -89,8 +115,11 @@ The recipe/components structure enables you to:
 #### Configure a Recipe
 An example YAML configuration is shown below. The complete config is available [here](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/llama3_2/llama3_2_1b_squad.yaml):
 ```yaml
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
 step_scheduler:
-  grad_acc_steps: 4
+  global_batch_size: 64
+  local_batch_size: 8
   ckpt_every_steps: 1000
   val_every_steps: 10  # will run every x number of gradient steps
   num_epochs: 1
@@ -107,14 +136,15 @@ dataset:
 
 More recipe examples are available under the [`examples/`](https://github.com/NVIDIA-NeMo/Automodel/tree/main/examples) directory.
 
-### CLI Directory (`cli/`)
+### CLI Directory (`nemo_automodel/cli/`)
 The `automodel` (or `am`) CLI application simplifies job execution across different environments, from
-single-GPU interactive sessions to batch multi-node runs. It supports interactive (local), SLURM,
-SkyPilot, and NeMo-Run launchers. The CLI lives at the repository root in the
-`cli/` package, separate from the core `nemo_automodel` library.
+single-GPU interactive sessions to batch multi-node runs. It dispatches interactive (local), SkyPilot,
+and NeMo-Run launchers; Slurm jobs are submitted with `sbatch` scripts directly. The installed CLI
+implementation lives in `nemo_automodel/cli/`, and both console scripts resolve to
+`nemo_automodel.cli.app:main`.
 
 ## Next Steps
 
 Learn how to train models with NeMo AutoModel on:
-- **Your local workstation**: See [`docs/launcher/local-workstation.md`](/job-launchers/local-workstation).
-- **A cluster**: See [`docs/launcher/slurm.md`](/job-launchers/slurm-cluster).
+- **Your local workstation**: See [`docs/launcher/local-workstation.mdx`](/job-launchers/local-workstation).
+- **A cluster**: See [`docs/launcher/slurm.mdx`](/job-launchers/slurm-cluster).

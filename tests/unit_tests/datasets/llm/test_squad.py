@@ -88,6 +88,25 @@ class DummyTokenizer:
         return ids
 
 
+class RewritingChatTokenizer(DummyTokenizer):
+    """Tokenizer whose no-generation template rewrites a user-only prefix."""
+
+    def __init__(self):
+        super().__init__(with_chat_template=True)
+        self.chat_template = "{{ messages }}"
+
+    def apply_chat_template(self, messages, return_dict=False, return_assistant_tokens_mask=False, **kwargs):
+        result = super().apply_chat_template(
+            messages,
+            return_dict=return_dict,
+            return_assistant_tokens_mask=return_assistant_tokens_mask,
+            **kwargs,
+        )
+        if len(messages) == 1 and not return_assistant_tokens_mask:
+            result["input_ids"].insert(-1, self._tok_to_id("<generation-prompt>"))
+        return result
+
+
 @pytest.fixture(scope="function")
 def tiny_hf_dataset():
     """
@@ -223,6 +242,22 @@ def test_chat_template_path():
     if "loss_mask" in row:
         assert sum(row["loss_mask"][:response_start]) == 0
         assert sum(row["loss_mask"][response_start:]) == len(row["loss_mask"][response_start:])
+
+
+def test_chat_template_override_path(tmp_path):
+    template_path = tmp_path / "chat_template.jinja"
+    template = "{{ messages }}{% generation %}"
+    template_path.write_text(template, encoding="utf-8")
+    tok = RewritingChatTokenizer()
+
+    with pytest.raises(ValueError, match="does not reproduce a prefix"):
+        make_squad_dataset(tok)[0]
+
+    ds = make_squad_dataset(tok, chat_template=str(template_path))
+    row = ds[0]
+
+    assert tok.chat_template == template
+    assert any(label != -100 for label in row["labels"])
 
 
 def test_fp8_flag_is_noop():

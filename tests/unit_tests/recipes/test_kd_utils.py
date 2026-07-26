@@ -1,0 +1,470 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.distributed as dist
+import yaml
+
+from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config
+from nemo_automodel.components.loss.kd_loss import KDLoss
+from nemo_automodel.recipes import kd_utils
+from tests.functional_tests.llm_pretrain_and_kd import kd_separate_mesh_test_utils
+from tests.functional_tests.llm_pretrain_and_kd.compare_kd_sep_mesh_losses import _compare_pair
+from tests.functional_tests.llm_pretrain_and_kd.kd_separate_mesh_test_utils import TinyKDDataset
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_KD_FP32_MASTER_YAMLS = (
+    "examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_cp2.yaml",
+    "examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_pp2.yaml",
+    "examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_tp2.yaml",
+    "examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd_separate_mesh_teacher_cp2.yaml",
+    "examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd_separate_mesh_teacher_dp2.yaml",
+    "examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd_separate_mesh_teacher_tp2.yaml",
+    "tests/functional_tests/llm_pretrain_and_kd/kd_separate_mesh.yaml",
+    "tests/functional_tests/llm_pretrain_and_kd/kd_sep_mesh_gemma_dense.yaml",
+    "tests/functional_tests/llm_pretrain_and_kd/kd_sep_mesh_gemma_moe.yaml",
+)
+_EXPECTED_TORCH_OPTIMIZER_TARGETS = {
+    "examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_cp2.yaml": "torch.optim.Adam",
+    "examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_pp2.yaml": "torch.optim.Adam",
+    "examples/llm_kd/llama3_2/llama3_2_1b_kd_separate_mesh_teacher_tp2.yaml": "torch.optim.Adam",
+    "examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd_separate_mesh_teacher_cp2.yaml": "torch.optim.AdamW",
+    "examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd_separate_mesh_teacher_dp2.yaml": "torch.optim.AdamW",
+    "examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd_separate_mesh_teacher_tp2.yaml": "torch.optim.AdamW",
+    "tests/functional_tests/llm_pretrain_and_kd/kd_separate_mesh.yaml": "torch.optim.AdamW",
+    "tests/functional_tests/llm_pretrain_and_kd/kd_sep_mesh_gemma_dense.yaml": "torch.optim.AdamW",
+    "tests/functional_tests/llm_pretrain_and_kd/kd_sep_mesh_gemma_moe.yaml": "torch.optim.AdamW",
+}
+
+
+def test_tiny_kd_dataset_requests_flat_chat_template_token_ids():
+    class Tokenizer:
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, return_dict):
+            assert messages == [
+                {"role": "user", "content": "Explain knowledge distillation and distributed validation."}
+            ]
+            assert tokenize is True
+            assert add_generation_prompt is True
+            assert return_dict is False
+            return [10, 11, 12, 13]
+
+        def encode(self, text, *, add_special_tokens):
+            assert text.startswith("Knowledge distillation")
+            assert add_special_tokens is False
+            return list(range(20, 84))
+
+    dataset = TinyKDDataset(Tokenizer(), num_samples=1, seq_length=8, use_chat_template=True)
+
+    assert dataset[0]["input_ids"] == [10, 11, 12, 13, 20, 21, 22, 23]
+    assert dataset[0]["labels"] == [-100, -100, -100, 20, 21, 22, 23, 24]
+
+
+def test_tiny_kd_dataset_preserves_non_chat_first_label_mask():
+    class Tokenizer:
+        def encode(self, text, *, add_special_tokens):
+            assert text.startswith("Knowledge distillation")
+            assert add_special_tokens is True
+            return list(range(64))
+
+    dataset = TinyKDDataset(Tokenizer(), num_samples=1, seq_length=8)
+
+    assert dataset[0]["input_ids"] == list(range(8))
+    assert dataset[0]["labels"] == [-100, 2, 3, 4, 5, 6, 7, 8]
+
+
+def test_tiny_kd_sft_dataset_masks_generation_prompt():
+    class Tokenizer:
+        eos_token_id = 2
+
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, return_dict):
+            assert messages == [{"role": "user", "content": "What is KD?"}]
+            assert tokenize is True
+            assert add_generation_prompt is True
+            assert return_dict is False
+            return [10, 11, 12, 13]
+
+        def encode(self, text, *, add_special_tokens):
+            assert text == "KD transfers teacher behavior to a student."
+            assert add_special_tokens is False
+            return [20, 21, 22, 23, 24, 25, 26, 27]
+
+    dataset = kd_separate_mesh_test_utils.make_tiny_kd_sft_dataset(
+        tokenizer=Tokenizer(),
+        prompt="What is KD?",
+        completion="KD transfers teacher behavior to a student.",
+        num_samples=2,
+        seq_length=8,
+    )
+
+    assert dataset[0]["input_ids"] == [10, 11, 12, 13, 20, 21, 22, 23]
+    assert dataset[0]["labels"] == [-100, -100, -100, 20, 21, 22, 23, 24]
+    assert dataset[0]["attention_mask"] == [1] * 8
+    dataset[0]["labels"][3] = -100
+    assert dataset[1]["labels"][3] == 20
+
+
+def test_kd_yamls_use_torch_optim_with_fp32_student_storage():
+    for relative_path in _KD_FP32_MASTER_YAMLS:
+        cfg = yaml.safe_load((_REPO_ROOT / relative_path).read_text())
+
+        optimizer = cfg["optimizer"]
+        assert optimizer["_target_"] == _EXPECTED_TORCH_OPTIMIZER_TARGETS[relative_path]
+        assert "master_weights" not in optimizer
+        assert "master_weight_dtype" not in optimizer
+
+        assert cfg["model"]["torch_dtype"] == "float32"
+        assert cfg["teacher_model"]["torch_dtype"] == "bfloat16"
+
+
+def test_loss_comparator_rejects_mismatched_kd_settings():
+    baseline = {
+        "step": 0,
+        "loss": 1.0,
+        "ce_loss": 1.0,
+        "kd_loss": 1.0,
+        "grad_norm": 1.0,
+        "kd_ratio": 0.5,
+        "temperature": 1.0,
+    }
+    candidate = baseline | {"temperature": 2.0}
+
+    with pytest.raises(ValueError, match="mismatched run settings"):
+        _compare_pair("teacher_tp2", [baseline], [candidate], 0.01, 0.01)
+
+
+def test_materialize_teacher_logits_unshards_cp_and_removes_padding(monkeypatch):
+    cp_mesh = SimpleNamespace(size=lambda: 2)
+
+    class Mesh:
+        mesh_dim_names = ("cp",)
+
+        def __getitem__(self, name):
+            assert name == "cp"
+            return cp_mesh
+
+    local = torch.tensor([[[1.0], [2.0]]])
+
+    def unshard(mesh, tensor, *, seq_dim):
+        """Expand local logits to the full sequence.
+
+        Args:
+            mesh: Mock context-parallel mesh.
+            tensor: Tensor of shape ``[batch=1, local_sequence=2, vocab=1]``
+                containing local logits.
+            seq_dim: Sequence axis, which must be one.
+
+        Returns:
+            Tensor of shape ``[batch=1, sequence=4, vocab=1]`` containing full
+            logits.
+        """
+        assert mesh is cp_mesh
+        assert tensor is local
+        assert seq_dim == 1
+        return torch.tensor([[[1.0], [2.0], [3.0], [0.0]]])
+
+    monkeypatch.setattr(kd_utils, "unshard_context_parallel_tensor", unshard)
+
+    result = kd_utils.materialize_teacher_logits(local, device_mesh=Mesh(), sequence_length=3)
+
+    assert torch.equal(result, torch.tensor([[[1.0], [2.0], [3.0]]]))
+
+
+def test_shared_kd_setup_keeps_existing_world(monkeypatch):
+    shared = SimpleNamespace(strategy_config=FSDP2Config())
+
+    def build(cfg, **kwargs):
+        return shared
+
+    monkeypatch.setattr(kd_utils, "create_distributed_setup_from_config", build)
+
+    setups = kd_utils.create_kd_distributed_setups({"distributed": {}}, world_size=4)
+
+    assert setups.student is shared
+    assert setups.teacher is shared
+    assert setups.student_ranks == (0, 1, 2, 3)
+    assert setups.teacher_ranks == (0, 1, 2, 3)
+    assert not setups.separate
+
+
+def test_separate_kd_setup_assigns_contiguous_disjoint_ranks(monkeypatch):
+    calls = []
+
+    def build(cfg, **kwargs):
+        calls.append((cfg, kwargs))
+        return SimpleNamespace(strategy_config=FSDP2Config())
+
+    monkeypatch.setattr(kd_utils, "create_distributed_setup_from_config", build)
+    cfg = {
+        "separate_meshes": True,
+        "distributed": {"strategy": "fsdp2", "dp_size": 2},
+        "teacher_distributed": {"strategy": "fsdp2", "dp_size": 1, "tp_size": 2},
+    }
+
+    setups = kd_utils.create_kd_distributed_setups(cfg, world_size=4)
+
+    assert setups.student_ranks == (0, 1)
+    assert setups.teacher_ranks == (2, 3)
+    assert setups.separate
+    assert calls[0][1] == {"world_size": 2, "ranks": (0, 1)}
+    assert calls[1][1] == {"world_size": 2, "ranks": (2, 3)}
+
+
+@pytest.mark.parametrize(
+    ("cfg", "message"),
+    [
+        (
+            {"distributed": {}, "teacher_distributed": {"dp_size": 1}},
+            "teacher_distributed requires separate_meshes=true",
+        ),
+        (
+            {"separate_meshes": True, "distributed": {"dp_size": 2}},
+            "requires a teacher_distributed section",
+        ),
+        (
+            {
+                "separate_meshes": True,
+                "distributed": {"tp_size": 2},
+                "teacher_distributed": {"dp_size": 2},
+            },
+            "distributed.dp_size must be set",
+        ),
+        (
+            {
+                "separate_meshes": True,
+                "distributed": {"dp_size": 2},
+                "teacher_distributed": {"dp_size": 1},
+            },
+            "student=2.*teacher=1 != world_size=4",
+        ),
+    ],
+)
+def test_kd_setup_rejects_ambiguous_rank_splits(cfg, message):
+    with pytest.raises(ValueError, match=message):
+        kd_utils.create_kd_distributed_setups(cfg, world_size=4)
+
+
+def test_separate_kd_setup_rejects_ddp(monkeypatch):
+    monkeypatch.setattr(
+        kd_utils,
+        "create_distributed_setup_from_config",
+        lambda cfg, **kwargs: SimpleNamespace(strategy_config=DDPConfig()),
+    )
+    cfg = {
+        "separate_meshes": True,
+        "distributed": {"strategy": "ddp", "dp_size": 2},
+        "teacher_distributed": {"strategy": "fsdp2", "dp_size": 2},
+    }
+
+    with pytest.raises(ValueError, match="DDP is not supported"):
+        kd_utils.create_kd_distributed_setups(cfg, world_size=4)
+
+
+def test_model_replicas_resolves_dp_pipeline_endpoints():
+    mesh = SimpleNamespace(
+        mesh_dim_names=("dp", "pp", "tp"),
+        mesh=torch.arange(8).reshape(2, 2, 2),
+    )
+    setup = SimpleNamespace(mesh_context=SimpleNamespace(device_mesh=mesh))
+
+    replicas = kd_utils._model_replicas(setup)
+
+    assert replicas == [
+        kd_utils._Replica(ranks=(0, 1, 2, 3), input_rank=0, output_rank=2),
+        kd_utils._Replica(ranks=(4, 5, 6, 7), input_rank=4, output_rank=6),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("device_mesh", "message"),
+    [
+        (None, "require a DeviceMesh"),
+        (SimpleNamespace(mesh_dim_names=("tp",), mesh=torch.arange(2)), "no data-parallel axis"),
+    ],
+)
+def test_model_replicas_rejects_missing_mesh_contract(device_mesh, message):
+    setup = SimpleNamespace(mesh_context=SimpleNamespace(device_mesh=device_mesh))
+
+    with pytest.raises(ValueError, match=message):
+        kd_utils._model_replicas(setup)
+
+
+def test_tree_spec_round_trip_preserves_nested_tensor_leaves():
+    first = torch.arange(4).reshape(2, 2)
+    second = torch.tensor([3.0])
+    value = {"items": [first, ("label", second)], "count": 2}
+    tensors = []
+
+    spec = kd_utils._tree_spec(value, tensors)
+    rebuilt = kd_utils._tree_from_spec(spec, tensors)
+
+    assert tensors == [first, second]
+    assert rebuilt["items"][0] is first
+    assert rebuilt["items"][1] == ("label", second)
+    assert rebuilt["count"] == 2
+
+
+def test_kd_mesh_bridge_builds_routes_and_moves_nested_values(monkeypatch):
+    student_replicas = [
+        kd_utils._Replica((0,), 0, 0),
+        kd_utils._Replica((1,), 1, 1),
+    ]
+    teacher_replicas = [kd_utils._Replica((2, 3), 2, 2)]
+    groups = []
+
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "new_group", lambda *, ranks: groups.append(tuple(ranks)) or object())
+    monkeypatch.setattr(kd_utils, "_model_replicas", lambda setup: setup.replicas)
+    setups = SimpleNamespace(
+        separate=True,
+        student_ranks=(0, 1),
+        teacher_ranks=(2, 3),
+        student=SimpleNamespace(replicas=student_replicas),
+        teacher=SimpleNamespace(replicas=teacher_replicas),
+    )
+
+    bridge = kd_utils.KDMeshBridge(setups, device=torch.device("cpu"))
+    nested = {"tensor": torch.ones(2), "items": [torch.zeros(1), ("value",)]}
+    moved = bridge.move_to_device(nested)
+
+    assert bridge.is_student
+    assert not bridge.is_teacher
+    assert bridge.num_waves == 2
+    assert [route.src for wave in bridge.input_routes for route in wave] == [0, 1]
+    assert [route.src for wave in bridge.output_routes for route in wave] == [2, 2]
+    assert groups == [(0, 1, 2, 3), (0, 1), (2, 3), (0, 2, 3), (2, 0), (1, 2, 3), (2, 1)]
+    assert moved is not nested
+    assert moved["tensor"].device.type == "cpu"
+    assert moved["items"][1] == ("value",)
+
+
+def test_kd_mesh_bridge_command_sync_and_non_dtensor_vocab(monkeypatch):
+    bridge = object.__new__(kd_utils.KDMeshBridge)
+    bridge.rank = 0
+    bridge.student_ranks = (0, 1)
+    bridge.teacher_ranks = (2, 3)
+    bridge.device = torch.device("cpu")
+    bridge.control_group = object()
+    broadcasts = []
+    barriers = []
+    monkeypatch.setattr(dist, "broadcast", lambda tensor, **kwargs: broadcasts.append((tensor.clone(), kwargs)))
+    monkeypatch.setattr(dist, "barrier", lambda **kwargs: barriers.append(kwargs))
+
+    assert bridge.broadcast_command(kd_utils.RUN_TEACHER) == kd_utils.RUN_TEACHER
+    bridge.synchronize()
+    teacher_logits = torch.randn(1, 2, 3)
+    assert bridge.match_student_vocab_shard(torch.randn(1, 2, 3), teacher_logits) is teacher_logits
+    assert broadcasts[0][1] == {"src": 0, "group": bridge.control_group}
+    assert barriers == [{"group": bridge.control_group}]
+
+
+def test_match_student_vocab_shard_selects_local_dtensor_chunk(monkeypatch):
+    class FakeShard:
+        def __init__(self, dim):
+            self.dim = dim
+
+    class FakeDTensor:
+        ndim = 3
+        placements = (FakeShard(-1),)
+        device_mesh = SimpleNamespace(get_group=lambda mesh_dim: f"group-{mesh_dim}")
+
+    monkeypatch.setattr(kd_utils, "DTensor", FakeDTensor)
+    monkeypatch.setattr(kd_utils, "Shard", FakeShard)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 1)
+    teacher_logits = torch.arange(8).reshape(1, 2, 4)
+
+    result = kd_utils.KDMeshBridge.match_student_vocab_shard(FakeDTensor(), teacher_logits)
+
+    assert torch.equal(result, teacher_logits[..., 2:])
+    assert result.is_contiguous()
+
+
+def test_broadcast_tree_covers_source_receiver_and_nonmember(monkeypatch):
+    bridge = object.__new__(kd_utils.KDMeshBridge)
+    bridge.device = torch.device("cpu")
+    route = kd_utils._Route(src=0, ranks=(0, 1), group=object())
+    value = {"items": [torch.ones(2), (torch.zeros(1),)], "label": "x"}
+    calls = []
+
+    bridge.rank = 0
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda objects, **kwargs: calls.append((objects[0], kwargs)))
+    monkeypatch.setattr(dist, "broadcast", lambda tensor, **kwargs: calls.append((tensor.clone(), kwargs)))
+    source_result = bridge._broadcast_tree(value, route)
+
+    spec_tensors = []
+    spec = kd_utils._tree_spec(value, spec_tensors)
+
+    def receive_spec(objects, **kwargs):
+        objects[0] = spec
+
+    bridge.rank = 1
+    monkeypatch.setattr(dist, "broadcast_object_list", receive_spec)
+    receiver_result = bridge._broadcast_tree(None, route)
+    bridge.rank = 3
+    nonmember_result = bridge._broadcast_tree(None, route)
+
+    assert torch.equal(source_result["items"][0], value["items"][0])
+    assert receiver_result["items"][0].shape == (2,)
+    assert receiver_result["items"][1][0].shape == (1,)
+    assert receiver_result["label"] == "x"
+    assert nonmember_result is None
+    assert calls[0][1] == {"src": 0, "group": route.group, "device": bridge.device}
+
+
+def test_send_batch_and_logits_select_current_role_routes(monkeypatch):
+    route = kd_utils._Route(src=0, ranks=(0, 2), group=object())
+    bridge = object.__new__(kd_utils.KDMeshBridge)
+    bridge.input_routes = [[route]]
+    bridge.output_routes = [[route]]
+    bridge.student_ranks = (0, 1)
+    bridge.teacher_ranks = (2, 3)
+    monkeypatch.setattr(bridge, "_broadcast_tree", lambda value, selected_route: value or "received")
+
+    bridge.rank = 2
+    assert bridge.send_batch(0, None) == "received"
+    bridge.rank = 0
+    logits = torch.ones(1)
+    assert bridge.send_logits(0, logits) is logits
+
+
+def test_pp_kd_wrapper_consumes_teacher_microbatches_in_order():
+    """Shared-mesh PP uses the matching captured teacher logits for each microbatch."""
+    from nemo_automodel.recipes.llm import kd as llm_kd
+
+    recipe = object.__new__(llm_kd.KnowledgeDistillationRecipeForNextTokenPrediction)
+    recipe.kd_ratio = 1.0
+    recipe.kd_loss_fn = KDLoss()
+    recipe._kd_loss_buffer = []
+    recipe._ce_loss_buffer = []
+    recipe.separate_meshes = False
+
+    teacher_logits = [
+        torch.tensor([[[1.0, 0.0, -1.0], [0.5, 0.0, -0.5]]]),
+        torch.tensor([[[-1.0, 0.0, 1.0], [-0.5, 0.0, 0.5]]]),
+    ]
+    recipe._current_teacher_logits = list(teacher_logits)
+    loss_fn = recipe._make_pp_kd_loss_wrapper()
+    labels = torch.tensor([[0, 1]])
+    student_logits = torch.zeros(1, 2, 3, requires_grad=True)
+
+    first = loss_fn(student_logits, labels)
+    second = loss_fn(student_logits, labels)
+
+    torch.testing.assert_close(first, KDLoss()(student_logits, teacher_logits[0], labels, num_batch_labels=1))
+    torch.testing.assert_close(second, KDLoss()(student_logits, teacher_logits[1], labels, num_batch_labels=1))
+    assert recipe._current_teacher_logits == []

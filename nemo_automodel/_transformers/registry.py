@@ -21,6 +21,7 @@ from functools import lru_cache
 from typing import Dict, Tuple, Type, Union
 
 import torch.nn as nn
+from transformers.configuration_utils import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.mimo_v2_flash.model", "MiMoV2FlashForCausalLM"),
         ),
         (
+            "LagunaForCausalLM",
+            ("nemo_automodel.components.models.laguna.model", "LagunaForCausalLM"),
+        ),
+        (
             "Ministral3ForCausalLM",
             ("nemo_automodel.components.models.mistral3.model", "Ministral3ForCausalLM"),
         ),
@@ -204,6 +209,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
         (
             "Qwen2ForCausalLM",
             ("nemo_automodel.components.models.qwen2.model", "Qwen2ForCausalLM"),
+        ),
+        (
+            "Qwen3ForCausalLM",
+            ("nemo_automodel.components.models.qwen3.model", "Qwen3ForCausalLM"),
         ),
         (
             "Qwen2_5OmniModel",
@@ -266,6 +275,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.step3p5.model", "Step3p5ForCausalLM"),
         ),
         (
+            "InklingForConditionalGeneration",
+            ("nemo_automodel.components.models.inkling.model", "InklingForConditionalGeneration"),
+        ),
+        (
             "Step3p7ForConditionalGeneration",
             ("nemo_automodel.components.models.step3p7.model", "Step3p7ForConditionalGeneration"),
         ),
@@ -282,8 +295,11 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
+    "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
+    "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
     "kimi_k25": ("nemo_automodel.components.models.kimi_k25_vl.model", "KimiK25VLConfig"),
     "kimi_vl": ("nemo_automodel.components.models.kimivl.model", "KimiVLConfig"),
+    "laguna": ("nemo_automodel.components.models.laguna.config", "LagunaConfig"),
     "llavaonevision1_5": ("nemo_automodel.components.models.llava_onevision.model", "Llavaonevision1_5Config"),
     "mimo_v2_flash": ("nemo_automodel.components.models.mimo_v2_flash.config", "MiMoV2FlashConfig"),
     "minimax_m3_vl": ("nemo_automodel.components.models.minimax_m3_vl.config", "MiniMaxM3VLConfig"),
@@ -292,19 +308,56 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
 }
 
+# model_types whose custom model implementation should win over a transformers
+# built-in config when one exists. A registration means the custom model reads
+# fields only our config class provides, so the built-in must NOT win by
+# default: when a transformers release starts shipping a config for a registered
+# model_type (same model_type string, often the same class name) it would
+# silently replace ours and break the model's field protocol at init -- e.g.
+# transformers 5.12 added minimax_m3_vl whose vision config drops rope_theta
+# (``'MiniMaxM3VLVisionConfig' object has no attribute 'rope_theta'``), and its
+# deepseek_v4 config renames ``compress_ratios`` to ``compress_rates``, which
+# silently collapses the DSV4 context-parallel shard multiple to 1.
+# Remove a model_type only once its custom model is verified to run on the
+# native config (mistral4 was written against it and runs green).
+_CUSTOM_CONFIG_OVERRIDES_BUILTIN = {
+    *(_CUSTOM_CONFIG_REGISTRATIONS.keys() - {"mistral4"}),
+}
+
+
+def resolve_custom_config_cls(model_type: str) -> Type[PretrainedConfig] | None:
+    """Resolve Automodel's preferred config class for ``model_type`` if one applies."""
+    if model_type not in _CUSTOM_CONFIG_REGISTRATIONS:
+        return None
+
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    is_builtin = model_type in CONFIG_MAPPING
+    if is_builtin and model_type not in _CUSTOM_CONFIG_OVERRIDES_BUILTIN:
+        return None
+
+    module_path, cls_name = _CUSTOM_CONFIG_REGISTRATIONS[model_type]
+    try:
+        mod = importlib.import_module(module_path)
+        return getattr(mod, cls_name)
+    except Exception:
+        logger.debug("Failed to resolve custom config for model_type=%s", model_type, exc_info=True)
+        return None
+
 
 def _register_custom_configs() -> None:
     from transformers import AutoConfig
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    for model_type, (module_path, cls_name) in _CUSTOM_CONFIG_REGISTRATIONS.items():
-        if model_type not in CONFIG_MAPPING:
-            try:
-                mod = importlib.import_module(module_path)
-                cfg_cls = getattr(mod, cls_name)
-                AutoConfig.register(model_type, cfg_cls)
-            except Exception:
-                logger.debug("Failed to register config for model_type=%s", model_type, exc_info=True)
+    for model_type in _CUSTOM_CONFIG_REGISTRATIONS:
+        is_builtin = model_type in CONFIG_MAPPING
+        cfg_cls = resolve_custom_config_cls(model_type)
+        if cfg_cls is None:
+            continue
+        try:
+            AutoConfig.register(model_type, cfg_cls, exist_ok=is_builtin)
+        except Exception:
+            logger.debug("Failed to register config for model_type=%s", model_type, exc_info=True)
 
 
 _register_custom_configs()

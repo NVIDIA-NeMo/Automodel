@@ -371,6 +371,43 @@ cover exactly the benchmark's own requests:
 python -m nemo_automodel.components.speculative.bench_vllm --server http://localhost:8000 --model Qwen/Qwen3-8B --input-data <prompts-dataset> --baseline-server http://localhost:8001
 ```
 
+### Multi-dataset sweep
+
+`bench_sglang.py`/`bench_vllm.py` measure one dataset per invocation, but the
+same draft's acceptance rate can vary sharply by task -- conversational data
+tends to accept far more tokens than math or code, whose token distributions
+diverge from the training mix. `bench_sweep.py` drives either engine through
+several datasets in one pass and reports a per-dataset table plus a
+completed-weighted aggregate, instead of invoking the single-dataset scripts
+once per dataset and collating the numbers by hand:
+
+```bash
+python -m nemo_automodel.components.speculative.bench_sweep --engine sglang --server http://localhost:30000 --model meta-llama/Llama-3.1-8B-Instruct
+```
+
+The default suite is the four benchmarks the EAGLE / EAGLE-2 papers report
+acceptance/speedup on -- MT-Bench (first turn), HumanEval (code), GSM8K
+(math), and Alpaca (single-turn instruction-following). None of these ship a
+chat-messages column, so each is read via `--prompt-column` (a raw text field
+wrapped into a fresh single-turn user message) rather than
+`--messages-column`; both flags are also available on `bench_sglang.py` /
+`bench_vllm.py` directly for a single custom dataset. Pass `--engine vllm` to
+sweep a vLLM server instead, `--baseline-server` for the speedup column,
+`--datasets <name...>` to run a subset, and `--datasets-config <path.yaml>` to
+swap in an entirely custom dataset list (see
+`bench_sweep/spec_bench_datasets.yaml`, which mirrors the built-in default and
+doubles as a template). One dataset failing to load or benchmark is reported
+as an error row and excluded from the aggregate rather than aborting the sweep.
+
+**`--engine sglang` caveat with more than one dataset:** SGLang's
+`avg_spec_accept_length` is a server-cumulative running average with no
+reset/delta API, so sweeping several datasets against one live SGLang server
+means every dataset after the first reports a blend with prior datasets'
+traffic, not an independent number (a warning is logged when this applies).
+Restart the server between datasets for independent numbers, or use
+`--engine vllm`, which diffs its Prometheus counters per dataset and has no
+such caveat.
+
 ## Inference-engine compatibility
 
 | Draft | SGLang | vLLM |
@@ -405,6 +442,20 @@ blocks) instead.
 | `compile` | Optional; in-place torch.compile of the draft (`CompileConfig`). Strongly recommended with `fp8`. |
 | `peft` | Optional, EAGLE-3 only; LoRA draft adaptation (`PeftConfig`). See "LoRA draft adaptation". |
 | `wandb` | Optional; `project`, `entity`, `name`. |
+
+### DFlash-family validation metrics
+
+When `recipe_args.val_data_path` is set, DFlash, Domino, and JetSpec report
+globally reduced `val_loss`, token-weighted `val_accuracy`, and block-weighted
+`val_accept_len`. Domino also reports final-head and base-head loss, base
+accuracy, and base acceptance length. The reductions sum raw token and block
+statistics across ranks before division, so uneven valid-token counts do not
+bias the result.
+
+Adding a top-level `wandb:` block uploads these values as `val/loss`,
+`val/accuracy`, `val/accept_len`, and the corresponding Domino base-head keys.
+Training logs include `train/loss`, `train/accuracy`, `train/accept_len`, and
+the method-specific Domino diagnostics.
 
 ### `recipe_args` common to all methods
 
@@ -444,6 +495,7 @@ examples/speculative/
   eagle1/    eagle2/    eagle3/    eagle3_1/    p-eagle/
   dflash/                     # DFlash + Domino (qwen3_domino.yaml) configs
   jetspec/   dspark/
+  bench_sweep/                # --datasets-config example for bench_sweep.py
   README.md                   # this file (includes the dataset regeneration guide)
 examples/dllm_sft/            # DFlash DLLM SFT configs (standard SFT schema)
 ```
@@ -466,6 +518,7 @@ nemo_automodel/components/speculative/
   bench_common.py          # shared chat-completions workload machinery
   bench_sglang.py          # acceptance-length / speedup benchmark (SGLang)
   bench_vllm.py            # acceptance-length / speedup benchmark (vLLM)
+  bench_sweep.py           # multi-dataset acceptance-length sweep (either engine)
 nemo_automodel/recipes/llm/
   train_eagle1.py  train_eagle2.py  train_eagle3.py  peagle_recipe.py
   train_dflash.py  train_domino.py  train_jetspec.py  train_dspark.py

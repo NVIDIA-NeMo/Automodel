@@ -34,22 +34,28 @@ description: ""
 
 | Recipe | Description |
 |---|---|
-| [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/../../../../examples/dllm_sft/diffusion_gemma_sft.yaml) | Full SFT — DiffusionGemma 26B-A4B with FSDP2 + Expert Parallelism |
-| [diffusion_gemma_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/../../../../examples/dllm_sft/diffusion_gemma_lora.yaml) | LoRA SFT — DiffusionGemma 26B-A4B with FSDP2 + Expert Parallelism |
+| [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) | Full SFT — DiffusionGemma 26B-A4B with FSDP2 + Expert Parallelism |
+| [diffusion_gemma_lora.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_lora.yaml) | LoRA SFT — DiffusionGemma 26B-A4B with FSDP2 + Expert Parallelism |
 
 ## Try with NeMo AutoModel
 
-**1. Install** ([full instructions](/get-started/installation)):
-
-```bash
-pip install nemo-automodel
-```
-
-**2. Clone the repo** to get the example recipes:
+**1. Clone the source checkout** that contains the example recipes:
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
+```
+
+**2. Install that checkout's locked environment** ([full instructions](/get-started/installation)):
+
+```bash
+uv sync --locked --all-groups --extra all
+```
+
+**3. Generate the GSM8K chat dataset** required by both DiffusionGemma recipes. Run this from the repository root; it writes `gsm8k_chat_train.jsonl`, the path used by both YAML files:
+
+```bash
+uv run python examples/dllm_sft/prep_gsm8k.py
 ```
 
 <Note>
@@ -59,10 +65,14 @@ This recipe was validated with **Expert Parallelism (EP=8)** on a single 8×H100
 
 </Note>
 
-**3. Run the recipe** from inside the repo:
+**4. Run either recipe** from inside the repository:
 
 ```bash
-automodel --nproc-per-node=8 examples/dllm_sft/diffusion_gemma_sft.yaml
+# Full SFT
+uv run automodel examples/dllm_sft/diffusion_gemma_sft.yaml --nproc-per-node 8
+
+# LoRA SFT
+uv run automodel examples/dllm_sft/diffusion_gemma_lora.yaml --nproc-per-node 8
 ```
 
 ## Fine-Tuning

@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from transformers import PreTrainedModel
 
 from nemo_automodel.components.speculative.eagle.draft_deepseek import DeepseekV3Eagle3DraftModel
+from nemo_automodel.components.speculative.eagle.draft_gemma import Gemma4Eagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_gpt_oss import GptOssEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
@@ -83,6 +84,18 @@ EAGLE3_DRAFT_REGISTRY["GptOssForCausalLM"] = DraftSpec(draft_cls=GptOssEagle3Dra
 # q/k head dim) cannot be represented by the Llama-style dense draft, so it gets a
 # dedicated MLA draft -- see ``draft_deepseek.py``. Only EAGLE-3 is wired up.
 EAGLE3_DRAFT_REGISTRY["DeepseekV3ForCausalLM"] = DraftSpec(draft_cls=DeepseekV3Eagle3DraftModel)
+
+# Gemma4 multimodal target (``Gemma4ForConditionalGeneration``). The draft is
+# Llama-style dense (it consumes only post-block hidden states from the frozen
+# target's text backbone), but the Gemma4 *text* config needs two quirks
+# reconciled before the shared draft can build -- the ``hidden_activation`` key
+# and the nested per-attention-type ``rope_parameters`` -- so it gets a thin
+# dedicated draft class. See ``draft_gemma.py`` for the rationale. The target's
+# decoder config is nested under ``config.text_config`` (the draft is built from
+# it via ``config.get_text_config()`` in the recipe) and its decoder layers live
+# under ``model.language_model.layers`` (handled by the target wrapper's
+# ``_get_transformer_layers``). Only EAGLE-3 is wired up.
+EAGLE3_DRAFT_REGISTRY["Gemma4ForConditionalGeneration"] = DraftSpec(draft_cls=Gemma4Eagle3DraftModel)
 
 
 EAGLE1_DRAFT_REGISTRY: dict[str, DraftSpec] = {

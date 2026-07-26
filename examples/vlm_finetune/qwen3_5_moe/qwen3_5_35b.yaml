@@ -115,7 +115,13 @@ optimizer:
 
 ci:
   recipe_owner: HuiyingLi
+  nodes: 1
   time: "00:30:00"
+  # Keep failures blocking; source/reload defects are tracked by AM-711/AM-717.
+  checkpoint_robustness:
+    check_source_load_parity: true
+    hf_device_map_auto: true
+    tokenizer_name: Qwen/Qwen3.5-35B-A3B
 
 # Uncomment and configure for W&B logging
 # wandb:

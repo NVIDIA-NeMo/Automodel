@@ -17,7 +17,9 @@
 The reject guard runs at the very start of ``__init__`` (before any device- or
 kernel-dependent construction), so this is CPU-safe even though the full
 qwen3_moe model build requires a GPU. qwen3_moe stands in for the whole
-untied-default family wired through ``reject_unsupported_tied_word_embeddings``.
+untied-default family, which declares ``tie_word_embeddings_support =
+TieSupport.UNTIED_ONLY`` and is validated by
+``reject_unsupported_tie_word_embeddings``.
 """
 
 import pytest

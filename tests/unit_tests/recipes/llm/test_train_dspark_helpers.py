@@ -40,6 +40,7 @@ Covers the recipe-level glue added for the DeepSeek-V4-Flash target:
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -48,6 +49,7 @@ from transformers import Qwen3Config
 
 from nemo_automodel.components.config.loader import ConfigNode
 from nemo_automodel.components.datasets.llm.dspark_cache import write_manifest, write_shard, write_target_weights
+from nemo_automodel.recipes.llm import train_dspark
 from nemo_automodel.recipes.llm._dspark_target_build import (
     build_deepseek_v4_backend,
     gather_full_weight_module,
@@ -56,6 +58,7 @@ from nemo_automodel.recipes.llm._dspark_target_build import (
 )
 from nemo_automodel.recipes.llm.train_dspark import (
     TrainDSparkRecipe,
+    _add_accept_rate_per_position,
     _apply_draft_activation_checkpointing,
     _apply_target_chat_template,
     _build_dspark_optimizer,
@@ -71,6 +74,18 @@ JINJA = (
     "{{ bos_token }}{% for m in messages %}{% if m['role'] == 'assistant' %}"
     "{% generation %}{{ m['content'] }}{% endgeneration %}{% endif %}{% endfor %}"
 )
+
+
+def test_accept_rate_per_position_omits_unmeasured_positions():
+    metrics = {}
+
+    _add_accept_rate_per_position(
+        metrics,
+        accept_num=torch.tensor([3.0, 1.0, 0.0]),
+        accept_den=torch.tensor([4.0, 2.0, 0.0]),
+    )
+
+    assert metrics == {"accept_rate@0": 0.75, "accept_rate@1": 0.5}
 
 
 def _tok(chat_template=None):
@@ -109,6 +124,133 @@ def test_draft_activation_checkpointing_false_is_noop():
     original_attention = draft.layers[0].self_attn
     _apply_draft_activation_checkpointing(draft, False)
     assert draft.layers[0].self_attn is original_attention
+
+
+def test_save_checkpoint_applies_retention_after_sync_save(tmp_path):
+    events = []
+    obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    obj.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    obj.checkpointer = SimpleNamespace(
+        config=SimpleNamespace(enabled=True, is_async=False),
+        async_wait=lambda: events.append("wait"),
+        save_model=lambda *args, **kwargs: events.append("save_model"),
+        save_optimizer=lambda *args, **kwargs: events.append("save_optimizer"),
+        save_on_dp_ranks=lambda *args, **kwargs: events.append("save_rng"),
+    )
+    obj._module = lambda: SimpleNamespace(draft_model=SimpleNamespace())
+    obj.tokenizer = None
+    obj.optimizer = SimpleNamespace()
+    obj.lr_scheduler = SimpleNamespace()
+    obj.rng = SimpleNamespace()
+    obj.runtime = SimpleNamespace(global_step=1)
+    obj.cfg = SimpleNamespace(raw_config={})
+    obj.block_size = 4
+    obj.num_anchors = 2
+    obj.mask_token_id = 99
+    obj.target_layer_ids = [0, 1]
+    obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
+    obj._complete_pending_checkpoint = lambda: events.append("complete_pending")
+    obj._update_latest_symlink = lambda path: events.append(("latest", path))
+    obj._update_best_symlink = lambda path, val, metric_key=None: events.append(("best", path, val, metric_key))
+    obj._prune_old_checkpoints = lambda: events.append("prune")
+
+    TrainDSparkRecipe.save_checkpoint(obj, epoch=0, step=1, val_loss={"val_loss": 0.25})
+
+    assert events[0:2] == ["wait", "complete_pending"]
+    assert any(event[0] == "best" and event[3] == "val_loss" for event in events if isinstance(event, tuple))
+    assert "prune" in events
+
+
+def test_save_checkpoint_records_async_best_pending_info_without_metric(tmp_path):
+    events = []
+    obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    obj.checkpoint_config = SimpleNamespace(checkpoint_dir=str(tmp_path))
+    obj.checkpointer = SimpleNamespace(
+        config=SimpleNamespace(enabled=True, is_async=True),
+        async_wait=lambda: events.append("wait"),
+        save_model=lambda *args, **kwargs: events.append("save_model"),
+        save_optimizer=lambda *args, **kwargs: events.append("save_optimizer"),
+        save_on_dp_ranks=lambda *args, **kwargs: events.append("save_rng"),
+    )
+    obj._module = lambda: SimpleNamespace(draft_model=SimpleNamespace())
+    obj.tokenizer = None
+    obj.optimizer = SimpleNamespace()
+    obj.lr_scheduler = SimpleNamespace()
+    obj.rng = SimpleNamespace()
+    obj.runtime = SimpleNamespace(global_step=1)
+    obj.cfg = SimpleNamespace(raw_config={})
+    obj.block_size = 4
+    obj.num_anchors = 2
+    obj.mask_token_id = 99
+    obj.target_layer_ids = [0, 1]
+    obj.target_wrapper = SimpleNamespace(target_layer_ids=[0, 1])
+    obj._complete_pending_checkpoint = lambda: events.append("complete_pending")
+
+    TrainDSparkRecipe.save_checkpoint(obj, epoch=0, step=1, best_metric_key="val_loss")
+
+    expected_path = str(tmp_path / "epoch_0_step_1")
+    assert events[0:2] == ["wait", "complete_pending"]
+    assert obj._last_pending_checkpoint_dir == expected_path
+    assert obj._last_pending_best_checkpoint_info == {
+        "path": expected_path,
+        "val": None,
+        "metric_key": "val_loss",
+    }
+
+
+def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog):
+    built = []
+
+    class FakeCheckpointer:
+        def __init__(self, config, **kwargs):
+            self.config = config
+            built.append((config, kwargs))
+
+    monkeypatch.setattr(train_dspark, "Checkpointer", FakeCheckpointer)
+    obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    obj.cfg = SimpleNamespace(
+        get=lambda key, default=None: {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1}
+        if key == "checkpoint"
+        else default
+    )
+    obj.output_dir = tmp_path
+    obj.draft_model = SimpleNamespace(state_dict=lambda: {"weight": torch.zeros(1)})
+
+    with caplog.at_level(logging.INFO):
+        TrainDSparkRecipe._build_checkpointer(obj, "target/repo")
+
+    assert built
+    assert "Checkpoint retention: keeping the most recent 1 checkpoint directory" in caplog.text
+
+
+def test_run_train_validation_loop_finalizes_before_close():
+    events = []
+
+    class FakePbar:
+        def close(self):
+            events.append("pbar_close")
+
+    obj = TrainDSparkRecipe.__new__(TrainDSparkRecipe)
+    obj.trainer_module = SimpleNamespace(train=lambda: None)
+    obj.num_epochs = 1
+    obj._resume_epoch = 0
+    obj.dist_env = SimpleNamespace(is_main=False)
+    obj.total_optim_steps = 1
+    obj.runtime = SimpleNamespace(global_step=1)
+    obj.block_size = 1
+    obj.device = torch.device("cpu")
+    obj.train_dataloader = []
+    obj._make_progress_bar = lambda **kwargs: FakePbar()
+    obj._run_eval = lambda: None
+    obj._maybe_save_final_checkpoint = lambda completed_epochs: events.append(("final", completed_epochs)) or True
+    obj._finalize_pending_checkpoint = lambda: events.append("finalize")
+    obj.checkpointer = SimpleNamespace(close=lambda: events.append("close"))
+    obj.metric_logger = None
+    obj._finish_wandb = lambda: events.append("wandb_finish")
+
+    TrainDSparkRecipe.run_train_validation_loop(obj)
+
+    assert events == [("final", 1), "finalize", "close", "pbar_close", "wandb_finish"]
 
 
 # ---------------------------------------------------------------------------
@@ -808,3 +950,67 @@ def test_recipe_cached_path_does_not_load_target_model(monkeypatch, tmp_path):
     assert len(recipe.train_dataloader.dataset) == 1
     torch.testing.assert_close(recipe.draft_model.embed_tokens.weight.detach().cpu(), embed.weight.detach())
     torch.testing.assert_close(recipe.draft_model.lm_head.weight.detach().cpu(), head.weight.detach())
+
+
+# ---------------------------------------------------------------------------
+# _should_shard_dense_target: opt-in gate for loading a frozen dense target
+# FSDP2-sharded via the standard distributed setup.
+# ---------------------------------------------------------------------------
+
+
+def _make_shard_recipe(cfg=None, world_size=8):
+    recipe = TrainDSparkRecipe({"distributed": {"strategy": "fsdp2"}} if cfg is None else cfg)
+    recipe.dist_env = SimpleNamespace(world_size=world_size, is_main=True)
+    return recipe
+
+
+def test_should_shard_dense_target_off_by_default():
+    # Existing configs (no shard_dense_target) keep the target replicated.
+    recipe = _make_shard_recipe()
+    assert recipe._should_shard_dense_target({}) is False
+
+
+def test_should_shard_dense_target_true_on_fsdp2_multi_rank():
+    recipe = _make_shard_recipe()
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True
+
+
+def test_should_shard_dense_target_default_strategy_is_fsdp2():
+    # With no distributed: block at all the default is fsdp2, so the flag takes effect
+    # (regression: the missing block must not raise).
+    recipe = _make_shard_recipe(cfg={})
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True
+
+
+def test_should_shard_dense_target_strategy_is_case_folded():
+    # parse_distributed_section case-folds the strategy, so 'FSDP2' is the same topology.
+    recipe = _make_shard_recipe(cfg={"distributed": {"strategy": "FSDP2"}})
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True
+
+
+def test_should_shard_dense_target_ignored_on_single_rank():
+    recipe = _make_shard_recipe(world_size=1)
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is False
+
+
+def test_should_shard_dense_target_ignored_on_ddp():
+    recipe = _make_shard_recipe(cfg={"distributed": {"strategy": "ddp"}})
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is False
+
+
+@pytest.mark.parametrize("axis", ["tp_size", "pp_size", "cp_size", "ep_size", "dp_replicate_size"])
+def test_should_shard_dense_target_rejects_non_pure_dp_axes(axis):
+    # Only a pure FSDP2 data-parallel topology is supported: pp_size>1 builds an
+    # AutoPipeline the target wrapper cannot run, tp/cp/ep are untested here, and
+    # HSDP replication (dp_replicate_size>1) re-replicates the target.
+    recipe = _make_shard_recipe(cfg={"distributed": {"strategy": "fsdp2", axis: 2}})
+    with pytest.raises(ValueError, match=axis):
+        recipe._should_shard_dense_target({"shard_dense_target": True})
+
+
+def test_should_shard_dense_target_allows_explicit_unit_or_null_axes():
+    # Explicit 1s or YAML nulls on the model-parallel axes are the supported topology.
+    recipe = _make_shard_recipe(
+        cfg={"distributed": {"strategy": "fsdp2", "tp_size": 1, "pp_size": None, "cp_size": 1, "ep_size": None}}
+    )
+    assert recipe._should_shard_dense_target({"shard_dense_target": True}) is True

@@ -40,27 +40,22 @@ description: ""
 
 Install NeMo AutoModel and follow the fine-tuning guide to configure a recipe for this model.
 
-**1. Install** ([full instructions](/get-started/installation)):
-
-```bash
-pip install nemo-automodel
-```
-
-**2. Clone the repo** to get example recipes you can adapt:
+**1. Clone and install from source** ([full instructions](/get-started/installation)):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Automodel.git
 cd Automodel
+uv sync --locked --all-groups --all-extras
 ```
 
-**3. Fine-tune** using one of the provided MiniCPM5 recipes:
+**2. Fine-tune** using one of the provided MiniCPM5 recipes:
 
 ```bash
 # Full fine-tuning
-automodel examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml --nproc-per-node 8
+uv run automodel examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml --nproc-per-node 8
 
 # LoRA fine-tuning
-automodel examples/llm_finetune/minicpm/minicpm5_1b_squad_peft.yaml --nproc-per-node 8
+uv run automodel examples/llm_finetune/minicpm/minicpm5_1b_squad_peft.yaml --nproc-per-node 8
 ```
 
 <Accordion title="Run with Docker">
@@ -83,7 +78,7 @@ cd /opt/Automodel
 
 ```bash
 automodel --nproc-per-node=8 examples/llm_finetune/minicpm/minicpm5_1b_squad.yaml \
-  --model.pretrained_model_name_or_path <MODEL_HF_ID>
+  --model.pretrained_model_name_or_path "<MODEL_HF_ID>"
 ```
 </Accordion>
 

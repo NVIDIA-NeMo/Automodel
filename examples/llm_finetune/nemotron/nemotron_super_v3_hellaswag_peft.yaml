@@ -110,6 +110,9 @@ lr_scheduler:
 ci:
   vllm_deploy: true
   vllm_smoke_test: true
+  vllm_deploy_gpus: 8  # the 120B BF16 model requires TP=8 for vLLM deployment
+  vllm_deploy_time: "00:30:00"
+  vllm_enable_expert_parallel: false  # vLLM 0.19 does not support expert parallelism with runtime LoRA
   recipe_owner: adil-a
   time: "00:25:00"
   checkpoint_robustness:

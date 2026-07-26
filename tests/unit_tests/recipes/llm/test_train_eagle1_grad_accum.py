@@ -72,7 +72,7 @@ class _ConstantGradModule(nn.Module):
 
 
 class _FakeTargetWrapper:
-    def generate_batch(self, input_ids, attention_mask, loss_mask):
+    def generate_batch(self, input_ids, attention_mask, loss_mask, **packing_kwargs):
         return SimpleNamespace(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -80,6 +80,9 @@ class _FakeTargetWrapper:
             input_hidden_states=None,
             target_hidden_states=None,
             target_logits=None,
+            position_ids=None,
+            seq_lens=None,
+            doc_remaining=None,
         )
 
 

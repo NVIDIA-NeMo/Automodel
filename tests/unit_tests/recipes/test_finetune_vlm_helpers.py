@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
+import types
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -419,8 +421,8 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
         return torch.tensor(1.0, requires_grad=True)
 
     monkeypatch.setattr(
-        "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-        lambda device_mesh, batch: (lambda: nullcontext(), batch),
+        "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+        lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
     )
     monkeypatch.setattr(
         "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
@@ -454,6 +456,76 @@ def test_run_train_step_supports_tensor_outputs(monkeypatch):
     assert metrics.metrics["grad_norm"] == 2.5
     assert recipe.optimizer[0].step_called
     assert recipe.optimizer[0].zero_grad_called
+
+
+@pytest.mark.cuda(False)
+def test_forward_backward_step_routes_thd_batch_through_te(monkeypatch):
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.mesh_context = SimpleNamespace(cp_size=1)
+    recipe.processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=7))
+    recipe.model_parts = [_TensorModel()]
+    recipe.pp_enabled = False
+    recipe.magi = SimpleNamespace(enabled=False)
+    recipe.distributed_config = None
+    recipe.loss_fn = object()
+    recipe.step_scheduler = SimpleNamespace(is_remote_logging_step=False)
+    recipe._get_dp_group_size = lambda include_cp=True: 1
+    captured = {}
+
+    def make_thd_batch(model, device_mesh, batch, **kwargs):
+        captured.update(kwargs)
+        captured["qkv_format"] = batch.get("qkv_format")
+        return SimpleNamespace(shard=lambda actual: (nullcontext, actual))
+
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ContextParallelSharder", make_thd_batch)
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.get_sync_ctx", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(
+        "nemo_automodel.recipes.vlm.finetune.calculate_loss",
+        lambda *args, **kwargs: torch.tensor(1.0, requires_grad=True),
+    )
+
+    recipe._forward_backward_step(
+        idx=0,
+        batch={
+            "input_ids": torch.tensor([[1, 2]]),
+            "labels": torch.tensor([[2, -100]]),
+            "qkv_format": "thd",
+        },
+        loss_buffer=[],
+        num_label_tokens=1,
+        num_batches=1,
+    )
+
+    assert captured["qkv_format"] == "thd"
+    assert "use_te" not in captured
+    assert "magi" not in captured
+    assert captured["padding_token_id"] == 7
+
+
+@pytest.mark.cuda(False)
+def test_forward_backward_step_rejects_thd_with_context_parallelism():
+    recipe = FinetuneRecipeForVLM.__new__(FinetuneRecipeForVLM)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.device_mesh = None
+    recipe.mesh_context = SimpleNamespace(cp_size=2)
+    recipe.model_parts = [_TensorModel()]
+    recipe.pp_enabled = False
+    recipe.magi = SimpleNamespace(enabled=False)
+
+    with pytest.raises(NotImplementedError, match="currently supports cp_size=1 only"):
+        recipe._forward_backward_step(
+            idx=0,
+            batch={
+                "input_ids": torch.tensor([[1, 2]]),
+                "labels": torch.tensor([[2, -100]]),
+                "qkv_format": "thd",
+            },
+            loss_buffer=[],
+            num_label_tokens=1,
+            num_batches=1,
+        )
 
 
 def _build_pp_recipe_for_optim_step(num_label_tokens_in_batch: int):
@@ -600,6 +672,24 @@ def test_run_train_step_pp_nonzero_label_tokens_divides(monkeypatch):
 # -----------------------------------------------------------------------------
 
 
+def _test_vlm_dataset(path_or_dataset=None, split=None):
+    return [{"path": path_or_dataset, "split": split}]
+
+
+def _test_vlm_collate(examples, processor=None):
+    return examples
+
+
+def _vlm_dataloader_cfg():
+    return ConfigNode(
+        {
+            "_target_": "torchdata.stateful_dataloader.StatefulDataLoader",
+            "collate_fn": {"_target_": _test_vlm_collate},
+            "num_workers": 0,
+        }
+    )
+
+
 def test_autoprocessor_success():
     """Test successful AutoProcessor creation."""
 
@@ -631,20 +721,8 @@ def test_autoprocessor_exception_handling(caplog):
         mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
 
         # Mock configurations - minimal setup
-        cfg_ds = MagicMock()
-        cfg_ds.instantiate.return_value = []
-        cfg_ds.path_or_dataset = "test/dataset"
-        cfg_ds.get.side_effect = lambda key, default=None: {
-            "pretokenize": False,
-            "packing": None,
-            "max_length": None,
-            "chat_template": None,
-            "preload_media": False,
-        }.get(key, default)
-
-        cfg_dl = MagicMock()
-        cfg_dl.get.return_value = None  # No custom settings
-        cfg_dl.instantiate.return_value = MagicMock()
+        cfg_ds = ConfigNode({"_target_": _test_vlm_dataset, "path_or_dataset": "test/dataset"})
+        cfg_dl = _vlm_dataloader_cfg()
 
         cfg_processor = None  # This triggers the exception path
 
@@ -682,20 +760,8 @@ def test_autoprocessor_retries_on_layer_types_mismatch():
         patch("torch.utils.data.distributed.DistributedSampler"),
         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"MagicMock": MagicMock()}),
     ):
-        cfg_ds = MagicMock()
-        cfg_ds.instantiate.return_value = []
-        cfg_ds.path_or_dataset = "test/dataset"
-        cfg_ds.get.side_effect = lambda key, default=None: {
-            "pretokenize": False,
-            "packing": None,
-            "max_length": None,
-            "chat_template": None,
-            "preload_media": False,
-        }.get(key, default)
-
-        cfg_dl = MagicMock()
-        cfg_dl.get.return_value = None
-        cfg_dl.instantiate.return_value = MagicMock()
+        cfg_ds = ConfigNode({"_target_": _test_vlm_dataset, "path_or_dataset": "test/dataset"})
+        cfg_dl = _vlm_dataloader_cfg()
 
         dataloader, processor = build_dataloader(cfg_ds, cfg_dl, "stepfun-ai/Step-3.5-Flash", None, None, 123, 1)
 
@@ -731,13 +797,8 @@ def test_autoprocessor_loads_inside_first_rank_per_node():
         patch("torch.utils.data.distributed.DistributedSampler"),
         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"NoneType": MagicMock()}),
     ):
-        cfg_ds = MagicMock()
-        cfg_ds.instantiate.return_value = []
-        cfg_ds.path_or_dataset = "test/dataset"
-
-        cfg_dl = MagicMock()
-        cfg_dl.get.return_value = None
-        cfg_dl.instantiate.return_value = MagicMock()
+        cfg_ds = ConfigNode({"_target_": _test_vlm_dataset, "path_or_dataset": "test/dataset"})
+        cfg_dl = _vlm_dataloader_cfg()
 
         build_dataloader(cfg_ds, cfg_dl, "test/model", None, None, 123, 1)
 
@@ -773,20 +834,8 @@ def test_autoprocessor_with_processor_kwargs(caplog):
         mock_from_pretrained.side_effect = Exception("Model does not have AutoProcessor")
 
         # Mock configurations - minimal setup
-        cfg_ds = MagicMock()
-        cfg_ds.instantiate.return_value = []
-        cfg_ds.path_or_dataset = "test/dataset"
-        cfg_ds.get.side_effect = lambda key, default=None: {
-            "pretokenize": False,
-            "packing": None,
-            "max_length": None,
-            "chat_template": None,
-            "preload_media": False,
-        }.get(key, default)
-
-        cfg_dl = MagicMock()
-        cfg_dl.get.return_value = None  # No custom settings
-        cfg_dl.instantiate.return_value = MagicMock()
+        cfg_ds = ConfigNode({"_target_": _test_vlm_dataset, "path_or_dataset": "test/dataset"})
+        cfg_dl = _vlm_dataloader_cfg()
 
         cfg_processor = ProcessorConfig()  # This has to_dict but no instantiate
 
@@ -811,7 +860,7 @@ def test_build_dataloader_chat_template_applied():
 
     def ds_factory(path_or_dataset, split=None):
         ds_calls.append({"path_or_dataset": path_or_dataset, "split": split})
-        return []
+        return [{}]
 
     class DummyProcessor:
         def __init__(self):
@@ -822,11 +871,10 @@ def test_build_dataloader_chat_template_applied():
     cfg_ds = ConfigNode(
         {"_target_": ds_factory, "path_or_dataset": "ds/path", "split": "train", "chat_template": "{{ custom }}"}
     )
-    cfg_dl = MagicMock()
-    cfg_dl.get.return_value = None
-    cfg_dl.instantiate.return_value = MagicMock()
+    cfg_dl = _vlm_dataloader_cfg()
 
     with (
+        pytest.warns(DeprecationWarning, match="RecipeConfig.vlm_dataloader"),
         patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
         patch("torch.utils.data.distributed.DistributedSampler"),
         patch("nemo_automodel.components.datasets.vlm.collate_fns.COLLATE_FNS", {"default": MagicMock()}),
@@ -843,7 +891,7 @@ def test_build_dataloader_no_chat_template():
     from nemo_automodel.recipes.vlm.finetune import build_dataloader
 
     def ds_factory(path_or_dataset, split=None):
-        return []
+        return [{}]
 
     class DummyProcessor:
         def __init__(self):
@@ -852,9 +900,7 @@ def test_build_dataloader_no_chat_template():
 
     processor = DummyProcessor()
     cfg_ds = ConfigNode({"_target_": ds_factory, "path_or_dataset": "ds/path", "split": "train"})
-    cfg_dl = MagicMock()
-    cfg_dl.get.return_value = None
-    cfg_dl.instantiate.return_value = MagicMock()
+    cfg_dl = _vlm_dataloader_cfg()
 
     with (
         patch("transformers.AutoProcessor.from_pretrained", return_value=processor),
@@ -1055,7 +1101,7 @@ def test_vlm_build_model_raises_value_error_for_non_nemo_auto_model():
 
     cfg_model = InvalidModelConfig()
 
-    with pytest.raises(ValueError, match="VLM finetuning requires NeMoAutoModelForImageTextToText"):
+    with pytest.raises(ValueError, match="VLM finetuning requires a recipe-compatible model target"):
         build_model(
             cfg_model=cfg_model,
             cfg_freeze=None,
@@ -1277,12 +1323,14 @@ class TestBuildCheckpointConfig:
         assert config.model_cache_dir == "/tmp/cache"
         assert config.save_consolidated.value == "final"
         assert config.is_peft is False
+        assert config.max_recent_checkpoints is None
 
     def test_build_checkpoint_config_with_custom_config(self):
         """Test checkpoint config with custom settings."""
         cfg_ckpt = MagicMock()
         cfg_ckpt.to_dict.return_value = {
             "checkpoint_dir": "/custom/ckpt/",
+            "max_recent_checkpoints": 3,
             "save_consolidated": False,
             "restore_from": "/some/path",  # Should be removed
         }
@@ -1295,6 +1343,7 @@ class TestBuildCheckpointConfig:
         )
 
         assert config.checkpoint_dir == "/custom/ckpt/"
+        assert config.max_recent_checkpoints == 3
         assert config.save_consolidated.value == "false"
         assert config.is_peft is True
 
@@ -1306,6 +1355,7 @@ class TestBuildCheckpointConfig:
         cfg_ckpt.to_dict.return_value = {
             "model_save_format": "torch_save",
             "checkpoint_dir": "/user/ckpt/",
+            "max_recent_checkpoints": 2,
             "save_consolidated": False,
         }
 
@@ -1320,9 +1370,10 @@ class TestBuildCheckpointConfig:
         assert any("falling back" in rec.message.lower() for rec in caplog.records)
         assert config.is_peft is True
         assert config.model_save_format == SerializationFormat.SAFETENSORS
-        # checkpoint_dir is preserved from the user config
+        # The builder preserves `checkpoint_dir` and `max_recent_checkpoints` from the user configuration.
         assert config.checkpoint_dir == "/user/ckpt/"
-        # other user-provided torch_save options are discarded; save_consolidated falls back to the default "final"
+        assert config.max_recent_checkpoints == 2
+        # The builder coerces incompatible `torch_save` options and restores the default `save_consolidated="final"`.
         assert config.save_consolidated.value == "final"
         assert config.is_async is False
 
@@ -1535,8 +1586,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline()
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch = {
@@ -1563,8 +1614,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch_size = 4
@@ -1624,8 +1675,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch_size = 4
@@ -1679,8 +1730,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch_size = 4
@@ -1763,8 +1814,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch_size = 4
@@ -1808,8 +1859,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         image_grid_thw = torch.tensor([[1, 2, 2], [1, 3, 3]])
@@ -1874,8 +1925,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch_size = 4
@@ -1914,8 +1965,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = _MockAutoPipeline(has_first_stage=True, has_last_stage=True, n_microbatches=2)
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch_size = 4
@@ -1962,8 +2013,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = pp
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch = {
@@ -1991,8 +2042,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = pp
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch = {
@@ -2028,8 +2079,8 @@ class TestForwardBackwardStepPP:
         pp_recipe.pp = pp
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch = {
@@ -2181,26 +2232,20 @@ class _DummyCPDeviceMesh(dict):
 
 
 class _CPPreEmbedModel(torch.nn.Module):
-    def __init__(self, *, return_mm_token_type_ids: bool = True):
+    """Sunk model: sharder-only CP hook (consumes nothing; the forward embeds +
+    shards per microbatch). Records that the hook was invoked."""
+
+    def __init__(self):
         super().__init__()
         self.scale = torch.nn.Parameter(torch.tensor(1.0))
-        self.return_mm_token_type_ids = return_mm_token_type_ids
+        self.hook_calls = []
 
-    def prepare_model_inputs_for_cp(self, *args, **kwargs):
-        raise AssertionError("prepare_model_inputs_for_cp should be invoked through model.__call__")
+    def prepare_model_inputs_for_cp(self, batch, *, num_chunks=1):
+        self.hook_calls.append(set(batch))
+        return {}
 
-    def forward(self, *, input_ids=None, mm_token_type_ids=None, _pre_embed_only=False, **kwargs):
-        assert _pre_embed_only is True
-        batch, seq = input_ids.shape
-        inputs_embeds = self.scale * torch.ones(batch, seq, 4)
-        per_layer_inputs = self.scale * torch.ones(batch, seq, 2, 3)
-        prepared = {
-            "inputs_embeds": inputs_embeds,
-            "per_layer_inputs": per_layer_inputs,
-        }
-        if self.return_mm_token_type_ids and mm_token_type_ids is not None:
-            prepared["mm_token_type_ids"] = mm_token_type_ids
-        return prepared
+    def forward(self, **kwargs):
+        raise AssertionError("forward should not run: ContextParallelSharder.shard raises first")
 
 
 class _CPPreEmbedStop(RuntimeError):
@@ -2210,25 +2255,35 @@ class _CPPreEmbedStop(RuntimeError):
 class TestForwardBackwardStepNonPP:
     """Tests for _forward_backward_step without pipeline parallelism."""
 
-    def test_non_pp_cp_pre_embed_uses_model_returned_mm_token_type_ids_and_grad(self, monkeypatch):
+    def test_non_pp_cp_invokes_sharder_only_hook_and_keeps_inputs(self, monkeypatch):
+        # Sunk contract: the non-PP CP path invokes the sharder-only hook, which
+        # consumes nothing, so input_ids / pixel_values / mm_token_type_ids all
+        # reach ContextParallelSharder.shard intact (the model embeds + shards them in
+        # its own forward, not here).
         model = _CPPreEmbedModel()
         non_pp_recipe = _create_non_pp_recipe(model)
         non_pp_recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=2)
 
         mm_token_type_ids = torch.tensor([[1, 1, 0, 0]])
 
-        def _capture_cp_batch(device_mesh, batch, loss_mask=None):
-            assert "input_ids" not in batch
-            assert "pixel_values" not in batch
-            assert "image_position_ids" not in batch
+        def _capture_cp_batch(sharder, batch):
+            """Validate the global model-input mapping before CP transport.
+
+            Args:
+                sharder: Sharder configured by the VLM recipe.
+                batch: Mutable model-input mapping whose tensor values have
+                    global batch and sequence extents.
+            """
+            del sharder
+            assert "input_ids" in batch
+            assert "pixel_values" in batch
             assert "mm_token_type_ids" in batch
-            assert "per_layer_inputs" in batch
             torch.testing.assert_close(batch["mm_token_type_ids"], mm_token_type_ids)
-            assert batch["inputs_embeds"].requires_grad
+            assert "inputs_embeds" not in batch
             raise _CPPreEmbedStop
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
+            "nemo_automodel.recipes.vlm.finetune.ContextParallelSharder.shard",
             _capture_cp_batch,
         )
 
@@ -2249,43 +2304,7 @@ class TestForwardBackwardStepNonPP:
                 num_batches=1,
                 is_train=False,
             )
-
-    def test_non_pp_cp_pre_embed_drops_mm_token_type_ids_when_model_does_not_return_it(self, monkeypatch):
-        model = _CPPreEmbedModel(return_mm_token_type_ids=False)
-        non_pp_recipe = _create_non_pp_recipe(model)
-        non_pp_recipe.__dict__["device_mesh"] = _DummyCPDeviceMesh(cp_size=2)
-
-        def _capture_cp_batch(device_mesh, batch, loss_mask=None):
-            assert "input_ids" not in batch
-            assert "pixel_values" not in batch
-            assert "image_position_ids" not in batch
-            assert "mm_token_type_ids" not in batch
-            assert "per_layer_inputs" in batch
-            assert batch["inputs_embeds"].requires_grad
-            raise _CPPreEmbedStop
-
-        monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            _capture_cp_batch,
-        )
-
-        batch = {
-            "labels": torch.randint(0, 50, (1, 4)),
-            "input_ids": torch.randint(0, 100, (1, 4)),
-            "pixel_values": torch.randn(1, 3, 8, 8),
-            "image_position_ids": torch.zeros(1, 1, 2, dtype=torch.long),
-            "mm_token_type_ids": torch.tensor([[1, 1, 0, 0]]),
-        }
-
-        with pytest.raises(_CPPreEmbedStop):
-            non_pp_recipe._forward_backward_step(
-                idx=0,
-                batch=batch,
-                loss_buffer=[],
-                num_label_tokens=4,
-                num_batches=1,
-                is_train=False,
-            )
+        assert len(model.hook_calls) == 1  # the CP hook ran before sharding
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="FusedLinearCE requires CUDA")
     def test_non_pp_with_fused_linear_ce(self, monkeypatch):
@@ -2326,8 +2345,8 @@ class TestForwardBackwardStepNonPP:
         non_pp_recipe.__dict__["loss_fn"] = FusedLinearCrossEntropy()
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
         monkeypatch.setattr(
             "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
@@ -2373,8 +2392,8 @@ class TestForwardBackwardStepNonPP:
         non_pp_recipe.__dict__["loss_fn"] = FusedLinearCrossEntropy()
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
         monkeypatch.setattr(
             "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
@@ -2416,8 +2435,8 @@ class TestForwardBackwardStepNonPP:
         non_pp_recipe.__dict__["loss_fn"] = MaskedCrossEntropy()
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
         monkeypatch.setattr(
             "nemo_automodel.recipes.vlm.finetune.get_sync_ctx",
@@ -2459,8 +2478,8 @@ class TestForwardBackwardStepNonPP:
         non_pp_recipe.__dict__["loss_fn"] = MaskedCrossEntropy()
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         batch = {
@@ -2493,8 +2512,8 @@ class TestForwardBackwardStepNonPP:
         non_pp_recipe.__dict__["loss_fn"] = MaskedCrossEntropy()
 
         monkeypatch.setattr(
-            "nemo_automodel.recipes.vlm.finetune.make_cp_batch_and_ctx",
-            lambda device_mesh, batch: (lambda: nullcontext(), batch),
+            "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
+            lambda device_mesh, batch, *a, **k: (lambda: nullcontext(), batch, None),
         )
 
         # Batch with nested dict (like attention_mask dict)
@@ -2617,6 +2636,96 @@ def test_vlm_build_model_accepts_multimodal_lm_entry_points(entry_point):
     assert model is not None
 
 
+_GEMMA4_COMPOSITE_MOD = "nemo_automodel.components.models.gemma4_drafter.composite"
+
+
+def _target_owner_names(targets):
+    """Class names of the objects that own each allowlisted classmethod target."""
+    names = set()
+    for t in targets:
+        owner = getattr(t, "__self__", None)
+        if owner is not None:
+            names.add(getattr(owner, "__name__", str(owner)))
+    return names
+
+
+class TestRecipeTargetAllowlist:
+    """Coverage for the recipe-side model-target allowlist that ``build_model``
+    gates on (``_accepted_targets`` / ``_is_recipe_target`` in
+    ``recipes/vlm/finetune.py``).
+
+    ``_accepted_targets`` adds the optional Gemma4 composite behind a
+    ``try/except ImportError``. Existing ``build_model`` tests only exercise
+    whichever branch matches the installed deps, so these tests force *both*
+    branches (import present and absent) deterministically, plus the
+    ``target is None`` short-circuit -- all without depending on whether the
+    optional ``transformers.models.gemma4_assistant`` dep is installed.
+    """
+
+    def test_accepted_targets_contains_all_nemo_auto_entrypoints(self):
+        from nemo_automodel._transformers import (
+            NeMoAutoModelForCausalLM,
+            NeMoAutoModelForImageTextToText,
+            NeMoAutoModelForMultimodalLM,
+        )
+        from nemo_automodel.recipes.vlm.finetune import _accepted_targets
+
+        targets = _accepted_targets()
+        assert isinstance(targets, set)
+        for cls in (
+            NeMoAutoModelForCausalLM,
+            NeMoAutoModelForImageTextToText,
+            NeMoAutoModelForMultimodalLM,
+        ):
+            assert cls.from_pretrained in targets
+            assert cls.from_config in targets
+
+    def test_accepted_targets_missing_gemma4_dep_takes_except_branch(self, monkeypatch):
+        """Force the optional composite import to fail: the ``except ImportError``
+        branch runs and the set still holds the NeMoAuto entrypoints while the
+        Gemma4 composite is absent."""
+        from nemo_automodel._transformers import NeMoAutoModelForCausalLM
+        from nemo_automodel.recipes.vlm.finetune import _accepted_targets
+
+        # A ``None`` entry in sys.modules makes ``from <mod> import X`` raise ImportError.
+        monkeypatch.setitem(sys.modules, _GEMMA4_COMPOSITE_MOD, None)
+
+        targets = _accepted_targets()
+        assert NeMoAutoModelForCausalLM.from_pretrained in targets
+        assert "Gemma4WithDrafter" not in _target_owner_names(targets)
+
+    def test_accepted_targets_present_gemma4_dep_adds_composite(self, monkeypatch):
+        """Inject a fake composite module so the ``accepted.add(...)`` branch runs
+        regardless of whether the real optional dep is installed."""
+        from nemo_automodel.recipes.vlm.finetune import _accepted_targets
+
+        class Gemma4WithDrafter:
+            @classmethod
+            def from_pretrained(cls):
+                return cls()
+
+        fake_mod = types.ModuleType(_GEMMA4_COMPOSITE_MOD)
+        fake_mod.Gemma4WithDrafter = Gemma4WithDrafter
+        monkeypatch.setitem(sys.modules, _GEMMA4_COMPOSITE_MOD, fake_mod)
+
+        targets = _accepted_targets()
+        assert Gemma4WithDrafter.from_pretrained in targets
+
+    def test_is_recipe_target_none_returns_false(self):
+        from nemo_automodel.recipes.vlm.finetune import _is_recipe_target
+
+        assert _is_recipe_target(None) is False
+
+    def test_is_recipe_target_accepts_nemo_auto_and_rejects_others(self):
+        from nemo_automodel._transformers import NeMoAutoModelForImageTextToText
+        from nemo_automodel.recipes.vlm.finetune import _is_recipe_target
+
+        assert _is_recipe_target(NeMoAutoModelForImageTextToText.from_pretrained) is True
+        assert _is_recipe_target(NeMoAutoModelForImageTextToText.from_config) is True
+        assert _is_recipe_target("some.invalid.Target") is False
+        assert _is_recipe_target(lambda: None) is False
+
+
 # -----------------------------------------------------------------------------
 # rope_fusion disabled when cp > 1
 # -----------------------------------------------------------------------------
@@ -2673,7 +2782,20 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
         "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
         property(lambda self: SimpleNamespace(build=lambda *a, **k: [dummy_opt])),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.build_dataloader", lambda *a, **k: ("dl", "proc"))
+    loader_config = SimpleNamespace(
+        packing=None,
+        resolve_packing_attn_implementation=lambda **kwargs: None,
+        build=lambda **kwargs: SimpleNamespace(dataloader="dl", processor="proc"),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.vlm_dataloader",
+        property(lambda self: loader_config),
+    )
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.vlm_validation_dataloader",
+        property(lambda self: None),
+    )
+    monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.ScopedRNG", lambda **kwargs: nullcontext())
     monkeypatch.setattr(
         "nemo_automodel.components.training.step_scheduler.StepSchedulerConfig.build",
         lambda self, *a, **k: SimpleNamespace(step=0, epoch=0, epochs=[]),
@@ -2715,20 +2837,48 @@ def _patch_vlm_setup_minimals(monkeypatch, cp_size):
     monkeypatch.setattr("nemo_automodel.recipes.vlm.finetune.FinetuneRecipeForVLM._get_pp_rank", lambda self: 0)
 
 
-def _minimal_vlm_cfg(cp_size: int, rope_fusion: bool):
-    return ConfigNode(
-        {
-            "model": {"backend": {"rope_fusion": rope_fusion}},
-            "dataloader": {},
-            "dataset": {"path_or_dataset": "dummy"},
-            "validation_dataloader": {},
-            "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
-            "optimizer": {},
-            "loss_fn": {},
-            "checkpoint": {"best_metric_key": "default"},
-            "distributed": {"cp_size": cp_size},
-        }
-    )
+def _minimal_vlm_cfg(
+    cp_size: int,
+    rope_fusion: bool,
+    prewarm: dict[str, bool] | None = None,
+    optimizer_target: str | None = None,
+) -> ConfigNode:
+    cfg = {
+        "model": {"backend": {"rope_fusion": rope_fusion}},
+        "dataloader": {},
+        "dataset": {"path_or_dataset": "dummy"},
+        "validation_dataloader": {},
+        "step_scheduler": {"local_batch_size": 1, "global_batch_size": 1},
+        "optimizer": {"_target_": optimizer_target} if optimizer_target is not None else {},
+        "loss_fn": {},
+        "checkpoint": {"best_metric_key": "default"},
+        "distributed": {"cp_size": cp_size},
+    }
+    if prewarm is not None:
+        cfg["prewarm"] = prewarm
+    return ConfigNode(cfg)
+
+
+def test_vlm_setup_applies_prewarm_config(monkeypatch):
+    """VLM setup should apply the typed prewarm config to its parallelized model parts."""
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=False, prewarm={"comm_groups": True})
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    calls = []
+
+    def _record_apply(self, *, model_parts, device, pp_mesh=None):
+        calls.append((self, model_parts, device, pp_mesh))
+
+    monkeypatch.setattr("nemo_automodel.components.training.prewarm.PrewarmConfig.apply", _record_apply)
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert len(calls) == 1
+    prewarm, model_parts, device, pp_mesh = calls[0]
+    assert prewarm.comm_groups is True
+    assert model_parts == trainer.model_parts
+    assert device == torch.device("cpu")
+    assert pp_mesh is None
 
 
 def test_vlm_rope_fusion_disabled_when_cp_gt_1(monkeypatch):
@@ -2751,6 +2901,23 @@ def test_vlm_rope_fusion_unchanged_when_cp_eq_1(monkeypatch):
     trainer.setup()
 
     assert cfg.model.backend.rope_fusion is True
+
+
+def test_vlm_setup_does_not_change_storage_dtype_for_non_kd_recipe(monkeypatch):
+    cfg = _minimal_vlm_cfg(cp_size=1, rope_fusion=True, optimizer_target="torch.optim.AdamW")
+    _patch_vlm_setup_minimals(monkeypatch, cp_size=1)
+    dummy_opt = SimpleNamespace(param_groups=[{"lr": 0.01}], step=lambda: None, zero_grad=lambda **k: None)
+    optimizer_config = build_optimizer_config("torch.optim.AdamW", {"lr": 0.01})
+    monkeypatch.setattr(optimizer_config, "build", lambda *a, **k: [dummy_opt])
+    monkeypatch.setattr(
+        "nemo_automodel.recipes._typed_config.RecipeConfig.optimizer",
+        property(lambda self: optimizer_config),
+    )
+
+    trainer = FinetuneRecipeForVLM(cfg)
+    trainer.setup()
+
+    assert not hasattr(cfg.model, "torch_dtype")
 
 
 def test_vlm_rope_fusion_stays_false_when_already_disabled(monkeypatch):
@@ -2977,7 +3144,7 @@ class TestChunkVlmMedia:
         assert "patch_pixel_values" not in chunks
         assert "patch_newline_mask" not in chunks
 
-        with pytest.raises(ValueError, match="one full image tensor per sample"):
+        with pytest.raises(ValueError, match="cannot align pixel_values with num_patches"):
             chunk_step3_media(pixel_values[:2], batch_size=3, n_microbatches=2)
         with pytest.raises(ValueError, match="num_patches must have length"):
             chunk_step3_media(pixel_values, batch_size=3, n_microbatches=2, num_patches=torch.tensor([1, 2]))
@@ -3014,6 +3181,84 @@ class TestChunkVlmMedia:
         assert model._vlm_patch_newline_mask_chunks is None
         assert model._vlm_chunk_idx is None
 
+    @pytest.mark.parametrize("schedule_flag", ["_stage_forward_initialized", "_stages_forward_initialized"])
+    def test_stage_media_replays_first_chunk_after_dynamic_metadata_forward(self, schedule_flag):
+        class MediaConsumer(nn.Module):
+            def forward(self):
+                chunk = self._vlm_pixel_values_chunks[self._vlm_chunk_idx]
+                self._vlm_chunk_idx += 1
+                return chunk
+
+        model = MediaConsumer()
+        schedule = SimpleNamespace(**{schedule_flag: False})
+        stage = SimpleNamespace(is_first=True)
+        pp = SimpleNamespace(
+            info=SimpleNamespace(has_first_stage=True, schedule=schedule, stages=[stage]),
+        )
+        first_chunk = torch.tensor([1.0])
+        second_chunk = torch.tensor([2.0])
+        batch = {
+            VLM_PP_MEDIA_KEY: {
+                "pixel_values": [first_chunk, second_chunk],
+                "image_grid_hws": [torch.ones(1), torch.ones(1)],
+            }
+        }
+
+        with stage_vlm_media_for_pp(pp, [model], batch):
+            metadata_output = model()
+            first_microbatch_output = model()
+            second_microbatch_output = model()
+
+            assert torch.equal(metadata_output, first_chunk)
+            assert torch.equal(first_microbatch_output, first_chunk)
+            assert torch.equal(second_microbatch_output, second_chunk)
+            assert model._vlm_chunk_idx == 2
+
+    @pytest.mark.parametrize("analytical_metadata,forward_initialized", [(True, False), (False, True)])
+    def test_stage_media_does_not_replay_without_dynamic_metadata_forward(
+        self, analytical_metadata, forward_initialized
+    ):
+        class MediaConsumer(nn.Module):
+            def forward(self):
+                chunk = self._vlm_pixel_values_chunks[self._vlm_chunk_idx]
+                self._vlm_chunk_idx += 1
+                return chunk
+
+        model = MediaConsumer()
+        schedule = SimpleNamespace(_stage_forward_initialized=forward_initialized)
+        stage = SimpleNamespace(is_first=True)
+        if analytical_metadata:
+            stage._configure_outputs_meta = lambda *_args: None
+        pp = SimpleNamespace(
+            info=SimpleNamespace(has_first_stage=True, schedule=schedule, stages=[stage]),
+        )
+        first_chunk = torch.tensor([1.0])
+        batch = {
+            VLM_PP_MEDIA_KEY: {
+                "pixel_values": [first_chunk],
+                "image_grid_hws": [torch.ones(1)],
+            }
+        }
+
+        with stage_vlm_media_for_pp(pp, [model], batch):
+            assert torch.equal(model(), first_chunk)
+            assert model._vlm_chunk_idx == 1
+
+    def test_prepare_flat_patches_without_image_grid(self):
+        pixel_values = torch.arange(5 * 2 * 2 * 2 * 3).reshape(5, 2, 2, 2, 3)
+        batch = {
+            "input_ids": torch.ones(2, 4, dtype=torch.long),
+            "pixel_values": pixel_values,
+            "num_patches": torch.tensor([2, 3]),
+        }
+
+        prepared = prepare_vlm_media_for_pp(batch, batch_size=2, n_microbatches=2)
+        media = prepared[VLM_PP_MEDIA_KEY]
+
+        assert torch.equal(media["pixel_values"][0], pixel_values[:2])
+        assert torch.equal(media["pixel_values"][1], pixel_values[2:])
+        assert [chunk.tolist() for chunk in media["num_patches"]] == [[2], [3]]
+
 
 # -----------------------------------------------------------------------------
 # get_rope_index forwarding tests for build_dataloader
@@ -3025,31 +3270,23 @@ class TestChunkVlmMedia:
 
 
 def _make_packing_cfg(pack_size=128):
-    cfg = MagicMock()
-    cfg.pack_size = pack_size
-    cfg.pretokenize = True
-    cfg.max_length = pack_size
-    cfg.get.side_effect = lambda key, default=None: {
-        "pack_size": pack_size,
-        "drop_long_samples": True,
-        "max_packs": None,
-        "packing_ratio": 1.0,
-        "balance_media_tokens": True,
-        "collate_max_length": None,
-        "post_tokenize_hook_fn": None,
-    }.get(key, default)
-    return cfg
+    return ConfigNode(
+        {
+            "pack_size": pack_size,
+            "pretokenize": True,
+            "max_length": pack_size,
+            "drop_long_samples": True,
+            "max_packs": None,
+            "packing_ratio": 1.0,
+            "balance_media_tokens": True,
+            "collate_max_length": None,
+            "post_tokenize_hook_fn": None,
+        }
+    )
 
 
 def _make_dataset_cfg():
-    cfg = MagicMock(spec=["get", "instantiate", "path_or_dataset"])
-    cfg.get.side_effect = lambda key, default=None: {
-        "path_or_dataset": None,
-        "truncate": True,
-    }.get(key, default)
-    cfg.path_or_dataset = None
-    cfg.instantiate.return_value = []
-    return cfg
+    return ConfigNode({"_target_": _test_vlm_dataset, "truncate": True})
 
 
 def _patches_for_packing(neat_pack_side_effect):
@@ -3067,6 +3304,7 @@ def _patches_for_packing(neat_pack_side_effect):
             "nemo_automodel.components.datasets.vlm.neat_packing_vlm.neat_pack_dataset_vlm",
             side_effect=neat_pack_side_effect,
         ),
+        patch("nemo_automodel.components.datasets.vlm.loader.StatefulDataLoader", return_value=MagicMock()),
         patch("nemo_automodel.components.models.common.packing.configure_packing"),
         patch(
             "nemo_automodel.components.models.common.packing.get_attn_implementation",
@@ -3095,7 +3333,7 @@ def test_build_dataloader_forwards_get_rope_index_to_packing():
             stack.enter_context(cm)
         build_dataloader(
             _make_dataset_cfg(),
-            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            _vlm_dataloader_cfg(),
             "test/model",
             None,
             None,
@@ -3129,7 +3367,7 @@ def test_build_dataloader_default_get_rope_index_is_none():
             stack.enter_context(cm)
         build_dataloader(
             _make_dataset_cfg(),
-            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            _vlm_dataloader_cfg(),
             "test/model",
             None,
             None,
@@ -3163,7 +3401,7 @@ def _run_build_dataloader_capturing_wrapper(dataset_cfg):
         )
         build_dataloader(
             dataset_cfg,
-            MagicMock(get=MagicMock(return_value=None), instantiate=MagicMock(return_value=MagicMock())),
+            _vlm_dataloader_cfg(),
             "test/model",
             None,
             None,
@@ -3182,14 +3420,7 @@ def test_build_dataloader_inject_fake_images_defaults_true():
 
 def test_build_dataloader_forwards_inject_fake_images_false():
     """inject_fake_images=False in dataset cfg must reach PreTokenizedDatasetWrapper."""
-    cfg = MagicMock(spec=["get", "instantiate", "path_or_dataset"])
-    cfg.get.side_effect = lambda key, default=None: {
-        "path_or_dataset": None,
-        "truncate": True,
-        "inject_fake_images": False,
-    }.get(key, default)
-    cfg.path_or_dataset = None
-    cfg.instantiate.return_value = []
+    cfg = ConfigNode({"_target_": _test_vlm_dataset, "truncate": True, "inject_fake_images": False})
 
     wrapper_mock = _run_build_dataloader_capturing_wrapper(cfg)
     assert wrapper_mock.call_args.kwargs["inject_fake_images"] is False

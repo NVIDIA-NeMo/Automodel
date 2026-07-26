@@ -19,12 +19,11 @@ import pathlib
 import time
 from collections import deque
 from contextlib import nullcontext
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 import wandb
-from torch.utils.data import IterableDataset
-from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import ProcessorMixin
 
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
@@ -39,7 +38,10 @@ from nemo_automodel.components.optim.precision_warnings import warn_if_torch_ada
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.components.utils.compile_utils import build_compile_config
-from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
+from nemo_automodel.recipes._dist_utils import (
+    create_distributed_setup_from_config,
+    shard_optimizers_for_megatron_fsdp,
+)
 from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
 from nemo_automodel.shared.te_patches import apply_te_patches
@@ -179,44 +181,6 @@ def _unpack_qp(inputs: dict[str, torch.Tensor]) -> tuple:
     return query_batch_dict, doc_batch_dict
 
 
-def build_dataloader(cfg_dl, tokenizer, seed, batch_size=None, dp_rank=0, dp_world_size=1):
-    """Build a DataLoader for encoder training."""
-    with ScopedRNG(seed=seed, ranked=True):
-        with FirstRankPerNode():
-            dataset = cfg_dl.dataset.instantiate()
-
-        collate_fn = None
-        if hasattr(cfg_dl, "collate_fn") and hasattr(cfg_dl.collate_fn, "_target_"):
-            collate_fn = cfg_dl.collate_fn.instantiate(tokenizer=tokenizer)
-
-        if not isinstance(dataset, IterableDataset):
-            shuffle = cfg_dl.get("shuffle", True)
-            if "shuffle" in cfg_dl:
-                del cfg_dl.shuffle
-
-            dist_sampler_kwargs = {
-                "num_replicas": dp_world_size,
-                "rank": dp_rank,
-                "shuffle": shuffle,
-            }
-            sampler = StatefulDistributedSampler(
-                dataset,
-                seed=seed,
-                drop_last=True,
-                **dist_sampler_kwargs,
-            )
-            dl_kwargs = {"sampler": sampler, "batch_size": batch_size}
-        else:
-            logging.info("Using IterableDataset; skipping sampler.")
-            dl_kwargs = {"dataset": dataset, "batch_size": batch_size}
-
-        dl_kwargs["dataset"] = dataset
-        if collate_fn is not None:
-            dl_kwargs["collate_fn"] = collate_fn
-
-        return cfg_dl.instantiate(**dl_kwargs)
-
-
 class TrainBiEncoderRecipe(BaseRecipe):
     """Recipe for training encoder models with contrastive learning."""
 
@@ -224,6 +188,31 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
         self.temperature = self.cfg.get("temperature", 1.0)
+
+    def _build_optimizer_param_groups(self) -> list[dict[str, Any]]:
+        """Build optimizer parameter groups for trainable model parameters."""
+        model = self.model_parts[0]
+        decay_params = []
+        no_decay_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            name_l = name.lower()
+            if name.endswith(".bias") or ("norm" in name_l):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        assert decay_params or no_decay_params, "no trainable parameters found"
+
+        param_groups = []
+        if decay_params:
+            param_groups.append({"params": decay_params})
+        if no_decay_params:
+            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+
+        logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
+        return param_groups
 
     def setup(self):
         """Build all components needed for training/validation/logging/checkpointing."""
@@ -295,29 +284,17 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.model_parts = [model]
         self.pp = None
 
-        # Apply weight decay only to non-bias/non-norm params
-        decay_params = []
-        no_decay_params = []
-        for name, param in self.model_parts[0].named_parameters():
-            if not param.requires_grad:
-                continue
-            name_l = name.lower()
-            if name.endswith(".bias") or ("norm" in name_l):
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-
-        assert decay_params or no_decay_params, "no trainable parameters found"
-
-        param_groups = []
-        if decay_params:
-            param_groups.append({"params": decay_params})
-        if no_decay_params:
-            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
-
-        logger.info("Optimizer param groups: decay=%d, no_decay=%d", len(decay_params), len(no_decay_params))
+        param_groups = self._build_optimizer_param_groups()
         optimizer = self.cfg.optimizer.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
-        self.optimizer = [optimizer]
+        # Megatron-FSDP ZeRO-1/2/3 requires registering the separately-built optimizer with the
+        # already-wrapped MegatronFSDP model (mirrors the LLM recipe train_ft.py). Without this,
+        # the deferred grad-sync / optimized-weight install hooks are never wired up. Assign
+        # self.optimizer exactly once so BaseRecipe.__setattr__ state-tracking does not reject a
+        # second "optimizer" registration.
+        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        self.optimizer = shard_optimizers_for_megatron_fsdp(
+            self.model_parts[0], [optimizer], self.distributed_config, allow=allow_megatron_fsdp_sharding
+        )
         warn_if_torch_adam_with_bf16_params(
             optimizer=self.optimizer,
             is_peft=self.peft_config is not None,
@@ -332,30 +309,29 @@ class TrainBiEncoderRecipe(BaseRecipe):
             tokenizer.pad_token = self.tokenizer.eos_token
             tokenizer.padding_side = "left"
 
-        self.dataloader = build_dataloader(
-            self.cfg.dataloader,
-            self.tokenizer,
-            seed=self.cfg.get("seed", 42),
-            batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
-            dp_rank=self._get_dp_rank(),
-            dp_world_size=self._get_dp_group_size(),
-        )
-        self.train_n_passages = self.cfg.get("dataloader.dataset.n_passages", 1)
+        dataloader_config = self.cfg.dataloader
+        if dataloader_config is None:
+            raise ValueError("Retrieval training requires a top-level dataset config")
+
+        def materialize_loader(config):
+            build_context = nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode()
+            with ScopedRNG(seed=config.seed, ranked=True):
+                return config.build(
+                    tokenizer=self.tokenizer,
+                    dataset_build_context=build_context,
+                    dp_rank=self._get_dp_rank(),
+                    dp_world_size=self._get_dp_group_size(),
+                )
+
+        self.dataloader = materialize_loader(dataloader_config)
+        self.train_n_passages = getattr(dataloader_config.dataset_config, "n_passages", 1)
 
         self.val_dataloader = None
-        if "validation_dataloader" in self.cfg:
-            val_batch_size = self.cfg.get(
-                "validation_dataloader.batch_size", self.cfg.get("step_scheduler.local_batch_size", 1)
-            )
-            self.val_dataloader = build_dataloader(
-                self.cfg.validation_dataloader,
-                self.tokenizer,
-                seed=self.cfg.get("seed", 42),
-                batch_size=val_batch_size,
-                dp_rank=self._get_dp_rank(),
-                dp_world_size=self._get_dp_group_size(),
-            )
-            self.val_n_passages = self.cfg.get("validation_dataloader.dataset.n_passages", self.train_n_passages)
+        validation_configs = self.cfg.validation_dataloaders
+        if validation_configs:
+            validation_config = next(iter(validation_configs.values()))
+            self.val_dataloader = materialize_loader(validation_config)
+            self.val_n_passages = getattr(validation_config.dataset_config, "n_passages", self.train_n_passages)
 
         self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
@@ -425,7 +401,7 @@ class TrainBiEncoderRecipe(BaseRecipe):
 
         self.metric_logger_train.close()
         self.metric_logger_valid.close()
-        self.checkpointer.close()
+        self._finalize_and_close_checkpointer()
 
     def _forward_backward_step(self, idx, batch, *, loss_buffer, num_batches, is_train: bool = True):
         """Forward and backward pass for a single micro-batch."""
@@ -586,6 +562,16 @@ class TrainBiEncoderRecipe(BaseRecipe):
             metrics=metrics,
         )
 
+    def _extract_scoring_reps(self, model_output):
+        """Return the embedding tensor used for validation scoring from a forward output.
+
+        The base bi-encoder forward returns an embedding tensor directly. Subclasses whose
+        forward returns a richer structure (e.g. the distillation student, which returns
+        ``(pooled, projected, intermediate_outputs)``) should override this to select the
+        tensor to score with.
+        """
+        return model_output
+
     def _run_validation_epoch(self, val_dataloader):
         """Run validation for one epoch and compute loss, accuracy@1, and MRR."""
         with ScopedRNG(seed=1, ranked=True):
@@ -604,8 +590,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     query, passage = _unpack_qp(batch)
 
                     model = self.model_parts[0]
-                    q_reps = model(query)
-                    p_reps = model(passage)
+                    q_reps = self._extract_scoring_reps(model(query))
+                    p_reps = self._extract_scoring_reps(model(passage))
 
                     if _uses_multi_vector_scoring(model):
                         scores, labels = maxsim_scores_and_labels(

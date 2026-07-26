@@ -62,6 +62,12 @@ FINETUNE_START=$SECONDS
 eval $RUN_CMD
 FINETUNE_EXIT_CODE=$?
 
+if [[ "$FINETUNE_EXIT_CODE" -eq 0 && "${REQUIRE_FINITE_METRICS:-false}" == "true" ]]; then
+  python3 /opt/Automodel/tests/ci_tests/scripts/assert_finite_train_metrics.py \
+    --log "$PIPELINE_DIR/${TEST_NAME}_slurm_${SLURM_JOB_ID}.out" \
+    || FINETUNE_EXIT_CODE=$?
+fi
+
 FINETUNE_ELAPSED=$((SECONDS - FINETUNE_START))
 echo "{\"test\":\"${TEST_NAME}\",\"phase\":\"finetune\",\"seconds\":${FINETUNE_ELAPSED}}" >> $TEST_DIR/timing.jsonl
 echo "[timing] Finetune completed in ${FINETUNE_ELAPSED}s"
@@ -87,8 +93,15 @@ if [[ "$HAS_ROBUSTNESS" == "true" ]]; then
     --phase checkpoint_robustness \
     --output "$TEST_DIR/robustness_config.yaml")
 
+  ROBUSTNESS_TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py"
+  case "$CONFIG_PATH" in
+    *vlm_finetune*)
+      ROBUSTNESS_TEST_SCRIPT="tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_vlm.py"
+      ;;
+  esac
+
   ROBUSTNESS_CMD="${CMD} --tee 3 --log-dir $TEST_DIR/robustness_logs \
-    -m pytest --tb=short tests/functional_tests/checkpoint_robustness/test_checkpoint_robustness_llm.py \
+    -m pytest --tb=short ${ROBUSTNESS_TEST_SCRIPT} \
     --config ${RESOLVED_ROBUSTNESS_CONFIG}"
 
   echo "============================================"

@@ -16,7 +16,7 @@ import builtins
 import json
 import logging
 import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -25,6 +25,7 @@ from safetensors.torch import load_file, save_file
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
     _write_sub_tensor_to_file_optimized,
     consolidate_safetensors_files,
+    consolidate_safetensors_files_on_every_rank,
     resolve_dtype_cast,
 )
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
@@ -270,6 +271,55 @@ def test_consolidate_cast_dtype_does_not_cast_fp8_tensors(tmp_path):
 
 
 @pytest.mark.run_only_on("CPU")
+def test_consolidate_cast_dtype_preserves_mapped_fp32_tensors(tmp_path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+
+    tensors = {
+        "protected_fp32_weight": torch.arange(4, dtype=torch.float32),
+        "ordinary_weight": torch.arange(4, dtype=torch.float32),
+        "ordinary_with_original_dtype": torch.arange(4, dtype=torch.float32),
+    }
+    dcp_metadata = {name: {"saved_offsets": [0 for _ in tensor.shape]} for name, tensor in tensors.items()}
+    save_file(
+        tensors,
+        input_dir / "model-00001-of-00001.safetensors",
+        metadata={CUSTOM_METADATA_KEY: json.dumps(dcp_metadata)},
+    )
+
+    consolidate_safetensors_files(
+        input_dir=str(input_dir),
+        output_dir=str(output_dir),
+        fqn_to_index_mapping={name: 1 for name in tensors},
+        cast_dtype=torch.float16,
+        fqn_to_dtype_mapping={
+            "protected_fp32_weight": "F32",
+            "ordinary_with_original_dtype": "BF16",
+        },
+    )
+
+    output_tensors = load_file(output_dir / "model-00001-of-00001.safetensors")
+    assert output_tensors["protected_fp32_weight"].dtype is torch.float32
+    assert output_tensors["ordinary_weight"].dtype is torch.float16
+    assert output_tensors["ordinary_with_original_dtype"].dtype is torch.float16
+    torch.testing.assert_close(output_tensors["protected_fp32_weight"], tensors["protected_fp32_weight"])
+    torch.testing.assert_close(output_tensors["ordinary_weight"], tensors["ordinary_weight"].to(torch.float16))
+    torch.testing.assert_close(
+        output_tensors["ordinary_with_original_dtype"], tensors["ordinary_with_original_dtype"].to(torch.float16)
+    )
+
+    with open(output_dir / "model.safetensors.index.json", "r") as f:
+        index = json.load(f)
+    expected_total_size = (
+        tensors["protected_fp32_weight"].numel() * 4
+        + (tensors["ordinary_weight"].numel() + tensors["ordinary_with_original_dtype"].numel()) * 2
+    )
+    assert index["metadata"]["total_size"] == expected_total_size
+
+
+@pytest.mark.run_only_on("CPU")
 def test_consolidate_preserves_original_hf_float_dtypes_when_available(tmp_path):
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
@@ -414,6 +464,48 @@ def test_resolve_dtype_cast_accepts_aliases_and_none():
     assert resolve_dtype_cast("none") is None
     assert resolve_dtype_cast("bf16") is torch.bfloat16
     assert resolve_dtype_cast("torch.float16") is torch.float16
+
+
+@pytest.mark.run_only_on("CPU")
+def test_every_rank_consolidation_uses_supplied_group_for_barrier():
+    process_group = MagicMock()
+
+    with (
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.is_available",
+            return_value=True,
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.is_initialized",
+            return_value=True,
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.get_rank",
+            return_value=0,
+        ) as get_rank,
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.get_world_size",
+            return_value=2,
+        ) as get_world_size,
+        patch("nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors.dist.barrier") as barrier,
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors._consolidate_safetensors_files"
+        ),
+        patch(
+            "nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors."
+            "_write_overall_metadata_file_from_shards"
+        ),
+    ):
+        consolidate_safetensors_files_on_every_rank(
+            input_dir="input",
+            output_dir="output",
+            fqn_to_index_mapping={"weight": 1},
+            process_group=process_group,
+        )
+
+    get_rank.assert_called_once_with(group=process_group)
+    get_world_size.assert_called_once_with(group=process_group)
+    barrier.assert_called_once_with(group=process_group)
 
 
 # =============================================================================

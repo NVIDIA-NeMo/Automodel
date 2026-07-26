@@ -24,13 +24,13 @@ from nemo_automodel.components.speculative.dflash.core import (
     DFlashStepMetrics,
     DFlashTrainerModule,
     NoValidAnchorsError,
+    compute_accept_len,
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
 from nemo_automodel.components.speculative.dflash.domino_core import (
     DominoStepMetrics,
     DominoTrainerModule,
-    compute_accept_len,
     get_lambda_base,
 )
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import (

@@ -48,11 +48,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nemo_automodel.components.attention.dflash_mask import (
-    create_dflash_block_mask,
-    create_dflash_sdpa_mask,
+from nemo_automodel.components.speculative.dflash.core import (
+    DFlashTrainerModule,
+    _to_full_tensor,
+    compute_acceptance_stats,
 )
-from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, _to_full_tensor
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 
 
@@ -74,21 +74,6 @@ def get_lambda_base(
     return max(0.0, min(1.0, lambda_base))
 
 
-def compute_accept_len(
-    pred_ids_4d: torch.Tensor,
-    target_ids_4d: torch.Tensor,
-    valid_mask_4d: torch.Tensor,
-) -> torch.Tensor:
-    """Per-block acceptance length: consecutive correct predictions from position 0.
-
-    Invalid (masked-out) positions count as correct so they never truncate a block
-    prematurely; the trailing valid mask then zeros their contribution.
-    """
-    correct = (pred_ids_4d == target_ids_4d) | (~valid_mask_4d)
-    accept_prefix = correct.long().cumprod(dim=2) * valid_mask_4d.long()
-    return accept_prefix.sum(dim=2).float()
-
-
 @dataclass
 class DominoStepMetrics:
     """Per-step training outputs for the Domino draft.
@@ -96,16 +81,39 @@ class DominoStepMetrics:
     ``loss``/``accuracy``/``valid_tokens`` mirror ``DFlashStepMetrics`` so the
     DFlash training loop consumes them unchanged. The remaining fields are
     diagnostics for the two supervised logits and the curriculum weight.
+
+    Attributes:
+        loss: Scalar tensor containing the mixed differentiable training loss.
+        loss_weight: Scalar tensor containing the effective loss denominator.
+        accuracy: Scalar tensor containing final-head greedy token accuracy.
+        valid_tokens: Scalar tensor containing the supervised-token count.
+        correct_tokens: Scalar tensor containing final-head correct-token count.
+        accept_len: Scalar tensor containing final-head mean acceptance length.
+        accept_len_sum: Scalar tensor containing final-head additive acceptance length.
+        valid_blocks: Scalar tensor containing the number of evaluated draft blocks.
+        final_loss: Scalar tensor containing final-head validation loss.
+        base_loss: Scalar tensor containing base-head validation loss.
+        base_accuracy: Scalar tensor containing base-head greedy token accuracy.
+        base_correct_tokens: Scalar tensor containing base-head correct-token count.
+        base_accept_len: Scalar tensor containing base-head mean acceptance length.
+        base_accept_len_sum: Scalar tensor containing base-head additive acceptance length.
+        lambda_base: Scalar tensor containing the current base-loss curriculum weight.
     """
 
     loss: torch.Tensor
+    loss_weight: torch.Tensor
     accuracy: torch.Tensor
     valid_tokens: torch.Tensor
+    correct_tokens: torch.Tensor
+    accept_len: torch.Tensor
+    accept_len_sum: torch.Tensor
+    valid_blocks: torch.Tensor
     final_loss: torch.Tensor
     base_loss: torch.Tensor
     base_accuracy: torch.Tensor
-    accept_len: torch.Tensor
+    base_correct_tokens: torch.Tensor
     base_accept_len: torch.Tensor
+    base_accept_len_sum: torch.Tensor
     lambda_base: torch.Tensor
 
 
@@ -244,7 +252,6 @@ class DominoTrainerModule(DFlashTrainerModule):
         flat_base_logits: torch.Tensor,
         flat_targets: torch.Tensor,
         binary_eval_mask: torch.Tensor,
-        actual_token_count: torch.Tensor,
         target_ids: torch.Tensor,
         eval_weight_mask: torch.Tensor,
         final_loss: torch.Tensor,
@@ -256,23 +263,28 @@ class DominoTrainerModule(DFlashTrainerModule):
 
         base_pred_ids = torch.argmax(flat_base_logits, dim=-1)
         base_correct = (base_pred_ids == flat_targets) & (binary_eval_mask > 0.5)
-        base_accuracy = base_correct.sum().float() / actual_token_count
+        valid_tokens = binary_eval_mask.sum()
+        base_correct_tokens = base_correct.sum()
+        base_accuracy = base_correct_tokens.float() / valid_tokens.clamp_min(1).float()
 
         valid_mask_4d = (eval_weight_mask > 0).bool()
-        pred_accept_len = compute_accept_len(pred_ids.view(bsz, n, bs), target_ids, valid_mask_4d)
-        base_accept_len = compute_accept_len(base_pred_ids.view(bsz, n, bs), target_ids, valid_mask_4d)
-
-        valid_block_mask = valid_mask_4d.any(dim=2)
-        num_valid_blocks = valid_block_mask.sum().float() + 1e-6
-        avg_accept_len = ((pred_accept_len + 1.0) * valid_block_mask.float()).sum() / num_valid_blocks
-        base_avg_accept_len = ((base_accept_len + 1.0) * valid_block_mask.float()).sum() / num_valid_blocks
+        accept_len, accept_len_sum, valid_blocks = compute_acceptance_stats(
+            pred_ids.view(bsz, n, bs), target_ids, valid_mask_4d
+        )
+        base_accept_len, base_accept_len_sum, _ = compute_acceptance_stats(
+            base_pred_ids.view(bsz, n, bs), target_ids, valid_mask_4d
+        )
 
         return {
             "final_loss": final_loss.detach(),
             "base_loss": base_loss.detach(),
             "base_accuracy": base_accuracy.detach(),
-            "accept_len": avg_accept_len.detach(),
-            "base_accept_len": base_avg_accept_len.detach(),
+            "base_correct_tokens": base_correct_tokens.detach(),
+            "accept_len": accept_len.detach(),
+            "accept_len_sum": accept_len_sum.detach(),
+            "valid_blocks": valid_blocks.detach(),
+            "base_accept_len": base_accept_len.detach(),
+            "base_accept_len_sum": base_accept_len_sum.detach(),
             "lambda_base": torch.tensor(float(lambda_base), device=final_loss.device),
         }
 
@@ -282,26 +294,26 @@ class DominoTrainerModule(DFlashTrainerModule):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         lambda_base: float = 0.0,
+        position_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        doc_remaining: torch.Tensor | None = None,
     ) -> DominoStepMetrics:
-        """Parallel block-wise training forward with the Domino correction head."""
-        bsz, seq_len = input_ids.shape
+        """Parallel block-wise training forward with the Domino correction head.
+
+        Sequence packing (``position_ids`` ``[B, S]`` per-document reset positions,
+        ``seq_lens`` ``[B, max_docs]`` document lengths, ``doc_remaining`` ``[B, S]``)
+        is handled by the shared DFlash prologue; ``shift_label`` labels reaching
+        one past the block (``anchor + block_size``) are truncated at the anchor's
+        document boundary by ``_build_block_targets``.
+        """
+        _, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(seq_len, loss_mask, device)
-        noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
-
-        context_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-
-        if self.attention_backend == "flex_attention":
-            dflash_attn_mask = create_dflash_block_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device
+        anchor_positions, block_keep_mask, noise_embedding, full_position_ids, dflash_attn_mask, _ = (
+            self._prepare_block_inputs(
+                input_ids, loss_mask, position_ids=position_ids, seq_lens=seq_lens, doc_remaining=doc_remaining
             )
-        else:
-            dflash_attn_mask = create_dflash_sdpa_mask(
-                anchor_positions, block_keep_mask, seq_len, self.block_size, device, dtype=noise_embedding.dtype
-            )
+        )
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
@@ -310,14 +322,19 @@ class DominoTrainerModule(DFlashTrainerModule):
             attention_mask=dflash_attn_mask,
         )
 
-        # --- Labels: block position k predicts anchor + label_start + k ---
+        # --- Labels: block position k predicts anchor + label_start + k. The shared
+        # builder bounds labels at the sequence end and (under packing) at the
+        # anchor's document boundary, which shift_label's last label can cross.
         label_start = 1 if self.shift_label else 0
-        label_offsets = torch.arange(label_start, label_start + self.block_size, device=device).view(1, 1, -1)
-        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
-        valid_label_mask = label_indices < seq_len
-        safe_target_indices = label_indices.clamp(max=seq_len - 1)
-        n = anchor_positions.size(1)
-        target_ids = torch.gather(input_ids.unsqueeze(1).expand(-1, n, -1), 2, safe_target_indices)
+        _, target_ids, block_mask = self._build_block_targets(
+            input_ids,
+            loss_mask,
+            anchor_positions,
+            block_keep_mask,
+            seq_len,
+            label_start=label_start,
+            doc_remaining=doc_remaining,
+        )
 
         bsz, n, bs = target_ids.shape
         # A tensor-parallel target's lm_head is column-parallel and returns
@@ -337,14 +354,12 @@ class DominoTrainerModule(DFlashTrainerModule):
             target_ids=target_ids,
         ).reshape(bsz, n * bs, -1)
 
-        # --- Weight mask: block validity * bounds * (exclude anchor) * loss_mask ---
-        weight_mask = block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
-        weight_mask = weight_mask * valid_label_mask.float()
+        # --- Weight mask: ``block_mask`` (block validity * bounds * loss_mask),
+        # plus the anchor-position exclusion when labels are not shifted.
+        weight_mask = block_mask
         if not self.shift_label:
             pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
             weight_mask = weight_mask * (pos_in_block > 0).float()
-        gathered_loss_mask = torch.gather(loss_mask.unsqueeze(1).expand(-1, n, -1), 2, safe_target_indices)
-        weight_mask = weight_mask * gathered_loss_mask
 
         # Binary eval mask (pre-decay) for accuracy / acceptance-length stats. The
         # decay below rebinds weight_mask to a fresh tensor (out-of-place), so these
@@ -358,6 +373,7 @@ class DominoTrainerModule(DFlashTrainerModule):
             offset = 0 if self.shift_label else 1
             decay_weights = torch.exp(-(k - offset).clamp(min=0).float() / self.loss_decay_gamma)
             weight_mask = weight_mask * decay_weights
+        loss_weight = weight_mask.sum()
 
         loss, final_loss, base_loss = self._compute_weighted_losses(
             final_logits=final_logits,
@@ -373,14 +389,14 @@ class DominoTrainerModule(DFlashTrainerModule):
             flat_targets = target_ids.reshape(-1)
             pred_ids = torch.argmax(flat_logits, dim=-1)
             correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
-            actual_token_count = binary_eval_mask.sum() + 1e-6
-            accuracy = correct.sum().float() / actual_token_count
+            valid_tokens = binary_eval_mask.sum()
+            correct_tokens = correct.sum()
+            accuracy = correct_tokens.float() / valid_tokens.clamp_min(1).float()
             metrics = self._compute_extra_metrics(
                 pred_ids=pred_ids,
                 flat_base_logits=flat_base_logits,
                 flat_targets=flat_targets,
                 binary_eval_mask=binary_eval_mask,
-                actual_token_count=actual_token_count,
                 target_ids=target_ids,
                 eval_weight_mask=eval_weight_mask,
                 final_loss=final_loss,
@@ -390,12 +406,18 @@ class DominoTrainerModule(DFlashTrainerModule):
 
         return DominoStepMetrics(
             loss=loss,
+            loss_weight=loss_weight.detach(),
             accuracy=accuracy.detach(),
-            valid_tokens=binary_eval_mask.sum().detach(),
+            valid_tokens=valid_tokens.detach(),
+            correct_tokens=correct_tokens.detach(),
+            accept_len=metrics["accept_len"],
+            accept_len_sum=metrics["accept_len_sum"],
+            valid_blocks=metrics["valid_blocks"],
             final_loss=metrics["final_loss"],
             base_loss=metrics["base_loss"],
             base_accuracy=metrics["base_accuracy"],
-            accept_len=metrics["accept_len"],
+            base_correct_tokens=metrics["base_correct_tokens"],
             base_accept_len=metrics["base_accept_len"],
+            base_accept_len_sum=metrics["base_accept_len_sum"],
             lambda_base=metrics["lambda_base"],
         )

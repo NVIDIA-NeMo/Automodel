@@ -41,6 +41,12 @@ model:
   trust_remote_code: true
   force_hf: true
 
+# Repair checkpoint input rows whose near-zero norm can produce extreme gradients
+# when those token IDs first occur during continued pretraining.
+embedding_row_repair:
+  min_norm: 1.0e-4
+  max_rows: 256
+
 compile:
   enabled: false
   mode: "default" # Options: "default", "reduce-overhead", "max-autotune"
@@ -94,4 +100,17 @@ lr_scheduler:
 
 ci:
   recipe_owner: adil-a
+  time: "00:20:00"
   known_issue_id: AM-153
+  checkpoint_robustness:
+    check_source_load_parity: true
+    kl_threshold: 5e-3
+    hf_kl_threshold: 5e-3
+    source_load_kl_threshold: 5e-3
+    source_load_cosine_threshold: 0.9995
+    tokenizer_name: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+    trust_remote_code: true
+    hf_device_map_auto: true
+    no_check_resume: true
+    dataset.limit_dataset_samples: 500
+    validation_dataset.limit_dataset_samples: 500

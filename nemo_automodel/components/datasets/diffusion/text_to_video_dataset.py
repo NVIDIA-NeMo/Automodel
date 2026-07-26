@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
 
@@ -38,6 +41,26 @@ def collate_optional_video_fields(batch: List[Dict], result: dict) -> None:
     for key in VIDEO_OPTIONAL_FIELDS:
         if key in batch[0]:
             result[key] = torch.cat([item[key] for item in batch], dim=0)
+
+
+@dataclass
+class TextToVideoDatasetConfig:
+    """Construction-time configuration for :class:`TextToVideoDataset`."""
+
+    cache_dir: str
+    """Directory containing preprocessed cache (metadata.json + shards + WxH/*.meta)."""
+    model_type: str = "wan"
+    """Model type for model-specific fields (e.g. 'wan', 'hunyuan')."""
+    device: str = "cpu"
+    """Device to load tensors to."""
+
+    def build(self) -> "TextToVideoDataset":
+        """Build a :class:`TextToVideoDataset` from this :class:`TextToVideoDatasetConfig`."""
+        return TextToVideoDataset(
+            cache_dir=self.cache_dir,
+            model_type=self.model_type,
+            device=self.device,
+        )
 
 
 class TextToVideoDataset(BaseMultiresolutionDataset):

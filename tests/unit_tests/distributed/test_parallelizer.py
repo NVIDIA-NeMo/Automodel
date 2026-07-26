@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 import torch
@@ -36,6 +37,7 @@ from nemo_automodel.components.distributed.parallelizer import (
     _extract_model_layers,
     _filter_layer_groups_for_activation_checkpointing,
     _get_parallel_plan,
+    _megatron_fsdp_compat_kwargs,
     _update_attention_head_counts_for_tp,
     apply_fsdp2_sharding_recursively,
     get_hf_tp_shard_plan,
@@ -390,19 +392,80 @@ def mock_optimized_tp_plans(monkeypatch):
         yield mock_plans
 
 
+class FakeMegatronFSDPMixedPrecisionPolicy:
+    """Stand-in for megatron_fsdp.MixedPrecisionPolicy (megatron-fsdp==0.5.0)."""
+
+    def __init__(self, *, main_params_dtype, main_grads_dtype, grad_comm_dtype):
+        self.main_params_dtype = main_params_dtype
+        self.main_grads_dtype = main_grads_dtype
+        self.grad_comm_dtype = grad_comm_dtype
+
+
 class TestMegatronFSDPStrategyParallelize:
     """Test suite for megatron_fsdp_strategy_parallelize function."""
 
     @pytest.fixture
     def mock_megatron_fsdp_env(self, monkeypatch):
-        """Mock Megatron FSDP environment and dependencies."""
+        """Mock Megatron FSDP environment and dependencies (megatron-fsdp==0.5.0 API)."""
+
+        def fully_shard_050(
+            *,
+            module,
+            optimizer,
+            fsdp_unit_modules,
+            device_mesh,
+            dp_shard_dim,
+            tp_dim,
+            zero_dp_strategy,
+            init_model_with_meta_device,
+            mixed_precision_policy,
+            overlap_grad_reduce,
+            overlap_param_gather,
+            report_nan_in_param_grad,
+            average_in_collective,
+            disable_bucketing,
+            calculate_per_token_loss,
+            keep_fp8_transpose_cache,
+            nccl_ub,
+            fsdp_double_buffer,
+        ):
+            del (
+                module,
+                optimizer,
+                fsdp_unit_modules,
+                device_mesh,
+                dp_shard_dim,
+                tp_dim,
+                zero_dp_strategy,
+                init_model_with_meta_device,
+                mixed_precision_policy,
+                overlap_grad_reduce,
+                overlap_param_gather,
+                report_nan_in_param_grad,
+                average_in_collective,
+                disable_bucketing,
+                calculate_per_token_loss,
+                keep_fp8_transpose_cache,
+                nccl_ub,
+                fsdp_double_buffer,
+            )
+
         # Mock megatron_fsdp module
         megatron_fsdp_mock = SimpleNamespace()
-        megatron_fsdp_mock.fully_shard = MagicMock(return_value=(MagicMock(), None))
+        megatron_fsdp_mock.fully_shard = create_autospec(
+            fully_shard_050,
+            return_value=(MagicMock(), None),
+        )
 
         # Mock HAVE_MEGATRON_FSDP flag
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.HAVE_MEGATRON_FSDP", True, raising=False
+        )
+        monkeypatch.setattr(
+            parallelizer,
+            "MegatronFSDPMixedPrecisionPolicy",
+            FakeMegatronFSDPMixedPrecisionPolicy,
+            raising=True,
         )
         monkeypatch.setattr(
             "nemo_automodel.components.distributed.parallelizer.megatron_fsdp_fully_shard",
@@ -425,7 +488,6 @@ class TestMegatronFSDPStrategyParallelize:
             import_classes_mock,
             raising=False,
         )
-
         return {
             "megatron_fsdp": megatron_fsdp_mock,
             "parallelize_module": parallelize_module_mock,
@@ -445,6 +507,7 @@ class TestMegatronFSDPStrategyParallelize:
             model=model,
             device_mesh=mesh,
             optimizer=optimizer,
+            megatron_fsdp_unit_modules=["dummy.MockLayer"],
         )
 
         # Verify megatron_fsdp_fully_shard was called with default mesh names
@@ -452,6 +515,49 @@ class TestMegatronFSDPStrategyParallelize:
         call_kwargs = mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.call_args[1]
         assert call_kwargs["dp_shard_dim"] == "dp"
         assert call_kwargs["tp_dim"] == "tp"
+
+    def test_explicit_unit_modules_take_precedence_over_derivation(
+        self, mock_device_mesh_megatron_fsdp, mock_megatron_fsdp_env, monkeypatch
+    ):
+        """When the config specifies unit modules, they are imported and derivation is skipped."""
+        mesh, _dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_megatron_fsdp
+        tp_mesh.size.return_value = 1
+        cp_mesh.size.return_value = 1
+
+        derive_spy = MagicMock(side_effect=AssertionError("derivation must not run when unit modules are explicit"))
+        monkeypatch.setattr(parallelizer, "_derive_megatron_fsdp_unit_modules", derive_spy, raising=True)
+
+        megatron_fsdp_strategy_parallelize(
+            model=MockModel(),
+            device_mesh=mesh,
+            optimizer=MagicMock(),
+            megatron_fsdp_unit_modules=["dummy.MockLayer"],
+        )
+
+        mock_megatron_fsdp_env["import_classes"].assert_called_once_with(["dummy.MockLayer"])
+        derive_spy.assert_not_called()
+
+    def test_unit_modules_are_derived_when_not_specified(
+        self, mock_device_mesh_megatron_fsdp, mock_megatron_fsdp_env, monkeypatch
+    ):
+        """When no unit modules are configured, they are derived and forwarded to fully_shard."""
+        mesh, _dp_mesh, tp_mesh, cp_mesh = mock_device_mesh_megatron_fsdp
+        tp_mesh.size.return_value = 1
+        cp_mesh.size.return_value = 1
+
+        derive_spy = MagicMock(return_value=[nn.Linear])
+        monkeypatch.setattr(parallelizer, "_derive_megatron_fsdp_unit_modules", derive_spy, raising=True)
+
+        megatron_fsdp_strategy_parallelize(
+            model=MockModel(),
+            device_mesh=mesh,
+            optimizer=MagicMock(),
+        )
+
+        derive_spy.assert_called_once()
+        mock_megatron_fsdp_env["import_classes"].assert_not_called()
+        call_kwargs = mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.call_args[1]
+        assert call_kwargs["fsdp_unit_modules"] == [nn.Linear]
 
     def test_megatron_fsdp_with_custom_mesh_names(self, mock_megatron_fsdp_env):
         """Test Megatron FSDP with custom mesh names."""
@@ -487,6 +593,7 @@ class TestMegatronFSDPStrategyParallelize:
             optimizer=optimizer,
             dp_shard_dim="my_dp",
             tp_dim="my_tp",
+            megatron_fsdp_unit_modules=["dummy.MockLayer"],
         )
 
         # Verify megatron_fsdp_fully_shard was called with custom mesh names
@@ -533,6 +640,7 @@ class TestMegatronFSDPStrategyParallelize:
             optimizer=optimizer,
             dp_shard_dim="dp_cp",
             tp_dim="tp_mesh",
+            megatron_fsdp_unit_modules=["dummy.MockLayer"],
         )
 
         # Verify megatron_fsdp_fully_shard was called with dp_cp_mesh_name set correctly
@@ -556,6 +664,269 @@ class TestMegatronFSDPStrategyParallelize:
                 model=model,
                 device_mesh=mesh,
             )
+
+    @pytest.mark.parametrize("grad_reduce_in_fp32", [False, True])
+    @pytest.mark.parametrize("preserve_fp32_weights", [False, True])
+    @pytest.mark.parametrize("check_for_nan_in_grad", [False, True])
+    @pytest.mark.parametrize("report_nan_in_param_grad", [False, True])
+    def test_megatron_fsdp_precision_controls_translate_to_050_api(
+        self,
+        monkeypatch,
+        grad_reduce_in_fp32,
+        preserve_fp32_weights,
+        check_for_nan_in_grad,
+        report_nan_in_param_grad,
+    ):
+        def fully_shard_050(*, mixed_precision_policy, report_nan_in_param_grad):
+            del mixed_precision_policy, report_nan_in_param_grad
+
+        monkeypatch.setattr(
+            parallelizer,
+            "MegatronFSDPMixedPrecisionPolicy",
+            FakeMegatronFSDPMixedPrecisionPolicy,
+            raising=True,
+        )
+        kwargs = _megatron_fsdp_compat_kwargs(
+            fully_shard_050,
+            grad_reduce_in_fp32=grad_reduce_in_fp32,
+            preserve_fp32_weights=preserve_fp32_weights,
+            check_for_nan_in_grad=check_for_nan_in_grad,
+            report_nan_in_param_grad=report_nan_in_param_grad,
+        )
+
+        assert set(kwargs) == {
+            "mixed_precision_policy",
+            "report_nan_in_param_grad",
+        }
+        policy = kwargs["mixed_precision_policy"]
+        assert policy.main_params_dtype is (torch.float32 if preserve_fp32_weights else None)
+        assert policy.main_grads_dtype is (torch.float32 if grad_reduce_in_fp32 else None)
+        assert policy.grad_comm_dtype is None
+        assert kwargs["report_nan_in_param_grad"] is report_nan_in_param_grad
+
+    def test_megatron_fsdp_legacy_precision_api_fails_loudly(self):
+        """Pre-0.5.0 fully_shard signatures are unsupported and must not be translated."""
+
+        def legacy_fully_shard(
+            *,
+            grad_reduce_in_fp32,
+            preserve_fp32_weights,
+            check_for_nan_in_grad,
+        ):
+            del grad_reduce_in_fp32, preserve_fp32_weights, check_for_nan_in_grad
+
+        with pytest.raises(RuntimeError, match=r"requires megatron-fsdp==0\.5\.0"):
+            _megatron_fsdp_compat_kwargs(
+                legacy_fully_shard,
+                grad_reduce_in_fp32=True,
+                preserve_fp32_weights=False,
+                check_for_nan_in_grad=True,
+                report_nan_in_param_grad=False,
+            )
+
+    def test_megatron_fsdp_missing_mixed_precision_policy_fails_loudly(self, monkeypatch):
+        """When MixedPrecisionPolicy is unavailable, constructing it names the required version."""
+        from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
+
+        placeholder = UnavailableMeta(
+            "MixedPrecisionPolicy", (), {"_msg": parallelizer._MEGATRON_FSDP_050_REQUIRED_MSG}
+        )
+        monkeypatch.setattr(parallelizer, "MegatronFSDPMixedPrecisionPolicy", placeholder, raising=True)
+
+        def fully_shard_050(*, mixed_precision_policy, report_nan_in_param_grad):
+            del mixed_precision_policy, report_nan_in_param_grad
+
+        with pytest.raises(UnavailableError, match=r"requires megatron-fsdp==0\.5\.0"):
+            _megatron_fsdp_compat_kwargs(
+                fully_shard_050,
+                grad_reduce_in_fp32=False,
+                preserve_fp32_weights=False,
+                check_for_nan_in_grad=False,
+                report_nan_in_param_grad=False,
+            )
+
+    def test_megatron_fsdp_dp1_skips_wrapper(self, mock_megatron_fsdp_env):
+        """dp==1 (e.g. world=2, tp=2) returns the TP-only model without fully_shard."""
+        mesh = MagicMock(spec=DeviceMesh)
+        mesh.device_type = "cpu"
+        dp_mesh = MagicMock()
+        tp_mesh = MagicMock()
+        dp_mesh.size.return_value = 1
+        tp_mesh.size.return_value = 2
+        dp_mesh.ndim = 1
+        tp_mesh.ndim = 1
+        mesh.__getitem__.side_effect = lambda key: {"dp": dp_mesh, "tp": tp_mesh}[key]
+
+        model = MockModel()
+        optimizer = MagicMock()
+
+        result_model, result_optimizer = megatron_fsdp_strategy_parallelize(
+            model=model,
+            device_mesh=mesh,
+            optimizer=optimizer,
+            tp_shard_plan={},
+        )
+
+        mock_megatron_fsdp_env["megatron_fsdp"].fully_shard.assert_not_called()
+        mock_megatron_fsdp_env["parallelize_module"].assert_called_once()
+        assert result_model is model
+        assert result_optimizer is optimizer
+
+    def test_megatron_fsdp_warns_once_when_nan_check_is_dropped(self, monkeypatch, caplog):
+        """megatron-fsdp 0.5.0 has no buffer-level NaN check; dropping it warns exactly once."""
+
+        def fully_shard_050(*, mixed_precision_policy, report_nan_in_param_grad):
+            del mixed_precision_policy, report_nan_in_param_grad
+
+        monkeypatch.setattr(
+            parallelizer,
+            "MegatronFSDPMixedPrecisionPolicy",
+            FakeMegatronFSDPMixedPrecisionPolicy,
+            raising=True,
+        )
+        monkeypatch.setattr(parallelizer, "_megatron_fsdp_nan_check_noop_warned", False, raising=True)
+
+        def modern_kwargs(check_for_nan_in_grad):
+            return _megatron_fsdp_compat_kwargs(
+                fully_shard_050,
+                grad_reduce_in_fp32=False,
+                preserve_fp32_weights=False,
+                check_for_nan_in_grad=check_for_nan_in_grad,
+                report_nan_in_param_grad=False,
+            )
+
+        with caplog.at_level(logging.WARNING, logger="nemo_automodel.components.distributed.parallelizer"):
+            modern_kwargs(check_for_nan_in_grad=False)
+            assert not [record for record in caplog.records if "check_for_nan_in_grad" in record.getMessage()]
+
+            modern_kwargs(check_for_nan_in_grad=True)
+            modern_kwargs(check_for_nan_in_grad=True)
+
+        dropped_warnings = [record for record in caplog.records if "check_for_nan_in_grad" in record.getMessage()]
+        assert len(dropped_warnings) == 1
+        assert dropped_warnings[0].levelno == logging.WARNING
+        message = dropped_warnings[0].getMessage()
+        assert "report_nan_in_param_grad" in message
+        # The warning must make the breaking behavior loud: NaN checking is now off.
+        assert "no-op" in message
+        assert "DISABLED" in message
+
+    def test_megatron_fsdp_unknown_precision_api_fails_closed(self):
+        def unknown_fully_shard(**kwargs):
+            del kwargs
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"unsupported Megatron-FSDP fully_shard API: NeMo Automodel requires megatron-fsdp==0\.5\.0",
+        ):
+            _megatron_fsdp_compat_kwargs(
+                unknown_fully_shard,
+                grad_reduce_in_fp32=False,
+                preserve_fp32_weights=False,
+                check_for_nan_in_grad=False,
+                report_nan_in_param_grad=False,
+            )
+
+    @pytest.mark.parametrize("with_optimizer", [False, True])
+    def test_megatron_fsdp_current_strict_signature_for_model_and_optimizer_paths(
+        self,
+        monkeypatch,
+        mock_device_mesh_megatron_fsdp,
+        mock_megatron_fsdp_env,
+        with_optimizer,
+    ):
+        calls = []
+
+        class ShardedModel:
+            def __init__(self):
+                self.replaced = False
+
+            def _replace_param_with_distributed_if_needed(self):
+                self.replaced = True
+
+        def record_modern_call(
+            *,
+            module,
+            fsdp_unit_modules,
+            device_mesh,
+            dp_shard_dim,
+            tp_dim,
+            zero_dp_strategy,
+            init_model_with_meta_device,
+            mixed_precision_policy,
+            overlap_grad_reduce,
+            overlap_param_gather,
+            report_nan_in_param_grad,
+            average_in_collective,
+            disable_bucketing,
+            calculate_per_token_loss,
+            keep_fp8_transpose_cache,
+            nccl_ub,
+            fsdp_double_buffer,
+        ):
+            calls.append(locals())
+            return ShardedModel()
+
+        def record_modern_call_with_optimizer(
+            *,
+            module,
+            optimizer,
+            fsdp_unit_modules,
+            device_mesh,
+            dp_shard_dim,
+            tp_dim,
+            zero_dp_strategy,
+            init_model_with_meta_device,
+            mixed_precision_policy,
+            overlap_grad_reduce,
+            overlap_param_gather,
+            report_nan_in_param_grad,
+            average_in_collective,
+            disable_bucketing,
+            calculate_per_token_loss,
+            keep_fp8_transpose_cache,
+            nccl_ub,
+            fsdp_double_buffer,
+        ):
+            calls.append(locals())
+            return ShardedModel(), optimizer
+
+        monkeypatch.setattr(
+            parallelizer,
+            "megatron_fsdp_fully_shard_model",
+            record_modern_call,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            parallelizer,
+            "megatron_fsdp_fully_shard",
+            record_modern_call_with_optimizer,
+            raising=False,
+        )
+
+        mesh, *_ = mock_device_mesh_megatron_fsdp
+        optimizer = object() if with_optimizer else None
+        result_model, result_optimizer = megatron_fsdp_strategy_parallelize(
+            model=MockModel(),
+            device_mesh=mesh,
+            optimizer=optimizer,
+            megatron_fsdp_unit_modules=["dummy.MockLayer"],
+            grad_reduce_in_fp32=True,
+            preserve_fp32_weights=False,
+            check_for_nan_in_grad=True,
+            report_nan_in_param_grad=False,
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["mixed_precision_policy"].main_params_dtype is None
+        assert calls[0]["mixed_precision_policy"].main_grads_dtype is torch.float32
+        assert calls[0]["mixed_precision_policy"].grad_comm_dtype is None
+        assert calls[0]["report_nan_in_param_grad"] is False
+        assert result_optimizer is optimizer
+        if with_optimizer:
+            assert calls[0]["optimizer"] is optimizer
+        else:
+            assert result_model.replaced is True
 
 
 class TestUtilityFunctions:
@@ -759,6 +1130,42 @@ class TestGetHfTpShardPlan:
         with pytest.raises(ValueError, match="Unknown parallel style"):
             get_hf_tp_shard_plan(model)
 
+    @staticmethod
+    def _bare_gemma3():
+        """Gemma3 instance with exact class identity but no HF ``__init__``."""
+        model = Gemma3ForConditionalGeneration.__new__(Gemma3ForConditionalGeneration)
+        nn.Module.__init__(model)
+        return model
+
+    def test_gemma3_pre_standardization_tree_uses_language_model_prefix(self):
+        """Old Gemma3 (transformers <= 4.51) hangs the text tower off a top-level
+        ``language_model``; the prefix must follow the registered child module,
+        not a transformers version gate.
+        """
+        model = self._bare_gemma3()
+        language_model = nn.Module()
+        language_model._tp_plan = {"model.layers.0.self_attn.q_proj": "colwise"}
+        model.language_model = language_model
+
+        result = get_hf_tp_shard_plan(model)
+
+        assert isinstance(result["language_model.model.layers.0.self_attn.q_proj"], ColwiseParallel)
+        assert "language_model.embed_tokens" in result
+
+    def test_gemma3_standardized_tree_uses_model_prefix(self):
+        """Standardized Gemma3 (transformers >= 4.52, incl. v5) nests everything
+        under ``model``; the prefix must resolve structurally to ``model``.
+        """
+        model = self._bare_gemma3()
+        inner = nn.Module()
+        inner._tp_plan = {"language_model.layers.0.self_attn.q_proj": "colwise"}
+        model.model = inner
+
+        result = get_hf_tp_shard_plan(model)
+
+        assert isinstance(result["model.language_model.layers.0.self_attn.q_proj"], ColwiseParallel)
+        assert "model.embed_tokens" in result
+
 
 class TestApplyFsdpShardingRecursively:
     """Test class for apply_fsdp2_sharding_recursively utility function."""
@@ -786,6 +1193,7 @@ class TestApplyFsdpShardingRecursively:
     def mock_mesh(self):
         """Create a mock device mesh."""
         mesh = MagicMock(spec=DeviceMesh)
+        mesh.mesh_dim_names = ("dp", "tp")
         return mesh
 
     @pytest.fixture
@@ -1402,7 +1810,13 @@ class TestActivationCheckpointingKVSharing:
             lambda mesh, *a, **kw: MagicMock(),
         )
 
-    def _run_parallelize(self, model, activation_checkpointing=True, activation_checkpointing_scope="all"):
+    def _run_parallelize(
+        self,
+        model,
+        activation_checkpointing=True,
+        activation_checkpointing_scope="all",
+        enable_compile=False,
+    ):
         """Invoke the strategy under test and return the model."""
         from nemo_automodel.components.distributed.parallelizer import DefaultParallelizationStrategy
 
@@ -1416,6 +1830,7 @@ class TestActivationCheckpointingKVSharing:
             device_mesh=mesh,
             activation_checkpointing=activation_checkpointing,
             activation_checkpointing_scope=activation_checkpointing_scope,
+            enable_compile=enable_compile,
         )
 
     # ------------------------------------------------------------------ #
@@ -1484,6 +1899,24 @@ class TestActivationCheckpointingKVSharing:
             assert isinstance(layer.self_attn, self._Wrapped), (
                 "self_attn should be checkpoint-wrapped for standard models"
             )
+
+    def test_linear_attn_wrapped_with_compile(self):
+        """Compile-compatible checkpointing wraps hybrid blocks' ``linear_attn`` mixers."""
+
+        class _LinearAttentionLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear_attn = nn.Linear(16, 16)
+                self.mlp = nn.Linear(16, 16)
+
+        model = _make_model_for_ac(num_kv_shared_layers=0)
+        model.model.layers = nn.ModuleList([_LinearAttentionLayer() for _ in range(2)])
+
+        self._run_parallelize(model, enable_compile=True)
+
+        for layer in model.model.layers:
+            assert isinstance(layer.linear_attn, self._Wrapped)
+            assert isinstance(layer.mlp, self._Wrapped)
 
     def test_mlp_always_wrapped(self):
         """MLP is checkpoint-wrapped regardless of KV sharing."""
@@ -2221,11 +2654,70 @@ class TestExtractModelLayers:
         assert len(result) == 4
         assert all(r is layers[i] for i, r in enumerate(result))
 
-    def test_multi_fqn_flattens_each_modulelist(self):
-        """Qwen2.5-VL entry ``["language_model.layers", "visual.blocks"]``.
+    def _attach_qwen_vl_towers(self, model, lang, vis, *, nested):
+        """Attach Qwen2-VL-style towers for one historical tree shape.
 
-        Both FQNs resolve to ModuleLists; both must be flattened so all decoder
-        and vision blocks appear as individual elements in the final list.
+        ``nested=True`` builds the standardized tree (transformers >= 4.52,
+        incl. v5): ``model.language_model.layers`` + ``model.visual.blocks``.
+        ``nested=False`` builds the pre-standardization tree (<= 4.51):
+        ``model.layers`` + top-level ``visual.blocks``.
+        """
+        visual = nn.Module()
+        visual.blocks = vis
+        if nested:
+            language_model = nn.Module()
+            language_model.layers = lang
+            inner = nn.Module()
+            inner.language_model = language_model
+            inner.visual = visual
+            model.model = inner
+        else:
+            text_model = nn.Module()
+            text_model.layers = lang
+            model.model = text_model
+            model.visual = visual
+
+    @staticmethod
+    def _attach_language_vision_towers(model, lang, vis, *, shape):
+        """Attach Gemma3/Llava-style towers for one historical tree ``shape``.
+
+        ``"pre_standardization"`` (<= 4.51): ``language_model.model.layers`` +
+        ``vision_tower.vision_model.encoder.layers``.
+        ``"standardized_v4"`` (4.52-4.x): ``model.language_model.layers`` +
+        ``model.vision_tower.vision_model.encoder.layers``.
+        ``"v5"`` (>= 5.0): ``model.language_model.layers`` +
+        ``model.vision_tower.encoder.layers`` (flattened tower).
+        """
+        if shape == "pre_standardization":
+            language_model = nn.Module()
+            language_model.model = nn.Module()
+            language_model.model.layers = lang
+            vision_tower = nn.Module()
+            vision_tower.vision_model = nn.Module()
+            vision_tower.vision_model.encoder = nn.Module()
+            vision_tower.vision_model.encoder.layers = vis
+            model.language_model = language_model
+            model.vision_tower = vision_tower
+            return
+        inner = nn.Module()
+        inner.language_model = nn.Module()
+        inner.language_model.layers = lang
+        inner.vision_tower = nn.Module()
+        if shape == "standardized_v4":
+            inner.vision_tower.vision_model = nn.Module()
+            inner.vision_tower.vision_model.encoder = nn.Module()
+            inner.vision_tower.vision_model.encoder.layers = vis
+        else:  # v5: flattened tower, no inner `vision_model`.
+            inner.vision_tower.encoder = nn.Module()
+            inner.vision_tower.encoder.layers = vis
+        model.model = inner
+
+    def test_multi_fqn_flattens_each_modulelist(self):
+        """Qwen2.5-VL pre-standardization tree (``model.layers`` + ``visual.blocks``).
+
+        Both groups resolve to ModuleLists; both must be flattened so all
+        decoder and vision blocks appear as individual elements in the final
+        list.
         """
         from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
             Qwen2_5_VLForConditionalGeneration,
@@ -2234,12 +2726,7 @@ class TestExtractModelLayers:
         model = self._bare_instance(Qwen2_5_VLForConditionalGeneration)
         lang = self._make_layers(5)
         vis = self._make_layers(2)
-        language_model = nn.Module()
-        language_model.layers = lang
-        model.language_model = language_model
-        visual = nn.Module()
-        visual.blocks = vis
-        model.visual = visual
+        self._attach_qwen_vl_towers(model, lang, vis, nested=False)
 
         result = _extract_model_layers(model)
 
@@ -2247,6 +2734,139 @@ class TestExtractModelLayers:
         assert [id(r) for r in result[:5]] == [id(item) for item in lang]
         assert [id(r) for r in result[5:]] == [id(item) for item in vis]
         assert not any(isinstance(r, nn.ModuleList) for r in result)
+
+    @pytest.mark.parametrize("nested", [False, True], ids=["pre_standardization", "standardized"])
+    def test_qwen2_vl_tree_shapes_extract_language_and_vision_groups(self, nested):
+        """Every historical Qwen2-VL tree must resolve structurally, no version gate.
+
+        Pre-standardization (verified transformers 4.51.3): ``model.layers`` +
+        ``visual.blocks``. Standardized (verified 4.57.1/5.8.1/5.12.1):
+        ``model.language_model.layers`` + ``model.visual.blocks``. Version-gated
+        FQNs picked the wrong tree for parts of the 4.x line and silently
+        disabled activation checkpointing.
+        """
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+            Qwen2_5_VLForConditionalGeneration,
+        )
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        for cls in (Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration):
+            model = self._bare_instance(cls)
+            lang = self._make_layers(3)
+            vis = self._make_layers(2)
+            self._attach_qwen_vl_towers(model, lang, vis, nested=nested)
+
+            groups = _extract_model_layer_groups(model)
+
+            assert set(groups) == {"language", "vision"}, cls.__name__
+            assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+            assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    def test_qwen2_vl_deprecation_aliases_do_not_double_count_layers(self):
+        """Standardized 4.x keeps deprecated top-level ``visual``/``language_model``
+        aliases for the nested towers; first-match resolution must count each
+        layer exactly once even when the historical FQN also resolves.
+        """
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        model = self._bare_instance(Qwen2VLForConditionalGeneration)
+        lang = self._make_layers(3)
+        vis = self._make_layers(2)
+        self._attach_qwen_vl_towers(model, lang, vis, nested=True)
+        # Simulate the transformers 4.52-4.x deprecation aliases: the same
+        # towers are reachable at the historical top-level paths too.
+        model.visual = model.model.visual
+        model.language_model = model.model.language_model
+
+        groups = _extract_model_layer_groups(model)
+
+        assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+        assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    @pytest.mark.parametrize("shape", ["pre_standardization", "standardized_v4", "v5"])
+    def test_gemma3_tree_shapes_extract_language_and_vision_groups(self, shape):
+        """Every historical Gemma3 tree must resolve structurally, no version gate.
+
+        Shapes verified by meta-instantiation: ``language_model.model.layers`` +
+        ``vision_tower.vision_model.encoder.layers`` on 4.51.3,
+        ``model.language_model.layers`` +
+        ``model.vision_tower.vision_model.encoder.layers`` on 4.57.1, and
+        ``model.language_model.layers`` + ``model.vision_tower.encoder.layers``
+        on 5.8.1/5.12.1.
+        """
+        model = self._bare_instance(Gemma3ForConditionalGeneration)
+        lang = self._make_layers(3)
+        vis = self._make_layers(2)
+        self._attach_language_vision_towers(model, lang, vis, shape=shape)
+
+        groups = _extract_model_layer_groups(model)
+
+        assert set(groups) == {"language", "vision"}
+        assert [id(m) for m in groups["language"]] == [id(item) for item in lang]
+        assert [id(m) for m in groups["vision"]] == [id(item) for item in vis]
+
+    @pytest.mark.parametrize("shape", ["pre_standardization", "standardized_v4", "v5"])
+    def test_llava_tree_shapes_extract_language_and_vision_groups(self, shape):
+        """Llava-family trees share the Gemma3 lineage (CLIP instead of SigLIP);
+        each historical shape must resolve structurally for every Llava class.
+        """
+        from transformers.models.llava.modeling_llava import LlavaForConditionalGeneration
+        from transformers.models.llava_next.modeling_llava_next import (
+            LlavaNextForConditionalGeneration,
+        )
+        from transformers.models.llava_next_video.modeling_llava_next_video import (
+            LlavaNextVideoForConditionalGeneration,
+        )
+        from transformers.models.llava_onevision.modeling_llava_onevision import (
+            LlavaOnevisionForConditionalGeneration,
+        )
+
+        for cls in (
+            LlavaForConditionalGeneration,
+            LlavaNextForConditionalGeneration,
+            LlavaNextVideoForConditionalGeneration,
+            LlavaOnevisionForConditionalGeneration,
+        ):
+            model = self._bare_instance(cls)
+            lang = self._make_layers(3)
+            vis = self._make_layers(2)
+            self._attach_language_vision_towers(model, lang, vis, shape=shape)
+
+            groups = _extract_model_layer_groups(model)
+
+            assert set(groups) == {"language", "vision"}, cls.__name__
+            assert [id(m) for m in groups["language"]] == [id(item) for item in lang], cls.__name__
+            assert [id(m) for m in groups["vision"]] == [id(item) for item in vis], cls.__name__
+
+    def test_spec_resolving_no_modules_warns_and_returns_empty(self, caplog):
+        """A mapped model class whose spec FQNs all fail to resolve must warn.
+
+        This is the transformers-version-drift failure mode: extraction used to
+        return ``{}`` silently and activation checkpointing became a no-op.
+        """
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLForConditionalGeneration,
+        )
+
+        # A tree that matches no known Qwen2-VL shape: top-level
+        # `language_model.layers` (never a registered module path for this
+        # class; it only ever existed as a deprecation alias).
+        model = self._bare_instance(Qwen2VLForConditionalGeneration)
+        language_model = nn.Module()
+        language_model.layers = self._make_layers(2)
+        model.language_model = language_model
+
+        with caplog.at_level("WARNING", logger=parallelizer.logger.name):
+            groups = _extract_model_layer_groups(model)
+
+        assert groups == {}
+        assert "Qwen2VLForConditionalGeneration" in caplog.text
+        assert "model.language_model.layers" in caplog.text
+        assert "model.visual.blocks" in caplog.text
 
     def test_moduledict_layer_container_flattens(self):
         """PP post-split: ``_reduce_attrs`` returns a ModuleDict.

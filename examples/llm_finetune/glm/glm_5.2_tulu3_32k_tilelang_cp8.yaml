@@ -110,3 +110,9 @@ optimizer:
 #   project: <your_wandb_project>
 #   entity: <your_wandb_entity>
 #   name: <your_wandb_exp_name>
+
+ci:
+  # 32k CP8 reaches the divisibility floor at 32 nodes, but needs 64 nodes to avoid OOM.
+  recipe_owner: huiyingl
+  nodes: 64
+  time: "01:00:00"

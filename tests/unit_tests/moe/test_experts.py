@@ -1811,6 +1811,46 @@ class TestGroupedExpertsTE:
             assert experts.gate_up_linear.out_features == config.moe_inter_dim
             assert experts.gate_up_linear.num_gemms == config.n_routed_experts // 2
 
+    def test_grouped_experts_te_zero_routed_tokens_grads_all_local_experts(self, te_moe_config):
+        """All local expert params must get (zero) grads when no tokens are routed locally.
+
+        Grouped GEMM produces explicit zero gradients for every local expert.
+        The zero-token fallback must do the same: a parameter left with
+        ``grad=None`` skips momentum decay, decoupled weight decay, and its
+        optimizer step, so its optimizer state silently diverges from ranks
+        that did receive tokens.
+        """
+        from nemo_automodel.components.moe.experts import GroupedExpertsTE
+
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        experts = GroupedExpertsTE(te_moe_config)
+        self._materialize_weights(experts, device)
+
+        num_tokens = 4
+        x = torch.randn(num_tokens, te_moe_config.dim, dtype=te_moe_config.dtype, device=device)
+        token_mask = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        weights = torch.rand(num_tokens, te_moe_config.n_activated_experts, device=device)
+        indices = torch.zeros(num_tokens, te_moe_config.n_activated_experts, dtype=torch.long, device=device)
+
+        # Simulate an EP step where the dispatcher hands this rank zero tokens.
+        empty_hidden = torch.zeros(0, te_moe_config.dim, dtype=te_moe_config.dtype, device=device)
+        empty_probs = torch.zeros(0, dtype=te_moe_config.dtype, device=device)
+        zero_splits = [0] * te_moe_config.n_routed_experts
+        dispatcher = Mock()
+        dispatcher.token_permutation2 = Mock(return_value=(empty_hidden, zero_splits, empty_probs))
+        dispatcher.token_unpermutation = Mock(side_effect=lambda output: output)
+        experts.token_dispatcher = dispatcher
+        experts.ep_size = 1
+
+        y = experts(x, token_mask, weights, indices)
+        y.sum().backward()
+
+        params = list(experts.gate_up_linear.parameters()) + list(experts.down_linear.parameters())
+        assert len(params) == 2 * te_moe_config.n_routed_experts
+        for param in params:
+            assert param.grad is not None, "expert parameter received no gradient in the zero-token fallback"
+            assert torch.count_nonzero(param.grad) == 0
+
 
 class TestPermuteTokensForGroupedMM:
     """Test _permute_tokens_for_grouped_mm helper function."""
