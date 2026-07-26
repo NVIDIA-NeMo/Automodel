@@ -410,6 +410,8 @@ def apply_ac(
             whole-decoder-block behavior. ``"mlp"`` checkpoints only the
             feed-forward/MoE path with the same router-save policy. Attention
             submodule checkpointing uses the dense selective AC save policy.
+            ``"shared_experts"`` checkpoints only the dense shared-expert MLP
+            nested under MoE blocks.
 
     Trainable VLM vision-tower blocks selected by the scope get the same per-submodule
     wrapping (attention/MLP/norms) as the generic FSDP2/DDP path, with the SDPA backend
@@ -565,7 +567,18 @@ def apply_ac(
                 return 1
             return 0
 
-        wrapped_counts = {"mlp": 0, "attention": 0, "norm": 0}
+        def _checkpoint_shared_experts(block: nn.Module) -> int:
+            mlp = getattr(block, "mlp", None)
+            mlp = getattr(mlp, "_checkpoint_wrapped_module", mlp)
+            shared_experts = getattr(mlp, "shared_experts", None)
+            if not isinstance(shared_experts, nn.Module):
+                return 0
+            if hasattr(shared_experts, "_checkpoint_wrapped_module"):
+                return 0
+            setattr(mlp, "shared_experts", ptd_checkpoint_wrapper(shared_experts, preserve_rng_state=True))
+            return 1
+
+        wrapped_counts = {"mlp": 0, "attention": 0, "norm": 0, "shared_experts": 0}
         for _, _, block in _iter_transformer_and_mtp_blocks(model):
             if mtp_repeated and id(block) in mtp_block_ids:
                 continue
@@ -590,6 +603,8 @@ def apply_ac(
                     block,
                     ("post_attention_layernorm", "ffn_norm", "layer_norm2", "norm2"),
                 )
+            if "shared_experts" in ac_modules and "mlp" not in ac_modules:
+                wrapped_counts["shared_experts"] += _checkpoint_shared_experts(block)
         logger.info("Applied MoE submodule activation checkpointing with modules=%s: %s", ac_modules, wrapped_counts)
         _apply_multimodal_tower_ac(model, scopes, ac_modules)
         return

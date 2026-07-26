@@ -149,6 +149,8 @@ def test_activation_checkpointing_scope_normalization_rejects_invalid_values(val
         (None, ("all",)),
         ("mlp", ("mlp",)),
         ("moe+attn", ("mlp", "attention")),
+        ("attention+shared-mlp", ("attention", "shared_experts")),
+        ("shared-expert", ("shared_experts",)),
         (["layernorm", "feed-forward"], ("norm", "mlp")),
     ],
 )

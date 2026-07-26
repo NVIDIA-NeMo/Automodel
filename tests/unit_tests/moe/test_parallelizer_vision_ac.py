@@ -76,10 +76,33 @@ class _DecoderLayer(nn.Module):
         self.mlp = nn.Linear(_DIM, _DIM)
 
 
+class _SharedExpertMLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.experts = nn.Linear(_DIM, _DIM)
+        self.shared_experts = nn.Linear(_DIM, _DIM)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.experts(x) + self.shared_experts(x)
+
+
+class _SharedExpertDecoderLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = nn.Linear(_DIM, _DIM)
+        self.mlp = _SharedExpertMLP()
+
+
 class _LanguageModel(nn.Module):
     def __init__(self, num_layers: int = 2):
         super().__init__()
         self.layers = nn.ModuleList(_DecoderLayer() for _ in range(num_layers))
+
+
+class _SharedExpertLanguageModel(nn.Module):
+    def __init__(self, num_layers: int = 2):
+        super().__init__()
+        self.layers = nn.ModuleList(_SharedExpertDecoderLayer() for _ in range(num_layers))
 
 
 class _InnerModel(nn.Module):
@@ -170,6 +193,25 @@ def test_apply_ac_modules_mlp_wraps_decoder_mlp_only():
     for block in model.model.visual.blocks:
         assert isinstance(block.mlp, CheckpointWrapper)
         assert not isinstance(block.attn, CheckpointWrapper)
+
+
+def test_apply_ac_modules_shared_experts_wraps_nested_shared_mlp_only():
+    model = _TextOnlyModel()
+    model.model = _SharedExpertLanguageModel()
+
+    moe_parallelizer.apply_ac(
+        model,
+        hidden_size=_DIM,
+        num_experts=2,
+        activation_checkpointing_modules=["attention", "shared_experts"],
+    )
+
+    for block in model.model.layers:
+        assert not isinstance(block, CheckpointWrapper)
+        assert isinstance(block.self_attn, CheckpointWrapper)
+        assert not isinstance(block.mlp, CheckpointWrapper)
+        assert not isinstance(block.mlp.experts, CheckpointWrapper)
+        assert isinstance(block.mlp.shared_experts, CheckpointWrapper)
 
 
 def test_apply_ac_scope_vision_skips_decoder_entirely():

@@ -56,7 +56,7 @@ DistributedStrategyConfig = Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfi
 DistributedConfig = DistributedStrategyConfig
 
 _VALID_ACTIVATION_CHECKPOINTING_SCOPES = {"all", "language", "vision", "audio", "multimodal"}
-_VALID_ACTIVATION_CHECKPOINTING_MODULES = {"all", "attention", "mlp", "norm"}
+_VALID_ACTIVATION_CHECKPOINTING_MODULES = {"all", "attention", "mlp", "norm", "shared_experts"}
 
 
 def normalize_activation_checkpointing_scope(value: Any) -> Tuple[str, ...]:
@@ -118,6 +118,9 @@ def normalize_activation_checkpointing_modules(value: Any) -> Tuple[str, ...]:
         "moe": "mlp",
         "ffn": "mlp",
         "feed_forward": "mlp",
+        "shared": "shared_experts",
+        "shared_expert": "shared_experts",
+        "shared_mlp": "shared_experts",
         "layernorm": "norm",
         "layer_norm": "norm",
         "norms": "norm",
@@ -277,13 +280,9 @@ class FSDP2Config:
         activation_checkpointing_modules (str | list[str]): Which decoder
             submodules to wrap for non-selective submodule activation
             checkpointing. ``"all"`` keeps the existing attention, MLP, and
-            norm wrapping; values such as ``"mlp"`` checkpoint only the
-            feed-forward/MoE path.
-        activation_checkpointing_modules (str | list[str]): Which decoder
-            submodules to wrap for non-selective submodule activation
-            checkpointing. ``"all"`` keeps the existing attention, MLP, and
-            norm wrapping; values such as ``"mlp"`` checkpoint only the
-            feed-forward/MoE path.
+            norm wrapping; values such as ``"mlp"`` checkpoint the full
+            feed-forward/MoE path, while ``"shared_experts"`` checkpoints only
+            the dense shared-expert MLP under MoE blocks.
         defer_fsdp_grad_sync (bool): Defer FSDP gradient sync to final micro-batch.
         reshard_after_forward (Optional[bool]): Override layer-level FSDP2 resharding.
             ``None`` preserves AutoModel's heuristic: pipeline-parallel layers do
