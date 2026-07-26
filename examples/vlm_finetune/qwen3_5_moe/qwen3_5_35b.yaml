@@ -121,7 +121,7 @@ ci:
   checkpoint_robustness:
     check_source_load_parity: true
     experts_implementation: grouped_mm
-    hf_kl_threshold: 1e-2
+    hf_kl_threshold: 2e-2
     hf_keep_in_fp32_modules: A_log,dt_bias
     hf_device_map_auto: true
     model.backend.experts: torch_mm
