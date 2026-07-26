@@ -40,6 +40,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nemo_automodel.components.loss.listmle import listmle_loss
+from nemo_automodel.components.speculative.eagle.core_v12 import FeatureNoiseConfig
 
 
 @dataclass
@@ -65,6 +66,9 @@ class VispecTrainerModule(nn.Module):
         rank_loss_weight: Weight on the ListMLE term (ViSpec: 0.1).
         rank_loss_topk: Number of target tokens the ranking term covers.
         mtp_steps: Number of self-rollout passes after the first draft pass.
+        feature_noise_config: Train-only feature augmentation, applied to the
+            target features entering the *first* pass. ViSpec's stage 2 enables
+            the same sequence-scaled draw as stage 1; ``None`` disables it.
     """
 
     def __init__(
@@ -76,6 +80,7 @@ class VispecTrainerModule(nn.Module):
         rank_loss_weight: float = 0.1,
         rank_loss_topk: int = 10,
         mtp_steps: int = 1,
+        feature_noise_config: FeatureNoiseConfig | None = None,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -87,6 +92,7 @@ class VispecTrainerModule(nn.Module):
         if mtp_steps < 0:
             raise ValueError(f"mtp_steps must be >= 0, got {mtp_steps}")
         self.mtp_steps = mtp_steps
+        self.feature_noise_config = feature_noise_config
 
     def _lm_head_weight(self) -> torch.Tensor:
         """Return the frozen target lm_head weight as a plain local tensor.
@@ -143,6 +149,12 @@ class VispecTrainerModule(nn.Module):
             VispecStepMetrics with scalar ``loss``/``prob_loss``/``rank_loss``/
             ``accuracy`` and the ``valid_tokens`` count the losses averaged over.
         """
+        if self.training and self.feature_noise_config is not None:
+            # Perturb once, before the first pass, so the rollout seed
+            # ``input_hidden_states[:, :1]`` below carries the same noise. The
+            # reference attaches the augmentation to the train dataset, so every
+            # read of the feature tensor within a step sees one identical draw.
+            input_hidden_states = self.feature_noise_config.apply(input_hidden_states)
         predicted_hidden_states = self.draft_model(
             inputs_embeds=inputs_embeds,
             target_hidden_states=input_hidden_states,

@@ -44,7 +44,39 @@ from transformers import PretrainedConfig
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import (
     LlamaEagleDraftModel,
     _build_causal_mask,
+    resolve_attention_bias,
+    resolve_fc_bias,
 )
+
+
+def apply_vispec_draft_architecture(config: PretrainedConfig) -> None:
+    """Pin a target-derived draft config to ViSpec's released draft architecture.
+
+    Both ViSpec stages derive the draft config from the target's text config, so
+    without this the draft silently inherits whatever the target's language tower
+    happens to use. The released draft is not that: ``qwen2.5_vl_7B_config.json``
+    in the reference repository sets ``num_attention_heads: 28``,
+    ``num_key_value_heads: 28`` and ``qkv_bias: true``, whereas the matching
+    Qwen2.5-VL-7B text tower is 28-head GQA over 4 KV heads. Copying the target
+    therefore produced a materially smaller draft than the paper's, which is not
+    a configuration difference a reader of the recipe would notice.
+
+    The three settings cannot be read off the target: HF's ``Qwen2_5_VLTextConfig``
+    exposes neither ``attention_bias`` nor ``qkv_bias`` (its attention hard-codes
+    the qkv bias inside the module), so there is nothing to inherit. They are
+    properties of the ViSpec draft rather than of any one target, and are applied
+    unconditionally for every ViSpec target.
+
+    Args:
+        config: The draft config, already derived from the target's text config.
+            Modified in place.
+    """
+    # Full multi-head attention, not the target's GQA.
+    config.num_key_value_heads = config.num_attention_heads
+    # Bias on q/k/v (and the adaptor's k/v); ``o_proj`` stays bias-free.
+    config.qkv_bias = True
+    # Bias on ``fc`` and ``img_fc``, matching the reference's ``bias=True`` default.
+    config.fc_bias = True
 
 
 class VispecImageAdaptor(nn.Module):
@@ -73,9 +105,12 @@ class VispecImageAdaptor(nn.Module):
         self.num_query_tokens = num_query_tokens
 
         self.query = nn.Parameter(torch.empty(num_query_tokens, self.num_heads, self.head_dim))
-        bias = bool(getattr(config, "attention_bias", False))
-        self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=bias)
+        # The reference's ``ImgAdaptor`` splits bias exactly like the draft's own
+        # attention, so it resolves through the same helper rather than restating
+        # the rule: k/v follow the qkv convention, ``o_proj`` stays bias-free.
+        kv_bias, _ = resolve_attention_bias(config)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=kv_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=kv_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
     def reset_query(self) -> None:
@@ -124,9 +159,9 @@ class VispecDraftModel(LlamaEagleDraftModel):
         super().__init__(config)
         self.num_query_tokens = int(getattr(config, "vispec_num_query_tokens", 2))
         self.img_adaptor = VispecImageAdaptor(config, self.num_query_tokens)
-        # ViSpec keeps a bias on ``img_fc``; AutoModel's EAGLE-1/2 ``fc`` is
-        # bias-free, so ``img_fc`` follows the surrounding draft convention.
-        self.img_fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+        # ``img_fc`` follows the base draft's ``fc``, which is how the reference
+        # builds them (both take its single ``bias`` argument).
+        self.img_fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=resolve_fc_bias(config))
         self.reset_vispec_parameters()
 
     def reset_vispec_parameters(self) -> None:
@@ -142,6 +177,8 @@ class VispecDraftModel(LlamaEagleDraftModel):
         with torch.no_grad():
             nn.init.eye_(self.img_fc.weight[:, :hidden_size])
             nn.init.zeros_(self.img_fc.weight[:, hidden_size:])
+            if self.img_fc.bias is not None:
+                nn.init.zeros_(self.img_fc.bias)
 
     def _fuse(
         self,

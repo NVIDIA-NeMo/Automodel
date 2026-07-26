@@ -42,7 +42,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
-from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
+from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule, FeatureNoiseConfig
 from nemo_automodel.components.speculative.eagle.registry import resolve_eagle1_draft_spec
 from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
@@ -59,6 +59,11 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _build_feature_noise(half_width: float) -> FeatureNoiseConfig | None:
+    """Build the EAGLE-1/2 augmentation from the recipe's fixed-width knob."""
+    return FeatureNoiseConfig.fixed(half_width) if half_width > 0 else None
 
 
 def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
@@ -268,7 +273,8 @@ class TrainEagle1Recipe(BaseRecipe):
             hidden_loss_weight=float(recipe_cfg.get("hidden_loss_weight", 1.0)),
             token_loss_weight=float(recipe_cfg.get("token_loss_weight", 0.1)),
             # EAGLE feature-noise augmentation U(-0.1, 0.1); paper default, set 0 to disable.
-            feature_noise=float(recipe_cfg.get("feature_noise", 0.1)),
+            # Unscaled: the paper states one width, unlike ViSpec's seq-len-scaled draw.
+            feature_noise_config=_build_feature_noise(float(recipe_cfg.get("feature_noise", 0.1))),
         ).to(self.device)
         if self.dist_env.world_size > 1:
             # Restrict the draft's gradient all-reduce to the "dp" sub-axis. With

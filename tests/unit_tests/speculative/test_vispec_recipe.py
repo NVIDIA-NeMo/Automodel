@@ -32,6 +32,7 @@ from nemo_automodel.components.speculative.eagle.vispec_target import HFVispecTa
 from nemo_automodel.recipes.llm.train_vispec import (
     TrainVispecRecipe,
     TrainVispecStage1Recipe,
+    _build_feature_noise_config,
     _resolve_image_token_id,
     _seed_draft_initialization,
 )
@@ -296,14 +297,13 @@ class TestRegenerateVlm:
         example = {"image": "a.jpg", "conversations": [{"from": "gpt", "value": "hi"}]}
         assert regenerate_vlm._extract_prompt(example) is None
 
-    def test_build_messages_appends_length_instruction_after_the_image(self):
-        messages = regenerate_vlm._build_messages("Describe.", "/data/a.jpg", regenerate_vlm.LENGTH_INSTRUCTION)
-        content = messages[0]["content"]
+    def test_build_user_content_appends_length_instruction_after_the_image(self):
+        content = regenerate_vlm._build_user_content("Describe.", "/data/a.jpg", regenerate_vlm.LENGTH_INSTRUCTION)
         assert [item["type"] for item in content] == ["text", "image", "text"]
         assert content[2]["text"] == regenerate_vlm.LENGTH_INSTRUCTION
 
-    def test_build_messages_without_instruction_or_prompt(self):
-        content = regenerate_vlm._build_messages("", "/data/a.jpg", "")[0]["content"]
+    def test_build_user_content_without_instruction_or_prompt(self):
+        content = regenerate_vlm._build_user_content("", "/data/a.jpg", "")
         assert [item["type"] for item in content] == ["image"]
 
     def test_write_meta_is_consumable_by_make_meta_dataset(self, tmp_path):
@@ -338,10 +338,13 @@ class TestRegenerateVlm:
         with pytest.raises(ValueError, match="must be greater than"):
             regenerate_vlm.main(argv)
 
-    def test_regenerate_writes_target_answers_without_the_length_instruction(self, tmp_path, monkeypatch):
-        """The stored prompt must be the original one: the length instruction is a
-        generation-time device, and training on it would teach the draft a prompt
-        shape that never occurs at deployment."""
+    def test_regenerate_stores_the_exact_generation_prompt(self, tmp_path, monkeypatch):
+        """The stored prompt must rebuild the prompt the answer was sampled under.
+
+        The answer is only a valid supervision target for its own prompt, so the
+        length instruction and the part order both have to survive into
+        ``data.jsonl`` and back out through ``make_meta_dataset``'s parser.
+        """
         image_root = tmp_path / "images"
         image_root.mkdir()
         (image_root / "a.jpg").write_bytes(b"")
@@ -389,12 +392,37 @@ class TestRegenerateVlm:
         written = [json.loads(line) for line in data_path.read_text().splitlines()]
         assert len(written) == 1  # the missing image and the human-turn-less row are skipped
         assert written[0]["images"] == ["a.jpg"]
-        assert written[0]["conversations"][0]["value"] == "<image>\nDescribe."
-        assert regenerate_vlm.LENGTH_INSTRUCTION not in written[0]["conversations"][0]["value"]
+        assert written[0]["conversations"][0]["value"] == f"Describe.\n<image>\n{regenerate_vlm.LENGTH_INSTRUCTION}"
         assert written[0]["conversations"][1] == {"from": "gpt", "value": "a long generated answer"}
-        # ...but the instruction WAS sent to the model.
-        assert prompts_seen[0][0]["content"][-1]["text"] == regenerate_vlm.LENGTH_INSTRUCTION
+        # The generation prompt keeps the reference's part order.
+        generated_content = prompts_seen[0][0]["content"]
+        assert [part["type"] for part in generated_content] == ["text", "image", "text"]
+        assert generated_content[-1]["text"] == regenerate_vlm.LENGTH_INSTRUCTION
+        # regenerate() runs _assert_prompt_round_trip per row, so reaching this
+        # line already proves the stored value rebuilds generated_content.
         assert (tmp_path / "out" / "meta.json").exists()
+
+    def test_regenerate_rejects_a_prompt_that_does_not_round_trip(self):
+        """A serialized row that rebuilds a different prompt must fail loudly."""
+        row = {
+            "conversations": [
+                {"from": "human", "value": "<image>\nDescribe."},
+                {"from": "gpt", "value": "answer"},
+            ],
+            "images": ["a.jpg"],
+        }
+        generated = [
+            {"type": "text", "text": "Describe."},
+            {"type": "image", "image": "/images/a.jpg"},
+        ]
+        with pytest.raises(ValueError, match="does not rebuild"):
+            regenerate_vlm._assert_prompt_round_trip(row, generated, "/images")
+
+    def test_serialize_human_turn_drops_empty_parts(self):
+        """An empty source turn or instruction must not leave a blank line behind."""
+        assert regenerate_vlm._serialize_human_turn("Describe.", "Be long.") == "Describe.\n<image>\nBe long."
+        assert regenerate_vlm._serialize_human_turn("", "Be long.") == "<image>\nBe long."
+        assert regenerate_vlm._serialize_human_turn("Describe.", "") == "Describe.\n<image>"
 
 
 class _StubConfigNode(dict):
@@ -668,3 +696,19 @@ def test_main_rejects_an_unknown_recipe(monkeypatch):
 
     with pytest.raises(ValueError, match="Unsupported ViSpec recipe"):
         train_vispec.main("test.yaml")
+
+
+class TestFeatureNoiseRecipeConfig:
+    """The recipes must build the noise config and reject the retired key."""
+
+    def test_defaults_to_the_reference_draw(self):
+        noise = _build_feature_noise_config(_StubConfigNode())
+        assert noise is not None
+        assert (noise.std, noise.reference_seq_len) == (0.2, 512)
+
+    def test_zero_std_disables_it(self):
+        assert _build_feature_noise_config(_StubConfigNode({"feature_noise_std": 0})) is None
+
+    def test_rejects_the_retired_fixed_width_key(self):
+        with pytest.raises(ValueError, match="no longer read"):
+            _build_feature_noise_config(_StubConfigNode({"feature_noise": 0.1}))

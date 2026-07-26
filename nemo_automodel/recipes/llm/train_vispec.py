@@ -48,13 +48,14 @@ from nemo_automodel.components.datasets.vlm.dspark_collate import build_dspark_v
 from nemo_automodel.components.datasets.vlm.utils import set_image_pixel_bounds
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
-from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule
+from nemo_automodel.components.speculative.eagle.core_v12 import EagleTrainerModule, FeatureNoiseConfig
 from nemo_automodel.components.speculative.eagle.registry import (
     resolve_vispec_draft_spec,
     resolve_vispec_stage1_draft_spec,
 )
 from nemo_automodel.components.speculative.eagle.target_v12 import HFEagleTargetModel
 from nemo_automodel.components.speculative.eagle.vispec_core import VispecTrainerModule
+from nemo_automodel.components.speculative.eagle.vispec_draft import apply_vispec_draft_architecture
 from nemo_automodel.components.speculative.eagle.vispec_target import HFVispecTargetModel
 from nemo_automodel.components.utils.model_utils import print_trainable_parameters
 from nemo_automodel.recipes.llm._spec_train_utils import (
@@ -135,6 +136,32 @@ def _seed_draft_initialization(recipe_cfg) -> int:
     seed = int(recipe_cfg.get("seed", recipe_cfg.get("shuffle_seed", 42)))
     torch.manual_seed(seed)
     return seed
+
+
+def _build_feature_noise_config(recipe_cfg) -> FeatureNoiseConfig | None:
+    """Build ViSpec's train-only feature augmentation from the recipe config.
+
+    ViSpec enables the same sequence-scaled uniform noise in both stages, so
+    both call this. ``feature_noise_std: 0`` disables it.
+
+    Raises:
+        ValueError: If the config still carries the old fixed-width
+            ``feature_noise`` key, which this no longer reads. Ignoring it would
+            silently train at a different noise level than the config states.
+    """
+    if recipe_cfg.get("feature_noise", None) is not None:
+        raise ValueError(
+            "recipe_args.feature_noise is no longer read by the ViSpec recipes. Replace it with "
+            "feature_noise_std (default 0.2) and feature_noise_reference_seq_len (default 512), "
+            "which apply the reference's sequence-scaled draw; feature_noise_std: 0 disables it."
+        )
+    std = float(recipe_cfg.get("feature_noise_std", 0.2))
+    if std <= 0:
+        return None
+    return FeatureNoiseConfig(
+        std=std,
+        reference_seq_len=int(recipe_cfg.get("feature_noise_reference_seq_len", 512)),
+    )
 
 
 class TrainVispecRecipe(TrainEagle1Recipe):
@@ -232,6 +259,7 @@ class TrainVispecRecipe(TrainEagle1Recipe):
         draft_config.architectures = ["VispecDraftModel"]
         draft_config.draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 1))
         draft_config.vispec_num_query_tokens = int(recipe_cfg.get("num_query_tokens", 2))
+        apply_vispec_draft_architecture(draft_config)
         _seed_draft_initialization(recipe_cfg)
         self.draft_model = draft_spec.draft_cls(draft_config).to(device=self.device, dtype=self.compute_dtype)
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
@@ -249,6 +277,7 @@ class TrainVispecRecipe(TrainEagle1Recipe):
             rank_loss_weight=float(recipe_cfg.get("rank_loss_weight", 0.1)),
             rank_loss_topk=int(recipe_cfg.get("rank_loss_topk", 10)),
             mtp_steps=int(recipe_cfg.get("mtp_steps", 1)),
+            feature_noise_config=_build_feature_noise_config(recipe_cfg),
         ).to(self.device)
         if self.dist_env.world_size > 1:
             trainer_module = DistributedDataParallel(
@@ -440,6 +469,10 @@ class TrainVispecStage1Recipe(TrainEagle1Recipe):
         draft_config = copy.deepcopy(target_config.get_text_config())
         draft_config.architectures = ["LlamaEagleDraftModel"]
         draft_config.draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 1))
+        # Stage 1 must build the same text tower stage 2 loads it into, or the
+        # stage-2 ``load_state_dict(..., strict=False)`` silently drops every
+        # shape-mismatched key instead of restoring the pretrained draft.
+        apply_vispec_draft_architecture(draft_config)
         _seed_draft_initialization(recipe_cfg)
         self.draft_model = draft_spec.draft_cls(draft_config).to(device=self.device, dtype=self.compute_dtype)
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
@@ -454,7 +487,7 @@ class TrainVispecStage1Recipe(TrainEagle1Recipe):
             target_lm_head=self.target_wrapper.get_lm_head(),
             hidden_loss_weight=float(recipe_cfg.get("hidden_loss_weight", 1.0)),
             token_loss_weight=float(recipe_cfg.get("token_loss_weight", 0.1)),
-            feature_noise=float(recipe_cfg.get("feature_noise", 0.1)),
+            feature_noise_config=_build_feature_noise_config(recipe_cfg),
             # ViSpec's stage 1 is EAGLE plus a ranking term, not plain EAGLE: the
             # reference optimizes v_w * vloss + p_w * (ploss + 0.1 * rloss) with
             # v_w=1.0 and p_w=0.1, so ListMLE carries an effective weight of 0.01.

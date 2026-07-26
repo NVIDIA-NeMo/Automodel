@@ -26,7 +26,13 @@ recipe_args:
   draft_num_hidden_layers: 1
   hidden_loss_weight: 1.0
   token_loss_weight: 0.1
-  feature_noise: 0.1
+  # Train-only feature augmentation, drawn as (rand - 0.5) * std * 512 / T and
+  # so calibrated at a 512-token sequence: the half-width is std/2 there and
+  # shrinks as the sequence grows. At this recipe's seq_length of 4096 that is
+  # 0.0125, not the 0.1 a fixed U(-0.1, 0.1) would apply. Stage 2 sets the same
+  # two fields. Set feature_noise_std to 0 to disable.
+  feature_noise_std: 0.2
+  feature_noise_reference_seq_len: 512
   # ViSpec's stage 1 is EAGLE plus a ListMLE ranking term over the target's
   # top-k. The reference optimizes v_w * vloss + p_w * (ploss + 0.1 * rloss)
   # with v_w=1.0 and p_w=0.1, so the ranking term carries an effective weight of

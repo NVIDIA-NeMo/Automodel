@@ -72,6 +72,11 @@ recipe_args:
   prob_loss_weight: 10.0
   rank_loss_weight: 0.1
   rank_loss_topk: 10
+  # Same train-only feature augmentation stage 1 uses: (rand - 0.5) * std * 512 / T,
+  # so the half-width is 0.0125 at this recipe's seq_length of 4096. The reference
+  # enables it in both stages. Set feature_noise_std to 0 to disable.
+  feature_noise_std: 0.2
+  feature_noise_reference_seq_len: 512
   freeze_embeddings: true
   trust_remote_code: false
   seed: 42

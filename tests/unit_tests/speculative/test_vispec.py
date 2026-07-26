@@ -20,6 +20,7 @@ import torch.nn as nn
 from transformers import LlamaConfig
 
 from nemo_automodel.components.loss.listmle import listmle_loss
+from nemo_automodel.components.speculative.eagle.core_v12 import FeatureNoiseConfig
 from nemo_automodel.components.speculative.eagle.draft_llama_v12 import LlamaEagleDraftModel
 from nemo_automodel.components.speculative.eagle.registry import (
     resolve_vispec_draft_spec,
@@ -29,7 +30,11 @@ from nemo_automodel.components.speculative.eagle.vispec_core import (
     VispecStepMetrics,
     VispecTrainerModule,
 )
-from nemo_automodel.components.speculative.eagle.vispec_draft import VispecDraftModel, VispecImageAdaptor
+from nemo_automodel.components.speculative.eagle.vispec_draft import (
+    VispecDraftModel,
+    VispecImageAdaptor,
+    apply_vispec_draft_architecture,
+)
 from nemo_automodel.components.speculative.eagle.vispec_target import (
     HFVispecTargetModel,
     _shift_left_with_zero,
@@ -220,25 +225,32 @@ class TestListMLE:
         assert listmle_loss(logits, target_probs, topk=3).item() == pytest.approx(expected, abs=1e-5)
 
 
-class TestTrainerModule:
-    def _module(self, mtp_steps: int = 1) -> VispecTrainerModule:
-        lm_head = nn.Linear(HIDDEN, VOCAB, bias=False)
-        lm_head.requires_grad_(False)
-        return VispecTrainerModule(_draft(), target_lm_head=lm_head, mtp_steps=mtp_steps)
+def _trainer_module(mtp_steps: int = 1, feature_noise_config=None) -> VispecTrainerModule:
+    lm_head = nn.Linear(HIDDEN, VOCAB, bias=False)
+    lm_head.requires_grad_(False)
+    return VispecTrainerModule(
+        _draft(), target_lm_head=lm_head, mtp_steps=mtp_steps, feature_noise_config=feature_noise_config
+    )
 
-    def _inputs(self, seq_len: int = 12):
-        inputs_embeds, hidden_states, attention_mask, image_mask = _batch(seq_len=seq_len)
-        loss_mask = torch.zeros(1, seq_len, dtype=torch.long)
-        loss_mask[0, 8:] = 1
-        target_logits = torch.randn(1, seq_len, VOCAB)
-        return dict(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            loss_mask=loss_mask,
-            input_hidden_states=hidden_states,
-            target_logits=target_logits,
-            image_mask=image_mask,
-        )
+
+def _trainer_inputs(seq_len: int = 12):
+    inputs_embeds, hidden_states, attention_mask, image_mask = _batch(seq_len=seq_len)
+    loss_mask = torch.zeros(1, seq_len, dtype=torch.long)
+    loss_mask[0, 8:] = 1
+    target_logits = torch.randn(1, seq_len, VOCAB)
+    return dict(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+        input_hidden_states=hidden_states,
+        target_logits=target_logits,
+        image_mask=image_mask,
+    )
+
+
+class TestTrainerModule:
+    _module = staticmethod(_trainer_module)
+    _inputs = staticmethod(_trainer_inputs)
 
     def test_returns_finite_metrics_and_trains(self):
         module = self._module()
@@ -421,3 +433,77 @@ def test_registry_resolves_supported_qwen_vl(architecture):
 def test_registry_rejects_unregistered_architecture():
     with pytest.raises(ValueError, match="TrainVispecRecipe"):
         resolve_vispec_draft_spec(["LlamaForCausalLM"])
+
+
+class TestDraftArchitecture:
+    """``apply_vispec_draft_architecture`` must reproduce ViSpec's released draft."""
+
+    def _gqa_config(self) -> LlamaConfig:
+        """A target-shaped text config: GQA, no bias fields, like Qwen2.5-VL's."""
+        config = _draft_config()
+        config.num_key_value_heads = 1
+        return config
+
+    def _pinned_draft(self) -> VispecDraftModel:
+        config = self._gqa_config()
+        apply_vispec_draft_architecture(config)
+        return VispecDraftModel(config)
+
+    def test_draft_built_from_pinned_config_matches_the_reference_bias_layout(self):
+        draft = self._pinned_draft()
+        attention = draft.layers[0].self_attn
+        # qkv carry a bias, o_proj does not -- the reference's ``qkv_bias`` split.
+        assert attention.q_proj.bias is not None
+        assert attention.k_proj.bias is not None
+        assert attention.v_proj.bias is not None
+        assert attention.o_proj.bias is None
+        # Full multi-head attention, not the target's GQA.
+        assert attention.num_key_value_heads == attention.num_heads
+        # ``fc`` and ``img_fc`` both take the reference's ``bias=True``.
+        assert draft.fc.bias is not None
+        assert draft.img_fc.bias is not None
+        # The adaptor follows the same qkv split.
+        assert draft.img_adaptor.k_proj.bias is not None
+        assert draft.img_adaptor.o_proj.bias is None
+
+    def test_img_fc_still_starts_as_identity(self):
+        """The added bias must be zeroed, or stage 2 no longer starts at stage 1."""
+        draft = self._pinned_draft()
+        assert torch.equal(draft.img_fc.bias, torch.zeros_like(draft.img_fc.bias))
+        assert torch.equal(draft.img_fc.weight[:, :HIDDEN], torch.eye(HIDDEN))
+        assert torch.equal(draft.img_fc.weight[:, HIDDEN:], torch.zeros(HIDDEN, HIDDEN))
+
+    def test_unpinned_config_keeps_the_bias_free_draft(self):
+        """EAGLE-1/2 configs set none of the three fields and must be unchanged."""
+        draft = LlamaEagleDraftModel(self._gqa_config())
+        assert draft.fc.bias is None
+        assert draft.layers[0].self_attn.q_proj.bias is None
+        assert draft.layers[0].self_attn.num_key_value_heads == 1
+
+    def test_attention_bias_still_biases_o_proj(self):
+        """The Llama-style flag keeps its meaning: all four projections."""
+        config = self._gqa_config()
+        config.attention_bias = True
+        attention = LlamaEagleDraftModel(config).layers[0].self_attn
+        assert attention.q_proj.bias is not None
+        assert attention.o_proj.bias is not None
+
+
+class TestStageNoiseWiring:
+    """Both stages must apply the augmentation, and only while training."""
+
+    def test_stage2_applies_the_noise_in_training_only(self):
+        """Stage 2 had no augmentation at all; it must now match stage 1's.
+
+        ``_batch`` reseeds, so the inputs are identical across calls. The noise
+        is toggled on one module rather than compared across two, so the check
+        cannot be perturbed by construction-order differences in the weights.
+        """
+        trainer = _trainer_module(mtp_steps=0)
+        clean_loss = trainer(**_trainer_inputs()).loss
+
+        trainer.feature_noise_config = FeatureNoiseConfig(std=2.0, reference_seq_len=512)
+        assert not torch.allclose(trainer(**_trainer_inputs()).loss, clean_loss)
+
+        trainer.eval()
+        assert torch.allclose(trainer(**_trainer_inputs()).loss, clean_loss)

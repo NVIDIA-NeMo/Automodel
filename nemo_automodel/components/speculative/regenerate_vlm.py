@@ -53,6 +53,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
+from nemo_automodel.components.datasets.vlm.datasets import convert_sharegpt_to_conversation
 from nemo_automodel.components.datasets.vlm.utils import set_image_pixel_bounds
 from nemo_automodel.shared.import_utils import safe_import
 
@@ -62,6 +63,12 @@ HAVE_PIL, PIL_Image = safe_import("PIL.Image")
 
 LENGTH_INSTRUCTION = "Please answer with at least 1000 words."
 IMAGE_PLACEHOLDER = "<image>"
+
+# The sharegpt mapping this script writes into meta.json. The round-trip check
+# parses with the same two dicts, so it cannot pass against a layout the
+# generated meta.json no longer declares.
+SHAREGPT_COLUMNS = {"messages": "conversations", "images": "images"}
+SHAREGPT_TAGS = {"role_tag": "from", "content_tag": "value", "user_tag": "human", "assistant_tag": "gpt"}
 
 
 @dataclass
@@ -127,16 +134,19 @@ def _extract_prompt(example: dict) -> tuple[str, str] | None:
     return None
 
 
-def _build_messages(prompt_text: str, image_path: str, length_instruction: str) -> list[dict]:
-    """Build the chat messages handed to the target's chat template.
+def _build_user_content(prompt_text: str, image_path: str, length_instruction: str) -> list[dict]:
+    """Build the user-turn content parts, in the order the target sees them.
+
+    The order (source text, image, length instruction) matches the reference
+    implementation's ``preprocess_function``.
 
     Args:
         prompt_text: The source row's human turn, image placeholder stripped.
-        image_path: Absolute path to the image for this row.
+        image_path: Path to the image for this row.
         length_instruction: Sentence appended after the image, or empty.
 
     Returns:
-        A single-user-turn message list in HuggingFace multimodal chat format.
+        The content list of a single multimodal user turn.
     """
     content: list[dict] = []
     if prompt_text:
@@ -144,7 +154,55 @@ def _build_messages(prompt_text: str, image_path: str, length_instruction: str) 
     content.append({"type": "image", "image": image_path})
     if length_instruction:
         content.append({"type": "text", "text": length_instruction})
-    return [{"role": "user", "content": content}]
+    return content
+
+
+def _serialize_human_turn(prompt_text: str, length_instruction: str) -> str:
+    """Serialize the generation prompt back into one ShareGPT ``value`` string.
+
+    ``make_meta_dataset`` rebuilds the user turn by splitting this string on the
+    ``<image>`` placeholder *positionally*, so writing the parts in the order
+    they were generated is what makes the training prefix reproduce the
+    generation prefix. :func:`_assert_prompt_round_trip` verifies that per row.
+
+    Args:
+        prompt_text: The source row's human turn, image placeholder stripped.
+        length_instruction: Sentence appended after the image, or empty.
+
+    Returns:
+        The ``value`` written to the human turn of ``data.jsonl``.
+    """
+    parts = [part for part in (prompt_text, IMAGE_PLACEHOLDER, length_instruction) if part]
+    return "\n".join(parts)
+
+
+def _assert_prompt_round_trip(row: dict, expected_content: list[dict], image_root: str) -> None:
+    """Fail if the serialized row does not rebuild the exact generation prompt.
+
+    The answer is only a valid supervision target for the prompt it was sampled
+    under, so the prompt stage 2 reconstructs has to be the prompt this script
+    generated from. That reconstruction happens in
+    :func:`convert_sharegpt_to_conversation`, which is what
+    ``make_meta_dataset`` runs over ``data.jsonl``, so the check calls the real
+    parser rather than a copy of its rules: a change to either side that breaks
+    the correspondence surfaces here instead of silently training the draft on a
+    prompt the target never answered.
+
+    Args:
+        row: The row about to be written to ``data.jsonl``.
+        expected_content: The user content that was handed to the target.
+        image_root: The ``media_dir`` recorded in ``meta.json``.
+
+    Raises:
+        ValueError: If the rebuilt user turn differs from ``expected_content``.
+    """
+    rebuilt = convert_sharegpt_to_conversation(row, columns=SHAREGPT_COLUMNS, tags=SHAREGPT_TAGS, media_dir=image_root)
+    actual = rebuilt["conversation"][0]["content"]
+    if actual != expected_content:
+        raise ValueError(
+            "The serialized prompt does not rebuild the prompt the answer was generated from.\n"
+            f"generated: {expected_content}\nrebuilt:   {actual}"
+        )
 
 
 @torch.no_grad()
@@ -154,7 +212,7 @@ def _generate_answer(model, processor, messages: list[dict], config: Regeneratio
     Args:
         model: The loaded target VLM.
         processor: The target's processor.
-        messages: Chat messages from :func:`_build_messages`.
+        messages: Chat messages wrapping :func:`_build_user_content`.
         config: The active regeneration settings.
 
     Returns:
@@ -191,13 +249,8 @@ def _write_meta(output_dir: Path, image_root: str) -> Path:
     meta = {
         "vispec_stage2": {
             "file_name": "data.jsonl",
-            "columns": {"messages": "conversations", "images": "images"},
-            "tags": {
-                "role_tag": "from",
-                "content_tag": "value",
-                "user_tag": "human",
-                "assistant_tag": "gpt",
-            },
+            "columns": SHAREGPT_COLUMNS,
+            "tags": SHAREGPT_TAGS,
             "media_dir": image_root,
         }
     }
@@ -282,22 +335,24 @@ def regenerate(config: RegenerationConfig) -> Path:
             if not os.path.exists(absolute_image):
                 skipped += 1
                 continue
-            messages = _build_messages(prompt_text, absolute_image, config.length_instruction)
-            answer = _generate_answer(model, processor, messages, config)
+            content = _build_user_content(prompt_text, absolute_image, config.length_instruction)
+            answer = _generate_answer(model, processor, [{"role": "user", "content": content}], config)
             if not answer:
                 skipped += 1
                 continue
-            # The prompt stored for training is the ORIGINAL one, without the
-            # length instruction: the instruction exists only to elicit a long
-            # answer, and training on it would teach the draft a prompt shape
-            # that never appears at deployment.
+            # The stored prompt is the generation prompt, length instruction and
+            # part order included. Dropping the instruction would be closer to
+            # the deployment prompt shape, but it would also supervise the draft
+            # with an answer the target produced under a different prompt, and
+            # the reference stores the features of the exact modified prompt.
             row = {
                 "conversations": [
-                    {"from": "human", "value": f"{IMAGE_PLACEHOLDER}\n{prompt_text}".strip()},
+                    {"from": "human", "value": _serialize_human_turn(prompt_text, config.length_instruction)},
                     {"from": "gpt", "value": answer},
                 ],
                 "images": [image_path],
             }
+            _assert_prompt_round_trip(row, content, config.image_root)
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             written += 1
 
