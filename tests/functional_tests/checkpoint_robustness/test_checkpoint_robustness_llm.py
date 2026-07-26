@@ -1354,6 +1354,8 @@ def run_checkpoint_robustness(
                 "KL divergence between original and HF-loaded model too large: "
                 f"max per-token KL = {max_kl_hf:.6e} > threshold {hf_kl_threshold:.6e}"
             )
+        del hf_logits
+        _release_model_memory()
 
     hf_reload_error = _finish_hf_reload_sync(hf_reload_sync_paths, hf_reload_error)
     _record_deferred_failure(deferred_failures, "Phase 4 HF reload parity", hf_reload_error)
