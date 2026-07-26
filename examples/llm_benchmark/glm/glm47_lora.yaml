@@ -42,7 +42,7 @@ distributed:
   tp_size: 1
   cp_size: 1
   pp_size: 2
-  ep_size: 16
+  ep_size: 32
   sequence_parallel: false
   activation_checkpointing: true
   pipeline:
@@ -71,8 +71,8 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: torch_mm
-    dispatcher: hybridep
+    experts: gmm
+    dispatcher: deepep
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true

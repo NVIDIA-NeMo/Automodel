@@ -38,9 +38,24 @@ def _to_local(proj):
     return proj.to_local() if isinstance(proj, DTensor) else proj
 
 
+def _to_compute_operand(proj, dtype: torch.dtype, *, contiguous: bool = False):
+    """Convert a projection tensor to the compute dtype, copying only when required."""
+    proj = _to_local(proj)
+    if proj.dtype != dtype:
+        proj = proj.to(dtype)
+    if contiguous and not proj.is_contiguous():
+        proj = proj.contiguous()
+    return proj
+
+
 def _to_grouped_mm_operand(proj, dtype: torch.dtype):
     """Convert a projection tensor to the dtype/layout expected by grouped MM."""
-    return _to_local(proj).to(dtype).contiguous()
+    return _to_compute_operand(proj, dtype, contiguous=True)
+
+
+def _to_gmm_operand(proj, dtype: torch.dtype):
+    """Convert a projection tensor for grouped_gemm without forcing layout copies."""
+    return _to_compute_operand(proj, dtype, contiguous=False)
 
 
 def _pad_lora_rank_for_grouped_mm(lora_A: torch.Tensor, lora_B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -185,12 +200,13 @@ class GroupedExpertsLoRA(GroupedExperts):
         assert self.n_routed_experts % ep_size == 0
 
         compute_dtype = x.dtype
-        gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
-        down_projs = _to_grouped_mm_operand(self.down_projs, compute_dtype)
-        lora_gate_and_up_A = _to_grouped_mm_operand(self.lora_gate_and_up_A, compute_dtype)
-        lora_gate_and_up_B = _to_grouped_mm_operand(self.lora_gate_and_up_B, compute_dtype)
-        lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
-        lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
+        to_operand = _to_grouped_mm_operand if self.use_torch_mm else _to_gmm_operand
+        gate_and_up_projs = to_operand(self.gate_and_up_projs, compute_dtype)
+        down_projs = to_operand(self.down_projs, compute_dtype)
+        lora_gate_and_up_A = to_operand(self.lora_gate_and_up_A, compute_dtype)
+        lora_gate_and_up_B = to_operand(self.lora_gate_and_up_B, compute_dtype)
+        lora_down_A = to_operand(self.lora_down_A, compute_dtype)
+        lora_down_B = to_operand(self.lora_down_B, compute_dtype)
 
         if ep_size > 1:
             x = DTensor.from_local(x, device_mesh=ep_mesh, placements=[Shard(0)]).full_tensor(
@@ -518,12 +534,13 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
         permuted_probs = permuted_probs.unsqueeze(-1)
 
         compute_dtype = x.dtype
-        gate_and_up_projs = _to_grouped_mm_operand(self.gate_and_up_projs, compute_dtype)
-        down_projs = _to_grouped_mm_operand(self.down_projs, compute_dtype)
-        lora_gate_and_up_A = _to_grouped_mm_operand(self.lora_gate_and_up_A, compute_dtype)
-        lora_gate_and_up_B = _to_grouped_mm_operand(self.lora_gate_and_up_B, compute_dtype)
-        lora_down_A = _to_grouped_mm_operand(self.lora_down_A, compute_dtype)
-        lora_down_B = _to_grouped_mm_operand(self.lora_down_B, compute_dtype)
+        to_operand = _to_grouped_mm_operand if self.use_torch_mm else _to_gmm_operand
+        gate_and_up_projs = to_operand(self.gate_and_up_projs, compute_dtype)
+        down_projs = to_operand(self.down_projs, compute_dtype)
+        lora_gate_and_up_A = to_operand(self.lora_gate_and_up_A, compute_dtype)
+        lora_gate_and_up_B = to_operand(self.lora_gate_and_up_B, compute_dtype)
+        lora_down_A = to_operand(self.lora_down_A, compute_dtype)
+        lora_down_B = to_operand(self.lora_down_B, compute_dtype)
 
         if permuted_local_hidden_states.size(0) > 0:
             if self.use_torch_mm:
