@@ -280,6 +280,7 @@ def test_deepep_lora_torch_mm_uses_grouped_gemm_for_unaligned_bf16_lora_rank(moe
     fake_gmm = MagicMock(
         side_effect=lambda a, b, *_args, **_kwargs: torch.zeros(a.shape[0], b.shape[-1], dtype=a.dtype)
     )
+    fake_grouped_mm_operand = MagicMock(side_effect=lambda proj, dtype: proj.to(dtype).contiguous())
 
     x = torch.randn(num_tokens, 16, dtype=torch.bfloat16)
     weights = torch.ones(num_tokens, 1, dtype=torch.bfloat16)
@@ -289,6 +290,7 @@ def test_deepep_lora_torch_mm_uses_grouped_gemm_for_unaligned_bf16_lora_rank(moe
     with (
         patch("nemo_automodel.components._peft.lora_experts.ops", SimpleNamespace(gmm=fake_gmm)),
         patch("nemo_automodel.components._peft.lora_experts.torch._grouped_mm", fake_torch_grouped_mm, create=True),
+        patch("nemo_automodel.components._peft.lora_experts._to_grouped_mm_operand", fake_grouped_mm_operand),
         patch(
             "nemo_automodel.components._peft.lora_experts._pad_lora_rank_for_grouped_mm",
             side_effect=AssertionError("unaligned LoRA rank should use grouped_gemm without padding"),
@@ -297,6 +299,7 @@ def test_deepep_lora_torch_mm_uses_grouped_gemm_for_unaligned_bf16_lora_rank(moe
         out = lora_module(x, token_mask, weights, indices)
 
     assert out.shape == (num_tokens, 16)
+    assert fake_grouped_mm_operand.call_count == 2
     assert fake_torch_grouped_mm.call_count == 2
     assert fake_gmm.call_count == 4
 
