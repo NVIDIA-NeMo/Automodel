@@ -121,6 +121,8 @@ ci:
   checkpoint_robustness:
     check_source_load_parity: true
     hf_device_map_auto: true
+    step_scheduler.global_batch_size: 16
+    step_scheduler.local_batch_size: 1
     tokenizer_name: Qwen/Qwen3.5-35B-A3B
 
 # Uncomment and configure for W&B logging
