@@ -120,7 +120,17 @@ ci:
   # Keep failures blocking; source/reload defects are tracked by AM-711/AM-717.
   checkpoint_robustness:
     check_source_load_parity: true
+    experts_implementation: grouped_mm
+    hf_kl_threshold: 2e-2
+    hf_keep_in_fp32_modules: A_log,dt_bias
     hf_device_map_auto: true
+    model.backend.experts: torch_mm
+    resume_loss_threshold: 1e-2
+    source_load_cosine_threshold: 0.9985
+    source_load_kl_threshold: 1e-1
+    source_load_mean_kl_threshold: 1e-2
+    step_scheduler.global_batch_size: 16
+    step_scheduler.local_batch_size: 1
     tokenizer_name: Qwen/Qwen3.5-35B-A3B
 
 # Uncomment and configure for W&B logging
