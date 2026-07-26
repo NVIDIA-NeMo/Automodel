@@ -37,8 +37,7 @@ fsdp:
   fsdp2_forward_prefetch_depth: 1
 
 flow_matching:
-  adapter:
-    _target_: nemo_automodel.components.models.qwen_image_edit.adapter.QwenImageEditAdapter
+  adapter_type: "qwen_image_edit"
   timestep_sampling: "beta"
   beta_alpha: 2.5
   beta_beta: 1.5

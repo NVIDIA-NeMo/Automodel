@@ -57,7 +57,6 @@ if TYPE_CHECKING:
     from nemo_automodel.components.datasets.loader import DataloaderConfig
     from nemo_automodel.components.datasets.multimodal.loader import BagelDataloaderConfig
     from nemo_automodel.components.datasets.vlm.loader import VlmDataloaderConfig, VlmProcessorConfig
-    from nemo_automodel.components.flow_matching.config import FlowMatchingConfig
     from nemo_automodel.components.loss.loss import LossConfig
     from nemo_automodel.components.loss.mtp import MTPLossConfig
     from nemo_automodel.components.optim.optimizer import OptimizerConfig
@@ -170,27 +169,6 @@ class RecipeConfig:
     def lr_scheduler(self) -> LRSchedulerConfig | None:
         node = self._raw.get("lr_scheduler", None)
         return LRSchedulerConfig(**_section_kwargs(node)) if node else None
-
-    @cached_property
-    def flow_matching(self) -> "FlowMatchingConfig":
-        """Typed flow-matching pipeline and adapter configuration."""
-        from nemo_automodel.components.flow_matching.config import (
-            FlowMatchingAdapterConfig,
-            FlowMatchingConfig,
-        )
-
-        node = self._raw.get("flow_matching", None)
-        if node is None:
-            return FlowMatchingConfig()
-
-        kwargs = _section_kwargs(node)
-        adapter_node = kwargs.pop("adapter", None)
-        if adapter_node is not None:
-            target, adapter_kwargs = _callable_and_kwargs(adapter_node)
-            kwargs["adapter"] = FlowMatchingAdapterConfig(target=target, kwargs=adapter_kwargs)
-        if "adapter_kwargs" in kwargs:
-            kwargs["adapter_kwargs"] = _as_dict(kwargs["adapter_kwargs"])
-        return FlowMatchingConfig(**kwargs)
 
     @cached_property
     def optimizer(self) -> "OptimizerConfig" | None:

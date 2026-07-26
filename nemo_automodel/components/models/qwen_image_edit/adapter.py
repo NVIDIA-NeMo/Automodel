@@ -32,12 +32,6 @@ class QwenImageEditAdapter(ModelAdapter):
     token, but flow matching supervises only the leading target-token span.
     """
 
-    def register_parallel_strategy(self) -> None:
-        """Register the model-owned Qwen transformer FSDP2 strategy."""
-        from .fsdp import register_qwen_image_edit_parallel_strategy
-
-        register_qwen_image_edit_parallel_strategy()
-
     @staticmethod
     def _pack_latents(latents: torch.Tensor) -> torch.Tensor:
         """Pack 2-by-2 latent patches in the upstream Diffusers layout.

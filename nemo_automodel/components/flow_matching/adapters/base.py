@@ -155,6 +155,3 @@ class ModelAdapter(ABC):
             Float32 tensor of shape [batch, ...] matching ``model_pred``, containing the per-element loss.
         """
         return nn.functional.mse_loss(model_pred.float(), target.float(), reduction="none")
-
-    def register_parallel_strategy(self) -> None:
-        """Register model-owned distributed strategies before model construction."""

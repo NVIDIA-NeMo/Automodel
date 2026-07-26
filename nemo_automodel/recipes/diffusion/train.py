@@ -28,6 +28,7 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.utils import get_sync_ctx
+from nemo_automodel.components.flow_matching.pipeline import FlowMatchingPipeline, create_adapter
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.training.rng import StatefulRNG
@@ -562,7 +563,7 @@ class TrainDiffusionRecipe(BaseRecipe):
         # Get distributed training configs (mutually exclusive)
         fsdp_cfg = self.cfg.get("fsdp", None)
         ddp_cfg = self.cfg.get("ddp", None)
-        self.flow_matching_config = self.cfg.flow_matching
+        fm_cfg = self.cfg.get("flow_matching", {})
 
         # Validate mutually exclusive distributed configs
         if fsdp_cfg is not None and ddp_cfg is not None:
@@ -574,28 +575,31 @@ class TrainDiffusionRecipe(BaseRecipe):
         self.cpu_offload = fsdp_cfg.get("cpu_offload", False) if fsdp_cfg else False
         self.defer_fsdp_grad_sync = fsdp_cfg.get("defer_fsdp_grad_sync", True) if fsdp_cfg else True
 
-        # Flow matching configuration. Construct the adapter before the model so
-        # model-owned parallel strategies are registered before FSDP planning.
-        self.adapter_type = self.flow_matching_config.adapter_type or (
-            "target" if self.flow_matching_config.adapter is not None else "simple"
+        # Flow matching configuration
+        self.adapter_type = fm_cfg.get("adapter_type", "simple")
+        self.timestep_sampling = fm_cfg.get("timestep_sampling", "logit_normal")
+        self.logit_mean = fm_cfg.get("logit_mean", 0.0)
+        self.logit_std = fm_cfg.get("logit_std", 1.0)
+        self.flow_shift = fm_cfg.get("flow_shift", 3.0)
+        self.mix_uniform_ratio = fm_cfg.get("mix_uniform_ratio", 0.1)
+        self.beta_alpha = fm_cfg.get("beta_alpha", 2.5)
+        self.beta_beta = fm_cfg.get("beta_beta", 1.5)
+        self.use_sigma_noise = fm_cfg.get("use_sigma_noise", True)
+        self.sigma_min = fm_cfg.get("sigma_min", 0.0)
+        self.sigma_max = fm_cfg.get("sigma_max", 1.0)
+        self.num_train_timesteps = fm_cfg.get("num_train_timesteps", 1000)
+        self.i2v_prob = fm_cfg.get("i2v_prob", 0.3)
+        self.cfg_dropout_prob = fm_cfg.get("cfg_dropout_prob", 0.1)
+        self.use_loss_weighting = fm_cfg.get("use_loss_weighting", True)
+        self.loss_weighting_scheme = fm_cfg.get("loss_weighting_scheme", "linear")
+        self.log_interval = fm_cfg.get("log_interval", 100)
+        self.summary_log_interval = fm_cfg.get("summary_log_interval", 10)
+
+        # Adapter-specific configuration
+        adapter_kwargs = fm_cfg.get("adapter_kwargs", {})
+        self.adapter_kwargs = (
+            adapter_kwargs.to_dict() if hasattr(adapter_kwargs, "to_dict") else dict(adapter_kwargs or {})
         )
-        self.timestep_sampling = self.flow_matching_config.timestep_sampling
-        self.logit_mean = self.flow_matching_config.logit_mean
-        self.logit_std = self.flow_matching_config.logit_std
-        self.flow_shift = self.flow_matching_config.flow_shift
-        self.mix_uniform_ratio = self.flow_matching_config.mix_uniform_ratio
-        self.use_sigma_noise = self.flow_matching_config.use_sigma_noise
-        self.sigma_min = self.flow_matching_config.sigma_min
-        self.sigma_max = self.flow_matching_config.sigma_max
-        self.num_train_timesteps = self.flow_matching_config.num_train_timesteps
-        self.i2v_prob = self.flow_matching_config.i2v_prob
-        self.cfg_dropout_prob = self.flow_matching_config.cfg_dropout_prob
-        self.use_loss_weighting = self.flow_matching_config.use_loss_weighting
-        self.loss_weighting_scheme = self.flow_matching_config.loss_weighting_scheme
-        self.log_interval = self.flow_matching_config.log_interval
-        self.summary_log_interval = self.flow_matching_config.summary_log_interval
-        self.model_adapter = self.flow_matching_config.build_adapter()
-        self.model_adapter.register_parallel_strategy()
         if self.optimize_hunyuan_flash_varlen_mask:
             if self.adapter_type != "hunyuan":
                 raise ValueError(
@@ -803,12 +807,28 @@ class TrainDiffusionRecipe(BaseRecipe):
 
         self.load_checkpoint(self.restore_from)
 
-        # Init Flow Matching Pipeline V2 with the adapter built in __init__
-        self.flow_matching_pipeline = self.flow_matching_config.build(
-            model_adapter=self.model_adapter,
-            device=self.device,
+        # Init Flow Matching Pipeline V2 with model adapter
+        model_adapter = create_adapter(self.adapter_type, **self.adapter_kwargs)
+        self.flow_matching_pipeline = FlowMatchingPipeline(
+            model_adapter=model_adapter,
+            num_train_timesteps=self.num_train_timesteps,
+            timestep_sampling=self.timestep_sampling,
+            flow_shift=self.flow_shift,
+            i2v_prob=self.i2v_prob,
+            cfg_dropout_prob=self.cfg_dropout_prob,
+            logit_mean=self.logit_mean,
+            logit_std=self.logit_std,
+            mix_uniform_ratio=self.mix_uniform_ratio,
+            beta_alpha=self.beta_alpha,
+            beta_beta=self.beta_beta,
+            use_sigma_noise=self.use_sigma_noise,
             sigma_min=self.sigma_min,
             sigma_max=self.sigma_max,
+            use_loss_weighting=self.use_loss_weighting,
+            loss_weighting_scheme=self.loss_weighting_scheme,
+            log_interval=self.log_interval,
+            summary_log_interval=self.summary_log_interval,
+            device=self.device,
         )
         logging.info(f"[INFO] Flow Matching Pipeline V2 initialized with {self.adapter_type} adapter")
 
