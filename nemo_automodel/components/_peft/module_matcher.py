@@ -107,10 +107,6 @@ class ModuleMatcher:
             )
             self.target_modules = ["*_proj"]
 
-        if self.target_modules and self.exclude_modules:
-            raise ValueError(
-                "target_modules and exclude_modules are mutually exclusive. Please provide only one of them."
-            )
         if self.match_all_linear and (len(self.target_modules) > 0 or len(self.exclude_modules) > 0):
             raise ValueError(
                 "Expected target_modules/exclude_modules to be empty when match_all_linear is true. Please provide only one of them."
@@ -127,11 +123,19 @@ class ModuleMatcher:
     # --------------------------------------------------------------------- #
     # Public API                                                            #
     # --------------------------------------------------------------------- #
+    def _excluded(self, name: str, full_name: str) -> bool:
+        return name in self.exclude_modules or any(
+            wildcard_match(pattern, full_name) for pattern in self.exclude_modules
+        )
+
     def match(self, m: nn.Module, name: str = None, prefix: str = None):
         """
         Return (pattern, full_name) if the module matches; otherwise None.
         """
         full_name = f"{prefix}.{name}" if prefix else name
+
+        if self._excluded(name, full_name):
+            return False
 
         # 1. matching by layer type takes absolute precedence
         if self.match_all_linear and _is_linear_module(m):
@@ -139,15 +143,10 @@ class ModuleMatcher:
 
         # 2. target_modules is the next most-specific rule set
         elif self.target_modules:
-            assert not self.exclude_modules, "`exclude_modules` must be empty when `target_modules` is used."
             for pattern in self.target_modules:
                 if name == pattern or wildcard_match(pattern, full_name):
                     return True
             return False
         # 3. Fallback: “all linear layers except those explicitly excluded”
         else:
-            return (
-                name not in self.exclude_modules
-                and not any(wildcard_match(pattern, full_name) for pattern in self.exclude_modules)
-                and _is_linear_module(m)
-            )
+            return _is_linear_module(m)
