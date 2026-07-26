@@ -34,6 +34,7 @@ from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm
     _post_load_dequant_max_memory,
     _prepare_hf_reload_sync,
     _record_deferred_failure,
+    _release_recipe_memory,
     _wait_for_hf_reload_rank0,
 )
 from tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_vlm import _get_vlm_input_ids
@@ -57,6 +58,32 @@ def _run_hf_reload_sync_rank(rank, init_path, checkpoint_dir):
         _finish_hf_reload_sync(sync_paths)
     finally:
         dist.destroy_process_group()
+
+
+def test_release_recipe_memory_frees_deepep_buffer_between_phases():
+    optimizer = SimpleNamespace(state={"step": object()}, param_groups=[{"params": [object()]}])
+    recipe = SimpleNamespace(
+        model_parts=[object()],
+        optimizer=optimizer,
+        lr_scheduler=object(),
+    )
+
+    with (
+        patch(
+            "tests.functional_tests.checkpoint_robustness.test_checkpoint_robustness_llm._barrier"
+        ) as barrier,
+        patch("nemo_automodel.components.moe.megatron.fused_a2a.free_buffer") as free_buffer,
+        patch.object(torch.cuda, "is_available", return_value=False),
+    ):
+        _release_recipe_memory(recipe)
+
+    assert optimizer.state == {}
+    assert optimizer.param_groups == []
+    assert recipe.model_parts is None
+    assert recipe.optimizer is None
+    assert recipe.lr_scheduler is None
+    assert barrier.call_count == 2
+    free_buffer.assert_called_once_with()
 
 
 @pytest.mark.parametrize(

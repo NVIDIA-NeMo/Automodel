@@ -1015,6 +1015,13 @@ def _release_recipe_memory(recipe) -> None:
     recipe.optimizer = None
     if getattr(recipe, "lr_scheduler", None) is not None:
         recipe.lr_scheduler = None
+    _barrier()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    from nemo_automodel.components.moe.megatron.fused_a2a import free_buffer
+
+    free_buffer()
+    _barrier()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
