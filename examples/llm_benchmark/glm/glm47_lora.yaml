@@ -29,7 +29,7 @@ benchmark:
   nsys_end: -1
   nsys_ranks: []
   torch_profile_iteration: 10
-  torch_profile_ranks: [0]
+  torch_profile_ranks: [0, 32]
   torch_profile_row_limit: 40
   num_nodes: 8
 step_scheduler:
