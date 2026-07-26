@@ -333,7 +333,7 @@ class LinearLoRA(nn.Linear):
                 lora_res = F.dropout(lora_res, p=self.dropout_p, training=self.training)
             if use_memory_efficient_lora:
                 return lora_res.add_(res)
-            return res + lora_res
+            return lora_res.add_(res)
 
         if getattr(self, "lora_magnitude", None) is None:
             raise RuntimeError("use_dora=True but lora_magnitude was not initialized")
@@ -423,7 +423,7 @@ class TritonLinearLoRA(LinearLoRA):
         if self.use_memory_efficient_lora:
             return lora_res.add_(res)
 
-        return res + lora_res
+        return lora_res.add_(res)
 
 
 def patch_linear_module(
