@@ -495,6 +495,20 @@ def test_apply_ep_parallelizes_diffusion_style_block_moe(monkeypatch):
     assert isinstance(kwargs["parallelize_plan"], P.ExpertParallel)
 
 
+def test_get_moe_module_unwraps_checkpoint_wrapper(monkeypatch):
+    P = _import_parallelizer_with_stubs(monkeypatch)
+    monkeypatch.setattr(P, "MoE", DummyMoE)
+
+    class Wrapped:
+        def __init__(self, module):
+            self._checkpoint_wrapped_module = module
+
+    inner = DummyMoE()
+    block = DummyBlock(mlp=Wrapped(inner))
+
+    assert P._get_moe_module(block) is inner
+
+
 def test_apply_ac_wraps_blocks_with_and_without_context(monkeypatch):
     P = _import_parallelizer_with_stubs(monkeypatch)
     wrapper_returns = [object(), object()]
