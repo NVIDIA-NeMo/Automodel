@@ -727,7 +727,7 @@ class Engine:
             model_inputs = self._batch_to_device(dict(pk.model_inputs), device)
             sync_ctx = get_sync_ctx(model, is_last, self.config.defer_fsdp_grad_sync) if is_train else nullcontext()
             fwd_ctx = nullcontext() if is_train else torch.no_grad()
-            # The caller already built the (THD/CP) layout, so no make_cp_batch_and_ctx here.
+            # The caller already built the (THD/CP) layout, so no CP sharding here.
             with fwd_ctx, sync_ctx:
                 out = model(**filter_forward_kwargs(model, model_inputs))
                 mo = self._build_packed_model_output(getattr(out, "logits", out), pk, detach=False)
