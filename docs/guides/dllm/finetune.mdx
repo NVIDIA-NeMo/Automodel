@@ -5,13 +5,13 @@ position: 17
 ---
 ## Introduction
 
-Diffusion language models (dLLMs) generate text by iteratively denoising masked tokens, rather than generating one token at a time left-to-right like autoregressive (AR) models. Starting from a sequence of `[MASK]` tokens, the model progressively unmasks the most confident positions over multiple denoising steps until the full response is revealed.
+Diffusion language models (dLLMs) generate text by iteratively denoising masked tokens rather than generating one token at a time from left to right, as autoregressive (AR) models do. Starting from a sequence of `[MASK]` tokens, the model progressively unmasks the most confident positions over multiple denoising steps until it reveals the full response.
 
-This approach enables **parallel token generation** and **bidirectional attention**, which gives the model more context for each prediction compared to AR models.
+This approach enables **parallel token generation** and **bidirectional attention**, giving the model more context for each prediction than AR models provide.
 
 NeMo AutoModel currently supports the following dLLM model families:
 
-- **LLaDA or LLaDA2 (Masked Diffusion Language Model or MDLM)**: This bidirectional masked diffusion model receives corrupted tokens and predicts the clean token at each masked position (see the [LLaDA2 paper](https://arxiv.org/abs/2602.08676)).
+- **LLaDA or LLaDA2 (Masked Diffusion Language Model or MDLM)**: This bidirectional masked diffusion model receives corrupted tokens and predicts the clean token at each masked position. For details, refer to the [LLaDA2 paper](https://arxiv.org/abs/2602.08676).
 - **Nemotron-Labs-Diffusion (hybrid)**: This model combines diffusion with an autoregressive loss. During training, the model processes clean tokens and a `masked_indices` sidecar, learning both a diffusion objective and an autoregressive objective simultaneously.
 - **DFlash**: This speculative block diffusion model uses a small draft model that proposes tokens for a block conditioned on frozen target language model (LM) hidden states. A decay-weighted loss trains the draft model to predict target tokens (see the [DFlash paper](https://arxiv.org/abs/2602.06036)).
 
@@ -43,8 +43,11 @@ The following table lists the supported models, their training modes, loss funct
 |---|---|---|---|---|
 | LLaDA | `mdlm` | MDLM cross-entropy | Standalone full-forward denoising (no KV cache) | [llada_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_sft.yaml) |
 | LLaDA2 | `mdlm` | MDLM cross-entropy | Built-in block-refinement generation | [llada2_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada2_sft.yaml) |
-| Nemotron-Labs-Diffusion | `hybrid` | Diffusion + AR (alpha-weighted) | Block diffusion with KV cache | [nemotron_labs_diffusion_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) |
-| DFlash | `dflash` | Decay-weighted cross-entropy (Eq. 4) | Speculative block decoding (draft + target) | [dflash_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/dflash_sft.yaml) |
+| Nemotron-Labs-Diffusion | `hybrid` | Diffusion and AR (alpha-weighted) | Block diffusion with KV cache | [nemotron_labs_diffusion_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) |
+| DiffusionGemma | `block_diffusion` | Flat block-diffusion cross-entropy and encoder AR | Built-in Hugging Face diffusion sampler (entropy-bounded denoising) | [diffusion_gemma_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/diffusion_gemma_sft.yaml) |
+| DFlash | `dflash` | Decay-weighted cross-entropy (Equation 4) | Training only (decoding occurs in the speculative-decoding stack) | [dflash_sft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/dflash_sft.yaml) |
+
+For a dedicated walkthrough of DiffusionGemma fine-tuning, including full fine-tuning and LoRA with expert parallelism for its 26B-A4B MoE, refer to the [DiffusionGemma Fine-Tuning Guide](/recipes-e2e-examples/diffusiongemma).
 
 ## Install NeMo AutoModel
 
@@ -54,7 +57,7 @@ source .venv/bin/activate
 uv pip install "nemo-automodel"
 ```
 
-Alternatively, use the pre-built Docker container:
+Alternatively, use the prebuilt Docker container:
 
 ```bash
 docker pull nvcr.io/nvidia/nemo-automodel:26.06.00
@@ -75,12 +78,13 @@ The recipe uses a **strategy pattern** to handle differences between model famil
 | Mode | Strategy | Description |
 |------|----------|-------------|
 | `mdlm` | `MDLMStrategy` | LLaDA-style: model receives corrupted tokens, MDLM cross-entropy loss |
-| `hybrid` | `HybridStrategy` | Nemotron-Labs-Diffusion-style: model receives clean tokens + `masked_indices`, combined diffusion + AR loss |
-| `dflash` | `DFlashStrategy` | DFlash: frozen target LM provides hidden states; draft model trained with decay-weighted loss |
+| `hybrid` | `HybridStrategy` | Nemotron-Labs-Diffusion-style: model receives clean tokens and `masked_indices`, with combined diffusion and AR loss |
+| `block_diffusion` | `BlockDiffusionStrategy` | DiffusionGemma-style: uniform random-token corruption over a response canvas, with flat cross-entropy and co-trained encoder AR loss |
+| `dflash` | `DFlashStrategy` | DFlash: frozen target LM provides hidden states, and the draft model trains with decay-weighted loss |
 
 ### LLaDA Configuration
 
-See [`llada_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_sft.yaml) for the full working configuration. The key dLLM-specific sections are shown in the following example.
+Refer to [`llada_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/llada_sft.yaml) for the full working configuration. The following example shows the key dLLM-specific sections.
 
 ```yaml
 model:
@@ -99,7 +103,7 @@ dataset:
 
 ### Nemotron-Labs-Diffusion Configuration
 
-See [`nemotron_labs_diffusion_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) for the full working configuration. The key dLLM-specific sections are shown in the following example.
+Refer to [`nemotron_labs_diffusion_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/nemotron_labs_diffusion_sft.yaml) for the full working configuration. The following example shows the key dLLM-specific sections.
 
 ```yaml
 model:
@@ -126,20 +130,20 @@ The following table describes the key configuration fields for dLLM fine-tuning.
 
 | Field | Description |
 |-------|-------------|
-| `dllm.mode` | Training strategy (`mdlm`, `hybrid`, or `dflash`) |
+| `dllm.mode` | Training strategy (`mdlm`, `hybrid`, `block_diffusion`, or `dflash`) |
 | `dllm.mask_token_id` | Token ID used for masking (`126336` for LLaDA, `156895` for LLaDA2.1, `100` for Nemotron-Labs-Diffusion) |
 | `dllm.eps` | Minimum corruption ratio to avoid zero-corruption samples |
-| `dllm.block_size` | When set, use block-wise corruption (otherwise uniform). Hybrid mode only. |
-| `dllm.half_life_ratio` | Half-life ratio for block-wise corruption (defaults to 0.25 when unset). Hybrid mode only. |
+| `dllm.block_size` | When set, use blockwise corruption (otherwise uniform). Hybrid mode only. |
+| `dllm.half_life_ratio` | Half-life ratio for blockwise corruption (defaults to 0.25 when unset). Hybrid mode only. |
 | `dllm.ar_loss_alpha` | Weight applied to the diffusion branch in the hybrid loss. Hybrid mode only. |
-| `dataset.unshifted` | Must be `true` for dLLM — disables the autoregressive input/target shift |
+| `dataset.unshifted` | Must be `true` for dLLM. Disables the autoregressive input and target shift. |
 
 ### DFlash Configuration
 
 DFlash trains a small draft model to predict tokens conditioned on a frozen causal target language model.
-Only the weights of the draft model are updated. The target language model is loaded once and remains frozen.
+Only the draft model weights are updated. The target language model loads one time and remains frozen.
 
-See [`dflash_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/dflash_sft.yaml) for the full working configuration. The key DFlash-specific sections are shown in the following example.
+Refer to [`dflash_sft.yaml`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_sft/dflash_sft.yaml) for the full working configuration. The following example shows the key DFlash-specific sections.
 
 ```yaml
 model:                                          # Draft model
@@ -168,10 +172,10 @@ The following table describes the key configuration fields for DFlash fine-tunin
 | Field | Description |
 |-------|-------------|
 | `dflash.target_model_id` | Hub ID of the frozen causal LM that conditions the draft |
-| `dflash.block_size` | Tokens per draft block; `0` reads from draft model config |
-| `dflash.loss_decay_gamma` | Decay γ for Eq. 4; `0` uses paper defaults (7/5/4 for block sizes 16/10/8) |
+| `dflash.block_size` | Tokens per draft block. `0` reads from the draft model config. |
+| `dflash.loss_decay_gamma` | Decay γ for Equation 4. `0` uses paper defaults (7, 5, and 4 for block sizes 16, 10, and 8). |
 | `dflash.num_blocks_per_sample` | Number of anchor blocks processed per sequence per step (paper default: 512, Appendix A.1) |
-| `dflash.attention_backend` | `flex_attention` (sparse, scales to 512 anchors) or `sdpa` (dense, OOMs above ~64). Default `sdpa` for backward compat — set to `flex_attention` for production runs |
+| `dflash.attention_backend` | `flex_attention` (sparse, scales to 512 anchors) or `sdpa` (dense, runs out of memory above approximately 64). The default is `sdpa` for backward compatibility. Set it to `flex_attention` for production runs. |
 | `dflash.overlap_anchors` | `true` (paper, independent sampling) or `false` (non-overlapping stars-and-bars, caps at `seq_len // block_size`) |
 
 #### DFlash Training Metrics
@@ -180,16 +184,16 @@ In addition to the shared metrics (such as `loss`, `grad_norm`, `lr`, `mem`, `tp
 
 | Metric | Meaning | Where |
 |--------|---------|-------|
-| `draft_acc` | Overall fraction of valid block positions where `argmax(draft_logits) == target_token` | Console line + wandb / mlflow / comet + file logger |
-| `draft_acc_k{k}` | Same fraction restricted to block offset `k` (`k = 1..block_size-1`) — the acceptance-length curve | wandb / mlflow / comet + file logger (one panel per offset); intentionally omitted from the console line to keep it readable |
+| `draft_acc` | Overall fraction of valid block positions where `argmax(draft_logits) == target_token` | Console line and `wandb`, `mlflow`, `comet`, and file loggers |
+| `draft_acc_k{k}` | Same fraction restricted to block offset `k` (`k = 1..block_size-1`), which forms the acceptance-length curve | `wandb`, `mlflow`, `comet`, and file loggers (one panel per offset). Intentionally omitted from the console line to keep it readable. |
 
-Both metrics are computed from the logits already produced by the chunked linear cross-entropy path, without an additional model forward pass. They are reduced across data parallel and context parallel ranks using per-rank raw `(correct, count)` sums that are summed with an all-reduce operation and then divided after reduction. This process ensures that the values are correct across arbitrary per-rank token distributions under any of the distributed modes of AutoModel.
+Both metrics are computed from the logits that the chunked linear cross-entropy path already produces, without an additional model forward pass. They are reduced across data-parallel and context-parallel ranks using per-rank raw `(correct, count)` sums. An all-reduce operation sums these values before division. This process ensures that the values are correct across arbitrary per-rank token distributions in any AutoModel distributed mode.
 
 #### Prepare DFlash Training Data
 
 The DFlash paper recommends training on responses regenerated by the target model, as described in Section 5.1. Rather than directly using the original dataset, you can construct the training set with responses generated by the target model to achieve better target alignment. Skipping this step trains the draft model on a different output distribution than the target model produces at inference, which directly reduces the acceptance length.
 
-The existing `nemo_automodel.components.speculative.regenerate` script handles this process. Start an SGLang server hosting the target model, and then regenerate the assistant turns:
+The existing `nemo_automodel.components.speculative.regenerate` script handles this process. Start an SGLang server that hosts the target model, and then regenerate the assistant turns:
 
 ```bash
 # 1. Serve the target model on the local node (default port 30000)
@@ -209,7 +213,7 @@ python -m nemo_automodel.components.speculative.regenerate \
     --resume
 ```
 
-The use of `--temperature 0.8` (compared to the EAGLE-oriented default value of `0.0` for the script) follows the DFlash paper. Sampling diversity in the supervised tokens teaches the draft model to handle a wider target distribution, which improves the acceptance length. The setting of `--concurrency 64` better saturates a vLLM or SGLang server.
+The use of `--temperature 0.8` (compared to the EAGLE-oriented default value of `0.0` for the script) follows the DFlash paper. Sampling diversity in the supervised tokens teaches the draft model to handle a wider target distribution, which improves the acceptance length. The `--concurrency 64` setting better saturates a vLLM or SGLang server.
 
 You can then point the recipe configuration `dataset.path_or_dataset_id` to the regenerated Parquet shards in the `/data/dflash-train-regen` directory instead of using the raw Hugging Face dataset.
 
@@ -241,9 +245,9 @@ torchrun --nproc-per-node=8 \
 
 ## Run Inference
 
-The generation script ([`generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_generate/generate.py)) supports chat and raw generation. Select the sampler that matches the trained family by using the `--sampler {llada,llada2,nemotron}` argument. Infilling is also available for LLaDA and Nemotron, but the LLaDA2 generation path does not support it.
+The generation script ([`generate.py`](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/dllm_generate/generate.py)) supports chat and raw generation. Select the sampler that matches the trained family by using the `--sampler {llada,llada2,nemotron,gemma}` argument. Infilling (`--infill`) is available with the `llada` sampler only.
 
-The `--checkpoint` argument accepts several path types, such as a path to a `consolidated/` directory, a step directory (for example, `.../epoch_0_step_499`), or the top-level checkpoint directory. The script automatically follows the path to `LATEST/model/consolidated/`.
+The `--checkpoint` argument accepts several path types, including a path to a `consolidated/` directory, a step directory such as `.../epoch_0_step_499`, or the top-level checkpoint directory. The script automatically resolves the path to `LATEST/model/consolidated/`. Training with the provided example configs automatically writes this consolidated Hugging Face-format directory at the final checkpoint (`checkpoint.save_consolidated: final`). You can pass the directory printed at the end of training directly to `--checkpoint`.
 
 ### Generate with LLaDA
 
@@ -256,7 +260,7 @@ python examples/dllm_generate/generate.py \
 
 ### Generate with LLaDA2
 
-LLaDA2 generation calls the built-in block-refinement `generate()` method of the model.
+LLaDA2 generation calls the model's built-in block-refinement `generate()` method.
 
 ```bash
 python examples/dllm_generate/generate.py \
@@ -278,15 +282,27 @@ python examples/dllm_generate/generate.py \
     --sampler nemotron
 ```
 
+### Generate with DiffusionGemma
+
+DiffusionGemma generation calls the diffusion sampler that ships with `transformers`
+(entropy-bounded denoising with adaptive stopping).
+
+```bash
+python examples/dllm_generate/generate.py \
+    --checkpoint <path> \
+    --prompt "Explain what a neural network is." \
+    --sampler gemma
+```
+
 ### Generation Parameters
 
 The sampler selected with the `--sampler` argument supplies these preset values. LLaDA uses the standalone AutoModel sampler. LLaDA2 and Nemotron call the built-in `generate()` methods of their models. The `--remasking` and `--no_kv_cache` arguments do not affect LLaDA2 generation. The following table lists the default and preset values for the generation parameters.
 
 | Parameter | Description | LLaDA Default | LLaDA2 Preset | Nemotron Preset |
 |-----------|-------------|---------------|----------------|------------------|
-| `--steps` | Number of denoising steps | 128 | 32 | 1024 (preset only; unused by built-in generation) |
+| `--steps` | Number of denoising steps | 128 | 32 | 1024 (preset only, unused by built-in generation) |
 | `--max_new_tokens` | Maximum tokens to generate | 128 | 128 | 1024 |
 | `--block_size` | Tokens per denoising block | 128 | 32 | 32 |
 | `--temperature` | Sampling temperature (0 = greedy) | 0.0 | 0.0 | 0.0 |
 | `--threshold` | Confidence threshold for committing tokens | `None` (disabled by default) | 0.5 | 0.9 |
-| `--remasking` | Confidence scoring strategy for selecting which positions to unmask | `low_confidence` | `low_confidence` (preset only; unused by built-in generation) | `low_confidence` (preset only; unused by built-in generation) |
+| `--remasking` | Confidence scoring strategy for selecting which positions to unmask | `low_confidence` | `low_confidence` (preset only, unused by built-in generation) | `low_confidence` (preset only, unused by built-in generation) |

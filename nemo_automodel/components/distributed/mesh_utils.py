@@ -569,3 +569,40 @@ def get_fsdp_dp_mesh(
             return device_mesh[dp_shard_name]
 
     return get_submesh(device_mesh, (dp_replicate_name, dp_shard_cp_name))
+
+
+def create_ring_ulysses_mesh(
+    device_mesh: "DeviceMesh",
+    *,
+    ring_degree: int,
+    ulysses_degree: int,
+) -> "DeviceMesh":
+    """Derive a 2D ``("ring", "ulysses")`` view of the mesh's ``"cp"`` axis.
+
+    Diffusers' context-parallel API (``ContextParallelConfig.mesh``) requires a
+    device mesh with dimensions named ``"ring"`` and ``"ulysses"``. This reshapes
+    the 1D ``"cp"`` axis of an existing root mesh into that layout so context
+    parallelism shares the process groups already created for FSDP2, instead of
+    initializing a second world mesh.
+
+    Args:
+        device_mesh: Root mesh containing a ``"cp"`` dimension (as created by
+            ``_create_fsdp2_device_mesh``).
+        ring_degree: Size of the ring-attention dimension.
+        ulysses_degree: Size of the Ulysses (all-to-all) attention dimension.
+
+    Returns:
+        A 2D DeviceMesh of shape ``(ring_degree, ulysses_degree)`` with dim
+        names ``("ring", "ulysses")`` covering this rank's CP group.
+
+    Raises:
+        ValueError: If ``ring_degree * ulysses_degree`` does not equal the size
+            of the mesh's ``"cp"`` dimension.
+    """
+    cp_mesh = device_mesh[MeshAxisName.CP]
+    if ring_degree * ulysses_degree != cp_mesh.size():
+        raise ValueError(
+            f"ring_degree ({ring_degree}) * ulysses_degree ({ulysses_degree}) must equal "
+            f"the cp mesh size ({cp_mesh.size()})."
+        )
+    return _unflatten_compat(cp_mesh, 0, (ring_degree, ulysses_degree), ("ring", "ulysses"))

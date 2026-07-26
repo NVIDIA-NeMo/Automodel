@@ -294,6 +294,7 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "baichuan": ("nemo_automodel.components.models.baichuan.configuration", "BaichuanConfig"),
     "bailing_moe": ("nemo_automodel.components.models.ling_v2.config", "BailingMoeV2Config"),
     "deepseek_v4": ("nemo_automodel.components.models.deepseek_v4.config", "DeepseekV4Config"),
+    "glm_moe_dsa": ("nemo_automodel.components.models.glm_moe_dsa.config", "GlmMoeDsaConfig"),
     "hy_v3": ("nemo_automodel.components.models.hy_v3.config", "HYV3Config"),
     "inkling_mm_model": ("nemo_automodel.components.models.inkling.configuration", "InklingConfig"),
     "kimi_k2": ("nemo_automodel.components.models.kimi_k2.config", "KimiK2Config"),
@@ -308,19 +309,20 @@ _CUSTOM_CONFIG_REGISTRATIONS: Dict[str, Tuple[str, str]] = {
     "step3p7": ("nemo_automodel.components.models.step3p7.configuration_step3p7", "Step3p7Config"),
 }
 
-# model_types whose custom model implementation reads fields that only our
-# config class provides. When a transformers release starts shipping its own
-# config for one of these model_types (same model_type string, often the same
-# class name), the skip-if-built-in registration below would silently hand the
-# native config to our custom model and break its field protocol at init
-# (transformers 5.12 added minimax_m3_vl whose vision config drops rope_theta
-# -> ``'MiniMaxM3VLVisionConfig' object has no attribute 'rope_theta'``).
-# These entries override the built-in registration instead. Entries NOT listed
-# here keep the built-in config when one exists (mistral4's custom model was
-# written against the native config and runs green with it).
+# model_types whose custom model implementation should win over a transformers
+# built-in config when one exists. A registration means the custom model reads
+# fields only our config class provides, so the built-in must NOT win by
+# default: when a transformers release starts shipping a config for a registered
+# model_type (same model_type string, often the same class name) it would
+# silently replace ours and break the model's field protocol at init -- e.g.
+# transformers 5.12 added minimax_m3_vl whose vision config drops rope_theta
+# (``'MiniMaxM3VLVisionConfig' object has no attribute 'rope_theta'``), and its
+# deepseek_v4 config renames ``compress_ratios`` to ``compress_rates``, which
+# silently collapses the DSV4 context-parallel shard multiple to 1.
+# Remove a model_type only once its custom model is verified to run on the
+# native config (mistral4 was written against it and runs green).
 _CUSTOM_CONFIG_OVERRIDES_BUILTIN = {
-    "laguna",
-    "minimax_m3_vl",
+    *(_CUSTOM_CONFIG_REGISTRATIONS.keys() - {"mistral4"}),
 }
 
 
