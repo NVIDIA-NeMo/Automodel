@@ -53,6 +53,18 @@ def _pad_lora_rank_for_grouped_mm(lora_A: torch.Tensor, lora_B: torch.Tensor) ->
     return F.pad(lora_A, (0, padding)), F.pad(lora_B, (0, 0, 0, padding))
 
 
+def _needs_lora_rank_padding_for_grouped_mm(lora_A: torch.Tensor) -> bool:
+    """Return whether torch._grouped_mm needs padding for the LoRA rank dimension."""
+    rank = lora_A.size(-1)
+    alignment = max(1, 16 // lora_A.element_size())
+    return rank % alignment != 0
+
+
+def _use_grouped_gemm_for_lora(lora_A: torch.Tensor) -> bool:
+    """Use grouped_gemm for LoRA ranks that would otherwise allocate padded copies."""
+    return ops is not None and _needs_lora_rank_padding_for_grouped_mm(lora_A)
+
+
 class GroupedExpertsLoRA(GroupedExperts):
     """
     GroupedExperts + LoRA.
@@ -515,10 +527,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
 
         if permuted_local_hidden_states.size(0) > 0:
             if self.use_torch_mm:
-                lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
-                    lora_gate_and_up_A, lora_gate_and_up_B
-                )
-                lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
+                use_grouped_gemm_lora = _use_grouped_gemm_for_lora(lora_gate_and_up_A)
+                if not use_grouped_gemm_lora:
+                    lora_gate_and_up_A, lora_gate_and_up_B = _pad_lora_rank_for_grouped_mm(
+                        lora_gate_and_up_A, lora_gate_and_up_B
+                    )
+                    lora_down_A, lora_down_B = _pad_lora_rank_for_grouped_mm(lora_down_A, lora_down_B)
                 tokens_per_expert_gpu = tokens_per_expert.to(
                     device=permuted_local_hidden_states.device, non_blocking=True
                 )
@@ -526,8 +540,17 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
 
                 # Gate+Up projection + LoRA
                 output1 = torch._grouped_mm(permuted_local_hidden_states, gate_and_up_projs, offs=offs)
-                lora_out1_A = torch._grouped_mm(permuted_local_hidden_states, lora_gate_and_up_A, offs=offs)
-                lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
+                if use_grouped_gemm_lora:
+                    lora_out1_A = ops.gmm(
+                        permuted_local_hidden_states,
+                        lora_gate_and_up_A,
+                        tokens_per_expert,
+                        trans_b=False,
+                    )
+                    lora_out1 = ops.gmm(lora_out1_A, lora_gate_and_up_B, tokens_per_expert, trans_b=False)
+                else:
+                    lora_out1_A = torch._grouped_mm(permuted_local_hidden_states, lora_gate_and_up_A, offs=offs)
+                    lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
                 output1.add_(lora_out1, alpha=self.scale)
 
                 if self.expert_bias:
@@ -538,8 +561,12 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
 
                 # Down projection + LoRA
                 output2 = torch._grouped_mm(output1, down_projs, offs=offs)
-                lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
-                lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
+                if use_grouped_gemm_lora:
+                    lora_out2_A = ops.gmm(output1, lora_down_A, tokens_per_expert, trans_b=False)
+                    lora_out2 = ops.gmm(lora_out2_A, lora_down_B, tokens_per_expert, trans_b=False)
+                else:
+                    lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
+                    lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
                 output2.add_(lora_out2, alpha=self.scale)
 
                 if self.expert_bias:
