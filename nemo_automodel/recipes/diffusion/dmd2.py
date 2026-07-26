@@ -26,7 +26,6 @@ from torch import nn
 
 from nemo_automodel._diffusers.auto_diffusion_pipeline import NeMoAutoDiffusionPipeline
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
-from nemo_automodel.components.models.qwen_image.fsdp import register_qwen_image_parallel_strategy
 from nemo_automodel.components.training.utils import (
     clip_grad_norm,
     prepare_after_first_microbatch,
@@ -125,8 +124,6 @@ class DMD2Objective:
         ema = self.modelopt_config.ema
         if ema is not None and (not ema.fsdp2 or ema.mode != "full_tensor"):
             raise ValueError("DMD2 checkpoint resume requires EMA with fsdp2=true and mode=full_tensor.")
-
-        register_qwen_image_parallel_strategy()
 
     def primary_optimizer_steps(self, outer_steps: int) -> int:
         """Return the number of student updates in ``outer_steps``."""

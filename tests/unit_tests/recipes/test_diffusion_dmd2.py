@@ -239,29 +239,8 @@ def test_qwen_image_dmd2_yaml_uses_the_native_trainer_contract():
     assert len(modelopt_config["sample_t_cfg"]["t_list"]) == 5
     assert "pipeline" not in dmd2
     assert "feature_capture_fn" not in dmd2
-    assert "register_parallel_strategy_fn" not in dmd2
+    assert config["fsdp"]["activation_checkpointing"] == "selective"
 
     dataloader = config["data"]["dataloader"]
     assert dataloader["_target_"].endswith("build_text_to_image_multiresolution_dataloader")
     assert "negative_prompt_embedding_path" not in dataloader
-
-
-def test_qwen_image_strategy_checkpoints_complete_blocks(monkeypatch):
-    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
-
-    from nemo_automodel.components.distributed.parallelizer import (
-        PARALLELIZATION_STRATEGIES,
-        DefaultParallelizationStrategy,
-    )
-    from nemo_automodel.components.models.qwen_image import fsdp
-
-    name = "QwenImageTransformer2DModel"
-    monkeypatch.delitem(PARALLELIZATION_STRATEGIES, name, raising=False)
-    wrapped = []
-    monkeypatch.setattr(fsdp, "checkpoint_wrapper", lambda block, **kwargs: wrapped.append(kwargs) or block)
-    monkeypatch.setattr(DefaultParallelizationStrategy, "parallelize", lambda self, model, *_args, **_kwargs: model)
-
-    fsdp.register_qwen_image_parallel_strategy()
-    model = SimpleNamespace(transformer_blocks=[object(), object()])
-    assert PARALLELIZATION_STRATEGIES[name].parallelize(model, object(), activation_checkpointing=True) is model
-    assert [call["checkpoint_impl"] for call in wrapped] == [CheckpointImpl.NO_REENTRANT] * 2

@@ -44,7 +44,8 @@ fsdp:
   tp_size: 1
   cp_size: 1
   pp_size: 1
-  activation_checkpointing: true
+  # AutoModel's native whole-block checkpointing mode for Qwen-Image.
+  activation_checkpointing: selective
 
 step_scheduler:
   num_epochs: 200
