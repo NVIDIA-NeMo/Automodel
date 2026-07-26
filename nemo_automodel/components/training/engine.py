@@ -27,7 +27,7 @@ Design choices (see ``automodel_tinker_api_plan.md``):
   components and the recipe builders, so it intentionally sits outside the
   "components must not import each other" independence contract.
 * **Reuse, don't reimplement.** Construction calls the same builders the LLM
-  recipe uses; the run loop calls the same ``prepare_*`` / ``make_cp_batch_and_ctx``
+  recipe uses; the run loop calls the same ``prepare_*`` / ``ContextParallelSharder``
   / ``calculate_loss`` / ``scale_grads_and_clip_grad_norm`` helpers.
 * **Lists, like the recipe.** ``model_parts`` / ``optimizers`` / ``lr_schedulers``
   are lists, matching what the builders return (PP parts, per-part optimizers).
@@ -63,6 +63,7 @@ from nemo_automodel.components.training.model_output import (
     selected_token_logprobs,
     split_per_datum,
 )
+
 __all__ = ["Engine", "CheckpointHandle"]
 
 # Datum-mode loss contract. The loss IS the algorithm and is owned by the caller:
@@ -140,8 +141,9 @@ class Engine:
         qat: Any = None
         sdpa_method: Any = None
 
-        # CP / THD batch shaping (forwarded to make_cp_batch_and_ctx).
-        cp_use_te: bool = False
+        # CP batch shaping (forwarded to ContextParallelSharder). The CP backend
+        # itself (model-owned / magi / TE-THD / round-robin) is resolved from the
+        # model, so it is not configured here.
         cp_padding_token_id: int = 0
         cp_num_chunks: int = 1
 
@@ -405,7 +407,6 @@ class Engine:
                 forward_only=forward_only,
             )
 
-        from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
         from nemo_automodel.components.distributed.utils import get_sync_ctx
         from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
         from nemo_automodel.components.loss.utils import calculate_loss
@@ -435,13 +436,7 @@ class Engine:
                 prepare_for_final_backward(self.model_parts, pp_enabled=False)
 
             mb = self._batch_to_device(mb, device)
-            train_ctx, mb = make_cp_batch_and_ctx(
-                self.device_mesh,
-                mb,
-                use_te=self.config.cp_use_te,
-                padding_token_id=self.config.cp_padding_token_id,
-                num_chunks=self.config.cp_num_chunks,
-            )
+            train_ctx, mb = self._shard_batch_for_cp(mb)
             labels = mb.pop("labels", None)
             sync_ctx = get_sync_ctx(model, is_last, self.config.defer_fsdp_grad_sync) if is_train else nullcontext()
             with train_ctx(), sync_ctx:
@@ -500,20 +495,13 @@ class Engine:
         if not datums or not isinstance(datums[0], Datum):
             raise TypeError("Engine.forward requires a non-empty sequence of Datum.")
 
-        from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
         from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 
         datums = list(datums)
         model = self.model_parts[0]
         device = self.device
         batch = self._batch_to_device(collate_datums(datums), device)
-        train_ctx, batch = make_cp_batch_and_ctx(
-            self.device_mesh,
-            batch,
-            use_te=self.config.cp_use_te,
-            padding_token_id=self.config.cp_padding_token_id,
-            num_chunks=self.config.cp_num_chunks,
-        )
+        train_ctx, batch = self._shard_batch_for_cp(batch)
         labels = batch.pop("labels", None)
         adapter_ctx = self.disable_adapter() if disable_adapters else nullcontext()
         with torch.no_grad(), adapter_ctx, train_ctx():
@@ -600,7 +588,6 @@ class Engine:
         per-token losses / global token count), so DP scaling stays identical to
         the proven path.
         """
-        from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
         from nemo_automodel.components.distributed.utils import get_sync_ctx
         from nemo_automodel.components.training.utils import (
             prepare_after_first_microbatch,
@@ -629,13 +616,7 @@ class Engine:
                 prepare_for_final_backward(self.model_parts, pp_enabled=False)
 
             batch = self._batch_to_device(collate_datums(mb), device)
-            train_ctx, batch = make_cp_batch_and_ctx(
-                self.device_mesh,
-                batch,
-                use_te=self.config.cp_use_te,
-                padding_token_id=self.config.cp_padding_token_id,
-                num_chunks=self.config.cp_num_chunks,
-            )
+            train_ctx, batch = self._shard_batch_for_cp(batch)
             labels = batch.pop("labels", None)
             sync_ctx = get_sync_ctx(model, is_last, self.config.defer_fsdp_grad_sync) if is_train else nullcontext()
             fwd_ctx = nullcontext() if is_train else torch.no_grad()
@@ -1016,3 +997,23 @@ class Engine:
             return v
 
         return {k: move(v) for k, v in batch.items()}
+
+    def _shard_batch_for_cp(self, batch: dict) -> tuple[Callable, dict]:
+        """Shard ``batch`` across the CP ranks and return ``(ctx_factory, batch)``.
+
+        Delegates to :class:`ContextParallelSharder`, which resolves the CP backend
+        from the model (model-owned CP, MagiAttention, TE/THD, or the generic
+        round-robin) and is a no-op when CP is not enabled. The sharder is
+        constructed per batch because data-dependent layouts (TE/THD, magi) capture
+        their partition during the shard.
+        """
+        from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
+
+        sharder = ContextParallelSharder(
+            self.model_parts[0] if self.model_parts else None,
+            self.device_mesh,
+            batch,
+            padding_token_id=self.config.cp_padding_token_id,
+            num_chunks=self.config.cp_num_chunks,
+        )
+        return sharder.shard(batch)

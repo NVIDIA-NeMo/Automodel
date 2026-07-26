@@ -2511,8 +2511,8 @@ def test_forward_backward_step_model_cp_hook(monkeypatch, cp_size, uses_thd, sup
         "nemo_automodel.components.distributed.context_parallel.utils._make_cp_batch_and_ctx",
         lambda device_mesh, batch, *a, **k: (nullcontext, batch, None),
     )
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.calculate_loss", _fake_calc_loss)
-    monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_final_hidden_states", lambda out: None)
+    monkeypatch.setattr("nemo_automodel.components.training.forward_backward.calculate_loss", _fake_calc_loss)
+    monkeypatch.setattr("nemo_automodel.components.training.forward_backward.get_final_hidden_states", lambda out: None)
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.get_sync_ctx", lambda *a, **k: nullcontext())
     monkeypatch.setattr("nemo_automodel.recipes.llm.train_ft.filter_forward_kwargs", lambda model, batch: batch)
 

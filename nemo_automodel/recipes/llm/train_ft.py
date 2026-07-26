@@ -1030,7 +1030,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                     labels,
                     self.loss_fn,
                     num_label_tokens=num_label_tokens,
-                    mtp_cfg=getattr(self.cfg, "mtp", None),
+                    mtp_cfg=getattr(getattr(self, "cfg", None), "mtp", None),
                     cu_seqlens=batch.get("cu_seqlens"),
                 )
                 loss_buffer.append(local_loss.clone().detach())
