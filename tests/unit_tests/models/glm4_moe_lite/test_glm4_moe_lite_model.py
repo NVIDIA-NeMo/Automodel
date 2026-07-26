@@ -289,6 +289,26 @@ class TestGlm4MoeLiteForCausalLM:
 
         assert logits.shape == (batch, seq_len, config.vocab_size)
 
+    def test_pp_return_hidden_states_skips_lm_head(self, config, backend_config, device):
+        class FailingHead(torch.nn.Module):
+            def forward(self, x):
+                raise AssertionError("lm_head should be deferred to FusedLinearCrossEntropy")
+
+        model = Glm4MoeLiteForCausalLM(config, backend=backend_config).to(device)
+        model._pp_return_hidden_states = True
+        model.lm_head = FailingHead()
+
+        batch, seq_len = 2, 6
+        input_ids = torch.randint(0, config.vocab_size, (batch, seq_len), device=device)
+        hidden = torch.randn(batch, seq_len, config.hidden_size, device=device).to(torch.bfloat16)
+
+        with patch.object(model.model, "forward", return_value=hidden):
+            out = model(input_ids, output_hidden_states=True)
+
+        assert model._pp_return_hidden_states_supported is True
+        assert torch.equal(out.logits, hidden)
+        assert torch.equal(out.hidden_states, hidden)
+
     def test_forward_handles_thd_format(self, config, backend_config, device):
         model = Glm4MoeLiteForCausalLM(config, backend=backend_config)
         model = model.to(device)

@@ -237,6 +237,7 @@ class Glm4MoeLiteModel(nn.Module):
 class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+    _pp_return_hidden_states_supported = True
 
     @dataclass(frozen=True)
     class ModelCapabilities:
@@ -340,6 +341,9 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             padding_mask=padding_mask,
             **attn_kwargs,
         )
+
+        if getattr(self, "_pp_return_hidden_states", False):
+            return CausalLMOutputWithPast(logits=hidden, hidden_states=hidden if output_hidden_states else None)
 
         return compute_lm_head_logits(
             self.lm_head, hidden, logits_to_keep, is_thd=is_thd, output_hidden_states=output_hidden_states
