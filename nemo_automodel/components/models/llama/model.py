@@ -29,7 +29,7 @@ model:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -135,6 +135,12 @@ class LlamaAttention(nn.Module):
                 num_gqa_groups=config.num_key_value_heads,
                 attention_dropout=config.attention_dropout,
             )
+        elif self.backend.attn == "upipe":
+            # Set by the CP sharder just before the first forward; until then
+            # UPipe stays dormant and the ordinary SDPA path runs, which is what
+            # single-GPU sanity runs and checkpoint conversion exercise.
+            self._upipe_cp_group = None
+            self._upipe_head_perm_size = None
 
     def forward(
         self,
@@ -170,6 +176,15 @@ class LlamaAttention(nn.Module):
         is_thd = kwargs.get("qkv_format") == "thd"
         if is_thd and hidden_states.ndim != 2:
             raise ValueError(f"THD attention requires hidden_states [T, H], got {tuple(hidden_states.shape)}.")
+
+        if getattr(self, "_upipe_cp_group", None) is not None:
+            return self._upipe_forward(
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                is_thd=is_thd,
+            )
 
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -253,6 +268,127 @@ class LlamaAttention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+
+    def bind_upipe_cp_group(self, cp_group, tp_size: int = 1) -> None:
+        """Attach the Ulysses process group and cache the head permutation.
+
+        Called by the CP sharder once per step. The permutation depends only on
+        ``(n_heads, n_kv_heads, cp_size)``, so it is rebuilt only when the group
+        size changes.
+
+        Args:
+            cp_group: The context-parallel process group, or None to disable UPipe.
+            tp_size: Tensor-parallel degree, which UPipe requires to be 1.
+
+        Raises:
+            ValueError: If the configuration is unsupported; see
+                :func:`validate_upipe_attention`.
+        """
+        from nemo_automodel.components.distributed.context_parallel.upipe import (
+            invert_permutation,
+            upipe_head_permutation,
+            validate_upipe_attention,
+        )
+
+        self._upipe_cp_group = cp_group
+        if cp_group is None:
+            return
+
+        cp_size = torch.distributed.get_world_size(cp_group)
+        if self._upipe_head_perm_size == cp_size:
+            return
+
+        n_heads = self.config.num_attention_heads
+        n_kv_heads = self.config.num_key_value_heads
+        validate_upipe_attention(
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=self.head_dim,
+            cp_size=cp_size,
+            tp_size=tp_size,
+            rope_backend=self.rope_backend,
+            rope_fusion=self.rope_fusion,
+            compile_attn=self.backend.compile_attn,
+        )
+        if self.q_proj.bias is not None:
+            raise ValueError("attn='upipe' does not support attention_bias=True; the fused op applies no bias.")
+
+        perm = upipe_head_permutation(n_heads, n_kv_heads, cp_size)
+        identity = perm == list(range(n_heads))
+        device = self.q_proj.weight.device
+        self.register_buffer(
+            "_upipe_head_perm",
+            None if identity else torch.tensor(perm, dtype=torch.long, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_upipe_head_perm_inverse",
+            None if identity else torch.tensor(invert_permutation(perm), dtype=torch.long, device=device),
+            persistent=False,
+        )
+        self._upipe_head_perm_size = cp_size
+
+    def _upipe_forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache],
+        is_thd: bool,
+    ) -> tuple[torch.Tensor, None]:
+        """Attention via the UPipe fused op, bypassing the q/k/v projections.
+
+        UPipe folds projection, RoPE and attention into one staged op so that
+        Q/K/V never exist at full width, which is the entire point of the
+        backend. That means this path cannot reuse anything below.
+
+        Args:
+            hidden_states: Local hidden states ``[B, S, H]``.
+            position_embeddings: ``(cos, sin)`` for this rank's local positions.
+            attention_mask: The framework's derived causal mask, which UPipe
+                reproduces internally and therefore ignores. Padding is rejected
+                earlier, on the raw batch, in ``prepare_model_inputs_for_cp``.
+            past_key_values: Must be None; UPipe has no KV cache.
+            is_thd: Must be False; UPipe does not support packed sequences.
+
+        Returns:
+            ``(attn_output, None)`` with the output shaped like ``hidden_states``.
+
+        Raises:
+            ValueError: If the runtime state is unsupported.
+        """
+        del attention_mask
+
+        from nemo_automodel.components.distributed.context_parallel.upipe.fused_attn import upipe_staged_attention
+        from nemo_automodel.components.distributed.context_parallel.upipe.validation import validate_upipe_runtime
+
+        validate_upipe_runtime(
+            has_peft=any(getattr(m, "_is_lora_layer", False) for m in self.modules()),
+            is_packed=is_thd,
+            has_non_trailing_pad=False,
+        )
+        # An empty cache object is normal in training -- HuggingFace allocates one
+        # whenever config.use_cache is left at its default. Only a cache that has
+        # actually accumulated state means someone is trying to generate.
+        if past_key_values is not None and getattr(past_key_values, "get_seq_length", lambda: 0)() > 0:
+            raise ValueError("attn='upipe' does not support a KV cache; it is a training-only backend.")
+
+        cos, sin = position_embeddings[:2]
+        attn_output = upipe_staged_attention(
+            hidden_states,
+            self.q_proj.weight,
+            self.k_proj.weight,
+            self.v_proj.weight,
+            cos,
+            sin,
+            head_dim=self.head_dim,
+            n_heads=self.config.num_attention_heads,
+            n_kv_heads=self.config.num_key_value_heads,
+            head_perm=self._upipe_head_perm,
+            head_perm_inverse=self._upipe_head_perm_inverse,
+            ulysses_group=self._upipe_cp_group,
+        )
+        return self.o_proj(attn_output), None
 
 
 class LlamaMLP(nn.Module):
@@ -612,6 +748,87 @@ class LlamaForCausalLM(HFCheckpointingMixin, LlamaPreTrainedModel):
 
     def get_decoder(self):
         return self.model
+
+    def prepare_model_inputs_for_cp(
+        self,
+        batch: dict[str, Any],
+        *,
+        num_chunks: int = 1,
+    ) -> dict[str, Any]:
+        """Claim context parallelism for UPipe, or defer to the framework.
+
+        UPipe carries the sequence across ranks itself, inside attention, so it
+        needs a plain contiguous shard and no torch ring-attention context
+        manager. Every other attention backend keeps AutoModel's generic
+        round-robin CP path, which returning an empty mapping selects.
+
+        Args:
+            batch: The full-sequence batch; left intact.
+            num_chunks: Accepted for hook-signature parity; unused.
+
+        Returns:
+            ``{"cp_sharder": ...}`` when UPipe is the attention backend, else ``{}``.
+
+        Raises:
+            ValueError: If UPipe is selected but the batch is unsupported. This is
+                the last point where the raw per-token mask is visible; by the time
+                attention runs it has been folded into a 4-D causal mask that
+                UPipe cannot read.
+        """
+        del num_chunks
+        if self.backend.attn != "upipe":
+            return {}
+
+        from nemo_automodel.components.distributed.context_parallel.sharder import (
+            ContextParallelSharder,
+            contiguous_local_indices,
+        )
+        from nemo_automodel.components.distributed.context_parallel.upipe.validation import (
+            has_non_trailing_padding,
+            validate_upipe_runtime,
+        )
+
+        mask = batch.get("attention_mask")
+        padding_mask = batch.get("padding_mask")
+        if mask is None and padding_mask is not None:
+            mask = ~padding_mask.bool()
+        validate_upipe_runtime(
+            has_peft=any(getattr(m, "_is_lora_layer", False) for m in self.modules()),
+            is_packed=batch.get("qkv_format") == "thd",
+            has_non_trailing_pad=has_non_trailing_padding(mask),
+        )
+
+        return {
+            "cp_sharder": ContextParallelSharder(
+                shard_batch=self._upipe_shard_batch,
+                local_token_global_indices=contiguous_local_indices,
+            )
+        }
+
+    def _upipe_shard_batch(self, cp_mesh, tp_mesh, batch, **kwargs):
+        """Shard contiguously and hand the CP group to every attention module.
+
+        The group is stamped on the modules rather than threaded through
+        ``forward`` as a kwarg because UPipe needs it three call frames down, in
+        :class:`LlamaAttention`, and every frame in between is shared with the
+        non-UPipe path.
+
+        Returns:
+            ``(contextlib.nullcontext, batch, ShardLayout)``. The null context is
+            what makes this correct: torch's ring-attention dispatcher must stay
+            uninstalled, since UPipe owns the transport.
+        """
+        from nemo_automodel.components.distributed.context_parallel.sharder import shard_batch_contiguous
+
+        ctx, batch, layout = shard_batch_contiguous(cp_mesh, tp_mesh, batch, **kwargs)
+
+        cp_group = cp_mesh.get_group() if cp_mesh is not None and cp_mesh.size() > 1 else None
+        tp_size = tp_mesh.size() if tp_mesh is not None else 1
+        for module in self.modules():
+            if isinstance(module, LlamaAttention):
+                module.bind_upipe_cp_group(cp_group, tp_size=tp_size)
+
+        return ctx, batch, layout
 
     @can_return_tuple
     def forward(

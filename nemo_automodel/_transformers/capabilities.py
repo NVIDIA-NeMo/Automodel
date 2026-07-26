@@ -104,6 +104,18 @@ def _uses_magi_attention(model: "nn.Module") -> bool:
     return getattr(backend, "attn", None) == "magi"
 
 
+def _uses_upipe_attention(model: "nn.Module") -> bool:
+    """True when the model uses the Untied Ulysses ("UPipe") attention backend.
+
+    UPipe carries the sequence across the CP group itself, inside its fused
+    attention op (see ``components/distributed/context_parallel/upipe``), so it
+    supports CP without the framework installing a transport. It does not
+    support sequence packing, so it is deliberately absent from those gates.
+    """
+    backend = getattr(model, "backend", None)
+    return getattr(backend, "attn", None) == "upipe"
+
+
 def _is_deepseek_v4(model: "nn.Module") -> bool:
     """True when the model is a DeepSeek V4 custom model.
 
@@ -243,6 +255,7 @@ class ModelSupports:
         +------------------+----------------+---------+
         | Custom           | TE             | Yes     |
         | Custom           | Magi (FFA)     | Yes     |
+        | Custom           | UPipe          | Yes     |
         | Custom hybrid    | TE / SDPA      | Yes     |
         | Custom           | FlexAttention  | No      |
         | HF (pure attn)   | SDPA           | Yes     |
@@ -260,7 +273,11 @@ class ModelSupports:
             if _is_hybrid(self._model) or getattr(self._model, "_supports_cp_sdpa", False):
                 backend_attn = getattr(getattr(self._model, "backend", None), "attn", None)
                 return backend_attn in ("te", "sdpa")
-            return _uses_te_attention(self._model) or _uses_magi_attention(self._model)
+            return (
+                _uses_te_attention(self._model)
+                or _uses_magi_attention(self._model)
+                or _uses_upipe_attention(self._model)
+            )
         if _is_hybrid(self._model):
             return False
         return getattr(self._model, "_supports_sdpa", False) is True
@@ -424,9 +441,9 @@ def validate_for_mesh(model: "nn.Module", mesh: "MeshContext") -> None:
             )
         elif _has_backend(model):
             errors.append(
-                f"Context parallelism (cp_size={cp_size}) for {arch} requires "
-                f"the TE attention backend (backend.attn='te').\n"
-                f"Please re-run with --distributed.cp_size=1 or switch to TE attention:\n"
+                f"Context parallelism (cp_size={cp_size}) for {arch} requires a CP-capable attention "
+                f"backend: 'te', 'magi', or 'upipe' (Untied Ulysses, Llama only, lowest activation memory).\n"
+                f"Please re-run with --distributed.cp_size=1 or switch attention backend:\n"
                 f"model:\n"
                 f"  backend:\n"
                 f"    attn: te"

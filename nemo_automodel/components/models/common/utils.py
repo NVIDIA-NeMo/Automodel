@@ -158,9 +158,15 @@ class BackendConfig:
     """Backend configuration for model components.
 
     Attributes:
-        attn: Attention backend ("te", "sdpa", "flex", "eager", or "tilelang").
-            For DeepSeek V4, "tilelang" enables the TileLang sparse attention,
-            indexer, and Sinkhorn kernels together.
+        attn: Attention backend ("te", "sdpa", "flex", "eager", "tilelang", or
+            "upipe"). For DeepSeek V4, "tilelang" enables the TileLang sparse
+            attention, indexer, and Sinkhorn kernels together. "upipe" selects
+            Untied Ulysses context-parallel attention (Llama only): it fuses the
+            QKV projection, RoPE and attention into one op staged over heads, so
+            peak QKV memory falls by n_heads/cp_size. It requires cp_size > 1,
+            rope="torch", rope_fusion=False, compile_attn=False, no tensor
+            parallelism, no PEFT, no sequence packing, and flash-attn installed.
+            At cp_size 1 it lies dormant and the sdpa path runs instead.
         linear: Linear layer backend ("torch", "te", or "quack").
         rms_norm: RMSNorm backend ("torch", "torch_fp32", "te", or "quack").
         rope: Rotary embedding backend ("torch" or "quack"). QuACK is currently
@@ -197,7 +203,9 @@ class BackendConfig:
             attn="sdpa", linear="torch", rms_norm="torch", rope_fusion=False.
     """
 
-    attn: Literal["te", "sdpa", "flex", "eager", "tilelang"] = "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    attn: Literal["te", "sdpa", "flex", "eager", "tilelang", "upipe"] = (
+        "te" if HAVE_TE and torch.cuda.is_available() else "sdpa"
+    )
     linear: Literal["torch", "te", "quack"] = "te" if HAVE_TE and torch.cuda.is_available() else "torch"
     rms_norm: Literal["torch", "torch_fp32", "te", "quack"] = "torch_fp32"
     rope: Literal["torch", "quack"] = "torch"
