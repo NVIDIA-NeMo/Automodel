@@ -368,7 +368,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             output1 = torch._grouped_mm(permuted_x, gate_and_up_projs, offs=offs)
             lora_out1_A = torch._grouped_mm(permuted_x, lora_gate_and_up_A, offs=offs)
             lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
-            output1.add_(lora_out1, alpha=self.scale)
+            output1 = output1 + lora_out1 * self.scale
 
             if self.expert_bias:
                 output1 = _apply_bias(output1, gate_up_proj_bias, tokens_per_expert)
@@ -379,7 +379,7 @@ class GroupedExpertsLoRA(GroupedExperts):
             output2 = torch._grouped_mm(output1, down_projs, offs=offs)
             lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
             lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
-            output2.add_(lora_out2, alpha=self.scale)
+            output2 = output2 + lora_out2 * self.scale
 
             if self.expert_bias:
                 output2 = _apply_bias(output2, down_proj_bias, tokens_per_expert, permuted_probs)
@@ -575,7 +575,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 else:
                     lora_out1_A = torch._grouped_mm(permuted_local_hidden_states, lora_gate_and_up_A, offs=offs)
                     lora_out1 = torch._grouped_mm(lora_out1_A, lora_gate_and_up_B, offs=offs)
-                output1.add_(lora_out1, alpha=self.scale)
+                output1 = output1 + lora_out1 * self.scale
 
                 if self.expert_bias:
                     gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
@@ -591,7 +591,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 else:
                     lora_out2_A = torch._grouped_mm(output1, lora_down_A, offs=offs)
                     lora_out2 = torch._grouped_mm(lora_out2_A, lora_down_B, offs=offs)
-                output2.add_(lora_out2, alpha=self.scale)
+                output2 = output2 + lora_out2 * self.scale
 
                 if self.expert_bias:
                     down_bias = _to_local(self.down_proj_bias)
@@ -611,7 +611,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                     trans_b=False,
                 )
                 lora_out1 = ops.gmm(lora_out1_A, lora_gate_and_up_B, tokens_per_expert, trans_b=False)
-                output1.add_(lora_out1, alpha=self.scale)
+                output1 = output1 + lora_out1 * self.scale
 
                 if self.expert_bias:
                     gate_up_proj_bias = _to_local(self.gate_up_proj_bias)
@@ -623,7 +623,7 @@ class GroupedExpertsDeepEPLoRA(GroupedExpertsDeepEP):
                 output2 = ops.gmm(output1, down_projs, tokens_per_expert, trans_b=False)
                 lora_out2_A = ops.gmm(output1, lora_down_A, tokens_per_expert, trans_b=False)
                 lora_out2 = ops.gmm(lora_out2_A, lora_down_B, tokens_per_expert, trans_b=False)
-                output2.add_(lora_out2, alpha=self.scale)
+                output2 = output2 + lora_out2 * self.scale
 
                 if self.expert_bias:
                     down_bias = _to_local(self.down_proj_bias)
