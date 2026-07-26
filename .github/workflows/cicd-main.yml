@@ -320,8 +320,25 @@ jobs:
           echo "$LAST_PRS" | tee -a $GITHUB_OUTPUT
           echo "EOF" | tee -a $GITHUB_OUTPUT
 
+      - name: Pull BuildKit image
+        shell: bash -e -o pipefail {0}
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull moby/buildkit:buildx-stable-1; then
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              exit 1
+            fi
+            delay=$((10 * attempt))
+            echo "BuildKit pull attempt $attempt failed; retrying in ${delay}s"
+            sleep "$delay"
+          done
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:buildx-stable-1
 
       - name: Compute cache keys
         id: cache_keys
