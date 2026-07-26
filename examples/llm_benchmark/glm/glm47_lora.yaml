@@ -73,6 +73,7 @@ model:
     rope_fusion: true
     experts: gmm
     dispatcher: hybridep
+    dispatcher_num_sms: 24
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
