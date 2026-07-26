@@ -14,6 +14,7 @@
 
 import sys
 import types
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -93,6 +94,20 @@ def _install_torch_and_layers_stubs(monkeypatch):
     nn_stub.Parameter = Parameter
     nn_stub.Module = Module
     torch_stub.nn = nn_stub
+
+    nn_attention_stub = types.ModuleType("torch.nn.attention")
+
+    class SDPBackend:
+        FLASH_ATTENTION = object()
+        EFFICIENT_ATTENTION = object()
+        CUDNN_ATTENTION = object()
+        MATH = object()
+
+    def sdpa_kernel(*args, **kwargs):
+        return nullcontext()
+
+    nn_attention_stub.SDPBackend = SDPBackend
+    nn_attention_stub.sdpa_kernel = sdpa_kernel
 
     # cuda submodule
     cuda_stub = types.ModuleType("torch.cuda")
@@ -174,7 +189,11 @@ def _install_torch_and_layers_stubs(monkeypatch):
     def checkpoint_wrapper(*args, **kwargs):
         return args[0]
 
+    class CheckpointImpl:
+        NO_REENTRANT = object()
+
     cpw_stub.checkpoint_wrapper = checkpoint_wrapper
+    cpw_stub.CheckpointImpl = CheckpointImpl
 
     # utils module hierarchy
     utils_stub = types.ModuleType("torch.utils")
@@ -209,9 +228,22 @@ def _install_torch_and_layers_stubs(monkeypatch):
     utils_checkpoint_stub.CheckpointPolicy = CheckpointPolicy
     utils_checkpoint_stub.create_selective_checkpoint_contexts = create_selective_checkpoint_contexts
 
-    # ops.aten.mm.default sentinel
-    aten = types.SimpleNamespace(mm=types.SimpleNamespace(default=object()))
+    # ops.aten.*.default sentinels
+    aten = types.SimpleNamespace(
+        addmm=types.SimpleNamespace(default=object()),
+        linear=types.SimpleNamespace(default=object()),
+        mm=types.SimpleNamespace(default=object()),
+    )
     torch_stub.ops = types.SimpleNamespace(aten=aten)
+
+    torch_stub.backends = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            flash_sdp_enabled=lambda: True,
+            mem_efficient_sdp_enabled=lambda: False,
+            cudnn_sdp_enabled=lambda: False,
+            math_sdp_enabled=lambda: True,
+        )
+    )
 
     # dtype and device classes for type annotations
     class dtype:
@@ -220,8 +252,12 @@ def _install_torch_and_layers_stubs(monkeypatch):
     class device:
         pass
 
+    class Tensor:
+        pass
+
     torch_stub.dtype = dtype
     torch_stub.device = device
+    torch_stub.Tensor = Tensor
 
     # common dtypes referenced by code
     torch_stub.bfloat16 = object()
@@ -230,6 +266,7 @@ def _install_torch_and_layers_stubs(monkeypatch):
     # register into sys.modules via monkeypatch
     monkeypatch.setitem(sys.modules, "torch", torch_stub)
     monkeypatch.setitem(sys.modules, "torch.nn", nn_stub)
+    monkeypatch.setitem(sys.modules, "torch.nn.attention", nn_attention_stub)
     monkeypatch.setitem(sys.modules, "torch.cuda", cuda_stub)
     monkeypatch.setitem(sys.modules, "torch.distributed", dist_stub)
     monkeypatch.setitem(sys.modules, "torch.distributed.device_mesh", device_mesh_stub)
