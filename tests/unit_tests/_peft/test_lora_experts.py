@@ -343,6 +343,46 @@ def test_deepep_lora_torch_mm_pads_aligned_lora_rank_without_grouped_gemm(moe_co
     assert fake_torch_grouped_mm.call_count == 6
 
 
+def test_deepep_lora_grouped_gemm_path_skips_grouped_mm_operand_conversion(moe_config):
+    """DeepEP LoRA grouped_gemm path should not force grouped-mm layout conversion."""
+    orig_experts = GroupedExpertsDeepEP(moe_config)
+    with torch.no_grad():
+        orig_experts.init_weights(torch.device("cpu"))
+    orig_experts.n_routed_experts = 4
+    orig_experts.ep_size = 1
+    orig_experts.use_torch_mm = False
+
+    lora_module = GroupedExpertsDeepEPLoRA(orig_experts, lora_dim=4)
+
+    num_tokens = 3
+    permuted_x = torch.randn(num_tokens, 16)
+    permuted_probs = torch.ones(num_tokens)
+    tokens_per_expert = torch.tensor([num_tokens, 0, 0, 0], dtype=torch.long)
+
+    mock_dispatcher = MockDeepEPDispatcher()
+    mock_dispatcher.token_permutation2 = MagicMock(return_value=(permuted_x, tokens_per_expert, permuted_probs))
+    mock_dispatcher.token_unpermutation = MagicMock(side_effect=lambda hidden_states: hidden_states)
+    lora_module.token_dispatcher = mock_dispatcher
+
+    fake_gmm = MagicMock(side_effect=lambda a, b, *_args, **_kwargs: torch.zeros(a.shape[0], b.shape[-1]))
+    x = torch.randn(num_tokens, 16)
+    weights = torch.ones(num_tokens, 1)
+    indices = torch.zeros(num_tokens, 1, dtype=torch.long)
+    token_mask = torch.ones(num_tokens, dtype=torch.bool)
+
+    with (
+        patch("nemo_automodel.components._peft.lora_experts.ops", SimpleNamespace(gmm=fake_gmm)),
+        patch(
+            "nemo_automodel.components._peft.lora_experts._to_grouped_mm_operand",
+            side_effect=AssertionError("grouped_gemm path should not request grouped-mm operands"),
+        ),
+    ):
+        out = lora_module(x, token_mask, weights, indices)
+
+    assert out.shape == (num_tokens, 16)
+    assert fake_gmm.call_count == 6
+
+
 def test_unaligned_lora_rank_detection_uses_grouped_gemm_when_available():
     """Rank 4 bf16 LoRA tensors need padding for torch._grouped_mm but not grouped_gemm."""
     lora_A = torch.randn(2, 16, 4, dtype=torch.bfloat16)
