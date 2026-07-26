@@ -71,8 +71,9 @@ model:
     linear: te
     rms_norm: te
     rope_fusion: true
-    experts: gmm
-    dispatcher: deepep
+    experts: torch_mm
+    dispatcher: hybridep
+    dispatcher_num_sms: 16
     fake_balanced_gate: true
     enable_hf_state_dict_adapter: true
     enable_fsdp_optimizations: true
