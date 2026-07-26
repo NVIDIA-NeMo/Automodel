@@ -15,6 +15,7 @@
 import json
 import logging
 import pathlib
+from contextlib import nullcontext
 
 import torch
 
@@ -120,6 +121,9 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
         self._bench_nsys_start = bench_cfg.nsys_start
         self._bench_nsys_end = bench_cfg.nsys_end
         self._bench_nsys_ranks = bench_cfg.nsys_ranks
+        self._bench_torch_profile_iteration = getattr(bench_cfg, "torch_profile_iteration", -1)
+        self._bench_torch_profile_ranks = set(getattr(bench_cfg, "torch_profile_ranks", []))
+        self._bench_torch_profile_row_limit = getattr(bench_cfg, "torch_profile_row_limit", 30)
         self._bench_json_output_path = getattr(bench_cfg, "json_output_path", None)
         self._wandb_enabled = cfg.get("wandb", None) is not None
 
@@ -338,7 +342,23 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
 
             # Time the iteration
             iter_timer = "iteration_warmup" if i < warmup_steps else "iteration"
-            with self.timers(iter_timer, log_level=1):
+            profile_this_iteration = (
+                i == self._bench_torch_profile_iteration and rank in self._bench_torch_profile_ranks
+            )
+            profile_ctx = (
+                torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_stack=False,
+                )
+                if profile_this_iteration
+                else nullcontext()
+            )
+            if profile_this_iteration:
+                logger.info(f"Rank {rank} | Starting torch.profiler at iteration {i}")
+
+            with profile_ctx as prof, self.timers(iter_timer, log_level=1):
                 # Gradient accumulation loop
                 num_label_tokens = 0
                 loss_buffer = []
@@ -375,6 +395,16 @@ class BenchmarkingRecipeForNextTokenPrediction(TrainFinetuneRecipeForNextTokenPr
                     for opt in self.optimizer:
                         opt.step()
                     logger.debug("Optimizer step")
+
+                if profile_this_iteration:
+                    torch.cuda.synchronize()
+
+            if profile_this_iteration:
+                table = prof.key_averages().table(
+                    sort_by="cuda_time_total",
+                    row_limit=self._bench_torch_profile_row_limit,
+                )
+                logger.info(f"Rank {rank} | torch.profiler key averages at iteration {i}:\n{table}")
 
             # Synchronize num_label_tokens across DP ranks
             num_label_tokens_tensor = torch.tensor(num_label_tokens, dtype=torch.long, device=device)
