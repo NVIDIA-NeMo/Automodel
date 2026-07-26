@@ -19,7 +19,6 @@ import os
 from contextlib import ExitStack
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -47,7 +46,6 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _divide_keys_by_size,
     _ensure_dirs,
     _equally_divide_layers,
-    _get_hf_safetensors_reference_path,
     _is_custom_model,
     _model_has_dtensors,
     _new_gloo_process_group,
@@ -253,108 +251,6 @@ def test_get_fqn_to_file_index_mapping_uses_index_json_for_qwen35_names(tmp_path
         "model.layers.1.weight": 2,
         "lm_head.weight": 3,
     }
-
-
-def test_diffusers_transformer_index_discovered_from_main_snapshot_and_preserves_five_shards(tmp_path):
-    """A cached Diffusers component keeps its 1,933-key upstream shard map."""
-    cache_dir = tmp_path / "hub"
-    repo_root = cache_dir / "models--Qwen--Qwen-Image-Edit-2511"
-    snapshots_root = repo_root / "snapshots"
-    main_revision = "2" * 40
-
-    refs_dir = repo_root / "refs"
-    refs_dir.mkdir(parents=True)
-    (refs_dir / "main").write_text(main_revision, encoding="utf-8")
-
-    transformer_dir = snapshots_root / main_revision / "transformer"
-    transformer_dir.mkdir(parents=True)
-    weight_map = {
-        f"transformer_blocks.{index}.weight": (f"diffusion_pytorch_model-{index % 5 + 1:05d}-of-00005.safetensors")
-        for index in range(1_933)
-    }
-    (transformer_dir / _DIFFUSERS_INDEX_FN).write_text(
-        json.dumps({"metadata": {"total_size": 0}, "weight_map": weight_map}),
-        encoding="utf-8",
-    )
-
-    reference_path = _get_hf_safetensors_reference_path(cache_dir, "Qwen/Qwen-Image-Edit-2511")
-
-    assert reference_path == str(transformer_dir)
-    mapping = get_fqn_to_file_index_mapping(reference_path)
-    assert len(mapping) == 1_933
-    assert set(mapping.values()) == {1, 2, 3, 4, 5}
-    assert mapping["transformer_blocks.0.weight"] == 1
-    assert mapping["transformer_blocks.1932.weight"] == 3
-
-    config = CheckpointingConfig(
-        checkpoint_dir=str(tmp_path / "checkpoints"),
-        model_cache_dir=cache_dir,
-        model_repo_id="Qwen/Qwen-Image-Edit-2511",
-        save_consolidated=False,
-    )
-    with patch("torch.distributed.is_initialized", return_value=False):
-        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
-    model = SimpleNamespace(
-        config=SimpleNamespace(_name_or_path=str(transformer_dir), model_type="qwen_image_transformer")
-    )
-    model_state = SimpleNamespace(model=[model], has_local_tied_lm_head=False, lm_head_param_name=None)
-    state_dict = {key: torch.empty(0) for key in weight_map}
-
-    assert checkpointer._maybe_build_consolidated_index(model_state, state_dict) == mapping
-
-
-def test_safetensors_reference_prefers_root_hf_weights_over_diffusers_component(tmp_path):
-    """Root Transformers checkpoints retain precedence over nested components."""
-    snapshot = tmp_path / "snapshot"
-    transformer_dir = snapshot / "transformer"
-    transformer_dir.mkdir(parents=True)
-    (snapshot / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {}}), encoding="utf-8")
-    (transformer_dir / _DIFFUSERS_INDEX_FN).write_text(json.dumps({"weight_map": {}}), encoding="utf-8")
-
-    assert _get_hf_safetensors_reference_path(None, str(snapshot)) == str(snapshot)
-
-
-def test_get_original_model_path_reads_config_without_probing_model_attributes(tmp_path):
-    """Config provenance must be used directly, without model-attribute probes.
-
-    Diffusers ``ModelMixin`` proxies unknown attributes to its config and emits a
-    deprecation warning for each direct ``_name_or_path`` access, so the resolver
-    must not touch those attributes on the model when the config provides them.
-    """
-
-    class _ConfigProxyingModel:
-        def __init__(self, config: SimpleNamespace) -> None:
-            self.config = config
-
-        def __getattr__(self, name: str) -> Any:
-            raise AssertionError(f"model attribute {name!r} was probed instead of the config")
-
-    config = CheckpointingConfig(
-        checkpoint_dir=str(tmp_path / "checkpoints"),
-        model_cache_dir=str(tmp_path / "cache"),
-        model_repo_id="Qwen/Qwen-Image-Edit-2511",
-        save_consolidated=False,
-    )
-    with patch("torch.distributed.is_initialized", return_value=False):
-        checkpointer = Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0)
-
-    component_dir = tmp_path / "snapshot" / "transformer"
-    component_dir.mkdir(parents=True)
-    model = _ConfigProxyingModel(SimpleNamespace(_name_or_path=str(component_dir)))
-    model_state = SimpleNamespace(model=[model])
-
-    assert checkpointer._get_original_model_path(model_state) == str(component_dir)
-
-
-def test_get_fqn_to_dtype_mapping_reads_diffusers_index_shards(tmp_path):
-    shard_name = "diffusion_pytorch_model-00001-of-00001.safetensors"
-    save_file({"transformer.weight": torch.ones(2, dtype=torch.bfloat16)}, tmp_path / shard_name)
-    (tmp_path / _DIFFUSERS_INDEX_FN).write_text(
-        json.dumps({"weight_map": {"transformer.weight": shard_name}}),
-        encoding="utf-8",
-    )
-
-    assert get_fqn_to_dtype_mapping(str(tmp_path)) == {"transformer.weight": "BF16"}
 
 
 def test_get_fqn_to_dtype_mapping_reads_safetensors_headers_and_applies_key_mapping(tmp_path):

@@ -109,7 +109,7 @@ uv run torchrun --nproc-per-node=8 \
   -c examples/diffusion/finetune/qwen_image_edit_2511_flow.yaml
 ```
 
-The baseline uses BF16 parameters and compute, whole Qwen transformer-block activation checkpointing, beta timestep sampling, and the distributed checkpoint manager. Consolidated model checkpoints retain the upstream Diffusers transformer state-dict representation. Set `checkpoint.restore_from: LATEST` to resume the optimizer, scheduler, dataloader, sampler, and step state.
+The baseline uses BF16 parameters and compute, whole Qwen transformer-block activation checkpointing, beta timestep sampling, and the distributed checkpoint manager. Consolidated model checkpoints are written in the Diffusers-compatible safetensors format (`checkpoint.diffusers_compatible: true`), matching the other diffusion recipes. Set `checkpoint.restore_from: LATEST` to resume the optimizer, scheduler, dataloader, sampler, and step state.
 
 ### Checkpoint-resume smoke test
 

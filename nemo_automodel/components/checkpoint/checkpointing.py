@@ -52,7 +52,6 @@ from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors 
 )
 from nemo_automodel.components.checkpoint._backports.filesystem import FileSystemReader, SerializationFormat
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
-    _DIFFUSERS_INDEX_FN,
     _HuggingFaceStorageReader,
     _HuggingFaceStorageWriter,
     _maybe_rename_index_for_diffusers,
@@ -1385,21 +1384,18 @@ fi
     def _maybe_build_consolidated_index(
         self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
     ) -> Optional[dict[str, int]]:
-        """Build FQN to shard index mapping for consolidated HF export.
+        """
+        Build FQN to shard index mapping for consolidated HF export.
 
         Uses the base checkpoint index (if present), removes non-persistent keys,
         and assigns new keys to the last shard by default.
 
         Args:
-            model_state: Wrapper exposing model parameters of arbitrary shape;
-                only model provenance and key metadata are inspected here.
-            state_dict: Mapping from FQN to scalar tensors of shape [] or model
-                tensors of arbitrary parameter/buffer shape. Tensor storage is
-                read only for size-based fallback sharding.
+            model_state: Wrapper exposing the primary model part.
+            state_dict: The state dict that will be saved.
 
         Returns:
-            Mapping from tensor FQN to one-based output shard index, or ``None``
-            when Hugging Face metadata is disabled. No tensors are returned.
+            Mapping from FQN to shard index, or None when not consolidating.
         """
         if not _should_write_hf_metadata(self.config):
             return None
@@ -1474,22 +1470,12 @@ fi
     def _maybe_build_original_dtype_mapping(
         self, model_state: ModelState, state_dict: dict[str, torch.Tensor]
     ) -> Optional[dict[str, str]]:
-        """Build an original-dtype mapping for consolidated Hugging Face export.
+        """
+        Build FQN to target safetensors dtype mapping for consolidated export.
 
         Original HF safetensors headers provide the baseline mapping when available.
         Model-owned adapter overrides are applied even for config-only runs so
         intrinsically fp32 tensors retain their required export dtype.
-
-        Args:
-            model_state: Wrapper exposing model parameters of arbitrary shape;
-                only model provenance and adapter metadata are inspected here.
-            state_dict: Mapping from FQN to scalar tensors of shape [] or model
-                tensors of arbitrary parameter/buffer shape. Tensor values are
-                not mutated.
-
-        Returns:
-            Mapping from exported tensor FQN to its safetensors dtype name, or
-            ``None`` when no dtype metadata applies. No tensors are returned.
         """
         if not _should_write_hf_metadata(self.config):
             return None
@@ -1597,26 +1583,16 @@ fi
         return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
     def _get_original_model_path(self, model_state: ModelState) -> str | None:
-        """Get the original local model path from Hugging Face provenance.
-
-        Args:
-            model_state: Wrapper around model parameters of arbitrary shape;
-                only model/config provenance attributes are inspected.
-
-        Returns:
-            Exact local model or component directory, or ``None`` when the model
-            was not constructed from a cached Hugging Face checkpoint.
         """
-        model = model_state.model[0]
-        config = getattr(model, "config", None)
-        # Read config provenance first: probing `_name_or_path` on the model itself
-        # routes through Diffusers' config-proxy ``__getattr__`` and emits a
-        # deprecation warning for every checkpoint save.
-        pretrained_model_name_or_path = (
-            getattr(config, "name_or_path", None)
-            or getattr(config, "_name_or_path", None)
-            or getattr(model, "name_or_path", None)
-            or getattr(model, "_name_or_path", None)
+        Get the path to the original model from the Hugging Face checkpoint.
+        """
+        if not hasattr(model_state.model[0], "name_or_path") and not hasattr(
+            getattr(model_state.model[0], "config", None), "name_or_path"
+        ):
+            return None
+
+        pretrained_model_name_or_path = getattr(model_state.model[0], "name_or_path", None) or getattr(
+            getattr(model_state.model[0], "config", None), "name_or_path", None
         )
         # Randomly initialized HF models often have an empty `name_or_path`. In that case,
         # there is no "original" HF snapshot to reference for metadata.
@@ -1626,67 +1602,19 @@ fi
         if os.path.isdir(pretrained_model_name_or_path):
             return pretrained_model_name_or_path
 
-        # `original_model_root_dir` is populated by base-model loading. Diffusers
-        # recipes instead retain their configured Hub cache directory.
-        cache_dir = getattr(self.config, "original_model_root_dir", None) or self.config.model_cache_dir or HF_HUB_CACHE
+        # `original_model_root_dir` exists on the config but may be None. In that case,
+        # fall back to the standard HF hub cache root.
+        cache_dir = getattr(self.config, "original_model_root_dir", None) or HF_HUB_CACHE
         return _get_hf_safetensors_reference_path(cache_dir, pretrained_model_name_or_path)
-
-
-def _find_safetensors_weight_directory(model_root: Path) -> Path | None:
-    """Find root HF weights or a Diffusers transformer component under ``model_root``.
-
-    Root-model weights take precedence so adding Diffusers support does not
-    change established Transformers/VLM checkpoint behavior.
-
-    Args:
-        model_root: Local model or snapshot directory to inspect.
-
-    Returns:
-        Directory containing an index or direct safetensors files, or ``None``
-        when neither the root nor its standard ``transformer`` component has
-        weights.
-    """
-    index_filenames = ("model.safetensors.index.json", _DIFFUSERS_INDEX_FN)
-    for candidate in (model_root, model_root / "transformer"):
-        if not candidate.is_dir():
-            continue
-        if any((candidate / filename).is_file() for filename in index_filenames):
-            return candidate
-        if any(candidate.glob("*.safetensors")):
-            return candidate
-    return None
-
-
-def _cached_snapshot_directories(snapshots_root: Path) -> list[Path]:
-    """Return cached snapshot candidates in deterministic order.
-
-    Args:
-        snapshots_root: Hugging Face repository ``snapshots`` directory.
-
-    Returns:
-        Ordered snapshot directories to inspect. The cached ``main`` ref is
-        preferred, followed by deterministic commit-path order.
-    """
-    snapshot_dirs = sorted(path for path in snapshots_root.glob("*") if path.is_dir())
-    main_ref = snapshots_root.parent / "refs" / "main"
-    if not main_ref.is_file():
-        return snapshot_dirs
-    main_snapshot_name = main_ref.read_text(encoding="utf-8").strip()
-    if not main_snapshot_name or Path(main_snapshot_name).name != main_snapshot_name:
-        return snapshot_dirs
-    main_snapshot = snapshots_root / main_snapshot_name
-    if not main_snapshot.is_dir():
-        return snapshot_dirs
-    return [main_snapshot, *(path for path in snapshot_dirs if path != main_snapshot)]
 
 
 def _get_hf_safetensors_reference_path(cache_dir: str | Path | None, repo_id: str | None) -> str | None:
     """Return the local HF safetensors reference directory for a model.
 
-    Prefer root Hugging Face weights, then the standard Diffusers
-    ``transformer`` component. Both ``model.safetensors.index.json`` and
-    ``diffusion_pytorch_model.safetensors.index.json`` are recognized, along
-    with unindexed safetensors files.
+    Prefer the snapshot directory containing `model.safetensors.index.json` for
+    sharded checkpoints. If no index exists but a snapshot directory is present,
+    return that directory as the single-file safetensors reference path. Return
+    None when `repo_id` is None or the repo has no cached snapshot directory.
 
     For example, if the located file is
 
@@ -1696,23 +1624,22 @@ def _get_hf_safetensors_reference_path(cache_dir: str | Path | None, repo_id: st
 
         /opt/models/models--meta-llama--Llama-3.2-3B/snapshots/13afe...
 
+    This will error if the model hasn't been downloaded or if the cache directory is incorrect.
+
     Args:
-        cache_dir: Path to the Hugging Face cache directory. Ignored when
-            ``repo_id`` is an existing local model path.
-        repo_id: Hugging Face repository ID or local model/snapshot path.
+        cache_dir: Path to cache directory
+        repo_id: Hugging Face repository ID
 
     Returns:
-        Path to the root model or Diffusers transformer directory containing
-        safetensors weights, or ``None`` when the requested local reference is
-        unavailable.
+        Path to the snapshot/model directory containing safetensors weights, or
+        None when no Hugging Face repo ID or cached snapshot is available.
     """
     # repo_id can be None if the model is not Hugging Face Hub yet
     if repo_id is None:
         return None
 
-    if os.path.isdir(repo_id):
-        reference_path = _find_safetensors_weight_directory(Path(repo_id))
-        return str(reference_path) if reference_path is not None else None
+    if os.path.exists(repo_id):
+        return repo_id
 
     cache_dir = cache_dir or HF_HUB_CACHE
     if cache_dir is None:
@@ -1720,10 +1647,22 @@ def _get_hf_safetensors_reference_path(cache_dir: str | Path | None, repo_id: st
         raise ValueError("Hugging Face cache directory is not set (cache_dir=None).")
     repo_dir = f"models--{repo_id.replace('/', '--')}"
     snapshots_root = Path(cache_dir) / repo_dir / "snapshots"
-    for snapshot_dir in _cached_snapshot_directories(snapshots_root):
-        reference_path = _find_safetensors_weight_directory(snapshot_dir)
-        if reference_path is not None:
-            return str(reference_path)
+
+    # Look for an index file inside any snapshot directory.
+    pattern = snapshots_root / "*" / "model.safetensors.index.json"
+    matches = glob.glob(str(pattern))
+    if matches:
+        # Return the directory path that contains the index file.
+        return str(Path(matches[0]).parent)
+
+    # Fall back: if no index file, return the first available snapshot directory (if any).
+    # This is the case for single-file models.
+    snapshot_dirs = [p for p in glob.glob(str(snapshots_root / "*")) if Path(p).is_dir()]
+    if snapshot_dirs:
+        try:
+            return snapshot_dirs[0]
+        except IndexError:
+            raise FileNotFoundError(f"No snapshot directories found in {snapshots_root}")
     return None
 
 
