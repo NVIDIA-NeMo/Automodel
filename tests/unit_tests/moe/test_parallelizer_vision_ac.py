@@ -123,6 +123,13 @@ def _assert_decoder_wrapped(language_model: nn.Module) -> None:
     assert all(isinstance(layer, CheckpointWrapper) for layer in language_model.layers)
 
 
+def _assert_decoder_mlp_only_wrapped(language_model: nn.Module) -> None:
+    for layer in language_model.layers:
+        assert not isinstance(layer, CheckpointWrapper)
+        assert not isinstance(layer.self_attn, CheckpointWrapper)
+        assert isinstance(layer.mlp, CheckpointWrapper)
+
+
 def _assert_decoder_untouched(language_model: nn.Module) -> None:
     assert all(not isinstance(layer, CheckpointWrapper) for layer in language_model.layers)
 
@@ -152,6 +159,17 @@ def test_apply_ac_scope_language_skips_vision_tower():
 
     _assert_decoder_wrapped(model.model.language_model)
     _assert_vision_untouched(model.model.visual)
+
+
+def test_apply_ac_modules_mlp_wraps_decoder_mlp_only():
+    model = Qwen3VLMoeForConditionalGeneration()
+
+    moe_parallelizer.apply_ac(model, hidden_size=_DIM, num_experts=2, activation_checkpointing_modules="mlp")
+
+    _assert_decoder_mlp_only_wrapped(model.model.language_model)
+    for block in model.model.visual.blocks:
+        assert isinstance(block.mlp, CheckpointWrapper)
+        assert not isinstance(block.attn, CheckpointWrapper)
 
 
 def test_apply_ac_scope_vision_skips_decoder_entirely():
