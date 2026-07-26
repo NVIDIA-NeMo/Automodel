@@ -28,6 +28,14 @@ if importlib.util.find_spec("cv2") is None:
 from tools.diffusion import preprocessing_multiprocess
 
 
+def test_qwen_image_edit_processor_is_registered():
+    from nemo_automodel.components.models.qwen_image_edit.preprocessing import QwenImageEditCacheEncoder
+    from tools.diffusion.processors import ProcessorRegistry
+
+    processor_cls = ProcessorRegistry.get_class("qwen_image_edit")
+    assert issubclass(processor_cls, QwenImageEditCacheEncoder)
+
+
 def test_image_edit_cli_materializes_and_invokes_configured_encoder(tmp_path, monkeypatch):
     calls = {}
     source_manifest = tmp_path / "materialized" / "hf_image_edit_manifest.jsonl"
@@ -69,8 +77,12 @@ def test_image_edit_cli_materializes_and_invokes_configured_encoder(tmp_path, mo
             }
             return output_dir / "metadata.json"
 
+    def fake_get_class(name):
+        calls["processor_name"] = name
+        return FakeEncoder
+
     monkeypatch.setattr(preprocessing_multiprocess, "materialize_hf_dataset", fake_materialize)
-    monkeypatch.setattr(preprocessing_multiprocess, "_resolve_processor_target", lambda target: FakeEncoder)
+    monkeypatch.setattr(preprocessing_multiprocess.ProcessorRegistry, "get_class", fake_get_class)
 
     monkeypatch.setattr(
         sys,
@@ -93,8 +105,8 @@ def test_image_edit_cli_materializes_and_invokes_configured_encoder(tmp_path, mo
             "condition=source_img",
             "--dataset_caption_column",
             "instruction",
-            "--processor_target",
-            "package.module.Encoder",
+            "--processor",
+            "qwen_image_edit",
             "--model_name",
             "org/model",
             "--model_revision",
@@ -127,6 +139,7 @@ def test_image_edit_cli_materializes_and_invokes_configured_encoder(tmp_path, mo
         HFDatasetMediaMapping("context", "source_img"),
         HFDatasetMediaMapping("condition", "source_img"),
     ]
+    assert calls["processor_name"] == "qwen_image_edit"
     assert calls["constructor"] == ("org/model", "model-branch", 384)
     assert calls["encode"] == {
         "manifest_path": source_manifest,
@@ -152,11 +165,7 @@ def test_image_edit_preprocessing_requires_encoder_contract(tmp_path, monkeypatc
             pass
 
     monkeypatch.setattr(preprocessing_multiprocess, "materialize_hf_dataset", lambda *args, **kwargs: export)
-    monkeypatch.setattr(
-        preprocessing_multiprocess,
-        "_resolve_processor_target",
-        lambda target: MissingEncodeManifest,
-    )
+    monkeypatch.setattr(preprocessing_multiprocess.ProcessorRegistry, "get_class", lambda name: MissingEncodeManifest)
 
     with pytest.raises(TypeError, match=r"must implement encode_manifest\(\.\.\.\)"):
         preprocessing_multiprocess._preprocess_image_edit_dataset(
@@ -173,7 +182,7 @@ def test_image_edit_preprocessing_requires_encoder_contract(tmp_path, monkeypatc
             dataset_streaming=True,
             dataset_trust_remote_code=None,
             output_dir=str(tmp_path / "cache"),
-            processor_target="package.module.Encoder",
+            processor_name="qwen_image_edit",
             model_name=None,
             model_revision=None,
             max_sequence_length=512,

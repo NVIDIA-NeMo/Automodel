@@ -26,6 +26,7 @@ from .flux import FluxProcessor
 from .flux2 import Flux2Processor
 from .hunyuan import HunyuanVideoProcessor
 from .qwen_image import QwenImageProcessor
+from .qwen_image_edit import QwenImageEditProcessor
 from .registry import ProcessorRegistry
 from .wan import Wan22Processor, WanProcessor
 
@@ -39,6 +40,7 @@ __all__ = [
     "FluxProcessor",
     "Flux2Processor",
     "QwenImageProcessor",
+    "QwenImageEditProcessor",
     # Video processors
     "WanProcessor",
     "Wan22Processor",

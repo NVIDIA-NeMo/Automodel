@@ -53,7 +53,7 @@ uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
   --max_items 64 \
   --max_pixels 1048576 \
   --max_sequence_length 512 \
-  --processor_target nemo_automodel.components.models.qwen_image_edit.preprocessing.QwenImageEditCacheEncoder \
+  --processor qwen_image_edit \
   --model_name Qwen/Qwen-Image-Edit-2511 \
   --model_revision 6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9 \
   --num_gpus 8 \
@@ -76,7 +76,7 @@ uv run python -m tools.diffusion.preprocessing_multiprocess image-edit \
   --max_items 1024 \
   --resolution_preset 1024p \
   --max_sequence_length 512 \
-  --processor_target nemo_automodel.components.models.qwen_image_edit.preprocessing.QwenImageEditCacheEncoder \
+  --processor qwen_image_edit \
   --model_name Qwen/Qwen-Image-Edit-2511 \
   --model_revision 6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9 \
   --num_gpus 8 \

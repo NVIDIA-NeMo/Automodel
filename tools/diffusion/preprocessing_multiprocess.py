@@ -48,12 +48,10 @@ Usage:
 
 import argparse
 import hashlib
-import importlib
 import json
 import logging
 import os
 import traceback
-from collections.abc import Callable
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
@@ -1133,24 +1131,6 @@ def _parse_dataset_media_mapping(value: str) -> HFDatasetMediaMapping:
     return HFDatasetMediaMapping(role=role, column=column)
 
 
-def _resolve_processor_target(target_path: str) -> Callable[..., object]:
-    """Resolve an image-edit processor target from a dotted import path."""
-    module_name, separator, attribute = target_path.rpartition(".")
-    if not separator or not module_name or not attribute:
-        raise ValueError(f"processor_target must be a dotted import path, got {target_path!r}")
-    try:
-        module = importlib.import_module(module_name)
-    except ImportError as exc:
-        raise ImportError(f"Could not import processor_target module {module_name!r}") from exc
-    try:
-        target = getattr(module, attribute)
-    except AttributeError as exc:
-        raise ImportError(f"processor_target {target_path!r} does not exist") from exc
-    if not callable(target):
-        raise TypeError(f"processor_target {target_path!r} must resolve to a class or callable")
-    return target
-
-
 def _preprocess_image_edit_dataset(
     *,
     dataset_name: str,
@@ -1163,7 +1143,7 @@ def _preprocess_image_edit_dataset(
     dataset_streaming: bool,
     dataset_trust_remote_code: bool | None,
     output_dir: str,
-    processor_target: str,
+    processor_name: str,
     model_name: str | None,
     model_revision: str | None,
     max_sequence_length: int,
@@ -1193,20 +1173,19 @@ def _preprocess_image_edit_dataset(
     if export.manifest_file is None:
         raise RuntimeError("Image-edit materialization did not produce a manifest")
 
-    target = _resolve_processor_target(processor_target)
+    processor_cls = ProcessorRegistry.get_class(processor_name)
     try:
-        processor = target(
+        processor = processor_cls(
             model_name=model_name,
             revision=model_revision,
             max_sequence_length=max_sequence_length,
         )
     except TypeError as exc:
         raise TypeError(
-            f"processor_target {processor_target!r} must accept keyword arguments model_name, revision, "
-            "and max_sequence_length"
+            f"processor {processor_name!r} must accept keyword arguments model_name, revision, and max_sequence_length"
         ) from exc
     if not isinstance(processor, _ImageEditManifestEncoder) or not callable(processor.encode_manifest):
-        raise TypeError(f"processor_target {processor_target!r} must implement encode_manifest(...)")
+        raise TypeError(f"processor {processor_name!r} must implement encode_manifest(...)")
 
     cache_manifest = processor.encode_manifest(
         manifest_path=export.manifest_file,
@@ -1218,7 +1197,7 @@ def _preprocess_image_edit_dataset(
     )
     if not isinstance(cache_manifest, Path):
         raise TypeError(
-            f"processor_target {processor_target!r} encode_manifest(...) must return pathlib.Path, "
+            f"processor {processor_name!r} encode_manifest(...) must return pathlib.Path, "
             f"got {type(cache_manifest).__name__}"
         )
 
@@ -1256,7 +1235,7 @@ Examples:
       --dataset_media_mapping target=target_image \\
       --dataset_media_mapping context=source_image \\
       --dataset_caption_column instruction \\
-      --processor_target package.module.ImageEditCacheEncoder \\
+      --processor qwen_image_edit \\
       --output_dir /cache
 
   # Video preprocessing with Wan2.1
@@ -1346,7 +1325,7 @@ Examples:
     )
     image_edit_parser.add_argument("--output_dir", type=str, required=True, help="Output cache directory")
     image_edit_parser.add_argument(
-        "--processor_target", type=str, required=True, help="Dotted target for the model-owned cache encoder"
+        "--processor", type=str, default="qwen_image_edit", help="Processor name (default: qwen_image_edit)"
     )
     image_edit_parser.add_argument("--model_name", type=str, default=None, help="Optional model name or path")
     image_edit_parser.add_argument(
@@ -1526,7 +1505,7 @@ Examples:
             dataset_streaming=args.dataset_streaming,
             dataset_trust_remote_code=args.dataset_trust_remote_code,
             output_dir=args.output_dir,
-            processor_target=args.processor_target,
+            processor_name=args.processor,
             model_name=args.model_name,
             model_revision=args.model_revision,
             max_sequence_length=args.max_sequence_length,
