@@ -22,7 +22,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PreTrainedModel
+from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification, PretrainedConfig, PreTrainedModel
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
 from transformers.utils import logging
 
@@ -184,14 +184,33 @@ def pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tensor, pool_ty
     return emb
 
 
-def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
+def _get_matching_remote_code_source(model: PreTrainedModel, config: PretrainedConfig) -> str | None:
+    """Return the original checkpoint path when its remote code implements the active model class."""
+    auto_map = getattr(config, "auto_map", None)
+    if not isinstance(auto_map, dict):
+        return None
+
+    encoder_class_name = model.__class__.__name__
+    auto_model_key = (
+        "AutoModelForSequenceClassification" if "ForSequenceClassification" in encoder_class_name else "AutoModel"
+    )
+    model_reference = auto_map.get(auto_model_key)
+    if not isinstance(model_reference, str) or model_reference.rsplit(".", 1)[-1] != encoder_class_name:
+        return None
+
+    source = getattr(config, "name_or_path", "")
+    return source or None
+
+
+def configure_encoder_metadata(model: PreTrainedModel, config: PretrainedConfig) -> None:
     """Configure HuggingFace consolidated checkpoint metadata on a model.
 
-    Sets ``config.architectures`` unconditionally.  For custom retrieval
-    architectures registered in :class:`ModelRegistry`, also writes
-    ``config.auto_map`` so that the saved checkpoint can be reloaded via
-    HuggingFace Auto classes.  Standard HF models already have their own
-    auto-resolution and do not need ``auto_map`` entries.
+    Sets ``config.architectures`` unconditionally. For custom retrieval
+    architectures registered in :class:`ModelRegistry`, preserves an existing
+    remote-code ``auto_map`` when it implements the active model class. Otherwise,
+    writes an ``auto_map`` for the local retrieval implementation so the saved
+    checkpoint can be reloaded via HuggingFace Auto classes. Standard HF models
+    already have their own auto-resolution and do not need ``auto_map`` entries.
 
     Args:
         model: The backbone ``PreTrainedModel`` instance.
@@ -200,9 +219,12 @@ def configure_encoder_metadata(model: PreTrainedModel, config) -> None:
     encoder_class_name = model.__class__.__name__
     config.architectures = [encoder_class_name]
 
-    # Only set auto_map for custom retrieval architectures.
-    # Standard HF models don't need auto_map pointing to a local model.py.
-    if ModelRegistry.has_retrieval_model(encoder_class_name):
+    # Converted retrieval backbones need auto_map to point to their local implementation.
+    # A matching original remote-code package is already portable and should remain unchanged.
+    if (
+        ModelRegistry.has_retrieval_model(encoder_class_name)
+        and _get_matching_remote_code_source(model, config) is None
+    ):
         config_class_name = config.__class__.__name__
         config_module = config.__class__.__module__.rsplit(".", 1)[-1]
         model_module = model.__class__.__module__.rsplit(".", 1)[-1]
@@ -365,7 +387,10 @@ def _init_encoder_common(encoder: nn.Module, model: PreTrainedModel) -> None:
     """Shared init for BiEncoderModel and CrossEncoderModel."""
     encoder.model = model
     encoder.config = model.config
-    if ModelRegistry.has_retrieval_model(model.__class__.__name__):
+    remote_code_source = _get_matching_remote_code_source(model, model.config)
+    if remote_code_source is not None:
+        encoder.name_or_path = remote_code_source
+    elif ModelRegistry.has_retrieval_model(model.__class__.__name__):
         encoder.name_or_path = os.path.dirname(inspect.getfile(type(model)))
     else:
         encoder.name_or_path = getattr(model.config, "name_or_path", "")

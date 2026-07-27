@@ -15,12 +15,12 @@
 """Functional tests for retrieval backbone extraction."""
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 import torch.nn as nn
-from transformers import AutoModel, Mistral3Config
+from transformers import AutoModel, Mistral3Config, PretrainedConfig, PreTrainedModel
 
 from nemo_automodel.components.models.llama_bidirectional.model import (
     LlamaBidirectionalForSequenceClassification,
@@ -33,6 +33,70 @@ def test_llama_nemotron_vl_supported_backbone_for_embedding():
     from nemo_automodel._transformers.retrieval import SUPPORTED_BACKBONES
 
     assert SUPPORTED_BACKBONES["llama_nemotron_vl"]["embedding"] == "LlamaNemotronVLModel"
+
+
+class _RemoteCodeConfig(PretrainedConfig):
+    model_type = "remote_code_test"
+
+
+class _RemoteCodeModel(PreTrainedModel):
+    config_class = _RemoteCodeConfig
+
+
+def test_custom_encoder_preserves_matching_original_remote_code(tmp_path):
+    from nemo_automodel._transformers.retrieval import _init_encoder_common
+
+    config = _RemoteCodeConfig()
+    config.name_or_path = str(tmp_path / "original_checkpoint")
+    config.auto_map = {
+        "AutoConfig": "configuration_remote.RemoteCodeConfig",
+        "AutoModel": "modeling_remote._RemoteCodeModel",
+        "AutoProcessor": "processing_remote.RemoteCodeProcessor",
+    }
+    original_auto_map = dict(config.auto_map)
+    model = _RemoteCodeModel(config)
+    encoder = nn.Module()
+
+    with patch(
+        "nemo_automodel._transformers.retrieval.ModelRegistry.has_retrieval_model",
+        return_value=True,
+    ):
+        _init_encoder_common(encoder, model)
+
+    assert encoder.name_or_path == config.name_or_path
+    assert config.architectures == ["_RemoteCodeModel"]
+    assert config.auto_map == original_auto_map
+
+
+def test_custom_encoder_exports_local_code_when_remote_class_differs():
+    from nemo_automodel._transformers.retrieval import _init_encoder_common
+
+    config = _RemoteCodeConfig()
+    config.name_or_path = "/original/checkpoint"
+    config.auto_map = {
+        "AutoConfig": "configuration_remote.RemoteCodeConfig",
+        "AutoModel": "modeling_remote.DifferentModel",
+    }
+    model = _RemoteCodeModel(config)
+    encoder = nn.Module()
+
+    with (
+        patch(
+            "nemo_automodel._transformers.retrieval.ModelRegistry.has_retrieval_model",
+            return_value=True,
+        ),
+        patch(
+            "nemo_automodel._transformers.retrieval.inspect.getfile",
+            return_value="/automodel/retrieval_model/model.py",
+        ),
+    ):
+        _init_encoder_common(encoder, model)
+
+    assert encoder.name_or_path == "/automodel/retrieval_model"
+    assert config.auto_map == {
+        "AutoConfig": "test_retrieval._RemoteCodeConfig",
+        "AutoModel": "test_retrieval._RemoteCodeModel",
+    }
 
 
 def _tiny_mistral3_vlm_config(text_model_type: str) -> Mistral3Config:
