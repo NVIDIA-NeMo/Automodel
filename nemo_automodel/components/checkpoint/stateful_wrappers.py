@@ -67,6 +67,7 @@ from nemo_automodel.components.checkpoint.utils import (
 
 _PREFIX = "model."
 _OPTIMIZER_PARTS_KEY = "optimizer_parts"
+_OPTIMIZER_PART_KEY_PREFIX = "stage_"
 
 
 def _is_quantized_module(module: torch.nn.Module) -> bool:
@@ -569,6 +570,7 @@ class OptimizerState:
         cpu_offload: bool = False,
         *,
         has_expert_parallelism: bool = False,
+        optimizer_part_ids: list[int] | None = None,
     ):
         """
         Initialize an OptimizerState instance.
@@ -592,12 +594,24 @@ class OptimizerState:
             has_expert_parallelism: Whether the distributed topology uses expert
                 parallelism. This runtime topology signal avoids inferring global
                 EP state from only one local pipeline part.
+            optimizer_part_ids: Global pipeline-stage indices corresponding to
+                ``optimizer``. These namespace native optimizer state across PP
+                ranks so different stages cannot produce overlapping DCP keys.
         """
         self.model = [model] if isinstance(model, torch.nn.Module) else model
         self.optimizer = [optimizer] if isinstance(optimizer, torch.optim.Optimizer) else optimizer
         self.scheduler = [scheduler] if isinstance(scheduler, torch.optim.lr_scheduler.LRScheduler) else scheduler
         self.is_peft = is_peft
         self.cpu_offload = cpu_offload
+        self.optimizer_part_ids = optimizer_part_ids
+        if self.optimizer_part_ids is not None:
+            if len(self.optimizer_part_ids) != len(self.optimizer):
+                raise ValueError(
+                    "Optimizer part IDs must match the local optimizer layout: "
+                    f"received {len(self.optimizer_part_ids)} IDs for {len(self.optimizer)} optimizers."
+                )
+            if len(set(self.optimizer_part_ids)) != len(self.optimizer_part_ids):
+                raise ValueError(f"Optimizer part IDs must be unique, got {self.optimizer_part_ids}.")
         self._use_native_optimizer_state = self.is_peft and (
             has_expert_parallelism
             or any(_has_expert_parallelism(model_part) for model_part in self.model)
@@ -620,10 +634,20 @@ class OptimizerState:
         if self._use_native_optimizer_state:
             for optimizer in self.optimizer:
                 _materialize_missing_adam_state(optimizer)
-            if len(self.optimizer) == 1:
+            if self.optimizer_part_ids is None:
+                if len(self.optimizer) != 1:
+                    raise ValueError(
+                        "Native optimizer checkpointing requires global optimizer part IDs "
+                        f"when saving {len(self.optimizer)} local optimizer parts."
+                    )
                 optimizer_state_dict = self.optimizer[0].state_dict()
             else:
-                optimizer_state_dict = {_OPTIMIZER_PARTS_KEY: [optimizer.state_dict() for optimizer in self.optimizer]}
+                optimizer_state_dict = {
+                    _OPTIMIZER_PARTS_KEY: {
+                        f"{_OPTIMIZER_PART_KEY_PREFIX}{part_id}": optimizer.state_dict()
+                        for part_id, optimizer in zip(self.optimizer_part_ids, self.optimizer, strict=True)
+                    }
+                }
         else:
             # this line automatically manages FSDP FQN's, as well as sets the default state dict type
             # to FSDP.SHARDED_STATE_DICT
@@ -651,21 +675,27 @@ class OptimizerState:
         # Mirror state_dict(): PEFT with quantized parameters or EP topology uses native optimizer state.
         if self._use_native_optimizer_state:
             optimizer_state_dict = state_dict["optim"]
-            if len(self.optimizer) == 1:
+            if self.optimizer_part_ids is None:
+                if len(self.optimizer) != 1:
+                    raise ValueError(
+                        "Native optimizer checkpointing requires global optimizer part IDs "
+                        f"when loading {len(self.optimizer)} local optimizer parts."
+                    )
                 self.optimizer[0].load_state_dict(optimizer_state_dict)
             else:
                 optimizer_parts = optimizer_state_dict.get(_OPTIMIZER_PARTS_KEY)
-                if not isinstance(optimizer_parts, list):
+                if not isinstance(optimizer_parts, dict):
                     raise ValueError(
-                        f"Multi-part native optimizer checkpoint is missing the '{_OPTIMIZER_PARTS_KEY}' state list."
+                        f"Pipeline native optimizer checkpoint is missing the '{_OPTIMIZER_PARTS_KEY}' state mapping."
                     )
-                if len(optimizer_parts) != len(self.optimizer):
+                expected_part_keys = [f"{_OPTIMIZER_PART_KEY_PREFIX}{part_id}" for part_id in self.optimizer_part_ids]
+                if set(optimizer_parts) != set(expected_part_keys):
                     raise ValueError(
-                        "Optimizer checkpoint part count does not match the current pipeline layout: "
-                        f"checkpoint has {len(optimizer_parts)} parts, current layout has {len(self.optimizer)}."
+                        "Optimizer checkpoint parts do not match the current pipeline layout: "
+                        f"checkpoint has {sorted(optimizer_parts)}, current rank expects {sorted(expected_part_keys)}."
                     )
-                for optimizer, optimizer_part in zip(self.optimizer, optimizer_parts, strict=True):
-                    optimizer.load_state_dict(optimizer_part)
+                for optimizer, part_key in zip(self.optimizer, expected_part_keys, strict=True):
+                    optimizer.load_state_dict(optimizer_parts[part_key])
         else:
             # sets our state dicts on the optimizer, now that we've loaded
             func = partial(

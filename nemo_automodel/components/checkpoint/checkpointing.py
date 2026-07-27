@@ -612,6 +612,8 @@ class Checkpointer:
         model: nn.Module | list[nn.Module],
         weights_path: str,
         scheduler: Optional[Any] = None,
+        *,
+        optimizer_part_ids: list[int] | None = None,
     ) -> None:
         """
         Save optimizer (and optional scheduler) state to `weights_path/optim` using DCP.
@@ -621,6 +623,8 @@ class Checkpointer:
             model: Model or pipeline model parts providing partitioning context.
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to include.
+            optimizer_part_ids: Global pipeline-stage indices corresponding to
+                per-model-part optimizers.
         """
         optimizer_path = os.path.join(weights_path, "optim")
         _ensure_dirs(optimizer_path, process_group=self.process_group)
@@ -631,6 +635,7 @@ class Checkpointer:
             is_peft=self.config.is_peft,
             cpu_offload=self.config.cpu_offload,
             has_expert_parallelism=self.moe_mesh is not None,
+            optimizer_part_ids=optimizer_part_ids,
         )
         state_dict = optimizer_state.state_dict()
         self._optim_ctx.future = self._do_save(state_dict, optimizer_path)
@@ -641,6 +646,8 @@ class Checkpointer:
         model: nn.Module | list[nn.Module],
         weights_path: str,
         scheduler: Optional[Any] = None,
+        *,
+        optimizer_part_ids: list[int] | None = None,
     ) -> None:
         """
         Load optimizer (and optional scheduler) state from `weights_path/optim` using DCP.
@@ -650,6 +657,8 @@ class Checkpointer:
             model: Model or pipeline model parts providing partitioning context.
             weights_path: Base directory for checkpoints.
             scheduler: Optional LR scheduler to populate.
+            optimizer_part_ids: Global pipeline-stage indices corresponding to
+                per-model-part optimizers.
         """
         optimizer_state = OptimizerState(
             model,
@@ -658,6 +667,7 @@ class Checkpointer:
             is_peft=self.config.is_peft,
             cpu_offload=self.config.cpu_offload,
             has_expert_parallelism=self.moe_mesh is not None,
+            optimizer_part_ids=optimizer_part_ids,
         )
         state_dict = optimizer_state.state_dict()
         self._do_load(state_dict, os.path.join(weights_path, "optim"))

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from unittest.mock import patch
 
 import pytest
@@ -67,14 +68,54 @@ def _assert_native_state_dicts_equal(actual: dict, expected: dict) -> None:
                 assert actual_value == expected_value
 
 
-def _make_peft_ep_checkpointer(tmp_path) -> Checkpointer:
+def _make_peft_ep_checkpointer(tmp_path, *, pp_rank: int = 0) -> Checkpointer:
     config = CheckpointingConfig(
         checkpoint_dir=tmp_path,
         model_save_format="safetensors",
         save_consolidated=False,
         is_peft=True,
     )
-    return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=0, moe_mesh=object())
+    return Checkpointer(config, dp_rank=0, tp_rank=0, pp_rank=pp_rank, moe_mesh=object())
+
+
+def _run_native_pp_optimizer_dcp_round_trip(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    checkpoint_dir: str,
+) -> None:
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        source_models, source_optimizers = _make_stepped_adam_parts(count=1)
+        source_optimizers[0].param_groups[0]["lr"] = 0.01 * (rank + 1)
+        source_parameter = source_optimizers[0].param_groups[0]["params"][0]
+        source_optimizers[0].state[source_parameter]["exp_avg"].fill_(rank + 1)
+        source_optimizers[0].state[source_parameter]["exp_avg_sq"].fill_(rank + 2)
+        checkpointer = _make_peft_ep_checkpointer(checkpoint_dir, pp_rank=rank)
+        checkpointer.save_optimizer(
+            source_optimizers,
+            source_models,
+            checkpoint_dir,
+            optimizer_part_ids=[rank],
+        )
+
+        target_models = [nn.Linear(2, 1, bias=False)]
+        target_optimizers = [torch.optim.AdamW(target_models[0].parameters(), lr=0.5)]
+        checkpointer.load_optimizer(
+            target_optimizers,
+            target_models,
+            checkpoint_dir,
+            optimizer_part_ids=[rank],
+        )
+        _assert_adam_states_equal(target_optimizers[0], source_optimizers[0])
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 def test_checkpointer_uses_native_state_for_all_optimizer_parts_with_ep_topology(tmp_path):
@@ -82,13 +123,18 @@ def test_checkpointer_uses_native_state_for_all_optimizer_parts_with_ep_topology
     checkpointer = _make_peft_ep_checkpointer(tmp_path)
 
     with patch.object(checkpointer, "_do_save") as do_save:
-        checkpointer.save_optimizer(optimizers, model_parts, str(tmp_path))
+        checkpointer.save_optimizer(
+            optimizers,
+            model_parts,
+            str(tmp_path),
+            optimizer_part_ids=[0, 8],
+        )
 
     state_dict = do_save.call_args.args[0]
     saved_parts = state_dict["optim"]["optimizer_parts"]
-    assert len(saved_parts) == len(optimizers)
-    for saved_part, optimizer in zip(saved_parts, optimizers, strict=True):
-        _assert_native_state_dicts_equal(saved_part, optimizer.state_dict())
+    assert saved_parts.keys() == {"stage_0", "stage_8"}
+    for part_key, optimizer in zip(("stage_0", "stage_8"), optimizers, strict=True):
+        _assert_native_state_dicts_equal(saved_parts[part_key], optimizer.state_dict())
 
 
 def test_native_single_optimizer_state_preserves_existing_checkpoint_schema():
@@ -106,17 +152,43 @@ def test_native_single_optimizer_state_preserves_existing_checkpoint_schema():
 def test_native_multi_optimizer_state_dcp_round_trip(tmp_path):
     source_models, source_optimizers = _make_stepped_adam_parts()
     checkpointer = _make_peft_ep_checkpointer(tmp_path)
-    checkpointer.save_optimizer(source_optimizers, source_models, str(tmp_path))
+    checkpointer.save_optimizer(
+        source_optimizers,
+        source_models,
+        str(tmp_path),
+        optimizer_part_ids=[0, 2],
+    )
 
     target_models = [nn.Linear(2, 1, bias=False) for _ in source_models]
     target_optimizers = [torch.optim.AdamW(model.parameters(), lr=0.5) for model in target_models]
-    checkpointer.load_optimizer(target_optimizers, target_models, str(tmp_path))
+    checkpointer.load_optimizer(
+        target_optimizers,
+        target_models,
+        str(tmp_path),
+        optimizer_part_ids=[0, 2],
+    )
 
     for target, source in zip(target_optimizers, source_optimizers, strict=True):
         _assert_adam_states_equal(target, source)
 
 
-def test_native_multi_optimizer_load_rejects_pipeline_part_count_mismatch():
+def test_native_pipeline_optimizer_load_rejects_stage_mismatch():
+    model_parts, optimizers = _make_stepped_adam_parts()
+    optimizer_state = OptimizerState(
+        model_parts,
+        optimizers,
+        is_peft=True,
+        has_expert_parallelism=True,
+        optimizer_part_ids=[0, 8],
+    )
+    state_dict = optimizer_state.state_dict()
+    state_dict["optim"]["optimizer_parts"]["stage_7"] = state_dict["optim"]["optimizer_parts"].pop("stage_8")
+
+    with pytest.raises(ValueError, match=r"checkpoint has \['stage_0', 'stage_7'\].*expects \['stage_0', 'stage_8'\]"):
+        optimizer_state.load_state_dict(state_dict)
+
+
+def test_native_multi_optimizer_state_requires_global_part_ids():
     model_parts, optimizers = _make_stepped_adam_parts()
     optimizer_state = OptimizerState(
         model_parts,
@@ -124,8 +196,16 @@ def test_native_multi_optimizer_load_rejects_pipeline_part_count_mismatch():
         is_peft=True,
         has_expert_parallelism=True,
     )
-    state_dict = optimizer_state.state_dict()
-    state_dict["optim"]["optimizer_parts"].pop()
 
-    with pytest.raises(ValueError, match="checkpoint has 1 parts, current layout has 2"):
-        optimizer_state.load_state_dict(state_dict)
+    with pytest.raises(ValueError, match="requires global optimizer part IDs"):
+        optimizer_state.state_dict()
+
+
+def test_native_pipeline_optimizer_state_dcp_round_trip_across_ranks(tmp_path):
+    world_size = 2
+    torch.multiprocessing.spawn(
+        _run_native_pp_optimizer_dcp_round_trip,
+        args=(world_size, str(tmp_path / "dist_init"), str(tmp_path / "checkpoint")),
+        nprocs=world_size,
+        join=True,
+    )
